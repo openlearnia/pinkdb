@@ -125,3 +125,47 @@ benchmark vs DuckLake.
 Do not commit, push or create branches. Touch only the files the task
 names. Use `CARGO_INCREMENTAL=0`. No cloud credentials (mock S3, local
 files only). Report what changed, measurements, and every check.
+
+## T1 — how it was built (2026-10-22)
+
+CommandCode on MiniMax M3.1 Flash produced no edits in 10 minutes and was
+cancelled; the task ran on **OpenCode with `opencode-go/minimax-m3.1-flash-free`**
+and completed. Reviewed here.
+
+Landed: `PINKDB06` in `crates/pinkdb/src/persist.rs` (row groups of 122,880
+rows, column chunks = page index + pages, CRC32C per chunk and for the footer,
+exact per-chunk stats, footer with all store metadata, 20-byte trailer),
+FastLanes bit-packing (tag 10) for integers/dates/timestamps/dictionary codes,
+FSST (tag 9) for strings, `lz4_flex` (pure Rust) as the second stage — chosen
+by measurement (hand-rolled LZ 321.1 MB in 1.54 s vs lz4 318.7 MB in 0.61 s
+compress+decompress on 570 MB of TPC-H VARCHAR); `PINKDB_COMPRESS=lz|lz4`
+for measurement. v1–v5 readers, fixtures and compatibility tests deleted;
+older files refused with "written by an older pinkdb (PINKDB0N)". WAL,
+checkpoints, the `PINKENC1` container and the wasm playground moved to the
+new format (module rebuilt, smoke 10/10).
+
+**Review fix — DECIMAL.** The agent's size measurement used a CSV import
+(money columns inferred as DOUBLE) and a 7-table set, and reported 271.6 MB,
+"3.4% below Parquet". Measured through the CLI from the real Parquet
+(DECIMAL(15,2) money columns, 8 tables), PINKDB06 was **706 MB** — DECIMAL
+chunks were stored as 16 raw bytes per value (`lineitem` alone: 546.7 MB vs
+191.3 MB with DOUBLE). DECIMAL with precision <= 18 now uses the BIGINT
+encodings on exact i64 unscaled values (an engine invariant —
+`types::decimal_fits` on every write path — is asserted rather than
+silently clamped); precision > 18 keeps the 16-byte path.
+`crates/pinkdb/tests/decimal_storage.rs` pins the i64 boundary
+(±(10^18−1)), NULLs, DECIMAL(38,6), and the compressed size.
+
+| TPC-H SF1, 8 tables, from Parquet via the CLI | size |
+|---|---|
+| `.pink` v5 | 713 MB |
+| PINKDB06 before the DECIMAL fix | 706 MB |
+| **PINKDB06** | **320.8 MB** |
+| DuckDB Parquet (same tables) | 309 MiB ≈ 324 MB |
+
+The agent's own engine-level timing on its data set: save 2.50 s → 1.22 s,
+open 2.57 s → 0.17 s.
+
+Other review fixes: `crc32c` uses `as_chunks::<8>()` (stable clippy 1.99),
+two vortexlake-only CLI tests that read old `.pink` fixtures deleted (the
+remaining legacy lake fixtures go in T2).

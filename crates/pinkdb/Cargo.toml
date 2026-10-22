@@ -25,6 +25,11 @@ js = ["dep:pinkdb-js", "pinkdb-js/engine"]
 csv = "1"
 peg = "0.8"
 rayon = "1.12.0"
+# The second compression stage of a `.pink` chunk frame (wave 102): the
+# pure-Rust LZ4 block format. No C code, so a default build stays free of C
+# dependencies (the measurement that picked it over the hand-rolled LZ77 is
+# in `persist.rs`).
+lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
 # Audited RustCrypto crates. `argon2` is unconditional (wave 48: RBAC hashes
 # user passwords with Argon2id; the same crate backs the `encryption`
 # feature's passphrase KDF). Default features are off and `rand` is not

@@ -2531,6 +2531,7 @@ dependencies = [
  "argon2",
  "csv",
  "getrandom 0.2.17",
+ "lz4_flex",
  "peg",
  "pinkdb-ext-loader",
  "pinkdb-js",

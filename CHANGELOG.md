@@ -9,6 +9,16 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-22
+### Wave 102 (part 1) — a new, faster `.pink` file format
+- `.pink` files use a new layout (`PINKDB06`): column data in row groups
+  with a directory at the end, a checksum per column chunk, and new
+  encodings (FastLanes bit-packing, FSST for text, LZ4).
+- TPC-H SF1 saved as `.pink` is now 321 MB instead of 713 MB — slightly
+  smaller than the same data as DuckDB Parquet — and opens far faster.
+- Files from earlier pinkdb versions are no longer readable (pinkdb is in
+  early development; there is one current format). They are refused with a
+  clear message.
+
 ### Wave 98b — fast lakes on S3/R2 ✅
 - Lakes on object storage read only what a query needs: Parquet and Vortex
   lake files fetch just the queried columns with concurrent range requests,

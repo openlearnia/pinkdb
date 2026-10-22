@@ -859,7 +859,7 @@ fn durable_transaction_preserves_index_ddl_order() {
 }
 
 fn flags_of(bytes: &[u8]) -> u32 {
-    u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+    pinkdb::persist::footer_flags(bytes).unwrap()
 }
 
 /// The sorted (key-agnostic) posting lists of one index: comparable across

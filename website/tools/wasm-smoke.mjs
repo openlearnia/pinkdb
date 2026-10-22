@@ -215,9 +215,11 @@ function main() {
     const snap = snapshot(handle);
     assert(snap.ok === true, `snapshot failed: ${JSON.stringify(snap)}`);
     snapshotBytes = snap.bytes;
-    assert(snapshotBytes.length > 8, "snapshot is empty");
-    const magic = textDecoder.decode(snapshotBytes.slice(0, 8));
-    assert(magic === "PINKDB05", `bad magic ${JSON.stringify(magic)}`);
+    assert(snapshotBytes.length > 20, "snapshot is empty");
+    // The `.pink` format's magic lives in the trailer: the last 20 bytes are
+    // `footer_crc32c u32 | footer_len u64 | "PINKDB06"`.
+    const magic = textDecoder.decode(snapshotBytes.slice(snapshotBytes.length - 8));
+    assert(magic === "PINKDB06", `bad magic ${JSON.stringify(magic)}`);
   });
 
   check("pw_restore into a second handle yields the same SELECT", () => {

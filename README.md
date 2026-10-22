@@ -93,7 +93,7 @@ SQL text
 | `pinkdb::plan` | Logical plan tree |
 | `pinkdb::optimizer` | Constant folding, predicate pushdown (incl. across joins) |
 | `pinkdb::exec` | Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel) |
-| `pinkdb::persist` | `.pink` single-file columnar persistence, v4 (typed paths + delta/dict-bitpack/ALP encodings + LZ frames; v1–v3 files load) |
+| `pinkdb::persist` | `.pink` single-file columnar persistence, `PINKDB06` (row groups + a footer with a per-table row-group directory, per-chunk CRC32C and exact per-chunk statistics; typed paths + delta/dict-bitpack/ALP/FastLanes/FSST encodings + a compression frame; one format, no legacy) |
 | `pinkdb::crypto` | optional at-rest encryption (`PINKENC1` container: AES-256-GCM + Argon2id) behind the `encryption` feature; a parse/identity stub otherwise |
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb::procedure` | Stored procedures: the SQL procedural language (parser + `CALL` executor), catalog definitions, `.pink` section |
@@ -104,7 +104,7 @@ SQL text
 | `pinkdb-arrow` | opt-in (`arrow` feature) Arrow IPC (Feather v2) file extension, engine-adjacent: a **table source** for `FROM 'f.arrow'` / `read_arrow` and a **COPY sink** for `COPY … (FORMAT arrow)`; reads materialize the file, writes are uncompressed; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects whole |
 | `pinkdb-parquet` | opt-in (`parquet` feature) read-side Parquet extension, engine-adjacent: `read_parquet`/`parquet_scan`, the four `parquet_*` metadata functions and DuckDB's replacement scan (`FROM 'file.parquet'`), with projection + row-group-statistics pushdown; flat schemas, TIMESTAMP(nanos)/TIME/UUID/FLOAT16/nested types refused by name; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects through a ranged `ChunkReader` |
 | `pinkdb-httpfs` | opt-in (`httpfs` feature) remote-file transport + `read_csv` table source: `https://` GET/HEAD/byte-range and the SigV4 `s3://` object client **shared with pink-lake and the parquet/arrow `remote` features**; `read_csv('url')`, `.import <url>`, `FROM 'https://…/x.csv'`; single objects only (no globs/compression/COPY TO yet) |
-| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the CLI `vortexlake` feature, `.pink` v4 with the `pinklake` feature; v1 `.pink` data files still readable; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature — pure storage, it combines explicitly as `pinklake,s3` / `vortexlake,s3`); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
+| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the CLI `vortexlake` feature, `.pink` (`PINKDB06`) with the `pinklake` feature; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature — pure storage, it combines explicitly as `pinklake,s3` / `vortexlake,s3`); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
 
 Design rules: Rust edition 2024 (MSRV 1.97), zero async (the server's opt-in
 `async-server` transport, wave 47, is the documented I/O-boundary carve-out);
@@ -443,40 +443,102 @@ rayon pool; anything else goes through the `csv` crate sequentially.
 ## Persistence
 
 `db.save("x.pink")` writes every database and table in a single-file
-columnar format (v4: `PINKDB04`, ending in a CRC-32 of the whole image);
-`PinkDb::open("x.pink")` loads it back (`.save` / `.open` in the REPL). The
-v4 encoder and decoder run on typed per-column paths (no per-row `Value`
-materialization; chunks save in parallel, and serial and parallel saves
-produce identical bytes) and add DELTA_BITPACK, DICT_BITPACK and ALP
-encodings (bit-exact exceptions) plus an "all valid" validity flag to the
-raw/RLE/bitpack/dictionary set. v1 files (`PINKDB01`, a flat table list), v2
-(`PINKDB02`, the databases layout) and v3 (`PINKDB03`, v2 + the checksum)
-still load; v1 tables become the single `main` database, and a format newer
-than this build (`PINKDB05`+) is refused with a clean "newer format" error,
-never guessed at. The encrypted `PINKENC1` container wraps v4 transparently
-(the container itself is version 2 since wave 45m — see Encryption). Views are
-session-local and never persisted. Round-trips are bit-exact (including `-0.0`
-and NaN payloads); truncated or corrupt files return errors, never panics — a
-damaged file fails its CRC-32 before any decoding, and no allocation is sized
-from an unvalidated length.
+columnar format; `PinkDb::open("x.pink")` loads it back (`.save` / `.open`
+in the REPL). The format is **`PINKDB06`** — one format, no legacy: the
+readers of `PINKDB01`–`PINKDB05` are gone with their fixtures and their
+compatibility tests, and a file written by an older pinkdb is refused with
+`this .pink file was written by an older pinkdb (PINKDB0N); this build
+reads PINKDB06 only`.
 
-v4 also carries an optional **LZ frame** (encoding tag 8, reserved since v4,
-implemented in wave 45j): a chunk whose best existing encoding is at least
-1024 B is probed on its first 4 KiB and, when the probe saves ≥10%, stored as
-a hand-rolled greedy LZ77 stream (64 KiB window, 4-byte hash, min match 4; no
-dependencies, no `unsafe`) framing the chosen encoding — `u32 raw_len | u8
-base_tag | u32 token_len | tokens`, where `base_tag` names the encoding the
-tokens rebuild — and only when strictly smaller. Measured on 1M-row text
-corpora (before → after, ×Vortex): JSON-like 70.4 → 15.7 MB (5.71× → 1.27×),
-logs 118.7 → 44.5 MB (3.48× → 1.30×), URLs 103.5 → 41.4 MB (3.15× → 1.26×).
-Random corpora and both sales tables stay byte-identical (a ~300 B
-bitpacked-dictionary candidate skips the scan; save +0–1%), and LZ also speeds
-save/open on text. Round trips stay bit-exact and old binaries reject a tag-8
-file cleanly (`unsupported v4 encoding tag 8; upgrade pinkdb`). A further
-string encoding, **FSST** (tag 9), is measured but deliberately not
-implemented: after LZ the text gaps to Vortex are 9.8% / 6.5%, and a
-255-symbol FSST floor estimate reaches only 3.2% / 4.3% (the remainder is the
-offset encoding); tag 9 stays reserved with a recorded design.
+### The layout (Parquet-shaped)
+
+```text
+data region: for every table (databases and tables in sorted name order)
+  for every row group (122,880 rows = 60 engine chunks of 2,048)
+    for every column (schema order)
+      column chunk = page index + pages
+
+footer: store metadata (databases, tables, schemas, column defaults,
+  constraints, index definitions + statistics, materialized views,
+  procedures, macros, RBAC) and, per table, the row count and the
+  row-group directory:
+    row groups [ { rows, per column: offset, length, page count,
+                             encoding summary, crc32c,
+                             stats { min, max, null_count, nan_count } } ]
+
+trailer (20 bytes): footer_crc32c u32 | footer_len u64 | "PINKDB06"
+```
+
+A **page** is one engine chunk (2,048 rows) encoded with the per-chunk
+encoder, so decoding stays chunk-native; a **column chunk** is the 60 pages
+of one (row group, column) pair. Every column chunk carries its own
+**CRC32C** and the footer carries its own — there is **no whole-file CRC**,
+so any chunk verifies on its own and a damaged chunk never invalidates the
+rest of the file. The magic lives in the **trailer**, at the end of the
+file: a reader needs the 20-byte trailer plus the footer (two small range
+requests), and the lake's `pink` provider reads exactly those plus the
+projected column chunks of the row groups that survive pruning.
+
+The footer records the **exact** statistics of every column chunk — its
+min and max (first-seen wins ties, exactly like the engine's MIN/MAX
+accumulators), its NULL count and its NaN count — which feed zone-map
+pruning and the lake's exact `COUNT`/`MIN`/`MAX`.
+
+The encoder and the decoder run on typed per-column paths (no per-row
+`Value` materialization); chunks save in parallel and load in parallel
+(columns × row groups, assembled in order), and **serial and parallel
+saves produce identical bytes**. Views are session-local and never
+persisted. Round-trips are bit-exact (including `-0.0` and NaN payloads);
+truncated or corrupt files return errors, never panics — the footer
+checksum is verified before a single byte of it is decoded, and no
+allocation is sized from an unvalidated length.
+
+### The encodings
+
+Per-chunk encoding is picked by size (smallest wins; ties keep the
+earlier candidate — the candidate order is part of the format contract):
+
+- Integers (INTEGER/BIGINT/DATE/TIMESTAMP): Plain (raw LE) vs RLE (low
+  run count) vs Bitpack (small range, min + width + packed bits) vs delta
+  bitpack (first value + min delta + width + packed deltas) vs
+  **FastLanes bit-packing** (1,024-value blocks, transposed lanes, a frame
+  of reference per block).
+- Doubles: Plain (raw bits) vs RLE vs ALP (decimal-scaled integer codes
+  plus a bit-exact exception list; non-finite, `-0.0`, subnormals and
+  out-of-range values ride the exceptions).
+- Booleans: Plain (bitpacked) vs RLE.
+- Varchars: Plain (offsets + data) vs Dictionary (first-occurrence codes)
+  vs RLE vs dictionary-bitpack (the dictionary with minimal-width codes,
+  packed in the FastLanes transposed layout) vs a **compression frame**
+  (tag 8) around the plain layout vs **FSST** (tag 9: a symbol table that
+  rewrites the string bytes, then the second compression stage).
+
+The **second compression stage** — the general-purpose compressor a chunk
+frame rides on — is a **measurement**, not a guess: wave 102 measured the
+hand-rolled LZ77 of wave 45j against the pure-Rust `lz4_flex` on the TPC-H
+SF1 set (18,569 VARCHAR chunks, 569.6 MB of plain payloads):
+
+| second stage | size | vs the plain | compress | compress + decompress |
+|---|---|---|---|---|
+| hand-rolled LZ77 | 321,112,231 B | 0.564× | 1.172 s | 1.559 s |
+| `lz4_flex` (pure Rust) | **318,692,386 B** | **0.560×** | **0.507 s** | **0.614 s** |
+
+`lz4_flex` wins on both size and speed, so it is the default. Both are
+pure Rust: **a default build links no C code**. `PINKDB_COMPRESS=lz|lz4`
+overrides the choice for a measurement run.
+
+Measured on the same TPC-H SF1 store (7 tables, 7.86M rows), the format
+change against the previous v5 container:
+
+| | size | save (encode) | open (decode) |
+|---|---|---|---|
+| v5 (`PINKDB05`, one CRC over the whole image) | 276,513,123 B | 2.502 s | 2.569 s |
+| `PINKDB06` (per-chunk CRC32C, footer, row groups) | **271,584,979 B** | **1.223 s** | **0.167 s** |
+
+(`PINKDB06` is 1.8% smaller, 2.0× faster to save and **15× faster to open**
+(the decode now runs over the columns *and* the row groups in parallel);
+DuckDB's own Parquet for the same tables is 281 MB.) The compression
+measurements: `PINKDB_COMPRESS=lz` gives 277,023,016 B / 1.317 s / 0.203 s.
 
 Durable opens add a sidecar write-ahead log: `PinkDb::open_durable("x.pink")`
 (the REPL's `.open`) loads the checkpoint, recovers an interrupted checkpoint,
@@ -716,8 +778,8 @@ separate validity bitmap, and an all-valid chunk sets a flag instead of
 writing one. 1M-row sales table: 24.5 MB CSV → **2.68 MB** `.pink` (1.015×
 the equivalent Vortex bytes), saved in 0.03 s, reopened in 0.03 s; the same
 table at 10M rows is 26.8 MB, saved in 0.29 s and reopened in 0.26 s. 1M-row
-text corpora (before → after the LZ frame): JSON-like 70.4 → 15.7 MB, logs
-118.7 → 44.5 MB, URLs 103.5 → 41.4 MB — now 1.26–1.30× Vortex (was
+text corpora (before → after the compression frame): JSON-like 70.4 → 15.7 MB,
+logs 118.7 → 44.5 MB, URLs 103.5 → 41.4 MB — now 1.26–1.30× Vortex (was
 3.15–5.71×). The same parallel encode pass also collects the exact facts a
 lake save publishes (row count, per-column NULL/NaN counts, bit-exact
 min/max — wave 45k); the `.pink` bytes are unchanged by it.
@@ -825,7 +887,7 @@ format**; wave 36 adds S3/R2 object storage; wave 45d adds read-only
 **`.lake attach`** — a footer-only open with exact `COUNT`/`MIN`/`MAX` from
 stored statistics and lazy materialization — and wave 45e adds **projection
 pushdown** (an attached scan decodes only the columns a query references).
-Wave 45i adds the `pinklake` build: the same lake over `.pink` v4
+Wave 45i adds the `pinklake` build: the same lake over `.pink`
 data files with no Vortex dependency, and wave 45k brings attach to it — a
 pinklake save publishes a CRC-protected per-column statistics block in the
 manifest (`statistics-only` attach), so exact `COUNT`/`MIN`/`MAX` read no data
@@ -1378,8 +1440,8 @@ same size. See the dependency/build note above.
 ### The `pinklake` build
 
 The same lake layer without the Vortex dependency: a `pinklake` build writes
-and reads **`.pink` v4 data files** (`data/<table>/<uuid>.pink`, the engine's
-single-table persistence bytes) under `format_version` 4 catalogs (each file
+and reads **`.pink` data files** (`data/<table>/<uuid>.pink`, the engine's
+single-table persistence bytes, `PINKDB06`) under `format_version` 4 catalogs (each file
 object carries its own statistics block) — no `vortex` crate and none of its
 ~218 transitive crates, a 5.21 MB binary instead of 47.78 MB. It enables every
 `.lake` command (save/open/attach/commit/versions/tables/info) and S3/R2
@@ -1407,7 +1469,7 @@ is slower than the `vortexlake` build — 0.023 s @1M / 0.238 s @10M printed vs
 constant in file size, 0 data-file reads) while eager open costs 29.9 /
 269.5 ms. Saves are ≈ equal (0.054 s @1M / 0.321 s @10M); data files are
 1.6–1.8% larger, because Vortex compresses the numeric columns better than
-`.pink` v4. In-session query results are identical, and both builds answer the
+`.pink`. In-session query results are identical, and both builds answer the
 statistics fast paths identically.
 
 Cross-build compatibility is verified both ways: a lake written by the
@@ -2837,7 +2899,7 @@ ties in ORDER BY have no stable order on either engine).
   plaintext; one S3 object is capped at 5 GiB (no multipart uploads) and
   credentials come only from the environment or explicit config (no
   profiles/IMDS/SSO); the `pinklake` build writes and reads only
-  `.pink` data files (v4 catalogs), attaches them
+  `.pink` data files (`PINKDB06`, v4 catalogs), attaches them
   statistics-only (exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks;
   `.pink` has no projected reader, so a fallback decodes the whole table),
   supports `.lake attach … write` + `.lake commit`, and refuses a Vortex lake
@@ -2861,6 +2923,14 @@ ties in ORDER BY have no stable order on either engine).
   protocol or the FFI yet
 - Known gaps and their scheduled waves are tracked in `docs/GAPS.md`
 
+Wave 102 replaced the `.pink` container with **`PINKDB06`**: a Parquet-shaped
+layout (row groups of 122,880 rows, a footer carrying the store metadata and
+the per-table row-group directory, a per-column-chunk CRC32C and exact
+per-chunk statistics, a 20-byte trailer) with FastLanes bit-packing, FSST and
+a measured second compression stage (pure-Rust `lz4_flex`). One format, no
+legacy: the `PINKDB01`–`PINKDB05` readers, their fixtures and their
+compatibility tests are gone.
+
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
 PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
 feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
@@ -2872,7 +2942,7 @@ exact `COUNT`/`MIN`/`MAX` from stored statistics; lazy materialize) in wave 45d
 and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
 brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
 10M), and wave 45j added LZ frames (tag 8) that shrink text corpora 3–5×. The
-`pinklake` build (`.pink` v4 lake data files, no `vortex` dependency,
+`pinklake` build (`.pink` lake data files, no `vortex` dependency,
 5.21 MB vs 47.78 MB CLI) shipped in wave 45i, and wave 45k gave it exact
 attach fast paths (a CRC-32-protected per-column statistics block published in
 the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a

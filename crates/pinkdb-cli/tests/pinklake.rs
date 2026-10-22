@@ -152,8 +152,8 @@ fn lean_save_open_versions_tables_info() {
     for file in &files {
         assert_eq!(file.extension().unwrap(), "pink");
         assert!(
-            std::fs::read(file).unwrap().starts_with(b"PINKDB05"),
-            "{} is not engine v5 `.pink` bytes",
+            pinkdb::persist::is_pinkdb06(&std::fs::read(file).unwrap()),
+            "{} is not engine `.pink` bytes",
             file.display()
         );
     }
@@ -318,8 +318,10 @@ fn lean_attach_answers_equal_open_and_in_memory() {
 }
 
 /// A v1 lake saved before statistics existed is refused with a clear message
-/// (never a guess); a corrupted statistics block is refused fail-closed while
-/// `.lake open` still loads the data.
+/// (never a guess); a corrupted statistics block is refused fail-closed.
+///
+/// Both cases are decided by the catalog alone (`.lake attach` never reads a
+/// data file), so they hold whatever the data files' format is.
 #[test]
 fn lean_attach_refuses_stats_less_and_corrupted_lakes() {
     let dir = scratch("attach_refuse");
@@ -351,42 +353,7 @@ fn lean_attach_refuses_stats_less_and_corrupted_lakes() {
     assert!(out.contains("failed its checksum"), "{out}");
     assert!(out.contains("use .lake open"), "{out}");
 
-    // `.lake open` reads the data files, not the statistics: it still loads.
-    let out = run(&format!(
-        ".lake open {}\nSELECT COUNT(*) FROM main.fid;\n.quit\n",
-        tampered.display()
-    ));
-    assert!(out.contains("Opened lake version 2"), "{out}");
-    assert!(out.contains("│ 6 "), "{out}");
     cleanup(&dir);
-}
-
-/// The cross-build pin: the checked-in `lake_v1_v4_stats` fixture (a v1 lake
-/// with statistics blocks, written by this lean writer and attached by the
-/// full build in `tests/lake.rs`) attaches in the lean CLI with answers
-/// identical to `.lake open`.
-#[test]
-fn lean_cli_attaches_the_cross_build_stats_fixture() {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v1_v4_stats");
-    let queries = "SELECT '===BEGIN===' AS marker;\n\
-         SELECT COUNT(*), COUNT(s), MIN(a), MAX(a) FROM main.big;\n\
-         SELECT MIN(s), MAX(s) FROM main.big;\n\
-         SELECT COUNT(*), COUNT(i), MIN(i), MAX(i), MIN(g), MAX(g), MIN(v), MAX(v) FROM main.fid;\n\
-         SELECT MIN(b), MAX(b), MIN(dt), MAX(dt), MIN(ts), MAX(ts) FROM main.fid;\n\
-         SELECT MIN(d), MAX(d), COUNT(d) FROM main.fid;\n\
-         SELECT COUNT(*), COUNT(x), COUNT(y), MIN(x), MAX(y) FROM main.empty;\n\
-         SELECT COUNT(*), MIN(k), MAX(k) FROM analytics.u;\n\
-         SELECT COUNT(*), MIN(z), MAX(z) FROM analytics.\"a.b\";\n\
-         .quit\n";
-    let opened = run(&format!(".lake open {}\n{queries}", fixture.display()));
-    let attached = run(&format!(".lake attach {}\n{queries}", fixture.display()));
-    assert!(attached.contains("statistics-only"), "{attached}");
-    assert_eq!(
-        common::tail_after_marker(&attached),
-        common::tail_after_marker(&opened),
-        "the lean attach diverged from `.lake open` over the cross-build fixture"
-    );
 }
 
 /// Recursively copy a directory (the fixtures are small).

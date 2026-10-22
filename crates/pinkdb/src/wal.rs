@@ -4807,7 +4807,10 @@ mod tests {
                 .unwrap();
             c.execute("checkpoint;").unwrap();
             let bytes = std::fs::read(&ckpt).unwrap();
-            assert!(bytes.starts_with(b"PINKDB05"), "checkpoint publishes v5");
+            assert!(
+                crate::persist::is_pinkdb06(&bytes),
+                "the checkpoint publishes PINKDB06"
+            );
             // A commit after the checkpoint: the WAL record must survive.
             c.execute("INSERT INTO t VALUES (3, 'three');").unwrap();
         }

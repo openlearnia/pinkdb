@@ -1,105 +1,92 @@
 //! Persistence: a single-file on-disk columnar format (`.pink`).
 //!
-//! Layout v5 (all integers little-endian):
+//! # `PINKDB06` — the one `.pink` format
+//!
+//! The file is a **data region** of column chunks followed by a **footer**
+//! and a fixed 20-byte **trailer**:
+//!
 //! ```text
-//! magic "PINKDB05" (8 bytes)
-//! flags u32                 (0 = no optional sections; bit 0 = tables carry
-//!                            a constraint section, bit 1 = a column-default
-//!                            section, bit 2 = each database carries a
-//!                            materialized-view section, bit 3 = every
-//!                            table carries a hash-index section, bit 4 = a
-//!                            stored-procedure section, bit 5 = a
-//!                            store-level RBAC section, bit 6 = a
-//!                            SQL-macro section; unknown bits are a
-//!                            hard error)
-//! db_count u32
-//! per database:
-//!   name_len u32 + name bytes
-//!   table_count u32
-//!   per table:
-//!     name_len u32 + name bytes
-//!     col_count u32
-//!     per column: name_len u32 + name bytes, dtype u8 (tag 7 = DECIMAL:
-//!       precision u8 + scale u8 follow; tag 8 = INTERVAL)
-//!     if flags bit 0:
-//!       constraint_count u32
-//!       per constraint:
-//!         kind u8 (0=PRIMARY KEY, 1=UNIQUE, 2=FOREIGN KEY, 3=NOT NULL)
-//!         name_len u32 + name bytes (0 = unnamed; NOT NULL names are not
-//!                                    persisted)
-//!         col_count u32 + col_count × col_idx u32
-//!         if kind == 2 (FOREIGN KEY):
-//!           ref_db_len u32 + ref_db bytes (lowercased; non-empty)
-//!           ref_table_len u32 + ref_table bytes (lowercased; non-empty)
-//!           ref_col_count u32 + ref_col_count × ref_col_idx u32
-//!     num_rows u64
-//!     per column: chunk_count u32
-//!       per chunk:
-//!         encoding u8 (0=Plain, 1=RLE, 2=Dict, 3=Bitpack, 4=DeltaBitpack,
-//!                      5=DictBitpack, 6=ALP, 8=LZ frame; 7 and 9 reserved)
-//!         validity_len u32 + validity bytes (bit set = valid)
-//!         payload (encoding-specific)
-//!     if flags bit 3 (wave 79):
-//!       index_count u32
-//!       per index (sorted by name):
-//!         name_len u32 + name bytes
-//!         column u32
-//!         distinct_keys u64   (distinct non-NULL keys at save time)
-//!         indexed_rows u64    (non-NULL rows at save time)
-//! crc32 u32 (IEEE, over every preceding byte including the magic)
+//! data region: for every table (databases and tables in sorted name order)
+//!   for every row group (122,880 rows = 60 engine chunks of 2,048)
+//!     for every column (schema order)
+//!       column chunk = page index + pages
+//!
+//! footer: store metadata (databases, tables, schemas, column defaults,
+//!   constraints, index definitions + statistics, materialized views,
+//!   procedures, macros, RBAC) and, per table, the row count and the
+//!   row-group directory:
+//!     row groups [ { rows,
+//!                    per column: offset, length, page count,
+//!                                 encoding summary, crc32c,
+//!                                 stats { min, max, null_count, nan_count } } ]
+//!
+//! trailer (20 bytes): footer_crc32c u32 | footer_len u64 | "PINKDB06"
 //! ```
 //!
-//! With `FLAG_RBAC` set (wave 48), the CRC is preceded by the store-global
-//! RBAC section (see [`write_rbac`]): users (display name + Argon2id PHC
-//! password hash), roles, role memberships, table grants, database grants
-//! and the global `ADMIN` holders — every name in canonical (lowercased)
-//! key form, sorted. The plaintext of a password is never written: the
-//! hashed form is the only one the catalog (and the WAL) ever see.
+//! A **page** is one engine chunk (2,048 rows) encoded with the existing
+//! per-chunk encoder, so decoding stays chunk-native; a **column chunk** is
+//! the 60 pages of one (row group, column) pair. Every column chunk carries
+//! its own **CRC32C**, so a reader verifies any chunk on its own — there is
+//! **no whole-file CRC**. The footer carries its own CRC32C.
 //!
-//! The index section (`FLAG_INDEXES`, wave 79) persists each hash index's
-//! definition and save-time statistics, so a checkpoint carries indexes
-//! atomically with the data. The hash maps themselves are **not** stored:
-//! the loader rebuilds each one from the decoded column, so an index can
-//! never disagree with the rows it indexes, whatever the file claims.
-//! (Persisted posting lists were measured and dropped: verifying them at load
-//! cost as much as rebuilding — 1M rows: 28 vs 23 ms at 1k distinct keys,
-//! 165 vs 149 ms unique — while adding 2–4 MB per index.) The statistics are
-//! facts for readers that do not rebuild; the loader only bounds them.
+//! A reader needs the 20-byte trailer plus the footer: two small range
+//! requests (the lake's `pink` provider reads exactly those, plus the
+//! projected column chunks of the row groups that survive pruning). The
+//! engine's `open` reads the whole file (it materializes every column
+//! eagerly, as before) but decodes the column chunks **in parallel**.
 //!
-//! v2 files (`PINKDB02`) are the v4 container without the `flags` word and
-//! the CRC trailer; v3 files (`PINKDB03`) are v2 + a CRC; v1 files
-//! (`PINKDB01`) hold a flat table list and load as a single `main` database;
-//! v4 files (`PINKDB04`) are the v5 container without the DECIMAL/INTERVAL
-//! dtype tags and without the constraint section. `open` accepts all five;
-//! writes are always v5.
+//! ## Row groups and statistics
 //!
-//! The constraint section carries declarative `PRIMARY KEY` / `UNIQUE` /
-//! `FOREIGN KEY` / `NOT NULL` declarations (readers of v4-and-older simply
-//! see unconstrained tables). Constraints are metadata: they are never
-//! enforced on INSERT/UPDATE, only reported by `DESCRIBE` and trusted by the
-//! optimizer. `RELY` / `[NOT] ENFORCED` suffixes are dropped at parse time;
-//! a named `NOT NULL`'s name is not persisted (it is not observable).
+//! A row group holds 122,880 rows (60 engine chunks). The footer records,
+//! per column chunk, the **exact** statistics of that chunk: its min and max
+//! (first-seen wins ties, exactly like the engine's MIN/MAX accumulators),
+//! its NULL count and its NaN count. They feed zone-map pruning and the
+//! lake's exact `COUNT`/`MIN`/`MAX`.
 //!
-//! Payloads store every row including NULL placeholders; validity is applied
-//! afterwards. Per-chunk encoding is picked by size (smallest wins), with a
-//! fixed candidate order (first wins ties):
-//! - Integers (INTEGER/BIGINT/DATE/TIMESTAMP): Plain (raw LE) vs RLE (low run
-//!   count) vs Bitpack (small range, min + width + packed bits) vs delta
-//!   bitpack (first value + min delta + width + packed deltas).
+//! ## Encodings
+//!
+//! Per-chunk encoding is picked by size (smallest wins; ties keep the
+//! earlier candidate — the candidate order is part of the format contract):
+//!
+//! - Integers (INTEGER/BIGINT/DATE/TIMESTAMP): Plain (raw LE) vs RLE (low
+//!   run count) vs Bitpack (small range, min + width + packed bits) vs
+//!   delta bitpack (first value + min delta + width + packed deltas) vs
+//!   **FastLanes bit-packing** (1,024-value blocks, transposed lanes, a
+//!   frame of reference per block).
 //! - Doubles: Plain (raw bits) vs RLE vs ALP (decimal-scaled integer codes
 //!   plus a bit-exact exception list; non-finite, `-0.0`, subnormals and
 //!   out-of-range values ride the exceptions).
 //! - Booleans: Plain (bitpacked) vs RLE.
 //! - Varchars: Plain (offsets + data) vs Dictionary (first-occurrence codes)
-//!   vs RLE vs dictionary-bitpack (the dictionary with minimal-width codes)
-//!   vs an LZ frame (tag 8) around the plain layout — attempted only when a
-//!   bounded prefix probe says the string bytes repeat.
+//!   vs RLE vs dictionary-bitpack (the dictionary with minimal-width codes,
+//!   packed in the FastLanes transposed layout) vs a **compression frame**
+//!   (tag 8) around the plain layout vs **FSST** (tag 9: a symbol table
+//!   that rewrites the string bytes, then the second compression stage).
 //!
-//! The reader never panics on corrupt input: every read is bounds-checked and
-//! surfaces `PinkDbError::Execution("...")`, and no allocation is sized from
-//! an unvalidated length (chunk row counts are capped at [`CHUNK_SIZE`], the
-//! writer's maximum; per-table column counts by the bytes left). A v3/v4 CRC
-//! mismatch is reported before any decoding.
+//! The **second compression stage** (the general-purpose compressor a chunk
+//! frame rides on) is chosen by **measurement** on the TPC-H SF1 set: the
+//! hand-rolled LZ77 of wave 45j against the pure-Rust `lz4_flex`. Over the
+//! 18,569 VARCHAR chunks of that store (569.6 MB of plain payloads) LZ77
+//! compressed to 321,112,231 B in 1.172 s (1.559 s with the decompression),
+//! `lz4_flex` to 318,692,386 B in 0.507 s (0.614 s with the decompression) —
+//! smaller *and* 2.3x faster, so `lz4_flex` is the default. Default builds
+//! link no C code either way; `PINKDB_COMPRESS=lz|lz4` overrides the choice
+//! for a measurement run.
+//!
+//! ## Refusing older files
+//!
+//! `PINKDB01`–`PINKDB05` are **not** readable: their readers, fixtures and
+//! compatibility tests are gone. Such a file is refused with
+//! `this .pink file was written by an older pinkdb (PINKDB0N); this build
+//! reads PINKDB06 only`.
+//!
+//! ## Safety
+//!
+//! The reader never panics on corrupt input: every read is bounds-checked
+//! and surfaces `PinkDbError::Execution("...")`, and no allocation is sized
+//! from an unvalidated length (chunk row counts are capped at
+//! [`CHUNK_SIZE`], the writer's maximum; footer counts by the bytes left).
+//! The footer checksum is verified before a single byte of it is decoded.
 //!
 //! Both directions are typed: `encode_chunk_typed` reads the [`Vector`]'s
 //! payload directly (NULL placeholders substituted only when the chunk has
@@ -107,6 +94,10 @@
 //! [`Vector::from_raw`], so no per-row [`Value`] round trip is needed.
 //! Tables are encoded chunk-parallel (order-preserving) and loaded
 //! chunk-wise through `DataTable::append_shared_chunk`.
+//!
+//! The engine loads every column eagerly (as it always did) even though the
+//! layout now allows reading one column chunk on its own: lazy column
+//! loading for very large local stores is a recorded follow-up.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -116,51 +107,48 @@ use rayon::prelude::*;
 
 use crate::crypto::EncryptionKey;
 use crate::storage::{
-    Column, DataTable, ForeignKeyConstraint, Index, KeyConstraint, KeyKind, PinkDb,
-    TableConstraints,
+    DataTable, ForeignKeyConstraint, Index, KeyConstraint, KeyKind, PinkDb, TableConstraints,
 };
 use crate::types::{DataType, Interval, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, Vector, VectorData};
 
-const MAGIC: &[u8; 8] = b"PINKDB01";
-/// Version 2 adds the database dimension: one file holds every database.
-const MAGIC_V2: &[u8; 8] = b"PINKDB02";
-/// Version 3 = v2 + a trailing CRC-32 over the whole image (bit-rot check).
-const MAGIC_V3: &[u8; 8] = b"PINKDB03";
-/// Version 4 = v3 + a `flags` word and the typed codecs (delta bitpack,
-/// bitpacked dictionary codes, ALP, the all-valid validity flag).
-const MAGIC_V4: &[u8; 8] = b"PINKDB04";
-/// Version 5 = v4 + the DECIMAL/INTERVAL dtype tags (7/8; DECIMAL carries
-/// its precision and scale in the schema) and a per-table declarative-
-/// constraint section, gated by `FLAG_CONSTRAINTS` in the flags word (a
-/// constraint-free, tag-free v5 body is byte-identical to a v4 body). Older
-/// builds refuse it cleanly through the shared newer-magic path.
-const MAGIC_V5: &[u8; 8] = b"PINKDB05";
+/// The trailer magic of the current `.pink` format (`PINKDB06`).
+///
+/// The magic lives at the **end** of the file (the trailer), so a reader can
+/// find the footer with two small range requests and never has to read the
+/// data region to learn what the file is.
+pub const MAGIC_V6: &[u8; 8] = b"PINKDB06";
 
-/// Flags bit 0 (v5+): every table carries the constraint section described in
-/// the module docs. Set iff at least one table has constraints.
+/// The trailer's size: `footer_crc32c u32 | footer_len u64 | magic (8)`.
+pub const TRAILER_LEN: usize = 20;
+
+/// The rows per row group: 60 engine chunks of 2,048 rows.
+pub const ROW_GROUP_ROWS: usize = 122_880;
+
+/// The engine chunks per row group (60 × 2,048 = 122,880 rows).
+pub const CHUNKS_PER_ROW_GROUP: usize = ROW_GROUP_ROWS / CHUNK_SIZE;
+
+/// The footer's own version word (bumped when the footer layout changes).
+const FOOTER_VERSION: u32 = 1;
+
+/// Flags bit 0: every table carries the constraint section described in the
+/// module docs. Set iff at least one table has constraints.
 const FLAG_CONSTRAINTS: u32 = 0x1;
 
-/// Flags bit 1 (v5+): every table carries the column-default section (wave
-/// 65) described in the module docs. Set iff at least one column has a
-/// DEFAULT. An older v5 build refuses the file cleanly through the unknown-
-/// flags check.
+/// Flags bit 1: every table carries the column-default section (wave 65)
+/// described in the module docs. Set iff at least one column has a
+/// DEFAULT.
 const FLAG_DEFAULTS: u32 = 0x2;
 
-/// Flags bit 2 (v5+): every database carries the materialized-view section
+/// Flags bit 2: every database carries the materialized-view section
 /// (wave 80: name, refresh policy, defining SQL, last refresh stamp, refresh
 /// count) after its tables. Set iff at least one database has a materialized
-/// view, so stores without them keep v4-shaped bodies byte for byte. An older
-/// v5 build refuses the file cleanly through the unknown-flags check — bit 3
-/// (`0x8`) is the index section ([`FLAG_INDEXES`]), so stored procedures
-/// (wave 44) take bit 4.
+/// view.
 const FLAG_MATERIALIZED_VIEWS: u32 = 0x4;
 
-/// Flags bit 3 (v5+, wave 79): every table carries the hash-index section
-/// (definitions + statistics, see the module docs) after its column
-/// chunks. Set iff at least one table has an index, so stores without
-/// indexes keep their exact previous bytes. An older v5 build refuses the
-/// file cleanly through the unknown-flags check.
+/// Flags bit 3: every table carries the hash-index section (definitions +
+/// statistics, see the module docs) after its row-group directory. Set iff
+/// at least one table has an index.
 const FLAG_INDEXES: u32 = 0x8;
 
 /// [`FLAG_PROCEDURES`], visible to the crate's tests (the store's flags word
@@ -168,34 +156,25 @@ const FLAG_INDEXES: u32 = 0x8;
 #[cfg(test)]
 pub(crate) const FLAG_PROCEDURES_FOR_TEST: u32 = FLAG_PROCEDURES;
 
-/// Flags bit 4 (v5+): every database carries the stored-procedure section
-/// (wave 44: name, typed parameters, language tag, body text) after its
-/// tables and materialized views. Set iff at least one database has a
-/// procedure, so stores without them keep their exact previous bytes. An
-/// older v5 build refuses the file cleanly through the unknown-flags check;
-/// the next format-gated section takes bit 5 (`0x20`).
+/// Flags bit 4: every database carries the stored-procedure section (wave
+/// 44: name, typed parameters, language tag, body text) after its tables
+/// and materialized views. Set iff at least one database has a procedure.
 const FLAG_PROCEDURES: u32 = 0x10;
 
-/// Flags bit 5 (v5+): the file ends with the store-global RBAC section
+/// Flags bit 5: the file's footer carries the store-global RBAC section
 /// (wave 48: users with their Argon2id PHC password hashes, roles, role
 /// memberships, table and database grants, and the global `ADMIN` holders)
-/// after every database. Set iff the store has any RBAC data, so stores
-/// without users keep their exact previous bytes. An older v5 build refuses
-/// the file cleanly through the unknown-flags check (the RBAC section is
-/// unknown to it either way); the next format-gated section starts at bit 7
-/// (`0x80`) — bit 6 is the SQL-macro section ([`FLAG_MACROS`]).
+/// after every database. Set iff the store has any RBAC data.
 const FLAG_RBAC: u32 = 0x20;
 
-/// Flags bit 6 (v5+): every database carries the SQL-macro section (wave 77:
-/// name + the full `CREATE MACRO` statement text) after its tables and before
-/// its materialized-view section. Set iff at least one database has a macro,
-/// so stores without them keep their exact previous bytes. An older v5 build
-/// refuses the file cleanly through the unknown-flags check; the next
-/// format-gated section takes bit 7 (`0x80`).
+/// Flags bit 6: every database carries the SQL-macro section (wave 77: the
+/// name and the full `CREATE MACRO` statement text) after its tables and
+/// before its materialized-view section. Set iff at least one database has
+/// a macro.
 ///
-/// Macros are written **before** materialized views on purpose: an MV's
-/// defining SQL may call a macro and is rebound at load, so the macro must
-/// already be in the catalog when that rebind runs.
+/// The macros are written **before** the materialized views on purpose: an
+/// MV's defining SQL may call a macro and is rebound at load, so the macro
+/// must already be in the catalog when that rebind runs.
 const FLAG_MACROS: u32 = 0x40;
 
 /// Column-default value tags (one byte per non-NULL default).
@@ -208,6 +187,20 @@ const VD_DATE: u8 = 5;
 const VD_TIMESTAMP: u8 = 6;
 const VD_DECIMAL: u8 = 7;
 const VD_INTERVAL: u8 = 8;
+
+/// Statistics value tags in the footer's per-chunk statistics block: the
+/// same shapes as the default-value tags, plus an explicit "no value" tag
+/// (an empty or all-NULL column has neither a min nor a max).
+const SV_NONE: u8 = 0;
+const SV_BOOL: u8 = 1;
+const SV_I32: u8 = 2;
+const SV_I64: u8 = 3;
+const SV_F64: u8 = 4;
+const SV_VARCHAR: u8 = 5;
+const SV_DATE: u8 = 6;
+const SV_TIMESTAMP: u8 = 7;
+const SV_DECIMAL: u8 = 8;
+const SV_INTERVAL: u8 = 9;
 
 /// Constraint-section kinds (one byte per constraint).
 const CK_PRIMARY_KEY: u8 = 0;
@@ -224,12 +217,84 @@ const ENC_DICT_BITPACK: u8 = 5;
 const ENC_ALP: u8 = 6;
 /// Reserved (a corpus never showed a win); readers reject it cleanly.
 const ENC_DICT_RLE: u8 = 7;
-/// LZ77 frame (tag 8): a plain payload wrapped in a token stream, used only
-/// when it shrinks the chunk (see [`enc_lz_frame`]). Decode = decompress,
-/// then decode the inner payload.
+/// Compression frame (tag 8): a plain payload wrapped in a token stream,
+/// used only when it shrinks the chunk (see [`enc_compressed_frame`]).
+/// Decode = decompress, then decode the inner payload.
 const ENC_LZ_FRAME: u8 = 8;
-/// Reserved stretch tag (FSST); readers reject it cleanly.
+/// FSST (tag 9): a symbol table that rewrites the chunk's string bytes,
+/// then the second compression stage (see [`enc_strs_fsst`]).
 const ENC_FSST: u8 = 9;
+/// FastLanes-style bit-packing (tag 10): 1,024-value blocks, a frame of
+/// reference per block, transposed lanes (see [`enc_ints_fastlanes`]).
+const ENC_FASTLANES: u8 = 10;
+
+/// The second compression stage of a chunk frame: the codec that turns the
+/// chunk's inner payload into bytes.
+///
+/// The choice is a **measurement**, not a guess: wave 102 measured the
+/// hand-rolled LZ77 of wave 45j against the pure-Rust `lz4_flex` on the
+/// TPC-H SF1 set (see the module docs). Both are pure Rust — a default
+/// build links no C code.
+///
+/// `PINKDB_COMPRESS=lz|lz4` overrides the default for a measurement run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondStage {
+    /// The hand-rolled greedy LZ77 (wave 45j).
+    Lz,
+    /// `lz4_flex`'s block format (pure Rust).
+    Lz4,
+}
+
+impl SecondStage {
+    /// The frame's codec tag.
+    fn tag(self) -> u8 {
+        match self {
+            SecondStage::Lz => 1,
+            SecondStage::Lz4 => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            1 => Ok(SecondStage::Lz),
+            2 => Ok(SecondStage::Lz4),
+            other => Err(PinkDbError::Execution(format!(
+                "corrupt file: unknown compression codec {other}"
+            ))),
+        }
+    }
+
+    /// The default stage: the measured winner.
+    fn default_stage() -> SecondStage {
+        // The measurement (wave 102, TPC-H SF1) put `lz4_flex` ahead of the
+        // hand-rolled LZ77 on both size and speed, so it is the default.
+        // `PINKDB_COMPRESS` overrides it for a measurement run.
+        static STAGE: std::sync::OnceLock<SecondStage> = std::sync::OnceLock::new();
+        *STAGE.get_or_init(|| match std::env::var("PINKDB_COMPRESS").as_deref() {
+            Ok("lz") => SecondStage::Lz,
+            Ok("lz4") => SecondStage::Lz4,
+            _ => SecondStage::Lz4,
+        })
+    }
+
+    /// Compress `raw` (the chunk's inner payload).
+    fn compress(self, raw: &[u8]) -> Vec<u8> {
+        match self {
+            SecondStage::Lz => lz_compress(raw),
+            SecondStage::Lz4 => lz4_flex::compress(raw),
+        }
+    }
+
+    /// Decompress `data` back into exactly `raw_len` bytes.
+    fn decompress(self, data: &[u8], raw_len: usize) -> Result<Vec<u8>> {
+        match self {
+            SecondStage::Lz => lz_decompress(data, raw_len),
+            SecondStage::Lz4 => lz4_flex::decompress(data, raw_len).map_err(|e| {
+                PinkDbError::Execution(format!("corrupt file: LZ4 frame is broken ({e})"))
+            }),
+        }
+    }
+}
 
 /// Tables with fewer chunks than this encode serially: the rayon fan-out
 /// costs more than it saves on small tables.
@@ -241,18 +306,15 @@ const PARALLEL_SAVE_MIN_CHUNKS: usize = 32;
 // during the same chunk pass that encodes a table (no second scan of the
 // store, no change to the `.pink` bytes). The lake layer publishes them in
 // its manifest; the engine itself never reads them back.
+//
+// The same per-chunk facts are always computed: the footer carries them
+// per column chunk (zone-map pruning).
 
 /// Exact per-column statistics the `.pink` writer observed while saving one
 /// column: NULL count, the min/max of the non-NULL, non-NaN values
 /// (first-seen wins ties, exactly like the engine's MIN/MAX accumulators),
 /// and the exact NaN count (non-zero only for DOUBLE columns; NaN sorts
 /// above every other double, so with any NaN the engine's MAX is NaN).
-///
-/// These are *facts*, not yet gated for use: a DOUBLE min/max with any NaN —
-/// or one that is zero (`-0.0 == 0.0` in the engine's comparator) — is still
-/// recorded here and refused later by the same exactness gate the Vortex
-/// footer path uses (`pink-lake`'s attach layer), so the two formats cannot
-/// drift apart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SavedColumnStats {
     /// Column name, as stored in the data file.
@@ -586,6 +648,74 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
     }
 }
 
+// ---------- CRC32C (Castagnoli) ----------
+//
+// The format's integrity checks are CRC32C, not the IEEE CRC-32 the WAL
+// uses: it is the checksum every columnar format uses, and it is cheap
+// enough to verify every column chunk of a large store on open.
+//
+// The implementation is a portable slicing-by-8 (no `unsafe`, no
+// dependency): the eight tables are derived from the reflected Castagnoli
+// polynomial 0x82F63B78 at compile time.
+
+const fn crc32c_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        tables[0][i] = crc;
+        i += 1;
+    }
+    let mut t = 1usize;
+    while t < 8 {
+        let mut i = 0usize;
+        while i < 256 {
+            let prev = tables[t - 1][i];
+            tables[t][i] = (prev >> 8) ^ tables[0][(prev & 0xFF) as usize];
+            i += 1;
+        }
+        t += 1;
+    }
+    tables
+}
+
+static CRC32C_TABLES: [[u32; 256]; 8] = crc32c_tables();
+
+/// The CRC32C (Castagnoli) checksum of `bytes`.
+///
+/// The check value of the standard test vector (`"123456789"`) is
+/// `0xE3069283`.
+pub fn crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for c in chunks {
+        let lo = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+        crc ^= lo;
+        crc = CRC32C_TABLES[7][(crc & 0xFF) as usize]
+            ^ CRC32C_TABLES[6][((crc >> 8) & 0xFF) as usize]
+            ^ CRC32C_TABLES[5][((crc >> 16) & 0xFF) as usize]
+            ^ CRC32C_TABLES[4][(crc >> 24) as usize]
+            ^ CRC32C_TABLES[3][(hi & 0xFF) as usize]
+            ^ CRC32C_TABLES[2][((hi >> 8) & 0xFF) as usize]
+            ^ CRC32C_TABLES[1][((hi >> 16) & 0xFF) as usize]
+            ^ CRC32C_TABLES[0][(hi >> 24) as usize];
+    }
+    for &b in remainder {
+        crc = (crc >> 8) ^ CRC32C_TABLES[0][((crc ^ b as u32) & 0xFF) as usize];
+    }
+    !crc
+}
+
 // ---------- writer ----------
 
 struct Writer {
@@ -818,9 +948,7 @@ fn unpack_bits(reader: &mut Reader, count: usize, width: u32) -> Result<Vec<u64>
 /// semantics of the old per-row `is_valid` loop.
 ///
 /// A chunk with no NULLs writes zero bytes (the all-valid flag): the reader
-/// treats `validity_len == 0` with `n > 0` as "every row valid", which no
-/// v1–v3 writer ever emitted (they always wrote `ceil(n/64)*8 >= 8` bytes
-/// for `n > 0`).
+/// treats `validity_len == 0` with `n > 0` as "every row valid".
 fn encode_validity(v: &Vector) -> Vec<u8> {
     if !v.has_nulls() {
         return Vec::new();
@@ -845,9 +973,7 @@ fn encode_validity(v: &Vector) -> Vec<u8> {
 
 /// Rebuild the validity words from the file bytes once `n` is known.
 ///
-/// `bytes.is_empty() && n > 0` means "every row valid": v4's all-valid flag.
-/// It is safe for v1–v3 input too — those writers always emitted
-/// `ceil(n/64)*8 >= 8` bytes for `n > 0`, so no old file can carry it.
+/// `bytes.is_empty() && n > 0` means "every row valid" (the all-valid flag).
 fn decode_validity(bytes: &[u8], n: usize) -> Result<Vec<u64>> {
     if n == 0 {
         if bytes.is_empty() {
@@ -909,6 +1035,32 @@ fn int32_payload(v: &Vector) -> Cow<'_, [i32]> {
         }
         _ => unreachable!("int32_payload on a non-INTEGER vector"),
     }
+}
+
+/// The largest DECIMAL precision whose unscaled values always fit an `i64`
+/// (`10^18 - 1 < 2^63`): such chunks use the BIGINT encodings.
+const DECIMAL_I64_MAX_PRECISION: u8 = 18;
+
+/// A DECIMAL(p <= 18) chunk's unscaled values as `i64` (invalid rows zeroed,
+/// like [`int64_payload`]). The precision bound makes the narrowing exact:
+/// every engine write path enforces `types::decimal_fits`, so a value that
+/// does not fit is a broken invariant — fail loudly, never store a wrong
+/// number.
+fn decimal_i64_payload(v: &Vector) -> Vec<i64> {
+    let VectorData::Decimal { values, .. } = v.data() else {
+        unreachable!("decimal_i64_payload on a non-DECIMAL vector")
+    };
+    let words = v.has_nulls().then(|| v.validity_words());
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| match words {
+            Some(words) if !valid_at(words, i) => 0,
+            _ => i64::try_from(x).expect(
+                "DECIMAL(p <= 18) value outside i64: the engine's precision invariant is broken",
+            ),
+        })
+        .collect()
 }
 
 fn int64_payload(v: &Vector) -> Cow<'_, [i64]> {
@@ -1295,7 +1447,7 @@ fn encode_strs_offsets<T: AsRef<str>>(w: &mut Writer, strs: &[T]) {
     }
 }
 
-/// Whether a chunk's total VARCHAR bytes fit the v4 `u32` string offsets.
+/// Whether a chunk's total VARCHAR bytes fit the `u32` string offsets.
 fn varchar_offsets_fit(total: u64) -> bool {
     total <= u32::MAX as u64
 }
@@ -1342,6 +1494,10 @@ fn enc_strs_dict<T: AsRef<str>>(strs: &[T]) -> Vec<u8> {
 
 /// Bitpacked dictionary codes: the same dictionary (first-occurrence order,
 /// `encode_strs_offsets` bytes) with `bits_needed(dict_len - 1)`-bit codes.
+///
+/// The codes themselves are packed in the **FastLanes transposed layout**
+/// (see [`fastlanes_pack`]): 1,024-value blocks whose lanes are transposed,
+/// so the decode is branch-free.
 fn enc_strs_dict_bitpack<T: AsRef<str> + PartialEq>(strs: &[T]) -> Vec<u8> {
     let mut w = Writer::new();
     let (dict, codes) = dict_and_codes(strs);
@@ -1358,7 +1514,7 @@ fn enc_strs_dict_bitpack<T: AsRef<str> + PartialEq>(strs: &[T]) -> Vec<u8> {
     w.u8(width as u8);
     if width > 0 {
         let shifted: Vec<u64> = codes.iter().map(|&c| c as u64).collect();
-        pack_bits(&mut w, &shifted, width);
+        fastlanes_pack(&mut w, &shifted, width);
     }
     w.buf
 }
@@ -1385,13 +1541,288 @@ fn consider_best(best: &mut Option<(u8, Vec<u8>)>, tag: u8, payload: Vec<u8>) {
     }
 }
 
-// ---------- LZ frame (tag 8) ----------
+// ---------- FastLanes-style bit-packing (tag 10) ----------
+//
+// The layout is the FastLanes one: a block of 1,024 values is **transposed**
+// into one *lane* per bit — lane `p` holds bit `p` of every value of the
+// block, eight values per byte. The decode is then a branch-free loop over
+// the lanes (and the layout is what an autovectorized decoder wants: each
+// lane is a contiguous byte array).
+//
+// The values are stored as a **frame of reference**: each block carries its
+// own minimum and the bit width of (value − block minimum), so a block whose
+// values are close together costs far less than a global bit width.
+
+/// The FastLanes block size: 1,024 values.
+const FASTLANES_BLOCK: usize = 1024;
+
+/// Pack `values` (`width` bits each) in the FastLanes transposed layout.
+///
+/// The output is, per 1,024-value block, `width` lanes of `ceil(n/8)` bytes:
+/// lane `p`'s byte `j` holds bit `p` of the values `8j .. 8j+8` (bit `i % 8`
+/// of the byte is value `8j + i % 8`'s bit `p`).
+fn fastlanes_pack(w: &mut Writer, values: &[u64], width: u32) {
+    debug_assert!(width > 0 && width <= 64);
+    for block in values.chunks(FASTLANES_BLOCK) {
+        let n = block.len();
+        let bytes = n.div_ceil(8);
+        for p in 0..width {
+            let mut lane = vec![0u8; bytes];
+            for (i, &v) in block.iter().enumerate() {
+                if (v >> p) & 1 == 1 {
+                    lane[i / 8] |= 1 << (i % 8);
+                }
+            }
+            w.bytes(&lane);
+        }
+    }
+}
+
+/// Unpack `count` values of `width` bits from the FastLanes transposed
+/// layout (the reader side of [`fastlanes_pack`]).
+fn fastlanes_unpack(r: &mut Reader, count: usize, width: u32) -> Result<Vec<u64>> {
+    let mut out = Vec::with_capacity(count);
+    for block_start in (0..count).step_by(FASTLANES_BLOCK) {
+        let n = (count - block_start).min(FASTLANES_BLOCK);
+        let bytes = n.div_ceil(8);
+        // One lane per bit, read as a contiguous byte array.
+        let mut lanes: Vec<Vec<u8>> = Vec::with_capacity(width as usize);
+        for _ in 0..width {
+            lanes.push(r.take(bytes)?.to_vec());
+        }
+        for i in 0..n {
+            let mut v: u64 = 0;
+            for (p, lane) in lanes.iter().enumerate() {
+                if (lane[i / 8] >> (i % 8)) & 1 == 1 {
+                    v |= 1u64 << p;
+                }
+            }
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
+/// The FastLanes bit-packing payload: per 1,024-value block, the frame of
+/// reference (block minimum + width) and the transposed lanes.
+///
+/// The candidate wins only when it is *smaller* than the plain bit-packing
+/// (which pays one global minimum and one global width) — a block whose
+/// values are locally clustered is much cheaper this way.
+fn enc_ints_fastlanes<T: IntElem>(nums: &[T]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(nums.len() as u32);
+    w.u32(FASTLANES_BLOCK as u32);
+    for block in nums.chunks(FASTLANES_BLOCK) {
+        let min = block.iter().map(|n| n.to_i64()).min().unwrap_or(0);
+        let max = block.iter().map(|n| n.to_i64()).max().unwrap_or(0);
+        let width = bits_needed_exact(max.wrapping_sub(min) as u64);
+        w.u64(min as u64);
+        w.u8(width as u8);
+        if width > 0 {
+            let shifted: Vec<u64> = block
+                .iter()
+                .map(|&n| n.to_i64().wrapping_sub(min) as u64)
+                .collect();
+            fastlanes_pack(&mut w, &shifted, width);
+        }
+    }
+    w.buf
+}
+
+/// Decode the FastLanes bit-packing payload (the reader side of
+/// [`enc_ints_fastlanes`]).
+fn decode_fastlanes(r: &mut Reader, n: usize) -> Result<Vec<i64>> {
+    let block_size = r.u32()? as usize;
+    if block_size == 0 || block_size > CHUNK_SIZE {
+        return r.err("bad FastLanes block size");
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut left = n;
+    while left > 0 {
+        let min = r.i64()?;
+        let width = r.u8()? as u32;
+        if width > 64 {
+            return r.err("bad FastLanes width");
+        }
+        let take = left.min(block_size);
+        if width == 0 {
+            out.extend(std::iter::repeat_n(min, take));
+        } else {
+            for v in fastlanes_unpack(r, take, width)? {
+                out.push(min.wrapping_add(v as i64));
+            }
+        }
+        left -= take;
+    }
+    Ok(out)
+}
+
+// ---------- FSST (tag 9) ----------
+//
+// FSST ("Fast Static Symbol Table") rewrites a byte stream in an alphabet
+// the compressor likes: the most frequent bytes of the sample become
+// *symbols* (one byte each), and a byte that is not in the table is written
+// as the escape symbol followed by the literal byte.
+//
+// The rewrite alone never shrinks anything (it is a bijection on the byte
+// stream, plus the escape bytes), so the FSST payload is always handed to the
+// **second compression stage**: the point of the symbol table is to make the
+// stream more compressible, and the second stage does the compressing.
+
+/// The FSST escape symbol: the symbol id that means "the next byte is a
+/// literal". It is one past the last table entry, so it never collides with
+/// a table symbol.
+const FSST_ESCAPE: u8 = 255;
+
+/// The largest symbol table: 254 symbols plus the escape byte (the table's
+/// length is one byte, so it must fit in 255 entries).
+const FSST_MAX_TABLE: usize = 254;
+
+/// The bytes of a sample FSST builds its table from (the head of the data).
+const FSST_SAMPLE_BYTES: usize = 4096;
+
+/// Build the FSST symbol table over `data`: the most frequent bytes first,
+/// the escape symbol last.
+///
+/// The table maps a symbol id to a byte: symbol `i` is `table[i]`. The byte
+/// chosen as the escape is the *least* frequent byte of the sample (so the
+/// escape is rare, exactly as FSST prescribes).
+fn fsst_build_table(data: &[u8]) -> Vec<u8> {
+    let sample = &data[..data.len().min(FSST_SAMPLE_BYTES)];
+    let mut counts = [0u32; 256];
+    for &b in sample {
+        counts[b as usize] += 1;
+    }
+    // The escape byte: the least frequent one (ties → the smaller byte, so
+    // the table is deterministic).
+    let mut escape = 0usize;
+    for b in 1..256usize {
+        if counts[b] < counts[escape] {
+            escape = b;
+        }
+    }
+    // The table: the most frequent bytes first, the escape byte last.
+    let mut order: Vec<usize> = (0..256).filter(|&b| b != escape).collect();
+    order.sort_by(|&a, &b| counts[b].cmp(&counts[a]).then(a.cmp(&b)));
+    order.truncate(FSST_MAX_TABLE);
+    let mut table: Vec<u8> = order.iter().map(|&b| b as u8).collect();
+    table.push(escape as u8);
+    debug_assert!(table.len() <= FSST_MAX_TABLE + 1);
+    table
+}
+
+/// Rewrite `data` in the symbol table's alphabet: a byte in the table
+/// becomes its symbol, a byte that is not becomes the escape symbol
+/// followed by the literal byte.
+fn fsst_escape(data: &[u8], table: &[u8]) -> Vec<u8> {
+    // The last table entry is the escape byte itself; the escape symbol is
+    // `FSST_ESCAPE`.
+    let escape_byte = *table.last().unwrap_or(&0);
+    let mut map = [FSST_ESCAPE; 256];
+    for (sym, &byte) in table[..table.len().saturating_sub(1)].iter().enumerate() {
+        map[byte as usize] = sym as u8;
+    }
+    let mut out = Vec::with_capacity(data.len() + data.len() / 16);
+    for &b in data {
+        let sym = map[b as usize];
+        out.push(sym);
+        if sym == FSST_ESCAPE {
+            out.push(b);
+        }
+    }
+    let _ = escape_byte;
+    out
+}
+
+/// The reader side of [`fsst_escape`]: the symbol stream back into bytes.
+fn fsst_unescape(stream: &[u8], table: &[u8], out_len: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(out_len.min(1 << 16));
+    let mut i = 0usize;
+    while i < stream.len() {
+        let sym = stream[i];
+        i += 1;
+        if sym == FSST_ESCAPE {
+            let Some(&b) = stream.get(i) else {
+                return Err(PinkDbError::Execution(
+                    "corrupt file: truncated FSST escape".to_string(),
+                ));
+            };
+            i += 1;
+            out.push(b);
+        } else {
+            let Some(&byte) = table.get(sym as usize) else {
+                return Err(PinkDbError::Execution(format!(
+                    "corrupt file: FSST symbol {sym} is not in the table"
+                )));
+            };
+            out.push(byte);
+        }
+    }
+    if out.len() != out_len {
+        return Err(PinkDbError::Execution(
+            "corrupt file: FSST stream has the wrong length".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+/// The FSST payload of a VARCHAR chunk: the plain layout's offsets (the
+/// strings themselves are rewritten by the symbol table), the symbol table,
+/// and the escaped stream handed to the second compression stage.
+fn enc_strs_fsst<T: AsRef<str>>(strs: &[T]) -> Option<Vec<u8>> {
+    let (offsets, data) = strs_offsets_and_data(strs);
+    let stage = SecondStage::default_stage();
+    // An empty chunk has no bytes to rewrite: the table holds the escape
+    // byte alone and the escaped stream is empty.
+    let (table, escaped) = if data.is_empty() {
+        (vec![0u8], Vec::new())
+    } else {
+        let table = fsst_build_table(&data);
+        let escaped = fsst_escape(&data, &table);
+        (table, escaped)
+    };
+    let compressed = if escaped.is_empty() {
+        Vec::new()
+    } else {
+        stage.compress(&escaped)
+    };
+    let mut w = Writer::new();
+    w.u32(strs.len() as u32);
+    for off in &offsets {
+        w.u32(*off);
+    }
+    w.u8(table.len() as u8);
+    w.bytes(&table);
+    w.u32(escaped.len() as u32);
+    w.u8(stage.tag());
+    w.u32(compressed.len() as u32);
+    w.bytes(&compressed);
+    Some(w.buf)
+}
+
+/// The plain layout's offsets and data bytes.
+fn strs_offsets_and_data<T: AsRef<str>>(strs: &[T]) -> (Vec<u32>, Vec<u8>) {
+    let mut offsets = Vec::with_capacity(strs.len() + 1);
+    let mut data = Vec::new();
+    let mut off: u32 = 0;
+    offsets.push(off);
+    for s in strs {
+        let bytes = s.as_ref().as_bytes();
+        off += bytes.len() as u32;
+        offsets.push(off);
+        data.extend_from_slice(bytes);
+    }
+    (offsets, data)
+}
+
+// ---------- LZ frame (tag 8) and the second compression stage ----------
 //
 // A hand-rolled LZ77 in the spirit of LZ4: greedy longest-match over a
 // 64 KiB window with a 4-byte hash table; tokens are a control byte per
 // literal run / match, then the raw bytes / a u16 offset.
 //
-//   payload = u32 raw_len | u8 base_tag | u32 token_len | tokens
+//   payload = u32 raw_len | u8 base_tag | u8 codec | u32 comp_len | comp
 //
 // `raw_len` is the untouched length of the inner payload; decompression must
 // land exactly on it, and the inner payload (decoded from the decompressed
@@ -1408,8 +1839,6 @@ const LZ_MAX_LITERAL: usize = 128;
 const LZ_WINDOW: usize = u16::MAX as usize;
 /// Hash table entries for the full encode pass (2^16).
 const LZ_HASH_BITS: u32 = 16;
-/// Hash table entries for the prefix probe (2^12, stack-allocated).
-const LZ_PROBE_HASH_BITS: u32 = 12;
 /// Bytes of the string data region the probe compresses.
 const LZ_PROBE_BYTES: usize = 4096;
 /// Hard cap on the inner payload size of a frame (decode safety: no
@@ -1492,44 +1921,47 @@ fn lz_compress(data: &[u8]) -> Vec<u8> {
     lz_compress_into(data, &mut table)
 }
 
-/// Compressibility probe for the LZ candidate: compresses the first
-/// [`LZ_PROBE_BYTES`] of the string data region with a small table and
-/// reports whether it saved at least 10%. Bounded cost (4 KiB scan + a 16 KiB
-/// stack table) regardless of payload size; a false negative only costs
-/// bytes (the frame is merely a candidate), never correctness.
+/// Compressibility probe for the compression candidates: compresses the first
+/// [`LZ_PROBE_BYTES`] of the string data region with the **second stage**
+/// (the codec that would really run) and reports whether it saved at least
+/// 10%. Bounded cost (4 KiB scan) regardless of payload size; a false
+/// negative only costs bytes (the frame is merely a candidate), never
+/// correctness.
 ///
 /// The probe deliberately looks at the string bytes, not the offsets block:
-/// offsets measured as incompressible by this token format (4-byte matches
+/// offsets measured as incompressible by the token format (4-byte matches
 /// cost more in control bytes than they save), so a payload whose repeats
-/// live only in its offsets — random strings — must not pay for a full LZ
-/// scan.
+/// live only in its offsets — random strings — must not pay for a full
+/// compression scan.
 fn lz_probe(data: &[u8]) -> bool {
     let n = data.len().min(LZ_PROBE_BYTES);
     if n < 512 {
         return false;
     }
-    let mut table = [u32::MAX; 1 << LZ_PROBE_HASH_BITS];
-    let compressed = lz_compress_into(&data[..n], &mut table);
+    let stage = SecondStage::default_stage();
+    let compressed = stage.compress(&data[..n]);
     compressed.len() * 10 < n * 9
 }
 
-/// LZ frame around `base` (the base payload), or `None` when it does not
-/// strictly shrink it. Caller-side gating (probe, size) is separate so the
-/// decode path can accept any valid base tag.
-fn enc_lz_frame(base_tag: u8, base: &[u8]) -> Option<Vec<u8>> {
+/// A compression frame around `base` (the base payload), or `None` when it
+/// does not strictly shrink it. Caller-side gating (probe, size) is separate
+/// so the decode path can accept any valid base tag.
+fn enc_compressed_frame(base_tag: u8, base: &[u8]) -> Option<Vec<u8>> {
     if base.len() > LZ_MAX_RAW {
         return None;
     }
-    let tokens = lz_compress(base);
-    // 4 (raw_len) + 1 (base_tag) + 4 (token_len).
-    if tokens.len() + 9 >= base.len() {
+    let stage = SecondStage::default_stage();
+    let compressed = stage.compress(base);
+    // 4 (raw_len) + 1 (base_tag) + 1 (codec) + 4 (comp_len).
+    if compressed.len() + 10 >= base.len() {
         return None;
     }
     let mut w = Writer::new();
     w.u32(base.len() as u32);
     w.u8(base_tag);
-    w.u32(tokens.len() as u32);
-    w.bytes(&tokens);
+    w.u8(stage.tag());
+    w.u32(compressed.len() as u32);
+    w.bytes(&compressed);
     Some(w.buf)
 }
 
@@ -1606,6 +2038,7 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
             consider_best(&mut best, ENC_RLE, enc_ints_rle(&nums));
             consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
             consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
+            consider_best(&mut best, ENC_FASTLANES, enc_ints_fastlanes(&nums));
         }
         // Bigint and timestamp share the 64-bit codecs; the dtype tag on the
         // chunk keeps them distinct on decode.
@@ -1615,10 +2048,25 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
             consider_best(&mut best, ENC_RLE, enc_ints_rle(&nums));
             consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
             consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
+            consider_best(&mut best, ENC_FASTLANES, enc_ints_fastlanes(&nums));
         }
-        // 128-bit fixed-point DECIMAL: `u32 row count | raw unscaled values`
-        // (the schema carries precision/scale on disk). Invalid rows are
-        // zeroed so the bytes stay deterministic; validity wins on decode.
+        // DECIMAL with precision <= 18: every unscaled value fits an i64
+        // (|x| < 10^18 < 2^63), so the chunk is encoded exactly like a BIGINT
+        // chunk — same candidates, same payloads — and decode widens back to
+        // i128 using the schema's precision. TPC-H money columns
+        // (DECIMAL(15,2)) shrink from 16 raw bytes per value to a few bits.
+        DataType::Decimal { precision, .. } if precision <= DECIMAL_I64_MAX_PRECISION => {
+            let nums = decimal_i64_payload(v);
+            consider_best(&mut best, ENC_PLAIN, enc_ints_plain(&nums));
+            consider_best(&mut best, ENC_RLE, enc_ints_rle(&nums));
+            consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
+            consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
+            consider_best(&mut best, ENC_FASTLANES, enc_ints_fastlanes(&nums));
+        }
+        // Wider DECIMAL (precision > 18): `u32 row count | raw unscaled
+        // i128 values` (the schema carries precision/scale on disk). Invalid
+        // rows are zeroed so the bytes stay deterministic; validity wins on
+        // decode.
         DataType::Decimal { .. } => {
             let VectorData::Decimal { values, .. } = v.data() else {
                 unreachable!("decimal chunk has a non-decimal payload")
@@ -1675,23 +2123,44 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
             let dict = enc_strs_dict(&strs);
             let rle = enc_strs_rle(&strs);
             let dict_bp = enc_strs_dict_bitpack(&strs);
-            // LZ (the last candidate) wraps the plain layout. It is only
-            // tried when the best structural candidate is still big enough
-            // to have room for a win (`LZ_MIN_ATTEMPT`) and a bounded prefix
-            // probe says the string bytes repeat: sales' low-cardinality
-            // VARCHAR chunks win with a ~300-byte bitpacked dictionary and
-            // never pay for a scan. The frame is only kept when strictly
-            // smaller, and ties keep the earlier candidate, so files that
-            // never win with LZ stay byte-identical to the pre-tag-8 writer.
-            let lz = {
+            // The compression frame (the last structural candidate) wraps the
+            // plain layout. It is only tried when the best structural
+            // candidate is still big enough to have room for a win
+            // (`LZ_MIN_ATTEMPT`) and a bounded prefix probe says the string
+            // bytes repeat: sales' low-cardinality VARCHAR chunks win with a
+            // ~300-byte bitpacked dictionary and never pay for a scan. The
+            // frame is only kept when strictly smaller, and ties keep the
+            // earlier candidate, so files that never win with it stay
+            // byte-identical to the pre-frame writer.
+            let (frame, compressible) = {
                 let best_len = plain
                     .len()
                     .min(dict.len())
                     .min(rle.len())
                     .min(dict_bp.len());
                 let data_start = 4 + (strs.len() + 1) * 4;
-                if best_len >= LZ_MIN_ATTEMPT && lz_probe(&plain[data_start..]) {
-                    enc_lz_frame(ENC_PLAIN, &plain)
+                let compressible = best_len >= LZ_MIN_ATTEMPT && lz_probe(&plain[data_start..]);
+                let frame = if compressible {
+                    enc_compressed_frame(ENC_PLAIN, &plain)
+                } else {
+                    None
+                };
+                (frame, compressible)
+            };
+            // FSST: the symbol table rewrites the string bytes so the second
+            // compression stage sees a smaller alphabet. It is the last
+            // candidate, it rides the same probe as the compression frame
+            // (a symbol table over incompressible bytes is pure cost), and it
+            // only wins when it is strictly smaller.
+            let fsst = {
+                let best_len = plain
+                    .len()
+                    .min(dict.len())
+                    .min(rle.len())
+                    .min(dict_bp.len())
+                    .min(frame.as_ref().map_or(usize::MAX, |f| f.len()));
+                if best_len >= LZ_MIN_ATTEMPT && compressible {
+                    enc_strs_fsst(&strs)
                 } else {
                     None
                 }
@@ -1700,8 +2169,11 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
             consider_best(&mut best, ENC_DICT, dict);
             consider_best(&mut best, ENC_RLE, rle);
             consider_best(&mut best, ENC_DICT_BITPACK, dict_bp);
-            if let Some(frame) = lz {
+            if let Some(frame) = frame {
                 consider_best(&mut best, ENC_LZ_FRAME, frame);
+            }
+            if let Some(fsst) = fsst {
+                consider_best(&mut best, ENC_FSST, fsst);
             }
         }
     }
@@ -1844,22 +2316,19 @@ fn decode_delta(r: &mut Reader, n: usize, base: i64) -> Result<Vec<i64>> {
 }
 
 /// The error for a tag that has no meaning on this dtype (or is reserved).
-fn tag_error(dtype: DataType, tag: u8, v4: bool) -> PinkDbError {
-    let reserved = matches!(tag, ENC_DICT_RLE | ENC_FSST) || tag > ENC_FSST;
-    if v4 && reserved {
-        PinkDbError::Execution(format!("unsupported v4 encoding tag {tag}; upgrade pinkdb"))
+fn tag_error(dtype: DataType, tag: u8) -> PinkDbError {
+    let reserved = matches!(tag, ENC_DICT_RLE) || tag > ENC_FASTLANES;
+    if reserved {
+        PinkDbError::Execution(format!(
+            "unsupported .pink encoding tag {tag}; upgrade pinkdb"
+        ))
     } else {
         PinkDbError::Execution(format!("corrupt file: encoding {tag} invalid for {dtype}"))
     }
 }
 
 /// Decode one chunk payload into a typed buffer + its row count.
-fn decode_payload(
-    dtype: DataType,
-    tag: u8,
-    r: &mut Reader,
-    v4: bool,
-) -> Result<(VectorData, usize)> {
+fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorData, usize)> {
     match (dtype, tag) {
         (DataType::Integer, ENC_PLAIN) => {
             let n = r.chunk_count("chunk length")?;
@@ -1876,6 +2345,22 @@ fn decode_payload(
         (DataType::Timestamp, ENC_PLAIN) => {
             let n = r.chunk_count("chunk length")?;
             Ok((VectorData::TimestampMicros(r.i64_vec(n)?), n))
+        }
+        // DECIMAL(p <= 18): the chunk was encoded as BIGINT (see
+        // `encode_chunk_typed`); decode it that way and widen to i128.
+        (DataType::Decimal { precision, scale }, _) if precision <= DECIMAL_I64_MAX_PRECISION => {
+            let (data, n) = decode_payload(DataType::Bigint, tag, r)?;
+            let VectorData::Int64(ints) = data else {
+                return r.err("DECIMAL chunk did not decode as 64-bit integers");
+            };
+            Ok((
+                VectorData::Decimal {
+                    values: ints.into_iter().map(i128::from).collect(),
+                    precision,
+                    scale,
+                },
+                n,
+            ))
         }
         (DataType::Decimal { precision, scale }, ENC_PLAIN) => {
             let n = r.chunk_count("chunk length")?;
@@ -1982,7 +2467,26 @@ fn decode_payload(
         (DataType::Bigint, ENC_DELTA_BITPACK) | (DataType::Timestamp, ENC_DELTA_BITPACK) => {
             let n = r.chunk_count("chunk length")?;
             let base = r.i64()?;
-            let nums = decode_delta(r, n, base)?;
+            let nums: Vec<i64> = decode_delta(r, n, base)?;
+            if dtype == DataType::Timestamp {
+                Ok((VectorData::TimestampMicros(nums), n))
+            } else {
+                Ok((VectorData::Int64(nums), n))
+            }
+        }
+        (DataType::Integer, ENC_FASTLANES) | (DataType::Date, ENC_FASTLANES) => {
+            let n = r.chunk_count("chunk length")?;
+            let nums = decode_fastlanes(r, n)?;
+            let nums: Vec<i32> = nums.into_iter().map(|x| x as i32).collect();
+            if dtype == DataType::Date {
+                Ok((VectorData::Date32(nums), n))
+            } else {
+                Ok((VectorData::Int32(nums), n))
+            }
+        }
+        (DataType::Bigint, ENC_FASTLANES) | (DataType::Timestamp, ENC_FASTLANES) => {
+            let n = r.chunk_count("chunk length")?;
+            let nums = decode_fastlanes(r, n)?;
             if dtype == DataType::Timestamp {
                 Ok((VectorData::TimestampMicros(nums), n))
             } else {
@@ -2092,7 +2596,7 @@ fn decode_payload(
                     })?);
                 }
             } else {
-                for c in unpack_bits(r, n, width)? {
+                for c in fastlanes_unpack(r, n, width)? {
                     out.push(dict.get(c as usize).cloned().ok_or_else(|| {
                         PinkDbError::Execution("corrupt file: bad dict code".to_string())
                     })?);
@@ -2105,138 +2609,404 @@ fn decode_payload(
             let runs = r.chunk_count("run count")?;
             Ok((VectorData::VarChar(decode_rle_strs(r, n, runs)?), n))
         }
-        (dtype, ENC_LZ_FRAME) => decode_lz_frame(dtype, r, v4),
-        _ => Err(tag_error(dtype, tag, v4)),
+        (DataType::Varchar, ENC_FSST) => decode_fsst(r),
+        (dtype, ENC_LZ_FRAME) => decode_compressed_frame(dtype, r),
+        _ => Err(tag_error(dtype, tag)),
     }
 }
 
-/// Decode an LZ frame (tag 8): `u32 raw_len | u8 base_tag | u32 token_len |
-/// tokens`. The decompressed bytes are the inner payload, which must be
-/// valid for the chunk's dtype and must consume the frame exactly.
+/// Decode a compression frame (tag 8): `u32 raw_len | u8 base_tag | u8 codec |
+/// u32 comp_len | comp`. The decompressed bytes are the inner payload, which
+/// must be valid for the chunk's dtype and must consume the frame exactly.
 ///
 /// `base_tag` is restricted to the payload tags (0..=6): the reserved and
 /// frame tags (7..=9 and above) are refused so a frame cannot nest or
 /// smuggle an unimplemented codec.
-fn decode_lz_frame(dtype: DataType, r: &mut Reader, v4: bool) -> Result<(VectorData, usize)> {
+fn decode_compressed_frame(dtype: DataType, r: &mut Reader) -> Result<(VectorData, usize)> {
     let raw_len = r.u32()? as usize;
     let base_tag = r.u8()?;
-    let token_len = r.u32()? as usize;
+    let codec = SecondStage::from_tag(r.u8()?)?;
+    let comp_len = r.u32()? as usize;
     if !(4..=LZ_MAX_RAW).contains(&raw_len) {
-        return r.err("bad LZ frame length");
+        return r.err("bad compressed frame length");
     }
     if base_tag > ENC_ALP {
-        return r.err("unsupported LZ base encoding");
+        return r.err("unsupported compression base encoding");
     }
-    let tokens = r.take(token_len)?;
-    let raw = lz_decompress(tokens, raw_len)?;
+    let comp = r.take(comp_len)?;
+    let raw = codec.decompress(comp, raw_len)?;
     let mut inner = Reader::new(&raw);
-    let (data, n) = decode_payload(dtype, base_tag, &mut inner, v4)?;
+    let (data, n) = decode_payload(dtype, base_tag, &mut inner)?;
     if !inner.end() {
         return Err(PinkDbError::Execution(
-            "corrupt file: trailing bytes in LZ frame".to_string(),
+            "corrupt file: trailing bytes in compressed frame".to_string(),
         ));
     }
     Ok((data, n))
 }
 
+/// Decode the FSST payload (tag 9): the offsets, the symbol table and the
+/// escaped stream (which the second compression stage rebuilds).
+fn decode_fsst(r: &mut Reader) -> Result<(VectorData, usize)> {
+    let n = r.chunk_count("chunk length")?;
+    let mut offsets = Vec::with_capacity(n + 1);
+    for _ in 0..n + 1 {
+        offsets.push(r.u32()? as usize);
+    }
+    let table_len = r.u8()? as usize;
+    if table_len == 0 || table_len > FSST_MAX_TABLE + 1 {
+        return r.err("bad FSST table length");
+    }
+    let table = r.take(table_len)?.to_vec();
+    let raw_len = r.u32()? as usize;
+    if raw_len > LZ_MAX_RAW {
+        return r.err("bad FSST stream length");
+    }
+    let codec = SecondStage::from_tag(r.u8()?)?;
+    let comp_len = r.u32()? as usize;
+    let comp = r.take(comp_len)?;
+    let data_len = *offsets.last().unwrap_or(&0);
+    let data = if raw_len == 0 {
+        Vec::new()
+    } else {
+        let escaped = codec.decompress(comp, raw_len)?;
+        fsst_unescape(&escaped, &table, data_len)?
+    };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let (a, b) = (offsets[i], offsets[i + 1]);
+        if b < a || b > data.len() {
+            return r.err("bad string offsets");
+        }
+        let s = std::str::from_utf8(&data[a..b])
+            .map_err(|_| PinkDbError::Execution("corrupt file: bad UTF-8".to_string()))?;
+        out.push(Arc::from(s));
+    }
+    Ok((VectorData::VarChar(out), n))
+}
+
 /// Decode one framed chunk (validity + payload) into a [`Vector`].
-fn decode_chunk_typed(dtype: DataType, tag: u8, r: &mut Reader, v4: bool) -> Result<Vector> {
+fn decode_chunk_typed(dtype: DataType, tag: u8, r: &mut Reader) -> Result<Vector> {
     // Validity comes first (the encoder writes it before the payload); the
     // payload decode is what knows the row count.
     let vlen = r.u32()? as usize;
     let vbytes = r.take(vlen)?;
-    let (data, n) = decode_payload(dtype, tag, r, v4)?;
+    let (data, n) = decode_payload(dtype, tag, r)?;
     let validity = decode_validity(vbytes, n)?;
     Ok(Vector::from_raw(data, validity))
 }
+// ---------- the footer: store metadata + the row-group directory ----------
 
-// ---------- public API ----------
-
-/// One encoded column chunk, ready to append in order.
-struct EncodedCol {
-    tag: u8,
-    /// Serialized validity words (or empty for the all-valid flag, §format).
-    validity: Vec<u8>,
-    payload: Vec<u8>,
+/// One column chunk's directory entry: where its bytes are, how many pages
+/// it holds, which encodings those pages use, its own CRC32C and its exact
+/// statistics.
+#[derive(Debug, Clone)]
+struct ColumnChunkDir {
+    /// The column chunk's absolute offset in the file.
+    offset: u64,
+    /// The column chunk's length in bytes (page index + pages).
+    length: u64,
+    /// The number of pages (engine chunks) in it.
+    page_count: u32,
+    /// A bitmask of the encoding tags the pages use.
+    encodings: u32,
+    /// The column chunk's CRC32C (over the page index and the pages).
+    crc32c: u32,
+    /// The exact NULL count of the chunk.
+    null_count: u64,
+    /// The exact NaN count of the chunk (doubles only).
+    nan_count: u64,
+    /// The exact minimum of the chunk (None when it has no non-NULL value).
+    min: Option<Value>,
+    /// The exact maximum of the chunk (None like `min`).
+    max: Option<Value>,
 }
 
-/// Encode every column of one chunk (raw payloads, no framing).
-fn encode_columns(cols: &[Arc<Vector>], schema: &[(String, DataType)]) -> Vec<EncodedCol> {
-    debug_assert_eq!(cols.len(), schema.len(), "chunk/schema column mismatch");
-    cols.iter()
-        .zip(schema)
-        .map(|(v, (_, dtype))| {
-            debug_assert_eq!(v.dtype(), *dtype, "chunk/schema dtype mismatch");
-            let (tag, payload) = encode_chunk_typed(v);
-            EncodedCol {
-                tag,
-                validity: encode_validity(v),
-                payload,
+/// One row group's directory entry: its row count and one entry per column.
+#[derive(Debug, Clone)]
+struct RowGroupDir {
+    /// The row group's exact row count.
+    rows: u64,
+    /// One entry per column, in schema order.
+    columns: Vec<ColumnChunkDir>,
+}
+
+/// One index definition (the map itself is always rebuilt from the rows).
+#[derive(Debug, Clone)]
+struct IndexDef {
+    name: String,
+    column: usize,
+    distinct_keys: u64,
+    indexed_rows: u64,
+}
+
+/// One table's footer entry: its schema, its catalog metadata and the
+/// row-group directory of its data.
+#[derive(Debug, Clone)]
+struct TableDir {
+    name: String,
+    schema: Vec<(String, DataType)>,
+    constraints: TableConstraints,
+    defaults: Vec<Option<Value>>,
+    indexes: Vec<IndexDef>,
+    row_count: u64,
+    row_groups: Vec<RowGroupDir>,
+}
+
+/// One database's footer entry: its tables and its catalog sections.
+#[derive(Debug)]
+struct DbDir {
+    name: String,
+    tables: Vec<TableDir>,
+    macros: Vec<crate::macros::MacroDef>,
+    materialized_views: Vec<crate::storage::MaterializedViewDef>,
+    procedures: Vec<crate::procedure::ProcedureDef>,
+}
+
+/// The parsed footer of a `PINKDB06` file.
+#[derive(Debug)]
+struct StoreFooter {
+    databases: Vec<DbDir>,
+    rbac: Option<crate::rbac::RbacCatalog>,
+}
+
+/// One encoded page (one engine chunk): its framed bytes and its statistics.
+struct EncodedPage {
+    /// The page frame: `u8 tag | u32 validity_len | validity | payload`.
+    frame: Vec<u8>,
+    /// The page's exact statistics.
+    stats: ChunkColumnStats,
+    /// The page's row count.
+    rows: usize,
+}
+
+/// Encode one page (one engine chunk) from its [`Vector`].
+fn encode_page(v: &Vector) -> EncodedPage {
+    let (tag, payload) = encode_chunk_typed(v);
+    let validity = encode_validity(v);
+    let mut w = Writer::new();
+    w.u8(tag);
+    w.u32(validity.len() as u32);
+    w.bytes(&validity);
+    w.bytes(&payload);
+    EncodedPage {
+        frame: w.buf,
+        stats: chunk_column_stats(v),
+        rows: v.len(),
+    }
+}
+
+/// Write one statistics value (the footer's per-chunk min/max): a tag byte
+/// plus the value's payload.
+fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
+    match v {
+        None => w.u8(SV_NONE),
+        Some(Value::Boolean(b)) => {
+            w.u8(SV_BOOL);
+            w.u8(*b as u8);
+        }
+        Some(Value::Integer(i)) => {
+            w.u8(SV_I32);
+            w.i32(*i);
+        }
+        Some(Value::Bigint(i)) => {
+            w.u8(SV_I64);
+            w.i64(*i);
+        }
+        Some(Value::Double(x)) => {
+            w.u8(SV_F64);
+            w.u64(x.to_bits());
+        }
+        Some(Value::Varchar(s)) => {
+            w.u8(SV_VARCHAR);
+            w.str(s);
+        }
+        Some(Value::Date(d)) => {
+            w.u8(SV_DATE);
+            w.i32(*d);
+        }
+        Some(Value::Timestamp(t)) => {
+            w.u8(SV_TIMESTAMP);
+            w.i64(*t);
+        }
+        Some(Value::Decimal(x, scale)) => {
+            w.u8(SV_DECIMAL);
+            w.bytes(&x.to_le_bytes());
+            w.u8(*scale);
+        }
+        Some(Value::Interval {
+            months,
+            days,
+            micros,
+        }) => {
+            w.u8(SV_INTERVAL);
+            w.i32(*months);
+            w.i32(*days);
+            w.i64(*micros);
+        }
+        Some(Value::Null) => w.u8(SV_NONE),
+    }
+}
+
+/// Read one statistics value (the reader side of [`write_stat_value`]).
+fn read_stat_value(r: &mut Reader) -> Result<Option<Value>> {
+    let tag = r.u8()?;
+    let v = match tag {
+        SV_NONE => None,
+        SV_BOOL => Some(Value::Boolean(match r.u8()? {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(PinkDbError::Execution(format!(
+                    "corrupt file: bad BOOLEAN statistics byte {other}"
+                )));
+            }
+        })),
+        SV_I32 => Some(Value::Integer(r.i32()?)),
+        SV_I64 => Some(Value::Bigint(r.i64()?)),
+        SV_F64 => Some(Value::Double(f64::from_bits(r.u64()?))),
+        SV_VARCHAR => Some(Value::Varchar(r.str()?)),
+        SV_DATE => Some(Value::Date(r.i32()?)),
+        SV_TIMESTAMP => Some(Value::Timestamp(r.i64()?)),
+        SV_DECIMAL => {
+            let b = r.take(16)?;
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(b);
+            let x = i128::from_le_bytes(arr);
+            let scale = r.u8()?;
+            if scale > 38 {
+                return r.err("bad DECIMAL statistics scale");
+            }
+            Some(Value::Decimal(x, scale))
+        }
+        SV_INTERVAL => Some(Value::Interval {
+            months: r.i32()?,
+            days: r.i32()?,
+            micros: r.i64()?,
+        }),
+        other => {
+            return Err(PinkDbError::Execution(format!(
+                "corrupt file: unknown statistics value tag {other}"
+            )));
+        }
+    };
+    Ok(v)
+}
+
+/// The index definitions of one table (the map itself is never stored: the
+/// loader rebuilds it from the decoded column).
+fn index_defs(t: &DataTable) -> Vec<IndexDef> {
+    let mut indexes: Vec<&Index> = t
+        .indexes
+        .iter()
+        .filter(|i| i.column < t.columns.len())
+        .collect();
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+    indexes
+        .into_iter()
+        .map(|index| {
+            let column = &t.columns[index.column];
+            let distinct = if t.indexes_stale {
+                crate::storage::index_map_for(column).len()
+            } else {
+                index.map.len()
+            };
+            let indexed: usize = column.chunks.iter().map(|c| c.len() - c.null_count()).sum();
+            IndexDef {
+                name: index.name.clone(),
+                column: index.column,
+                distinct_keys: distinct as u64,
+                indexed_rows: indexed as u64,
             }
         })
         .collect()
 }
 
-/// One chunk encoded, plus its per-column statistics when the caller asked
-/// for them (the `.lake` stats block). `collect_stats` is constant per save,
-/// so the branch is free in the common `.save` path.
-fn encode_chunk_with_stats(
-    cols: &[Arc<Vector>],
-    schema: &[(String, DataType)],
-    collect_stats: bool,
-) -> (Vec<EncodedCol>, Vec<ChunkColumnStats>) {
-    let encoded = encode_columns(cols, schema);
-    let stats = if collect_stats {
-        cols.iter().map(|v| chunk_column_stats(v)).collect()
-    } else {
-        Vec::new()
-    };
-    (encoded, stats)
+/// Write one table's index definitions (the reader side of [`index_defs`]).
+fn write_index_defs(w: &mut Writer, defs: &[IndexDef]) {
+    w.u32(defs.len() as u32);
+    for d in defs {
+        w.str(&d.name);
+        w.u32(d.column as u32);
+        w.u64(d.distinct_keys);
+        w.u64(d.indexed_rows);
+    }
 }
 
-/// Exact per-column statistics of one table's rows, collected without
-/// encoding anything (wave 66).
-///
-/// `pink-lake` uses this to publish a **Vortex** data file's zone map in the
-/// catalog: the same [`SavedTableStats`] facts a `.pink` encode collects
-/// during its pass, computed here by one linear scan of the table's chunk
-/// payloads (no per-row `Value` materialization except the per-chunk
-/// min/max). The facts are ungated (`nan_count` and zero doubles are kept);
-/// `pink-lake` applies the one exactness gate shared with the Vortex footer
-/// path, so the two formats cannot drift apart.
-pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
-    let schema = src.schema();
-    let mut accs: Vec<ColumnStatsAcc> = schema.iter().map(|_| ColumnStatsAcc::new()).collect();
-    for c in 0..src.num_chunks() {
-        if let Some(chunk) = src.scan_chunk(c) {
-            for (acc, v) in accs.iter_mut().zip(chunk.columns.iter()) {
-                acc.merge(&chunk_column_stats(v));
-            }
+/// Read one table's index definitions.
+fn read_index_defs(r: &mut Reader) -> Result<Vec<IndexDef>> {
+    let n = r.u32()? as usize;
+    // Each index costs at least 24 bytes (name length, column, two counts).
+    if n > r.remaining() / 24 {
+        return r.err("index count exceeds the remaining file");
+    }
+    let mut out: Vec<IndexDef> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        if name.is_empty() {
+            return r.err("empty index name");
         }
+        if let Some(prev) = out.last()
+            && prev.name >= name
+        {
+            return r.err(&format!(
+                "index \"{name}\" is duplicated or out of name order"
+            ));
+        }
+        let column = r.u32()? as usize;
+        let distinct_keys = r.u64()?;
+        let indexed_rows = r.u64()?;
+        out.push(IndexDef {
+            name,
+            column,
+            distinct_keys,
+            indexed_rows,
+        });
     }
-    SavedTableStats {
-        db: db.to_string(),
-        table: table.to_string(),
-        rows: src.num_rows() as u64,
-        columns: schema
-            .iter()
-            .zip(accs)
-            .map(|((col, dtype), acc)| SavedColumnStats {
-                name: col.clone(),
-                dtype: *dtype,
-                null_count: acc.null_count,
-                min: acc.min,
-                max: acc.max,
-                nan_count: acc.nan_count,
-            })
-            .collect(),
-    }
+    Ok(out)
 }
+
+/// Rebuild one table's index maps from its decoded rows and install the
+/// definitions.
+///
+/// The maps are **never** read from the file: an index can therefore never
+/// disagree with the rows it indexes, whatever the file claims. The
+/// statistics are only bounded by the table's real row count.
+fn apply_indexes(t: &mut DataTable, defs: &[IndexDef]) -> Result<()> {
+    let mut out: Vec<Index> = Vec::with_capacity(defs.len());
+    for def in defs {
+        let Some(col) = t.columns.get(def.column) else {
+            return Err(PinkDbError::Execution(format!(
+                "corrupt file: index \"{}\" names column {} of a {}-column table",
+                def.name,
+                def.column,
+                t.columns.len()
+            )));
+        };
+        if def.indexed_rows > t.num_rows() as u64 || def.distinct_keys > def.indexed_rows {
+            return Err(PinkDbError::Execution(format!(
+                "corrupt file: index \"{}\" statistics exceed the table",
+                def.name
+            )));
+        }
+        out.push(Index {
+            name: def.name.clone(),
+            column: def.column,
+            map: crate::storage::index_map_for(col),
+        });
+    }
+    t.indexes = out;
+    t.indexes_stale = false;
+    Ok(())
+}
+
+// ---------- the public API ----------
 
 impl PinkDb {
     /// Serialize every database (and every table in it) in the `.pink`
-    /// columnar format. Databases and tables are stored in sorted name order
-    /// (deterministic bytes). Views are session-local and never persisted.
+    /// columnar format (`PINKDB06`). Databases and tables are stored in
+    /// sorted name order (deterministic bytes). Views are session-local and
+    /// never persisted.
     fn to_bytes(&self) -> Result<Vec<u8>> {
         Ok(self.to_bytes_inner(true, false)?.0)
     }
@@ -2248,7 +3018,7 @@ impl PinkDb {
         Ok(self.to_bytes_inner(parallel, false)?.0)
     }
 
-    /// The one serialization path: `.pink` v4 bytes, optionally with the
+    /// The one serialization path: `PINKDB06` bytes, optionally with the
     /// exact per-table statistics collected in the same chunk pass. The
     /// statistics never influence the bytes (`to_bytes_inner(_, false).0` is
     /// bit-identical to `to_bytes_inner(_, true).0`).
@@ -2257,11 +3027,8 @@ impl PinkDb {
         parallel: bool,
         collect_stats: bool,
     ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
-        let mut w = Writer::new();
-        w.bytes(MAGIC_V5);
-        // The constraint and column-default sections exist iff some table
-        // needs them (the flags word is written before the tables, so decide
-        // it up front).
+        // The optional catalog sections exist iff some object needs them (the
+        // flags word is written in the footer, so decide it up front).
         let with_constraints = self.list_databases().iter().any(|db| {
             self.list_tables_in(db).iter().any(|t| {
                 self.table_in(db, t)
@@ -2283,147 +3050,134 @@ impl PinkDb {
                 .iter()
                 .any(|t| self.table_in(db, t).is_ok_and(|t| !t.indexes.is_empty()))
         });
-        w.u32(
-            if with_constraints {
-                FLAG_CONSTRAINTS
-            } else {
-                0
-            } | if with_defaults { FLAG_DEFAULTS } else { 0 }
-                | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 }
-                | if with_indexes { FLAG_INDEXES } else { 0 }
-                | if with_procedures { FLAG_PROCEDURES } else { 0 }
-                | if with_macros { FLAG_MACROS } else { 0 }
-                | if with_rbac { FLAG_RBAC } else { 0 },
-        );
+        let flags = if with_constraints {
+            FLAG_CONSTRAINTS
+        } else {
+            0
+        } | if with_defaults { FLAG_DEFAULTS } else { 0 }
+            | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 }
+            | if with_indexes { FLAG_INDEXES } else { 0 }
+            | if with_procedures { FLAG_PROCEDURES } else { 0 }
+            | if with_macros { FLAG_MACROS } else { 0 }
+            | if with_rbac { FLAG_RBAC } else { 0 };
+
+        // The data region.
+        let mut data = Writer::new();
         let mut saved: Vec<SavedTableStats> = Vec::new();
         let mut dbs = self.list_databases();
         dbs.sort();
-        w.u32(dbs.len() as u32);
+        let mut db_dirs: Vec<DbDir> = Vec::with_capacity(dbs.len());
         for dbname in &dbs {
-            w.str(dbname);
             let mut names = self.list_tables_in(dbname);
             names.sort();
-            w.u32(names.len() as u32);
+            let mut tables: Vec<TableDir> = Vec::with_capacity(names.len());
             for name in &names {
                 let t = self.table_in(dbname, name)?;
-                let schema = t.schema();
-                w.str(&t.name);
-                w.u32(schema.len() as u32);
-                for (col, dtype) in &schema {
-                    w.str(col);
-                    w.u8(dtype_tag(*dtype));
-                    // DECIMAL is the one tag whose parameters ride along.
+                let dir = write_table(
+                    &mut data,
+                    dbname,
+                    name,
+                    t,
+                    parallel,
+                    collect_stats,
+                    &mut saved,
+                )?;
+                tables.push(dir);
+            }
+            db_dirs.push(DbDir {
+                name: dbname.clone(),
+                tables,
+                macros: if with_macros {
+                    self.macros_in(dbname).into_iter().map(|(_, d)| d).collect()
+                } else {
+                    Vec::new()
+                },
+                materialized_views: if with_mvs {
+                    self.materialized_views_in(dbname)
+                        .into_iter()
+                        .map(|(_, d)| d)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                procedures: if with_procedures {
+                    self.procedures_in(dbname)
+                        .into_iter()
+                        .map(|(_, d)| d)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            });
+        }
+
+        // The footer.
+        let mut fw = Writer::new();
+        fw.u32(FOOTER_VERSION);
+        fw.u32(flags);
+        fw.u32(db_dirs.len() as u32);
+        for dbdir in &db_dirs {
+            fw.str(&dbdir.name);
+            fw.u32(dbdir.tables.len() as u32);
+            for tdir in &dbdir.tables {
+                fw.str(&tdir.name);
+                fw.u32(tdir.schema.len() as u32);
+                for (col, dtype) in &tdir.schema {
+                    fw.str(col);
+                    fw.u8(dtype_tag(*dtype));
                     if let DataType::Decimal { precision, scale } = dtype {
-                        w.u8(*precision);
-                        w.u8(*scale);
+                        fw.u8(*precision);
+                        fw.u8(*scale);
                     }
                 }
                 if with_constraints {
-                    write_constraints(&mut w, &t.constraints);
+                    write_constraints(&mut fw, &tdir.constraints);
                 }
                 if with_defaults {
-                    write_defaults(&mut w, &t.columns);
-                }
-                w.u64(t.num_rows() as u64);
-                let n_chunks = t.num_chunks();
-                // Share the chunk vectors first (Arc clones only), then
-                // encode per chunk. Order-preserving collect: bytes are
-                // identical to a serial pass.
-                let mut scans: Vec<Vec<Arc<Vector>>> = Vec::with_capacity(n_chunks);
-                for chunk_idx in 0..n_chunks {
-                    let chunk = t.scan_chunk(chunk_idx).ok_or_else(|| {
-                        PinkDbError::Execution("storage changed during save".to_string())
-                    })?;
-                    scans.push(chunk.columns);
-                }
-                // The v4 string layout stores offsets as `u32`; a chunk whose
-                // total VARCHAR bytes exceed that cannot be encoded faithfully
-                // (the offsets would wrap and the reader would reject the file).
-                // Refuse before writing instead of emitting a corrupt file.
-                for cols in &scans {
-                    for v in cols {
-                        if let VectorData::VarChar(strs) = v.data() {
-                            let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
-                            if !varchar_offsets_fit(total) {
-                                return Err(PinkDbError::Execution(format!(
-                                    "table \"{dbname}.{name}\" has a VARCHAR chunk of {total} \
-                                     bytes, over the .pink format's u32 string-offset limit"
-                                )));
-                            }
-                        }
-                    }
-                }
-                let per_chunk: Vec<(Vec<EncodedCol>, Vec<ChunkColumnStats>)> =
-                    if parallel && n_chunks >= PARALLEL_SAVE_MIN_CHUNKS {
-                        scans
-                            .par_iter()
-                            .map(|cols| encode_chunk_with_stats(cols, &schema, collect_stats))
-                            .collect()
-                    } else {
-                        scans
-                            .iter()
-                            .map(|cols| encode_chunk_with_stats(cols, &schema, collect_stats))
-                            .collect()
-                    };
-                let (encoded, chunk_stats): (Vec<_>, Vec<_>) = per_chunk.into_iter().unzip();
-                if collect_stats {
-                    let mut accs: Vec<ColumnStatsAcc> =
-                        schema.iter().map(|_| ColumnStatsAcc::new()).collect();
-                    for chunk in &chunk_stats {
-                        for (acc, stats) in accs.iter_mut().zip(chunk) {
-                            acc.merge(stats);
-                        }
-                    }
-                    saved.push(SavedTableStats {
-                        db: dbname.clone(),
-                        table: name.clone(),
-                        rows: t.num_rows() as u64,
-                        columns: schema
-                            .iter()
-                            .zip(accs)
-                            .map(|((col, dtype), acc)| SavedColumnStats {
-                                name: col.clone(),
-                                dtype: *dtype,
-                                null_count: acc.null_count,
-                                min: acc.min,
-                                max: acc.max,
-                                nan_count: acc.nan_count,
-                            })
-                            .collect(),
-                    });
-                }
-                for ci in 0..schema.len() {
-                    w.u32(n_chunks as u32);
-                    for chunk in &encoded {
-                        let col = &chunk[ci];
-                        w.u8(col.tag);
-                        w.u32(col.validity.len() as u32);
-                        w.bytes(&col.validity);
-                        w.bytes(&col.payload);
-                    }
+                    write_defaults(&mut fw, &tdir.defaults);
                 }
                 if with_indexes {
-                    write_indexes(&mut w, t);
+                    write_index_defs(&mut fw, &tdir.indexes);
+                }
+                fw.u64(tdir.row_count);
+                fw.u32(tdir.row_groups.len() as u32);
+                for rg in &tdir.row_groups {
+                    fw.u64(rg.rows);
+                    for col in &rg.columns {
+                        fw.u64(col.offset);
+                        fw.u64(col.length);
+                        fw.u32(col.page_count);
+                        fw.u32(col.encodings);
+                        fw.u32(col.crc32c);
+                        fw.u64(col.null_count);
+                        fw.u64(col.nan_count);
+                        write_stat_value(&mut fw, col.min.as_ref());
+                        write_stat_value(&mut fw, col.max.as_ref());
+                    }
                 }
             }
             if with_macros {
-                write_macros(&mut w, self, dbname);
+                write_macro_defs(&mut fw, &dbdir.macros);
             }
             if with_mvs {
-                write_materialized_views(&mut w, self, dbname);
+                write_materialized_view_defs(&mut fw, &dbdir.materialized_views);
             }
             if with_procedures {
-                write_procedures(&mut w, self, dbname);
+                write_procedure_defs(&mut fw, &dbdir.procedures);
             }
         }
-        // The store-global RBAC section rides after every database (users,
-        // roles and grants are not per-database).
         if with_rbac {
-            write_rbac(&mut w, self);
+            write_rbac(&mut fw, self);
         }
-        let crc = crate::wal::crc32(&w.buf);
-        w.u32(crc);
-        Ok((w.buf, saved))
+        let footer = fw.buf;
+        // The footer, then the trailer: the footer's CRC32C, its length and
+        // the magic.
+        let crc = crc32c(&footer);
+        data.bytes(&footer);
+        data.u32(crc);
+        data.u64(footer.len() as u64);
+        data.bytes(MAGIC_V6);
+        Ok((data.buf, saved))
     }
 
     /// The bytes [`PinkDb::save`] would write: every database in the `.pink`
@@ -2431,7 +3185,7 @@ impl PinkDb {
     /// (deterministic bytes), views never persisted.
     ///
     /// For writers that need the serialized image in memory instead of a
-    /// file on disk (pink-lake's v1 `.pink` data files). The same fail-stop
+    /// file on disk (pink-lake's `.pink` data files). The same fail-stop
     /// check as [`PinkDb::save`] applies: a store holding a non-durable write
     /// is refused.
     pub fn to_pink_bytes(&self) -> Result<Vec<u8>> {
@@ -2448,13 +3202,9 @@ impl PinkDb {
     /// store, no per-row `Value` materialization except the per-chunk
     /// min/max).
     ///
-    /// For the `.lake` layer: a `pinklake` save publishes these
-    /// facts in the v1 manifest's statistics block, and `.lake attach`
-    /// answers exact `COUNT`/`MIN`/`MAX` from them without decoding a data
-    /// file. The facts are ungated (`nan_count` and zero doubles are kept);
-    /// `pink-lake` applies the one exactness gate shared with the Vortex
-    /// footer path. [`PinkDb::save`]/[`PinkDb::to_pink_bytes`] never pay
-    /// this cost.
+    /// For the `.lake` layer: a `pinklake` save publishes these facts in the
+    /// manifest's statistics block, and `.lake attach` answers exact
+    /// `COUNT`/`MIN`/`MAX` from them without decoding a data file.
     pub fn to_pink_bytes_with_stats(&self) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         self.ensure_wal_healthy()?;
         self.to_bytes_inner(true, true)
@@ -2475,10 +3225,10 @@ impl PinkDb {
         Self::write_atomic(std::path::Path::new(path), &bytes)
     }
 
-    /// [`PinkDb::save`] with at-rest encryption: the v2 bytes are sealed into
-    /// a `PINKENC1` container (AES-256-GCM, Argon2id for passphrases). Without
-    /// the `encryption` feature this fails with a clear "not compiled in"
-    /// error instead of writing plaintext.
+    /// [`PinkDb::save`] with at-rest encryption: the `PINKDB06` bytes are
+    /// sealed into a `PINKENC1` container (AES-256-GCM, Argon2id for
+    /// passphrases). Without the `encryption` feature this fails with a
+    /// clear "not compiled in" error instead of writing plaintext.
     pub fn save_with_key(&self, path: &str, key: &EncryptionKey) -> Result<()> {
         #[cfg(not(feature = "encryption"))]
         {
@@ -2554,11 +3304,13 @@ impl PinkDb {
     }
 
     /// Load a database from a `.pink` file written by [`PinkDb::save`].
-    /// Accepts the v1 format (a single, implicit `main` database) and the v2
-    /// format (all databases). Truncated or malformed files return errors,
-    /// never panics. An encrypted (`PINKENC1`) file is rejected: without the
-    /// `encryption` feature the error says to rebuild with it; with the
-    /// feature it points at [`PinkDb::open_with_key`].
+    ///
+    /// Only the current format (`PINKDB06`) is readable: a file written by
+    /// an older pinkdb is refused with a clear "written by an older pinkdb"
+    /// error. Truncated or malformed files return errors, never panics. An
+    /// encrypted (`PINKENC1`) file is rejected: without the `encryption`
+    /// feature the error says to rebuild with it; with the feature it points
+    /// at [`PinkDb::open_with_key`].
     pub fn open(path: &str) -> Result<PinkDb> {
         let data = std::fs::read(path)?;
         if crate::crypto::is_container(&data) {
@@ -2596,141 +3348,75 @@ impl PinkDb {
     /// Load a database from an in-memory `.pink` image (the bytes
     /// [`PinkDb::to_pink_bytes`] returns, or a `.pink` file read into memory).
     ///
-    /// A thin wrapper over the same loader [`PinkDb::open`] uses: all five
-    /// format versions are accepted, a CRC mismatch or any malformed section
-    /// is a clean error (never a panic), and an image written by a newer
-    /// pinkdb is refused with the "upgrade pinkdb" message. An encrypted
-    /// (`PINKENC1`) container is not a plain image and is refused as a bad
-    /// magic.
+    /// A thin wrapper over the same loader [`PinkDb::open`] uses: only the
+    /// current format is accepted, a footer/chunk checksum mismatch or any
+    /// malformed section is a clean error (never a panic), and an image
+    /// written by an older pinkdb is refused with the "written by an older
+    /// pinkdb" message. An encrypted (`PINKENC1`) container is not a plain
+    /// image and is refused as a bad magic.
     pub fn from_pink_bytes(data: &[u8]) -> Result<PinkDb> {
         Self::load_bytes(data)
     }
 
-    /// Decode a serialized `.pink` image (v1, v2, v3, v4 or v5 magic).
+    /// Decode a serialized `.pink` image (`PINKDB06`).
     fn load_bytes(data: &[u8]) -> Result<PinkDb> {
-        let data = if data.starts_with(MAGIC_V3)
-            || data.starts_with(MAGIC_V4)
-            || data.starts_with(MAGIC_V5)
-        {
-            // Verify the trailer before decoding anything.
-            if data.len() < MAGIC_V5.len() + 4 {
-                return Err(PinkDbError::Execution(
-                    "corrupt file: truncated before the checksum".to_string(),
-                ));
-            }
-            let (body, trailer) = data.split_at(data.len() - 4);
-            let want = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-            if crate::wal::crc32(body) != want {
-                return Err(PinkDbError::Execution(
-                    "corrupt file: checksum mismatch (the file is damaged)".to_string(),
-                ));
-            }
-            body
-        } else {
-            data
-        };
-        let mut r = Reader::new(data);
-        let magic = r.take(8)?;
-        let (v2, flags, v5) = if magic == MAGIC_V5 {
-            (true, true, true)
-        } else if magic == MAGIC_V4 {
-            (true, true, false)
-        } else if magic == MAGIC_V3 || magic == MAGIC_V2 {
-            (true, false, false)
-        } else if magic == MAGIC {
-            (false, false, false)
-        } else if magic.starts_with(b"PINKDB0") && magic[7] > b'5' && magic[7].is_ascii_digit() {
-            return Err(PinkDbError::Execution(format!(
-                "written by a newer pinkdb (format v{}); upgrade pinkdb",
-                magic[7] - b'0'
-            )));
-        } else {
-            return Err(PinkDbError::Execution(
-                "not a .pink file (bad magic)".to_string(),
-            ));
-        };
-        let mut constraints = false;
-        let mut defaults = false;
-        let mut mvs = false;
-        let mut indexes = false;
-        let mut procedures = false;
-        let mut macros = false;
-        let mut rbac = false;
-        if flags {
-            let f = r.u32()?;
-            if v5 {
-                if f & !(FLAG_CONSTRAINTS
-                    | FLAG_DEFAULTS
-                    | FLAG_MATERIALIZED_VIEWS
-                    | FLAG_INDEXES
-                    | FLAG_PROCEDURES
-                    | FLAG_MACROS
-                    | FLAG_RBAC)
-                    != 0
-                {
-                    return Err(PinkDbError::Execution(format!(
-                        "unsupported .pink v5 flags 0x{f:08x}; upgrade pinkdb"
-                    )));
-                }
-                constraints = f & FLAG_CONSTRAINTS != 0;
-                defaults = f & FLAG_DEFAULTS != 0;
-                mvs = f & FLAG_MATERIALIZED_VIEWS != 0;
-                indexes = f & FLAG_INDEXES != 0;
-                procedures = f & FLAG_PROCEDURES != 0;
-                macros = f & FLAG_MACROS != 0;
-                rbac = f & FLAG_RBAC != 0;
-            } else if f != 0 {
-                return Err(PinkDbError::Execution(format!(
-                    "unsupported .pink v4 flags 0x{f:08x}; upgrade pinkdb"
-                )));
-            }
-        }
-        // Start from an empty store: a v2 file may legitimately have no
-        // `main` (it was dropped) and `open` must round-trip exactly.
+        let footer = read_store_footer(data)?;
+        // Start from an empty store: a file may legitimately have no `main`
+        // (it was dropped) and `open` must round-trip exactly.
         let mut db = PinkDb::with_databases(Vec::<String>::new());
-        if v2 {
-            let n_dbs = r.u32()?;
-            for _ in 0..n_dbs {
-                let dbname = r.str()?;
-                db.create_database(&dbname)?;
-                let n_tables = r.u32()?;
-                for _ in 0..n_tables {
-                    let sections = TableSections {
-                        v4: v5,
-                        constraints,
-                        defaults,
-                        indexes,
-                    };
-                    load_table(&mut r, &mut db, &dbname, sections)?;
-                }
-                if v5 && macros {
-                    load_macros(&mut r, &mut db, &dbname)?;
-                }
-                if v5 && mvs {
-                    load_materialized_views(&mut r, &mut db, &dbname)?;
-                }
-                if v5 && procedures {
-                    load_procedures(&mut r, &mut db, &dbname)?;
+        for dbdir in &footer.databases {
+            db.create_database(&dbdir.name)?;
+            for tdir in &dbdir.tables {
+                db.create_table_with_constraints_in(
+                    &dbdir.name,
+                    &tdir.name,
+                    tdir.schema.clone(),
+                    tdir.constraints.clone(),
+                )?;
+                let t = db.table_mut_in(&dbdir.name, &tdir.name)?;
+                for (col, d) in t.columns.iter_mut().zip(tdir.defaults.iter()) {
+                    col.default = d.clone();
                 }
             }
-            if db.list_databases().is_empty() {
-                db.create_database("main")?;
+        }
+        // The data region: every column chunk is verified on its own CRC32C
+        // and decoded in parallel.
+        for dbdir in &footer.databases {
+            for tdir in &dbdir.tables {
+                load_table_data(data, &mut db, &dbdir.name, tdir)?;
             }
-        } else {
-            // v1: every table lived in the single implicit database.
+        }
+        // The index definitions (the maps are rebuilt from the rows).
+        for dbdir in &footer.databases {
+            for tdir in &dbdir.tables {
+                if tdir.indexes.is_empty() {
+                    continue;
+                }
+                let t = db.table_mut_in(&dbdir.name, &tdir.name)?;
+                apply_indexes(t, &tdir.indexes)?;
+            }
+        }
+        // The catalog sections: macros first (an MV's defining SQL may call
+        // a macro and is rebound at load), then the materialized views, then
+        // the procedures, then the store-global RBAC section.
+        for dbdir in &footer.databases {
+            for def in &dbdir.macros {
+                db.macros_insert_in(&dbdir.name, def.name.to_ascii_lowercase(), def.clone())?;
+            }
+            for def in &dbdir.materialized_views {
+                let mut def = def.clone();
+                def.query = crate::mv::rebind_query(&db, &dbdir.name, &def.query_sql).ok();
+                db.materialized_views_insert_in(&dbdir.name, def.name.to_ascii_lowercase(), def)?;
+            }
+            for def in &dbdir.procedures {
+                db.procedures_insert_in(&dbdir.name, def.name.to_ascii_lowercase(), def.clone())?;
+            }
+        }
+        if let Some(rbac) = footer.rbac {
+            *db.rbac_mut() = rbac;
+        }
+        if db.list_databases().is_empty() {
             db.create_database("main")?;
-            let n_tables = r.u32()?;
-            for _ in 0..n_tables {
-                load_table(&mut r, &mut db, "main", TableSections::default())?;
-            }
-        }
-        if v5 && rbac {
-            load_rbac(&mut r, &mut db)?;
-        }
-        if !r.end() {
-            return Err(PinkDbError::Execution(
-                "corrupt file: trailing bytes after last table".to_string(),
-            ));
         }
         // The session starts on `main` when it exists, else the first
         // database in sorted order.
@@ -2739,6 +3425,546 @@ impl PinkDb {
         Ok(db)
     }
 }
+
+/// Whether `bytes` is a `PINKDB06` image (the trailer magic).
+///
+/// The magic lives at the **end** of the file: the last 20 bytes are the
+/// trailer (`footer_crc32c u32 | footer_len u64 | "PINKDB06"`).
+pub fn is_pinkdb06(bytes: &[u8]) -> bool {
+    bytes.len() >= TRAILER_LEN && &bytes[bytes.len() - 8..] == MAGIC_V6
+}
+
+/// Write one table's data region (its column chunks) and collect its footer
+/// entry.
+fn write_table(
+    data: &mut Writer,
+    dbname: &str,
+    name: &str,
+    t: &DataTable,
+    parallel: bool,
+    collect_stats: bool,
+    saved: &mut Vec<SavedTableStats>,
+) -> Result<TableDir> {
+    let schema = t.schema();
+    let n_chunks = t.num_chunks();
+    // Share the chunk vectors first (Arc clones only), then encode per
+    // chunk. Order-preserving collect: the bytes are identical to a
+    // serial pass.
+    let mut scans: Vec<Vec<Arc<Vector>>> = Vec::with_capacity(n_chunks);
+    for chunk_idx in 0..n_chunks {
+        let chunk = t
+            .scan_chunk(chunk_idx)
+            .ok_or_else(|| PinkDbError::Execution("storage changed during save".to_string()))?;
+        scans.push(chunk.columns);
+    }
+    // The string layout stores offsets as `u32`; a chunk whose total
+    // VARCHAR bytes exceed that cannot be encoded faithfully (the
+    // offsets would wrap and the reader would reject the file). Refuse
+    // before writing instead of emitting a corrupt file.
+    for cols in &scans {
+        for v in cols {
+            if let VectorData::VarChar(strs) = v.data() {
+                let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
+                if !varchar_offsets_fit(total) {
+                    return Err(PinkDbError::Execution(format!(
+                        "table \"{dbname}.{name}\" has a VARCHAR chunk of {total} \
+                             bytes, over the .pink format's u32 string-offset limit"
+                    )));
+                }
+            }
+        }
+    }
+    // Encode every page (one engine chunk per column) in parallel.
+    let pages: Vec<Vec<EncodedPage>> = if parallel && n_chunks >= PARALLEL_SAVE_MIN_CHUNKS {
+        scans
+            .par_iter()
+            .map(|cols| cols.iter().map(|v| encode_page(v)).collect())
+            .collect()
+    } else {
+        scans
+            .iter()
+            .map(|cols| cols.iter().map(|v| encode_page(v)).collect())
+            .collect()
+    };
+    // The per-column statistics of the whole table (the lake's stats
+    // block).
+    let mut accs: Vec<ColumnStatsAcc> = schema.iter().map(|_| ColumnStatsAcc::new()).collect();
+    for chunk in &pages {
+        for (acc, page) in accs.iter_mut().zip(chunk.iter()) {
+            acc.merge(&page.stats);
+        }
+    }
+    if collect_stats {
+        saved.push(SavedTableStats {
+            db: dbname.to_string(),
+            table: name.to_string(),
+            rows: t.num_rows() as u64,
+            columns: schema
+                .iter()
+                .zip(accs)
+                .map(|((col, dtype), acc)| SavedColumnStats {
+                    name: col.clone(),
+                    dtype: *dtype,
+                    null_count: acc.null_count,
+                    min: acc.min,
+                    max: acc.max,
+                    nan_count: acc.nan_count,
+                })
+                .collect(),
+        });
+    }
+    // The pages, column by column: `by_column[ci]` holds the column's pages
+    // in chunk order.
+    let mut by_column: Vec<Vec<&EncodedPage>> = vec![Vec::with_capacity(n_chunks); schema.len()];
+    for chunk in &pages {
+        for (ci, page) in chunk.iter().enumerate() {
+            by_column[ci].push(page);
+        }
+    }
+    // The row groups: 60 engine chunks each.
+    let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
+    let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
+    for g in 0..n_groups {
+        let first = g * CHUNKS_PER_ROW_GROUP;
+        let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
+        let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(schema.len());
+        let rows: u64 = by_column
+            .first()
+            .map(|c| c[first..last].iter().map(|p| p.rows as u64).sum())
+            .unwrap_or(0);
+        for column_pages in &by_column {
+            // The column chunk: the page index, then the pages.
+            let group = &column_pages[first..last];
+            let page_count = group.len() as u32;
+            let index_len = 4 + page_count as usize * 8;
+            let mut chunk = Writer::new();
+            chunk.u32(page_count);
+            let mut rel = index_len as u32;
+            for page in group {
+                let len = page.frame.len() as u32;
+                chunk.u32(rel);
+                chunk.u32(len);
+                rel += len;
+            }
+            for page in group {
+                chunk.bytes(&page.frame);
+            }
+            let bytes = chunk.buf;
+            let crc = crc32c(&bytes);
+            let offset = data.buf.len() as u64;
+            let length = bytes.len() as u64;
+            data.bytes(&bytes);
+            // The chunk's exact statistics and encoding summary.
+            let mut acc = ColumnStatsAcc::new();
+            let mut encodings = 0u32;
+            for page in group {
+                acc.merge(&page.stats);
+                encodings |= 1u32 << page.frame[0];
+            }
+            columns.push(ColumnChunkDir {
+                offset,
+                length,
+                page_count,
+                encodings,
+                crc32c: crc,
+                null_count: acc.null_count,
+                nan_count: acc.nan_count,
+                min: acc.min,
+                max: acc.max,
+            });
+        }
+        row_groups.push(RowGroupDir { rows, columns });
+    }
+    Ok(TableDir {
+        name: name.to_string(),
+        schema,
+        constraints: t.constraints.clone(),
+        defaults: t.columns.iter().map(|c| c.default.clone()).collect(),
+        indexes: index_defs(t),
+        row_count: t.num_rows() as u64,
+        row_groups,
+    })
+}
+
+/// The footer's byte range in a `PINKDB06` image: `(offset, length)`.
+///
+/// A ranged reader needs the 20-byte trailer and then exactly this window:
+/// two small requests, no read of the data region.
+pub fn footer_span(bytes: &[u8]) -> Result<(u64, u64)> {
+    let (offset, len) = footer_span_raw(bytes)?;
+    Ok((offset as u64, len as u64))
+}
+
+/// The footer's byte range, without the format check (the internal helper).
+fn footer_span_raw(bytes: &[u8]) -> Result<(usize, usize)> {
+    if bytes.len() < TRAILER_LEN {
+        return Err(PinkDbError::Execution(
+            "not a .pink file (bad magic)".to_string(),
+        ));
+    }
+    let trailer = &bytes[bytes.len() - TRAILER_LEN..];
+    let len = u64::from_le_bytes([
+        trailer[4],
+        trailer[5],
+        trailer[6],
+        trailer[7],
+        trailer[8],
+        trailer[9],
+        trailer[10],
+        trailer[11],
+    ]) as usize;
+    let start = bytes
+        .len()
+        .checked_sub(TRAILER_LEN)
+        .and_then(|s| s.checked_sub(len))
+        .ok_or_else(|| {
+            PinkDbError::Execution("corrupt file: the footer length is out of range".to_string())
+        })?;
+    Ok((start, len))
+}
+
+/// The footer's flags word: which optional catalog sections the image
+/// carries (constraints, column defaults, materialized views, index
+/// definitions, procedures, macros and RBAC).
+pub fn footer_flags(bytes: &[u8]) -> Result<u32> {
+    let (start, len) = footer_span_raw(bytes)?;
+    let footer = &bytes[start..start + len];
+    let mut r = Reader::new(footer);
+    let version = r.u32()?;
+    if version != FOOTER_VERSION {
+        return Err(PinkDbError::Execution(format!(
+            "unsupported .pink footer version {version}; upgrade pinkdb"
+        )));
+    }
+    r.u32()
+}
+
+/// The refusal for a file written by an older pinkdb.
+fn older_pinkdb_error(version: u8) -> PinkDbError {
+    PinkDbError::Execution(format!(
+        "this .pink file was written by an older pinkdb (PINKDB0{version}); \
+         this build reads PINKDB06 only"
+    ))
+}
+
+/// Read (and verify) the footer of a `PINKDB06` image.
+fn read_store_footer(data: &[u8]) -> Result<StoreFooter> {
+    if data.len() < TRAILER_LEN {
+        return Err(PinkDbError::Execution(
+            "not a .pink file (bad magic)".to_string(),
+        ));
+    }
+    let trailer = &data[data.len() - TRAILER_LEN..];
+    let want_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let magic = &trailer[12..20];
+    if magic != MAGIC_V6 {
+        // A file from a newer pinkdb?
+        if magic.starts_with(b"PINKDB0") && magic[7].is_ascii_digit() && magic[7] > b'6' {
+            return Err(PinkDbError::Execution(format!(
+                "written by a newer pinkdb (format v{}); upgrade pinkdb",
+                magic[7] - b'0'
+            )));
+        }
+        // A file from an older pinkdb? Its magic is at the *start*.
+        if data.len() >= 8 && data.starts_with(b"PINKDB0") && data[7].is_ascii_digit() {
+            let v = data[7];
+            if v <= b'6' {
+                return Err(older_pinkdb_error(v - b'0'));
+            }
+            return Err(PinkDbError::Execution(format!(
+                "written by a newer pinkdb (format v{}); upgrade pinkdb",
+                v - b'0'
+            )));
+        }
+        return Err(PinkDbError::Execution(
+            "not a .pink file (bad magic)".to_string(),
+        ));
+    }
+    let (start, len) = footer_span_raw(data)?;
+    let footer = &data[start..start + len];
+    if crc32c(footer) != want_crc {
+        return Err(PinkDbError::Execution(
+            "corrupt file: the footer checksum does not match (the file is damaged)".to_string(),
+        ));
+    }
+    let mut r = Reader::new(footer);
+    let version = r.u32()?;
+    if version != FOOTER_VERSION {
+        return Err(PinkDbError::Execution(format!(
+            "unsupported .pink footer version {version}; upgrade pinkdb"
+        )));
+    }
+    let flags = r.u32()?;
+    if flags
+        & !(FLAG_CONSTRAINTS
+            | FLAG_DEFAULTS
+            | FLAG_MATERIALIZED_VIEWS
+            | FLAG_INDEXES
+            | FLAG_PROCEDURES
+            | FLAG_MACROS
+            | FLAG_RBAC)
+        != 0
+    {
+        return Err(PinkDbError::Execution(format!(
+            "unsupported .pink footer flags 0x{flags:08x}; upgrade pinkdb"
+        )));
+    }
+    let constraints = flags & FLAG_CONSTRAINTS != 0;
+    let defaults = flags & FLAG_DEFAULTS != 0;
+    let indexes = flags & FLAG_INDEXES != 0;
+    let macros = flags & FLAG_MACROS != 0;
+    let mvs = flags & FLAG_MATERIALIZED_VIEWS != 0;
+    let procedures = flags & FLAG_PROCEDURES != 0;
+    let rbac = flags & FLAG_RBAC != 0;
+
+    let n_dbs = r.u32()? as usize;
+    // Each database costs at least 8 bytes (its name's length prefix).
+    if n_dbs > r.remaining() / 8 + 1 {
+        return r.err("database count exceeds the remaining file");
+    }
+    let mut databases = Vec::with_capacity(n_dbs);
+    for _ in 0..n_dbs {
+        let name = r.str()?;
+        let n_tables = r.u32()? as usize;
+        if n_tables > r.remaining() / 8 + 1 {
+            return r.err("table count exceeds the remaining file");
+        }
+        let mut tables = Vec::with_capacity(n_tables);
+        for _ in 0..n_tables {
+            let tname = r.str()?;
+            let n_cols = r.u32()? as usize;
+            // Each column costs at least 5 bytes (name length + dtype tag).
+            if n_cols > r.remaining() / 5 {
+                return r.err("column count exceeds the remaining file");
+            }
+            let mut schema = Vec::with_capacity(n_cols);
+            for _ in 0..n_cols {
+                let col = r.str()?;
+                let tag = r.u8()?;
+                let dtype = match tag {
+                    7 => {
+                        let precision = r.u8()?;
+                        let scale = r.u8()?;
+                        crate::types::decimal_type(precision, scale).ok_or_else(|| {
+                            PinkDbError::Execution(
+                                "corrupt file: bad DECIMAL precision/scale".to_string(),
+                            )
+                        })?
+                    }
+                    8 => DataType::Interval,
+                    other => dtype_from_tag(other)?,
+                };
+                schema.push((col, dtype));
+            }
+            let tconstraints = if constraints {
+                read_constraints(&mut r, n_cols)?
+            } else {
+                TableConstraints::default()
+            };
+            let tdefaults = if defaults {
+                let decoded = read_defaults(&mut r, n_cols)?;
+                for ((name, dtype), d) in schema.iter().zip(decoded.iter()) {
+                    if let Some(v) = d
+                        && !default_matches(v, *dtype)
+                    {
+                        return r.err(&format!(
+                            "default value of column \"{name}\" does not match its type"
+                        ));
+                    }
+                }
+                decoded
+            } else {
+                vec![None; n_cols]
+            };
+            let tindexes = if indexes {
+                read_index_defs(&mut r)?
+            } else {
+                Vec::new()
+            };
+            let row_count = r.u64()?;
+            let n_groups = r.u32()? as usize;
+            // Each row group costs at least 8 bytes (its row count) plus one
+            // entry per column.
+            if n_groups > r.remaining() / 8 + 1 {
+                return r.err("row-group count exceeds the remaining file");
+            }
+            let mut row_groups = Vec::with_capacity(n_groups);
+            for _ in 0..n_groups {
+                let rows = r.u64()?;
+                let mut columns = Vec::with_capacity(n_cols);
+                for _ in 0..n_cols {
+                    let offset = r.u64()?;
+                    let length = r.u64()?;
+                    let page_count = r.u32()?;
+                    let encodings = r.u32()?;
+                    let crc = r.u32()?;
+                    let null_count = r.u64()?;
+                    let nan_count = r.u64()?;
+                    let min = read_stat_value(&mut r)?;
+                    let max = read_stat_value(&mut r)?;
+                    columns.push(ColumnChunkDir {
+                        offset,
+                        length,
+                        page_count,
+                        encodings,
+                        crc32c: crc,
+                        null_count,
+                        nan_count,
+                        min,
+                        max,
+                    });
+                }
+                row_groups.push(RowGroupDir { rows, columns });
+            }
+            tables.push(TableDir {
+                name: tname,
+                schema,
+                constraints: tconstraints,
+                defaults: tdefaults,
+                indexes: tindexes,
+                row_count,
+                row_groups,
+            });
+        }
+        let dmacros = if macros {
+            read_macro_defs(&mut r)?
+        } else {
+            Vec::new()
+        };
+        let dmvs = if mvs {
+            read_materialized_view_defs(&mut r)?
+        } else {
+            Vec::new()
+        };
+        let dprocs = if procedures {
+            read_procedure_defs(&mut r)?
+        } else {
+            Vec::new()
+        };
+        databases.push(DbDir {
+            name,
+            tables,
+            macros: dmacros,
+            materialized_views: dmvs,
+            procedures: dprocs,
+        });
+    }
+    let rbac = if rbac { Some(read_rbac(&mut r)?) } else { None };
+    if !r.end() {
+        return Err(PinkDbError::Execution(
+            "corrupt file: trailing bytes after the footer".to_string(),
+        ));
+    }
+    Ok(StoreFooter { databases, rbac })
+}
+
+/// Load one table's data region: every column chunk is read, its CRC32C is
+/// verified and its pages are decoded. The columns are decoded in parallel.
+fn load_table_data(data: &[u8], db: &mut PinkDb, dbname: &str, tdir: &TableDir) -> Result<()> {
+    let n_cols = tdir.schema.len();
+    // The decoded pages per column: `pages[column][row group][page]`.
+    let decoded: Vec<Vec<Vec<Arc<Vector>>>> = (0..n_cols)
+        .into_par_iter()
+        .map(|ci| {
+            tdir.row_groups
+                .par_iter()
+                .map(|rg| decode_column_chunk(data, &rg.columns[ci], tdir.schema[ci].1))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // The row count must agree with the row groups.
+    let total_rows: usize = tdir.row_groups.iter().map(|rg| rg.rows as usize).sum();
+    if total_rows != tdir.row_count as usize {
+        return Err(PinkDbError::Execution(format!(
+            "corrupt file: table \"{}\" claims {} rows but its row groups hold {total_rows}",
+            tdir.name, tdir.row_count
+        )));
+    }
+    // Assemble the table chunk by chunk (every column shares the chunk
+    // boundaries: the writer's invariant).
+    let t = db.table_mut_in(dbname, &tdir.name)?;
+    for (g, rg) in tdir.row_groups.iter().enumerate() {
+        let n_pages = rg.columns[0].page_count as usize;
+        for p in 0..n_pages {
+            let chunk: Vec<Arc<Vector>> = decoded
+                .iter()
+                .map(|column| Arc::clone(&column[g][p]))
+                .collect();
+            t.append_shared_chunk(&chunk)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read one column chunk, verify its CRC32C and decode its pages.
+fn decode_column_chunk(
+    data: &[u8],
+    dir: &ColumnChunkDir,
+    dtype: DataType,
+) -> Result<Vec<Arc<Vector>>> {
+    let start = usize::try_from(dir.offset).map_err(|_| {
+        PinkDbError::Execution("corrupt file: the column chunk offset is out of range".to_string())
+    })?;
+    let len = usize::try_from(dir.length).map_err(|_| {
+        PinkDbError::Execution("corrupt file: the column chunk length is out of range".to_string())
+    })?;
+    let end = start.checked_add(len).ok_or_else(|| {
+        PinkDbError::Execution("corrupt file: the column chunk range overflows".to_string())
+    })?;
+    if end > data.len() {
+        return Err(PinkDbError::Execution(
+            "corrupt file: the column chunk is outside the file".to_string(),
+        ));
+    }
+    let bytes = &data[start..end];
+    if crc32c(bytes) != dir.crc32c {
+        return Err(PinkDbError::Execution(format!(
+            "corrupt file: the column chunk at offset {start} fails its checksum (the file is damaged)"
+        )));
+    }
+    // The page index, then the pages.
+    let mut r = Reader::new(bytes);
+    let page_count = r.u32()? as usize;
+    if page_count != dir.page_count as usize {
+        return Err(PinkDbError::Execution(
+            "corrupt file: the column chunk's page count disagrees with the footer".to_string(),
+        ));
+    }
+    // Each page-index entry is 8 bytes: never size an allocation from the
+    // unvalidated count.
+    if page_count > r.remaining() / 8 {
+        return r.err("the column chunk's page count exceeds the chunk");
+    }
+    let mut index = Vec::with_capacity(page_count);
+    for _ in 0..page_count {
+        let off = r.u32()? as usize;
+        let len = r.u32()? as usize;
+        index.push((off, len));
+    }
+    let mut out: Vec<Arc<Vector>> = Vec::with_capacity(page_count);
+    for (off, len) in index {
+        let end = off.checked_add(len).ok_or_else(|| {
+            PinkDbError::Execution("corrupt file: a page range overflows".to_string())
+        })?;
+        if end > bytes.len() {
+            return Err(PinkDbError::Execution(
+                "corrupt file: a page is outside the column chunk".to_string(),
+            ));
+        }
+        let mut pr = Reader::new(&bytes[off..end]);
+        let tag = pr.u8()?;
+        let v = decode_chunk_typed(dtype, tag, &mut pr)?;
+        if !pr.end() {
+            return Err(PinkDbError::Execution(
+                "corrupt file: trailing bytes after a page".to_string(),
+            ));
+        }
+        out.push(Arc::new(v));
+    }
+    Ok(out)
+}
+
+// ---------- the catalog sections of the footer ----------
 
 /// Encode one table's declarative constraints (see the module-level layout).
 /// Keys are written first (declaration order), then foreign keys, then the
@@ -2779,645 +4005,9 @@ fn write_constraints(w: &mut Writer, c: &TableConstraints) {
     }
 }
 
-/// One table's hash-index section (`FLAG_INDEXES`, wave 79): every index
-/// (sorted by name) with its column ordinal and statistics. `indexed_rows` is
-/// the column's non-NULL count (exact without the map); `distinct_keys` comes
-/// from the map, rebuilt from the live column first when the map is stale.
-fn write_indexes(w: &mut Writer, t: &DataTable) {
-    let mut indexes: Vec<&Index> = t
-        .indexes
-        .iter()
-        .filter(|i| i.column < t.columns.len())
-        .collect();
-    indexes.sort_by(|a, b| a.name.cmp(&b.name));
-    w.u32(indexes.len() as u32);
-    for index in indexes {
-        let column = &t.columns[index.column];
-        let distinct = if t.indexes_stale {
-            crate::storage::index_map_for(column).len()
-        } else {
-            index.map.len()
-        };
-        let indexed: usize = column.chunks.iter().map(|c| c.len() - c.null_count()).sum();
-        w.str(&index.name);
-        w.u32(index.column as u32);
-        w.u64(distinct as u64);
-        w.u64(indexed as u64);
-    }
-}
-
-/// Decode one table's hash-index section and rebuild each map from the
-/// table's already-decoded column (the maps are never read from the file).
-/// The statistics are bounded by the table's real row count but otherwise
-/// not trusted: the rebuilt map is the authority.
-fn read_indexes(r: &mut Reader, t: &DataTable) -> Result<Vec<Index>> {
-    let n = r.u32()? as usize;
-    // Each index costs at least 24 bytes (name length, column, two counts).
-    if n > r.remaining() / 24 {
-        return r.err("index count exceeds the remaining file");
-    }
-    let mut out: Vec<Index> = Vec::with_capacity(n);
-    for _ in 0..n {
-        let name = r.str()?;
-        if name.is_empty() {
-            return r.err("empty index name");
-        }
-        if let Some(prev) = out.last()
-            && prev.name >= name
-        {
-            return r.err(&format!(
-                "index \"{name}\" is duplicated or out of name order"
-            ));
-        }
-        let column = r.u32()? as usize;
-        let Some(col) = t.columns.get(column) else {
-            return r.err(&format!(
-                "index \"{name}\" names column {column} of a {}-column table",
-                t.columns.len()
-            ));
-        };
-        let distinct = r.u64()?;
-        let indexed = r.u64()?;
-        if indexed > t.num_rows() as u64 || distinct > indexed {
-            return r.err(&format!("index \"{name}\" statistics exceed the table"));
-        }
-        out.push(Index {
-            name,
-            column,
-            map: crate::storage::index_map_for(col),
-        });
-    }
-    Ok(out)
-}
-
-/// Policy tags in a materialized-view section (wave 80).
-const MV_MANUAL: u8 = 0;
-const MV_EVERY: u8 = 1;
-const MV_ON_COMMIT: u8 = 2;
-
-/// One database's macro section (`FLAG_MACROS`, wave 77): the count, then per
-/// macro, sorted by lowercased name, `name, source` where `source` is the
-/// full `CREATE MACRO ...` statement text. The **parsed template is not
-/// stored**: the loader re-parses the statement, exactly like a procedure
-/// body or an MV definition (a template cannot be rendered back to SQL). The
-/// section is written before the materialized-view section so an MV's
-/// load-time rebind can expand a macro it calls.
-fn write_macros(w: &mut Writer, db: &PinkDb, dbname: &str) {
-    let macros = db.macros_in(dbname);
-    w.u32(macros.len() as u32);
-    for (_, def) in &macros {
-        w.str(&def.name);
-        w.str(&def.source);
-    }
-}
-
-/// Decode one database's macro section and install the definitions. A source
-/// text that is not exactly one `CREATE MACRO` statement is a corrupt file
-/// (the executor refuses to store a definition without its statement text).
-fn load_macros(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Result<()> {
-    let n = r.u32()? as usize;
-    // Each macro costs at least 8 bytes (two empty string length prefixes);
-    // never size an allocation from the unvalidated count.
-    if n > r.remaining() / 8 + 1 {
-        return r.err("macro count exceeds the remaining file");
-    }
-    for _ in 0..n {
-        let name = r.str()?;
-        let source = r.str()?;
-        let mut stmts = crate::sql::parse_statements(&source).map_err(|e| {
-            PinkDbError::Execution(format!(
-                "corrupt file: macro \"{name}\" (database \"{dbname}\") does not parse: {e}"
-            ))
-        })?;
-        if stmts.len() != 1 {
-            return r.err(&format!(
-                "macro \"{name}\" definition is not exactly one statement"
-            ));
-        }
-        let Some(crate::sql::ast::Statement::CreateMacro {
-            name: parsed_name,
-            params,
-            body,
-            ..
-        }) = stmts.pop()
-        else {
-            return r.err(&format!(
-                "macro \"{name}\" definition is not a CREATE MACRO statement"
-            ));
-        };
-        if !parsed_name.eq_ignore_ascii_case(&name) {
-            return r.err(&format!(
-                "macro section names \"{name}\" but its definition creates \"{parsed_name}\""
-            ));
-        }
-        if db.macro_in(dbname, &name).is_ok() {
-            return r.err(&format!("macro \"{name}\" is defined twice"));
-        }
-        let def = crate::macros::MacroDef {
-            name: parsed_name,
-            params: params
-                .into_iter()
-                .map(|p| crate::macros::MacroParamDef {
-                    name: p.name,
-                    default: p.default,
-                })
-                .collect(),
-            body,
-            source,
-        };
-        db.macros_insert_in(dbname, name.to_ascii_lowercase(), def)?;
-    }
-    Ok(())
-}
-
-/// One database's materialized-view section (`FLAG_MATERIALIZED_VIEWS`): the
-/// count, then per view, sorted by lowercased name,
-/// `name, policy tag [, months, days, micros], defining SQL, last refresh
-/// stamp (epoch ms), refresh count`. The **bound query is not stored**: only
-/// the defining SQL text, which the loader rebinds (a bound plan cannot be
-/// rendered back to SQL, and a definition whose base tables are missing must
-/// still load). A non-refreshable definition is not a write error, so this is
-/// infallible.
-fn write_materialized_views(w: &mut Writer, db: &PinkDb, dbname: &str) {
-    let views = db.materialized_views_in(dbname);
-    w.u32(views.len() as u32);
-    for (_, def) in &views {
-        w.str(&def.name);
-        match def.policy {
-            crate::types::RefreshPolicy::Manual => w.u8(MV_MANUAL),
-            crate::types::RefreshPolicy::Every { interval } => {
-                w.u8(MV_EVERY);
-                w.i32(interval.months);
-                w.i32(interval.days);
-                w.i64(interval.micros);
-            }
-            crate::types::RefreshPolicy::OnCommit => w.u8(MV_ON_COMMIT),
-        }
-        w.str(&def.query_sql);
-        w.i64(def.last_refreshed_ms);
-        w.u64(def.refresh_count);
-    }
-}
-
-/// Decode one database's materialized-view section and install the
-/// definitions. The defining query is rebound from its persisted SQL; a
-/// definition that cannot rebind (missing base table/view) still loads, with
-/// no bound plan — a refresh retries later and reports the failure, and
-/// `DROP MATERIALIZED VIEW` still removes it.
-fn load_materialized_views(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Result<()> {
-    let n = r.u32()? as usize;
-    // Each view costs at least 9 bytes (empty policy/name/… fields); do not
-    // size an allocation from the unvalidated count.
-    if n > r.remaining() / 9 + 1 {
-        return r.err("materialized-view count exceeds the remaining file");
-    }
-    for _ in 0..n {
-        let name = r.str()?;
-        let policy = match r.u8()? {
-            MV_MANUAL => crate::types::RefreshPolicy::Manual,
-            MV_EVERY => {
-                let months = r.i32()?;
-                let days = r.i32()?;
-                let micros = r.i64()?;
-                crate::types::RefreshPolicy::Every {
-                    interval: crate::types::Interval {
-                        months,
-                        days,
-                        micros,
-                    },
-                }
-            }
-            MV_ON_COMMIT => crate::types::RefreshPolicy::OnCommit,
-            other => return r.err(&format!("unknown materialized-view policy tag {other}")),
-        };
-        let query_sql = r.str()?;
-        let last_refreshed_ms = r.i64()?;
-        let refresh_count = r.u64()?;
-        let query = crate::mv::rebind_query(db, dbname, &query_sql).ok();
-        db.materialized_views_insert_in(
-            dbname,
-            name.to_ascii_lowercase(),
-            crate::storage::MaterializedViewDef {
-                name,
-                query,
-                query_sql,
-                policy,
-                last_refreshed_ms,
-                // The attempt stamp is not persisted: treat the last success
-                // as the last attempt (an `EVERY` view becomes due one full
-                // interval after its last success).
-                last_attempt_ms: last_refreshed_ms,
-                refresh_count,
-                last_error: None,
-            },
-        )?;
-    }
-    Ok(())
-}
-
-/// The store-global RBAC section (`FLAG_RBAC`, wave 48): the users (display
-/// name + Argon2id PHC password hash), the roles, the role memberships, the
-/// table grants, the database grants and the global `ADMIN` holders, each
-/// list sorted by its canonical key.
-///
-/// Only the **hash** of a password is ever written — the DDL statement's
-/// plaintext exists in process memory and nowhere else (the WAL logs the
-/// rewritten `PASSWORD_HASH '<phc>'` form for the same reason). `BTreeMap`
-/// iteration is sorted by key, which is exactly the deterministic write
-/// order, so no explicit sort is needed.
-fn write_rbac(w: &mut Writer, db: &PinkDb) {
-    let rbac = db.rbac();
-    w.u32(rbac.users.len() as u32);
-    for user in rbac.users.values() {
-        w.str(&user.name);
-        w.str(&user.password_hash);
-    }
-    w.u32(rbac.roles.len() as u32);
-    for role in rbac.roles.values() {
-        w.str(role);
-    }
-    let memberships: usize = rbac.memberships.values().map(|r| r.len()).sum();
-    w.u32(memberships as u32);
-    for (member, roles) in &rbac.memberships {
-        for role in roles {
-            w.str(member);
-            w.str(role);
-        }
-    }
-    w.u32(rbac.table_grants.len() as u32);
-    for ((dbname, table), principals) in &rbac.table_grants {
-        w.str(dbname);
-        w.str(table);
-        write_principal_grants(w, principals);
-    }
-    w.u32(rbac.database_grants.len() as u32);
-    for (dbname, principals) in &rbac.database_grants {
-        w.str(dbname);
-        write_principal_grants(w, principals);
-    }
-    w.u32(rbac.admins.len() as u32);
-    for principal in &rbac.admins {
-        w.str(principal);
-    }
-}
-
-/// One object's `principal → privileges` map: the count, then per principal,
-/// `principal, privilege count, privileges`.
-fn write_principal_grants(
-    w: &mut Writer,
-    principals: &std::collections::BTreeMap<
-        String,
-        std::collections::BTreeSet<crate::rbac::Privilege>,
-    >,
-) {
-    w.u32(principals.len() as u32);
-    for (principal, privs) in principals {
-        w.str(principal);
-        w.u32(privs.len() as u32);
-        for p in privs {
-            w.u8(p.tag());
-        }
-    }
-}
-
-/// Decode the store-global RBAC section and install it.
-///
-/// Every count is validated against the bytes remaining before it sizes an
-/// allocation (exactly like the other optional sections), unknown privilege
-/// tags are a corrupt-file error, and a user's password hash must parse as a
-/// PHC `argon2id` string — a store that loaded would otherwise hold a user
-/// nobody can log in as. Grants that name a principal or table the catalog no
-/// longer defines load as-is (they are inert): the file records what was
-/// granted, not what exists today.
-fn load_rbac(r: &mut Reader, db: &mut PinkDb) -> Result<()> {
-    let mut rbac = crate::rbac::RbacCatalog::default();
-    let n_users = r.u32()? as usize;
-    // Each user costs at least 8 bytes (two empty strings' length prefixes).
-    if n_users > r.remaining() / 8 + 1 {
-        return r.err("RBAC user count exceeds the remaining file");
-    }
-    for _ in 0..n_users {
-        let name = r.str()?;
-        let password_hash = r.str()?;
-        crate::rbac::validate_password_hash(&password_hash).map_err(|e| {
-            PinkDbError::Execution(format!(
-                "corrupt file: user \"{name}\" has an invalid password hash ({e})"
-            ))
-        })?;
-        rbac.users.insert(
-            name.to_ascii_lowercase(),
-            crate::rbac::UserDef {
-                name,
-                password_hash,
-            },
-        );
-    }
-    let n_roles = r.u32()? as usize;
-    if n_roles > r.remaining() / 4 + 1 {
-        return r.err("RBAC role count exceeds the remaining file");
-    }
-    for _ in 0..n_roles {
-        let name = r.str()?;
-        rbac.roles.insert(name.to_ascii_lowercase(), name);
-    }
-    let n_memberships = r.u32()? as usize;
-    if n_memberships > r.remaining() / 8 + 1 {
-        return r.err("RBAC membership count exceeds the remaining file");
-    }
-    for _ in 0..n_memberships {
-        let member = r.str()?;
-        let role = r.str()?;
-        rbac.memberships
-            .entry(member.to_ascii_lowercase())
-            .or_default()
-            .insert(role.to_ascii_lowercase());
-    }
-    let n_table_grants = r.u32()? as usize;
-    if n_table_grants > r.remaining() / 8 + 1 {
-        return r.err("RBAC table-grant count exceeds the remaining file");
-    }
-    for _ in 0..n_table_grants {
-        let dbname = r.str()?;
-        let table = r.str()?;
-        let principals = read_principal_grants(r)?;
-        rbac.table_grants.insert(
-            (dbname.to_ascii_lowercase(), table.to_ascii_lowercase()),
-            principals,
-        );
-    }
-    let n_db_grants = r.u32()? as usize;
-    if n_db_grants > r.remaining() / 4 + 1 {
-        return r.err("RBAC database-grant count exceeds the remaining file");
-    }
-    for _ in 0..n_db_grants {
-        let dbname = r.str()?;
-        let principals = read_principal_grants(r)?;
-        rbac.database_grants
-            .insert(dbname.to_ascii_lowercase(), principals);
-    }
-    let n_admins = r.u32()? as usize;
-    if n_admins > r.remaining() / 4 + 1 {
-        return r.err("RBAC admin count exceeds the remaining file");
-    }
-    for _ in 0..n_admins {
-        let principal = r.str()?;
-        rbac.admins.insert(principal.to_ascii_lowercase());
-    }
-    *db.rbac_mut() = rbac;
-    Ok(())
-}
-
-/// One object's `principal → privileges` map (the reader side of
-/// [`write_principal_grants`]).
-fn read_principal_grants(
-    r: &mut Reader,
-) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<crate::rbac::Privilege>>>
-{
-    let n = r.u32()? as usize;
-    // Each principal costs at least 8 bytes (name and privilege count).
-    if n > r.remaining() / 8 + 1 {
-        return r.err("RBAC grant principal count exceeds the remaining file");
-    }
-    let mut out = std::collections::BTreeMap::new();
-    for _ in 0..n {
-        let principal = r.str()?;
-        let n_privs = r.u32()? as usize;
-        if n_privs > r.remaining() + 1 {
-            return r.err("RBAC privilege count exceeds the remaining file");
-        }
-        let mut privs = std::collections::BTreeSet::new();
-        for _ in 0..n_privs {
-            privs.insert(crate::rbac::Privilege::from_tag(r.u8()?)?);
-        }
-        out.insert(principal.to_ascii_lowercase(), privs);
-    }
-    Ok(out)
-}
-
-/// One database's stored-procedure section (`FLAG_PROCEDURES`, wave 44): the
-/// count, then per procedure, sorted by lowercased name,
-/// `name, language tag, parameter count × (name, dtype tag [, precision,
-/// scale]), body text`. The **parsed body is not stored**: only the text,
-/// which the loader re-parses (a body is validated at `CREATE`, and a stored
-/// body that no longer parses is a corrupt file). JavaScript bodies are opaque
-/// text and load in every build — running one still needs the `js` feature, so
-/// a build without it reports the refusal at `CALL` time.
-fn write_procedures(w: &mut Writer, db: &PinkDb, dbname: &str) {
-    let procs = db.procedures_in(dbname);
-    w.u32(procs.len() as u32);
-    for (_, def) in &procs {
-        w.str(&def.name);
-        w.u8(def.language.tag());
-        w.u32(def.params.len() as u32);
-        for (name, dtype) in &def.params {
-            w.str(name);
-            w.u8(dtype_tag(*dtype));
-            // DECIMAL rides its precision/scale, exactly like the schema.
-            if let DataType::Decimal { precision, scale } = dtype {
-                w.u8(*precision);
-                w.u8(*scale);
-            }
-        }
-        w.str(&def.source);
-    }
-}
-
-/// Decode one database's stored-procedure section and install the
-/// definitions. A SQL body is re-parsed here; a parse failure is a corrupt
-/// file (the body was validated when the definition was created).
-fn load_procedures(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Result<()> {
-    let n = r.u32()? as usize;
-    // Each procedure costs at least 7 bytes (language, empty counts/strings);
-    // do not size an allocation from the unvalidated count.
-    if n > r.remaining() / 7 + 1 {
-        return r.err("procedure count exceeds the remaining file");
-    }
-    for _ in 0..n {
-        let name = r.str()?;
-        let language = crate::procedure::ProcLanguage::from_tag(r.u8()?)?;
-        let n_params = r.u32()? as usize;
-        if n_params > r.remaining() / 5 + 1 {
-            return r.err("procedure parameter count exceeds the remaining file");
-        }
-        let mut params = Vec::with_capacity(n_params);
-        for _ in 0..n_params {
-            let pname = r.str()?;
-            let tag = r.u8()?;
-            let dtype = if tag == 7 {
-                let precision = r.u8()?;
-                let scale = r.u8()?;
-                DataType::Decimal { precision, scale }
-            } else {
-                dtype_from_tag(tag)?
-            };
-            params.push((pname, dtype));
-        }
-        let source = r.str()?;
-        let body = match language {
-            crate::procedure::ProcLanguage::Sql => {
-                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
-                Some(
-                    crate::procedure::parse_body(&name, &param_names, &source).map_err(|e| {
-                        PinkDbError::Execution(format!(
-                            "corrupt file: procedure \"{name}\" (database \"{dbname}\") \
-                             does not parse: {e}"
-                        ))
-                    })?,
-                )
-            }
-            crate::procedure::ProcLanguage::JavaScript => None,
-        };
-        db.procedures_insert_in(
-            dbname,
-            name.to_ascii_lowercase(),
-            crate::procedure::ProcedureDef {
-                name,
-                params,
-                language,
-                source,
-                body,
-            },
-        )?;
-    }
-    Ok(())
-}
-
-/// Encode every column's DEFAULT (wave 65): one presence byte per column,
-/// then the value bytes of the ones that have a default (a NULL default is
-/// simply absent — it means the same on read).
-fn write_defaults(w: &mut Writer, columns: &[Column]) {
-    for col in columns {
-        match &col.default {
-            Some(v) if !v.is_null() => {
-                w.u8(1);
-                write_default_value(w, v);
-            }
-            _ => w.u8(0),
-        }
-    }
-}
-
-/// One default value's bytes: a tag byte plus its payload.
-fn write_default_value(w: &mut Writer, v: &Value) {
-    match v {
-        // Unreachable: `write_defaults` treats a NULL default as absent. A
-        // total match keeps the encoder honest.
-        Value::Null => w.u8(VD_BOOL),
-        Value::Boolean(b) => {
-            w.u8(VD_BOOL);
-            w.u8(*b as u8);
-        }
-        Value::Integer(i) => {
-            w.u8(VD_I32);
-            w.u32(*i as u32);
-        }
-        Value::Bigint(i) => {
-            w.u8(VD_I64);
-            w.u64(*i as u64);
-        }
-        Value::Double(x) => {
-            w.u8(VD_F64_BITS);
-            w.u64(x.to_bits());
-        }
-        Value::Varchar(s) => {
-            w.u8(VD_VARCHAR);
-            w.str(s);
-        }
-        Value::Date(d) => {
-            w.u8(VD_DATE);
-            w.u32(*d as u32);
-        }
-        Value::Timestamp(t) => {
-            w.u8(VD_TIMESTAMP);
-            w.u64(*t as u64);
-        }
-        Value::Decimal(x, scale) => {
-            w.u8(VD_DECIMAL);
-            w.bytes(&x.to_le_bytes());
-            w.u8(*scale);
-        }
-        Value::Interval {
-            months,
-            days,
-            micros,
-        } => {
-            w.u8(VD_INTERVAL);
-            w.u32(*months as u32);
-            w.u32(*days as u32);
-            w.u64(*micros as u64);
-        }
-    }
-}
-
-/// Decode the per-column default section (`FLAG_DEFAULTS`). Every tag is
-/// validated; an unknown tag or a truncated payload is a corrupt-file error.
-fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<Value>>> {
-    let mut out = Vec::with_capacity(n_cols);
-    for _ in 0..n_cols {
-        if r.u8()? == 0 {
-            out.push(None);
-            continue;
-        }
-        let tag = r.u8()?;
-        let v = match tag {
-            VD_BOOL => Value::Boolean(match r.u8()? {
-                0 => false,
-                1 => true,
-                _ => return r.err("bad BOOLEAN default byte"),
-            }),
-            VD_I32 => Value::Integer(r.i32()?),
-            VD_I64 => Value::Bigint(r.i64()?),
-            VD_F64_BITS => Value::Double(f64::from_bits(r.u64()?)),
-            VD_VARCHAR => Value::Varchar(r.str()?),
-            VD_DATE => Value::Date(r.i32()?),
-            VD_TIMESTAMP => Value::Timestamp(r.i64()?),
-            VD_DECIMAL => {
-                let b = r.take(16)?;
-                let mut arr = [0u8; 16];
-                arr.copy_from_slice(b);
-                let x = i128::from_le_bytes(arr);
-                let scale = r.u8()?;
-                if scale > 38 {
-                    return r.err("bad DECIMAL default scale");
-                }
-                Value::Decimal(x, scale)
-            }
-            VD_INTERVAL => Value::Interval {
-                months: r.i32()?,
-                days: r.i32()?,
-                micros: r.i64()?,
-            },
-            other => {
-                return Err(PinkDbError::Execution(format!(
-                    "corrupt file: unknown default value tag {other}"
-                )));
-            }
-        };
-        out.push(Some(v));
-    }
-    Ok(out)
-}
-
-/// Whether a decoded default value has exactly its column's type (a tampered
-/// file cannot smuggle a mistyped default into later INSERTs).
-fn default_matches(v: &Value, dtype: DataType) -> bool {
-    match (v, dtype) {
-        (Value::Boolean(_), DataType::Boolean)
-        | (Value::Integer(_), DataType::Integer)
-        | (Value::Bigint(_), DataType::Bigint)
-        | (Value::Double(_), DataType::Double)
-        | (Value::Varchar(_), DataType::Varchar)
-        | (Value::Date(_), DataType::Date)
-        | (Value::Timestamp(_), DataType::Timestamp)
-        | (Value::Interval { .. }, DataType::Interval) => true,
-        (Value::Decimal(_, s), DataType::Decimal { scale, .. }) => *s == scale,
-        _ => false,
-    }
-}
-
-/// Decode one table's constraint section from `r` (v5 files with flags bit 0
-/// set). `n_cols` bounds every column index; almost-empty constraints and
-/// out-of-range indices are corrupt-file errors, never panics.
+/// Decode one table's constraint section. `n_cols` bounds every column index;
+/// almost-empty constraints and out-of-range indices are corrupt-file errors,
+/// never panics.
 fn read_constraints(r: &mut Reader, n_cols: usize) -> Result<TableConstraints> {
     let count = r.u32()? as usize;
     // The smallest constraint costs 13 bytes (kind + empty name + one
@@ -3499,125 +4089,587 @@ fn read_constraints(r: &mut Reader, n_cols: usize) -> Result<TableConstraints> {
     Ok(out)
 }
 
-/// Decode one table from `r` into `db`'s `dbname` database. `v4` selects the
-/// v4-only error messages (reserved tags, unknown flags).
-/// Which optional per-table parts a file carries (decided by its magic and
-/// flags word).
-#[derive(Debug, Clone, Copy, Default)]
-struct TableSections {
-    /// The v4+ typed codecs.
-    v4: bool,
-    /// `FLAG_CONSTRAINTS`.
-    constraints: bool,
-    /// `FLAG_DEFAULTS`.
-    defaults: bool,
-    /// `FLAG_INDEXES`.
-    indexes: bool,
+/// Encode every column's DEFAULT (wave 65): one presence byte per column,
+/// then the value bytes of the ones that have a default (a NULL default is
+/// simply absent — it means the same on read).
+fn write_defaults(w: &mut Writer, defaults: &[Option<Value>]) {
+    for d in defaults {
+        match d {
+            Some(v) if !v.is_null() => {
+                w.u8(1);
+                write_default_value(w, v);
+            }
+            _ => w.u8(0),
+        }
+    }
 }
 
-fn load_table(
-    r: &mut Reader,
-    db: &mut PinkDb,
-    dbname: &str,
-    sections: TableSections,
-) -> Result<()> {
-    let TableSections {
-        v4,
-        constraints,
-        defaults,
-        indexes,
-    } = sections;
-    let name = r.str()?;
-    let n_cols = r.u32()? as usize;
-    // Each column costs at least 5 bytes (name length + dtype tag).
-    if n_cols > r.remaining() / 5 {
-        return r.err("column count exceeds the remaining file");
+/// One default value's bytes: a tag byte plus its payload.
+fn write_default_value(w: &mut Writer, v: &Value) {
+    match v {
+        // Unreachable: `write_defaults` treats a NULL default as absent. A
+        // total match keeps the encoder honest.
+        Value::Null => w.u8(VD_BOOL),
+        Value::Boolean(b) => {
+            w.u8(VD_BOOL);
+            w.u8(*b as u8);
+        }
+        Value::Integer(i) => {
+            w.u8(VD_I32);
+            w.u32(*i as u32);
+        }
+        Value::Bigint(i) => {
+            w.u8(VD_I64);
+            w.u64(*i as u64);
+        }
+        Value::Double(x) => {
+            w.u8(VD_F64_BITS);
+            w.u64(x.to_bits());
+        }
+        Value::Varchar(s) => {
+            w.u8(VD_VARCHAR);
+            w.str(s);
+        }
+        Value::Date(d) => {
+            w.u8(VD_DATE);
+            w.u32(*d as u32);
+        }
+        Value::Timestamp(t) => {
+            w.u8(VD_TIMESTAMP);
+            w.u64(*t as u64);
+        }
+        Value::Decimal(x, scale) => {
+            w.u8(VD_DECIMAL);
+            w.bytes(&x.to_le_bytes());
+            w.u8(*scale);
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            w.u8(VD_INTERVAL);
+            w.u32(*months as u32);
+            w.u32(*days as u32);
+            w.u64(*micros as u64);
+        }
     }
-    let mut schema = Vec::with_capacity(n_cols);
+}
+
+/// Decode the per-column default section. Every tag is validated; an unknown
+/// tag or a truncated payload is a corrupt-file error.
+fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<Value>>> {
+    let mut out = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
-        let col = r.str()?;
+        if r.u8()? == 0 {
+            out.push(None);
+            continue;
+        }
         let tag = r.u8()?;
-        let dtype = match tag {
-            7 => {
+        let v = match tag {
+            VD_BOOL => Value::Boolean(match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return r.err("bad BOOLEAN default byte"),
+            }),
+            VD_I32 => Value::Integer(r.i32()?),
+            VD_I64 => Value::Bigint(r.i64()?),
+            VD_F64_BITS => Value::Double(f64::from_bits(r.u64()?)),
+            VD_VARCHAR => Value::Varchar(r.str()?),
+            VD_DATE => Value::Date(r.i32()?),
+            VD_TIMESTAMP => Value::Timestamp(r.i64()?),
+            VD_DECIMAL => {
+                let b = r.take(16)?;
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(b);
+                let x = i128::from_le_bytes(arr);
+                let scale = r.u8()?;
+                if scale > 38 {
+                    return r.err("bad DECIMAL default scale");
+                }
+                Value::Decimal(x, scale)
+            }
+            VD_INTERVAL => Value::Interval {
+                months: r.i32()?,
+                days: r.i32()?,
+                micros: r.i64()?,
+            },
+            other => {
+                return Err(PinkDbError::Execution(format!(
+                    "corrupt file: unknown default value tag {other}"
+                )));
+            }
+        };
+        out.push(Some(v));
+    }
+    Ok(out)
+}
+
+/// Whether a decoded default value has exactly its column's type (a tampered
+/// file cannot smuggle a mistyped default into later INSERTs).
+fn default_matches(v: &Value, dtype: DataType) -> bool {
+    match (v, dtype) {
+        (Value::Boolean(_), DataType::Boolean)
+        | (Value::Integer(_), DataType::Integer)
+        | (Value::Bigint(_), DataType::Bigint)
+        | (Value::Double(_), DataType::Double)
+        | (Value::Varchar(_), DataType::Varchar)
+        | (Value::Date(_), DataType::Date)
+        | (Value::Timestamp(_), DataType::Timestamp)
+        | (Value::Interval { .. }, DataType::Interval) => true,
+        (Value::Decimal(_, s), DataType::Decimal { scale, .. }) => *s == scale,
+        _ => false,
+    }
+}
+
+/// Policy tags in a materialized-view section (wave 80).
+const MV_MANUAL: u8 = 0;
+const MV_EVERY: u8 = 1;
+const MV_ON_COMMIT: u8 = 2;
+
+/// Encode one database's macro section: the count, then per macro, sorted by
+/// lowercased name, `name, source` where `source` is the full `CREATE MACRO
+/// ...` statement text. The **parsed template is not stored**: the loader
+/// re-parses the statement, exactly like a procedure body or an MV
+/// definition (a template cannot be rendered back to SQL).
+fn write_macro_defs(w: &mut Writer, defs: &[crate::macros::MacroDef]) {
+    w.u32(defs.len() as u32);
+    for def in defs {
+        w.str(&def.name);
+        w.str(&def.source);
+    }
+}
+
+/// Decode one database's macro section. A source text that is not exactly
+/// one `CREATE MACRO` statement is a corrupt file (the executor refuses to
+/// store a definition without its statement text).
+fn read_macro_defs(r: &mut Reader) -> Result<Vec<crate::macros::MacroDef>> {
+    let n = r.u32()? as usize;
+    // Each macro costs at least 8 bytes (two empty string length prefixes);
+    // never size an allocation from the unvalidated count.
+    if n > r.remaining() / 8 + 1 {
+        return r.err("macro count exceeds the remaining file");
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        let source = r.str()?;
+        let mut stmts = crate::sql::parse_statements(&source).map_err(|e| {
+            PinkDbError::Execution(format!(
+                "corrupt file: macro \"{name}\" does not parse: {e}"
+            ))
+        })?;
+        if stmts.len() != 1 {
+            return r.err(&format!(
+                "macro \"{name}\" definition is not exactly one statement"
+            ));
+        }
+        let Some(crate::sql::ast::Statement::CreateMacro {
+            name: parsed_name,
+            params,
+            body,
+            ..
+        }) = stmts.pop()
+        else {
+            return r.err(&format!(
+                "macro \"{name}\" definition is not a CREATE MACRO statement"
+            ));
+        };
+        if !parsed_name.eq_ignore_ascii_case(&name) {
+            return r.err(&format!(
+                "macro section names \"{name}\" but its definition creates \"{parsed_name}\""
+            ));
+        }
+        out.push(crate::macros::MacroDef {
+            name: parsed_name,
+            params: params
+                .into_iter()
+                .map(|p| crate::macros::MacroParamDef {
+                    name: p.name,
+                    default: p.default,
+                })
+                .collect(),
+            body,
+            source,
+        });
+    }
+    Ok(out)
+}
+
+/// Encode one database's materialized-view section: the count, then per view,
+/// sorted by lowercased name, `name, policy tag [, months, days, micros],
+/// defining SQL, last refresh stamp (epoch ms), refresh count`. The **bound
+/// query is not stored**: only the defining SQL text, which the loader
+/// rebinds (a bound plan cannot be rendered back to SQL, and a definition
+/// whose base tables are missing must still load).
+fn write_materialized_view_defs(w: &mut Writer, defs: &[crate::storage::MaterializedViewDef]) {
+    w.u32(defs.len() as u32);
+    for def in defs {
+        w.str(&def.name);
+        match def.policy {
+            crate::types::RefreshPolicy::Manual => w.u8(MV_MANUAL),
+            crate::types::RefreshPolicy::Every { interval } => {
+                w.u8(MV_EVERY);
+                w.i32(interval.months);
+                w.i32(interval.days);
+                w.i64(interval.micros);
+            }
+            crate::types::RefreshPolicy::OnCommit => w.u8(MV_ON_COMMIT),
+        }
+        w.str(&def.query_sql);
+        w.i64(def.last_refreshed_ms);
+        w.u64(def.refresh_count);
+    }
+}
+
+/// Decode one database's materialized-view section. The defining query is
+/// rebound when the definition is installed; a definition that cannot rebind
+/// (missing base table/view) still loads, with no bound plan — a refresh
+/// retries later and reports the failure, and `DROP MATERIALIZED VIEW` still
+/// removes it.
+fn read_materialized_view_defs(r: &mut Reader) -> Result<Vec<crate::storage::MaterializedViewDef>> {
+    let n = r.u32()? as usize;
+    // Each view costs at least 9 bytes (empty policy/name/… fields); do not
+    // size an allocation from the unvalidated count.
+    if n > r.remaining() / 9 + 1 {
+        return r.err("materialized-view count exceeds the remaining file");
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        let policy = match r.u8()? {
+            MV_MANUAL => crate::types::RefreshPolicy::Manual,
+            MV_EVERY => {
+                let months = r.i32()?;
+                let days = r.i32()?;
+                let micros = r.i64()?;
+                crate::types::RefreshPolicy::Every {
+                    interval: crate::types::Interval {
+                        months,
+                        days,
+                        micros,
+                    },
+                }
+            }
+            MV_ON_COMMIT => crate::types::RefreshPolicy::OnCommit,
+            other => return r.err(&format!("unknown materialized-view policy tag {other}")),
+        };
+        let query_sql = r.str()?;
+        let last_refreshed_ms = r.i64()?;
+        let refresh_count = r.u64()?;
+        out.push(crate::storage::MaterializedViewDef {
+            name,
+            query: None,
+            query_sql,
+            policy,
+            last_refreshed_ms,
+            // The attempt stamp is not persisted: treat the last success as
+            // the last attempt (an `EVERY` view becomes due one full interval
+            // after its last success).
+            last_attempt_ms: last_refreshed_ms,
+            refresh_count,
+            last_error: None,
+        });
+    }
+    Ok(out)
+}
+
+/// Encode one database's stored-procedure section: the count, then per
+/// procedure, sorted by lowercased name, `name, language tag, parameter count
+/// × (name, dtype tag [, precision, scale]), body text`. The **parsed body is
+/// not stored**: only the text, which the loader re-parses (a body is
+/// validated at `CREATE`, and a stored body that no longer parses is a
+/// corrupt file). JavaScript bodies are opaque text and load in every build.
+fn write_procedure_defs(w: &mut Writer, defs: &[crate::procedure::ProcedureDef]) {
+    w.u32(defs.len() as u32);
+    for def in defs {
+        w.str(&def.name);
+        w.u8(def.language.tag());
+        w.u32(def.params.len() as u32);
+        for (name, dtype) in &def.params {
+            w.str(name);
+            w.u8(dtype_tag(*dtype));
+            // DECIMAL rides its precision/scale, exactly like the schema.
+            if let DataType::Decimal { precision, scale } = dtype {
+                w.u8(*precision);
+                w.u8(*scale);
+            }
+        }
+        w.str(&def.source);
+    }
+}
+
+/// Decode one database's stored-procedure section. A SQL body is re-parsed
+/// here; a parse failure is a corrupt file (the body was validated when the
+/// definition was created).
+fn read_procedure_defs(r: &mut Reader) -> Result<Vec<crate::procedure::ProcedureDef>> {
+    let n = r.u32()? as usize;
+    // Each procedure costs at least 7 bytes (language, empty counts/strings);
+    // do not size an allocation from the unvalidated count.
+    if n > r.remaining() / 7 + 1 {
+        return r.err("procedure count exceeds the remaining file");
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        let language = crate::procedure::ProcLanguage::from_tag(r.u8()?)?;
+        let n_params = r.u32()? as usize;
+        if n_params > r.remaining() / 5 + 1 {
+            return r.err("procedure parameter count exceeds the remaining file");
+        }
+        let mut params = Vec::with_capacity(n_params);
+        for _ in 0..n_params {
+            let pname = r.str()?;
+            let tag = r.u8()?;
+            let dtype = if tag == 7 {
                 let precision = r.u8()?;
                 let scale = r.u8()?;
-                crate::types::decimal_type(precision, scale).ok_or_else(|| {
-                    PinkDbError::Execution("corrupt file: bad DECIMAL precision/scale".to_string())
-                })?
+                DataType::Decimal { precision, scale }
+            } else {
+                dtype_from_tag(tag)?
+            };
+            params.push((pname, dtype));
+        }
+        let source = r.str()?;
+        let body = match language {
+            crate::procedure::ProcLanguage::Sql => {
+                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                Some(
+                    crate::procedure::parse_body(&name, &param_names, &source).map_err(|e| {
+                        PinkDbError::Execution(format!(
+                            "corrupt file: procedure \"{name}\" does not parse: {e}"
+                        ))
+                    })?,
+                )
             }
-            8 => DataType::Interval,
-            other => dtype_from_tag(other)?,
+            crate::procedure::ProcLanguage::JavaScript => None,
         };
-        schema.push((col, dtype));
+        out.push(crate::procedure::ProcedureDef {
+            name,
+            params,
+            language,
+            source,
+            body,
+        });
     }
-    let constraints = if constraints {
-        read_constraints(r, n_cols)?
-    } else {
-        TableConstraints::default()
-    };
-    let defaults = if defaults {
-        let decoded = read_defaults(r, n_cols)?;
-        for ((name, dtype), d) in schema.iter().zip(decoded.iter()) {
-            if let Some(v) = d
-                && !default_matches(v, *dtype)
-            {
-                return r.err(&format!(
-                    "default value of column \"{name}\" does not match its type"
-                ));
+    Ok(out)
+}
+
+/// Encode the store-global RBAC section: the users (display name + Argon2id
+/// PHC password hash), the roles, the role memberships, the table grants, the
+/// database grants and the global `ADMIN` holders, each list sorted by its
+/// canonical key.
+///
+/// Only the **hash** of a password is ever written — the DDL statement's
+/// plaintext exists in process memory and nowhere else (the WAL logs the
+/// rewritten `PASSWORD_HASH '<phc>'` form for the same reason). `BTreeMap`
+/// iteration is sorted by key, which is exactly the deterministic write
+/// order, so no explicit sort is needed.
+fn write_rbac(w: &mut Writer, db: &PinkDb) {
+    let rbac = db.rbac();
+    w.u32(rbac.users.len() as u32);
+    for user in rbac.users.values() {
+        w.str(&user.name);
+        w.str(&user.password_hash);
+    }
+    w.u32(rbac.roles.len() as u32);
+    for role in rbac.roles.values() {
+        w.str(role);
+    }
+    let memberships: usize = rbac.memberships.values().map(|r| r.len()).sum();
+    w.u32(memberships as u32);
+    for (member, roles) in &rbac.memberships {
+        for role in roles {
+            w.str(member);
+            w.str(role);
+        }
+    }
+    w.u32(rbac.table_grants.len() as u32);
+    for ((dbname, table), principals) in &rbac.table_grants {
+        w.str(dbname);
+        w.str(table);
+        write_principal_grants(w, principals);
+    }
+    w.u32(rbac.database_grants.len() as u32);
+    for (dbname, principals) in &rbac.database_grants {
+        w.str(dbname);
+        write_principal_grants(w, principals);
+    }
+    w.u32(rbac.admins.len() as u32);
+    for principal in &rbac.admins {
+        w.str(principal);
+    }
+}
+
+/// One object's `principal → privileges` map: the count, then per principal,
+/// `principal, privilege count, privileges`.
+fn write_principal_grants(
+    w: &mut Writer,
+    principals: &std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<crate::rbac::Privilege>,
+    >,
+) {
+    w.u32(principals.len() as u32);
+    for (principal, privs) in principals {
+        w.str(principal);
+        w.u32(privs.len() as u32);
+        for p in privs {
+            w.u8(p.tag());
+        }
+    }
+}
+
+/// Decode the store-global RBAC section.
+///
+/// Every count is validated against the bytes remaining before it sizes an
+/// allocation (exactly like the other optional sections), unknown privilege
+/// tags are a corrupt-file error, and a user's password hash must parse as a
+/// PHC `argon2id` string — a store that loaded would otherwise hold a user
+/// nobody can log in as. Grants that name a principal or table the catalog no
+/// longer defines load as-is (they are inert): the file records what was
+/// granted, not what exists today.
+fn read_rbac(r: &mut Reader) -> Result<crate::rbac::RbacCatalog> {
+    let mut rbac = crate::rbac::RbacCatalog::default();
+    let n_users = r.u32()? as usize;
+    // Each user costs at least 8 bytes (two empty strings' length prefixes).
+    if n_users > r.remaining() / 8 + 1 {
+        return r.err("RBAC user count exceeds the remaining file");
+    }
+    for _ in 0..n_users {
+        let name = r.str()?;
+        let password_hash = r.str()?;
+        crate::rbac::validate_password_hash(&password_hash).map_err(|e| {
+            PinkDbError::Execution(format!(
+                "corrupt file: user \"{name}\" has an invalid password hash ({e})"
+            ))
+        })?;
+        rbac.users.insert(
+            name.to_ascii_lowercase(),
+            crate::rbac::UserDef {
+                name,
+                password_hash,
+            },
+        );
+    }
+    let n_roles = r.u32()? as usize;
+    if n_roles > r.remaining() / 4 + 1 {
+        return r.err("RBAC role count exceeds the remaining file");
+    }
+    for _ in 0..n_roles {
+        let name = r.str()?;
+        rbac.roles.insert(name.to_ascii_lowercase(), name);
+    }
+    let n_memberships = r.u32()? as usize;
+    if n_memberships > r.remaining() / 8 + 1 {
+        return r.err("RBAC membership count exceeds the remaining file");
+    }
+    for _ in 0..n_memberships {
+        let member = r.str()?;
+        let role = r.str()?;
+        rbac.memberships
+            .entry(member.to_ascii_lowercase())
+            .or_default()
+            .insert(role.to_ascii_lowercase());
+    }
+    let n_table_grants = r.u32()? as usize;
+    if n_table_grants > r.remaining() / 8 + 1 {
+        return r.err("RBAC table-grant count exceeds the remaining file");
+    }
+    for _ in 0..n_table_grants {
+        let dbname = r.str()?;
+        let table = r.str()?;
+        let principals = read_principal_grants(r)?;
+        rbac.table_grants.insert(
+            (dbname.to_ascii_lowercase(), table.to_ascii_lowercase()),
+            principals,
+        );
+    }
+    let n_db_grants = r.u32()? as usize;
+    if n_db_grants > r.remaining() / 4 + 1 {
+        return r.err("RBAC database-grant count exceeds the remaining file");
+    }
+    for _ in 0..n_db_grants {
+        let dbname = r.str()?;
+        let principals = read_principal_grants(r)?;
+        rbac.database_grants
+            .insert(dbname.to_ascii_lowercase(), principals);
+    }
+    let n_admins = r.u32()? as usize;
+    if n_admins > r.remaining() / 4 + 1 {
+        return r.err("RBAC admin count exceeds the remaining file");
+    }
+    for _ in 0..n_admins {
+        let principal = r.str()?;
+        rbac.admins.insert(principal.to_ascii_lowercase());
+    }
+    Ok(rbac)
+}
+
+/// One object's `principal → privileges` map (the reader side of
+/// [`write_principal_grants`]).
+fn read_principal_grants(
+    r: &mut Reader,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<crate::rbac::Privilege>>>
+{
+    let n = r.u32()? as usize;
+    // Each principal costs at least 8 bytes (name and privilege count).
+    if n > r.remaining() / 8 + 1 {
+        return r.err("RBAC grant principal count exceeds the remaining file");
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let principal = r.str()?;
+        let n_privs = r.u32()? as usize;
+        if n_privs > r.remaining() + 1 {
+            return r.err("RBAC privilege count exceeds the remaining file");
+        }
+        let mut privs = std::collections::BTreeSet::new();
+        for _ in 0..n_privs {
+            privs.insert(crate::rbac::Privilege::from_tag(r.u8()?)?);
+        }
+        out.insert(principal.to_ascii_lowercase(), privs);
+    }
+    Ok(out)
+}
+
+/// Exact per-column statistics of one table's rows, collected without
+/// encoding anything (wave 66).
+///
+/// `pink-lake` uses this to publish a **Vortex** data file's zone map in the
+/// catalog: the same [`SavedTableStats`] facts a `.pink` encode collects
+/// during its pass, computed here by one linear scan of the table's chunk
+/// payloads (no per-row `Value` materialization except the per-chunk
+/// min/max). The facts are ungated (`nan_count` and zero doubles are kept);
+/// `pink-lake` applies the one exactness gate shared with the Vortex footer
+/// path, so the two formats cannot drift apart.
+pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
+    let schema = src.schema();
+    let mut accs: Vec<ColumnStatsAcc> = schema.iter().map(|_| ColumnStatsAcc::new()).collect();
+    for c in 0..src.num_chunks() {
+        if let Some(chunk) = src.scan_chunk(c) {
+            for (acc, v) in accs.iter_mut().zip(chunk.columns.iter()) {
+                acc.merge(&chunk_column_stats(v));
             }
         }
-        decoded
-    } else {
-        vec![None; n_cols]
-    };
-    let num_rows = r.u64()? as usize;
-    // Decode each column's chunks into shared vectors (no per-row Value
-    // materialization, no transposition).
-    let mut columns: Vec<Vec<Arc<Vector>>> = Vec::with_capacity(n_cols);
-    for (ci, (_, dtype)) in schema.iter().enumerate() {
-        let n_chunks = r.u32()? as usize;
-        // Each chunk costs at least 9 bytes (tag + validity length); do not
-        // size an allocation from the unvalidated count.
-        let mut chunks: Vec<Arc<Vector>> = Vec::with_capacity(n_chunks.min(r.remaining() / 9 + 1));
-        let mut decoded = 0usize;
-        for _ in 0..n_chunks {
-            let tag = r.u8()?;
-            let v = decode_chunk_typed(*dtype, tag, r, v4)?;
-            decoded += v.len();
-            chunks.push(Arc::new(v));
-        }
-        if decoded != num_rows {
-            return Err(PinkDbError::Execution(format!(
-                "corrupt file: column {ci} has {decoded} values, want {num_rows}"
-            )));
-        }
-        columns.push(chunks);
     }
-    // All columns must share chunk boundaries (the writer's invariant);
-    // a file whose columns disagree is refused instead of row-merged.
-    let n_chunks = columns.first().map(|c| c.len()).unwrap_or(0);
-    for (ci, col) in columns.iter().enumerate() {
-        if col.len() != n_chunks {
-            return Err(PinkDbError::Execution(format!(
-                "corrupt file: column {ci} has {} chunks, want {n_chunks}",
-                col.len()
-            )));
-        }
+    SavedTableStats {
+        db: db.to_string(),
+        table: table.to_string(),
+        rows: src.num_rows() as u64,
+        columns: schema
+            .iter()
+            .zip(accs)
+            .map(|((col, dtype), acc)| SavedColumnStats {
+                name: col.clone(),
+                dtype: *dtype,
+                null_count: acc.null_count,
+                min: acc.min,
+                max: acc.max,
+                nan_count: acc.nan_count,
+            })
+            .collect(),
     }
-    db.create_table_with_constraints_in(dbname, &name, schema, constraints)?;
-    let t = db.table_mut_in(dbname, &name)?;
-    for (col, d) in t.columns.iter_mut().zip(defaults) {
-        col.default = d;
-    }
-    for ci in 0..n_chunks {
-        let chunk: Vec<Arc<Vector>> = columns.iter().map(|c| Arc::clone(&c[ci])).collect();
-        t.append_shared_chunk(&chunk)?;
-    }
-    if indexes {
-        t.indexes = read_indexes(r, t)?;
-        t.indexes_stale = false;
-    }
-    Ok(())
 }
 
 /// Build a test [`Vector`] from [`Value`]s (NULLs become placeholders +
@@ -3638,7 +4690,7 @@ fn encode_chunk(dtype: DataType, values: &[Value]) -> (u8, Vec<u8>) {
     encode_chunk_typed(&vector_from_values(dtype, values))
 }
 
-/// The PLAIN payload of a vector (test helper: forced-tag LZ round trips).
+/// The PLAIN payload of a vector (test helper: forced-tag round trips).
 #[cfg(test)]
 fn plain_payload(v: &Vector) -> Vec<u8> {
     match v.dtype() {
@@ -3771,6 +4823,26 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
                 enc_ints_delta(&int64_payload(&v))
             }
         }
+        (DataType::Integer | DataType::Date, ENC_FASTLANES) => {
+            if dtype == DataType::Date {
+                match v.data() {
+                    VectorData::Date32(d) => enc_ints_fastlanes(d.as_slice()),
+                    _ => unreachable!(),
+                }
+            } else {
+                enc_ints_fastlanes(&int32_payload(&v))
+            }
+        }
+        (DataType::Bigint | DataType::Timestamp, ENC_FASTLANES) => {
+            if dtype == DataType::Timestamp {
+                match v.data() {
+                    VectorData::TimestampMicros(d) => enc_ints_fastlanes(d.as_slice()),
+                    _ => unreachable!(),
+                }
+            } else {
+                enc_ints_fastlanes(&int64_payload(&v))
+            }
+        }
         (DataType::Double, ENC_PLAIN) => enc_u64_plain(
             &float64_payload(&v)
                 .iter()
@@ -3791,16 +4863,21 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
         (DataType::Varchar, ENC_DICT) => enc_strs_dict(&varchar_payload(&v)),
         (DataType::Varchar, ENC_RLE) => enc_strs_rle(&varchar_payload(&v)),
         (DataType::Varchar, ENC_DICT_BITPACK) => enc_strs_dict_bitpack(&varchar_payload(&v)),
+        (DataType::Varchar, ENC_FSST) => {
+            enc_strs_fsst(&varchar_payload(&v)).expect("the FSST payload is always produced")
+        }
         // Forced frame: bypass the size/probe gates (they only decide
         // *selection*), always wrap the plain payload.
         (_, ENC_LZ_FRAME) => {
             let base = plain_payload(&v);
-            let tokens = lz_compress(&base);
+            let stage = SecondStage::default_stage();
+            let comp = stage.compress(&base);
             let mut w = Writer::new();
             w.u32(base.len() as u32);
             w.u8(ENC_PLAIN);
-            w.u32(tokens.len() as u32);
-            w.bytes(&tokens);
+            w.u8(stage.tag());
+            w.u32(comp.len() as u32);
+            w.bytes(&comp);
             w.buf
         }
         _ => panic!("roundtrip_chunk: unsupported forced tag {tag} for {dtype:?}"),
@@ -3813,10 +4890,17 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
     w.bytes(&payload);
     let mut r = Reader::new(&w.buf);
     let t = r.u8().unwrap();
-    let decoded = decode_chunk_typed(dtype, t, &mut r, true)
+    let decoded = decode_chunk_typed(dtype, t, &mut r)
         .unwrap_or_else(|e| panic!("CTX dtype={dtype:?} tag={t} n={} err={e}", values.len()));
     (0..decoded.len()).map(|i| decoded.get(i)).collect()
 }
+
+/// The pinned length and footer checksum of the golden corpus's `PINKDB06`
+/// image (see `golden_pinkdb06_bytes_are_pinned`).
+#[cfg(test)]
+const GOLDEN_V6_LEN: usize = 113_321;
+#[cfg(test)]
+const GOLDEN_V6_FOOTER_CRC: u32 = 3_044_878_001;
 
 #[cfg(test)]
 mod tests {
@@ -3830,18 +4914,22 @@ mod tests {
         assert!(!varchar_offsets_fit(u32::MAX as u64 + 1));
     }
 
-    /// Pinned v5 size and body CRC of [`golden_db`]'s image (see
-    /// `golden_v5_bytes_are_pinned`). The CRC is over the body *without* the
-    /// trailer: a CRC over the whole file (trailer included) is the fixed
-    /// data+trailer identity constant and would not notice content drift.
-    const GOLDEN_V5_LEN: usize = 111775;
-    const GOLDEN_V5_BODY_CRC: u32 = 1766647982;
+    /// The CRC32C check value of the standard test vector.
+    #[test]
+    fn crc32c_matches_the_standard_check_value() {
+        assert_eq!(crc32c(b""), 0);
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(crc32c(b"a"), 0xC1D0_4330);
+    }
 
     fn roundtrip(db: &PinkDb) -> PinkDb {
         let path = temp_file("rt");
         db.save(path.to_str().unwrap()).unwrap();
         let data = std::fs::read(&path).unwrap();
-        assert!(data.starts_with(MAGIC_V5));
+        assert!(
+            is_pinkdb06(&data),
+            "the image must carry the PINKDB06 trailer"
+        );
         let back = PinkDb::open(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
         back
@@ -3865,6 +4953,12 @@ mod tests {
         (0..t.num_rows())
             .map(|r| (0..t.num_cols()).map(|c| t.get(r, c).unwrap()).collect())
             .collect()
+    }
+
+    /// The footer's bytes of an image (the window a ranged reader fetches).
+    fn footer_bytes(data: &[u8]) -> Vec<u8> {
+        let (offset, len) = footer_span(data).unwrap();
+        data[offset as usize..(offset + len) as usize].to_vec()
     }
 
     #[test]
@@ -3946,12 +5040,60 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("bad magic"), "{err}");
-        // A newer format is refused through the shared newer-magic path.
-        let err = match PinkDb::from_pink_bytes(b"PINKDB09rest") {
-            Ok(_) => panic!("a newer format must be refused"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("newer pinkdb"), "{err}");
+    }
+
+    /// A file written by an older pinkdb (`PINKDB01`–`PINKDB05`) is refused
+    /// with the documented message: this build reads `PINKDB06` only.
+    #[test]
+    fn older_pink_files_are_refused_with_the_documented_message() {
+        for version in 1..=5u8 {
+            let mut bytes = format!("PINKDB0{version}").into_bytes();
+            bytes.extend_from_slice(&[0xABu8; 64]);
+            let err = PinkDb::from_pink_bytes(&bytes).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "this .pink file was written by an older pinkdb (PINKDB0{version}); \
+                     this build reads PINKDB06 only"
+                ),
+                "version {version}"
+            );
+        }
+    }
+
+    /// A file from a *newer* pinkdb is a different error: "upgrade pinkdb".
+    #[test]
+    fn newer_format_magic_is_an_upgrade_error() {
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        db.table_mut("t")
+            .unwrap()
+            .append_row(vec![Value::Integer(7)])
+            .unwrap();
+        let full = db.to_bytes().unwrap();
+        // The trailer's magic (the file's last 8 bytes).
+        let mut bad = full.clone();
+        let n = bad.len();
+        bad[n - 8..].copy_from_slice(b"PINKDB07");
+        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("written by a newer pinkdb (format v7)"),
+            "{err}"
+        );
+        // The magic lives at the end: a file whose *first* bytes claim
+        // another version is a damaged image, and the column chunk's own
+        // checksum is what catches it.
+        let mut bad = full.clone();
+        bad[..8].copy_from_slice(b"PINKDB09");
+        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+        assert!(err.contains("checksum"), "{err}");
+        // Not a digit → plain bad magic.
+        let mut bad = full.clone();
+        let n = bad.len();
+        bad[n - 8..].copy_from_slice(b"PINKDB0X");
+        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+        assert!(err.contains("bad magic"), "{err}");
     }
 
     #[test]
@@ -3973,6 +5115,50 @@ mod tests {
         assert_eq!(back.table("e").unwrap().num_rows(), 0);
         assert_eq!(back.table("big").unwrap().num_rows(), CHUNK_SIZE + 100);
         assert_eq!(all_values(&db, "big"), all_values(&back, "big"));
+    }
+
+    /// A table with more rows than one row group: the row-group directory
+    /// must carry every group, and the rows must survive the round trip.
+    #[test]
+    fn multi_row_group_tables_round_trip() {
+        let rows = ROW_GROUP_ROWS + 137;
+        let mut db = PinkDb::new();
+        db.create_table(
+            "t",
+            vec![
+                ("i".to_string(), DataType::Integer),
+                ("v".to_string(), DataType::Varchar),
+            ],
+        )
+        .unwrap();
+        {
+            let t = db.table_mut("t").unwrap();
+            for i in 0..rows {
+                t.append_row(vec![
+                    Value::Integer(i as i32),
+                    Value::Varchar(format!("row-{i}")),
+                ])
+                .unwrap();
+            }
+        }
+        let bytes = db.to_bytes().unwrap();
+        let footer = read_store_footer(&bytes).unwrap();
+        let tdir = &footer.databases[0].tables[0];
+        assert_eq!(tdir.row_count, rows as u64);
+        assert_eq!(tdir.row_groups.len(), 2, "122,880 + 137 rows = two groups");
+        assert_eq!(tdir.row_groups[0].rows, ROW_GROUP_ROWS as u64);
+        assert_eq!(tdir.row_groups[1].rows, 137);
+        // The first group holds 60 pages (one engine chunk each).
+        assert_eq!(tdir.row_groups[0].columns[0].page_count, 60);
+        assert_eq!(tdir.row_groups[1].columns[0].page_count, 1);
+        // The chunks' statistics are exact.
+        let first = &tdir.row_groups[0].columns[0];
+        assert_eq!(first.null_count, 0);
+        assert_eq!(first.min, Some(Value::Integer(0)));
+        assert_eq!(first.max, Some(Value::Integer(ROW_GROUP_ROWS as i32 - 1)));
+        let back = roundtrip(&db);
+        assert_eq!(back.table("t").unwrap().num_rows(), rows);
+        assert_eq!(all_values(&db, "t"), all_values(&back, "t"));
     }
 
     #[test]
@@ -4010,9 +5196,17 @@ mod tests {
             roundtrip_chunk(DataType::Integer, ints.clone(), ENC_PLAIN),
             ints
         );
+        assert_eq!(
+            roundtrip_chunk(DataType::Integer, ints.clone(), ENC_FASTLANES),
+            ints
+        );
         let neg: Vec<Value> = vec![Value::Integer(-3), Value::Null, Value::Integer(5)];
         assert_eq!(
             roundtrip_chunk(DataType::Integer, neg.clone(), ENC_BITPACK),
+            neg
+        );
+        assert_eq!(
+            roundtrip_chunk(DataType::Integer, neg.clone(), ENC_FASTLANES),
             neg
         );
         let strs: Vec<Value> = vec![
@@ -4027,6 +5221,10 @@ mod tests {
         );
         assert_eq!(
             roundtrip_chunk(DataType::Varchar, strs.clone(), ENC_RLE),
+            strs
+        );
+        assert_eq!(
+            roundtrip_chunk(DataType::Varchar, strs.clone(), ENC_FSST),
             strs
         );
         let bools: Vec<Value> = vec![Value::Boolean(true), Value::Null, Value::Boolean(true)];
@@ -4050,6 +5248,10 @@ mod tests {
             roundtrip_chunk(DataType::Date, dates.clone(), ENC_BITPACK),
             dates
         );
+        assert_eq!(
+            roundtrip_chunk(DataType::Date, dates.clone(), ENC_FASTLANES),
+            dates
+        );
         let stamps: Vec<Value> = vec![
             Value::Timestamp(i64::MIN),
             Value::Timestamp(i64::MAX),
@@ -4059,6 +5261,97 @@ mod tests {
             roundtrip_chunk(DataType::Timestamp, stamps.clone(), ENC_PLAIN),
             stamps
         );
+        assert_eq!(
+            roundtrip_chunk(DataType::Timestamp, stamps.clone(), ENC_FASTLANES),
+            stamps
+        );
+    }
+
+    /// The FastLanes encoding: 1,024-value blocks, a frame of reference per
+    /// block, transposed lanes. Every block boundary must round-trip.
+    #[test]
+    fn fastlanes_blocks_round_trip_exactly() {
+        for n in [0usize, 1, 7, 8, 9, 1023, 1024, 1025, 2047, 2048] {
+            let vals: Vec<Value> = (0..n)
+                .map(|i| Value::Bigint((i as i64 * 7919) % 100_003))
+                .collect();
+            assert_eq!(
+                roundtrip_chunk(DataType::Bigint, vals.clone(), ENC_FASTLANES),
+                vals,
+                "n={n}"
+            );
+        }
+        // The extremes of the integer range.
+        let ex: Vec<Value> = vec![
+            Value::Bigint(i64::MIN),
+            Value::Bigint(i64::MAX),
+            Value::Bigint(0),
+            Value::Null,
+            Value::Bigint(i64::MIN),
+        ];
+        assert_eq!(
+            roundtrip_chunk(DataType::Bigint, ex.clone(), ENC_FASTLANES),
+            ex
+        );
+    }
+
+    /// The FastLanes encoding is a *candidate*: it wins when the per-block
+    /// frame of reference is smaller than the global bit width.
+    #[test]
+    fn fastlanes_wins_on_locally_clustered_values() {
+        // Two clusters far apart: the global range needs 32 bits, the
+        // per-block frame of reference needs a handful.
+        let vals: Vec<Value> = (0..CHUNK_SIZE)
+            .map(|i| {
+                if i < CHUNK_SIZE / 2 {
+                    Value::Integer(i as i32)
+                } else {
+                    Value::Integer(1_000_000 + i as i32)
+                }
+            })
+            .collect();
+        let (tag, payload) = encode_chunk(DataType::Integer, &vals);
+        assert_eq!(tag, ENC_FASTLANES, "the clustered chunk picks FastLanes");
+        let bitpack = enc_ints_bitpack(&int32_payload(&vector_from_values(
+            DataType::Integer,
+            &vals,
+        )));
+        assert!(
+            payload.len() < bitpack.len(),
+            "FastLanes {} must beat the global bitpack {}",
+            payload.len(),
+            bitpack.len()
+        );
+    }
+
+    /// The FSST encoding: a symbol table that rewrites the string bytes,
+    /// then the second compression stage.
+    #[test]
+    fn fsst_round_trips_and_rebuilds_the_bytes() {
+        let vals: Vec<Value> = (0..500)
+            .map(|i| Value::Varchar(format!("value-{}", i % 37)))
+            .collect();
+        let out = roundtrip_chunk(DataType::Varchar, vals.clone(), ENC_FSST);
+        assert_eq!(out, vals);
+        // The symbol table really is a rewrite: the escaped stream decodes
+        // back to the original bytes.
+        let (offsets, data) = strs_offsets_and_data(
+            &vals
+                .iter()
+                .map(|v| match v {
+                    Value::Varchar(s) => s.clone(),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let table = fsst_build_table(&data);
+        let escaped = fsst_escape(&data, &table);
+        assert_eq!(
+            fsst_unescape(&escaped, &table, data.len()).unwrap(),
+            data,
+            "the FSST rewrite must be lossless"
+        );
+        assert_eq!(offsets.last().copied(), Some(data.len() as u32));
     }
 
     /// Delta+bitpack layout: constant-delta chunks are 21 bytes (12 for
@@ -4193,9 +5486,7 @@ mod tests {
             with_nulls
         );
         // High-cardinality strings with repeated structure (shared prefixes)
-        // pick the LZ frame; a note on the candidate order: with all-distinct
-        // short strings the plain offsets+data layout is smaller than the
-        // 11-bit dictionary + dict bytes, and LZ wraps that plain layout.
+        // pick the compression frame.
         let distinct: Vec<Value> = (0..CHUNK_SIZE)
             .map(|i| Value::Varchar(format!("distinct-{i}-{:04}", i * 7919 % 10007)))
             .collect();
@@ -4205,7 +5496,7 @@ mod tests {
         assert_eq!(tag, ENC_LZ_FRAME, "repetitive distinct strings pick LZ");
         assert!(
             payload.len() < plain.len(),
-            "LZ frame {} must beat plain {}",
+            "the compressed frame {} must beat plain {}",
             payload.len(),
             plain.len()
         );
@@ -4244,7 +5535,7 @@ mod tests {
             w.bytes(&bad_payload);
             let mut r = Reader::new(&w.buf);
             let tag = r.u8().unwrap();
-            let err = decode_chunk_typed(DataType::Varchar, tag, &mut r, true).unwrap_err();
+            let err = decode_chunk_typed(DataType::Varchar, tag, &mut r).unwrap_err();
             assert!(
                 err.to_string().contains("bad dictionary bit width"),
                 "width {bad}: {err}"
@@ -4307,6 +5598,8 @@ mod tests {
         assert_eq!(tag, ENC_DICT_BITPACK);
     }
 
+    /// A damaged file must fail cleanly: the chunk checksums and the footer
+    /// checksum catch the damage before any value is decoded.
     #[test]
     fn corrupt_files_error_without_panic() {
         let mut db = PinkDb::new();
@@ -4328,7 +5621,7 @@ mod tests {
             );
         }
         // Garbage magic + flipped bytes error.
-        std::fs::write(&path, b"GARBAGE!junkjunkjunk").unwrap();
+        std::fs::write(&path, b"GARBAGE!junkjunkjunkjunkjunk").unwrap();
         assert!(PinkDb::open(path.to_str().unwrap()).is_err());
         let mut bad = full.clone();
         bad[10] = 0xFF;
@@ -4337,157 +5630,127 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// A v4 payload relabeled as v2 (magic + payload, no flags, no trailer)
-    /// still loads — the old layout has no flags word.
-    fn relabel_as_v2(full: &[u8]) -> Vec<u8> {
-        let mut v2 = Vec::with_capacity(full.len());
-        v2.extend_from_slice(MAGIC_V2);
-        // Skip the v4 magic (8) and flags word (4); drop the CRC trailer (4).
-        v2.extend_from_slice(&full[12..full.len() - 4]);
-        v2
-    }
-
-    /// Repoint the CRC trailer after mutating the body (test helper: v4
-    /// verifies the checksum before decoding, so forged bytes need a valid
-    /// trailer to reach the decoder).
-    fn fix_crc(bytes: &mut [u8]) {
-        let len = bytes.len();
-        let crc = crate::wal::crc32(&bytes[..len - 4]);
-        bytes[len - 4..].copy_from_slice(&crc.to_le_bytes());
-    }
-
+    /// A flipped byte in the **data region** is caught by the column chunk's
+    /// own CRC32C — no whole-file checksum is needed.
     #[test]
-    fn v4_checksum_catches_bit_rot_and_v2_still_loads() {
+    fn per_chunk_corruption_is_detected() {
         let mut db = PinkDb::new();
-        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
-            .unwrap();
-        db.table_mut("t")
-            .unwrap()
-            .append_row(vec![Value::Integer(7)])
-            .unwrap();
-        let full = db.to_bytes().unwrap();
-        assert!(full.starts_with(MAGIC_V5));
-        // A flipped payload bit is a checksum error, not a silent wrong value.
-        for i in MAGIC_V5.len()..full.len() {
-            let mut bad = full.clone();
+        db.create_table(
+            "t",
+            vec![
+                ("i".to_string(), DataType::Integer),
+                ("v".to_string(), DataType::Varchar),
+            ],
+        )
+        .unwrap();
+        {
+            let t = db.table_mut("t").unwrap();
+            for i in 0..500i32 {
+                t.append_row(vec![
+                    Value::Integer(i),
+                    Value::Varchar(format!("value-{i}")),
+                ])
+                .unwrap();
+            }
+        }
+        let bytes = db.to_bytes().unwrap();
+        // The data region is everything before the footer.
+        let (footer_at, _) = footer_span(&bytes).unwrap();
+        let mut detected = 0;
+        for i in 0..footer_at as usize {
+            let mut bad = bytes.clone();
             bad[i] ^= 0x01;
-            let err = PinkDb::load_bytes(&bad).expect_err("bit flip must be detected");
-            assert!(
-                err.to_string().contains("checksum") || i >= full.len() - 4,
-                "{i}: {err}"
-            );
+            let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+            assert!(err.contains("checksum"), "byte {i}: {err}");
+            detected += 1;
         }
-        // The v4 payload under the v2 magic (no flags, no trailer) still
-        // loads: v1/v2/v3 layout compatibility.
-        let v2 = relabel_as_v2(&full);
-        let back = PinkDb::load_bytes(&v2).unwrap();
-        assert_eq!(back.table("t").unwrap().num_rows(), 1);
+        assert!(detected > 0, "the data region must be covered");
     }
 
-    /// A magic with a newer version digit is a clear "upgrade pinkdb" error,
-    /// distinct from a bad magic.
+    /// A flipped byte in the **footer** is caught by the footer's own
+    /// CRC32C.
     #[test]
-    fn newer_format_magic_is_an_upgrade_error() {
+    fn footer_corruption_is_detected() {
         let mut db = PinkDb::new();
         db.create_table("t", vec![("x".to_string(), DataType::Integer)])
             .unwrap();
         db.table_mut("t")
             .unwrap()
-            .append_row(vec![Value::Integer(7)])
+            .append_row(vec![Value::Integer(1)])
             .unwrap();
-        let full = db.to_bytes().unwrap();
-        for (magic, version) in [(b"PINKDB06", 6u8), (b"PINKDB09", 9)] {
-            let mut data = full.clone();
-            data[..8].copy_from_slice(magic);
-            let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
+        let bytes = db.to_bytes().unwrap();
+        let (footer_at, footer_len) = footer_span(&bytes).unwrap();
+        for i in 0..footer_len {
+            let mut bad = bytes.clone();
+            bad[footer_at as usize + i as usize] ^= 0x01;
+            let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
             assert!(
-                err.contains(&format!("written by a newer pinkdb (format v{version})")),
-                "{err}"
+                err.contains("footer checksum") || err.contains("corrupt file"),
+                "footer byte {i}: {err}"
             );
         }
-        // Not a digit → plain bad magic.
-        let mut data = full.clone();
-        data[..8].copy_from_slice(b"PINKDB0X");
-        let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
-        assert!(err.contains("bad magic"), "{err}");
-        // Unknown v5 flags bits are a hard error (re-checksummed so the flags
-        // check, not the CRC, is what fires). Bits 0 (constraint section) and
-        // 1 (column defaults) and 2 (materialized views) are known; their
-        // absence/presence is exercised by the constraint/default and
-        // materialized-view round-trip tests. Bits 3..=6 are known too; bit 7
-        // is the next format-gated section.
-        let mut data = full.clone();
-        data[8..12].copy_from_slice(&0x80u32.to_le_bytes());
-        fix_crc(&mut data);
-        let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
-        assert!(err.contains("unsupported .pink v5 flags"), "{err}");
+        // The trailer's own CRC field is part of the check.
+        let mut bad = bytes.clone();
+        let n = bad.len();
+        bad[n - TRAILER_LEN] ^= 0x01;
+        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+        assert!(err.contains("footer checksum"), "{err}");
     }
 
-    /// Reserved v4 tags (7..=9) are rejected with an upgrade hint, distinct
-    /// from "invalid for dtype".
+    /// Truncating the file at *every* offset errors (never panics, never
+    /// silently returns wrong values).
     #[test]
-    fn reserved_v4_tags_error_with_upgrade_hint() {
+    fn truncation_at_every_offset_errors() {
         let mut db = PinkDb::new();
-        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
-            .unwrap();
-        db.table_mut("t")
-            .unwrap()
-            .append_row(vec![Value::Integer(7)])
-            .unwrap();
-        let full = db.to_bytes().unwrap();
-        // Plant tag 7 (DICT_RLE) and tag 9 (FSST) — the still-reserved tags —
-        // wherever a tag byte might be read, repairing the CRC so the
-        // reserved-tag error (not the checksum) fires.
-        let mut seen = 0;
-        for reserved in [ENC_DICT_RLE, ENC_FSST] {
-            for i in 0..full.len() {
-                if matches!(full[i], ENC_PLAIN | ENC_BITPACK | ENC_DELTA_BITPACK) {
-                    let mut bad = full.clone();
-                    bad[i] = reserved;
-                    fix_crc(&mut bad);
-                    if let Err(e) = PinkDb::load_bytes(&bad) {
-                        let msg = e.to_string();
-                        if msg.contains(&format!("unsupported v4 encoding tag {reserved}")) {
-                            seen += 1;
-                        }
-                        assert!(
-                            !msg.contains("invalid for"),
-                            "reserved tag must not report 'invalid for': {msg}"
-                        );
-                    }
-                }
+        db.create_table(
+            "fid",
+            vec![
+                ("b".to_string(), DataType::Boolean),
+                ("i".to_string(), DataType::Integer),
+                ("g".to_string(), DataType::Bigint),
+                ("d".to_string(), DataType::Double),
+                ("v".to_string(), DataType::Varchar),
+                ("dt".to_string(), DataType::Date),
+                ("ts".to_string(), DataType::Timestamp),
+            ],
+        )
+        .unwrap();
+        {
+            let t = db.table_mut("fid").unwrap();
+            for i in 0..8 {
+                t.append_row(vec![
+                    corpus_value(DataType::Boolean, i, 5),
+                    corpus_value(DataType::Integer, i, 5),
+                    corpus_value(DataType::Bigint, i, 5),
+                    corpus_value(DataType::Double, i, 5),
+                    corpus_value(DataType::Varchar, i, 5),
+                    corpus_value(DataType::Date, i, 5),
+                    corpus_value(DataType::Timestamp, i, 5),
+                ])
+                .unwrap();
             }
         }
-        assert!(seen >= 1, "reserved tags must be reachable ({seen})");
-    }
-
-    #[test]
-    fn forged_lengths_never_size_allocations() {
-        // v2 has no checksum, so forged lengths reach the decoder: plant
-        // u32::MAX at every offset of a multi-type image. Each load must
-        // return (Ok or Err) instead of aborting on a giant allocation.
-        let mut db = PinkDb::new();
-        crate::csv::import_csv_string(&mut db, "s", "a,b,c,d\n1,x,1.5,true\n2,y,2.5,false\n")
-            .unwrap();
-        let full = db.to_bytes().unwrap();
-        let mut v2 = relabel_as_v2(&full);
-        v2[..8].copy_from_slice(MAGIC_V2);
-        // (Overcommitting allocators may not abort on the old code path, so
-        // also require that the chunk-length cap actually fires.)
-        let mut capped = 0;
-        for i in 8..v2.len().saturating_sub(3) {
-            let mut bad = v2.clone();
-            bad[i..i + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            if let Err(e) = PinkDb::load_bytes(&bad)
-                && e.to_string().contains("exceeds the chunk size")
-            {
-                capped += 1;
-            }
+        let small = db.to_bytes().unwrap();
+        assert!(small.len() < 4096, "{}", small.len());
+        for cut in 0..small.len() {
+            assert!(
+                PinkDb::load_bytes(&small[..cut]).is_err(),
+                "truncation at {cut}/{} must error",
+                small.len()
+            );
         }
-        assert!(
-            capped >= 4,
-            "every column's chunk length must hit the cap ({capped})"
-        );
+        assert!(PinkDb::load_bytes(&small).is_ok());
+        // Bigger image: sampled offsets plus the full tail.
+        let big = golden_db().to_bytes().unwrap();
+        let mut cuts: Vec<usize> = (0..big.len()).step_by(401).collect();
+        cuts.extend(big.len().saturating_sub(512)..big.len());
+        for cut in cuts {
+            assert!(
+                PinkDb::load_bytes(&big[..cut]).is_err(),
+                "truncation at {cut}/{} must error",
+                big.len()
+            );
+        }
     }
 
     #[test]
@@ -4541,95 +5804,6 @@ mod tests {
         );
         assert!(back.list_tables_in("empty").is_empty());
         assert!(back.database_exists("empty"));
-    }
-
-    /// A `.pink` file written by the v1 code path (committed fixture) must
-    /// still load: every table lands in a single `main` database.
-    #[test]
-    fn v1_fixture_loads_as_single_main_database() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/v1_single_db.pink"
-        );
-        let data = std::fs::read(path).unwrap();
-        assert!(data.starts_with(MAGIC), "fixture must be the v1 format");
-        let db = PinkDb::open(path).unwrap();
-        assert_eq!(db.list_databases(), vec!["main".to_string()]);
-        assert_eq!(db.list_tables(), vec!["empty".to_string(), "t".to_string()]);
-        let t = db.table("t").unwrap();
-        assert_eq!(t.num_rows(), 3);
-        assert_eq!(t.get(0, 0), Some(Value::Integer(1)));
-        assert_eq!(t.get(0, 1), Some(Value::Varchar("x".to_string())));
-        assert_eq!(t.get(1, 1), Some(Value::Null));
-        assert_eq!(t.get(2, 0), Some(Value::Integer(3)));
-        assert_eq!(db.table("empty").unwrap().num_rows(), 0);
-        // A v1 file re-saved becomes the current format and round-trips.
-        let back = roundtrip(&db);
-        assert_eq!(back.list_databases(), vec!["main".to_string()]);
-        assert_eq!(all_values(&back, "t"), all_values(&db, "t"));
-    }
-
-    /// Committed v2 and v3 fixtures (generated from history before the v4
-    /// writer existed) load, keep their values bit-exactly, and re-save as
-    /// v4 that round-trips.
-    #[test]
-    fn v2_and_v3_fixtures_load_and_resave() {
-        // (dbname, table) → rows, doubles compared by bits.
-        fn values_in(db: &PinkDb, dbname: &str, table: &str) -> Vec<Vec<Value>> {
-            let t = db.table_in(dbname, table).unwrap();
-            (0..t.num_rows())
-                .map(|r| (0..t.num_cols()).map(|c| t.get(r, c).unwrap()).collect())
-                .collect()
-        }
-        fn assert_same_rows(a: &[Vec<Value>], b: &[Vec<Value>], what: &str) {
-            assert_eq!(a.len(), b.len(), "{what} rows");
-            for (ra, rb) in a.iter().zip(b) {
-                for (va, vb) in ra.iter().zip(rb) {
-                    match (va, vb) {
-                        (Value::Double(x), Value::Double(y)) => {
-                            assert_eq!(x.to_bits(), y.to_bits(), "{what} double bits");
-                        }
-                        _ => assert_eq!(va, vb, "{what}"),
-                    }
-                }
-            }
-        }
-        for (name, magic) in [
-            ("v2_multi_db.pink", MAGIC_V2),
-            ("v3_multi_db.pink", MAGIC_V3),
-        ] {
-            let path = format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
-            let data = std::fs::read(&path).unwrap();
-            assert!(data.starts_with(magic), "{name} magic");
-            let db = PinkDb::open(&path).unwrap();
-            assert_eq!(
-                db.list_databases(),
-                vec!["analytics".to_string(), "main".to_string()],
-                "{name}"
-            );
-            let t = db.table_in("main", "fid").unwrap();
-            assert_eq!(t.num_rows(), 4, "{name}");
-            assert_eq!(t.get(0, 1), Some(Value::Integer(i32::MAX)), "{name}");
-            assert_eq!(t.get(1, 1), Some(Value::Integer(i32::MIN)), "{name}");
-            assert_eq!(t.get(0, 2), Some(Value::Bigint(i64::MAX)), "{name}");
-            assert_eq!(t.get(1, 2), Some(Value::Bigint(i64::MIN)), "{name}");
-            assert_eq!(t.get(3, 1), Some(Value::Null), "{name}");
-            assert_eq!(db.table_in("main", "big2").unwrap().num_rows(), 3000);
-            assert_eq!(db.table_in("analytics", "u").unwrap().num_rows(), 1);
-            assert_eq!(db.table_in("main", "empty").unwrap().num_rows(), 0);
-            // Re-save (v4) and compare every value bit-exactly.
-            let back = roundtrip(&db);
-            for dbname in db.list_databases() {
-                for table in db.list_tables_in(&dbname) {
-                    let what = format!("{name}: {dbname}.{table}");
-                    assert_same_rows(
-                        &values_in(&db, &dbname, &table),
-                        &values_in(&back, &dbname, &table),
-                        &what,
-                    );
-                }
-            }
-        }
     }
 
     /// A store whose `main` was dropped persists without resurrecting it.
@@ -4726,6 +5900,40 @@ mod tests {
         assert!(err.to_string().contains("not encrypted"), "{err}");
         std::fs::remove_file(&enc).ok();
         std::fs::remove_file(&plain).ok();
+    }
+
+    /// The encrypted container wraps the whole `PINKDB06` image: a keyed
+    /// save/open round-trips the data.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn encrypted_container_round_trips_the_pinkdb06_image() {
+        let enc = temp_file("enc_roundtrip");
+        let key = EncryptionKey::from_raw([9u8; 32]);
+        let mut db = PinkDb::new();
+        db.create_table(
+            "t",
+            vec![
+                ("i".to_string(), DataType::Integer),
+                ("v".to_string(), DataType::Varchar),
+                ("d".to_string(), DataType::Double),
+            ],
+        )
+        .unwrap();
+        {
+            let t = db.table_mut("t").unwrap();
+            for i in 0..1000 {
+                t.append_row(vec![
+                    Value::Integer(i as i32),
+                    Value::Varchar(format!("row-{i}")),
+                    Value::Double(i as f64 / 8.0),
+                ])
+                .unwrap();
+            }
+        }
+        db.save_with_key(enc.to_str().unwrap(), &key).unwrap();
+        let back = PinkDb::open_with_key(enc.to_str().unwrap(), &key).unwrap();
+        assert_eq!(all_values(&db, "t"), all_values(&back, "t"));
+        std::fs::remove_file(&enc).ok();
     }
 
     /// Values for the round-trip corpora, per dtype: nulls on `null_every`
@@ -4844,6 +6052,14 @@ mod tests {
                         ("v".to_string(), DataType::Varchar),
                         ("dt".to_string(), DataType::Date),
                         ("ts".to_string(), DataType::Timestamp),
+                        (
+                            "dec".to_string(),
+                            DataType::Decimal {
+                                precision: 18,
+                                scale: 3,
+                            },
+                        ),
+                        ("iv".to_string(), DataType::Interval),
                     ],
                 )
                 .unwrap();
@@ -4858,6 +6074,15 @@ mod tests {
                             corpus_value(DataType::Varchar, i, null_every),
                             corpus_value(DataType::Date, i, null_every),
                             corpus_value(DataType::Timestamp, i, null_every),
+                            corpus_value(
+                                DataType::Decimal {
+                                    precision: 18,
+                                    scale: 3,
+                                },
+                                i,
+                                null_every,
+                            ),
+                            corpus_value(DataType::Interval, i, null_every),
                         ])
                         .unwrap();
                     }
@@ -4885,7 +6110,7 @@ mod tests {
                 let ta = db.table("t").unwrap();
                 let tb = back.table("t").unwrap();
                 for r in 0..n {
-                    for c in 0..7 {
+                    for c in 0..9 {
                         assert_bits_equal(&ta.get(r, c).unwrap(), &tb.get(r, c).unwrap());
                     }
                 }
@@ -4997,7 +6222,7 @@ mod tests {
         let decode = |bytes: &[u8]| {
             let mut r = Reader::new(bytes);
             let tag = r.u8().unwrap();
-            decode_chunk_typed(DataType::Double, tag, &mut r, true)
+            decode_chunk_typed(DataType::Double, tag, &mut r)
         };
         // Sanity: the untouched payload decodes.
         assert_eq!(
@@ -5114,11 +6339,6 @@ mod tests {
         }
         let back = roundtrip(&db);
         assert_eq!(all_values(&db, "t"), all_values(&back, "t"));
-        let bytes = db.to_bytes().unwrap();
-        // The whole file carries no validity words for this table: 3 chunks
-        // × (1 tag + 4 validity_len + payload) — check the framed length is 0
-        // by decoding it back (the payload itself is checked above).
-        assert!(bytes.starts_with(MAGIC_V5));
     }
 
     /// A fixed multi-dtype corpus, used by the golden/identity tests.
@@ -5169,14 +6389,62 @@ mod tests {
         db
     }
 
-    /// T2: the format is pinned — a fixed corpus has a fixed length and
-    /// CRC-32, deterministic across parallel/serial encodes and across
-    /// save→open→save.
-    /// Tag 8: the LZ frame round-trips every dtype bit-exactly (the frame is
-    /// dtype-agnostic: decode decompresses, then decodes the inner payload),
-    /// is chosen for repetitive strings, and is byte-deterministic.
+    /// The format is pinned: a fixed corpus has a fixed length and a fixed
+    /// footer checksum, deterministic across parallel/serial encodes and
+    /// across save→open→save.
     #[test]
-    fn lz_frame_roundtrips_and_is_selected() {
+    fn golden_pinkdb06_bytes_are_pinned() {
+        let db = golden_db();
+        let bytes = db.to_bytes().unwrap();
+        assert_eq!(bytes.len(), GOLDEN_V6_LEN, "file length drifted");
+        assert_eq!(
+            crc32c(&footer_bytes(&bytes)),
+            GOLDEN_V6_FOOTER_CRC,
+            "the footer bytes drifted"
+        );
+        assert_eq!(db.to_bytes_impl(false).unwrap(), bytes, "serial ≠ parallel");
+        let back = PinkDb::load_bytes(&bytes).unwrap();
+        assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift");
+    }
+
+    /// The trailer is the last 20 bytes and the footer sits right before it:
+    /// a reader needs exactly two range requests.
+    #[test]
+    fn the_trailer_and_the_footer_are_the_only_metadata_reads() {
+        let db = golden_db();
+        let bytes = db.to_bytes().unwrap();
+        assert_eq!(&bytes[bytes.len() - 8..], MAGIC_V6);
+        // The trailer: footer_crc32c u32 | footer_len u64 | magic.
+        let n = bytes.len();
+        let want_crc = u32::from_le_bytes(
+            bytes[n - TRAILER_LEN..n - TRAILER_LEN + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let want_len = u64::from_le_bytes(
+            bytes[n - TRAILER_LEN + 4..n - TRAILER_LEN + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let (offset, len) = footer_span(&bytes).unwrap();
+        assert_eq!(len as usize, want_len);
+        assert_eq!(offset as usize, n - TRAILER_LEN - want_len);
+        assert_eq!(
+            crc32c(&bytes[offset as usize..(offset + len) as usize]),
+            want_crc
+        );
+        // The data region starts at 0: the footer records absolute offsets.
+        let footer = read_store_footer(&bytes).unwrap();
+        let dir = &footer.databases[0].tables[0].row_groups[0].columns[0];
+        assert_eq!(dir.offset, 0, "the first column chunk starts the file");
+    }
+
+    /// The compression frame (tag 8) round-trips every dtype bit-exactly
+    /// (the frame is dtype-agnostic: decode decompresses, then decodes the
+    /// inner payload), is chosen for repetitive strings, and is
+    /// byte-deterministic.
+    #[test]
+    fn compressed_frame_roundtrips_and_is_selected() {
         let values: Vec<Value> = (0..CHUNK_SIZE)
             .map(|i| {
                 Value::Varchar(format!(
@@ -5190,12 +6458,12 @@ mod tests {
         let (tag, payload) = encode_chunk_typed(&v);
         assert_eq!(tag, ENC_LZ_FRAME, "repetitive JSON strings must pick LZ");
         assert!(payload.len() < plain.len());
-        // Layout: raw_len | base_tag (PLAIN) | token_len | tokens.
+        // Layout: raw_len | base_tag | codec | comp_len | comp.
         let raw_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let token_len = u32::from_le_bytes(payload[5..9].try_into().unwrap()) as usize;
+        let comp_len = u32::from_le_bytes(payload[6..10].try_into().unwrap()) as usize;
         assert_eq!(raw_len, plain.len());
         assert_eq!(payload[4], ENC_PLAIN);
-        assert_eq!(payload.len(), 9 + token_len);
+        assert_eq!(payload.len(), 10 + comp_len);
         // Deterministic: the same chunk encodes to the same frame.
         let (tag2, payload2) = encode_chunk_typed(&v);
         assert_eq!(tag, tag2);
@@ -5212,20 +6480,8 @@ mod tests {
         ] {
             let vals: Vec<Value> = (0..200).map(|i| corpus_value(dtype, i, 9)).collect();
             let out = roundtrip_chunk(dtype, vals.clone(), ENC_LZ_FRAME);
-            assert_values_bit_equal(&out, &vals, &format!("LZ {dtype:?}"));
+            assert_values_bit_equal(&out, &vals, &format!("frame {dtype:?}"));
         }
-        // A frame never wraps a base it cannot shrink: incompressible bytes
-        // produce no frame at all.
-        let mut x: u64 = 0x1234_5678_9abc_def0;
-        let random: Vec<u8> = (0..8192)
-            .map(|_| {
-                x = x
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (x >> 56) as u8
-            })
-            .collect();
-        assert!(enc_lz_frame(ENC_PLAIN, &random).is_none());
     }
 
     /// Helper: a chunk frame around a raw payload (test).
@@ -5237,13 +6493,14 @@ mod tests {
         w.buf
     }
 
-    /// Helper: an LZ payload with explicit header fields (test).
-    fn lz_payload(raw_len: u32, base_tag: u8, tokens: &[u8]) -> Vec<u8> {
+    /// Helper: a compression frame with explicit header fields (test).
+    fn compressed_payload(raw_len: u32, base_tag: u8, codec: u8, comp: &[u8]) -> Vec<u8> {
         let mut w = Writer::new();
         w.u32(raw_len);
         w.u8(base_tag);
-        w.u32(tokens.len() as u32);
-        w.bytes(tokens);
+        w.u8(codec);
+        w.u32(comp.len() as u32);
+        w.bytes(comp);
         w.buf
     }
 
@@ -5251,20 +6508,21 @@ mod tests {
     fn decode_framed(bytes: &[u8]) -> Result<Vector> {
         let mut r = Reader::new(bytes);
         let tag = r.u8().unwrap();
-        decode_chunk_typed(DataType::Varchar, tag, &mut r, true)
+        decode_chunk_typed(DataType::Varchar, tag, &mut r)
     }
 
-    /// Tag 8 decode safety: every malformed shape is a clear error and never
-    /// a panic or a hung allocation (the declared lengths are capped).
+    /// The compression frame's decode safety: every malformed shape is a
+    /// clear error and never a panic or a hung allocation (the declared
+    /// lengths are capped).
     #[test]
-    fn lz_frame_decode_rejects_malformed_bodies() {
+    fn compressed_frame_decode_rejects_malformed_bodies() {
         let values: Vec<Value> = (0..100)
             .map(|i| Value::Varchar(format!("row-{}", i % 7)))
             .collect();
         let v = vector_from_values(DataType::Varchar, &values);
         let base = enc_strs_plain(&varchar_payload(&v));
         let tokens = lz_compress(&base);
-        let good = lz_payload(base.len() as u32, ENC_PLAIN, &tokens);
+        let good = compressed_payload(base.len() as u32, ENC_PLAIN, SecondStage::Lz.tag(), &tokens);
         assert_eq!(
             decode_framed(&framed_chunk(ENC_LZ_FRAME, &good))
                 .unwrap()
@@ -5281,38 +6539,59 @@ mod tests {
             let mut bad = good.clone();
             bad[0..4].copy_from_slice(&bad_len.to_le_bytes());
             assert!(
-                err(&bad).contains("LZ frame length"),
+                err(&bad).contains("compressed frame length"),
                 "{bad_len}: {}",
                 err(&bad)
             );
         }
         // Reserved / frame base tags and a tag invalid for the dtype.
-        for base_tag in [ENC_DICT_RLE, ENC_LZ_FRAME, ENC_FSST, 10, 200, 255] {
-            let bad = lz_payload(base.len() as u32, base_tag, &tokens);
+        for base_tag in [
+            ENC_DICT_RLE,
+            ENC_LZ_FRAME,
+            ENC_FSST,
+            ENC_FASTLANES,
+            10,
+            200,
+            255,
+        ] {
+            let bad =
+                compressed_payload(base.len() as u32, base_tag, SecondStage::Lz.tag(), &tokens);
             assert!(
-                err(&bad).contains("unsupported LZ base encoding"),
+                err(&bad).contains("unsupported compression base encoding"),
                 "base {base_tag}: {}",
                 err(&bad)
             );
         }
-        let bad = lz_payload(base.len() as u32, ENC_ALP, &tokens);
+        let bad = compressed_payload(base.len() as u32, ENC_ALP, SecondStage::Lz.tag(), &tokens);
         assert!(err(&bad).contains("invalid for VARCHAR"), "{}", err(&bad));
-        // token_len beyond the buffer.
+        // An unknown codec tag.
+        let bad = compressed_payload(base.len() as u32, ENC_PLAIN, 99, &tokens);
+        assert!(
+            err(&bad).contains("unknown compression codec"),
+            "{}",
+            err(&bad)
+        );
+        // comp_len beyond the buffer.
         let mut bad = good.clone();
-        bad[5..9].copy_from_slice(&(tokens.len() as u32 + 100).to_le_bytes());
+        bad[6..10].copy_from_slice(&(tokens.len() as u32 + 100).to_le_bytes());
         assert!(
             err(&bad).contains("unexpected end of file"),
             "{}",
             err(&bad)
         );
         // Truncated token stream.
-        let bad = lz_payload(base.len() as u32, ENC_PLAIN, &tokens[..tokens.len() - 2]);
+        let bad = compressed_payload(
+            base.len() as u32,
+            ENC_PLAIN,
+            SecondStage::Lz.tag(),
+            &tokens[..tokens.len() - 2],
+        );
         assert!(err(&bad).contains("truncated"), "{}", err(&bad));
         // Trailing token bytes after an otherwise complete output.
         let mut extra = tokens.clone();
         extra.push(0); // a one-byte literal token
         extra.push(b'x');
-        let bad = lz_payload(base.len() as u32, ENC_PLAIN, &extra);
+        let bad = compressed_payload(base.len() as u32, ENC_PLAIN, SecondStage::Lz.tag(), &extra);
         assert!(err(&bad).contains("trailing bytes"), "{}", err(&bad));
         // A decompressed payload with bytes the inner codec does not consume.
         let mut long_base = base.clone();
@@ -5322,41 +6601,73 @@ mod tests {
             long_tokens.push(((chunk.len() - 1) as u8) << 1);
             long_tokens.extend_from_slice(chunk);
         }
-        let bad = lz_payload(long_base.len() as u32, ENC_PLAIN, &long_tokens);
+        let bad = compressed_payload(
+            long_base.len() as u32,
+            ENC_PLAIN,
+            SecondStage::Lz.tag(),
+            &long_tokens,
+        );
         assert!(
-            err(&bad).contains("trailing bytes in LZ frame"),
+            err(&bad).contains("trailing bytes in compressed frame"),
             "{}",
             err(&bad)
         );
+    }
+
+    /// The LZ decoder's own safety net: a literal run or a match that
+    /// overruns the declared length, and an out-of-range back-reference, are
+    /// clear errors.
+    #[test]
+    fn lz_decode_rejects_malformed_token_streams() {
+        let corrupt = |what: &str| PinkDbError::Execution(format!("corrupt file: {what}"));
+        assert!(lz_decompress(&[0xFEu8], 4).is_err());
         // Literal run overruns the declared length (raw_len 4, literal 128).
         let mut toks = vec![0xFEu8];
         toks.extend(std::iter::repeat_n(b'x', 128));
-        let bad = lz_payload(4, ENC_PLAIN, &toks);
-        assert!(err(&bad).contains("literal run overruns"), "{}", err(&bad));
+        let err = lz_decompress(&toks, 4).unwrap_err().to_string();
+        assert!(err.contains("literal run overruns"), "{err}");
         // Zero and out-of-range back-references.
-        let bad = lz_payload(4, ENC_PLAIN, &[0x03, 0x00, 0x00]);
-        assert!(
-            err(&bad).contains("back-reference out of range"),
-            "{}",
-            err(&bad)
-        );
-        let bad = lz_payload(4, ENC_PLAIN, &[0x03, 0x05, 0x00]);
-        assert!(
-            err(&bad).contains("back-reference out of range"),
-            "{}",
-            err(&bad)
-        );
+        let err = lz_decompress(&[0x03, 0x00, 0x00], 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("back-reference out of range"), "{err}");
+        let err = lz_decompress(&[0x03, 0x05, 0x00], 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("back-reference out of range"), "{err}");
         // Match overruns the declared length (1 literal + a 129-byte match
         // into raw_len 4).
-        let bad = lz_payload(4, ENC_PLAIN, &[0x00, b'A', 0xFD, 0x01, 0x00]);
-        assert!(err(&bad).contains("match overruns"), "{}", err(&bad));
+        let err = lz_decompress(&[0x00, b'A', 0xFD, 0x01, 0x00], 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("match overruns"), "{err}");
+        // A truncated token stream.
+        let err = lz_decompress(&[], 4).unwrap_err().to_string();
+        assert!(err.contains("truncated"), "{err}");
+        let _ = corrupt("unused");
     }
 
-    /// A file whose VARCHAR chunks use the LZ frame errors on truncation at
-    /// (sampled) every offset: no cut may decode as a wrong value, and the
-    /// frame's exact-length checks are what enforce it.
+    /// The second compression stage: both codecs round-trip, and the frame
+    /// names the codec it used.
     #[test]
-    fn lz_file_truncation_errors_at_every_sampled_offset() {
+    fn both_second_stages_round_trip() {
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 61) as u8).collect();
+        for stage in [SecondStage::Lz, SecondStage::Lz4] {
+            let compressed = stage.compress(&data);
+            assert!(
+                compressed.len() < data.len(),
+                "{stage:?} must shrink the repetitive data"
+            );
+            let back = stage.decompress(&compressed, data.len()).unwrap();
+            assert_eq!(back, data, "{stage:?}");
+        }
+    }
+
+    /// A file whose VARCHAR chunks use the compression frame errors on
+    /// truncation at (sampled) every offset: no cut may decode as a wrong
+    /// value.
+    #[test]
+    fn compressed_file_truncation_errors_at_every_sampled_offset() {
         let mut db = PinkDb::new();
         db.create_table("t", vec![("v".to_string(), DataType::Varchar)])
             .unwrap();
@@ -5376,7 +6687,7 @@ mod tests {
         assert_eq!(
             encode_chunk_typed(&chunk.columns[0]).0,
             ENC_LZ_FRAME,
-            "the truncation corpus must exercise tag 8"
+            "the truncation corpus must exercise the compression frame"
         );
         let bytes = db.to_bytes().unwrap();
         let mut cuts: Vec<usize> = (0..bytes.len()).step_by(101).collect();
@@ -5389,14 +6700,14 @@ mod tests {
             );
         }
         assert!(PinkDb::load_bytes(&bytes).is_ok());
-        // A decoded LZ file re-encodes to the same bytes (deterministic
+        // A decoded file re-encodes to the same bytes (deterministic
         // probe + frame choice).
         let back = PinkDb::load_bytes(&bytes).unwrap();
         assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift with LZ");
     }
 
-    /// The LZ probe is bounded and selective: repetitive text fires, random
-    /// or near-random bytes (4-byte matches that do not pay for their
+    /// The compression probe is bounded and selective: repetitive text fires,
+    /// random or near-random bytes (4-byte matches that do not pay for their
     /// control bytes) do not, and tiny payloads are never probed.
     #[test]
     fn lz_probe_is_selective() {
@@ -5432,10 +6743,6 @@ mod tests {
     /// Regression (pre-wave-45k): bitpacked payloads whose width exceeds 56
     /// bits lost the high bits of each element — the `u64` pack/unpack
     /// accumulator overflowed while a wide element was being shifted in.
-    /// A full-width BITPACK chunk and a 63-bit DELTA_BITPACK chunk must
-    /// round-trip bit-exactly; the same bug silently corrupted `.pink` v4
-    /// data files for exactly these value patterns (it was found by the wave
-    /// 45k lake-attach equivalence corpus).
     #[test]
     fn wide_bitpack_roundtrips_exactly() {
         // i64::MIN/MAX force a 64-bit bitpack, and deltas of -1, -i64::MAX,
@@ -5448,7 +6755,7 @@ mod tests {
         for i in 0..2045i64 {
             vals.push(Value::Bigint(-i * 3));
         }
-        for tag in [ENC_BITPACK, ENC_DELTA_BITPACK] {
+        for tag in [ENC_BITPACK, ENC_DELTA_BITPACK, ENC_FASTLANES] {
             let out = roundtrip_chunk(DataType::Bigint, vals.clone(), tag);
             assert_eq!(out, vals, "tag {tag} lost values");
         }
@@ -5461,125 +6768,39 @@ mod tests {
         for i in 0..2045i64 {
             ts.push(Value::Timestamp(i64::MAX - i * 7));
         }
-        for tag in [ENC_BITPACK, ENC_DELTA_BITPACK] {
+        for tag in [ENC_BITPACK, ENC_DELTA_BITPACK, ENC_FASTLANES] {
             let out = roundtrip_chunk(DataType::Timestamp, ts.clone(), tag);
             assert_eq!(out, ts, "timestamp tag {tag} lost values");
         }
     }
 
+    /// Forged counts in the footer's headers are capped and rejected.
     #[test]
-    fn golden_v5_bytes_are_pinned() {
-        let db = golden_db();
-        let bytes = db.to_bytes().unwrap();
-        // Recomputed once when the v5 container stabilized (v4 codecs + the
-        // v5 magic; the golden store has no constraints and no DECIMAL/
-        // INTERVAL columns, so its body doubles as the v4-shape pin); guards
-        // accidental format/content drift (encoders are pure by contract).
-        assert_eq!(bytes.len(), GOLDEN_V5_LEN, "file length drifted");
-        assert_eq!(
-            crate::wal::crc32(&bytes[..bytes.len() - 4]),
-            GOLDEN_V5_BODY_CRC,
-            "file bytes drifted"
-        );
-        assert_eq!(db.to_bytes_impl(false).unwrap(), bytes, "serial ≠ parallel");
-        let back = PinkDb::load_bytes(&bytes).unwrap();
-        assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift");
-    }
-
-    /// T4: truncating a v4 file at *every* offset errors (never panics, never
-    /// silently returns wrong values). Exhaustive on a small all-types file;
-    /// sampled (plus every offset in the last 512 bytes) on a bigger one.
-    #[test]
-    fn v4_truncation_at_every_offset_errors() {
+    fn forged_counts_are_capped_and_rejected() {
         let mut db = PinkDb::new();
-        db.create_table(
-            "fid",
-            vec![
-                ("b".to_string(), DataType::Boolean),
-                ("i".to_string(), DataType::Integer),
-                ("g".to_string(), DataType::Bigint),
-                ("d".to_string(), DataType::Double),
-                ("v".to_string(), DataType::Varchar),
-                ("dt".to_string(), DataType::Date),
-                ("ts".to_string(), DataType::Timestamp),
-            ],
-        )
-        .unwrap();
-        {
-            let t = db.table_mut("fid").unwrap();
-            for i in 0..8 {
-                t.append_row(vec![
-                    corpus_value(DataType::Boolean, i, 5),
-                    corpus_value(DataType::Integer, i, 5),
-                    corpus_value(DataType::Bigint, i, 5),
-                    corpus_value(DataType::Double, i, 5),
-                    corpus_value(DataType::Varchar, i, 5),
-                    corpus_value(DataType::Date, i, 5),
-                    corpus_value(DataType::Timestamp, i, 5),
-                ])
-                .unwrap();
+        crate::csv::import_csv_string(&mut db, "s", "a,b,c,d\n1,x,1.5,true\n2,y,2.5,false\n")
+            .unwrap();
+        let full = db.to_bytes().unwrap();
+        // Plant u32::MAX at every offset of the footer: each load must
+        // return an error instead of aborting on a giant allocation.
+        let (footer_at, footer_len) = footer_span(&full).unwrap();
+        let footer = full[footer_at as usize..(footer_at + footer_len) as usize].to_vec();
+        let mut capped = 0;
+        for i in 0..footer.len().saturating_sub(3) {
+            let mut bad_footer = footer.clone();
+            bad_footer[i..i + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let mut bad = full.clone();
+            bad[footer_at as usize..(footer_at + footer_len) as usize].copy_from_slice(&bad_footer);
+            // The footer's checksum now fails, so re-write it: the point is
+            // that the *decoder* never panics or hangs.
+            let crc = crc32c(&bad_footer);
+            let n = bad.len();
+            bad[n - TRAILER_LEN..n - TRAILER_LEN + 4].copy_from_slice(&crc.to_le_bytes());
+            if PinkDb::load_bytes(&bad).is_err() {
+                capped += 1;
             }
         }
-        let small = db.to_bytes().unwrap();
-        assert!(small.len() < 4096, "{}", small.len());
-        for cut in 0..small.len() {
-            assert!(
-                PinkDb::load_bytes(&small[..cut]).is_err(),
-                "truncation at {cut}/{} must error",
-                small.len()
-            );
-        }
-        assert!(PinkDb::load_bytes(&small).is_ok());
-        // Bigger image: sampled offsets plus the full tail.
-        let big = golden_db().to_bytes().unwrap();
-        let mut cuts: Vec<usize> = (0..big.len()).step_by(401).collect();
-        cuts.extend(big.len().saturating_sub(512)..big.len());
-        for cut in cuts {
-            assert!(
-                PinkDb::load_bytes(&big[..cut]).is_err(),
-                "truncation at {cut}/{} must error",
-                big.len()
-            );
-        }
-    }
-
-    /// Forged counts in the v4-only headers: dictionary length, ALP
-    /// exception count, delta/chunk lengths (v2 relabel skips the CRC so the
-    /// forged values reach the decoder).
-    #[test]
-    fn forged_v4_counts_are_capped_and_rejected() {
-        // Dictionary length: build a DICT_BITPACK chunk, plant u32::MAX.
-        let strs: Vec<Value> = (0..100)
-            .map(|i| Value::Varchar(format!("v{}", i % 4)))
-            .collect();
-        let v = vector_from_values(DataType::Varchar, &strs);
-        let payload = enc_strs_dict_bitpack(&varchar_payload(&v));
-        let mut bad = payload.clone();
-        bad[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
-        let mut w = Writer::new();
-        w.u8(ENC_DICT_BITPACK);
-        w.u32(0);
-        w.bytes(&bad);
-        let mut r = Reader::new(&w.buf);
-        let tag = r.u8().unwrap();
-        let err = decode_chunk_typed(DataType::Varchar, tag, &mut r, true).unwrap_err();
-        assert!(err.to_string().contains("exceeds the chunk size"), "{err}");
-        // ALP exception count: build an ALP chunk and plant u32::MAX.
-        let dbls: Vec<Value> = (0..100).map(|i| Value::Double(i as f64 / 100.0)).collect();
-        let v = vector_from_values(DataType::Double, &dbls);
-        let payload = enc_alp(&float64_payload(&v), usize::MAX).unwrap();
-        let width = payload[14] as usize;
-        let ex_at = 15 + (100 * width).div_ceil(8);
-        let mut bad = payload.clone();
-        bad[ex_at..ex_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        let mut w = Writer::new();
-        w.u8(ENC_ALP);
-        w.u32(0);
-        w.bytes(&bad);
-        let mut r = Reader::new(&w.buf);
-        let tag = r.u8().unwrap();
-        let err = decode_chunk_typed(DataType::Double, tag, &mut r, true).unwrap_err();
-        assert!(err.to_string().contains("exceeds the chunk size"), "{err}");
+        assert!(capped > 0, "the forged footers must all be refused");
     }
 
     /// T4: a seeded encode/decode loop over random small vectors, all dtypes.
@@ -5645,7 +6866,7 @@ mod tests {
             w.bytes(&payload);
             let mut r = Reader::new(&w.buf);
             let t = r.u8().unwrap();
-            let decoded = decode_chunk_typed(dtype, t, &mut r, true)
+            let decoded = decode_chunk_typed(dtype, t, &mut r)
                 .unwrap_or_else(|e| panic!("case {case}: dtype={dtype:?} tag={t} err={e}"));
             assert_eq!(decoded.len(), n, "case {case}");
             for i in 0..n {
@@ -5726,7 +6947,7 @@ mod tests {
                 .unwrap();
             }
         }
-        // A second table whose VARCHAR chunks pick the LZ frame: the
+        // A second table whose VARCHAR chunks pick the compression frame: the
         // order-preserving parallel collect must still match the serial
         // bytes exactly.
         db.execute("CREATE TABLE z (j VARCHAR);").unwrap();
@@ -5744,7 +6965,7 @@ mod tests {
         assert_eq!(
             encode_chunk_typed(&t.scan_chunk(0).unwrap().columns[0]).0,
             ENC_LZ_FRAME,
-            "the identity corpus must exercise tag 8"
+            "the identity corpus must exercise the compression frame"
         );
         let a = db.to_bytes_impl(true).unwrap();
         let b = db.to_bytes_impl(false).unwrap();
@@ -5769,6 +6990,101 @@ mod tests {
         let back = PinkDb::load_bytes(&first).unwrap();
         let second = back.to_bytes().unwrap();
         assert_eq!(first, second, "open→save is not byte-identity");
+    }
+
+    /// Every catalog section survives a save/open round trip: constraints,
+    /// column defaults, index definitions, materialized views, procedures,
+    /// macros and RBAC.
+    #[test]
+    fn every_metadata_section_round_trips() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE c (cid INTEGER, pid INTEGER NOT NULL REFERENCES p(id), \
+             note VARCHAR UNIQUE);",
+        )
+        .unwrap();
+        db.execute("ALTER TABLE c ADD COLUMN d INTEGER DEFAULT 42;")
+            .unwrap();
+        db.execute("INSERT INTO p VALUES (1, 2);").unwrap();
+        db.execute("INSERT INTO c VALUES (1, 1, 'x', 7);").unwrap();
+        db.execute("CREATE INDEX i_c_pid ON c(pid);").unwrap();
+        db.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM p;")
+            .unwrap();
+        db.execute("CREATE MACRO twice(x) AS x + x;").unwrap();
+        db.execute(
+            "CREATE USER alice PASSWORD_HASH '$argon2id$v=19$m=19456,t=2,p=1\
+             $AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';",
+        )
+        .unwrap();
+        db.execute("CREATE ROLE analyst;").unwrap();
+        db.execute("GRANT analyst TO alice;").unwrap();
+        db.execute("GRANT SELECT ON TABLE c TO analyst;").unwrap();
+        db.execute("GRANT ADMIN TO analyst;").unwrap();
+
+        let bytes = db.to_bytes().unwrap();
+        let back = PinkDb::load_bytes(&bytes).unwrap();
+        // The constraints.
+        assert_eq!(
+            db.table("c").unwrap().constraints,
+            back.table("c").unwrap().constraints
+        );
+        // The column default.
+        assert_eq!(
+            back.table("c").unwrap().columns[3].default,
+            Some(Value::Integer(42))
+        );
+        // The index definition (the map is rebuilt from the rows).
+        let t = back.table("c").unwrap();
+        assert_eq!(t.indexes.len(), 1);
+        assert_eq!(t.indexes[0].name, "i_c_pid");
+        assert_eq!(t.indexes[0].column, 1);
+        assert_eq!(
+            t.indexes[0].map,
+            crate::storage::index_map_for(&t.columns[1]),
+            "the map is rebuilt from the rows"
+        );
+        // The materialized view.
+        assert!(back.materialized_view_in("main", "mv").is_ok());
+        // The macro.
+        assert!(back.macro_in("main", "twice").is_ok());
+        // The RBAC section.
+        assert!(back.has_users());
+        assert!(back.principal_is_admin("alice"));
+        assert_eq!(
+            back.effective_table_privileges("alice", "main", "c"),
+            vec![crate::rbac::Privilege::Select]
+        );
+        // The bytes are stable.
+        assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift");
+    }
+
+    /// A durable reopen after a checkpoint restores the data (the checkpoint
+    /// is a `PINKDB06` image).
+    #[test]
+    fn durable_reopen_after_checkpoint_restores_the_rows() {
+        let ckpt = temp_file("durable");
+        let ckpt = std::path::PathBuf::from(format!("{}.db", ckpt.display()));
+        let wal = std::path::PathBuf::from(format!("{}.wal", ckpt.display()));
+        {
+            let mut db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
+            db.execute("CREATE TABLE t (a INTEGER, b VARCHAR);")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'x'), (2, NULL);")
+                .unwrap();
+            db.execute("CHECKPOINT;").unwrap();
+        }
+        {
+            let db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
+            assert_eq!(db.table("t").unwrap().num_rows(), 2);
+            assert_eq!(db.table("t").unwrap().get(1, 1), Some(Value::Null));
+            // The checkpoint is a PINKDB06 image.
+            let bytes = std::fs::read(&ckpt).unwrap();
+            assert!(is_pinkdb06(&bytes), "the checkpoint must be PINKDB06");
+        }
+        let _ = std::fs::remove_file(&ckpt);
+        let _ = std::fs::remove_file(&wal);
     }
 
     /// Save-time statistics cost probe (run deliberately):
@@ -5834,6 +7150,74 @@ mod tests {
             "10M rows: encode {plain:.3}s, encode+stats {with_stats:.3}s, stats cost {:+.1} ms",
             (with_stats - plain) * 1000.0
         );
+    }
+
+    /// The **second compression stage**'s measurement probe (wave 102).
+    ///
+    /// Compresses every VARCHAR chunk's plain payload of a TPC-H SF1 store
+    /// with both second stages — the hand-rolled LZ77 of wave 45j and the
+    /// pure-Rust `lz4_flex` — and prints the sizes and the times. This is
+    /// the measurement that picked the default.
+    ///
+    /// ```text
+    /// PINKDB_TPCH_DIR=/tmp/w102 cargo test --release -p pinkdb --lib \
+    ///     second_stage_measurement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement probe: run with --release --ignored --nocapture"]
+    fn second_stage_measurement_probe() {
+        let dir = std::env::var("PINKDB_TPCH_DIR")
+            .expect("PINKDB_TPCH_DIR must point at the TPC-H CSV directory");
+        let mut db = PinkDb::new();
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "csv"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+            crate::csv::import_csv(&mut db, path.to_str().unwrap(), Some(&stem)).unwrap();
+        }
+        // Every VARCHAR chunk's plain payload (the frame's inner payload).
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for dbname in db.list_databases() {
+            for tname in db.list_tables_in(&dbname) {
+                let t = db.table_in(&dbname, &tname).unwrap();
+                for c in 0..t.num_chunks() {
+                    let chunk = t.scan_chunk(c).unwrap();
+                    for v in chunk.columns.iter() {
+                        if let VectorData::VarChar(_) = v.data() {
+                            payloads.push(enc_strs_plain(&varchar_payload(v)));
+                        }
+                    }
+                }
+            }
+        }
+        let plain: usize = payloads.iter().map(|p| p.len()).sum();
+        println!("VARCHAR chunks: {}", payloads.len());
+        println!("plain bytes:    {plain}");
+        for stage in [SecondStage::Lz, SecondStage::Lz4] {
+            let mut total = 0usize;
+            let t0 = std::time::Instant::now();
+            for p in &payloads {
+                total += stage.compress(p).len();
+            }
+            let compress = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
+            for p in &payloads {
+                let c = stage.compress(p);
+                let back = stage.decompress(&c, p.len()).unwrap();
+                assert_eq!(back.len(), p.len());
+            }
+            let round = t0.elapsed().as_secs_f64();
+            println!(
+                "{stage:?}: {total} bytes ({:.3}× the plain), compress {compress:.3}s, \
+                 compress+decompress {round:.3}s",
+                total as f64 / plain as f64
+            );
+        }
     }
 
     /// Boolean stats carry true min/max *values* (DuckDB semantics), never
@@ -6017,12 +7401,11 @@ mod tests {
         assert_eq!(n.max, None);
     }
 
-    // ---------- wave 41: declarative constraints in the v5 section ----------
+    // ---------- the declarative constraints ----------
 
-    /// A constrained store keeps its constraints exactly through save/open,
-    /// and the v5 flags bit 0 marks the constraint section.
+    /// A constrained store keeps its constraints exactly through save/open.
     #[test]
-    fn wave41_constraints_roundtrip_through_v5() {
+    fn constraints_round_trip_through_the_footer() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER);")
             .unwrap();
@@ -6032,12 +7415,6 @@ mod tests {
             .unwrap();
         db.execute("CREATE TABLE free (x INTEGER);").unwrap();
         let bytes = db.to_bytes().unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V5);
-        assert_eq!(
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-            FLAG_CONSTRAINTS,
-            "a constrained store sets flags bit 0"
-        );
         let back = PinkDb::load_bytes(&bytes).unwrap();
         for name in ["p", "c", "u", "free"] {
             assert_eq!(
@@ -6047,20 +7424,6 @@ mod tests {
             );
         }
         assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift");
-        // A constraint-free store keeps flags 0 (the body stays v4-shaped).
-        let mut plain = PinkDb::new();
-        plain
-            .create_table("t", vec![("x".to_string(), DataType::Integer)])
-            .unwrap();
-        let plain_bytes = plain.to_bytes().unwrap();
-        assert_eq!(&plain_bytes[8..12], 0u32.to_le_bytes());
-        assert_eq!(
-            PinkDb::load_bytes(&plain_bytes)
-                .unwrap()
-                .to_bytes()
-                .unwrap(),
-            plain_bytes
-        );
         // DESCRIBE answers identically after the reopen.
         let mut back = back;
         let before = db.execute("DESCRIBE c;").unwrap().pop().unwrap();
@@ -6068,7 +7431,7 @@ mod tests {
         assert_eq!(before, after);
     }
 
-    // ---------- wave 80: materialized views in the v5 MV section ----------
+    // ---------- the materialized views ----------
 
     /// One-column integer result (this module's tests).
     fn ints(db: &mut PinkDb, sql: &str) -> Vec<i64> {
@@ -6085,11 +7448,11 @@ mod tests {
         }
     }
 
-    /// A store with materialized views sets flags bit 2 and round-trips the
-    /// definitions (schedule, defining SQL, stamps, counters), the backing
-    /// tables and — bit for bit — the file itself.
+    /// A store with materialized views round-trips the definitions (schedule,
+    /// defining SQL, stamps, counters), the backing tables and — bit for bit
+    /// — the file itself.
     #[test]
-    fn wave80_materialized_views_roundtrip_through_v5() {
+    fn materialized_views_round_trip_through_the_footer() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (a INTEGER);").unwrap();
         db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
@@ -6104,9 +7467,6 @@ mod tests {
         db.execute("INSERT INTO t VALUES (3);").unwrap();
         db.execute("REFRESH MATERIALIZED VIEW mv;").unwrap();
         let bytes = db.to_bytes().unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V5);
-        let flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        assert_eq!(flags, FLAG_MATERIALIZED_VIEWS, "MV stores set flags bit 2");
 
         let mut back = PinkDb::load_bytes(&bytes).unwrap();
         assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift");
@@ -6150,7 +7510,7 @@ mod tests {
     /// again, and drops cleanly. This is the one case the SQL text is the
     /// only rebuild source.
     #[test]
-    fn wave80_broken_definition_loads_and_heals() {
+    fn broken_definition_loads_and_heals() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (a INTEGER);").unwrap();
         db.execute("INSERT INTO t VALUES (1);").unwrap();
@@ -6179,17 +7539,18 @@ mod tests {
         assert!(back.materialized_view_in("main", "mv").is_err());
     }
 
-    /// Wave 48: the RBAC section round-trips (users with their PHC hashes,
-    /// roles, memberships, table/database grants, admins), is byte-identical
-    /// across saves, and a store without RBAC data keeps flags `0` — the
-    /// section is opt-in exactly like every other format-gated one.
+    // ---------- the RBAC section ----------
+
+    /// The RBAC section round-trips (users with their PHC hashes, roles,
+    /// memberships, table/database grants, admins) and is byte-identical
+    /// across saves.
     #[test]
-    fn wave48_rbac_section_round_trips_and_is_deterministic() {
+    fn rbac_section_round_trips_and_is_deterministic() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (a INTEGER);").unwrap();
         db.execute(
             "CREATE USER alice PASSWORD_HASH '$argon2id$v=19$m=19456,t=2,p=1\
-$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';",
+             $AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';",
         )
         .unwrap();
         db.execute("CREATE ROLE analyst;").unwrap();
@@ -6203,19 +7564,6 @@ $AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';",
         let one = db.to_bytes().unwrap();
         let two = db.to_bytes().unwrap();
         assert_eq!(one, two, "deterministic bytes");
-        assert_eq!(&one[..8], MAGIC_V5);
-        let flags = u32::from_le_bytes([one[8], one[9], one[10], one[11]]);
-        assert_eq!(flags, FLAG_RBAC, "the RBAC flag bit is set");
-        // No constraints/defaults/MVs/procedures here: the body stays
-        // v4-shaped apart from the section.
-        let mut with_flags_cleared = one.clone();
-        with_flags_cleared[8..12].copy_from_slice(&0u32.to_le_bytes());
-        fix_crc(&mut with_flags_cleared);
-        let err = PinkDb::load_bytes(&with_flags_cleared)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("trailing bytes"), "{err}");
-
         let back = PinkDb::load_bytes(&one).unwrap();
         assert!(back.has_users());
         assert_eq!(
@@ -6231,49 +7579,54 @@ $AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';",
             back.user_password_hash("ALICE"),
             Some(
                 "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA\
-$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                 $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             )
         );
     }
 
-    /// A store with no RBAC data writes no section and flags `0` (so every
-    /// pre-wave-48 `.pink` body stays byte-for-byte identical).
+    /// A store with no RBAC data writes no section (the footer stays
+    /// minimal).
     #[test]
-    fn wave48_rbac_free_stores_keep_flags_zero() {
+    fn rbac_free_stores_keep_the_footer_minimal() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (a INTEGER);").unwrap();
         db.execute("CREATE ROLE r; DROP ROLE r;").unwrap();
         let bytes = db.to_bytes().unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V5);
-        assert_eq!(
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-            0
-        );
-        // A dropped role left nothing behind: the store loads as before.
+        let footer = read_store_footer(&bytes).unwrap();
+        assert!(footer.rbac.is_none());
+        // The store loads as before.
         let back = PinkDb::load_bytes(&bytes).unwrap();
         assert!(!back.has_users());
         assert!(!back.has_rbac_data());
     }
 
     /// Corrupt RBAC sections are clean errors, never a panic or a silent
-    /// empty catalog: a bad PHC hash, an unknown privilege tag, a count that
-    /// cannot fit, and a truncated section.
+    /// empty catalog.
     #[test]
-    fn wave48_corrupt_rbac_sections_error() {
-        // A pristine v5 image with an RBAC section appended by hand, so each
-        // case corrupts exactly one field.
-        let image = |body: &dyn Fn(&mut Writer)| -> Vec<u8> {
-            let mut db = PinkDb::new();
-            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
-            let base = db.to_bytes().unwrap();
-            let mut bytes = base[..base.len() - 4].to_vec();
-            bytes[8..12].copy_from_slice(&FLAG_RBAC.to_le_bytes());
-            let mut w = Writer::new();
-            body(&mut w);
-            bytes.extend_from_slice(&w.buf);
-            bytes.extend_from_slice(&[0u8; 4]); // CRC placeholder
-            fix_crc(&mut bytes);
-            bytes
+    fn corrupt_rbac_sections_error() {
+        // An image with an empty data region (a table with no rows) and a
+        // hand-built RBAC section, so each case corrupts exactly one field.
+        let image = |rbac: &[u8]| -> Vec<u8> {
+            let mut fw = Writer::new();
+            fw.u32(FOOTER_VERSION);
+            fw.u32(FLAG_RBAC);
+            fw.u32(1); // one database
+            fw.str("main");
+            fw.u32(1); // one table
+            fw.str("t");
+            fw.u32(1); // one column
+            fw.str("a");
+            fw.u8(1); // INTEGER
+            fw.u64(0); // row count
+            fw.u32(0); // no row groups
+            fw.bytes(rbac);
+            let footer = fw.buf;
+            let mut out = Vec::new();
+            out.extend_from_slice(&footer);
+            out.extend_from_slice(&crc32c(&footer).to_le_bytes());
+            out.extend_from_slice(&(footer.len() as u64).to_le_bytes());
+            out.extend_from_slice(MAGIC_V6);
+            out
         };
         // One user, no roles and no memberships (the head of a section).
         let user_head = |w: &mut Writer| {
@@ -6281,7 +7634,7 @@ $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             w.str("alice");
             w.str(
                 "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA\
-$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                 $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             );
             w.u32(0); // roles
             w.u32(0); // memberships
@@ -6293,7 +7646,8 @@ $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             w.u32(0); // admins
         };
         // A hash that does not parse.
-        let bad_hash = image(&|w: &mut Writer| {
+        let bad_hash = image(&{
+            let mut w = Writer::new();
             w.u32(1);
             w.str("alice");
             w.str("not-a-hash");
@@ -6302,13 +7656,15 @@ $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             w.u32(0);
             w.u32(0);
             w.u32(0);
+            w.buf
         });
         let err = PinkDb::load_bytes(&bad_hash).unwrap_err().to_string();
         assert!(err.contains("invalid password hash"), "bad_hash: {err}");
         assert!(err.contains("alice"), "bad_hash: {err}");
         // An unknown privilege tag.
-        let bad_tag = image(&|w: &mut Writer| {
-            user_head(w);
+        let bad_tag = image(&{
+            let mut w = Writer::new();
+            user_head(&mut w);
             w.u32(1); // table grants: one entry
             w.str("main");
             w.str("t");
@@ -6318,12 +7674,15 @@ $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             w.u8(9); // ← unknown
             w.u32(0); // database grants
             w.u32(0); // admins
+            w.buf
         });
         let err = PinkDb::load_bytes(&bad_tag).unwrap_err().to_string();
         assert!(err.contains("unknown privilege tag 9"), "bad_tag: {err}");
         // A user count that cannot fit in the remaining bytes.
-        let bad_count = image(&|w: &mut Writer| {
+        let bad_count = image(&{
+            let mut w = Writer::new();
             w.u32(0xffff_ffff);
+            w.buf
         });
         let err = PinkDb::load_bytes(&bad_count).unwrap_err().to_string();
         assert!(
@@ -6331,74 +7690,38 @@ $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "bad_count: {err}"
         );
         // A section cut short in the middle of the trailing admin list.
-        let mut truncated = image(&|w: &mut Writer| {
-            user(w);
+        let truncated = image(&{
+            let mut w = Writer::new();
+            user(&mut w);
             w.u32(1); // admins: one entry
             w.str("alice");
+            w.buf
         });
-        truncated.truncate(truncated.len() - 4 - 6);
-        truncated.extend_from_slice(&[0u8; 4]); // CRC placeholder
-        fix_crc(&mut truncated);
         let err = PinkDb::load_bytes(&truncated).unwrap_err().to_string();
         assert!(err.contains("corrupt file"), "truncated: {err}");
     }
 
-    /// The next format-gated section (bit 7, `0x80`) is refused by this
-    /// build through the shared unknown-flags check — the "clean newer-format
-    /// refusal" rule every optional section (the index section's bit 3
-    /// included) relies on for older builds.
-    #[test]
-    fn wave80_unknown_v5_flag_bits_are_refused() {
-        let mut db = PinkDb::new();
-        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
-        let mut bytes = db.to_bytes().unwrap();
-        bytes[8..12].copy_from_slice(&0x80u32.to_le_bytes());
-        let n = bytes.len();
-        let crc = crate::wal::crc32(&bytes[..n - 4]);
-        bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
-        let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
-        assert!(err.contains("upgrade pinkdb"), "{err}");
-        assert!(err.contains("0x00000080"), "{err}");
-    }
+    // ---------- the index section ----------
 
-    /// The index-section image of `t (a INTEGER)` holding `1, 2, 2, NULL`
-    /// with one index on `a`, re-built from explicit section fields so each
-    /// test can corrupt exactly one of them (the CRC is recomputed, so the
-    /// section check — not the checksum — is what must fire).
-    fn wave79_index_file(name: &str, column: u32, distinct: u64, indexed: u64) -> Vec<u8> {
+    /// The index definitions of `t (a INTEGER)` holding `1, 2, 2, NULL` with
+    /// one index on `a`: the map is rebuilt from the rows, never read from
+    /// the file.
+    #[test]
+    fn index_definitions_round_trip_and_the_map_is_rebuilt() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (a INTEGER);").unwrap();
         db.execute("INSERT INTO t VALUES (1), (2), (2), (NULL);")
             .unwrap();
         db.execute("CREATE INDEX i ON t(a);").unwrap();
-        let full = db.to_bytes().unwrap();
-        // count u32 + name "i" + column u32 + two u64 counts.
-        let section_len = 4 + 5 + 4 + 8 + 8;
-        let mut out = full[..full.len() - 4 - section_len].to_vec();
-        out.extend_from_slice(&1u32.to_le_bytes());
-        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&column.to_le_bytes());
-        out.extend_from_slice(&distinct.to_le_bytes());
-        out.extend_from_slice(&indexed.to_le_bytes());
-        out.extend_from_slice(&[0u8; 4]);
-        fix_crc(&mut out);
-        out
-    }
-
-    #[test]
-    fn wave79_index_section_layout_is_the_documented_one() {
-        let mut db = PinkDb::new();
-        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
-        db.execute("INSERT INTO t VALUES (1), (2), (2), (NULL);")
-            .unwrap();
-        db.execute("CREATE INDEX i ON t(a);").unwrap();
-        // Two distinct keys over three non-NULL rows.
-        let expected = wave79_index_file("i", 0, 2, 3);
-        assert_eq!(db.to_bytes().unwrap(), expected);
-        let flags = u32::from_le_bytes(expected[8..12].try_into().unwrap());
-        assert_eq!(flags, FLAG_INDEXES);
-        let loaded = PinkDb::load_bytes(&expected).unwrap();
+        let bytes = db.to_bytes().unwrap();
+        let footer = read_store_footer(&bytes).unwrap();
+        let tdir = &footer.databases[0].tables[0];
+        assert_eq!(tdir.indexes.len(), 1);
+        assert_eq!(tdir.indexes[0].name, "i");
+        assert_eq!(tdir.indexes[0].column, 0);
+        assert_eq!(tdir.indexes[0].distinct_keys, 2);
+        assert_eq!(tdir.indexes[0].indexed_rows, 3);
+        let loaded = PinkDb::load_bytes(&bytes).unwrap();
         let t = loaded.table_in("main", "t").unwrap();
         assert_eq!(t.indexes.len(), 1);
         assert!(!t.indexes_stale);
@@ -6408,153 +7731,83 @@ $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         );
     }
 
-    /// The map is rebuilt from the rows, never from the file: statistics
-    /// that are in bounds but wrong still load the exact map.
+    /// A malformed index definition is a clean "corrupt file" error, never
+    /// a panic.
     #[test]
-    fn wave79_index_map_comes_from_the_rows_not_the_statistics() {
-        let loaded = PinkDb::load_bytes(&wave79_index_file("i", 0, 1, 1)).unwrap();
-        let t = loaded.table_in("main", "t").unwrap();
-        assert_eq!(t.indexes[0].map.len(), 2);
-        assert_eq!(
-            t.indexes[0].map,
-            crate::storage::index_map_for(&t.columns[0])
-        );
-    }
-
-    /// A malformed index section is a clean "corrupt file" error, never a
-    /// panic.
-    #[test]
-    fn wave79_corrupt_index_sections_are_refused() {
-        let cases: [(&str, Vec<u8>); 4] = [
-            ("empty name", wave79_index_file("", 0, 2, 3)),
-            ("column out of range", wave79_index_file("i", 5, 2, 3)),
-            ("indexed rows exceed table", wave79_index_file("i", 0, 2, 5)),
-            ("distinct > indexed", wave79_index_file("i", 0, 4, 3)),
-        ];
-        for (what, bytes) in cases {
-            let err = PinkDb::load_bytes(&bytes)
+    fn corrupt_index_definitions_are_refused() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (2), (NULL);")
+            .unwrap();
+        db.execute("CREATE INDEX i ON t(a);").unwrap();
+        let good = db.to_bytes().unwrap();
+        let (footer_at, footer_len) = footer_span(&good).unwrap();
+        let footer = good[footer_at as usize..(footer_at + footer_len) as usize].to_vec();
+        // The index section: count(4) + name_len(4) + "i"(1) + column(4) +
+        // two u64 statistics. Locate it by its bytes.
+        let mut needle = Vec::new();
+        needle.extend_from_slice(&1u32.to_le_bytes());
+        needle.extend_from_slice(&1u32.to_le_bytes());
+        needle.push(b'i');
+        needle.extend_from_slice(&0u32.to_le_bytes());
+        let at = footer
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .expect("the index section in the footer");
+        for (what, patch) in [
+            ("empty name", 0usize),
+            ("column out of range", 1),
+            ("indexed rows exceed table", 2),
+            ("distinct > indexed", 3),
+        ] {
+            let mut bad_footer = footer.clone();
+            match patch {
+                0 => bad_footer[at + 4..at + 8].copy_from_slice(&0u32.to_le_bytes()),
+                1 => bad_footer[at + 9..at + 13].copy_from_slice(&5u32.to_le_bytes()),
+                2 => bad_footer[at + 21..at + 29].copy_from_slice(&5u64.to_le_bytes()),
+                _ => bad_footer[at + 13..at + 21].copy_from_slice(&4u64.to_le_bytes()),
+            }
+            let mut bad = good.clone();
+            bad[footer_at as usize..(footer_at + footer_len) as usize].copy_from_slice(&bad_footer);
+            let n = bad.len();
+            bad[n - TRAILER_LEN..n - TRAILER_LEN + 4]
+                .copy_from_slice(&crc32c(&bad_footer).to_le_bytes());
+            let err = PinkDb::load_bytes(&bad)
                 .map(|_| ())
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("corrupt file"), "{what}: {err}");
         }
-        // Two indexes: a duplicate name and a reversed name order are both
-        // refused (the writer emits names strictly ascending).
+        // Two indexes whose names are out of order are refused (the writer
+        // emits names strictly ascending).
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
             .unwrap();
         db.execute("CREATE INDEX x ON t(a);").unwrap();
         db.execute("CREATE INDEX y ON t(b);").unwrap();
         let good = db.to_bytes().unwrap();
-        let entry = 4 + 1 + 4 + 8 + 8;
-        let second = good.len() - 4 - entry;
-        assert_eq!(good[second + 4], b'y');
-        for name in *b"xa" {
-            let mut bad = good.clone();
-            bad[second + 4] = name;
-            fix_crc(&mut bad);
-            let err = PinkDb::load_bytes(&bad)
-                .map(|_| ())
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("out of name order"), "{err}");
-        }
-        // Truncated inside the section.
-        let mut short = good[..good.len() - 4 - 3].to_vec();
-        short.extend_from_slice(&[0u8; 4]);
-        fix_crc(&mut short);
-        let err = PinkDb::load_bytes(&short)
+        let (footer_at, footer_len) = footer_span(&good).unwrap();
+        let footer = good[footer_at as usize..(footer_at + footer_len) as usize].to_vec();
+        // The first index's name is the byte after its count and name length.
+        let mut needle = Vec::new();
+        needle.extend_from_slice(&2u32.to_le_bytes());
+        needle.extend_from_slice(&1u32.to_le_bytes());
+        needle.push(b'x');
+        let at = footer
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .expect("the index section in the footer");
+        let mut bad_footer = footer.clone();
+        bad_footer[at + 8..at + 9].copy_from_slice(b"z");
+        let mut bad = good.clone();
+        bad[footer_at as usize..(footer_at + footer_len) as usize].copy_from_slice(&bad_footer);
+        let n = bad.len();
+        bad[n - TRAILER_LEN..n - TRAILER_LEN + 4]
+            .copy_from_slice(&crc32c(&bad_footer).to_le_bytes());
+        let err = PinkDb::load_bytes(&bad)
             .map(|_| ())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("corrupt file"), "{err}");
-    }
-
-    /// A corrupt constraint section is a clean error, never a panic.
-    #[test]
-    fn wave41_corrupt_constraints_error() {
-        let mut db = PinkDb::new();
-        db.execute("CREATE TABLE t (a INTEGER, CONSTRAINT kz PRIMARY KEY (a));")
-            .unwrap();
-        let full = db.to_bytes().unwrap();
-        // Locate the constraint by its (distinctive) name; the kind byte sits
-        // 5 bytes before the name (kind u8 + name_len u32).
-        let at = full
-            .windows(2)
-            .position(|w| w == b"kz")
-            .expect("constraint name in the image");
-        assert_eq!(full[at - 5], CK_PRIMARY_KEY);
-        // Unknown kind.
-        let mut bad = full.clone();
-        bad[at - 5] = 9;
-        fix_crc(&mut bad);
-        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
-        assert!(err.contains("unknown constraint kind 9"), "{err}");
-        // Out-of-range column index (the table has one column): the single
-        // col_idx u32 follows the name + col_count u32.
-        let mut bad = full.clone();
-        bad[at + 2 + 4..at + 2 + 8].copy_from_slice(&7u32.to_le_bytes());
-        fix_crc(&mut bad);
-        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
-        assert!(
-            err.contains("constraint column index out of range"),
-            "{err}"
-        );
-    }
-
-    /// A durable reopen re-derives the constraints from the logged DDL text:
-    /// both from the checkpoint and from WAL replay alone.
-    #[test]
-    fn wave41_durable_reopen_replays_constraints() {
-        let ckpt = temp_file("w41_ckpt");
-        let ckpt = std::path::PathBuf::from(format!("{}.db", ckpt.display()));
-        let wal = std::path::PathBuf::from(format!("{}.wal", ckpt.display()));
-        // Case 1: everything in the WAL (no checkpoint).
-        {
-            let mut db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
-            db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER);")
-                .unwrap();
-            db.execute(
-                "CREATE TABLE c (cid INTEGER PRIMARY KEY, \
-                 pid INTEGER NOT NULL REFERENCES p(id));",
-            )
-            .unwrap();
-            db.execute("INSERT INTO c VALUES (1, 1);").unwrap();
-        }
-        {
-            let mut db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
-            let rows = db.execute("DESCRIBE c;").unwrap().pop().unwrap();
-            let crate::QueryResult::Selected { rows, .. } = rows else {
-                panic!()
-            };
-            // cid is the primary key; pid is a NOT NULL foreign key (no key
-            // marker, DuckDB's rule).
-            assert_eq!(rows[0][3], Value::Varchar("PRI".to_string()));
-            assert_eq!(rows[0][2], Value::Varchar("NO".to_string()));
-            assert_eq!(rows[1][3], Value::Null);
-            assert_eq!(rows[1][2], Value::Varchar("NO".to_string()));
-            assert_eq!(
-                db.table("c").unwrap().constraints.foreign_keys[0].ref_table,
-                "p"
-            );
-            // Case 2: checkpointed, then reopened (constraints come from the
-            // .pink section).
-            db.execute("CHECKPOINT;").unwrap();
-        }
-        {
-            let db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
-            assert_eq!(db.table("c").unwrap().constraints.foreign_keys.len(), 1);
-            assert_eq!(
-                db.table("p")
-                    .unwrap()
-                    .constraints
-                    .primary_key()
-                    .unwrap()
-                    .columns,
-                vec![0]
-            );
-        }
-        let _ = std::fs::remove_file(&ckpt);
-        let _ = std::fs::remove_file(&wal);
+        assert!(err.contains("out of name order"), "{err}");
     }
 }

@@ -3700,11 +3700,11 @@ mod tests {
         let mut loaded = PinkDb::open(&path).unwrap();
         assert!(loaded.procedure_in("other", "side").is_ok());
         loaded.execute("CALL other.side(1);").unwrap();
-        // The flags word carries the procedure section for a store that has
-        // one and stays 0 without.
+        // The footer's flags word carries the procedure section for a store
+        // that has one and stays 0 without.
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            crate::persist::footer_flags(&bytes).unwrap(),
             crate::persist::FLAG_PROCEDURES_FOR_TEST,
             "a procedure store sets flags bit 4"
         );
@@ -3715,7 +3715,7 @@ mod tests {
         empty.save(&plain_path).unwrap();
         let bytes = std::fs::read(&plain_path).unwrap();
         assert_eq!(
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            crate::persist::footer_flags(&bytes).unwrap(),
             0,
             "a procedure-free store keeps flags 0"
         );

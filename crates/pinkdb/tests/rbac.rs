@@ -738,7 +738,7 @@ fn pink_round_trip_preserves_users_roles_and_grants() {
     db.save(path.to_str().unwrap()).unwrap();
 
     let bytes = std::fs::read(&path).unwrap();
-    let flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let flags = pinkdb::persist::footer_flags(&bytes).unwrap();
     assert_eq!(flags & 0x20, 0x20, "the RBAC flag bit is set");
     // A store without RBAC data keeps flags 0 (byte-identical to wave 47).
     let plain = {
@@ -746,10 +746,7 @@ fn pink_round_trip_preserves_users_roles_and_grants() {
         exec(&mut p, "CREATE TABLE t (i INTEGER);");
         p.to_pink_bytes().unwrap()
     };
-    assert_eq!(
-        u32::from_le_bytes([plain[8], plain[9], plain[10], plain[11]]),
-        0
-    );
+    assert_eq!(pinkdb::persist::footer_flags(&plain).unwrap(), 0);
 
     let mut reopened = PinkDb::open(path.to_str().unwrap()).unwrap();
     assert_eq!(

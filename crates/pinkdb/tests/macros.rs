@@ -635,7 +635,7 @@ fn persistence_round_trips_macros_and_sets_the_flag() {
     db.save(s.path()).unwrap();
 
     let bytes = std::fs::read(s.path()).unwrap();
-    let flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let flags = pinkdb::persist::footer_flags(&bytes).unwrap();
     assert_eq!(flags & 0x40, 0x40, "macros set flags bit 6: {flags:#x}");
     // A macro-free store keeps the bit clear.
     let plain = Scratch::new("plain");
@@ -643,7 +643,7 @@ fn persistence_round_trips_macros_and_sets_the_flag() {
     empty.execute("CREATE TABLE x (a INTEGER);").unwrap();
     empty.save(plain.path()).unwrap();
     let bytes = std::fs::read(plain.path()).unwrap();
-    let flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let flags = pinkdb::persist::footer_flags(&bytes).unwrap();
     assert_eq!(flags & 0x40, 0, "no macros, no macro section: {flags:#x}");
     // Dropping the last macro clears the bit again (the section is recomputed
     // from the live catalog, never left behind).
@@ -653,7 +653,7 @@ fn persistence_round_trips_macros_and_sets_the_flag() {
     db2.execute("DROP MACRO gone;").unwrap();
     db2.save(dropped.path()).unwrap();
     let bytes = std::fs::read(dropped.path()).unwrap();
-    let flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let flags = pinkdb::persist::footer_flags(&bytes).unwrap();
     assert_eq!(flags & 0x40, 0, "no live macros: {flags:#x}");
 
     let mut loaded = PinkDb::open(s.path()).unwrap();
@@ -679,26 +679,32 @@ fn newer_formats_and_unknown_flags_are_refused() {
     db.save(s.path()).unwrap();
     let good = std::fs::read(s.path()).unwrap();
 
+    // The format's magic lives in the trailer: a file from a newer pinkdb
+    // is refused there.
     let mut newer = good.clone();
-    newer[..8].copy_from_slice(b"PINKDB06");
+    let n = newer.len();
+    newer[n - 8..].copy_from_slice(b"PINKDB07");
     std::fs::write(s.path(), &newer).unwrap();
     let e = PinkDb::open(s.path())
         .expect_err("newer format")
         .to_string();
-    assert!(e.contains("newer pinkdb") && e.contains("format v6"), "{e}");
+    assert!(e.contains("newer pinkdb") && e.contains("format v7"), "{e}");
 
-    // An as-yet-unknown flag bit (bit 7) is refused even with a valid CRC.
+    // An as-yet-unknown footer flag bit (bit 7) is refused even with a
+    // valid footer CRC.
     let mut flagged = good;
-    let flags = u32::from_le_bytes([flagged[8], flagged[9], flagged[10], flagged[11]]) | 0x80;
-    flagged[8..12].copy_from_slice(&flags.to_le_bytes());
-    let body_len = flagged.len() - 4;
-    let crc = pinkdb::wal::crc32(&flagged[..body_len]);
-    flagged[body_len..].copy_from_slice(&crc.to_le_bytes());
+    let (footer_at, footer_len) = pinkdb::persist::footer_span(&flagged).unwrap();
+    let flags_at = footer_at as usize + 4;
+    let flags = u32::from_le_bytes(flagged[flags_at..flags_at + 4].try_into().unwrap()) | 0x80;
+    flagged[flags_at..flags_at + 4].copy_from_slice(&flags.to_le_bytes());
+    let footer = flagged[footer_at as usize..(footer_at + footer_len) as usize].to_vec();
+    let n = flagged.len();
+    flagged[n - 20..n - 16].copy_from_slice(&pinkdb::persist::crc32c(&footer).to_le_bytes());
     std::fs::write(s.path(), &flagged).unwrap();
     let e = PinkDb::open(s.path())
         .expect_err("unknown flags")
         .to_string();
-    assert!(e.contains("unsupported .pink v5 flags"), "{e}");
+    assert!(e.contains("unsupported .pink footer flags"), "{e}");
 }
 
 // ---------- WAL replay ----------

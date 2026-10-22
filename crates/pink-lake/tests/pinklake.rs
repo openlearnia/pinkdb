@@ -196,9 +196,10 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
     assert_eq!(files.len(), all_tables(&expected).len());
     for file in &files {
         let bytes = std::fs::read(file).unwrap();
-        // The engine's current `.pink` magic: v4 since wave 45i's base commit.
+        // The engine's current `.pink` format: `PINKDB06`, whose magic lives
+        // in the trailer (the last 20 bytes).
         assert!(
-            bytes.starts_with(b"PINKDB0"),
+            pinkdb::persist::is_pinkdb06(&bytes),
             "{} is not engine `.pink` bytes",
             file.display()
         );
@@ -432,62 +433,11 @@ fn unsupported_future_format_versions_are_named() {
     cleanup(&dir);
 }
 
-/// The wave-34 v1 fixture (engine v2 `.pink` bytes) still loads bit-exactly
-/// in the lean build: the lean reader *is* the v1 reader.
-#[test]
-fn v1_fixture_written_by_wave34_still_loads_bit_exactly() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1");
-    let scratch = scratch("v1_fixture");
-    let catalog = read_json(&fixture.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 1, "fixture must stay v1");
-    let lake = Lake::open(&fixture).unwrap();
-    assert_eq!(lake.format_version(), 1);
-    assert_eq!(lake.current_version(), 2);
-    let loaded = lake.load(None).unwrap();
-    assert_same_store(&common::fidelity_store(), &loaded);
-    assert_eq!(
-        store_bytes(&loaded, &scratch, "loaded"),
-        store_bytes(&common::fidelity_store(), &scratch, "expected"),
-    );
-    cleanup(&scratch);
-}
-
 /// `tests/fixtures/lake_v1_v4/` is a v1 lake written by **this** (lean)
 /// writer: engine v4 `.pink` data files under a v1 catalog. The lean build
 /// reads it bit-exactly, and `tests/lake.rs` (the full build) opens the same
 /// directory — that is the lean-writes / full-reads compatibility pin, and
 /// the byte-identity of the re-save proves no value or chunking was lost.
-#[test]
-fn v1_v4_fixture_written_by_the_lean_writer_loads_bit_exactly() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1_v4");
-    let scratch = scratch("v1_v4_fixture");
-
-    let catalog = read_json(&fixture.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 1, "fixture must stay v1");
-    for entry in catalog["tables"].as_object().unwrap().values() {
-        assert!(entry.get("format").is_none(), "{entry}");
-        assert!(entry["files"][0].as_str().unwrap().ends_with(".pink"));
-    }
-    for file in data_files(&fixture.join("data")) {
-        assert!(
-            std::fs::read(&file).unwrap().starts_with(b"PINKDB04"),
-            "{} must be engine v4 bytes",
-            file.display()
-        );
-    }
-
-    let lake = Lake::open(&fixture).unwrap();
-    assert_eq!(lake.format_version(), 1);
-    let expected = common::fidelity_store();
-    let loaded = lake.load(None).unwrap();
-    assert_same_store(&expected, &loaded);
-    assert_eq!(
-        store_bytes(&loaded, &scratch, "loaded"),
-        store_bytes(&expected, &scratch, "expected"),
-    );
-    cleanup(&scratch);
-}
-
 /// A v1 lake over the mock S3 backend: the lean writer puts one `.pink`
 /// object per table with the same catalog/snapshot contract, and reads it
 /// back bit-exactly.
@@ -536,143 +486,9 @@ fn lean_s3_v4_roundtrip() {
 // same fixture is attached by the full build in `tests/lake.rs`).
 // ---------------------------------------------------------------------------
 
-/// Regenerate the checked-in `tests/fixtures/lake_v1_v4_stats/` fixture — a
-/// v1 lake written by **this** lean writer, with the `.pink` v4 data files and
-/// the CRC-protected statistics blocks `.lake attach` reads. It pins the
-/// cross-build contract: the lean build attaches it bit-exactly and so does a
-/// full (`vortexlake`) build (`tests/lake.rs`), which is the lean-writes /
-/// full-attaches compatibility pin.
-///
-/// Run deliberately, only when the writer's stats-block shape is meant to
-/// change (never as part of a normal test run):
-///
-/// ```text
-/// cargo test -p pink-lake --test pinklake -- --ignored generate_v1_v4_stats_fixture
-/// ```
-#[test]
-#[ignore = "writes the checked-in tests/fixtures/lake_v1_v4_stats; run with --ignored"]
-fn generate_v1_v4_stats_fixture() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1_v4_stats");
-    std::fs::remove_dir_all(&fixture).ok();
-    save_store(&common::fidelity_store(), &fixture).unwrap();
-    let catalog = read_json(&fixture.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 1);
-    let snapshot = read_json(&fixture.join("snapshots/2.json"));
-    assert_eq!(catalog, snapshot, "catalog == snapshot byte invariant");
-    for (key, entry) in catalog["tables"].as_object().unwrap() {
-        assert!(entry["stats"].is_object(), "{key}: {entry}");
-        assert!(entry["stats"]["crc32"].is_u64(), "{key}: {entry}");
-    }
-}
-
 /// The `lake_v1_v4_stats` fixture: a v1 lake with statistics blocks loads
 /// bit-exactly, attaches without touching a data file, answers the fast paths
 /// exactly, and attaches with identical answers as a full build.
-#[test]
-fn v1_v4_stats_fixture_attaches_bit_exactly() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1_v4_stats");
-    let dir = scratch("v1_v4_stats_fixture");
-    let expected = common::fidelity_store();
-
-    let lake = Lake::open(&fixture).unwrap();
-    assert_eq!(lake.format_version(), 1);
-
-    // The attached descriptors equal the decoded truth, and the query
-    // battery answers bit-identically to the `.lake open` store.
-    let report = lake.attach(None).unwrap();
-    assert_eq!(report.version, 2);
-    assert_eq!(report.format_version, 1);
-    assert!(!report.remote, "v1 attach never reads a data file");
-    let loaded = lake.load(None).unwrap();
-    assert_same_store(&expected, &loaded);
-    let mut attached = PinkDb::new();
-    let tables = attached.attach_lake(report.lake.clone()).unwrap();
-    assert_eq!(tables.len(), all_tables(&expected).len());
-    for table in &tables {
-        let decoded = loaded.table_in(&table.db, &table.table).unwrap();
-        assert_eq!(table.rows, decoded.num_rows() as u64);
-        assert_eq!(table.schema, decoded.schema());
-        for (i, (name, _)) in table.schema.iter().enumerate() {
-            let mut nulls = 0u64;
-            let (mut min, mut max): (Option<Value>, Option<Value>) = (None, None);
-            for row in 0..decoded.num_rows() {
-                let v = decoded.get(row, i).unwrap();
-                if v.is_null() {
-                    nulls += 1;
-                    continue;
-                }
-                if min
-                    .as_ref()
-                    .is_none_or(|m| pinkdb::plan::compare_values(&v, m).is_lt())
-                {
-                    min = Some(v.clone());
-                }
-                if max
-                    .as_ref()
-                    .is_none_or(|m| pinkdb::plan::compare_values(&v, m).is_gt())
-                {
-                    max = Some(v);
-                }
-            }
-            assert_eq!(table.stats[i].null_count, Some(nulls), "{name} nulls");
-            if let Some(stat) = &table.stats[i].min {
-                assert_eq!(Some(stat), min.as_ref(), "{name} min");
-            }
-            if let Some(stat) = &table.stats[i].max {
-                assert_eq!(Some(stat), max.as_ref(), "{name} max");
-            }
-        }
-    }
-    let mut mut_loaded = lake.load(None).unwrap();
-    let mut queries = vec![
-        "SELECT COUNT(*) FROM main.fid;".to_string(),
-        "SELECT COUNT(*) FROM big;".to_string(),
-        "SELECT COUNT(*) FROM empty;".to_string(),
-        "SELECT MIN(i), MAX(i), COUNT(v) FROM fid;".to_string(),
-        "SELECT MIN(b), MAX(b), MIN(g), MAX(g) FROM fid;".to_string(),
-        "SELECT MIN(d), MAX(d) FROM fid;".to_string(),
-        "SELECT COUNT(x), MIN(x), MAX(y) FROM empty;".to_string(),
-        "SELECT SUM(i), AVG(i) FROM fid;".to_string(),
-        "SELECT COUNT(*) FROM big WHERE a > 0;".to_string(),
-        "SELECT z FROM analytics.\"a.b\";".to_string(),
-    ];
-    for (col, _) in loaded.table_in("main", "fid").unwrap().schema() {
-        queries.push(format!(
-            "SELECT COUNT({col}), MIN({col}), MAX({col}) FROM fid;"
-        ));
-    }
-    for sql in queries {
-        let a = select_rows(&mut attached, &sql);
-        let b = select_rows(&mut mut_loaded, &sql);
-        assert_rows_bit_same(&a, &b, &sql);
-    }
-
-    // A pinned snapshot version reads the same statistics blocks (the
-    // manifest is byte-identical to the catalog of its version).
-    let pinned = Lake::open(&fixture).unwrap().attach(Some(2)).unwrap();
-    assert_eq!(pinned.version, 2);
-    let mut pinned_db = PinkDb::new();
-    pinned_db.attach_lake(pinned.lake.clone()).unwrap();
-    assert_rows_bit_same(
-        &select_rows(
-            &mut pinned_db,
-            "SELECT COUNT(*), COUNT(s), MIN(a) FROM main.big;",
-        ),
-        &select_rows(
-            &mut attached,
-            "SELECT COUNT(*), COUNT(s), MIN(a) FROM main.big;",
-        ),
-        "pinned v1 attach",
-    );
-
-    // The fixture's own decodes: the fast paths above never decoded a table
-    // except the fallbacks (SUM/AVG/filter/`d`'s NaN-gated MIN/MAX are all
-    // gated to materialize), which cache.
-    let (loads, ..) = report.lake.decode_stats();
-    assert!(loads >= 1, "the fallback queries must have materialized");
-    cleanup(&dir);
-}
-
 /// Query `db` and return the rows bit-exactly (NaN payloads and `-0.0`
 /// compared by bits).
 fn select_rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
