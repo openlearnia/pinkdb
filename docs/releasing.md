@@ -30,7 +30,10 @@ A manual `workflow_dispatch` of **Release** with a `version` input is the
 recovery path when a tag run failed before publishing. It does not let a
 different version through: the input is checked against Cargo.toml exactly like
 a tag. **Publish extensions** keeps its own manual dispatch inputs
-(`name`, `version`, `platform`) for a single extension or a platform backfill.
+(`name`, `version`, `platform`) for a single extension or a platform backfill;
+`platform=all` builds and publishes every platform in one run (the recovery
+path when a tag run failed at its publish step — re-running that tag run
+would reuse the tag's code).
 
 ## CLI and server matrix
 

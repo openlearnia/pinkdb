@@ -51,7 +51,7 @@ on:
         required: false
         type: string
       platform:
-        description: "catalog platform tag (default: darwin-arm64)"
+        description: "catalog platform tag, or `all` for every platform (default: darwin-arm64)"
         required: false
         type: string
 
@@ -104,6 +104,10 @@ jobs:
           else
             version="${INPUT_VERSION:-$cargo_version}"
             platform="${INPUT_PLATFORM:-darwin-arm64}"
+            # `all` builds every platform in one run, like a tag push.
+            if [ "$platform" = "all" ]; then
+              platform=""
+            fi
           fi
           name="${INPUT_NAME:-}"
           case "$platform" in

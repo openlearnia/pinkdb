@@ -304,8 +304,11 @@ def check_against_live(entries: list) -> None:
     otherwise wipe live entries).
     """
     url = f"{BASE_URL}/index.json"
+    # An explicit User-Agent: Cloudflare in front of the repository answers
+    # Python's default `Python-urllib/x.y` with HTTP 403.
+    request = urllib.request.Request(url, headers={"User-Agent": "pinkdb-ext-publisher/1"})
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
+        with urllib.request.urlopen(request, timeout=30) as resp:
             live = json.load(resp)
     except urllib.error.HTTPError as e:
         if e.code == 404:
