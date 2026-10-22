@@ -2214,7 +2214,10 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         }
         LogicalPlan::Explain { plan } => {
             let mut chunk = Vector::with_capacity(DataType::Varchar, 0);
-            for line in explain_lines(plan, Some(&cx.prunes)) {
+            // The projected width is computed over the *explained* plan, not
+            // the EXPLAIN wrapper (wave 98a): `(4 of 16 columns)`.
+            let projections = crate::plan::ScanProjections::of(plan);
+            for line in explain_lines(plan, Some(&cx.prunes), Some(&projections)) {
                 chunk.push_valid(Value::Varchar(line))?;
             }
             let chunks = if chunk.is_empty() {
@@ -4797,9 +4800,13 @@ fn prune_op_symbol(op: PruneOp) -> &'static str {
     }
 }
 
-fn explain_lines(plan: &LogicalPlan, prunes: Option<&crate::plan::ScanFilters>) -> Vec<String> {
+fn explain_lines(
+    plan: &LogicalPlan,
+    prunes: Option<&crate::plan::ScanFilters>,
+    projections: Option<&crate::plan::ScanProjections>,
+) -> Vec<String> {
     let mut out = Vec::new();
-    explain_into(plan, 0, prunes, &mut out);
+    explain_into(plan, 0, prunes, projections, &mut out);
     out
 }
 
@@ -4807,6 +4814,7 @@ fn explain_into(
     plan: &LogicalPlan,
     depth: usize,
     prunes: Option<&crate::plan::ScanFilters>,
+    projections: Option<&crate::plan::ScanProjections>,
     out: &mut Vec<String>,
 ) {
     let pad = "  ".repeat(depth);
@@ -4963,7 +4971,14 @@ fn explain_into(
                     line.push('\'');
                 }
             }
-            line.push_str(&format!(" ({} columns)", schema.len()));
+            line.push_str(
+                &match projections.and_then(|projections| projections.for_scan(plan)) {
+                    Some(projected) if projected.len() < schema.len() => {
+                        format!(" ({} of {} columns)", projected.len(), schema.len())
+                    }
+                    _ => format!(" ({} columns)", schema.len()),
+                },
+            );
             // DuckDB's `Filters:` line: the conjuncts the planner pushed into
             // this scan (they prune row groups and files; the engine still
             // re-applies them above the scan).
@@ -5038,8 +5053,8 @@ fn explain_into(
         }
         LogicalPlan::Cte { name, query, body } => {
             out.push(format!("{pad}Cte {name}"));
-            explain_into(query, depth + 1, prunes, out);
-            explain_into(body, depth + 1, prunes, out);
+            explain_into(query, depth + 1, prunes, projections, out);
+            explain_into(body, depth + 1, prunes, projections, out);
             return;
         }
         LogicalPlan::Join {
@@ -5130,7 +5145,7 @@ fn explain_into(
     };
     out.push(format!("{pad}{head}"));
     for c in children {
-        explain_into(c, depth + 1, prunes, out);
+        explain_into(c, depth + 1, prunes, projections, out);
     }
 }
 

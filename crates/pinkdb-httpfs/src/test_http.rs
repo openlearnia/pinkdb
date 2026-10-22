@@ -12,9 +12,10 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 #[derive(Clone)]
 struct File {
@@ -33,6 +34,14 @@ struct State {
     head_unsupported: AtomicBool,
     /// `(path, remaining)` one-shot failures.
     failures: Mutex<Vec<(String, usize, u16)>>,
+    /// Requests currently being answered, and the high-water mark (the
+    /// read-ahead concurrency tests).
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    /// An artificial response delay, so a concurrent burst is observable.
+    delay: Mutex<Option<Duration>>,
+    /// Truncate ranged response bodies by this many bytes (short-read tests).
+    short_read: AtomicUsize,
     stop: AtomicBool,
 }
 
@@ -57,6 +66,10 @@ impl TestHttpServer {
             range_enabled: AtomicBool::new(true),
             head_unsupported: AtomicBool::new(false),
             failures: Mutex::new(Vec::new()),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            delay: Mutex::new(None),
+            short_read: AtomicUsize::new(0),
             stop: AtomicBool::new(false),
         });
         let thread_state = Arc::clone(&state);
@@ -131,6 +144,27 @@ impl TestHttpServer {
         self.state.head_unsupported.store(on, Ordering::Relaxed);
     }
 
+    /// Delay every response by `delay` (makes concurrent read-ahead visible).
+    pub fn set_delay(&self, delay: Option<Duration>) {
+        *self.state.delay.lock().unwrap() = delay;
+    }
+
+    /// The high-water mark of simultaneously served requests.
+    pub fn max_active(&self) -> usize {
+        self.state.max_active.load(Ordering::Relaxed)
+    }
+
+    /// The number of requests being served right now.
+    pub fn active(&self) -> usize {
+        self.state.active.load(Ordering::Relaxed)
+    }
+
+    /// Drop `bytes` off every ranged (`206`) response body, simulating a
+    /// short read.
+    pub fn set_short_read(&self, bytes: usize) {
+        self.state.short_read.store(bytes, Ordering::Relaxed);
+    }
+
     /// The `Range` header of every request (`""` when absent), in request
     /// order.
     pub fn ranges(&self) -> Vec<String> {
@@ -155,6 +189,7 @@ impl Drop for TestHttpServer {
 }
 
 fn handle(mut stream: TcpStream, state: Arc<State>) {
+    let _active = ActiveGuard::new(&state);
     let _ = stream.set_nonblocking(false);
     let reader_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -255,6 +290,18 @@ fn handle(mut stream: TcpStream, state: Arc<State>) {
         Some(Err(())) => (416, Vec::new(), Some(format!("bytes */{}", bytes.len()))),
         None => (status, bytes, None),
     };
+    // Short-read simulation: a 206 with fewer bytes than its Content-Range
+    // claims. The parquet reader must surface that, never recover silently.
+    let bytes = if status == 206 {
+        let drop = state.short_read.load(Ordering::Relaxed);
+        if drop > 0 && bytes.len() > drop {
+            bytes[..bytes.len() - drop].to_vec()
+        } else {
+            bytes
+        }
+    } else {
+        bytes
+    };
 
     let mut out = Vec::new();
     write!(
@@ -271,8 +318,32 @@ fn handle(mut stream: TcpStream, state: Arc<State>) {
     if method != "HEAD" {
         out.extend_from_slice(&bytes);
     }
+    if let Some(delay) = *state.delay.lock().unwrap() {
+        thread::sleep(delay);
+    }
     let _ = stream.write_all(&out);
     let _ = stream.flush();
+}
+
+/// Tracks one in-flight request and its high-water mark.
+struct ActiveGuard<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl<'a> ActiveGuard<'a> {
+    fn new(state: &'a State) -> Self {
+        let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        state.max_active.fetch_max(active, Ordering::SeqCst);
+        Self {
+            active: &state.active,
+        }
+    }
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn parse_range(value: &str, len: usize) -> Option<std::result::Result<(usize, usize), ()>> {

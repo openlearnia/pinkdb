@@ -40,9 +40,12 @@
 //! the lake's existing configuration conventions (`AWS_REGION` or
 //! `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL`,
 //! `AWS_S3_FORCE_PATH_STYLE`, `PINKDB_S3_RETRIES`, `PINKDB_S3_ALLOW_HTTP`).
-//! For `https://`, transient failures (`429`, `500`, `502`, `503`, `504`, and
-//! transport errors) are retried with the same exponential backoff + jitter
-//! as the S3 client; a GET is safe to repeat.
+//! `PINKDB_HTTPFS_PARALLELISM` (default 8, 0/1 = serial, clamped to 16) is the
+//! ranged-reader read-ahead limit; both transports size their idle-connection
+//! pool per host from it (see [`parallelism_from_env`]). For `https://`,
+//! transient failures (`429`, `500`, `502`, `503`, `504`, and transport
+//! errors) are retried with the same exponential backoff + jitter as the S3
+//! client; a GET is safe to repeat.
 //!
 //! # Error model
 //!
@@ -113,6 +116,37 @@ pub use s3::S3Config;
 /// Retries after a retryable failure (so up to 4 attempts), shared with
 /// pink-lake's default (`DEFAULT_RETRIES`).
 pub const DEFAULT_RETRIES: u32 = 3;
+
+/// The default in-flight range-request limit for ranged readers (wave 98a).
+/// 0/1 means "today's serial behavior"; anything else is clamped to
+/// [`MAX_PARALLELISM`].
+pub const DEFAULT_PARALLELISM: usize = 8;
+
+/// The largest in-flight limit [`parallelism_from_env`] returns.
+pub const MAX_PARALLELISM: usize = 16;
+
+/// The remote read-ahead parallelism: `PINKDB_HTTPFS_PARALLELISM` (default
+/// [`DEFAULT_PARALLELISM`], clamped to [`MAX_PARALLELISM`]). `0` and `1` both
+/// request the legacy serial path (one lazy 128 KiB range at a time). The
+/// transport also sizes its idle-connection pool from this value, so a scan
+/// never forces a fresh connection/TLS handshake per request.
+pub fn parallelism_from_env() -> usize {
+    let requested = std::env::var("PINKDB_HTTPFS_PARALLELISM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PARALLELISM);
+    if requested <= 1 {
+        1
+    } else {
+        requested.min(MAX_PARALLELISM)
+    }
+}
+
+/// The idle connections a transport pool keeps per host: at least the
+/// in-flight read-ahead limit, and never below ureq's own default (3).
+pub(crate) fn idle_connections_per_host() -> usize {
+    parallelism_from_env().max(3)
+}
 
 /// Whole-request timeout (connect + transfer) for both transports — the
 /// lake's pinned 120 s.

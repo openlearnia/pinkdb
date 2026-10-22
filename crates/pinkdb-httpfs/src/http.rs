@@ -51,6 +51,9 @@ impl HttpClient {
                 // A CDN/redirecting host is normal for https; 10 matches
                 // ureq's default, stated explicitly.
                 .max_redirects(10)
+                // Wave 98a read-ahead: keep at least the in-flight limit of
+                // connections alive per host instead of ureq's default 3.
+                .max_idle_connections_per_host(crate::idle_connections_per_host())
                 .user_agent(concat!("pinkdb-httpfs/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .into(),

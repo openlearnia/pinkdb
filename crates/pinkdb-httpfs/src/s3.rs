@@ -755,6 +755,9 @@ impl S3Client {
                 // A 301 (wrong region/endpoint) must surface as an S3
                 // error, not be followed blindly.
                 .max_redirects(0)
+                // Wave 98a read-ahead: keep at least the in-flight limit of
+                // connections alive per host instead of ureq's default 3.
+                .max_idle_connections_per_host(crate::idle_connections_per_host())
                 .user_agent(user_agent)
                 .build()
                 .into(),

@@ -93,10 +93,15 @@
 //!   transport refuses it unless `PINKDB_HTTPFS_ALLOW_HTTP=1`. Remote paths
 //!   are single objects (globs/directories are refused). Reads go through
 //!   parquet's `ChunkReader` over [`pinkdb_httpfs::Fetcher`]: the footer and
-//!   every row-group/column-chunk read are **byte-range GETs**; a whole-object
-//!   GET happens only when the backend reports no size (HEAD without
-//!   `Content-Length`, 405/501), in which case the object is fetched once and
-//!   reused. Credentials/envs are the lake's (`AWS_*` / `PINKDB_S3_*`).
+//!   every projected column-chunk byte range are **range GETs**; wave 98a
+//!   coalesces each row group's projected chunks into one request per run and
+//!   reads ahead with a bounded pool (`PINKDB_HTTPFS_PARALLELISM`, 0/1 =
+//!   serial 128 KiB blocks). `COUNT(*)` needs no data page at all. A
+//!   whole-object GET happens only when the backend reports no size (HEAD
+//!   without `Content-Length`, 405/501), in which case the object is fetched
+//!   once and reused. Credentials/envs are the lake's (`AWS_*` /
+//!   `PINKDB_S3_*`); the source's `remote_stats()` reports requests, bytes
+//!   and network wait per session.
 //!
 //! # Honest limits
 //!
@@ -112,7 +117,9 @@
 //! - No bloom-filter, page-index or dictionary-based pruning: row-group
 //!   min/max/NULL-count statistics only.
 //! - No `hive_types`/`schema` overrides, no pushdown of `LIKE`/`OR`
-//!   predicates, no parallel column decode.
+//!   predicates, no parallel column decode (row groups decode in parallel on
+//!   the remote read-ahead path, but columns inside one row group are
+//!   decoded one at a time).
 //! - Remote: one object per call, no globs/directories, no HTTP auth beyond
 //!   the transport (no custom CA), and no ranged `HEAD` cache across
 //!   statements (bind and scan each read the footer again, cheaply).
@@ -134,6 +141,7 @@ use pinkdb::attached::PrunePredicate;
 use pinkdb::{DataType, PinkDb, Result, TableFunctionCall, TableScanOutput, TableSource};
 
 pub use file_meta::{ChunkInfo, ColStats, FileMeta, RowGroupMeta};
+pub use remote::RemoteReadStats;
 pub use resolve::{Call, Options, OutKind, Resolved};
 pub use schema_map::FileColumn;
 
@@ -174,6 +182,11 @@ pub struct ParquetSource {
     row_groups: std::sync::atomic::AtomicU64,
     pruned: std::sync::atomic::AtomicU64,
     columns: std::sync::atomic::AtomicU64,
+    /// Remote transport counters (wave 98a): requests, bytes received and
+    /// wall time spent in transport calls, summed over this source's scans.
+    remote_requests: std::sync::atomic::AtomicU64,
+    remote_bytes: std::sync::atomic::AtomicU64,
+    remote_wait_nanos: std::sync::atomic::AtomicU64,
 }
 
 impl ParquetSource {
@@ -183,6 +196,18 @@ impl ParquetSource {
 
     fn parse(&self, call: &TableFunctionCall) -> Result<Option<Call>> {
         resolve::parse_call(call)
+    }
+
+    /// The remote transport counters accumulated since the last reset (wave
+    /// 98a). Local scans contribute nothing. This is per-source state, so it
+    /// is also where `.parquet`-style tooling reads request/byte/wait totals.
+    pub fn remote_stats(&self) -> RemoteReadStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        RemoteReadStats {
+            requests: self.remote_requests.load(Relaxed),
+            bytes: self.remote_bytes.load(Relaxed),
+            wait_nanos: self.remote_wait_nanos.load(Relaxed),
+        }
     }
 
     /// The resolved scan for `call`, from the cache when `bind` just put it
@@ -243,7 +268,14 @@ impl TableSource for ParquetSource {
         let out = match parsed {
             Call::Scan { path, options } => {
                 let resolved = self.resolved(call, &options, &path)?;
-                scan::scan(&resolved, projection, filters)?
+                let (out, transport) = scan::scan(&resolved, projection, filters)?;
+                self.remote_requests
+                    .fetch_add(transport.requests, std::sync::atomic::Ordering::Relaxed);
+                self.remote_bytes
+                    .fetch_add(transport.bytes, std::sync::atomic::Ordering::Relaxed);
+                self.remote_wait_nanos
+                    .fetch_add(transport.wait_nanos, std::sync::atomic::Ordering::Relaxed);
+                out
             }
             Call::Metadata { function, path } => {
                 let chunks = introspect::run(&function, &path)?;
@@ -294,5 +326,8 @@ impl TableSource for ParquetSource {
         self.row_groups.store(0, Relaxed);
         self.pruned.store(0, Relaxed);
         self.columns.store(0, Relaxed);
+        self.remote_requests.store(0, Relaxed);
+        self.remote_bytes.store(0, Relaxed);
+        self.remote_wait_nanos.store(0, Relaxed);
     }
 }

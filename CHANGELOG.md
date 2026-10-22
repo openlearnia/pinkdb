@@ -9,6 +9,16 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-22
+### Wave 98a — fast remote Parquet ✅
+- Reading Parquet from S3/R2/HTTPS is dramatically faster: TPC-H Q6 on a
+  196 MB file went from 6 min 46 s to about 4 s, on par with DuckDB 2.0, and
+  `count(*)` is answered from the file footer (29 s → 0.6 s).
+- pinkdb now fetches only the columns a query needs, in one request per
+  column chunk instead of many small ones, with several requests in flight
+  while earlier data is decoded. `PINKDB_HTTPFS_PARALLELISM` sets how many
+  (default 8; 1 restores the old serial reads).
+- `EXPLAIN` shows how many columns a file scan reads (`4 of 16 columns`).
+
 ### Wave 94 — `database.table.column` references ✅
 - Columns can be qualified with their database: `SELECT db1.t.a FROM db1.t`,
   and `db1.t.*` in a SELECT list. It works in every clause, in `UPDATE … SET`

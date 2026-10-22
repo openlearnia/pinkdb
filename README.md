@@ -2092,6 +2092,22 @@ SELECT * FROM 'data/sales.csv';                  -- local .csv, same source
   `PINKDB_S3_*` environment variables, endpoint addressing, conditional
   writes, retry/backoff and timeouts as before — pink-lake's behavior did not
   change, its tests and the S3 CI job still cover it.
+- **Remote reads (wave 98a)**: a remote Parquet scan computes the projected
+  column chunks' byte ranges from the footer, coalesces adjacent chunks (and
+  gaps up to 1 MiB, capped at a 64 MiB request) into one range GET, and
+  fetches the next row groups with a bounded pool while earlier ones decode.
+  Results are assembled in row-group order, so values and row order are
+  identical to a local read. `PINKDB_HTTPFS_PARALLELISM` sets the in-flight
+  limit (default 8, clamped to 16); `0`/`1` restores the legacy **serial**
+  path (one lazy 128 KiB range at a time). One read-ahead window buffers at
+  most 128 MiB. A scan whose projection needs no file column — `COUNT(*)` —
+  is answered from the footer's row counts with **zero data-page requests**,
+  for local files too. Every transport call a scan makes is counted
+  (requests, bytes, wall time); the parquet source exposes the session
+  totals through `ParquetSource::remote_stats()`. `EXPLAIN` shows the pushed
+  width (`(4 of 16 columns)`). The transport keeps at least the in-flight
+  limit of idle connections per host, so requests reuse one `ureq::Agent`
+  pool instead of setting up TLS per range.
 - **Credentials**: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
   `AWS_SESSION_TOKEN`; `AWS_REGION` or `AWS_DEFAULT_REGION`; a custom
   endpoint via `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` (R2 uses
@@ -2118,7 +2134,7 @@ SELECT * FROM 'data/sales.csv';                  -- local .csv, same source
 | Format | Schemes | Read strategy | Limits |
 |---|---|---|---|
 | CSV (`httpfs`) | `https://`, `s3://` (claim); `http://` explicit-only | whole-object `fetch()`; parser reuses `.import` | single object; default dialect only |
-| Parquet (`parquet/remote`) | `https://`, `s3://`, `http://` (claim; transport gate) | **ranged** footer + row-group/page reads via `ChunkReader`; whole-object only when HEAD reports no size | single object; no remote globs/dirs |
+| Parquet (`parquet/remote`) | `https://`, `s3://`, `http://` (claim; transport gate) | **ranged** footer + projected column-chunk ranges (one request per coalesced run, bounded read-ahead; serial 128 KiB blocks when `PINKDB_HTTPFS_PARALLELISM=0/1`); whole-object only when HEAD reports no size; `COUNT(*)` from footer row counts | single object; no remote globs/dirs |
 | Arrow IPC (`arrow/remote`) | `https://`, `s3://`, `http://` (claim; transport gate) | **whole-object** `fetch()` (IPC has no ranged footer protocol); one fetch per bind→scan | single object; no remote globs/dirs |
 
 A minimal extension registering one `hello_add(BIGINT, BIGINT) -> BIGINT`:
