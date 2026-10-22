@@ -2631,4 +2631,13 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   `Python-urllib` user agent, which Cloudflare answers with 403 (curl, `ureq`
   — the CLI's `INSTALL` client — and custom agents get 200). Fixed in
   d20d7a4 (explicit `User-Agent`; `platform=all` manual dispatch so a failed
-  tag publish can be redone from main).
+  tag publish can be redone from main). The `platform=all` dispatch
+  (run 39728577930) then published and signed the catalog — 16 entries,
+  `cpp_ext`/`math_ext`/`string`/`string_ext` × darwin-arm64/darwin-x64/
+  linux-arm64/linux-x64 — but its verify step got 404 for `/index.json.sig`:
+  the job deployed the Worker only after verifying through it, and the live
+  Worker predated the signature route. 118a58c deploys first; the re-dispatch
+  (run 39729164421) deployed the current Worker. Verified from here: live
+  `index.json` + `index.json.sig` both 200, `verify.sh` signature OK (key
+  `c84e54bfea6b2d09`), and all 16 artifacts' bytes match the signed catalog's
+  SHA-256.
