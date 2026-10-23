@@ -206,10 +206,24 @@ fn print_help() {
         const LAKE: &str = "<dir|s3://bucket/prefix>";
         #[cfg(not(feature = "s3"))]
         const LAKE: &str = "<dir>";
-        println!("  .lake save {LAKE} [force] [author '…'] [message '…']");
+        // The `data` option exists only in a build that accepts a SQL catalog.
+        #[cfg(feature = "catalog-sqlite")]
+        const DATA: &str = " [data <dir|s3://…>]";
+        #[cfg(not(feature = "catalog-sqlite"))]
+        const DATA: &str = "";
+        println!("  .lake save {LAKE}{DATA} [force] [author '…'] [message '…']");
         println!("                                snapshot the store into a lake");
-        println!("  .lake open {LAKE} [v]      load the lake's latest (or version v) into memory");
-        println!("  .lake attach {LAKE} [v] [read-only|write]");
+        println!(
+            "  .lake open {LAKE}{DATA} [v]  load the lake's latest (or \
+             version v) into memory"
+        );
+        println!("  .lake attach {LAKE}{DATA} [v] [read-only|write]");
+        #[cfg(feature = "catalog-sqlite")]
+        {
+            println!("                                {LAKE} may also be a `sqlite:<path>`");
+            println!("                                catalog; `data <location>` is where its");
+            println!("                                data files live (given at create)");
+        }
         println!("        read-only (default): query the lake from its statistics");
         println!("        write: materialize its tables into the session store");
         println!(

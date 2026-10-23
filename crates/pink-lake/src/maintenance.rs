@@ -151,8 +151,8 @@ use crate::incremental::CommitSettings;
 use crate::local::CATALOG_FILE;
 use crate::snapshot::SnapshotInfo;
 use crate::{
-    FORMAT_VERSION, Lake, LakeError, Result, apply_file_deletes, copy_chunks, manifest_for,
-    next_schema_version, only_table, split_key, validate_rel_path,
+    FORMAT_VERSION, LAKE_DATA_FILE, Lake, LakeError, Result, apply_file_deletes, copy_chunks,
+    manifest_for, next_schema_version, only_table, split_key, validate_rel_path,
 };
 
 /// The default object-cleanup retention: `2 days`, exactly DuckLake's
@@ -1161,6 +1161,9 @@ impl Lake {
             bytes += self.storage.stat(&commit_rel)?.map(|i| i.size).unwrap_or(0);
         }
         if !settings.dry_run {
+            // Wave 96a: the metadata deletes are one publish scope (a SQL
+            // catalog removes the delta + snapshot rows in one transaction).
+            let publish = self.storage.begin_publish()?;
             for info in &victims {
                 let snapshot_rel = format!("snapshots/{}.json", info.version);
                 let commit_rel = format!("commits/{}.json", info.version);
@@ -1171,6 +1174,7 @@ impl Lake {
                 self.delete_if_present(&commit_rel)?;
                 self.delete_if_present(&snapshot_rel)?;
             }
+            publish.commit()?;
         }
         Ok(ExpireReport {
             versions: victims,
@@ -1248,6 +1252,14 @@ impl Lake {
                 ),
             });
         }
+        // Wave 96a: a split lake owns its data location through the
+        // `lake-data.json` marker. Verify it before deleting anything, so two
+        // catalogs pointed at one data location can never remove each other's
+        // files. The default object-store layout has no marker and pays no
+        // extra read here.
+        if self.storage.catalog_split() {
+            self.verify_data_owner()?;
+        }
         for path in &paths {
             self.delete_if_present(path)?;
         }
@@ -1257,6 +1269,37 @@ impl Lake {
             dry_run: false,
             deleted: true,
         })
+    }
+
+    /// Verify the split lake's `lake-data.json` ownership marker before any
+    /// destructive maintenance (wave 96a). A missing or mismatched marker is a
+    /// clear refusal: the files belong to another lake (or to no catalog-backed
+    /// lake at all), so deleting them could destroy another lake's data.
+    fn verify_data_owner(&self) -> Result<()> {
+        let path = self.storage.abs(LAKE_DATA_FILE);
+        let context = format!("reading {}", path.display());
+        let Some(bytes) = self.storage.read_optional(LAKE_DATA_FILE, &context)? else {
+            return Err(LakeError::NotRepresentable {
+                message: format!(
+                    "refusing to delete data objects: {} has no {LAKE_DATA_FILE} owner marker \
+                     (only a lake created with a catalog writes one); pass the lake's own data \
+                     location, or create the catalog with Lake::create_with_catalog",
+                    path.display()
+                ),
+            });
+        };
+        let owner = crate::parse_data_owner(&bytes, &path)?;
+        if owner != self.lake_id {
+            return Err(LakeError::Corrupt {
+                path,
+                message: format!(
+                    "the data location belongs to lake {owner}, not to this lake ({}); \
+                     refusing to delete its files",
+                    self.lake_id
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Every `data/` path any retained version references: the catalog plus

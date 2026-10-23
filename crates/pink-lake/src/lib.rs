@@ -457,6 +457,7 @@ use pinkdb::{DataTable, DataType, PinkDb};
 
 mod attach;
 mod catalog;
+mod catalog_store;
 mod cdc;
 mod crypto;
 mod delete_file;
@@ -483,6 +484,7 @@ pub mod replication;
 
 pub use attach::AttachmentReport;
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
+use catalog_store::SplitStorage;
 pub use cdc::{ChangeKind, ChangeRow};
 pub use crypto::EncryptionKey;
 pub use incremental::{
@@ -580,6 +582,12 @@ pub(crate) const LAKE_FILE: &str = "lake.json";
 /// The lake-relative name of the authenticated highest-published-version
 /// marker (M-7). Rewritten after every successful catalog replacement.
 pub(crate) const HIGHEST_FILE: &str = "highest.json";
+
+/// The data-root ownership marker of a split lake (wave 96a): `{"lake_id": …}`.
+/// Written at create and verified only by the destructive maintenance paths,
+/// so two catalogs pointed at one data location can never delete each other's
+/// files. The default object-store layout never writes or reads it.
+pub(crate) const LAKE_DATA_FILE: &str = "lake-data.json";
 
 /// The largest manifest `version` this build reads or writes.
 ///
@@ -954,14 +962,74 @@ impl Lake {
     /// without conditional writes); use `Lake::create_s3` (with the `s3`
     /// feature) for explicit configuration.
     pub fn create_url(location: &str) -> Result<Self> {
-        Self::create_with(storage_for(Location::parse(location)?)?, None)
+        let parsed = Location::parse(location)?;
+        if let Location::Sqlite(_) = parsed {
+            return Err(catalog_needs_data(location, "create"));
+        }
+        Self::create_with(storage_for(parsed)?, None)
     }
 
     /// [`Lake::create_url`] with at-rest encryption (local directory or
     /// `s3://bucket/prefix`): a keyed create in a build without the
     /// `encryption` feature fails before touching any storage.
     pub fn create_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
-        Self::create_with(storage_for(Location::parse(location)?)?, Some(key))
+        let parsed = Location::parse(location)?;
+        if let Location::Sqlite(_) = parsed {
+            return Err(catalog_needs_data(location, "create"));
+        }
+        Self::create_with(storage_for(parsed)?, Some(key))
+    }
+
+    /// Create a lake whose metadata lives in `catalog_url` (`sqlite:<path>`)
+    /// and whose data files live at `data_location` (a local directory or an
+    /// `s3://bucket/prefix` URL). The data location is recorded in
+    /// `pink_lake_meta`, so [`Lake::open_url`] needs only the catalog URL
+    /// afterwards.
+    ///
+    /// The data location must be empty: an existing full lake
+    /// (`catalog.json`/`lake.json`) or any `data/` object is refused, and a
+    /// `lake-data.json` owner marker is written at the data root for
+    /// maintenance (wave 96a).
+    pub fn create_with_catalog(catalog_url: &str, data_location: &str) -> Result<Self> {
+        Self::create_with_catalog_keyed(catalog_url, data_location, None)
+    }
+
+    /// [`Lake::create_with_catalog`] with at-rest encryption (the same key
+    /// semantics as [`Lake::create_with_key`]).
+    pub fn create_with_catalog_with_key(
+        catalog_url: &str,
+        data_location: &str,
+        key: EncryptionKey,
+    ) -> Result<Self> {
+        Self::create_with_catalog_keyed(catalog_url, data_location, Some(key))
+    }
+
+    fn create_with_catalog_keyed(
+        catalog_url: &str,
+        data_location: &str,
+        key: Option<EncryptionKey>,
+    ) -> Result<Self> {
+        let catalog_location = Location::parse(catalog_url)?;
+        let data = data_storage(data_location)?;
+        // Refuse a data location that already belongs to a lake *before* the
+        // catalog file is created, so a rejected create leaves nothing behind.
+        ensure_data_location_free(&*data, data_location)?;
+        let catalog = catalog_store::open_catalog(catalog_url, &catalog_location, true)?;
+        let storage: Arc<dyn Storage> =
+            Arc::new(SplitStorage::new(Arc::clone(&catalog), Arc::clone(&data)));
+        let lake = Self::create_with(storage, key)?;
+        // The split's two facts live in the catalog, not in an object. Write
+        // them after the create transaction committed: the catalog is the
+        // authoritative metadata store, and a crash between the two leaves a
+        // lake whose data location must be passed explicitly on open (never a
+        // lake pointing at the wrong data).
+        catalog.set_data_location(data_location)?;
+        catalog.set_lake_id(&lake.lake_id)?;
+        // The ownership marker is a *data* object, written through the lake's
+        // storage so a keyed lake seals it like every other data artifact.
+        lake.storage
+            .put(LAKE_DATA_FILE, &data_ownership_json(&lake.lake_id)?)?;
+        Ok(lake)
     }
 
     fn create_with(inner: Arc<dyn Storage>, key: Option<EncryptionKey>) -> Result<Self> {
@@ -971,6 +1039,12 @@ impl Lake {
             return Err(LakeError::AlreadyALake { path: root });
         }
         storage.create_dir("")?;
+        // Wave 96a: one publish scope around the whole identity + manifest
+        // sequence. On a SQL catalog the identity, the version-1 snapshot, the
+        // catalog and highest.json land in one transaction (or not at all);
+        // on the object-store layout every primitive is already atomic, so
+        // the default scope is a no-op and the request sequence is unchanged.
+        let publish = storage.begin_publish()?;
         // M-7: one random 128-bit identity per lake, fixed for its lifetime.
         // An interrupted create may already have written it; adopt that id
         // instead of minting a second one.
@@ -1035,6 +1109,7 @@ impl Lake {
         // a marker above the authoritative catalog (which would look like a
         // rollback).
         storage.put_highest(HIGHEST_FILE, &highest_json(&lake_id, 1)?, &lake_id, 1)?;
+        publish.commit()?;
         Ok(Self {
             root,
             storage,
@@ -1068,12 +1143,64 @@ impl Lake {
     /// `Lake::open_s3` (with the `s3` feature) for explicit S3
     /// configuration.
     pub fn open_url(location: &str) -> Result<Self> {
-        Self::open_with(storage_for(Location::parse(location)?)?, None)
+        match Location::parse(location)? {
+            Location::Sqlite(_) => Self::open_with_catalog_keyed(location, None, None),
+            parsed => Self::open_with(storage_for(parsed)?, None),
+        }
     }
 
     /// [`Lake::open_url`] with at-rest encryption.
     pub fn open_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
-        Self::open_with(storage_for(Location::parse(location)?)?, Some(key))
+        match Location::parse(location)? {
+            Location::Sqlite(_) => Self::open_with_catalog_keyed(location, None, Some(key)),
+            parsed => Self::open_with(storage_for(parsed)?, Some(key)),
+        }
+    }
+
+    /// Open the lake whose metadata lives in `catalog_url` (`sqlite:<path>`).
+    /// The data location comes from `pink_lake_meta` unless
+    /// `data_location` is given, which overrides it for this session (a moved
+    /// bucket or directory); opening never rewrites the recorded location.
+    pub fn open_with_catalog(catalog_url: &str, data_location: Option<&str>) -> Result<Self> {
+        Self::open_with_catalog_keyed(catalog_url, data_location, None)
+    }
+
+    /// [`Lake::open_with_catalog`] with at-rest encryption.
+    pub fn open_with_catalog_with_key(
+        catalog_url: &str,
+        data_location: Option<&str>,
+        key: EncryptionKey,
+    ) -> Result<Self> {
+        Self::open_with_catalog_keyed(catalog_url, data_location, Some(key))
+    }
+
+    fn open_with_catalog_keyed(
+        catalog_url: &str,
+        data_location: Option<&str>,
+        key: Option<EncryptionKey>,
+    ) -> Result<Self> {
+        let catalog_location = Location::parse(catalog_url)?;
+        let catalog = catalog_store::open_catalog(catalog_url, &catalog_location, false)?;
+        let recorded = catalog.data_location()?;
+        let Some(data_location) = data_location.map(str::to_string).or(recorded) else {
+            // No record yet: distinguish an empty catalog (create it with a
+            // data location) from one whose metadata lost its data location.
+            if catalog.exists(CATALOG_FILE)? {
+                return Err(LakeError::Corrupt {
+                    path: PathBuf::from(catalog_url),
+                    message: "the catalog has no pink_lake_meta.data_location; pass an explicit \
+                              data location (Lake::open_with_catalog / `.lake open <catalog> data \
+                              <location>`)"
+                        .to_string(),
+                });
+            }
+            return Err(LakeError::NotALake {
+                path: PathBuf::from(catalog_url),
+            });
+        };
+        let data = data_storage(&data_location)?;
+        let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(Arc::clone(&catalog), data));
+        Self::open_with(storage, key)
     }
 
     fn open_with(inner: Arc<dyn Storage>, key: Option<EncryptionKey>) -> Result<Self> {
@@ -1313,13 +1440,23 @@ impl Lake {
     /// [`Lake::open_url`] when the location already holds a lake, else
     /// [`Lake::create_url`].
     pub fn open_or_create_url(location: &str) -> Result<Self> {
-        match Self::open_url(location) {
-            Ok(lake) => Ok(lake),
-            Err(LakeError::NotALake { .. }) => match Self::create_url(location) {
+        let parsed = Location::parse(location)?;
+        if let Location::Sqlite(_) = parsed {
+            return match Self::open_url(location) {
                 Ok(lake) => Ok(lake),
-                Err(LakeError::AlreadyALake { .. }) => Self::open_url(location),
+                Err(LakeError::NotALake { .. }) => Err(catalog_needs_data(location, "save")),
                 Err(e) => Err(e),
-            },
+            };
+        }
+        match Self::open_with(storage_for(parsed.clone())?, None) {
+            Ok(lake) => Ok(lake),
+            Err(LakeError::NotALake { .. }) => {
+                match Self::create_with(storage_for(parsed)?, None) {
+                    Ok(lake) => Ok(lake),
+                    Err(LakeError::AlreadyALake { .. }) => Self::open_url(location),
+                    Err(e) => Err(e),
+                }
+            }
             Err(e) => Err(e),
         }
     }
@@ -1327,10 +1464,18 @@ impl Lake {
     /// [`Lake::open_or_create_url`] with at-rest encryption (see
     /// [`Lake::open_or_create_with_key`] for the plaintext-lake refusal).
     pub fn open_or_create_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
-        match Self::open_url_with_key(location, key.clone()) {
+        let parsed = Location::parse(location)?;
+        if let Location::Sqlite(_) = parsed {
+            return match Self::open_url_with_key(location, key) {
+                Ok(lake) => Ok(lake),
+                Err(LakeError::NotALake { .. }) => Err(catalog_needs_data(location, "save")),
+                Err(e) => Err(e),
+            };
+        }
+        match Self::open_with(storage_for(parsed.clone())?, Some(key.clone())) {
             Ok(lake) => Ok(lake),
             Err(LakeError::NotALake { .. }) => {
-                match Self::create_url_with_key(location, key.clone()) {
+                match Self::create_with(storage_for(parsed)?, Some(key.clone())) {
                     Ok(lake) => Ok(lake),
                     Err(LakeError::AlreadyALake { .. }) => Self::open_url_with_key(location, key),
                     Err(e) => Err(e),
@@ -1905,7 +2050,10 @@ impl Lake {
         };
         let commit_bytes = commit_manifest_json(&commit_manifest)?;
         // Same publication order as a commit: the delta manifest, the
-        // snapshot, then the catalog.
+        // snapshot, then the catalog. Wave 96a: the whole metadata sequence
+        // is one publish scope (data files were written above, before it
+        // opened), so a SQL catalog publishes it atomically.
+        let publish = self.storage.begin_publish()?;
         let commit_rel = format!("commits/{version}.json");
         if !self.storage.put_new(&commit_rel, &commit_bytes)? {
             let snapshot_exists = self.storage.exists(&snapshot_rel)?;
@@ -1926,6 +2074,7 @@ impl Lake {
         }
         bytes_written += bytes.len() as u64;
         self.replace_catalog(version, &plain, &bytes, "save")?;
+        publish.commit()?;
         bytes_written += bytes.len() as u64;
         Ok(SaveReport {
             version,
@@ -2705,7 +2854,69 @@ fn storage_for(location: Location) -> Result<Arc<dyn Storage>> {
     match location {
         Location::Local(path) => Ok(Arc::new(LocalStorage::new(&path))),
         Location::S3 { bucket, prefix } => s3_storage(&bucket, &prefix),
+        Location::Sqlite(path) => Err(LakeError::BadLocation {
+            location: format!("sqlite:{}", path.display()),
+            message: "a catalog location is not a data location; use Lake::create_with_catalog \
+                      / Lake::open_with_catalog"
+                .to_string(),
+        }),
     }
+}
+
+/// The data half of a split lake: a local directory or an `s3://` URL, never
+/// another catalog.
+fn data_storage(location: &str) -> Result<Arc<dyn Storage>> {
+    let parsed = Location::parse(location)?;
+    if let Location::Sqlite(_) = parsed {
+        return Err(LakeError::BadLocation {
+            location: location.to_string(),
+            message: "the data location must be a local directory or an `s3://` URL, not a \
+                      catalog location"
+                .to_string(),
+        });
+    }
+    storage_for(parsed)
+}
+
+/// The clear "a SQL catalog needs a data location" error used by the existing
+/// URL entry points (`create_url`, `open_or_create_url` on a missing catalog).
+fn catalog_needs_data(location: &str, verb: &str) -> LakeError {
+    LakeError::BadLocation {
+        location: location.to_string(),
+        message: format!(
+            "a SQL catalog needs a data location to {verb}; use Lake::create_with_catalog \
+             (CLI: `.lake save {location} data <dir|s3://…>`) or pass one on open \
+             (`.lake open {location} data <location>`)"
+        ),
+    }
+}
+
+/// Refuse a data location that already belongs to a lake: an existing
+/// `catalog.json`/`lake.json` (the default layout), another catalog's
+/// `lake-data.json` owner marker (a split lake that has no data files yet),
+/// or any `data/` object (wave 96a ownership).
+fn ensure_data_location_free(data: &dyn Storage, data_location: &str) -> Result<()> {
+    if data.exists(CATALOG_FILE)? || data.exists(LAKE_FILE)? {
+        return Err(LakeError::AlreadyALake { path: data.abs("") });
+    }
+    if !data.list_recursive("data")?.is_empty() {
+        return Err(LakeError::BadLocation {
+            location: data_location.to_string(),
+            message: "the data location already holds lake data files; a new catalog needs an \
+                      empty data location (or a new prefix)"
+                .to_string(),
+        });
+    }
+    if data.exists(LAKE_DATA_FILE)? {
+        return Err(LakeError::BadLocation {
+            location: data_location.to_string(),
+            message: format!(
+                "the data location is owned by another catalog ({LAKE_DATA_FILE} is present); \
+                 a new catalog needs an empty data location (or a new prefix)"
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(feature = "s3")]
@@ -2772,6 +2983,55 @@ pub fn validate_store(db: &PinkDb) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A test-only hook for the crash-injection test: arm one failure right after
+/// a commit's snapshot insert (inside the publish scope), so the test can
+/// prove the transaction rolls back the delta, snapshot, catalog and highest
+/// marker together. The arm names the lake id so parallel tests' publications
+/// are untouched. Compiled only with `catalog-sqlite`.
+#[doc(hidden)]
+#[cfg(feature = "catalog-sqlite")]
+pub fn fail_next_publish_after_snapshot(lake_id: &str) {
+    *FAIL_PUBLISH_AFTER_SNAPSHOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lake_id.to_string());
+}
+
+#[cfg(feature = "catalog-sqlite")]
+static FAIL_PUBLISH_AFTER_SNAPSHOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The armed crash-injection point (a no-op without `catalog-sqlite`).
+pub(crate) fn maybe_fail_publish_after_snapshot(lake_id: &str) -> Result<()> {
+    #[cfg(feature = "catalog-sqlite")]
+    {
+        let mut armed = FAIL_PUBLISH_AFTER_SNAPSHOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if armed.as_deref() == Some(lake_id) {
+            *armed = None;
+            return Err(LakeError::Internal {
+                message: format!(
+                    "injected catalog publish failure after the snapshot insert (lake {lake_id})"
+                ),
+            });
+        }
+    }
+    #[cfg(not(feature = "catalog-sqlite"))]
+    let _ = lake_id;
+    Ok(())
+}
+
+/// The stored bytes of one catalog object, bypassing any decorator (wave 96a
+/// tests): an encrypted lake's row holds the sealed blob, a plaintext lake's
+/// the JSON. Not part of the supported API.
+#[doc(hidden)]
+#[cfg(feature = "catalog-sqlite")]
+pub fn catalog_stored_bytes(catalog_url: &str, rel: &str) -> Result<Option<Vec<u8>>> {
+    let location = Location::parse(catalog_url)?;
+    let store = catalog_store::open_catalog(catalog_url, &location, false)?;
+    let context = format!("reading {catalog_url}#{rel}");
+    store.read_optional(rel, &context)
 }
 
 /// The manifest for the latest version (`None`) or one snapshot, with the path
@@ -2912,6 +3172,45 @@ fn identity_json(lake_id: &str) -> Result<Vec<u8>> {
     })?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+/// The data-root ownership marker of a split lake (wave 96a):
+/// `{"lake_id": "<32 hex>"}`. It is a data object (routed to the data
+/// location, sealed for a keyed lake), written at create and verified only by
+/// the destructive maintenance paths.
+fn data_ownership_json(lake_id: &str) -> Result<Vec<u8>> {
+    #[derive(serde::Serialize)]
+    struct DataOwnership<'a> {
+        lake_id: &'a str,
+    }
+    let mut bytes =
+        serde_json::to_vec_pretty(&DataOwnership { lake_id }).map_err(|e| LakeError::Internal {
+            message: format!("serializing the data-location owner marker: {e}"),
+        })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Parse a `lake-data.json` owner marker. The path is for error attribution.
+pub(crate) fn parse_data_owner(bytes: &[u8], path: &Path) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct DataOwnership {
+        lake_id: String,
+    }
+    let owner: DataOwnership = serde_json::from_slice(bytes).map_err(|e| LakeError::Corrupt {
+        path: path.to_path_buf(),
+        message: format!("{LAKE_DATA_FILE} does not parse: {e}"),
+    })?;
+    if !is_lake_id(&owner.lake_id) {
+        return Err(LakeError::Corrupt {
+            path: path.to_path_buf(),
+            message: format!(
+                "{LAKE_DATA_FILE} carries an invalid lake_id (expected 32 lowercase hex \
+                 characters)"
+            ),
+        });
+    }
+    Ok(owner.lake_id)
 }
 
 fn highest_json(lake_id: &str, version: u64) -> Result<Vec<u8>> {

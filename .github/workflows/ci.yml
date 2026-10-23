@@ -86,6 +86,8 @@ jobs:
               cargo test -p pink-lake --features s3,vortexlake
               cargo test -p pink-lake --features s3,encryption
               cargo test -p pink-lake --features s3,vortexlake,encryption
+              cargo test -p pink-lake --features catalog-sqlite
+              cargo test -p pink-lake --features catalog-sqlite,s3,encryption
           - name: cli-lake
             run: |
               cargo test -p pinkdb-cli --features vortexlake,s3
@@ -93,6 +95,9 @@ jobs:
               cargo test -p pinkdb-cli --features pinklake
               cargo test -p pinkdb-cli --features pinklake,s3
               cargo test -p pinkdb-cli --features s3
+              cargo test -p pinkdb-cli --features pinklake,s3,catalog-sqlite
+              # The default build must never link SQLite (wave 96a).
+              ! cargo tree -p pinkdb-cli -e normal | grep -q rusqlite
           - name: cli-misc
             run: |
               cargo test -p pinkdb-cli --features encryption
@@ -159,6 +164,8 @@ jobs:
           cargo clippy --all-targets -p pink-lake --features s3,vortexlake -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3,encryption -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3,vortexlake,encryption -- -D warnings
+          cargo clippy --all-targets -p pink-lake --features catalog-sqlite,s3,encryption -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,catalog-sqlite -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features tls -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features vortexlake,s3,repo,client,tls,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features client,tls -- -D warnings

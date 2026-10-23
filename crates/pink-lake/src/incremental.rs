@@ -2840,6 +2840,11 @@ impl Lake {
         let snapshot_bytes = self
             .storage
             .seal_manifest(snapshot_plain, &self.lake_id, version)?;
+        // Wave 96a: the delta manifest, the snapshot, the catalog CAS and
+        // highest.json are one publish scope. On a SQL catalog the loser of a
+        // concurrent publication rolls back cleanly instead of leaving a stray
+        // delta, and a failed replace leaves no snapshot behind.
+        let publish = self.storage.begin_publish()?;
         if !self.storage.put_new(&commit_rel, commit_bytes)? {
             // Version `version` already published (another writer won the
             // race), or a stray delta manifest from a crashed attempt that
@@ -2858,7 +2863,9 @@ impl Lake {
                 message: format!("another writer published version {version}; rebasing"),
             });
         }
-        self.replace_catalog(version, snapshot_plain, &snapshot_bytes, "commit")
+        crate::maybe_fail_publish_after_snapshot(&self.lake_id)?;
+        self.replace_catalog(version, snapshot_plain, &snapshot_bytes, "commit")?;
+        publish.commit()
     }
 
     /// Read `catalog.json` for a commit attempt: whatever version it names

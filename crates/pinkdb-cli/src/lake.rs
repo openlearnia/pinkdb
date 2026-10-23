@@ -10,7 +10,20 @@
 //! URLs when the `s3` feature is built (AWS S3, Cloudflare R2; credentials
 //! and endpoint come from the usual `AWS_*` environment; the safety opt-ins
 //! `PINKDB_S3_ALLOW_HTTP` and `PINKDB_S3_ALLOW_DEGRADED` work exactly as the
-//! library documents). `.lake open` replaces the in-memory store:
+//! library documents).
+//!
+//! # SQL catalogs (wave 96a)
+//!
+//! With the `catalog-sqlite` feature a lake's metadata may live in a SQLite
+//! file instead of the data location: `<catalog>` is then `sqlite:<path>` and
+//! `.lake save <catalog> data <dir|s3://…>` gives the data location once, at
+//! create (it is recorded in the catalog). Every later command needs only the
+//! catalog URL; an explicit `data <location>` on `.lake open`/`.lake attach`
+//! overrides the recorded one for that session (a moved directory or bucket).
+//! Without the feature a `sqlite:` URL is the library's clear rebuild hint.
+//! The object-store layout is unchanged when no SQL catalog is used.
+//!
+//! `.lake open` replaces the in-memory store:
 //!
 //! - the session database is reset to `main` (the lake has no session state;
 //!   the output says so when it changes);
@@ -111,9 +124,21 @@ fn lake_key() -> Option<pink_lake::EncryptionKey> {
 /// constructor when `PINKDB_KEY` is set (so the key can never be silently
 /// ignored), the plaintext one otherwise.
 fn open_lake(dir: &str) -> pink_lake::Result<Lake> {
-    match lake_key() {
-        Some(key) => Lake::open_url_with_key(dir, key),
-        None => Lake::open_url(dir),
+    open_lake_with_data(dir, None)
+}
+
+/// [`open_lake`] with an optional explicit data location (wave 96a).
+///
+/// A SQL catalog (`sqlite:<path>`) records its data location, so `data`
+/// overrides it for this session without rewriting the catalog; without
+/// `data` the plain open reads the recorded location. A `data` on a plain
+/// location is refused by the library (it has no separate data root).
+fn open_lake_with_data(catalog: &str, data: Option<&str>) -> pink_lake::Result<Lake> {
+    match (lake_key(), data) {
+        (Some(key), Some(data)) => Lake::open_with_catalog_with_key(catalog, Some(data), key),
+        (None, Some(data)) => Lake::open_with_catalog(catalog, Some(data)),
+        (Some(key), None) => Lake::open_url_with_key(catalog, key),
+        (None, None) => Lake::open_url(catalog),
     }
 }
 
@@ -127,11 +152,40 @@ fn open_or_create_lake(dir: &str) -> pink_lake::Result<Lake> {
     }
 }
 
-/// The one-line pointer to object-storage locations appended to usage text:
-/// with the `s3` feature `s3://` URLs are accepted, without it they are not.
-#[cfg(feature = "s3")]
+/// [`open_or_create_lake`] with a data location for a SQL catalog.
+///
+/// A split lake is always created through `create_with_catalog` (there is no
+/// `open_or_create` variant in the library because the first create needs the
+/// data location, not every open). The open attempt distinguishes a fresh
+/// catalog (`NotALake`) from every other failure, so a wrong key or a corrupt
+/// catalog is never silently masked by a create. Without `data` this is the
+/// ordinary object-store path (a `sqlite:` URL then gets the library's
+/// "needs a data location" hint).
+fn open_or_create_lake_with_data(catalog: &str, data: Option<&str>) -> pink_lake::Result<Lake> {
+    let Some(data) = data else {
+        return open_or_create_lake(catalog);
+    };
+    match open_lake_with_data(catalog, Some(data)) {
+        Ok(lake) => Ok(lake),
+        Err(pink_lake::LakeError::NotALake { .. }) => match lake_key() {
+            Some(key) => Lake::create_with_catalog_with_key(catalog, data, key),
+            None => Lake::create_with_catalog(catalog, data),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// The one-line pointer to object-storage and SQL-catalog locations appended
+/// to usage text: each accepted location shape is named only when the build
+/// has its feature, so the hint never offers something the binary refuses.
+#[cfg(all(feature = "s3", feature = "catalog-sqlite"))]
+const HINT: &str = "   (locations may be s3://bucket/prefix, or sqlite:<path> data <dir|s3://…>)";
+#[cfg(all(not(feature = "s3"), feature = "catalog-sqlite"))]
+const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; a \
+                    sqlite:<path> catalog needs `data <dir>`)";
+#[cfg(all(feature = "s3", not(feature = "catalog-sqlite")))]
 const HINT: &str = "   (locations may be s3://bucket/prefix)";
-#[cfg(not(feature = "s3"))]
+#[cfg(all(not(feature = "s3"), not(feature = "catalog-sqlite")))]
 const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature)";
 
 /// Per-lake base version of this REPL session (one session per process):
@@ -326,9 +380,28 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
     }
 }
 
+/// The `data <location>` option in usage text: offered only by a build that
+/// accepts a SQL catalog (the same rule as [`HINT`]).
+#[cfg(feature = "catalog-sqlite")]
+macro_rules! data_opt {
+    () => {
+        " [data <dir|s3://…>]"
+    };
+}
+#[cfg(not(feature = "catalog-sqlite"))]
+macro_rules! data_opt {
+    () => {
+        ""
+    };
+}
+
 /// The `.lake save` usage line (kept in one place: the argument parser and
 /// both of its error paths print it).
-const SAVE_USAGE: &str = "Usage: .lake save <dir> [force] [author '<name>'] [message '<text>']";
+const SAVE_USAGE: &str = concat!(
+    "Usage: .lake save <location>",
+    data_opt!(),
+    " [force] [author '<name>'] [message '<text>']"
+);
 
 /// One option *value*: `"…"` / `'…'` (spaces included) or a bare word, plus
 /// the remaining text. Quotes are stripped.
@@ -355,8 +428,9 @@ fn take_value(input: &str) -> Option<(String, &str)> {
 }
 
 /// `.lake save <location>`: snapshot every database/table of the current
-/// store (a directory or an `s3://bucket/prefix` URL with the `s3` feature).
-/// `author '<name>'` / `message '<text>'` record the version's commit
+/// store (a directory or an `s3://bucket/prefix` URL with the `s3` feature;
+/// a `sqlite:<path>` catalog with `data <location>` when `catalog-sqlite` is
+/// built). `author '<name>'` / `message '<text>'` record the version's commit
 /// metadata, like DuckLake's `ducklake_set_commit_message`.
 fn cmd_save(db: &PinkDb, arg: &str) {
     let Some((dir, mut rest)) = take_token(arg) else {
@@ -366,6 +440,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
     let mut force = false;
     let mut author: Option<String> = None;
     let mut message: Option<String> = None;
+    let mut data: Option<String> = None;
     loop {
         let tail = rest.trim_start();
         if tail.is_empty() {
@@ -377,6 +452,14 @@ fn cmd_save(db: &PinkDb, arg: &str) {
         match token.to_ascii_lowercase().as_str() {
             "force" => {
                 force = true;
+                rest = after;
+            }
+            "data" => {
+                let Some((value, after)) = take_value(after) else {
+                    println!("{SAVE_USAGE}{HINT}");
+                    return;
+                };
+                data = Some(unquote(&value));
                 rest = after;
             }
             "author" | "message" => {
@@ -411,7 +494,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
         cli_error!("{e}");
         return;
     }
-    let mut lake = match open_or_create_lake(&dir) {
+    let mut lake = match open_or_create_lake_with_data(&dir, data.as_deref()) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -443,8 +526,12 @@ fn cmd_save(db: &PinkDb, arg: &str) {
             set_baseline(&lake, report.version);
             // A writable attachment of this lake just had its whole change
             // published by the save: re-pin it to the new version with the
-            // store's current content (nothing pending any more).
-            let key = lake.path().display().to_string();
+            // store's current content (nothing pending any more). The map is
+            // keyed by the location string the attach used (the catalog URL
+            // for a split lake, the resolved path otherwise), which for a
+            // plain lake is exactly `lake.path()`; `dir` covers the split
+            // case where `lake.path()` is the data location.
+            let key = dir.clone();
             let mut writables = writables();
             if let Some(wa) = writables.get_mut(&key) {
                 match wa.repin_at(report.version, db) {
@@ -511,25 +598,45 @@ fn warn_unavailable_tables(lake: &Lake, version: Option<u64>, outcome: &str) {
     }
 }
 
-/// `.lake open <location> [version]`: replace the in-memory store with the lake's
-/// latest (or the given) version.
+/// `.lake open <location> [data <dir|s3://…>] [version]`: replace the
+/// in-memory store with the lake's latest (or the given) version.
 fn cmd_open(db: &mut PinkDb, arg: &str) {
-    let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake open <dir> [version]{HINT}");
+    const USAGE: &str = concat!("Usage: .lake open <location>", data_opt!(), " [version]");
+    let Some((dir, mut rest)) = take_token(arg) else {
+        println!("{USAGE}{HINT}");
         return;
     };
     let dir = unquote(&dir);
-    let version = if rest.trim().is_empty() {
-        None
-    } else {
-        match rest.trim().parse::<u64>() {
-            Ok(v) => Some(v),
-            Err(_) => {
-                println!("Usage: .lake open <dir> [version]{HINT}");
+    let mut data: Option<String> = None;
+    let mut version: Option<u64> = None;
+    loop {
+        let tail = rest.trim_start();
+        if tail.is_empty() {
+            break;
+        }
+        let Some((token, after)) = take_token(tail) else {
+            break;
+        };
+        if token.eq_ignore_ascii_case("data") {
+            let Some((value, after)) = take_value(after) else {
+                println!("{USAGE}{HINT}");
                 return;
+            };
+            data = Some(unquote(&value));
+            rest = after;
+        } else {
+            match token.parse::<u64>() {
+                Ok(v) if version.is_none() => {
+                    version = Some(v);
+                    rest = after;
+                }
+                _ => {
+                    println!("{USAGE}{HINT}");
+                    return;
+                }
             }
         }
-    };
+    }
     // `.lake open` replaces the whole store: refuse when that would silently
     // discard an open transaction or detach a durable database (later
     // statements would no longer be logged to its WAL).
@@ -566,7 +673,7 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
             }
         }
     }
-    let lake = match open_lake(&dir) {
+    let lake = match open_lake_with_data(&dir, data.as_deref()) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -625,7 +732,8 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
     }
 }
 
-/// `.lake attach <location> [version] [read-only|write]`: attach the lake.
+/// `.lake attach <location> [data <dir|s3://…>] [version] [read-only|write]`:
+/// attach the lake.
 ///
 /// The default (`read-only`) attach reads the published statistics only: a
 /// Vortex data file contributes its footer, metadata segment and stored
@@ -640,44 +748,64 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
 /// matching schema is adopted as the writable copy (the recovery path); a
 /// schema mismatch is refused.
 fn cmd_attach(db: &mut PinkDb, arg: &str) {
-    let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake attach <dir> [version] [read-only|write]{HINT}");
+    const USAGE: &str = concat!(
+        "Usage: .lake attach <location>",
+        data_opt!(),
+        " [version] [read-only|write]"
+    );
+    let Some((dir, mut rest)) = take_token(arg) else {
+        println!("{USAGE}{HINT}");
         return;
     };
     let dir = unquote(&dir);
-    let mut tokens = rest.split_whitespace();
-    let (version, mut mode) = match tokens.next() {
-        None => (None, None),
-        Some("read-only") | Some("read") | Some("ro") => (None, Some("read-only")),
-        Some("write") | Some("read-write") | Some("read_write") | Some("rw") => {
-            (None, Some("write"))
+    let mut version: Option<u64> = None;
+    let mut mode: Option<&str> = None;
+    let mut data: Option<String> = None;
+    loop {
+        let tail = rest.trim_start();
+        if tail.is_empty() {
+            break;
         }
-        Some(v) => match v.parse::<u64>() {
-            Ok(v) => (Some(v), None),
-            Err(_) => {
-                println!("Usage: .lake attach <dir> [version] [read-only|write]{HINT}");
-                return;
-            }
-        },
-    };
-    if mode.is_none() {
-        mode = match tokens.next() {
-            None => Some("read-only"),
-            Some("read-only") | Some("read") | Some("ro") => Some("read-only"),
-            Some("write") | Some("read-write") | Some("read_write") | Some("rw") => Some("write"),
-            Some(_) => None,
+        let Some((token, after)) = take_token(tail) else {
+            break;
         };
-    }
-    let (version, write) = match mode {
-        Some("read-only") => (version, false),
-        Some("write") => (version, true),
-        _ => {
-            println!("Usage: .lake attach <dir> [version] [read-only|write]{HINT}");
-            return;
+        let token_lower = token.to_ascii_lowercase();
+        match token_lower.as_str() {
+            "data" => {
+                let Some((value, after)) = take_value(after) else {
+                    println!("{USAGE}{HINT}");
+                    return;
+                };
+                data = Some(unquote(&value));
+                rest = after;
+            }
+            "read-only" | "read" | "ro" => {
+                mode = Some("read-only");
+                rest = after;
+            }
+            "write" | "read-write" | "read_write" | "rw" => {
+                mode = Some("write");
+                rest = after;
+            }
+            _ => match token.parse::<u64>() {
+                Ok(v) if version.is_none() => {
+                    version = Some(v);
+                    rest = after;
+                }
+                _ => {
+                    println!("{USAGE}{HINT}");
+                    return;
+                }
+            },
         }
+    }
+    let write = match mode.unwrap_or("read-only") {
+        "read-only" => false,
+        "write" => true,
+        _ => unreachable!("mode is parsed from the two literals above"),
     };
     if write {
-        cmd_attach_write(db, &dir, version);
+        cmd_attach_write(db, &dir, data.as_deref(), version);
         return;
     }
     // Attaching changes session state that a ROLLBACK cannot undo (like
@@ -686,7 +814,7 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
         cli_error!(".lake attach is not allowed inside a transaction; COMMIT or ROLLBACK first");
         return;
     }
-    let lake = match open_lake(&dir) {
+    let lake = match open_lake_with_data(&dir, data.as_deref()) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -769,17 +897,24 @@ fn attach_inlining_limit() -> Option<u64> {
     }
 }
 
-fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
+fn cmd_attach_write(db: &mut PinkDb, dir: &str, data: Option<&str>, version: Option<u64>) {
     if db.in_transaction() {
         cli_error!(".lake attach is not allowed inside a transaction; COMMIT or ROLLBACK first");
         return;
     }
     let t0 = Instant::now();
-    let wa = match lake_key() {
-        Some(key) => WritableAttachment::open_with_key(dir, version, key),
-        None => WritableAttachment::open(dir, version),
+    // The writable attachment opens through the same catalog-aware helper as
+    // every other command, then materializes; this is the plaintext/keyed
+    // open plus `WritableAttachment::attach`, so a `sqlite:` catalog with an
+    // explicit or recorded data location works exactly like a directory.
+    let lake = match open_lake_with_data(dir, data) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
     };
-    let mut wa = match wa {
+    let mut wa = match WritableAttachment::attach(lake, version) {
         Ok(wa) => wa,
         Err(e) => {
             cli_error!("{e}");
@@ -794,7 +929,11 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
     if let Some(limit) = attach_inlining_limit() {
         wa.set_data_inlining_row_limit(limit);
     }
-    let key = wa.location().display().to_string();
+    // Key the attachment by the location string the user gave (the catalog
+    // URL for a split lake): `.lake commit`/`.lake detach` take the same
+    // argument, while `wa.location()` is the resolved data root for a split
+    // lake and would never match them.
+    let key = dir.to_string();
     if writables().contains_key(&key) {
         cli_error!(
             "{dir} is already attached writable in this session; .lake commit it or \
@@ -974,7 +1113,13 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
             );
         }
         Ok(report) => {
+            // The baseline map is keyed by the resolved lake path elsewhere
+            // (`.lake save`/`.lake open`), while the writable map is keyed by
+            // the user's location string. Record both: for a plain lake they
+            // are the same, and for a split lake this keeps the one-live-
+            // writer check in `.lake save` meaningful.
             set_baseline_version_only(&dir, report.version);
+            set_baseline_version_only(&wa.location().display().to_string(), report.version);
             println!(
                 "Committed lake version {} onto {dir} in {:.3}s ({} file{}: {} data, {} \
                  delete{};{} +{} row{}, -{} row{}; {} bytes; {} retr{})",
@@ -1550,6 +1695,16 @@ fn cmd_detach(db: &mut PinkDb, arg: &str) {
     if db.detach_lake(&dir) {
         println!("Detached {dir}");
         return;
+    }
+    // A split lake is attached under its resolved data path (`Lake::path`),
+    // while the user names it by catalog URL. Resolve and retry so
+    // `.lake detach <catalog>` matches `.lake attach <catalog>`.
+    if let Ok(lake) = open_lake(&dir) {
+        let resolved = lake.path().display().to_string();
+        if resolved != dir && db.detach_lake(&resolved) {
+            println!("Detached {dir}");
+            return;
+        }
     }
     if writable.is_none() {
         cli_error!("no lake is attached at {dir} (see .lake attached)");

@@ -28,6 +28,13 @@ s3 = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3"]
 # ignored, and an encrypted lake reports a clear build hint instead of a
 # parse error.
 encryption = ["dep:aes-gcm", "dep:argon2", "dep:sha2"]
+# Opt-in SQL catalog store (wave 96a): a lake's metadata (`lake.json`,
+# `catalog.json`, `highest.json`, `snapshots/`, `commits/`, `replication/`)
+# lives in one SQLite file while its data files stay on local disk or S3 —
+# DuckLake's catalog/data-path split. `bundled` compiles SQLite in, so no
+# system library is needed (the musl Docker image works). Without this feature
+# a `sqlite:` location is a clear `FeatureMissing` naming the rebuild flag.
+catalog-sqlite = ["dep:rusqlite"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
@@ -55,3 +62,6 @@ aes-gcm = { version = "0.10", optional = true }
 argon2 = { version = "0.5", optional = true }
 # Nonce derivation from the per-container 128-bit random base (L-4).
 sha2 = { version = "0.10", optional = true }
+# The SQLite catalog store (`catalog-sqlite`): the SQL half of a split lake.
+# `bundled` builds SQLite from source so no system library is involved.
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }

@@ -2167,6 +2167,10 @@ fn mutate_state<T>(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = dest.storage.abs(STATE_PATH);
     for _ in 0..STATE_WRITE_RETRIES {
+        // Wave 96a: the read-modify-write is one publish scope, so a SQL
+        // catalog's state row moves atomically (the conditional write still
+        // guards cross-process races).
+        let publish = dest.storage.begin_publish()?;
         let (mut state, tag) = read_state(dest)?;
         let value = change(&mut state)?;
         let bytes = state_json(&state, &path)?;
@@ -2175,8 +2179,11 @@ fn mutate_state<T>(
             Some(tag) => dest.storage.put_if_match(STATE_PATH, &bytes, tag)?,
         };
         if written {
+            publish.commit()?;
             return Ok(value);
         }
+        // A lost race: drop the scope (rolling back) and re-read the state.
+        std::mem::drop(publish);
     }
     Err(LakeError::Conflict {
         path,

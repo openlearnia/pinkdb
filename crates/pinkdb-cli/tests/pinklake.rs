@@ -165,7 +165,7 @@ fn lean_save_open_versions_tables_info() {
     assert!(help.contains(".lake save"), "{help}");
     assert!(help.contains("pinklake build"), "{help}");
     assert!(
-        help.contains(".lake attach <dir"),
+        help.contains(".lake attach "),
         "help must offer attach in a pinklake build (statistics-only):\n{help}"
     );
     assert!(
@@ -325,20 +325,6 @@ fn lean_attach_refuses_stats_less_and_corrupted_lakes() {
     assert!(out.contains("use .lake open"), "{out}");
 
     cleanup(&dir);
-}
-
-/// Recursively copy a directory (the fixtures are small).
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let dst = to.join(entry.file_name());
-        if entry.path().is_dir() {
-            copy_dir(&entry.path(), &dst);
-        } else {
-            std::fs::copy(entry.path(), dst).unwrap();
-        }
-    }
 }
 
 /// The pinklake build over mock S3: `.lake save`/`open` work against

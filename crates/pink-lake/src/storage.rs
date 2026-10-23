@@ -82,11 +82,72 @@ pub(crate) struct StorageStats {
 ///
 /// For S3 this is the object's `ETag` **including its quotes** (sent back
 /// verbatim as `If-Match: <etag>`); for local files it is the file's identity
-/// (byte length + modification time in nanoseconds). A tag is captured by
+/// (byte length + modification time in nanoseconds); for a SQL catalog it is
+/// the row's monotonically bumped `tag` column. A tag is captured by
 /// [`Storage::read_tagged`] when the lake reads a manifest and is required to
 /// still match when the same manifest is replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VersionTag(pub(crate) String);
+
+/// The publish scope of one metadata publication (wave 96a).
+///
+/// [`Storage::begin_publish`] opens it before a publishing path's sequence of
+/// metadata calls; [`PublishScope::commit`] makes the sequence durable and
+/// dropping it rolls the sequence back. The default scope is a no-op — local
+/// storage and object storage keep their per-object atomicity, which is the
+/// publication protocol they have always had. A SQL catalog overrides it with
+/// one transaction, so the commit delta, the snapshot, the catalog CAS and the
+/// highest marker land atomically or not at all.
+///
+/// **Invariant:** data files are written *before* the scope opens. An
+/// abandoned publication can therefore only leave unreferenced data objects,
+/// which `delete_orphaned_files` already removes; it can never leave a
+/// catalog that references a partially written file.
+pub(crate) struct PublishScope {
+    finish: Option<Box<dyn FnOnce(bool) -> Result<()> + Send>>,
+}
+
+impl fmt::Debug for PublishScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublishScope")
+            .field("open", &self.finish.is_some())
+            .finish()
+    }
+}
+
+impl PublishScope {
+    /// The no-op scope of a backend whose objects are individually atomic.
+    pub(crate) fn noop() -> Self {
+        Self { finish: None }
+    }
+
+    /// A scope whose `finish(true)` commits and `finish(false)` rolls back.
+    #[cfg_attr(not(feature = "catalog-sqlite"), allow(dead_code))]
+    pub(crate) fn new(finish: Box<dyn FnOnce(bool) -> Result<()> + Send>) -> Self {
+        Self {
+            finish: Some(finish),
+        }
+    }
+
+    /// Make the scope's metadata sequence durable. Consumes the scope so a
+    /// committed scope is never rolled back by its own drop.
+    pub(crate) fn commit(mut self) -> Result<()> {
+        match self.finish.take() {
+            Some(finish) => finish(true),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for PublishScope {
+    fn drop(&mut self) {
+        if let Some(finish) = self.finish.take() {
+            // A rollback failure cannot be reported from `drop`; the caller's
+            // original error (or early return) is what matters.
+            let _ = finish(false);
+        }
+    }
+}
 
 impl VersionTag {
     /// The tag as it goes on the wire (an S3 `If-Match` value).
@@ -364,6 +425,23 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
     /// `Path::exists`).
     fn exists(&self, rel: &str) -> Result<bool> {
         Ok(!matches!(self.head(rel)?, Head::Missing))
+    }
+
+    /// Open the publish scope around one metadata publication (wave 96a): the
+    /// caller writes its data files first, then begins the scope, then runs
+    /// its existing metadata calls and commits. The default is a no-op (the
+    /// per-object atomic protocol); the SQL catalog store overrides it with a
+    /// real transaction. Decorators must forward it.
+    fn begin_publish(&self) -> Result<PublishScope> {
+        Ok(PublishScope::noop())
+    }
+
+    /// Whether the catalog lives separately from the data location (wave
+    /// 96a: a `sqlite:` catalog). Only such a lake writes and verifies the
+    /// `lake-data.json` ownership marker; the default object-store layout is
+    /// untouched and pays no extra request. Decorators forward it.
+    fn catalog_split(&self) -> bool {
+        false
     }
 
     /// Restore `snapshots/<version>.json` to the authoritative
@@ -976,6 +1054,16 @@ impl Storage for CryptoStorage {
     fn tighten_existing(&self) -> Result<()> {
         self.inner.tighten_existing()
     }
+
+    fn begin_publish(&self) -> Result<PublishScope> {
+        // The scope covers the *stored* metadata sequence (sealed bytes); the
+        // decorator itself has nothing transactional to add.
+        self.inner.begin_publish()
+    }
+
+    fn catalog_split(&self) -> bool {
+        self.inner.catalog_split()
+    }
 }
 
 /// The first 8 bytes of a file, when it has that many.
@@ -987,22 +1075,43 @@ fn read_magic(path: &Path) -> Option<[u8; 8]> {
     Some(magic)
 }
 
-/// A parsed lake location: a local directory path or an `s3://` URL.
+/// A parsed lake location: a local directory path, an `s3://` URL, or a SQL
+/// catalog URL (`sqlite:<path>`; wave 96a). A catalog location names only the
+/// metadata store — the data location is recorded in the catalog itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Location {
     Local(PathBuf),
     S3 { bucket: String, prefix: String },
+    Sqlite(PathBuf),
 }
 
 impl Location {
     /// Parse a lake location string: `s3://bucket[/prefix…]` is object
-    /// storage; anything else is a local path (a directory literally named
-    /// `s3://…` is not a thing).
+    /// storage, `sqlite:<path>` is a SQLite catalog (relative or absolute),
+    /// anything else is a local path (a directory literally named `s3://…` is
+    /// not a thing).
     pub(crate) fn parse(location: &str) -> Result<Self> {
+        if let Some(rest) = location.strip_prefix("sqlite:") {
+            return Self::parse_sqlite(location, rest);
+        }
         match location.strip_prefix("s3://") {
             Some(rest) => Self::parse_s3(location, rest),
             None => Ok(Location::Local(PathBuf::from(location))),
         }
+    }
+
+    fn parse_sqlite(original: &str, rest: &str) -> Result<Self> {
+        // A lake catalog must persist: an in-memory database would vanish with
+        // the handle. Refused here, before any backend is constructed.
+        if rest.is_empty() || rest == ":memory:" {
+            return Err(LakeError::BadLocation {
+                location: original.to_string(),
+                message: "a lake catalog must persist; `sqlite::memory:` is not a lake location \
+                          (use `sqlite:<path>`)"
+                    .to_string(),
+            });
+        }
+        Ok(Location::Sqlite(PathBuf::from(rest)))
     }
 
     fn parse_s3(original: &str, rest: &str) -> Result<Self> {

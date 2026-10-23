@@ -97,6 +97,13 @@ parquetlake = ["pinklake", "parquet", "dep:pink-lake-parquet"]
 # `cargo build -p pinkdb-cli --features pinklake,s3` or
 # `--features vortexlake,s3` (add `,encryption` for a keyed lake).
 s3 = ["pink-lake/s3"]
+# Opt-in SQL catalog for the lake (wave 96a): `.lake save/open/attach` accept
+# `sqlite:<path>` as the catalog location, with the data files at the `data`
+# location given at create. Forwards to pink-lake's `catalog-sqlite`; the
+# `?` keeps it from enabling the optional pink-lake dependency on its own (a
+# `catalog-sqlite`-only build stays a lean CLI), so combine it with a lake
+# feature exactly like `s3`.
+catalog-sqlite = ["pink-lake?/catalog-sqlite"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }

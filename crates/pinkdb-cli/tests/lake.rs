@@ -18,6 +18,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// The `data <location>` usage option, printed only by a `catalog-sqlite`
+/// build.
+#[cfg(feature = "catalog-sqlite")]
+const DATA_OPT: &str = " [data <dir|s3://…>]";
+#[cfg(not(feature = "catalog-sqlite"))]
+const DATA_OPT: &str = "";
+
 /// Unique scratch directory for one test.
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -253,8 +260,11 @@ fn lake_errors_are_clear() {
         ".lake save\n.lake open\n.lake versions\n.lake snapshots\n.lake tables\n.lake info\n.lake\n\
          .quit\n",
     );
-    assert!(out.contains("Usage: .lake save <dir>"), "{out}");
-    assert!(out.contains("Usage: .lake open <dir> [version]"), "{out}");
+    assert!(out.contains("Usage: .lake save <location>"), "{out}");
+    assert!(
+        out.contains(&format!("Usage: .lake open <location>{DATA_OPT} [version]")),
+        "{out}"
+    );
     assert!(out.contains("Usage: .lake versions <dir>"), "{out}");
     assert!(out.contains("Usage: .lake snapshots <dir>"), "{out}");
     assert!(out.contains("Usage: .lake tables <dir>"), "{out}");
@@ -282,7 +292,10 @@ fn lake_errors_are_clear() {
         lake = lake.display()
     ));
     assert!(out.contains("has no snapshot version 99"), "{out}");
-    assert!(out.contains("Usage: .lake open <dir> [version]"), "{out}");
+    assert!(
+        out.contains(&format!("Usage: .lake open <location>{DATA_OPT} [version]")),
+        "{out}"
+    );
     cleanup(&dir);
 }
 
@@ -1532,7 +1545,9 @@ fn save_records_messages_and_snapshots_lists_them() {
     ));
     assert_eq!(code, 0, "usage lines do not fail the script");
     assert!(
-        stdout.contains("Usage: .lake save <dir> [force] [author '<name>'] [message '<text>']"),
+        stdout.contains(&format!(
+            "Usage: .lake save <location>{DATA_OPT} [force] [author '<name>'] [message '<text>']"
+        )),
         "stdout: {stdout} stderr: {stderr}"
     );
     cleanup(&dir);
