@@ -117,11 +117,11 @@ use std::sync::{Arc, Mutex};
 use pinkdb::attached::AttachedScan;
 use pinkdb::{AtSpec, AttachedLake, AttachedTable, ColumnStats, DataTable, PinkDbError, Value};
 
-use crate::catalog::{DeleteRef, PartitionKey, TableEntry};
+use crate::catalog::{PartitionKey, TableEntry};
 use crate::format::{DataFile, LakeFormat};
 use crate::incremental::entry_layout;
 use crate::inlined::InlinedFact;
-use crate::storage::{Head, Storage};
+use crate::storage::Storage;
 use crate::zone::{self, FileFacts};
 use crate::{
     Lake, LakeError, Result, apply_file_deletes, copy_chunks, manifest_for, only_table,
@@ -1566,9 +1566,18 @@ pub(crate) fn build_from(
                 continue;
             }
         };
-        // Every file (and delete file) must be present before anything is
-        // read from it; the layout read decodes and validates every delete
-        // file against the entry.
+        // Every referenced path is validated before anything is read. Data
+        // files are NOT probed for existence (wave 96a, like DuckLake): a
+        // statistics-only attach issues no request per data file, and a
+        // missing file fails at its first read with the file and table named
+        // (`load_file`). Delete files need no probe either — the layout read
+        // below fetches and decodes every one, so a missing one fails here.
+        for file in &entry.files {
+            validate_rel_path(file.path())?;
+        }
+        for d in &entry.deletes {
+            validate_rel_path(&d.path)?;
+        }
         let layout = entry_layout(&**storage, entry, key, &manifest_path)?;
         // `entry.rows` backs the statistics-only `COUNT(*)`. The deduped
         // layout plus the live inlined rows is the truth: if two delete files
@@ -1595,31 +1604,6 @@ pub(crate) fn build_from(
                         .map_or_else(|| "an overflowing count".to_string(), |r| r.to_string())
                 ),
             });
-        }
-        for d in &entry.deletes {
-            check_delete_file_present(&**storage, d, key)?;
-        }
-        for (rel, _, _) in &layout {
-            validate_rel_path(rel)?;
-            let path = storage.abs(rel);
-            match storage.head(rel)? {
-                Head::File => {}
-                Head::Missing => {
-                    return Err(LakeError::Io {
-                        context: format!("loading data file \"{rel}\""),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("{} is missing", path.display()),
-                        ),
-                    });
-                }
-                Head::NotAFile => {
-                    return Err(LakeError::Corrupt {
-                        path,
-                        message: "data file is not a regular file".to_string(),
-                    });
-                }
-            }
         }
         let projected = provider.supports_projection();
         if provider.has_footer_stats() {
@@ -2007,29 +1991,6 @@ pub(crate) fn build_from(
         lake: Arc::clone(&attachment) as Arc<dyn AttachedLake>,
     };
     Ok((attachment, report))
-}
-
-/// A referenced delete file must exist (present, and a regular file locally).
-fn check_delete_file_present(storage: &dyn Storage, d: &DeleteRef, key: &str) -> Result<()> {
-    validate_rel_path(&d.path)?;
-    match storage.head(&d.path)? {
-        Head::File => Ok(()),
-        Head::Missing => Err(LakeError::Io {
-            context: format!("loading delete file \"{}\"", d.path),
-            source: std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "{} (delete file of table \"{key}\" targeting \"{}\") is missing",
-                    storage.abs(&d.path).display(),
-                    d.file
-                ),
-            ),
-        }),
-        Head::NotAFile => Err(LakeError::Corrupt {
-            path: storage.abs(&d.path),
-            message: "delete file is not a regular file".to_string(),
-        }),
-    }
 }
 
 #[cfg(test)]
@@ -2641,22 +2602,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A missing data file fails attach with a clean error.
+    /// Attach never probes data files (wave 96a, like DuckLake): with every
+    /// data file removed a statistics-only attach still succeeds and answers
+    /// `COUNT(*)` from the catalog, and the first query that has to read a
+    /// file fails with a clean error naming it. Pinned to `.pink`: a Vortex
+    /// attach reads each footer, so a missing Vortex file still fails there.
     #[test]
-    fn missing_data_file_fails_attach() {
+    fn missing_data_file_fails_at_first_read() {
         let dir = scratch("missing");
         let lake_dir = dir.join("lake");
-        crate::save_store(&fixture_store(), &lake_dir).unwrap();
+        let mut writer = Lake::create(&lake_dir).unwrap();
+        writer.set_write_format("pink").unwrap();
+        writer.write_from_store(&fixture_store()).unwrap();
+        drop(writer);
         // Remove every data file the manifest references.
-        for entry in walk(&lake_dir.join("data")) {
-            std::fs::remove_file(&entry).unwrap();
+        let removed = walk(&lake_dir.join("data"));
+        for entry in &removed {
+            std::fs::remove_file(entry).unwrap();
         }
         let lake = Lake::open(&lake_dir).unwrap();
-        let err = build(&lake, None).unwrap_err().to_string();
-        assert!(
-            err.contains("is missing") || err.contains("loading data file"),
-            "{err}"
-        );
+        let (attachment, _) = build(&lake, None).unwrap();
+        let mut db = PinkDb::new();
+        db.attach_lake(attachment).unwrap();
+        match db
+            .execute("SELECT COUNT(*) FROM t;")
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            pinkdb::QueryResult::Selected { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Bigint(3)]]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let err = db.execute("SELECT * FROM t;").unwrap_err().to_string();
+        let t_file = removed
+            .iter()
+            .find(|p| p.parent().is_some_and(|d| d.ends_with("main.t")))
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        assert!(err.contains(&t_file), "the error must name {t_file}: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

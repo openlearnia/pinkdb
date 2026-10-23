@@ -426,15 +426,14 @@ fn attach_and_count_issue_no_data_requests_over_s3() {
     let lake = Lake::open_with_catalog(&catalog, None).unwrap();
     let report = lake.attach(None).unwrap();
     assert_eq!(report.version, 2);
-    let after_attach = mock.requests().len();
-    // Attach's cheap integrity check HEADs each referenced file; it must never
-    // GET (a data read) when the manifest carries the statistics.
-    for request in &mock.requests()[before..after_attach] {
-        assert!(
-            request.starts_with("HEAD "),
-            "attach must not read a data object: {request}"
-        );
-    }
+    // With the catalog in SQLite and no data-file probes at attach (wave
+    // 96a, like DuckLake), a statistics-only attach sends nothing to S3.
+    assert_eq!(
+        mock.requests().len(),
+        before,
+        "attach must not send any request to S3: {:?}",
+        &mock.requests()[before..]
+    );
     let mut db = PinkDb::new();
     db.attach_lake(report.lake).unwrap();
     let before_query = mock.requests().len();

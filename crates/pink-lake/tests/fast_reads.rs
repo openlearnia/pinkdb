@@ -159,8 +159,8 @@ fn vortex_lake_attach_and_queries_use_the_ranged_read_path() {
         "open: identity HEAD, then lake.json+catalog, then highest+snapshot"
     );
     assert_eq!(
-        attach_count, 4,
-        "attach: manifest GET + file HEAD + two ranged footer reads"
+        attach_count, 3,
+        "attach: manifest GET + two ranged footer reads (no existence HEAD)"
     );
     assert_eq!(query_count, 0, "COUNT(*) must not read a data file");
     assert!(
@@ -179,7 +179,7 @@ fn vortex_lake_attach_and_queries_use_the_ranged_read_path() {
     );
     assert_eq!(scan_rows.len(), 20_000);
     assert_eq!(open_scan, 5);
-    assert_eq!(attach_scan, 4);
+    assert_eq!(attach_scan, 3);
     assert!(query_scan >= 1, "the scan reads at least one data range");
     assert!(
         query_stats.1 < file_bytes as u64,

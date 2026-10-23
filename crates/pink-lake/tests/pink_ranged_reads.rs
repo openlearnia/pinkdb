@@ -164,3 +164,64 @@ fn pink_lake_reads_only_projected_chunks_of_surviving_row_groups() {
         "pruning one of two row groups reads less: {pruned_fetch} vs {fetched}"
     );
 }
+
+/// Wave 96a: attach never probes data files (DuckLake's behavior). A
+/// statistics-only attach issues no request of any kind against a `.pink`
+/// object — no GET and no existence HEAD — so on object storage it costs
+/// only the catalog reads. A data file deleted behind the lake's back is
+/// therefore not noticed at attach: the statistics-only `COUNT(*)` still
+/// answers from the catalog, and the first query that has to read the file
+/// fails with a clear error naming it.
+#[test]
+fn attach_never_probes_data_files_and_a_missing_file_fails_at_first_read() {
+    let mock = MockS3::start();
+    let prefix = "lakes/no-probe";
+    {
+        let mut lake = Lake::create_s3(mock_config(&mock, prefix)).unwrap();
+        lake.set_write_format("pink").unwrap();
+        lake.set_data_inlining_row_limit(0);
+        lake.write_from_store(&store()).unwrap();
+    }
+
+    let lake = Lake::open_s3(mock_config(&mock, prefix)).unwrap();
+    let before_attach = mock.requests().len();
+    let report = lake.attach(None).unwrap();
+    let data_touches: Vec<String> = mock.requests()[before_attach..]
+        .iter()
+        .filter(|request| request.contains("/data/"))
+        .cloned()
+        .collect();
+    assert!(
+        data_touches.is_empty(),
+        "attach must not touch a data object: {data_touches:?}"
+    );
+    drop(report);
+
+    // Remove the data file, then attach again: still fine, and COUNT(*) is
+    // still metadata-only.
+    let data_key = mock
+        .keys()
+        .into_iter()
+        .find(|key| key.starts_with(&format!("{prefix}/data/")) && key.ends_with(".pink"))
+        .expect("the lake has a .pink data object");
+    mock.remove_object(&data_key);
+    let lake = Lake::open_s3(mock_config(&mock, prefix)).unwrap();
+    let report = lake.attach(None).unwrap();
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake).unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT COUNT(*) FROM t;"),
+        vec![vec![Value::Bigint(ROWS)]]
+    );
+
+    // The first real read fails, and says which file.
+    let err = db
+        .execute("SELECT SUM(i) FROM t;")
+        .expect_err("reading a deleted data file must fail")
+        .to_string();
+    let file_name = data_key.rsplit('/').next().unwrap();
+    assert!(
+        err.contains(file_name),
+        "the error must name the missing data file {file_name}: {err}"
+    );
+}
