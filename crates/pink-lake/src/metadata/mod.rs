@@ -30,18 +30,21 @@
 //! # Dialects
 //!
 //! The SQL is written once. [`Dialect`] names the small syntactic differences
-//! a backend needs (placeholder style, upsert spelling, transaction start);
-//! today only SQLite is implemented, but the SQLite backend keeps every query
-//! in [`dialect`] so Postgres and the future `.pink` backend can reuse it.
+//! a backend needs (placeholder style, DDL spellings, transaction start).
+//! SQLite and the `.pink` database are implemented on the same core; Postgres
+//! reuses it in T2.
 
 use crate::Result;
 use crate::catalog::{Catalog, CommitManifest, TableEntry};
 
-// The core is compiled in every build (it has no optional dependencies), but
-// only a SQL-catalog build consumes it today. Silencing dead-code here keeps
-// the default build warning-free without hiding real errors in the backends.
+// The core is compiled in every build (it has no optional dependencies), and
+// the `.pink` backend is always available: pinkdb is already a dependency.
+// Only the rusqlite half is behind `catalog-sqlite`.
+mod conn;
 #[allow(dead_code)]
 pub(crate) mod dialect;
+pub(crate) mod pink;
+pub(crate) mod store;
 
 #[cfg(feature = "catalog-sqlite")]
 pub(crate) mod sqlite;
@@ -133,11 +136,20 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// The latest pinkdb version (`None` for a catalog with no snapshots).
     fn head_version(&self) -> Result<Option<u64>>;
 
-    /// Build the engine-facing catalog handle visible at the head — version,
-    /// format, identity, author and change metadata — with `tables` left
-    /// empty. Commit paths use this so publishing never renders or parses the
-    /// whole lake.
+    /// Build the engine-facing head catalog, **with every table loaded**.
+    ///
+    /// Lake-wide operations (flush, merge/rewrite, add-files) and any caller
+    /// that walks `tables` must use this. It is O(lake), so commit planning
+    /// uses [`MetadataStore::head_shell`] plus the tables the delta names.
     fn head(&self) -> Result<Option<Catalog>>;
+
+    /// Build the head catalog handle — version, format, identity, author and
+    /// change metadata — with `tables` deliberately left empty.
+    ///
+    /// Only commit planning may use this: it must then load every table it
+    /// operates on. The distinct name keeps a table-less catalog from being
+    /// mistaken for an empty lake.
+    fn head_shell(&self) -> Result<Option<Catalog>>;
 
     /// Load one table's engine-facing entry (all files, delete files and
     /// inlined rows) at `version` (`None` = head).

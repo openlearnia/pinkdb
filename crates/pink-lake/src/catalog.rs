@@ -341,8 +341,11 @@ impl FileFormat {
 /// by a full save, a maintenance output (merge/rewrite), or a pre-wave-68
 /// file — its rows then have no recorded row id (`NULL` in a change row); the
 /// values stay exact either way.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
+// The entry variant is the hot path (one per data file); boxing it would add
+// an allocation to every attach and commit for no runtime benefit.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum FileRef {
     /// v1–v3: a plain lake-relative path (the entry's single data file).
     Path(String),
@@ -386,7 +389,58 @@ pub(crate) enum FileRef {
         /// verifies the footer against it before decoding a byte of it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         footer_crc32c: Option<u32>,
+        /// True when `stats` was built and sealed from the catalog rows in
+        /// this process (the SQL store's `load_files`). Attach may then skip
+        /// re-hashing the block. Never serialized: a manifest read from disk
+        /// must verify.
+        #[serde(skip)]
+        stats_sealed: bool,
     },
+}
+
+impl PartialEq for FileRef {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (FileRef::Path(a), FileRef::Path(b)) => a == b,
+            (
+                FileRef::Entry {
+                    path,
+                    rows,
+                    schema_version,
+                    stats,
+                    partition,
+                    row_id_start,
+                    footer_offset,
+                    footer_len,
+                    footer_crc32c,
+                    ..
+                },
+                FileRef::Entry {
+                    path: other_path,
+                    rows: other_rows,
+                    schema_version: other_schema,
+                    stats: other_stats,
+                    partition: other_partition,
+                    row_id_start: other_row_id,
+                    footer_offset: other_offset,
+                    footer_len: other_len,
+                    footer_crc32c: other_crc,
+                    ..
+                },
+            ) => {
+                path == other_path
+                    && rows == other_rows
+                    && schema_version == other_schema
+                    && stats == other_stats
+                    && partition == other_partition
+                    && row_id_start == other_row_id
+                    && footer_offset == other_offset
+                    && footer_len == other_len
+                    && footer_crc32c == other_crc
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Hand-written so a malformed v4 file object gets a precise message (the
@@ -447,6 +501,7 @@ impl<'de> Deserialize<'de> for FileRef {
                     footer_offset,
                     footer_len,
                     footer_crc32c,
+                    stats_sealed: false,
                 })
             }
         }
@@ -479,6 +534,15 @@ impl FileRef {
         match self {
             FileRef::Path(_) => None,
             FileRef::Entry { stats, .. } => stats.as_ref(),
+        }
+    }
+
+    /// True when [`FileRef::stats`] was built and sealed from catalog rows in
+    /// this process; attach can skip its CRC re-hash.
+    pub(crate) fn stats_sealed(&self) -> bool {
+        match self {
+            FileRef::Path(_) => false,
+            FileRef::Entry { stats_sealed, .. } => *stats_sealed,
         }
     }
 
@@ -515,6 +579,7 @@ impl FileRef {
                 footer_offset,
                 footer_len,
                 footer_crc32c,
+                stats_sealed,
             } => FileRef::Entry {
                 path: path.clone(),
                 rows: *rows,
@@ -525,6 +590,7 @@ impl FileRef {
                 footer_offset: *footer_offset,
                 footer_len: *footer_len,
                 footer_crc32c: *footer_crc32c,
+                stats_sealed: *stats_sealed,
             },
         }
     }
@@ -562,6 +628,7 @@ impl FileRef {
                 footer_offset,
                 footer_len,
                 footer_crc32c,
+                stats_sealed,
                 ..
             } => FileRef::Entry {
                 path: path.clone(),
@@ -573,6 +640,7 @@ impl FileRef {
                 footer_offset: *footer_offset,
                 footer_len: *footer_len,
                 footer_crc32c: *footer_crc32c,
+                stats_sealed: *stats_sealed,
             },
         }
     }

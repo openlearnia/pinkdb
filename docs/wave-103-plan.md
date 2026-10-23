@@ -175,6 +175,25 @@ ones with `row_id >= base.next_row_id` (the table's row-id high-water
 mark), and ended rows come from the delta, not a diff of the full lists.
 Gate: inlining-on commit time at 1,000 rows within 1.5× of 10 rows.
 
+T1b measured (`/tmp/w96a/scale/bench4.py`, 1,000 one-row commits,
+checkpointed; attach + `count(*)` is one process start, median of 5):
+
+| catalog | inlining | one-row commit, 10 → 1,000 | catalog at 1,000 | attach + `count(*)`, 10 → 1,000 |
+|---|---|---|---|---|
+| `sqlite:` | on | 0–1 → 1 ms | 0.67 MB | 3.9 → 10.2 ms |
+| `sqlite:` | off | 9 → 10 ms | 1.37 MB | 5.0 → 39.8 ms |
+| `pink:` | on | 8 → 7 ms | 0.15 MB | 7.1 → 12.4 ms |
+| `pink:` | off | 17–19 → 27 ms | 0.36 MB | 7.6 → 42.2 ms |
+
+T1b also fixed a T1a bug: flush, merge, rewrite and `add_data_files` read
+a table-less head on SQL catalogs and silently did nothing.
+
+**Carried into T2:** with inlining off, a `pink:` commit grows ~10 ms per
+1,000 files (1.42–1.59× across runs, at the 1.5× gate), while SQLite stays
+flat. Some commit query is O(files) on pinkdb (likely a scan where SQLite
+uses an index). Since T2 makes `.pink` the default catalog, gate it at
+10,000 files: commit within 1.5× of the 10-file time.
+
 ## Gates
 
 fmt; `cargo test --workspace`; pink-lake and CLI feature matrices (with

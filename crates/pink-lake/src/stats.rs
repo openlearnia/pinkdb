@@ -186,11 +186,23 @@ impl StatsBlock {
     /// is not version 1, disagrees with its own schema, or carries an
     /// undecodable value is [`LakeError::Corrupt`], never a guess.
     pub(crate) fn schema_and_stats(&self, manifest_path: &Path) -> Result<SchemaAndStats> {
+        self.schema_and_stats_with_crc_check(manifest_path, true)
+    }
+
+    /// [`StatsBlock::schema_and_stats`] with the CRC check optional. The SQL
+    /// store's loader built and sealed this block from catalog rows in this
+    /// process, so attach can skip re-serializing it; a manifest read from
+    /// disk never takes this path.
+    pub(crate) fn schema_and_stats_with_crc_check(
+        &self,
+        manifest_path: &Path,
+        check_crc: bool,
+    ) -> Result<SchemaAndStats> {
         let corrupt = |message: String| LakeError::Corrupt {
             path: manifest_path.to_path_buf(),
             message,
         };
-        if !self.verify_crc() {
+        if check_crc && !self.verify_crc() {
             return Err(corrupt(format!(
                 "table \"{}\": the statistics block failed its checksum (corrupted or edited \
                  metadata); refusing to attach from it — use .lake open, or re-save the store \

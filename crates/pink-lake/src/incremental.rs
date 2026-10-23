@@ -1513,7 +1513,7 @@ impl Lake {
         current: &[(String, Arc<DataTable>)],
     ) -> Result<(Commit, BTreeMap<String, Arc<DataTable>>)> {
         let (manifest, manifest_path) = if let Some(store) = self.storage.metadata_store() {
-            let mut catalog = store.head()?.ok_or_else(|| LakeError::NotALake {
+            let mut catalog = store.head_shell()?.ok_or_else(|| LakeError::NotALake {
                 path: self.root.clone(),
             })?;
             let mut keys: BTreeSet<&str> = BTreeSet::new();
@@ -1809,11 +1809,19 @@ impl Lake {
                         row.flushed = true;
                     }
                 }
+                let ended: Vec<crate::catalog::InlinedRow> = new_entry
+                    .inlined
+                    .iter()
+                    .filter(|row| row.end == Some(version))
+                    .cloned()
+                    .collect();
                 deltas.insert(
                     key.clone(),
                     TableDelta {
                         runtime: crate::catalog::TableRuntime {
                             kind: crate::catalog::DeltaKind::Flush,
+                            meta: Some(crate::catalog::TableMeta::from_entry(&new_entry)),
+                            inlined_ends: ended,
                             ..Default::default()
                         },
                         data_files: files,
@@ -1887,7 +1895,12 @@ impl Lake {
                     + commit_bytes.len() as u64
                     + 2 * snapshot_plain.len() as u64,
             };
-            match self.publish_commit_version(version, &commit_bytes, &snapshot_plain) {
+            match self.publish_catalog_version(
+                &new_catalog,
+                commit_manifest,
+                &commit_bytes,
+                &snapshot_plain,
+            ) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -2124,6 +2137,7 @@ impl Lake {
                     footer_offset: None,
                     footer_len: None,
                     footer_crc32c: None,
+                    stats_sealed: true,
                 };
                 new_entry.files.push(file.clone());
                 new_entry.rows =
@@ -2139,6 +2153,11 @@ impl Lake {
                 delta.rows_added += rows;
                 registered.push((table.to_string(), rel.to_string(), rows));
             }
+            delta.runtime = crate::catalog::TableRuntime {
+                kind: crate::catalog::DeltaKind::Commit,
+                meta: Some(crate::catalog::TableMeta::from_entry(&new_entry)),
+                ..Default::default()
+            };
             let mut tables = head.tables.clone();
             tables.insert(table.to_string(), new_entry);
             let mut deltas: BTreeMap<String, TableDelta> = BTreeMap::new();
@@ -2181,7 +2200,12 @@ impl Lake {
                 files: registered,
                 bytes_written: commit_bytes.len() as u64 + 2 * snapshot_plain.len() as u64,
             };
-            match self.publish_commit_version(version, &commit_bytes, &snapshot_plain) {
+            match self.publish_catalog_version(
+                &new_catalog,
+                commit_manifest,
+                &commit_bytes,
+                &snapshot_plain,
+            ) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -2329,7 +2353,7 @@ impl Lake {
         retries: u32,
     ) -> std::result::Result<CommitReport, PublishFailure> {
         let mut head = self
-            .read_catalog_for_commit()
+            .read_catalog_shell_for_commit()
             .map_err(PublishFailure::Fatal)?;
         if let Some(planned) = uploaded
             .head
@@ -2999,6 +3023,33 @@ impl Lake {
         Ok(())
     }
 
+    /// Publish one maintenance/settings version through the backend's native
+    /// path: a typed delta on a SQL catalog (so `pinkdb_table_change` and the
+    /// inlined end markers are written), the object sequence otherwise.
+    pub(crate) fn publish_catalog_version(
+        &mut self,
+        catalog: &crate::catalog::Catalog,
+        manifest: crate::catalog::CommitManifest,
+        commit_bytes: &[u8],
+        snapshot_plain: &[u8],
+    ) -> Result<()> {
+        if self.storage.metadata_store().is_some() {
+            let change = crate::metadata::CatalogChange {
+                catalog: None,
+                manifest,
+                schema_version: catalog.schema_version,
+                format_version: catalog.format_version,
+                updated: catalog.updated.clone(),
+                lake_id: catalog.lake_id.clone(),
+                author: catalog.author.clone(),
+                commit_message: catalog.commit_message.clone(),
+            };
+            self.publish_sql_commit(change)
+        } else {
+            self.publish_commit_version(catalog.version, commit_bytes, snapshot_plain)
+        }
+    }
+
     pub(crate) fn publish_commit_version(
         &mut self,
         version: u64,
@@ -3038,11 +3089,28 @@ impl Lake {
         publish.commit()
     }
 
-    /// Read `catalog.json` for a commit attempt: whatever version it names
-    /// becomes this handle's base (a rebase).
+    /// Read the head **with every table loaded** for a lake-wide commit path
+    /// (flush, compaction, add-files). The SQL core's table-less shell is
+    /// never enough here: walking `head.tables` must see the lake.
     pub(crate) fn read_catalog_for_commit(&mut self) -> Result<crate::catalog::Catalog> {
         let manifest = if let Some(store) = self.storage.metadata_store() {
             store.head()?.ok_or_else(|| LakeError::NotALake {
+                path: self.root.clone(),
+            })?
+        } else {
+            crate::read_catalog(&*self.storage, &self.root)?
+        };
+        self.version = manifest.version;
+        self.format_version = manifest.format_version;
+        Ok(manifest)
+    }
+
+    /// Read only the head's handle facts for the publish loop; the caller
+    /// then loads the tables its commit names. Deliberately distinct from
+    /// [`Self::read_catalog_for_commit`], which is full.
+    fn read_catalog_shell_for_commit(&mut self) -> Result<crate::catalog::Catalog> {
+        let manifest = if let Some(store) = self.storage.metadata_store() {
+            store.head_shell()?.ok_or_else(|| LakeError::NotALake {
                 path: self.root.clone(),
             })?
         } else {
@@ -3061,7 +3129,7 @@ impl Lake {
         let Some(store) = self.storage.metadata_store() else {
             return crate::read_catalog(&*self.storage, &self.root);
         };
-        let head = store.head()?.ok_or_else(|| LakeError::NotALake {
+        let head = store.head_shell()?.ok_or_else(|| LakeError::NotALake {
             path: self.root.clone(),
         })?;
         let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -3113,7 +3181,7 @@ impl Lake {
     /// Re-read the catalog after a conflict: the new head becomes the base.
     pub(crate) fn rebase_catalog(&mut self) -> Result<()> {
         let manifest = if let Some(store) = self.storage.metadata_store() {
-            store.head()?.ok_or_else(|| LakeError::NotALake {
+            store.head_shell()?.ok_or_else(|| LakeError::NotALake {
                 path: self.root.clone(),
             })?
         } else {

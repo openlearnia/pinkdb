@@ -18,11 +18,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// The `data <location>` usage option, printed only by a build with a SQL
-/// catalog feature.
-#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
+/// The `data <location>` usage option, printed by a build with a lake or SQL
+/// catalog feature (a `.pink` catalog accepts it too).
+#[cfg(any(
+    feature = "pinklake",
+    feature = "vortexlake",
+    feature = "catalog-sqlite",
+    feature = "catalog-postgres"
+))]
 const DATA_OPT: &str = " [data <dir|s3://…>]";
-#[cfg(not(any(feature = "catalog-sqlite", feature = "catalog-postgres")))]
+#[cfg(not(any(
+    feature = "pinklake",
+    feature = "vortexlake",
+    feature = "catalog-sqlite",
+    feature = "catalog-postgres"
+)))]
 const DATA_OPT: &str = "";
 
 /// Unique scratch directory for one test.

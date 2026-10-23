@@ -134,6 +134,31 @@ fn encrypted_migration_keeps_sealed_bytes() {
     catalog_suite::encrypted_migration_keeps_sealed_bytes(&mut SqliteSuite::new());
 }
 
+#[test]
+fn flush_moves_inlined_rows_to_a_data_file() {
+    catalog_suite::flush_moves_inlined_rows_to_a_data_file(&mut SqliteSuite::new());
+}
+
+#[test]
+fn merge_adjacent_files_reduces_the_file_count() {
+    catalog_suite::merge_adjacent_files_reduces_the_file_count(&mut SqliteSuite::new());
+}
+
+#[test]
+fn rewrite_with_deletes_drops_the_delete_files() {
+    catalog_suite::rewrite_with_deletes_drops_the_delete_files(&mut SqliteSuite::new());
+}
+
+#[test]
+fn add_data_files_registers_an_existing_file() {
+    catalog_suite::add_data_files_registers_an_existing_file(&mut SqliteSuite::new());
+}
+
+#[test]
+fn partition_and_inlining_settings_publish() {
+    catalog_suite::partition_and_inlining_settings_publish(&mut SqliteSuite::new());
+}
+
 /// Wave 103 T1a: a commit writes its delta, never the catalog.
 ///
 /// 300 one-row appends (inlining off) produce one `ducklake_data_file` row

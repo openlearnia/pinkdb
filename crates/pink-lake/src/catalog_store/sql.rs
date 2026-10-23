@@ -1,7 +1,7 @@
-//! The SQLite DuckLake catalog (wave 103).
+//! The SQL DuckLake catalog facade (wave 103).
 //!
 //! The physical metadata lives in the normalized DuckLake v1.1 tables
-//! ([`SqliteMetadataStore`]). This type is the thin compatibility facade the
+//! ([`SqlMetadataStore`]). This type is the thin compatibility facade the
 //! lake code already speaks: `catalog.json`, `snapshots/<v>.json`,
 //! `commits/<v>.json`, `lake.json`, `highest.json` and `replication/…` are
 //! *rendered* from those rows (or stored as opaque side rows), never kept as
@@ -19,7 +19,7 @@
 //!   fallback: parse the target [`Catalog`], diff it against the base
 //!   DuckLake snapshot in one transaction, and insert the delta rows. The
 //!   ordinary commit and save paths bypass this and hand
-//!   [`SqliteMetadataStore::commit`] a typed [`crate::metadata::CatalogChange`]
+//!   [`SqlMetadataStore::commit`] a typed [`crate::metadata::CatalogChange`]
 //!   with only the touched tables, so their cost is O(delta), not O(lake).
 //!   The `tag` is the rendered head version (`v<version>`), so a moved head is
 //!   the same conflict the object layout reports.
@@ -28,39 +28,29 @@
 //! (`begin_snapshot` / `end_snapshot`), which is why a catalog written by
 //! DuckDB opens here and a catalog written here attaches in DuckDB.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::CatalogStore;
 use crate::catalog::Catalog;
 use crate::local::CATALOG_FILE;
-use crate::metadata::sqlite::SqliteMetadataStore;
+use crate::metadata::store::SqlMetadataStore;
 use crate::metadata::{CatalogChange, MetadataStore};
 use crate::storage::{Head, LocalCopy, ObjectInfo, PublishScope, Storage, VersionTag};
 use crate::{HIGHEST_FILE, LAKE_FILE, LakeError, Result};
 
-/// The SQLite catalog facade over one [`SqliteMetadataStore`].
+/// The catalog facade over one [`SqlMetadataStore`] (SQLite or `.pink`).
 #[derive(Debug)]
-pub(crate) struct SqliteCatalog {
-    store: Arc<SqliteMetadataStore>,
+pub(crate) struct SqlCatalog {
+    store: Arc<SqlMetadataStore>,
     url: String,
 }
 
-impl SqliteCatalog {
-    /// Open the one lake in `path`. With `create`, an absent file (and its
-    /// parent directory) is created; without it, an absent file is
-    /// `NotALake` and nothing is written.
-    pub(crate) fn open(url: &str, path: &Path, create: bool) -> Result<Self> {
-        Ok(Self {
-            store: Arc::new(SqliteMetadataStore::open(url, path, create)?),
-            url: url.to_string(),
-        })
-    }
-
+impl SqlCatalog {
     /// Wrap a store the caller already opened (the direct create/open path in
     /// [`crate::Lake`] uses this so it can read or seed the catalog without
     /// opening a second connection).
-    pub(crate) fn from_store(url: &str, store: SqliteMetadataStore) -> Self {
+    pub(crate) fn from_store(url: &str, store: SqlMetadataStore) -> Self {
         Self {
             store: Arc::new(store),
             url: url.to_string(),
@@ -135,7 +125,7 @@ impl SqliteCatalog {
     }
 }
 
-impl Storage for SqliteCatalog {
+impl Storage for SqlCatalog {
     fn metadata_store(&self) -> Option<Arc<dyn crate::metadata::MetadataStore>> {
         Some(self.store.clone())
     }
@@ -380,7 +370,7 @@ impl Storage for SqliteCatalog {
     }
 }
 
-impl SqliteCatalog {
+impl SqlCatalog {
     fn list_at(&self, rel: &str, direct: bool) -> Result<Vec<String>> {
         match rel {
             "snapshots" => Ok(self
@@ -430,7 +420,7 @@ impl SqliteCatalog {
     }
 }
 
-impl CatalogStore for SqliteCatalog {
+impl CatalogStore for SqlCatalog {
     fn data_location(&self) -> Result<Option<String>> {
         MetadataStore::data_location(&*self.store)
     }

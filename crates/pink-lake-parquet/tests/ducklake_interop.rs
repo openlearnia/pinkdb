@@ -306,6 +306,80 @@ fn duckdb_reads_pinkdb_inlined_rows_with_the_right_types() {
 }
 
 #[test]
+fn duckdb_reads_a_lake_after_a_pinkdb_flush() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+
+    let dir = scratch("pink-flush-to-duckdb");
+    let catalog_path = dir.join("catalog.db");
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let data = dir.join("data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(10);
+    let mut empty = PinkDb::new();
+    empty
+        .execute("CREATE TABLE main.t (i INTEGER, v VARCHAR);")
+        .unwrap();
+    lake.write_from_store(&empty).unwrap();
+    let mut table = DataTable::new(
+        "t".to_string(),
+        vec![
+            ("i".to_string(), DataType::Integer),
+            ("v".to_string(), DataType::Varchar),
+        ],
+    )
+    .unwrap();
+    for i in 0..3 {
+        table
+            .append_row(vec![
+                Value::Integer(i),
+                Value::Varchar(format!("flushed-{i}")),
+            ])
+            .unwrap();
+    }
+    let mut commit = Commit::new();
+    commit.append("main.t", Arc::new(table));
+    assert_eq!(lake.commit(&commit).unwrap().version, 3);
+    let report = lake.flush_inlined_data(Some("main.t")).unwrap();
+    assert!(report.committed, "{report:?}");
+    assert_eq!(report.tables, vec![("main.t".to_string(), 3)]);
+    drop(lake);
+
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH 'ducklake:sqlite:{}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n\
+         SELECT count(*) FROM l.t;\n\
+         SELECT i, v FROM l.t ORDER BY i;\n",
+        catalog_path.display(),
+        data.display()
+    );
+    let rows = match run_duckdb(&binary, &script) {
+        Ok(rows) => rows,
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip DuckDB interop test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    };
+    assert_eq!(
+        rows,
+        vec![
+            "3".to_string(),
+            "0,flushed-0".to_string(),
+            "1,flushed-1".to_string(),
+            "2,flushed-2".to_string(),
+        ],
+        "DuckDB must read the parquet files a pinkdb flush materialized"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
 fn a_duckdb_catalog_opens_and_refuses_parquet_deletes() {
     register().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

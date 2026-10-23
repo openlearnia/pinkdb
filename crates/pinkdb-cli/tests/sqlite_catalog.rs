@@ -146,3 +146,118 @@ fn a_sqlite_save_without_data_uses_the_default_data_root() {
     assert!(out.contains("│ 1        │"), "{out}");
     cleanup(&dir);
 }
+
+/// Lake-wide maintenance and settings through the CLI: the SQL catalog must
+/// see its tables, not a table-less head. Each command's effect is checked by
+/// a later read, not just by the absence of an error.
+#[test]
+fn maintenance_and_settings_commands_work() {
+    let dir = scratch("maintenance");
+    let (catalog, data) = paths(&dir);
+
+    // Flush: three inlined rows become one data file; values survive.
+    let out = run(&format!(
+        "CREATE TABLE t (a INTEGER, b VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'one');\n\
+         .lake save {catalog} data {data}\n\
+         .lake attach {catalog} write\n\
+         INSERT INTO t VALUES (2, 'two'), (3, 'three'), (4, 'four');\n\
+         .lake commit {catalog}\n\
+         .lake detach {catalog}\n\
+         .lake flush {catalog}\n\
+         .lake open {catalog}\n\
+         SELECT count(*) FROM t;\n\
+         SELECT a, b FROM t ORDER BY a;\n\
+         .quit\n"
+    ));
+    assert!(out.contains("Flushed 3 inlined rows"), "{out}");
+    assert!(out.contains("│ 4        │"), "{out}");
+    assert!(out.contains("│ 4       │ four    │"), "{out}");
+    assert!(!out.contains("Error"), "{out}");
+
+    // Merge / rewrite / settings on a second catalog, with inlining off so
+    // every commit is a data file.
+    let (maint, maint_data) = (
+        format!("{}maint", catalog),
+        dir.join("maintenance-data").display().to_string(),
+    );
+    let mut script = format!(
+        "CREATE TABLE t (a INTEGER);\n\
+         INSERT INTO t VALUES (1);\n\
+         .lake save {maint} data {maint_data}\n\
+         .lake inlining {maint} t 0\n\
+         .lake attach {maint} write\n"
+    );
+    for i in 2..6 {
+        script.push_str(&format!(
+            "INSERT INTO t VALUES ({i});\n.lake commit {maint}\n"
+        ));
+    }
+    script.push_str(&format!(
+        ".lake detach {maint}\n\
+         .lake merge {maint}\n\
+         .lake attach {maint} write\n\
+         DELETE FROM t WHERE a = 1;\n\
+         .lake commit {maint}\n\
+         .lake detach {maint}\n\
+         .lake rewrite {maint} delete_threshold=0.0\n\
+         .lake partition {maint} t by (a)\n\
+         .lake inlining {maint} t 5\n\
+         .lake open {maint}\n\
+         SELECT count(*) FROM t;\n\
+         .quit\n"
+    ));
+    let out = run(&script);
+    assert!(out.contains("Merged"), "{out}");
+    assert!(!out.contains("Nothing to merge"), "{out}");
+    assert!(out.contains("Rewrote"), "{out}");
+    assert!(!out.contains("Nothing to rewrite"), "{out}");
+    assert!(out.contains("Partitioned"), "{out}");
+    assert!(out.contains("5 rows are stored"), "{out}");
+    assert!(out.contains("│ 4        │"), "{out}");
+    assert!(!out.contains("Error"), "{out}");
+
+    // Register an existing data file written by another lake.
+    let source_catalog = format!("{}source", catalog);
+    let source_data = dir.join("source-data").display().to_string();
+    let out = run(&format!(
+        "CREATE TABLE t (a INTEGER);\n\
+         INSERT INTO t VALUES (7), (8);\n\
+         .lake save {source_catalog} data {source_data}\n\
+         .quit\n"
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    let source_dir = std::path::Path::new(&source_data).join("data/main.t");
+    let file = std::fs::read_dir(&source_dir)
+        .expect("source data files")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .find(|name| name.ends_with(".pink"))
+        .expect("one .pink data file");
+    let rel = format!("data/main.t/{file}");
+    let target_catalog = format!("{}target", catalog);
+    let target_data = dir.join("target-data").display().to_string();
+    let out = run(&format!(
+        "CREATE TABLE t (a INTEGER);\n\
+         .lake save {target_catalog} data {target_data}\n\
+         .quit\n"
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    let target_file = std::path::Path::new(&target_data)
+        .join("data/main.t")
+        .join(&file);
+    std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+    std::fs::copy(source_dir.join(&file), &target_file).unwrap();
+    let out = run(&format!(
+        ".lake add_data_files {target_catalog} t {rel}\n\
+         .lake open {target_catalog}\n\
+         SELECT count(*) FROM t;\n\
+         .quit\n"
+    ));
+    assert!(out.contains("Registered"), "{out}");
+    assert!(out.contains("2 rows"), "{out}");
+    assert!(out.contains("│ 2        │"), "{out}");
+    assert!(!out.contains("Error"), "{out}");
+
+    cleanup(&dir);
+}

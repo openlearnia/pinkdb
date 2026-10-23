@@ -190,54 +190,56 @@ fn open_or_create_lake_with_data(catalog: &str, data: Option<&str>) -> pink_lake
     feature = "catalog-sqlite",
     feature = "catalog-postgres"
 ))]
-const HINT: &str = "   (locations may be s3://bucket/prefix, sqlite:<path> [data <dir|s3://…>], \
+const HINT: &str = "   (locations may be s3://bucket/prefix, pink:<path> [data <dir|s3://…>], \
+                    sqlite:<path> [data <dir|s3://…>], or postgres://… data <dir>)";
+#[cfg(all(
+    feature = "s3",
+    feature = "catalog-sqlite",
+    not(feature = "catalog-postgres")
+))]
+const HINT: &str = "   (locations may be s3://bucket/prefix, pink:<path> [data <dir|s3://…>], \
+                    or sqlite:<path> [data <dir|s3://…>])";
+#[cfg(all(
+    feature = "s3",
+    not(feature = "catalog-sqlite"),
+    feature = "catalog-postgres"
+))]
+const HINT: &str = "   (locations may be s3://bucket/prefix, pink:<path> [data <dir|s3://…>], \
                     or postgres://… data <dir>)";
 #[cfg(all(
     feature = "s3",
-    feature = "catalog-sqlite",
-    not(feature = "catalog-postgres")
-))]
-const HINT: &str = "   (locations may be s3://bucket/prefix, or sqlite:<path> \
-                    [data <dir|s3://…>])";
-#[cfg(all(
-    feature = "s3",
-    not(feature = "catalog-sqlite"),
-    feature = "catalog-postgres"
-))]
-const HINT: &str = "   (locations may be s3://bucket/prefix, or postgres://… data <dir>)";
-#[cfg(all(
-    feature = "s3",
     not(feature = "catalog-sqlite"),
     not(feature = "catalog-postgres")
 ))]
-const HINT: &str = "   (locations may be s3://bucket/prefix)";
+const HINT: &str = "   (locations may be s3://bucket/prefix, pink:<path> [data <dir|s3://…>])";
 #[cfg(all(
     not(feature = "s3"),
     feature = "catalog-sqlite",
     feature = "catalog-postgres"
 ))]
-const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; sqlite:<path> \
-                    [data <dir>]; postgres://… catalogs need `data <dir>`)";
+const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; pink:<path> or \
+                    sqlite:<path> [data <dir>]; postgres://… catalogs need `data <dir>`)";
 #[cfg(all(
     not(feature = "s3"),
     feature = "catalog-sqlite",
     not(feature = "catalog-postgres")
 ))]
-const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; a \
-                    sqlite:<path> catalog accepts optional `data <dir>`)";
+const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; a pink:<path> \
+                    or sqlite:<path> catalog accepts optional `data <dir>`)";
 #[cfg(all(
     not(feature = "s3"),
     not(feature = "catalog-sqlite"),
     feature = "catalog-postgres"
 ))]
-const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; a \
-                    postgres://… catalog needs `data <dir>`)";
+const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; a pink:<path> \
+                    catalog accepts optional `data <dir>`; postgres://… needs `data <dir>`)";
 #[cfg(all(
     not(feature = "s3"),
     not(feature = "catalog-sqlite"),
     not(feature = "catalog-postgres")
 ))]
-const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature)";
+const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; a pink:<path> \
+                    catalog accepts optional `data <dir>`)";
 
 /// Per-lake base version of this REPL session (one session per process):
 /// the version `.lake open` last loaded from or `.lake save` last published
@@ -434,13 +436,23 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
 
 /// The `data <location>` option in usage text: offered only by a build that
 /// accepts a SQL catalog (the same rule as [`HINT`]).
-#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
+#[cfg(any(
+    feature = "pinklake",
+    feature = "vortexlake",
+    feature = "catalog-sqlite",
+    feature = "catalog-postgres"
+))]
 macro_rules! data_opt {
     () => {
         " [data <dir|s3://…>]"
     };
 }
-#[cfg(not(any(feature = "catalog-sqlite", feature = "catalog-postgres")))]
+#[cfg(not(any(
+    feature = "pinklake",
+    feature = "vortexlake",
+    feature = "catalog-sqlite",
+    feature = "catalog-postgres"
+)))]
 macro_rules! data_opt {
     () => {
         ""

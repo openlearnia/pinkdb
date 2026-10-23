@@ -2,9 +2,9 @@
 //!
 //! The DuckLake v1.1 schema and every statement the catalog issues are written
 //! once here. [`Dialect`] names the small syntactic differences a backend has:
-//! placeholder style and how a write transaction begins. SQLite is the first
-//! implementation; Postgres and the future `.pink` database reuse the same
-//! text with another variant.
+//! placeholder style, how a write transaction begins and the few DDL spellings
+//! a backend lacks. SQLite and pinkdb are the implementations; T2's Postgres
+//! reuses the same text with another variant.
 //!
 //! Values are always bound, never interpolated. The only text this module
 //! builds by concatenation is DDL that names an inlined table
@@ -19,36 +19,56 @@ pub(crate) const DUCKLAKE_VERSION: &str = "1.1";
 pub(crate) enum Dialect {
     /// SQLite (the `catalog-sqlite` feature).
     Sqlite,
+    /// The durable pinkdb `.pink` database (`pink:<path>`), always built.
+    Pink,
 }
 
 impl Dialect {
-    /// The dialect the running backend uses.
-    pub(crate) const fn current() -> Self {
-        Self::Sqlite
-    }
-
-    /// One bound-parameter placeholder (`?1` for SQLite, `$1` for Postgres).
+    /// One bound-parameter placeholder (`?1` for SQLite, `?` for pinkdb,
+    /// whose prepared statements are strictly positional).
     pub(crate) fn ph(&self, index: usize) -> String {
         match self {
             Self::Sqlite => format!("?{index}"),
+            Self::Pink => "?".to_string(),
         }
     }
 
     /// Start one write transaction. SQLite takes its write lock up front so
-    /// two writers serialize instead of deadlocking on an upgrade.
+    /// two writers serialize instead of deadlocking on an upgrade; pinkdb's
+    /// `BEGIN` is its documented optimistic snapshot, and `COMMIT` validates
+    /// the read/write set under the write lease (a moved head is the same
+    /// retryable conflict).
     pub(crate) fn begin_write(&self) -> &'static str {
         match self {
             Self::Sqlite => "BEGIN IMMEDIATE",
+            Self::Pink => "BEGIN",
         }
     }
 
-    /// Start a read transaction (not used by the SQLite backend today; the
+    /// Start a read transaction (not used by either backend today; the
     /// trait reads are single statements).
     #[allow(dead_code)]
     pub(crate) fn begin_read(&self) -> &'static str {
         match self {
-            Self::Sqlite => "BEGIN",
+            Self::Sqlite | Self::Pink => "BEGIN",
         }
+    }
+
+    /// The binary column type. pinkdb has no BLOB: the opaque side objects
+    /// (JSON bytes only) are stored as lower-case hex text there, which the
+    /// [`super::conn`] value layer encodes and decodes.
+    pub(crate) fn blob_type(&self) -> &'static str {
+        match self {
+            Self::Sqlite => "BLOB",
+            Self::Pink => "VARCHAR",
+        }
+    }
+
+    /// The pinkdb side tables. One list, with the two backend differences
+    /// applied here: the BLOB spelling, and no `DEFAULT` clause (pinkdb's
+    /// `CREATE TABLE` grammar has none; every insert supplies the column).
+    pub(crate) fn side_ddl(&self) -> String {
+        SIDE_DDL.replace("BLOB", self.blob_type())
     }
 
     /// The exact DuckLake v1.1 catalog tables. Column names, order and types
@@ -169,8 +189,8 @@ CREATE TABLE IF NOT EXISTS pinkdb_table_change (
     snapshot_id       BIGINT NOT NULL,
     table_id          BIGINT NOT NULL,
     kind              BIGINT NOT NULL,
-    partition_changed BIGINT NOT NULL DEFAULT 0,
-    inlining_changed  BIGINT NOT NULL DEFAULT 0,
+    partition_changed BIGINT NOT NULL,
+    inlining_changed  BIGINT NOT NULL,
     inlined_limit     BIGINT,
     PRIMARY KEY (snapshot_id, table_id)
 );

@@ -65,6 +65,23 @@ impl Suite for SqliteSuite {
     }
 }
 
+/// pinkdb `.pink`: one durable database file per catalog in the test's
+/// scratch directory.
+#[derive(Debug, Default)]
+pub struct PinkSuite;
+
+impl PinkSuite {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Suite for PinkSuite {
+    fn catalog(&mut self, dir: &Path, name: &str) -> String {
+        format!("pink:{}", dir.join(format!("{name}.pink")).display())
+    }
+}
+
 /// Postgres: one schema per catalog, named `w96a_<pid>_<seq>`, dropped on
 /// drop.
 #[cfg(feature = "catalog-postgres")]
@@ -341,10 +358,13 @@ pub fn create_save_open_round_trip(suite: &mut dyn Suite) {
     let reopened = Lake::open_url(&catalog).unwrap();
     assert_eq!(reopened.current_version(), 2);
     let fresh = suite.catalog(&dir, "fresh");
-    if fresh.starts_with("sqlite:") {
+    if fresh.starts_with("sqlite:") || fresh.starts_with("pink:") {
         let created = Lake::open_or_create_url(&fresh).unwrap();
         assert_eq!(created.current_version(), 1);
-        let created_path = fresh.strip_prefix("sqlite:").unwrap();
+        let created_path = fresh
+            .strip_prefix("sqlite:")
+            .or_else(|| fresh.strip_prefix("pink:"))
+            .unwrap();
         assert!(
             std::path::Path::new(&format!("{created_path}.files"))
                 .join("lake-data.json")
@@ -973,6 +993,273 @@ pub fn encrypted_migration_keeps_sealed_bytes(suite: &mut dyn Suite) {
 
     let err = Lake::open_with_key(&plain, key).unwrap_err();
     assert!(matches!(err, LakeError::CatalogMoved { .. }), "{err:?}");
+
+    cleanup(&dir);
+}
+
+// ---------- lake-wide operations on a SQL catalog ----------
+//
+// These are the regressions behind the table-less head: every caller that
+// walks the catalog must see the tables. Each test asserts the effect (rows,
+// files, deletes, settings), not merely that the call returned `Ok`.
+
+fn catalog_entry(catalog: &str, key: &str) -> serde_json::Value {
+    let bytes = catalog_stored_bytes(catalog, "catalog.json")
+        .unwrap()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    json["tables"][key].clone()
+}
+
+fn file_count(entry: &serde_json::Value) -> usize {
+    entry["files"].as_array().map_or(0, Vec::len)
+}
+
+fn live_inlined(entry: &serde_json::Value) -> usize {
+    entry["inlined"].as_array().map_or(0, |rows| {
+        rows.iter().filter(|row| row["end"].is_null()).count()
+    })
+}
+
+pub fn flush_moves_inlined_rows_to_a_data_file(suite: &mut dyn Suite) {
+    let dir = scratch("flush");
+    let catalog = suite.catalog(&dir, "catalog");
+    let data = dir.join("data-root");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_data_inlining_row_limit(10);
+    assert_eq!(lake.write_from_store(&store(0)).unwrap(), 2);
+    let mut commit = Commit::new();
+    commit.append("main.t", sub_table(&[(1, "a"), (2, "b"), (3, "c")]));
+    assert_eq!(lake.commit(&commit).unwrap().version, 3);
+
+    let before = catalog_entry(&catalog, "main.t");
+    assert_eq!(live_inlined(&before), 3, "{before}");
+    let files_before = file_count(&before);
+
+    let report = lake.flush_inlined_data(Some("main.t")).unwrap();
+    assert!(report.committed, "{report:?}");
+    assert_eq!(report.tables, vec![("main.t".to_string(), 3)], "{report:?}");
+    assert!(report.data_files >= 1, "{report:?}");
+    assert_eq!(report.version, 4);
+    drop(lake);
+
+    let after = catalog_entry(&catalog, "main.t");
+    assert_eq!(live_inlined(&after), 0, "flushed rows are ended: {after}");
+    assert!(
+        file_count(&after) > files_before,
+        "the flush wrote a data file: {after}"
+    );
+    let flushed: Vec<&serde_json::Value> = after["inlined"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["flushed"] == serde_json::Value::Bool(true))
+        .collect();
+    assert_eq!(flushed.len(), 3, "{after}");
+    for row in flushed {
+        assert_eq!(row["end"], serde_json::json!(4), "{after}");
+    }
+
+    let lake = Lake::open_with_catalog(&catalog, None).unwrap();
+    assert_eq!(lake.current_version(), 4);
+    let mut db = lake.load(None).unwrap();
+    assert_eq!(count(&lake, "SELECT count(*) FROM t"), 3);
+    assert_eq!(
+        rows(&mut db, "SELECT i, s FROM t ORDER BY i"),
+        vec![
+            vec![Value::Integer(1), Value::Varchar("a".into())],
+            vec![Value::Integer(2), Value::Varchar("b".into())],
+            vec![Value::Integer(3), Value::Varchar("c".into())],
+        ]
+    );
+
+    cleanup(&dir);
+}
+
+pub fn merge_adjacent_files_reduces_the_file_count(suite: &mut dyn Suite) {
+    let dir = scratch("merge");
+    let catalog = suite.catalog(&dir, "catalog");
+    let data = dir.join("data-root");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    assert_eq!(lake.write_from_store(&store(0)).unwrap(), 2);
+    for i in 0..4 {
+        let mut commit = Commit::new();
+        commit.append("main.t", sub_table(&[(i, "m")]));
+        lake.commit(&commit).unwrap();
+    }
+    let before = catalog_entry(&catalog, "main.t");
+    let files_before = file_count(&before);
+    assert!(files_before >= 4, "{before}");
+
+    let report = lake
+        .merge_adjacent_files(Some("main.t"), &Default::default())
+        .unwrap();
+    assert!(report.committed, "{report:?}");
+    assert!(report.files_processed() >= 2, "{report:?}");
+    assert_eq!(report.files_created(), 1, "{report:?}");
+    drop(lake);
+
+    let after = catalog_entry(&catalog, "main.t");
+    assert!(
+        file_count(&after) < files_before,
+        "files {} -> {}: {after}",
+        files_before,
+        file_count(&after)
+    );
+    let lake = Lake::open_with_catalog(&catalog, None).unwrap();
+    assert_eq!(count(&lake, "SELECT count(*) FROM t"), 4);
+    let mut db = lake.load(None).unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT i FROM t ORDER BY i"),
+        vec![
+            vec![Value::Integer(0)],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ]
+    );
+
+    cleanup(&dir);
+}
+
+pub fn rewrite_with_deletes_drops_the_delete_files(suite: &mut dyn Suite) {
+    let dir = scratch("rewrite");
+    let catalog = suite.catalog(&dir, "catalog");
+    let data = dir.join("data-root");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    assert_eq!(lake.write_from_store(&store(3)).unwrap(), 2);
+    let before = catalog_entry(&catalog, "main.t");
+    let file = before["files"][0]["path"].as_str().unwrap().to_string();
+
+    let mut commit = Commit::new();
+    commit.delete_positions("main.t", &file, &[1]);
+    assert_eq!(lake.commit(&commit).unwrap().version, 3);
+    let with_delete = catalog_entry(&catalog, "main.t");
+    assert_eq!(
+        with_delete["deletes"].as_array().map_or(0, Vec::len),
+        1,
+        "{with_delete}"
+    );
+
+    let report = lake
+        .rewrite_data_files(
+            Some("main.t"),
+            &pink_lake::RewriteSettings {
+                delete_threshold: 0.0,
+                max_compacted_files: None,
+            },
+        )
+        .unwrap();
+    assert!(report.committed, "{report:?}");
+    drop(lake);
+
+    let after = catalog_entry(&catalog, "main.t");
+    assert_eq!(
+        after["deletes"].as_array().map_or(0, Vec::len),
+        0,
+        "the rewrite baked the deletes in: {after}"
+    );
+    let lake = Lake::open_with_catalog(&catalog, None).unwrap();
+    assert_eq!(count(&lake, "SELECT count(*) FROM t"), 2);
+    let mut db = lake.load(None).unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT i FROM t ORDER BY i"),
+        vec![vec![Value::Integer(100)], vec![Value::Integer(102)]]
+    );
+
+    cleanup(&dir);
+}
+
+pub fn add_data_files_registers_an_existing_file(suite: &mut dyn Suite) {
+    let dir = scratch("add-files");
+    // A source lake writes a real data file for `main.t`.
+    let source_dir = dir.join("source");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let source_catalog = suite.catalog(&source_dir, "source");
+    let source_data = source_dir.join("data");
+    let mut source =
+        Lake::create_with_catalog(&source_catalog, source_data.to_str().unwrap()).unwrap();
+    source.set_data_inlining_row_limit(0);
+    assert_eq!(source.write_from_store(&store(2)).unwrap(), 2);
+    drop(source);
+    let source_entry = catalog_entry(&source_catalog, "main.t");
+    let rel = source_entry["files"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let source_file = source_data.join(&rel);
+    assert!(source_file.is_file(), "{}", source_file.display());
+
+    // A target with the same table schema, then copy the file in.
+    let catalog = suite.catalog(&dir, "target");
+    let data = dir.join("target-data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    assert_eq!(lake.write_from_store(&store(0)).unwrap(), 2);
+    let before = catalog_entry(&catalog, "main.t");
+    let target_file = data.join(&rel);
+    std::fs::create_dir_all(target_file.parent().unwrap()).unwrap();
+    std::fs::copy(&source_file, &target_file).unwrap();
+
+    let report = lake
+        .add_data_files_with_settings(
+            "main.t",
+            std::slice::from_ref(&rel),
+            &CommitSettings::default(),
+        )
+        .unwrap();
+    assert!(report.committed, "{report:?}");
+    assert_eq!(report.files.len(), 1, "{report:?}");
+    assert_eq!(report.files[0].1, rel);
+    assert_eq!(report.files[0].2, 2, "{report:?}");
+    drop(lake);
+
+    let after = catalog_entry(&catalog, "main.t");
+    assert_eq!(
+        file_count(&after),
+        file_count(&before) + 1,
+        "the registered file joins the entry: {after}"
+    );
+    let lake = Lake::open_with_catalog(&catalog, None).unwrap();
+    assert_eq!(count(&lake, "SELECT count(*) FROM t"), 2);
+    let mut db = lake.load(None).unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT i FROM t ORDER BY i"),
+        vec![vec![Value::Integer(100)], vec![Value::Integer(101)]]
+    );
+
+    cleanup(&dir);
+}
+
+pub fn partition_and_inlining_settings_publish(suite: &mut dyn Suite) {
+    let dir = scratch("settings");
+    let catalog = suite.catalog(&dir, "catalog");
+    let data = dir.join("data-root");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    assert_eq!(lake.write_from_store(&store(2)).unwrap(), 2);
+
+    let report = lake
+        .set_partition_spec("main.t", &["i".to_string()], &CommitSettings::default())
+        .unwrap();
+    assert!(report.committed, "{report:?}");
+    assert_eq!(report.version, 3);
+    let entry = catalog_entry(&catalog, "main.t");
+    assert_eq!(
+        entry["partition_by"],
+        serde_json::json!([{"column": "i", "transform": "identity"}]),
+        "{entry}"
+    );
+
+    let report = lake
+        .set_inlining_limit("main.t", Some(5), &CommitSettings::default())
+        .unwrap();
+    assert!(report.committed, "{report:?}");
+    assert_eq!(report.version, 4);
+    let entry = catalog_entry(&catalog, "main.t");
+    assert_eq!(entry["inlined_limit"], serde_json::json!(5), "{entry}");
+    assert_eq!(count(&lake, "SELECT count(*) FROM t"), 2);
 
     cleanup(&dir);
 }

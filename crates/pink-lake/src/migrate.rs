@@ -182,12 +182,15 @@ impl Lake {
 }
 
 fn is_catalog_location(location: &Location) -> bool {
-    matches!(location, Location::Sqlite(_) | Location::Postgres(_))
+    matches!(
+        location,
+        Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
+    )
 }
 
 fn read_source(location: &str, parsed: &Location) -> Result<Source> {
     match parsed {
-        Location::Sqlite(_) | Location::Postgres(_) => {
+        Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_) => {
             let store = catalog_store::open_catalog(location, parsed, false)?;
             if store.moved_to()?.is_some() {
                 return Err(catalog_moved(location, &*store)?);
@@ -351,7 +354,7 @@ type TargetReopen = Box<dyn FnOnce() -> Result<Target>>;
 /// the target plus a closure that reopens it for verification.
 fn open_target(to: &str, parsed: &Location) -> Result<(Target, TargetReopen)> {
     match parsed {
-        Location::Sqlite(_) | Location::Postgres(_) => {
+        Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_) => {
             let store = match catalog_store::open_catalog(to, parsed, false) {
                 Ok(store) => {
                     if store.moved_to()?.is_some() {

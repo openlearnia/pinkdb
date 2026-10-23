@@ -1104,23 +1104,33 @@ fn read_magic(path: &Path) -> Option<[u8; 8]> {
 }
 
 /// A parsed lake location: a local directory path, an `s3://` URL, or a SQL
-/// catalog URL (`sqlite:<path>` / `postgres://…`; wave 96a). A catalog
-/// location names only the metadata store — the data location is recorded in
-/// the catalog itself.
+/// catalog URL (`pink:<path>` / `sqlite:<path>` / `postgres://…`; wave 96a and
+/// wave 103). A catalog location names only the metadata store — the data
+/// location is recorded in the catalog itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Location {
     Local(PathBuf),
-    S3 { bucket: String, prefix: String },
+    S3 {
+        bucket: String,
+        prefix: String,
+    },
+    /// A durable pinkdb `.pink` catalog (`pink:<path>`).
+    Pink(PathBuf),
     Sqlite(PathBuf),
     Postgres(String),
 }
 
 impl Location {
     /// Parse a lake location string: `s3://bucket[/prefix…]` is object
-    /// storage, `sqlite:<path>` is a SQLite catalog, `postgres://…` /
-    /// `postgresql://…` is a Postgres catalog, anything else is a local path
-    /// (a directory literally named `s3://…` is not a thing).
+    /// storage, `pink:<path>` is a durable pinkdb catalog, `sqlite:<path>` is
+    /// a SQLite catalog, `postgres://…` / `postgresql://…` is a Postgres
+    /// catalog, anything else is a local path (a directory literally named
+    /// `s3://…` is not a thing). A bare path keeps its current meaning: the
+    /// object-store JSON directory layout.
     pub(crate) fn parse(location: &str) -> Result<Self> {
+        if let Some(rest) = location.strip_prefix("pink:") {
+            return Self::parse_pink(location, rest);
+        }
         if let Some(rest) = location.strip_prefix("sqlite:") {
             return Self::parse_sqlite(location, rest);
         }
@@ -1137,6 +1147,20 @@ impl Location {
             Some(rest) => Self::parse_s3(location, rest),
             None => Ok(Location::Local(PathBuf::from(location))),
         }
+    }
+
+    fn parse_pink(original: &str, rest: &str) -> Result<Self> {
+        // A lake catalog must persist: an in-memory database would vanish with
+        // the handle. pinkdb's `:memory:` is not a `.pink` file location.
+        if rest.is_empty() || rest == ":memory:" {
+            return Err(LakeError::BadLocation {
+                location: original.to_string(),
+                message: "a lake catalog must persist; `pink::memory:` is not a lake location \
+                          (use `pink:<path>`)"
+                    .to_string(),
+            });
+        }
+        Ok(Location::Pink(PathBuf::from(rest)))
     }
 
     fn parse_sqlite(original: &str, rest: &str) -> Result<Self> {

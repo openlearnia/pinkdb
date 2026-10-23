@@ -486,7 +486,6 @@ pub mod replication;
 
 pub use attach::AttachmentReport;
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
-#[cfg(feature = "catalog-sqlite")]
 use catalog_store::CatalogStore;
 use catalog_store::SplitStorage;
 pub use cdc::{ChangeKind, ChangeRow};
@@ -1035,16 +1034,34 @@ impl Lake {
         key: Option<EncryptionKey>,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
-        // Wave 103: a keyless SQLite catalog is created directly in the
-        // DuckLake tables. The object-store create protocol would need a
-        // version-1 `snapshots/…`/`catalog.json` pair; seeding the snapshot-0
-        // row instead is the same empty lake in the new layout. A keyed
-        // SQLite catalog still goes through the (T2) sealing path.
-        #[cfg(feature = "catalog-sqlite")]
-        if key.is_none()
-            && let Location::Sqlite(path) = &catalog_location
-        {
-            return Self::create_sqlite_catalog(catalog_url, path, data_location);
+        // Catalog encryption is wave 103 T2. Refuse a keyed `.pink` catalog
+        // clearly instead of walking the old sealed-object create path over
+        // plaintext DuckLake rows.
+        if key.is_some() && matches!(catalog_location, Location::Pink(_)) {
+            return Err(LakeError::FeatureMissing {
+                feature: "catalog-encryption",
+                message: "an encrypted `.pink` catalog is wave 103 T2; create it without \
+                          PINKDB_KEY or use `sqlite:<path>` with encryption"
+                    .to_string(),
+            });
+        }
+        // Wave 103: a keyless SQL catalog (the `.pink` database, or SQLite
+        // with `catalog-sqlite`) is created directly in the DuckLake tables.
+        // The object-store create protocol would need a version-1
+        // `snapshots/…`/`catalog.json` pair; seeding the snapshot-0 row
+        // instead is the same empty lake in the new layout. A keyed SQL
+        // catalog still goes through the (T2) sealing path.
+        if key.is_none() && matches!(catalog_location, Location::Pink(_) | Location::Sqlite(_)) {
+            // Refuse a data location that already belongs to a lake *before*
+            // the catalog database is created, so a rejected create leaves
+            // nothing behind.
+            let data = data_storage(data_location)?;
+            ensure_data_location_free(&*data, data_location)?;
+            if let Some(store) =
+                catalog_store::open_metadata_store(catalog_url, &catalog_location, true)?
+            {
+                return Self::create_sql_catalog(catalog_url, store, data_location);
+            }
         }
         let data = data_storage(data_location)?;
         // Refuse a data location that already belongs to a lake *before* the
@@ -1068,25 +1085,19 @@ impl Lake {
         Ok(lake)
     }
 
-    /// Create a keyless SQLite-catalog lake directly on the DuckLake tables.
+    /// Create a keyless SQL-catalog lake directly on the DuckLake tables.
     ///
     /// The store seeds `ducklake_metadata` (`version`, `created_by`,
     /// `data_path`, `encrypted=false`), snapshot 0 (`created_schema:"main"`)
     /// and the pink side rows in one transaction; the handle starts at pink
-    /// version 1, which *is* snapshot 0 (see [`crate::metadata`]).
-    #[cfg(feature = "catalog-sqlite")]
-    fn create_sqlite_catalog(catalog_url: &str, path: &Path, data_location: &str) -> Result<Self> {
+    /// version 1, which *is* snapshot 0 (see [`crate::metadata`]). Shared by
+    /// the `.pink` database and SQLite.
+    fn create_sql_catalog(
+        catalog_url: &str,
+        store: catalog_store::SqlMetadataStore,
+        data_location: &str,
+    ) -> Result<Self> {
         let data = data_storage(data_location)?;
-        // Refuse a data location that already belongs to a lake *before* the
-        // catalog database is created, so a rejected create leaves nothing
-        // behind.
-        ensure_data_location_free(&*data, data_location)?;
-        let store = catalog_store::SqliteMetadataStore::open(catalog_url, path, true)?;
-        if store.initialized()? {
-            return Err(LakeError::AlreadyALake {
-                path: PathBuf::from(redact_location(catalog_url)),
-            });
-        }
         let lake_id = fresh_lake_id()?;
         let manifest = Catalog {
             format_version: FORMAT_VERSION,
@@ -1106,7 +1117,7 @@ impl Lake {
             &manifest,
         )?;
         let catalog: Arc<dyn CatalogStore> =
-            Arc::new(catalog_store::SqliteCatalog::from_store(catalog_url, store));
+            Arc::new(catalog_store::SqlCatalog::from_store(catalog_url, store));
         let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(catalog, data));
         let root = storage.abs("");
         let lake = Self {
@@ -1279,16 +1290,25 @@ impl Lake {
         key: Option<EncryptionKey>,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
-        // Wave 103: a keyless SQLite catalog opens directly from the DuckLake
+        // Catalog encryption is wave 103 T2 (see the create path).
+        if key.is_some() && matches!(catalog_location, Location::Pink(_)) {
+            return Err(LakeError::FeatureMissing {
+                feature: "catalog-encryption",
+                message: "an encrypted `.pink` catalog is wave 103 T2; open it without \
+                          PINKDB_KEY or use `sqlite:<path>` with encryption"
+                    .to_string(),
+            });
+        }
+        // Wave 103: a keyless SQL catalog opens directly from the DuckLake
         // tables. The rendered compatibility objects (`lake.json`,
         // `highest.json`, `catalog.json`) exist too, but going through them
         // would add a JSON round trip to every open and would require a side
         // row for catalogs DuckDB created.
-        #[cfg(feature = "catalog-sqlite")]
         if key.is_none()
-            && let Location::Sqlite(path) = &catalog_location
+            && let Some(store) =
+                catalog_store::open_metadata_store(catalog_url, &catalog_location, false)?
         {
-            return Self::open_sqlite_catalog(catalog_url, path, data_location);
+            return Self::open_sql_catalog(catalog_url, store, data_location);
         }
         let catalog = catalog_store::open_catalog(catalog_url, &catalog_location, false)?;
         // A migrated-away SQL catalog keeps its rows and records the target in
@@ -1322,20 +1342,19 @@ impl Lake {
         Self::open_with(storage, key)
     }
 
-    /// Open a keyless SQLite-catalog lake directly from the DuckLake tables.
+    /// Open a keyless SQL-catalog lake directly from the DuckLake tables
+    /// (`.pink` or SQLite).
     ///
     /// A catalog written by DuckDB has no pink side row for its snapshots;
     /// the first open adopts a lake identity into `pinkdb_lake` (the only
     /// fact DuckLake has no column for), so every later load and commit has
     /// one. `data_location` overrides the recorded `ducklake_metadata.data_path`
     /// for this session, exactly like the object-store split open.
-    #[cfg(feature = "catalog-sqlite")]
-    fn open_sqlite_catalog(
+    fn open_sql_catalog(
         catalog_url: &str,
-        path: &Path,
+        store: catalog_store::SqlMetadataStore,
         data_location: Option<&str>,
     ) -> Result<Self> {
-        let store = catalog_store::SqliteMetadataStore::open(catalog_url, path, false)?;
         if let Some(moved_to) = store.moved_to()? {
             return Err(LakeError::CatalogMoved {
                 path: PathBuf::from(redact_location(catalog_url)),
@@ -1368,7 +1387,7 @@ impl Lake {
             }
         };
         let catalog: Arc<dyn CatalogStore> =
-            Arc::new(catalog_store::SqliteCatalog::from_store(catalog_url, store));
+            Arc::new(catalog_store::SqlCatalog::from_store(catalog_url, store));
         let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(catalog, data));
         let root = storage.abs("");
         Ok(Self {
@@ -1618,10 +1637,10 @@ impl Lake {
             return match Self::open_url(location) {
                 Ok(lake) => Ok(lake),
                 Err(LakeError::NotALake { .. }) => match &parsed {
-                    // DuckLake's `DATA_PATH` default: a fresh SQLite catalog
+                    // DuckLake's `DATA_PATH` default: a fresh SQL catalog
                     // keeps its data next to the database, `<catalog>.files/`.
-                    Location::Sqlite(path) => {
-                        Self::create_with_catalog(location, &default_sqlite_data_location(path))
+                    Location::Pink(path) | Location::Sqlite(path) => {
+                        Self::create_with_catalog(location, &default_catalog_data_location(path))
                     }
                     _ => Err(catalog_needs_data(location, "save")),
                 },
@@ -2514,6 +2533,7 @@ impl Lake {
                 footer_offset: footer.map(|f| f.offset),
                 footer_len: footer.map(|f| f.length),
                 footer_crc32c: footer.map(|f| f.crc32c),
+                stats_sealed: true,
             },
             written,
         ))
@@ -3137,6 +3157,12 @@ fn storage_for(location: Location) -> Result<Arc<dyn Storage>> {
     match location {
         Location::Local(path) => Ok(Arc::new(LocalStorage::new(&path))),
         Location::S3 { bucket, prefix } => s3_storage(&bucket, &prefix),
+        Location::Pink(path) => Err(LakeError::BadLocation {
+            location: format!("pink:{}", path.display()),
+            message: "a catalog location is not a data location; use Lake::create_with_catalog \
+                      / Lake::open_with_catalog"
+                .to_string(),
+        }),
         Location::Sqlite(path) => Err(LakeError::BadLocation {
             location: format!("sqlite:{}", path.display()),
             message: "a catalog location is not a data location; use Lake::create_with_catalog \
@@ -3154,7 +3180,10 @@ fn storage_for(location: Location) -> Result<Arc<dyn Storage>> {
 
 /// Whether a parsed location names a SQL catalog rather than a data location.
 fn is_catalog_location(location: &Location) -> bool {
-    matches!(location, Location::Sqlite(_) | Location::Postgres(_))
+    matches!(
+        location,
+        Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
+    )
 }
 
 /// Redact the password out of a Postgres catalog URL for display (every other
@@ -3179,9 +3208,9 @@ fn data_storage(location: &str) -> Result<Arc<dyn Storage>> {
     storage_for(parsed)
 }
 
-/// The DuckLake default data location for a SQLite catalog: a sibling
-/// `<catalog path>.files/` directory (DuckLake's `DATA_PATH` default).
-fn default_sqlite_data_location(path: &Path) -> String {
+/// The DuckLake default data location for a SQL catalog (`.pink` or SQLite):
+/// a sibling `<catalog path>.files/` directory (DuckLake's `DATA_PATH` default).
+fn default_catalog_data_location(path: &Path) -> String {
     format!("{}.files/", path.display())
 }
 
@@ -3299,19 +3328,16 @@ pub fn validate_store(db: &PinkDb) -> Result<()> {
 /// marker together. The arm names the lake id so parallel tests' publications
 /// are untouched. Compiled only with `catalog-sqlite`.
 #[doc(hidden)]
-#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
 pub fn fail_next_publish_after_snapshot(lake_id: &str) {
     *FAIL_PUBLISH_AFTER_SNAPSHOT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lake_id.to_string());
 }
 
-#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
 static FAIL_PUBLISH_AFTER_SNAPSHOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// The armed crash-injection point (a no-op without a SQL catalog feature).
+/// The armed crash-injection point (a no-op unless a test armed it).
 pub(crate) fn maybe_fail_publish_after_snapshot(lake_id: &str) -> Result<()> {
-    #[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
     {
         let mut armed = FAIL_PUBLISH_AFTER_SNAPSHOT
             .lock()
@@ -3325,8 +3351,6 @@ pub(crate) fn maybe_fail_publish_after_snapshot(lake_id: &str) -> Result<()> {
             });
         }
     }
-    #[cfg(not(any(feature = "catalog-sqlite", feature = "catalog-postgres")))]
-    let _ = lake_id;
     Ok(())
 }
 
@@ -3336,14 +3360,20 @@ pub(crate) fn maybe_fail_publish_after_snapshot(lake_id: &str) -> Result<()> {
 #[doc(hidden)]
 #[cfg(feature = "catalog-sqlite")]
 pub fn sqlite_last_commit_rows_touched() -> u64 {
-    crate::metadata::sqlite::last_commit_rows_touched()
+    crate::metadata::store::last_commit_rows_touched()
+}
+
+/// Rows the catalog reported as changed by the most recent successful delta
+/// commit in this process (used by the pink backend's scaling tests).
+#[doc(hidden)]
+pub fn last_commit_rows_touched() -> u64 {
+    crate::metadata::store::last_commit_rows_touched()
 }
 
 /// The stored bytes of one catalog object, bypassing any decorator (wave 96a
 /// tests): an encrypted lake's row holds the sealed blob, a plaintext lake's
 /// the JSON. Not part of the supported API.
 #[doc(hidden)]
-#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
 pub fn catalog_stored_bytes(catalog_url: &str, rel: &str) -> Result<Option<Vec<u8>>> {
     let location = Location::parse(catalog_url)?;
     let store = catalog_store::open_catalog(catalog_url, &location, false)?;

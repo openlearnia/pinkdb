@@ -25,14 +25,10 @@ use crate::{HIGHEST_FILE, LAKE_FILE, LakeError, Result};
 
 pub(crate) mod url;
 
-#[cfg(feature = "catalog-sqlite")]
-mod sqlite;
+mod sql;
 
-#[cfg(feature = "catalog-sqlite")]
-pub(crate) use sqlite::SqliteCatalog;
-
-#[cfg(feature = "catalog-sqlite")]
-pub(crate) use crate::metadata::sqlite::SqliteMetadataStore;
+pub(crate) use crate::metadata::store::SqlMetadataStore;
+pub(crate) use sql::SqlCatalog;
 
 #[cfg(feature = "catalog-postgres")]
 mod postgres;
@@ -98,10 +94,17 @@ pub(crate) fn open_catalog(
     create: bool,
 ) -> Result<Arc<dyn CatalogStore>> {
     match location {
+        // The `.pink` catalog is always built: pinkdb is already a dependency,
+        // so a `pink:<path>` URL needs no feature gate.
+        Location::Pink(path) => {
+            let store = crate::metadata::pink::open(catalog_url, path, create)?;
+            Ok(Arc::new(SqlCatalog::from_store(catalog_url, store)))
+        }
         Location::Sqlite(path) => {
             #[cfg(feature = "catalog-sqlite")]
             {
-                Ok(Arc::new(SqliteCatalog::open(catalog_url, path, create)?))
+                let store = crate::metadata::sqlite::open(catalog_url, path, create)?;
+                Ok(Arc::new(SqlCatalog::from_store(catalog_url, store)))
             }
             #[cfg(not(feature = "catalog-sqlite"))]
             {
@@ -151,10 +154,39 @@ fn describe(location: &Location) -> String {
         Location::S3 { bucket, prefix } => {
             format!("the object-storage location s3://{bucket}/{prefix}")
         }
+        Location::Pink(path) => format!("the catalog pink:{}", path.display()),
         Location::Sqlite(path) => format!("the SQL catalog sqlite:{}", path.display()),
         Location::Postgres(catalog) => {
             format!("the Postgres catalog {}", url::redact_location(catalog))
         }
+    }
+}
+
+/// Open a SQL catalog's metadata store when `location` names one this build
+/// can serve directly (the `.pink` backend always, SQLite with the feature).
+/// `None` means "not a SQL catalog this build opens here"; the caller either
+/// falls through to [`open_catalog`] (which reports a missing feature) or is
+/// not a catalog at all.
+pub(crate) fn open_metadata_store(
+    catalog_url: &str,
+    location: &Location,
+    create: bool,
+) -> Result<Option<SqlMetadataStore>> {
+    match location {
+        Location::Pink(path) => Ok(Some(crate::metadata::pink::open(
+            catalog_url,
+            path,
+            create,
+        )?)),
+        #[cfg(feature = "catalog-sqlite")]
+        Location::Sqlite(path) => Ok(Some(crate::metadata::sqlite::open(
+            catalog_url,
+            path,
+            create,
+        )?)),
+        #[cfg(not(feature = "catalog-sqlite"))]
+        Location::Sqlite(_) => Ok(None),
+        Location::Local(_) | Location::S3 { .. } | Location::Postgres(_) => Ok(None),
     }
 }
 

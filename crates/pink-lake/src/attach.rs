@@ -1224,7 +1224,14 @@ fn block_file_stats(
         },
     };
     let rows = file_rows.unwrap_or(entry.rows);
-    block_schema_and_stats(entry_key, rel, rows, block, manifest_path)
+    block_schema_and_stats(
+        entry_key,
+        rel,
+        rows,
+        block,
+        manifest_path,
+        !file.stats_sealed(),
+    )
 }
 
 /// Verify one statistics block against its entry and turn it into the
@@ -1240,12 +1247,17 @@ fn block_schema_and_stats(
     rows: u64,
     block: &crate::stats::StatsBlock,
     manifest_path: &std::path::Path,
+    check_crc: bool,
 ) -> Result<SchemaAndStats> {
     let corrupt = |message: String| LakeError::Corrupt {
         path: manifest_path.to_path_buf(),
         message,
     };
-    let (schema, stats) = block.schema_and_stats(manifest_path)?;
+    let (schema, stats) = if check_crc {
+        block.schema_and_stats(manifest_path)?
+    } else {
+        block.schema_and_stats_with_crc_check(manifest_path, false)?
+    };
     if block.table != entry_key {
         return Err(corrupt(format!(
             "table \"{entry_key}\" carries the statistics block of \"{}\"",
@@ -1294,6 +1306,7 @@ fn vortex_catalog_stats(
         rows,
         block,
         manifest_path,
+        !file.stats_sealed(),
     )?))
 }
 
@@ -2238,6 +2251,7 @@ mod tests {
                 footer_offset: None,
                 footer_len: None,
                 footer_crc32c: None,
+                stats_sealed: false,
             }],
             rows: 3,
             table_id: None,

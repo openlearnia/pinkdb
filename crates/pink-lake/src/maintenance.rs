@@ -656,6 +656,7 @@ impl Lake {
                     TableDelta {
                         runtime: crate::catalog::TableRuntime {
                             kind: crate::catalog::DeltaKind::Compaction,
+                            meta: Some(crate::catalog::TableMeta::from_entry(&planned.entry)),
                             ..Default::default()
                         },
                         data_files: planned.new_files.clone(),
@@ -722,7 +723,12 @@ impl Lake {
                     + commit_bytes.len() as u64
                     + 2 * snapshot_plain.len() as u64,
             };
-            match self.publish_commit_version(version, &commit_bytes, &snapshot_plain) {
+            match self.publish_catalog_version(
+                &new_catalog,
+                commit_manifest,
+                &commit_bytes,
+                &snapshot_plain,
+            ) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
