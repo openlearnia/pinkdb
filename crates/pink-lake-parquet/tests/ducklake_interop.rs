@@ -19,7 +19,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{Commit, Lake, LakeError};
+use pink_lake::{Commit, Lake};
 use pink_lake_parquet::{FORMAT_ID, register};
 use pinkdb::{DataTable, DataType, PinkDb, QueryResult, Value};
 
@@ -380,7 +380,247 @@ fn duckdb_reads_a_lake_after_a_pinkdb_flush() {
 }
 
 #[test]
-fn a_duckdb_catalog_opens_and_refuses_parquet_deletes() {
+fn duckdb_refuses_an_encrypted_pinkdb_lake() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+
+    let dir = scratch("pink-encrypted-to-duckdb");
+    let catalog_path = dir.join("catalog.db");
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let data = dir.join("data");
+    let key = pink_lake::EncryptionKey::from_passphrase("duckdb-must-not-read-this");
+    let mut lake =
+        Lake::create_with_catalog_with_key(&catalog, data.to_str().unwrap(), key.clone()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    lake.write_from_store(&parquet_store()).unwrap();
+    // Prove the file on disk really is sealed before DuckDB tries it.
+    let data_file = std::fs::read_dir(data.join("data").join("main.t"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .expect("the save produced a .parquet data file");
+    assert!(
+        std::fs::read(&data_file).unwrap().starts_with(b"PNKLAKE1"),
+        "the data file must be sealed"
+    );
+    drop(lake);
+
+    // PNKLAKE1 is AES-GCM with raw per-file keys, not Parquet modular
+    // encryption. DuckDB must fail (never return rows) rather than treat the
+    // container as a Parquet file.
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH 'ducklake:sqlite:{}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n\
+         SELECT i, s FROM l.t;\n",
+        catalog_path.display(),
+        data.display()
+    );
+    match run_duckdb(&binary, &script) {
+        Ok(rows) => panic!("DuckDB must refuse an encrypted pinkdb lake, got {rows:?}"),
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip DuckDB interop test: {message}");
+        }
+        Err(message) => {
+            assert!(
+                !message.contains("-1\n") && !message.contains("row-0"),
+                "never wrong rows: {message}"
+            );
+        }
+    }
+
+    cleanup(&dir);
+}
+
+/// Wave 103 T2: DuckDB attaches a pinkdb Parquet lake whose catalog is
+/// Postgres. Skipped with a printed note when the server variable or DuckDB is
+/// absent. Each run uses a fresh schema in the throwaway test database.
+#[cfg(feature = "catalog-postgres")]
+#[test]
+fn a_pinkdb_postgres_catalog_lake_attaches_in_duckdb() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    let Ok(base) = std::env::var("PINKDB_TEST_POSTGRES_URL") else {
+        println!("skip Postgres interop test: PINKDB_TEST_POSTGRES_URL is not set");
+        return;
+    };
+    let base = base.trim();
+    if base.is_empty() {
+        println!("skip Postgres interop test: PINKDB_TEST_POSTGRES_URL is empty");
+        return;
+    }
+    register().unwrap();
+
+    let dir = scratch("pink-postgres-to-duckdb");
+    let sequence = SEQ.fetch_add(1, Ordering::Relaxed);
+    let schema = format!("w103_{}_{}", std::process::id(), sequence);
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let catalog = format!("{base}{separator}schema={schema}");
+    let data = dir.join("data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    lake.write_from_store(&parquet_store()).unwrap();
+    let mut commit = Commit::new();
+    commit.append("main.t", append_table());
+    lake.commit(&commit).unwrap();
+    drop(lake);
+
+    // DuckDB's postgres connection string has no `schema` parameter; the
+    // DuckLake extension selects the metadata schema with METADATA_SCHEMA.
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH 'ducklake:postgres:{base}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true, METADATA_SCHEMA '{schema}');\n\
+         SELECT count(*) FROM l.t;\n\
+         SELECT count(*) FROM l.t WHERE i >= 3;\n",
+        data.display()
+    );
+    let rows = match run_duckdb(&binary, &script) {
+        Ok(rows) => rows,
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip Postgres interop test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    };
+    assert_eq!(
+        rows,
+        vec!["5".to_string(), "2".to_string()],
+        "DuckDB attach/count/filter over a pinkdb Parquet lake with a Postgres catalog"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn maintenance_round_trips_with_duckdb() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+
+    let dir = scratch("pink-maintenance-duckdb");
+    let catalog_path = dir.join("catalog.db");
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let data = dir.join("data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    // v2: three rows in file A; v3: a second save replaces them with file B,
+    // ending file A at snapshot 2.
+    lake.write_from_store(&parquet_store()).unwrap();
+    lake.write_from_store(&parquet_store()).unwrap();
+
+    let report = lake
+        .expire_snapshots(&pink_lake::ExpireSettings {
+            versions: Some(vec![2]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(report.version_numbers(), vec![2]);
+    let cleaned = lake
+        .cleanup_old_files(&pink_lake::CleanupSettings {
+            all: true,
+            confirm: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(cleaned.deleted, "{cleaned:?}");
+    drop(lake);
+
+    // DuckDB still attaches the pruned catalog and answers the same rows.
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH 'ducklake:sqlite:{}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n\
+         SELECT count(*) FROM l.t;\n\
+         CALL ducklake_expire_snapshots('l', versions => [3]);\n\
+         CALL ducklake_cleanup_old_files('l', cleanup_all => true);\n",
+        catalog_path.display(),
+        data.display()
+    );
+    match run_duckdb(&binary, &script) {
+        Ok(rows) => assert_eq!(rows.first().map(String::as_str), Some("3"), "{rows:?}"),
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip DuckDB interop test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    }
+
+    // Pink opens what DuckDB expired and cleaned.
+    let lake = Lake::open_with_catalog(&catalog, None).unwrap();
+    assert_eq!(
+        count(&mut lake.load(None).unwrap(), "SELECT count(*) FROM t"),
+        3
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn pinkdb_parquet_deletes_apply_in_duckdb() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+
+    let dir = scratch("pink-delete-to-duckdb");
+    let catalog_path = dir.join("catalog.db");
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let data = dir.join("data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    lake.write_from_store(&parquet_store()).unwrap();
+
+    let file = lake
+        .list_files(Some("main.t"), None, false)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the saved table has one data file")
+        .path;
+    let mut commit = Commit::new();
+    commit.delete_positions("main.t", &file, &[1]);
+    assert_eq!(lake.commit(&commit).unwrap().version, 3);
+    drop(lake);
+
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH 'ducklake:sqlite:{}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n\
+         SELECT count(*) FROM l.t;\n\
+         SELECT i, s FROM l.t ORDER BY i;\n",
+        catalog_path.display(),
+        data.display()
+    );
+    let rows = match run_duckdb(&binary, &script) {
+        Ok(rows) => rows,
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip DuckDB interop test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    };
+    assert_eq!(
+        rows,
+        vec![
+            "2".to_string(),
+            "0,row-0".to_string(),
+            "2,row-2".to_string(),
+        ],
+        "DuckDB must apply pinkdb's Parquet delete file"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
+fn a_duckdb_catalog_with_parquet_deletes_opens() {
     register().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -412,14 +652,26 @@ fn a_duckdb_catalog_opens_and_refuses_parquet_deletes() {
         ]
     );
 
-    // The head has a DuckLake Parquet delete file (format `parquet`); this
-    // build reads only pinkdb positional deletes and says so clearly.
-    let err: LakeError = lake.load(None).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("unsupported delete file format parquet"),
-        "the refusal must name the format: {err}"
+    // The head has a DuckLake Parquet delete file (format `parquet`): it is a
+    // Parquet table of `(file_path, pos)`. Pink reads it and drops exactly
+    // the ten deleted positions.
+    let latest = lake.load(None).unwrap();
+    assert_eq!(
+        count(&mut lake.load(None).unwrap(), "SELECT count(*) FROM t"),
+        2
     );
+    assert_eq!(
+        count(&mut lake.load(None).unwrap(), "SELECT count(*) FROM f"),
+        991
+    );
+    assert_eq!(
+        count(
+            &mut lake.load(None).unwrap(),
+            "SELECT count(*) FROM f WHERE a >= 10"
+        ),
+        991
+    );
+    drop(latest);
 
     cleanup(&dir);
 }

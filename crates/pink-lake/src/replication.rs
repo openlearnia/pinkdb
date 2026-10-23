@@ -406,11 +406,11 @@ pub struct CatchUpReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReplicationState {
-    replication_format: u32,
-    next_id: u64,
+pub(crate) struct ReplicationState {
+    pub(crate) replication_format: u32,
+    pub(crate) next_id: u64,
     #[serde(default)]
-    jobs: Vec<Job>,
+    pub(crate) jobs: Vec<Job>,
 }
 
 impl Default for ReplicationState {
@@ -2129,6 +2129,11 @@ fn drop_destination_table(dest: &mut Lake, key: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn read_state(dest: &Lake) -> Result<(ReplicationState, Option<VersionTag>)> {
+    if let Some(store) = dest.storage.metadata_store() {
+        // A SQL catalog keeps replication in typed side tables; there is no
+        // conditional object tag (the publish transaction is the guard).
+        return Ok((store.replication_state()?.unwrap_or_default(), None));
+    }
     let path = dest.storage.abs(STATE_PATH);
     let context = format!("reading {}", path.display());
     match dest.storage.read_tagged(STATE_PATH, &context) {
@@ -2165,6 +2170,18 @@ fn mutate_state<T>(
     let _serialized = STATE_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(store) = dest.storage.metadata_store() {
+        // One transaction: read the typed rows, apply the change, rewrite
+        // them. SQLite's `BEGIN IMMEDIATE` and pinkdb's commit validation
+        // serialize writers; Postgres's state row is locked in the same
+        // transaction by the store.
+        let publish = dest.storage.begin_publish()?;
+        let mut state = store.replication_state()?.unwrap_or_default();
+        let value = change(&mut state)?;
+        store.store_replication_state(&state)?;
+        publish.commit()?;
+        return Ok(value);
+    }
     let path = dest.storage.abs(STATE_PATH);
     for _ in 0..STATE_WRITE_RETRIES {
         // Wave 96a: the read-modify-write is one publish scope, so a SQL

@@ -49,37 +49,8 @@ pub(crate) mod store;
 #[cfg(feature = "catalog-sqlite")]
 pub(crate) mod sqlite;
 
-/// One snapshot row's user-visible record (DuckLake `ducklake_snapshot` +
-/// `ducklake_snapshot_changes`, mapped back to pinkdb versions).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // part of the store surface; the SQL adapter renders snapshots from rows (T2)
-pub(crate) struct SnapshotRecord {
-    /// pinkdb version (`snapshot_id + 1`).
-    pub(crate) version: u64,
-    /// The snapshot's publish time, as the catalog stores it.
-    pub(crate) time: String,
-    /// The lake-wide schema version at this snapshot.
-    pub(crate) schema_version: u64,
-    /// The recorded author, if any.
-    pub(crate) author: Option<String>,
-    /// The recorded commit message, if any.
-    pub(crate) commit_message: Option<String>,
-    /// DuckLake's `changes_made` string for this snapshot.
-    pub(crate) changes_made: Option<String>,
-}
-
-/// One snapshot-changes row (DuckLake `ducklake_snapshot_changes`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // part of the store surface; the SQL adapter renders changes from rows (T2)
-pub(crate) struct SnapshotChangeRecord {
-    /// pinkdb version (`snapshot_id + 1`).
-    pub(crate) version: u64,
-    /// DuckLake's `changes_made` string.
-    pub(crate) changes_made: Option<String>,
-    pub(crate) author: Option<String>,
-    pub(crate) commit_message: Option<String>,
-    pub(crate) commit_extra_info: Option<String>,
-}
+#[cfg(feature = "catalog-postgres")]
+pub(crate) mod postgres;
 
 /// One commit's typed change.
 ///
@@ -173,11 +144,48 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// Returns `None` when the snapshot does not exist.
     fn load(&self, version: Option<u64>) -> Result<Option<Catalog>>;
 
-    /// Every snapshot at or below the head, ascending, with its change row.
-    fn snapshots(&self) -> Result<Vec<SnapshotRecord>>;
+    /// Expire snapshots: delete their snapshot and change rows, then remove
+    /// the catalog rows no remaining snapshot can see (DuckLake's rule: an
+    /// ended row is dead when no remaining snapshot lies in
+    /// `[begin_snapshot, end_snapshot)`) and schedule their files for
+    /// deletion. One transaction.
+    fn expire_snapshots(&self, versions: &[u64]) -> Result<()>;
 
-    /// The snapshot-changes rows in `from..=to` (pinkdb versions).
-    fn changes(&self, from: u64, to: u64) -> Result<Vec<SnapshotChangeRecord>>;
+    /// Files in `ducklake_files_scheduled_for_deletion`, as
+    /// `(id, catalog-relative path)`.
+    fn scheduled_files(&self) -> Result<Vec<(i64, String)>>;
+
+    /// Remove rows from `ducklake_files_scheduled_for_deletion` by id (the
+    /// files were deleted from the data location).
+    fn forget_scheduled(&self, ids: &[i64]) -> Result<()>;
+
+    /// Every data/delete file path any catalog row names, in the two spellings
+    /// a data location may use (`data/<schema>/<table>/<file>` and
+    /// DuckLake's own `<schema>/<table>/<file>`). The orphan scan treats a
+    /// data object as referenced when it matches either.
+    fn referenced_file_paths(&self) -> Result<Vec<String>>;
+
+    /// The replication side tables as the in-memory state (`None` before the
+    /// first job is created).
+    fn replication_state(&self) -> Result<Option<crate::replication::ReplicationState>>;
+
+    /// Replace the replication side tables in one transaction.
+    fn store_replication_state(&self, state: &crate::replication::ReplicationState) -> Result<()>;
+
+    /// The per-file key recorded for a data or delete file whose catalog row
+    /// names `rel` (the path's basename). `None` for a plaintext file.
+    fn file_key(&self, rel: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Every recorded per-file key (diagnostics/tests: prove each file has
+    /// its own 256-bit key).
+    fn file_keys(&self) -> Result<Vec<Vec<u8>>>;
+
+    /// Whether `ducklake_metadata.encrypted` says the lake's data files are
+    /// sealed (DuckLake's own flag).
+    fn is_encrypted(&self) -> Result<bool>;
+
+    /// Set `ducklake_metadata.encrypted`.
+    fn set_encrypted(&self, encrypted: bool) -> Result<()>;
 
     /// Publish `change` on top of `base_version` in one transaction.
     ///
@@ -185,11 +193,6 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// (the caller rebases). A successful commit returns the new pinkdb
     /// version.
     fn commit(&self, base_version: u64, change: CatalogChange) -> Result<u64>;
-
-    /// `COUNT(*)` from the catalog alone: data-file row counts minus live
-    /// delete counts plus live inlined rows (DuckLake's
-    /// `GetNetDataFileRowCountForStats`). `None` for an unknown table.
-    fn table_row_count(&self, table: &str, version: Option<u64>) -> Result<Option<u64>>;
 
     /// The stored commit-delta manifest (`commits/<version>.json`'s logical
     /// content), if the store keeps one. Used by change-data reads.
@@ -207,10 +210,6 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// Create the catalog: `ducklake_metadata`, snapshot 0
     /// (`created_schema:"main"`) and the side rows. Must be atomic.
     fn create(&self, data_location: &str, created_by: &str, catalog: &Catalog) -> Result<()>;
-
-    /// The catalog file's current storage tag (the version string a
-    /// conditional replace compares against).
-    fn version_tag(&self) -> Result<Option<String>>;
 }
 
 /// pinkdb's version for one DuckLake snapshot id.

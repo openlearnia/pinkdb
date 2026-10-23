@@ -755,6 +755,14 @@ pub(crate) struct DeleteRef {
     /// Number of positions in the delete file (its exact row count), checked
     /// against the file's contents when it is read.
     pub(crate) count: u64,
+    /// The DuckLake delete-file format (`"pink"` or `"parquet"`). Old JSON
+    /// manifests omit it; they always held pink's container.
+    #[serde(default = "pink_delete_format")]
+    pub(crate) format: String,
+}
+
+fn pink_delete_format() -> String {
+    crate::format::PINK_FORMAT_ID.to_string()
 }
 
 /// One version of a lake. Keys of `tables` are flat `db.table` names; a

@@ -21,6 +21,24 @@ fn next_table_version() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+// Full index-map rebuilds on this test thread. A test hook: appends must not
+// increment it, mutations that move or remove rows may. Thread-local so
+// parallel tests do not count each other's rebuilds.
+#[cfg(test)]
+thread_local! {
+    static INDEX_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn index_rebuild_count() -> u64 {
+    INDEX_REBUILDS.with(|count| count.get())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_index_rebuild_count() {
+    INDEX_REBUILDS.with(|count| count.set(0));
+}
+
 /// One column: its schema + its chunk list.
 #[derive(Debug, Clone)]
 pub struct Column {
@@ -430,7 +448,8 @@ impl DataTable {
         Ok(())
     }
 
-    /// Mark the table's hash indexes stale after a mutation. Cheap (one flag);
+    /// Mark the table's hash indexes stale after a mutation that may move or
+    /// remove rows (UPDATE/DELETE/TRUNCATE/ALTER). Cheap (one flag);
     /// [`Self::rebuild_indexes`] rebuilds them lazily on the next indexed
     /// lookup.
     pub(crate) fn invalidate_indexes(&mut self) {
@@ -439,11 +458,56 @@ impl DataTable {
         }
     }
 
+    /// Extend every fresh index map with the rows appended in `start..num_rows`.
+    ///
+    /// An append-only mutation does not move earlier rows, so each map only
+    /// needs the new positions. If an index was already stale (an UPDATE or
+    /// DELETE left a map describing an older snapshot), leave the flag alone:
+    /// [`Self::rebuild_indexes`] will rebuild it from the final rows. This is
+    /// why a stale map is always a missed optimization, never a wrong answer.
+    fn extend_indexes(&mut self, start: usize) {
+        if self.indexes.is_empty() || self.indexes_stale || start >= self.num_rows {
+            return;
+        }
+        let mut indexes = std::mem::take(&mut self.indexes);
+        for index in &mut indexes {
+            let Some(column) = self.columns.get(index.column) else {
+                continue;
+            };
+            // Walk the chunks once from the one holding `start`: a per-row
+            // global lookup would rescan the chunk list for every row, which
+            // makes a bulk append into an indexed table O(rows × chunks).
+            let mut offset = 0usize;
+            for chunk in &column.chunks {
+                let len = chunk.len();
+                if offset + len > start {
+                    for local in start.saturating_sub(offset)..len {
+                        let value = chunk.get(local);
+                        if matches!(value, Value::Null) {
+                            continue;
+                        }
+                        let mut buf = Vec::new();
+                        crate::exec::aggregate::encode_value(&mut buf, &value);
+                        index
+                            .map
+                            .entry(buf)
+                            .or_insert_with(Vec::new)
+                            .push(offset + local);
+                    }
+                }
+                offset += len;
+            }
+        }
+        self.indexes = indexes;
+    }
+
     /// Rebuild every hash index on this table from the live chunks, clearing
     /// the stale flag. Called lazily by [`PinkDb::rebuild_stale_indexes`] at
     /// the next statement boundary, so a later indexed lookup sees a snapshot
     /// of the current rows.
     pub(crate) fn rebuild_indexes(&mut self) {
+        #[cfg(test)]
+        INDEX_REBUILDS.with(|count| count.set(count.get() + 1));
         // Drop an index whose column ordinal no longer exists (only possible
         // if a catalog bug skipped the ALTER reindex) rather than panicking.
         self.indexes.retain(|i| i.column < self.columns.len());
@@ -584,13 +648,14 @@ impl DataTable {
                     .push(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
             }
         }
+        let start = self.num_rows;
         for (col, val) in self.columns.iter_mut().zip(values) {
             let coerced = Self::coerce(val, col.dtype)?;
             Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists")).push_value(coerced)?;
         }
         self.num_rows += 1;
         self.version = next_table_version();
-        self.invalidate_indexes();
+        self.extend_indexes(start);
         Ok(())
     }
 
@@ -643,6 +708,7 @@ impl DataTable {
         if rows == 0 {
             return Ok(());
         }
+        let start = self.num_rows;
         // Fast paths (rows ≤ CHUNK_SIZE by the check above): the batch fills
         // an empty tail chunk, or starts a new chunk after a full one — share
         // the built vectors in without copying. The copy path below would
@@ -662,7 +728,7 @@ impl DataTable {
             }
             self.num_rows += rows;
             self.version = next_table_version();
-            self.invalidate_indexes();
+            self.extend_indexes(start);
             return Ok(());
         }
         // Partial tail: merge, splitting at chunk boundaries as needed.
@@ -691,7 +757,7 @@ impl DataTable {
             self.num_rows += take;
         }
         self.version = next_table_version();
-        self.invalidate_indexes();
+        self.extend_indexes(start);
         Ok(())
     }
 
@@ -2623,5 +2689,147 @@ mod tests {
         assert_eq!(db.list_views(), vec!["v".to_string()]);
         db.drop_view_in("db1", "v").unwrap();
         assert!(db.view_in("db1", "v").is_err());
+    }
+
+    fn assert_index_matches_table(db: &PinkDb) {
+        let table = db.table("t").unwrap();
+        for index in &table.indexes {
+            assert_eq!(
+                index.map,
+                index_map_for(&table.columns[index.column]),
+                "index {} must equal a full rebuild of the visible rows",
+                index.name
+            );
+        }
+    }
+
+    /// Appends extend the maps in place: 10,000 single-row INSERTs must never
+    /// trigger a full rebuild, and every map still equals a rebuild of the
+    /// final rows.
+    #[test]
+    fn appends_extend_indexes_without_rebuilding() {
+        reset_index_rebuild_count();
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (id BIGINT, g BIGINT);").unwrap();
+        db.execute("CREATE INDEX i_g ON t(g);").unwrap();
+        for i in 0..10_000i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {});", i % 97))
+                .unwrap();
+            if db.table("t").unwrap().indexes_stale {
+                panic!("index went stale at insert {i}");
+            }
+        }
+        assert_eq!(
+            index_rebuild_count(),
+            0,
+            "an append must not rebuild the whole index map"
+        );
+        assert_index_matches_table(&db);
+    }
+
+    /// Positions are global across chunk boundaries: a batch that fills one
+    /// chunk and a second batch that opens the next one land at
+    /// `CHUNK_SIZE..CHUNK_SIZE+n`.
+    #[test]
+    fn append_index_positions_cross_chunk_boundaries() {
+        reset_index_rebuild_count();
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("g".to_string(), DataType::Integer)])
+            .unwrap();
+        db.create_index_in("main", "t", "i_g", 0).unwrap();
+        let mut first = Vector::with_capacity(DataType::Integer, CHUNK_SIZE);
+        for i in 0..CHUNK_SIZE {
+            first.push_value(Value::Integer((i % 7) as i32)).unwrap();
+        }
+        db.table_mut("t")
+            .unwrap()
+            .append_chunk(vec![first])
+            .unwrap();
+        let mut second = Vector::with_capacity(DataType::Integer, 10);
+        for i in 0..10 {
+            second.push_value(Value::Integer(i)).unwrap();
+        }
+        db.table_mut("t")
+            .unwrap()
+            .append_chunk(vec![second])
+            .unwrap();
+        assert_eq!(index_rebuild_count(), 0);
+        let table = db.table("t").unwrap();
+        let map = &table.indexes[0].map;
+        let zeros = map.get(&{
+            let mut buf = Vec::new();
+            crate::exec::aggregate::encode_value(&mut buf, &Value::Integer(0));
+            buf
+        });
+        assert!(zeros.is_some_and(|positions| positions.contains(&0)));
+        assert!(zeros.is_some_and(|positions| positions.contains(&CHUNK_SIZE)));
+        assert!(zeros.is_some_and(|positions| positions.iter().all(|p| *p < table.num_rows)));
+        assert_index_matches_table(&db);
+    }
+
+    /// A deterministic mix of inserts, updates, deletes and rolled-back
+    /// transactions leaves every index exactly equal to a full rebuild of
+    /// the final visible rows.
+    #[test]
+    fn mixed_mutations_and_rollbacks_leave_indexes_exact() {
+        reset_index_rebuild_count();
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (id BIGINT, g BIGINT);").unwrap();
+        db.execute("CREATE INDEX i_g ON t(g);").unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for step in 0..600i64 {
+            match next() % 7 {
+                0..=2 => {
+                    db.execute(&format!(
+                        "INSERT INTO t VALUES ({step}, {});",
+                        (next() % 23) as i64
+                    ))
+                    .unwrap();
+                }
+                3 => {
+                    db.execute(&format!(
+                        "UPDATE t SET g = {} WHERE id = {};",
+                        (next() % 23) as i64,
+                        (next() % (step as u64 + 1)) as i64
+                    ))
+                    .unwrap();
+                }
+                4 => {
+                    db.execute(&format!(
+                        "DELETE FROM t WHERE id = {};",
+                        (next() % (step as u64 + 1)) as i64
+                    ))
+                    .unwrap();
+                }
+                5 => {
+                    db.execute("BEGIN;").unwrap();
+                    db.execute(&format!(
+                        "INSERT INTO t VALUES ({}, {});",
+                        step + 10_000,
+                        (next() % 23) as i64
+                    ))
+                    .unwrap();
+                    db.execute(&format!(
+                        "UPDATE t SET g = 99 WHERE id = {};",
+                        (next() % (step as u64 + 1)) as i64
+                    ))
+                    .unwrap();
+                    db.execute("ROLLBACK;").unwrap();
+                }
+                _ => {
+                    // A statement boundary rebuilds anything a moving
+                    // mutation left stale; the result must be exact.
+                    db.rebuild_stale_indexes();
+                }
+            }
+            db.rebuild_stale_indexes();
+            assert_index_matches_table(&db);
+        }
     }
 }

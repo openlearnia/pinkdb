@@ -62,6 +62,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+/// `PINKDB_LAKE_PROFILE` enables the commit-split timers on stderr (wave 103
+/// T2): the session-table diff/plan span vs the catalog publish span.
+pub(crate) fn profile() -> bool {
+    std::env::var_os("PINKDB_LAKE_PROFILE").is_some()
+}
+
 use pinkdb::{AttachedLake, DataTable, PinkDb, Value};
 
 use crate::catalog::{
@@ -1136,10 +1142,19 @@ impl WritableAttachment {
                 current.push((key.clone(), Arc::new(t.clone())));
             }
         }
+        let started = std::time::Instant::now();
         let (commit, after) = self
             .lake
             .plan_tables_commit(self.base_version, &base, &current)?;
+        let plan_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let commit_started = std::time::Instant::now();
         let report = self.lake.commit_with_settings(&commit, settings)?;
+        if profile() {
+            eprintln!(
+                "lake profile plan_diff={plan_ms:.3}ms commit_total={:.3}ms",
+                commit_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         if report.committed {
             // The planned content is exact: `plan_tables_commit` marked every
             // table in scope as expected-unchanged, so a rebase can only have
@@ -1245,7 +1260,7 @@ pub(crate) fn entry_layout(
             })?;
         let path = storage.abs(&d.path);
         let bytes = storage.read(&d.path, &format!("reading {}", path.display()))?;
-        let positions = delete_file::decode(&bytes, &path)?;
+        let positions = delete_file::read_positions(&bytes, &d.format, &d.file, &path)?;
         if positions.len() as u64 != d.count {
             return Err(LakeError::Corrupt {
                 path,
@@ -2299,8 +2314,9 @@ impl Lake {
             uploaded.formats.insert(key.clone(), format);
         }
         for (key, files) in &commit.deletes {
+            let format = self.resolve_append_format(key, head.tables.get(key));
             for (file, positions) in files {
-                let (dref, bytes) = self.write_delete_file(key, file, positions)?;
+                let (dref, bytes) = self.write_delete_file(key, file, positions, &format)?;
                 uploaded.bytes += bytes;
                 uploaded
                     .deletes
@@ -2777,8 +2793,13 @@ impl Lake {
                         .storage
                         .read(&existing.path, &format!("reading {}", epath.display()))
                         .map_err(PublishFailure::Fatal)?;
-                    let epos =
-                        delete_file::decode(&bytes, &epath).map_err(PublishFailure::Fatal)?;
+                    let epos = delete_file::read_positions(
+                        &bytes,
+                        &existing.format,
+                        &existing.file,
+                        &epath,
+                    )
+                    .map_err(PublishFailure::Fatal)?;
                     let overlap: Vec<u64> = pos
                         .iter()
                         .copied()
@@ -3018,7 +3039,14 @@ impl Lake {
             });
         };
         let base = self.version;
+        let started = std::time::Instant::now();
         let version = store.commit(base, change)?;
+        if crate::incremental::profile() {
+            eprintln!(
+                "lake profile catalog_txn={:.3}ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         self.version = version;
         Ok(())
     }
@@ -3155,7 +3183,20 @@ impl Lake {
             };
             let entry = match expected {
                 Some(entry) => Some(entry),
-                None => store.table_layout(&key, Some(catalog.version))?,
+                None => {
+                    // An append-only change needs the table's non-file facts
+                    // (format, schema, next row id), never its file list. A
+                    // delete must validate positions against the files, so it
+                    // loads the layout. Keeping appends on the stub makes a
+                    // commit O(delta) even at 10,000 files.
+                    let needs_layout = commit.deletes.contains_key(&key)
+                        || commit.inlined_deletes.contains_key(&key);
+                    if needs_layout {
+                        store.table_layout(&key, Some(catalog.version))?
+                    } else {
+                        store.table_stub(&key, Some(catalog.version))?
+                    }
+                }
             };
             if let Some(entry) = entry {
                 catalog.tables.insert(key, entry);

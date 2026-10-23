@@ -651,15 +651,18 @@ pub fn replication_state_round_trips(suite: &mut dyn Suite) {
     assert!(
         catalog_stored_bytes(&catalog, "replication/state.json")
             .unwrap()
-            .is_some()
+            .is_none(),
+        "replication state lives in typed side tables, not a JSON object"
     );
 
     cleanup(&dir);
 }
 
-/// A keyed split lake seals the catalog rows: the bytes in SQL are `PNKLAKE1`
-/// containers, not plaintext metadata. The keyed open round-trips; a wrong
-/// key fails closed at the catalog.
+/// A keyed SQL lake follows DuckLake's encryption model: metadata rows are
+/// plaintext, every data/delete file is a `PNKLAKE1` container with its own
+/// random 256-bit key in that row's `encryption_key` column, and a `pink:`
+/// catalog database may itself be engine-encrypted (its file holds no
+/// plaintext key bytes). There is no passphrase-derived lake key.
 #[cfg(feature = "encryption")]
 pub fn encrypted_catalog_rows_are_sealed(suite: &mut dyn Suite) {
     use pink_lake::EncryptionKey;
@@ -667,30 +670,76 @@ pub fn encrypted_catalog_rows_are_sealed(suite: &mut dyn Suite) {
     let dir = scratch("encryption");
     let catalog = suite.catalog(&dir, "catalog");
     let data = dir.join("data-root");
-    let key = EncryptionKey::from_passphrase("wave-96a-catalog");
+    let key = EncryptionKey::from_passphrase("wave-103-t2-catalog");
     let mut lake =
         Lake::create_with_catalog_with_key(&catalog, data.to_str().unwrap(), key.clone()).unwrap();
+    // One row per file: a real data file must exist so it gets its own key.
+    lake.set_write_format("pink").unwrap();
+    lake.set_data_inlining_row_limit(0);
     assert_eq!(lake.write_from_store(&store(3)).unwrap(), 2);
     drop(lake);
 
-    let bytes = catalog_stored_bytes(&catalog, "catalog.json")
+    // Metadata is plaintext: the rendered catalog carries the manifest, and
+    // it is not a container.
+    let bytes = pink_lake::catalog_stored_bytes_keyed(&catalog, "catalog.json", Some(key.clone()))
         .unwrap()
         .unwrap();
-    assert!(bytes.starts_with(b"PNKLAKE1"), "the row must be sealed");
+    assert!(!bytes.starts_with(b"PNKLAKE1"), "metadata stays plaintext");
     assert!(
-        !bytes.windows(14).any(|w| w == b"format_version"),
-        "no plaintext metadata in the catalog"
+        bytes.windows(14).any(|w| w == b"format_version"),
+        "the rendered catalog is plaintext JSON"
     );
 
-    let lake = Lake::open_with_catalog_with_key(&catalog, None, key).unwrap();
+    // Every data/delete file row carries its own 256-bit key.
+    let keys = pink_lake::catalog_encryption_keys(&catalog, Some(key.clone())).unwrap();
+    assert!(!keys.is_empty(), "a data file must have a per-file key");
+    for key_bytes in &keys {
+        assert_eq!(key_bytes.len(), 32, "each key is 256 bits");
+    }
+    let unique: std::collections::BTreeSet<&Vec<u8>> = keys.iter().collect();
+    assert_eq!(unique.len(), keys.len(), "each file gets a fresh key");
+
+    // The file on disk is a PNKLAKE1 container, never the format's plaintext.
+    let data_file = files(&data)
+        .into_iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == "pink"))
+        .expect("the write produced a .pink data file");
+    let head = std::fs::read(&data_file).unwrap();
+    assert!(head.starts_with(b"PNKLAKE1"), "{}", data_file.display());
+
+    // A keyed `pink:` catalog database is itself engine-encrypted: no
+    // plaintext per-file key survives in the file.
+    if catalog.starts_with("pink:") {
+        let path = catalog.trim_start_matches("pink:");
+        // The durable database may still be all WAL (no checkpoint yet), so
+        // both files are part of "the database file".
+        let mut db = std::fs::read(path).unwrap_or_default();
+        db.extend(std::fs::read(format!("{path}.wal")).unwrap_or_default());
+        for key_bytes in &keys {
+            assert!(
+                !db.windows(key_bytes.len())
+                    .any(|window| window == key_bytes),
+                "the catalog file must not hold a plaintext per-file key"
+            );
+        }
+    }
+
+    let lake = Lake::open_with_catalog_with_key(&catalog, None, key.clone()).unwrap();
     assert_eq!(count(&lake, "SELECT count(*) FROM t"), 3);
-    let wrong = Lake::open_with_catalog_with_key(
-        &catalog,
-        None,
-        EncryptionKey::from_passphrase("not-the-key"),
-    )
-    .unwrap_err();
-    assert!(matches!(wrong, LakeError::WrongKey { .. }), "{wrong:?}");
+
+    // A keyed `pink:` database rejects the wrong key at the engine; SQLite and
+    // Postgres catalog databases are protected by their operator, and their
+    // per-file keys live inside the catalog, so the user key never decrypts
+    // data there.
+    if catalog.starts_with("pink:") {
+        let wrong = Lake::open_with_catalog_with_key(
+            &catalog,
+            None,
+            EncryptionKey::from_passphrase("not-the-key"),
+        )
+        .unwrap_err();
+        assert!(matches!(wrong, LakeError::WrongKey { .. }), "{wrong:?}");
+    }
 
     cleanup(&dir);
 }

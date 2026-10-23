@@ -68,7 +68,6 @@ fn time_travel_reads_older_versions() {
 }
 
 #[test]
-#[ignore = "wave 103 T2"]
 fn expire_and_cleanup_on_a_split_lake() {
     catalog_suite::expire_and_cleanup_on_a_split_lake(&mut PinkSuite::new());
 }
@@ -91,7 +90,6 @@ fn replication_state_round_trips() {
 
 #[cfg(feature = "encryption")]
 #[test]
-#[ignore = "wave 103 T2"]
 fn encrypted_catalog_rows_are_sealed() {
     catalog_suite::encrypted_catalog_rows_are_sealed(&mut PinkSuite::new());
 }

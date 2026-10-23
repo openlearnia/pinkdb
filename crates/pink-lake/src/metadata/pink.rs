@@ -51,6 +51,19 @@ use crate::{LakeError, Result};
 /// fsyncs a committed catalog transaction before the commit returns, so a
 /// snapshot that the lake reported is on disk after a crash.
 pub(crate) fn open(url: &str, path: &Path, create: bool) -> Result<SqlMetadataStore> {
+    open_keyed(url, path, create, None)
+}
+
+/// Open the `pink:` catalog, optionally with the engine's at-rest key: a
+/// keyed lake may keep its catalog database itself encrypted (`PINKENC1`).
+/// The DuckLake rows are still plaintext *inside* that container; the engine
+/// unseals them, so the catalog adapter sees ordinary SQL.
+pub(crate) fn open_keyed(
+    url: &str,
+    path: &Path,
+    create: bool,
+    engine_key: Option<pinkdb::EncryptionKey>,
+) -> Result<SqlMetadataStore> {
     SqlMetadataStore::open(url, path, create, |url, path, create| {
         // A durable database may exist only as `<path>.pink.wal` until its
         // first checkpoint; the main file alone is not the existence test.
@@ -65,8 +78,13 @@ pub(crate) fn open(url: &str, path: &Path, create: bool) -> Result<SqlMetadataSt
             busy_timeout: busy_timeout(),
             ..DurableOpenOptions::default()
         };
-        let (db, _) = PinkDb::open_durable_with_options(&path.to_string_lossy(), options)
-            .map_err(|e| map_error(url, e))?;
+        let opened = match &engine_key {
+            Some(key) => {
+                PinkDb::open_durable_with_key_and_options(&path.to_string_lossy(), key, options)
+            }
+            None => PinkDb::open_durable_with_options(&path.to_string_lossy(), options),
+        };
+        let (db, _) = opened.map_err(|e| map_error(url, e))?;
         let connection = PinkConnection {
             db: Arc::new(Mutex::new(db)),
             url: url.to_string(),
@@ -366,6 +384,26 @@ fn map_error(url: &str, error: pinkdb::PinkDbError) -> LakeError {
     let text = error.to_string();
     if text.contains("write conflict on") || text.contains(" is busy:") {
         return LakeError::Conflict {
+            path: PathBuf::from(url),
+            message: text,
+        };
+    }
+    // The engine's at-rest encryption errors keep their meaning at the lake
+    // boundary: a keyed `pink:` catalog database is opened with the user's key.
+    if text.contains("wrong key") {
+        return LakeError::WrongKey {
+            path: PathBuf::from(url),
+            message: text,
+        };
+    }
+    if text.contains("file is encrypted") || text.contains("encryption support is not compiled") {
+        return LakeError::Encrypted {
+            path: PathBuf::from(url),
+            message: text,
+        };
+    }
+    if text.contains("not encrypted") {
+        return LakeError::NotEncrypted {
             path: PathBuf::from(url),
             message: text,
         };

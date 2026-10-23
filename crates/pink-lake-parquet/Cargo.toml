@@ -10,6 +10,9 @@ license = "MIT"
 # Wave 103: the DuckLake/SQLite catalog interop tests. Forwarded so
 # `cargo test -p pink-lake-parquet --features catalog-sqlite` runs them.
 catalog-sqlite = ["pink-lake/catalog-sqlite"]
+# Wave 103 T2: the Postgres-catalog interop case (needs a live test server from
+# PINKDB_TEST_POSTGRES_URL).
+catalog-postgres = ["catalog-sqlite", "pink-lake/catalog-postgres", "pink-lake/catalog-sqlite"]
 
 [dependencies]
 pink-lake = { path = "../pink-lake" }
@@ -25,4 +28,4 @@ serde_json = "1"
 # Parquet provider in one process; enabling `vortexlake` here affects test
 # targets only (the normal dependency above stays feature-lean). Wave 98b's
 # fast-read tests also need the mock-S3 backend.
-pink-lake = { path = "../pink-lake", features = ["vortexlake", "s3"] }
+pink-lake = { path = "../pink-lake", features = ["vortexlake", "s3", "encryption"] }

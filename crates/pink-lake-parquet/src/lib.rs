@@ -80,6 +80,32 @@ impl pinkdb_parquet::RangeSource for LakeRange {
     }
 }
 
+/// A [`RangeSource`](pinkdb_parquet::RangeSource) over one in-memory delete
+/// file: a delete file is tiny, so it is read whole.
+#[derive(Debug)]
+struct BytesRange(Vec<u8>);
+
+impl pinkdb_parquet::RangeSource for BytesRange {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn read_range(&self, offset: u64, len: u64) -> std::result::Result<Vec<u8>, String> {
+        let start = usize::try_from(offset).map_err(|_| "offset overflow".to_string())?;
+        let end = start
+            .checked_add(usize::try_from(len).map_err(|_| "length overflow".to_string())?)
+            .ok_or_else(|| "range overflow".to_string())?;
+        self.0
+            .get(start..end)
+            .map(|slice| slice.to_vec())
+            .ok_or_else(|| format!("range {offset}+{len} is outside the file"))
+    }
+
+    fn parallelism(&self) -> usize {
+        1
+    }
+}
+
 impl LakeFormat for ParquetLakeFormat {
     fn id(&self) -> &str {
         FORMAT_ID
@@ -87,6 +113,105 @@ impl LakeFormat for ParquetLakeFormat {
 
     fn extension(&self) -> &str {
         EXTENSION
+    }
+
+    fn delete_format(&self) -> &str {
+        // DuckLake's own delete files: a Parquet table of (file_path, pos).
+        "parquet"
+    }
+
+    fn delete_extension(&self) -> &str {
+        EXTENSION
+    }
+
+    /// Decode DuckLake's Parquet delete file. Each row names a data file and
+    /// a 0-based position in it; rows for another data file are ignored (one
+    /// catalog delete row binds one data file, but a rewritten DuckDB file
+    /// may carry several).
+    fn read_delete_file(
+        &self,
+        bytes: &[u8],
+        data_file: &str,
+        path: &std::path::Path,
+    ) -> Result<Vec<u64>> {
+        let source = Arc::new(BytesRange(bytes.to_vec()));
+        let scan = pinkdb_parquet::scan_source("<delete>", source, None, &[]).map_err(|e| {
+            corrupt_path(path, format!("cannot decode the parquet delete file: {e}"))
+        })?;
+        let wanted = data_file.rsplit('/').next().unwrap_or(data_file);
+        let mut positions: Vec<u64> = Vec::new();
+        for chunk in &scan.output.chunks {
+            if chunk.columns.len() < 2 {
+                return Err(corrupt_path(
+                    path,
+                    "a parquet delete file needs (file_path, pos)".to_string(),
+                ));
+            }
+            for row in 0..chunk.num_rows {
+                let file = match chunk.columns[0].get(row) {
+                    Value::Varchar(v) => v,
+                    other => {
+                        return Err(corrupt_path(
+                            path,
+                            format!("parquet delete file_path is {other:?}, not VARCHAR"),
+                        ));
+                    }
+                };
+                if !(file == data_file
+                    || file.ends_with(&format!("/{data_file}"))
+                    || file.ends_with(&format!("/{wanted}"))
+                    || file == wanted)
+                {
+                    continue;
+                }
+                let pos = match chunk.columns[1].get(row) {
+                    Value::Bigint(v) if v >= 0 => v as u64,
+                    Value::Integer(v) if v >= 0 => v as u64,
+                    other => {
+                        return Err(corrupt_path(
+                            path,
+                            format!("parquet delete pos is {other:?}, not a non-negative BIGINT"),
+                        ));
+                    }
+                };
+                positions.push(pos);
+            }
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        Ok(positions)
+    }
+
+    /// Encode DuckLake's Parquet `(file_path, pos)` delete file. `file_path`
+    /// is the data file's full path (DuckDB compares it to the data path it
+    /// resolves), so a DuckDB reader applies pinkdb's deletes.
+    fn write_delete_file(
+        &self,
+        _db: &str,
+        table: &str,
+        _data_file: &str,
+        data_file_path: &str,
+        positions: &[u64],
+    ) -> Result<Vec<u8>> {
+        let mut rows = DataTable::new(
+            table.to_string(),
+            vec![
+                ("file_path".to_string(), DataType::Varchar),
+                ("pos".to_string(), DataType::Bigint),
+            ],
+        )
+        .map_err(|e| engine(format!("creating the delete table of \"{table}\""), e))?;
+        for position in positions {
+            rows.append_row(vec![
+                Value::Varchar(data_file_path.to_string()),
+                Value::Bigint(*position as i64),
+            ])
+            .map_err(|e| engine(format!("appending a delete position of \"{table}\""), e))?;
+        }
+        pinkdb_parquet::write::write_table(&rows).map_err(|e| LakeError::Engine {
+            context: format!("encoding the parquet delete file of \"{table}\""),
+            source: PinkDbError::Execution(e.to_string()),
+        })
     }
 
     fn write(&self, db: &str, table: &str, src: &DataTable) -> Result<EncodedFile> {
@@ -365,6 +490,13 @@ fn build_store(
 fn corrupt(file: &DataFile<'_>, message: String) -> LakeError {
     LakeError::Corrupt {
         path: file.path().to_path_buf(),
+        message,
+    }
+}
+
+fn corrupt_path(path: &std::path::Path, message: String) -> LakeError {
+    LakeError::Corrupt {
+        path: path.to_path_buf(),
         message,
     }
 }

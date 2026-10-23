@@ -21,6 +21,10 @@ pub(crate) enum Dialect {
     Sqlite,
     /// The durable pinkdb `.pink` database (`pink:<path>`), always built.
     Pink,
+    /// Postgres (`catalog-postgres`): numbered `$n` placeholders, `BYTEA`
+    /// binary columns and a plain `BEGIN` (a snapshot-id unique violation is
+    /// the retryable conflict; no advisory lock is needed).
+    Postgres,
 }
 
 impl Dialect {
@@ -30,6 +34,7 @@ impl Dialect {
         match self {
             Self::Sqlite => format!("?{index}"),
             Self::Pink => "?".to_string(),
+            Self::Postgres => format!("${index}"),
         }
     }
 
@@ -41,16 +46,16 @@ impl Dialect {
     pub(crate) fn begin_write(&self) -> &'static str {
         match self {
             Self::Sqlite => "BEGIN IMMEDIATE",
-            Self::Pink => "BEGIN",
+            Self::Pink | Self::Postgres => "BEGIN",
         }
     }
 
-    /// Start a read transaction (not used by either backend today; the
-    /// trait reads are single statements).
+    /// Start a read transaction (not used by any backend today; the trait
+    /// reads are single statements).
     #[allow(dead_code)]
     pub(crate) fn begin_read(&self) -> &'static str {
         match self {
-            Self::Sqlite | Self::Pink => "BEGIN",
+            Self::Sqlite | Self::Pink | Self::Postgres => "BEGIN",
         }
     }
 
@@ -61,6 +66,7 @@ impl Dialect {
         match self {
             Self::Sqlite => "BLOB",
             Self::Pink => "VARCHAR",
+            Self::Postgres => "BYTEA",
         }
     }
 
@@ -68,7 +74,11 @@ impl Dialect {
     /// applied here: the BLOB spelling, and no `DEFAULT` clause (pinkdb's
     /// `CREATE TABLE` grammar has none; every insert supplies the column).
     pub(crate) fn side_ddl(&self) -> String {
-        SIDE_DDL.replace("BLOB", self.blob_type())
+        let tables = SIDE_DDL.replace("BLOB", self.blob_type());
+        // One index list for all three backends. The engine extends index
+        // maps incrementally on append, so an index on a per-commit table no
+        // longer makes a commit O(files).
+        format!("{tables}{INDEX_DDL}")
     }
 
     /// The exact DuckLake v1.1 catalog tables. Column names, order and types
@@ -198,6 +208,53 @@ CREATE TABLE IF NOT EXISTS pinkdb_object (
     path  TEXT PRIMARY KEY,
     bytes BLOB NOT NULL
 );
+-- Replication state (wave 103 T2): every field the old `replication/state.json`
+-- carried has its own typed column. Tables are keyed by DuckLake's table id
+-- where one exists (`dest_table_id`); `source`/`dest` stay the flat catalog
+-- keys because a duckdb-created catalog may not have the destination table
+-- yet.
+CREATE TABLE IF NOT EXISTS pinkdb_replication_state (
+    id                 BIGINT PRIMARY KEY,
+    replication_format BIGINT NOT NULL,
+    next_id            BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pinkdb_replication_job (
+    job_id            BIGINT PRIMARY KEY,
+    source_kind       TEXT NOT NULL,
+    source_location   TEXT,
+    source_database   TEXT,
+    status            TEXT NOT NULL,
+    interval_ms       BIGINT NOT NULL,
+    \"include\"         TEXT NOT NULL,
+    \"exclude\"         TEXT NOT NULL,
+    watermark_columns TEXT NOT NULL,
+    created           TEXT NOT NULL,
+    last_run          TEXT,
+    last_ok           TEXT,
+    last_error        TEXT
+);
+CREATE TABLE IF NOT EXISTS pinkdb_replication_table (
+    job_id                 BIGINT NOT NULL,
+    source                 TEXT NOT NULL,
+    dest                   TEXT NOT NULL,
+    dest_table_id          BIGINT,
+    strategy               TEXT NOT NULL,
+    watermark_column       TEXT,
+    pk_columns             TEXT,
+    source_table_id        TEXT,
+    last_watermark         TEXT,
+    last_source_version    BIGINT,
+    last_full_sync_version BIGINT,
+    rows_dest              BIGINT,
+    last_error             TEXT,
+    synced                 TEXT,
+    PRIMARY KEY (job_id, source)
+);
+";
+
+/// The access-path indexes SQLite and Postgres get (pink rebuilds its whole
+/// index map on every write, which would make a per-commit row O(files)).
+pub(crate) const INDEX_DDL: &str = "
 CREATE INDEX IF NOT EXISTS pinkdb_file_stats_data_file
     ON ducklake_file_column_stats(data_file_id);
 CREATE INDEX IF NOT EXISTS pinkdb_data_file_table

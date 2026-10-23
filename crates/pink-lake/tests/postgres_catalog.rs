@@ -45,18 +45,15 @@ postgres_test!(cdc_reports_the_committed_rows);
 postgres_test!(replication_state_round_trips);
 postgres_test!(a_failure_after_the_snapshot_insert_rolls_back_the_publication);
 postgres_test!(data_location_ownership_is_enforced);
-postgres_test!(migrate_object_catalog_to_sql);
-postgres_test!(migrate_sql_catalog_to_object);
-postgres_test!(migrate_sql_catalog_to_sql);
+// Catalog migration is the legacy JSON-to-SQL copy operation deleted in
+// Part 2 (the SQLite/pink suites already ignore it). It is not a shared-suite
+// assertion about the DuckLake tables, so it does not run here.
 
 #[cfg(feature = "s3")]
 postgres_test!(attach_and_count_issue_no_data_requests_over_s3);
 
 #[cfg(feature = "encryption")]
 postgres_test!(encrypted_catalog_rows_are_sealed);
-
-#[cfg(feature = "encryption")]
-postgres_test!(encrypted_migration_keeps_sealed_bytes);
 
 /// Opening a schema that does not exist is `NotALake` and creates nothing (a
 /// mistyped URL never leaves an empty schema behind).

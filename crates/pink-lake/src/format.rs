@@ -406,6 +406,40 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
         false
     }
 
+    /// The catalog's `ducklake_delete_file.format` value for this data
+    /// format: `"pink"` for pink-lake's own positional container, `"parquet"`
+    /// for DuckLake's `(file_path, pos)` files. `.pink` and Vortex keep
+    /// pink's own format.
+    fn delete_format(&self) -> &str {
+        PINK_FORMAT_ID
+    }
+
+    /// The delete-file name extension (`pinkdel`, `parquet`).
+    fn delete_extension(&self) -> &str {
+        "pinkdel"
+    }
+
+    /// Decode one delete file. `data_file` is the catalog-relative data file
+    /// the delete file belongs to; a format that records the data path per
+    /// row (DuckLake's Parquet) uses it to filter. The default is pink-lake's
+    /// `PINKDL1` container.
+    fn read_delete_file(&self, bytes: &[u8], _data_file: &str, path: &Path) -> Result<Vec<u64>> {
+        crate::delete_file::decode(bytes, path)
+    }
+
+    /// Encode one delete file. `data_file_path` is the data file's absolute
+    /// (or `s3://`) path, which DuckLake's Parquet format stores per row.
+    fn write_delete_file(
+        &self,
+        _db: &str,
+        _table: &str,
+        _data_file: &str,
+        _data_file_path: &str,
+        positions: &[u64],
+    ) -> Result<Vec<u8>> {
+        Ok(crate::delete_file::encode(positions))
+    }
+
     /// Whether this format can prune **row groups** from a query's pushed-down
     /// predicates (Parquet's column-chunk statistics). The default is `false`.
     /// A provider that answers `true` makes [`LakeAttachment::load_filtered`]

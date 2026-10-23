@@ -127,6 +127,23 @@ pub(crate) fn validate_bounds(
     Ok(())
 }
 
+/// Decode one delete file through its catalog-declared format. `"pink"` (and
+/// the empty default of an old JSON manifest) is this module's `PINKDL1`
+/// container; another id resolves a [`LakeFormat`](crate::format::LakeFormat)
+/// that owns the encoding (Parquet's DuckLake `(file_path, pos)` format).
+pub(crate) fn read_positions(
+    bytes: &[u8],
+    format: &str,
+    data_file: &str,
+    path: &std::path::Path,
+) -> Result<Vec<u64>> {
+    if format.is_empty() || format == crate::format::PINK_FORMAT_ID {
+        return decode(bytes, path);
+    }
+    let provider = crate::format::format_for(format, path)?;
+    provider.read_delete_file(bytes, data_file, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

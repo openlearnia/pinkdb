@@ -492,6 +492,15 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
         false
     }
 
+    /// The random 256-bit key one just-written data/delete file was sealed
+    /// with. A keyed SQL lake records it in that file's `encryption_key`
+    /// catalog column; every other backend has no per-file key. `None` for a
+    /// path this session did not write.
+    #[allow(dead_code)] // part of the storage surface; `FileKeyStorage` overrides it
+    fn object_key(&self, _rel: &str) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Seal one version's manifest **once**, so the exact ciphertext bytes
     /// can be published as both `snapshots/<version>.json` and
     /// `catalog.json` — the byte-identity invariant every published version
@@ -1014,6 +1023,10 @@ impl Storage for CryptoStorage {
         self.crypto.is_some()
     }
 
+    fn object_key(&self, rel: &str) -> Option<Vec<u8>> {
+        self.inner.object_key(rel)
+    }
+
     fn seal_manifest(&self, plain: &[u8], lake_id: &str, version: u64) -> Result<Vec<u8>> {
         match &self.crypto {
             None => Ok(plain.to_vec()),
@@ -1086,6 +1099,256 @@ impl Storage for CryptoStorage {
     fn begin_publish(&self) -> Result<PublishScope> {
         // The scope covers the *stored* metadata sequence (sealed bytes); the
         // decorator itself has nothing transactional to add.
+        self.inner.begin_publish()
+    }
+
+    fn catalog_split(&self) -> bool {
+        self.inner.catalog_split()
+    }
+}
+
+/// Keys of files this process just wrote, keyed by lake-relative path.
+/// A keyed SQL lake's commit writes the key into the file's catalog row; the
+/// path (a fresh UUID per file) is unique, so one map for the process is
+/// enough. A file written by another process gets its key from the catalog on
+/// read (the resolver below), never from here.
+static WRITTEN_KEYS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The per-file key a data/delete file was just sealed with.
+pub(crate) fn written_file_key(rel: &str) -> Option<Vec<u8>> {
+    WRITTEN_KEYS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(rel)
+        .copied()
+        .map(|key| key.to_vec())
+}
+
+/// Per-file-key encryption for a keyed SQL catalog (wave 103 T2).
+///
+/// DuckLake protects each data/delete file with its own random 256-bit key and
+/// keeps the key in that file's catalog row; the metadata rows stay plaintext
+/// (the catalog database's own protection is the operator's job — for a
+/// `pink:` catalog the engine's `PINKENC1` at-rest encryption). This decorator
+/// wraps only the *data* half of a split lake: it seals every written object in
+/// a `PNKLAKE1` container with KDF id 0 (a raw key, no passphrase derivation),
+/// records the key for the commit, and unseals on read with the key resolved
+/// from the catalog. A keyless session never sees these objects (the catalog's
+/// `encrypted` row refuses it before a data read).
+/// The key resolver and cache of a keyed SQL lake (see [`FileKeyStorage`]).
+type KeyResolver = Arc<dyn Fn(&str) -> Option<[u8; 32]> + Send + Sync>;
+type KeyCache = std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>;
+
+pub(crate) struct FileKeyStorage {
+    inner: Arc<dyn Storage>,
+    /// Looks a file's key up in the catalog after a reopen. `None` while a
+    /// just-created lake has no catalog row yet.
+    resolver: KeyResolver,
+    cache: KeyCache,
+}
+
+impl fmt::Debug for FileKeyStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileKeyStorage")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileKeyStorage {
+    pub(crate) fn new(inner: Arc<dyn Storage>, resolver: KeyResolver) -> Self {
+        Self {
+            inner,
+            resolver,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn key_for(&self, rel: &str) -> Option<[u8; 32]> {
+        if let Some(key) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(rel)
+            .copied()
+        {
+            return Some(key);
+        }
+        let key = (self.resolver)(rel)?;
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(rel.to_string(), key);
+        Some(key)
+    }
+
+    fn seal(&self, rel: &str, plain: &[u8]) -> Result<Vec<u8>> {
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).map_err(|e| LakeError::Io {
+            context: format!("generating the per-file encryption key for {rel}"),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+        let crypto = Crypto::new(crypto::EncryptionKey::from_raw(key))?;
+        let (domain, binding) = crypto_domain(rel);
+        let sealed = crypto.seal(&self.inner.abs(rel), domain, binding, plain)?;
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(rel.to_string(), key);
+        WRITTEN_KEYS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(rel.to_string(), key);
+        Ok(sealed)
+    }
+
+    fn open(&self, rel: &str, stored: &[u8]) -> Result<Vec<u8>> {
+        if !crypto::is_container(stored) {
+            return Err(crypto::not_encrypted_error(&self.inner.abs(rel)));
+        }
+        let key = self
+            .key_for(rel)
+            .ok_or_else(|| crypto::encrypted_error(&self.inner.abs(rel)))?;
+        let crypto = Crypto::new(crypto::EncryptionKey::from_raw(key))?;
+        let (domain, binding) = crypto_domain(rel);
+        crypto.open(&self.inner.abs(rel), domain, binding, stored)
+    }
+}
+
+impl Storage for FileKeyStorage {
+    fn abs(&self, rel: &str) -> PathBuf {
+        self.inner.abs(rel)
+    }
+
+    fn head(&self, rel: &str) -> Result<Head> {
+        self.inner.head(rel)
+    }
+
+    fn stat(&self, rel: &str) -> Result<Option<ObjectInfo>> {
+        self.inner.stat(rel)
+    }
+
+    fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>> {
+        let stored = self.inner.read(rel, context)?;
+        self.open(rel, &stored)
+    }
+
+    fn read_optional(&self, rel: &str, context: &str) -> Result<Option<Vec<u8>>> {
+        match self.inner.read_optional(rel, context)? {
+            Some(stored) => self.open(rel, &stored).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn read_range(&self, rel: &str, _offset: u64, _len: u64, context: &str) -> Result<Vec<u8>> {
+        Err(LakeError::Internal {
+            message: format!(
+                "the encrypted data file {rel} has no plaintext ranges ({context}); read it \
+                 whole so the container authenticates"
+            ),
+        })
+    }
+
+    fn ranged_reads(&self) -> bool {
+        false
+    }
+
+    fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
+        let (stored, tag) = self.inner.read_tagged(rel, context)?;
+        Ok((self.open(rel, &stored)?, tag))
+    }
+
+    fn read_with_stored(&self, rel: &str, context: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+        let stored = self.inner.read(rel, context)?;
+        Ok((self.open(rel, &stored)?, stored))
+    }
+
+    fn create_dir(&self, rel: &str) -> Result<()> {
+        self.inner.create_dir(rel)
+    }
+
+    fn put(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let sealed = self.seal(rel, bytes)?;
+        self.inner.put(rel, &sealed)
+    }
+
+    fn put_streamed(
+        &self,
+        rel: &str,
+        fill: &mut dyn FnMut(&mut (dyn std::io::Write + Send)) -> Result<()>,
+    ) -> Result<u64> {
+        let mut plain = Vec::new();
+        fill(&mut plain)?;
+        let sealed = self.seal(rel, &plain)?;
+        self.inner.put(rel, &sealed)?;
+        Ok(sealed.len() as u64)
+    }
+
+    fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
+        let sealed = self.seal(rel, bytes)?;
+        self.inner.put_new(rel, &sealed)
+    }
+
+    fn put_if_match(&self, rel: &str, bytes: &[u8], expected: &VersionTag) -> Result<bool> {
+        let sealed = self.seal(rel, bytes)?;
+        self.inner.put_if_match(rel, &sealed, expected)
+    }
+
+    fn list(&self, rel: &str) -> Result<Vec<String>> {
+        self.inner.list(rel)
+    }
+
+    fn list_recursive(&self, rel: &str) -> Result<Vec<String>> {
+        self.inner.list_recursive(rel)
+    }
+
+    fn delete(&self, rel: &str) -> Result<()> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(rel);
+        self.inner.delete(rel)
+    }
+
+    fn local_copy(&self, rel: &str, context: &str) -> Result<LocalCopy> {
+        let bytes = self.read(rel, context)?;
+        let (dir, path) = private_temp_dir().map_err(|e| LakeError::Io {
+            context: format!("creating a private temp dir for the decrypted copy of {rel}"),
+            source: e,
+        })?;
+        if let Err(e) = write_private(&path, &bytes) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(LakeError::Io {
+                context: format!("writing the decrypted temp copy {}", path.display()),
+                source: e,
+            });
+        }
+        Ok(LocalCopy::Temp { file: path, dir })
+    }
+
+    fn local_path(&self, _rel: &str) -> Option<PathBuf> {
+        None
+    }
+
+    fn exists(&self, rel: &str) -> Result<bool> {
+        self.inner.exists(rel)
+    }
+
+    fn encrypted(&self) -> bool {
+        true
+    }
+
+    fn object_key(&self, rel: &str) -> Option<Vec<u8>> {
+        self.key_for(rel).map(|key| key.to_vec())
+    }
+
+    fn tighten_existing(&self) -> Result<()> {
+        self.inner.tighten_existing()
+    }
+
+    fn begin_publish(&self) -> Result<PublishScope> {
         self.inner.begin_publish()
     }
 

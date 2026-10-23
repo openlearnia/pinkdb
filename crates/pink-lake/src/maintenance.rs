@@ -1174,15 +1174,23 @@ impl Lake {
             // Wave 96a: the metadata deletes are one publish scope (a SQL
             // catalog removes the delta + snapshot rows in one transaction).
             let publish = self.storage.begin_publish()?;
-            for info in &victims {
-                let snapshot_rel = format!("snapshots/{}.json", info.version);
-                let commit_rel = format!("commits/{}.json", info.version);
-                // Delta first, then the snapshot: a crash in between leaves
-                // a snapshot without its audit delta (harmless — the
-                // snapshot stays authoritative), never a delta pretending a
-                // version exists its snapshot cannot load.
-                self.delete_if_present(&commit_rel)?;
-                self.delete_if_present(&snapshot_rel)?;
+            if let Some(store) = self.storage.metadata_store() {
+                // DuckLake semantics: the snapshot rows and every catalog row
+                // no remaining snapshot can see go in one transaction; their
+                // files move to `files_scheduled_for_deletion`.
+                let versions: Vec<u64> = victims.iter().map(|info| info.version).collect();
+                store.expire_snapshots(&versions)?;
+            } else {
+                for info in &victims {
+                    let snapshot_rel = format!("snapshots/{}.json", info.version);
+                    let commit_rel = format!("commits/{}.json", info.version);
+                    // Delta first, then the snapshot: a crash in between leaves
+                    // a snapshot without its audit delta (harmless — the
+                    // snapshot stays authoritative), never a delta pretending a
+                    // version exists its snapshot cannot load.
+                    self.delete_if_present(&commit_rel)?;
+                    self.delete_if_present(&snapshot_rel)?;
+                }
             }
             publish.commit()?;
         }
@@ -1199,6 +1207,9 @@ impl Lake {
     /// the same scan (pinkdb has no scheduled-deletion queue; the module
     /// docs explain).
     pub fn cleanup_old_files(&mut self, settings: &CleanupSettings) -> Result<CleanupReport> {
+        if self.storage.metadata_store().is_some() {
+            return self.cleanup_scheduled(settings);
+        }
         self.cleanup(settings)
     }
 
@@ -1210,10 +1221,106 @@ impl Lake {
         self.cleanup(settings)
     }
 
+    /// `ducklake_cleanup_old_files`: delete the files DuckLake's expiration
+    /// queued in `ducklake_files_scheduled_for_deletion`, past the retention
+    /// cutoff. A catalog that has no queue (the object-store layout) uses the
+    /// unreferenced-object scan.
+    fn cleanup_scheduled(&mut self, settings: &CleanupSettings) -> Result<CleanupReport> {
+        self.ensure_catalog_unchanged()?;
+        let store = self
+            .storage
+            .metadata_store()
+            .expect("caller checked the catalog has a metadata store");
+        let cutoff = settings
+            .older_than_micros
+            .unwrap_or_else(|| now_micros() - DEFAULT_RETENTION_SECS * 1_000_000);
+        let mut found: Vec<(String, u64, i64)> = Vec::new();
+        for (id, path) in store.scheduled_files()? {
+            // DuckLake records the path relative to the data root; pink's
+            // own catalogs already carry the `data/` prefix.
+            let candidates = if path.starts_with("data/") {
+                vec![path.clone()]
+            } else {
+                vec![format!("data/{path}"), path.clone()]
+            };
+            let Some(actual) = candidates
+                .iter()
+                .find(|candidate| self.storage.stat(candidate).ok().flatten().is_some())
+                .cloned()
+            else {
+                // The bytes are already gone; drop the queue row so it cannot
+                // accumulate.
+                found.push((path, 0, id));
+                continue;
+            };
+            let info = self.storage.stat(&actual)?;
+            if !settings.all {
+                let Some(modified) = info.and_then(|i| i.modified_micros) else {
+                    continue;
+                };
+                if modified >= cutoff {
+                    continue;
+                }
+            }
+            found.push((actual, info.map(|i| i.size).unwrap_or(0), id));
+        }
+        found.sort();
+        let paths: Vec<String> = found.iter().map(|(path, _, _)| path.clone()).collect();
+        let bytes: u64 = found.iter().map(|(_, size, _)| *size).sum();
+        if settings.dry_run || paths.is_empty() {
+            return Ok(CleanupReport {
+                paths,
+                bytes,
+                dry_run: settings.dry_run,
+                deleted: false,
+            });
+        }
+        if !settings.confirm {
+            return Err(LakeError::NotRepresentable {
+                message: format!(
+                    "refusing to delete {} scheduled lake file(s) without confirmation: run \
+                     with dry_run to preview them, or confirm to delete them (pass all to skip \
+                     the retention cutoff)",
+                    paths.len()
+                ),
+            });
+        }
+        if self.storage.catalog_split() {
+            self.verify_data_owner()?;
+        }
+        let mut ids = Vec::new();
+        for (path, _, id) in &found {
+            if path.starts_with("data/") {
+                self.delete_if_present(path)?;
+            }
+            ids.push(*id);
+        }
+        store.forget_scheduled(&ids)?;
+        Ok(CleanupReport {
+            paths,
+            bytes,
+            dry_run: false,
+            deleted: true,
+        })
+    }
+
     fn cleanup(&mut self, settings: &CleanupSettings) -> Result<CleanupReport> {
         // Single-writer guard before anything is deleted.
         self.ensure_catalog_unchanged()?;
-        let referenced = self.referenced_paths()?;
+        let referenced: BTreeSet<String> = if let Some(store) = self.storage.metadata_store() {
+            let mut paths: BTreeSet<String> = store.referenced_file_paths()?.into_iter().collect();
+            // A scheduled file is still protected by the retention window;
+            // `cleanup_old_files` is the function that removes it.
+            for (_, path) in store.scheduled_files()? {
+                paths.insert(path.clone());
+                if !path.starts_with("data/") {
+                    paths.insert(format!("data/{path}"));
+                }
+            }
+            paths
+        } else {
+            self.referenced_paths()?
+        };
         let cutoff = settings
             .older_than_micros
             .unwrap_or_else(|| now_micros() - DEFAULT_RETENTION_SECS * 1_000_000);

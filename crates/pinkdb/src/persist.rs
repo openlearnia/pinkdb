@@ -6345,11 +6345,11 @@ mod tests {
         .unwrap();
         {
             let t = db.table_mut("t").unwrap();
-            for i in 0..1000 {
+            for i in 0..1000i32 {
                 t.append_row(vec![
-                    Value::Integer(i as i32),
+                    Value::Integer(i),
                     Value::Varchar(format!("row-{i}")),
-                    Value::Double(i as f64 / 8.0),
+                    Value::Double(f64::from(i) / 8.0),
                 ])
                 .unwrap();
             }

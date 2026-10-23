@@ -206,3 +206,27 @@ Postgres; website changelog freshness.
 Same as wave 96a: do not commit/push/tag; mock S3 only; only a throwaway
 local Postgres; `CARGO_INCREMENTAL=0`; no legacy format support; touch only
 the crates and docs the task names.
+
+## T2 Part 1 result (2026-10-24)
+
+Postgres runs on the shared DuckLake core (the 96a blob tables are deleted). It is a third `SqlConnection`, and writers race on the `ducklake_snapshot` primary key with no advisory lock. The other Part 1 changes:
+- **Maintenance:** expire, cleanup and orphans follow DuckLake semantics on all three backends. DuckDB is the oracle in both directions.
+- **Replication state:** typed `pinkdb_replication_*` tables.
+- **Encryption:** each file gets a random 256-bit key in `encryption_key` (PNKLAKE1 raw-key container). Metadata rows are plaintext, and a `pink:` catalog may itself be a PINKENC1-encrypted database.
+- **Delete files:** DuckLake Parquet delete files are read and, for Parquet tables, written through new `LakeFormat` hooks.
+
+Release bench at 10,000 files, with full per-file statistics:
+
+| mode | commit, 10 → 10,000 | catalog transaction, 10 → 10,000 | catalog | attach + `count(*)` |
+|---|---|---|---|---|
+| `pink:` inlining off | 20 → 22 ms | 9.8 → 7.1 ms | 3.43 MB | 184 ms |
+| `sqlite:` inlining off | 8 → 16 ms | 0.7 → 0.7 ms | 11.82 MB | 192 ms |
+| `pink:` inlining on | 10 → 12 ms | 7.9 → 6.0 ms | 1.24 MB | 68 ms |
+
+The catalog transaction stays flat. The remaining end-to-end growth is the CLI writable attachment re-diffing the whole session table on each commit, which is O(session rows), not catalog work.
+
+### Decisions taken while the user was away (2026-10-23/24)
+
+- **T2 runs in two passes.** Part 1 builds the features on the new tables; Part 2 deletes the JSON layout and updates CI and docs. This follows decision 8, which deletes the layout only after the new path passes the suites.
+- **Engine fix instead of a workaround.** Part 1 first dropped the catalog's indexes on pinkdb and stopped loading per-file statistics above 2,048 files. That cost large tables their pruning and refused writable attach on them. The root cause was that every pinkdb INSERT marked a table's hash indexes stale, so the next statement rebuilt them in full (O(rows)). Appends now extend the index maps in place; UPDATE, DELETE and ALTER still rebuild (`crates/pinkdb/src/storage.rs`). The workarounds are reverted.
+- **Deferred:** the writable-attachment session-table diff (O(rows) per commit) is left as is. It belongs to a later wave, not to the catalog work.

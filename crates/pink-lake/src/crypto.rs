@@ -346,6 +346,19 @@ impl EncryptionKey {
     fn holds_material(&self) -> bool {
         self.raw.is_some() || self.passphrase.is_some()
     }
+
+    /// The same key as the engine's type, for opening a `pink:` catalog
+    /// database (the engine's own `PINKENC1` at-rest encryption). A keyed
+    /// lake's data files never use this key — each gets its own random key —
+    /// but the catalog database may.
+    pub(crate) fn engine_key(&self) -> Option<pinkdb::EncryptionKey> {
+        if let Some(raw) = self.raw {
+            return Some(pinkdb::EncryptionKey::from_raw(raw));
+        }
+        self.passphrase
+            .as_ref()
+            .map(|pass| pinkdb::EncryptionKey::from_passphrase(&String::from_utf8_lossy(pass)))
+    }
 }
 
 impl fmt::Debug for EncryptionKey {

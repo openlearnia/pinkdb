@@ -27,7 +27,7 @@ s3 = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3"]
 # feature a keyed lake handle cannot be constructed — a key is never silently
 # ignored, and an encrypted lake reports a clear build hint instead of a
 # parse error.
-encryption = ["dep:aes-gcm", "dep:argon2", "dep:sha2"]
+encryption = ["dep:aes-gcm", "dep:argon2", "dep:sha2", "pinkdb/encryption"]
 # Opt-in SQL catalog store (wave 96a): a lake's metadata (`lake.json`,
 # `catalog.json`, `highest.json`, `snapshots/`, `commits/`, `replication/`)
 # lives in one SQLite file while its data files stay on local disk or S3 —

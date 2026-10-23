@@ -1034,33 +1034,26 @@ impl Lake {
         key: Option<EncryptionKey>,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
-        // Catalog encryption is wave 103 T2. Refuse a keyed `.pink` catalog
-        // clearly instead of walking the old sealed-object create path over
-        // plaintext DuckLake rows.
-        if key.is_some() && matches!(catalog_location, Location::Pink(_)) {
-            return Err(LakeError::FeatureMissing {
-                feature: "catalog-encryption",
-                message: "an encrypted `.pink` catalog is wave 103 T2; create it without \
-                          PINKDB_KEY or use `sqlite:<path>` with encryption"
-                    .to_string(),
-            });
-        }
-        // Wave 103: a keyless SQL catalog (the `.pink` database, or SQLite
-        // with `catalog-sqlite`) is created directly in the DuckLake tables.
-        // The object-store create protocol would need a version-1
-        // `snapshots/…`/`catalog.json` pair; seeding the snapshot-0 row
-        // instead is the same empty lake in the new layout. A keyed SQL
-        // catalog still goes through the (T2) sealing path.
-        if key.is_none() && matches!(catalog_location, Location::Pink(_) | Location::Sqlite(_)) {
+        // Wave 103 T2: every SQL catalog is created directly in the DuckLake
+        // tables, keyed or not. A keyed lake's metadata rows stay plaintext;
+        // the data files get per-file keys and (for `pink:`) the catalog
+        // database itself may be engine-encrypted.
+        if matches!(
+            catalog_location,
+            Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
+        ) {
             // Refuse a data location that already belongs to a lake *before*
             // the catalog database is created, so a rejected create leaves
             // nothing behind.
             let data = data_storage(data_location)?;
             ensure_data_location_free(&*data, data_location)?;
-            if let Some(store) =
-                catalog_store::open_metadata_store(catalog_url, &catalog_location, true)?
-            {
-                return Self::create_sql_catalog(catalog_url, store, data_location);
+            if let Some(store) = catalog_store::open_metadata_store_keyed(
+                catalog_url,
+                &catalog_location,
+                true,
+                key.as_ref(),
+            )? {
+                return Self::create_sql_catalog(catalog_url, store, data_location, key.as_ref());
             }
         }
         let data = data_storage(data_location)?;
@@ -1085,17 +1078,18 @@ impl Lake {
         Ok(lake)
     }
 
-    /// Create a keyless SQL-catalog lake directly on the DuckLake tables.
+    /// Create a SQL-catalog lake directly on the DuckLake tables.
     ///
     /// The store seeds `ducklake_metadata` (`version`, `created_by`,
-    /// `data_path`, `encrypted=false`), snapshot 0 (`created_schema:"main"`)
-    /// and the pink side rows in one transaction; the handle starts at pink
-    /// version 1, which *is* snapshot 0 (see [`crate::metadata`]). Shared by
-    /// the `.pink` database and SQLite.
+    /// `data_path`, `encrypted`), snapshot 0 (`created_schema:"main"`) and the
+    /// pink side rows in one transaction; the handle starts at pink version 1,
+    /// which *is* snapshot 0 (see [`crate::metadata`]). Shared by the `.pink`
+    /// database, SQLite and Postgres.
     fn create_sql_catalog(
         catalog_url: &str,
         store: catalog_store::SqlMetadataStore,
         data_location: &str,
+        key: Option<&EncryptionKey>,
     ) -> Result<Self> {
         let data = data_storage(data_location)?;
         let lake_id = fresh_lake_id()?;
@@ -1116,8 +1110,15 @@ impl Lake {
             concat!("pinkdb ", env!("CARGO_PKG_VERSION")),
             &manifest,
         )?;
-        let catalog: Arc<dyn CatalogStore> =
-            Arc::new(catalog_store::SqlCatalog::from_store(catalog_url, store));
+        crate::metadata::MetadataStore::set_encrypted(&store, key.is_some())?;
+        // A shared handle so the data decorator can resolve a file's key from
+        // the catalog after the catalog facade takes its own share.
+        let shared = Arc::new(store);
+        let data = keyed_data_storage(data, Arc::clone(&shared))?;
+        let catalog: Arc<dyn CatalogStore> = Arc::new(catalog_store::SqlCatalog::from_store(
+            catalog_url,
+            (*shared).clone(),
+        ));
         let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(catalog, data));
         let root = storage.abs("");
         let lake = Self {
@@ -1290,25 +1291,21 @@ impl Lake {
         key: Option<EncryptionKey>,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
-        // Catalog encryption is wave 103 T2 (see the create path).
-        if key.is_some() && matches!(catalog_location, Location::Pink(_)) {
-            return Err(LakeError::FeatureMissing {
-                feature: "catalog-encryption",
-                message: "an encrypted `.pink` catalog is wave 103 T2; open it without \
-                          PINKDB_KEY or use `sqlite:<path>` with encryption"
-                    .to_string(),
-            });
-        }
-        // Wave 103: a keyless SQL catalog opens directly from the DuckLake
-        // tables. The rendered compatibility objects (`lake.json`,
-        // `highest.json`, `catalog.json`) exist too, but going through them
-        // would add a JSON round trip to every open and would require a side
-        // row for catalogs DuckDB created.
-        if key.is_none()
-            && let Some(store) =
-                catalog_store::open_metadata_store(catalog_url, &catalog_location, false)?
-        {
-            return Self::open_sql_catalog(catalog_url, store, data_location);
+        // Wave 103 T2: every SQL catalog opens directly from the DuckLake
+        // tables, keyed or not. The rendered compatibility objects
+        // (`lake.json`, `highest.json`, `catalog.json`) exist too, but going
+        // through them would add a JSON round trip to every open and would
+        // require a side row for catalogs DuckDB created.
+        if matches!(
+            catalog_location,
+            Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
+        ) && let Some(store) = catalog_store::open_metadata_store_keyed(
+            catalog_url,
+            &catalog_location,
+            false,
+            key.as_ref(),
+        )? {
+            return Self::open_sql_catalog(catalog_url, store, data_location, key.as_ref());
         }
         let catalog = catalog_store::open_catalog(catalog_url, &catalog_location, false)?;
         // A migrated-away SQL catalog keeps its rows and records the target in
@@ -1342,8 +1339,8 @@ impl Lake {
         Self::open_with(storage, key)
     }
 
-    /// Open a keyless SQL-catalog lake directly from the DuckLake tables
-    /// (`.pink` or SQLite).
+    /// Open a SQL-catalog lake directly from the DuckLake tables (`.pink`,
+    /// SQLite or Postgres).
     ///
     /// A catalog written by DuckDB has no pink side row for its snapshots;
     /// the first open adopts a lake identity into `pinkdb_lake` (the only
@@ -1354,7 +1351,20 @@ impl Lake {
         catalog_url: &str,
         store: catalog_store::SqlMetadataStore,
         data_location: Option<&str>,
+        key: Option<&EncryptionKey>,
     ) -> Result<Self> {
+        let encrypted = crate::metadata::MetadataStore::is_encrypted(&store)?;
+        if !encrypted && key.is_some() {
+            // A key supplied for a plaintext SQL catalog would be silently
+            // ignored (SQLite/Postgres keep the per-file keys in the catalog);
+            // refuse rather than pretend it protects anything. A keyed
+            // `pink:` database is already opened (or refused) by the engine.
+            return Err(LakeError::NotEncrypted {
+                path: PathBuf::from(redact_location(catalog_url)),
+                message: "the catalog's data files are plaintext; open it without a key"
+                    .to_string(),
+            });
+        }
         if let Some(moved_to) = store.moved_to()? {
             return Err(LakeError::CatalogMoved {
                 path: PathBuf::from(redact_location(catalog_url)),
@@ -1386,8 +1396,12 @@ impl Lake {
                 id
             }
         };
-        let catalog: Arc<dyn CatalogStore> =
-            Arc::new(catalog_store::SqlCatalog::from_store(catalog_url, store));
+        let shared = Arc::new(store);
+        let data = keyed_data_storage(data, Arc::clone(&shared))?;
+        let catalog: Arc<dyn CatalogStore> = Arc::new(catalog_store::SqlCatalog::from_store(
+            catalog_url,
+            (*shared).clone(),
+        ));
         let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(catalog, data));
         let root = storage.abs("");
         Ok(Self {
@@ -2634,19 +2648,23 @@ impl Lake {
         key: &str,
         file: &str,
         positions: &[u64],
+        format: &FileFormat,
     ) -> Result<(DeleteRef, u64)> {
-        split_key(key, &self.root.join(CATALOG_FILE))?;
+        let (dbname, table) = split_key(key, &self.root.join(CATALOG_FILE))?;
         validate_rel_path(file)?;
+        let provider = crate::format::format_for(format.id(), &self.root.join(CATALOG_FILE))?;
         let positions = delete_file::normalize(positions.to_vec());
         let dir = format!("data/{}", encode_key(key));
-        let rel = format!("{dir}/{}.pinkdel", fresh_id());
-        let bytes = delete_file::encode(&positions);
+        let rel = format!("{dir}/{}.{}", fresh_id(), provider.delete_extension());
+        let data_file_path = self.storage.abs(file).to_string_lossy().to_string();
+        let bytes = provider.write_delete_file(dbname, table, file, &data_file_path, &positions)?;
         self.storage.put(&rel, &bytes)?;
         Ok((
             DeleteRef {
                 path: rel,
                 file: file.to_string(),
                 count: positions.len() as u64,
+                format: provider.delete_format().to_string(),
             },
             bytes.len() as u64,
         ))
@@ -3208,6 +3226,29 @@ fn data_storage(location: &str) -> Result<Arc<dyn Storage>> {
     storage_for(parsed)
 }
 
+/// Wrap a SQL lake's data half in per-file-key encryption when the catalog's
+/// `encrypted` row says the files are sealed. The resolver reads a file's key
+/// from its catalog row (for a file written by an earlier process).
+fn keyed_data_storage(
+    data: Arc<dyn Storage>,
+    store: Arc<catalog_store::SqlMetadataStore>,
+) -> Result<Arc<dyn Storage>> {
+    if !crate::metadata::MetadataStore::is_encrypted(&*store)? {
+        return Ok(data);
+    }
+    let resolver_store = Arc::clone(&store);
+    let resolver = Arc::new(move |rel: &str| {
+        resolver_store
+            .file_key(rel)
+            .ok()
+            .flatten()
+            .and_then(|bytes| bytes.try_into().ok())
+    });
+    Ok(Arc::new(crate::storage::FileKeyStorage::new(
+        data, resolver,
+    )))
+}
+
 /// The DuckLake default data location for a SQL catalog (`.pink` or SQLite):
 /// a sibling `<catalog path>.files/` directory (DuckLake's `DATA_PATH` default).
 fn default_catalog_data_location(path: &Path) -> String {
@@ -3379,6 +3420,43 @@ pub fn catalog_stored_bytes(catalog_url: &str, rel: &str) -> Result<Option<Vec<u
     let store = catalog_store::open_catalog(catalog_url, &location, false)?;
     let context = format!("reading {catalog_url}#{rel}");
     store.read_optional(rel, &context)
+}
+
+/// [`catalog_stored_bytes`] for a keyed lake (a `pink:` catalog database may
+/// itself be engine-encrypted). Not part of the supported API.
+#[doc(hidden)]
+pub fn catalog_stored_bytes_keyed(
+    catalog_url: &str,
+    rel: &str,
+    key: Option<EncryptionKey>,
+) -> Result<Option<Vec<u8>>> {
+    let location = Location::parse(catalog_url)?;
+    let Some(store) =
+        catalog_store::open_metadata_store_keyed(catalog_url, &location, false, key.as_ref())?
+    else {
+        return catalog_stored_bytes(catalog_url, rel);
+    };
+    let catalog = catalog_store::SqlCatalog::from_store(catalog_url, store);
+    let context = format!("reading {catalog_url}#{rel}");
+    Storage::read_optional(&catalog, rel, &context)
+}
+
+/// Every per-file encryption key recorded in a SQL catalog (diagnostics and
+/// tests: prove each file carries its own 256-bit key). `key` opens a `pink:`
+/// catalog database that is itself engine-encrypted. Not part of the
+/// supported API.
+#[doc(hidden)]
+pub fn catalog_encryption_keys(
+    catalog_url: &str,
+    key: Option<EncryptionKey>,
+) -> Result<Vec<Vec<u8>>> {
+    let location = Location::parse(catalog_url)?;
+    let store =
+        catalog_store::open_metadata_store_keyed(catalog_url, &location, false, key.as_ref())?
+            .ok_or_else(|| LakeError::NotALake {
+                path: PathBuf::from(redact_location(catalog_url)),
+            })?;
+    crate::metadata::MetadataStore::file_keys(&store)
 }
 
 /// The manifest for the latest version (`None`) or one snapshot, with the path

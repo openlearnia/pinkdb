@@ -30,12 +30,6 @@ mod sql;
 pub(crate) use crate::metadata::store::SqlMetadataStore;
 pub(crate) use sql::SqlCatalog;
 
-#[cfg(feature = "catalog-postgres")]
-mod postgres;
-
-#[cfg(feature = "catalog-postgres")]
-pub(crate) use postgres::PostgresCatalog;
-
 /// Whether `rel` is one of the six catalog metadata families.
 ///
 /// The bare directory names are included because `Storage::list` is called
@@ -122,7 +116,8 @@ pub(crate) fn open_catalog(
         Location::Postgres(_) => {
             #[cfg(feature = "catalog-postgres")]
             {
-                Ok(Arc::new(PostgresCatalog::open(catalog_url, create)?))
+                let store = crate::metadata::postgres::open(catalog_url, create)?;
+                Ok(Arc::new(SqlCatalog::from_store(catalog_url, store)))
             }
             #[cfg(not(feature = "catalog-postgres"))]
             {
@@ -162,21 +157,22 @@ fn describe(location: &Location) -> String {
     }
 }
 
-/// Open a SQL catalog's metadata store when `location` names one this build
-/// can serve directly (the `.pink` backend always, SQLite with the feature).
-/// `None` means "not a SQL catalog this build opens here"; the caller either
-/// falls through to [`open_catalog`] (which reports a missing feature) or is
-/// not a catalog at all.
-pub(crate) fn open_metadata_store(
+/// Open a catalog's metadata store for a keyed lake. Only the `pink:` catalog
+/// itself can be at-rest encrypted (the engine's `PINKENC1`); SQLite and
+/// Postgres catalogs are protected by whoever runs them, so their rows stay
+/// plaintext and the lake key is used only for data files.
+pub(crate) fn open_metadata_store_keyed(
     catalog_url: &str,
     location: &Location,
     create: bool,
+    key: Option<&crate::EncryptionKey>,
 ) -> Result<Option<SqlMetadataStore>> {
     match location {
-        Location::Pink(path) => Ok(Some(crate::metadata::pink::open(
+        Location::Pink(path) => Ok(Some(crate::metadata::pink::open_keyed(
             catalog_url,
             path,
             create,
+            key.and_then(|key| key.engine_key()),
         )?)),
         #[cfg(feature = "catalog-sqlite")]
         Location::Sqlite(path) => Ok(Some(crate::metadata::sqlite::open(
@@ -186,7 +182,11 @@ pub(crate) fn open_metadata_store(
         )?)),
         #[cfg(not(feature = "catalog-sqlite"))]
         Location::Sqlite(_) => Ok(None),
-        Location::Local(_) | Location::S3 { .. } | Location::Postgres(_) => Ok(None),
+        #[cfg(feature = "catalog-postgres")]
+        Location::Postgres(_) => Ok(Some(crate::metadata::postgres::open(catalog_url, create)?)),
+        #[cfg(not(feature = "catalog-postgres"))]
+        Location::Postgres(_) => Ok(None),
+        Location::Local(_) | Location::S3 { .. } => Ok(None),
     }
 }
 
@@ -344,7 +344,13 @@ impl Storage for SplitStorage {
     }
 
     fn encrypted(&self) -> bool {
-        false
+        // A keyed SQL lake seals only its data/delete files (per-file keys);
+        // the metadata rows are plaintext. The data half answers.
+        self.data.encrypted()
+    }
+
+    fn object_key(&self, rel: &str) -> Option<Vec<u8>> {
+        self.data.object_key(rel)
     }
 
     fn seal_manifest(&self, plain: &[u8], lake_id: &str, version: u64) -> Result<Vec<u8>> {

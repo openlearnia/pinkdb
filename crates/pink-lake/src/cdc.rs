@@ -349,7 +349,8 @@ impl Lake {
         let bytes = self
             .storage
             .read(&delete.path, &format!("reading {}", path.display()))?;
-        let positions = crate::delete_file::decode(&bytes, &path)?;
+        let positions =
+            crate::delete_file::read_positions(&bytes, &delete.format, &delete.file, &path)?;
         if positions.len() as u64 != delete.count {
             return Err(LakeError::Corrupt {
                 path,
@@ -606,6 +607,7 @@ mod tests {
                     path: "data/main.t/x.pinkdel".to_string(),
                     file: "../escape".to_string(),
                     count: 1,
+                    format: "pink".to_string(),
                 }],
                 rows_deleted: 1,
                 ..TableDelta::default()

@@ -113,14 +113,13 @@ fn drop_schema(base: &str, schema: &str) {
 }
 
 #[test]
-fn save_open_and_migrate_a_postgres_catalog_without_printing_the_password() {
+fn save_and_open_a_postgres_catalog_without_printing_the_password() {
     let Some(base) = base_url() else {
         return;
     };
     let dir = scratch("roundtrip");
     let data = dir.join("data-root").display().to_string();
     let (source, source_schema) = catalog(&base, "source");
-    let (target, target_schema) = catalog(&base, "target");
     let password = "w96a-s3cret";
     let source_with_password = with_password(&source, password);
 
@@ -140,48 +139,11 @@ fn save_open_and_migrate_a_postgres_catalog_without_printing_the_password() {
         "the password must never reach the terminal: {out}"
     );
 
-    // SQL -> SQL keeps the recorded data location, so `to` needs no `data`.
-    let out = run(&format!(
-        ".lake migrate-catalog {source_with_password} to {target}\n\
-         .quit\n"
-    ));
-    assert!(out.contains("Migrated catalog"), "{out}");
-    assert!(out.contains("source retired"), "{out}");
-    assert!(
-        out.contains("***"),
-        "the printed URL must be redacted: {out}"
-    );
-    assert!(
-        !out.contains(password),
-        "the password must never reach the terminal: {out}"
-    );
-    assert!(
-        !out.contains("w96a-cli-secret"),
-        "the password must never reach the terminal: {out}"
-    );
-
-    // The target opens and serves the copied metadata.
-    let out = run(&format!(
-        ".lake open {target}\nSELECT COUNT(*) FROM t;\n.quit\n"
-    ));
-    assert!(out.contains("Opened lake version 2"), "{out}");
-    assert!(out.contains("│ 2        │"), "{out}");
-
-    // The retired source reports the move rather than `not a lake`, and the
-    // message never leaks the password.
-    let out = run(&format!(".lake open {source_with_password}\n.quit\n"));
-    assert!(
-        out.contains("was moved to") || out.contains("moved"),
-        "the retired source names the move: {out}"
-    );
-    assert!(
-        !out.contains(password),
-        "the password must never reach the terminal: {out}"
-    );
+    // `.lake migrate-catalog` is the legacy JSON-to-SQL copy operation,
+    // deleted in Part 2; it is not exercised here.
 
     cleanup(&dir);
     drop_schema(&base, &source_schema);
-    drop_schema(&base, &target_schema);
 }
 
 /// A malformed Postgres URL in the usage/error path is still redacted.
