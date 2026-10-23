@@ -579,6 +579,47 @@ fn values_identical(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Whether `current`'s first `base.num_rows()` rows are identical to `base`'s
+/// rows, in order. This is the append-only fast path of the writable diff: if
+/// true, every base row still exists at the same position and the only change
+/// is the suffix.
+fn rows_prefix_equal(base: &DataTable, current: &DataTable) -> bool {
+    if base.num_cols() != current.num_cols()
+        || base.num_cols() == 0
+        || base.num_chunks() == 0
+        || current.num_chunks() == 0
+        || current.num_rows() < base.num_rows()
+    {
+        return false;
+    }
+    let (mut bc, mut br) = (0usize, 0usize);
+    let (mut cc, mut cr) = (0usize, 0usize);
+    for _ in 0..base.num_rows() {
+        while bc < base.num_chunks() && br >= base.columns[0].chunks[bc].len() {
+            bc += 1;
+            br = 0;
+        }
+        while cc < current.num_chunks() && cr >= current.columns[0].chunks[cc].len() {
+            cc += 1;
+            cr = 0;
+        }
+        if bc >= base.num_chunks()
+            || cc >= current.num_chunks()
+            || !(0..base.num_cols()).all(|c| {
+                values_identical(
+                    &base.columns[c].chunks[bc].get(br),
+                    &current.columns[c].chunks[cc].get(cr),
+                )
+            })
+        {
+            return false;
+        }
+        br += 1;
+        cr += 1;
+    }
+    true
+}
+
 /// [`rows_identical`] for a base row read through a schema-delta view: `a` is
 /// the base table, `b` the current one, and `view[i]` says where the current
 /// column `i` comes from in `a` (a column, or a constant default).
@@ -1314,8 +1355,7 @@ impl Lake {
                     }
                     Err(e) => return Err(e),
                 }
-                let specs = self.upload_partition_specs(commit)?;
-                uploaded = Some(self.upload_commit(commit, &specs)?);
+                uploaded = Some(self.upload_commit(commit)?);
             }
             match self.try_publish_commit(
                 commit,
@@ -1323,7 +1363,9 @@ impl Lake {
                 origin,
                 attempt,
             ) {
-                Ok(report) => return Ok(report),
+                Ok(report) => {
+                    return Ok(report);
+                }
                 Err(PublishFailure::Fatal(e)) => return Err(e),
                 Err(PublishFailure::Retry(e)) => {
                     if attempt >= settings.max_retry_count {
@@ -1470,7 +1512,23 @@ impl Lake {
         base: &[(String, Arc<DataTable>)],
         current: &[(String, Arc<DataTable>)],
     ) -> Result<(Commit, BTreeMap<String, Arc<DataTable>>)> {
-        let (manifest, manifest_path) = self.manifest(Some(base_version))?;
+        let (manifest, manifest_path) = if let Some(store) = self.storage.metadata_store() {
+            let mut catalog = store.head()?.ok_or_else(|| LakeError::NotALake {
+                path: self.root.clone(),
+            })?;
+            let mut keys: BTreeSet<&str> = BTreeSet::new();
+            keys.extend(base.iter().map(|(key, _)| key.as_str()));
+            keys.extend(current.iter().map(|(key, _)| key.as_str()));
+            catalog.tables.clear();
+            for key in keys {
+                if let Some(entry) = store.table_layout(key, Some(base_version))? {
+                    catalog.tables.insert(key.to_string(), entry);
+                }
+            }
+            (catalog, self.storage.abs(CATALOG_FILE))
+        } else {
+            self.manifest(Some(base_version))?
+        };
         let base_map: BTreeMap<&str, &Arc<DataTable>> =
             base.iter().map(|(k, t)| (k.as_str(), t)).collect();
         let current_map: BTreeMap<&str, &Arc<DataTable>> =
@@ -1509,6 +1567,23 @@ impl Lake {
                     let delta = crate::schema::plan_schema_delta(key, &entry, base_table, table)?;
                     if let Some(record) = &delta.record {
                         commit.set_schema(key, record.clone());
+                    }
+                    // The common writable-commit shape is an append at the end
+                    // of an otherwise unchanged table. In that case the exact
+                    // diff and the merge-order rebuild both reduce to "keep the
+                    // current table, publish the suffix", so skip the per-row
+                    // hash pass and the full base copy.
+                    if delta.record.is_none() && rows_prefix_equal(base_table, table) {
+                        let start = base_table.num_rows();
+                        if start < table.num_rows() {
+                            let indices: Vec<usize> = (start..table.num_rows()).collect();
+                            let sub = sub_table(table, &indices)?;
+                            let _appended_inlined =
+                                self.inlines_appends(Some(&entry), false, sub.num_rows() as u64);
+                            commit.append(key, Arc::new(sub));
+                        }
+                        after.insert((*key).to_string(), Arc::clone(table));
+                        continue;
                     }
                     let layout = BaseLayout {
                         files: self.entry_layout(&entry, key, &manifest_path)?,
@@ -1737,6 +1812,10 @@ impl Lake {
                 deltas.insert(
                     key.clone(),
                     TableDelta {
+                        runtime: crate::catalog::TableRuntime {
+                            kind: crate::catalog::DeltaKind::Flush,
+                            ..Default::default()
+                        },
                         data_files: files,
                         delete_files: Vec::new(),
                         rows_added: 0,
@@ -2164,17 +2243,17 @@ impl Lake {
     /// rows ride in [`UploadedCommit::inlined`] and the publish stores them in
     /// the manifest. The decision is kept across retries: the uploaded rows
     /// are what a rebased publish records.
-    fn upload_commit(
-        &self,
-        commit: &Commit,
-        specs: &BTreeMap<String, Vec<PartitionKey>>,
-    ) -> Result<UploadedCommit> {
-        let head = crate::read_catalog(&*self.storage, &self.root)?;
+    fn upload_commit(&self, commit: &Commit) -> Result<UploadedCommit> {
+        let head = self.commit_head(commit, true)?;
+        let specs = partition_specs_for(commit, &head);
         // Wave 88, rule 5: a commit that targets a table this build cannot
         // read fails before any file is written; a commit that merely
         // coexists with one is fine (the entry rides through the publish).
         self.ensure_commit_tables_available(&head, commit)?;
-        let mut uploaded = UploadedCommit::default();
+        let mut uploaded = UploadedCommit {
+            head: Some(head.clone()),
+            ..Default::default()
+        };
         for (key, rows) in &commit.appends {
             let entry = head.tables.get(key);
             if self.inlines_appends(
@@ -2207,30 +2286,6 @@ impl Lake {
             }
         }
         Ok(uploaded)
-    }
-
-    /// The partition specs the commit's appends must be split by: the head
-    /// version's spec per appended table, or — for a table this commit
-    /// creates (`partition_changes` without a head entry) — the spec being
-    /// set. Read without touching this handle's cached version (the commit
-    /// loop has already checked the catalog is still the head).
-    fn upload_partition_specs(
-        &self,
-        commit: &Commit,
-    ) -> Result<BTreeMap<String, Vec<PartitionKey>>> {
-        let head = crate::read_catalog(&*self.storage, &self.root)?;
-        let mut out = BTreeMap::new();
-        for key in commit.appends.keys() {
-            let spec = head
-                .tables
-                .get(key)
-                .and_then(|entry| entry.partition_by.clone())
-                .or_else(|| commit.partition_changes.get(key).cloned().flatten());
-            if let Some(spec) = spec {
-                out.insert(key.clone(), spec);
-            }
-        }
-        Ok(out)
     }
 
     /// Whether an append of `rows` rows to `entry` (the head entry; `None`
@@ -2273,9 +2328,19 @@ impl Lake {
         origin: u64,
         retries: u32,
     ) -> std::result::Result<CommitReport, PublishFailure> {
-        let head = self
+        let mut head = self
             .read_catalog_for_commit()
             .map_err(PublishFailure::Fatal)?;
+        if let Some(planned) = uploaded
+            .head
+            .as_ref()
+            .filter(|planned| planned.version == head.version)
+        {
+            head.tables = planned.tables.clone();
+        } else {
+            self.load_commit_tables(&mut head, commit)
+                .map_err(PublishFailure::Fatal)?;
+        }
         // The head on disk governs: a legacy (format_version 1–3) entry lists
         // one path-only data file, so the committed manifest would be written
         // at format_version 5 with an entry the reader rejects.
@@ -2307,7 +2372,19 @@ impl Lake {
         // writer's rows from the positional mapping. A hand-built commit has
         // no expectations and rebases freely.
         for (key, expected) in &commit.expect {
-            if tables.get(key) != expected.as_ref() {
+            // Statistics are derived from the rows and are not part of the
+            // physical layout the expectation pins; ignore them so a layout
+            // loaded without statistics compares equal to an entry loaded
+            // with them.
+            let actual = tables.get(key).cloned().map(|mut entry| {
+                entry.stats = None;
+                entry
+            });
+            let expected = expected.clone().map(|mut entry| {
+                entry.stats = None;
+                entry
+            });
+            if actual != expected {
                 return Err(PublishFailure::Fatal(LakeError::Conflict {
                     path: self.storage.abs(CATALOG_FILE),
                     message: format!(
@@ -2739,6 +2816,40 @@ impl Lake {
         // entry written before wave 89 acquires one. Existing entries were
         // cloned from the head, so their id is preserved.
         crate::catalog::assign_missing_table_ids(&mut tables).map_err(PublishFailure::Fatal)?;
+        // The runtime-only delta facts: target table metadata, creation/drop
+        // markers and the inlined row versions this version began/ended. A
+        // SQL catalog applies these directly; the object layout serializes
+        // only the documented `TableDelta` fields (runtime is `serde(skip)`).
+        for (key, delta) in &mut deltas {
+            let base_entry = head.tables.get(key);
+            let target_entry = tables.get(key);
+            delta.runtime = crate::catalog::TableRuntime {
+                meta: target_entry.map(crate::catalog::TableMeta::from_entry),
+                created: base_entry.is_none() && target_entry.is_some(),
+                dropped: target_entry.is_none(),
+                kind: crate::catalog::DeltaKind::Commit,
+                inlined_rows: target_entry
+                    .map(|entry| {
+                        entry
+                            .inlined
+                            .iter()
+                            .filter(|row| row.begin == version)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                inlined_ends: target_entry
+                    .map(|entry| {
+                        entry
+                            .inlined
+                            .iter()
+                            .filter(|row| row.end == Some(version))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+        }
         // The per-version record, mirroring a save: the author/message kept
         // pending by `Lake::set_commit_message` and the change summary diffed
         // against the base manifest (absent when it is unavailable).
@@ -2746,14 +2857,36 @@ impl Lake {
             Some((author, message)) => (author.clone(), message.clone()),
             None => (None, None),
         };
-        let changes = crate::manifest_for(&*self.storage, &self.root, Some(version - 1))
-            .ok()
-            .map(|(previous, _)| crate::snapshot::ChangeSummary::diff(&previous.tables, &tables));
-        let schema_version = crate::next_schema_version(Some(&head), &tables);
+        let updated = crate::time::iso8601_utc(std::time::SystemTime::now());
+        let sql_store = self.storage.metadata_store();
+        let changes = if sql_store.is_some() {
+            None
+        } else {
+            crate::manifest_for(&*self.storage, &self.root, Some(version - 1))
+                .ok()
+                .map(|(previous, _)| {
+                    crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
+                })
+        };
+        let schema_version = if sql_store.is_some() {
+            let changed =
+                deltas.iter().any(|(key, delta)| {
+                    delta.runtime.created
+                        || delta.runtime.dropped
+                        || head.tables.get(key).zip(tables.get(key)).is_some_and(
+                            |(before, after)| {
+                                before.columns != after.columns || before.renames != after.renames
+                            },
+                        )
+                });
+            head.schema_version + u64::from(changed)
+        } else {
+            crate::next_schema_version(Some(&head), &tables)
+        };
         let new_catalog = crate::catalog::Catalog {
             format_version: crate::FORMAT_VERSION,
             lake_id: Some(self.lake_id.clone()),
-            updated: crate::time::iso8601_utc(std::time::SystemTime::now()),
+            updated,
             version,
             tables,
             author,
@@ -2761,19 +2894,22 @@ impl Lake {
             changes,
             schema_version,
         };
-        let snapshot_bytes =
-            crate::manifest_json(&new_catalog, &self.root).map_err(PublishFailure::Fatal)?;
         let rows_inlined: u64 = deltas.values().map(|d| d.rows_inlined).sum();
         let inlined_deleted: u64 = deltas.values().map(|d| d.inlined_ended).sum();
         let commit_manifest = CommitManifest {
             format_version: crate::FORMAT_VERSION,
             version,
             base_version: version - 1,
-            updated: crate::time::iso8601_utc(std::time::SystemTime::now()),
+            updated: new_catalog.updated.clone(),
             tables: deltas,
         };
         let commit_bytes =
             crate::commit_manifest_json(&commit_manifest).map_err(PublishFailure::Fatal)?;
+        let snapshot_bytes = if sql_store.is_some() {
+            Vec::new()
+        } else {
+            crate::manifest_json(&new_catalog, &self.root).map_err(PublishFailure::Fatal)?
+        };
         let tables_changed: BTreeSet<&String> = commit
             .appends
             .keys()
@@ -2813,8 +2949,23 @@ impl Lake {
             rows_inlined,
             inlined_deleted,
         };
-        self.publish_commit_version(version, &commit_bytes, &snapshot_bytes)
-            .map_err(PublishFailure::Retry)?;
+        if sql_store.is_some() {
+            let change = crate::metadata::CatalogChange {
+                catalog: None,
+                manifest: commit_manifest,
+                schema_version: new_catalog.schema_version,
+                format_version: new_catalog.format_version,
+                updated: new_catalog.updated.clone(),
+                lake_id: new_catalog.lake_id.clone(),
+                author: new_catalog.author.clone(),
+                commit_message: new_catalog.commit_message.clone(),
+            };
+            self.publish_sql_commit(change)
+                .map_err(PublishFailure::Retry)?;
+        } else {
+            self.publish_commit_version(version, &commit_bytes, &snapshot_bytes)
+                .map_err(PublishFailure::Retry)?;
+        }
         // The commit record is published; a later save without a new
         // `set_commit_message` must not repeat it.
         self.pending_commit = None;
@@ -2829,6 +2980,25 @@ impl Lake {
     /// the exact same bytes go to `snapshots/<v>.json` and to `catalog.json`,
     /// so the byte-identity invariant survives encryption (see
     /// `Storage::seal_manifest`).
+    /// Apply one typed delta through the SQL metadata store. The store owns
+    /// the transaction (head check + snapshot row + delta rows + incremental
+    /// statistics); a moved head is the same retryable conflict the object
+    /// layout reports.
+    pub(crate) fn publish_sql_commit(
+        &mut self,
+        change: crate::metadata::CatalogChange,
+    ) -> Result<()> {
+        let Some(store) = self.storage.metadata_store() else {
+            return Err(LakeError::Internal {
+                message: "a SQL commit was attempted on an object-store catalog".to_string(),
+            });
+        };
+        let base = self.version;
+        let version = store.commit(base, change)?;
+        self.version = version;
+        Ok(())
+    }
+
     pub(crate) fn publish_commit_version(
         &mut self,
         version: u64,
@@ -2871,15 +3041,84 @@ impl Lake {
     /// Read `catalog.json` for a commit attempt: whatever version it names
     /// becomes this handle's base (a rebase).
     pub(crate) fn read_catalog_for_commit(&mut self) -> Result<crate::catalog::Catalog> {
-        let manifest = crate::read_catalog(&*self.storage, &self.root)?;
+        let manifest = if let Some(store) = self.storage.metadata_store() {
+            store.head()?.ok_or_else(|| LakeError::NotALake {
+                path: self.root.clone(),
+            })?
+        } else {
+            crate::read_catalog(&*self.storage, &self.root)?
+        };
         self.version = manifest.version;
         self.format_version = manifest.format_version;
         Ok(manifest)
     }
 
+    /// The head catalog a commit needs: for a SQL catalog only the tables the
+    /// commit names are loaded (and only the non-file facts for append-only
+    /// ones). This keeps a commit proportional to its delta rather than to
+    /// the lake. The object layout loads the whole catalog as before.
+    fn commit_head(&self, commit: &Commit, use_expect: bool) -> Result<crate::catalog::Catalog> {
+        let Some(store) = self.storage.metadata_store() else {
+            return crate::read_catalog(&*self.storage, &self.root);
+        };
+        let head = store.head()?.ok_or_else(|| LakeError::NotALake {
+            path: self.root.clone(),
+        })?;
+        let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        keys.extend(commit.appends.keys().cloned());
+        keys.extend(commit.deletes.keys().cloned());
+        keys.extend(commit.inlined_deletes.keys().cloned());
+        keys.extend(commit.drops.iter().cloned());
+        keys.extend(commit.partition_changes.keys().cloned());
+        keys.extend(commit.inlining_changes.keys().cloned());
+        keys.extend(commit.schemas.keys().cloned());
+        keys.extend(commit.expect.keys().cloned());
+        let mut catalog = head;
+        let planned_at_head = use_expect && catalog.version == self.version;
+        for key in keys {
+            // The writable diff already loaded this table's layout at the
+            // handle's base and pinned it in `expect`. If the head has not
+            // moved since, that entry is exactly the head entry and no second
+            // layout load is needed. A moved head ignores it and reads rows.
+            let expected = if planned_at_head {
+                commit.expect.get(&key).and_then(|entry| entry.clone())
+            } else {
+                None
+            };
+            let entry = match expected {
+                Some(entry) => Some(entry),
+                None => store.table_layout(&key, Some(catalog.version))?,
+            };
+            if let Some(entry) = entry {
+                catalog.tables.insert(key, entry);
+            }
+        }
+        Ok(catalog)
+    }
+
+    /// Load the named tables into a head handle that was read without tables.
+    fn load_commit_tables(
+        &self,
+        head: &mut crate::catalog::Catalog,
+        commit: &Commit,
+    ) -> Result<()> {
+        if self.storage.metadata_store().is_none() {
+            return Ok(());
+        }
+        let loaded = self.commit_head(commit, false)?;
+        head.tables = loaded.tables;
+        Ok(())
+    }
+
     /// Re-read the catalog after a conflict: the new head becomes the base.
     pub(crate) fn rebase_catalog(&mut self) -> Result<()> {
-        let manifest = crate::read_catalog(&*self.storage, &self.root)?;
+        let manifest = if let Some(store) = self.storage.metadata_store() {
+            store.head()?.ok_or_else(|| LakeError::NotALake {
+                path: self.root.clone(),
+            })?
+        } else {
+            crate::read_catalog(&*self.storage, &self.root)?
+        };
         self.version = manifest.version;
         self.format_version = manifest.format_version;
         Ok(())
@@ -2904,6 +3143,33 @@ struct UploadedCommit {
     /// format (the files would be mislabeled).
     formats: BTreeMap<String, crate::catalog::FileFormat>,
     bytes: u64,
+    /// The head catalog the upload planned against. If the publish still sees
+    /// the same version, it reuses these tables instead of loading them again
+    /// (a conflict rebases and reloads).
+    head: Option<crate::catalog::Catalog>,
+}
+
+/// The partition specs the commit's appends must be split by: the head
+/// version's spec per appended table, or — for a table this commit creates
+/// (`partition_changes` without a head entry) — the spec being set. The caller
+/// passes the head it already read, so planning the upload costs no second
+/// layout load.
+fn partition_specs_for(
+    commit: &Commit,
+    head: &crate::catalog::Catalog,
+) -> BTreeMap<String, Vec<PartitionKey>> {
+    let mut out = BTreeMap::new();
+    for key in commit.appends.keys() {
+        let spec = head
+            .tables
+            .get(key)
+            .and_then(|entry| entry.partition_by.clone())
+            .or_else(|| commit.partition_changes.get(key).cloned().flatten());
+        if let Some(spec) = spec {
+            out.insert(key.clone(), spec);
+        }
+    }
+    out
 }
 
 /// Assign `row_id_start` ranges to the commit's new data files, continuing

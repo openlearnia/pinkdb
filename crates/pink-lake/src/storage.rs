@@ -447,6 +447,16 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
         Ok(PublishScope::noop())
     }
 
+    /// The typed metadata backend, when the catalog is a SQL database. A
+    /// commit that has one applies its delta directly through
+    /// [`crate::metadata::MetadataStore`] instead of rendering and parsing a
+    /// whole `catalog.json`. Decorators that seal metadata (the encryption
+    /// layer) deliberately do not forward this: a keyed SQL catalog keeps the
+    /// compatibility-object path.
+    fn metadata_store(&self) -> Option<Arc<dyn crate::metadata::MetadataStore>> {
+        None
+    }
+
     /// Whether the catalog lives separately from the data location (wave
     /// 96a: a `sqlite:` catalog). Only such a lake writes and verifies the
     /// `lake-data.json` ownership marker; the default object-store layout is

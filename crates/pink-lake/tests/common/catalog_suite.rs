@@ -335,14 +335,27 @@ pub fn create_save_open_round_trip(suite: &mut dyn Suite) {
     assert_eq!(lake.commits().unwrap(), vec![2]);
 
     // Opening an existing SQL catalog by URL alone works (the recorded data
-    // location is used); `open_or_create` on a *fresh* one explains that a
-    // create needs `data`.
+    // location is used). A fresh SQLite catalog gets DuckLake's default data
+    // location (`<catalog>.files/`), so `open_or_create` creates it there; a
+    // Postgres catalog (wave 103 T2) still says a create needs `data`.
     let reopened = Lake::open_url(&catalog).unwrap();
     assert_eq!(reopened.current_version(), 2);
     let fresh = suite.catalog(&dir, "fresh");
-    let err = Lake::open_or_create_url(&fresh).unwrap_err();
-    assert!(matches!(err, LakeError::BadLocation { .. }), "{err:?}");
-    assert!(err.to_string().contains("data location"), "{err}");
+    if fresh.starts_with("sqlite:") {
+        let created = Lake::open_or_create_url(&fresh).unwrap();
+        assert_eq!(created.current_version(), 1);
+        let created_path = fresh.strip_prefix("sqlite:").unwrap();
+        assert!(
+            std::path::Path::new(&format!("{created_path}.files"))
+                .join("lake-data.json")
+                .is_file(),
+            "the default data root sits next to the catalog"
+        );
+    } else {
+        let err = Lake::open_or_create_url(&fresh).unwrap_err();
+        assert!(matches!(err, LakeError::BadLocation { .. }), "{err:?}");
+        assert!(err.to_string().contains("data location"), "{err}");
+    }
 
     cleanup(&dir);
 }

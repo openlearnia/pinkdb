@@ -114,14 +114,35 @@ fn save_open_attach_and_commit_through_a_sqlite_catalog() {
     cleanup(&dir);
 }
 
-/// A fresh SQL catalog needs `data <location>` on save; the error names both
-/// the flag and the library call instead of creating a lake with no data root.
+/// A fresh SQLite catalog defaults its data root to DuckLake's
+/// `<catalog path>.files/` when `data` is omitted, and records it so later
+/// opens need only the catalog URL.
 #[test]
-fn a_sqlite_save_without_data_is_explained() {
-    let dir = scratch("needs-data");
+fn a_sqlite_save_without_data_uses_the_default_data_root() {
+    let dir = scratch("default-data");
     let (catalog, _) = paths(&dir);
-    let out = run(&format!(".lake save {catalog}\n.quit\n"));
-    assert!(out.contains("needs a data location"), "{out}");
-    assert!(out.contains("data <"), "{out}");
+    let out = run(&format!(
+        "CREATE TABLE t (a INTEGER);\n\
+         INSERT INTO t VALUES (1);\n\
+         .lake save {catalog}\n\
+         .quit\n"
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    let data = dir.join("catalog.db.files");
+    assert!(out.contains(&format!("lake: {}", data.display())), "{out}");
+    assert!(
+        data.join("lake-data.json").is_file(),
+        "the default data root sits next to the catalog"
+    );
+    assert!(
+        data.join("data").is_dir(),
+        "the data files are under the default root"
+    );
+
+    let out = run(&format!(
+        ".lake open {catalog}\nSELECT COUNT(*) FROM t;\n.quit\n"
+    ));
+    assert!(out.contains("Opened lake version 2"), "{out}");
+    assert!(out.contains("│ 1        │"), "{out}");
     cleanup(&dir);
 }

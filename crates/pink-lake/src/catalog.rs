@@ -949,6 +949,12 @@ pub(crate) struct CommitManifest {
 /// One table's change inside a [`CommitManifest`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TableDelta {
+    /// The runtime-only part of a delta: the target table facts and the
+    /// inlined row versions that no `commits/<v>.json` needs to carry (the
+    /// SQL catalog derives the audit manifest back from its rows). Skipped
+    /// by serde so the object-store delta JSON stays exactly as it was.
+    #[serde(skip)]
+    pub(crate) runtime: TableRuntime,
     /// Data files this commit added.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) data_files: Vec<FileRef>,
@@ -1007,4 +1013,73 @@ pub(crate) struct TableDelta {
     /// True when this commit set or cleared the table's inlining limit.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) inlining_changed: bool,
+}
+
+/// The target facts of one table a commit touched (wave 103).
+///
+/// A SQL catalog applies a delta to its rows directly, so it needs the
+/// table's *after* facts — its identity, format, schema record, partition
+/// spec, inlining limit and row-id counter — without rebuilding (or even
+/// loading) the table's whole file list. This is the typed form of exactly
+/// those facts.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TableMeta {
+    pub(crate) table_id: Option<String>,
+    pub(crate) format: Option<FileFormat>,
+    pub(crate) inlined_limit: Option<u64>,
+    pub(crate) partition_by: Option<Vec<PartitionKey>>,
+    pub(crate) schema_version: u64,
+    pub(crate) columns: Option<Vec<ColumnEntry>>,
+    pub(crate) renames: Vec<RenameEntry>,
+    pub(crate) next_row_id: u64,
+}
+
+impl TableMeta {
+    pub(crate) fn from_entry(entry: &TableEntry) -> Self {
+        Self {
+            table_id: entry.table_id.clone(),
+            format: entry.format.clone(),
+            inlined_limit: entry.inlined_limit,
+            partition_by: entry.partition_by.clone(),
+            schema_version: entry.schema_version,
+            columns: entry.columns.clone(),
+            renames: entry.renames.clone(),
+            next_row_id: entry.next_row_id,
+        }
+    }
+}
+
+/// What kind of publication produced a [`TableDelta`]. The SQL catalog keeps
+/// this as a narrow integer per changed table: it is the one fact the rows
+/// cannot tell apart (an appended file and a rewritten file both begin at the
+/// commit's snapshot, but their `rows_added` semantics differ).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DeltaKind {
+    /// An ordinary incremental commit.
+    #[default]
+    Commit,
+    /// A full save (`replaced` is also true).
+    Save,
+    /// A maintenance rewrite (`compacted_files` / `removed_delete_files`).
+    Compaction,
+    /// A `.lake flush` of inlined rows into data files.
+    Flush,
+}
+
+/// The runtime-only part of a [`TableDelta`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TableRuntime {
+    /// The table's facts after the commit.
+    pub(crate) meta: Option<TableMeta>,
+    /// The table did not exist in the base version.
+    pub(crate) created: bool,
+    /// The table disappeared in this commit.
+    pub(crate) dropped: bool,
+    pub(crate) kind: DeltaKind,
+    /// Inlined row versions this commit began (their `begin` is the commit
+    /// version).
+    pub(crate) inlined_rows: Vec<InlinedRow>,
+    /// Inlined row versions this commit ended (their `end` is the commit
+    /// version; `flushed` distinguishes a materialization).
+    pub(crate) inlined_ends: Vec<InlinedRow>,
 }

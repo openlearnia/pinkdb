@@ -654,6 +654,10 @@ impl Lake {
                 deltas.insert(
                     planned.key.clone(),
                     TableDelta {
+                        runtime: crate::catalog::TableRuntime {
+                            kind: crate::catalog::DeltaKind::Compaction,
+                            ..Default::default()
+                        },
                         data_files: planned.new_files.clone(),
                         delete_files: Vec::new(),
                         rows_added: 0,

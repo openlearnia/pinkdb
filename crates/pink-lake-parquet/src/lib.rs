@@ -124,7 +124,7 @@ impl LakeFormat for ParquetLakeFormat {
                 pinkdb_parquet::scan_source(&path_text, Arc::new(LakeRange(source)), None, &[])
                     .map_err(|e| corrupt(file, format!("cannot decode the parquet data: {e}")))?;
             let schema = meta_schema(&scan.meta);
-            let (db, table) = meta_identity(&scan.meta);
+            let (db, table) = file_identity(file, &scan.meta);
             return build_store(file, &db, &table, schema, scan.output);
         }
         // Encrypted lakes have no plaintext byte ranges: stage one decrypted
@@ -145,7 +145,7 @@ impl LakeFormat for ParquetLakeFormat {
         let Some(meta) = read_meta(file)? else {
             return Ok(None);
         };
-        let (db, table) = meta_identity(&meta);
+        let (db, table) = file_identity(file, &meta);
         Ok(Some(FileFooter {
             db,
             table,
@@ -185,7 +185,7 @@ impl LakeFormat for ParquetLakeFormat {
         )
         .map_err(|e| corrupt(file, format!("cannot decode the parquet data: {e}")))?;
         let schema = meta_schema(&scan.meta);
-        let (db, table) = meta_identity(&scan.meta);
+        let (db, table) = file_identity(file, &scan.meta);
         let mut present = vec![false; schema.len()];
         for &column in columns {
             if column < present.len() {
@@ -225,7 +225,9 @@ fn read_local_path(file: &DataFile<'_>, path: &std::path::Path) -> Result<PinkDb
         .map_err(|e| corrupt(file, format!("cannot decode the parquet data: {e}")))?;
     let identity = pinkdb_parquet::write::read_identity(path)
         .map_err(|e| corrupt(file, format!("cannot read the parquet metadata: {e}")))?;
-    let (db, table) = identity.unwrap_or_else(|| ("main".to_string(), "data".to_string()));
+    let (db, table) = identity
+        .or_else(|| identity_from_rel(file.rel()))
+        .unwrap_or_else(|| ("main".to_string(), "data".to_string()));
     build_store(file, &db, &table, schema, output)
 }
 
@@ -255,7 +257,10 @@ fn meta_schema(meta: &pinkdb_parquet::FileMeta) -> Vec<(String, DataType)> {
         .collect()
 }
 
-fn meta_identity(meta: &pinkdb_parquet::FileMeta) -> (String, String) {
+/// A file's declared database/table identity from its footer. `None` for a
+/// file this lake did not write (for example a Parquet file from DuckDB's
+/// `ducklake` extension), which carries no pink identity keys.
+fn meta_identity(meta: &pinkdb_parquet::FileMeta) -> Option<(String, String)> {
     let mut db = None;
     let mut table = None;
     for (key, value) in &meta.kv {
@@ -269,10 +274,32 @@ fn meta_identity(meta: &pinkdb_parquet::FileMeta) -> (String, String) {
             _ => {}
         }
     }
-    (
-        db.unwrap_or_else(|| "main".to_string()),
-        table.unwrap_or_else(|| "data".to_string()),
-    )
+    Some((db?, table?))
+}
+
+/// The file's database/table identity: the footer's pink identity when the
+/// file declares one, else the DuckLake layout it sits in
+/// (`<data path>/<schema path>/<table path>/<file>`). The catalog is the
+/// authority for a foreign file; deriving the identity from the path keeps
+/// the lake's file-identity check meaningful instead of rejecting every file
+/// DuckDB wrote.
+fn file_identity(file: &DataFile<'_>, meta: &pinkdb_parquet::FileMeta) -> (String, String) {
+    meta_identity(meta)
+        .or_else(|| identity_from_rel(file.rel()))
+        .unwrap_or_else(|| ("main".to_string(), "data".to_string()))
+}
+
+/// The schema-path/table-path pair a lake-relative file sits under. The
+/// trailing component is the file name, so the two before it name the table
+/// path and schema path.
+fn identity_from_rel(rel: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = rel.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let table = parts[parts.len() - 2];
+    let schema = parts[parts.len() - 3];
+    Some((schema.to_string(), table.to_string()))
 }
 
 /// Replace a projected scan's zero-length placeholders with NULL vectors of

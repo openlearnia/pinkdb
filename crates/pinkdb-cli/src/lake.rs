@@ -165,9 +165,9 @@ fn open_or_create_lake(dir: &str) -> pink_lake::Result<Lake> {
 /// `open_or_create` variant in the library because the first create needs the
 /// data location, not every open). The open attempt distinguishes a fresh
 /// catalog (`NotALake`) from every other failure, so a wrong key or a corrupt
-/// catalog is never silently masked by a create. Without `data` this is the
-/// ordinary object-store path (a `sqlite:` URL then gets the library's
-/// "needs a data location" hint).
+/// catalog is never silently masked by a create. Without `data` a fresh SQLite
+/// catalog gets DuckLake's default `<catalog>.files/` data root (the library's
+/// `open_or_create_url`); Postgres still explains that a create needs `data`.
 fn open_or_create_lake_with_data(catalog: &str, data: Option<&str>) -> pink_lake::Result<Lake> {
     let Some(data) = data else {
         return open_or_create_lake(catalog);
@@ -190,14 +190,15 @@ fn open_or_create_lake_with_data(catalog: &str, data: Option<&str>) -> pink_lake
     feature = "catalog-sqlite",
     feature = "catalog-postgres"
 ))]
-const HINT: &str = "   (locations may be s3://bucket/prefix, sqlite:<path> data <dir|s3://…>, \
+const HINT: &str = "   (locations may be s3://bucket/prefix, sqlite:<path> [data <dir|s3://…>], \
                     or postgres://… data <dir>)";
 #[cfg(all(
     feature = "s3",
     feature = "catalog-sqlite",
     not(feature = "catalog-postgres")
 ))]
-const HINT: &str = "   (locations may be s3://bucket/prefix, or sqlite:<path> data <dir|s3://…>)";
+const HINT: &str = "   (locations may be s3://bucket/prefix, or sqlite:<path> \
+                    [data <dir|s3://…>])";
 #[cfg(all(
     feature = "s3",
     not(feature = "catalog-sqlite"),
@@ -216,14 +217,14 @@ const HINT: &str = "   (locations may be s3://bucket/prefix)";
     feature = "catalog-postgres"
 ))]
 const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; sqlite:<path> \
-                    and postgres://… catalogs need `data <dir>`)";
+                    [data <dir>]; postgres://… catalogs need `data <dir>`)";
 #[cfg(all(
     not(feature = "s3"),
     feature = "catalog-sqlite",
     not(feature = "catalog-postgres")
 ))]
 const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; a \
-                    sqlite:<path> catalog needs `data <dir>`)";
+                    sqlite:<path> catalog accepts optional `data <dir>`)";
 #[cfg(all(
     not(feature = "s3"),
     not(feature = "catalog-sqlite"),

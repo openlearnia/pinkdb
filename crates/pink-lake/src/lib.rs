@@ -466,6 +466,7 @@ mod incremental;
 mod inlined;
 mod local;
 mod maintenance;
+mod metadata;
 mod migrate;
 #[cfg(test)]
 mod mock_s3;
@@ -485,6 +486,8 @@ pub mod replication;
 
 pub use attach::AttachmentReport;
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
+#[cfg(feature = "catalog-sqlite")]
+use catalog_store::CatalogStore;
 use catalog_store::SplitStorage;
 pub use cdc::{ChangeKind, ChangeRow};
 pub use crypto::EncryptionKey;
@@ -1032,6 +1035,17 @@ impl Lake {
         key: Option<EncryptionKey>,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
+        // Wave 103: a keyless SQLite catalog is created directly in the
+        // DuckLake tables. The object-store create protocol would need a
+        // version-1 `snapshots/…`/`catalog.json` pair; seeding the snapshot-0
+        // row instead is the same empty lake in the new layout. A keyed
+        // SQLite catalog still goes through the (T2) sealing path.
+        #[cfg(feature = "catalog-sqlite")]
+        if key.is_none()
+            && let Location::Sqlite(path) = &catalog_location
+        {
+            return Self::create_sqlite_catalog(catalog_url, path, data_location);
+        }
         let data = data_storage(data_location)?;
         // Refuse a data location that already belongs to a lake *before* the
         // catalog file is created, so a rejected create leaves nothing behind.
@@ -1049,6 +1063,65 @@ impl Lake {
         catalog.set_lake_id(&lake.lake_id)?;
         // The ownership marker is a *data* object, written through the lake's
         // storage so a keyed lake seals it like every other data artifact.
+        lake.storage
+            .put(LAKE_DATA_FILE, &data_ownership_json(&lake.lake_id)?)?;
+        Ok(lake)
+    }
+
+    /// Create a keyless SQLite-catalog lake directly on the DuckLake tables.
+    ///
+    /// The store seeds `ducklake_metadata` (`version`, `created_by`,
+    /// `data_path`, `encrypted=false`), snapshot 0 (`created_schema:"main"`)
+    /// and the pink side rows in one transaction; the handle starts at pink
+    /// version 1, which *is* snapshot 0 (see [`crate::metadata`]).
+    #[cfg(feature = "catalog-sqlite")]
+    fn create_sqlite_catalog(catalog_url: &str, path: &Path, data_location: &str) -> Result<Self> {
+        let data = data_storage(data_location)?;
+        // Refuse a data location that already belongs to a lake *before* the
+        // catalog database is created, so a rejected create leaves nothing
+        // behind.
+        ensure_data_location_free(&*data, data_location)?;
+        let store = catalog_store::SqliteMetadataStore::open(catalog_url, path, true)?;
+        if store.initialized()? {
+            return Err(LakeError::AlreadyALake {
+                path: PathBuf::from(redact_location(catalog_url)),
+            });
+        }
+        let lake_id = fresh_lake_id()?;
+        let manifest = Catalog {
+            format_version: FORMAT_VERSION,
+            lake_id: Some(lake_id.clone()),
+            updated: time::iso8601_utc(SystemTime::now()),
+            version: 1,
+            tables: BTreeMap::new(),
+            author: None,
+            commit_message: None,
+            changes: None,
+            schema_version: 0,
+        };
+        crate::metadata::MetadataStore::create(
+            &store,
+            data_location,
+            concat!("pinkdb ", env!("CARGO_PKG_VERSION")),
+            &manifest,
+        )?;
+        let catalog: Arc<dyn CatalogStore> =
+            Arc::new(catalog_store::SqliteCatalog::from_store(catalog_url, store));
+        let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(catalog, data));
+        let root = storage.abs("");
+        let lake = Self {
+            root,
+            storage,
+            lake_id,
+            format_version: FORMAT_VERSION,
+            version: 1,
+            pending_commit: None,
+            inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
+            write_format_choice: None,
+            table_format_choices: BTreeMap::new(),
+        };
+        // The ownership marker is a *data* object: it lives at the data root,
+        // never in the catalog.
         lake.storage
             .put(LAKE_DATA_FILE, &data_ownership_json(&lake.lake_id)?)?;
         Ok(lake)
@@ -1206,6 +1279,17 @@ impl Lake {
         key: Option<EncryptionKey>,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
+        // Wave 103: a keyless SQLite catalog opens directly from the DuckLake
+        // tables. The rendered compatibility objects (`lake.json`,
+        // `highest.json`, `catalog.json`) exist too, but going through them
+        // would add a JSON round trip to every open and would require a side
+        // row for catalogs DuckDB created.
+        #[cfg(feature = "catalog-sqlite")]
+        if key.is_none()
+            && let Location::Sqlite(path) = &catalog_location
+        {
+            return Self::open_sqlite_catalog(catalog_url, path, data_location);
+        }
         let catalog = catalog_store::open_catalog(catalog_url, &catalog_location, false)?;
         // A migrated-away SQL catalog keeps its rows and records the target in
         // `pink_lake_meta.moved_to`; opening the source reports that instead
@@ -1236,6 +1320,68 @@ impl Lake {
         let data = data_storage(&data_location)?;
         let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(Arc::clone(&catalog), data));
         Self::open_with(storage, key)
+    }
+
+    /// Open a keyless SQLite-catalog lake directly from the DuckLake tables.
+    ///
+    /// A catalog written by DuckDB has no pink side row for its snapshots;
+    /// the first open adopts a lake identity into `pinkdb_lake` (the only
+    /// fact DuckLake has no column for), so every later load and commit has
+    /// one. `data_location` overrides the recorded `ducklake_metadata.data_path`
+    /// for this session, exactly like the object-store split open.
+    #[cfg(feature = "catalog-sqlite")]
+    fn open_sqlite_catalog(
+        catalog_url: &str,
+        path: &Path,
+        data_location: Option<&str>,
+    ) -> Result<Self> {
+        let store = catalog_store::SqliteMetadataStore::open(catalog_url, path, false)?;
+        if let Some(moved_to) = store.moved_to()? {
+            return Err(LakeError::CatalogMoved {
+                path: PathBuf::from(redact_location(catalog_url)),
+                moved_to,
+            });
+        }
+        let Some(mut manifest) = store.head_catalog()? else {
+            return Err(LakeError::NotALake {
+                path: PathBuf::from(redact_location(catalog_url)),
+            });
+        };
+        let recorded = store.data_location()?;
+        let Some(data_location) = data_location.map(str::to_string).or(recorded) else {
+            return Err(LakeError::Corrupt {
+                path: PathBuf::from(redact_location(catalog_url)),
+                message: "the catalog has no ducklake_metadata.data_path; pass an explicit \
+                          data location (Lake::open_with_catalog / `.lake open <catalog> data \
+                          <location>`)"
+                    .to_string(),
+            });
+        };
+        let data = data_storage(&data_location)?;
+        let lake_id = match manifest.lake_id.clone() {
+            Some(id) => id,
+            None => {
+                let id = fresh_lake_id()?;
+                store.set_lake_id(&id)?;
+                manifest.lake_id = Some(id.clone());
+                id
+            }
+        };
+        let catalog: Arc<dyn CatalogStore> =
+            Arc::new(catalog_store::SqliteCatalog::from_store(catalog_url, store));
+        let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(catalog, data));
+        let root = storage.abs("");
+        Ok(Self {
+            root,
+            storage,
+            lake_id,
+            format_version: manifest.format_version,
+            version: manifest.version,
+            pending_commit: None,
+            inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
+            write_format_choice: None,
+            table_format_choices: BTreeMap::new(),
+        })
     }
 
     fn open_with(inner: Arc<dyn Storage>, key: Option<EncryptionKey>) -> Result<Self> {
@@ -1471,7 +1617,14 @@ impl Lake {
         if is_catalog_location(&parsed) {
             return match Self::open_url(location) {
                 Ok(lake) => Ok(lake),
-                Err(LakeError::NotALake { .. }) => Err(catalog_needs_data(location, "save")),
+                Err(LakeError::NotALake { .. }) => match &parsed {
+                    // DuckLake's `DATA_PATH` default: a fresh SQLite catalog
+                    // keeps its data next to the database, `<catalog>.files/`.
+                    Location::Sqlite(path) => {
+                        Self::create_with_catalog(location, &default_sqlite_data_location(path))
+                    }
+                    _ => Err(catalog_needs_data(location, "save")),
+                },
                 Err(e) => Err(e),
             };
         }
@@ -1890,7 +2043,11 @@ impl Lake {
         // cannot read is carried forward verbatim when the store has no table
         // under its key; a store table under that key would replace data this
         // build cannot read, so the save is refused (wave 88, rule 5).
-        let head = crate::read_catalog(&*self.storage, &self.root)?;
+        let head = if self.storage.metadata_store().is_some() {
+            manifest_for(&*self.storage, &self.root, None)?.0
+        } else {
+            crate::read_catalog(&*self.storage, &self.root)?
+        };
         let head_path = self.storage.abs(CATALOG_FILE);
         let mut store_keys: BTreeSet<String> = BTreeSet::new();
         for dbname in db.list_databases() {
@@ -1920,6 +2077,7 @@ impl Lake {
             }
             carried.push((key.clone(), entry.clone()));
         }
+        let has_carried = !carried.is_empty();
         let mut tables: BTreeMap<String, TableEntry> = BTreeMap::new();
         let mut deltas: BTreeMap<String, catalog::TableDelta> = BTreeMap::new();
         let mut bytes_written = 0u64;
@@ -1983,6 +2141,7 @@ impl Lake {
                 deltas.insert(
                     key.clone(),
                     catalog::TableDelta {
+                        runtime: Default::default(),
                         data_files: files.clone(),
                         delete_files: Vec::new(),
                         rows_added: src.num_rows() as u64,
@@ -2038,6 +2197,57 @@ impl Lake {
         // a table this save created gets a fresh one, a pre-wave-89 entry
         // acquires one here.
         catalog::assign_missing_table_ids(&mut tables)?;
+        // A SQL catalog applies the save as a typed delta: each table it
+        // rewrote is replaced in place, and a table the store no longer has is
+        // dropped. (An unreadable carried entry, if any, uses the full-catalog
+        // compatibility path below.)
+        let sql_store = self.storage.metadata_store();
+        let delta_save = sql_store.is_some() && !has_carried;
+        if delta_save {
+            for (key, entry) in &tables {
+                if let Some(delta) = deltas.get_mut(key) {
+                    delta.runtime = catalog::TableRuntime {
+                        meta: Some(catalog::TableMeta::from_entry(entry)),
+                        created: !head.tables.contains_key(key),
+                        dropped: false,
+                        kind: catalog::DeltaKind::Save,
+                        inlined_rows: Vec::new(),
+                        inlined_ends: Vec::new(),
+                    };
+                }
+            }
+            for key in head.tables.keys() {
+                if tables.contains_key(key) {
+                    continue;
+                }
+                deltas
+                    .entry(key.clone())
+                    .or_insert_with(|| catalog::TableDelta {
+                        runtime: catalog::TableRuntime {
+                            meta: None,
+                            created: false,
+                            dropped: true,
+                            kind: catalog::DeltaKind::Save,
+                            inlined_rows: Vec::new(),
+                            inlined_ends: Vec::new(),
+                        },
+                        data_files: Vec::new(),
+                        delete_files: Vec::new(),
+                        rows_added: 0,
+                        rows_deleted: 0,
+                        replaced: false,
+                        partition_changed: false,
+                        partition_by: None,
+                        compacted_files: Vec::new(),
+                        removed_delete_files: Vec::new(),
+                        rows_inlined: 0,
+                        inlined_ended: 0,
+                        inlined_flushed: 0,
+                        inlined_limit: None,
+                        inlining_changed: false,
+                    });
+            }
+        }
         // The per-version record: the author/message [`Lake::set_commit_message`]
         // recorded for this save (kept pending until the save succeeds below),
         // and the change summary — the diff against the previous version's
@@ -2062,20 +2272,50 @@ impl Lake {
             changes,
             schema_version,
         };
-        let plain = manifest_json(&manifest, &self.root)?;
+        let plain = if delta_save {
+            Vec::new()
+        } else {
+            manifest_json(&manifest, &self.root)?
+        };
         // Seal the manifest **once**: the exact same bytes are published as
         // `snapshots/<version>.json` and as `catalog.json`, so the
         // byte-identity invariant survives encryption. A keyless save seals
-        // nothing.
-        let bytes = self.storage.seal_manifest(&plain, &self.lake_id, version)?;
+        // nothing. A SQL catalog applies its rows directly and stores neither.
+        let bytes = if delta_save {
+            Vec::new()
+        } else {
+            self.storage.seal_manifest(&plain, &self.lake_id, version)?
+        };
         let commit_manifest = catalog::CommitManifest {
             format_version: FORMAT_VERSION,
             version,
             base_version: version - 1,
-            updated: time::iso8601_utc(SystemTime::now()),
+            updated: manifest.updated.clone(),
             tables: deltas,
         };
         let commit_bytes = commit_manifest_json(&commit_manifest)?;
+        let table_count = manifest.tables.len();
+        if delta_save {
+            let change = crate::metadata::CatalogChange {
+                catalog: None,
+                manifest: commit_manifest,
+                schema_version: manifest.schema_version,
+                format_version: manifest.format_version,
+                updated: manifest.updated.clone(),
+                lake_id: manifest.lake_id.clone(),
+                author: manifest.author.clone(),
+                commit_message: manifest.commit_message.clone(),
+            };
+            self.publish_sql_commit(change)?;
+            bytes_written += commit_bytes.len() as u64;
+            self.pending_commit = None;
+            return Ok(SaveReport {
+                version,
+                tables: table_count,
+                rows,
+                bytes_written,
+            });
+        }
         // Same publication order as a commit: the delta manifest, the
         // snapshot, then the catalog. Wave 96a: the whole metadata sequence
         // is one publish scope (data files were written above, before it
@@ -2105,7 +2345,7 @@ impl Lake {
         bytes_written += bytes.len() as u64;
         Ok(SaveReport {
             version,
-            tables: manifest.tables.len(),
+            tables: table_count,
             rows,
             bytes_written,
         })
@@ -2571,6 +2811,22 @@ impl Lake {
     /// last saved from; anything else means another writer published. Returns
     /// the catalog's version tag for the conditional replace that follows.
     fn ensure_catalog_unchanged(&self) -> Result<VersionTag> {
+        if let Some(store) = self.storage.metadata_store() {
+            let head = store.head_version()?;
+            if head != Some(self.version) {
+                return Err(LakeError::Conflict {
+                    path: self.storage.abs(CATALOG_FILE),
+                    message: format!(
+                        "another writer published version {} (this handle is based on version \
+                         {}); reopen the lake",
+                        head.map(|v| v.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        self.version
+                    ),
+                });
+            }
+            return Ok(VersionTag(format!("v{}", self.version)));
+        }
         let path = self.storage.abs(CATALOG_FILE);
         // A directory-shaped catalog (local) still proceeds to the read and
         // its I/O error, exactly as before; only a missing file is the
@@ -2923,6 +3179,12 @@ fn data_storage(location: &str) -> Result<Arc<dyn Storage>> {
     storage_for(parsed)
 }
 
+/// The DuckLake default data location for a SQLite catalog: a sibling
+/// `<catalog path>.files/` directory (DuckLake's `DATA_PATH` default).
+fn default_sqlite_data_location(path: &Path) -> String {
+    format!("{}.files/", path.display())
+}
+
 /// The clear "a SQL catalog needs a data location" error used by the existing
 /// URL entry points (`create_url`, `open_or_create_url` on a missing catalog).
 fn catalog_needs_data(location: &str, verb: &str) -> LakeError {
@@ -3068,6 +3330,15 @@ pub(crate) fn maybe_fail_publish_after_snapshot(lake_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Rows SQLite reported as changed by the most recent successful delta commit
+/// in this process. Wave 103 tests use it to prove a late commit touches the
+/// same number of rows as an early one; it is not part of the public API.
+#[doc(hidden)]
+#[cfg(feature = "catalog-sqlite")]
+pub fn sqlite_last_commit_rows_touched() -> u64 {
+    crate::metadata::sqlite::last_commit_rows_touched()
+}
+
 /// The stored bytes of one catalog object, bypassing any decorator (wave 96a
 /// tests): an encrypted lake's row holds the sealed blob, a plaintext lake's
 /// the JSON. Not part of the supported API.
@@ -3089,6 +3360,28 @@ pub(crate) fn manifest_for(
     root: &Path,
     version: Option<u64>,
 ) -> Result<(Catalog, PathBuf)> {
+    // A SQL catalog is not a tree of JSON objects: build the engine model
+    // straight from the typed rows instead of rendering `catalog.json` or
+    // `snapshots/<v>.json` and parsing it back.
+    if let Some(store) = storage.metadata_store() {
+        let Some(catalog) = store.load(version)? else {
+            return Err(match version {
+                Some(version) => LakeError::VersionNotFound {
+                    path: root.to_path_buf(),
+                    version,
+                },
+                None => LakeError::NotALake {
+                    path: root.to_path_buf(),
+                },
+            });
+        };
+        let rel = match version {
+            None => CATALOG_FILE.to_string(),
+            Some(v) => format!("snapshots/{v}.json"),
+        };
+        let abs = storage.abs(&rel);
+        return Ok((catalog, abs));
+    }
     match version {
         None => {
             let manifest = read_catalog(storage, root)?;

@@ -31,6 +31,9 @@ mod sqlite;
 #[cfg(feature = "catalog-sqlite")]
 pub(crate) use sqlite::SqliteCatalog;
 
+#[cfg(feature = "catalog-sqlite")]
+pub(crate) use crate::metadata::sqlite::SqliteMetadataStore;
+
 #[cfg(feature = "catalog-postgres")]
 mod postgres;
 
@@ -191,6 +194,10 @@ impl SplitStorage {
 }
 
 impl Storage for SplitStorage {
+    fn metadata_store(&self) -> Option<Arc<dyn crate::metadata::MetadataStore>> {
+        self.catalog_storage.metadata_store()
+    }
+
     fn abs(&self, rel: &str) -> PathBuf {
         // `abs("")` is the lake root the handle exposes (`Lake::path`, the
         // `data_path` option): for a split lake that is the *data* location.

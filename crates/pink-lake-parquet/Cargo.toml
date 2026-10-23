@@ -6,6 +6,11 @@ rust-version = "1.97"
 description = "pink-lake's Parquet data-file format provider: the wave-87 LakeFormat bridge over pinkdb-parquet's reader and writer"
 license = "MIT"
 
+[features]
+# Wave 103: the DuckLake/SQLite catalog interop tests. Forwarded so
+# `cargo test -p pink-lake-parquet --features catalog-sqlite` runs them.
+catalog-sqlite = ["pink-lake/catalog-sqlite"]
+
 [dependencies]
 pink-lake = { path = "../pink-lake" }
 pinkdb = { path = "../pinkdb" }
