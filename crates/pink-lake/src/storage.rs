@@ -122,7 +122,10 @@ impl PublishScope {
     }
 
     /// A scope whose `finish(true)` commits and `finish(false)` rolls back.
-    #[cfg_attr(not(feature = "catalog-sqlite"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "catalog-sqlite", feature = "catalog-postgres")),
+        allow(dead_code)
+    )]
     pub(crate) fn new(finish: Box<dyn FnOnce(bool) -> Result<()> + Send>) -> Self {
         Self {
             finish: Some(finish),
@@ -312,6 +315,14 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
             }),
             Head::File => Ok(Some(self.read(rel, context)?)),
         }
+    }
+
+    /// Read the `moved.json` retirement marker, bypassing any encryption
+    /// decorator (wave 96a): the marker is always plaintext metadata, written
+    /// by `migrate_catalog` without a key, and read only on the
+    /// missing-catalog error path. The default is an ordinary optional read.
+    fn read_moved_optional(&self, context: &str) -> Result<Option<Vec<u8>>> {
+        self.read_optional(crate::MOVED_FILE, context)
     }
 
     /// Read a byte window of one object: `offset..offset+len`. The default
@@ -818,6 +829,13 @@ impl Storage for CryptoStorage {
         }
     }
 
+    fn read_moved_optional(&self, context: &str) -> Result<Option<Vec<u8>>> {
+        // The retirement marker is not a lake artifact: it stays plaintext so
+        // an open of a migrated-away location can report where the lake went
+        // without (or before) a key.
+        self.inner.read_optional(crate::MOVED_FILE, context)
+    }
+
     fn read_range(&self, rel: &str, offset: u64, len: u64, context: &str) -> Result<Vec<u8>> {
         if self.crypto.is_some() {
             return Err(LakeError::Internal {
@@ -1076,23 +1094,34 @@ fn read_magic(path: &Path) -> Option<[u8; 8]> {
 }
 
 /// A parsed lake location: a local directory path, an `s3://` URL, or a SQL
-/// catalog URL (`sqlite:<path>`; wave 96a). A catalog location names only the
-/// metadata store — the data location is recorded in the catalog itself.
+/// catalog URL (`sqlite:<path>` / `postgres://…`; wave 96a). A catalog
+/// location names only the metadata store — the data location is recorded in
+/// the catalog itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Location {
     Local(PathBuf),
     S3 { bucket: String, prefix: String },
     Sqlite(PathBuf),
+    Postgres(String),
 }
 
 impl Location {
     /// Parse a lake location string: `s3://bucket[/prefix…]` is object
-    /// storage, `sqlite:<path>` is a SQLite catalog (relative or absolute),
-    /// anything else is a local path (a directory literally named `s3://…` is
-    /// not a thing).
+    /// storage, `sqlite:<path>` is a SQLite catalog, `postgres://…` /
+    /// `postgresql://…` is a Postgres catalog, anything else is a local path
+    /// (a directory literally named `s3://…` is not a thing).
     pub(crate) fn parse(location: &str) -> Result<Self> {
         if let Some(rest) = location.strip_prefix("sqlite:") {
             return Self::parse_sqlite(location, rest);
+        }
+        if location.starts_with("postgres://") || location.starts_with("postgresql://") {
+            crate::catalog_store::url::PostgresUrl::parse(location).map_err(|message| {
+                LakeError::BadLocation {
+                    location: crate::catalog_store::url::redact_location(location),
+                    message,
+                }
+            })?;
+            return Ok(Location::Postgres(location.to_string()));
         }
         match location.strip_prefix("s3://") {
             Some(rest) => Self::parse_s3(location, rest),

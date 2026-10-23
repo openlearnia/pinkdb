@@ -103,7 +103,14 @@ use pinkdb::{PinkDb, sanitize_terminal};
 
 use crate::{plural, take_token, unquote};
 
-/// The lake key from `PINKDB_KEY`, the engine's convention (a non-empty value
+/// A location as it may appear in output: a Postgres catalog URL loses its
+/// password (every other location is unchanged). Callers keep the raw string
+/// for the actual open/save/commit and print this one.
+fn shown(location: &str) -> String {
+    pink_lake::redact_location(location)
+}
+
+/// The key from `PINKDB_KEY`, the engine's convention (a non-empty value
 /// is a passphrase; unset/empty means plaintext). A set-but-non-UTF-8 value
 /// is a hard error — never a silent plaintext lake. The CLI already exits on
 /// such a value at startup (`EncryptionKey::from_env` in `main`); this is the
@@ -178,14 +185,57 @@ fn open_or_create_lake_with_data(catalog: &str, data: Option<&str>) -> pink_lake
 /// The one-line pointer to object-storage and SQL-catalog locations appended
 /// to usage text: each accepted location shape is named only when the build
 /// has its feature, so the hint never offers something the binary refuses.
-#[cfg(all(feature = "s3", feature = "catalog-sqlite"))]
+#[cfg(all(
+    feature = "s3",
+    feature = "catalog-sqlite",
+    feature = "catalog-postgres"
+))]
+const HINT: &str = "   (locations may be s3://bucket/prefix, sqlite:<path> data <dir|s3://…>, \
+                    or postgres://… data <dir>)";
+#[cfg(all(
+    feature = "s3",
+    feature = "catalog-sqlite",
+    not(feature = "catalog-postgres")
+))]
 const HINT: &str = "   (locations may be s3://bucket/prefix, or sqlite:<path> data <dir|s3://…>)";
-#[cfg(all(not(feature = "s3"), feature = "catalog-sqlite"))]
+#[cfg(all(
+    feature = "s3",
+    not(feature = "catalog-sqlite"),
+    feature = "catalog-postgres"
+))]
+const HINT: &str = "   (locations may be s3://bucket/prefix, or postgres://… data <dir>)";
+#[cfg(all(
+    feature = "s3",
+    not(feature = "catalog-sqlite"),
+    not(feature = "catalog-postgres")
+))]
+const HINT: &str = "   (locations may be s3://bucket/prefix)";
+#[cfg(all(
+    not(feature = "s3"),
+    feature = "catalog-sqlite",
+    feature = "catalog-postgres"
+))]
+const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; sqlite:<path> \
+                    and postgres://… catalogs need `data <dir>`)";
+#[cfg(all(
+    not(feature = "s3"),
+    feature = "catalog-sqlite",
+    not(feature = "catalog-postgres")
+))]
 const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; a \
                     sqlite:<path> catalog needs `data <dir>`)";
-#[cfg(all(feature = "s3", not(feature = "catalog-sqlite")))]
-const HINT: &str = "   (locations may be s3://bucket/prefix)";
-#[cfg(all(not(feature = "s3"), not(feature = "catalog-sqlite")))]
+#[cfg(all(
+    not(feature = "s3"),
+    not(feature = "catalog-sqlite"),
+    feature = "catalog-postgres"
+))]
+const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature; a \
+                    postgres://… catalog needs `data <dir>`)";
+#[cfg(all(
+    not(feature = "s3"),
+    not(feature = "catalog-sqlite"),
+    not(feature = "catalog-postgres")
+))]
 const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature)";
 
 /// Per-lake base version of this REPL session (one session per process):
@@ -349,6 +399,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "open" => cmd_open(db, rest),
         "attach" => cmd_attach(db, rest),
         "commit" => cmd_commit(db, rest),
+        "migrate-catalog" => cmd_migrate_catalog(rest),
         "replicate" => cmd_replicate(db, rest),
         "partition" => cmd_partition(db, rest),
         "inlining" => cmd_inlining(rest),
@@ -372,7 +423,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
         "" => println!(
-            "Usage: .lake <save|open|attach|commit|replicate|partition|inlining|flush|changes|\
+            "Usage: .lake <save|open|attach|commit|migrate-catalog|replicate|partition|inlining|flush|changes|\
              add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
              settings|format|detach|attached|versions|snapshots|tables|info> ..."
         ),
@@ -382,13 +433,13 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
 
 /// The `data <location>` option in usage text: offered only by a build that
 /// accepts a SQL catalog (the same rule as [`HINT`]).
-#[cfg(feature = "catalog-sqlite")]
+#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
 macro_rules! data_opt {
     () => {
         " [data <dir|s3://…>]"
     };
 }
-#[cfg(not(feature = "catalog-sqlite"))]
+#[cfg(not(any(feature = "catalog-sqlite", feature = "catalog-postgres")))]
 macro_rules! data_opt {
     () => {
         ""
@@ -481,6 +532,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
         }
     }
     let dir = unquote(&dir);
+    let dir_shown = shown(&dir);
     // An open transaction's rows are applied in place but uncommitted: a
     // lake snapshot must never publish them.
     if db.in_transaction() {
@@ -509,7 +561,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
         let current = lake.current_version();
         if current != base && !force {
             cli_error!(
-                "write conflict: lake {dir} moved from version {base} to {current} \
+                "write conflict: lake {dir_shown} moved from version {base} to {current} \
                  since this session opened or saved it; saving would overwrite that \
                  work. Reopen it with .lake open, save elsewhere, or use \
                  .lake save <dir> force"
@@ -536,7 +588,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
             if let Some(wa) = writables.get_mut(&key) {
                 match wa.repin_at(report.version, db) {
                     Ok(()) => println!(
-                        "  (writable attach at {dir} re-pinned to version {})",
+                        "  (writable attach at {dir_shown} re-pinned to version {})",
                         report.version
                     ),
                     Err(e) => cli_error!("{e}"),
@@ -607,6 +659,7 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
         return;
     };
     let dir = unquote(&dir);
+    let dir_shown = shown(&dir);
     let mut data: Option<String> = None;
     let mut version: Option<u64> = None;
     loop {
@@ -660,7 +713,7 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
             for (location, wa) in writables.iter() {
                 let changed = wa.changed_tables(db).unwrap_or_default();
                 if !changed.is_empty() {
-                    pending.push(format!("{location} ({} table(s))", changed.len()));
+                    pending.push(format!("{} ({} table(s))", shown(location), changed.len()));
                 }
             }
             if !pending.is_empty() {
@@ -710,7 +763,7 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
                 println!("Note: .lake open discarded the session's writable attachment(s).");
             }
             println!(
-                "Opened lake version {shown} in {:.3}s ({tables} table{}) from {dir}",
+                "Opened lake version {shown} in {:.3}s ({tables} table{}) from {dir_shown}",
                 t0.elapsed().as_secs_f64(),
                 plural(tables)
             );
@@ -758,6 +811,7 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
         return;
     };
     let dir = unquote(&dir);
+    let dir_shown = shown(&dir);
     let mut version: Option<u64> = None;
     let mut mode: Option<&str> = None;
     let mut data: Option<String> = None;
@@ -831,7 +885,7 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
                     "footer-only"
                 };
                 println!(
-                    "Attached {dir} version {} in {:.3}s ({} table{}, {shape})",
+                    "Attached {dir_shown} version {} in {:.3}s ({} table{}, {shape})",
                     report.version,
                     t0.elapsed().as_secs_f64(),
                     tables.len(),
@@ -898,6 +952,7 @@ fn attach_inlining_limit() -> Option<u64> {
 }
 
 fn cmd_attach_write(db: &mut PinkDb, dir: &str, data: Option<&str>, version: Option<u64>) {
+    let dir_shown = shown(dir);
     if db.in_transaction() {
         cli_error!(".lake attach is not allowed inside a transaction; COMMIT or ROLLBACK first");
         return;
@@ -936,7 +991,7 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, data: Option<&str>, version: Opt
     let key = dir.to_string();
     if writables().contains_key(&key) {
         cli_error!(
-            "{dir} is already attached writable in this session; .lake commit it or \
+            "{dir_shown} is already attached writable in this session; .lake commit it or \
              .lake detach it first"
         );
         return;
@@ -956,7 +1011,7 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, data: Option<&str>, version: Opt
             Ok(existing) => {
                 if existing.schema() != base_table.schema() {
                     cli_error!(
-                        "cannot attach {dir} writable: table \"{table_key}\" already exists \
+                        "cannot attach {dir_shown} writable: table \"{table_key}\" already exists \
                          in the session with a different shape — the lake has ({}) and the \
                          store has ({}); drop or rename one of them",
                         schema_text(&base_table.schema()),
@@ -1021,7 +1076,7 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, data: Option<&str>, version: Opt
         }
     }
     println!(
-        "Attached {dir} version {base} writable in {:.3}s ({created} table{} materialized, \
+        "Attached {dir_shown} version {base} writable in {:.3}s ({created} table{} materialized, \
          {adopted} adopted)",
         t0.elapsed().as_secs_f64(),
         plural(created)
@@ -1047,7 +1102,7 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, data: Option<&str>, version: Opt
             );
         }
     }
-    println!("  publish changes with .lake commit {dir}");
+    println!("  publish changes with .lake commit {dir_shown}");
 }
 
 fn schema_text(schema: &[(String, pinkdb::DataType)]) -> String {
@@ -1073,13 +1128,14 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
         return;
     }
     let dir = unquote(&dir);
+    let dir_shown = shown(&dir);
     if db.in_transaction() {
         cli_error!(".lake commit is not allowed inside a transaction; COMMIT or ROLLBACK first");
         return;
     }
     let Some(wa) = writables().remove(&dir) else {
         cli_error!(
-            "no writable attach at {dir}; run .lake attach {dir} write first (read-only \
+            "no writable attach at {dir_shown}; run .lake attach {dir_shown} write first (read-only \
              attaches are never written)"
         );
         return;
@@ -1108,7 +1164,7 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
     match wa.commit(db, &settings) {
         Ok(report) if !report.committed => {
             println!(
-                "Nothing to commit to {dir}: no change against version {}",
+                "Nothing to commit to {dir_shown}: no change against version {}",
                 report.version
             );
         }
@@ -1121,7 +1177,7 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
             set_baseline_version_only(&dir, report.version);
             set_baseline_version_only(&wa.location().display().to_string(), report.version);
             println!(
-                "Committed lake version {} onto {dir} in {:.3}s ({} file{}: {} data, {} \
+                "Committed lake version {} onto {dir_shown} in {:.3}s ({} file{}: {} data, {} \
                  delete{};{} +{} row{}, -{} row{}; {} bytes; {} retr{})",
                 report.version,
                 t0.elapsed().as_secs_f64(),
@@ -1161,7 +1217,7 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
             let text = e.to_string();
             if text.contains("changed in the lake since this change was computed") {
                 println!(
-                    "hint: .lake detach {dir} force + .lake attach {dir} write re-materializes \
+                    "hint: .lake detach {dir_shown} force + .lake attach {dir_shown} write re-materializes \
                      the base at the current version (the session's tables are adopted, and \
                      the next commit reconciles the lake to them)"
                 );
@@ -1169,6 +1225,68 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
         }
     }
     writables().insert(dir, wa);
+}
+
+/// `.lake migrate-catalog <from> to <to> [data <location>]`: copy every
+/// metadata object byte-for-byte to the target catalog and retire the source
+/// (wave 96a). Both locations are redacted before printing, so a Postgres
+/// password can never reach the terminal.
+fn cmd_migrate_catalog(arg: &str) {
+    const USAGE: &str = "Usage: .lake migrate-catalog <from> to <to> [data <location>]";
+    let Some((from, rest)) = take_token(arg) else {
+        println!("{USAGE}");
+        return;
+    };
+    let Some((separator, rest)) = take_token(rest) else {
+        println!("{USAGE}");
+        return;
+    };
+    if separator != "to" {
+        cli_error!("expected `to` between the source and target locations. {USAGE}");
+        return;
+    }
+    let Some((to, mut rest)) = take_token(rest) else {
+        println!("{USAGE}");
+        return;
+    };
+    let mut data = None;
+    loop {
+        let tail = rest.trim_start();
+        if tail.is_empty() {
+            break;
+        }
+        let Some((option, after)) = take_token(tail) else {
+            break;
+        };
+        if option != "data" {
+            cli_error!("unknown migrate-catalog option {option:?}. {USAGE}");
+            return;
+        }
+        let Some((value, after)) = take_value(after) else {
+            cli_error!("`data` needs a location. {USAGE}");
+            return;
+        };
+        data = Some(value);
+        rest = after;
+    }
+    match Lake::migrate_catalog(&from, &to, data.as_deref()) {
+        Ok(report) => {
+            let retired = if report.source_retired {
+                "source retired"
+            } else {
+                "source left in place"
+            };
+            println!(
+                "Migrated catalog {} -> {}: {} metadata object{}, {} bytes; {retired}",
+                pink_lake::redact_location(&from),
+                pink_lake::redact_location(&to),
+                report.objects,
+                plural(report.objects),
+                report.bytes
+            );
+        }
+        Err(e) => cli_error!("{e}"),
+    }
 }
 
 /// Set the save-conflict baseline for a location that was never `.lake
@@ -1213,6 +1331,7 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
         return;
     };
     let dir = unquote(&dir);
+    let dir_shown = shown(&dir);
     let table = unquote(&table);
     // A bare table name means main.<name> (the flat catalog's key shape).
     let key = if table.contains('.') {
@@ -1268,8 +1387,8 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
         let writables = writables();
         if writables.contains_key(&dir) {
             cli_error!(
-                "{dir} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir}) it before changing its partition specification"
+                "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir_shown}) it before changing its partition specification"
             );
             return;
         }
@@ -1292,12 +1411,12 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
         Ok(report) if !report.committed => {
             if keys.is_empty() {
                 println!(
-                    "Table {} in {dir} has no partition specification (nothing to clear)",
+                    "Table {} in {dir_shown} has no partition specification (nothing to clear)",
                     sanitize_terminal(&key)
                 );
             } else {
                 println!(
-                    "Table {} in {dir} is already partitioned by ({}); nothing published",
+                    "Table {} in {dir_shown} is already partitioned by ({}); nothing published",
                     sanitize_terminal(&key),
                     keys.iter()
                         .map(|k| sanitize_terminal(k))
@@ -1310,7 +1429,7 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
             set_baseline_version_only(&dir, report.version);
             if keys.is_empty() {
                 println!(
-                    "Cleared the partition specification of {} in {dir} (version {} in \
+                    "Cleared the partition specification of {} in {dir_shown} (version {} in \
                      {:.3}s); existing files keep their values",
                     sanitize_terminal(&key),
                     report.version,
@@ -1318,7 +1437,7 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
                 );
             } else {
                 println!(
-                    "Partitioned {} by ({}) in {dir} (version {} in {:.3}s; new writes \
+                    "Partitioned {} by ({}) in {dir_shown} (version {} in {:.3}s; new writes \
                      split into one data file per {} value)",
                     sanitize_terminal(&key),
                     keys.iter()
@@ -1361,6 +1480,7 @@ fn cmd_inlining(arg: &str) {
         return;
     }
     let dir = unquote(&dir);
+    let dir_shown = shown(&dir);
     let table = flat_table_key(&unquote(&table));
     let limit: Option<u64> = if value.eq_ignore_ascii_case("default") {
         None
@@ -1377,8 +1497,8 @@ fn cmd_inlining(arg: &str) {
         let writables = writables();
         if writables.contains_key(&dir) {
             cli_error!(
-                "{dir} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir}) it before changing its inlining setting"
+                "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir_shown}) it before changing its inlining setting"
             );
             return;
         }
@@ -1394,7 +1514,7 @@ fn cmd_inlining(arg: &str) {
     match lake.set_inlining_limit(&table, limit, &settings) {
         Ok(report) if !report.committed => {
             println!(
-                "Table {} in {dir} already has that inlining limit; nothing published",
+                "Table {} in {dir_shown} already has that inlining limit; nothing published",
                 sanitize_terminal(&table)
             );
         }
@@ -1402,14 +1522,14 @@ fn cmd_inlining(arg: &str) {
             set_baseline_version_only(&dir, report.version);
             match limit {
                 Some(limit) => println!(
-                    "Table {} in {dir}: commits appending at most {limit} row{} are stored \
+                    "Table {} in {dir_shown}: commits appending at most {limit} row{} are stored \
                      in the catalog metadata (version {}); 0 disables inlining",
                     sanitize_terminal(&table),
                     if limit == 1 { "" } else { "s" },
                     report.version,
                 ),
                 None => println!(
-                    "Cleared the inlining limit of {} in {dir} (version {}); the \
+                    "Cleared the inlining limit of {} in {dir_shown} (version {}); the \
                      handle's data_inlining_row_limit default applies",
                     sanitize_terminal(&table),
                     report.version,
@@ -1430,6 +1550,7 @@ fn cmd_flush(arg: &str) {
         return;
     };
     let dir = unquote(&dir);
+    let dir_shown = shown(&dir);
     let rest = rest.trim();
     let table = if rest.is_empty() {
         None
@@ -1443,8 +1564,8 @@ fn cmd_flush(arg: &str) {
         let writables = writables();
         if writables.contains_key(&dir) {
             cli_error!(
-                "{dir} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir}) it before flushing its inlined rows"
+                "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir_shown}) it before flushing its inlined rows"
             );
             return;
         }
@@ -1464,16 +1585,16 @@ fn cmd_flush(arg: &str) {
     match lake.flush_inlined_data(table.as_deref()) {
         Ok(report) if !report.committed => match table {
             Some(table) => println!(
-                "Table {} in {dir} has no live inlined rows to flush",
+                "Table {} in {dir_shown} has no live inlined rows to flush",
                 sanitize_terminal(&table)
             ),
-            None => println!("{dir} has no live inlined rows to flush"),
+            None => println!("{dir_shown} has no live inlined rows to flush"),
         },
         Ok(report) => {
             set_baseline_version_only(&dir, report.version);
             for (key, rows) in &report.tables {
                 println!(
-                    "Flushed {rows} inlined row{} of {} into {dir} data files (version {})",
+                    "Flushed {rows} inlined row{} of {} into {dir_shown} data files (version {})",
                     plural(*rows as usize),
                     sanitize_terminal(key),
                     report.version,
@@ -1622,13 +1743,14 @@ fn cmd_add_data_files(arg: &str) {
         return;
     }
     let dir = unquote(&dir);
+    let dir_shown = shown(&dir);
     let table = flat_table_key(&unquote(&table));
     {
         let writables = writables();
         if writables.contains_key(&dir) {
             cli_error!(
-                "{dir} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir}) it before registering files"
+                "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir_shown}) it before registering files"
             );
             return;
         }
@@ -1646,7 +1768,7 @@ fn cmd_add_data_files(arg: &str) {
             set_baseline_version_only(&dir, report.version);
             for (_, path, rows) in &report.files {
                 println!(
-                    "Registered {} ({rows} row{}) as {} in {dir} (version {})",
+                    "Registered {} ({rows} row{}) as {} in {dir_shown} (version {})",
                     sanitize_terminal(path),
                     plural(*rows as usize),
                     sanitize_terminal(&table),
@@ -1668,6 +1790,7 @@ fn cmd_detach(db: &mut PinkDb, arg: &str) {
         return;
     };
     let dir = unquote(&dir);
+    let dir_shown = shown(&dir);
     let force = match rest.trim() {
         "" => false,
         "force" => true,
@@ -1682,18 +1805,20 @@ fn cmd_detach(db: &mut PinkDb, arg: &str) {
         if !changed.is_empty() && !force {
             writables().insert(dir.clone(), writable.take().expect("writable present"));
             cli_error!(
-                "writable attach {dir} has uncommitted changes in {} table(s) ({}); \
-                 .lake commit {dir} first, or detach with `force` to keep the session \
+                "writable attach {dir_shown} has uncommitted changes in {} table(s) ({}); \
+                 .lake commit {dir_shown} first, or detach with `force` to keep the session \
                  tables as ordinary tables and abandon the attachment",
                 changed.len(),
                 changed.join(", ")
             );
             return;
         }
-        println!("Detached writable attach {dir} (the session tables stay as ordinary tables)");
+        println!(
+            "Detached writable attach {dir_shown} (the session tables stay as ordinary tables)"
+        );
     }
     if db.detach_lake(&dir) {
-        println!("Detached {dir}");
+        println!("Detached {dir_shown}");
         return;
     }
     // A split lake is attached under its resolved data path (`Lake::path`),
@@ -1702,12 +1827,12 @@ fn cmd_detach(db: &mut PinkDb, arg: &str) {
     if let Ok(lake) = open_lake(&dir) {
         let resolved = lake.path().display().to_string();
         if resolved != dir && db.detach_lake(&resolved) {
-            println!("Detached {dir}");
+            println!("Detached {dir_shown}");
             return;
         }
     }
     if writable.is_none() {
-        cli_error!("no lake is attached at {dir} (see .lake attached)");
+        cli_error!("no lake is attached at {dir_shown} (see .lake attached)");
     }
 }
 
@@ -1726,7 +1851,7 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
     }
     let stats = db.attached_decode_stats();
     for ((location, tables), (_, loads, columns, files)) in lakes.into_iter().zip(stats) {
-        println!("{}", sanitize_terminal(location));
+        println!("{}", sanitize_terminal(&shown(location)));
         for t in tables {
             let rows = if t.rows == pink_lake::UNAVAILABLE_ROWS {
                 "unavailable: its data-file format cannot be read".to_string()
@@ -1748,7 +1873,7 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
     }
     for (location, wa) in writables().iter() {
         let changed = wa.changed_tables(db).unwrap_or_default();
-        println!("{} (writable)", sanitize_terminal(location));
+        println!("{} (writable)", sanitize_terminal(&shown(location)));
         for (key, rows) in wa.tables() {
             println!(
                 "  {} ({rows} row{})",
@@ -2175,8 +2300,9 @@ fn cmd_replicate_create(arg: &str) {
             }
         }
     }
-    let source_label = spec.source.to_string();
+    let source_label = shown(&spec.source.to_string());
     let interval_secs = spec.interval.as_secs();
+    let dest_shown = shown(&dest);
     let mut lake = match open_or_create_lake(&dest) {
         Ok(lake) => lake,
         Err(e) => {
@@ -2186,7 +2312,7 @@ fn cmd_replicate_create(arg: &str) {
     };
     match replication::create(&mut lake, spec) {
         Ok(id) => println!(
-            "Created replication job {id} on {dest} from {source_label} (every {interval_secs}s)"
+            "Created replication job {id} on {dest_shown} from {source_label} (every {interval_secs}s)"
         ),
         Err(e) => cli_error!("{e}"),
     }
@@ -2199,6 +2325,7 @@ fn cmd_replicate_catchup(db: &mut PinkDb, arg: &str) {
     let Some((dest, id)) = replicate_dest_id(arg, usage) else {
         return;
     };
+    let dest_shown = shown(&dest);
     let mut lake = match open_lake(&dest) {
         Ok(lake) => lake,
         Err(e) => {
@@ -2208,7 +2335,7 @@ fn cmd_replicate_catchup(db: &mut PinkDb, arg: &str) {
     };
     match replication::catch_up(&mut lake, id, Some(db), lake_key()) {
         Ok(report) => println!(
-            "Caught up replication job {id} on {dest}: {}",
+            "Caught up replication job {id} on {dest_shown}: {}",
             report.message
         ),
         Err(e) => cli_error!("{e}"),
@@ -2222,8 +2349,9 @@ fn cmd_replicate_start(arg: &str) {
     let Some(dest) = replicate_dest(arg, usage) else {
         return;
     };
+    let dest_shown = shown(&dest);
     if supervisor_key(&dest).is_some_and(|key| supervisors().contains_key(&key)) {
-        println!("A replication supervisor for {dest} is already running in this session");
+        println!("A replication supervisor for {dest_shown} is already running in this session");
         return;
     }
     match Supervisor::start(&dest, lake_key()) {
@@ -2231,7 +2359,7 @@ fn cmd_replicate_start(arg: &str) {
             let location = supervisor.destination().to_string();
             let skipped = supervisor.skipped();
             supervisors().insert(location, supervisor);
-            println!("Started replication supervisor for {dest}");
+            println!("Started replication supervisor for {dest_shown}");
             for (id, reason) in skipped {
                 println!("  job {id} skipped: {reason}");
             }
@@ -2246,17 +2374,20 @@ fn cmd_replicate_stop(arg: &str) {
     let Some(dest) = replicate_dest(arg, usage) else {
         return;
     };
+    let dest_shown = shown(&dest);
     let Some(key) = supervisor_key(&dest) else {
-        cli_error!("no replication supervisor for {dest} is running in this session");
+        cli_error!("no replication supervisor for {dest_shown} is running in this session");
         return;
     };
     let supervisor = supervisors().remove(&key);
     match supervisor {
         Some(supervisor) => {
             supervisor.stop();
-            println!("Stopped replication supervisor for {dest}");
+            println!("Stopped replication supervisor for {dest_shown}");
         }
-        None => cli_error!("no replication supervisor for {dest} is running in this session"),
+        None => {
+            cli_error!("no replication supervisor for {dest_shown} is running in this session")
+        }
     }
 }
 
@@ -2266,12 +2397,13 @@ fn cmd_replicate_pause(arg: &str) {
     let Some((dest, id)) = replicate_dest_id(arg, usage) else {
         return;
     };
+    let dest_shown = shown(&dest);
     let result = match with_supervisor(&dest, |supervisor| supervisor.pause(id)) {
         Some(result) => result,
         None => open_lake(&dest).and_then(|mut lake| replication::pause(&mut lake, id)),
     };
     match result {
-        Ok(()) => println!("Paused replication job {id} on {dest}"),
+        Ok(()) => println!("Paused replication job {id} on {dest_shown}"),
         Err(e) => cli_error!("{e}"),
     }
 }
@@ -2282,12 +2414,13 @@ fn cmd_replicate_resume(arg: &str) {
     let Some((dest, id)) = replicate_dest_id(arg, usage) else {
         return;
     };
+    let dest_shown = shown(&dest);
     let result = match with_supervisor(&dest, |supervisor| supervisor.resume(id)) {
         Some(result) => result,
         None => open_lake(&dest).and_then(|mut lake| replication::resume(&mut lake, id)),
     };
     match result {
-        Ok(()) => println!("Resumed replication job {id} on {dest}"),
+        Ok(()) => println!("Resumed replication job {id} on {dest_shown}"),
         Err(e) => cli_error!("{e}"),
     }
 }
@@ -2298,14 +2431,15 @@ fn cmd_replicate_resume_all(arg: &str) {
     let Some(dest) = replicate_dest(arg, usage) else {
         return;
     };
+    let dest_shown = shown(&dest);
     let result = match with_supervisor(&dest, |supervisor| supervisor.resume_all()) {
         Some(result) => result,
         None => open_lake(&dest).and_then(|mut lake| replication::resume_all(&mut lake)),
     };
     match result {
-        Ok(ids) if ids.is_empty() => println!("No paused or errored jobs on {dest}"),
+        Ok(ids) if ids.is_empty() => println!("No paused or errored jobs on {dest_shown}"),
         Ok(ids) => println!(
-            "Resumed {count} replication job{plural} on {dest}: {list}",
+            "Resumed {count} replication job{plural} on {dest_shown}: {list}",
             count = ids.len(),
             plural = plural(ids.len()),
             list = ids
@@ -2352,7 +2486,7 @@ fn cmd_replicate_status(arg: &str) {
         println!(
             "job {}  {}  status={}  behind={}  last ok={}  last error={}",
             job.id,
-            sanitize_terminal(&job.source.to_string()),
+            sanitize_terminal(&shown(&job.source.to_string())),
             job.status.as_str(),
             behind,
             sanitize_terminal(job.last_ok.as_deref().unwrap_or("-")),
@@ -2416,8 +2550,8 @@ fn cmd_replicate_tables(arg: &str) {
             println!(
                 "job {job_id}  {} -> {}  strategy={}  rows={}  watermark={}  source version={}  \
                  full sync={}  synced={}  error={}",
-                sanitize_terminal(&table.source),
-                sanitize_terminal(&table.dest),
+                sanitize_terminal(&shown(&table.source)),
+                sanitize_terminal(&shown(&table.dest)),
                 table.strategy,
                 table
                     .rows_dest
@@ -2453,6 +2587,7 @@ fn cmd_replicate_drop(arg: &str) {
     let Some((dest, id)) = replicate_dest_id(arg, usage) else {
         return;
     };
+    let dest_shown = shown(&dest);
     let mut lake = match open_lake(&dest) {
         Ok(lake) => lake,
         Err(e) => {
@@ -2461,7 +2596,9 @@ fn cmd_replicate_drop(arg: &str) {
         }
     };
     match replication::drop(&mut lake, id) {
-        Ok(()) => println!("Dropped replication job {id} from {dest} (its replicated tables stay)"),
+        Ok(()) => {
+            println!("Dropped replication job {id} from {dest_shown} (its replicated tables stay)")
+        }
         Err(e) => cli_error!("{e}"),
     }
 }
@@ -2562,10 +2699,11 @@ fn parse_versions_option(value: &str) -> Option<Vec<u64>> {
 /// publish a version (a writable attachment's base would go stale; the
 /// session's `.lake commit` must land or be detached first).
 fn writable_refusal(dir: &str, what: &str) -> Option<String> {
+    let dir_shown = shown(dir);
     writables().contains_key(dir).then(|| {
         format!(
-            "{dir} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir}) it before {what}"
+            "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir_shown}) it before {what}"
         )
     })
 }
@@ -2582,6 +2720,7 @@ fn cmd_merge(arg: &str) {
     let Some(args) = parse_maintenance_args(usage, arg) else {
         return;
     };
+    let dir_shown = shown(&args.dir);
     if args.bare.len() > 1 {
         unexpected_token(usage);
         return;
@@ -2619,7 +2758,7 @@ fn cmd_merge(arg: &str) {
     let t0 = Instant::now();
     match lake.merge_adjacent_files(table.as_deref(), &settings) {
         Ok(report) if !report.committed => println!(
-            "Nothing to merge in {dir} (no eligible file group: candidates must share \
+            "Nothing to merge in {dir_shown} (no eligible file group: candidates must share \
              partition values and schema epoch, carry no deletes, and number at least two)"
         ),
         Ok(report) => {
@@ -2634,7 +2773,7 @@ fn cmd_merge(arg: &str) {
                 );
             }
             println!(
-                "Merged {} file{} into {} in {dir} (version {}, {} bytes written, {:.3}s)",
+                "Merged {} file{} into {} in {dir_shown} (version {}, {} bytes written, {:.3}s)",
                 report.files_processed(),
                 plural(report.files_processed() as usize),
                 report.files_created(),
@@ -2661,6 +2800,7 @@ fn cmd_rewrite(arg: &str) {
     let Some(args) = parse_maintenance_args(usage, arg) else {
         return;
     };
+    let dir_shown = shown(&args.dir);
     // Wave 88: `.lake rewrite <dir> <table> format <id>` converts the whole
     // table (every file, deletes materialized) into another registered
     // format. The ordinary form still takes at most one bare table token.
@@ -2739,7 +2879,7 @@ fn cmd_rewrite(arg: &str) {
             .expect("flat_table_key yields a db.table key");
         match lake.rewrite_table_format(db, name, &id) {
             Ok(report) if !report.committed => println!(
-                "Nothing to convert in {dir}: table \"{table}\" already uses format \"{id}\""
+                "Nothing to convert in {dir_shown}: table \"{table}\" already uses format \"{id}\""
             ),
             Ok(report) => {
                 set_baseline_version_only(&dir, report.version);
@@ -2760,7 +2900,7 @@ fn cmd_rewrite(arg: &str) {
     }
     match lake.rewrite_data_files(table.as_deref(), &settings) {
         Ok(report) if !report.committed => println!(
-            "Nothing to rewrite in {dir} (no file's delete ratio reaches the threshold; the \
+            "Nothing to rewrite in {dir_shown} (no file's delete ratio reaches the threshold; the \
              default is 0.95 — pass delete_threshold=0 to rewrite any file with deletes)"
         ),
         Ok(report) => {
@@ -2775,7 +2915,7 @@ fn cmd_rewrite(arg: &str) {
                 );
             }
             println!(
-                "Rewrote {} file{} into {} in {dir} (version {}, {} bytes written, {:.3}s)",
+                "Rewrote {} file{} into {} in {dir_shown} (version {}, {} bytes written, {:.3}s)",
                 report.files_processed(),
                 plural(report.files_processed() as usize),
                 report.files_created(),
@@ -2799,6 +2939,7 @@ fn cmd_expire(arg: &str) {
     let Some(args) = parse_maintenance_args(usage, arg) else {
         return;
     };
+    let dir_shown = shown(&args.dir);
     let mut settings = ExpireSettings::default();
     let mut bare_ok = true;
     for token in &args.bare {
@@ -2845,9 +2986,9 @@ fn cmd_expire(arg: &str) {
     match lake.expire_snapshots(&settings) {
         Ok(report) if report.versions.is_empty() => {
             if settings.dry_run {
-                println!("Nothing to expire in {dir} (no version matched the rule)");
+                println!("Nothing to expire in {dir_shown} (no version matched the rule)");
             } else {
-                println!("Nothing expired in {dir} (no version matched the rule)");
+                println!("Nothing expired in {dir_shown} (no version matched the rule)");
             }
         }
         Ok(report) => {
@@ -2873,7 +3014,7 @@ fn cmd_expire(arg: &str) {
                 );
             } else {
                 println!(
-                    "Expired {} snapshot{} from {dir} ({} bytes freed; earlier versions can no \
+                    "Expired {} snapshot{} from {dir_shown} ({} bytes freed; earlier versions can no \
                      longer be opened)",
                     report.versions.len(),
                     plural(report.versions.len()),
@@ -2910,6 +3051,7 @@ fn cmd_cleanup(arg: &str, kind: CleanupKind) {
     let Some(args) = parse_maintenance_args(&usage, arg) else {
         return;
     };
+    let dir_shown = shown(&args.dir);
     let mut settings = CleanupSettings::default();
     let mut bare_ok = true;
     for token in &args.bare {
@@ -2950,7 +3092,7 @@ fn cmd_cleanup(arg: &str, kind: CleanupKind) {
     };
     match result {
         Ok(report) if report.paths.is_empty() => {
-            println!("Nothing to {sub} in {dir} (no object is unreferenced)");
+            println!("Nothing to {sub} in {dir_shown} (no object is unreferenced)");
         }
         Ok(report) => {
             for path in &report.paths {
@@ -2970,7 +3112,7 @@ fn cmd_cleanup(arg: &str, kind: CleanupKind) {
                 );
             } else {
                 println!(
-                    "Deleted {} object{} from {dir} ({} bytes freed; still-referenced versions \
+                    "Deleted {} object{} from {dir_shown} ({} bytes freed; still-referenced versions \
                      are untouched)",
                     report.paths.len(),
                     plural(report.paths.len()),
@@ -3315,7 +3457,8 @@ fn cmd_format(arg: &str) {
             for (location, wa) in writables.iter_mut() {
                 if let Err(e) = wa.lake_mut().set_write_format(&id) {
                     cli_error!(
-                        "cannot apply format \"{id}\" to the writable attach at {location}: {e}"
+                        "cannot apply format \"{id}\" to the writable attach at {}: {e}",
+                        shown(location)
                     );
                     return;
                 }
@@ -3338,7 +3481,8 @@ fn cmd_format(arg: &str) {
             if let Err(e) = wa.lake_mut().set_table_format(db, name, &id) {
                 cli_error!(
                     "cannot apply format \"{id}\" for table \"{key}\" to the writable attach at \
-                     {location}: {e}"
+                     {}: {e}",
+                    shown(location)
                 );
                 return;
             }

@@ -35,6 +35,18 @@ encryption = ["dep:aes-gcm", "dep:argon2", "dep:sha2"]
 # system library is needed (the musl Docker image works). Without this feature
 # a `sqlite:` location is a clear `FeatureMissing` naming the rebuild flag.
 catalog-sqlite = ["dep:rusqlite"]
+# Opt-in Postgres catalog store (wave 96a): the same split-catalog semantics as
+# `catalog-sqlite`, over a `postgres://` / `postgresql://` URL (one lake per
+# schema, `?schema=<name>`). TLS is rustls with the ring provider the workspace
+# already uses, so the dependency graph adds no second crypto stack. Without
+# this feature a `postgres://` location is a clear `FeatureMissing` naming the
+# rebuild flag.
+catalog-postgres = [
+    "dep:postgres",
+    "dep:rustls",
+    "dep:tokio-postgres-rustls",
+    "dep:webpki-roots",
+]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
@@ -65,3 +77,11 @@ sha2 = { version = "0.10", optional = true }
 # The SQLite catalog store (`catalog-sqlite`): the SQL half of a split lake.
 # `bundled` builds SQLite from source so no system library is involved.
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+# The Postgres catalog store (`catalog-postgres`): the synchronous client (its
+# own small tokio runtime is internal, no async runtime leaks into the lake).
+# TLS goes through rustls + ring + the webpki roots the workspace already
+# locks, so `catalog-postgres` adds no second TLS stack.
+postgres = { version = "0.19", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"], optional = true }
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"], optional = true }
+webpki-roots = { version = "1", optional = true }

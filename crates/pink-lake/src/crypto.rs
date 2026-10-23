@@ -260,6 +260,38 @@ pub(crate) fn is_container(data: &[u8]) -> bool {
     data.starts_with(ENC_MAGIC)
 }
 
+/// The authenticated header binding of one container, without a key (wave
+/// 96a migration): the binding is public data covered by the AEAD, and a
+/// sealed `catalog.json` encodes `(lake_id, version)` there. Used to record a
+/// migrated lake's identity while copying sealed blobs byte-for-byte.
+pub(crate) fn binding_of_container(path: &Path, data: &[u8]) -> Result<String> {
+    if !is_container(data) || data.len() < LEGACY_HEADER_FIXED_LEN {
+        return Err(tampered(path, "not a pink-lake encrypted container"));
+    }
+    let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
+    let (len_at, start) = if version >= CONTAINER_VERSION {
+        if data.len() < HEADER_FIXED_LEN {
+            return Err(tampered(path, "truncated container header"));
+        }
+        (HEADER_FIXED_LEN - 4, HEADER_FIXED_LEN)
+    } else if version == CONTAINER_VERSION_V1 {
+        (LEGACY_HEADER_FIXED_LEN - 4, LEGACY_HEADER_FIXED_LEN)
+    } else {
+        return Err(crate::LakeError::UnsupportedContainer {
+            path: path.to_path_buf(),
+            found: version,
+        });
+    };
+    let binding_len =
+        u32::from_le_bytes(data[len_at..len_at + 4].try_into().expect("4 bytes")) as usize;
+    let Some(end) = start.checked_add(binding_len).filter(|e| *e <= data.len()) else {
+        return Err(tampered(path, "truncated binding"));
+    };
+    std::str::from_utf8(&data[start..end])
+        .map(str::to_string)
+        .map_err(|_| tampered(path, "binding is not valid UTF-8"))
+}
+
 // ---------- key material ----------
 
 /// Key material for at-rest encryption: a raw 32-byte key or a passphrase

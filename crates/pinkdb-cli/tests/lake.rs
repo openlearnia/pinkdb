@@ -18,11 +18,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// The `data <location>` usage option, printed only by a `catalog-sqlite`
-/// build.
-#[cfg(feature = "catalog-sqlite")]
+/// The `data <location>` usage option, printed only by a build with a SQL
+/// catalog feature.
+#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
 const DATA_OPT: &str = " [data <dir|s3://…>]";
-#[cfg(not(feature = "catalog-sqlite"))]
+#[cfg(not(any(feature = "catalog-sqlite", feature = "catalog-postgres")))]
 const DATA_OPT: &str = "";
 
 /// Unique scratch directory for one test.
@@ -271,9 +271,9 @@ fn lake_errors_are_clear() {
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
         out.contains(
-            "Usage: .lake <save|open|attach|commit|replicate|partition|inlining|flush|changes|\
-             add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
-             settings|format|detach|attached|versions|snapshots|tables|info> ..."
+            "Usage: .lake <save|open|attach|commit|migrate-catalog|replicate|partition|inlining|\
+             flush|changes|add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|\
+             options|settings|format|detach|attached|versions|snapshots|tables|info> ..."
         ),
         "{out}"
     );

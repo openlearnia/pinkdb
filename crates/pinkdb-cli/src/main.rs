@@ -207,9 +207,9 @@ fn print_help() {
         #[cfg(not(feature = "s3"))]
         const LAKE: &str = "<dir>";
         // The `data` option exists only in a build that accepts a SQL catalog.
-        #[cfg(feature = "catalog-sqlite")]
+        #[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
         const DATA: &str = " [data <dir|s3://…>]";
-        #[cfg(not(feature = "catalog-sqlite"))]
+        #[cfg(not(any(feature = "catalog-sqlite", feature = "catalog-postgres")))]
         const DATA: &str = "";
         println!("  .lake save {LAKE}{DATA} [force] [author '…'] [message '…']");
         println!("                                snapshot the store into a lake");
@@ -224,11 +224,24 @@ fn print_help() {
             println!("                                catalog; `data <location>` is where its");
             println!("                                data files live (given at create)");
         }
+        #[cfg(feature = "catalog-postgres")]
+        {
+            println!(
+                "                                {LAKE} may also be a \
+                 `postgres://user:password@host/db?schema=lake`"
+            );
+            println!("                                catalog (the password is never printed);");
+            println!("                                `data <location>` is where its data files");
+            println!("                                live (given at create)");
+        }
         println!("        read-only (default): query the lake from its statistics");
         println!("        write: materialize its tables into the session store");
         println!(
             "  .lake commit {LAKE}        publish the writable attach as one incremental version"
         );
+        println!("  .lake migrate-catalog <from> to <to> [data <location>]");
+        println!("                                copy metadata byte-for-byte to a catalog and");
+        println!("                                retire the source (password never printed)");
         println!("  .lake partition {LAKE} <t> by (<key>, ...) | clear");
         println!("                                set/clear a table's partition spec (identity or");
         println!("                                bucket(N, col)); new writes split per value set");

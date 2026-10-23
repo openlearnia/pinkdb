@@ -490,6 +490,18 @@ impl CatalogStore for SqliteCatalog {
     fn set_lake_id(&self, lake_id: &str) -> Result<()> {
         self.put_meta("lake_id", lake_id)
     }
+
+    fn lake_id(&self) -> Result<Option<String>> {
+        self.query_meta("lake_id")
+    }
+
+    fn moved_to(&self) -> Result<Option<String>> {
+        self.query_meta("moved_to")
+    }
+
+    fn set_moved_to(&self, target: &str) -> Result<()> {
+        self.put_meta("moved_to", target)
+    }
 }
 
 /// Commit or roll back the thread's active transaction. Runs from

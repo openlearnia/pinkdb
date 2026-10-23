@@ -8,6 +8,43 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-23
+### Wave 96a (part 2) — Postgres catalogs and catalog migration ✅
+- A lake's metadata can now live in **Postgres**, not just SQLite or the
+  object-store layout: `.lake save postgres://user:password@host/db?schema=lake
+  data <dir|s3://…>` keeps the same lake, with the two catalog tables in a
+  schema you choose and the data files where they were. Publication is one
+  database transaction with a per-schema advisory lock, so concurrent writers
+  keep the conflict/rebase rules.
+- TLS verifies remote servers by default (`verify-full`, with
+  `sslrootcert=<pem file>` for a private CA); `sslmode=require` opts into
+  encrypt-only, and `disable` is allowed only for loopback hosts. Passwords are never printed —
+  every error and command output shows `***`.
+- `.lake migrate-catalog <from> to <to> [data <location>]` copies metadata
+  byte-for-byte between the object-store, SQLite and Postgres backends in one
+  publish scope, verifies it, and retires the source; opening the old location
+  says where it moved. Encrypted lakes migrate without their key (sealed blobs
+  are copied verbatim), and a non-empty target is refused.
+- The Postgres catalog runs through the same shared test suite as SQLite in CI
+  against a throwaway `postgres:17` service, and locally when
+  `PINKDB_TEST_POSTGRES_URL` is set. The default CLI still links neither
+  `rusqlite` nor the Postgres client.
+
+### Wave 96a (part 1) — SQL catalogs: SQLite and split data locations ✅
+- A lake's metadata may live in a **SQLite** file (`sqlite:<path>`) while its
+  data files stay on local disk or S3/R2: `.lake save <catalog> data
+  <dir|s3://…>` records the data location once, and later `.lake
+  open`/`attach`/`commit` commands need only the catalog URL. An explicit
+  `data <location>` overrides a moved data root for one session.
+- Catalogs are a `CatalogStore` seam inside `pink-lake`: the object-store
+  layout remains the default, and the SQL backends store the same
+  byte-identical manifests, snapshots and commit deltas. Version uniqueness,
+  crash safety, time travel, CDC, attach statistics, replication state and
+  encryption keep their existing rules.
+- The `catalog-sqlite` and `catalog-postgres` features are opt-in
+  (`pinklake`/`vortexlake` combine with them explicitly), and the default
+  binary stays lean.
+
 ## 2026-10-22
 ### Wave 91 — Docker image ✅
 - pinkdb ships as a container: `docker run -p 5433:5433 -v pinkdb-data:/data

@@ -96,8 +96,8 @@ jobs:
               cargo test -p pinkdb-cli --features pinklake,s3
               cargo test -p pinkdb-cli --features s3
               cargo test -p pinkdb-cli --features pinklake,s3,catalog-sqlite
-              # The default build must never link SQLite (wave 96a).
-              ! cargo tree -p pinkdb-cli -e normal | grep -q rusqlite
+              # The default build must never link SQLite or Postgres (wave 96a).
+              ! cargo tree -p pinkdb-cli -e normal | grep -qE "postgres|rusqlite"
           - name: cli-misc
             run: |
               cargo test -p pinkdb-cli --features encryption
@@ -136,6 +136,54 @@ jobs:
       - name: ${{ matrix.name }} feature tests
         run: ${{ matrix.run }}
 
+  # The Postgres catalog (wave 96a) needs a real server: this job runs the
+  # shared catalog suite against a throwaway `postgres:17` service and the
+  # env-gated CLI test. Every test allocates a fresh schema and drops it.
+  catalog-postgres:
+    name: catalog (Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pinktest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PINKDB_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/pinktest?sslmode=disable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+
+      - name: Postgres catalog suite (the backend alone)
+        run: cargo test -p pink-lake --features catalog-postgres
+
+      - name: Postgres catalog suite (every catalog feature)
+        run: cargo test -p pink-lake --features catalog-postgres,catalog-sqlite,s3,encryption
+
+      - name: CLI Postgres catalog and migration
+        run: cargo test -p pinkdb-cli --features pinklake,s3,catalog-sqlite,catalog-postgres
+
+      # The default build must stay lean even after the feature tests above.
+      - name: default build links no SQL or Postgres client
+        run: '! cargo tree -p pinkdb-cli -e normal | grep -qE "postgres|rusqlite"'
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
@@ -165,7 +213,10 @@ jobs:
           cargo clippy --all-targets -p pink-lake --features s3,encryption -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3,vortexlake,encryption -- -D warnings
           cargo clippy --all-targets -p pink-lake --features catalog-sqlite,s3,encryption -- -D warnings
+          cargo clippy --all-targets -p pink-lake --features catalog-postgres -- -D warnings
+          cargo clippy --all-targets -p pink-lake --features catalog-postgres,catalog-sqlite,s3,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,catalog-sqlite -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,catalog-sqlite,catalog-postgres -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features tls -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features vortexlake,s3,repo,client,tls,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features client,tls -- -D warnings

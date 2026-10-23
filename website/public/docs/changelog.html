@@ -188,6 +188,20 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-23">2026-10-23<a class="anchor" href="#2026-10-23" aria-label="Permalink: 2026-10-23">#</a></h2>
+<h3>Wave 96a (part 2) — Postgres catalogs and catalog migration ✅</h3>
+<ul>
+<li>A lake's metadata can now live in <strong>Postgres</strong>, not just SQLite or the object-store layout: <code>.lake save postgres://user:password@host/db?schema=lake data &lt;dir|s3://…&gt;</code> keeps the same lake, with the two catalog tables in a schema you choose and the data files where they were. Publication is one database transaction with a per-schema advisory lock, so concurrent writers keep the conflict/rebase rules.</li>
+<li>TLS verifies remote servers by default (<code>verify-full</code>, with <code>sslrootcert=&lt;pem file&gt;</code> for a private CA); <code>sslmode=require</code> opts into encrypt-only, and <code>disable</code> is allowed only for loopback hosts. Passwords are never printed — every error and command output shows <code>***</code>.</li>
+<li><code>.lake migrate-catalog &lt;from&gt; to &lt;to&gt; [data &lt;location&gt;]</code> copies metadata byte-for-byte between the object-store, SQLite and Postgres backends in one publish scope, verifies it, and retires the source; opening the old location says where it moved. Encrypted lakes migrate without their key (sealed blobs are copied verbatim), and a non-empty target is refused.</li>
+<li>The Postgres catalog runs through the same shared test suite as SQLite in CI against a throwaway <code>postgres:17</code> service, and locally when <code>PINKDB_TEST_POSTGRES_URL</code> is set. The default CLI still links neither <code>rusqlite</code> nor the Postgres client.</li>
+</ul>
+<h3>Wave 96a (part 1) — SQL catalogs: SQLite and split data locations ✅</h3>
+<ul>
+<li>A lake's metadata may live in a <strong>SQLite</strong> file (<code>sqlite:&lt;path&gt;</code>) while its data files stay on local disk or S3/R2: <code>.lake save &lt;catalog&gt; data &lt;dir|s3://…&gt;</code> records the data location once, and later <code>.lake open</code>/<code>attach</code>/<code>commit</code> commands need only the catalog URL. An explicit <code>data &lt;location&gt;</code> overrides a moved data root for one session.</li>
+<li>Catalogs are a <code>CatalogStore</code> seam inside <code>pink-lake</code>: the object-store layout remains the default, and the SQL backends store the same byte-identical manifests, snapshots and commit deltas. Version uniqueness, crash safety, time travel, CDC, attach statistics, replication state and encryption keep their existing rules.</li>
+<li>The <code>catalog-sqlite</code> and <code>catalog-postgres</code> features are opt-in (<code>pinklake</code>/<code>vortexlake</code> combine with them explicitly), and the default binary stays lean.</li>
+</ul>
 <h2 id="2026-10-22">2026-10-22<a class="anchor" href="#2026-10-22" aria-label="Permalink: 2026-10-22">#</a></h2>
 <h3>Wave 91 — Docker image ✅</h3>
 <ul>
@@ -636,6 +650,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-23">2026-10-23</a></li>
   <li><a href="#2026-10-22">2026-10-22</a></li>
   <li><a href="#2026-10-21">2026-10-21</a></li>
   <li><a href="#2026-10-20">2026-10-20</a></li>

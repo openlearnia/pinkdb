@@ -104,6 +104,13 @@ s3 = ["pink-lake/s3"]
 # `catalog-sqlite`-only build stays a lean CLI), so combine it with a lake
 # feature exactly like `s3`.
 catalog-sqlite = ["pink-lake?/catalog-sqlite"]
+# Opt-in Postgres catalog for the lake (wave 96a): the same `.lake save/open/
+# attach/commit` surface with the metadata in Postgres. A catalog URL is
+# `postgres://user:password@host:5432/db?schema=lake` (a password is redacted
+# from every message); the data location is local or `s3://` and is given with
+# `data` at create. Forwards to pink-lake's `catalog-postgres`; like
+# `catalog-sqlite` the `?` keeps it from enabling pink-lake on its own.
+catalog-postgres = ["pink-lake?/catalog-postgres"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }

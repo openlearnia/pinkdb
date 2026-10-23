@@ -23,11 +23,19 @@ use crate::storage::{
 };
 use crate::{HIGHEST_FILE, LAKE_FILE, LakeError, Result};
 
+pub(crate) mod url;
+
 #[cfg(feature = "catalog-sqlite")]
 mod sqlite;
 
 #[cfg(feature = "catalog-sqlite")]
 pub(crate) use sqlite::SqliteCatalog;
+
+#[cfg(feature = "catalog-postgres")]
+mod postgres;
+
+#[cfg(feature = "catalog-postgres")]
+pub(crate) use postgres::PostgresCatalog;
 
 /// Whether `rel` is one of the six catalog metadata families.
 ///
@@ -62,6 +70,19 @@ pub(crate) trait CatalogStore: Storage {
     /// Record the lake identity in `pink_lake_meta` (the authoritative copy
     /// stays `lake.json`, so an ordinary object-store open still works).
     fn set_lake_id(&self, lake_id: &str) -> Result<()>;
+
+    /// The lake identity recorded by create, if any.
+    fn lake_id(&self) -> Result<Option<String>>;
+
+    /// The target a retired catalog was moved to (wave 96a migration). Set on
+    /// the source after a successful `migrate_catalog`; opening it then fails
+    /// with the clear "the catalog moved to …" error instead of `NotALake`.
+    fn moved_to(&self) -> Result<Option<String>>;
+
+    /// Retire this catalog by recording where it moved to. The rows stay (a
+    /// hand recovery can copy them back); only `catalog.json` is ignored by
+    /// the open path.
+    fn set_moved_to(&self, target: &str) -> Result<()>;
 }
 
 /// Open a catalog location's backend. `create` is set only by the create
@@ -92,10 +113,29 @@ pub(crate) fn open_catalog(
                 })
             }
         }
+        Location::Postgres(_) => {
+            #[cfg(feature = "catalog-postgres")]
+            {
+                Ok(Arc::new(PostgresCatalog::open(catalog_url, create)?))
+            }
+            #[cfg(not(feature = "catalog-postgres"))]
+            {
+                let _ = create;
+                Err(LakeError::FeatureMissing {
+                    feature: "catalog-postgres",
+                    message: format!(
+                        "the location {} is a Postgres catalog; rebuild with the \
+                         `catalog-postgres` feature (for the CLI: `cargo build -p pinkdb-cli \
+                         --features pinklake,catalog-postgres`)",
+                        url::redact_location(catalog_url)
+                    ),
+                })
+            }
+        }
         other => Err(LakeError::BadLocation {
-            location: catalog_url.to_string(),
+            location: url::redact_location(catalog_url),
             message: format!(
-                "expected a catalog location (`sqlite:<path>`), got {}",
+                "expected a catalog location (`sqlite:<path>` or `postgres://…`), got {}",
                 describe(other)
             ),
         }),
@@ -109,6 +149,9 @@ fn describe(location: &Location) -> String {
             format!("the object-storage location s3://{bucket}/{prefix}")
         }
         Location::Sqlite(path) => format!("the SQL catalog sqlite:{}", path.display()),
+        Location::Postgres(catalog) => {
+            format!("the Postgres catalog {}", url::redact_location(catalog))
+        }
     }
 }
 

@@ -466,6 +466,7 @@ mod incremental;
 mod inlined;
 mod local;
 mod maintenance;
+mod migrate;
 #[cfg(test)]
 mod mock_s3;
 mod ranged;
@@ -496,6 +497,8 @@ pub use maintenance::{
     ExpireSettings, LakeFileInfo, LakeOption, LakeSettings, MergeSettings, RewriteSettings,
     TableCompaction, TableInfo,
 };
+pub use migrate::MigrateReport;
+use migrate::missing_catalog_error;
 pub use snapshot::{ChangeSummary, SnapshotInfo};
 use storage::{CryptoStorage, Head, Location, Storage, VersionTag};
 
@@ -589,6 +592,13 @@ pub(crate) const HIGHEST_FILE: &str = "highest.json";
 /// files. The default object-store layout never writes or reads it.
 pub(crate) const LAKE_DATA_FILE: &str = "lake-data.json";
 
+/// The retirement marker a migrated-away object-store catalog leaves at its
+/// root (wave 96a): `{"moved_to": "<redacted target>", "lake_id": …,
+/// "moved_at": …}`. Plaintext even for an encrypted source; `catalog.json` is
+/// deleted only after it is written, and an open that finds no catalog reads
+/// it to report where the lake went instead of `NotALake`.
+pub(crate) const MOVED_FILE: &str = "moved.json";
+
 /// The largest manifest `version` this build reads or writes.
 ///
 /// `version + 1` is computed with `checked_add`, so `u64::MAX` is provably
@@ -611,6 +621,12 @@ pub type Result<T> = std::result::Result<T, LakeError>;
 pub enum LakeError {
     /// The directory is not a lake: `catalog.json` is missing.
     NotALake { path: PathBuf },
+    /// The lake's catalog was migrated away (wave 96a): the source carries a
+    /// `moved.json` (object store) or a `pink_lake_meta.moved_to` row (SQL),
+    /// naming the new location. Opening the old location is refused with this
+    /// instead of `NotALake`, so a moved lake is never mistaken for a deleted
+    /// one.
+    CatalogMoved { path: PathBuf, moved_to: String },
     /// `catalog.json` already exists; `create` refuses to overwrite a lake.
     AlreadyALake { path: PathBuf },
     /// Malformed lake metadata (bad JSON, bad shape, bad file references).
@@ -705,6 +721,12 @@ impl fmt::Display for LakeError {
             LakeError::NotALake { path } => write!(
                 f,
                 "{} is not a pink-lake directory (no catalog.json; use create)",
+                path.display()
+            ),
+            LakeError::CatalogMoved { path, moved_to } => write!(
+                f,
+                "this lake's catalog moved to {moved_to} (the source {} is retired; open the new \
+                 location instead)",
                 path.display()
             ),
             LakeError::AlreadyALake { path } => write!(
@@ -963,7 +985,7 @@ impl Lake {
     /// feature) for explicit configuration.
     pub fn create_url(location: &str) -> Result<Self> {
         let parsed = Location::parse(location)?;
-        if let Location::Sqlite(_) = parsed {
+        if is_catalog_location(&parsed) {
             return Err(catalog_needs_data(location, "create"));
         }
         Self::create_with(storage_for(parsed)?, None)
@@ -974,7 +996,7 @@ impl Lake {
     /// `encryption` feature fails before touching any storage.
     pub fn create_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
         let parsed = Location::parse(location)?;
-        if let Location::Sqlite(_) = parsed {
+        if is_catalog_location(&parsed) {
             return Err(catalog_needs_data(location, "create"));
         }
         Self::create_with(storage_for(parsed)?, Some(key))
@@ -1144,7 +1166,9 @@ impl Lake {
     /// configuration.
     pub fn open_url(location: &str) -> Result<Self> {
         match Location::parse(location)? {
-            Location::Sqlite(_) => Self::open_with_catalog_keyed(location, None, None),
+            parsed if is_catalog_location(&parsed) => {
+                Self::open_with_catalog_keyed(location, None, None)
+            }
             parsed => Self::open_with(storage_for(parsed)?, None),
         }
     }
@@ -1152,7 +1176,9 @@ impl Lake {
     /// [`Lake::open_url`] with at-rest encryption.
     pub fn open_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
         match Location::parse(location)? {
-            Location::Sqlite(_) => Self::open_with_catalog_keyed(location, None, Some(key)),
+            parsed if is_catalog_location(&parsed) => {
+                Self::open_with_catalog_keyed(location, None, Some(key))
+            }
             parsed => Self::open_with(storage_for(parsed)?, Some(key)),
         }
     }
@@ -1181,13 +1207,22 @@ impl Lake {
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
         let catalog = catalog_store::open_catalog(catalog_url, &catalog_location, false)?;
+        // A migrated-away SQL catalog keeps its rows and records the target in
+        // `pink_lake_meta.moved_to`; opening the source reports that instead
+        // of pretending the lake vanished.
+        if let Some(moved_to) = catalog.moved_to()? {
+            return Err(LakeError::CatalogMoved {
+                path: PathBuf::from(redact_location(catalog_url)),
+                moved_to,
+            });
+        }
         let recorded = catalog.data_location()?;
         let Some(data_location) = data_location.map(str::to_string).or(recorded) else {
             // No record yet: distinguish an empty catalog (create it with a
             // data location) from one whose metadata lost its data location.
             if catalog.exists(CATALOG_FILE)? {
                 return Err(LakeError::Corrupt {
-                    path: PathBuf::from(catalog_url),
+                    path: PathBuf::from(redact_location(catalog_url)),
                     message: "the catalog has no pink_lake_meta.data_location; pass an explicit \
                               data location (Lake::open_with_catalog / `.lake open <catalog> data \
                               <location>`)"
@@ -1195,7 +1230,7 @@ impl Lake {
                 });
             }
             return Err(LakeError::NotALake {
-                path: PathBuf::from(catalog_url),
+                path: PathBuf::from(redact_location(catalog_url)),
             });
         };
         let data = data_storage(&data_location)?;
@@ -1233,11 +1268,7 @@ impl Lake {
                         &format!("reading {}", storage.abs(CATALOG_FILE).display()),
                     )? {
                         Some(bytes) => parse_catalog(&root, &bytes)?,
-                        None => {
-                            return Err(LakeError::NotALake {
-                                path: root.to_path_buf(),
-                            });
-                        }
+                        None => return Err(missing_catalog_error(&*storage, &root)?),
                     };
                     (None, manifest)
                 }
@@ -1267,11 +1298,7 @@ impl Lake {
                     }
                     let manifest = match fetched.next().expect("two objects fetched") {
                         Ok(Some(bytes)) => parse_catalog(&root, &bytes)?,
-                        Ok(None) => {
-                            return Err(LakeError::NotALake {
-                                path: root.to_path_buf(),
-                            });
-                        }
+                        Ok(None) => return Err(missing_catalog_error(&*storage, &root)?),
                         Err(e) => return Err(e),
                     };
                     (identity, manifest)
@@ -1441,7 +1468,7 @@ impl Lake {
     /// [`Lake::create_url`].
     pub fn open_or_create_url(location: &str) -> Result<Self> {
         let parsed = Location::parse(location)?;
-        if let Location::Sqlite(_) = parsed {
+        if is_catalog_location(&parsed) {
             return match Self::open_url(location) {
                 Ok(lake) => Ok(lake),
                 Err(LakeError::NotALake { .. }) => Err(catalog_needs_data(location, "save")),
@@ -1465,7 +1492,7 @@ impl Lake {
     /// [`Lake::open_or_create_with_key`] for the plaintext-lake refusal).
     pub fn open_or_create_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
         let parsed = Location::parse(location)?;
-        if let Location::Sqlite(_) = parsed {
+        if is_catalog_location(&parsed) {
             return match Self::open_url_with_key(location, key) {
                 Ok(lake) => Ok(lake),
                 Err(LakeError::NotALake { .. }) => Err(catalog_needs_data(location, "save")),
@@ -2860,16 +2887,34 @@ fn storage_for(location: Location) -> Result<Arc<dyn Storage>> {
                       / Lake::open_with_catalog"
                 .to_string(),
         }),
+        Location::Postgres(url) => Err(LakeError::BadLocation {
+            location: redact_location(&url),
+            message: "a catalog location is not a data location; use Lake::create_with_catalog \
+                      / Lake::open_with_catalog"
+                .to_string(),
+        }),
     }
+}
+
+/// Whether a parsed location names a SQL catalog rather than a data location.
+fn is_catalog_location(location: &Location) -> bool {
+    matches!(location, Location::Sqlite(_) | Location::Postgres(_))
+}
+
+/// Redact the password out of a Postgres catalog URL for display (every other
+/// location is returned unchanged). The library's errors and the CLI use this
+/// so a credential can never reach a terminal or a log.
+pub fn redact_location(location: &str) -> String {
+    catalog_store::url::redact_location(location)
 }
 
 /// The data half of a split lake: a local directory or an `s3://` URL, never
 /// another catalog.
 fn data_storage(location: &str) -> Result<Arc<dyn Storage>> {
     let parsed = Location::parse(location)?;
-    if let Location::Sqlite(_) = parsed {
+    if is_catalog_location(&parsed) {
         return Err(LakeError::BadLocation {
-            location: location.to_string(),
+            location: redact_location(location),
             message: "the data location must be a local directory or an `s3://` URL, not a \
                       catalog location"
                 .to_string(),
@@ -2881,12 +2926,13 @@ fn data_storage(location: &str) -> Result<Arc<dyn Storage>> {
 /// The clear "a SQL catalog needs a data location" error used by the existing
 /// URL entry points (`create_url`, `open_or_create_url` on a missing catalog).
 fn catalog_needs_data(location: &str, verb: &str) -> LakeError {
+    let shown = redact_location(location);
     LakeError::BadLocation {
-        location: location.to_string(),
+        location: shown.clone(),
         message: format!(
             "a SQL catalog needs a data location to {verb}; use Lake::create_with_catalog \
-             (CLI: `.lake save {location} data <dir|s3://…>`) or pass one on open \
-             (`.lake open {location} data <location>`)"
+             (CLI: `.lake save {shown} data <dir|s3://…>`) or pass one on open \
+             (`.lake open {shown} data <location>`)"
         ),
     }
 }
@@ -2991,19 +3037,19 @@ pub fn validate_store(db: &PinkDb) -> Result<()> {
 /// marker together. The arm names the lake id so parallel tests' publications
 /// are untouched. Compiled only with `catalog-sqlite`.
 #[doc(hidden)]
-#[cfg(feature = "catalog-sqlite")]
+#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
 pub fn fail_next_publish_after_snapshot(lake_id: &str) {
     *FAIL_PUBLISH_AFTER_SNAPSHOT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lake_id.to_string());
 }
 
-#[cfg(feature = "catalog-sqlite")]
+#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
 static FAIL_PUBLISH_AFTER_SNAPSHOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// The armed crash-injection point (a no-op without `catalog-sqlite`).
+/// The armed crash-injection point (a no-op without a SQL catalog feature).
 pub(crate) fn maybe_fail_publish_after_snapshot(lake_id: &str) -> Result<()> {
-    #[cfg(feature = "catalog-sqlite")]
+    #[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
     {
         let mut armed = FAIL_PUBLISH_AFTER_SNAPSHOT
             .lock()
@@ -3017,7 +3063,7 @@ pub(crate) fn maybe_fail_publish_after_snapshot(lake_id: &str) -> Result<()> {
             });
         }
     }
-    #[cfg(not(feature = "catalog-sqlite"))]
+    #[cfg(not(any(feature = "catalog-sqlite", feature = "catalog-postgres")))]
     let _ = lake_id;
     Ok(())
 }
@@ -3026,7 +3072,7 @@ pub(crate) fn maybe_fail_publish_after_snapshot(lake_id: &str) -> Result<()> {
 /// tests): an encrypted lake's row holds the sealed blob, a plaintext lake's
 /// the JSON. Not part of the supported API.
 #[doc(hidden)]
-#[cfg(feature = "catalog-sqlite")]
+#[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
 pub fn catalog_stored_bytes(catalog_url: &str, rel: &str) -> Result<Option<Vec<u8>>> {
     let location = Location::parse(catalog_url)?;
     let store = catalog_store::open_catalog(catalog_url, &location, false)?;
@@ -3318,9 +3364,9 @@ fn read_catalog(storage: &dyn Storage, root: &Path) -> Result<Catalog> {
     let path = storage.abs(CATALOG_FILE);
     match storage.read_optional(CATALOG_FILE, &format!("reading {}", path.display()))? {
         Some(bytes) => parse_catalog(root, &bytes),
-        None => Err(LakeError::NotALake {
-            path: root.to_path_buf(),
-        }),
+        // An encrypted lake reads the catalog through this path, so a retired
+        // source must still report `CatalogMoved` rather than `NotALake`.
+        None => Err(missing_catalog_error(storage, root)?),
     }
 }
 

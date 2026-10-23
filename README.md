@@ -167,7 +167,7 @@ SQL text
 | `pinkdb-arrow` | opt-in (`arrow` feature) Arrow IPC (Feather v2) file extension, engine-adjacent: a **table source** for `FROM 'f.arrow'` / `read_arrow` and a **COPY sink** for `COPY … (FORMAT arrow)`; reads materialize the file, writes are uncompressed; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects whole |
 | `pinkdb-parquet` | opt-in (`parquet` feature) read-side Parquet extension, engine-adjacent: `read_parquet`/`parquet_scan`, the four `parquet_*` metadata functions and DuckDB's replacement scan (`FROM 'file.parquet'`), with projection + row-group-statistics pushdown; flat schemas, TIMESTAMP(nanos)/TIME/UUID/FLOAT16/nested types refused by name; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects through a ranged `ChunkReader` |
 | `pinkdb-httpfs` | opt-in (`httpfs` feature) remote-file transport + `read_csv` table source: `https://` GET/HEAD/byte-range and the SigV4 `s3://` object client **shared with pink-lake and the parquet/arrow `remote` features**; `read_csv('url')`, `.import <url>`, `FROM 'https://…/x.csv'`; single objects only (no globs/compression/COPY TO yet) |
-| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the CLI `vortexlake` feature, `.pink` (`PINKDB06`) with the `pinklake` feature; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature — pure storage, it combines explicitly as `pinklake,s3` / `vortexlake,s3`); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
+| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the CLI `vortexlake` feature, `.pink` (`PINKDB06`) with the `pinklake` feature; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature — pure storage, it combines explicitly as `pinklake,s3` / `vortexlake,s3`); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session); opt-in `catalog-sqlite` / `catalog-postgres` features put the metadata in a SQLite file or a Postgres schema while data stays on disk/S3 (wave 96a) |
 
 Design rules: Rust edition 2024 (MSRV 1.97), zero async (the server's opt-in
 `async-server` transport, wave 47, is the documented I/O-boundary carve-out);
@@ -940,6 +940,30 @@ supervisor, kept in the CLI's lake state), `pause|resume <dest> <id>`,
 <id>`. Encrypted lakes use `PINKDB_KEY` like every other `.lake` command.
 **Limitation:** store-source jobs are not supervised (the session store is
 single-threaded); they run only through `.lake replicate catchup`.
+
+**SQL catalogs (wave 96a).** A lake's metadata may live in **SQLite**
+(`sqlite:<path>`, feature `catalog-sqlite`) or **Postgres**
+(`postgres://user:password@host:5432/db?schema=lake`, feature
+`catalog-postgres`) while its data files stay on local disk or S3/R2. Create
+the lake with `.lake save <catalog> data <dir|s3://…>` once; every later
+command needs only the catalog URL, and `data <location>` on open/attach
+overrides the recorded location for that session. Publication is one catalog
+transaction: the two tables (`pink_lake_meta`, `pink_lake_objects`) hold the
+same byte-identical manifests as the object-store layout, so crash safety,
+version uniqueness, concurrent-writer rebase, time travel, expire/cleanup,
+CDC, replication state and encryption all keep their rules (sealed blobs are
+stored verbatim; migration copies them without a key). The Postgres URL's
+`?schema=` selects the schema (default `public`). A remote host verifies the
+server certificate by default (`verify-full`, against the public roots or
+`sslrootcert=<pem file>`); `sslmode=require` opts into encryption without
+verification, and `disable` is allowed only for loopback hosts. Passwords are redacted from every
+error and every `.lake` output. `.lake migrate-catalog <from> to <to>
+[data <location>]` copies the metadata byte-for-byte in one target publish
+scope, verifies it, then retires the source (`moved.json` or
+`pink_lake_meta.moved_to`); opening a retired source reports where it moved.
+The Postgres suite runs against a throwaway `postgres:17` service in CI and
+locally when `PINKDB_TEST_POSTGRES_URL` names one; the default CLI links
+neither `rusqlite` nor the `postgres` client.
 
 `pink-lake` is the minimal lake: **metadata and data storage decoupled** — a
 JSON catalog plus immutable per-table data files, on local disk or (with the

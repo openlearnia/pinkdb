@@ -241,6 +241,51 @@ session. Every <code>&lt;dir&gt;</code> argument also accepts an
 <code>s3://bucket/prefix</code> URL when the build has the <code>s3</code>
 feature.</p>
 
+<h2>SQL catalogs: SQLite and Postgres (wave 96a)</h2>
+
+<p>A lake's <strong>metadata can live in a SQL database</strong> while its data
+files stay on local disk or S3/R2. Two opt-in features provide the backends:
+<code>catalog-sqlite</code> (<code>sqlite:&lt;path&gt;</code>) and
+<code>catalog-postgres</code> (<code>postgres://user:password@host:5432/db?schema=lake</code>).
+The data location is given once, at create, and recorded in the catalog:</p>
+
+<pre class="code" data-lang="sql"><code>.lake save sqlite:/srv/lakes/sales.db data /srv/lake-data
+.lake save postgres://lake:secret@db.internal/analytics?schema=sales data s3://bucket/sales
+.lake open sqlite:/srv/lakes/sales.db      -- the data location comes from the catalog
+.lake attach postgres://…/analytics?schema=sales
+.lake migrate-catalog sqlite:/srv/lakes/sales.db to postgres://…/analytics?schema=sales</code></pre>
+
+<ul>
+  <li><strong>Same lake, two tables.</strong> <code>pink_lake_meta</code> and
+  <code>pink_lake_objects</code> hold the same byte-identical manifests as the
+  object-store layout. One publication is one catalog transaction, so crash
+  safety (data files before metadata), version uniqueness, concurrent-writer
+  conflict and rebase, time travel, expire/cleanup, CDC, replication state and
+  encryption keep exactly the same rules. Encrypted lakes store the sealed
+  blobs verbatim; migration needs no key.</li>
+  <li><strong>Postgres details.</strong> <code>?schema=</code> selects the
+  schema (default <code>public</code>). A remote host verifies the server
+  certificate by default (<code>sslmode=verify-full</code>, against the public
+  roots or <code>sslrootcert=&lt;pem file&gt;</code>);
+  <code>sslmode=require</code> opts into encryption without verification, and
+  <code>sslmode=disable</code> is allowed only for loopback hosts. Publication
+  takes a per-schema advisory lock. Passwords are replaced by
+  <code>***</code> in every error and every <code>.lake</code> line.</li>
+  <li><strong>Migration.</strong> <code>.lake migrate-catalog &lt;from&gt; to
+  &lt;to&gt; [data &lt;location&gt;]</code> copies every metadata object
+  byte-for-byte in one target publish scope, verifies the copy, then retires
+  the source (<code>moved.json</code> for an object-store source,
+  <code>pink_lake_meta.moved_to</code> for a SQL source). Opening the retired
+  source says where the lake moved instead of “not a lake”; snapshots stay
+  behind for manual recovery. A non-empty target is refused. The three
+  directions are object store → SQL, SQL → object store (the target must be
+  the lake's data location) and SQL → SQL.</li>
+  <li><strong>Tests and size.</strong> SQLite tests always run; the Postgres
+  suite runs in CI against a throwaway <code>postgres:17</code> service and
+  locally when <code>PINKDB_TEST_POSTGRES_URL</code> is set. The default build
+  links neither the SQLite nor the Postgres client.</li>
+</ul>
+
 <h2>Read-only attach</h2>
 
 <p><code>.lake attach &lt;dir|s3://…&gt; [version]</code> attaches a lake for the
