@@ -53,13 +53,15 @@ on GitHub, and the wave-by-wave summary in the
   </li>
   <li class="card">
     <h3>Lake layer</h3>
-    <p>JSON catalog (<code>format_version</code> 5) plus immutable per-version
-    manifests; <strong>incremental commits</strong> (append-only data files and
-    positional deletes, never rewriting published files), <strong>writable
-    attachments</strong> (<code>.lake attach … write</code> + <code>.lake
+    <p>DuckLake-schema catalogs (<code>ducklake_*</code> tables) in SQLite,
+    Postgres or the bundled pink catalog; <strong>incremental commits</strong>
+    (append-only data files and positional deletes, never rewriting published
+    files), <strong>writable attachments</strong> (<code>.lake attach … write</code> + <code>.lake
     commit</code>), <strong>time travel</strong> (<code>AT (VERSION =&gt; n)</code> /
     <code>AT (TIMESTAMP =&gt; ts)</code>), per-version records
-    (<code>.lake snapshots</code>), retry/backoff parity with DuckLake, and
+    (<code>.lake snapshots</code>), retry/backoff parity with DuckLake,
+    compaction and maintenance (<code>.lake merge</code>, <code>.lake expire</code>,
+    <code>.lake cleanup</code>, <code>.lake orphans</code>, inlined small writes), and
     statistics-fast read-only attach. <code>.pink</code> data files, with
     Parquet through the <code>parquetlake</code> provider.</p>
   </li>
@@ -86,16 +88,6 @@ on GitHub, and the wave-by-wave summary in the
     SDKs, and the hosted <a href="{{root}}extensions.html">extension catalog</a>
     with one-command <code>.install</code>.</p>
   </li>
-</ul>
-
-<h2>In progress</h2>
-
-<ul>
-  <li><strong>DuckLake parity (waves 63–68).</strong> Incremental commits, time
-  travel, schema evolution on lake tables (<code>ALTER TABLE</code> with catalog
-  schema versions) and partition splits with per-file zone-map pruning are shipped;
-  next: maintenance/compaction (<code>merge_adjacent_files</code>,
-  <code>expire_snapshots</code>) and inlined small writes.</li>
 </ul>
 
 <h2>Planned</h2>
@@ -132,8 +124,8 @@ on GitHub, and the wave-by-wave summary in the
   <li><strong>File-format extensions:</strong> parquet (read/write with statistics
   pushdown), Arrow (IPC files + the C Data Interface), and Iceberg v2 reads with
   time travel — as separate crates/extensions.</li>
-  <li><strong>Extension trust:</strong> Ed25519 artifact signatures, SQL
-  <code>INSTALL</code>, Linux artifacts.</li>
+  <li><strong>Extension trust:</strong> SQL <code>INSTALL</code> (today only the CLI
+  <code>.install</code> dot-command), in builds that ship the <code>repo</code> feature.</li>
   <li><strong>Extensions on wasm — side modules:</strong> linked registration
   landed; loading pre-built WASI side modules through a per-runtime loader
   remains (feature-gated, out of the default graph).</li>
