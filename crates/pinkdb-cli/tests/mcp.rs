@@ -193,7 +193,17 @@ impl Client {
                 .stdout
                 .read_line(&mut line)
                 .expect("read from the server");
-            assert_ne!(read, 0, "the server closed its stdout (id {id} unanswered)");
+            if read == 0 {
+                // Show why the server went away: its exit status and stderr.
+                let status = self.child.wait().ok();
+                let mut stderr = String::new();
+                if let Some(mut pipe) = self.child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+                }
+                panic!(
+                    "the server closed its stdout (id {id} unanswered); exit {status:?}; stderr:\n{stderr}"
+                );
+            }
             let line = line.trim();
             if !line.starts_with('{') {
                 continue;
