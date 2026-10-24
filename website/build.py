@@ -106,6 +106,7 @@ NAV = [
             {"key": "persistence", "label": "Persistence", "out": "docs/persistence.html"},
             {"key": "lake", "label": "Lake", "out": "docs/lake.html"},
             {"key": "server", "label": "Server", "out": "docs/server.html"},
+            {"key": "agents", "label": "Agents and MCP", "out": "docs/agents.html"},
         ],
     },
     {
@@ -247,6 +248,16 @@ PAGES = {
         "description": (
             "Run pinkdb-server over TCP: flags, durable mode, the framed "
             "binary protocol, remote CLI mode, and the security posture."
+        ),
+    },
+    "agents.html": {
+        "out": "docs/agents.html",
+        "nav": "agents",
+        "title": "Agents and MCP — pinkdb",
+        "description": (
+            "Serve a store to an MCP client: the pinkdb-mcp extension, its "
+            "tools and JSON Schemas, stdio and localhost HTTP transports, the "
+            "read-only default, the extension ABI additions, and connecting an agent."
         ),
     },
     "bindings.html": {

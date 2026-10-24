@@ -1918,6 +1918,201 @@ fn cmd_snapshots(arg: &str) {
     }
 }
 
+/// Run a `.lake` command for a served client (the MCP bridge's `lake_*`
+/// tools) and return the answer as agent Markdown.
+///
+/// Only the catalog readers are served. Maintenance (`commit`, `merge`,
+/// `expire`, …) changes a catalog that no session owns, so it stays a CLI
+/// operation even in an `allow-writes` session; `read_only` only words the
+/// refusal.
+pub(crate) fn lake_markdown(
+    _db: &mut PinkDb,
+    text: &str,
+    read_only: bool,
+) -> Result<String, String> {
+    let rest = text.trim().strip_prefix(".lake").unwrap_or(text).trim();
+    let (command, args) = match rest.split_once(char::is_whitespace) {
+        Some((command, args)) => (command, args.trim()),
+        None => (rest, ""),
+    };
+    match command {
+        "tables" => {
+            let catalog = one_token(".lake tables", args)?;
+            let lake = open_lake(&catalog).map_err(lake_error)?;
+            let tables = lake.tables().map_err(lake_error)?;
+            let rows = tables
+                .into_iter()
+                .map(|(name, rows)| vec![text_value(name), count_value(rows)])
+                .collect();
+            Ok(catalog_table(
+                &["table", "rows"],
+                &[pinkdb::DataType::Varchar, pinkdb::DataType::Bigint],
+                rows,
+            ))
+        }
+        "versions" => {
+            let catalog = one_token(".lake versions", args)?;
+            let lake = open_lake(&catalog).map_err(lake_error)?;
+            let current = lake.current_version();
+            let rows = lake
+                .versions()
+                .map_err(lake_error)?
+                .into_iter()
+                .map(|version| {
+                    vec![
+                        count_value(version),
+                        pinkdb::Value::Boolean(version == current),
+                    ]
+                })
+                .collect();
+            Ok(catalog_table(
+                &["version", "current"],
+                &[pinkdb::DataType::Bigint, pinkdb::DataType::Boolean],
+                rows,
+            ))
+        }
+        "changes" => {
+            let (catalog, table, from, to) = change_args(args)?;
+            let lake = open_lake(&catalog).map_err(lake_error)?;
+            let to = to.unwrap_or_else(|| lake.current_version());
+            let keys = match table {
+                Some(table) => vec![table],
+                None => lake
+                    .tables()
+                    .map_err(lake_error)?
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect(),
+            };
+            let mut rows = Vec::new();
+            for key in keys {
+                for change in lake
+                    .table_changes(&key, from, Some(to))
+                    .map_err(lake_error)?
+                {
+                    rows.push(vec![
+                        text_value(key.clone()),
+                        count_value(change.version),
+                        match change.row_id {
+                            Some(id) => count_value(id),
+                            None => pinkdb::Value::Null,
+                        },
+                        text_value(change.change_type.as_str()),
+                        text_value(
+                            change
+                                .values
+                                .iter()
+                                .map(|value| value.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                    ]);
+                }
+            }
+            Ok(catalog_table(
+                &["table", "version", "row_id", "change", "values"],
+                &[
+                    pinkdb::DataType::Varchar,
+                    pinkdb::DataType::Bigint,
+                    pinkdb::DataType::Bigint,
+                    pinkdb::DataType::Varchar,
+                    pinkdb::DataType::Varchar,
+                ],
+                rows,
+            ))
+        }
+        other => {
+            let why = if read_only {
+                "read-only session: lake catalogs are read-only here"
+            } else {
+                "lake maintenance stays a CLI operation: a served session only reads catalogs"
+            };
+            Err(pinkdb::agent::error_json(
+                &format!(
+                    "\".lake {other}\" is not available over MCP ({why}); \
+                     served commands are tables, versions and changes"
+                ),
+                "permission",
+                None,
+            ))
+        }
+    }
+}
+
+/// One catalog token, unquoted.
+fn one_token(usage: &str, args: &str) -> Result<String, String> {
+    let Some((token, rest)) = take_token(args) else {
+        return Err(pinkdb::agent::error_json(
+            &format!("usage: {usage} <catalog>"),
+            "parameter",
+            None,
+        ));
+    };
+    if !rest.trim().is_empty() {
+        return Err(pinkdb::agent::error_json(
+            &format!("usage: {usage} <catalog>"),
+            "parameter",
+            None,
+        ));
+    }
+    Ok(unquote(&token))
+}
+
+/// The `.lake changes` arguments: catalog, optional table, optional versions.
+fn change_args(args: &str) -> Result<(String, Option<String>, u64, Option<u64>), String> {
+    let Some((catalog, rest)) = take_token(args) else {
+        return Err(pinkdb::agent::error_json(
+            "usage: .lake changes <catalog> [table] [from] [to]",
+            "parameter",
+            None,
+        ));
+    };
+    let usage = || {
+        pinkdb::agent::error_json(
+            "usage: .lake changes <catalog> [table] [from] [to]",
+            "parameter",
+            None,
+        )
+    };
+    let mut table = None;
+    let mut from = None;
+    let mut to = None;
+    for token in rest.split_whitespace() {
+        match token.parse::<u64>() {
+            Ok(n) if from.is_none() => from = Some(n),
+            Ok(n) if to.is_none() => to = Some(n),
+            Ok(_) => return Err(usage()),
+            Err(_) if table.is_none() => table = Some(flat_table_key(&unquote(token))),
+            Err(_) => return Err(usage()),
+        }
+    }
+    Ok((unquote(&catalog), table, from.unwrap_or(1), to))
+}
+
+/// A lake error as the client receives it: the library's message, execution
+/// kind.
+fn lake_error(error: pink_lake::LakeError) -> String {
+    pinkdb::agent::error_json(&error.to_string(), "execution", None)
+}
+
+fn text_value(text: impl Into<String>) -> pinkdb::Value {
+    pinkdb::Value::Varchar(sanitize_terminal(&text.into()))
+}
+
+fn count_value(count: u64) -> pinkdb::Value {
+    pinkdb::Value::Bigint(count as i64)
+}
+
+/// Rows in the wave-99 agent format, so a lake answer looks like a query.
+fn catalog_table(
+    names: &[&str],
+    types: &[pinkdb::DataType],
+    rows: Vec<Vec<pinkdb::Value>>,
+) -> String {
+    let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+    pinkdb::agent::format_table(&names, types, &rows, pinkdb::agent::AgentDisplay::DEFAULT)
+}
+
 /// `.lake tables <location>`: the current version's `db.table` names + row counts.
 fn cmd_tables(arg: &str) {
     let Some((dir, rest)) = take_token(arg) else {
@@ -3420,5 +3615,24 @@ mod tests {
         let text = partition_text(&partition);
         assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
         assert!(text.contains("Chloé"), "{text}");
+    }
+
+    /// A served session reads catalogs; maintenance is an operator action even
+    /// when the session allows writes.
+    #[test]
+    fn lake_markdown_serves_only_the_catalog_readers() {
+        let mut db = PinkDb::new();
+        let mut refused = |text: &str, read_only: bool| -> String {
+            lake_markdown(&mut db, text, read_only).expect_err("maintenance is not served")
+        };
+        for command in [".lake commit /tmp/catalog", ".lake merge /tmp/catalog"] {
+            for read_only in [true, false] {
+                let text = refused(command, read_only);
+                assert!(text.contains("\"kind\":\"permission\""), "{text}");
+                assert!(text.contains("not available over MCP"), "{text}");
+            }
+        }
+        let text = lake_markdown(&mut db, ".lake nope /tmp/catalog", true).unwrap_err();
+        assert!(text.contains("\"kind\":\"permission\""), "{text}");
     }
 }

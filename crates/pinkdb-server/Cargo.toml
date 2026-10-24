@@ -58,3 +58,5 @@ pinkdb-server-ui = { path = "../pinkdb-server-ui", optional = true }
 # Test-only self-signed certificate generation (the `tls` tests); `ring` is
 # already in the workspace's crypto stack.
 rcgen = "0.14"
+# The wave-105 MCP bridge test speaks JSON-RPC over HTTP as a client.
+serde_json = "1"

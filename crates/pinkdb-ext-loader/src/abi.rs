@@ -14,9 +14,23 @@
 use std::ffi::{c_char, c_void};
 use std::fmt;
 
-/// ABI version implemented by this loader and required from extensions.
+/// ABI **major** version implemented by this loader and required from
+/// extensions. Wave 105 bumped the minor version only: a v1 extension (which
+/// reports `1` here) still loads, because every addition after v1 is detected
+/// at runtime — a bigger [`PinkdbHostApi`] `struct_size`, or the presence of
+/// the optional `pinkdb_ext_serve` symbol.
 #[cfg(not(target_arch = "wasm32"))]
 pub const PINKDB_EXT_ABI_VERSION: u32 = 1;
+
+/// ABI **minor** version implemented by this loader (major 1, minor 2).
+///
+/// Minor 2 adds [`PinkdbHostApi::execute_statement`] and the optional
+/// `pinkdb_ext_serve` export; both are additive, so minor 1 and minor 0
+/// extensions are unchanged. The wire exposes the minor only indirectly
+/// (`struct_size`, symbol presence), which is why the major check stayed an
+/// equality check.
+#[cfg(not(target_arch = "wasm32"))]
+pub const PINKDB_EXT_ABI_MINOR: u32 = 2;
 
 /// Maximum argument count accepted by [`crate::PinkdbHostApi::register_scalar`]
 /// and by [`crate::LinkedFunction::new`]. Kept identical for both loading
@@ -149,6 +163,48 @@ pub type PinkdbExtNameFn = unsafe extern "C" fn() -> *const c_char;
 pub type PinkdbExtInitFn =
     unsafe extern "C" fn(api: *const PinkdbHostApi, host_ctx: *mut c_void) -> i32;
 
+/// The host's statement callback ([`PinkdbHostApi::execute_statement`]).
+///
+/// `sql` is `sql_len` UTF-8 bytes (no trailing NUL required). The host runs
+/// them under its own [`crate::StatementHost`] policy and returns text it
+/// allocated with [`PinkdbHostApi::alloc`]:
+///
+/// - return `0`: `*out_text`/`*out_len` hold the formatted result
+///   (`pinkdb::agent` Markdown, truncation notice included);
+/// - return `1`: the statement failed, and the text is the one-line
+///   `pinkdb::agent` JSON error;
+/// - any other code: no text (the pointers are NULL/0); the host could not
+///   run a statement (no live session, closed store).
+///
+/// The extension owns the returned buffer and must release it with
+/// [`PinkdbHostApi::free`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type PinkdbExtExecuteStatementFn = extern "C" fn(
+    ctx: *mut c_void,
+    sql: *const c_char,
+    sql_len: usize,
+    out_text: *mut *mut c_char,
+    out_len: *mut usize,
+) -> i32;
+
+/// `pinkdb_ext_serve(api, host_ctx, transport, options) -> i32` — the optional
+/// serve entry point (ABI minor 2).
+///
+/// The host hands control to the extension (an MCP server, typically) and
+/// blocks until the client disconnects or the host asks for shutdown; a
+/// non-zero return is a server failure. `transport` is `stdio` or
+/// `http:HOST:PORT`, `options` a host-defined string. During the call
+/// [`PinkdbHostApi::execute_statement`] is live with the `host_ctx` the host
+/// passed; in the API handed to init the field is a stub that answers
+/// "no session" (code 2) and never dereferences `host_ctx`.
+#[cfg(not(target_arch = "wasm32"))]
+pub type PinkdbExtServeFn = unsafe extern "C" fn(
+    api: *const PinkdbHostApi,
+    host_ctx: *mut c_void,
+    transport: *const c_char,
+    options: *const c_char,
+) -> i32;
+
 /// Host-provided services handed to `pinkdb_extension_init`. Mirrors
 /// `PinkdbHostApi` in the header field for field. A plain POD: extensions
 /// copy it out of init (the header documents it as init-scoped), and the
@@ -196,6 +252,14 @@ pub struct PinkdbHostApi {
         func: Option<PinkdbExtScalarFn>,
         user_data: *mut c_void,
     ) -> i32,
+    /// Run one statement in the host (ABI minor 2), returning text out.
+    ///
+    /// Set only in the API handed to `pinkdb_ext_serve`; the init API carries
+    /// a function that reports "no live session" and never dereferences
+    /// `ctx`, so an extension cannot reach a statement outside a serve call.
+    /// Appended after v1 shipped: an extension must compare `struct_size`
+    /// before calling it.
+    pub execute_statement: PinkdbExtExecuteStatementFn,
 }
 
 /// The ABI's type tags as a Rust enum (the host never uses the NULL tag for
@@ -507,12 +571,15 @@ mod tests {
                 std::mem::offset_of!(PinkdbHostApi, register_scalar_flags),
                 32
             );
-            assert_eq!(std::mem::size_of::<PinkdbHostApi>(), 40);
+            // ABI minor 2: the statement callback is appended after the v1
+            // fields, never inserted between them.
+            assert_eq!(std::mem::offset_of!(PinkdbHostApi, execute_statement), 40);
+            assert_eq!(std::mem::size_of::<PinkdbHostApi>(), 48);
         }
         // The check an extension makes before calling the new field: the
         // host's struct_size covers it exactly when it is the last field.
-        const FIELD_END: usize = std::mem::offset_of!(PinkdbHostApi, register_scalar_flags)
-            + std::mem::size_of::<usize>();
+        const FIELD_END: usize = std::mem::offset_of!(PinkdbHostApi, execute_statement)
+            + std::mem::size_of::<PinkdbExtExecuteStatementFn>();
         assert_eq!(FIELD_END, std::mem::size_of::<PinkdbHostApi>());
     }
 

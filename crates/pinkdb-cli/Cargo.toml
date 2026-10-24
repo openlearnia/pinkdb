@@ -154,3 +154,10 @@ pink-lake-parquet = { path = "../pink-lake-parquet", optional = true }
 [dev-dependencies]
 # Test-only self-signed certificate generation for the TLS remote-mode tests.
 rcgen = "0.14"
+# The MCP bridge is never linked into this binary: tests/mcp.rs runs the CLI
+# with `LOAD EXTENSION`, so it needs the extension's shared library (`cargo
+# build -p pinkdb-mcp` writes it to the workspace target directory; set
+# PINKDB_MCP_LIB to use one from elsewhere). serde_json parses the JSON-RPC
+# replies on the client side (already in the workspace; the binary links it
+# only behind `repo`).
+serde_json = "1"

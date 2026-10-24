@@ -65,7 +65,32 @@ pub(crate) fn host_api() -> PinkdbHostApi {
         alloc: host_alloc,
         free: host_free,
         register_scalar_flags,
+        // The init-scoped API has no statement session: the field exists so
+        // its offset is fixed for every extension, but calling it before a
+        // `pinkdb_ext_serve` returns "no session" instead of dereferencing a
+        // context that is a `Collector`, not a host.
+        execute_statement: no_statement_session,
     }
+}
+
+/// `execute_statement` in the init-scoped API: there is no live session.
+extern "C" fn no_statement_session(
+    _ctx: *mut c_void,
+    _sql: *const std::ffi::c_char,
+    _sql_len: usize,
+    out_text: *mut *mut std::ffi::c_char,
+    out_len: *mut usize,
+) -> i32 {
+    if !out_text.is_null() {
+        // SAFETY: the caller passed a writable out pointer; a NULL check
+        // precedes every write.
+        unsafe { *out_text = std::ptr::null_mut() };
+    }
+    if !out_len.is_null() {
+        // SAFETY: as above.
+        unsafe { *out_len = 0 };
+    }
+    2
 }
 
 /// `register_scalar` implementation; never unwinds into extension code.
@@ -317,6 +342,21 @@ extern "C" fn host_free(ptr: *mut c_void) {
     // (result text it just copied); an extension calling `api->free` on
     // anything else violates the ABI's alloc/free pairing rule.
     unsafe { free(ptr) };
+}
+
+/// Copy `bytes` into a host-allocated buffer (no trailing NUL required) and
+/// return it for an extension to free with `api->free`. An empty string still
+/// gets a one-byte block, so `NULL` unambiguously means allocation failure.
+pub(crate) fn alloc_text(bytes: &[u8]) -> *mut c_char {
+    let size = bytes.len().max(1);
+    let ptr = host_alloc(size);
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `ptr` is a fresh block of at least `size` bytes and `bytes`
+    // points at `bytes.len()` readable bytes.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len()) };
+    ptr.cast::<c_char>()
 }
 
 /// Result-text allocation diagnostics: how many buffers the extension API

@@ -1753,6 +1753,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinkdb-mcp"
+version = "0.1.0"
+dependencies = [
+ "pinkdb-ext-loader",
+ "pinkdb-ext-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "pinkdb-parquet"
 version = "0.1.0"
 dependencies = [
@@ -1771,6 +1780,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "serde_json",
  "tokio",
 ]
 

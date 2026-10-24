@@ -9,7 +9,64 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-24
-### Wave 99 — agent-friendly CLI mode ✅
+### Wave 105 — agent bridge: MCP server, no model code ✅
+- **A store is an MCP server.** `pinkdb --mcp <file.pink>` loads the
+  `pinkdb-mcp` extension from the install directory and serves one MCP
+  client over stdio (JSON-RPC 2.0); `.mcp serve [stdio|http <port>]
+  [allow-writes]` does the same after `LOAD EXTENSION`, and
+  `pinkdb-server --mcp-extension <path>` bridges the server's own store over
+  loopback HTTP (`--mcp-port`, default 7801) under its logins
+  (`--mcp-user` + `PINKDB_MCP_PASSWORD` on a store with users, RBAC applied).
+- Eight tools, each with a JSON Schema and a model-facing description:
+  `query(sql)`, `describe(table)`, `tables(database?)`, `databases()`,
+  `explain(sql)` (with wave 99's scan-size hint) and the lake readers
+  `lake_tables(catalog)`, `lake_versions(catalog)`,
+  `lake_changes(catalog, table?, from?, to?)`. Answers are the wave-99
+  Markdown tables with truncation notices and one-line JSON errors, under the
+  same 1,000,000-row / 30 s budget.
+- **Read-only by default, enforced in the host.** The statement callback
+  parses every statement and, without `allow-writes`, refuses everything but
+  `SELECT`/`EXPLAIN`/`DESCRIBE`/`SHOW …`/`USE`: DML, DDL, `COPY … TO`,
+  `LOAD EXTENSION`, `CHECKPOINT`, role changes and lake maintenance answer
+  `{"error":…,"kind":"permission"}`. Lake maintenance is never served. The
+  HTTP transport binds loopback only and refuses any other address.
+- **No external files or URLs by default.** A query alone can leak data, so
+  the host also binds every statement and refuses it when the plan or the
+  `FROM` clause reaches a table function or a bare path
+  (`read_csv('/home/u/.ssh/id_rsa')`, `read_parquet('https://…')`,
+  `FROM 'x.parquet'`), including through CTEs, subqueries, set-operation arms,
+  joins and `EXPLAIN`; `allow-files` (`--mcp-allow-files`,
+  `.mcp serve … allow-files`) lifts it and is independent of `allow-writes`.
+  The `pinkdb-server` bridge keeps its login's grants instead, where file
+  scans are administrator-only.
+- **Extension ABI minor 2, additive.** `PinkdbHostApi::execute_statement`
+  runs SQL text in the host and returns formatted text (no engine pointer
+  crosses the boundary), and the optional `pinkdb_ext_serve` export hands the
+  extension a transport descriptor (`stdio` or `http:HOST:PORT`) plus an
+  options string. Detection is by symbol presence and `struct_size`, so every
+  ABI 1 extension loads unchanged; the loader refuses to load or serve a
+  library twice at once. The C header documents both, vendored into the three
+  SDKs; the C/C++/Go wrappers get the surface in the wave-93 refresh.
+- The extension is `extensions/mcp` (`pinkdb-mcp`, a cdylib using
+  `serde_json` only); the host's policy, budgets and formatting live in
+  `pinkdb::serve`, and the CLI routes `.lake` reads back through the same
+  callback, so the extension never links pink-lake. Neither default binary
+  grows beyond the host-side field.
+- Any MCP client connects with no adapter: `pi mcp add pinkdb -- pinkdb --mcp
+  store.pink` (pi) or `claude mcp add pinkdb -- pinkdb --mcp store.pink`
+  (Claude Code).
+- Tests: the loader's C serve extension (6), engine serve policy/rendering
+  (8), MCP protocol conformance and transport rules (11), a CLI end-to-end
+  set that drives `pinkdb --mcp` over stdio through a TPC-H style
+  top-3-customers question, every write refusal, a truncation case and the
+  `allow-writes` counterparts over HTTP (6, plus the lake catalog reader
+  with `pinklake`, 7), and the server bridge under logins (3). Workspace:
+  1,753 tests in 155 suites, 0 failed, 7 ignored (pre-existing).
+- Release sizes, unchanged feature sets: `pinkdb` 4,221,296 → **4,260,048 B**
+  (+0.9%), `pinkdb-server` 3,802,464 → **3,927,120 B** (+3.3%); the bridge
+  itself is a 565,824 B cdylib that no binary links. `pinkdb` still builds
+  for wasm32.
+
 - **Agent mode** turns on with `-agent`, or automatically when stdout is not
   a terminal and one of `AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE`, `PI_AGENT`,
   `OPENCODE`, `CODEX_SANDBOX`, `CURSOR_AGENT` or `GEMINI_CLI` is set. A flag

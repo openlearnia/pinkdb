@@ -36,6 +36,10 @@ members = [
     # Core parquet extension (wave 70): read-side Parquet, the same
     # engine-adjacent shape, wired behind the CLI's opt-in `parquet` feature.
     "extensions/parquet",
+    # The MCP bridge (wave 105): an agent's client talks to this cdylib over
+    # stdio or loopback HTTP; it is loaded, never linked, so no pinkdb binary
+    # grows beyond the small host-side ABI addition.
+    "extensions/mcp",
     # Shared remote-file transport + `read_csv` table source (wave 75):
     # https GET/range and the SigV4 S3 client pink-lake's `s3` feature uses.
     "crates/pinkdb-httpfs",

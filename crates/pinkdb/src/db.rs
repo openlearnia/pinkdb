@@ -152,6 +152,21 @@ impl Database {
         }
     }
 
+    /// Load a native extension into the shared store (the host-bootstrap step
+    /// a server that ships an extension does before serving). Returns the
+    /// extension's declared name.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_extension(&self, path: &str) -> Result<String> {
+        write_lock(&self.shared).load_extension(path)
+    }
+
+    /// A loaded native extension's handle, for a host that drives its
+    /// `pinkdb_ext_serve` entry point (see [`crate::serve::serve_with`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn dynamic_extension(&self, name: &str) -> Result<pinkdb_ext_loader::LoadedExtension> {
+        read_lock(&self.shared).dynamic_extension(name)
+    }
+
     pub fn connect(&self) -> Connection {
         // Start on the store's current database (fresh stores: `main`).
         let current_db = read_lock(&self.shared).current_db().to_string();

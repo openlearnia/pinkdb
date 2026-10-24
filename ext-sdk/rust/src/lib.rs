@@ -178,12 +178,16 @@
 mod macros;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
+#[cfg(not(target_arch = "wasm32"))]
+mod serve;
 mod spec;
 mod value;
 
 pub use pinkdb_ext_loader::{
     ExtArg, ExtError, ExtType, ExtValue, LinkedExtension, LinkedFunction, linked,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use serve::{HostSession, StatementReply};
 pub use spec::ScalarSpec;
 pub use value::{
     Date, ExtArgType, FromExtArg, FromExtArgAt, Interval, IntoExtValue, Optional, Timestamp,
@@ -202,6 +206,8 @@ pub fn register_linked_extension(ext: LinkedExtension) -> Result<(), ExtError> {
 pub mod __private {
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::native::native_init;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use crate::serve::native_serve;
     /// The argument tag type, so a generated `min_args` can borrow a slice of
     /// declared types.
     pub use pinkdb_ext_loader::ExtType;

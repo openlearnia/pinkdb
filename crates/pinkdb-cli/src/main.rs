@@ -418,6 +418,9 @@ fn print_help() {
     if cfg!(feature = "parquet") {
         println!("  .parquet [stats|reset] parquet reader counters (pushdown evidence)");
     }
+    println!("  .mcp serve [stdio|http <port>] [allow-writes] [allow-files]");
+    println!("                         serve an MCP client (after LOAD EXTENSION of");
+    println!("                         libpinkdb_mcp): read-only unless allow-writes");
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
     if cfg!(feature = "pinklake") {
@@ -1358,6 +1361,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                 }
             }
         }
+        ".mcp" => cmd_mcp(db, rest),
         ".lake" => {
             #[cfg(feature = "pinklake")]
             lake::cmd_lake(db, rest);
@@ -1813,6 +1817,14 @@ struct Opts {
     /// (wave 98c). Off unless given; `PINKDB_EXTERNAL_FILE_CACHE=1` and its
     /// `_DIR`/`_BYTES` variables do the same without the flag.
     file_cache: Option<String>,
+    /// `--mcp FILE`: open FILE and serve an MCP client on stdio (wave 105).
+    mcp: Option<String>,
+    /// `--mcp-extension PATH`: where the `pinkdb_mcp` shared library lives;
+    /// defaults to the directory of this executable.
+    mcp_extension: Option<String>,
+    /// `--mcp-allow-files`: let an MCP client read external files and URLs
+    /// (`read_csv`, `read_parquet`); off by default, see `.mcp serve`.
+    mcp_allow_files: bool,
 }
 
 fn print_usage() {
@@ -1836,6 +1848,14 @@ fn print_usage() {
     println!("                     let SQL `LOAD EXTENSION '<path>'` run: it loads and runs");
     println!("                     native code from a path the SQL names (off by default;");
     println!("                     PINKDB_ALLOW_LOAD_EXTENSION=1 does the same)");
+    println!("  --mcp FILE         open FILE and serve an MCP client (an agent) on stdio:");
+    println!("                     read-only, no LLM code in pinkdb; .mcp serve explains the");
+    println!("                     rest (http, allow-writes)");
+    println!("  --mcp-allow-files  let the MCP client read external files and URLs:");
+    println!("                     table functions and bare paths, e.g. read_csv('/x.csv')");
+    println!("  --mcp-extension PATH");
+    println!("                     the pinkdb_mcp shared library for --mcp (default: next to");
+    println!("                     this executable)");
     println!("  --file-cache DIR   keep remote byte ranges on disk between queries");
     println!("                     (off by default; PINKDB_EXTERNAL_FILE_CACHE=1 with");
     println!("                     PINKDB_EXTERNAL_FILE_CACHE_DIR/_BYTES does the same)");
@@ -1855,6 +1875,7 @@ fn print_usage() {
 
 fn parse_args() -> Result<Opts, String> {
     let mut opts = Opts {
+        mcp_allow_files: false,
         host: None,
         user: None,
         password: None,
@@ -1866,6 +1887,8 @@ fn parse_args() -> Result<Opts, String> {
         extension_root: None,
         agent: None,
         file_cache: None,
+        mcp: None,
+        mcp_extension: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1926,6 +1949,21 @@ fn parse_args() -> Result<Opts, String> {
             other if other.starts_with("--tls-ca-cert=") => {
                 opts.tls_ca_cert = Some(other["--tls-ca-cert=".len()..].to_string());
             }
+            "--mcp" => {
+                let value = args.next().ok_or("--mcp requires a database file")?;
+                opts.mcp = Some(value);
+            }
+            other if other.starts_with("--mcp=") => {
+                opts.mcp = Some(other["--mcp=".len()..].to_string());
+            }
+            "--mcp-allow-files" => opts.mcp_allow_files = true,
+            "--mcp-extension" => {
+                let value = args.next().ok_or("--mcp-extension requires a path")?;
+                opts.mcp_extension = Some(value);
+            }
+            other if other.starts_with("--mcp-extension=") => {
+                opts.mcp_extension = Some(other["--mcp-extension=".len()..].to_string());
+            }
             "-agent" | "--agent" => opts.agent = Some(true),
             "-no-agent" | "--no-agent" => opts.agent = Some(false),
             "-c" => {
@@ -1937,6 +1975,11 @@ fn parse_args() -> Result<Opts, String> {
     }
     validate_tls_args(&opts)?;
     validate_auth_args(&mut opts)?;
+    if opts.mcp_extension.is_some() && opts.mcp.is_none() {
+        return Err(
+            "--mcp-extension only says where the MCP bridge lives: it needs --mcp FILE".to_string(),
+        );
+    }
     if let Some(dir) = &opts.file_cache {
         // The transport reads the cache configuration from the environment
         // when a source is registered, which happens after argument parsing
@@ -2164,6 +2207,192 @@ fn remote_session(mut client: Client, opts: &Opts) -> Session {
 ///
 /// The extension policy rides along: a WAL that records an extension is
 /// replayed into a load only when the operator opted in
+/// `.mcp serve [stdio|http <port>] [allow-writes]`: hand the session to the
+/// MCP bridge extension.
+///
+/// The extension holds the protocol; this function only chooses the transport
+/// and the policy the *host* enforces (see `pinkdb::serve`). A tool-call
+/// budget is not a flag: the bridge turns it into `ExecLimits` on every
+/// statement, and `PINKDB_AGENT_*` tunes it like the rest of the agent mode.
+fn cmd_mcp(db: &mut PinkDb, rest: &str) {
+    let mut args = rest.split_whitespace();
+    match args.next() {
+        Some("serve") => {}
+        _ => return mcp_usage(),
+    }
+    let mut allow_writes = false;
+    let mut allow_files = false;
+    let mut transport = "stdio".to_string();
+    while let Some(token) = args.next() {
+        match token {
+            "allow-writes" => allow_writes = true,
+            "allow-files" => allow_files = true,
+            "stdio" => transport = "stdio".to_string(),
+            "http" => match args.next() {
+                Some(addr) if addr.contains(':') => transport = format!("http:{addr}"),
+                Some(port) => transport = format!("http:127.0.0.1:{port}"),
+                None => return mcp_usage(),
+            },
+            other if other.starts_with("http:") => transport = other.to_string(),
+            other => {
+                cli_error!("unknown .mcp argument {other:?}");
+                return mcp_usage();
+            }
+        }
+    }
+    if !db
+        .serveable_extensions()
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("mcp"))
+    {
+        cli_error!(
+            "the mcp extension is not loaded: \n\
+             LOAD EXTENSION '<dir>/{}' first",
+            mcp_library_name()
+        );
+        return;
+    }
+    eprintln!(
+        "serving MCP on {transport} ({}) — the client's disconnect ends it",
+        mcp_mode(allow_writes, allow_files)
+    );
+    let options = mcp_options(allow_writes, allow_files);
+    if let Err(e) = db.serve_extension(
+        "mcp",
+        &transport,
+        &options,
+        mcp_policy(allow_writes, allow_files),
+    ) {
+        cli_error!("{e}");
+    }
+}
+
+fn mcp_usage() {
+    println!("Usage: .mcp serve [stdio | http <port>] [allow-writes] [allow-files]");
+}
+
+/// The host-side policy for a served MCP session. `.lake` reads are routed
+/// back into this module (the catalogs have no SQL table function); every
+/// statement still passes `pinkdb::serve`'s allowlist.
+/// The flags the extension shows its client in `initialize`; it reports the
+/// policy, the host enforces it.
+fn mcp_options(allow_writes: bool, allow_files: bool) -> String {
+    let mut options = Vec::new();
+    if allow_writes {
+        options.push("allow-writes");
+    }
+    if allow_files {
+        options.push("allow-files");
+    }
+    options.join(" ")
+}
+
+/// What a served session may do, in the words the operator sees on stderr.
+fn mcp_mode(allow_writes: bool, allow_files: bool) -> &'static str {
+    match (allow_writes, allow_files) {
+        (false, false) => "read-only: queries over tables only",
+        (false, true) => "read-only, read-files: queries plus external files and URLs",
+        (true, false) => "read-write: allow-writes, tables only",
+        (true, true) => "read-write, read-files: allow-writes and allow-files",
+    }
+}
+
+fn mcp_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::ServePolicy {
+    #[cfg(feature = "pinklake")]
+    let command = Some(lake::lake_markdown as pinkdb::serve::CommandHook);
+    #[cfg(not(feature = "pinklake"))]
+    let command = None;
+    pinkdb::serve::ServePolicy {
+        allow_writes,
+        allow_files,
+        command,
+        // One session, one hint threshold: `PINKDB_AGENT_HINT_ROWS` tunes the
+        // CLI and the MCP tools the same way.
+        hint_rows: agent_budget().hint_rows,
+        ..Default::default()
+    }
+}
+
+/// The bridge library file name of this platform: what `.mcp serve` tells the
+/// user to load, and what `--mcp` loads on its own.
+fn mcp_library_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "libpinkdb_mcp.dylib"
+    } else if cfg!(target_os = "windows") {
+        "pinkdb_mcp.dll"
+    } else {
+        "libpinkdb_mcp.so"
+    }
+}
+
+/// `--mcp <file.pink>`: serve a durable store over stdio with the bridge
+/// loaded from the install directory. Never returns.
+fn run_mcp(opts: &Opts, path: &str, key: Option<EncryptionKey>) -> ! {
+    let mut db = PinkDb::new();
+    db.set_encryption_key(key.clone());
+    let opened = match key {
+        Some(key) => PinkDb::open_durable_with_key_and_options(path, &key, durable_options()),
+        None => PinkDb::open_durable_with_options(path, durable_options()),
+    };
+    let (mut db, report) = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            cli_error!("cannot open {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Opening replays the WAL, whose extension records were already checked
+    // by `durable_options`; a fresh load is the operator's own flag, so it is
+    // not gated on `--allow-load-extension`.
+    load_builtin_extensions(&mut db);
+    if let Some(extension) = opts.mcp_extension.clone() {
+        if let Err(e) = db.load_extension(&extension) {
+            cli_error!("{e}");
+            std::process::exit(1);
+        }
+    } else {
+        serve_installed_mcp(&mut db);
+    }
+    if report.replayed_records > 0 {
+        eprintln!(
+            "replayed {} WAL record(s) ({} statement(s))",
+            report.replayed_records, report.replayed_statements
+        );
+    }
+    eprintln!(
+        "serving MCP on stdio ({}) — the client's disconnect ends it",
+        mcp_mode(false, opts.mcp_allow_files)
+    );
+    let options = mcp_options(false, opts.mcp_allow_files);
+    if let Err(e) = db.serve_extension(
+        "mcp",
+        "stdio",
+        &options,
+        mcp_policy(false, opts.mcp_allow_files),
+    ) {
+        cli_error!("{e}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+/// Load the bridge that sits next to this executable.
+fn serve_installed_mcp(db: &mut PinkDb) {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(mcp_library_name())))
+        .unwrap_or_else(|| std::path::PathBuf::from(mcp_library_name()));
+    if let Err(e) = db.load_extension(&path.display().to_string()) {
+        cli_error!("{e}");
+        eprintln!(
+            "       --mcp loads {} from the install directory; build it with \
+             `cargo build --release -p pinkdb-mcp` and install it next to pinkdb",
+            path.display()
+        );
+        std::process::exit(1);
+    }
+}
+
 /// (`--allow-load-extension`) *and* the library is inside the extension root
 /// (`--extension-root`). Without the opt-in, such a database fails to open
 /// with an actionable error instead of loading a path the file names.
@@ -2250,18 +2479,21 @@ fn main() {
     if opts.commands.is_empty() {
         TIMER.store(interactive, Ordering::Relaxed);
     }
-    let mut session = build_session(
-        &opts,
-        match EncryptionKey::from_env() {
-            Ok(key) => key,
-            Err(e) => {
-                // A set-but-non-UTF-8 PINKDB_KEY must not silently fall back to
-                // plaintext.
-                cli_error!("{e}");
-                std::process::exit(2);
-            }
-        },
-    );
+    let key = match EncryptionKey::from_env() {
+        Ok(key) => key,
+        Err(e) => {
+            // A set-but-non-UTF-8 PINKDB_KEY must not silently fall back to
+            // plaintext.
+            cli_error!("{e}");
+            std::process::exit(2);
+        }
+    };
+    // `--mcp` owns the process: an agent client drives the session, so there
+    // is no prompt to fall back to.
+    if let Some(path) = opts.mcp.clone() {
+        run_mcp(&opts, &path, key);
+    }
+    let mut session = build_session(&opts, key);
 
     // `-c`: run the given commands as one script and exit.
     if !opts.commands.is_empty() {

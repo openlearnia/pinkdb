@@ -1,5 +1,5 @@
 /*
- * pinkdb loadable-extension ABI v1 — https://github.com/openlearnia/pinkdb
+ * pinkdb loadable-extension ABI v1 (minor 2) — https://github.com/openlearnia/pinkdb
  *
  * An extension is a shared library (`.dylib` / `.so` / `.dll`) loaded at
  * runtime by the `pinkdb-ext-loader` crate (host side: the SQL statement
@@ -13,11 +13,30 @@
  * ---------------------------------------------------------------------------
  *   uint32_t    pinkdb_extension_abi_version(void);
  *       Must return PINKDB_EXT_ABI_VERSION (1). Any other value aborts the
- *       load with an error naming both versions.
+ *       load with an error naming both versions. The version is the major
+ *       one: ABI 1 has grown additively (minor 2 added the optional
+ *       `pinkdb_ext_serve` export and the `execute_statement` host field),
+ *       so a v1 extension still loads unchanged, and an extension that does
+ *       not export `pinkdb_ext_serve` is a functions-only extension.
  *
  *   const char *pinkdb_extension_name(void);
  *       NUL-terminated UTF-8, non-empty. The host copies it immediately, so
  *       a string literal (or any buffer that outlives the call) is fine.
+ *
+ *   int32_t     pinkdb_ext_serve(const PinkdbHostApi *api, void *host_ctx,
+ *                                const char *transport, const char *options);
+ *       OPTIONAL (ABI minor 2). Present when the extension can be handed a
+ *       client. The host calls it in place of init's registrations-only
+ *       lifetime and blocks until the extension returns; it returns 0 when
+ *       the client disconnected or the host asked it to stop (SIGINT closes
+ *       stdin, the HTTP loop sees its listener closed), non-zero on failure.
+ *       `transport` is "stdio" or "http:HOST:PORT"; `options` is a
+ *       host-defined string ("" when none). Both are NUL-terminated UTF-8,
+ *       valid for the call only. The same rules as init apply: no unwinding
+ *       across the call.
+ *
+ *       While a serve call runs the library is never unloaded and cannot be
+ *       loaded a second time; the host enforces both.
  *
  *   int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);
  *       Called exactly once, on the loading thread, right after the version
@@ -236,6 +255,10 @@ extern "C" {
 
 /* ABI version of this header / the host loader. */
 #define PINKDB_EXT_ABI_VERSION 1
+/* Additive level of that major version: 2 = pinkdb_ext_serve and the
+ * execute_statement host field. Extensions that do not use them need not
+ * care; hosts compare PINKDB_EXT_ABI_VERSION and probe the additions. */
+#define PINKDB_EXT_ABI_MINOR 2
 
 /* Maximum number of function arguments the host accepts. */
 #define PINKDB_EXT_MAX_ARGS 64
@@ -277,7 +300,26 @@ typedef int32_t (*PinkdbExtScalarFn)(void *user_data,
                                      size_t n_args,
                                      pinkdb_ext_value *out);
 
-/* Host-provided services, valid during pinkdb_extension_init only. */
+/* SQL text the extension asks the host to run (see pinkdb_ext_serve). The
+ * callback runs a statement under the host's own limits, read-only policy
+ * and role checks and returns
+ *   0  success, *out_text/*out_len carry the formatted result (Markdown);
+ *   1  the statement failed, the text is a JSON error object;
+ *   2  no live session (the API this extension got did not come from serve).
+ * `sql` need not be NUL-terminated: exactly `sql_len` bytes are read. The
+ * returned text is `*out_len` bytes, allocated by the host and freed with
+ * `free` below; it is not NUL-terminated. Either out pointer may be NULL
+ * (NULL `*out_text` with code 0 means "no output", e.g. an empty result).
+ * Statements the read-only policy refuses are code 1 with a JSON error. */
+typedef int32_t (*PinkdbExtExecuteStatementFn)(void *ctx,
+                                               const char *sql,
+                                               size_t sql_len,
+                                               char **out_text,
+                                               size_t *out_len);
+
+/* Host-provided services. Valid during pinkdb_extension_init, and for the
+ * whole pinkdb_ext_serve call (the host builds a fresh struct for each and
+ * wires `execute_statement` to the live session). */
 typedef struct PinkdbHostApi {
     /* PINKDB_EXT_ABI_VERSION and sizeof(PinkdbHostApi) as known to the host. */
     uint32_t abi_version;
@@ -308,6 +350,12 @@ typedef struct PinkdbHostApi {
                                      uint32_t flags,
                                      PinkdbExtScalarFn fn,
                                      void *user_data);
+
+    /* Appended with ABI minor 2: run a statement in the host (see above).
+     * Check `struct_size` before calling — an older host has no such field,
+     * and calling it there reads past the struct. In the struct handed to
+     * pinkdb_extension_init this is a stub that always answers 2. */
+    PinkdbExtExecuteStatementFn execute_statement;
 } PinkdbHostApi;
 
 #ifdef __cplusplus

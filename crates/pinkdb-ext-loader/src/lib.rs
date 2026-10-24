@@ -85,6 +85,9 @@ mod function;
 #[cfg(not(target_arch = "wasm32"))]
 mod host;
 pub mod linked;
+/// The optional serve entry point (ABI minor 2, native only).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod serve;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::ffi::{CStr, c_void};
@@ -102,8 +105,9 @@ pub use abi::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use abi::{
-    PINKDB_EXT_ABI_VERSION, PINKDB_EXT_FLAG_KNOWN, PINKDB_EXT_FLAG_VOLATILE, PinkdbExtAbiVersionFn,
-    PinkdbExtInitFn, PinkdbExtNameFn, PinkdbExtScalarFn, PinkdbExtValue, PinkdbHostApi,
+    PINKDB_EXT_ABI_MINOR, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_FLAG_KNOWN, PINKDB_EXT_FLAG_VOLATILE,
+    PinkdbExtAbiVersionFn, PinkdbExtExecuteStatementFn, PinkdbExtInitFn, PinkdbExtNameFn,
+    PinkdbExtScalarFn, PinkdbExtServeFn, PinkdbExtValue, PinkdbHostApi,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use function::DynamicFunction;
@@ -362,6 +366,17 @@ pub enum ExtError {
     /// has no "must not unwind" rule like the C ABI, so a panic is a normal
     /// statement error there.
     Panicked { function: String, message: String },
+    /// The extension exports no `pinkdb_ext_serve`: it registers functions
+    /// but cannot be handed a client.
+    NoServe { path: String },
+    /// A serve loop is already running for this library, or the library is
+    /// being served and cannot be loaded again.
+    Serving { path: String },
+    /// `pinkdb_ext_serve` returned a non-zero code.
+    ServeFailed { path: String, code: i32 },
+    /// A transport descriptor is not `stdio` or `http:HOST:PORT`, or the
+    /// options/transport contains a NUL byte.
+    BadTransport { message: String },
 }
 
 impl ExtError {
@@ -422,6 +437,20 @@ impl fmt::Display for ExtError {
             ExtError::Panicked { function, message } => {
                 write!(f, "extension function {function}() panicked: {message}")
             }
+            ExtError::NoServe { path } => write!(
+                f,
+                "extension \"{path}\" exports no pinkdb_ext_serve (it registers functions only)"
+            ),
+            ExtError::Serving { path } => write!(
+                f,
+                "extension \"{path}\" is serving (or being served): it cannot be loaded or served twice concurrently"
+            ),
+            ExtError::ServeFailed { path, code } => {
+                write!(f, "extension \"{path}\" serve loop failed with code {code}")
+            }
+            ExtError::BadTransport { message } => {
+                write!(f, "invalid extension transport: {message}")
+            }
         }
     }
 }
@@ -451,6 +480,9 @@ pub struct LoadedExtension {
     /// context pointer valid, so a late `register_scalar` reaches the
     /// `init_complete` flag instead of a dead stack frame.
     collector: Arc<host::Collector>,
+    /// The optional `pinkdb_ext_serve` export (ABI minor 2), detected by
+    /// symbol presence so a v1 library loads unchanged.
+    serve: Option<PinkdbExtServeFn>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -475,6 +507,12 @@ impl LoadedExtension {
     /// Registered functions.
     pub fn functions(&self) -> &[DynamicFunction] {
         &self.collector.functions
+    }
+
+    /// The library's optional `pinkdb_ext_serve` entry point (ABI minor 2),
+    /// or `None` for a functions-only extension.
+    pub fn serve_fn(&self) -> Option<PinkdbExtServeFn> {
+        self.serve
     }
 
     /// Consume the handle, yielding the functions (and with them the shared
@@ -760,6 +798,12 @@ pub fn load_in_root(root: &Path, path: &str) -> Result<LoadedExtension, ExtError
 #[cfg(not(target_arch = "wasm32"))]
 fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, ExtError> {
     let path = display.to_string();
+    // No unload while serving: a serve loop holds the mapped image, and a
+    // second load would run the library's initializers (and init) again
+    // underneath it.
+    if serve::is_serving(canonical) {
+        return Err(ExtError::Serving { path });
+    }
     // SAFETY: dlopen runs the library's initializers and maps its code; that
     // is exactly what loading an extension means, and the caller asked for
     // this path. The handle is kept alive by the returned functions.
@@ -866,6 +910,15 @@ fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, Ext
         });
     }
 
+    // ABI minor 2: optional, detected by symbol presence. A library without
+    // it is a plain functions-only extension and loads unchanged.
+    // SAFETY: looked up under the exact name and signature this ABI defines;
+    // the version check above guards that the library speaks this ABI.
+    let serve = match unsafe { library.get::<PinkdbExtServeFn>(b"pinkdb_ext_serve\0") } {
+        Ok(symbol) => Some(*symbol),
+        Err(_) => None,
+    };
+
     Ok(LoadedExtension {
         name,
         // The canonical path, not the spelling the caller used: it is what
@@ -874,6 +927,7 @@ fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, Ext
         path: canonical.to_string_lossy().into_owned(),
         canonical_path: canonical.to_path_buf(),
         collector,
+        serve,
     })
     .inspect(|ext| {
         // The process-wide registry: the library stays mapped for the

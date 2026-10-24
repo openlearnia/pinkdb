@@ -518,6 +518,17 @@ mod tests {
         }
     }
 
+    /// The statement callback of a host with no live serve call.
+    extern "C" fn test_execute(
+        _ctx: *mut c_void,
+        _sql: *const std::ffi::c_char,
+        _sql_len: usize,
+        _out_text: *mut *mut std::ffi::c_char,
+        _out_len: *mut usize,
+    ) -> i32 {
+        2
+    }
+
     /// Give the process a host API so `write_result` can allocate text (the
     /// unit-test binary never loads a real extension).
     fn install_test_host_api() {
@@ -528,6 +539,7 @@ mod tests {
             alloc: test_alloc,
             free: test_free,
             register_scalar_flags: dummy_register_flags,
+            execute_statement: test_execute,
         });
     }
 

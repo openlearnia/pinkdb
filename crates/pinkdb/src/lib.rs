@@ -69,6 +69,9 @@ pub mod profile;
 /// Role-based access control (wave 48): users, roles, grants, password
 /// hashing, and the privilege check authenticated sessions run under.
 pub mod rbac;
+/// Serving an extension's client (ABI minor 2; native targets only).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod serve;
 pub mod sql;
 pub mod storage;
 /// Host-registered table sources (wave 70): the engine-adjacent surface the

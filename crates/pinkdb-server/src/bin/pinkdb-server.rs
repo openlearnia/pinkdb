@@ -8,6 +8,7 @@
 //!               [--transport sync|async] [--allow-load-extension]
 //!               [--extension-root PATH]
 //!               [--allow-copy-to --copy-root PATH]
+//!               [--mcp-extension PATH [--mcp-port PORT] [--mcp-user NAME]]
 //!               [--tls-cert PATH --tls-key PATH]        (built with `tls`)
 //!               [--enable-ui --ui-host HOST --ui-port PORT]  (built with `ui`)
 //! pinkdb-server --health-check [HOST:PORT]
@@ -58,6 +59,8 @@ use pinkdb_server::{
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5433;
+/// The bridge's own listener; separate from the wire protocol's port.
+const DEFAULT_MCP_PORT: u16 = 7801;
 const DEFAULT_HEALTH_CHECK_TIMEOUT_MS: u64 = 2_000;
 
 /// The console's default bind address: loopback only.
@@ -106,6 +109,11 @@ struct Args {
     extension_root: Option<String>,
     /// `--allow-copy-to`: let clients run COPY … TO (off by default; ADMIN is
     /// still required in an authenticated session).
+    /// Wave 105: the MCP bridge extension (`libpinkdb_mcp.*`). Its presence
+    /// starts a loopback HTTP listener in front of the same store.
+    mcp_extension: Option<String>,
+    mcp_port: u16,
+    mcp_user: Option<String>,
     allow_copy_to: bool,
     /// `--copy-root PATH`: the directory every COPY … TO destination is
     /// confined to. Opting in without it refuses every COPY.
@@ -150,6 +158,7 @@ fn usage() -> &'static str {
      \x20                    [--extension-root PATH]\n\
      \x20                    [--allow-copy-to --copy-root PATH]\n\
      \x20                    [--tls-cert PATH.pem --tls-key PATH.pem]\n\
+     \x20                    [--mcp-extension PATH [--mcp-port PORT] [--mcp-user NAME]]\n\
      \x20       pinkdb-server --health-check [HOST:PORT]\n\
      \n\
      \x20 --host HOST            bind address (default 127.0.0.1)\n\
@@ -185,6 +194,16 @@ fn usage() -> &'static str {
      \x20 --tls-key PATH         PEM private key matching --tls-cert (PKCS#8/#1/SEC1);\n\
      \x20                        both or neither, only in a build with `tls`, and\n\
      \x20                        only with the sync transport\n\
+     \x20 --mcp-extension PATH  serve the MCP bridge (wave 105) for this store on\n\
+     \x20                        127.0.0.1:7801: agents call the tools, the bridge runs\n\
+     \x20                        every statement under this server's login and grants,\n\
+     \x20                        read-only (the model brings the reasoning; no LLM\n\
+     \x20                        code runs here). Needs libpinkdb_mcp.<ext>.\n\
+     \x20 --mcp-port PORT        the bridge's loopback port (default 7801)\n\
+     \x20 --mcp-user NAME        the store user the bridge logs in as; with users\n\
+     \x20                        defined this is required, and PINKDB_MCP_PASSWORD\n\
+     \x20                        holds its password (an unauthenticated bridge would\n\
+     \x20                        bypass the store's authentication)\n\
      \x20 --enable-ui           serve the read-only warehouse browsing console (wave 78);\n\
      \x20                        needs a build with the `ui` feature; off by default\n\
      \x20 --ui-host HOST        the console's bind address (default 127.0.0.1; a\n\
@@ -236,6 +255,9 @@ fn parse_args() -> Result<Args, String> {
         transport: Transport::Sync,
         allow_load_extension: false,
         extension_root: None,
+        mcp_extension: None,
+        mcp_port: DEFAULT_MCP_PORT,
+        mcp_user: None,
         allow_copy_to: false,
         copy_root: None,
         tls_cert: None,
@@ -349,6 +371,14 @@ fn parse_args() -> Result<Args, String> {
             "--extension-root" => args.extension_root = Some(value("--extension-root")?),
             "--allow-copy-to" if inline.is_none() => args.allow_copy_to = true,
             "--copy-root" => args.copy_root = Some(value("--copy-root")?),
+            "--mcp-extension" => args.mcp_extension = Some(value("--mcp-extension")?),
+            "--mcp-port" => {
+                let raw = value("--mcp-port")?;
+                args.mcp_port = raw
+                    .parse()
+                    .map_err(|_| format!("invalid --mcp-port value {raw:?}"))?;
+            }
+            "--mcp-user" => args.mcp_user = Some(value("--mcp-user")?),
             "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
             "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             "--enable-ui" => {
@@ -624,6 +654,54 @@ fn run_tcp_health_check(target: &str, timeout: Duration) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// `--mcp-extension PATH`: hand the MCP bridge this server's store over a
+/// loopback HTTP listener.
+///
+/// The bridge is loaded into the shared store like any other extension and
+/// served on one connection: every statement it runs goes through the
+/// connection's login, so the store's roles and grants apply exactly as they
+/// do to a protocol client. With users defined the bridge needs `--mcp-user`
+/// and `PINKDB_MCP_PASSWORD` — an unauthenticated MCP session on a store with
+/// users would be a privilege bypass. The policy is read-only; the bridge's
+/// `allow-writes` is a CLI flag, not a server one.
+fn start_mcp(db: Database, path: &str, port: u16, user: Option<&str>) -> Result<(), String> {
+    db.load_extension(path)
+        .map_err(|e| format!("cannot load the MCP bridge {path:?}: {e}"))?;
+    let ext = db
+        .dynamic_extension("mcp")
+        .map_err(|e| format!("the MCP bridge did not register: {e}"))?;
+    let mut conn = db.connect();
+    if db.has_users() {
+        let user = user.ok_or_else(|| {
+            "--mcp-extension on a store with users needs --mcp-user NAME and \
+             PINKDB_MCP_PASSWORD"
+                .to_string()
+        })?;
+        let password = std::env::var("PINKDB_MCP_PASSWORD").map_err(|_| {
+            "PINKDB_MCP_PASSWORD must hold the --mcp-user password on a store with users"
+                .to_string()
+        })?;
+        conn.login(user, &password)
+            .map_err(|e| format!("MCP login as {user:?} failed: {e}"))?;
+        conn.require_login(true);
+    }
+    let transport = format!("http:127.0.0.1:{port}");
+    eprintln!(
+        "pinkdb mcp: bridging this store on http://127.0.0.1:{port} ({}, read-only)",
+        match user {
+            Some(user) if db.has_users() => format!("as {user}"),
+            _ => "trusted".to_string(),
+        }
+    );
+    // Read-only, and no `allow_files`: a `Connection` has no store handle, so
+    // the policy cannot inspect the plan. The login's RBAC gate is what
+    // restricts file scans here — `rbac` M-4 makes them administrator-only.
+    let policy = pinkdb::serve::ServePolicy::default();
+    let mut host = pinkdb::serve::SessionHost::new(&mut conn, &policy);
+    pinkdb::serve::serve_with(&ext, &transport, "", &mut host)
+        .map_err(|e| format!("the MCP bridge stopped: {e}"))
+}
+
 fn main() -> ExitCode {
     // The probe is a mode of its own: it must run before any database or
     // listener setup (a health check inside the server container is a second
@@ -729,6 +807,27 @@ fn main() -> ExitCode {
     } else {
         None
     };
+
+    // The bridge (wave 105) starts before the server binds: it shares the
+    // same store and its own loopback listener, so a failure to load or log
+    // in stops the process instead of leaving a half-configured server.
+    if let Some(path) = args.mcp_extension.clone() {
+        let bridge_db = db.clone();
+        let user = args.mcp_user.clone();
+        let port = args.mcp_port;
+        let spawned = std::thread::Builder::new()
+            .name("pinkdb-mcp".to_string())
+            .spawn(move || {
+                if let Err(message) = start_mcp(bridge_db, &path, port, user.as_deref()) {
+                    eprintln!("Error: {message}");
+                    std::process::exit(1);
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("Error: cannot start the MCP bridge thread: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     match args.transport {
         Transport::Sync => {

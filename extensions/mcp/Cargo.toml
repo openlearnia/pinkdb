@@ -1,0 +1,25 @@
+[package]
+name = "pinkdb-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb MCP bridge: serve a Model Context Protocol client (pi, Claude Code, fx, any MCP client) over stdio or localhost HTTP, with no LLM code in pinkdb"
+license = "MIT"
+
+[lib]
+# A cdylib is what `LOAD EXTENSION '<path>/libpinkdb_mcp.dylib'` loads; the
+# rlib lets this crate's own tests exercise the protocol without a host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The ABI + safe Rust surface (wave 105: `pinkdb_ext_serve` and the host
+# statement callback). Its only dependency is the loader, so this extension
+# adds no async runtime and no HTTP stack of its own.
+pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
+# JSON-RPC 2.0 and MCP both speak JSON; serde_json is already in the
+# workspace, so this adds no new external crate.
+serde_json = "1"
+
+[dev-dependencies]
+# The loader compiles/loads the built cdylib in the ABI test.
+pinkdb-ext-loader = { path = "../../crates/pinkdb-ext-loader" }

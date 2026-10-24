@@ -402,3 +402,45 @@ macro_rules! pinkdb_abi_exports {
         }
     };
 }
+
+/// [`pinkdb_abi_exports!`](crate::pinkdb_abi_exports) plus the optional
+/// `pinkdb_ext_serve` export (ABI minor 2).
+///
+/// `$serve` is a function with the shape
+/// `fn(&mut HostSession, transport: &str, options: &str) -> Result<(), String>`;
+/// the generated export hands it the host's statement callback and returns
+/// `0` on success, `1` when the function reports an error (printed to stderr,
+/// since the client is gone by then) and `2` on a panic. A serve extension
+/// usually declares no scalar functions:
+///
+/// ```no_run
+/// pinkdb_ext_sdk::pinkdb_extension! { name = "mcp", functions = [] }
+/// fn serve(session: &mut pinkdb_ext_sdk::HostSession, transport: &str, options: &str) -> Result<(), String> {
+///     // speak the protocol; ask the host through `session.execute_statement`
+///     let _ = (transport, options, session);
+///     Ok(())
+/// }
+/// pinkdb_ext_sdk::pinkdb_abi_exports_with_serve!(serve);
+/// ```
+#[macro_export]
+macro_rules! pinkdb_abi_exports_with_serve {
+    ($serve:path) => {
+        $crate::pinkdb_abi_exports!();
+
+        /// `pinkdb_ext_serve` (ABI minor 2): the host hands control to this
+        /// extension and blocks until it returns. Never unwinds.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn pinkdb_ext_serve(
+            api: *const $crate::__private::HostApi,
+            host_ctx: *mut ::core::ffi::c_void,
+            transport: *const ::core::ffi::c_char,
+            options: *const ::core::ffi::c_char,
+        ) -> i32 {
+            // SAFETY: the loader passes a live host API, its opaque context
+            // and two NUL-terminated strings (or NULL); `native_serve`
+            // documents the contract and copies nothing past the call.
+            unsafe { $crate::__private::native_serve(api, host_ctx, transport, options, $serve) }
+        }
+    };
+}
