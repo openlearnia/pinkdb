@@ -289,6 +289,14 @@ fn physical_type(dtype: DataType, column: &str) -> Result<PhysicalType, WriteErr
                     .to_string(),
             });
         }
+        DataType::Variant => {
+            return Err(WriteError::UnsupportedType {
+                column: column.to_string(),
+                message: "VARIANT needs parquet's shredded representation (wave 101b); \
+                          refusing to write it as JSON text"
+                    .to_string(),
+            });
+        }
     })
 }
 
@@ -333,7 +341,9 @@ fn build_schema(schema: &[(String, DataType)]) -> Result<Type, WriteError> {
                     builder = builder.with_length(DECIMAL_FIXED_LEN);
                 }
             }
-            DataType::Interval => unreachable!("refused by physical_type"),
+            DataType::Interval | DataType::Variant => {
+                unreachable!("refused by physical_type")
+            }
         }
         fields.push(Arc::new(builder.build()?));
     }
@@ -490,6 +500,7 @@ fn write_column(
         }
         // Refused in `physical_type`/`build_schema` before any row is read.
         DataType::Interval => unreachable!("interval columns are refused before writing"),
+        DataType::Variant => unreachable!("variant columns are refused before writing"),
     }
     column.close()?;
     Ok(())

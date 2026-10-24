@@ -193,6 +193,7 @@ const VD_DATE: u8 = 5;
 const VD_TIMESTAMP: u8 = 6;
 const VD_DECIMAL: u8 = 7;
 const VD_INTERVAL: u8 = 8;
+const VD_VARIANT: u8 = 9;
 
 /// Statistics value tags in the footer's per-chunk statistics block: the
 /// same shapes as the default-value tags, plus an explicit "no value" tag
@@ -568,6 +569,15 @@ fn chunk_column_stats(v: &Vector) -> ChunkColumnStats {
                 nan_count: 0,
             }
         }
+        // VARIANT: no min/max. The total order spans kinds, so a chunk extreme
+        // says nothing about a later point lookup; the row-group prune would
+        // have to compare a VARIANT literal with the same code either way.
+        VectorData::Variant(_) => ChunkColumnStats {
+            null_count,
+            min: None,
+            max: None,
+            nan_count: 0,
+        },
     }
 }
 
@@ -636,6 +646,9 @@ fn dtype_tag(t: DataType) -> u8 {
         // the schema reader assembles the type before any chunk is read.
         DataType::Decimal { .. } => 7,
         DataType::Interval => 8,
+        // VARIANT's payload is self-describing, so the tag carries no schema
+        // parameters.
+        DataType::Variant => 9,
     }
 }
 
@@ -648,6 +661,7 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
         4 => Ok(DataType::Varchar),
         5 => Ok(DataType::Date),
         6 => Ok(DataType::Timestamp),
+        9 => Ok(DataType::Variant),
         _ => Err(PinkDbError::Execution(format!(
             "corrupt file: bad dtype tag {b}"
         ))),
@@ -2106,6 +2120,11 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
             }
             best = Some((ENC_PLAIN, w.buf));
         }
+        // VARIANT: `u32 row count | u32 offsets (count + 1) | values`. A NULL
+        // row contributes no bytes at all (its offset is unchanged), so the
+        // validity bitmap alone decides NULL-ness and `Variant::Null` stays a
+        // real value.
+        DataType::Variant => best = Some((ENC_PLAIN, variant_payload(v))),
         DataType::Double => {
             let values = float64_payload(v);
             let bits: Vec<u64> = values.iter().map(|x| x.to_bits()).collect();
@@ -2334,8 +2353,58 @@ fn tag_error(dtype: DataType, tag: u8) -> PinkDbError {
 }
 
 /// Decode one chunk payload into a typed buffer + its row count.
+/// The PLAIN payload of a VARIANT chunk: `u32 row count | u32 offsets
+/// (count + 1) | encoded values`. A NULL row contributes no bytes (its offset
+/// equals the next one).
+fn variant_payload(v: &Vector) -> Vec<u8> {
+    let VectorData::Variant(values) = v.data() else {
+        unreachable!("variant chunk has a non-variant payload")
+    };
+    let mut w = Writer::new();
+    w.u32(values.len() as u32);
+    let mut data = Vec::new();
+    let mut offsets = Vec::with_capacity(values.len() + 1);
+    for (i, x) in values.iter().enumerate() {
+        offsets.push(data.len() as u32);
+        if !v.has_nulls() || v.is_valid(i) {
+            crate::variant::encode(x, &mut data);
+        }
+    }
+    offsets.push(data.len() as u32);
+    for o in offsets {
+        w.u32(o);
+    }
+    w.bytes(&data);
+    w.buf
+}
+
 fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorData, usize)> {
     match (dtype, tag) {
+        (DataType::Variant, ENC_PLAIN) => {
+            let n = r.chunk_count("variant chunk length")?;
+            let mut offsets = Vec::with_capacity(n + 1);
+            for _ in 0..=n {
+                offsets.push(r.u32()? as usize);
+            }
+            let total = *offsets.last().unwrap_or(&0);
+            let data = r.take(total)?;
+            let mut out = Vec::with_capacity(n);
+            for w in offsets.windows(2) {
+                let (from, to) = (w[0], w[1]);
+                let bytes = data.get(from..to).ok_or_else(|| {
+                    PinkDbError::Execution("corrupt file: bad VARIANT chunk offsets".to_string())
+                })?;
+                // A row with no bytes is NULL (validity says so); the
+                // placeholder kind is irrelevant but must not be a decode
+                // error.
+                out.push(Arc::new(if bytes.is_empty() {
+                    crate::variant::Variant::Null
+                } else {
+                    crate::variant::decode(bytes)?
+                }));
+            }
+            Ok((VectorData::Variant(out), n))
+        }
         (DataType::Integer, ENC_PLAIN) => {
             let n = r.chunk_count("chunk length")?;
             Ok((VectorData::Int32(r.i32_vec(n)?), n))
@@ -2852,6 +2921,10 @@ fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
             w.i64(*micros);
         }
         Some(Value::Null) => w.u8(SV_NONE),
+        // VARIANT columns carry no min/max: the total order spans kinds, so the
+        // extremes prune nothing a reader would not compare anyway. Their
+        // null_count is still exact.
+        Some(Value::Variant(_)) => w.u8(SV_NONE),
     }
 }
 
@@ -4055,6 +4128,10 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
             };
             rows
         ]),
+        DataType::Variant => {
+            let null = Arc::new(crate::variant::Variant::Null);
+            VectorData::Variant(vec![null; rows])
+        }
     };
     // No validity words: every row reads NULL.
     Vector::from_raw(data, Vec::new())
@@ -4609,6 +4686,13 @@ fn write_default_value(w: &mut Writer, v: &Value) {
             w.u32(*days as u32);
             w.u64(*micros as u64);
         }
+        Value::Variant(v) => {
+            let mut bytes = Vec::new();
+            crate::variant::encode(v, &mut bytes);
+            w.u8(VD_VARIANT);
+            w.u32(bytes.len() as u32);
+            w.bytes(&bytes);
+        }
     }
 }
 
@@ -4650,6 +4734,14 @@ fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<Value>>> {
                 days: r.i32()?,
                 micros: r.i64()?,
             },
+            VD_VARIANT => {
+                let n = r.u32()? as usize;
+                let bytes = r.take(n)?;
+                match crate::variant::decode(bytes) {
+                    Ok(v) => Value::Variant(Arc::new(v)),
+                    Err(_) => return r.err("bad VARIANT default"),
+                }
+            }
             other => {
                 return Err(PinkDbError::Execution(format!(
                     "corrupt file: unknown default value tag {other}"
@@ -4674,6 +4766,7 @@ fn default_matches(v: &Value, dtype: DataType) -> bool {
         | (Value::Timestamp(_), DataType::Timestamp)
         | (Value::Interval { .. }, DataType::Interval) => true,
         (Value::Decimal(_, s), DataType::Decimal { scale, .. }) => *s == scale,
+        (Value::Variant(_), DataType::Variant) => true,
         _ => false,
     }
 }
@@ -5207,6 +5300,7 @@ fn plain_payload(v: &Vector) -> Vec<u8> {
         }
         DataType::Boolean => enc_bool_plain(&bool_payload(v)),
         DataType::Varchar => enc_strs_plain(&varchar_payload(v)),
+        DataType::Variant => variant_payload(v),
         DataType::Decimal { .. } => {
             let VectorData::Decimal { values, .. } = v.data() else {
                 unreachable!()
@@ -6470,6 +6564,20 @@ mod tests {
                 days: (i as i32) % 31 - 15,
                 micros: (i as i64).wrapping_mul(1_000_003) % 86_400_000_000,
             },
+            DataType::Variant => Value::Variant(Arc::new(match i % 7 {
+                0 => crate::variant::Variant::Null,
+                1 => crate::variant::Variant::Bool(i.is_multiple_of(2)),
+                2 => crate::variant::Variant::Int(i as i64),
+                3 => crate::variant::Variant::Double(i as f64 / 8.0),
+                4 => crate::variant::Variant::Str(Arc::from(format!("s{i}").as_str())),
+                5 => crate::variant::Variant::array(vec![crate::variant::Variant::Int(i as i64)])
+                    .unwrap(),
+                _ => crate::variant::Variant::object(vec![
+                    (Arc::from("k"), crate::variant::Variant::Int(i as i64)),
+                    (Arc::from("n"), crate::variant::Variant::Null),
+                ])
+                .unwrap(),
+            })),
             DataType::Integer => Value::Integer(match i % 8 {
                 0 => i32::MIN,
                 1 => i32::MAX,
@@ -7320,7 +7428,7 @@ mod tests {
         };
         for case in 0..2000 {
             let n = (next() % 300) as usize;
-            let dtype = match next() % 9 {
+            let dtype = match next() % 10 {
                 0 => DataType::Boolean,
                 1 => DataType::Integer,
                 2 => DataType::Bigint,
@@ -7332,7 +7440,8 @@ mod tests {
                     precision: 18,
                     scale: 3,
                 },
-                _ => DataType::Interval,
+                8 => DataType::Interval,
+                _ => DataType::Variant,
             };
             let mut values: Vec<Value> = Vec::with_capacity(n);
             for _ in 0..n {
@@ -7357,6 +7466,16 @@ mod tests {
                         days: (r % 60) as i32,
                         micros: r as i64 % 86_400_000_000,
                     },
+                    DataType::Variant => Value::Variant(Arc::new(match r % 5 {
+                        0 => crate::variant::Variant::Null,
+                        1 => crate::variant::Variant::Bool(r % 3 == 0),
+                        2 => crate::variant::Variant::Int(r as i64),
+                        3 => crate::variant::Variant::Double(r as f64 / 3.0),
+                        _ => crate::variant::Variant::array(vec![crate::variant::Variant::Int(
+                            r as i64,
+                        )])
+                        .unwrap(),
+                    })),
                 };
                 values.push(if r % 11 == 0 { Value::Null } else { val });
             }
@@ -7378,6 +7497,14 @@ mod tests {
                 match (&a, &b) {
                     (Value::Double(x), Value::Double(y)) => {
                         assert_eq!(x.to_bits(), y.to_bits(), "case {case} row {i}");
+                    }
+                    // VARIANT equality is numeric (1 = 1.0), so compare the
+                    // encodings: that pins the kind too.
+                    (Value::Variant(x), Value::Variant(y)) => {
+                        let (mut a, mut b) = (Vec::new(), Vec::new());
+                        crate::variant::encode(x, &mut a);
+                        crate::variant::encode(y, &mut b);
+                        assert_eq!(a, b, "case {case} row {i}");
                     }
                     _ => assert_eq!(a, b, "case {case} row {i} dtype={dtype:?} tag={t}"),
                 }

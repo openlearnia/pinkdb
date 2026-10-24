@@ -382,6 +382,10 @@ as a follow-up wave.</p>
     <tr><td><code>DATE</code></td><td>days since epoch</td></tr>
     <tr><td><code>TIMESTAMP</code></td><td>microseconds, naive (no time zone)</td></tr>
     <tr><td><code>INTERVAL</code></td><td>months + days + microseconds</td></tr>
+    <tr><td><code>VARIANT</code></td><td>a tagged value of any shape — JSON null,
+    boolean, bigint, double, decimal, varchar, date, timestamp, array or object —
+    stored columnar in a binary encoding, not as text (see
+    <a href="#variant">VARIANT</a>)</td></tr>
   </tbody>
 </table>
 </div>
@@ -415,6 +419,111 @@ auto-detects <code>YYYY-MM-DD</code> as <code>DATE</code> and
   <li>Mixed <code>DATE</code>/<code>TIMESTAMP</code> comparison is rejected;
   timestamps never mix with integers — use <code>date ± interval</code>.</li>
 </ul>
+
+<h2 id="variant">VARIANT<a class="anchor" href="#variant" aria-label="Permalink: VARIANT">#</a></h2>
+
+<p><code>VARIANT</code> holds a value whose shape can differ from row to row —
+the semi-structured type DuckDB 2.0 and DuckLake define. Values are stored
+columnar in a binary encoding (a kind tag plus the payload, with object keys
+kept sorted), never as JSON text, so a query that does not mention a
+<code>VARIANT</code> column takes no new path.</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">CREATE</span> <span class="tok-k">TABLE</span> events (id BIGINT, payload VARIANT);
+<span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> events <span class="tok-k">VALUES</span>
+  (<span class="tok-n">1</span>, <span class="tok-s">'{"a": 1, "b": [2, 2.5, "x"]}'</span>),           <span class="tok-c">-- VARCHAR parses as JSON</span>
+  (<span class="tok-n">2</span>, <span class="tok-k">CAST</span>(<span class="tok-n">42</span> <span class="tok-k">AS</span> VARIANT)),                            <span class="tok-c">-- any type widens</span>
+  (<span class="tok-n">3</span>, <span class="tok-k">CAST</span>(<span class="tok-s">'null'</span> <span class="tok-k">AS</span> VARIANT)),                        <span class="tok-c">-- a JSON null is a value</span>
+  (<span class="tok-n">4</span>, <span class="tok-k">NULL</span>);                                           <span class="tok-c">-- SQL NULL is no value</span>
+<span class="tok-k">SELECT</span> id, typeof(payload), variant_type(payload) <span class="tok-k">FROM</span> events;
+<span class="tok-c">--      VARCHAR   VARIANT    OBJECT / BIGINT / NULL / NULL</span>
+<span class="tok-k">SELECT</span> payload, <span class="tok-k">CAST</span>(payload <span class="tok-k">AS</span> VARCHAR) <span class="tok-k">FROM</span> events;   <span class="tok-c">-- JSON text</span>
+<span class="tok-c">--      {"a": 1, "b": [2, 2.5, "x"]}   {"a": 1, "b": [2, 2.5, "x"]}</span></code></pre></div>
+
+<p><strong>Casts.</strong> Every type casts to <code>VARIANT</code> (BOOLEAN,
+INTEGER/BIGINT, DOUBLE, DECIMAL, VARCHAR, DATE, TIMESTAMP, INTERVAL), and
+<code>VARIANT</code> casts back to every scalar type, erroring with the kind and
+the value when the shape does not fit:</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">CAST</span>(<span class="tok-k">CAST</span>(<span class="tok-s">'"5"'</span> <span class="tok-k">AS</span> VARIANT) <span class="tok-k">AS</span> INTEGER)      <span class="tok-c">-- 5   (a JSON string like DuckDB)</span>
+<span class="tok-k">CAST</span>(<span class="tok-k">CAST</span>(<span class="tok-s">'1.9'</span> <span class="tok-k">AS</span> VARIANT) <span class="tok-k">AS</span> INTEGER)      <span class="tok-c">-- 2   (rounds half away from zero)</span>
+<span class="tok-k">CAST</span>(<span class="tok-k">CAST</span>(<span class="tok-s">'null'</span> <span class="tok-k">AS</span> VARIANT) <span class="tok-k">AS</span> INTEGER)     <span class="tok-c">-- NULL for every target except VARCHAR</span>
+<span class="tok-k">CAST</span>(<span class="tok-k">CAST</span>(<span class="tok-s">'null'</span> <span class="tok-k">AS</span> VARIANT) <span class="tok-k">AS</span> VARCHAR)     <span class="tok-c">-- 'null'  (keeps the text round trip exact)</span>
+<span class="tok-k">CAST</span>(<span class="tok-k">CAST</span>(<span class="tok-s">'{"a":1}'</span> <span class="tok-k">AS</span> VARIANT) <span class="tok-k">AS</span> INTEGER)  <span class="tok-c">-- Error: cannot CAST VARIANT(OBJECT) value … to INTEGER</span></code></pre></div>
+
+<p>pinkdb has no <code>TRY_CAST</code>; a failed cast is an error. JSON text and
+<code>VARIANT</code> round-trip losslessly for JSON's value model: keys come out
+sorted, unicode stays raw UTF-8, integral numbers stay integers and fractional
+ones stay exact decimals (<code>1.0</code> and
+<code>-1234567890123.456789</code> keep their digits); <code>NaN</code>,
+<code>Infinity</code> and <code>-Infinity</code> survive as those spellings.
+A <code>DATE</code> or <code>TIMESTAMP</code> inside a variant prints as an ISO
+string and reads back as a string, which is why the binary encoding — not JSON
+text — is what persistence and the wire use.</p>
+
+<h3>Functions</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Function</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td><code>typeof(v)</code></td><td><code>'VARIANT'</code> (the existing type
+    name for every other type)</td></tr>
+    <tr><td><code>variant_type(v)</code></td><td><code>'NULL'</code>,
+    <code>'BOOL'</code>, <code>'BIGINT'</code>, <code>'DOUBLE'</code>,
+    <code>'DECIMAL'</code>, <code>'VARCHAR'</code>, <code>'DATE'</code>,
+    <code>'TIMESTAMP'</code>, <code>'ARRAY'</code> or <code>'OBJECT'</code>;
+    SQL <code>NULL</code> for SQL <code>NULL</code> and for a JSON null</td></tr>
+    <tr><td><code>variant_keys(v)</code></td><td>an object's keys as JSON array
+    text (<code>'["a","b"]'</code> — pinkdb has no list type yet),
+    <code>'[]'</code> for a non-object, SQL <code>NULL</code> for SQL
+    <code>NULL</code> and a JSON null</td></tr>
+    <tr><td><code>variant_extract(v, path)</code></td><td>a variant; 0-based
+    JSONPath — <code>'a.b[1]'</code>, <code>'$.a[0]'</code>,
+    <code>&quot;['a']&quot;</code>. A missing path or a field of a scalar is SQL
+    <code>NULL</code>; a malformed path errors</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">SELECT</span> variant_extract(payload, <span class="tok-s">'b[1]'</span>) <span class="tok-k">FROM</span> events;   <span class="tok-c">-- 2.5, as a VARIANT</span>
+<span class="tok-k">SELECT</span> variant_keys(payload) <span class="tok-k">FROM</span> events;              <span class="tok-c">-- ["a","b"] / [] / NULL / NULL</span></code></pre></div>
+
+<p>There is no subscript operator, so <code>payload['a']</code> does not parse;
+<code>variant_extract(payload, 'a')</code> is the spelling. The JSON
+extension's functions also accept a <code>VARIANT</code> and see its JSON text
+(<code>json_extract</code>, <code>json_array_length</code>,
+<code>json_valid</code>, …).</p>
+
+<h3>Equality, ordering and grouping</h3>
+
+<ul>
+  <li>Equality is structural. Numbers compare <em>by value</em> across kinds, so
+  <code>1</code>, <code>1.0</code> and <code>1.00</code> are equal and land in one
+  group; a string that spells a number is a different value
+  (<code>'1' ≠ 1</code>), and a <code>DATE</code> never equals a
+  <code>TIMESTAMP</code> or a string.</li>
+  <li>One total order serves <code>ORDER BY</code>, <code>MIN</code>/<code>MAX</code>
+  and the comparison operators: boolean &lt; number &lt; string &lt; date &lt;
+  timestamp &lt; array &lt; object &lt; JSON null, with SQL <code>NULL</code>
+  last in both directions (like every other column). Arrays and objects order
+  lexicographically.</li>
+  <li><code>GROUP BY</code>, <code>DISTINCT</code> and join keys hash one
+  canonical key that agrees with <code>=</code> by construction. A JSON null is
+  its own group and is never equal to SQL <code>NULL</code>:
+  <code>SELECT DISTINCT</code> over
+  <code>{1, 1.0, '1', true, JSON null, NULL}</code> returns five rows while
+  <code>count(DISTINCT v)</code> returns four.</li>
+</ul>
+
+<p><strong>Persistence and encodings.</strong> A <code>VARIANT</code> column
+survives save/open, WAL replay, checkpoint and
+<code>ALTER TABLE … ADD COLUMN … DEFAULT</code> (new <code>.pink</code> dtype
+tag; no statistics). It crosses the wire protocol as a length-prefixed blob
+(protocol v11), the C ABI as its JSON text (<code>PINKDB_TYPE_VARIANT</code>),
+and the JS/WASM binding as a native JSON value. The extension ABI, Arrow and
+Parquet refuse it with a clear error; a <code>.pink</code> lake data file
+round-trips it. Parquet <code>VARIANT</code>, shredding into typed
+sub-columns and statistics on shredded paths are wave 101b.</p>
 
 <h2 id="three-valued-logic">Three-valued logic<a class="anchor" href="#three-valued-logic" aria-label="Permalink: Three-valued logic">#</a></h2>
 
@@ -587,6 +696,7 @@ SHOW MATERIALIZED VIEWS;               <span class="tok-c">-- schedule, last ref
   <li><a href="#aggregates-and-window-functions">Aggregates and window functions</a></li>
   <li><a href="#scalar-functions-and-expressions">Scalar functions and expressions</a></li>
   <li><a href="#types-and-literals">Types and literals</a></li>
+  <li><a href="#variant">VARIANT</a></li>
   <li><a href="#three-valued-logic">Three-valued logic</a></li>
   <li><a href="#databases-and-sessions">Databases and sessions</a></li>
   <li><a href="#stored-procedures">Stored procedures</a></li>

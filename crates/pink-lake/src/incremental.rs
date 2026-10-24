@@ -559,6 +559,13 @@ fn mix_value(h: &mut u64, v: &Value) {
             b[8..].copy_from_slice(&micros.to_le_bytes());
             mix(h, 9, &b);
         }
+        // The canonical key, so two rows whose VARIANTs are SQL-equal
+        // (`1` and `1.0`) hash equal.
+        Value::Variant(v) => {
+            let mut b = Vec::new();
+            pinkdb::variant::hash_key(v, &mut b);
+            mix(h, 10, &b);
+        }
     }
 }
 

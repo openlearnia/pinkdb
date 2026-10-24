@@ -485,6 +485,38 @@ fn interval_is_refused_naming_the_column() {
     cleanup(&dir);
 }
 
+/// Wave 101a: parquet VARIANT needs the shredded (metadata + value buffer)
+/// representation, which is wave 101b; writing it as JSON text would produce a
+/// file that no reader could check against the DuckDB spec.
+#[test]
+fn variant_is_refused_naming_the_column_and_wave_101b() {
+    let dir = scratch("variant");
+    let src = table(
+        "vr",
+        vec![
+            ("ok".to_string(), DataType::Integer),
+            ("doc".to_string(), DataType::Variant),
+        ],
+        vec![vec![
+            Value::Integer(1),
+            Value::Variant(std::sync::Arc::new(
+                pinkdb::variant::from_json_str(r#"{"a":[1,2]}"#).unwrap(),
+            )),
+        ]],
+    );
+    let err = write_table(&src).unwrap_err();
+    assert!(matches!(err, WriteError::UnsupportedType { .. }), "{err:?}");
+    let text = err.to_string();
+    assert!(text.contains("doc"), "must name the column: {text}");
+    assert!(
+        text.to_lowercase().contains("variant"),
+        "must say what was refused: {text}"
+    );
+    assert!(text.contains("101b"), "must point at the plan: {text}");
+    assert!(!dir.join("data.parquet").exists());
+    cleanup(&dir);
+}
+
 #[test]
 fn lake_identity_is_written_to_the_footer() {
     let dir = scratch("identity");

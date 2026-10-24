@@ -76,7 +76,9 @@ use pinkdb::{DataType, Value};
 /// profiling flag, [`Response::ProfilingSet`] (tag 19) confirms it, and while
 /// it is on the server sends one [`Response::Profile`] (tag 20) after each
 /// statement's `Done` with that statement's timings and facts (wave 84).
-pub const PROTOCOL_VERSION: u32 = 10;
+/// v11: `VARIANT` value (tag 10) and dtype (tag 9) tags (wave 101a). A
+/// VARIANT rides as `u32 byte length | encoded value`.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -149,6 +151,9 @@ mod value_tag {
     /// `INTERVAL(months i32 | days i32 | micros i64)`.
     pub const DECIMAL: u8 = 8;
     pub const INTERVAL: u8 = 9;
+    /// v11: `VARIANT(u32 len | encoded value)` — the same per-value encoding
+    /// a `.pink` page stores.
+    pub const VARIANT: u8 = 10;
 }
 
 /// DataType tag bytes (one per [`DataType`] variant).
@@ -164,6 +169,8 @@ mod dtype_tag {
     /// carries no parameters.
     pub const DECIMAL: u8 = 7;
     pub const INTERVAL: u8 = 8;
+    /// v11: no parameters.
+    pub const VARIANT: u8 = 9;
 }
 
 // ---------- errors ----------
@@ -952,6 +959,13 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) -> Result<(), ProtocolError> {
             buf.extend_from_slice(&days.to_le_bytes());
             buf.extend_from_slice(&micros.to_le_bytes());
         }
+        Value::Variant(v) => {
+            put_u8(buf, value_tag::VARIANT);
+            let mut bytes = Vec::new();
+            pinkdb::variant::encode(v, &mut bytes);
+            put_u32(buf, count_u32(bytes.len(), "VARIANT value")?);
+            buf.extend_from_slice(&bytes);
+        }
     }
     Ok(())
 }
@@ -967,6 +981,7 @@ fn dtype_byte(dtype: DataType) -> u8 {
         DataType::Timestamp => dtype_tag::TIMESTAMP,
         DataType::Decimal { .. } => dtype_tag::DECIMAL,
         DataType::Interval => dtype_tag::INTERVAL,
+        DataType::Variant => dtype_tag::VARIANT,
     }
 }
 
@@ -1087,6 +1102,14 @@ impl<'a> Reader<'a> {
                     ]),
                 }
             }
+            value_tag::VARIANT => {
+                let len = self.u32(what)? as usize;
+                let bytes = self.take(len, what)?;
+                Value::Variant(std::sync::Arc::new(
+                    pinkdb::variant::decode(bytes)
+                        .map_err(|e| ProtocolError::Malformed(format!("bad VARIANT value: {e}")))?,
+                ))
+            }
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown value tag {other}"
@@ -1115,6 +1138,7 @@ impl<'a> Reader<'a> {
                 })?
             }
             dtype_tag::INTERVAL => DataType::Interval,
+            dtype_tag::VARIANT => DataType::Variant,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown data type tag {other}"

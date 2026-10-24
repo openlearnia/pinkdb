@@ -236,6 +236,12 @@ fn push_field(col: &mut Vector, field: &str, dtype: DataType) -> Result<()> {
             .map(Value::Timestamp)
             .ok_or_else(|| PinkDbError::Type(format!("cannot parse \"{c}\" as TIMESTAMP")))
             .and_then(|v| col.push_valid(v)),
+        // A CSV cell for a VARIANT column is JSON text (what CAST and SELECT
+        // print), so the round trip through a CSV export/import holds.
+        DataType::Variant => crate::variant::from_json_str(c)
+            .map(|v| Value::Variant(Arc::new(v)))
+            .map_err(|e| PinkDbError::Type(format!("cannot parse \"{c}\" as VARIANT: {e}")))
+            .and_then(|v| col.push_valid(v)),
     }
 }
 

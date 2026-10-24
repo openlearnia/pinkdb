@@ -94,7 +94,10 @@ enum {
     /* v1 additive: DECIMAL/INTERVAL render into `text` (canonical DuckDB
        forms); `i`/`d` are zero. */
     PINKDB_TYPE_DECIMAL = 8,
-    PINKDB_TYPE_INTERVAL = 9
+    PINKDB_TYPE_INTERVAL = 9,
+    /* v1 additive: VARIANT renders into `text` as its JSON value. Its DATE and
+       TIMESTAMP kinds print as ISO strings (they come back as VARCHAR). */
+    PINKDB_TYPE_VARIANT = 10
 };
 
 /* One result value, passed by value.

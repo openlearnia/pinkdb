@@ -330,6 +330,19 @@ pub(crate) fn value_literal(value: &Value) -> Result<String> {
                 )));
             }
         }
+        Value::Variant(v) => {
+            // VARIANT's literal form is its JSON text, which CAST reads back
+            // through the same parser. DATE/TIMESTAMP nodes have no JSON form,
+            // so they reject instead of silently replaying as strings.
+            if !v.is_json_exact() {
+                return Err(PinkDbError::Parameter(
+                    "a VARIANT containing DATE or TIMESTAMP cannot be written as a SQL \
+                     literal (JSON text cannot carry those kinds)"
+                        .to_string(),
+                ));
+            }
+            format!("CAST('{}' AS VARIANT)", v.to_json().replace('\'', "''"))
+        }
     })
 }
 

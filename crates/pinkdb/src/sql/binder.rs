@@ -85,6 +85,18 @@ pub enum ScalarFunc {
     Sign,
     Power,
     Mod,
+    /// `typeof(x)` — the argument's SQL type name (DuckDB spells it the same
+    /// way). Reads the argument's *vector* type, so a NULL cell still answers.
+    TypeOf,
+    /// `variant_type(v)` — the VARIANT's own kind (`OBJECT`, `BIGINT`, `NULL`,
+    /// …); SQL NULL stays NULL.
+    VariantType,
+    /// `variant_keys(v)` — an object's keys, sorted, as JSON array text (there
+    /// is no LIST type); `[]` for a non-object.
+    VariantKeys,
+    /// `variant_extract(v, path)` — the value at a JSONPath (`'a.b[0]'` or
+    /// `'$.a[0]'`); SQL NULL when the path is missing.
+    VariantExtract,
 }
 
 impl ScalarFunc {
@@ -118,6 +130,10 @@ impl ScalarFunc {
             "sign" => ScalarFunc::Sign,
             "power" | "pow" => ScalarFunc::Power,
             "mod" => ScalarFunc::Mod,
+            "typeof" => ScalarFunc::TypeOf,
+            "variant_type" => ScalarFunc::VariantType,
+            "variant_keys" => ScalarFunc::VariantKeys,
+            "variant_extract" => ScalarFunc::VariantExtract,
             _ => return None,
         })
     }
@@ -738,6 +754,12 @@ fn check_cast(from: DataType, to: DataType) -> Result<()> {
     if from == DataType::Varchar || to == DataType::Varchar {
         return Ok(());
     }
+    // VARIANT is the universal sink and the universal source: any value can
+    // be wrapped, and a VARIANT converts to a kind its target can read (the
+    // runtime errors on a kind mismatch, so TRY_CAST yields NULL).
+    if to == DataType::Variant || from == DataType::Variant {
+        return Ok(());
+    }
     // Boolean ↔ numeric.
     if (from == DataType::Boolean && to.is_numeric())
         || (from.is_numeric() && to == DataType::Boolean)
@@ -761,6 +783,7 @@ fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
         || (l == DataType::Date && r == DataType::Date)
         || (l == DataType::Timestamp && r == DataType::Timestamp)
         || (l == DataType::Interval && r == DataType::Interval)
+        || (l == DataType::Variant && r == DataType::Variant)
     {
         return match op {
             // LIKE only compares strings.
@@ -2163,15 +2186,17 @@ impl<'a> Binder<'a> {
             // callback `is_null` with the registered type tag.
             //
             // Everything else must equal the registered argument type — ABI
-            // v1 inserts no implicit casts — with one documented widening
-            // rule: a **DOUBLE parameter accepts any numeric argument**
+            // v1 inserts no implicit casts — with two documented widening
+            // rules: a **DOUBLE parameter accepts any numeric argument**
             // (INTEGER, BIGINT, DECIMAL) and the engine inserts the CAST to
             // DOUBLE that DuckDB applies implicitly, so `exp(1)`, `log(100)`
-            // and an integer or DECIMAL column all work like DuckDB. Every
-            // other declared type stays exact and keeps the CAST hint —
-            // VARCHAR included (`json_array(1)` and `ext_repeat('x', 1)`
-            // keep their documented errors): a string is not a number, and
-            // parsing one is not this ABI's job.
+            // and an integer or DECIMAL column all work like DuckDB; and a
+            // **VARCHAR parameter accepts a VARIANT**, whose text form is its
+            // JSON value, so the `json_*` functions read VARIANT directly as
+            // DuckDB's do. Every other declared type stays exact and keeps
+            // the CAST hint (`json_array(1)` and `ext_repeat('x', 1)` keep
+            // their documented errors): a string is not a number, and parsing
+            // one is not this ABI's job.
             let mut b = b;
             if !matches!(b, BoundExpr::Literal(Value::Null))
                 && crate::ext::ext_type_of(b.dtype()) != Some(want)
@@ -2180,6 +2205,11 @@ impl<'a> Binder<'a> {
                     b = BoundExpr::Cast {
                         expr: Box::new(b),
                         dtype: DataType::Double,
+                    };
+                } else if want == crate::ext::ExtType::Varchar && b.dtype() == DataType::Variant {
+                    b = BoundExpr::Cast {
+                        expr: Box::new(b),
+                        dtype: DataType::Varchar,
                     };
                 } else {
                     return Err(PinkDbError::Type(format!(
@@ -2311,6 +2341,7 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                 && t != DataType::Date
                 && t != DataType::Timestamp
                 && t != DataType::Interval
+                && t != DataType::Variant
             {
                 return Err(PinkDbError::Type(
                     "MIN/MAX need an orderable argument".to_string(),
@@ -2400,6 +2431,42 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
                 return Err(PinkDbError::Type("length needs VARCHAR".to_string()));
             }
             Ok(DataType::Integer)
+        }
+        // typeof answers with the argument's SQL type name, so it accepts any
+        // type (including VARIANT, where a column's type is what it reports).
+        ScalarFunc::TypeOf => {
+            arity(&[1])?;
+            Ok(DataType::Varchar)
+        }
+        ScalarFunc::VariantType | ScalarFunc::VariantKeys => {
+            arity(&[1])?;
+            // A bare NULL literal is typeless and answers NULL at run time.
+            if args[0].dtype() != DataType::Variant
+                && !matches!(args[0], BoundExpr::Literal(Value::Null))
+            {
+                return Err(PinkDbError::Type(format!(
+                    "{func:?} needs a VARIANT argument, got {}",
+                    args[0].dtype()
+                )));
+            }
+            Ok(DataType::Varchar)
+        }
+        ScalarFunc::VariantExtract => {
+            arity(&[2])?;
+            if args[0].dtype() != DataType::Variant
+                && !matches!(args[0], BoundExpr::Literal(Value::Null))
+            {
+                return Err(PinkDbError::Type(format!(
+                    "variant_extract needs a VARIANT argument, got {}",
+                    args[0].dtype()
+                )));
+            }
+            if args[1].dtype() != DataType::Varchar {
+                return Err(PinkDbError::Type(
+                    "variant_extract's path must be VARCHAR".to_string(),
+                ));
+            }
+            Ok(DataType::Variant)
         }
         ScalarFunc::Substr => {
             arity(&[2, 3])?;

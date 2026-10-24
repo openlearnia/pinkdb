@@ -643,6 +643,11 @@ fn eval_comparison(
                     &mut out,
                 )?;
             }
+            (VectorData::Variant(a), VectorData::Variant(b)) => {
+                // `variant::cmp` is the same total order (and equality) that
+                // `compare_values` uses, so `=` here agrees with GROUP BY.
+                cmp_loop(op, &l, &r, a, b, |x, y| crate::variant::cmp(x, y), &mut out)?;
+            }
             _ => unreachable!("same dtype implies same vector layout"),
         }
         return Ok(out);
@@ -1562,6 +1567,9 @@ fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vec
     }
     // Common single-arg functions read typed payloads directly (no per-row
     // `Vec<Value>`); rare shapes fall through to the generic row loop.
+    if let Some(out) = eval_scalar_typed(func, args)? {
+        return Ok(out);
+    }
     if let Some(out) = eval_scalar_fast(func, dtype, args)? {
         return Ok(out);
     }
@@ -1597,6 +1605,50 @@ fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vec
         out.push_valid(apply_scalar(func, dtype, &row)?)?;
     }
     Ok(out)
+}
+
+/// Scalar functions whose answer depends on the argument's *column type* (or
+/// on the VARIANT kind inside it) rather than on converting the row to a
+/// [`Value`]: a NULL cell still reports what it is, so these run before the
+/// any-NULL-in → NULL-out loop.
+fn eval_scalar_typed(func: ScalarFunc, args: &[Vector]) -> Result<Option<Vector>> {
+    let Some(src) = args.first() else {
+        return Ok(None);
+    };
+    let out = match func {
+        ScalarFunc::TypeOf => Vector::new_const(&Value::Varchar(src.dtype().name()), src.len()),
+        ScalarFunc::VariantType | ScalarFunc::VariantKeys => {
+            let want_kind = func == ScalarFunc::VariantType;
+            let mut out = Vector::new_empty(DataType::Varchar);
+            for i in 0..src.len() {
+                match src.get(i) {
+                    Value::Null => out.push_null()?,
+                    // DuckDB answers NULL for the variant-null: it has no type
+                    // name and no keys (DuckDB 2.0.0).
+                    Value::Variant(v) if matches!(&*v, crate::variant::Variant::Null) => {
+                        out.push_null()?
+                    }
+                    Value::Variant(v) if want_kind => {
+                        out.push_valid(Value::Varchar(v.type_name().to_string()))?
+                    }
+                    Value::Variant(v) => {
+                        out.push_valid(Value::Varchar(crate::variant::keys_json(&v)))?
+                    }
+                    other => {
+                        return Err(PinkDbError::Execution(format!(
+                            "{func:?} needs a VARIANT argument, got {}",
+                            other
+                                .data_type()
+                                .map_or_else(|| "NULL".to_string(), |t| t.name())
+                        )));
+                    }
+                }
+            }
+            out
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(out))
 }
 
 /// Typed fast paths for the common scalar functions. `Ok(None)` ⇒ arg
@@ -2041,6 +2093,20 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
             v => Err(PinkDbError::Execution(format!("sign of {v}"))),
         },
         ScalarFunc::Power => Ok(Value::Double(as_f64(&row[0])?.powf(as_f64(&row[1])?))),
+        ScalarFunc::VariantExtract => match (&row[0], &row[1]) {
+            (Value::Variant(v), Value::Varchar(path)) => {
+                let steps = crate::variant::parse_path(path)?;
+                Ok(match crate::variant::walk(v, &steps) {
+                    Some(x) => Value::Variant(std::sync::Arc::new(x.clone())),
+                    // The path does not exist: SQL NULL, not a variant null
+                    // (DuckDB agrees; `variant_type` of the result is NULL).
+                    None => Value::Null,
+                })
+            }
+            (v, path) => Err(PinkDbError::Execution(format!(
+                "variant_extract of {v} and {path}"
+            ))),
+        },
         ScalarFunc::Mod => match (&row[0], &row[1]) {
             (Value::Double(a), Value::Double(b)) => {
                 if *b == 0.0 {
@@ -2064,6 +2130,9 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
         },
         ScalarFunc::Concat | ScalarFunc::NullIf | ScalarFunc::Greatest | ScalarFunc::Least => {
             unreachable!("non-strict scalar reached the strict path")
+        }
+        ScalarFunc::TypeOf | ScalarFunc::VariantType | ScalarFunc::VariantKeys => {
+            unreachable!("evaluated by eval_scalar_typed")
         }
     }
 }
@@ -2275,6 +2344,13 @@ fn cast_out_of_range(v: &Value, target: DataType) -> PinkDbError {
 pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
     match (v, target) {
         (v, t) if v.data_type() == Some(t) => Ok(v),
+        // Every value becomes a VARIANT (VARCHAR parses as JSON text), and a
+        // VARIANT converts to whatever kind its target can read — a kind
+        // mismatch is an error here, which TRY_CAST turns into NULL.
+        (v, DataType::Variant) => {
+            crate::variant::from_value(&v).map(|x| Value::Variant(std::sync::Arc::new(x)))
+        }
+        (Value::Variant(x), t) => crate::variant::cast(&x, t),
         // Numeric tower (DuckDB rules): narrowing out of range is an error,
         // and float→int rounds half away from zero (NaN/±Inf error).
         (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),

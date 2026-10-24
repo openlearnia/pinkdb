@@ -5034,7 +5034,8 @@ fn canonical_sql_value(
         | DataType::Timestamp
         | DataType::Varchar
         | DataType::Decimal { .. }
-        | DataType::Interval => match canonical_to_ducklake(dtype, canonical) {
+        | DataType::Interval
+        | DataType::Variant => match canonical_to_ducklake(dtype, canonical) {
             Some(text) => SqlValue::Text(text),
             None => SqlValue::Text(canonical.to_string()),
         },
@@ -5273,6 +5274,7 @@ fn pink_dtype(ducklake: &str) -> pinkdb::DataType {
             pinkdb::DataType::Timestamp
         }
         "interval" => pinkdb::DataType::Interval,
+        "variant" => pinkdb::DataType::Variant,
         _ => pinkdb::DataType::Varchar,
     }
 }
@@ -5298,7 +5300,9 @@ fn canonical_to_ducklake(dtype: pinkdb::DataType, canonical: &str) -> Option<Str
             }
         }
         pinkdb::DataType::Varchar => canonical.to_string(),
-        pinkdb::DataType::Decimal { .. } | pinkdb::DataType::Interval => canonical.to_string(),
+        pinkdb::DataType::Decimal { .. }
+        | pinkdb::DataType::Interval
+        | pinkdb::DataType::Variant => canonical.to_string(),
     })
 }
 
@@ -5326,6 +5330,9 @@ fn ducklake_to_canonical(dtype: pinkdb::DataType, ducklake: &str) -> Option<Stri
             let value = crate::stats::decode_value(dtype, ducklake)?;
             crate::stats::encode_value(dtype, &value)?
         }
+        // VARIANT has no canonical text of its own (no min/max statistics are
+        // written for it); its JSON text passes through unchanged.
+        pinkdb::DataType::Variant => ducklake.to_string(),
     })
 }
 

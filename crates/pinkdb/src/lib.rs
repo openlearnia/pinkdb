@@ -81,6 +81,7 @@ pub mod table_source;
 pub mod text;
 pub mod trigger;
 pub mod types;
+pub mod variant;
 pub mod vector;
 pub mod wal;
 

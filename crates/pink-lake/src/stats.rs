@@ -330,6 +330,7 @@ pub(crate) fn dtype_name(dtype: DataType) -> String {
         DataType::Date => "date",
         DataType::Timestamp => "timestamp",
         DataType::Interval => "interval",
+        DataType::Variant => "variant",
         DataType::Decimal { .. } => unreachable!("handled above"),
     }
     .to_string()
@@ -352,6 +353,7 @@ pub(crate) fn dtype_from_name(name: &str) -> Option<DataType> {
         "date" => DataType::Date,
         "timestamp" => DataType::Timestamp,
         "interval" => DataType::Interval,
+        "variant" => DataType::Variant,
         _ => return None,
     })
 }
@@ -422,6 +424,9 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
                 micros: iv.micros,
             }
         }
+        // No writer emits VARIANT statistics (its kinds have no single order
+        // text), so nothing to decode.
+        DataType::Variant => return None,
     })
 }
 

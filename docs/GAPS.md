@@ -92,6 +92,17 @@ The 40b items below (WAL growth, write-before-log, bind/execute race, file locki
   blocks in 512 KiB. A proper fix bounds the executor by measured stack use
   (or grows the stack), rather than by call depth alone.
 
+## Open items found after wave 101a
+
+- **VARIANT spelling gaps** (wave 101a). There is no subscript operator in the
+  grammar, so `v['a']` / `v.a` do not parse for any type and extraction is
+  `variant_extract(v, 'a.b[0]')` (JSONPath, 0-based). `TRY_CAST` does not exist
+  for any type, so a failing VARIANT cast is an error. DuckDB's
+  `variant_extract_string`, `variant_array_length`, `variant_exists`,
+  `variant_normalize`, `variant_comparator` and the `variant_type(v, path)`
+  spelling are missing; the extension ABI refuses VARIANT (like DECIMAL);
+  Parquet VARIANT and shredded statistics are wave 101b.
+
 ## Docs drift and hygiene (wave 40c — closed)
 
 - `website/` still describes the deleted hand-written parser (`architecture.html`), protocol v2 (`server.html`), "wave 26 shipped" (`index.html`), stale test counts (`roadmap.html`), and TLS/RBAC as waves 45/47.

@@ -4402,6 +4402,9 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) {
                 + iv.micros as i128;
             push_be_i128(out, key, desc);
         }
+        // Unreachable: `encode_sort_keys` bails to the `Value` comparator for
+        // VARIANT, whose byte order is not the cross-kind sort order.
+        VectorData::Variant(_) => unreachable!("VARIANT sort keys use the Value comparator"),
     }
 }
 
@@ -4439,6 +4442,12 @@ fn encode_sort_keys(
                 Some(_) => return None,
             }
         }
+    }
+    // VARIANT sorts by the cross-kind total order and one chunk may mix kinds,
+    // so no byte encoding reproduces `compare_values`; the caller's `Value`
+    // comparator (first-seen ties) takes over.
+    if dtypes.contains(&DataType::Variant) {
+        return None;
     }
     // Encode chunks in parallel into per-chunk buffers, then concatenate in
     // chunk order (offsets shifted by each chunk's base), so the arena stays

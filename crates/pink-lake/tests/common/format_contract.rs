@@ -114,6 +114,7 @@ fn engine_types() -> Vec<(String, DataType)> {
             },
         ),
         ("iv", DataType::Interval),
+        ("vr", DataType::Variant),
     ])
 }
 
@@ -209,6 +210,26 @@ fn special_values(dtype: DataType) -> Vec<Value> {
                 Value::Null,
                 Value::Decimal(max / 3, scale),
                 Value::Decimal(-42, scale),
+            ]
+        }
+        // Kinds a JSON-text encoding would flatten (DATE, TIMESTAMP, a
+        // DOUBLE that prints as an integer) sit next to the plain JSON shapes,
+        // so a lossy provider cannot pass this corpus.
+        DataType::Variant => {
+            let v = |json: &str| {
+                Value::Variant(Arc::new(
+                    pinkdb::variant::from_json_str(json).expect("the variant corpus is valid JSON"),
+                ))
+            };
+            vec![
+                v(r#"{"a": 1, "b": [2, 2.5, "x"]}"#),
+                v(r#""19000-01-01"::DATE"#.trim_end_matches("::DATE")),
+                Value::Null,
+                v("1.0"),
+                v("-1234567890123.456789"),
+                Value::Null,
+                v(r#"{"nested": {"deep": [true, null, {"n": -2}]}}"#),
+                v(r#""héllo 世界 🚀""#),
             ]
         }
         DataType::Interval => vec![
@@ -314,6 +335,9 @@ fn sample_value(dtype: DataType) -> Value {
             days: 2,
             micros: 3,
         },
+        DataType::Variant => Value::Variant(Arc::new(
+            pinkdb::variant::from_json_str("\"blocked\"").expect("valid JSON"),
+        )),
     }
 }
 

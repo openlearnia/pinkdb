@@ -9,6 +9,52 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-24
+### Wave 101a — the `VARIANT` type core ✅
+- **The type.** `VARIANT` is now a column type: one column, any shape per row —
+  a JSON null, boolean, integer, double, decimal, string, date/timestamp, array
+  or object. Values live in a binary, self-describing encoding (a kind tag per
+  value plus the payload), not in JSON text, and objects keep their keys sorted
+  so equal objects encode identically. `typeof(v)` reports `'VARIANT'`.
+- **Casts.** Any type → `VARIANT`; `VARIANT` → every scalar, with an error that
+  names the kind and the value (`cannot CAST VARIANT(VARCHAR) value "hi" to
+  INTEGER`) instead of a wrong answer. `'{"a":1}'::VARIANT` parses JSON — the
+  literal form the parser, the WAL and prepared statements already carry (this
+  is where we differ from DuckDB, where `VARCHAR → VARIANT` is the identity
+  and the JSON extension is required first). A JSON null reads as SQL `NULL`
+  for every target except `VARCHAR`, which keeps the text `null`, so
+  `VARIANT → VARCHAR → VARIANT` is lossless for JSON's value model.
+- **Functions.** `variant_type(v)`, `variant_keys(v)` (a JSON array of the
+  keys; pinkdb has no list type yet) and `variant_extract(v, path)` with
+  0-based JSONPath (`'a.b[1]'`, `'$.a[0]'`) — a missing path is SQL `NULL`.
+  The JSON extension's functions (`json_extract`, `json_array_length`, …)
+  accept a `VARIANT` and see its JSON text.
+- **Semantics, defined and tested.** Equality is structural, with numbers
+  comparing by value across kinds (`1` = `1.0` = `1.00`, `'1'` ≠ `1`). One
+  documented total order serves `ORDER BY`, `MIN`/`MAX` and range comparisons:
+  bool < number < string < date < timestamp < array < object < JSON null, with
+  SQL `NULL` last. `GROUP BY`, `DISTINCT` and joins hash a canonical key that
+  agrees with `=` by construction. A JSON null is its own group and is never
+  equal to SQL `NULL`.
+- **Persistence.** New `.pink` dtype tag (9) and default-value tag; a
+  `VARIANT` column survives save/open, WAL replay, checkpoint and
+  `ALTER TABLE … ADD COLUMN … DEFAULT`. VARIANT chunks carry no min/max
+  statistics. An older build that meets the new tag reports a clear
+  `corrupt file: bad dtype tag 9` — no legacy reader.
+- **Encodings elsewhere.** Wire protocol v11 (new dtype and value tags; a
+  `VARIANT` rides as a length-prefixed blob so an old client fails cleanly);
+  FFI `PINKDB_TYPE_VARIANT` (the JSON text); the JS/WASM binding hands it over
+  as a native JSON value. Refused with clear errors: the extension C ABI
+  (like `DECIMAL`), the Arrow extension, and Parquet write.
+- **Lake.** A `VARIANT` column round-trips in a `.pink` lake data file; a
+  Parquet-format lake refuses it with a message naming wave 101b rather than
+  writing it as text.
+- **Not in this wave.** `TRY_CAST` (does not exist anywhere in pinkdb),
+  DuckDB's `variant_extract_string`/`variant_array_length`/`variant_exists`/
+  `variant_normalize`/`variant_comparator`, array/field subscript syntax
+  (`v['a']`), and Parquet `VARIANT` — that is 101b, together with shredding
+  into typed sub-columns and statistics on shredded paths. The plan for it,
+  the full tag table, the semantics and every deliberate difference from
+  DuckDB are written in `docs/wave-101-plan.md`.
 ### Wave 100 — Triggers ✅
 - **Triggers.** `CREATE [OR REPLACE] TRIGGER name {BEFORE|AFTER}
   {INSERT|UPDATE [OF col, …]|DELETE} [OR …] ON table [REFERENCING OLD TABLE

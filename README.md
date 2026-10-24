@@ -234,6 +234,75 @@ LIMIT n [OFFSET m] | OFFSET m;
 -- (uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL).
 ```
 
+### VARIANT (wave 101a)
+
+A `VARIANT` column holds a value whose shape can differ from row to row — a
+JSON null, boolean, integer, double, decimal, string, date/timestamp, array or
+object — the semi-structured type DuckDB 2.0 and DuckLake define. Values are
+stored columnar in a binary, self-describing encoding (a kind tag per value,
+object keys kept sorted), never as JSON text, and a query that does not mention
+a `VARIANT` column takes no new path.
+
+```sql
+CREATE TABLE events (id BIGINT, payload VARIANT);
+INSERT INTO events VALUES
+  (1, '{"a": 1, "b": [2, 2.5, "x"]}'),      -- VARCHAR parses as JSON
+  (2, CAST(42 AS VARIANT)),                 -- every type widens
+  (3, CAST('null' AS VARIANT)),             -- a JSON null is a value
+  (4, NULL);                                -- SQL NULL is no value
+SELECT typeof(payload), variant_type(payload), variant_keys(payload) FROM events;
+SELECT variant_extract(payload, 'b[1]') FROM events;   -- 2.5
+SELECT CAST(payload AS VARCHAR) FROM events;           -- JSON text
+```
+
+Casts go both ways. `VARIANT → VARCHAR` yields JSON text, and that round trip
+is lossless for JSON's value model (sorted keys, raw unicode, integral numbers
+stay integers, fractional ones stay exact decimals — `1.0` keeps its digit —
+and `NaN`/`Infinity`/`-Infinity` keep their spellings); `DATE` and
+`TIMESTAMP` print as ISO strings and read back as strings, which is why
+persistence and the wire use the binary encoding instead. `VARIANT → INTEGER`
+/ `BIGINT` / `DOUBLE` / `DECIMAL` / `BOOLEAN` / `DATE` / `TIMESTAMP` accepts a
+matching kind, a JSON string that parses as that value (like DuckDB), and
+rounds a fractional number half away from zero; when the shape does not fit the
+cast errors with the kind and the value
+(`cannot CAST VARIANT(VARCHAR) value "hi" to INTEGER`). A JSON null reads as
+SQL `NULL` for every target except `VARCHAR`, which keeps the text `null`.
+There is no `TRY_CAST` in pinkdb, so a failing cast is an error.
+
+Unlike DuckDB, `VARCHAR → VARIANT` **parses JSON** rather than copying the
+string, so `'{"a":1}'::VARIANT` is the object; this is what gives the type a
+literal form that the parser, the WAL and prepared statements already carry
+(DuckDB needs the JSON extension's `json()` first).
+
+Functions: `typeof(v)` (`'VARIANT'`), `variant_type(v)` (`NULL`, `BOOL`,
+`BIGINT`, `DOUBLE`, `DECIMAL`, `VARCHAR`, `DATE`, `TIMESTAMP`, `ARRAY`,
+`OBJECT`), `variant_keys(v)` (an object's keys as JSON array text —
+`'["a","b"]'` — because pinkdb has no list type yet) and
+`variant_extract(v, path)` with 0-based JSONPath (`'a.b[1]'`, `'$.a[0]'`;
+a missing path is SQL `NULL`). There is no subscript operator, so
+`payload['a']` does not parse. The JSON extension's functions
+(`json_extract`, `json_array_length`, `json_valid`, …) accept a `VARIANT`
+and see its JSON text.
+
+Semantics are defined and tested: equality is structural with numbers compared
+by value across kinds (`1` = `1.0` = `1.00`; `'1'` ≠ `1`), one total order
+serves `ORDER BY`/`MIN`/`MAX` (boolean < number < string < date < timestamp <
+array < object < JSON null, SQL `NULL` last), and `GROUP BY`/`DISTINCT`/join
+keys hash a canonical key that agrees with `=` by construction. A JSON null is
+its own group and is never equal to SQL `NULL`.
+
+Persistence: `.pink` gained dtype tag 9 (a column) and default-value tag 9, so
+a `VARIANT` column survives save/open, WAL replay, checkpoint and
+`ALTER TABLE … ADD COLUMN … DEFAULT`; VARIANT chunks carry no min/max
+statistics. An older build that meets the new tag reports a clear
+`corrupt file: bad dtype tag 9` — no legacy reader. The C ABI exposes
+`PINKDB_TYPE_VARIANT` with the JSON text, the JS/WASM binding hands it over as
+a native JSON value, and the extension ABI, the Arrow extension and Parquet
+write refuse it with a clear error (Parquet `VARIANT` is wave 101b, together
+with shredding and statistics on shredded paths — plan in
+[`docs/wave-101-plan.md`](docs/wave-101-plan.md)). A `.pink` lake data file
+round-trips a `VARIANT` column.
+
 ### Browser playground
 
 The docs site's **Playground** page (wave 85) runs the real engine compiled
@@ -1138,12 +1207,14 @@ NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP; `DataType` tag byte), then
 { user }` answers `Login`; so neither side parses SQL just to count
 statements. A failing statement ends the batch with a single
 `Error { message }` instead; SQL errors arrive as `Error` frames and the
-connection stays open. The protocol version is **10** (v2 added the
+connection stays open. The protocol version is **11** (v2 added the
 `BatchDone` terminator, v3 `LoadedExtension`, v4 `Checkpointed`, v5
 prepared statements, v6 DECIMAL/INTERVAL, v7 `AlteredTable`, v8 `Called`,
 v9 the `Login`/`LoggedIn` frames and the RBAC `Done` kinds, v10 query
 profiles: `SetProfiling { enabled }` → `ProfilingSet`, after which every
-statement's `Done` is followed by one `Profile` frame).
+statement's `Done` is followed by one `Profile` frame, v11 `VARIANT`: dtype
+tag 9 and value tag 10 carrying the binary value as `u32 length | bytes`, so a
+client that predates it reports an unknown tag instead of mis-reading one).
 
 The client (`pinkdb_server::Client`) reconstructs pinkdb's public
 `QueryResult`/`Value`/`DataType`, so the CLI renders remote results with the

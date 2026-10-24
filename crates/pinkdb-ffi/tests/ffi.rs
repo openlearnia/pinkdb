@@ -38,10 +38,12 @@ fn durable_roundtrip_through_the_c_abi() {
     assert!(!h.is_null(), "open failed: {}", last_error());
     let r = exec(
         h,
-        "CREATE TABLE t (i INTEGER, b BIGINT, d DOUBLE, s VARCHAR, dt DATE, ts TIMESTAMP);
+        "CREATE TABLE t (i INTEGER, b BIGINT, d DOUBLE, s VARCHAR, dt DATE, ts TIMESTAMP, va VARIANT);
          INSERT INTO t VALUES
-           (-2147483647 - 1, 9223372036854775807, -0.0, '', DATE '1970-01-01', TIMESTAMP '1970-01-01 00:00:00.000001'),
-           (NULL, NULL, NULL, NULL, NULL, NULL);",
+           (-2147483647 - 1, 9223372036854775807, -0.0, '', DATE '1970-01-01',
+            TIMESTAMP '1970-01-01 00:00:00.000001',
+            CAST('{\"a\":[1,2.5,\"s\",null,true]}' AS VARIANT)),
+           (NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
     );
     assert_eq!(pinkdb_result_kind(r, 1), PINKDB_STMT_INSERTED);
     assert_eq!(pinkdb_result_affected(r, 1), 2);
@@ -51,7 +53,7 @@ fn durable_roundtrip_through_the_c_abi() {
     // Reopen the durable store (checkpoint + WAL) and read everything back.
     let h = pinkdb_open(cpath.as_ptr());
     assert!(!h.is_null(), "reopen failed: {}", last_error());
-    let r = exec(h, "SELECT i, b, d, s, dt, ts FROM t ORDER BY b;");
+    let r = exec(h, "SELECT i, b, d, s, dt, ts, va FROM t ORDER BY b;");
     assert_eq!(pinkdb_result_statement_count(r), 1);
     assert_eq!(pinkdb_result_row_count(r, 0), 2);
     let v = pinkdb_result_value(r, 0, 0, 0);
@@ -73,11 +75,21 @@ fn durable_roundtrip_through_the_c_abi() {
     assert_eq!((v.type_tag, v.int64), (PINKDB_TYPE_DATE, 0));
     let v = pinkdb_result_value(r, 0, 0, 5);
     assert_eq!((v.type_tag, v.int64), (PINKDB_TYPE_TIMESTAMP, 1));
-    for col in 0..6 {
+    // A VARIANT crosses as its JSON text (wave 101a); DATE/TIMESTAMP kinds
+    // would print ISO strings and cannot be carried back exactly.
+    let v = pinkdb_result_value(r, 0, 0, 6);
+    assert_eq!(v.type_tag, PINKDB_TYPE_VARIANT);
+    assert_eq!(
+        text(&v),
+        r#"{"a":[1,2.5,"s",null,true]}"#,
+        "VARIANT crosses as JSON text"
+    );
+    for col in 0..7 {
         let v = pinkdb_result_value(r, 0, 1, col);
         assert_eq!(v.is_null, 1, "column {col} should be NULL");
     }
     assert_eq!(pinkdb_result_column_type(r, 0, 5), PINKDB_TYPE_TIMESTAMP);
+    assert_eq!(pinkdb_result_column_type(r, 0, 6), PINKDB_TYPE_VARIANT);
     pinkdb_result_free(r);
     pinkdb_close(h);
 

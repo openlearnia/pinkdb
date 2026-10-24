@@ -143,6 +143,13 @@ pub fn arrow_type(dtype: DataType) -> Result<ArrowType> {
         DataType::Timestamp => ArrowType::Timestamp(TimeUnit::Microsecond, None),
         DataType::Decimal { precision, scale } => ArrowType::Decimal128(precision, scale as i8),
         DataType::Interval => ArrowType::Interval(IntervalUnit::MonthDayNano),
+        DataType::Variant => {
+            return Err(PinkDbError::Type(
+                "arrow has no VARIANT type pinkdb can write exactly; the arrow extension \
+                 refuses rather than flattening it to text"
+                    .to_string(),
+            ));
+        }
     })
 }
 

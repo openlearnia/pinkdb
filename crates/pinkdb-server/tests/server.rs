@@ -595,7 +595,7 @@ fn mismatched_hello_is_rejected() {
     handle.join();
 }
 
-/// v10: a version-9 client is refused cleanly at the handshake (the server
+/// v11: a version-9 client is refused cleanly at the handshake (the server
 /// names both versions and closes), exactly like any other mismatch.
 #[test]
 fn a_version_9_hello_is_refused() {
@@ -613,7 +613,7 @@ fn a_version_9_hello_is_refused() {
     match protocol::read_response(&mut reader).unwrap() {
         Response::Error { message } => {
             assert!(message.contains("protocol version mismatch"), "{message}");
-            assert!(message.contains("server speaks v10"), "{message}");
+            assert!(message.contains("server speaks v11"), "{message}");
             assert!(message.contains("asked for v9"), "{message}");
         }
         other => panic!("expected Error, got {other:?}"),

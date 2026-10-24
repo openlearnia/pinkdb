@@ -416,6 +416,7 @@ impl Drop for ActiveGuard {
 /// Encoded size of one row (tag byte + payload per value), used to batch
 /// `Rows` frames without materializing them first.
 fn row_encoded_len(row: &[Value]) -> usize {
+    let mut scratch = Vec::new();
     row.iter()
         .map(|value| {
             1 + match value {
@@ -426,6 +427,14 @@ fn row_encoded_len(row: &[Value]) -> usize {
                 Value::Decimal(_, _) => 16 + 1,
                 Value::Interval { .. } => 16,
                 Value::Varchar(s) => 4 + s.len(),
+                // A VARIANT's wire length is its encoding's length; encoding
+                // into a reused buffer keeps the frame-size estimate exact so
+                // one frame never grows past `MAX_FRAME_SIZE`.
+                Value::Variant(v) => {
+                    scratch.clear();
+                    pinkdb::variant::encode(v, &mut scratch);
+                    4 + scratch.len()
+                }
             }
         })
         .sum()

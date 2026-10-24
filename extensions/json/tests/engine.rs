@@ -474,3 +474,63 @@ fn durable_records_touching_json_replay() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Wave 101a: the six functions declare `VARCHAR` arguments, and the binder
+/// inserts the one documented widening `VARIANT → VARCHAR` (the JSON text), so
+/// they read a VARIANT column directly — DuckDB's `json_*` accept VARIANT too.
+#[test]
+fn variant_arguments_reach_json_functions_as_their_text_form() {
+    let mut db = db_with_json();
+    db.execute("CREATE TABLE v (id INTEGER, doc VARIANT);")
+        .unwrap();
+    db.execute(
+        "INSERT INTO v VALUES
+             (1, CAST('{\"a\": {\"b\": [1, 2]}}' AS VARIANT)),
+             (2, CAST('[1,2,3]' AS VARIANT)),
+             (3, CAST('null' AS VARIANT));",
+    )
+    .unwrap();
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT json_extract(doc, '$.a.b[1]') FROM v WHERE id = 1;"
+        )
+        .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT json_array_length(doc) FROM v WHERE id = 2;"
+        ),
+        Value::Bigint(3)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT json_valid(doc) FROM v WHERE id = 1;"),
+        Value::Boolean(true)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT json_valid(doc) FROM v WHERE id = 3;"),
+        Value::Boolean(true)
+    );
+    // A JSON null stays the text `null`, which `json_extract` then sees as a
+    // JSON null document rather than SQL NULL.
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT json_extract(doc, '$.a') IS NULL FROM v WHERE id = 3;"
+        ),
+        Value::Boolean(true)
+    );
+    // The variant functions and the JSON functions cross: extract a value,
+    // then read it as JSON again.
+    assert_eq!(
+        text(
+            &mut db,
+            "SELECT json_extract(CAST(variant_extract(doc, 'a') AS VARCHAR), '$.b[0]') \
+             FROM v WHERE id = 1;"
+        )
+        .as_deref(),
+        Some("1")
+    );
+}

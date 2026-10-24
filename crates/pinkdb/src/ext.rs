@@ -98,6 +98,11 @@ pub(crate) fn ext_type_of(dtype: DataType) -> Option<ExtType> {
         // rejects such arguments with its usual message.
         DataType::Interval => Some(ExtType::Interval),
         DataType::Decimal { .. } => None,
+        // VARIANT has no ABI type (nor does DECIMAL): the binder's exact-type
+        // check rejects it as an argument or return type with a clear error.
+        // Pushing it through the C ABI needs a byte-string payload and a
+        // follow-up, so extensions cannot read or build one for now.
+        DataType::Variant => None,
     }
 }
 
@@ -574,6 +579,8 @@ pub(crate) fn push_ext_arg<'a>(
         VectorData::Decimal { .. } => {
             unreachable!("extensions v1 do not accept DECIMAL arguments")
         }
+        // Same for VARIANT.
+        VectorData::Variant(_) => unreachable!("extensions v1 do not accept VARIANT arguments"),
     });
 }
 

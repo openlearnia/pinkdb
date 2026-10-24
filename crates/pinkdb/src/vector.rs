@@ -31,6 +31,9 @@ pub enum VectorData {
     },
     /// INTERVAL: DuckDB's `(months, days, micros)` triples.
     Interval(Vec<Interval>),
+    /// VARIANT: one shared semi-structured tree per row (see
+    /// [`crate::variant`]).
+    Variant(Vec<Arc<crate::variant::Variant>>),
 }
 
 impl VectorData {
@@ -50,6 +53,7 @@ impl VectorData {
                 scale: *scale,
             },
             VectorData::Interval(_) => DataType::Interval,
+            VectorData::Variant(_) => DataType::Variant,
         }
     }
 
@@ -70,6 +74,7 @@ impl VectorData {
             VectorData::TimestampMicros(v) => v.len(),
             VectorData::Decimal { values, .. } => values.len(),
             VectorData::Interval(v) => v.len(),
+            VectorData::Variant(v) => v.len(),
         }
     }
 
@@ -88,6 +93,7 @@ impl VectorData {
                 scale,
             },
             DataType::Interval => VectorData::Interval(Vec::with_capacity(cap)),
+            DataType::Variant => VectorData::Variant(Vec::with_capacity(cap)),
         }
     }
 }
@@ -185,6 +191,8 @@ impl Vector {
                 ]),
                 true,
             ),
+            // A constant VARIANT shares one tree across the rows.
+            Value::Variant(x) => (VectorData::Variant(vec![Arc::clone(x); n]), true),
         };
         let mut validity = vec![if all_valid { u64::MAX } else { 0 }; mask_len(n)];
         if all_valid && !n.is_multiple_of(64) {
@@ -225,6 +233,7 @@ impl Vector {
             VectorData::TimestampMicros(v) => v.push(0),
             VectorData::Decimal { values, .. } => values.push(0),
             VectorData::Interval(v) => v.push(Interval::default()),
+            VectorData::Variant(v) => v.push(Arc::new(crate::variant::Variant::Null)),
         }
     }
 
@@ -336,6 +345,7 @@ impl Vector {
                 days: v[idx].days,
                 micros: v[idx].micros,
             },
+            VectorData::Variant(v) => Value::Variant(Arc::clone(&v[idx])),
         }
     }
 
@@ -380,6 +390,7 @@ impl Vector {
                 days,
                 micros,
             }),
+            (VectorData::Variant(v), Value::Variant(x)) => v.push(x),
             (data, other) => {
                 return Err(PinkDbError::Type(format!(
                     "type mismatch: cannot push {other} into {:?} vector",
@@ -580,6 +591,7 @@ impl Vector {
                     micros,
                 }
             }
+            (VectorData::Variant(v), Value::Variant(x)) => v[idx] = x,
             (_, Value::Null) => {} // placeholder stays; bit cleared below
             (data, other) => {
                 return Err(PinkDbError::Type(format!(
@@ -665,6 +677,13 @@ impl Vector {
                 let key = crate::types::interval_key(iv.months, iv.days, iv.micros);
                 buf.extend_from_slice(&key.to_le_bytes());
             }
+            // VARIANT: the canonical hash key (see `variant::hash_key`), which
+            // is byte-equal exactly when `compare_values` reports equality —
+            // `1`, `1.0` and a DECIMAL 1.0 land in one bucket.
+            VectorData::Variant(v) => {
+                buf.push(10);
+                crate::variant::hash_key(&v[idx], buf);
+            }
         }
     }
     /// Copy element `idx` from `other` into `self` (for UPDATE-adjacent
@@ -694,6 +713,7 @@ impl Vector {
                 d.push(s[idx])
             }
             (VectorData::Interval(d), VectorData::Interval(s)) => d.push(s[idx]),
+            (VectorData::Variant(d), VectorData::Variant(s)) => d.push(Arc::clone(&s[idx])),
             _ => {
                 return Err(PinkDbError::Execution(
                     "push_from needs matching vector types".to_string(),

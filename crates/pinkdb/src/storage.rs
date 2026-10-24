@@ -552,6 +552,12 @@ impl DataTable {
             (Value::Varchar(s), DataType::Varchar) => Ok(Value::Varchar(s)),
             (Value::Date(d), DataType::Date) => Ok(Value::Date(d)),
             (Value::Timestamp(us), DataType::Timestamp) => Ok(Value::Timestamp(us)),
+            // Any value can widen to VARIANT (the same matrix as CAST), and a
+            // VARIANT value is stored as it is.
+            (Value::Variant(v), DataType::Variant) => Ok(Value::Variant(v)),
+            (other, DataType::Variant) => {
+                crate::variant::from_value(&other).map(|v| Value::Variant(std::sync::Arc::new(v)))
+            }
             // DECIMAL/INTERVAL columns accept numeric values and string cells
             // (parsed like an implicit cast), mirroring DuckDB's INSERT/CSV
             // behavior.
@@ -769,6 +775,9 @@ impl DataTable {
             (DataType::Integer, DataType::Bigint)
             | (DataType::Integer, DataType::Double)
             | (DataType::Bigint, DataType::Double) => true,
+            // Widening into VARIANT; the other direction needs an explicit
+            // CAST because it can fail per row.
+            (_, DataType::Variant) => true,
             _ => false,
         }
     }

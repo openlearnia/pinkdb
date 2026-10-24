@@ -2221,6 +2221,9 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
                 micros: *bu,
             },
         ),
+        // VARIANT: the documented cross-kind total order (`variant::cmp`),
+        // which is also its equality and its hash key.
+        (Value::Variant(x), Value::Variant(y)) => crate::variant::cmp(x, y),
         // Binder rejects mixed-type comparisons; order deterministically anyway.
         _ => format!("{a:?}").cmp(&format!("{b:?}")),
     }

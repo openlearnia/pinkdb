@@ -20,12 +20,12 @@ fn pink_meets_the_format_contract() {
 fn parquet_meets_the_format_contract() {
     pink_lake_parquet::register().unwrap();
     // Parquet has no INTERVAL logical type in the writer
-    // (`pinkdb_parquet::write` refuses it), so INTERVAL is the one allowed
-    // refusal.
+    // (`pinkdb_parquet::write` refuses it), and VARIANT needs the shredded
+    // representation of wave 101b, so those are the two allowed refusals.
     run_contract(
         "parquet",
         ContractOptions {
-            refused_types: vec![DataType::Interval],
+            refused_types: vec![DataType::Interval, DataType::Variant],
         },
     );
 }

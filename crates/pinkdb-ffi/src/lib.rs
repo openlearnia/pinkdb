@@ -95,6 +95,11 @@ pub const PINKDB_TYPE_TIMESTAMP: i32 = 7;
 /// forms) in `text`/`text_len`; `i`/`d` stay zero.
 pub const PINKDB_TYPE_DECIMAL: i32 = 8;
 pub const PINKDB_TYPE_INTERVAL: i32 = 9;
+/// v1 additive: a VARIANT renders into `text` as its JSON value. The DATE and
+/// TIMESTAMP kinds inside it print as ISO strings there and come back as
+/// VARCHAR from a C-side parse — the C ABI has no slot for those kinds, so
+/// the extension ABI refuses VARIANT instead of pretending.
+pub const PINKDB_TYPE_VARIANT: i32 = 10;
 
 // ----- thread-local error -----
 
@@ -266,6 +271,17 @@ impl Cell {
                     text: Some(b),
                 }
             }
+            Value::Variant(v) => {
+                let mut b = v.to_json().into_bytes();
+                b.push(0);
+                Cell {
+                    tag: PINKDB_TYPE_VARIANT,
+                    is_null: false,
+                    i: 0,
+                    d: 0.0,
+                    text: Some(b),
+                }
+            }
             Value::Interval {
                 months,
                 days,
@@ -311,6 +327,7 @@ fn dtype_tag(t: DataType) -> i32 {
         DataType::Timestamp => PINKDB_TYPE_TIMESTAMP,
         DataType::Decimal { .. } => PINKDB_TYPE_DECIMAL,
         DataType::Interval => PINKDB_TYPE_INTERVAL,
+        DataType::Variant => PINKDB_TYPE_VARIANT,
     }
 }
 
@@ -1281,6 +1298,31 @@ mod tests {
         let n = unsafe { CStr::from_ptr(pinkdb_result_name(r, 0)) };
         assert_eq!(n.to_str().unwrap(), "v");
         assert_eq!(pinkdb_result_kind(r, 1), PINKDB_STMT_DROPPED_VIEW);
+        pinkdb_result_free(r);
+        close(h);
+    }
+
+    /// Wave 101a: a VARIANT column reports `PINKDB_TYPE_VARIANT` and each cell
+    /// carries its JSON text (the only exact spelling the C ABI has).
+    #[test]
+    fn variant_crosses_as_json_text() {
+        let h = pinkdb_open_memory();
+        let r = exec_ok(
+            h,
+            "SELECT CAST('{\"a\":[1,true,null]}' AS VARIANT) AS v,
+                    CAST('null' AS VARIANT) AS n,
+                    CAST(NULL AS VARIANT) AS m;",
+        );
+        assert_eq!(pinkdb_result_column_type(r, 0, 0), PINKDB_TYPE_VARIANT);
+        let v = pinkdb_result_value(r, 0, 0, 0);
+        assert_eq!((v.type_tag, v.is_null), (PINKDB_TYPE_VARIANT, 0));
+        assert_eq!(text_of(&v), r#"{"a":[1,true,null]}"#);
+        // A JSON null is a value, not a SQL NULL.
+        let n = pinkdb_result_value(r, 0, 0, 1);
+        assert_eq!((n.type_tag, n.is_null), (PINKDB_TYPE_VARIANT, 0));
+        assert_eq!(text_of(&n), "null");
+        let m = pinkdb_result_value(r, 0, 0, 2);
+        assert_eq!((m.type_tag, m.is_null), (PINKDB_TYPE_NULL, 1));
         pinkdb_result_free(r);
         close(h);
     }

@@ -75,6 +75,11 @@ pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             let key = crate::types::interval_key(*months, *days, *micros);
             buf.extend_from_slice(&key.to_le_bytes());
         }
+        // VARIANT: the canonical hash key (same as the vector path).
+        Value::Variant(v) => {
+            buf.push(10);
+            crate::variant::hash_key(v, buf);
+        }
     }
 }
 
@@ -831,6 +836,7 @@ fn cell_value(data: &VectorData, i: usize) -> Value {
             days: d[i].days,
             micros: d[i].micros,
         },
+        VectorData::Variant(d) => Value::Variant(std::sync::Arc::clone(&d[i])),
     }
 }
 

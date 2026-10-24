@@ -240,7 +240,8 @@ pub fn alpha_type_name(ty: DataType) -> Option<String> {
         | DataType::Varchar
         | DataType::Date
         | DataType::Timestamp
-        | DataType::Interval => ty.name(),
+        | DataType::Interval
+        | DataType::Variant => ty.name(),
         DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
     })
 }

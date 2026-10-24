@@ -2686,6 +2686,12 @@ fn encode_key(value: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&days.to_le_bytes());
             out.extend_from_slice(&micros.to_le_bytes());
         }
+        // the stored encoding (not the canonical hash key): the replica must
+        // hold the source's exact values, kinds included.
+        Value::Variant(v) => {
+            out.push(10);
+            pinkdb::variant::encode(v, out);
+        }
     }
 }
 

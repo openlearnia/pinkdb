@@ -22,6 +22,12 @@ fn response_round_trip(response: Response) {
     assert_eq!(decoded, response);
 }
 
+/// A VARIANT value from its JSON text (the tests spell values the way a user
+/// would).
+fn variant(json: &str) -> std::sync::Arc<pinkdb::variant::Variant> {
+    std::sync::Arc::new(pinkdb::variant::from_json_str(json).expect(json))
+}
+
 /// Hand-build a frame (length prefix + type + body) for malformed cases.
 fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -69,11 +75,11 @@ fn requests_round_trip() {
 
 /// Wave 48 pins the wire surface of protocol v9: the version number, the
 /// `Login`/`LoggedIn` tags, and the seven RBAC `Done` kinds. Wave 84 adds the
-/// v10 profiling messages; a change here is a protocol change and must bump
-/// [`PROTOCOL_VERSION`].
+/// v10 profiling messages; wave 101a adds the VARIANT value and dtype tags.
+/// A change here is a protocol change and must bump [`PROTOCOL_VERSION`].
 #[test]
-fn protocol_v10_pins_the_profiling_frames_and_keeps_the_v9_surface() {
-    assert_eq!(PROTOCOL_VERSION, 10);
+fn protocol_v11_pins_the_variant_tags_and_keeps_the_v10_surface() {
+    assert_eq!(PROTOCOL_VERSION, 11);
     assert_eq!(msg_type::LOGIN, 6);
     assert_eq!(msg_type::LOGGED_IN, 18);
     assert_eq!(msg_type::SET_PROFILING, 7);
@@ -239,7 +245,7 @@ fn set_profiling_rejects_a_non_boolean_byte() {
 
 #[test]
 fn result_set_round_trips_every_data_type() {
-    let names = ["b", "i", "bi", "d", "v", "dt", "ts"]
+    let names = ["b", "i", "bi", "d", "v", "dt", "ts", "va"]
         .map(String::from)
         .to_vec();
     let types = vec![
@@ -250,6 +256,7 @@ fn result_set_round_trips_every_data_type() {
         DataType::Varchar,
         DataType::Date,
         DataType::Timestamp,
+        DataType::Variant,
     ];
     response_round_trip(Response::ResultSet { names, types });
 }
@@ -305,25 +312,17 @@ fn rows_round_trip_every_value_kind_and_extremes() {
             Value::Date(i32::MAX),
             Value::Timestamp(i64::MIN),
             Value::Timestamp(i64::MAX),
+            Value::Variant(variant("null")),
+            Value::Variant(variant("true")),
+            Value::Variant(variant("-9223372036854775808")),
+            Value::Variant(variant("1.5")),
+            Value::Variant(variant("-1234567890123456789012345678.000001")),
+            Value::Variant(variant("\"héllo 世界 🚀\"")),
+            Value::Variant(variant("[]")),
+            Value::Variant(variant("{}")),
+            Value::Variant(variant(r#"{"a":[1,{"b":null}]}"#)),
         ],
-        vec![
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ],
+        vec![Value::Null; 25],
     ];
     response_round_trip(Response::Rows { rows });
 }
@@ -577,6 +576,58 @@ fn unknown_value_and_type_tags_are_rejected() {
     // Done: kind 99.
     let err = decode_response(&frame(msg_type::DONE, &[99])).unwrap_err();
     assert!(err.to_string().contains("unknown Done kind 99"), "{err}");
+}
+
+/// Wave 101a: a VARIANT rides as `u32 byte length | encoded value` under value
+/// tag 10, and its column type under dtype tag 9. The inner encoding is
+/// `pinkdb::variant`'s business; this pins the framing.
+#[test]
+fn variant_rows_and_columns_use_tags_10_and_9() {
+    let value = variant(r#"{"a":[1,2.5,"s",null]}"#);
+    let mut payload = Vec::new();
+    pinkdb::variant::encode(&value, &mut payload);
+
+    let bytes = encode_response(&Response::Rows {
+        rows: vec![vec![Value::Variant(std::sync::Arc::clone(&value))]],
+    })
+    .unwrap();
+    assert_eq!(bytes[4], msg_type::ROWS);
+    assert_eq!(&bytes[5..9], &1u32.to_le_bytes(), "one row");
+    assert_eq!(&bytes[9..13], &1u32.to_le_bytes(), "one column");
+    assert_eq!(bytes[13], 10, "VARIANT value tag");
+    assert_eq!(&bytes[14..18], &(payload.len() as u32).to_le_bytes());
+    assert_eq!(&bytes[18..], &payload[..]);
+    assert_eq!(
+        decode_response(&bytes).unwrap(),
+        Response::Rows {
+            rows: vec![vec![Value::Variant(value)]],
+        }
+    );
+
+    let bytes = encode_response(&Response::ResultSet {
+        names: vec!["v".to_string()],
+        types: vec![DataType::Variant],
+    })
+    .unwrap();
+    assert_eq!(bytes[4], msg_type::RESULT_SET);
+    assert_eq!(bytes[14], 9, "VARIANT dtype tag");
+
+    // A corrupt payload is a malformed frame, not a panic.
+    let mut body = 1u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(10);
+    body.extend_from_slice(&4u32.to_le_bytes());
+    body.extend_from_slice(&[0x7f, 0, 0, 0]);
+    let err = decode_response(&frame(msg_type::ROWS, &body)).unwrap_err();
+    assert!(err.to_string().contains("bad VARIANT value"), "{err}");
+
+    // A length past the frame end is truncated.
+    let mut body = 1u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(10);
+    body.extend_from_slice(&9u32.to_le_bytes());
+    let err = decode_response(&frame(msg_type::ROWS, &body)).unwrap_err();
+    assert!(err.to_string().contains("truncated"), "{err}");
 }
 
 #[test]

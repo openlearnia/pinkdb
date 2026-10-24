@@ -149,6 +149,9 @@ pub enum DataType {
     /// Calendar interval (months, days, microseconds). DuckDB's three-field
     /// interval representation.
     Interval,
+    /// Semi-structured value: any of ten kinds, stored as a tagged binary
+    /// encoding (see [`crate::variant`] and `docs/wave-101-plan.md`).
+    Variant,
 }
 
 impl DataType {
@@ -164,6 +167,7 @@ impl DataType {
             DataType::Timestamp => "TIMESTAMP".to_string(),
             DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
             DataType::Interval => "INTERVAL".to_string(),
+            DataType::Variant => "VARIANT".to_string(),
         }
     }
 
@@ -184,6 +188,7 @@ impl DataType {
                 scale: DECIMAL_DEFAULT_SCALE,
             }),
             "INTERVAL" => Some(DataType::Interval),
+            "VARIANT" => Some(DataType::Variant),
             _ => None,
         }
     }
@@ -268,6 +273,8 @@ pub enum Value {
         days: i32,
         micros: i64,
     },
+    /// Semi-structured value. Shared so copying a cell never copies a tree.
+    Variant(std::sync::Arc<crate::variant::Variant>),
 }
 
 impl Value {
@@ -295,6 +302,7 @@ impl Value {
                 scale: *scale,
             }),
             Value::Interval { .. } => Some(DataType::Interval),
+            Value::Variant(_) => Some(DataType::Variant),
         }
     }
 }
@@ -316,6 +324,8 @@ impl fmt::Display for Value {
                 days,
                 micros,
             } => write!(f, "{}", format_interval(*months, *days, *micros)),
+            // The JSON text, so `CAST(v AS VARCHAR)` and this agree.
+            Value::Variant(v) => write!(f, "{v}"),
         }
     }
 }
