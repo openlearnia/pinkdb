@@ -144,6 +144,8 @@ fn register_builtin_extensions() {
     pinkdb_arrow::ensure_registered();
     #[cfg(feature = "parquet")]
     pinkdb_parquet::ensure_registered();
+    #[cfg(feature = "iceberg")]
+    pinkdb_iceberg::ensure_registered();
     // The lake's Parquet data-file format provider (`parquetlake`): registered
     // process-wide before any handle exists, so `.lake format parquet` and
     // the save/commit paths resolve the id.

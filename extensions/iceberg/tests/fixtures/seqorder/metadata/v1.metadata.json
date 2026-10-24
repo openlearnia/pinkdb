@@ -1,0 +1,58 @@
+{
+  "format-version": 2,
+  "table-uuid": "66666666-6666-6666-6666-666666666666",
+  "location": "fixtures/seqorder",
+  "last-sequence-number": 2,
+  "last-updated-ms": 1700000000000,
+  "last-column-id": 2,
+  "schemas": [
+    {
+      "type": "struct",
+      "schema-id": 0,
+      "fields": [
+        {
+          "id": 1,
+          "name": "id",
+          "required": true,
+          "type": "long"
+        },
+        {
+          "id": 2,
+          "name": "name",
+          "required": false,
+          "type": "string"
+        }
+      ]
+    }
+  ],
+  "current-schema-id": 0,
+  "partition-specs": [
+    {
+      "spec-id": 0,
+      "fields": []
+    }
+  ],
+  "default-spec-id": 0,
+  "last-partition-id": 999,
+  "properties": {},
+  "current-snapshot-id": 1001,
+  "snapshots": [
+    {
+      "snapshot-id": 1001,
+      "sequence-number": 2,
+      "timestamp-ms": 1700000000000,
+      "summary": {
+        "operation": "append"
+      },
+      "manifest-list": "metadata/snap-1001.avro",
+      "schema-id": 0
+    }
+  ],
+  "snapshot-log": [
+    {
+      "timestamp-ms": 1700000000000,
+      "snapshot-id": 1001
+    }
+  ],
+  "metadata-log": []
+}

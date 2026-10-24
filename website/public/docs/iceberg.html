@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iceberg tables — pinkdb</title>
+<meta name="description" content="The iceberg extension: Iceberg v2 table reads on local disk, https:// and s3:// through the shared transport — iceberg_scan with snapshot_from_id/snapshot_from_timestamp time travel, positional deletes, schema evolution by field id, partition and bound pruning, and the iceberg_snapshots/iceberg_metadata introspection functions.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/iceberg.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Iceberg tables — pinkdb">
+<meta property="og:description" content="The iceberg extension: Iceberg v2 table reads on local disk, https:// and s3:// through the shared transport — iceberg_scan with snapshot_from_id/snapshot_from_timestamp time travel, positional deletes, schema evolution by field id, partition and bound pruning, and the iceberg_snapshots/iceberg_metadata introspection functions.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/iceberg.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+<script data-theme-script>
+/* Theme: follows the OS until the visitor picks one; the choice is kept in
+   localStorage and applied before first paint. Without JS the controls stay
+   hidden and the page simply follows prefers-color-scheme. */
+(function () {
+  var KEY = "pinkdb-theme";
+  var root = document.documentElement;
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var mode = "system";
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved === "light" || saved === "dark") mode = saved;
+  } catch (e) {}
+
+  function effective() { return mode === "system" ? (media.matches ? "dark" : "light") : mode; }
+
+  function apply() {
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    var dark = effective() === "dark";
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-pressed", String(dark));
+      toggles[i].setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      toggles[i].title = dark ? "Switch to light theme" : "Switch to dark theme";
+    }
+    var choices = document.querySelectorAll("[data-theme-choice]");
+    for (var j = 0; j < choices.length; j++) {
+      choices[j].setAttribute("aria-pressed", String(choices[j].getAttribute("data-theme-choice") === mode));
+    }
+  }
+
+  function choose(next) {
+    mode = next;
+    try {
+      if (mode === "system") localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, mode);
+    } catch (e) {}
+    // Switch in one frame: no per-element colour transitions.
+    root.classList.add("theme-switching");
+    apply();
+    void root.offsetWidth;
+    requestAnimationFrame(function () { root.classList.remove("theme-switching"); });
+  }
+
+  apply();
+  if (media.addEventListener) media.addEventListener("change", apply);
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var controls = document.querySelectorAll("[data-theme-toggle], .theme-switch");
+    for (var i = 0; i < controls.length; i++) controls[i].hidden = false;
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest("[data-theme-toggle], [data-theme-choice]");
+      if (!target) return;
+      if (target.hasAttribute("data-theme-toggle")) choose(effective() === "dark" ? "light" : "dark");
+      else choose(target.getAttribute("data-theme-choice"));
+    });
+    apply();
+  });
+})();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
+        <li><a href="../playground">Playground</a></li>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
+      </ul>
+    </nav>
+    <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle hidden aria-label="Switch theme">
+      <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+    </button>
+    <a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a>
+    </div>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Iceberg</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+<li><a href="install">Install</a></li>
+<li><a href="docker">Docker</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="dialect">SQL dialect</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="iceberg" class="active" aria-current="page">Iceberg</a></li>
+<li><a href="server">Server</a></li>
+<li><a href="agents">Agents and MCP</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
+<li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<p class="eyebrow">Reference</p>
+<h1>Iceberg tables</h1>
+
+<p class="doc-meta">The <code>iceberg</code> extension reads <strong>Apache
+Iceberg v2</strong> tables — the current snapshot or an older one — from local
+disk, <code>https://</code> or <code>s3://</code>. It is opt-in
+(<code>--features iceberg</code>, which turns <code>parquet</code> on), and it
+uses the same remote transport as <code>read_parquet</code>.</p>
+
+<h2 id="scanning-a-table">Scanning a table<a class="anchor" href="#scanning-a-table" aria-label="Permalink: Scanning a table">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">SELECT</span> * <span class="tok-k">FROM</span> iceberg_scan(<span class="tok-s">'s3://bucket/sales'</span>);
+<span class="tok-k">SELECT</span> * <span class="tok-k">FROM</span> iceberg_scan(<span class="tok-s">'warehouse/sales'</span>);            <span class="tok-c">-- local table directory</span>
+<span class="tok-k">SELECT</span> * <span class="tok-k">FROM</span> iceberg_scan(<span class="tok-s">'warehouse/sales/metadata/v3.metadata.json'</span>);
+
+<span class="tok-c">-- time travel, with DuckDB's parameter names</span>
+<span class="tok-k">SELECT</span> * <span class="tok-k">FROM</span> iceberg_scan(<span class="tok-s">'warehouse/sales'</span>, snapshot_from_id := <span class="tok-n">1001</span>);
+<span class="tok-k">SELECT</span> * <span class="tok-k">FROM</span> iceberg_scan(<span class="tok-s">'warehouse/sales'</span>,
+    snapshot_from_timestamp := TIMESTAMP <span class="tok-s">'2026-10-01 00:00:00'</span>);
+
+<span class="tok-c">-- introspection</span>
+<span class="tok-k">SELECT</span> * <span class="tok-k">FROM</span> iceberg_snapshots(<span class="tok-s">'warehouse/sales'</span>);
+<span class="tok-k">SELECT</span> * <span class="tok-k">FROM</span> iceberg_metadata(<span class="tok-s">'warehouse/sales'</span>);        <span class="tok-c">-- live manifest entries</span>
+<span class="tok-k">SELECT</span> count(*) <span class="tok-k">FROM</span> iceberg_scan(<span class="tok-s">'warehouse/sales'</span>);     <span class="tok-c">-- from the manifests</span></code></pre></div>
+
+<p>A directory resolves through <code>metadata/version-hint.text</code> and, when
+that is missing, through the newest <code>metadata/vN.metadata.json</code>. Paths
+recorded in the metadata resolve against the table root, so a table copied to
+another prefix — or served from a mock bucket in the tests — reads unchanged.
+That is what DuckDB calls <code>allow_moved_paths</code>, done always. A remote
+table needs the hint file: a directory cannot be listed over HTTP or S3, so pass
+the metadata file when there is none.</p>
+
+<h2 id="what-a-scan-does">What a scan does<a class="anchor" href="#what-a-scan-does" aria-label="Permalink: What a scan does">#</a></h2>
+
+<ol>
+  <li>Read the table metadata JSON and pick the snapshot.</li>
+  <li>Read the snapshot's <strong>manifest list</strong>, drop manifests whose
+  partition summaries cannot match the <code>WHERE</code> clause, and read the
+  remaining <strong>manifests</strong> (Avro).</li>
+  <li>Drop data files whose lower/upper bounds or NULL counts cannot match, and
+  drop the <code>DELETED</code> entries.</li>
+  <li>Apply <strong>positional delete files</strong>: their
+  <code>file_path</code>/<code>pos</code> rows remove those positions from the
+  matching data file.</li>
+  <li>Read the surviving Parquet files through the Parquet reader, mapping each
+  output column to a file column by <strong>field id</strong>.</li>
+</ol>
+
+<p>Field-id mapping is what makes schema evolution work: a renamed column
+projects under its new name, and a column added later reads NULL in files
+written before it existed. <code>iceberg_metadata</code> reports the entries of
+the selected snapshot with DuckDB's column set (<code>manifest_path</code>,
+<code>status</code>, <code>file_path</code>, <code>record_count</code>, …), and
+<code>iceberg_snapshots</code> lists every snapshot in the metadata.</p>
+
+<h2 id="remote-reads">Remote reads<a class="anchor" href="#remote-reads" aria-label="Permalink: Remote reads">#</a></h2>
+
+<p>With the CLI's <code>httpfs</code> feature the extension reads through
+<code>pinkdb-httpfs</code> — the shared transport — with a 256 KiB read-ahead
+window over the metadata JSON and the Avro manifests, so a manifest is a couple
+of ranged requests instead of one whole-object fetch. The data files then use
+Parquet's ranged reader, so column-chunk coalescing, the opt-in range cache and
+the <code>PINKDB_HTTPFS_PARALLELISM</code> knob all apply. Credentials come from
+the same environment as every other remote read
+(<code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code>,
+<code>AWS_REGION</code>, <code>AWS_ENDPOINT_URL_S3</code>).</p>
+
+<h2 id="limits">Limits<a class="anchor" href="#limits" aria-label="Permalink: Limits">#</a></h2>
+
+<ul>
+  <li><strong>Read-only</strong>: no <code>INSERT</code>, no commit, no catalog.
+  Point the function at a table a writer already produced.</li>
+  <li><strong>Positional deletes only.</strong> An <strong>equality</strong>
+  delete file is refused with an error naming the file — DuckDB applies them;
+  that is the follow-up.</li>
+  <li><strong>v2 only</strong>: v1 metadata and a newer format version are
+  refused at open with its number.</li>
+  <li><strong>Partition pruning is identity-only</strong>: a bucket or truncate
+  summary is ignored, never misapplied, so the scan stays correct and simply
+  reads more files.</li>
+  <li>The Avro decoder handles the <code>null</code> and <code>deflate</code>
+  block codecs; a table written with <code>snappy</code> or
+  <code>zstd</code> blocks is refused by codec name.</li>
+  <li>One table per call: no remote globs or directories, and no
+  <code>MERGE</code>/rewrite/maintenance.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="../docs/lake">Lake →</a></li>
+  <li><a href="../docs/extensions">Using extensions →</a></li>
+  <li><a href="../docs/roadmap">Roadmap →</a></li>
+</ul>
+
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="lake"><span class="pager-dir">Previous</span><span class="pager-title">Lake</span></a><a class="pager-link next" href="server"><span class="pager-dir">Next</span><span class="pager-title">Server</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/iceberg.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#scanning-a-table">Scanning a table</a></li>
+  <li><a href="#what-a-scan-does">What a scan does</a></li>
+  <li><a href="#remote-reads">Remote reads</a></li>
+  <li><a href="#limits">Limits</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <div class="theme-switch" role="group" aria-label="Paper edition" hidden>
+      <span class="theme-switch-label" aria-hidden="true">edition</span>
+      <button type="button" data-theme-choice="system" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
+    </div>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

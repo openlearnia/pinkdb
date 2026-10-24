@@ -1,0 +1,36 @@
+[package]
+name = "pinkdb-iceberg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb core extension: read-side Iceberg v2 tables (iceberg_scan / iceberg_snapshots / iceberg_metadata)"
+license = "MIT"
+
+[dependencies]
+# The engine, for the `TableSource` surface and `Value`/`DataType`/`Vector`.
+# The dependency direction matches the other readers': the extension depends
+# on the engine, never the other way around.
+pinkdb = { path = "../../crates/pinkdb" }
+# Data files are Parquet and are read by the existing reader (ranged footer and
+# column-chunk reads, projection pushdown, row-group pruning); only the
+# metadata layers are Iceberg's.
+pinkdb-parquet = { path = "../parquet" }
+# Remote tables (`remote` feature): the shared https/SigV4 transport, which is
+# also where the read-ahead and the opt-in range cache live.
+pinkdb-httpfs = { path = "../../crates/pinkdb-httpfs", optional = true }
+# Table metadata is JSON. `serde_json` is already in the lock (the lake, the
+# MCP extension), and a hand-rolled JSON parser would be larger than the
+# Avro decoder below, which the brief does ask for by hand.
+serde_json = "1"
+# `deflate`-coded Avro blocks. `flate2`'s pure-Rust backend is already in the
+# lock through parquet's `gzip` feature, so this adds no new production.
+# shortcut: no zstd/snappy codecs for Avro blocks (Iceberg writers use null or
+# deflate); add `parquet/zstd` + a codec arm if a table needs it.
+flate2 = "1"
+
+[features]
+default = []
+# `https://` and `s3://` table locations. Off by default like every other
+# reader's remote feature: the transport (rustls) is linked only when the host
+# asks for it.
+remote = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3"]

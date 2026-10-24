@@ -1,0 +1,71 @@
+{
+  "format-version": 2,
+  "table-uuid": "44444444-4444-4444-4444-444444444444",
+  "location": "fixtures/partitioned",
+  "last-sequence-number": 1,
+  "last-updated-ms": 1700000000000,
+  "last-column-id": 3,
+  "schemas": [
+    {
+      "type": "struct",
+      "schema-id": 0,
+      "fields": [
+        {
+          "id": 1,
+          "name": "id",
+          "required": true,
+          "type": "long"
+        },
+        {
+          "id": 2,
+          "name": "region",
+          "required": false,
+          "type": "string"
+        },
+        {
+          "id": 3,
+          "name": "value",
+          "required": false,
+          "type": "double"
+        }
+      ]
+    }
+  ],
+  "current-schema-id": 0,
+  "partition-specs": [
+    {
+      "spec-id": 0,
+      "fields": [
+        {
+          "name": "region",
+          "source-id": 2,
+          "field-id": 1000,
+          "transform": "identity"
+        }
+      ]
+    }
+  ],
+  "default-spec-id": 0,
+  "last-partition-id": 1000,
+  "properties": {},
+  "current-snapshot-id": 1001,
+  "snapshots": [
+    {
+      "snapshot-id": 1001,
+      "sequence-number": 1,
+      "timestamp-ms": 1700000000000,
+      "summary": {
+        "operation": "append"
+      },
+      "manifest-list": "metadata/snap-1001.avro",
+      "schema-id": 0
+    }
+  ],
+  "snapshot-log": [
+    {
+      "timestamp-ms": 1700000000000,
+      "snapshot-id": 1001
+    }
+  ],
+  "metadata-log": []
+}

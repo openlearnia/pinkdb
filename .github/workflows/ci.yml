@@ -106,6 +106,12 @@ jobs:
           - name: cli-misc
             run: |
               cargo test -p pinkdb-cli --features encryption
+              # The iceberg reader (wave 72): its fixtures and its local reads,
+              # then the same tables through the mock S3 transport. The DuckDB
+              # oracle cases self-skip here (no reference binary on the runner).
+              cargo test -p pinkdb-iceberg
+              cargo test -p pinkdb-iceberg --features remote
+              cargo test -p pinkdb-cli --features iceberg
               cargo test -p pinkdb --features encryption
               cargo test -p pinkdb-cli --features client
               cargo test -p pinkdb-cli --features client,tls
@@ -227,6 +233,8 @@ jobs:
           cargo clippy --all-targets -p pinkdb-cli --features client,tls -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,parquetlake -- -D warnings
+          cargo clippy --all-targets -p pinkdb-iceberg --features remote -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features iceberg,httpfs -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features s3 -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features async-server -- -D warnings
           cargo clippy --all-targets -p pinkdb-js --features engine -- -D warnings

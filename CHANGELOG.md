@@ -55,6 +55,52 @@ one-liners below.
   into typed sub-columns and statistics on shredded paths. The plan for it,
   the full tag table, the semantics and every deliberate difference from
   DuckDB are written in `docs/wave-101-plan.md`.
+### Wave 72 — Core extension: iceberg ✅
+- **`iceberg_scan`, `iceberg_snapshots`, `iceberg_metadata`** in a new
+  engine-adjacent crate, `extensions/iceberg` (`pinkdb-iceberg`), behind the
+  opt-in `iceberg` CLI feature (which turns `parquet` on — the data files are
+  read by that reader). A table location is the table directory, its
+  `metadata/` directory or one `…/metadata/vN.metadata.json`; a directory is
+  resolved through `metadata/version-hint.text`, else the newest
+  `vN.metadata.json`. Paths inside the metadata resolve against the table root,
+  so a copied or mocked table works unchanged — what DuckDB calls
+  `allow_moved_paths`.
+- **Iceberg v2 semantics.** The current snapshot, or one named by
+  `snapshot_from_id` / `snapshot_from_timestamp` (DuckDB's names); the manifest
+  list, then the Avro manifests, then the live Parquet data files; **positional
+  delete files** applied; **equality deletes refused by name** (a documented
+  follow-up — DuckDB applies them, and the test pins that difference); schema
+  evolution by **field id**, so a renamed column projects under its new name
+  and an added one reads NULL in files written before it; **partition-summary
+  pruning** (identity transforms) and **lower/upper-bound + NULL-count pruning**
+  from the manifest entries; `count(*)` answered from the manifest record counts
+  without opening a data file.
+- **A hand-written Avro decoder**, not apache-avro: container header, sync
+  markers, `null`/`deflate` block codecs, and the records, unions, arrays,
+  maps, enums and fixed types the Iceberg manifest schemas use (600 lines
+  against a dependency tree). `serde_json` parses the metadata JSON (already in
+  the lock file).
+- **Remote tables through the shared transport.** The `remote` feature (enabled
+  by the CLI's `httpfs` feature) reads `https://`/`s3://` tables through
+  `pinkdb-httpfs` — the same path `read_parquet` uses — with windowed 256 KiB
+  read-ahead for the metadata JSON and the Avro files, then Parquet's ranged
+  reader for the data. A remote table needs a `version-hint.text`; without one,
+  pass the metadata file.
+- **Fixtures without downloads.** `extensions/iceberg/tests/fixtures/gen.py`
+  writes Iceberg v2 tables with the standard library alone — metadata JSON, an
+  Avro container writer and manifests by hand, Parquet through the DuckDB 2.0
+  binary — for six tables (two snapshots, positional deletes, equality
+  deletes, a delete file older than the data file it names, schema evolution,
+  partitioned), 232 KB committed. The **DuckDB 2.0 α oracle** compares every
+  fixture's results (13 query/table pairs) and runs whenever the binary is
+  present; a mock S3 and the local HTTP test server prove the remote path with
+  ranged request counts.
+- **Cost:** the crate's release rlib is 1,165,120 B; the CLI binary grows
+  254,560 B over `parquet` (6,475,744 B with `iceberg`, 8,626,896 B with
+  `iceberg,httpfs`) and the default binary is untouched — the crate is not in
+  its dependency graph.
+
+## 2026-10-24
 ### Wave 92 — Language bindings: Node.js, Python DB-API 2.0, Go ✅
 - **One conformance corpus.** `bindings/conformance/corpus.json` is the
   language-neutral contract every binding is tested against: every SQL type's

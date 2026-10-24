@@ -1,0 +1,92 @@
+<h1>Iceberg tables</h1>
+
+<p class="doc-meta">The <code>iceberg</code> extension reads <strong>Apache
+Iceberg v2</strong> tables — the current snapshot or an older one — from local
+disk, <code>https://</code> or <code>s3://</code>. It is opt-in
+(<code>--features iceberg</code>, which turns <code>parquet</code> on), and it
+uses the same remote transport as <code>read_parquet</code>.</p>
+
+<h2>Scanning a table</h2>
+
+<pre class="code" data-lang="sql"><code>SELECT * FROM iceberg_scan('s3://bucket/sales');
+SELECT * FROM iceberg_scan('warehouse/sales');            -- local table directory
+SELECT * FROM iceberg_scan('warehouse/sales/metadata/v3.metadata.json');
+
+-- time travel, with DuckDB's parameter names
+SELECT * FROM iceberg_scan('warehouse/sales', snapshot_from_id := 1001);
+SELECT * FROM iceberg_scan('warehouse/sales',
+    snapshot_from_timestamp := TIMESTAMP '2026-10-01 00:00:00');
+
+-- introspection
+SELECT * FROM iceberg_snapshots('warehouse/sales');
+SELECT * FROM iceberg_metadata('warehouse/sales');        -- live manifest entries
+SELECT count(*) FROM iceberg_scan('warehouse/sales');     -- from the manifests</code></pre>
+
+<p>A directory resolves through <code>metadata/version-hint.text</code> and, when
+that is missing, through the newest <code>metadata/vN.metadata.json</code>. Paths
+recorded in the metadata resolve against the table root, so a table copied to
+another prefix — or served from a mock bucket in the tests — reads unchanged.
+That is what DuckDB calls <code>allow_moved_paths</code>, done always. A remote
+table needs the hint file: a directory cannot be listed over HTTP or S3, so pass
+the metadata file when there is none.</p>
+
+<h2>What a scan does</h2>
+
+<ol>
+  <li>Read the table metadata JSON and pick the snapshot.</li>
+  <li>Read the snapshot's <strong>manifest list</strong>, drop manifests whose
+  partition summaries cannot match the <code>WHERE</code> clause, and read the
+  remaining <strong>manifests</strong> (Avro).</li>
+  <li>Drop data files whose lower/upper bounds or NULL counts cannot match, and
+  drop the <code>DELETED</code> entries.</li>
+  <li>Apply <strong>positional delete files</strong>: their
+  <code>file_path</code>/<code>pos</code> rows remove those positions from the
+  matching data file.</li>
+  <li>Read the surviving Parquet files through the Parquet reader, mapping each
+  output column to a file column by <strong>field id</strong>.</li>
+</ol>
+
+<p>Field-id mapping is what makes schema evolution work: a renamed column
+projects under its new name, and a column added later reads NULL in files
+written before it existed. <code>iceberg_metadata</code> reports the entries of
+the selected snapshot with DuckDB's column set (<code>manifest_path</code>,
+<code>status</code>, <code>file_path</code>, <code>record_count</code>, …), and
+<code>iceberg_snapshots</code> lists every snapshot in the metadata.</p>
+
+<h2>Remote reads</h2>
+
+<p>With the CLI's <code>httpfs</code> feature the extension reads through
+<code>pinkdb-httpfs</code> — the shared transport — with a 256 KiB read-ahead
+window over the metadata JSON and the Avro manifests, so a manifest is a couple
+of ranged requests instead of one whole-object fetch. The data files then use
+Parquet's ranged reader, so column-chunk coalescing, the opt-in range cache and
+the <code>PINKDB_HTTPFS_PARALLELISM</code> knob all apply. Credentials come from
+the same environment as every other remote read
+(<code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code>,
+<code>AWS_REGION</code>, <code>AWS_ENDPOINT_URL_S3</code>).</p>
+
+<h2>Limits</h2>
+
+<ul>
+  <li><strong>Read-only</strong>: no <code>INSERT</code>, no commit, no catalog.
+  Point the function at a table a writer already produced.</li>
+  <li><strong>Positional deletes only.</strong> An <strong>equality</strong>
+  delete file is refused with an error naming the file — DuckDB applies them;
+  that is the follow-up.</li>
+  <li><strong>v2 only</strong>: v1 metadata and a newer format version are
+  refused at open with its number.</li>
+  <li><strong>Partition pruning is identity-only</strong>: a bucket or truncate
+  summary is ignored, never misapplied, so the scan stays correct and simply
+  reads more files.</li>
+  <li>The Avro decoder handles the <code>null</code> and <code>deflate</code>
+  block codecs; a table written with <code>snappy</code> or
+  <code>zstd</code> blocks is refused by codec name.</li>
+  <li>One table per call: no remote globs or directories, and no
+  <code>MERGE</code>/rewrite/maintenance.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="{{root}}docs/lake.html">Lake →</a></li>
+  <li><a href="{{root}}docs/extensions.html">Using extensions →</a></li>
+  <li><a href="{{root}}docs/roadmap.html">Roadmap →</a></li>
+</ul>

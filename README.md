@@ -165,6 +165,7 @@ SQL text
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
 | `pinkdb-arrow` | opt-in (`arrow` feature) Arrow IPC (Feather v2) file extension, engine-adjacent: a **table source** for `FROM 'f.arrow'` / `read_arrow` and a **COPY sink** for `COPY … (FORMAT arrow)`; reads materialize the file, writes are uncompressed; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects whole |
 | `pinkdb-parquet` | opt-in (`parquet` feature) read-side Parquet extension, engine-adjacent: `read_parquet`/`parquet_scan`, the four `parquet_*` metadata functions and DuckDB's replacement scan (`FROM 'file.parquet'`), with projection + row-group-statistics pushdown; flat schemas, TIMESTAMP(nanos)/TIME/UUID/FLOAT16/nested types refused by name; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects through a ranged `ChunkReader` |
+| `pinkdb-iceberg` | opt-in (`iceberg` feature) read-side Iceberg v2 extension, engine-adjacent: `iceberg_scan`, `iceberg_snapshots` and `iceberg_metadata` over a table location (the table directory, `metadata/` or a `…/metadata/vN.metadata.json` file), the current snapshot or a named one (`snapshot_from_id`, `snapshot_from_timestamp`), positional deletes, schema evolution by field id, partition-summary + column-stat pruning and `count(*)` from the manifest record counts; equality deletes are refused by name and a newer-than-v2 format is refused at open; turns `parquet` on for the data files, and its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` tables through the same ranged transport `read_parquet` uses |
 | `pinkdb-httpfs` | opt-in (`httpfs` feature) remote-file transport + `read_csv` table source: `https://` GET/HEAD/byte-range and the SigV4 `s3://` object client **shared with pink-lake and the parquet/arrow `remote` features**; `read_csv('url')`, `.import <url>`, `FROM 'https://…/x.csv'`; single objects only (no globs/compression/COPY TO yet) |
 | `pink-lake` | lake layer: a catalog database (`pink:` `.pink` file, `sqlite:`, or `postgres://`) on DuckLake v1.1's tables plus immutable data files — `.pink` (`PINKDB06`) always, Parquet with `parquetlake`; data on local disk or S3/R2 (opt-in `s3`); opt-in `encryption` seals each data/delete file with its own key in a `PNKLAKE1` container; `catalog-sqlite` / `catalog-postgres` add the SQL backends |
 
@@ -1490,6 +1491,7 @@ per store, and packages are plain Rust, so they work on wasm32 too.
 |---|---|---|---|
 | `arrow` | `extensions/arrow` (`pinkdb-arrow`) | `FROM 'f.arrow'` / `read_arrow('f.arrow')` (`read_ipc`/`read_feather`; `.arrow`/`.ipc`/`.feather`/`.arrows`) | `COPY t TO 'f.arrow' (FORMAT arrow)` |
 | `parquet` | `extensions/parquet` (`pinkdb-parquet`) | `read_parquet('glob')` / `parquet_scan`, `FROM 'f.parquet'`, `parquet_schema`/`parquet_metadata`/`parquet_file_metadata`/`parquet_kv_metadata`; globs + `union_by_name`, hive partitions, `filename`, projection + row-group-statistics pushdown | — (follow-up) |
+| `iceberg` | `extensions/iceberg` (`pinkdb-iceberg`) | `iceberg_scan('table')`, `iceberg_snapshots('table')`, `iceberg_metadata('table')`; current or named snapshot, positional deletes, schema evolution by field id, partition + bound pruning, `count(*)` from the manifests | — (read-only) |
 
 ```sql
 SELECT * FROM 'data.arrow';                        -- replacement scan (.arrow/.ipc/.feather)
@@ -1498,6 +1500,10 @@ COPY t TO 'out.arrow' (FORMAT arrow);              -- write (FORMAT inferred fro
 SELECT * FROM read_parquet('data/*.parquet') WHERE id > 10;
 SELECT * FROM 'data/people.parquet';
 SELECT * FROM parquet_metadata('data/people.parquet');
+SELECT * FROM iceberg_scan('s3://bucket/sales');   -- current snapshot
+SELECT * FROM iceberg_scan('sales', snapshot_from_id := 1001);
+SELECT * FROM iceberg_snapshots('sales');
+SELECT * FROM iceberg_metadata('sales');
 ```
 
 Arrow: IPC **file** format (Feather v2) only — the IPC *stream* format is
@@ -1519,9 +1525,35 @@ statistics prune scans (visible in `EXPLAIN`'s `filters=[…]` and
 FLOAT16/BSON/VARIANT/geo/nested columns are refused by name. Add
 `,parquet-zstd` for zstd-compressed files (compiles the C zstd library).
 
-Both are **opt-in** CLI features (`cargo build -p pinkdb-cli --features
-arrow,parquet`; sizes in the builds table above): the default binary stays
-lean and refuses every file surface with a clear error. A durable store
+Iceberg: **v2 tables, read-only** (v1 metadata is refused by name — a
+follow-up, like equality deletes). The metadata JSON, the Avro manifest list and the Avro manifests are
+decoded inside the extension — a hand-written Avro binary decoder (`null` and
+`deflate` block codecs; records, unions, arrays, maps, enums and fixed), not
+the apache-avro crate — and the data files go through `read_parquet`'s reader,
+so they inherit its pushdowns and ranged remote reads. A table location is the
+table directory (resolved through `metadata/version-hint.text`, else the newest
+`metadata/vN.metadata.json`), its `metadata/` directory, or one metadata file.
+Object paths inside the metadata are resolved against the table root, which is
+what DuckDB's `allow_moved_paths` opts into and what makes a copied or mocked
+table work unchanged. `iceberg_metadata` lists the manifest entries of the
+selected snapshot with DuckDB's column set; `iceberg_snapshots` lists every
+snapshot in the metadata (without DuckDB's `summary` map). **Positional**
+delete files are applied; **equality** deletes are refused with a message
+naming the file (DuckDB applies them — that is the follow-up). Pruning uses the
+manifest-list partition summaries for identity transforms (a bucket or
+truncate summary is ignored, never misapplied) and the manifest entries'
+lower/upper bounds and NULL counts, so `WHERE region = 'eu'` opens one file of
+a two-file table; a file with deletes is read without pushdowns, because its
+row offsets have to stay aligned with the delete positions. `count(*)` with no
+deletes is answered from the manifests without opening a data file. A position
+delete applies only to a data file whose data sequence number is at or before
+the delete's, so a file rewritten under the same path keeps its rows. A remote
+table needs a `version-hint.text` (a directory cannot be listed over HTTP/S3);
+pass the metadata file when there is none.
+
+All three are **opt-in** CLI features (`cargo build -p pinkdb-cli --features
+arrow,parquet,iceberg`; sizes in the builds table above): the default binary
+stays lean and refuses every file surface with a clear error. A durable store
 replays a logged statement that reads a file by **re-reading** the file
 (DuckDB's rule; the host registers the sources process-wide before any store
 is opened, which is what makes that replay resolvable). A file deleted
@@ -1605,7 +1637,10 @@ SELECT * FROM 'data/sales.csv';                  -- local .csv, same source
   the next statement (the re-read policy); a durable store replays a logged
   URL read by re-fetching it, and a missing object is a hard recovery error.
 - **Size**: opt-in `httpfs` is 5,811,760 B (+1.95 MiB over the 3,762,736 B
-  default); the default binary stays transport-free. The `pinklake,s3` build
+  default); the default binary stays transport-free. Today's default is
+  4,372,272 B; `parquet` is 6,221,184 B, `iceberg` 6,475,744 B (+254,560 B
+  over `parquet`, +2,103,472 B over the default) and `iceberg,httpfs`
+  8,626,896 B. The `pinklake,s3` build
   shares the same client and re-measures at 7,116,144 B; `parquet,httpfs` is
   6,998,912 B, `arrow,httpfs` 9,018,112 B, and `arrow,parquet,httpfs`
   10,187,840 B.
@@ -1622,6 +1657,7 @@ SELECT * FROM 'data/sales.csv';                  -- local .csv, same source
 | CSV (`httpfs`) | `https://`, `s3://` (claim); `http://` explicit-only | whole-object `fetch()`; parser reuses `.import` | single object; default dialect only |
 | Parquet (`parquet/remote`) | `https://`, `s3://`, `http://` (claim; transport gate) | **ranged** footer + projected column-chunk ranges (one request per coalesced run, bounded read-ahead; serial 128 KiB blocks when `PINKDB_HTTPFS_PARALLELISM=0/1`); whole-object only when HEAD reports no size; `COUNT(*)` from footer row counts | single object; no remote globs/dirs |
 | Arrow IPC (`arrow/remote`) | `https://`, `s3://`, `http://` (claim; transport gate) | **whole-object** `fetch()` (IPC has no ranged footer protocol); one fetch per bind→scan | single object; no remote globs/dirs |
+| Iceberg (`iceberg/remote`) | `https://`, `s3://` (claim; transport gate) | **ranged**: the metadata JSON, the manifest list and each Avro manifest are windowed reads (256 KiB read-ahead), the data files then go through Parquet's ranged reader | single table; no remote directory listing, so the table needs `metadata/version-hint.text` |
 
 A minimal extension registering one `hello_add(BIGINT, BIGINT) -> BIGINT`:
 

@@ -105,6 +105,7 @@ NAV = [
             {"key": "dialect", "label": "SQL dialect", "out": "docs/dialect.html"},
             {"key": "persistence", "label": "Persistence", "out": "docs/persistence.html"},
             {"key": "lake", "label": "Lake", "out": "docs/lake.html"},
+            {"key": "iceberg", "label": "Iceberg", "out": "docs/iceberg.html"},
             {"key": "server", "label": "Server", "out": "docs/server.html"},
             {"key": "agents", "label": "Agents and MCP", "out": "docs/agents.html"},
         ],
@@ -229,6 +230,19 @@ PAGES = {
             "The .pink v4 columnar format, durable databases with a WAL, "
             "crash recovery, checkpoints, multi-process writers, and optional "
             "at-rest encryption (AES-256-GCM + Argon2id)."
+        ),
+    },
+    "iceberg.html": {
+        "out": "docs/iceberg.html",
+        "nav": "iceberg",
+        "title": "Iceberg tables — pinkdb",
+        "description": (
+            "The iceberg extension: Iceberg v2 table reads on local disk, "
+            "https:// and s3:// through the shared transport — iceberg_scan "
+            "with snapshot_from_id/snapshot_from_timestamp time travel, "
+            "positional deletes, schema evolution by field id, partition and "
+            "bound pruning, and the iceberg_snapshots/iceberg_metadata "
+            "introspection functions."
         ),
     },
     "lake.html": {

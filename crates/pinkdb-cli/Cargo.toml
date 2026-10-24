@@ -42,6 +42,11 @@ arrow = ["dep:pinkdb-arrow"]
 # `parquet` crate and its codec dependencies are the largest dependency any
 # extension brings, and the default CLI stays lean.
 parquet = ["dep:pinkdb-parquet"]
+# Opt-in Iceberg v2 reader (wave 72): `iceberg_scan`, `iceberg_snapshots` and
+# `iceberg_metadata` over a local, `https://` or `s3://` table location. Turns
+# `parquet` on — data files are read by that reader — and the `httpfs`
+# feature, when also given, enables the remote half.
+iceberg = ["dep:pinkdb-iceberg", "parquet"]
 # Opt-in remote-file access (wave 75): `read_csv('https://…/x.csv')`,
 # `read_csv('s3://bucket/x.csv')`, the replacement scan for `.csv` paths and
 # the two schemes, and `.import <url>` / `import_csv(url)` through the shared
@@ -52,7 +57,7 @@ parquet = ["dep:pinkdb-parquet"]
 # `remote` halves too, so `--features parquet,arrow,httpfs` reads remote
 # `.parquet`/`.arrow` objects from the same crate (`?/remote` leaves an
 # absent format absent — `httpfs` alone stays transport + CSV).
-httpfs = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3", "pinkdb-parquet?/remote", "pinkdb-arrow?/remote"]
+httpfs = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3", "pinkdb-parquet?/remote", "pinkdb-arrow?/remote", "pinkdb-iceberg?/remote"]
 # Opt-in zstd parquet codec: forwards to pinkdb-parquet's `zstd` feature
 # (which compiles the C zstd library through `zstd-sys`, so a C toolchain for
 # the target is required).
@@ -132,6 +137,9 @@ pinkdb-server = { path = "../pinkdb-server", optional = true }
 # the arrow-rs `parquet` crate; opt-in only, so the default binary is
 # byte-for-byte unaffected.
 pinkdb-parquet = { path = "../../extensions/parquet", optional = true }
+# Iceberg v2 reader (iceberg feature): metadata and Avro manifests decoded in
+# the extension, data files through `pinkdb-parquet`.
+pinkdb-iceberg = { path = "../../extensions/iceberg", optional = true }
 # Remote-file transport and the `read_csv` table source (httpfs feature):
 # https GET/range + the SigV4 S3 client shared with pink-lake.
 pinkdb-httpfs = { path = "../pinkdb-httpfs", optional = true }
