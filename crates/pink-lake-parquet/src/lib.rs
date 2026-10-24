@@ -8,8 +8,8 @@
 //!   [`pinkdb_parquet::write::write_table_with_identity`] and publishes the
 //!   engine's exact per-column facts from
 //!   [`pinkdb::persist::table_stats`] — the same `SavedTableStats` the `.pink`
-//!   and Vortex providers publish. The lake's shared exactness gate applies
-//!   to the block uniformly.
+//!   provider publishes. The lake's shared exactness gate applies to the
+//!   block uniformly.
 //! - **read**: the file's footer and the projected column-chunk ranges are
 //!   read through the lake's positional [`pink_lake::format::RangedFile`] and
 //!   the *existing* parquet reader's ranged scan core

@@ -75,15 +75,10 @@ js = ["pinkdb/js"]
 # Keeps the default binary lean: HTTP + TLS, JSON parsing, SHA-256 and Ed25519
 # catalog-signature verification live only behind this feature.
 repo = ["dep:ureq", "dep:serde_json", "dep:sha2", "dep:ed25519-dalek", "dep:base64"]
-# Opt-in lake layer (full): `.lake save/open/versions/tables/info/attach`
-# snapshot the store into a `pink-lake` directory (JSON metadata + immutable
-# Vortex data files). Keeps the default binary lean: lake + JSON metadata +
-# Vortex code lives only behind this feature.
-vortexlake = ["dep:pink-lake", "pink-lake/vortexlake"]
-# Opt-in `pinklake` lake layer: the same `.lake save/open/versions/tables/info`
-# commands plus the statistics-only `.lake attach`, over the v1 `.pink`
-# data-file format, without the Vortex dependency (~42 MB of binary size).
-# Reading a v2/v3 Vortex lake fails with a clear feature error.
+# Opt-in lake layer: `.lake save/open/versions/tables/info/attach` snapshot
+# the store into a lake catalog database (a `.pink`, SQLite or Postgres
+# database) plus immutable `.pink` data files. Keeps the default binary lean:
+# the lake code lives only behind this feature.
 pinklake = ["dep:pink-lake"]
 # Opt-in Parquet lake format (wave 87): `pinklake` plus the parquet extension
 # and the `pink-lake-parquet` provider. Registers the `parquet` format at
@@ -92,10 +87,10 @@ pinklake = ["dep:pink-lake"]
 parquetlake = ["pinklake", "parquet", "dep:pink-lake-parquet"]
 # Opt-in object storage for the lake: `.lake …` accepts `s3://bucket/prefix`
 # URLs (AWS S3, Cloudflare R2) via pink-lake's `s3` feature (ureq + SigV4).
-# Pure storage: it implies neither lake build, and on its own it adds the
-# storage client but no `.lake` commands. Combine explicitly:
-# `cargo build -p pinkdb-cli --features pinklake,s3` or
-# `--features vortexlake,s3` (add `,encryption` for a keyed lake).
+# Pure storage: it implies no lake build, and on its own it adds the storage
+# client but no `.lake` commands. Combine explicitly:
+# `cargo build -p pinkdb-cli --features pinklake,s3` (add `,encryption` for a
+# keyed lake).
 s3 = ["pink-lake/s3"]
 # Opt-in SQL catalog for the lake (wave 96a): `.lake save/open/attach` accept
 # `sqlite:<path>` as the catalog location, with the data files at the `data`
@@ -130,7 +125,7 @@ pinkdb-math = { path = "../../extensions/math", optional = true }
 # Core arrow extension (opt-in `arrow` feature): Arrow IPC file read/write —
 # the engine-adjacent crate that implements `pinkdb::FileFormat` over the
 # arrow-rs crates (`arrow-array`/`arrow-ipc`/`arrow-schema`, pinned to the
-# 59.x line the workspace lock already carries for vortex).
+# 59.x line the parquet extension uses).
 pinkdb-arrow = { path = "../../extensions/arrow", optional = true }
 pinkdb-server = { path = "../pinkdb-server", optional = true }
 # Parquet reader (parquet feature): the engine-adjacent table source. Links
@@ -150,7 +145,7 @@ serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"], optional = true }
 base64 = { version = "0.23", optional = true }
-# Lake layer (vortexlake/pinklake features): catalog + immutable data files.
+# Lake layer (`pinklake` feature): catalog + immutable data files.
 pink-lake = { path = "../pink-lake", optional = true }
 # Parquet lake format provider (`parquetlake` feature): the LakeFormat bridge
 # over pinkdb-parquet's reader and writer.

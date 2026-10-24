@@ -216,14 +216,12 @@ export line to add. It never uses <code>sudo</code>.</p>
     <tr><td><code>lean</code></td><td><code>--no-default-features</code></td><td>the same core without the linked json/datetime/math extensions</td></tr>
     <tr><td><code>pinklake</code></td><td><code>pinklake</code></td><td><code>.lake</code> over <code>.pink</code> data files</td></tr>
     <tr><td><code>pinklake-s3</code></td><td><code>pinklake,s3</code></td><td>pinklake + <code>s3://</code> storage (AWS S3, R2)</td></tr>
-    <tr><td><code>vortexlake</code></td><td><code>vortexlake</code></td><td><code>.lake</code> over Vortex data files</td></tr>
-    <tr><td><code>vortexlake-s3</code></td><td><code>vortexlake,s3</code></td><td>Vortex lake + <code>s3://</code> storage</td></tr>
   </tbody>
 </table>
 </div>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>sh install.sh <span class="tok-f">--variant</span> pinklake-s3
-sh install.sh <span class="tok-f">--variant</span> vortexlake <span class="tok-f">--prefix</span> <span class="tok-s">"$HOME/bin"</span></code></pre></div>
+sh install.sh <span class="tok-f">--variant</span> pinklake <span class="tok-f">--prefix</span> <span class="tok-s">"$HOME/bin"</span></code></pre></div>
 
 <h2 id="pin-a-version">Pin a version<a class="anchor" href="#pin-a-version" aria-label="Permalink: Pin a version">#</a></h2>
 

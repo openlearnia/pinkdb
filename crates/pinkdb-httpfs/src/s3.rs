@@ -1444,12 +1444,12 @@ mod tests {
     #[test]
     fn endpoints_build_both_addressing_styles() {
         let path_style = Endpoint::parse("https://acc.r2.cloudflarestorage.com", true).unwrap();
-        let target = path_style.target("mybucket", "data/main.t/x.vortex", "");
+        let target = path_style.target("mybucket", "data/main.t/x.pink", "");
         assert_eq!(
             target.url,
-            "https://acc.r2.cloudflarestorage.com/mybucket/data/main.t/x.vortex"
+            "https://acc.r2.cloudflarestorage.com/mybucket/data/main.t/x.pink"
         );
-        assert_eq!(target.canonical_uri, "/mybucket/data/main.t/x.vortex");
+        assert_eq!(target.canonical_uri, "/mybucket/data/main.t/x.pink");
         assert_eq!(target.host, "acc.r2.cloudflarestorage.com");
 
         let virtual_hosted = Endpoint::parse("https://s3.us-east-1.amazonaws.com", false).unwrap();

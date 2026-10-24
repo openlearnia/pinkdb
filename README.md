@@ -46,13 +46,12 @@ Pin a version or choose a feature variant:
 ```sh
 sh install.sh --version 0.1.0 --variant default
 sh install.sh --variant pinklake-s3     # .lake over .pink files + s3://
-sh install.sh --variant vortexlake      # Vortex data files
 sh install.sh --variant lean            # no linked json/datetime/math
 ```
 
 `--dry-run` prints the resolved version, asset, URL and destination without
 downloading; `--force` replaces an existing install. Supported variants are
-`default`, `lean`, `pinklake`, `pinklake-s3`, `vortexlake`, `vortexlake-s3`.
+`default`, `lean`, `pinklake`, `pinklake-s3`.
 Server binaries (`pinkdb-server-<version>-<os>-<arch>-{default,async-server,tls}.tar.gz`)
 and the `SHA256SUMS` manifest are attached to the same release. **Windows is
 not supported** — there is no Windows binary or `install.ps1`. See
@@ -83,8 +82,8 @@ docker run --rm --network container:<name> ghcr.io/openlearnia/pinkdb \
 
 Two CLI variants are tagged: `:<version>` / `:latest` (default features plus
 `pinklake,s3` — `.lake` over `.pink` data files and `s3://` storage) and
-`:<version>-lake` / `:lake` (adds `vortexlake,parquetlake,s3` — Vortex and
-Parquet data files; a larger image). Both share the same server binary.
+`:<version>-lake` / `:lake` (adds `pinklake,parquetlake,s3` — Parquet data
+files; a larger image). Both share the same server binary.
 
 Every `pinkdb-server` flag still works after the image name; explicit flags
 win over the environment:
@@ -167,7 +166,7 @@ SQL text
 | `pinkdb-arrow` | opt-in (`arrow` feature) Arrow IPC (Feather v2) file extension, engine-adjacent: a **table source** for `FROM 'f.arrow'` / `read_arrow` and a **COPY sink** for `COPY … (FORMAT arrow)`; reads materialize the file, writes are uncompressed; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects whole |
 | `pinkdb-parquet` | opt-in (`parquet` feature) read-side Parquet extension, engine-adjacent: `read_parquet`/`parquet_scan`, the four `parquet_*` metadata functions and DuckDB's replacement scan (`FROM 'file.parquet'`), with projection + row-group-statistics pushdown; flat schemas, TIMESTAMP(nanos)/TIME/UUID/FLOAT16/nested types refused by name; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects through a ranged `ChunkReader` |
 | `pinkdb-httpfs` | opt-in (`httpfs` feature) remote-file transport + `read_csv` table source: `https://` GET/HEAD/byte-range and the SigV4 `s3://` object client **shared with pink-lake and the parquet/arrow `remote` features**; `read_csv('url')`, `.import <url>`, `FROM 'https://…/x.csv'`; single objects only (no globs/compression/COPY TO yet) |
-| `pink-lake` | lake layer: a catalog database (`pink:` `.pink` file, `sqlite:`, or `postgres://`) on DuckLake v1.1's tables plus immutable data files — `.pink` (`PINKDB06`) always, Vortex with `vortexlake`, Parquet with `parquetlake`; data on local disk or S3/R2 (opt-in `s3`); opt-in `encryption` seals each data/delete file with its own key in a `PNKLAKE1` container; `catalog-sqlite` / `catalog-postgres` add the SQL backends |
+| `pink-lake` | lake layer: a catalog database (`pink:` `.pink` file, `sqlite:`, or `postgres://`) on DuckLake v1.1's tables plus immutable data files — `.pink` (`PINKDB06`) always, Parquet with `parquetlake`; data on local disk or S3/R2 (opt-in `s3`); opt-in `encryption` seals each data/delete file with its own key in a `PNKLAKE1` container; `catalog-sqlite` / `catalog-postgres` add the SQL backends |
 
 Design rules: Rust edition 2024 (MSRV 1.97), zero async (the server's opt-in
 `async-server` transport, wave 47, is the documented I/O-boundary carve-out);
@@ -838,12 +837,12 @@ between raw, RLE, bitpacking (min + width + packed bits) and DELTA_BITPACK;
 doubles raw, RLE or ALP (bit-exact exceptions); booleans bitpacked or RLE;
 strings raw, dictionary (u32 codes), RLE or DICT_BITPACK. NULLs ride in a
 separate validity bitmap, and an all-valid chunk sets a flag instead of
-writing one. 1M-row sales table: 24.5 MB CSV → **2.68 MB** `.pink` (1.015×
-the equivalent Vortex bytes), saved in 0.03 s, reopened in 0.03 s; the same
+writing one. 1M-row sales table: 24.5 MB CSV → **2.68 MB** `.pink`, saved in
+0.03 s, reopened in 0.03 s; the same
 table at 10M rows is 26.8 MB, saved in 0.29 s and reopened in 0.26 s. 1M-row
 text corpora (before → after the compression frame): JSON-like 70.4 → 15.7 MB,
-logs 118.7 → 44.5 MB, URLs 103.5 → 41.4 MB — now 1.26–1.30× Vortex (was
-3.15–5.71×). The same parallel encode pass also collects the exact facts a
+logs 118.7 → 44.5 MB, URLs 103.5 → 41.4 MB. The same parallel encode pass
+also collects the exact facts a
 lake save publishes (row count, per-column NULL/NaN counts, bit-exact
 min/max — wave 45k); the `.pink` bytes are unchanged by it.
 
@@ -876,7 +875,7 @@ store-unique, so a table dropped and recreated underneath a transaction is
 always a conflict. The plain `PinkDb` API remains for single-connection
 embedding.
 
-## Lake layer (features `pinklake` / `vortexlake` / `parquetlake`)
+## Lake layer (features `pinklake` / `parquetlake`)
 
 **A lake is a catalog database plus data files.** The catalog is always one of
 three databases:
@@ -905,7 +904,7 @@ data there:
 ```
 
 **Data-file formats are providers** (wave 87). `.pink` (`PINKDB06`) is always
-available; Vortex comes with `vortexlake`, Parquet with `parquetlake`. A table
+available; Parquet comes with `parquetlake`. A table
 pins its provider, and appends keep it. Append-only commits add immutable data
 files (and DuckLake Parquet delete files when rows are removed); merge,
 rewrite, expire and cleanup are explicit maintenance commands.
@@ -1860,8 +1859,8 @@ best-of-5; "before" = the same battery immediately before the wave:
 | **battery total** | **493** | **447** (421 on a quiet host) |
 
 The wins are profile-driven: typed aggregate kernels + a count-filter fast path
-(`WHERE total > 500`), a window-key rework (the `OVER` rows) and parallel Vortex
-lake writes (see below). The typed kernels keep semantics pinned exactly
+(`WHERE total > 500`), a window-key rework (the `OVER` rows) and parallel lake
+data-file writes. The typed kernels keep semantics pinned exactly
 (wrapping integer `SUM`, NULL skips, NaN rules), and no join row regressed.
 
 ### Wave 45 refresh (Oct 2026)
@@ -1880,129 +1879,14 @@ best-of-5 on the same host; full numbers in ROADMAP.md):
 | **battery total** | **416** | **245–250** |
 
 At 10M: GROUP BY region 68–70 → 33–35 ms (DuckLake 37–55), import 274 → 173
-ms, `.lake save` 632–758 → 296–340 ms (format_version 3: 8,192-row Vortex
-blocks), `.lake open` 618 → 100 ms, data 29.7 → 25 MB, store teardown 93 → 16
+ms, `.lake save` 632–758 → 296–340 ms, `.lake open` 618 → 100 ms, data
+29.7 → 25 MB, store teardown 93 → 16
 ms. The techniques: two-pass hash aggregation (group ids, then one typed loop
 per aggregate) with typed single-column keys; DISTINCT through that
 aggregation; parallel window partitioning/sorting/assembly; prefix-keyed
-sorting; moving (not copying) bulk-loaded chunks; streamed + parallel Vortex
+sorting; moving (not copying) bulk-loaded chunks; streamed + parallel data-file
 encode and parallel bulk decode; parallel teardown. Every result is pinned
 to the old semantics (duckdiff 60/60 + the 1M battery 64/64).
-
-### Lake format comparison (Vortex vs DuckLake)
-
-`bench/lake_bench.py` (stdlib-only Python, one file) runs the same 1M-row CSV
-through both lake formats and the same four queries, and prints the raw
-numbers as JSON:
-
-```sh
-cargo build --release -p pinkdb-cli --features vortexlake
-python3 bench/lake_bench.py --rows 1000000 --runs 5
-```
-
-Both arms store the table as `lake.sales`, so the SQL text is identical
-(pink-lake is told to import into a database named `lake`; DuckLake attaches
-a catalog named `lake`). Measured 2026-10-14 on this machine (macOS 26.6.2,
-Apple Silicon, 10 CPUs, load average ≈3 during the run; `pinkdb`
-44,567,680 B with `--features vortexlake`; `duckdb` v1.5.5 with the `ducklake`
-extension already cached, `INSTALL` ≈1 ms):
-
-| Metric (1M rows) | pink-lake (Vortex) | DuckLake (DuckDB) |
-|---|---|---|
-| ingest wall (s) | 0.243 (import 0.031 + lake save 0.174) | 0.125 (CTAS 0.091) |
-| stored total | 3.12 MB (4 files) | 13.26 MB (2 files) |
-|  data | 3,117,735 B Vortex (1 file) | 9,313,736 B Parquet (1 file) |
-|  metadata | 643 B (catalog 272 B + 2 snapshots) | 3,944,448 B SQLite catalog |
-| cold open printed (s) | 0.061 (`.lake open`) | n/a (ATTACH ≈3 ms, lazy) |
-| cold end-to-end wall (s) | 0.077 (start→open→first query→exit) | 0.036 (start→attach→query→exit) |
-| `COUNT(*)` best-of-5 (ms) | <1 | 7 (printed; 36 as fresh-process wall) |
-| GROUP BY region + 5 aggs (ms) | 10 | 12 (printed; 41 as fresh-process wall) |
-| `WHERE total > 500` (ms) | 5 | 11 (printed; 39 as fresh-process wall) |
-| ORDER BY total DESC LIMIT 10 (ms) | 3 | 12 (printed; 41 as fresh-process wall) |
-
-Both CLIs print `real X.XXX` (1 ms resolution; 0.000 means <1 ms), both
-numbers above are best-of-5, and the run-to-run spread is ±1 ms at this
-resolution. A 10M-row run (`--rows 10000000`, generated
-deterministically, 243 MB CSV) shows DuckLake winning the larger scans:
-ingest 0.368 s vs 1.943 s, stored 97.1 MB (93.1 MB Parquet + 3.9 MB catalog)
-vs 31.1 MB Vortex, cold open 0.036 s vs 0.724 s, and query best-of-5
-group-by 37 ms vs 93 ms, filter 24 ms vs 48 ms, order-by 28 ms vs 30 ms —
-pink-lake keeps only `COUNT(*)` (<1 ms vs 8 ms). No cherry-picking: at 10M
-DuckLake wins ingest, cold start and three of the four queries.
-
-**Wave 40 refresh (Oct 2026):** `.lake save` now runs the Vortex compression
-cascade on a driven worker pool instead of inline on the main thread, and the
-written files are **byte-identical** (sha256 unchanged): 1M save 0.180 s →
-**0.088 s**, 10M 1.562 s → **0.76–1.22 s** (2.0–2.7×). At 10M, pink-lake's
-in-memory queries moved too: filter 50 → **23–25 ms** (now ~equal to
-DuckLake's 24 ms), order-by 36 → 24–32 ms, group-by 100 → **68–74 ms** (still
-~1.7× DuckLake's 37 ms). Targets were ≤30 ms filter (met) and ≤60 ms
-group-by (missed; 444 ms single-thread at the measured 6.0× parallel ceiling
-of this 4P+6E M4, merge 3 ms) — SoA accumulators are the next round's
-breadcrumb. At 10M, lake save is still behind DuckLake's ingest (0.76 s vs
-0.37 s), and the `.lake open` decode (~0.63 s) is the last obvious lake gap
-(bulk typed decode is the other breadcrumb).
-
-**Wave 45 refresh (Oct 2026, sub-waves 45c/45d):** `.lake open` at 10M went
-110–126 → **30 ms** printed (open CPU 540 → 190 ms, peak RSS 996 → 352 MB;
-13 → 4 ms at 1M) via a zero-copy file read, shared decoded chunks and
-per-chunk varchar interning; 10M ingest wall 0.482 s (save 0.275 s), storage
-25.1 MB vs DuckLake's 92.6 MB. `.lake attach` (wave 45d) is the lazy
-counterpart: footer-only (no column decode), exact `COUNT`/`MIN`/`MAX` from
-the stored statistics, and lazy per-table materialization for anything else.
-Cold-process runs (fresh process → open/attach → one query → exit; best-of-5,
-2026-10-15, same host — the `COUNT(*)`/attach rows are from 45d's
-side-by-side run, the scan-query rows from 45c's official run):
-
-| cold process (ms) | pink `.lake attach` | pink `.lake open` | DuckLake |
-|---|---|---|---|
-| @10M `COUNT(*)` | **4.94** | 34.76 | 34.92 |
-| @10M `MIN(total)` / `MAX(total)` | **4.90** | — | — |
-| @10M group-by / filter / order-by | fallback = decode, within noise of open | 72.2 / 62.2 / 77.2 | 64.3 / 52.2 / 55.4 |
-| @1M `COUNT(*)` | **4.62** | — | — |
-
-Attach overhead (catalog + manifest + footers) is ~1.2–1.7 ms, constant in
-file size. `.lake open` is now within 1.1–1.4× of DuckLake on the three scan
-queries (was 2.8–4.2× behind); the remaining gap is the scan path itself —
-stage 2 (projection pushdown) shipped as 45e right below, and stage 3
-(filter/zone-map pruning) is the follow-up.
-
-**Wave 45e refresh (Oct 2026):** projection pushdown for `.lake attach` — an
-attached scan decodes only the columns the query references, into a per-column
-lazy cache (a missed reference is a hard internal error, never a silent NULL).
-Cold-process @10M, fresh process → attach → one query → exit, best-of-5,
-2026-10-15, DuckLake measured alongside:
-
-| cold process, @10M (ms) | pink pre-45e | pink 45e | DuckLake |
-|---|---|---|---|
-| `COUNT(*)` — 0 columns decoded | ~5 | ~5 | 34.9 |
-| `WHERE total > 500` — 1 column | 60.6 | **41.9** (1.45×) | 51.9 |
-| `ORDER BY total DESC LIMIT 10` — 2 columns | 74.0 | **60.5** (1.22×) | 55.4 |
-| group-by — 2 columns | 72.8 | **68.9** (1.06×) | 63.8 |
-
-@1M: filter 10.7 → 8.9 ms, top-10 12.5 → 11.1 ms. The cold scorecard vs
-DuckLake is now: `COUNT(*)` 6.8× faster, filter 1.24× faster, order-by and
-group-by ~1.1–1.2× behind.
-
-**Fairness caveat — this is "same data, same queries, different
-architectures", not an apples-to-apples product comparison.** `.lake open`
-eagerly loads the whole table from Vortex back into pinkdb's in-memory
-engine, so pink-lake's per-query lines are in-memory scans and the load cost
-is the separate open row; DuckLake is lazy — ATTACH only opens the SQL
-catalog and every query scans Parquet at query time, so its printed query
-times include the scan and its fresh-process wall adds ~30 ms of process
-start + LOAD + ATTACH at 1M on top of the query. `.lake attach` is pink-lake's
-lazy mode (footer-only; statistics-only answers), but a query the statistics
-cannot answer still decodes the whole table (projection pushdown shipped in
-45e, so only the columns it references decode; filter/zone-map pruning is not
-implemented yet). DuckLake is a full
-lakehouse format (transactional SQL
-catalog, MVCC-ish snapshots, time travel) and its catalog DB grows with
-every write/snapshot (this run is a single ingest), while pink-lake
-publishes a full snapshot per save and keeps old versions' files. No cache
-was dropped on either side, and both engines returned matching results
-(float sums differ in the last few digits from different summation orders;
-ties in ORDER BY have no stable order on either engine).
 
 ## Known v1 limits
 
@@ -2057,24 +1941,20 @@ ties in ORDER BY have no stable order on either engine).
   (limit 64)` — the AST is freed iteratively, so even a multi-megabyte chain
   cannot overflow the stack during rejection
 
-- Lake (`vortexlake`/`pinklake`/`s3` features): every `.lake save` writes a full snapshot of
+- Lake (`pinklake`/`s3` features): every `.lake save` writes a full snapshot of
   every table; old versions and orphaned data files are never garbage
   collected; the lake is reached through `.lake open` (whole store into memory)
-  or `.lake attach` (read-only, one version pinned, footer-only: exact
-  COUNT/MIN/MAX from stored statistics, anything else lazily decodes the one
-  table it touches — no time travel within a session; projection pushdown
-  shipped in 45e, so only referenced columns decode, but there is no
-  filter/zone-map pruning yet); attached tables are session-local, not saved,
-  and mutations over them are refused (mutating SQL over them on a durable
-  store is refused too, since the log could not replay them); lake files are
-  plaintext; one S3 object is capped at 5 GiB (no multipart uploads) and
-  credentials come only from the environment or explicit config (no
-  profiles/IMDS/SSO); the `pinklake` build writes and reads only
-  `.pink` data files (`PINKDB06`, v4 catalogs), attaches them
-  statistics-only (exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks;
-  `.pink` has no projected reader, so a fallback decodes the whole table),
-  supports `.lake attach … write` + `.lake commit`, and refuses a Vortex lake
-  with the rebuild-with-`vortexlake` error
+  or `.lake attach` (read-only, one version pinned, statistics-only: exact
+  COUNT/MIN/MAX from the catalog's blocks, anything else lazily decodes the
+  one table it touches — no time travel within a session; projections decode
+  only referenced columns, and row-group statistics prune chunks inside a
+  file); attached tables are session-local, not saved, and mutations over
+  them are refused (mutating SQL over them on a durable store is refused too,
+  since the log could not replay them); lake data files are plaintext unless
+  the lake is keyed; one S3 object is capped at 5 GiB (no multipart uploads)
+  and credentials come only from the environment or explicit config (no
+  profiles/IMDS/SSO); the lake writes and reads `.pink` (`PINKDB06`) data
+  files and supports `.lake attach … write` + `.lake commit`
 - Extensions repository: artifacts are verified by SHA-256 from the catalog
   (no signatures yet), and only `darwin-arm64` builds are published
 - Stored procedures (wave 44): a body's expressions bind at `CALL` time (the
@@ -2105,27 +1985,21 @@ compatibility tests are gone.
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
 PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
 feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
-layer (`pink-lake`, CLI `vortexlake` feature) shipped in wave 34, became
-Vortex-first in wave 35 (v1 `.pink` lakes still load; open + save migrates)
-and gained S3/R2 object storage in wave 36 (`s3` feature; `s3://` locations,
-conditional-write conflict detection), read-only `.lake attach` (footer-only;
-exact `COUNT`/`MIN`/`MAX` from stored statistics; lazy materialize) in wave 45d
-and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
-brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
-10M), and wave 45j added LZ frames (tag 8) that shrink text corpora 3–5×. The
-`pinklake` build (`.pink` lake data files, no `vortex` dependency,
-5.21 MB vs 47.78 MB CLI) shipped in wave 45i, and wave 45k gave it exact
-attach fast paths (a CRC-32-protected per-column statistics block published in
+layer (`pink-lake`, CLI `pinklake` feature) shipped in wave 34 and gained S3/R2
+object storage in wave 36 (`s3` feature; `s3://` locations, conditional-write
+conflict detection), read-only `.lake attach` (statistics-only; exact
+`COUNT`/`MIN`/`MAX` from stored statistics; lazy materialize) in wave 45d and
+projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
+brought single-file saves to roughly the size of a Parquet lake, and wave 45j
+added LZ frames (tag 8) that shrink text corpora 3–5×. Wave 45k gave attach
+exact fast paths (a CRC-32-protected per-column statistics block published in
 the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
 `.pink` v4 bit-pack correctness fix (u64 accumulators dropped high bits for
 widths > 56). Durable `.pink` databases became multi-process in wave 45m — a
 per-operation write lease, lock-free epoch refresh, WAL v3 and encrypted
 container v2 — with stage 5 (optimistic disjoint-table commits) deferred and
 the stability-hardening round shipped as wave 45n (chaos soak, lock-file
-identity, WAL fuzz). Remaining lake follow-ups (not
-committed): projection pushdown for `.pink`, per-chunk statistics +
-filter/zone pruning (stage 3), and the parked cold order-by/group-by items.
-Authentication and TLS are deferred.
+identity, WAL fuzz). Authentication and TLS are deferred.
 
 ## Development
 
@@ -2134,16 +2008,13 @@ cargo build            # workspace
 cargo test             # 100+ unit + end-to-end tests
 cargo test -p pinkdb-server                          # protocol + server + durable tests
 cargo test -p pinkdb-cli --features client           # remote-mode CLI tests
-cargo test -p pinkdb-cli --features vortexlake       # Vortex lake round-trip + CLI tests
-cargo test -p pinkdb-cli --features vortexlake,s3    # + S3/R2 over a hermetic mock S3
-cargo test -p pinkdb-cli --features pinklake         # lean `.pink` lake round-trips (no Vortex)
+cargo test -p pinkdb-cli --features pinklake         # `.pink` lake round-trips + CLI tests
 cargo test -p pinkdb-cli --features pinklake,s3      # + S3/R2 over a hermetic mock S3
 cargo test -p pinkdb-cli --features s3               # storage client alone: no .lake commands
 crates/pink-lake/tests/s3_docker.sh                  # real S3 round-trip/race in Docker: SERVER=s3mock (default)|seaweedfs|rustfs (not cargo test)
-cargo build -p pinkdb-cli --features vortexlake      # REPL with .lake commands
-cargo build -p pinkdb-cli --features vortexlake,s3   # REPL with .lake s3:// URLs
-cargo build -p pinkdb-cli --features pinklake        # REPL with the lean `.pink` lake
-PINKDB_CLI_BIN=./target/release/pinkdb cargo test -p pinkdb-cli --features vortexlake  # release CLI (overflow checks off)
+cargo build -p pinkdb-cli --features pinklake        # REPL with .lake commands
+cargo build -p pinkdb-cli --features pinklake,s3     # REPL with .lake s3:// URLs
+PINKDB_CLI_BIN=./target/release/pinkdb cargo test -p pinkdb-cli --features pinklake  # release CLI (overflow checks off)
 cargo test -p pinkdb-ext-loader                      # loadable extensions (compiles C test extensions with cc)
 cargo test --features encryption                     # encrypted round-trips + WAL recovery
 cargo build -p pinkdb-cli --features encryption      # REPL with PINKDB_KEY support
@@ -2161,8 +2032,8 @@ only:
 
 | Workflow | Trigger | Jobs / steps |
 |---|---|---|
-| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,vortexlake`, `pinkdb-cli --features vortexlake,s3` / `pinklake` / `pinklake,s3` / `s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + the C/C++, Go and Rust SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the whole workspace on Rust 1.97 (the edition-2024 MSRV); `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
-| `release.yml` | push of a `v*` tag, or manual dispatch with a version | `prepare` (tag/version/Cargo.toml match + matrix), one `build` matrix job per CLI/server variant × platform (build → `scripts/release/smoke.sh` → tarball + `.sha256`, no secrets), then one `publish` job (`contents: write`) that downloads all 36 artifacts, regenerates and validates `SHA256SUMS`, refuses an existing release, and uploads the GitHub release |
+| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,encryption`, `pinkdb-cli --features pinklake` / `pinklake,s3` / `s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + the C/C++, Go and Rust SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the whole workspace on Rust 1.97 (the edition-2024 MSRV); `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
+| `release.yml` | push of a `v*` tag, or manual dispatch with a version | `prepare` (tag/version/Cargo.toml match + matrix), one `build` matrix job per CLI/server variant × platform (build → `scripts/release/smoke.sh` → tarball + `.sha256`, no secrets), then one `publish` job (`contents: write`) that downloads all 28 artifacts, regenerates and validates `SHA256SUMS`, refuses an existing release, and uploads the GitHub release |
 | `deploy-docs.yml` | push to `main` touching `website/**` (or the workflow itself), manual dispatch | `python3 website/build.py`, then `wrangler deploy` from `website/` (the `pinkdb-docs` Worker) |
 | `publish-extensions.yml` | push of a `v*` tag, or manual dispatch | builds the extension catalog in a per-platform matrix (C/C++, Go and Rust SDKs plus `extensions/*/Makefile`s; `file` architecture check; native SDK smokes), fans in to one publish job that fetches the live catalog, skips already-published coordinates, publishes with `ext-repo/publish.sh` (wrangler → R2), signs the catalog, deploys the Worker exactly once, then verifies the local/live signature and artifacts through it |
 

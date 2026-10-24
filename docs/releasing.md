@@ -47,8 +47,6 @@ CLI assets:
 | `lean` | `--no-default-features` | no linked json/datetime/math extensions |
 | `pinklake` | `pinklake` | `.lake` over `.pink` data files |
 | `pinklake-s3` | `pinklake,s3` | pinklake + `s3://` storage |
-| `vortexlake` | `vortexlake` | `.lake` over Vortex data files |
-| `vortexlake-s3` | `vortexlake,s3` | Vortex lake + `s3://` storage |
 
 Server assets:
 
@@ -68,7 +66,7 @@ Platforms and runners:
 | `darwin-x86_64` | `macos-latest` + `rustup target add x86_64-apple-darwin` | cross-build; smoke under Rosetta |
 
 `scripts/release/matrix.py --kind all` is the single definition of these 36
-rows (24 CLI + 12 server). The prepare job also uses it to compute the expected
+rows (16 CLI + 12 server). The prepare job also uses it to compute the expected
 asset count; the publish job refuses to publish if any job's artifact is
 missing.
 
@@ -109,7 +107,7 @@ the version is checked against the same three manifests as **Release**.
 | tag | contents |
 | --- | --- |
 | `<version>`, `latest` | `pinkdb-server` (tls + async-server) and the CLI with default features + `client,tls,pinklake,s3` |
-| `<version>-lake`, `lake` | the same server and the CLI with `client,tls,vortexlake,s3,parquetlake` (Vortex/Parquet lake data files; larger) |
+| `<version>-lake`, `lake` | the same server and the CLI with `client,tls,pinklake,s3,parquetlake` (Parquet lake data files; larger) |
 
 The image is `linux/amd64` + `linux/arm64` (buildx + QEMU, multi-arch
 manifest), non-root (UID/GID 10001), `WORKDIR`/`VOLUME` `/data`, `EXPOSE 5433`,
@@ -122,14 +120,9 @@ win, and `docker run … pinkdb …` passes through to the CLI.
 
 **Runtime choice.** The Dockerfile defines both a musl candidate (built on
 Alpine, run on Alpine) and a `debian:*-slim` glibc candidate (`--build-arg
-RUNTIME=musl|glibc`). The default musl variant is fully static. The lake
-variant is dynamically linked against musl: its C++ dependency (custom-labels
-via vortex-io) uses bindgen, which dlopen()s libclang and therefore cannot run
-in a fully static build script. The lake image therefore adds `libgcc` and
-`libstdc++`; Alpine ships musl in its base image, so this has no portability
-cost. The measured image sizes and the chosen runtime are recorded in the
-wave-91 notes and README; the default is the smaller one that passes
-`scripts/docker/smoke.sh`.
+RUNTIME=musl|glibc`). Both variants are fully static. The measured image sizes
+and the chosen runtime are recorded in the wave-91 notes and README; the
+default is the smaller one that passes `scripts/docker/smoke.sh`.
 
 Publishing is the only writer: pull requests and pushes to `main` build both
 variants for both architectures and smoke the native amd64 image without
@@ -146,9 +139,9 @@ cannot upload anything that has not executed:
 - CLI `default`: `json_valid('{}')`, `exp(1)`, and `strftime` on a TIMESTAMP.
 - CLI `lean`: `SELECT 42` succeeds and `json_valid`/`exp` are refused (the
   default-feature functions are genuinely absent).
-- CLI lake variants: `.help` advertises `.lake save`; `pinklake` reports the
-  pinklake data format, `vortexlake` does not; `*-s3` variants advertise
-  `s3://` URLs. No network is touched.
+- CLI lake variants: `.help` advertises `.lake save` and names the `.pink`
+  data format/catalog version; `*-s3` variants advertise `s3://` URLs. No
+  network is touched.
 - Server: start with `--host 127.0.0.1 --port 0`, wait for the documented
   `listening on HOST:PORT` line, connect with `python3` over TCP, then stop.
 - Server `async-server`: starts with `--transport async`, and refuses

@@ -8,7 +8,7 @@
 #     variants to GHCR with the GITHUB_TOKEN.
 #
 # Tags: <version> and latest (default CLI features), <version>-lake and lake
-# (Vortex/Parquet lake CLI features). The version is checked against the same
+# (Parquet lake CLI features). The version is checked against the same
 # three Cargo.toml files as release.yml. Publishing is the only writer.
 name: Docker
 

@@ -50,7 +50,7 @@ lto = "thin"
 codegen-units = 1
 
 # Dependency debug info is the bulk of target/debug once a large tree like
-# vortex is in play; keep our own crates debuggable, strip deps.
+# large dependencies are in play; keep our own crates debuggable, strip deps.
 [profile.dev.package."*"]
 debug = false
 

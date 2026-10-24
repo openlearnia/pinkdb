@@ -188,9 +188,6 @@ data files in S3, R2 or MinIO, using the SigV4 client behind the optional
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-c"># .pink data files over object storage</span>
 cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> pinklake,s3
-
-<span class="tok-c"># Vortex data files over object storage</span>
-cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> vortexlake,s3
 <span class="tok-c"># `--features s3` alone adds the storage client but no `.lake` commands</span></code></pre></div>
 
 <h2 id="2-configure-credentials">2. Configure credentials<a class="anchor" href="#2-configure-credentials" aria-label="Permalink: 2. Configure credentials">#</a></h2>

@@ -554,9 +554,6 @@ pub fn attach_and_count_issue_no_data_requests_over_s3(suite: &mut dyn Suite) {
     let dir = scratch("s3-attach");
     let catalog = suite.catalog(&dir, "catalog");
     let mut lake = Lake::create_with_catalog(&catalog, "s3://catalog-bucket/split-data").unwrap();
-    // Pin the `.pink` format so attach never needs a data-file footer (a
-    // `vortexlake` build would otherwise default to Vortex).
-    lake.set_write_format("pink").unwrap();
     assert_eq!(lake.write_from_store(&store(4)).unwrap(), 2);
     drop(lake);
 

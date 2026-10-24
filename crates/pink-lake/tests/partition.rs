@@ -4,10 +4,9 @@
 //! zone maps, and pruned scans that decode only the files a simple `WHERE`
 //! can still match.
 //!
-//! Format-agnostic on purpose: the suite runs in a default (lean `.pink`)
-//! build and in a `vortexlake` build, and the data-file extension follows
-//! the build. The catalog shape, the partition values, the zone maps and the
-//! pruning semantics are identical.
+//! Format-agnostic on purpose: the suite runs over the built-in `.pink`
+//! data format. The catalog shape, the partition values, the zone maps and
+//! the pruning semantics are what it pins.
 #[path = "common/local_lake.rs"]
 mod local_lake;
 use local_lake::*;
@@ -21,9 +20,6 @@ use pinkdb::{PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "vortexlake")]
-const EXT: &str = "vortex";
-#[cfg(not(feature = "vortexlake"))]
 const EXT: &str = "pink";
 
 fn scratch(tag: &str) -> PathBuf {
@@ -351,7 +347,7 @@ fn zone_map_pruning_decodes_only_matching_files() {
         attached_query(&lake_dir, "SELECT s FROM t WHERE id = 11;");
     assert_eq!(got, vec![vec![Value::Varchar("v11".to_string())]]);
     assert_eq!((loads, files), (1, 1), "one load, one file");
-    // Vortex and `.pink` (wave 102) both decode only the needed columns.
+    // The `.pink` provider (wave 102) decodes only the needed columns.
     assert_eq!(columns, 2, "id (predicate) and s (projection) only");
     cleanup(&dir);
 }
@@ -804,33 +800,6 @@ fn tampered_partition_values_and_zone_maps_are_refused() {
     let err = lake.attach(None).unwrap_err().to_string();
     assert!(
         err.contains("partition") || err.contains("zone map"),
-        "{err}"
-    );
-    cleanup(&dir);
-}
-
-#[cfg(feature = "vortexlake")]
-#[test]
-fn vortex_zone_maps_cross_check_against_the_footer() {
-    // A catalog zone map that disagrees with the file footer is corrupt:
-    // write a min that the footer cannot confirm.
-    let dir = scratch("vortex_cross");
-    let lake_dir = dir.join("lake");
-    let mut lake = open_or_create_lake(&lake_dir).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    lake.write_from_store(&store(&[(1, Some("a")), (2, Some("b"))]))
-        .unwrap();
-    drop(lake);
-
-    catalog_sql(
-        &lake_dir,
-        "UPDATE ducklake_file_column_stats SET min_value = '0', max_value = '0' \
-         WHERE column_id = (SELECT MIN(column_id) FROM ducklake_column);",
-    );
-    let lake = open_lake(&lake_dir).unwrap();
-    let err = lake.attach(None).unwrap_err().to_string();
-    assert!(
-        err.contains("zone map") || err.contains("statistics"),
         "{err}"
     );
     cleanup(&dir);

@@ -4,8 +4,7 @@
 //! DEFAULT` materialization, hidden dropped columns), with time travel
 //! reading each version's own schema.
 //!
-//! Format-agnostic: runs in a default (lean `.pink`) build and in a
-//! `vortexlake` build; the mapping semantics are the same either way.
+//! Format-agnostic: the suite runs over the built-in `.pink` data format.
 #[path = "common/local_lake.rs"]
 mod local_lake;
 use local_lake::*;
@@ -18,11 +17,7 @@ use pinkdb::{PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-const EXT: &str = if cfg!(feature = "vortexlake") {
-    "vortex"
-} else {
-    "pink"
-};
+const EXT: &str = "pink";
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(

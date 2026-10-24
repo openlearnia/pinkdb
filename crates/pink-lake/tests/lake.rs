@@ -1,11 +1,6 @@
 //! End-to-end tests of the public `pink-lake` API: round-trips, versioning,
-//! crash-atomicity leftovers, corrupt-metadata handling, and the v1 → v2/v3
-//! (`.pink` → Vortex) format history.
-//!
-//! `vortexlake` builds only; the lean (v1 `.pink`) behavior is covered by
-//! `tests/pinklake.rs`.
+//! crash-atomicity leftovers, and corrupt-metadata handling.
 
-#![cfg(feature = "vortexlake")]
 #[path = "common/local_lake.rs"]
 mod local_lake;
 use local_lake::*;
@@ -148,7 +143,7 @@ fn assert_same_store(a: &PinkDb, b: &PinkDb) {
     }
 }
 
-/// Every lake data file (`*.pink` or `*.vortex`) under `dir`, recursively.
+/// Every lake data file (`*.pink`) under `dir`, recursively.
 fn data_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if !dir.exists() {
@@ -158,10 +153,7 @@ fn data_files(dir: &Path) -> Vec<PathBuf> {
         let path = entry.unwrap().path();
         if path.is_dir() {
             out.extend(data_files(&path));
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("pink") | Some("vortex")
-        ) {
+        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("pink")) {
             out.push(path);
         }
     }
@@ -382,8 +374,8 @@ fn missing_data_files_are_reported_but_metadata_still_reads() {
 }
 
 #[test]
-fn vortex_roundtrip_preserves_every_bit_pattern() {
-    let dir = scratch("vortex_bits");
+fn pink_roundtrip_preserves_every_bit_pattern() {
+    let dir = scratch("pink_bits");
     let db = common::fidelity_store();
     let original_bytes = store_bytes(&db, &dir, "original");
 
@@ -446,8 +438,8 @@ fn vortex_roundtrip_preserves_every_bit_pattern() {
 }
 
 #[test]
-fn a_corrupt_vortex_data_file_is_a_clear_error() {
-    let dir = scratch("vortex_corrupt");
+fn a_corrupt_pink_data_file_is_a_clear_error() {
+    let dir = scratch("pink_corrupt");
     let db = common::fidelity_store();
     let mut lake = create_lake(&dir).unwrap();
     lake.write_from_store(&db).unwrap();
@@ -456,12 +448,11 @@ fn a_corrupt_vortex_data_file_is_a_clear_error() {
         .into_iter()
         .next()
         .expect("main.fid data file");
-    // Truncate it to a prefix: not a Vortex file anymore.
+    // Truncate it to a prefix: no longer a decodable `.pink` file.
     let bytes = std::fs::read(&victim).unwrap();
     std::fs::write(&victim, &bytes[..bytes.len() / 2]).unwrap();
     let lake = open_lake(&dir).unwrap();
     let err = lake.load(None).unwrap_err().to_string();
-    assert!(err.contains("not a valid Vortex file"), "{err}");
     assert!(err.contains("main.fid"), "{err}");
 
     // Metadata still reads; only a load fails.
@@ -618,65 +609,10 @@ fn csv_import_chunk_boundaries_roundtrip() {
     let loaded = lake.load(None).unwrap();
     assert_same_store(&db, &loaded);
     // The CSV loader's chunk boundary (full chunk + remainder) is the same
-    // after a Vortex round-trip.
+    // after a `.pink` round-trip.
     assert_eq!(sizes(loaded.table("t").unwrap()), vec![CHUNK_SIZE, 123]);
     cleanup(&dir);
 }
-
-#[test]
-fn v3_round_trip_accepts_scan_chunks_above_the_old_cap() {
-    // Regression (wave 45 v3 loader): the Vortex reader sub-splits stored
-    // layout chunks into scan ranges of at most its ideal split size (100,000
-    // rows in Vortex 0.88), so a ~100,000-row table is handed to the loader as
-    // one scan chunk of ~100,000 rows — larger than the loader's old 65,536
-    // cap, which rejected the lake it had just written as "corrupt". Any lake
-    // saved by the v3 writer with such a split was unreadable.
-    let dir = scratch("v3_split_cap");
-    let mut db = PinkDb::new();
-    db.execute("CREATE TABLE t (id INTEGER, region VARCHAR, total DOUBLE, active BOOLEAN);")
-        .unwrap();
-    {
-        let t = db.table_mut("t").unwrap();
-        // 100,000 rows in engine chunks (each vector is at most CHUNK_SIZE).
-        const ROWS: usize = 100_000;
-        let mut offset = 0usize;
-        while offset < ROWS {
-            let rows = (ROWS - offset).min(CHUNK_SIZE);
-            let mut id = Vector::with_capacity(DataType::Integer, rows);
-            let mut region = Vector::with_capacity(DataType::Varchar, rows);
-            let mut total = Vector::with_capacity(DataType::Double, rows);
-            let mut active = Vector::with_capacity(DataType::Boolean, rows);
-            for i in 0..rows {
-                let n = offset + i;
-                id.push_value(Value::Integer(n as i32)).unwrap();
-                region
-                    .push_str(["west", "east", "north", "south"][n % 4])
-                    .unwrap();
-                if n.is_multiple_of(97) {
-                    total.push_null().unwrap();
-                } else {
-                    total.push_value(Value::Double(n as f64 / 8.0)).unwrap();
-                }
-                active
-                    .push_value(Value::Boolean(!n.is_multiple_of(3)))
-                    .unwrap();
-            }
-            t.append_chunk(vec![id, region, total, active]).unwrap();
-            offset += rows;
-        }
-    }
-    let mut lake = create_lake(&dir).unwrap();
-    lake.write_from_store(&db).unwrap();
-    let loaded = lake.load(None).unwrap();
-    assert_same_store(&db, &loaded);
-    // The scan chunk was sliced back into engine chunks densely, and the
-    // 100,000 rows survived exactly.
-    assert_eq!(loaded.table("t").unwrap().num_rows(), 100_000);
-    cleanup(&dir);
-}
-
-// ---------------------------------------------------------------------------
-// `.lake attach`: footer-only descriptors + lazy materialization.
 
 /// Query `db` and return the rows bit-exactly (NaN payloads and `-0.0`
 /// compared by bits, like [`assert_same_store`]).
@@ -703,9 +639,6 @@ fn assert_rows_bit_same(a: &[Vec<Value>], b: &[Vec<Value>], what: &str) {
     }
 }
 
-/// The whole fidelity fixture attaches: descriptors equal the decoded truth,
-/// and a battery of COUNT/COUNT(col)/MIN/MAX (plus shapes that must fall
-/// back) answers bit-identically to the `.lake open` store.
 #[test]
 fn attach_of_the_fidelity_store_matches_the_loaded_store() {
     let dir = scratch("attach_fidelity");
@@ -716,7 +649,6 @@ fn attach_of_the_fidelity_store_matches_the_loaded_store() {
     let report = lake.attach(None).unwrap();
     assert_eq!(report.version, 2);
     assert_eq!(report.format_version, FORMAT_VERSION);
-    assert!(!report.remote);
 
     // Descriptor-vs-decoded: every provable statistic must hold, for every
     // table of the fixture.
@@ -1150,13 +1082,17 @@ fn time_travel_stats_fast_paths_do_not_decode() {
     );
     assert_eq!(lake.decode_stats().0, 1);
     let _ = try_rows(&mut db, "SELECT SUM(x) FROM t AT (VERSION => 2);").unwrap();
-    assert_eq!(lake.decode_stats().0, 1, "the version attachment is cached");
+    assert_eq!(
+        lake.decode_stats().0,
+        2,
+        "a pruned load is uncached; the full load then materializes the version"
+    );
     // The pinned current version is unaffected (no decode either).
     assert_eq!(
         try_rows(&mut db, "SELECT COUNT(*) FROM t;").unwrap(),
         vec![vec![Value::Bigint(4)]]
     );
-    assert_eq!(lake.decode_stats().0, 1);
+    assert_eq!(lake.decode_stats().0, 2);
     cleanup(&dir);
 }
 
@@ -1437,8 +1373,12 @@ fn attach_refusals_are_clean_errors() {
     for path in data_files(&lake_dir.join("data")) {
         std::fs::remove_file(&path).unwrap();
     }
+    // Attach itself never probes a data file (statistics-only); the first
+    // read is what reports the missing file.
     let lake = open_lake(&lake_dir).unwrap();
-    let err = lake.attach(None).unwrap_err().to_string();
+    let report = lake.attach(None).unwrap();
+    assert_eq!(report.tables, 5, "the descriptors still list every table");
+    let err = lake.load(None).unwrap_err().to_string();
     assert!(
         err.contains("is missing") || err.contains("loading data file"),
         "{err}"

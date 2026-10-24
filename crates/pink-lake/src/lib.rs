@@ -15,9 +15,8 @@
 //!   catalog.json                current catalog (authoritative for "latest")
 //!   snapshots/<version>.json    immutable manifests, one per published version
 //!   commits/<version>.json      immutable per-commit delta manifests (audit)
-//!   data/<table>/<uuid>.vortex  immutable per-table data files (v4, Vortex)
-//!   data/<table>/<uuid>.pink    `.pink` data files (v1/v4 lean builds)
-//!   data/<table>/<uuid>.pinkdel positional delete files (v4; see delete_file)
+//!   data/<table>/<uuid>.pink    immutable per-table data files (`PINKDB06`)
+//!   data/<table>/<uuid>.pinkdel positional delete files (see delete_file)
 //!   replication/state.json      replication jobs + per-table cursor state (wave 89)
 //! ```
 //!
@@ -32,15 +31,15 @@
 //!   "tables": {
 //!     "main.t": {
 //!       "files": [
-//!         { "path": "data/main.t/3f2a….vortex", "rows": 5 },
-//!         { "path": "data/main.t/9c01….vortex", "rows": 2 }
+//!         { "path": "data/main.t/3f2a….pink", "rows": 5 },
+//!         { "path": "data/main.t/9c01….pink", "rows": 2 }
 //!       ],
 //!       "deletes": [
-//!         { "path": "data/main.t/77aa….pinkdel", "file": "data/main.t/3f2a….vortex",
+//!         { "path": "data/main.t/77aa….pinkdel", "file": "data/main.t/3f2a….pink",
 //!           "count": 1 }
 //!       ],
 //!       "rows": 6,
-//!       "format": "vortex",
+//!       "format": "pink",
 //!       "table_id": "0123456789abcdef0123456789abcdef"
 //!     }
 //!   }
@@ -56,15 +55,12 @@
 //! `deletes` entry names one **positional delete file** (0-based positions
 //! within the one data file it targets) whose rows the reader drops
 //! (merge-on-read). `rows` is the logical count and must equal
-//! `sum(files.rows) - sum(deletes.count)`. A v4 entry's `format` is
-//! `"vortex"` in a `vortexlake` build or `"pink"` (the engine's
-//! single-table `.pink` bytes) in a lean one — or any other id a registered
-//! provider ([`crate::format`]) supplies; every v4 data file carries a
-//! CRC-protected statistics/zone-map block in its `files` object — for
-//! `.pink` the exact facts its encode pass collected, for Vortex the same
-//! facts published from the writer and cross-checked against the file's own
-//! footer at attach — so aggregate fast paths and **file pruning** work
-//! without decoding anything.
+//! `sum(files.rows) - sum(deletes.count)`. An entry's `format` is `"pink"`
+//! (the engine's single-table `.pink` bytes) or any other id a registered
+//! provider ([`crate::format`]) supplies; every data file carries a
+//! CRC-protected statistics/zone-map block in its `files` object — the exact
+//! facts its encode pass collected — so aggregate fast paths and **file
+//! pruning** work without decoding anything.
 //!
 //! # Partitioning (wave 66)
 //!
@@ -96,47 +92,24 @@
 //! `COUNT`/`MIN`/`MAX` fast paths keep their wave-63 honesty rule (any
 //! delete file makes the per-column facts unknown).
 //!
-//! Versions 1–3 remain readable and are never written any more: a v1 entry
-//! (the wave-34 lean format) is one `.pink` file as a plain string path plus
-//! one entry-level `"stats"` block; versions 2 and 3 are one `.vortex` file
-//! as a plain string path (`"format": "vortex"`), v3 with larger row blocks.
-//! A v1–v3 entry that omits `format` (v2/v3) or declares the wrong one, a
-//! manifest with any other `format_version`, a v4 file object without a row
-//! count, or a v4 table whose row count does not add up is a clear
+//! Only the current catalog (`format_version` 7) is read: a manifest with
+//! any other `format_version`, an entry whose `format` names a removed or
+//! unknown provider, a file object without a row count, or a table whose row
+//! count does not add up is a clear
 //! [`LakeError::Unsupported`]/[`LakeError::Corrupt`] error, never a guess.
-//! Decoding a corrupt Vortex data file is the same clear [`LakeError::Corrupt`]
-//! error: the whole decoder boundary is guarded, so a panic inside Vortex's
-//! malformed-layout paths is caught and reported (the default panic hook may
-//! still print one line to stderr first; the crate does not swap the global
-//! hook).
 //!
-//! **With the `vortexlake` feature (not on by default; the full CLI builds
-//! enable it) Vortex is the format for new writes**: every new data file is a
-//! plain Vortex file holding one struct array — one field per column, row
-//! order preserved, `-0.0` and NaN payloads bit-exact — plus a
-//! `pinkdb.table` metadata segment carrying the table's `db`/`table` identity
-//! and its pinkdb column schema (the `vortex_file` module docs have the
-//! type mapping; DATE/TIMESTAMP are raw `i32`/`i64` storage because the native
-//! `vortex.timestamp` extension cannot represent the full engine range).
-//! **Without the feature** — the `pinklake` builds — new writes are
-//! engine `.pink` single-table persistence files
+//! New writes are engine `.pink` single-table persistence files
 //! ([`PinkDb::to_pink_bytes_with_stats`]) **plus a CRC-protected statistics
 //! block per file** (the exact per-column facts the same encode pass
-//! collected; see the `stats` module docs). A v4–v6 lake whose entries
-//! include Vortex tables still **opens** in a lean build: those tables are
-//! listed as unavailable (wave 88, rule 5) and every read or targeted write
-//! of one is a clear [`LakeError::FeatureMissing`] naming the table — never a
-//! corrupt-file error and never a wrong-format guess; [`Lake::load`] skips
-//! them. A v2/v3 all-Vortex lake keeps the whole-lake refusal, and a v4
-//! `.pink` lake stays readable in every build (its data files open
-//! standalone with [`PinkDb::open`]).
+//! collected; see the `stats` module docs). A catalog row naming the removed
+//! (wave 104) data format fails with a clear re-save error; there is no reader
+//! and no converter for it.
 //!
 //! # Data-file format providers (wave 87)
 //!
 //! An entry's `format` string is a **format id**, resolved through a
-//! process-global registry ([`crate::format`]). The crate registers the built-ins
-//! lazily: `"pink"` in every build and `"vortex"` with the `vortexlake`
-//! feature. An extension registers a [`format::LakeFormat`] — writer, reader,
+//! process-global registry ([`crate::format`]). The crate registers `"pink"`
+//! lazily in every build. An extension registers a [`format::LakeFormat`] — writer, reader,
 //! optional footer statistics, extension, id — with
 //! [`format::register_lake_format`], making its id usable in a catalog:
 //!
@@ -150,18 +123,16 @@
 //! The writer contract is the `.pink` writer's own: [`format::LakeFormat::write`]
 //! returns the file bytes and the exact per-column [`pinkdb::persist::SavedTableStats`]
 //! facts, which the lake seals into the manifest's CRC-protected block (the
-//! shared exactness gate in `stats` applies to every provider). Attach reads
-//! that block, or the format's own footer when it advertises one via
-//! [`format::LakeFormat::footer_stats`] (Vortex), and either way the decode
-//! goes through [`format::LakeFormat::read`]. Format ids are recorded in the
-//! catalog: existing manifests stay byte-identical (`"pink"`/`"vortex"`, and
-//! a v1 entry without `format` still means `"pink"`), while an id with no
-//! registered provider is a clean [`LakeError::UnknownFormat`] naming the id
+//! shared exactness gate in `stats` applies to every provider). Attach normally
+//! reads that block; a projected read may also read the format's footer via
+//! [`format::LakeFormat::footer_stats`] to map the file's physical schema.
+//! Either way the decode goes through [`format::LakeFormat::read`]. Format ids
+//! are recorded in the catalog: a registered id is accepted, while an id with
+//! no registered provider is a clean [`LakeError::UnknownFormat`] naming the id
 //! when that table is read or written — never a panic and never a silent
 //! fallback (wave 88 makes that a per-table refusal: the rest of the lake
 //! still opens). [`Lake::set_write_format`] selects a registered format for a
-//! handle's subsequent writes; the default is unchanged (Vortex with
-//! `vortexlake`, `.pink` otherwise).
+//! handle's subsequent writes; the default is `.pink`.
 //!
 //! # Per-table formats (wave 88)
 //!
@@ -193,27 +164,25 @@
 //! the ordinary expire/cleanup path. Ordinary compaction/rewrite keeps the
 //! entry's format.
 //!
-//! **Unavailable formats are refused per table, not per lake.** In a
-//! format_version 4–6 catalog, an entry whose format id has no registered
-//! provider ([`LakeError::UnknownFormat`], or [`LakeError::FeatureMissing`]
-//! for `vortex` without the `vortexlake` feature) no longer refuses the whole
-//! lake: `open`/`attach` succeed, [`Lake::unavailable_tables`] lists each such
-//! table with its id and error, [`Lake::load`] materializes the readable
-//! tables and skips the rest, and `.lake attach` lists the table while any
-//! read of it fails with that error naming the table and the id. A full save
-//! carries such an entry forward verbatim when the store has no table under
-//! its key and refuses when it does; a commit/append, rewrite or compaction
-//! targeting it fails, and lake-wide maintenance skips it. v2/v3 catalogs
-//! (all-Vortex by definition) keep the whole-lake [`LakeError::FeatureMissing`]
-//! refusal, and corrupt format/version combinations still refuse the lake.
+//! **Unavailable formats are refused per table, not per lake.** An entry
+//! whose format id has no registered provider ([`LakeError::UnknownFormat`])
+//! does not refuse the whole lake: `open`/`attach` succeed,
+//! [`Lake::unavailable_tables`] lists the table with its id and error,
+//! [`Lake::load`] materializes the readable tables and skips the rest, and
+//! `.lake attach` lists the table while any read of it fails with that error
+//! naming the table and the id. A full save carries such an entry forward
+//! verbatim when the store has no table under its key and refuses when it
+//! does; a commit/append, rewrite or compaction targeting it fails, and
+//! lake-wide maintenance skips it. The format id removed in wave 104
+//! is the exception: it is refused up front, never treated as a missing
+//! provider, because no build will ever read it again.
 //!
 //! `.lake open` (every build) and `.lake attach` (every build) are the two
 //! ways in: `open` eagerly loads a version into the store, `attach` reads
-//! only the catalog, the manifest, and the statistics layer — a Vortex data
-//! file's footer, metadata segment and stored statistics, or the per-file
-//! `.pink` statistics blocks (no data file is opened at attach) — and lazily
-//! materializes the one table a query actually scans, with exact
-//! `COUNT`/`MIN`/`MAX` answered straight from those statistics. Attached
+//! only the catalog, the manifest, and the per-file `.pink` statistics blocks
+//! (no data file is opened at attach) — and lazily materializes the one table
+//! a query actually scans, with exact `COUNT`/`MIN`/`MAX` answered straight
+//! from those statistics. Attached
 //! lakes are read-only, session-local, and never part of a save, a
 //! checkpoint, or the WAL; the write path is [`commit`](Lake::commit) (see
 //! the `incremental` module), which appends immutable data files and
@@ -420,10 +389,9 @@
 //!   data files carry **no checksums**: mutating a data file in place is
 //!   undetected by design (an encrypted lake authenticates the whole file,
 //!   and binds it to its catalog path). The checks that do run on load are
-//!   structural: a v2 file's `pinkdb.table` metadata must name the catalog's
-//!   table, agree with the Vortex field names/types, and the chunk and row
-//!   counts must match — so a file swapped in from a *differently named*
-//!   table is rejected. Swapping two *plaintext* files of the *same* table
+//!   structural: a `.pink` file's footer must name the catalog's table and
+//!   its schema/row count must match — so a file swapped in from a
+//!   *differently named* table is rejected. Swapping two *plaintext* files of the *same* table
 //!   (same name, same schema, same row count) is not detectable (an
 //!   encrypted file is bound to its catalog path), and a tampered plaintext
 //!   file can still decode to different values or fail with a
@@ -471,8 +439,6 @@ mod snapshot;
 mod stats;
 mod storage;
 mod time;
-#[cfg(feature = "vortexlake")]
-mod vortex_file;
 mod zone;
 
 pub mod replication;
@@ -496,61 +462,19 @@ use storage::{Head, Location, Storage};
 #[cfg(feature = "s3")]
 pub use s3::{DEFAULT_RETRIES, S3Config};
 
-/// The catalog format version this build writes (and its newest read).
+/// The catalog format version this build writes (and its only read).
 ///
-/// Version 6 (M-7): every manifest records the lake's random 128-bit
-/// `lake_id`, and `lake.json` (identity) plus `highest.json` (the
-/// monotonically increasing published version) anchor it. Manifests are
-/// sealed under a `(lake_id, version)` binding; a catalog below
-/// `highest.json`, a catalog/snapshot version mismatch, or a manifest from
-/// another lake under the same key is refused at open. A v6 manifest without
-/// a valid `lake_id` is corrupt; a pre-v6 manifest never has one. A keyed
-/// pre-v6 lake is refused with a clear legacy-format error (its manifest
-/// containers carry the empty binding and cannot be upgraded safely in
-/// place); a plaintext pre-v6 lake opens and is upgraded on its next save.
+/// Version 7 (wave 102): one entry per table with a **schema record**
+/// (`schema_version`, `columns`, `renames`), a growing, never-rewritten file
+/// list, positional delete files, inlined rows, per-file statistics/zone maps
+/// and a catalog-recorded footer location. Every file of a table carries the
+/// schema epoch it was written under, so `ALTER TABLE` publishes metadata-only
+/// changes and old data files stay readable through the name mapping.
 ///
-/// Version 5 (wave 65): version 4 plus the per-table **schema record** —
-/// `schema_version`, `columns` (every live column with its type, default and
-/// the epoch it appeared) and `renames` — so `ALTER TABLE` publishes
-/// metadata-only changes and old data files stay readable through the name
-/// mapping; every data file records the schema epoch it was written under.
-/// A v5 manifest may still carry *legacy entries* (no record): a table a
-/// commit did not touch, and tables of a v4 lake that was never re-saved.
-/// The lake also carries a lake-wide `schema_version` counter
-/// (DuckLake's `snapshot.schema_version`).
-///
-/// Version 4 (wave 63): the incremental format — every data file carries its
-/// own row count, a table lists a growing, never-rewritten file list, and
-/// positional delete files (merge-on-read) express `DELETE`/`UPDATE`. Written
-/// by every build: Vortex data files with `vortexlake`, engine `.pink`
-/// files (with a per-file statistics block) without it.
-///
-/// Wave 66 extends v4 additively (no version bump): an entry may declare a
-/// `partition_by` spec, a data file may record its `partition` values and a
-/// zone map (`stats`) in every format; an older v4 reader ignores the fields
-/// and reads the same files (it just cannot prune or interpret partitions).
-///
-/// Wave 68 extends v4/v5 additively as well: a table may carry **inlined
-/// rows** (small commits stored in the manifest) with their change history
-/// and a row-id counter, a data file may record its `row_id_start`, and the
-/// per-commit delta gains the inlining audit fields. A wave-67 reader ignores
-/// all of them except the row-count invariant (which already includes live
-/// inlined rows in `rows`); this build refuses nothing a wave-67 writer
-/// published.
-///
-/// Versions 1–3 stay readable and are never written any more. Version 3
-/// (wave 45): Vortex data files with 8,192-row / ~1 MiB row blocks. Version
-/// 2: Vortex data files with one block per engine chunk. Both list one
-/// `.vortex` file as a plain string and declare `"format": "vortex"` on
-/// every entry. Version 1 (wave 34): one engine `.pink` file per entry (no
-/// `format` field) plus one entry-level statistics block.
-///
-/// A build without `vortexlake` — the `pinklake` builds — writes v6 with
-/// `.pink` files and refuses a v2/v3 Vortex lake with a clear
-/// [`LakeError::FeatureMissing`], never a corrupt-file error. A v4–v6 lake
-/// whose entries include Vortex tables **opens**: those tables are listed by
-/// [`Lake::unavailable_tables`], skipped by [`Lake::load`], and refused per
-/// table on read/write (wave 88, rule 5).
+/// Wave 102 dropped every older catalog: pinkdb carries no legacy readers
+/// while in early development, and an older lake is refused with "written by
+/// an older pinkdb". Wave 104 removed the legacy columnar data format; a
+/// catalog row naming it is refused with a re-save hint instead of read.
 pub const FORMAT_VERSION: u32 = 7;
 
 /// The oldest catalog format version this build reads: the current one
@@ -559,11 +483,8 @@ pub const FORMAT_VERSION: u32 = 7;
 /// older pinkdb").
 pub const MIN_FORMAT_VERSION: u32 = 7;
 
-/// The newest catalog format version this codebase knows: 6 (the schema
-/// record plus lake identity/highest-version binding). A manifest above this
-/// (a future format) is [`LakeError::Unsupported`] in every build; a v4/v5/v6
-/// Vortex lake in a build without `vortexlake` is
-/// [`LakeError::FeatureMissing`].
+/// The newest catalog format version this codebase knows. A manifest above
+/// this (a future format) is [`LakeError::Unsupported`] in every build.
 pub const MAX_FORMAT_VERSION: u32 = 7;
 
 /// The lake-relative name of the identity object (M-7). Created once, never
@@ -643,10 +564,9 @@ pub enum LakeError {
         context: String,
         source: pinkdb::PinkDbError,
     },
-    /// The Vortex layer rejected data while encoding or decoding a data file
-    /// (the error is a string because Vortex errors are not `std` error
-    /// sources).
-    Vortex { context: String, message: String },
+    /// A catalog row names the data format removed in wave 104. There is no
+    /// reader and no converter: the lake must be re-saved by an older build.
+    RemovedFormat { message: String },
     /// An encrypted lake artifact was read without a key: `catalog.json`, a
     /// snapshot, a commit delta, or a data file is a `PNKLAKE1` container (or
     /// this build cannot read it at all). A keyless open never guesses.
@@ -759,9 +679,7 @@ impl fmt::Display for LakeError {
             LakeError::Engine { context, source } => {
                 write!(f, "lake data error ({context}): {source}")
             }
-            LakeError::Vortex { context, message } => {
-                write!(f, "lake vortex error ({context}): {message}")
-            }
+            LakeError::RemovedFormat { message } => f.write_str(message),
             LakeError::Encrypted { path, message } => {
                 write!(f, "{}: the lake is encrypted; {message}", path.display())
             }
@@ -793,14 +711,9 @@ impl fmt::Display for LakeError {
             LakeError::UnknownFormat { path, format } => write!(
                 f,
                 "corrupt lake metadata at {}: no lake format provider is registered for \
-                 data-file format {format:?} (this build registers `pink`{}; extensions register \
+                 data-file format {format:?} (this build registers `pink`; extensions register \
                  one with pink_lake::format::register_lake_format)",
-                path.display(),
-                if cfg!(feature = "vortexlake") {
-                    " and `vortex`"
-                } else {
-                    "; `vortex` needs the `vortexlake` feature"
-                }
+                path.display()
             ),
             LakeError::DuplicateFormat { format } => write!(
                 f,
@@ -833,11 +746,10 @@ pub const UNAVAILABLE_ROWS: u64 = u64::MAX;
 /// 88, rule 5): the flat `db.table` catalog key, the entry's format id, and
 /// the error every read or targeted write of the table returns.
 ///
-/// A v4–v6 lake holding such a table still opens; [`Lake::unavailable_tables`]
+/// A lake holding such a table still opens; [`Lake::unavailable_tables`]
 /// lists it, [`Lake::load`] skips it, and `.lake attach` lists it with any
 /// read failing. The error is the provider-resolution failure
-/// ([`LakeError::UnknownFormat`], or [`LakeError::FeatureMissing`] for
-/// `vortex` in a build without the `vortexlake` feature) and names the id.
+/// ([`LakeError::UnknownFormat`]) and names the id.
 #[derive(Debug)]
 pub struct UnavailableTable {
     /// The flat `db.table` catalog key.
@@ -899,9 +811,8 @@ pub struct Lake {
     /// [`TableEntry::inlined_limit`] wins over it.
     inline_row_limit: u64,
     /// The data-file format [`Lake::set_write_format`] selected for this
-    /// handle's subsequent writes; `None` keeps the build default (Vortex
-    /// with `vortexlake`, else `pink`). Not persisted — a reopened handle
-    /// starts at the default again.
+    /// handle's subsequent writes; `None` keeps the build default (`pink`).
+    /// Not persisted — a reopened handle starts at the default again.
     write_format_choice: Option<FileFormat>,
     /// Per-table format choices ([`Lake::set_table_format`]), keyed by the
     /// flat `db.table` catalog key. A choice wins over the entry's pinned
@@ -1285,8 +1196,8 @@ impl Lake {
         }
     }
 
-    /// The data-file format id pinned for one table (`pink`, `vortex`,
-    /// `parquet`), if the table exists.
+    /// The data-file format id pinned for one table (`pink`, `parquet`), if
+    /// the table exists.
     pub fn table_format_name(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .store
@@ -1356,9 +1267,7 @@ impl Lake {
     }
 
     /// The catalog `format_version` this handle last saw: the version the lake
-    /// was opened with, or [`FORMAT_VERSION`] after a successful save (a save
-    /// from a v1 lake migrates it to v3 in a `vortexlake` build; a build
-    /// without the feature always publishes v1 and keeps reporting 1).
+    /// was opened with, or [`FORMAT_VERSION`] after a successful save.
     pub fn format_version(&self) -> u32 {
         self.format_version
     }
@@ -1504,15 +1413,10 @@ impl Lake {
         self.rebuild(&manifest, &manifest_path)
     }
 
-    /// Footer-only *attach* of the latest version (`None`) or a specific
-    /// snapshot: read the manifest, then the statistics attach needs — a
-    /// Vortex data file's footer, metadata segment and stored statistics
-    /// (`vortexlake` builds; no column data is read or decoded. The footers
-    /// of all files are read concurrently, and over object storage they are
-    /// **range** reads — wave 98b. An encrypted lake unseals each container
-    /// whole first, since a sealed object has no plaintext ranges), or the
-    /// `.pink` files' published statistics blocks (every build: the manifest
-    /// is all attach reads; `data` files are never opened, encrypted or not).
+    /// Statistics-only *attach* of the latest version (`None`) or a specific
+    /// snapshot: read the manifest and the `.pink` files' published statistics
+    /// blocks — no data file is opened, encrypted or not, and no column is
+    /// decoded.
     ///
     /// The returned [`AttachmentReport`] carries the version-pinned
     /// [`pinkdb::AttachedLake`] handle; register it with
@@ -1554,8 +1458,7 @@ impl Lake {
 
     /// The tables of the current version this build cannot read (wave 88,
     /// rule 5): each entry's format id has no registered provider in this
-    /// process ([`LakeError::UnknownFormat`], or [`LakeError::FeatureMissing`]
-    /// for `vortex` without the `vortexlake` feature).
+    /// process ([`LakeError::UnknownFormat`]).
     ///
     /// Such a table no longer refuses the lake by itself: [`Lake::open`] and
     /// [`Lake::attach`] succeed, [`Lake::load`] skips it, and
@@ -1916,26 +1819,18 @@ impl Lake {
 
     /// Choose the registered data-file format this handle writes for every
     /// subsequent save/append that does not pin a format explicitly (see the
-    /// [`crate::format`] module). The id must have a provider registered in this
-    /// process — an unknown id is [`LakeError::UnknownFormat`], and `vortex`
-    /// in a build without the `vortexlake` feature is
-    /// [`LakeError::FeatureMissing`]; nothing is silently substituted.
+    /// [`crate::format`] module). The id must have a provider registered in
+    /// this process — an unknown id is [`LakeError::UnknownFormat`]; nothing
+    /// is silently substituted.
     ///
     /// The choice is per handle and not persisted: [`Lake::open`] and
-    /// [`Lake::create`] always start with the build default (Vortex with
-    /// `vortexlake`, else `.pink`). It applies to a table with no per-table
-    /// choice ([`Lake::set_table_format`]) and no already-pinned catalog
-    /// format — a full save preserves an existing table's format, and a
-    /// commit appends in it. Set it on the handle performing the write;
-    /// maintenance rewrites always re-encode under the entry's own pinned
-    /// format (or the target of [`Lake::rewrite_table_format`]).
-    ///
-    /// **The choice pins (wave 88):** a table this handle writes in the
-    /// format selected here gets `"format_pinned": true` in its catalog
-    /// entry, so later full saves keep it. An entry written under the build
-    /// default (this method never called) stays unpinned and keeps the
-    /// wave-45 migration behavior — a full save re-encodes it into the
-    /// saving build's write format.
+    /// [`Lake::create`] always start with the build default (`.pink`). It
+    /// applies to a table with no per-table choice
+    /// ([`Lake::set_table_format`]) and no already-pinned catalog format — a
+    /// full save preserves an existing table's format, and a commit appends
+    /// in it. Set it on the handle performing the write; maintenance rewrites
+    /// always re-encode under the entry's own pinned format (or the target of
+    /// [`Lake::rewrite_table_format`]).
     pub fn set_write_format(&mut self, id: &str) -> Result<()> {
         crate::format::format_for(id, &self.root.join(CATALOG_FILE))?;
         self.write_format_choice = Some(FileFormat::new(id));
@@ -1945,19 +1840,15 @@ impl Lake {
     /// Choose the data-file format for one table on this handle, keyed by
     /// `db.table` (wave 88). The id is validated against the registry exactly
     /// like [`Lake::set_write_format`] — an id with no provider is
-    /// [`LakeError::UnknownFormat`], `vortex` without the `vortexlake`
-    /// feature is [`LakeError::FeatureMissing`], never a silent substitution.
+    /// [`LakeError::UnknownFormat`], never a silent substitution.
     ///
     /// The choice wins over the format the table's catalog entry already
     /// pins for a **full save** (so a per-table choice is how a save asks for
     /// a table to be re-encoded), and it selects the format of a table the
-    /// handle creates through a commit. A table saved with this choice is
-    /// recorded **pinned** (`"format_pinned": true`), so a later save keeps
-    /// it even without the choice. An **append** to an existing table always
-    /// keeps that entry's pinned format and pin flag — one catalog entry
-    /// names one data-file format, so a commit or flush never mixes formats
-    /// inside it. To convert an existing table use
-    /// [`Lake::rewrite_table_format`] (which also pins the result).
+    /// handle creates through a commit. An **append** to an existing table
+    /// always keeps that entry's pinned format — one catalog entry names one
+    /// data-file format, so a commit or flush never mixes formats inside it.
+    /// To convert an existing table use [`Lake::rewrite_table_format`].
     ///
     /// Like [`Lake::set_write_format`], the choice is in memory and applies
     /// to this handle only.
@@ -1977,8 +1868,7 @@ impl Lake {
     }
 
     /// The data-file format this handle writes by default: the one
-    /// [`Lake::set_write_format`] selected, else the build default — Vortex
-    /// with `vortexlake`, engine `.pink` bytes without it.
+    /// [`Lake::set_write_format`] selected, else engine `.pink` bytes.
     fn write_format(&self) -> FileFormat {
         self.write_format_choice
             .clone()
@@ -2038,8 +1928,7 @@ impl Lake {
     /// one container for an encrypted lake) and publishes the exact
     /// per-column facts as the file's catalog statistics block, so
     /// `.lake attach` answers `COUNT`/`MIN`/`MAX` and prunes by zone map
-    /// without opening the file. Vortex additionally carries the same facts in
-    /// its footer (cross-checked at attach).
+    /// without opening the file.
     fn write_data_file(
         &self,
         key: &str,
@@ -2439,17 +2328,9 @@ impl Lake {
     }
 }
 
-/// The build's default data-file format: Vortex with `vortexlake`, engine
-/// `.pink` bytes without it.
+/// The build's default data-file format: engine `.pink` bytes.
 fn default_write_format() -> FileFormat {
-    #[cfg(feature = "vortexlake")]
-    {
-        FileFormat::new(crate::format::VORTEX_FORMAT_ID)
-    }
-    #[cfg(not(feature = "vortexlake"))]
-    {
-        FileFormat::pink()
-    }
+    FileFormat::pink()
 }
 
 /// Snapshot the store into the lake at `dir`, creating the lake if `dir` is
@@ -2766,13 +2647,13 @@ fn s3_storage(bucket: &str, prefix: &str) -> Result<Arc<dyn Storage>> {
         feature: "s3",
         message: format!(
             "the location {location} needs object-storage support; rebuild with the `s3` \
-             feature (for the CLI: `cargo build -p pinkdb-cli --features vortexlake,s3`)"
+             feature (for the CLI: `cargo build -p pinkdb-cli --features pinklake,s3`)"
         ),
     })
 }
 
 /// The largest encoded `data/<table>` directory segment a writer accepts,
-/// so `<segment>/<uuid>.vortex.<uuid>.tmp` (the data file plus a unique temp
+/// so `<segment>/<uuid>.pink.<uuid>.tmp` (the data file plus a unique temp
 /// sibling) fits the common 255-byte name limit. Also enforced by
 /// [`Lake::write_from_store`].
 const MAX_ENCODED_SEGMENT: usize = 200;
@@ -2966,6 +2847,16 @@ pub(crate) fn manifest_for(
             },
         });
     };
+    // A catalog row naming the data format removed in wave 104 is refused
+    // for every operation, not treated as a missing provider: no build will
+    // ever read it again, and the lake must be re-saved by an older build.
+    if catalog
+        .tables
+        .values()
+        .any(|entry| crate::format::is_removed(entry.format().id()))
+    {
+        return Err(crate::format::removed_format_error());
+    }
     let rel = match version {
         None => "catalog".to_string(),
         Some(v) => format!("snapshot {v}"),
@@ -3332,8 +3223,7 @@ pub(crate) fn apply_file_deletes(
 /// chunks are shared with `src` (no deep copy) and appended with
 /// `append_chunk`'s chunking rules, exactly what the loader's `copy_chunks`
 /// reverses. The engine's `.pink` encoder is then byte-deterministic for a
-/// given dense table. Every build needs it: a `vortexlake` build still
-/// appends `.pink` files to a pinklake lake's v4 entries.
+/// given dense table.
 fn single_table_store(dbname: &str, table: &str, src: &DataTable) -> Result<PinkDb> {
     let mut mini = empty_structure(dbname, table, src.schema(), "saving")?;
     let dst = mini
@@ -3373,20 +3263,6 @@ fn empty_structure(
             source: e,
         })?;
     Ok(mini)
-}
-
-/// An empty one-table [`PinkDb`]: `dbname.table` created with `schema`, the
-/// default `main` of a fresh store dropped when the table lives elsewhere.
-/// The Vortex decoder builds one per data file, so a decoded file has
-/// exactly one database and table — the shape a v1 `.pink` data file opens
-/// as, which is what the loader's checks expect.
-#[cfg(feature = "vortexlake")]
-fn empty_single_table_store(
-    dbname: &str,
-    table: &str,
-    schema: Vec<(String, DataType)>,
-) -> Result<PinkDb> {
-    empty_structure(dbname, table, schema, "loading")
 }
 
 /// `&DataTable` with a lake error instead of an engine error.

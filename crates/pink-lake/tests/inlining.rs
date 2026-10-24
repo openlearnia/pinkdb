@@ -34,9 +34,6 @@ use pinkdb::{DataTable, PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "vortexlake")]
-const EXT: &str = "vortex";
-#[cfg(not(feature = "vortexlake"))]
 const EXT: &str = "pink";
 
 fn scratch(tag: &str) -> PathBuf {

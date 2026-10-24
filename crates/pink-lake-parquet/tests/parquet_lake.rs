@@ -335,9 +335,9 @@ fn save_reopen_open_and_attach_agree_for_every_type() {
 
     // Attach answers the same COUNT/MIN/MAX facts as the open path.
     let attachment = reopened.attach(None).unwrap();
-    assert!(
-        attachment.statistics_only,
-        "a format without footer statistics attaches from the manifest block"
+    assert_eq!(
+        attachment.requests, 0,
+        "attach reads the catalog's statistics block, not a parquet file"
     );
     let mut attached = PinkDb::new();
     attached.attach_lake(attachment.lake).unwrap();

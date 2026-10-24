@@ -1421,7 +1421,7 @@ impl Lake {
     /// Keys are parsed like [`Commit::set_partition`] (a column name, or
     /// `bucket(N, column)`); every identity key's column must exist in the
     /// table's schema (read the way `.lake attach` reads it: from the data
-    /// files' statistics blocks or Vortex footers). Existing data files keep
+    /// files' statistics blocks). Existing data files keep
     /// their recorded partition values — like DuckLake, the spec governs new
     /// writes, not files already published — and re-setting the identical
     /// spec is a no-op ([`CommitReport::committed`] `false`). A concurrent

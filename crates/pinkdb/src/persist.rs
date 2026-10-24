@@ -5060,13 +5060,13 @@ fn read_principal_grants(
 /// Exact per-column statistics of one table's rows, collected without
 /// encoding anything (wave 66).
 ///
-/// `pink-lake` uses this to publish a **Vortex** data file's zone map in the
-/// catalog: the same [`SavedTableStats`] facts a `.pink` encode collects
-/// during its pass, computed here by one linear scan of the table's chunk
-/// payloads (no per-row `Value` materialization except the per-chunk
-/// min/max). The facts are ungated (`nan_count` and zero doubles are kept);
-/// `pink-lake` applies the one exactness gate shared with the Vortex footer
-/// path, so the two formats cannot drift apart.
+/// `pink-lake` uses this to publish a data file's zone map in the catalog:
+/// the same [`SavedTableStats`] facts a `.pink` encode collects during its
+/// pass, computed here by one linear scan of the table's chunk payloads (no
+/// per-row `Value` materialization except the per-chunk min/max). The facts
+/// are ungated (`nan_count` and zero doubles are kept); `pink-lake` applies
+/// the one exactness gate shared with its footer path, so the two cannot
+/// drift apart.
 pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
     let schema = src.schema();
     let mut accs: Vec<ColumnStatsAcc> = schema.iter().map(|_| ColumnStatsAcc::new()).collect();

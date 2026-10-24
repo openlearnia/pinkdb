@@ -117,10 +117,10 @@ import sys
 rows = json.load(open(sys.argv[1], encoding="utf-8"))
 cli = [r for r in rows if r["kind"] == "cli"]
 server = [r for r in rows if r["kind"] == "server"]
-assert len(cli) == 24, len(cli)
+assert len(cli) == 16, len(cli)
 assert len(server) == 12, len(server)
 assert {r["variant"] for r in cli} == {
-    "default", "lean", "pinklake", "pinklake-s3", "vortexlake", "vortexlake-s3"
+    "default", "lean", "pinklake", "pinklake-s3"
 }
 assert {r["platform"] for r in rows} == {
     "linux-x86_64", "linux-aarch64", "darwin-aarch64", "darwin-x86_64"
@@ -129,7 +129,7 @@ assert all(r["runner"] for r in rows)
 assert [r for r in rows if r["platform"] == "darwin-x86_64"][0]["target"] == "x86_64-apple-darwin"
 PY
     then
-        ok "matrix.py: 24 CLI + 12 server rows"
+        ok "matrix.py: 16 CLI + 12 server rows"
     else
         fail "matrix.py row validation"
     fi

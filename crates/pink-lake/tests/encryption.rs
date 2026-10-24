@@ -212,11 +212,10 @@ fn stats_fast_paths_on_an_encrypted_lake_decode_no_data_file() {
     let dir = scratch("fast");
     let mut lake = create_lake_with_key(&dir, key()).unwrap();
     lake.set_data_inlining_row_limit(0);
-    lake.set_write_format("pink").unwrap();
     lake.write_from_store(&store(3)).unwrap();
     let report = lake.attach(None).unwrap();
     assert!(report.encrypted);
-    assert!(report.statistics_only);
+    assert_eq!(report.requests, 0, "attach reads no data file");
     let mut db = PinkDb::new();
     db.attach_lake(report.lake.clone()).unwrap();
     let QueryResult::Selected { rows, .. } = db

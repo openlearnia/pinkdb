@@ -235,8 +235,8 @@ PAGES = {
         "nav": "lake",
         "title": "Lake — pinkdb",
         "description": (
-            "The pinkdb lake layer: catalog + immutable snapshots, Vortex or "
-            "lean .pink data files, S3/R2 object storage, read-only attach "
+            "The pinkdb lake layer: a catalog database plus immutable .pink "
+            "or Parquet data files, S3/R2 object storage, read-only attach "
             "with COUNT/MIN/MAX fast paths, and writer conflict semantics."
         ),
     },

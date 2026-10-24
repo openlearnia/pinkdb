@@ -1,5 +1,5 @@
 //! Ingest/open timing for the lake path, best-of-N per phase:
-//! CSV import → `.lake save` (Vortex encode + publish) → `.lake open`.
+//! CSV import → `.lake save` (encode + publish) → `.lake open`.
 //!
 //! ```sh
 //! cargo run --release -p pink-lake --example ingest_bench -- --csv bench/sales_1m.csv --runs 5

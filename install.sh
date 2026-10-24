@@ -12,8 +12,7 @@
 #
 # Options:
 #   --version VERSION   install a pinned version (default: the latest release)
-#   --variant NAME      default | lean | pinklake | pinklake-s3 |
-#                       vortexlake | vortexlake-s3   (default: default)
+#   --variant NAME      default | lean | pinklake | pinklake-s3   (default: default)
 #   --prefix DIR        install prefix (default: $PREFIX or $HOME/.local)
 #   --dry-run           resolve and print the plan; download/install nothing
 #   --force             replace an existing pinkdb at the destination
@@ -96,11 +95,10 @@ done
 
 # Variant slugs are the release asset names; accept the cargo spelling too.
 case "$variant" in
-    default | lean | pinklake | vortexlake | pinklake-s3 | vortexlake-s3) ;;
+    default | lean | pinklake | pinklake-s3) ;;
     pinklake,s3) variant=pinklake-s3 ;;
-    vortexlake,s3) variant=vortexlake-s3 ;;
     *)
-        die "unsupported variant '$variant' (choose: default, lean, pinklake, pinklake-s3, vortexlake, vortexlake-s3)"
+        die "unsupported variant '$variant' (choose: default, lean, pinklake, pinklake-s3)"
         ;;
 esac
 

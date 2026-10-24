@@ -55,8 +55,7 @@
 //!
 //! # Strategies
 //!
-//! The strategy is chosen per table, in this order (the ducklake-vortex
-//! order):
+//! The strategy is chosen per table, in this order (DuckLake's order):
 //!
 //! 1. **watermark** — configured in [`JobSpec::watermark_columns`] as
 //!    `db.table=column`; the column must exist, and a NULL value in it

@@ -14,38 +14,8 @@ mod local_lake;
 mod format_contract;
 
 use format_contract::{ContractOptions, run_contract};
-#[cfg(feature = "vortexlake")]
-use pinkdb::DataType;
 
 #[test]
 fn pink_meets_the_format_contract() {
     run_contract("pink", ContractOptions::default());
-}
-
-#[cfg(feature = "vortexlake")]
-#[test]
-fn vortex_meets_the_format_contract() {
-    // The Vortex encoder refuses DECIMAL and INTERVAL at its entry (a wave-87
-    // limitation, not a lossy write), so they are listed as allowed refusals
-    // and left out of the round-trip corpus.
-    run_contract(
-        "vortex",
-        ContractOptions {
-            refused_types: vec![
-                DataType::Decimal {
-                    precision: 9,
-                    scale: 2,
-                },
-                DataType::Decimal {
-                    precision: 18,
-                    scale: 4,
-                },
-                DataType::Decimal {
-                    precision: 38,
-                    scale: 6,
-                },
-                DataType::Interval,
-            ],
-        },
-    );
 }

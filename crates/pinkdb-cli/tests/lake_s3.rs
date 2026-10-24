@@ -3,9 +3,9 @@
 //! driven as child processes so the `AWS_*` environment is exactly what each
 //! test sets.
 //!
-//! This file only compiles when `lake` **and** `s3` are on.
+//! This file only compiles when `pinklake` **and** `s3` are on.
 
-#![cfg(all(feature = "vortexlake", feature = "s3"))]
+#![cfg(all(feature = "pinklake", feature = "s3"))]
 
 #[path = "../../pink-lake/src/mock_s3.rs"]
 mod mock_s3;
@@ -306,11 +306,15 @@ fn lake_s3_attach_reports_and_queries() {
              .quit\n"
         ),
     );
+    assert!(!out.contains("footer-only"), "{out}");
     assert!(
-        out.contains("footer-only") && out.contains("ranged requests"),
+        out.contains("statistics-only") && out.contains("decodes: 0 loads"),
         "{out}"
     );
-    assert!(out.contains("Transport:"), "{out}");
+    assert!(
+        !out.contains("Transport:"),
+        "attach reads the catalog, not a data object:\n{out}"
+    );
     assert!(out.contains("main.t (2 rows)"), "{out}");
     assert!(out.contains("Detached"), "{out}");
     assert!(!out.contains("Error:"), "{out}");

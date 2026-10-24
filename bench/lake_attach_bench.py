@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """`.lake attach` cold-process benchmark: projection pushdown before/after.
 
-Wave-E companion to `bench/lake_bench.py`. It measures the exact shape stage 2
+The lake attach benchmark. It measures the exact shape stage 2
 is about — fresh process -> `.lake attach` -> one fallback query -> exit — for
 two pinkdb binaries (a `--pinkdb-before` one, e.g. the wave-D commit, and the
 current `--pinkdb`), interleaved best-of-N so process/cache noise hits both
@@ -37,7 +37,8 @@ ROOT = BENCH_DIR.parent
 DEFAULT_CSV = BENCH_DIR / "sales_1m.csv"
 GEN_SALES = BENCH_DIR / "gen_sales.py"
 
-# The four `lake_bench.py` queries plus the stats fast-path probe.
+# The same four lake queries the wider benchmark used, plus the stats fast-path
+# probe.
 QUERIES = [
     ("count", "SELECT COUNT(*) FROM {t};"),
     ("filter", "SELECT COUNT(*) FROM {t} WHERE total > 500;"),
@@ -211,7 +212,7 @@ def main() -> None:
     if not after.exists():
         die(
             f"pinkdb not found: {after}",
-            "cargo build --release -p pinkdb-cli --features vortexlake",
+            "cargo build --release -p pinkdb-cli --features pinklake",
         )
     before = Path(args.pinkdb_before).resolve() if args.pinkdb_before else None
     if before is not None and not before.exists():

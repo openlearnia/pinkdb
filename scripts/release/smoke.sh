@@ -241,21 +241,12 @@ if [ "$kind" = cli ]; then
             ;;
         pinklake)
             expect_contains "pinklake .help" ".lake save" -c ".help"
-            expect_contains "pinklake build marker" "pinklake build" -c ".help"
+            expect_contains "pinklake format marker" "catalog format_version 7" -c ".help"
             ;;
         pinklake-s3)
             expect_contains "pinklake-s3 .help" ".lake save" -c ".help"
-            expect_contains "pinklake-s3 build marker" "pinklake build" -c ".help"
+            expect_contains "pinklake-s3 format marker" "catalog format_version 7" -c ".help"
             expect_contains "pinklake-s3 URLs" "s3://bucket/prefix" -c ".help"
-            ;;
-        vortexlake)
-            expect_contains "vortexlake .help" ".lake save" -c ".help"
-            expect_absent "vortexlake is not pinklake" "pinklake build" -c ".help"
-            ;;
-        vortexlake-s3)
-            expect_contains "vortexlake-s3 .help" ".lake save" -c ".help"
-            expect_absent "vortexlake-s3 is not pinklake" "pinklake build" -c ".help"
-            expect_contains "vortexlake-s3 URLs" "s3://bucket/prefix" -c ".help"
             ;;
         *)
             die "unknown CLI variant '$variant'"

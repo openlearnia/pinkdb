@@ -1,27 +1,25 @@
 //! At-rest encryption for a pink-lake (cargo feature `encryption`; no crypto
 //! is linked without it).
 //!
-//! This module mirrors the engine's `pinkdb::crypto` approach — the same two
-//! audited RustCrypto crates (AES-256-GCM, Argon2id), the same KDF defaults
-//! and parameter caps, the same "wrong key vs tampering" key-check trick — but
-//! the container is the lake's own: a lake **artifact** is wrapped, not an
-//! engine `.pink` file. The magic is deliberately different (`PNKLAKE1` vs
-//! the engine's `PINKENC1`) so the two layers can never be confused, and a
-//! lake never stores a `PINKENC1` file.
+//! This module mirrors the engine's `pinkdb::crypto` approach — the same
+//! audited RustCrypto AES-256-GCM, the same "wrong key vs tampering"
+//! key-check trick — but the container is the lake's own: a lake **artifact**
+//! is wrapped, not an engine `.pink` file. The magic is deliberately
+//! different (`PNKLAKE1` vs the engine's `PINKENC1`) so the two layers can
+//! never be confused, and a lake never stores a `PINKENC1` file.
 //!
 //! # Container format (`PNKLAKE1`, all integers little-endian)
 //!
 //! ```text
 //! magic "PNKLAKE1" (8 bytes)
-//! container version u32 (= 2; version 1 is read)
+//! container version u32 (= 2)
 //! cipher id u8 (1 = AES-256-GCM)
-//! kdf id u8 (0 = raw 32-byte key, 1 = Argon2id)
+//! kdf id u8 (0 = raw 32-byte key)
 //! domain u8 (1 = manifest, 2 = data file, 3 = commit delta, 4 = delete file)
 //! key-check length u32 (= the key-check plaintext's length)
-//! nonce base [16] (fresh 128-bit random value *per container*, v2+)
+//! nonce base [16] (fresh 128-bit random value *per container*)
 //! binding length u32
 //! binding bytes ("" for a manifest; the lake-relative path otherwise)
-//! [kdf id == 1] m_cost u32 KiB | t_cost u32 | p_cost u32 | salt_len u32 | salt
 //! key-check: AEAD of the fixed key-check plaintext, + 16 bytes
 //! payload: frames of `plain_len u32 LE | ciphertext (plain_len + 16)`,
 //!          each frame at most 1 MiB of plaintext; the last frame is a
@@ -35,13 +33,11 @@
 //! base is fresh 128-bit random data **per container** (never shared across
 //! the containers of one save), so a (key, nonce) pair is never reused — not
 //! within one container, and not across the data files, the manifest, or the
-//! delete files of a version. The birthday bound for the fixed-plaintext
-//! key-check is `P ≈ n²/2⁹⁷` (the version-1 64-bit prefix gave `n²/2⁶⁵`).
-//! Version-1 containers still open with the legacy `prefix || counter` nonce;
-//! every write emits version 2. The AAD binds the whole public header (magic,
-//! version, cipher, KDF id, domain, binding, nonce base, and the KDF
-//! parameters — all of it is `aad_base`) plus the counter, so a container
-//! cannot be reinterpreted across domains, paths, or parameters.
+//! delete files of a version. Older container versions are not read: wave 104
+//! removed the version-1 reader. The AAD binds the whole public header
+//! (magic, version, cipher, KDF id, domain, binding, nonce base) plus the
+//! counter, so a container cannot be reinterpreted across domains, paths, or
+//! contexts.
 //!
 //! The binding is the whole integrity story for *identity*: a data or delete
 //! file's container authenticates the lake-relative path it was written for,
@@ -57,24 +53,12 @@
 //! value depends on not being interchangeable), and `highest.json` is bound
 //! to `(lake_id, highest_version)`.
 //!
-//! # Key material and the KDF policy
+//! # Key material
 //!
-//! [`EncryptionKey`] is either a raw 32-byte key or a passphrase; passphrases
-//! are stretched with Argon2id and the salt/parameters live in **every**
-//! container header, so a container written with a different configuration
-//! still opens. The salt and KDF parameters live in the *plaintext container
-//! header* (not in a sidecar file): a container is self-describing, so any
-//! single object — including a snapshot whose catalog is gone — opens with
-//! just the user's key, and there is no second object to lose or keep in
-//! sync. The header is public data by construction, and the AEAD binds it, so
-//! tampering with the salt/parameters fails authentication instead of
-//! silently changing the derived key. Argon2id is the one *expensive*
-//! primitive here, so the policy is **one derivation per lake session**: a
-//! [`Crypto`] session mints one write salt when it starts, every container of
-//! that session records it, and the derived-key cache is keyed by
-//! `(kdf, m, t, p, salt)` — so writing a whole version (N data files + delete
-//! files + manifest) and reading a whole version (snapshot + N files) each
-//! cost exactly one Argon2id run, whatever the file count.
+//! Per-file data keys are raw 32-byte values recorded in each file's catalog
+//! row (DuckLake semantics). No KDF runs here: a passphrase in
+//! [`EncryptionKey`] is for the engine-encrypted `pink:` catalog database
+//! only and is passed to `pinkdb::crypto`; a [`Crypto`] session rejects it.
 //!
 //! Key bytes are zeroed on drop on a best-effort basis (safe writes only — no
 //! `unsafe`; a compiler may in principle elide the overwrite). No key material
@@ -108,22 +92,16 @@ pub(crate) const ENC_MAGIC: &[u8; 8] = b"PNKLAKE1";
 const ENGINE_ENC_MAGIC: &[u8; 8] = b"PINKENC1";
 
 /// Container format version written by this build (L-4: 128-bit nonce base).
-/// Version 1 is still read with the legacy 8-byte prefix. A newer version is
-/// refused with a clean message (the format stays additive-friendly).
+/// Any other version is refused with a clean message; wave 104 removed the
+/// version-1 reader.
 pub(crate) const CONTAINER_VERSION: u32 = 2;
-/// The legacy version, read-only.
-const CONTAINER_VERSION_V1: u32 = 1;
 const CIPHER_AES256_GCM: u8 = 1;
 const KDF_RAW: u8 = 0;
-const KDF_ARGON2ID: u8 = 1;
 
 const KEY_LEN: usize = 32;
 const TAG_LEN: usize = 16;
-/// v2+: the random per-container nonce base.
+/// The random per-container nonce base.
 const NONCE_BASE_LEN: usize = 16;
-const LEGACY_NONCE_PREFIX_LEN: usize = 8;
-const LEGACY_HEADER_FIXED_LEN: usize = 31;
-const KDF_PARAMS_LEN: usize = 16; // m_cost, t_cost, p_cost, salt_len
 
 /// Plaintext authenticated by the key-check block so a wrong key is reported
 /// as `wrong key` instead of a parse error.
@@ -132,28 +110,10 @@ const KEY_CHECK_PLAIN: &[u8] = b"pinkdb lake encryption key-check/v1";
 /// magic(8) + version(4) + cipher(1) + kdf(1) + domain(1) + key-check
 /// length(4) + nonce base(16) + binding length(4).
 const HEADER_FIXED_LEN: usize = 39;
-const DEFAULT_SALT_LEN: u32 = 16;
-const MIN_SALT_LEN: u32 = 8;
-const MAX_SALT_LEN: u32 = 64;
 
 /// Payloads are sealed in 1 MiB plaintext frames (the engine's checkpoint
 /// segment size), so a whole file never has to be held twice in memory.
 pub(crate) const SEGMENT_PLAIN_MAX: usize = 1 << 20;
-
-/// Default Argon2id work factors (OWASP-recommended configuration): 19 MiB,
-/// 2 iterations, 1 lane — the exact engine defaults, so a lake passphrase
-/// costs the same as a `.pink` one. Stored in every header, so raising them
-/// later keeps existing files readable.
-const ARGON2_M_COST_KIB: u32 = 19 * 1024;
-const ARGON2_T_COST: u32 = 2;
-const ARGON2_P_COST: u32 = 1;
-/// Upper bounds accepted from a file header: a crafted header must not be
-/// able to make an open burn minutes of Argon2id time or allocate unbounded
-/// memory (the same envelope the engine enforces).
-const ARGON2_MAX_M_COST_KIB: u32 = 4 * ARGON2_M_COST_KIB;
-const ARGON2_MAX_T_COST: u32 = 4 * ARGON2_T_COST;
-const ARGON2_MAX_P_COST: u32 = 4 * ARGON2_P_COST;
-const ARGON2_MAX_WORK_KIB: u64 = 8 * (ARGON2_M_COST_KIB as u64) * (ARGON2_T_COST as u64);
 
 /// Which kind of lake artifact a container holds; the AAD binds it, so a
 /// manifest can never authenticate as a data file (or the reverse).
@@ -163,7 +123,7 @@ pub(crate) enum Domain {
     /// `catalog.json` and `snapshots/<v>.json` (bound to nothing path-like:
     /// the pair is the same bytes, see the module docs).
     Manifest,
-    /// One `data/<table>/<uuid>.{pink,vortex}` file, bound to its path.
+    /// One `data/<table>/<uuid>.pink` file, bound to its path.
     DataFile,
     /// One `commits/<v>.json` delta manifest, bound to its path.
     Commit,
@@ -217,7 +177,7 @@ pub(crate) fn unavailable() -> LakeError {
         feature: "encryption",
         message: "at-rest encryption is not compiled into this pink-lake build; rebuild with \
                   the `encryption` feature (for the CLI: `cargo build -p pinkdb-cli \
-                  --features vortexlake,s3,encryption`)"
+                  --features pinklake,s3,encryption`)"
             .to_string(),
     }
 }
@@ -274,8 +234,8 @@ impl EncryptionKey {
         }
     }
 
-    /// A passphrase, stretched with Argon2id when a container is written or
-    /// read. The salt and parameters are stored in the container headers.
+    /// A passphrase for the engine-encrypted `pink:` catalog database. Lake
+    /// data files never derive from it — they use raw per-file keys.
     pub fn from_passphrase(passphrase: &str) -> Self {
         Self {
             raw: None,
@@ -300,10 +260,6 @@ impl EncryptionKey {
                 }),
             },
         }
-    }
-
-    fn holds_material(&self) -> bool {
-        self.raw.is_some() || self.passphrase.is_some()
     }
 
     /// The same key as the engine's type, for opening a `pink:` catalog
@@ -356,10 +312,6 @@ pub(crate) use imp::Crypto;
 mod imp {
     use super::*;
 
-    use std::collections::HashMap;
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
-
     use aes_gcm::aead::rand_core::{OsRng, RngCore};
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes256Gcm, Nonce};
@@ -383,53 +335,15 @@ mod imp {
         }
     }
 
-    /// The KDF identity of one key: either the raw key, or the exact Argon2id
-    /// parameters and salt a container was written with. The session cache is
-    /// keyed by it, so a whole version costs one derivation.
-    #[derive(Clone, PartialEq, Eq, Hash)]
-    enum Derivation {
-        Raw,
-        Argon2 {
-            m_cost: u32,
-            t_cost: u32,
-            p_cost: u32,
-            salt: Vec<u8>,
-        },
-    }
-
-    impl fmt::Debug for Derivation {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Derivation::Raw => write!(f, "Derivation(raw key)"),
-                Derivation::Argon2 {
-                    m_cost,
-                    t_cost,
-                    p_cost,
-                    ..
-                } => write!(
-                    f,
-                    "Derivation(Argon2id m={m_cost} KiB t={t_cost} p={p_cost}, salt redacted)"
-                ),
-            }
-        }
-    }
-
-    /// One lake session's key: the user's key material, the derivation every
-    /// *container this session writes* records, and the derived-key cache, so
-    /// Argon2id runs once per distinct salt, not once per file.
+    /// One lake session's key: the raw 32-byte value the per-file catalog
+    /// rows record.
     pub(crate) struct Crypto {
         key: EncryptionKey,
-        /// What this session seals with: the raw key, or Argon2id with one
-        /// freshly minted salt — the session's one KDF specification. Every
-        /// container of the session carries it (so any single object opens
-        /// even if the catalog is gone).
-        write: Derivation,
-        cache: Mutex<HashMap<Derivation, Arc<DerivedKey>>>,
     }
 
     impl fmt::Debug for Crypto {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "Crypto({:?}, {:?})", self.key, self.write)
+            write!(f, "Crypto({:?})", self.key)
         }
     }
 
@@ -440,30 +354,18 @@ mod imp {
     }
 
     /// The 96-bit nonce of one unit (L-4): a 128-bit random base plus the
-    /// counter for v2+, the legacy `prefix || counter` for v1 files.
-    pub(crate) fn nonce_for(
-        version: u32,
-        base: &[u8; NONCE_BASE_LEN],
-        domain: Domain,
-        counter: u32,
-    ) -> [u8; 12] {
-        if version >= CONTAINER_VERSION {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(b"pinkdb-nonce-v4\0");
-            h.update([domain.id()]);
-            h.update(base);
-            h.update(counter.to_le_bytes());
-            let digest = h.finalize();
-            let mut nonce = [0u8; 12];
-            nonce.copy_from_slice(&digest[..12]);
-            nonce
-        } else {
-            let mut nonce = [0u8; 12];
-            nonce[..LEGACY_NONCE_PREFIX_LEN].copy_from_slice(&base[..LEGACY_NONCE_PREFIX_LEN]);
-            nonce[LEGACY_NONCE_PREFIX_LEN..].copy_from_slice(&counter.to_le_bytes());
-            nonce
-        }
+    /// domain and counter.
+    pub(crate) fn nonce_for(base: &[u8; NONCE_BASE_LEN], domain: Domain, counter: u32) -> [u8; 12] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"pinkdb-nonce-v4\0");
+        h.update([domain.id()]);
+        h.update(base);
+        h.update(counter.to_le_bytes());
+        let digest = h.finalize();
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&digest[..12]);
+        nonce
     }
 
     /// The AAD of one unit: the whole public header (which already binds the
@@ -477,7 +379,6 @@ mod imp {
 
     fn seal_unit(
         key: &DerivedKey,
-        version: u32,
         base: &[u8; NONCE_BASE_LEN],
         domain: Domain,
         counter: u32,
@@ -488,7 +389,7 @@ mod imp {
             .map_err(|_| internal("bad key length for AES-256-GCM"))?;
         cipher
             .encrypt(
-                Nonce::from_slice(&nonce_for(version, base, domain, counter)),
+                Nonce::from_slice(&nonce_for(base, domain, counter)),
                 Payload { msg: plain, aad },
             )
             .map_err(|_| internal("AEAD encryption failed"))
@@ -497,7 +398,6 @@ mod imp {
     /// `None` = authentication failed (wrong key or tampering).
     fn try_open_unit(
         key: &DerivedKey,
-        version: u32,
         base: &[u8; NONCE_BASE_LEN],
         domain: Domain,
         counter: u32,
@@ -507,7 +407,7 @@ mod imp {
         let cipher = Aes256Gcm::new_from_slice(&key.bytes).ok()?;
         cipher
             .decrypt(
-                Nonce::from_slice(&nonce_for(version, base, domain, counter)),
+                Nonce::from_slice(&nonce_for(base, domain, counter)),
                 Payload {
                     msg: ciphertext,
                     aad,
@@ -522,75 +422,28 @@ mod imp {
         }
     }
 
-    fn argon2_derive(
-        passphrase: &[u8],
-        m_cost: u32,
-        t_cost: u32,
-        p_cost: u32,
-        salt: &[u8],
-    ) -> Result<DerivedKey> {
-        let params = argon2::Params::new(m_cost, t_cost, p_cost, Some(KEY_LEN))
-            .map_err(|e| internal(format!("invalid Argon2id parameters: {e}")))?;
-        let argon =
-            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-        let mut bytes = [0u8; KEY_LEN];
-        argon
-            .hash_password_into(passphrase, salt, &mut bytes)
-            .map_err(|e| internal(format!("Argon2id derivation failed: {e}")))?;
-        Ok(DerivedKey { bytes })
-    }
-
     /// Serialize the public header up to (but excluding) the key-check block.
     /// This is also the AAD base of every unit, so a change to any field —
-    /// including the container version, the nonce prefix, the domain, the
-    /// binding, and the KDF parameters — breaks every unit instead of being a
-    /// cheap header edit.
-    fn header_base(
-        derivation: &Derivation,
-        nonce_base: &[u8; NONCE_BASE_LEN],
-        domain: Domain,
-        binding: &str,
-        version: u32,
-    ) -> Vec<u8> {
-        let mut v = Vec::with_capacity(HEADER_FIXED_LEN + KDF_PARAMS_LEN + MAX_SALT_LEN as usize);
+    /// including the container version, the nonce base, the domain, or the
+    /// binding — breaks every unit instead of being a cheap header edit.
+    fn header_base(nonce_base: &[u8; NONCE_BASE_LEN], domain: Domain, binding: &str) -> Vec<u8> {
+        let mut v = Vec::with_capacity(HEADER_FIXED_LEN + binding.len());
         v.extend_from_slice(ENC_MAGIC);
-        v.extend_from_slice(&version.to_le_bytes());
+        v.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
         v.push(CIPHER_AES256_GCM);
-        v.push(match derivation {
-            Derivation::Raw => KDF_RAW,
-            Derivation::Argon2 { .. } => KDF_ARGON2ID,
-        });
+        v.push(KDF_RAW);
         v.push(domain.id());
         v.extend_from_slice(&(KEY_CHECK_PLAIN.len() as u32).to_le_bytes());
-        if version >= CONTAINER_VERSION {
-            v.extend_from_slice(nonce_base);
-        } else {
-            v.extend_from_slice(&nonce_base[..LEGACY_NONCE_PREFIX_LEN]);
-        }
+        v.extend_from_slice(nonce_base);
         v.extend_from_slice(&(binding.len() as u32).to_le_bytes());
         v.extend_from_slice(binding.as_bytes());
-        if let Derivation::Argon2 {
-            m_cost,
-            t_cost,
-            p_cost,
-            salt,
-        } = derivation
-        {
-            v.extend_from_slice(&m_cost.to_le_bytes());
-            v.extend_from_slice(&t_cost.to_le_bytes());
-            v.extend_from_slice(&p_cost.to_le_bytes());
-            v.extend_from_slice(&(salt.len() as u32).to_le_bytes());
-            v.extend_from_slice(salt);
-        }
         v
     }
 
     /// The public part of a parsed container header.
     struct ParsedHeader {
-        version: u32,
         domain: u8,
         binding: String,
-        derivation: Derivation,
         nonce_base: [u8; NONCE_BASE_LEN],
         aad_base: Vec<u8>,
         key_check: Vec<u8>,
@@ -611,11 +464,11 @@ mod imp {
                 "not a pink-lake encrypted container (bad magic)",
             ));
         }
-        if data.len() < LEGACY_HEADER_FIXED_LEN {
+        if data.len() < HEADER_FIXED_LEN {
             return Err(tampered(path, "truncated container header"));
         }
         let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-        if version != CONTAINER_VERSION && version != CONTAINER_VERSION_V1 {
+        if version != CONTAINER_VERSION {
             return Err(crate::LakeError::UnsupportedContainer {
                 path: path.to_path_buf(),
                 found: version,
@@ -625,7 +478,16 @@ mod imp {
         if cipher != CIPHER_AES256_GCM {
             return Err(tampered(path, format!("unsupported cipher id {cipher}")));
         }
-        let kdf = data[13];
+        if data[13] != KDF_RAW {
+            return Err(tampered(
+                path,
+                format!(
+                    "unsupported KDF id {} (wave 104 removed the KDF path; per-file keys \
+                     are raw)",
+                    data[13]
+                ),
+            ));
+        }
         let domain = data[14];
         if !(1..=5).contains(&domain) {
             return Err(tampered(path, format!("unknown container domain {domain}")));
@@ -637,22 +499,12 @@ mod imp {
                 format!("bad key-check length {key_check_len}"),
             ));
         }
-        let (nonce_base, binding_len, mut pos) = if version >= CONTAINER_VERSION {
-            if data.len() < HEADER_FIXED_LEN {
-                return Err(tampered(path, "truncated container header"));
-            }
-            let mut base = [0u8; NONCE_BASE_LEN];
-            base.copy_from_slice(&data[19..19 + NONCE_BASE_LEN]);
-            let len_at = 19 + NONCE_BASE_LEN;
-            let len =
-                u32::from_le_bytes(data[len_at..len_at + 4].try_into().expect("4 bytes")) as usize;
-            (base, len, HEADER_FIXED_LEN)
-        } else {
-            let mut base = [0u8; NONCE_BASE_LEN];
-            base[..LEGACY_NONCE_PREFIX_LEN].copy_from_slice(&data[19..27]);
-            let len = u32::from_le_bytes(data[27..31].try_into().expect("4 bytes")) as usize;
-            (base, len, LEGACY_HEADER_FIXED_LEN)
-        };
+        let mut nonce_base = [0u8; NONCE_BASE_LEN];
+        nonce_base.copy_from_slice(&data[19..19 + NONCE_BASE_LEN]);
+        let len_at = 19 + NONCE_BASE_LEN;
+        let binding_len =
+            u32::from_le_bytes(data[len_at..len_at + 4].try_into().expect("4 bytes")) as usize;
+        let mut pos = HEADER_FIXED_LEN;
         // Checked: on a 32-bit target `pos + binding_len` can wrap for a crafted
         // (up to u32::MAX) length, letting the slice below panic.
         let Some(binding_end) = pos
@@ -665,64 +517,14 @@ mod imp {
             .map_err(|_| tampered(path, "binding is not valid UTF-8"))?
             .to_string();
         pos = binding_end;
-        let derivation = match kdf {
-            KDF_RAW => Derivation::Raw,
-            KDF_ARGON2ID => {
-                if data.len() < pos + KDF_PARAMS_LEN {
-                    return Err(tampered(path, "truncated Argon2id parameters"));
-                }
-                let u32_at = |off: usize| {
-                    u32::from_le_bytes(data[off..off + 4].try_into().expect("4 bytes"))
-                };
-                let m_cost = u32_at(pos);
-                let t_cost = u32_at(pos + 4);
-                let p_cost = u32_at(pos + 8);
-                let salt_len = u32_at(pos + 12);
-                if !(8..=ARGON2_MAX_M_COST_KIB).contains(&m_cost)
-                    || !(1..=ARGON2_MAX_T_COST).contains(&t_cost)
-                    || !(1..=ARGON2_MAX_P_COST).contains(&p_cost)
-                    || m_cost < 8 * p_cost
-                    || (m_cost as u64) * (t_cost as u64) > ARGON2_MAX_WORK_KIB
-                {
-                    return Err(tampered(
-                        path,
-                        format!(
-                            "implausible Argon2id parameters (m={m_cost} KiB, t={t_cost}, \
-                             p={p_cost}; caps m<={ARGON2_MAX_M_COST_KIB}, \
-                             t<={ARGON2_MAX_T_COST}, p<={ARGON2_MAX_P_COST}, \
-                             m*t<={ARGON2_MAX_WORK_KIB})"
-                        ),
-                    ));
-                }
-                if !(MIN_SALT_LEN..=MAX_SALT_LEN).contains(&salt_len) {
-                    return Err(tampered(path, format!("bad salt length {salt_len}")));
-                }
-                let salt_len = salt_len as usize;
-                let salt_start = pos + KDF_PARAMS_LEN;
-                if data.len() < salt_start + salt_len {
-                    return Err(tampered(path, "truncated salt"));
-                }
-                let salt = data[salt_start..salt_start + salt_len].to_vec();
-                pos = salt_start + salt_len;
-                Derivation::Argon2 {
-                    m_cost,
-                    t_cost,
-                    p_cost,
-                    salt,
-                }
-            }
-            other => return Err(tampered(path, format!("unsupported KDF id {other}"))),
-        };
         if data.len() < pos + key_check_len + TAG_LEN {
             return Err(tampered(path, "truncated key-check block"));
         }
         let key_check = data[pos..pos + key_check_len + TAG_LEN].to_vec();
         let payload_start = pos + key_check_len + TAG_LEN;
         Ok(ParsedHeader {
-            version,
             domain,
             binding,
-            derivation,
             nonce_base,
             aad_base: data[..pos].to_vec(),
             key_check,
@@ -731,84 +533,38 @@ mod imp {
     }
 
     impl Crypto {
-        /// One keyed lake session: the key plus the session's KDF
-        /// specification. For a passphrase the write salt is minted here (and
-        /// recorded in every container this session writes); a raw key needs
-        /// no salt.
+        /// One keyed lake session over a raw 32-byte key. A passphrase key is
+        /// rejected here: per-file keys are raw, and a passphrase exists only
+        /// to unlock the engine-encrypted catalog database.
         pub(crate) fn new(key: EncryptionKey) -> Result<Self> {
-            if !key.holds_material() {
-                return Err(internal("encryption key holds no material"));
+            if key.raw.is_none() {
+                return Err(match key.passphrase {
+                    Some(_) => internal(
+                        "a lake data file needs a raw 32-byte key; the passphrase is only for \
+                         the engine-encrypted catalog",
+                    ),
+                    None => internal("encryption key holds no material"),
+                });
             }
-            let write = match (&key.raw, &key.passphrase) {
-                (Some(_), _) => Derivation::Raw,
-                (None, Some(_)) => {
-                    let mut salt = vec![0u8; DEFAULT_SALT_LEN as usize];
-                    OsRng.fill_bytes(&mut salt);
-                    Derivation::Argon2 {
-                        m_cost: ARGON2_M_COST_KIB,
-                        t_cost: ARGON2_T_COST,
-                        p_cost: ARGON2_P_COST,
-                        salt,
-                    }
-                }
-                (None, None) => return Err(internal("encryption key holds no material")),
-            };
-            Ok(Self {
-                key,
-                write,
-                cache: Mutex::new(HashMap::new()),
-            })
+            Ok(Self { key })
         }
 
-        /// Derive (or fetch from the session cache) the key of one header.
-        fn derive(&self, path: &Path, derivation: &Derivation) -> Result<Arc<DerivedKey>> {
-            if let Some(hit) = self
-                .cache
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(derivation)
-            {
-                return Ok(Arc::clone(hit));
+        /// The session's raw 32-byte key.
+        fn derive(&self, path: &Path) -> Result<DerivedKey> {
+            match self.key.raw {
+                Some(raw) => Ok(DerivedKey { bytes: raw }),
+                None => Err(wrong_key(
+                    path,
+                    "the file uses a raw 32-byte key, but a passphrase was supplied",
+                )),
             }
-            let derived = Arc::new(match derivation {
-                Derivation::Raw => match self.key.raw {
-                    Some(raw) => DerivedKey { bytes: raw },
-                    None => {
-                        return Err(wrong_key(
-                            path,
-                            "the file uses a raw 32-byte key, but a passphrase was supplied",
-                        ));
-                    }
-                },
-                Derivation::Argon2 {
-                    m_cost,
-                    t_cost,
-                    p_cost,
-                    salt,
-                } => match &self.key.passphrase {
-                    Some(pass) => argon2_derive(pass, *m_cost, *t_cost, *p_cost, salt)?,
-                    None => {
-                        return Err(wrong_key(
-                            path,
-                            "the file is passphrase-encrypted (Argon2id), but a raw key was \
-                             supplied",
-                        ));
-                    }
-                },
-            });
-            self.cache
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(derivation.clone(), Arc::clone(&derived));
-            Ok(derived)
         }
 
         /// Seal one whole artifact into a container. Every call mints a fresh
-        /// random nonce prefix (so no two containers of a session ever reuse
-        /// a (key, nonce) pair), while the derivation — and therefore the
-        /// Argon2id cost — is the session's one specification.
+        /// random nonce base (so no two containers of a session ever reuse a
+        /// (key, nonce) pair).
         ///
-        /// Because the prefix is per container, sealing the same plaintext
+        /// Because the base is per container, sealing the same plaintext
         /// twice produces two different containers; the
         /// `catalog.json == snapshots/<v>.json` invariant is preserved by
         /// sealing **once per version** and publishing those exact bytes to
@@ -821,46 +577,12 @@ mod imp {
             binding: &str,
             plain: &[u8],
         ) -> Result<Vec<u8>> {
-            self.seal_version(
-                path,
-                domain,
-                binding,
-                plain,
-                CONTAINER_VERSION,
-                random_nonce_base(),
-            )
-        }
-
-        /// Test-only: seal in the legacy v1 layout (8-byte prefix) so the
-        /// read-old/write-new policy is exercised against real bytes.
-        #[cfg(test)]
-        pub(crate) fn seal_v1(
-            &self,
-            path: &Path,
-            domain: Domain,
-            binding: &str,
-            plain: &[u8],
-        ) -> Result<Vec<u8>> {
-            let mut base = [0u8; NONCE_BASE_LEN];
-            OsRng.fill_bytes(&mut base[..LEGACY_NONCE_PREFIX_LEN]);
-            self.seal_version(path, domain, binding, plain, CONTAINER_VERSION_V1, base)
-        }
-
-        fn seal_version(
-            &self,
-            path: &Path,
-            domain: Domain,
-            binding: &str,
-            plain: &[u8],
-            version: u32,
-            nonce_base: [u8; NONCE_BASE_LEN],
-        ) -> Result<Vec<u8>> {
-            let key = self.derive(path, &self.write)?;
-            let aad = header_base(&self.write, &nonce_base, domain, binding, version);
+            let key = self.derive(path)?;
+            let nonce_base = random_nonce_base();
+            let aad = header_base(&nonce_base, domain, binding);
             let mut out = aad.clone();
             out.extend_from_slice(&seal_unit(
                 &key,
-                version,
                 &nonce_base,
                 domain,
                 0,
@@ -877,7 +599,6 @@ mod imp {
                 let frame = &plain[pos..end];
                 let ct = seal_unit(
                     &key,
-                    version,
                     &nonce_base,
                     domain,
                     counter,
@@ -894,7 +615,6 @@ mod imp {
             }
             let terminal = seal_unit(
                 &key,
-                version,
                 &nonce_base,
                 domain,
                 counter,
@@ -904,59 +624,6 @@ mod imp {
             out.extend_from_slice(&0u32.to_le_bytes());
             out.extend_from_slice(&terminal);
             Ok(out)
-        }
-
-        /// A writer that seals what is written through it into `sink` (used
-        /// by the Vortex data-file path so a big file is never materialized
-        /// whole). Call [`SealWriter::finish`] when the plaintext is done.
-        #[allow(dead_code)]
-        pub(crate) fn sealing_writer<'a>(
-            &'a self,
-            path: &Path,
-            domain: Domain,
-            binding: &str,
-            sink: &'a mut (dyn Write + Send),
-        ) -> Result<SealWriter<'a>> {
-            let key = self.derive(path, &self.write)?;
-            let nonce_base = random_nonce_base();
-            let aad = header_base(&self.write, &nonce_base, domain, binding, CONTAINER_VERSION);
-            let mut header = aad.clone();
-            header.extend_from_slice(&seal_unit(
-                &key,
-                CONTAINER_VERSION,
-                &nonce_base,
-                domain,
-                0,
-                &unit_aad(&aad, 0),
-                KEY_CHECK_PLAIN,
-            )?);
-            sink.write_all(&header).map_err(|e| LakeError::Io {
-                context: format!(
-                    "writing the encrypted container header of {}",
-                    path.display()
-                ),
-                source: e,
-            })?;
-            Ok(SealWriter {
-                path: path.to_path_buf(),
-                key,
-                nonce_base,
-                domain,
-                aad,
-                sink,
-                buf: Vec::with_capacity(SEGMENT_PLAIN_MAX),
-                counter: 1,
-                finished: false,
-            })
-        }
-
-        /// The authenticated header binding of one container (public data,
-        /// covered by the AEAD). Used for manifest/highest objects whose
-        /// version is encoded in the binding itself: the caller opens with
-        /// it, then cross-checks the decrypted payload against it (M-7).
-        #[allow(dead_code)]
-        pub(crate) fn container_binding(&self, path: &Path, data: &[u8]) -> Result<String> {
-            Ok(parse_header(path, data)?.binding)
         }
 
         /// Verify the key-check and open a whole container. All of the
@@ -1000,10 +667,9 @@ mod imp {
                     ),
                 ));
             }
-            let key = self.derive(path, &header.derivation)?;
+            let key = self.derive(path)?;
             if try_open_unit(
                 &key,
-                header.version,
                 &header.nonce_base,
                 domain,
                 0,
@@ -1045,7 +711,6 @@ mod imp {
                 }
                 let plain = try_open_unit(
                     &key,
-                    header.version,
                     &header.nonce_base,
                     domain,
                     counter,
@@ -1080,122 +745,6 @@ mod imp {
                 "truncated container: the terminal frame is missing",
             ))
         }
-
-        /// Number of distinct derived keys cached (test/diagnostic only).
-        #[cfg(test)]
-        pub(crate) fn cache_len(&self) -> usize {
-            self.cache.lock().unwrap_or_else(|p| p.into_inner()).len()
-        }
-    }
-
-    /// [`Crypto::sealing_writer`]'s sink: buffers plaintext up to one frame
-    /// and seals each full frame straight into the underlying writer, so a
-    /// data file is never held in memory whole. Only the `vortexlake`
-    /// writer path uses it (a v1 `.pink` data file is sealed in one pass).
-    #[allow(dead_code)]
-    pub(crate) struct SealWriter<'a> {
-        path: std::path::PathBuf,
-        key: Arc<DerivedKey>,
-        nonce_base: [u8; NONCE_BASE_LEN],
-        domain: Domain,
-        aad: Vec<u8>,
-        sink: &'a mut (dyn Write + Send),
-        buf: Vec<u8>,
-        counter: u32,
-        finished: bool,
-    }
-
-    #[allow(dead_code)]
-    impl SealWriter<'_> {
-        fn seal_buffered(&mut self) -> std::io::Result<()> {
-            if self.buf.is_empty() {
-                return Ok(());
-            }
-            if self.counter == u32::MAX {
-                return Err(std::io::Error::other(
-                    "pink-lake encryption: too many container frames",
-                ));
-            }
-            let plain = std::mem::take(&mut self.buf);
-            let ct = seal_unit(
-                &self.key,
-                CONTAINER_VERSION,
-                &self.nonce_base,
-                self.domain,
-                self.counter,
-                &unit_aad(&self.aad, self.counter),
-                &plain,
-            )
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-            let mut frame = (plain.len() as u32).to_le_bytes().to_vec();
-            frame.extend_from_slice(&ct);
-            self.sink.write_all(&frame)?;
-            self.counter += 1;
-            self.buf = plain;
-            self.buf.clear();
-            Ok(())
-        }
-
-        /// Flush the pending partial frame, seal the terminal zero-length
-        /// frame, and flush the underlying writer. Must be called exactly
-        /// once, after the last [`std::io::Write::write`]; an unfinished
-        /// writer leaves no valid container behind (the storage layer
-        /// discards its temp file on the error path).
-        pub(crate) fn finish(mut self) -> Result<()> {
-            let out = (|| -> std::io::Result<()> {
-                self.seal_buffered()?;
-                if self.counter == u32::MAX {
-                    return Err(std::io::Error::other(
-                        "pink-lake encryption: too many container frames",
-                    ));
-                }
-                let terminal = seal_unit(
-                    &self.key,
-                    CONTAINER_VERSION,
-                    &self.nonce_base,
-                    self.domain,
-                    self.counter,
-                    &unit_aad(&self.aad, self.counter),
-                    &[],
-                )
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-                self.sink.write_all(&0u32.to_le_bytes())?;
-                self.sink.write_all(&terminal)?;
-                self.sink.flush()?;
-                Ok(())
-            })();
-            self.finished = true;
-            out.map_err(|e| LakeError::Io {
-                context: format!("sealing the encrypted container of {}", self.path.display()),
-                source: e,
-            })
-        }
-    }
-
-    #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
-    impl Write for SealWriter<'_> {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if self.finished {
-                return Err(std::io::Error::other(
-                    "pink-lake encryption: write after finish",
-                ));
-            }
-            let mut rest = buf;
-            while !rest.is_empty() {
-                let room = SEGMENT_PLAIN_MAX - self.buf.len();
-                let take = room.min(rest.len());
-                self.buf.extend_from_slice(&rest[..take]);
-                rest = &rest[take..];
-                if self.buf.len() == SEGMENT_PLAIN_MAX {
-                    self.seal_buffered()?;
-                }
-            }
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.sink.flush()
-        }
     }
 }
 
@@ -1203,23 +752,14 @@ mod imp {
 mod imp {
     use super::*;
 
-    use std::io::Write;
-
     /// Stub: unconstructible without the feature, so a keyed lake handle can
     /// never exist and every artifact stays plaintext.
     #[derive(Debug)]
     pub(crate) struct Crypto(());
 
-    #[derive(Debug)]
-    #[allow(dead_code)]
-    pub(crate) struct SealWriter<'a>(std::marker::PhantomData<&'a ()>);
-
     #[allow(unused_variables)]
     impl Crypto {
         pub(crate) fn new(key: EncryptionKey) -> Result<Self> {
-            Err(unavailable())
-        }
-        pub(crate) fn container_binding(&self, _path: &Path, _data: &[u8]) -> Result<String> {
             Err(unavailable())
         }
         pub(crate) fn seal(
@@ -1231,16 +771,6 @@ mod imp {
         ) -> Result<Vec<u8>> {
             Err(unavailable())
         }
-        #[allow(dead_code)]
-        pub(crate) fn sealing_writer<'a>(
-            &'a self,
-            path: &Path,
-            domain: Domain,
-            binding: &str,
-            sink: &'a mut (dyn Write + Send),
-        ) -> Result<SealWriter<'a>> {
-            Err(unavailable())
-        }
         pub(crate) fn open(
             &self,
             path: &Path,
@@ -1248,25 +778,6 @@ mod imp {
             binding: &str,
             data: &[u8],
         ) -> Result<Vec<u8>> {
-            Err(unavailable())
-        }
-    }
-
-    /// The stub must still satisfy `Write` so the shared `vortexlake`
-    /// writer path type-checks; it can never be constructed
-    /// ([`Crypto::sealing_writer`] always fails first).
-    impl std::io::Write for SealWriter<'_> {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[allow(dead_code)]
-    impl SealWriter<'_> {
-        pub(crate) fn finish(self) -> Result<()> {
             Err(unavailable())
         }
     }
@@ -1281,6 +792,11 @@ mod tests {
     }
 
     #[cfg(feature = "encryption")]
+    fn crypto() -> Crypto {
+        Crypto::new(EncryptionKey::from_raw([7u8; 32])).unwrap()
+    }
+
+    #[cfg(feature = "encryption")]
     fn seal(crypto: &Crypto, domain: Domain, binding: &str, plain: &[u8]) -> Vec<u8> {
         crypto.seal(&path(), domain, binding, plain).unwrap()
     }
@@ -1288,10 +804,10 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn round_trips_manifests_and_data_files() {
-        let crypto = Crypto::new(EncryptionKey::from_passphrase("lake sesame")).unwrap();
+        let crypto = crypto();
         for (domain, binding) in [
             (Domain::Manifest, ""),
-            (Domain::DataFile, "data/main.t/x.vortex"),
+            (Domain::DataFile, "data/main.t/x.pink"),
             (Domain::Commit, "commits/2.json"),
             (Domain::DeleteFile, "data/main.t/x.pinkdel"),
         ] {
@@ -1310,49 +826,13 @@ mod tests {
 
     #[cfg(feature = "encryption")]
     #[test]
-    fn the_kdf_runs_once_per_session_whatever_the_file_count() {
-        let crypto = Crypto::new(EncryptionKey::from_passphrase("lake sesame")).unwrap();
-        assert_eq!(crypto.cache_len(), 0, "no eager derivation");
-        let mut containers = Vec::new();
-        for plain in [
-            b"a".to_vec(),
-            b"b".to_vec(),
-            vec![7u8; SEGMENT_PLAIN_MAX + 1],
-        ] {
-            containers.push(seal(&crypto, Domain::DataFile, "data/t/x.vortex", &plain));
-        }
-        let manifest = seal(&crypto, Domain::Manifest, "", b"manifest");
-        assert_eq!(
-            crypto.cache_len(),
-            1,
-            "one session salt: one Argon2id derivation for every container"
-        );
-        for (i, plain) in [b"a".to_vec(), b"b".to_vec()].into_iter().enumerate() {
-            assert_eq!(
-                crypto
-                    .open(&path(), Domain::DataFile, "data/t/x.vortex", &containers[i])
-                    .unwrap(),
-                plain
-            );
-        }
-        assert_eq!(
-            crypto
-                .open(&path(), Domain::Manifest, "", &manifest)
-                .unwrap(),
-            b"manifest"
-        );
-        assert_eq!(crypto.cache_len(), 1, "opens reuse the session cache");
-    }
-
-    #[cfg(feature = "encryption")]
-    #[test]
-    fn every_container_has_a_fresh_nonce_prefix_and_cannot_be_replayed() {
-        let crypto = Crypto::new(EncryptionKey::from_passphrase("lake sesame")).unwrap();
+    fn every_container_has_a_fresh_nonce_base_and_cannot_be_replayed() {
+        let crypto = crypto();
         let a = seal(&crypto, Domain::Manifest, "", b"same bytes");
         let b = seal(&crypto, Domain::Manifest, "", b"same bytes");
         assert_ne!(
             a, b,
-            "two containers must never share a nonce prefix (keystream reuse)"
+            "two containers must never share a nonce base (keystream reuse)"
         );
         assert_eq!(
             crypto.open(&path(), Domain::Manifest, "", &a).unwrap(),
@@ -1364,12 +844,12 @@ mod tests {
         );
     }
 
-    /// L-4: v2 containers carry a 128-bit nonce base; the derived nonce
+    /// L-4: containers carry a 128-bit nonce base; the derived nonce
     /// separates domains and counters.
     #[cfg(feature = "encryption")]
     #[test]
-    fn v2_nonce_base_is_128_bits_and_domain_separated() {
-        let crypto = Crypto::new(EncryptionKey::from_raw([0x31u8; 32])).unwrap();
+    fn nonce_base_is_128_bits_and_domain_separated() {
+        let crypto = crypto();
         let a = seal(&crypto, Domain::Manifest, "", b"same");
         let b = seal(&crypto, Domain::Manifest, "", b"same");
         assert_eq!(u32::from_le_bytes(a[8..12].try_into().unwrap()), 2);
@@ -1378,65 +858,40 @@ mod tests {
         assert!(base_a.iter().any(|x| *x != 0));
         assert_ne!(base_a, base_b);
         assert_ne!(
-            imp::nonce_for(2, &base_a, Domain::Manifest, 0),
-            imp::nonce_for(2, &base_a, Domain::DataFile, 0)
+            imp::nonce_for(&base_a, Domain::Manifest, 0),
+            imp::nonce_for(&base_a, Domain::DataFile, 0)
         );
         assert_ne!(
-            imp::nonce_for(2, &base_a, Domain::Manifest, 0),
-            imp::nonce_for(2, &base_a, Domain::Manifest, 1)
+            imp::nonce_for(&base_a, Domain::Manifest, 0),
+            imp::nonce_for(&base_a, Domain::Manifest, 1)
         );
     }
 
-    /// L-4 old-format policy: a version-1 lake container opens, while every
-    /// new seal is version 2.
+    /// Wave 104 removed the version-1 reader: an old container is refused
+    /// as unsupported, never decoded with the legacy nonce layout.
     #[cfg(feature = "encryption")]
     #[test]
-    fn legacy_v1_lake_container_is_read_and_writes_are_v2() {
-        let crypto = Crypto::new(EncryptionKey::from_raw([0x32u8; 32])).unwrap();
-        let old = crypto
-            .seal_v1(
-                &path(),
-                Domain::DataFile,
-                "data/t/x.pink",
-                b"old lake bytes",
-            )
-            .unwrap();
-        assert_eq!(u32::from_le_bytes(old[8..12].try_into().unwrap()), 1);
-        assert_eq!(
-            crypto
-                .open(&path(), Domain::DataFile, "data/t/x.pink", &old)
-                .unwrap(),
-            b"old lake bytes"
-        );
-        let new = seal(
-            &crypto,
-            Domain::DataFile,
-            "data/t/x.pink",
-            b"new lake bytes",
-        );
-        assert_eq!(u32::from_le_bytes(new[8..12].try_into().unwrap()), 2);
-        assert_eq!(
-            crypto
-                .open(&path(), Domain::DataFile, "data/t/x.pink", &new)
-                .unwrap(),
-            b"new lake bytes"
+    fn legacy_v1_containers_are_refused() {
+        let crypto = crypto();
+        let new = seal(&crypto, Domain::DataFile, "data/t/x.pink", b"bytes");
+        let mut old = new.clone();
+        old[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let err = crypto
+            .open(&path(), Domain::DataFile, "data/t/x.pink", &old)
+            .unwrap_err();
+        assert!(
+            matches!(err, LakeError::UnsupportedContainer { found: 1, .. }),
+            "{err:?}"
         );
     }
 
     #[cfg(feature = "encryption")]
     #[test]
     fn wrong_key_is_distinguished_from_tampering() {
-        let good = Crypto::new(EncryptionKey::from_passphrase("lake sesame")).unwrap();
-        let bad = Crypto::new(EncryptionKey::from_passphrase("not it")).unwrap();
+        let good = crypto();
+        let bad = Crypto::new(EncryptionKey::from_raw([8u8; 32])).unwrap();
         let sealed = seal(&good, Domain::Manifest, "", b"payload");
         let err = bad
-            .open(&path(), Domain::Manifest, "", &sealed)
-            .unwrap_err();
-        assert!(matches!(err, LakeError::WrongKey { .. }), "{err:?}");
-
-        // Wrong key *type* is a wrong key, not a structural error.
-        let raw = Crypto::new(EncryptionKey::from_raw([9u8; 32])).unwrap();
-        let err = raw
             .open(&path(), Domain::Manifest, "", &sealed)
             .unwrap_err();
         assert!(matches!(err, LakeError::WrongKey { .. }), "{err:?}");
@@ -1450,7 +905,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
 
-        // A flipped header byte (the nonce prefix) fails the key-check: the
+        // A flipped header byte (the nonce base) fails the key-check: the
         // error says wrong key *or* a tampered header, the engine's contract.
         let mut flipped = sealed.clone();
         flipped[19] ^= 0x01;
@@ -1483,9 +938,9 @@ mod tests {
     #[cfg(feature = "encryption")]
     #[test]
     fn keyed_reads_of_plaintext_and_engine_containers_are_refused() {
-        let crypto = Crypto::new(EncryptionKey::from_passphrase("lake sesame")).unwrap();
+        let crypto = crypto();
         let err = crypto
-            .open(&path(), Domain::Manifest, "", b"{\"format_version\":4}")
+            .open(&path(), Domain::Manifest, "", b"{\"format_version\":7}")
             .unwrap_err();
         assert!(matches!(err, LakeError::NotEncrypted { .. }), "{err:?}");
         // An engine container mistaken for a lake one names the mixup.
@@ -1503,7 +958,7 @@ mod tests {
     fn an_unsupported_container_version_is_not_tampering() {
         // A container whose version this build does not know is an upgrade
         // error, not corruption/tampering.
-        let crypto = Crypto::new(EncryptionKey::from_passphrase("lake version")).unwrap();
+        let crypto = crypto();
         let mut data = ENC_MAGIC.to_vec();
         data.extend_from_slice(&99u32.to_le_bytes());
         data.resize(128, 0);
@@ -1518,59 +973,21 @@ mod tests {
 
     #[cfg(feature = "encryption")]
     #[test]
-    fn a_raw_key_round_trips_and_never_uses_argon2() {
-        let crypto = Crypto::new(EncryptionKey::from_raw([7u8; 32])).unwrap();
-        let sealed = seal(&crypto, Domain::DataFile, "data/t/f.vortex", b"bytes");
+    fn a_raw_key_round_trips_and_the_header_has_no_kdf() {
+        let crypto = crypto();
+        let sealed = seal(&crypto, Domain::DataFile, "data/t/f.pink", b"bytes");
         // The header carries kdf = raw and no parameters.
         assert_eq!(sealed[13], KDF_RAW);
         assert_eq!(
             crypto
-                .open(&path(), Domain::DataFile, "data/t/f.vortex", &sealed)
+                .open(&path(), Domain::DataFile, "data/t/f.pink", &sealed)
                 .unwrap(),
             b"bytes"
         );
-        // A passphrase cannot open a raw-key container and vice versa.
-        let pass = Crypto::new(EncryptionKey::from_passphrase("lake sesame")).unwrap();
-        let err = pass
-            .open(&path(), Domain::DataFile, "data/t/f.vortex", &sealed)
-            .unwrap_err();
-        assert!(matches!(err, LakeError::WrongKey { .. }), "{err:?}");
-    }
-
-    #[cfg(feature = "encryption")]
-    #[test]
-    fn the_sealing_writer_matches_whole_buffer_sealing() {
-        use std::io::Write;
-        let crypto = Crypto::new(EncryptionKey::from_passphrase("lake sesame")).unwrap();
-        let plain = vec![0x5Au8; SEGMENT_PLAIN_MAX + 12345];
-        let whole = crypto
-            .seal(&path(), Domain::DataFile, "data/t/x.vortex", &plain)
-            .unwrap();
-        let mut sink: Vec<u8> = Vec::new();
-        {
-            let mut w = crypto
-                .sealing_writer(&path(), Domain::DataFile, "data/t/x.vortex", &mut sink)
-                .unwrap();
-            for chunk in plain.chunks(1000) {
-                w.write_all(chunk).unwrap();
-            }
-            w.finish().unwrap();
-        }
-        // The streamed container has its own fresh prefix, so it is not
-        // byte-equal to `whole`; what must match is the decrypted payload.
-        assert_ne!(sink, whole, "each container mints its own prefix");
-        assert_eq!(
-            crypto
-                .open(&path(), Domain::DataFile, "data/t/x.vortex", &sink)
-                .unwrap(),
-            plain
-        );
-        assert_eq!(
-            crypto
-                .open(&path(), Domain::DataFile, "data/t/x.vortex", &whole)
-                .unwrap(),
-            plain
-        );
+        // A passphrase is only for the engine-encrypted catalog; the per-file
+        // container needs the raw key.
+        let err = Crypto::new(EncryptionKey::from_passphrase("lake sesame")).unwrap_err();
+        assert!(err.to_string().contains("raw 32-byte key"), "{err}");
     }
 
     #[cfg(feature = "encryption")]
@@ -1583,7 +1000,7 @@ mod tests {
     #[cfg(not(feature = "encryption"))]
     #[test]
     fn without_the_feature_every_keyed_operation_names_the_missing_support() {
-        let key = EncryptionKey::from_passphrase("lake sesame");
+        let key = EncryptionKey::from_raw([7u8; 32]);
         let err = Crypto::new(key).unwrap_err();
         assert!(matches!(
             err,

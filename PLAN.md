@@ -160,27 +160,6 @@ LIMIT n;
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 
-## Lake benchmark note (Vortex vs DuckLake, Oct 2026)
-
-`bench/lake_bench.py` (stdlib-only) compares pink-lake (Vortex) with DuckLake
-(DuckDB v1.5.5 `ducklake` extension) on the same CSV and the same four
-queries, both storing `lake.sales`: 1M rows — pink-lake ingest 0.243 s vs
-0.125 s, stored 3.12 MB vs 13.26 MB, cold open 0.061 s (eager) vs ATTACH
-≈3 ms (lazy), first-query cold wall 0.077 s vs 0.036 s, queries best-of-5
-<1/10/5/3 ms (count/group-by/filter/order-by) vs 7/12/11/12 ms printed
-(36–41 ms as fresh-process wall); 10M rows — 1.943 s vs 0.368 s ingest,
-31.1 MB vs 97.1 MB stored, cold open 0.724 s vs 0.036 s, group-by 93 ms vs
-37 ms, filter 48 ms vs 24 ms, order-by 30 ms vs 28 ms, `COUNT(*)` <1 ms vs
-8 ms. So at 10M DuckLake wins ingest, cold start and three of four queries
-while pink-lake keeps the compactness (≈3× smaller) and the in-session
-`COUNT(*)` fast path. Caveat: architectures differ — pink-lake eagerly
-loads Vortex into the in-memory engine at `.lake open`, DuckLake scans
-Parquet lazily at query time; not an apples-to-apples product comparison.
-Reproduce: `python3 bench/lake_bench.py --rows 1000000 --runs 5` (add
-`--rows 10000000` for the larger run). Follow-up candidate for wave 40:
-Vortex scan/decode speed at 10M (the engine's in-memory scans lose to
-Parquet for filter/group-by/order-by there).
-
 ## Wave 45 follow-ons (sub-waves 45b–45o, Oct 2026)
 
 Follow-on work after wave 45: the staged lake-scan design (design doc:
@@ -210,7 +189,7 @@ decode of the columns it reads. The lean `lake-lite` build shipped as 45i
 45j (text corpora 3–5× smaller). 45k shipped exact attach fast paths for lean
 `.pink` lakes — a CRC-protected per-column statistics block published in the
 manifest on every lean save, so `COUNT`/`MIN`/`MAX` are answered with zero
-data-file reads under the same exactness gate as the Vortex path — which is
+data-file reads under the same exactness gate as the footer path — which is
 what makes `.lake attach` work in `lake-lite` too. Remaining follow-ups (not
 committed): lean projection pushdown (`.pink` has no projected reader — a
 fallback decodes the whole table), per-chunk statistics + filter/zone pruning
@@ -231,7 +210,7 @@ and its catalog/snapshots are not. Wave 57 derives **one Argon2id key per lake
 session** (salt recorded in the catalog — the engine's per-container KDF measured
 ~0.64 s CPU per keyed open, too slow to pay per data file) and wraps the catalog +
 snapshots and each data file in AEAD containers (stage 1: `.pink` data files;
-stage 2: Vortex files): `PINKDB_KEY` on `.lake save`/`open`/`attach` matches the
+stage 2: the other formats): `PINKDB_KEY` on `.lake save`/`open`/`attach` matches the
 engine UX, plaintext lakes keep working, an encrypted lake without or with the
 wrong key fails closed with an authenticated error, the `catalog == snapshot`
 byte invariant and the S3 conditional-PUT CAS (on ciphertext) are preserved, and
@@ -350,7 +329,7 @@ tolerating 409/200-already-exists. `cargo test -q` unchanged: 494 passed /
 | 32 | Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) | infra service |
 | 33 | Custom repositories: user-configurable extension repository URLs and config | core config + repo client |
 | 34 | Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) | separate crates (storage layer) |
-| 35 | Vortex file format as the default lake data format | format crate / extension |
+| 35 | Vortex file format as the default lake data format (removed in wave 104) | format crate / extension |
 | 36 | S3 bucket support for lake storage and file reading | optional `s3` feature (storage provider) |
 | 37 | Documentation website | separate site/track |
 | 38 | Host the website and extension repository on Cloudflare Workers + R2 | infra |

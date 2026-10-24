@@ -51,9 +51,8 @@
 //! from the same writer path as any other data file (`write_data_file`), and
 //! the manifest's `rows = sum(files) - sum(deletes)` invariant is re-checked
 //! before publishing. Stats-fast attach and filter pruning work on the
-//! merged file unchanged (`vortexlake` footers, `.pink` blocks, the
-//! catalog-published zone map); prune tests pin that the surviving decode
-//! counters still fire.
+//! merged file unchanged (the `.pink` blocks and the catalog-published zone
+//! map); prune tests pin that the surviving decode counters still fire.
 //!
 //! Wave 88 adds [`Lake::rewrite_table_format`]: the same engine in **convert**
 //! mode. Every file of one table — whatever its delete ratio — is decoded

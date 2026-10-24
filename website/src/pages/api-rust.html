@@ -18,8 +18,7 @@ default build links no crypto, TLS or format code; features opt in:</p>
   <thead><tr><th>Feature</th><th>Adds</th></tr></thead>
   <tbody>
     <tr><td><code>encryption</code></td><td><code>PINKENC1</code> at-rest encryption (AES-256-GCM + Argon2id)</td></tr>
-    <tr><td><code>vortexlake</code> (on <code>pink-lake</code>)</td><td>the Vortex lake data format (the CLI's <code>vortexlake</code> feature enables it)</td></tr>
-    <tr><td><code>s3</code> (on <code>pink-lake</code>)</td><td>S3/R2 object storage (pure storage — it implies neither lake build; pair it with the CLI's <code>pinklake</code> / <code>vortexlake</code> features)</td></tr>
+    <tr><td><code>s3</code> (on <code>pink-lake</code>)</td><td>S3/R2 object storage (pure storage — it implies no lake build; pair it with the CLI's <code>pinklake</code> feature)</td></tr>
   </tbody>
 </table>
 </div>
@@ -187,7 +186,7 @@ let report = lake.attach(None)?;                 // read-only attachment (statis
 // rewritten) and/or record positional deletes.
 let mut commit = pink_lake::Commit::new();
 commit.append("main.t", rows);                   // same schema as the table
-commit.delete_positions("main.t", "data/main.t/&lt;uuid&gt;.vortex", &amp;[0]);
+commit.delete_positions("main.t", "data/main.t/&lt;uuid&gt;.pink", &amp;[0]);
 let report = lake.commit(&amp;commit)?;              // one new version, retried on conflicts
 // save_store_s3 / save_store_url for object storage
 // S3Config::new(bucket).with_prefix(..).with_region(..)

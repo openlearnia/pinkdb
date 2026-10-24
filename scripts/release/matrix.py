@@ -35,8 +35,6 @@ CLI_VARIANTS = (
     "lean",
     "pinklake",
     "pinklake-s3",
-    "vortexlake",
-    "vortexlake-s3",
 )
 SERVER_VARIANTS = ("default", "async-server", "tls")
 

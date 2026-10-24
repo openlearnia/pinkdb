@@ -2,11 +2,10 @@
 //! (feature-less) build, and in an `s3`-only build (`s3` is pure storage:
 //! it implies neither lake build).
 //!
-//! This file only compiles when neither lake feature is on; the feature-on
-//! behavior is covered by `tests/lake.rs` (vortexlake) and `tests/pinklake.rs`
-//! (pinklake).
+//! This file only compiles when the lake feature is off; the feature-on
+//! behavior is covered by `tests/lake.rs` and `tests/pinklake.rs`.
 
-#![cfg(not(any(feature = "pinklake", feature = "vortexlake")))]
+#![cfg(not(feature = "pinklake"))]
 
 mod common;
 
@@ -29,19 +28,19 @@ fn lake_dot_commands_report_the_missing_feature() {
         "missing feature-less message:\n{text}"
     );
     assert!(
-        text.contains("rebuild with `cargo build -p pinkdb-cli --features vortexlake`"),
+        text.contains("rebuild with `cargo build -p pinkdb-cli --features pinklake`"),
         "{text}"
     );
     assert!(
-        text.contains("`--features pinklake` (lean: `.pink` data files)"),
-        "the pinklake alternative must be named too:\n{text}"
+        text.contains("`.pink` data files, incremental writes, attach"),
+        "the rebuild hint must name what the feature provides:\n{text}"
     );
     assert!(
-        text.contains("combine either with `,s3` (`vortexlake,s3` / `pinklake,s3`) for s3://"),
+        text.contains("combine it with `,s3` (`pinklake,s3`) for s3://"),
         "the s3-combination rule must be named too:\n{text}"
     );
     assert!(
-        text.contains("(not built; needs the `pinklake` or `vortexlake` feature)"),
+        text.contains("(not built; needs the `pinklake` feature)"),
         "help must mention the missing feature:\n{text}"
     );
 }
@@ -61,7 +60,7 @@ fn s3_alone_does_not_provide_lake_commands() {
         "an s3-only build must not hide the missing lake feature:\n{text}"
     );
     assert!(
-        text.contains("(not built; needs the `pinklake` or `vortexlake` feature)"),
+        text.contains("(not built; needs the `pinklake` feature)"),
         "help must mention the missing feature in an s3-only build:\n{text}"
     );
 }

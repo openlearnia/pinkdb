@@ -1,4 +1,4 @@
-//! CLI coverage for the opt-in `lake` feature: `.lake save/open/versions/
+//! CLI coverage for the opt-in `pinklake` feature: `.lake save/open/versions/
 //! tables/info` end to end, in a temp lake directory.
 //!
 //! This file only compiles when the feature is ON; the feature-less behavior
@@ -7,7 +7,7 @@
 //! Set `PINKDB_CLI_BIN` to run the whole file against another CLI build
 //! (e.g. a release binary) — the overflow tests then prove release behavior.
 
-#![cfg(feature = "vortexlake")]
+#![cfg(feature = "pinklake")]
 
 mod common;
 
@@ -22,14 +22,12 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// catalog feature (a `.pink` catalog accepts it too).
 #[cfg(any(
     feature = "pinklake",
-    feature = "vortexlake",
     feature = "catalog-sqlite",
     feature = "catalog-postgres"
 ))]
 const DATA_OPT: &str = " [data <dir|s3://…>]";
 #[cfg(not(any(
     feature = "pinklake",
-    feature = "vortexlake",
     feature = "catalog-sqlite",
     feature = "catalog-postgres"
 )))]
@@ -142,7 +140,7 @@ fn save_open_query_and_metadata_commands() {
     let data = std::fs::read_dir(data_root(&lake).join("main.t")).unwrap();
     for entry in data {
         let path = entry.unwrap().path();
-        assert_eq!(path.extension().unwrap(), "vortex", "{}", path.display());
+        assert_eq!(path.extension().unwrap(), "pink", "{}", path.display());
     }
 
     // Info/versions/tables report the metadata without touching the store.
@@ -501,7 +499,7 @@ fn keyed_lake_commands_roundtrip_and_fail_closed() {
             ".lake inlining {lake} main.t 0\n\
              .lake inlining {lake} main.t default\n\
              .lake flush {lake}\n\
-             .lake add_data_files {lake} main.t data/main.t/does-not-exist.vortex\n\
+             .lake add_data_files {lake} main.t data/main.t/does-not-exist.pink\n\
              .quit\n",
             lake = lake.display()
         ),
@@ -516,7 +514,7 @@ fn keyed_lake_commands_roundtrip_and_fail_closed() {
         ".lake partition {lake} t clear",
         ".lake inlining {lake} main.t 0",
         ".lake flush {lake}",
-        ".lake add_data_files {lake} main.t data/main.t/x.vortex",
+        ".lake add_data_files {lake} main.t data/main.t/x.pink",
     ] {
         let command = sub.replace("{lake}", &lake.display().to_string());
         let out = run_no_key(&format!("{command}\n.quit\n"));
@@ -690,8 +688,7 @@ fn concurrent_lake_saves_stay_consistent() {
 }
 
 /// A tampered lake data file must produce a clean CLI error and leave the
-/// REPL (and the process) alive: `.lake open` runs the guarded Vortex decode,
-/// so even a flip that panics the decoder is caught as a corrupt-file error.
+/// REPL (and the process) alive.
 #[test]
 fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
     let dir = scratch("tamper_data");
@@ -729,16 +726,12 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
         }
         tampers.push(("zeroed window", b));
     }
-    // Broken `pinkdb.table` JSON (the identity/schema segment).
+    // A broken trailer (the last bytes carry the footer location and magic).
     {
-        let needle = b"{\"db\":";
-        let pos = original
-            .windows(needle.len())
-            .position(|w| w == needle)
-            .expect("pinkdb.table metadata JSON");
         let mut b = original.clone();
-        b[pos + 1] = b'x';
-        tampers.push(("metadata JSON", b));
+        let last = b.len() - 1;
+        b[last] ^= 0xFF;
+        tampers.push(("broken trailer", b));
     }
 
     let mut saw_error = false;
@@ -766,8 +759,8 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
             assert_eq!(code, 1, "{what}: a failed open must fail the script");
             assert!(
                 stderr.contains("corrupt lake metadata")
-                    || stderr.contains("lake vortex error")
-                    || stderr.contains("not a valid Vortex file"),
+                    || stderr.contains("lake data error")
+                    || stderr.contains("corrupt"),
                 "{what}: error is not a clean corrupt-file error: {stderr}"
             );
         }
@@ -801,9 +794,8 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
         if code == 1 {
             assert!(
                 stderr.contains("corrupt lake metadata")
-                    || stderr.contains("lake vortex error")
-                    || stderr.contains("not a valid Vortex file")
-                    || stderr.contains("decoding a Vortex chunk"),
+                    || stderr.contains("lake data error")
+                    || stderr.contains("corrupt"),
                 "{what}: attach-path error is not a clean corrupt-file error: {stderr}"
             );
         }
@@ -828,33 +820,34 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
 #[cfg(not(feature = "s3"))]
 #[test]
 fn s3_urls_need_the_s3_feature() {
-    let out = run(".lake save s3://bucket/prefix\n\
-         .lake open s3://bucket/prefix\n\
-         .lake versions s3://bucket/prefix\n\
-         .lake tables s3://bucket/prefix\n\
-         .lake info s3://bucket/prefix\n\
-         .quit\n");
-    assert!(out.contains("does not include the `s3` feature"), "{out}");
+    // An `s3://` URL alone is a data location, not a catalog: the error
+    // names the catalog + data form.
+    let dir = scratch("s3_feature");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        ".lake save s3://bucket/prefix\n\
+         .lake save pink:{lake} data s3://bucket/prefix\n\
+         .quit\n",
+        lake = lake.display()
+    ));
     assert!(
-        out.contains("cargo build -p pinkdb-cli --features vortexlake,s3"),
+        out.contains("is a data location, not a lake catalog"),
         "{out}"
     );
-    assert_eq!(
-        out.matches("Error:").count(),
-        5,
-        "every .lake subcommand reports the feature error: {out}"
+    assert!(
+        out.contains(".lake save pink:lake.pink data s3://bucket/prefix"),
+        "{out}"
     );
-    // The URL is named so the typo is obvious.
+    // A catalog with an S3 data location needs the `s3` feature.
+    assert!(out.contains("does not include the `s3` feature"), "{out}");
+    assert!(out.contains("--features pinklake,s3"), "{out}");
     assert!(out.contains("s3://bucket/prefix"), "{out}");
     // A malformed s3 URL is a location error, not a feature error.
     let out = run(".lake info s3://\n.quit\n");
-    assert!(out.contains("Error:"), "{out}");
     assert!(out.contains("invalid lake location"), "{out}");
+    cleanup(&dir);
 }
 
-/// Two REPL sessions open the same lake version; the first to save wins and
-/// the second gets a conflict instead of silently overwriting that work.
-/// `force` saves on purpose.
 #[test]
 fn second_session_save_conflicts_instead_of_losing_an_update() {
     use std::io::{BufRead, BufReader};
@@ -999,9 +992,9 @@ fn attach_answers_equal_open_and_in_memory() {
         base,
         "`.lake attach` diverged from the in-memory answers"
     );
-    // The fast paths really ran: the attach arm printed the footer-only line
-    // and the eager loader was not used.
-    assert!(attached.contains("footer-only"), "{attached}");
+    // The fast paths really ran: the attach arm printed the statistics-only
+    // line and the eager loader was not used.
+    assert!(attached.contains("statistics-only"), "{attached}");
     cleanup(&dir);
 }
 
@@ -1082,7 +1075,7 @@ fn attach_lifecycle_and_read_only_rules() {
     ));
     assert!(
         out.contains(&format!("Attached {} version 2 in", lake.display()))
-            && out.contains("(2 tables, footer-only)"),
+            && out.contains("(2 tables, statistics-only)"),
         "{out}"
     );
     assert!(out.contains("main.t (3 rows)"), "{out}");
@@ -2059,8 +2052,8 @@ fn add_data_files_registers_through_the_cli() {
          INSERT INTO t VALUES {};\n\
          .lake save {lake}\n\
          .lake files {lake}\n\
-         .lake add_data_files {lake} main.t data/main.t/nope.vortex\n\
-         .lake add_data_files {lake} main.t elsewhere/x.vortex\n\
+         .lake add_data_files {lake} main.t data/main.t/nope.pink\n\
+         .lake add_data_files {lake} main.t elsewhere/x.pink\n\
          .quit\n",
         values.join(", "),
         lake = lake.display()
@@ -2257,8 +2250,12 @@ fn attach_errors_are_clear_and_never_panic() {
         .next()
         .expect("a data file");
     std::fs::remove_file(data).unwrap();
-    let (out, err, code) =
-        run_captured(&format!(".lake attach {}\n.quit\n", missing_lake.display()));
+    // Attach itself is statistics-only and succeeds; the first read reports
+    // the missing file.
+    let (out, err, code) = run_captured(&format!(
+        ".lake attach {}\nSELECT SUM(a) FROM t;\n.quit\n",
+        missing_lake.display()
+    ));
     assert_eq!(code, 1);
     assert!(
         err.contains("is missing") || err.contains("loading data file"),
@@ -2278,7 +2275,10 @@ fn attach_errors_are_clear_and_never_panic() {
         .expect("a data file");
     let bytes = std::fs::read(&data).unwrap();
     std::fs::write(&data, &bytes[..bytes.len() / 4]).unwrap();
-    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", truncated.display()));
+    let (out, err, code) = run_captured(&format!(
+        ".lake attach {}\nSELECT SUM(a) FROM t;\n.quit\n",
+        truncated.display()
+    ));
     assert_eq!(code, 1);
     assert!(err.contains("Error:"), "{out}\n{err}");
 

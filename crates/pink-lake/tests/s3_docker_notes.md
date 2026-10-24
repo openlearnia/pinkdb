@@ -1,7 +1,8 @@
 # Real-S3 integration harness — notes (`s3_docker.sh`)
 
-Companion notes for `crates/pink-lake/tests/s3_docker.sh`. Everything here was
-measured on this machine (macOS, Docker Desktop, 2026-10-14); treat the
+Companion notes for `crates/pink-lake/tests/s3_docker.sh`. The server
+measurements here (SigV4 enforcement, conditional-PUT atomicity, save timings)
+were taken on this machine (macOS, Docker Desktop, 2026-10-14); treat the
 numbers as evidence, not as constants.
 
 ## What the harness is
@@ -11,7 +12,7 @@ the CLI's `lake_s3` tests) is the hermetic protocol suite — it even verifies
 SigV4 on every request — but it is a home-grown server inside the test
 process. `s3_docker.sh` is the independent check: a real, separate HTTP
 server in a container, real sockets, driven through the release CLI
-(`cargo build --release -p pinkdb-cli --features vortexlake,s3`) exactly as a user
+(`cargo build --release -p pinkdb-cli --features pinklake,s3`) exactly as a user
 would. `SERVER=` picks which real server:
 
 ```sh
@@ -29,27 +30,65 @@ Knobs (see the script header): `SERVER`, `PORT` (per-server default 9090 /
 The script is **not wired into `cargo test`** (it needs Docker), so the
 default suite is unchanged.
 
+## What a lake is since wave 103 (what the assertions below rely on)
+
+A lake has two halves, and only one of them is on S3:
+
+* **The catalog** is a database on local disk, named by the `.lake`
+  location: `pink:<path>` (a single file), a bare path (a `pink:` catalog at
+  that path, with the default data location `<path>.files/`), `sqlite:<path>`,
+  or a `postgres://` URL (the multi-machine form). Versions, snapshots,
+  commit manifests and the head pointer all live in that database.
+* **The data location** holds immutable `data/<table>/<uuid>.pink` data files
+  and `.pinkdel` delete files. It may be a directory or an `s3://bucket/prefix`
+  URL; the split form names both: `.lake save <catalog> data s3://bucket/prefix`.
+
+An `s3://…` URL alone is **not** a lake: `.lake open`/`.lake save` refuse it
+with `is a data location, not a lake catalog` and point at the split form, e.g.
+`.lake save pink:lake.pink data s3://bucket/prefix` (or a `postgres://`
+catalog for multi-machine lakes).
+
+Nothing named `catalog.json`, `snapshots/`, `commits/`, `highest.json`,
+`lake.json` or `moved.json` is written to S3 any more; the only non-data
+object under a split lake's prefix is the `lake-data.json` ownership marker
+(lake id) that cleanup verifies before deleting anything.
+
+The harness reads that state with `pinkdb-cli`'s own commands (all of which
+accept the catalog and print catalog state, never S3 metadata):
+
+| command | what the harness asserts from it |
+|---|---|
+| `.lake versions <catalog>` | one line per version, `N` or `N (current)`; exactly `1..FINAL`, no gaps |
+| `.lake info <catalog>` | `Lake <data location>`, `current version:`, `snapshots:       N (1, …, N)`, `tables (N):` and `    <table> (<rows> row[s])` |
+| `.lake tables <catalog>` | `main.<table> (<rows> rows)` per table |
+| `.lake files <catalog> [all]` | `data/…: table=… rows=… size=… schema_version=…` lines and (with `all`) a `N files (R referenced, U unreferenced)` summary; `all` adds every `data/` object no retained version references |
+| `.lake orphans <catalog> [all] [dry-run\|confirm]` | `would delete <path>` / `deleted <path>` lines, `Deleted N object(s) from … (B bytes freed; still-referenced versions are untouched)`, or `Nothing to orphans in …` |
+
+`referenced` in `.lake files all` means the file is in the listed (head)
+manifest; `unreferenced` means **no retained version** references the object —
+exactly the set `.lake orphans` deletes. The harness checks the head's one file
+against the REST listing and compares the `unreferenced` count with the orphan
+dry-run's `would delete` lines.
+
 ## The three servers: capability matrix and enforcement policy
 
 The harness probes each endpoint **before any lake write** — an unsigned PUT
-(SigV4 enforcement), the sequential conditional semantics, and a bounded
-two-writer atomicity race (4× `If-None-Match: *` + 4× `If-Match`, fresh key
-per trial) — and sets its policy from the probe results, not from the server
-name. Measured on this machine:
+(SigV4 enforcement) — and sets its policy from the probe results, not from
+the server name. Measured on this machine:
 
-| server (container) | SigV4 rejected when unsigned? | conditionals atomic under true concurrency? | one-winner race assertion |
-|---|---|---|---|
-| `s3mock` (`pinkdb-s3mock-itest`, default config) | **no** — unsigned PUT -> 200 (documented; the in-repo mock checks signatures separately) | **no** — 4/4 racing trials answered both writers 200 | reported |
-| `seaweedfs` + `-s3.config` identities (`pinkdb-seaweed-itest`, started by the harness) | **yes** — unsigned -> 403, wrong-key signed -> 403 | **yes** — 0/4 both-200 trials | **enforced** (hard failure) |
-| `seaweedfs` default config (a plain `pk-seaweed`, no identities file) | **no** — unsigned PUT -> 200, garbage signed -> 200 | **yes** | enforced conditionals; SigV4 reported |
-| `rustfs` (`pk-rustfs`) | **yes** — unsigned -> 403, wrong-key signed -> 403 | **yes** — 0/4 both-200 trials | **enforced** (hard failure) |
+| server (container) | SigV4 rejected when unsigned? | harness policy |
+|---|---|---|
+| `s3mock` (`pinkdb-s3mock-itest`, default config) | **no** — unsigned PUT -> 200 (documented; the in-repo mock checks signatures separately) | SigV4 reported, not asserted |
+| `seaweedfs` + `-s3.config` identities (`pinkdb-seaweed-itest`, started by the harness) | **yes** — unsigned -> 403, wrong-key signed -> 403 | SigV4 **asserted** (strict) |
+| `seaweedfs` default config (a plain `pk-seaweed`, no identities file) | **no** — unsigned PUT -> 200, garbage signed -> 200 | SigV4 reported |
+| `rustfs` (`pk-rustfs`) | **yes** — unsigned -> 403, wrong-key signed -> 403 | SigV4 **asserted** (strict) |
 
-"Enforced" means: the run hard-fails if an unsigned PUT is not 403 (on the
-SigV4-verifying containers), if a racing conditional PUT trial has two
-winners, if two writers claim the same race version, or if
-`catalog.json` is not byte-identical to the snapshot it names. On s3mock the
-one-winner-per-version outcome stays **reported** (the previous policy), with
-the raw evidence below.
+`STRICT` is now only about signatures: an unsigned PUT must be answered 403.
+Every catalog and race assertion (one winner per version, gapless chain, the
+head's table and row counts, the S3 object set, orphan cleanup) is a hard
+failure on **every** endpoint, because it is decided by a local database
+transaction rather than by an S3 conditional PUT. See the history section for
+the pre-wave-103 measurements that used to justify a per-server policy here.
 
 ### Container recipes
 
@@ -57,7 +96,7 @@ The harness starts (or reuses) exactly one container per run. These are the
 equivalent manual recipes:
 
 ```sh
-# s3mock (lenient: no SigV4 check, non-atomic conditionals)
+# s3mock (no SigV4 check)
 docker run -d --name pinkdb-s3mock-itest -p 127.0.0.1:9090:9090 \
   -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS=pinklake \
   adobe/s3mock:latest
@@ -138,13 +177,21 @@ SigV4 with **any** configured key pair works against SeaweedFS — the key just
 has to match its config; RustFS verifies the pair it was started with
 (`RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY`).
 
-## s3mock conditional writes: sequential yes, atomic no
+## History: S3 conditional writes are no longer in the write path
 
-`adobe/s3mock:latest` (5.x) supports the conditional headers the single-writer
-contract uses — added for PutObject in 4.3.0
+Before wave 103 the catalog was JSON on S3 and the one-winner rule was built on
+`If-None-Match: *` / `If-Match` PUTs, so each server's conditional-write
+behaviour mattered. That is gone: the catalog is a database transaction
+locally, data files are written with unconditional PUTs, and the harness no
+longer probes or asserts conditional semantics. The measurements below are
+kept because they explain the old per-server policy and remain true of the
+servers themselves.
+
+`adobe/s3mock:latest` (5.x) supports the conditional headers — added for
+PutObject in 4.3.0
 ([adobe/S3Mock#2371](https://github.com/adobe/S3Mock/issues/2371),
-[PR #2382](https://github.com/adobe/S3Mock/pull/2382)) — and the harness
-verifies the *sequential* semantics before any lake write:
+[PR #2382](https://github.com/adobe/S3Mock/pull/2382)) — and honoured them
+**sequentially**:
 
 | request | s3mock answer |
 |---|---|
@@ -153,7 +200,7 @@ verifies the *sequential* semantics before any lake write:
 | `PUT` with the current `If-Match: <etag>` | 200, replaced |
 | `PUT` with a wrong `If-Match` | 412 |
 
-But under **true concurrency** s3mock does not evaluate the precondition
+But under **true concurrency** s3mock did not evaluate the precondition
 atomically with the write:
 
 ```
@@ -164,11 +211,10 @@ $ for t in $(seq 1 60); do curl -X PUT -H 'If-None-Match: *' .../condrace/t$t & 
 both-succeeded: 60 ; exactly-one: 0 ; neither: 0
 ```
 
-The same holds for `If-Match` (the harness's atomicity probe races both
-headers, 4 trials each; s3mock answered 4/4 duplicate wins for each header in
-the regression run below). Both strict servers answered 0/4 duplicate wins
-in the same probe — and 0/20 in the raw two-writer race that preceded this
-work (RustFS and SeaweedFS both evaluate the precondition with the write).
+The same held for `If-Match` (4/4 duplicate wins for each header in the
+regression run). Both strict servers answered 0/4 duplicate wins in the same
+probe — and 0/20 in the raw two-writer race that preceded this work (RustFS
+and SeaweedFS both evaluate the precondition with the write).
 
 **Mechanism (from the S3Mock sources):** in
 `server/src/main/kotlin/com/adobe/testing/s3mock/s3/controller/ObjectController.kt`,
@@ -179,117 +225,60 @@ The store does have per-object locks (`ObjectStore.kt` wraps its operations in
 `synchronized(lockFor(id))`), but the precondition check is outside that lock:
 check-then-act. Two requests can both pass the check before either write
 lands. AWS S3 / Cloudflare R2 / SeaweedFS / RustFS evaluate the condition as
-part of the write commit (that is exactly what the README's "Conditional
-writes are the conflict machinery" bullet relies on).
+part of the write commit.
 
-### What the harness does about it
+## What the race asserts now
 
-1. It probes capabilities up front and **says so** (the probe results are
-   printed; no silent assumption), then picks the policy: strict on
-   seaweedfs/rustfs, lenient on s3mock.
-2. The 3×3 race still asserts everything that does not need server atomicity:
-   every attempt is win-xor-conflict, every loser's message is one of the
-   documented conflict forms, and the published version chain is gapless.
-   On a strict server duplicate publications are a hard failure; on s3mock
-   they are reported as the measured server limitation, with the
-   `PINKDB_S3_LIVE=1` / in-repo-mock pointer for the enforced check.
-3. A **deterministic** same-version conflict is asserted regardless of
-   atomicity: a slow save opens the lake at v2, a quick save publishes v3
-   while the slow writer is still encoding, and the slow writer's own
-   snapshot PUT then correctly gets 412 (it is a plain "does this key exist"
-   case by the time it runs — no overlap window). The harness asserts exactly
-   one winner of v3, the loser's conflict, and `catalog.json ==
-   snapshots/3.json` bytes.
-4. A **settle save** after the race reopens the lake and publishes one more
-   version alone (the documented "reopen the lake to continue"), so the
-   final version of the race prefix has exactly one claimant and the
-   final-version `catalog.json == snapshots/<v>.json` byte check is enforced
-   on any server.
-5. On the strict servers the raced prefix gets one more hard check *before*
-   the settle save: `catalog.json` must be byte-identical to the snapshot it
-   names. Atomic conditionals make that an invariant (the one-winner snapshot
-   PUT is immutable and the catalog's `If-Match` replace publishes those same
-   bytes); with s3mock's check-then-act a late racer can overwrite snapshot
-   bytes, so there the check is reported.
+The race sections are all catalog-database checks; none of them reads a
+metadata object from S3:
 
-Observed effect on the race (four earlier s3mock runs of the script): 7
-claims/2 conflicts/2 duplicate versions, 5/4/2, then 3/6/**0** (the strict
-one-winner assertion held and the run reported it), then 4/5/1. The duplicate
-count depends on how much the three writers' conditional PUTs overlap, which
-is exactly the server's window — the controlled same-version conflict and the
-settle save assertions passed in all four runs.
-
-## Strict runs measured on this machine (2026-10-14)
-
-`SERVER=seaweedfs` (identity container, free port, `SKIP_BUILD=1`) — key
-output:
-
-```
-   pk-seaweed is running but accepts unsigned writes (SeaweedFS default anonymous config)
-   => starting the SigV4-enforcing pinkdb-seaweed-itest instead; pk-seaweed is left untouched
-  ok: seaweedfs answered the readiness GET (7 retries at http://127.0.0.1:64969)
-  ok: bucket pinklake ready (CreateBucket -> 200; the CLI never creates buckets)
-  ok: unsigned PUT -> 403: the server verifies SigV4 (enforced for this run)
-  ok: server enforces If-None-Match: * (412) and If-Match (200 / 412) — checked sequentially
-  ok: conditional PUTs are atomic under concurrency (4+4 racing trials, exactly one winner each)
-   policy: STRICT — one winner per version and catalog==snapshot bytes are hard assertions
-  ok: catalog.json == snapshots/2.json (bytes; enforced)          # round-trip
-  9 save attempts -> 3 claim(s) of 3 version(s), 6 conflict(s)
-  ok: exactly one winner per version, no gaps (versions 3..5)
-  ok: every loser got the documented write conflict (6 conflict(s))
-  ok: catalog.json == snapshots/5.json (bytes)                    # the raced catalog
-  ok: reopened after the race; the settle save published version 6 alone
-  ok: catalog.json == snapshots/6.json (bytes, version field 6, single claimant; enforced)
-  ok: exactly one winner of version 3: the quick save
-  ok: the slow save got the documented conflict: Error: write conflict at
-      s3://pinklake/conflict/snapshots/3.json: snapshot 3 already exists; refusing to replace a published version
-  ok: catalog.json == snapshots/3.json (bytes; single claimant; enforced)
-  server:        seaweedfs (container pinkdb-seaweed-itest at http://127.0.0.1:64969)
-  signatures:    SigV4 enforced — unsigned PUT -> 403 (asserted)
-  enforcement:   STRICT — one winner per version and catalog == snapshot bytes are hard assertions
-ALL CHECKS PASSED
-```
-
-`SERVER=rustfs` (reusing the running `pk-rustfs`, `SKIP_BUILD=1`):
-
-```
-   reusing running container pk-rustfs
-  ok: reuse: container pk-rustfs is running on 127.0.0.1:9100
-  ok: rustfs answered the readiness GET (1 retries at http://127.0.0.1:9100)
-  ok: bucket pinklake ready (CreateBucket -> 200; the CLI never creates buckets)
-  ok: unsigned PUT -> 403: the server verifies SigV4 (enforced for this run)
-  ok: server enforces If-None-Match: * (412) and If-Match (200 / 412) — checked sequentially
-  ok: conditional PUTs are atomic under concurrency (4+4 racing trials, exactly one winner each)
-   policy: STRICT — one winner per version and catalog==snapshot bytes are hard assertions
-  ok: catalog.json == snapshots/2.json (bytes; enforced)
-  9 save attempts -> 3 claim(s) of 3 version(s), 6 conflict(s)
-  ok: exactly one winner per version, no gaps (versions 3..5)
-  ok: every loser got the documented write conflict (6 conflict(s))
-  ok: catalog.json == snapshots/5.json (bytes)
-  ok: reopened after the race; the settle save published version 6 alone
-  ok: catalog.json == snapshots/6.json (bytes, version field 6, single claimant; enforced)
-  ok: exactly one winner of version 3: the quick save
-  ok: the slow save got the documented conflict: Error: write conflict at
-      s3://pinklake/conflict/snapshots/3.json: snapshot 3 already exists; refusing to replace a published version
-  ok: catalog.json == snapshots/3.json (bytes; single claimant; enforced)
-  server:        rustfs (container pk-rustfs at http://127.0.0.1:9100)
-  signatures:    SigV4 enforced — unsigned PUT -> 403 (asserted)
-  enforcement:   STRICT — one winner per version and catalog == snapshot bytes are hard assertions
-ALL CHECKS PASSED
-```
-
-`s3mock` regression run (same script, `SKIP_BUILD=1`): readiness/roundtrip/
-races/refusal all pass; the capability probe reports
-`WARNING: conditional PUTs are NOT atomic under concurrency on this server`
-(4/4 both-200 per header), the policy stays
-`lenient — duplicates are reported as the measured server limitation`, and
-the run ends `ALL CHECKS PASSED`.
+1. **Per attempt, win-xor-conflict.** All 9 outputs are parsed together: each
+   writer either printed exactly one `Saved lake version N` and exited 0, or
+   printed exactly one `Error: write conflict at <catalog>: …` whose text is
+   one of the documented forms — the handle check
+   (`another writer published version N … reopen the lake`), the store's
+   commit (`the catalog head moved to N while this commit was based on M;
+   rebase and retry`), or the engine's write lease (`… is busy`). Two writers
+   claiming one version is a hard failure on every server.
+2. **Gapless chain.** `.lake versions` lists exactly `1..FINAL`, with `FINAL`
+   marked current; `FINAL` is the last version the race claimed.
+3. **The head is the final claimant's save.** `.lake info` and `.lake tables`
+   report `current version: FINAL`, one table (`main.t<writer>`), and that
+   writer's row count — each save writes the whole lake from its own session
+   store, so the winning version holds exactly its writer's one table.
+4. **A settle save** reopens the catalog and publishes one more version
+   alone (the documented "reopen the lake to continue"), which also pins the
+   full-snapshot semantics: the settle save drops the race's table and
+   publishes `main.settle`.
+5. **The S3 side is data only.** Under `conc/` the harness asserts there is
+   no `catalog.json`, `snapshots/`, `commits/`, `highest.json` or `lake.json`,
+   that `lake-data.json` is present, that the data objects match
+   `data/main.<table>/<uuid>.pink`, and that `.lake files` names exactly the
+   head's one data file, which is in the listing.
+6. **Leftovers are cleaned exactly.** `.lake files all` must agree with the
+   bucket: exactly one `referenced` file, and its `unreferenced` objects are
+   exactly the lines `.lake orphans all dry-run` would delete (the bucket holds
+   `FINAL - 1` files of retained versions plus those leftovers). `all confirm`
+   then reports exactly that many deletions and a second dry-run says
+   `Nothing to orphans`. After that `conc/data/` holds exactly `FINAL - 1`
+   objects — one per version above the empty v1 — `.lake files all` reports
+   `1` file (`1 referenced, 0 unreferenced`), and `.lake versions` is
+   unchanged.
+7. **The slow-vs-quick pair** (below) still asserts exactly one winner of v3
+   and the loser's documented conflict; both writers' data objects may remain
+   (the loser's upload is a documented orphan) and the catalog must show
+   version 3 with the winner's single table.
+8. **Refusal.** `.lake open s3://…` and `.lake save s3://…` fail with
+   `is a data location, not a lake catalog` and the split-form hint; a second
+   `.lake save` in one session publishes the next version; the split form
+   (`pink:` catalog + `data s3://…`) publishes normally, and its prefix holds
+   data plus `lake-data.json` only.
 
 ### The slow-vs-quick pair needed a wider window on RustFS
 
-The deterministic conflict (point 3 above) is a *timing* construction: the
-quick writer must read the catalog (v2) while the slow writer's save is still
-in flight. With the original `SLOWROWS=400000` the window is too narrow on a
+The deterministic conflict (point 7) is a *timing* construction: the quick
+writer must read the catalog (v2) while the slow writer's save is still in
+flight. With the original `SLOWROWS=400000` the window is too narrow on a
 fast local server — measured on this machine against RustFS:
 
 ```
@@ -303,10 +292,10 @@ catalog read landed after v3 was published: two clean saves of *different*
 versions, no conflict. The harness now uses `SLOWROWS=4000000` and a 0.3 s
 head start; on RustFS that is a ~1.5 s save window
 (`Imported 4000000 rows in 0.186s`, `Saved lake version 3 in 1.501s (1 table,
-4000000 rows, 22277590 bytes written)`), and the pair behaves deterministically
+4000000 rows, 22277590 bytes written)`), and the pair behaved deterministically
 (2/2 manual trials + both full strict runs: the quick save wins v3, the slow
 save gets the documented conflict). If the window is ever missed, the failure
-message now says so explicitly (both writers published different versions)
+message says so explicitly (both writers published different versions)
 instead of blaming the client.
 
 ## MinIO images are not pullable right now
@@ -324,10 +313,10 @@ https://quay.io/v2/minio/manifests/latest: 401 UNAUTHORIZED
 ```
 
 So s3mock remains the default recipe, and SeaweedFS/RustFS are the
-SigV4-verifying, atomic-conditional witnesses (`SERVER=seaweedfs|rustfs`).
-Any S3-compatible endpoint works with the same script (`CONTAINER=`/`PORT=`,
-or point the CLI's `AWS_ENDPOINT_URL` at your own server); for a real AWS/R2
-bucket use the opt-in live test:
+SigV4-verifying witnesses (`SERVER=seaweedfs|rustfs`). Any S3-compatible
+endpoint works with the same script (`CONTAINER=`/`PORT=`, or point the CLI's
+`AWS_ENDPOINT_URL` at your own server); for a real AWS/R2 bucket use the
+opt-in live test:
 
 ```sh
 PINKDB_S3_LIVE=1 PINKDB_S3_BUCKET=<bucket> PINKDB_S3_PREFIX=<prefix> \
@@ -336,30 +325,34 @@ cargo test -p pink-lake --features s3 --test s3 live_s3_roundtrip -- --nocapture
 ```
 
 The in-repo CLI test `concurrent_lake_saves_over_s3_stay_consistent`
-(`cargo test -p pinkdb-cli --features vortexlake,s3`) is the hermetic version of the
-one-winner assertion, against the mock's conditional writes.
+(`crates/pinkdb-cli/tests/lake_s3.rs:190`, run with
+`cargo test -p pinkdb-cli --features pinklake,s3`) is the hermetic version of
+the same race: the same `pink:` catalog + `data s3://…` split form, one
+winner per version, against the in-process mock. It does not depend on the
+mock's conditional-PUT support.
 
 ## What is asserted where
 
-| check | server atomicity needed | s3mock run | seaweedfs/rustfs run |
-|---|---|---|---|
-| unsigned PUT → 403 (SigV4 enforced) | no (but fails there) | reported (accepted, documented) | **enforced** |
-| typed CSV round-trip, exact values in a fresh process | no | enforced | enforced |
-| published object set (REST `?list-type=2`) | no | enforced | enforced |
-| `catalog.json == snapshots/2.json` (round-trip lake) | no | enforced | enforced |
-| race: win-xor-conflict per attempt, documented conflict forms | no | enforced | enforced |
-| race: version chain gapless, `.lake versions` == 1..V | no | enforced | enforced |
-| race: exactly one winner per version | **yes** | reported (duplicates = measured server quirk) | **enforced** |
-| race: `catalog.json == snapshots/<catalog version>.json` (pre-settle) | **yes** | reported | **enforced** |
-| slow-vs-quick: exactly one winner of one version + loser conflict | no (see above) | enforced | enforced |
-| slow-vs-quick: `catalog.json == snapshots/3.json` | no | enforced | enforced |
-| settle save: final version single-claimant, bytes equal | no | enforced | enforced |
-| second `.lake save` → new version (same process) | no | enforced | enforced |
-| planted stray snapshot → `snapshot N already exists …` refusal, then a clean save after removing it | no | enforced | enforced |
+| check | s3mock run | seaweedfs/rustfs run |
+|---|---|---|
+| unsigned PUT → 403 (SigV4 enforced) | reported (accepted, documented) | **enforced** |
+| typed CSV round-trip, exact values in a fresh process | enforced | enforced |
+| S3 holds data objects + `lake-data.json` only (no catalog/snapshots/commits) | enforced | enforced |
+| local `pink:` catalog exists and `.lake info` reports the data location | enforced | enforced |
+| `.lake versions` == `1..N`, `N` current, no gaps | enforced | enforced |
+| race: win-xor-conflict per attempt, documented conflict forms | enforced | enforced |
+| race: exactly one winner per version (catalog transaction) | enforced | enforced |
+| race: head = final claimant's single table, its row count | enforced | enforced |
+| `.lake files` head file ∈ REST listing; `.lake files all` unreferenced == orphan dry-run | enforced | enforced |
+| leftover objects: dry-run count == confirmed deletes, second dry-run empty | enforced | enforced |
+| after cleanup: `FINAL - 1` data objects; `.lake files all` = 1 referenced, 0 unreferenced | enforced | enforced |
+| slow-vs-quick: exactly one winner of v3 + loser conflict | enforced | enforced |
+| settle save: new version, single claimant, `main.settle` in the head | enforced | enforced |
+| refusal: `s3://` alone is not a catalog; split form publishes | enforced | enforced |
+| encrypted: sealed catalog on disk, containers on S3, no/wrong key refused | enforced (feature builds) | enforced (feature builds) |
 
-Also asserted on every run: the sequential conditional semantics
-(`If-None-Match: *` on an existing key → 412, `If-Match` → 200/412) and the
-bucket existing before the first write.
+Also asserted on every run: the bucket exists before the first write, and
+every encrypted `enc/data/` object is a `PNKLAKE1` container.
 
 ## Other observations
 
@@ -369,10 +362,11 @@ bucket existing before the first write.
   version. The harness pins that explicitly, and covers the cross-process
   conflict with the slow-vs-quick pair.
 * A conflicted writer may leave its already-uploaded data object behind
-  (unreferenced; documented, no GC). The harness bounds and reports that
-  count instead of asserting an exact one.
-* The first save into a fresh prefix publishes **version 2**: the CLI's
-  `open_or_create` creates the empty version 1 first (also over S3).
+  (unreferenced, no retained version uses it). The concurrency section
+  cleans those with `.lake orphans` and asserts the exact count; the
+  slow-vs-quick prefix keeps them, documented.
+* The first save into a fresh catalog publishes **version 2**: the CLI's
+  `open_or_create` publishes the empty version 1 first.
 * s3mock does not verify SigV4; the harness's s3mock REST calls are unsigned
   on purpose. Signature verification lives in the in-repo mock
   (`cargo test -p pink-lake --features s3`) and, for real sockets, in the

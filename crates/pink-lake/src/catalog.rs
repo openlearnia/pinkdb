@@ -11,15 +11,15 @@
 //!   "tables": {
 //!     "main.t": {
 //!       "files": [
-//!         { "path": "data/main.t/<uuid>.vortex", "rows": 5 },
-//!         { "path": "data/main.t/<uuid>.vortex", "rows": 3 }
+//!         { "path": "data/main.t/<uuid>.pink", "rows": 5 },
+//!         { "path": "data/main.t/<uuid>.pink", "rows": 3 }
 //!       ],
 //!       "deletes": [
-//!         { "path": "data/main.t/<uuid>.pinkdel", "file": "data/main.t/<a-uuid>.vortex",
+//!         { "path": "data/main.t/<uuid>.pinkdel", "file": "data/main.t/<a-uuid>.pink",
 //!           "count": 1 }
 //!       ],
 //!       "rows": 7,
-//!       "format": "vortex"
+//!       "format": "pink"
 //!     }
 //!   }
 //! }
@@ -30,14 +30,13 @@
 //! file names the one data file whose positions it drops (`file`) and how many
 //! it drops (`count`); `rows` is the logical row count (data rows minus
 //! deleted positions) and must equal `sum(files.rows) - sum(deletes.count)`.
-//! Every entry declares its `format`: `"vortex"` in a `vortexlake` build,
-//! `"pink"` (the engine's single-table `.pink` bytes, with a per-file
-//! CRC-protected statistics block) in a lean one. The field is a **format
-//! id**, resolved through the process-global provider registry
-//! ([`crate::format`]): `"pink"` and `"vortex"` are the built-ins, and an
-//! extension may register more. An id with no registered provider is a clean
+//! Every entry declares its `format`: `"pink"` (the engine's single-table
+//! `.pink` bytes, with a per-file CRC-protected statistics block) is the
+//! built-in. The field is a **format id**, resolved through the
+//! process-global provider registry ([`crate::format`]), and an extension may
+//! register more. An id with no registered provider is a clean
 //! [`LakeError::UnknownFormat`] when that table is read or written — never a
-//! panic or a silent fallback; a v4–v6 lake still opens, and
+//! panic or a silent fallback; a lake still opens, and
 //! [`crate::Lake::unavailable_tables`] names the tables this build cannot
 //! read (wave 88, rule 5). The catalog stores only the id string, so existing
 //! manifests stay byte-identical.
@@ -47,7 +46,7 @@
 //! and preserved for the same catalog key across later versions:
 //!
 //! ```json
-//! "main.t": { "files": [ … ], "rows": 7, "format": "vortex",
+//! "main.t": { "files": [ … ], "rows": 7, "format": "pink",
 //!             "table_id": "0123456789abcdef0123456789abcdef" }
 //! ```
 //!
@@ -65,11 +64,7 @@
 //! version this build reads) adds each `.pink` data file's footer location
 //! to its file object (`footer_offset`, `footer_len`, `footer_crc32c`).
 //!
-//! `format_version` 2 and 3 are single-file Vortex lakes (3: larger row
-//! blocks) — no longer read (wave 102 dropped every pre-7 catalog); a v1 manifest — written by the
-//! wave-34 lean writer — has no `format` field, implies the engine's `.pink`
-//! bytes, and carries one entry-level statistics block. In v1–v3 every entry
-//! lists exactly one data file, as a plain string path.
+//! Only `format_version` 7 is read: wave 102 dropped every older catalog.
 //!
 //! Schema and typing live inside the data files, never here (a v1/v4 lean
 //! entry's statistics block duplicates the schema so attach can serve it
@@ -89,12 +84,12 @@
 //! ```json
 //! "main.t": {
 //!   "files": [
-//!     { "path": "data/main.t/<uuid>.vortex", "rows": 2,
+//!     { "path": "data/main.t/<uuid>.pink", "rows": 2,
 //!       "partition": { "b": "x" },
 //!       "stats": { …zone map… } }
 //!   ],
 //!   "rows": 2,
-//!   "format": "vortex",
+//!   "format": "pink",
 //!   "partition_by": [ { "column": "b", "transform": "identity" } ]
 //! }
 //! ```
@@ -120,7 +115,7 @@
 //! "main.t": {
 //!   "files": [ … ],
 //!   "rows": 3,
-//!   "format": "vortex",
+//!   "format": "pink",
 //!   "schema_version": 1,
 //!   "columns": [ … ],
 //!   "inlined": [
@@ -278,9 +273,7 @@ fn bucket_n(transform: &str) -> &str {
 /// - `"pink"` is the engine's own `.pink` single-table persistence bytes (the
 ///   v1 lake format, and the v4 lean format); it is registered by every
 ///   build;
-/// - `"vortex"` is a Vortex file (the v2/v3 format and the v4 `vortexlake`
-///   format), registered by `vortexlake` builds;
-/// - extensions may register further ids.
+/// - extensions may register further ids (the Parquet provider does).
 ///
 /// Serialized exactly as that string (`#[serde(transparent)]`), so existing
 /// catalogs stay byte-identical. The type deliberately accepts any string on
@@ -317,13 +310,11 @@ impl FileFormat {
 /// describes it, so `.lake attach` can merge per-file statistics across an
 /// append-only file list without opening any file.
 ///
-/// Wave 66 adds two optional fields to the v4 object: `stats` may also carry
-/// the CRC-protected zone map of a **Vortex** file (published at write time
-/// from the same facts the Vortex footer stores; attach cross-checks the two
-/// and prefers the block, which can be more informative for truncated string
-/// statistics), and `partition` is the file's partition value map (one entry
-/// per partition key, keyed by [`PartitionKey::key_text`]; `None` is a SQL
-/// NULL). Both are additive: a manifest without them keeps its old shape.
+/// Wave 66 adds two optional fields to the file object: `stats` carries the
+/// CRC-protected zone map of the file, and `partition` is the file's
+/// partition value map (one entry per partition key, keyed by
+/// [`PartitionKey::key_text`]; `None` is a SQL NULL). Both are additive: a
+/// manifest without them keeps its old shape.
 ///
 /// Wave 68 adds `row_id_start`: the first row id of the file's rows, assigned
 /// by the commit that published it (the per-table [`TableEntry::next_row_id`]
@@ -517,10 +508,8 @@ impl FileRef {
         }
     }
 
-    /// The file's statistics block: the v4 `.pink` per-file block, or the
-    /// catalog-published Vortex zone map (both v4). `None` for v1–v3 paths
-    /// (the v1 entry-level block lives on the entry) and for a file published
-    /// without one.
+    /// The file's per-file `.pink` statistics block. `None` for a file
+    /// published without one.
     pub(crate) fn stats(&self) -> Option<&crate::stats::StatsBlock> {
         match self {
             FileRef::Path(_) => None,
@@ -864,10 +853,8 @@ fn is_zero(v: &u64) -> bool {
 ///
 /// A v4 writer appends: a table's entry grows by new data files (and delete
 /// files) from commit to commit, and never rewrites a file it published
-/// before. A v1–v3 entry has exactly one `.pink`/`.vortex` data file (as a
-/// plain string path, no `deletes`), and a v1 entry may carry one entry-level
-/// `stats` block (see the `stats` module); v4 `.pink` entries carry one
-/// per-file stats block inside each `files` object instead.
+/// before. An entry carries one per-file stats block inside each `files`
+/// object (see the `stats` module).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TableEntry {
     pub(crate) files: Vec<FileRef>,

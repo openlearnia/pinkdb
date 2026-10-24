@@ -21,7 +21,7 @@
 //!    no-op);
 //!
 //! Every assertion names the format id under test, so one failing provider is
-//! unambiguous when the same body runs for `pink`, `vortex` and `parquet` in
+//! unambiguous when the same body runs for `pink` and `parquet` in
 //! one test binary.
 //!
 //! This file is included through `#[path]` by
@@ -729,9 +729,9 @@ fn attach_check(format_id: &str, lake: &Lake, source: &PinkDb, opened: &mut Pink
 
 /// Run the whole wave-88 format contract against `format_id`.
 ///
-/// `format_id` must have a provider registered in this process (`pink` and,
-/// with `vortexlake`, `vortex` always do; `parquet` is registered by its
-/// crate). Every assertion names the id.
+/// `format_id` must have a provider registered in this process (`pink` is
+/// built in; `parquet` is registered by its crate). Every assertion names the
+/// id.
 pub fn run_contract(format_id: &str, opts: ContractOptions) {
     // Fail before doing any work when the binary has no such provider.
     provider_extension(format_id);

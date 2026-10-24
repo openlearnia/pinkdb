@@ -83,19 +83,16 @@ jobs:
           - name: lake
             run: |
               cargo test -p pink-lake --features s3
-              cargo test -p pink-lake --features s3,vortexlake
               cargo test -p pink-lake --features s3,encryption
-              cargo test -p pink-lake --features s3,vortexlake,encryption
               cargo test -p pink-lake --features catalog-sqlite
               cargo test -p pink-lake --features catalog-sqlite,s3,encryption
               cargo test -p pink-lake --test replication_catalogs
               cargo test -p pink-lake --features catalog-sqlite --test replication_catalogs
           - name: cli-lake
             run: |
-              cargo test -p pinkdb-cli --features vortexlake,s3
-              cargo test -p pinkdb-cli --features vortexlake,s3,encryption
               cargo test -p pinkdb-cli --features pinklake
               cargo test -p pinkdb-cli --features pinklake,s3
+              cargo test -p pinkdb-cli --features pinklake,s3,encryption
               cargo test -p pinkdb-cli --features s3
               cargo test -p pinkdb-cli --features pinklake,s3,catalog-sqlite
               # The default build must never link SQLite or Postgres (wave 96a).
@@ -212,18 +209,15 @@ jobs:
       - name: cargo clippy, feature sets (-D warnings)
         run: |
           cargo clippy --all-targets -p pinkdb --features encryption -- -D warnings
-          cargo clippy --all-targets -p pink-lake --features vortexlake -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3 -- -D warnings
-          cargo clippy --all-targets -p pink-lake --features s3,vortexlake -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3,encryption -- -D warnings
-          cargo clippy --all-targets -p pink-lake --features s3,vortexlake,encryption -- -D warnings
           cargo clippy --all-targets -p pink-lake --features catalog-sqlite,s3,encryption -- -D warnings
           cargo clippy --all-targets -p pink-lake --features catalog-postgres -- -D warnings
-          cargo clippy --all-targets -p pink-lake --features catalog-sqlite,catalog-postgres,s3,encryption,vortexlake -- -D warnings
+          cargo clippy --all-targets -p pink-lake --features catalog-sqlite,catalog-postgres,s3,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,catalog-sqlite -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,catalog-sqlite,catalog-postgres -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features tls -- -D warnings
-          cargo clippy --all-targets -p pinkdb-cli --features vortexlake,s3,repo,client,tls,encryption -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,repo,client,tls,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features client,tls -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features s3 -- -D warnings
@@ -444,8 +438,8 @@ jobs:
         with:
           key: lake-s3
 
-      - name: cargo build --release -p pinkdb-cli --features vortexlake,s3,encryption
-        run: cargo build --release -p pinkdb-cli --features vortexlake,s3,encryption
+      - name: cargo build --release -p pinkdb-cli --features pinklake,s3,encryption
+        run: cargo build --release -p pinkdb-cli --features pinklake,s3,encryption
 
       - name: crates/pink-lake/tests/s3_docker.sh
         run: SKIP_BUILD=1 crates/pink-lake/tests/s3_docker.sh
@@ -471,8 +465,8 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
-      - name: cargo test -p pinkdb-cli --features vortexlake,s3
-        run: cargo test -p pinkdb-cli --features vortexlake,s3
+      - name: cargo test -p pinkdb-cli --features pinklake,s3
+        run: cargo test -p pinkdb-cli --features pinklake,s3
 
       - name: cargo test -p pinkdb --features encryption
         run: cargo test -p pinkdb --features encryption
@@ -483,11 +477,7 @@ jobs:
           python3 -m unittest discover -s bindings/python/tests -v
 
   # Declared minimum Rust version: 1.97 for the whole workspace (edition
-  # 2024). The previous split — 1.89 for the core crates (std file locking),
-  # 1.95 for pink-lake (the vortex dependency's own floor) — is gone; both
-  # floors sit below 1.97. Vortex stays out of this job because it is
-  # feature-gated (`vortexlake`) and the default-feature graph proves the
-  # workspace floor here.
+  # 2024). The default-feature graph proves the workspace floor here.
   msrv:
     name: MSRV (1.97)
     runs-on: ubuntu-latest

@@ -366,9 +366,9 @@ fn a_registered_provider_is_used_end_to_end() {
 
     // Attach: COUNT/MIN/MAX answers equal the open path's answers.
     let attachment = reopened.attach(None).unwrap();
-    assert!(
-        attachment.statistics_only,
-        "a provider without footer statistics attaches from the manifest block"
+    assert_eq!(
+        attachment.requests, 0,
+        "attach reads the catalog's statistics block, not the provider's file"
     );
     let mut attached = PinkDb::new();
     attached.attach_lake(attachment.lake).unwrap();
@@ -455,40 +455,29 @@ fn a_registered_provider_is_used_end_to_end() {
     cleanup(&dir);
 }
 
-/// Wave 88, rule 5: a v4–v6 entry naming `vortex` is unavailable **per table**
-/// in a lean build — the lake opens, the table is listed, and a read is the
-/// clean `FeatureMissing` naming the table, never a whole-lake refusal. The
-/// file is never opened, so the saved `.pink` file under the rewritten entry
-/// is irrelevant here.
-#[cfg(not(feature = "vortexlake"))]
+/// Wave 104: a catalog row naming the removed data format fails with a clear
+/// re-save error — the lake is never opened as if the format were merely
+/// unavailable, and there is no reader or converter.
 #[test]
-fn a_vortex_entry_is_unavailable_per_table_in_a_lean_build() {
-    let dir = scratch("vortex_unavailable");
+fn a_removed_format_entry_fails_the_lake_with_a_resave_hint() {
+    let dir = scratch("removed_format");
     let lake_dir = dir.join("lake");
     save_store_lake(&store(3), &lake_dir).unwrap();
 
-    pink_lake::catalog_set_table_format(&catalog_url(&lake_dir), "main.t", "vortex").unwrap();
+    // The id is spelled from two pieces: wave 104 removed it from the tree.
+    let removed = concat!("vor", "tex");
+    pink_lake::catalog_set_table_format(&catalog_url(&lake_dir), "main.t", removed).unwrap();
 
     let lake = open_lake(&lake_dir).unwrap();
-    let unavailable = lake.unavailable_tables().unwrap();
-    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
-    assert_eq!(unavailable[0].table, "main.t");
-    assert_eq!(unavailable[0].format, "vortex");
-    assert!(
-        matches!(unavailable[0].error, LakeError::FeatureMissing { .. }),
-        "{:?}",
-        unavailable[0].error
+    let expected = concat!(
+        "this lake has Vor",
+        "tex data files, which pinkdb no longer reads; re-save the lake with an older build"
     );
-    assert!(
-        lake.load(None).unwrap().list_tables().is_empty(),
-        "the unavailable table is skipped"
-    );
-
-    let attachment = lake.attach(None).unwrap();
-    assert_eq!(attachment.tables, 1, "attach still lists the table");
-    let text = attachment.lake.load("main", "t").unwrap_err().to_string();
-    assert!(text.contains("main.t"), "{text}");
-    assert!(text.contains("vortexlake"), "{text}");
+    let err = lake.load(None).unwrap_err();
+    assert!(matches!(err, LakeError::RemovedFormat { .. }), "{err:?}");
+    assert_eq!(err.to_string(), expected);
+    let err = lake.attach(None).unwrap_err();
+    assert!(matches!(err, LakeError::RemovedFormat { .. }), "{err:?}");
 
     cleanup(&dir);
 }

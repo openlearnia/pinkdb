@@ -3,7 +3,7 @@
 Arrow IPC (**Feather v2 file format**, the `ARROW1` magic + footer) file
 read/write for pinkdb, over the arrow-rs crates (`arrow-array`,
 `arrow-buffer`, `arrow-schema`, `arrow-ipc` — the 59.x line the workspace lock
-already carries for vortex).
+already carries for parquet).
 
 ## SQL surface
 

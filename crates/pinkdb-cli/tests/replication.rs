@@ -3,11 +3,11 @@
 //! catch-up/status/tables surface, the session supervisor's start/stop, and
 //! the error paths.
 //!
-//! This file only compiles when the `vortexlake` feature is ON (like
+//! This file only compiles when the `pinklake` feature is ON (like
 //! `tests/lake.rs`); the feature-less behavior is covered by
 //! `tests/lake_disabled.rs`.
 
-#![cfg(feature = "vortexlake")]
+#![cfg(feature = "pinklake")]
 
 mod common;
 

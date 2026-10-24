@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lake — pinkdb</title>
-<meta name="description" content="The pinkdb lake layer: catalog + immutable snapshots, Vortex or lean .pink data files, S3/R2 object storage, read-only attach with COUNT/MIN/MAX fast paths, and writer conflict semantics.">
+<meta name="description" content="The pinkdb lake layer: a catalog database plus immutable .pink or Parquet data files, S3/R2 object storage, read-only attach with COUNT/MIN/MAX fast paths, and writer conflict semantics.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
@@ -12,7 +12,7 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
 <meta property="og:title" content="Lake — pinkdb">
-<meta property="og:description" content="The pinkdb lake layer: catalog + immutable snapshots, Vortex or lean .pink data files, S3/R2 object storage, read-only attach with COUNT/MIN/MAX fast paths, and writer conflict semantics.">
+<meta property="og:description" content="The pinkdb lake layer: a catalog database plus immutable .pink or Parquet data files, S3/R2 object storage, read-only attach with COUNT/MIN/MAX fast paths, and writer conflict semantics.">
 <meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/lake.html">
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
@@ -201,7 +201,7 @@ opens need only the catalog.</p>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>mylake.pink                          catalog database
 mylake.pink.files/data/&lt;table&gt;/…     immutable data files
-                                     (.pink, Vortex or Parquet)</code></pre></div>
+                                     (.pink or Parquet)</code></pre></div>
 
 <p>Metadata and data may live apart: a catalog on local disk or Postgres, data on
 S3. A lone <code>s3://…</code> URL is <em>not</em> a lake — always give the catalog
@@ -241,8 +241,6 @@ typed snapshots, not a rendered manifest.</p>
 <ul>
   <li><code>.pink</code> (<code>PINKDB06</code>) is always available and carries a
   statistics block per file.</li>
-  <li>Vortex with the <code>vortexlake</code> feature: footer-only attach and
-  ranged reads.</li>
   <li>Parquet with the <code>parquetlake</code> feature (and DuckDB interop).</li>
 </ul>
 

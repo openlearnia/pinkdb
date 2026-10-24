@@ -53,7 +53,7 @@ use pinkdb_server::ClientTrust;
 #[cfg(feature = "repo")]
 mod repo;
 
-#[cfg(any(feature = "pinklake", feature = "vortexlake"))]
+#[cfg(feature = "pinklake")]
 mod lake;
 
 const PROMPT: &str = "pinkdb> ";
@@ -201,16 +201,15 @@ fn print_help() {
     }
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
-    if cfg!(any(feature = "pinklake", feature = "vortexlake")) {
+    if cfg!(feature = "pinklake") {
+        // Wave 103: a lake is a catalog database plus a data location. The
+        // catalog is a `.pink` path (or `pink:<path>`), `sqlite:<path>` or a
+        // `postgres://` URL; `s3://…` alone is a data location, not a lake.
+        const LAKE: &str = "<catalog>";
         #[cfg(feature = "s3")]
-        const LAKE: &str = "<dir|s3://bucket/prefix>";
+        const DATA: &str = " [data <dir|s3://bucket/prefix>]";
         #[cfg(not(feature = "s3"))]
-        const LAKE: &str = "<dir>";
-        // The `data` option exists only in a build that accepts a SQL catalog.
-        #[cfg(any(feature = "catalog-sqlite", feature = "catalog-postgres"))]
-        const DATA: &str = " [data <dir|s3://…>]";
-        #[cfg(not(any(feature = "catalog-sqlite", feature = "catalog-postgres")))]
-        const DATA: &str = "";
+        const DATA: &str = " [data <dir>]";
         println!("  .lake save {LAKE}{DATA} [force] [author '…'] [message '…']");
         println!("                                snapshot the store into a lake");
         println!(
@@ -218,21 +217,18 @@ fn print_help() {
              version v) into memory"
         );
         println!("  .lake attach {LAKE}{DATA} [v] [read-only|write]");
+        println!("                                {LAKE} is a `.pink` catalog path (or");
+        println!(
+            "                                `pink:<path>`); data defaults to <catalog>.files/"
+        );
         #[cfg(feature = "catalog-sqlite")]
-        {
-            println!("                                {LAKE} may also be a `sqlite:<path>`");
-            println!("                                catalog; `data <location>` is where its");
-            println!("                                data files live (given at create)");
-        }
+        println!("                                or a `sqlite:<path>` catalog");
         #[cfg(feature = "catalog-postgres")]
         {
             println!(
-                "                                {LAKE} may also be a \
-                 `postgres://user:password@host/db?schema=lake`"
+                "                                or `postgres://user:password@host/db?schema=lake`"
             );
-            println!("                                catalog (the password is never printed);");
-            println!("                                `data <location>` is where its data files");
-            println!("                                live (given at create)");
+            println!("                                (the password is never printed)");
         }
         println!("        read-only (default): query the lake from its statistics");
         println!("        write: materialize its tables into the session store");
@@ -300,15 +296,9 @@ fn print_help() {
         if !cfg!(feature = "s3") {
             println!("  .lake s3:// URLs need a build with the `s3` feature");
         }
-        if !cfg!(feature = "vortexlake") {
-            println!(
-                "  (pinklake build: `.pink` data files, format_version 4); Vortex needs `vortexlake`"
-            );
-        }
+        println!("  (`.pink` data files, catalog format_version 7)");
     } else {
-        println!(
-            "  .lake <subcommand>     (not built; needs the `pinklake` or `vortexlake` feature)"
-        );
+        println!("  .lake <subcommand>     (not built; needs the `pinklake` feature)");
     }
     if cfg!(feature = "repo") {
         println!("  .install <name[@version]>   install from a repository, then load it");
@@ -371,14 +361,13 @@ fn repo_unavailable(cmd: &str) {
     eprintln!("       rebuild with `cargo build -p pinkdb-cli --features repo`.");
 }
 
-/// The `.lake` message when the binary was built without either lake feature.
-#[cfg(not(any(feature = "pinklake", feature = "vortexlake")))]
+/// The `.lake` message when the binary was built without the lake feature.
+#[cfg(not(feature = "pinklake"))]
 fn lake_unavailable(cmd: &str) {
     cli_error!("{cmd} is not available: this pinkdb binary was built without a lake feature;");
     eprintln!(
-        "       rebuild with `cargo build -p pinkdb-cli --features vortexlake` (Vortex data \
-         files, incremental writes, attach) or `--features pinklake` (lean: `.pink` data \
-         files); combine either with `,s3` (`vortexlake,s3` / `pinklake,s3`) for s3:// \
+        "       rebuild with `cargo build -p pinkdb-cli --features pinklake` (`.pink` data \
+         files, incremental writes, attach); combine it with `,s3` (`pinklake,s3`) for s3:// \
          locations."
     );
 }
@@ -1129,9 +1118,9 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
             }
         }
         ".lake" => {
-            #[cfg(any(feature = "pinklake", feature = "vortexlake"))]
+            #[cfg(feature = "pinklake")]
             lake::cmd_lake(db, rest);
-            #[cfg(not(any(feature = "pinklake", feature = "vortexlake")))]
+            #[cfg(not(feature = "pinklake"))]
             lake_unavailable(".lake");
         }
         _ => cli_error!("unknown dot-command \"{cmd}\". Try .help"),

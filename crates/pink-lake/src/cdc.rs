@@ -417,8 +417,8 @@ impl Lake {
                 ),
             });
         }
-        // A delete position is per the file's physical rows; `.pink` files
-        // decode whole and project in memory, Vortex files too on this path.
+        // A delete position is per the file's physical rows; the data file
+        // decodes whole and projects in memory on this path.
         let file_epoch = entry
             .files
             .iter()

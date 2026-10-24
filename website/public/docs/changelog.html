@@ -189,6 +189,14 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-24">2026-10-24<a class="anchor" href="#2026-10-24" aria-label="Permalink: 2026-10-24">#</a></h2>
+<h3>Wave 104 — the legacy lake data format removed ✅</h3>
+<ul>
+<li><strong>Breaking:</strong> a lake whose catalog names the removed columnar data format no longer opens, with a clear message asking for a re-save with an older build. There is no reader and no converter. <code>.pink</code> (<code>PINKDB06</code>) and Parquet (the <code>parquetlake</code> provider, for DuckDB interop) remain.</li>
+<li>The old full-lake cargo feature and its large dependency tree are gone, so <code>pinklake</code> is the lake build. The release, install and Docker variants drop the old names. Tests that used the removed format for general subjects (format contract, mixed lakes, ranged/projected reads, partition pruning, schema evolution, fast reads) now run on <code>.pink</code> or Parquet.</li>
+<li>Leftover wave-103 crypto removed: PNKLAKE1 version-1 reading and the Argon2id KDF path. Per-file keys are raw, and <code>argon2</code> is no longer a pink-lake dependency.</li>
+<li>Size (release, Apple Silicon): <code>pinkdb-cli --features pinklake,s3,encryption</code> is <strong>8,780,560 B</strong>, down 41,632 B from the same build at HEAD; the removed full-lake build was <strong>51,407,280 B</strong>. The dependency tree is 109 lines (was 422 with the old format, 110 for HEAD <code>pinklake</code>), pink-lake is 51,714 → 47,865 <code>.rs</code> lines across the crate (−7.4%; <code>src/</code> 26,598 → 23,183, −12.8%), and a clean debug build takes 12.95 → 13.69 s (noise: the removed feature was already off in the <code>pinklake</code> set).</li>
+</ul>
+<h2 id="2026-10-24-2">2026-10-24<a class="anchor" href="#2026-10-24-2" aria-label="Permalink: 2026-10-24">#</a></h2>
 <h3>Wave 103 — Lake catalogs are databases (DuckLake v1.1 tables) ✅</h3>
 <ul>
 <li><strong>The catalog is always a database.</strong> A lake is a <code>pink:&lt;path&gt;</code> durable pinkdb catalog (default), <code>sqlite:&lt;path&gt;</code> (<code>catalog-sqlite</code>) or <code>postgres://…</code> (<code>catalog-postgres</code>), all using DuckLake v1.1's <code>ducklake_*</code> tables with <code>begin_snapshot</code>/<code>end_snapshot</code>. Commits insert a typed delta and one snapshot row instead of rewriting <code>catalog.json</code>/<code>snapshots/</code>; <code>count(*)</code> is <code>SUM(record_count)</code>, and time travel, expire, cleanup, CDC, replication state and statistics read the same rows. DuckDB's <code>ducklake</code> extension can attach the SQLite/Postgres catalogs, and pinkdb opens DuckDB-written DuckLakes.</li>
@@ -196,7 +204,7 @@ progress log</a>.</p>
 <li><strong>Per-file encryption</strong> stays: each data/delete file is a PNKLAKE1 raw-key container with its own random 256-bit key recorded in the catalog; a <code>pink:</code> catalog may itself be engine-encrypted. Manifest sealing, the passphrase-derived lake key, <code>highest.json</code>, <code>lake.json</code>, <code>moved.json</code> and the degraded/conditional metadata-write paths are gone.</li>
 <li><strong>Breaking:</strong> lakes saved by an older build in the JSON layout do not open. There is no converter; re-save them with an older build (for example <code>.lake open &lt;old&gt;</code> then <code>.lake save pink:new.pink</code>) before opening with this build.</li>
 <li><strong>Fix after review:</strong> file statistics were resolved against the column's *current* name, so a file written before a RENAME lost its old physical column when attach rebuilt the zone map. Statistics now resolve through the <code>ducklake_column</code> definition visible at the file's <code>begin_snapshot</code>; a v1 file projects through the rename at head, and time travel to v1 sees its original names and rows. Positional deletes keep addressing the same rows across ADD/DROP COLUMN. The schema, time-travel, replication, S3, encryption, corruption and attach-error tests deleted in the first pass were restored (and the schema/ replication ones run on both <code>pink:</code> and <code>sqlite:</code>).</li>
-<li>Result at 10,000 files: catalog transaction stays flat (pink 7.1–9.8 ms, sqlite 0.7 ms), pink catalog 3.43 MB with statistics, attach + <code>count(*)</code> 184 ms. Data formats (<code>.pink</code>, Vortex, Parquet) and the S3 data path are unchanged.</li>
+<li>Result at 10,000 files: catalog transaction stays flat (pink 7.1–9.8 ms, sqlite 0.7 ms), pink catalog 3.43 MB with statistics, attach + <code>count(*)</code> 184 ms. Data formats (<code>.pink</code>, Parquet) and the S3 data path are unchanged.</li>
 </ul>
 <h2 id="2026-10-23">2026-10-23<a class="anchor" href="#2026-10-23" aria-label="Permalink: 2026-10-23">#</a></h2>
 <h3>Wave 96a (part 2) — Postgres catalogs and catalog migration ✅</h3>
@@ -210,12 +218,12 @@ progress log</a>.</p>
 <ul>
 <li>A lake's metadata may live in a <strong>SQLite</strong> file (<code>sqlite:&lt;path&gt;</code>) while its data files stay on local disk or S3/R2: <code>.lake save &lt;catalog&gt; data &lt;dir|s3://…&gt;</code> records the data location once, and later <code>.lake open</code>/<code>attach</code>/<code>commit</code> commands need only the catalog URL. An explicit <code>data &lt;location&gt;</code> overrides a moved data root for one session.</li>
 <li>Catalogs are a <code>CatalogStore</code> seam inside <code>pink-lake</code>: the object-store layout remains the default, and the SQL backends store the same byte-identical manifests, snapshots and commit deltas. Version uniqueness, crash safety, time travel, CDC, attach statistics, replication state and encryption keep their existing rules.</li>
-<li>The <code>catalog-sqlite</code> and <code>catalog-postgres</code> features are opt-in (<code>pinklake</code>/<code>vortexlake</code> combine with them explicitly), and the default binary stays lean.</li>
+<li>The <code>catalog-sqlite</code> and <code>catalog-postgres</code> features are opt-in (<code>pinklake</code> combines with them explicitly), and the default binary stays lean.</li>
 </ul>
 <h2 id="2026-10-22">2026-10-22<a class="anchor" href="#2026-10-22" aria-label="Permalink: 2026-10-22">#</a></h2>
 <h3>Wave 91 — Docker image ✅</h3>
 <ul>
-<li>pinkdb ships as a container: <code>docker run -p 5433:5433 -v pinkdb-data:/data ghcr.io/openlearnia/pinkdb</code> runs the server with a durable database on the volume; <code>docker run --rm -it ghcr.io/openlearnia/pinkdb pinkdb</code> gives the CLI. A <code>lake</code> tag adds the Vortex/Parquet lake features.</li>
+<li>pinkdb ships as a container: <code>docker run -p 5433:5433 -v pinkdb-data:/data ghcr.io/openlearnia/pinkdb</code> runs the server with a durable database on the volume; <code>docker run --rm -it ghcr.io/openlearnia/pinkdb pinkdb</code> gives the CLI. A <code>lake</code> tag adds the Parquet lake feature.</li>
 <li>Small (about 37 MB), runs as a non-root user, configurable with <code>PINKDB_*</code> environment variables, and reports its health to Docker.</li>
 <li>Images are built and published automatically with each release (the first images appear with the next release tag).</li>
 </ul>
@@ -234,7 +242,7 @@ progress log</a>.</p>
 </ul>
 <h3>Wave 98b — fast lakes on S3/R2 ✅</h3>
 <ul>
-<li>Lakes on object storage read only what a query needs: Parquet and Vortex lake files fetch just the queried columns with concurrent range requests, Vortex footers are read in parallel, and whole files download in parallel parts. On R2, TPC-H Q6 over a Parquet lake went from 23 s to 6 s, over a Vortex lake from 31 s to 4.5 s, and opening a Vortex lake from 15 s to 2 s.</li>
+<li>Lakes on object storage read only what a query needs: lake files fetch just the queried columns with concurrent range requests, and whole files download in parallel parts. On R2, TPC-H Q6 over a Parquet lake went from 23 s to 6 s.</li>
 <li>Encrypted lakes keep reading whole files (each file is one sealed container).</li>
 <li><code>.lake attach</code> reports the requests and bytes it transferred.</li>
 </ul>
@@ -262,12 +270,12 @@ progress log</a>.</p>
 <li>One lake can hold tables in different formats: <code>.lake format parquet for main.events</code> picks a table's format, and <code>.lake rewrite &lt;dir&gt; &lt;table&gt; format &lt;id&gt;</code> converts an existing table in one step.</li>
 <li>A format you choose explicitly is remembered in the catalog ("pinned"), so later saves and appends keep it. Tables written with the build's default still migrate to the saving build's format, as before.</li>
 <li>A table in a format this build can't read no longer blocks the whole lake: the other tables open, the CLI warns about the skipped one, reading it gives a clear error, and saving keeps it unchanged.</li>
-<li>Every format (<code>.pink</code>, Vortex, Parquet) now passes the same contract test suite. It caught two bugs, now fixed: saving a DECIMAL or INTERVAL table as Vortex crashed instead of giving an error, and very large INTERVAL values made <code>.lake attach</code> refuse the lake.</li>
+<li>Every format (<code>.pink</code>, Parquet) now passes the same contract test suite. It caught two bugs, now fixed: saving a DECIMAL or INTERVAL table crashed instead of giving an error, and very large INTERVAL values made <code>.lake attach</code> refuse the lake.</li>
 </ul>
 <h2 id="2026-10-21">2026-10-21<a class="anchor" href="#2026-10-21" aria-label="Permalink: 2026-10-21">#</a></h2>
 <h3>Wave 87 — lake data formats are pluggable; Parquet lakes ✅</h3>
 <ul>
-<li>A lake's data files are now written by a registered <strong>format provider</strong>: <code>.pink</code> is built in, Vortex comes with <code>vortexlake</code>, and the new <code>parquetlake</code> CLI feature adds <strong>Parquet</strong>.</li>
+<li>A lake's data files are now written by a registered <strong>format provider</strong>: <code>.pink</code> is built in, and the new <code>parquetlake</code> CLI feature adds <strong>Parquet</strong>.</li>
 <li><code>.lake format parquet</code> (or <code>Lake::set_write_format</code>) picks the format for the next saves; attach, commits, S3, encryption and maintenance work the same for every format. INTERVAL columns are refused in Parquet (it cannot store microseconds exactly).</li>
 <li>A lake that names a format this build doesn't have is refused with a clear error; existing lakes are unchanged.</li>
 </ul>
@@ -481,8 +489,8 @@ progress log</a>.</p>
 </ul>
 <h3>Wave 74 — lake naming sweep ✅</h3>
 <ul>
-<li>The lake builds are now <strong><code>pinklake</code></strong> (the <code>.pink</code>-file lake; formerly <code>lake-lite</code>) and <strong><code>vortexlake</code></strong> (the Vortex-file lake; formerly <code>lake</code>), in cargo features, help text, tests, CI, README and the docs site.</li>
-<li><strong><code>s3</code> is pure storage</strong>: it implies neither build — combine explicitly, <code>pinklake,s3</code> or <code>vortexlake,s3</code> (<code>--features s3</code> alone has no <code>.lake</code> commands and says so). No old aliases survive.</li>
+<li>The lake builds are now <strong><code>pinklake</code></strong> (the <code>.pink</code>-file lake; formerly <code>lake-lite</code>) and <code>lake</code> (the full lake; later removed), in cargo features, help text, tests, CI, README and the docs site.</li>
+<li><strong><code>s3</code> is pure storage</strong>: it implies no lake build — combine it explicitly (<code>pinklake,s3</code>; <code>--features s3</code> alone has no <code>.lake</code> commands and says so). No old aliases survive.</li>
 </ul>
 <h3>Wave 80 — materialized-view refresh policies ✅</h3>
 <ul>
@@ -526,7 +534,7 @@ progress log</a>.</p>
 <ul>
 <li>With the <code>encryption</code> feature, a keyed session (<code>PINKDB_KEY</code>, consistent with the engine) seals <strong>every lake object</strong> — catalogs, snapshots, commit deltas, data files, delete files — as <code>PNKLAKE1</code> <strong>AES-256-GCM</strong> containers under one Argon2id derivation per session. A <code>Storage</code>-level decorator means commits, deletes, time travel and retry paths are covered with no per-call-site code.</li>
 <li>The <code>catalog.json == snapshots/&lt;v&gt;.json</code> byte invariant survives (seal once, publish the same ciphertext); <strong>S3 conditional-write CAS is unchanged</strong>; statistics-fast attach on encrypted lean lakes still decodes zero data files.</li>
-<li>Wrong/missing keys and tampered containers fail closed with authenticated errors (never “corrupt file”); plaintext lakes stay byte-identical and are refused by keyed sessions. Encrypted Vortex attach reads whole objects in stage 1 (segment-level reads documented as the follow-up).</li>
+<li>Wrong/missing keys and tampered containers fail closed with authenticated errors (never “corrupt file”); plaintext lakes stay byte-identical and are refused by keyed sessions. Encrypted lake attach reads whole objects in stage 1 (segment-level reads documented as the follow-up).</li>
 </ul>
 <h3>Wave 65 — lake schema evolution ✅</h3>
 <ul>
@@ -537,7 +545,7 @@ progress log</a>.</p>
 <h3>Wave 66 — lake partitioning &amp; pruning ✅</h3>
 <ul>
 <li>Lake tables can be <strong>partitioned</strong>: identity values or <code>bucket(N)</code> labels are recorded per file, commits write <strong>one data file per partition value set</strong>, and spec changes (<code>.lake partition … by (…) | clear</code>) never rewrite old files.</li>
-<li>Every v4 data file publishes a CRC-protected <strong>zone map</strong> in the catalog (Vortex files newly); the planner prunes whole files for exact predicates — <code>WHERE region = 'x'</code> reads only that partition's file, and disjoint ranges read zero.</li>
+<li>Every v4 data file publishes a CRC-protected <strong>zone map</strong> in the catalog; the planner prunes whole files for exact predicates — <code>WHERE region = 'x'</code> reads only that partition's file, and disjoint ranges read zero.</li>
 <li><code>COUNT</code>/<code>MIN</code>/<code>MAX</code> honesty rules are preserved (fall back once positional deletes exist); pruning stays correct with deletes and across time travel.</li>
 <li>Limits (documented): bucket labels are pinkdb's own hash (no cross-engine numbers, no bucket-value pruning); <code>year/month/…</code> transforms are refused by name.</li>
 </ul>
@@ -616,7 +624,7 @@ progress log</a>.</p>
 <li><strong>Wave 40</strong> — performance tuning.</li>
 <li><strong>Wave 39</strong> — CI/CD publishing of extensions.</li>
 <li><strong>Wave 36</strong> — S3 bucket support for lake storage + file reading.</li>
-<li><strong>Waves 35 + 35b</strong> — Vortex default lake format + parser cleanup.</li>
+<li><strong>Waves 35 + 35b</strong> — lake data format + parser cleanup.</li>
 <li><strong>Wave 34</strong> — pink-lake minimal lake layer.</li>
 <li><strong>Wave 33</strong> — custom repositories + client-side INSTALL.</li>
 <li><strong>Wave 32</strong> — extensions repository.</li>
@@ -661,6 +669,7 @@ progress log</a>.</p>
 <p class="toc-title">On this page</p>
 <ul>
   <li><a href="#2026-10-24">2026-10-24</a></li>
+  <li><a href="#2026-10-24-2">2026-10-24</a></li>
   <li><a href="#2026-10-23">2026-10-23</a></li>
   <li><a href="#2026-10-22">2026-10-22</a></li>
   <li><a href="#2026-10-21">2026-10-21</a></li>

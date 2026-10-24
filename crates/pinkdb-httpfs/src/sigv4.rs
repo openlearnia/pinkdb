@@ -470,13 +470,13 @@ mod tests {
         let (amz_date, date_stamp) = at(1_791_972_672);
         let mut credentials = creds();
         credentials.session_token = Some("TOKEN+/=".to_string());
-        let body = b"vortex-bytes";
+        let body = b"lake-bytes";
         let hash = payload_hash(body);
         let signed = sign(
             &credentials,
             &SigningInput {
                 method: "PUT",
-                canonical_uri: "/lakebucket/lakes/mine/data/main.a%252Fb/0123abcd.vortex",
+                canonical_uri: "/lakebucket/lakes/mine/data/main.a%252Fb/0123abcd.pink",
                 canonical_query: "",
                 headers: vec![
                     ("host", "127.0.0.1:9000"),
@@ -492,17 +492,17 @@ mod tests {
         );
         assert_eq!(
             signed.canonical_request,
-            "PUT\n/lakebucket/lakes/mine/data/main.a%252Fb/0123abcd.vortex\n\n\
+            "PUT\n/lakebucket/lakes/mine/data/main.a%252Fb/0123abcd.pink\n\n\
              host:127.0.0.1:9000\n\
-             x-amz-content-sha256:10e8115208c795e82cb18de3889b990b4dd6e7146b6789a9ca4d8f0d5494574d\n\
+             x-amz-content-sha256:8d0521cadc770da8c5a33dd141eb82b37b624f759d7cbffeeec929488a3d7f3f\n\
              x-amz-date:20261014T101112Z\n\
              x-amz-security-token:TOKEN+/=\n\n\
              host;x-amz-content-sha256;x-amz-date;x-amz-security-token\n\
-             10e8115208c795e82cb18de3889b990b4dd6e7146b6789a9ca4d8f0d5494574d"
+             8d0521cadc770da8c5a33dd141eb82b37b624f759d7cbffeeec929488a3d7f3f"
         );
         assert_eq!(
             signed.signature,
-            "2eea23231c52dbb56e4e9f00c21575d2c96f1210bb38037a8c52460c86ef8ede"
+            "77edc2f7ab8b3688ae011fc361c53f76c29d2162fc0ec53a98489a5d8b97aa92"
         );
     }
 

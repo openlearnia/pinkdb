@@ -198,8 +198,7 @@ default build links no crypto, TLS or format code; features opt in:</p>
   <thead><tr><th>Feature</th><th>Adds</th></tr></thead>
   <tbody>
     <tr><td><code>encryption</code></td><td><code>PINKENC1</code> at-rest encryption (AES-256-GCM + Argon2id)</td></tr>
-    <tr><td><code>vortexlake</code> (on <code>pink-lake</code>)</td><td>the Vortex lake data format (the CLI's <code>vortexlake</code> feature enables it)</td></tr>
-    <tr><td><code>s3</code> (on <code>pink-lake</code>)</td><td>S3/R2 object storage (pure storage — it implies neither lake build; pair it with the CLI's <code>pinklake</code> / <code>vortexlake</code> features)</td></tr>
+    <tr><td><code>s3</code> (on <code>pink-lake</code>)</td><td>S3/R2 object storage (pure storage — it implies no lake build; pair it with the CLI's <code>pinklake</code> feature)</td></tr>
   </tbody>
 </table>
 </div>
@@ -367,7 +366,7 @@ db.save_with_key(<span class="tok-s">"x.pink"</span>, &amp;key)?;
 <span class="tok-c">// rewritten) and/or record positional deletes.</span>
 <span class="tok-k">let</span> <span class="tok-k">mut</span> commit = pink_lake::Commit::new();
 commit.append(<span class="tok-s">"main.t"</span>, rows);                   <span class="tok-c">// same schema as the table</span>
-commit.delete_positions(<span class="tok-s">"main.t"</span>, <span class="tok-s">"data/main.t/&lt;uuid&gt;.vortex"</span>, &amp;[<span class="tok-n">0</span>]);
+commit.delete_positions(<span class="tok-s">"main.t"</span>, <span class="tok-s">"data/main.t/&lt;uuid&gt;.pink"</span>, &amp;[<span class="tok-n">0</span>]);
 <span class="tok-k">let</span> report = lake.commit(&amp;commit)?;              <span class="tok-c">// one new version, retried on conflicts</span>
 <span class="tok-c">// save_store_s3 / save_store_url for object storage</span>
 <span class="tok-c">// S3Config::new(bucket).with_prefix(..).with_region(..)</span>

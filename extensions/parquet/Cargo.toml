@@ -19,8 +19,8 @@ pinkdb-httpfs = { path = "../../crates/pinkdb-httpfs", optional = true }
 # is a normal dependency; it is already in the lock through parquet itself.
 bytes = "1"
 # The Apache Arrow `parquet` crate (arrow-rs), pinned to the 59.x family the
-# workspace's Cargo.lock already carries (vortex-* pull arrow-* 59.3.0), so a
-# build that also enables a lake consumes one arrow generation. Only the
+# workspace's Cargo.lock already carries (the arrow extension uses the same
+# line), so a build that also enables a lake consumes one arrow generation. Only the
 # low-level reader/writer half is used: the `arrow` feature stays **off** (no
 # arrow-array dependency, no duplicate compile units).
 parquet = { version = "59.3", default-features = false }

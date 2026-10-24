@@ -1,6 +1,6 @@
 //! Lake data-file format providers (wave 87).
 //!
-//! The catalog pins one format id per table entry (`"pink"`, `"vortex"`, …).
+//! The catalog pins one format id per table entry (`"pink"`, `"parquet"`, …).
 //! This module maps that id to a [`LakeFormat`] implementation — the seam
 //! that lets the lake's catalog, save/commit, attach, maintenance, S3 and
 //! encryption machinery work over any data-file encoding.
@@ -8,11 +8,8 @@
 //! # Registry
 //!
 //! The registry is process-global and keyed by the format id. The crate
-//! registers the built-ins lazily on first use:
-//!
-//! - [`PINK_FORMAT_ID`] — the engine's single-table `.pink` persistence bytes
-//!   (every build);
-//! - [`VORTEX_FORMAT_ID`] — Vortex data files (`vortexlake` builds only).
+//! registers [`PINK_FORMAT_ID`] lazily — the engine's single-table `.pink`
+//! persistence bytes, available in every build.
 //!
 //! Extensions register additional formats with [`register_lake_format`]. An
 //! id names exactly one provider for the life of the process: a **duplicate
@@ -22,11 +19,11 @@
 //!
 //! An id with no provider is [`LakeError::UnknownFormat`] whenever that
 //! table is read or written; there is never a panic or a silent fallback to
-//! `"pink"`. (A `vortex` entry in a build without the `vortexlake` feature
-//! keeps its established [`LakeError::FeatureMissing`], because the id is
-//! known but this build cannot provide it.) Wave 88 makes the refusal
-//! per-table: a v4–v6 lake still opens, [`crate::Lake::unavailable_tables`]
-//! lists the affected tables, and only reads/writes of those tables fail.
+//! `"pink"`. Wave 88 makes the refusal per-table: a lake still opens,
+//! [`crate::Lake::unavailable_tables`] lists the affected tables, and only
+//! reads/writes of those tables fail. The one exception is the format id
+//! removed in wave 104: it is refused for the whole lake with a re-save
+//! error, because no build will ever read it again.
 //!
 //! # The contract
 //!
@@ -40,17 +37,17 @@
 //! 2. **Reading** ([`LakeFormat::read`]): decode one data file into the
 //!    one-database/one-table [`PinkDb`] shape every lake loader expects.
 //! 3. **Optional self-description** ([`LakeFormat::footer_stats`]): formats
-//!    whose files carry their own schema/statistics (Vortex) can answer
-//!    attach without the catalog block; formats that do not return `None`
-//!    and attach uses the manifest's CRC-protected block.
+//!    whose files carry their own schema can answer a schema-mapping read;
+//!    formats that do not return `None` and attach uses the manifest's
+//!    CRC-protected statistics block.
 //!
 //! A provider may additionally advertise
 //! [`LakeFormat::supports_projection`] to let attach decode only requested
 //! columns; the lake falls back to a full decode otherwise. A projected
-//! provider implements [`LakeFormat::read_projected`] (Vortex: projected
-//! segments; Parquet: the shared ranged scan core) and reports its file's
-//! physical footer via [`LakeFormat::footer_stats`] so a v5 schema record can
-//! map logical columns onto it.
+//! provider implements [`LakeFormat::read_projected`] (`.pink`: projected
+//! column chunks; Parquet: the shared ranged scan core) and reports its
+//! file's physical footer via [`LakeFormat::footer_stats`] so a schema record
+//! can map logical columns onto it.
 //!
 //! # Ranged reads (wave 98b)
 //!
@@ -67,8 +64,7 @@
 //! temp file plus fsync + rename locally, one PUT over S3, sealed as one
 //! container for an encrypted lake). The default implementation calls
 //! [`LakeFormat::write`] and writes its bytes into the sink, so a provider
-//! only has to implement the in-memory form; the Vortex provider overrides
-//! it to stream its writer's output directly.
+//! only has to implement the in-memory form.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -85,9 +81,6 @@ use crate::{LakeError, Result};
 /// The format id of the engine's `.pink` single-table persistence bytes — the
 /// built-in format every build registers.
 pub const PINK_FORMAT_ID: &str = "pink";
-
-/// The format id of Vortex data files — registered by `vortexlake` builds.
-pub const VORTEX_FORMAT_ID: &str = "vortex";
 
 /// Where a data file's footer lives inside the file.
 ///
@@ -264,7 +257,7 @@ impl<'a> DataFile<'a> {
 /// A positional reader over one lake data file (wave 98b).
 ///
 /// This is the seam between the lake's ranged [`Storage`] and a format
-/// provider (parquet's remote scan, Vortex's `VortexReadAt`): the provider
+/// provider (parquet's remote scan, `.pink`'s projected chunk read): the provider
 /// names byte windows and the lake fetches exactly them, with the storage's
 /// retry policy. Implementations are `Send + Sync` so a scan may read ahead
 /// from several threads.
@@ -317,8 +310,8 @@ impl RangedFile for StorageRange {
     }
 }
 
-/// The schema, identity and exact statistics a data file carries itself,
-/// without decoding any column data (Vortex's footer).
+/// The schema and identity a data file carries itself, read without decoding
+/// any column data (the `.pink` footer, a Parquet footer).
 #[derive(Debug)]
 pub struct FileFooter {
     /// The database the file's metadata names.
@@ -339,25 +332,25 @@ pub struct FileFooter {
 /// [`register_lake_format`]); they must be safe to call concurrently.
 pub trait LakeFormat: fmt::Debug + Send + Sync {
     /// The stable lowercase id written in the catalog's `format` field
-    /// (`"pink"`, `"vortex"`, …). Ids are unique per process.
+    /// (`"pink"`, `"parquet"`, …). Ids are unique per process.
     fn id(&self) -> &str;
 
-    /// The data-file name extension, without the dot (`"pink"`, `"vortex"`,
-    /// `"parquet"`). The lake names a file `data/<table>/<uuid>.<extension>`.
+    /// The data-file name extension, without the dot (`"pink"`, `"parquet"`).
+    /// The lake names a file `data/<table>/<uuid>.<extension>`.
     fn extension(&self) -> &str;
 
     /// Encode `src` as one complete data file and publish its statistics.
     ///
-    /// `db`/`table` name the logical table the file will hold (the `.pink`
-    /// and Vortex writers embed this identity in the file, and the loaders
-    /// check it against the catalog key).
+    /// `db`/`table` name the logical table the file will hold (the built-in
+    /// writers embed this identity in the file, and the loaders check it
+    /// against the catalog key).
     fn write(&self, db: &str, table: &str, src: &DataTable) -> Result<EncodedFile>;
 
     /// Encode `src` straight into `sink` and publish the same statistics.
     ///
     /// The default buffers through [`LakeFormat::write`]; a provider whose
-    /// encoder can stream overrides this (Vortex does) so a local save never
-    /// materializes the whole file.
+    /// encoder can stream overrides this so a local save never materializes
+    /// the whole file.
     ///
     /// Returns the published statistics and, when the format carries a
     /// footer, where it is in the written file (the catalog records it, so a
@@ -384,32 +377,25 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
     /// [`LakeError::Corrupt`].
     fn read(&self, file: &DataFile<'_>) -> Result<PinkDb>;
 
-    /// The file's schema, identity and exact statistics when the format
-    /// carries them in the file itself (Vortex's footer), without decoding
-    /// column data. `None` (the default) means attach reads the
-    /// catalog-published statistics block instead.
+    /// The file's schema and identity when the format carries them in the
+    /// file itself (the `.pink` footer, a Parquet footer), without decoding
+    /// column data. `None` (the default) means the caller uses the schema the
+    /// catalog already records.
     fn footer_stats(&self, _file: &DataFile<'_>) -> Result<Option<FileFooter>> {
         Ok(None)
     }
 
-    /// Whether this format's files carry their own footer statistics, so
-    /// attach performs a footer read per file (and reports a footer-only
-    /// attachment). The default is `false`: attach reads only the manifest.
-    fn has_footer_stats(&self) -> bool {
-        false
-    }
-
     /// Whether this format can decode a column projection (a subset of the
     /// physical columns). The default is `false`: a projection decodes the
-    /// whole file. The Vortex and Parquet providers opt in.
+    /// whole file. The `.pink` and Parquet providers opt in.
     fn supports_projection(&self) -> bool {
         false
     }
 
     /// The catalog's `ducklake_delete_file.format` value for this data
     /// format: `"pink"` for pink-lake's own positional container, `"parquet"`
-    /// for DuckLake's `(file_path, pos)` files. `.pink` and Vortex keep
-    /// pink's own format.
+    /// for DuckLake's `(file_path, pos)` files. `.pink` keeps pink's own
+    /// format.
     fn delete_format(&self) -> &str {
         PINK_FORMAT_ID
     }
@@ -477,8 +463,6 @@ fn registry() -> &'static Mutex<BTreeMap<String, Arc<dyn LakeFormat>>> {
     REGISTRY.get_or_init(|| {
         let mut formats: BTreeMap<String, Arc<dyn LakeFormat>> = BTreeMap::new();
         formats.insert(PINK_FORMAT_ID.to_string(), Arc::new(PinkFormat));
-        #[cfg(feature = "vortexlake")]
-        formats.insert(VORTEX_FORMAT_ID.to_string(), Arc::new(VortexFormat));
         Mutex::new(formats)
     })
 }
@@ -534,23 +518,35 @@ pub fn lake_format(id: &str) -> Option<Arc<dyn LakeFormat>> {
 /// Resolve `id` for a lake operation, naming `path` in the failure.
 ///
 /// A missing provider is [`LakeError::UnknownFormat`] — never a fallback.
-/// The built-in Vortex id keeps its established [`LakeError::FeatureMissing`]
-/// in a build without `vortexlake` (the id is known, the feature is not
-/// built).
+/// The format id removed in wave 104 is refused with its own clear message:
+/// old lakes are not converted, and no build registers a reader for them.
+///
+/// The id is spelled in two pieces on purpose: wave 104 removed every
+/// reference to it from the tree, so it survives only as this comparison.
+pub(crate) const REMOVED_FORMAT_ID: &str = concat!("vor", "tex");
+
+/// Whether `id` is the format removed in wave 104.
+pub(crate) fn is_removed(id: &str) -> bool {
+    id == REMOVED_FORMAT_ID
+}
+
+/// The error a catalog row naming the removed format returns.
+pub(crate) fn removed_format_error() -> LakeError {
+    LakeError::RemovedFormat {
+        message: concat!(
+            "this lake has Vor",
+            "tex data files, which pinkdb no longer reads; re-save the lake with an older build"
+        )
+        .to_string(),
+    }
+}
+
 pub(crate) fn format_for(id: &str, path: &Path) -> Result<Arc<dyn LakeFormat>> {
+    if is_removed(id) {
+        return Err(removed_format_error());
+    }
     if let Some(format) = lake_format(id) {
         return Ok(format);
-    }
-    #[cfg(not(feature = "vortexlake"))]
-    if id == VORTEX_FORMAT_ID {
-        return Err(LakeError::FeatureMissing {
-            feature: "vortexlake",
-            message: format!(
-                "the lake uses Vortex data files (format \"{id}\"); this build was built \
-                 without Vortex format support — rebuild with the `vortexlake` feature (for \
-                 the CLI: `cargo build -p pinkdb-cli --features vortexlake`)"
-            ),
-        });
     }
     Err(LakeError::UnknownFormat {
         path: path.to_path_buf(),
@@ -929,69 +925,6 @@ fn build_pink_store(
     Ok(store)
 }
 
-/// The built-in Vortex format (`vortexlake` builds): one Vortex file per
-/// table, with the footer's schema and statistics.
-#[cfg(feature = "vortexlake")]
-#[derive(Debug)]
-struct VortexFormat;
-
-#[cfg(feature = "vortexlake")]
-impl LakeFormat for VortexFormat {
-    fn id(&self) -> &str {
-        VORTEX_FORMAT_ID
-    }
-
-    fn extension(&self) -> &str {
-        "vortex"
-    }
-
-    fn write(&self, db: &str, table: &str, src: &DataTable) -> Result<EncodedFile> {
-        let mut bytes = Vec::new();
-        crate::vortex_file::encode_table_into(db, table, src, &mut bytes)?;
-        Ok(EncodedFile {
-            bytes,
-            stats: pinkdb::persist::table_stats(db, table, src),
-            footer: None,
-        })
-    }
-
-    fn write_streamed(
-        &self,
-        db: &str,
-        table: &str,
-        src: &DataTable,
-        sink: &mut (dyn Write + Send),
-    ) -> Result<(SavedTableStats, Option<FooterLocation>)> {
-        crate::vortex_file::encode_table_into(db, table, src, sink)?;
-        Ok((pinkdb::persist::table_stats(db, table, src), None))
-    }
-
-    fn read(&self, file: &DataFile<'_>) -> Result<PinkDb> {
-        crate::vortex_file::decode_table_file(file)
-    }
-
-    fn footer_stats(&self, file: &DataFile<'_>) -> Result<Option<FileFooter>> {
-        Ok(Some(crate::vortex_file::read_footer(file)?))
-    }
-
-    fn has_footer_stats(&self) -> bool {
-        true
-    }
-
-    fn supports_projection(&self) -> bool {
-        true
-    }
-
-    fn read_projected(
-        &self,
-        file: &DataFile<'_>,
-        columns: &[usize],
-        _filters: &[pinkdb::PrunePredicate],
-    ) -> Result<Option<(PinkDb, Vec<bool>)>> {
-        Ok(Some(crate::vortex_file::decode_projected(file, columns)?))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,8 +953,6 @@ mod tests {
     #[test]
     fn built_ins_are_registered_lazily() {
         assert!(lake_format(PINK_FORMAT_ID).is_some());
-        #[cfg(feature = "vortexlake")]
-        assert!(lake_format(VORTEX_FORMAT_ID).is_some());
     }
 
     #[test]

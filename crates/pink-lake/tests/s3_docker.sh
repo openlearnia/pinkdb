@@ -4,7 +4,7 @@
 # ============================================================================
 #
 # The in-repo `mock_s3.rs` (used by
-# `cargo test -p pink-lake --features s3,vortexlake` and the CLI's
+# `cargo test -p pink-lake --features s3` and the CLI's
 # `lake_s3` tests) is the hermetic protocol suite — it even
 # verifies SigV4 on every request — but it is a home-grown server inside the
 # test process. This script is the independent check: a real, separate HTTP
@@ -14,14 +14,10 @@
 # It needs Docker, python3 and curl 7.75+ (for `--aws-sigv4`, the harness's
 # own signed probes) plus cargo for the default CLI build:
 #   * SERVER=s3mock     adobe/s3mock:latest — accepts unsigned requests (no
-#                       SigV4 verification) and evaluates conditional PUTs
-#                       non-atomically under true concurrency. The one-winner
-#                       race assertion is REPORTED there, as before (the
-#                       in-repo atomic mock and the strict servers below pin
-#                       the client logic).
+#                       SigV4 verification).
 #   * SERVER=seaweedfs  chrislusf/seaweedfs:latest — a container started with
 #                       `-s3.config` identities verifies SigV4 (unsigned PUT
-#                       -> 403) and evaluates conditionals atomically: STRICT.
+#                       -> 403): STRICT.
 #                       A pre-existing `pk-seaweed` running SeaweedFS's
 #                       DEFAULT config is measured to accept anonymous writes
 #                       and is therefore NOT reused: the harness leaves it
@@ -29,12 +25,13 @@
 #                       `pinkdb-seaweed-itest`. (A `pk-seaweed` that verifies
 #                       SigV4 is reused.)
 #   * SERVER=rustfs     rustfs/rustfs:latest — verifies SigV4 (unsigned and
-#                       wrong-key puts -> 403) and evaluates conditionals
-#                       atomically: STRICT.
-#   Strict means: an unsigned PUT must be answered 403 (asserted), the
-#   two-writer atomicity probe must show one winner per trial (asserted), and
-#   the race's exactly-one-winner-per-version + catalog==snapshot byte checks
-#   are hard failures, not reports.
+#                       wrong-key puts -> 403): STRICT.
+#   Strict means: an unsigned PUT must be answered 403 (asserted).
+#
+# The lake's concurrency contract does not depend on the server: since wave 103
+# the catalog is a database transaction on local disk and S3 holds data files
+# only, so exactly one writer wins each version on every endpoint and the race
+# assertions are hard failures everywhere.
 #
 # Container recipes (equivalent manual `docker run` commands; the client
 # never creates buckets, so the harness creates $BUCKET itself):
@@ -54,10 +51,9 @@
 #   The script itself pins every image by digest (`repo:tag@sha256:…`), so the
 #   tag in these recipes is only for readability; see the pin table below.
 #
-# On this machine (2026-10-14) seaweedfs and rustfs both answered the
-# two-writer conditional race with exactly one 200 in every trial, while
-# s3mock let both racers win (its precondition check is check-then-act);
-# see `s3_docker_notes.md` for the evidence and the capability matrix.
+# S3 conditional PUTs are no longer in the lake's write path, so the harness no
+# longer probes them; `s3_docker_notes.md` keeps the pre-wave-103 measurements
+# (SeaweedFS/RustFS atomic, s3mock check-then-act) as history.
 #
 # Per-server container lifecycle:
 #   * s3mock uses `pinkdb-s3mock-itest` (initial bucket via env); reuse of an
@@ -183,8 +179,6 @@ ENDPOINT=""
 OWNED=0          # 1 when this run created the container
 SIG_EXPECTED=0   # 1 when the run requires a SigV4-verifying endpoint
 SIG_VERIFIED=0   # probe result: unsigned PUT answered 403
-RACE_ATOMIC=""   # probe result: one winner per racing conditional PUT
-ENFORCE_ATOMIC="$STRICT"
 BUCKET_READY=0
 BUCKET_CODE=""
 
@@ -599,7 +593,7 @@ ensure_bucket() {
 }
 
 # ---------------------------------------------------------------------------
-# capability probes -> enforcement policy
+# server capability probe -> enforcement policy
 # ---------------------------------------------------------------------------
 
 # A real signature check: a SigV4-enforcing endpoint rejects an unsigned PUT
@@ -636,99 +630,6 @@ check_signature_enforcement() {
     ok "the unsigned-403 assertion is reported, not enforced, on this endpoint"
 }
 
-# The single-writer contract needs conditional writes (the client refuses a
-# degraded endpoint by default; this proves the safe path is the one tested).
-check_conditional_writes() {
-    local key="itest-conditional-probe" code etag headers
-    headers="$(s3curl -sS --max-time 30 -D - -o /dev/null -X PUT --data-binary 'first' "$ENDPOINT/$BUCKET/$key")" \
-        || fail "conditional probe PUT failed"
-    etag="$(printf '%s' "$headers" | tr -d '\r' | awk 'tolower($1) == "etag:" { print $2; exit }')"
-    [ -n "$etag" ] || fail "conditional probe: the server returned no ETag"
-
-    code="$(s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-None-Match: *' --data-binary 'second' "$ENDPOINT/$BUCKET/$key")"
-    [ "$code" = "412" ] || fail "If-None-Match: * on an existing key returned $code, expected 412 (conditional writes not enforced?)"
-
-    code="$(s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H "If-Match: $etag" --data-binary 'third' "$ENDPOINT/$BUCKET/$key")"
-    [ "$code" = "200" ] || fail "If-Match with the current ETag returned $code, expected 200"
-
-    code="$(s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-Match: "deadbeefdeadbeef"' --data-binary 'fourth' "$ENDPOINT/$BUCKET/$key")"
-    [ "$code" = "412" ] || fail "If-Match with a wrong ETag returned $code, expected 412"
-
-    s3curl -fsS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/$key" -o /dev/null || fail "conditional probe DELETE failed"
-    ok "server enforces If-None-Match: * (412) and If-Match (200 / 412) — checked sequentially"
-}
-
-# Is the server's conditional evaluation atomic with the write? Two racing
-# conditional PUTs to one fresh key must leave exactly one 200 for a
-# concurrent-safe endpoint (AWS S3 / Cloudflare R2 / SeaweedFS / RustFS
-# evaluate the precondition as part of the write; measured here on this
-# machine). s3mock's PutObject checks the precondition outside its
-# per-object lock (check-then-act), so both racers can be told 200 — on the
-# strict servers that would be a hard failure of the run's contract.
-probe_conditional_atomicity() {
-    local trials=4 t a b both=0 create_dup=0 replace_dup=0 key
-    for t in 1 2 3 4; do
-        key="itest-atomic-probe-$t"
-        (
-            s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-None-Match: *' \
-                --data-binary "racer-a-$t" "$ENDPOINT/$BUCKET/$key" >"$TMP/atomic_a.$t"
-        ) &
-        (
-            s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-None-Match: *' \
-                --data-binary "racer-b-$t" "$ENDPOINT/$BUCKET/$key" >"$TMP/atomic_b.$t"
-        ) &
-        wait
-        a="$(cat "$TMP/atomic_a.$t")"
-        b="$(cat "$TMP/atomic_b.$t")"
-        [ "$a" = "200" ] || [ "$b" = "200" ] || fail "If-None-Match race trial $t: neither racer won ($a/$b)"
-        if [ "$a" = "200" ] && [ "$b" = "200" ]; then
-            both=$((both + 1))
-        fi
-        # If-Match race: two concurrent replaces of one key with the same ETag.
-        key="itest-atomic-probe-replace-$t"
-        s3curl -fsS --max-time 30 -o /dev/null -X PUT --data-binary 'base' "$ENDPOINT/$BUCKET/$key" || fail "atomic probe PUT failed"
-        a="$(s3curl -sS --max-time 30 -D - -o /dev/null -X PUT --data-binary 'base2' "$ENDPOINT/$BUCKET/$key" | tr -d '\r' | awk 'tolower($1) == "etag:" { print $2; exit }')"
-        [ -n "$a" ] || fail "atomic probe: no ETag"
-        (
-            s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H "If-Match: $a" \
-                --data-binary "repl-a-$t" "$ENDPOINT/$BUCKET/$key" >"$TMP/atomic_c.$t"
-        ) &
-        (
-            s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H "If-Match: $a" \
-                --data-binary "repl-b-$t" "$ENDPOINT/$BUCKET/$key" >"$TMP/atomic_d.$t"
-        ) &
-        wait
-        a="$(cat "$TMP/atomic_c.$t")"
-        b="$(cat "$TMP/atomic_d.$t")"
-        [ "$a" = "200" ] || [ "$b" = "200" ] || fail "If-Match race trial $t: neither racer won ($a/$b)"
-        if [ "$a" = "200" ] && [ "$b" = "200" ]; then
-            replace_dup=$((replace_dup + 1))
-        fi
-    done
-    for key in $(list_keys "itest-atomic-probe"); do
-        s3curl -sS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/$key" -o /dev/null || true
-    done
-
-    if [ "$both" = "0" ] && [ "$replace_dup" = "0" ]; then
-        RACE_ATOMIC=1
-        ENFORCE_ATOMIC=1
-        ok "conditional PUTs are atomic under concurrency (4+4 racing trials, exactly one winner each)"
-    else
-        RACE_ATOMIC=0
-        if [ "$STRICT" = "1" ]; then
-            fail "conditional PUTs are NOT atomic on $SERVER (If-None-Match both-200: $both/4, If-Match both-200: $replace_dup/4); this run requires the atomic-conditional contract"
-        fi
-        ENFORCE_ATOMIC=0
-        warn "conditional PUTs are NOT atomic under concurrency on this server"
-        warn "  If-None-Match races with both PUTs answered 200: $both/4"
-        warn "  If-Match races with both PUTs answered 200:      $replace_dup/4"
-        warn "  (s3mock checks the precondition outside the store lock: adobe/S3Mock"
-        warn "   ObjectController.putObject -> verifyObjectMatching, then putObject)"
-        warn "  the race's one-winner-per-version assertion is REPORTED here, not enforced;"
-        warn "  use SERVER=seaweedfs, SERVER=rustfs or AWS S3/R2 (PINKDB_S3_LIVE=1) for the enforced check"
-    fi
-}
-
 # ===========================================================================
 # main
 # ===========================================================================
@@ -737,24 +638,34 @@ printf 'pink-lake real-S3 integration test (SERVER=%s)\n' "$SERVER"
 printf 'repo: %s\n' "$ROOT"
 
 # --- CLI binary ------------------------------------------------------------
+# Whether a CLI build has the lake + s3 features: its `.help` documents an
+# S3 data location for `.lake save`. The help text is captured first, because
+# `grep -q` exiting early would SIGPIPE the CLI and, under `pipefail`, make a
+# matching build look like a failure.
+lake_s3_help() {
+    local help
+    help="$(printf '.help\n.quit\n' | "$1" 2>/dev/null)" || true
+    printf '%s\n' "$help" | grep -qF '.lake save <catalog> [data <dir|s3://bucket/prefix>]'
+}
+
 if [ -n "${PINKDB_BIN:-}" ]; then
     BIN="$PINKDB_BIN"
     [ -x "$BIN" ] || fail "PINKDB_BIN=$BIN is not executable"
-    if ! printf '.help\n.quit\n' | "$BIN" 2>/dev/null | grep -qF 'lake save <dir|s3://bucket/prefix>'; then
-        fail "PINKDB_BIN=$BIN lacks the lake+s3 features (build with --features vortexlake,s3)"
+    if ! lake_s3_help "$BIN"; then
+        fail "PINKDB_BIN=$BIN lacks the lake+s3 features (build with --features pinklake,s3)"
     fi
     note "using PINKDB_BIN=$BIN"
 elif [ "${SKIP_BUILD:-0}" = "1" ]; then
     BIN="$ROOT/target/release/pinkdb"
     [ -x "$BIN" ] || fail "SKIP_BUILD=1 but $BIN does not exist"
-    if ! printf '.help\n.quit\n' | "$BIN" 2>/dev/null | grep -qF 'lake save <dir|s3://bucket/prefix>'; then
-        fail "SKIP_BUILD=1 but $BIN lacks the lake+s3 features (another build may have overwritten it; rebuild with: cargo build --release -p pinkdb-cli --features vortexlake,s3)"
+    if ! lake_s3_help "$BIN"; then
+        fail "SKIP_BUILD=1 but $BIN lacks the lake+s3 features (another build may have overwritten it; rebuild with: cargo build --release -p pinkdb-cli --features pinklake,s3)"
     fi
     note "SKIP_BUILD=1: using $BIN"
 else
-    step "build the CLI (cargo build --release -p pinkdb-cli --features vortexlake,s3)"
-    (cd "$ROOT" && cargo build --release -p pinkdb-cli --features vortexlake,s3) \
-        || fail "cargo build --release -p pinkdb-cli --features vortexlake,s3 failed"
+    step "build the CLI (cargo build --release -p pinkdb-cli --features pinklake,s3)"
+    (cd "$ROOT" && cargo build --release -p pinkdb-cli --features pinklake,s3) \
+        || fail "cargo build --release -p pinkdb-cli --features pinklake,s3 failed"
     BIN="$ROOT/target/release/pinkdb"
     ok "built $BIN"
 fi
@@ -767,13 +678,8 @@ note "endpoint: $ENDPOINT (bucket $BUCKET)"
 wait_ready
 ensure_bucket
 check_signature_enforcement
-check_conditional_writes
-probe_conditional_atomicity
-if [ "$STRICT" = "1" ]; then
-    note "policy: STRICT — one winner per version and catalog==snapshot bytes are hard assertions"
-else
-    note "policy: lenient — duplicates are reported as the measured server limitation"
-fi
+note "policy: the catalog database decides every commit, so the race assertions"
+note "  are hard failures on every endpoint (STRICT adds only the SigV4 check)"
 
 # --- clean slate for the run's prefixes ------------------------------------
 step "clean slate (list + delete of the run's prefixes)"
@@ -820,6 +726,7 @@ assert_contains "$TMP/roundtrip_save.log" "Imported 3 rows"
 # publishes version 2 (documented full-snapshot semantics).
 assert_re "$TMP/roundtrip_save.log" '^Saved lake version 2 in .* \(1 table, 3 rows, [0-9]+ bytes written\)$'
 assert_contains "$TMP/roundtrip_save.log" "lake: $ITEST"
+assert_contains "$TMP/roundtrip_save.log" "Lake $ITEST"   # .lake info reports the data location
 assert_re "$TMP/roundtrip_save.log" '^1$'
 assert_re "$TMP/roundtrip_save.log" '^2 \(current\)$'
 assert_contains "$TMP/roundtrip_save.log" "main.t (3 rows)"
@@ -834,7 +741,8 @@ assert_contains "$TMP/roundtrip_save.log" "tables (1):"
     echo ".quit"
 } | cli_run "$TMP/roundtrip_open.log"
 assert_status_zero "$TMP/roundtrip_open.log" "$?"
-assert_re "$TMP/roundtrip_open.log" "^Opened lake version 2 in .* \(1 table\) from s3://$BUCKET/itest$"
+assert_contains "$TMP/roundtrip_open.log" "Opened lake version 2"
+assert_contains "$TMP/roundtrip_open.log" "(1 table) from $ITEST_CAT"
 
 python3 - "$TMP/roundtrip_open.log" <<'PY' || fail "roundtrip values differ (see the diff above)"
 import sys
@@ -881,22 +789,24 @@ PY
 # Published objects, listed over the REST API (signed for the strict servers):
 # the catalog is a local pinkdb database; S3 holds only data files.
 KEYS="$(list_keys "itest/")" || fail "listing itest/ failed"
-printf '%s\n' "$KEYS" | grep -qE '^itest/data/main\.t/[0-9a-f-]+\.(vortex|pink|parquet)$' \
+printf '%s\n' "$KEYS" | grep -qE '^itest/data/main\.t/[0-9a-f-]+\.(pink|parquet)$' \
     || fail "the roundtrip's data object is missing"
 if printf '%s\n' "$KEYS" | grep -qE 'itest/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
     fail "metadata objects must not be written to S3 anymore: $KEYS"
 fi
+printf '%s\n' "$KEYS" | grep -qxF "itest/lake-data.json" \
+    || fail "the lake-data.json ownership marker is missing"
+assert_listing_count "$KEYS" "itest/" 2
 [ -f "$TMP/itest.pink" ] || [ -f "$TMP/itest.pink.wal" ] \
     || fail "the local pink catalog is missing"
-ok "S3 holds data only; the catalog is the local pink: database"
+ok "S3 holds the marker and one data object; the catalog is the local pink: database"
 
 # --- encrypted roundtrip (PINKDB_KEY) --------------------------------------
 step "encrypted roundtrip: .lake save/open/attach with PINKDB_KEY on $ENC"
-note "a keyed save writes PNKLAKE1 containers (catalog + snapshots + commit"
-note "deltas + data files + delete files); the harness fetches the objects over"
-note "REST and checks they are ciphertext-only, byte-identical as a pair, and"
-note "openable only with the right key. Requires a CLI built with the"
-note 'the `encryption` feature (the CI build is --features vortexlake,s3,encryption);'
+note "a keyed save writes PNKLAKE1 data containers, and a keyed catalog is a"
+note "sealed pink: database on local disk; the harness fetches every enc/ data"
+note "object over REST and checks it is ciphertext-only. Requires a CLI built"
+note 'with the `encryption` feature (the CI build is --features pinklake,s3,encryption);'
 note 'a build without it is reported and skipped.'
 
 ENC_SUPPORTED=0
@@ -904,9 +814,9 @@ if printf '.lake save %s\n.quit\n' "$TMP/enc-probe" | cli_run_keyed "$TMP/enc_pr
     ENC_SUPPORTED=1
     rm -rf "$TMP/enc-probe"
 else
-    if grep -qF 'does not include the `encryption` feature' "$TMP/enc_probe.log"; then
+    if grep -qF 'encryption support is not compiled in' "$TMP/enc_probe.log"; then
         warn 'this CLI build has no `encryption` feature: skipping the encrypted roundtrip'
-        warn "  (build with: cargo build --release -p pinkdb-cli --features vortexlake,s3,encryption)"
+        warn "  (build with: cargo build --release -p pinkdb-cli --features pinklake,s3,encryption)"
     else
         fail "the encryption feature probe failed unexpectedly (see $(basename "$TMP/enc_probe.log"))"
     fi
@@ -926,7 +836,7 @@ ok "keyed save reported the encrypted lake"
 
 # Only data objects live on S3, each a PNKLAKE1 container.
 ENC_KEYS="$(list_keys "enc/")" || fail "listing enc/ failed"
-printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.(vortex|pink|parquet)$' \
+printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.(pink|parquet)$' \
     || fail "the encrypted roundtrip's data object is missing"
 for k in $(printf '%s\n' "$ENC_KEYS" | grep -E '^enc/data/'); do
     s3curl -fsS --max-time 30 -o "$TMP/enc_data.bin" "$ENDPOINT/$BUCKET/$k" \
@@ -951,17 +861,21 @@ assert_contains "$TMP/enc_open.log" "Opened lake version 2"
 assert_contains "$TMP/enc_open.log" "the lake is encrypted at rest with PINKDB_KEY"
 assert_contains "$TMP/enc_open.log" "main.t (3 rows)"
 
-# Attach unseals the footer without a decode.
+# Attach is statistics-only on an encrypted lake too: it unseals the catalog
+# and its statistics and reads no data object, and COUNT(*) is answered from
+# the catalog.
 {
     echo ".lake attach $ENC_CAT"
     echo "SELECT COUNT(*) FROM t;"
     echo ".quit"
 } | cli_run_keyed "$TMP/enc_attach.log" "$ENC_KEY"
 assert_status_zero "$TMP/enc_attach.log" "$?"
-assert_contains "$TMP/enc_attach.log" "the lake is encrypted: attach read the whole ciphertext"
+assert_contains "$TMP/enc_attach.log" "(1 table, statistics-only)"
+assert_contains "$TMP/enc_attach.log" "attach unsealed the catalog and its statistics blocks and read no data file"
+assert_contains "$TMP/enc_attach.log" "│ 3        │"
 
-# The conditional ciphertext CAS is unchanged: a keyed incremental commit on
-# the encrypted prefix publishes a delete file + new data file as containers.
+# A keyed incremental commit on the encrypted prefix publishes a delete file
+# and a new data file as containers; S3 still holds data only.
 {
     echo ".lake attach $ENC_CAT write"
     echo "DELETE FROM t WHERE i = 1;"
@@ -1015,8 +929,6 @@ assert_contains "$TMP/enc_plain_keyed.log" "not an encrypted pink-lake container
     || fail "the plaintext lake's local catalog is missing"
 ok "keyed open of a plaintext lake refused, and the plaintext lake is untouched"
 
-ok "keyed open of a plaintext lake refused, and the plaintext lake is untouched"
-
 fi # ENC_SUPPORTED
 
 # --- concurrency (a): 3 writers x 3 rounds ---------------------------------
@@ -1066,10 +978,15 @@ for f in "$TMP"/conc_r*_w*.log; do
     assert_contains "$f" "Imported $WROWS rows"
 done
 
-python3 - "$TMP" "$ENFORCE_ATOMIC" <<'PY' || fail "the race did not behave as documented (see above)"
+# The documented loser's conflict: the handle check at save start, the store's
+# commit once the head moved, and the engine's write lease, all rendered as
+# "write conflict at <catalog>: …" by the wave-103 catalog database.
+CONFLICT_FORMS=("another writer published version" "the catalog head moved to" "write conflict on" "is busy")
+
+python3 - "$TMP" "${CONFLICT_FORMS[@]}" <<'PY' || fail "the race did not behave as documented (see above)"
 import glob, os, re, sys
 
-tmp, atomic = sys.argv[1], sys.argv[2] == "1"
+tmp, conflict_forms = sys.argv[1], tuple(sys.argv[2:])
 logs = sorted(glob.glob(os.path.join(tmp, "conc_r*_w*.log")))
 if len(logs) != 9:
     print(f"expected 9 writer logs, found {len(logs)}", file=sys.stderr)
@@ -1078,7 +995,6 @@ if len(logs) != 9:
 claims = {}          # version -> [log names that were told they published it]
 conflicts = []
 problems = []
-conflict_forms = ("another writer published version", "already exists", "changed while this save was in flight")
 for log in logs:
     name = os.path.basename(log)
     text = open(log, encoding="utf-8", errors="replace").read()
@@ -1125,6 +1041,9 @@ with open(os.path.join(tmp, "conc.state"), "w", encoding="utf-8") as f:
     f.write(f"final={final}\nclaims={total_claims}\nunique_versions={len(versions)}\n")
     f.write(f"conflicts={len(conflicts)}\nduplicates={len(duplicates)}\n")
     f.write(f"final_claimants={len(claims[final])}\n")
+    m = re.search(r"_w(\d+)\.log$", claims[final][0])
+    if m:
+        f.write(f"final_table=t{m.group(1)}\n")
 
 print(f"  9 save attempts -> {total_claims} claim(s) of {len(versions)} version(s), {len(conflicts)} conflict(s)")
 for v, names in sorted(claims.items()):
@@ -1132,34 +1051,39 @@ for v, names in sorted(claims.items()):
 for name, message in conflicts:
     print(f"    conflict ({name}): {message[:110]}")
 for v, names in duplicates.items():
-    target = sys.stderr if atomic else sys.stdout
-    heading = "DUPLICATE PUBLISH (wrong on an atomic server):" if atomic else "duplicate claim (server quirk):"
-    print(f"    {heading} version {v} claimed by {', '.join(names)}", file=target)
-if duplicates and atomic:
-    print("the server claimed atomic conditionals but let two writers publish one version", file=sys.stderr)
-    sys.exit(1)
+    print(f"    DUPLICATE PUBLISH: version {v} claimed by {', '.join(names)}", file=sys.stderr)
 if duplicates:
-    print("  NOTE: the exactly-one-winner-per-version assertion is NOT enforced on this server")
-    print("        (non-atomic conditionals; see s3_docker_notes.md) — the catalog chain is gapless")
-else:
-    print(f"  ok: exactly one winner per version, no gaps (versions {versions[0]}..{final})")
+    print("two writers published one version: the catalog transaction must make that impossible", file=sys.stderr)
+    sys.exit(1)
+print(f"  ok: exactly one winner per version, no gaps (versions {versions[0]}..{final})")
 print(f"  ok: every loser got the documented write conflict ({len(conflicts)} conflict(s))")
 PY
 
 FINAL="$(sed -n 's/^final=//p' "$TMP/conc.state")"
 CLAIMS="$(sed -n 's/^claims=//p' "$TMP/conc.state")"
-UNIQUE_VERSIONS="$(sed -n 's/^unique_versions=//p' "$TMP/conc.state")"
 RACE_CONFLICTS="$(sed -n 's/^conflicts=//p' "$TMP/conc.state")"
 DUPES="$(sed -n 's/^duplicates=//p' "$TMP/conc.state")"
 RACE_FINAL_CLAIMANTS="$(sed -n 's/^final_claimants=//p' "$TMP/conc.state")"
+RACE_FINAL_TABLE="$(sed -n 's/^final_table=//p' "$TMP/conc.state")"
+RACE_FINAL="$FINAL"
+[ -n "$RACE_FINAL_TABLE" ] || fail "the race state does not name the final claimant's table"
 note "final race version: $FINAL ($CLAIMS claims, $RACE_CONFLICTS conflicts, $DUPES duplicate claim(s), $RACE_FINAL_CLAIMANTS claimant(s))"
 
-# The catalog is one database transaction, so the raced chain has exactly one
-# row per claimed version; the CLI check below reads the typed rows back.
+# The head the race leaves behind is the final claimant's save: its one table
+# and row count, read from the catalog database (no S3 metadata object).
+{ echo ".lake info $CONC_CAT"; echo ".lake tables $CONC_CAT"; echo ".quit"; } \
+    | cli_run "$TMP/conc_head.log"
+assert_status_zero "$TMP/conc_head.log" "$?"
+assert_contains "$TMP/conc_head.log" "current version: $FINAL"
+assert_contains "$TMP/conc_head.log" "Lake $CONC"
+assert_contains "$TMP/conc_head.log" "snapshots:       $FINAL ("
+assert_contains "$TMP/conc_head.log" "main.$RACE_FINAL_TABLE ($WROWS rows)"
+assert_contains "$TMP/conc_head.log" "tables (1):"
+ok "catalog head: v$FINAL, one table (main.$RACE_FINAL_TABLE, $WROWS rows) from the final claimant"
+
 # Reopen and continue (the documented recovery after a conflict): one fresh
-# save settles the chain. Its version has exactly one claimant by
-# construction, so the catalog/snapshot byte-equality below is enforced even
-# on a server with non-atomic conditionals.
+# save settles the chain, and its full-snapshot write replaces the head's
+# table set from that session's store.
 step "settle save after the race (reopen and continue)"
 { echo ".lake info $CONC_CAT"; echo "CREATE TABLE settle (x INTEGER);"; echo "INSERT INTO settle VALUES (7);"; echo ".lake save $CONC_CAT data $CONC"; echo ".quit"; } \
     | cli_run "$TMP/conc_settle.log"
@@ -1200,53 +1124,165 @@ if f"{final} (current)" not in text:
 print(f"  ok: .lake versions lists 1..{final} with {final} marked current")
 PY
 assert_contains "$TMP/conc_metadata.log" "main.settle (1 row)"
+assert_contains "$TMP/conc_metadata.log" "tables (1):"
+# The settle save rewrote the whole lake from its session store, so the head
+# holds exactly that one table — the catalog says so, not an S3 object.
+assert_re "$TMP/conc_metadata.log" '^main\.settle \(1 row\)$'
 
-# catalog.json == snapshots/<final>.json (bytes) for the final version.
-s3curl -fsS --max-time 30 -o "$TMP/conc_catalog.json" "$ENDPOINT/$BUCKET/conc/catalog.json" || fail "fetching conc/catalog.json failed"
-s3curl -fsS --max-time 30 -o "$TMP/conc_snapshot.json" "$ENDPOINT/$BUCKET/conc/snapshots/$FINAL.json" \
-    || fail "fetching conc/snapshots/$FINAL.json failed"
-V_JSON="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$TMP/conc_catalog.json")" \
-    || fail "conc/catalog.json does not parse as JSON"
-[ "$V_JSON" = "$FINAL" ] || fail "catalog.json declares version $V_JSON, expected $FINAL"
-cmp -s "$TMP/conc_catalog.json" "$TMP/conc_snapshot.json" \
-    || fail "conc: catalog.json is not byte-identical to snapshots/$FINAL.json"
-ok "catalog.json == snapshots/$FINAL.json (bytes, version field $V_JSON, single claimant; enforced)"
-
+# The split lake keeps its data under conc/ and nothing else but the
+# `lake-data.json` ownership marker: no catalog, no snapshots, no commits.
 CONC_KEYS="$(list_keys "conc/")" || fail "listing conc/ failed"
-for v in $(seq 1 "$FINAL"); do
-    printf '%s\n' "$CONC_KEYS" | grep -qxF "conc/snapshots/$v.json" \
-        || fail "conc/snapshots/$v.json is missing"
-done
-ok "conc/snapshots/1..$FINAL all exist"
-DATA_COUNT="$(printf '%s\n' "$CONC_KEYS" | grep -cE '^conc/data/')"
-printf '%s\n' "$CONC_KEYS" | grep -qE '^conc/data/main\.[A-Za-z0-9_-]+/[0-9a-f-]+\.vortex$' \
+if printf '%s\n' "$CONC_KEYS" | grep -qE 'conc/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
+    fail "catalog metadata must not be written to S3: $CONC_KEYS"
+fi
+printf '%s\n' "$CONC_KEYS" | grep -qxF "conc/lake-data.json" \
+    || fail "the split lake's lake-data.json ownership marker is missing"
+printf '%s\n' "$CONC_KEYS" | grep -qE '^conc/data/main\.[A-Za-z0-9_-]+/[0-9a-f-]+\.(pink|pinkdel)$' \
     || fail "conc data objects are missing"
-for v in $(seq 2 "$FINAL"); do
-    printf '%s\n' "$CONC_KEYS" | grep -qxF "conc/commits/$v.json" \
-        || fail "conc/commits/$v.json (the v$v delta manifest) is missing"
-done
-ok "conc/commits/2..$FINAL all exist"
-# Every published version above the empty v1 has exactly one referenced data
-# object; a writer that lost after uploading, and an extra claimant of a
-# version on a non-atomic server, may leave unreferenced leftovers
-# (documented, harmless, no GC).
-if [ "$DATA_COUNT" -lt "$((FINAL - 1))" ]; then
-    fail "fewer data objects ($DATA_COUNT) than published versions above v1 ($((FINAL - 1)))"
+DATA_COUNT="$(printf '%s\n' "$CONC_KEYS" | grep -cE '^conc/data/')"
+assert_listing_count "$CONC_KEYS" "conc/" "$((1 + DATA_COUNT))"
+ok "conc/: $DATA_COUNT data object(s) + the lake-data.json marker, no catalog metadata"
+
+# `.lake files` lists the head manifest's files; `all` adds every `data/`
+# object **no retained version references** — the same scan `.lake orphans`
+# deletes. So the head run must name one file that exists in S3, and the two
+# views must agree on the leftovers: the catalog database decides what
+# belongs to the lake, not an S3 metadata object.
+printf '%s\n' "$CONC_KEYS" | grep -E '^conc/data/' | sed 's|^conc/||' >"$TMP/conc_objects.txt"
+{ echo ".lake files $CONC_CAT"; echo ".quit"; } | cli_run "$TMP/conc_files.log"
+assert_status_zero "$TMP/conc_files.log" "$?"
+assert_re "$TMP/conc_files.log" '^data/main\.settle/[0-9a-f-]+\.(pink|parquet): table=main\.settle rows=1 '
+{ echo ".lake files $CONC_CAT all"; echo ".quit"; } | cli_run "$TMP/conc_files_all.log"
+assert_status_zero "$TMP/conc_files_all.log" "$?"
+python3 - "$TMP/conc_files.log" "$TMP/conc_files_all.log" "$TMP/conc_objects.txt" "$FINAL" "$TMP/conc.leftover" <<'PY' || fail "the catalog's files and the S3 objects disagree"
+import re, sys
+
+head_text = open(sys.argv[1], encoding="utf-8").read()
+all_text = open(sys.argv[2], encoding="utf-8").read()
+objects = {l.strip() for l in open(sys.argv[3], encoding="utf-8") if l.strip()}
+final = int(sys.argv[4])
+
+line_re = re.compile(r"^(data/\S+): (.*)$")
+head = []
+for line in head_text.splitlines():
+    m = line_re.match(line)
+    if m:
+        head.append((m.group(1), m.group(2)))
+listed = {}
+summary = None
+for line in all_text.splitlines():
+    m = line_re.match(line)
+    if m:
+        listed[m.group(1)] = "unreferenced" in m.group(2)
+        continue
+    m = re.match(r"^(\d+) files? \((\d+) referenced, (\d+) unreferenced\)$", line)
+    if m:
+        summary = tuple(int(x) for x in m.groups())
+
+problems = []
+if len(head) != 1:
+    problems.append(f"the head lists {len(head)} file(s), expected the settle save's one")
+for path, fields in head:
+    if path not in objects:
+        problems.append(f"the head file {path} is not in the bucket")
+    if "table=main.settle" not in fields or "rows=1" not in fields:
+        problems.append(f"the head file line does not say table=main.settle rows=1: {path}: {fields}")
+if summary is None:
+    problems.append("no `.lake files all` summary line found")
+else:
+    total, referenced, unreferenced = summary
+    if total != len(listed):
+        problems.append(f"summary counts {total} files, listed {len(listed)}")
+    if referenced != 1:
+        problems.append(f"{referenced} files are referenced at the head, expected 1")
+    if unreferenced != sum(1 for p in listed.values() if p):
+        problems.append(f"summary says {unreferenced} unreferenced, listed {sum(1 for p in listed.values() if p)}")
+    if sum(1 for p in listed.values() if not p) != 1:
+        problems.append("`all` must mark exactly the head's file as referenced")
+    claimed = {p for p, unref in listed.items() if not unref}
+    if not claimed <= objects:
+        problems.append(f"referenced but missing from the bucket: {sorted(claimed - objects)[:4]}")
+    if len(objects) != (final - 1) + unreferenced:
+        problems.append(f"the bucket holds {len(objects)} object(s), expected {final - 1} retained file(s) + {unreferenced} leftover(s)")
+if problems:
+    print("`.lake files` vs the conc/ listing:", file=sys.stderr)
+    for p in problems:
+        print("  " + p, file=sys.stderr)
+    sys.exit(1)
+open(sys.argv[5], "w", encoding="utf-8").write(f"{unreferenced}\n")
+print(f"  ok: the head names its one data file; {len(objects)} object(s) = {final - 1} retained + {unreferenced} leftover")
+PY
+CONC_ORPHANS="$(cat "$TMP/conc.leftover")"
+
+# Orphans cleanup: `all` skips the age gate. The dry-run must list exactly the
+# leftovers `.lake files all` reported, the confirm deletes exactly those, and
+# a second dry-run proves that cleanup is idempotent. The catalog's versions
+# and head file must survive both.
+{ echo ".lake orphans $CONC_CAT all dry-run"; echo ".quit"; } | cli_run "$TMP/conc_orphans.log"
+assert_status_zero "$TMP/conc_orphans.log" "$?"
+CONC_LEFTOVER="$(grep -c '^would delete ' "$TMP/conc_orphans.log")"
+[ "$CONC_LEFTOVER" = "$CONC_ORPHANS" ] \
+    || fail ".lake files all saw $CONC_ORPHANS leftover(s), the orphan dry-run would delete $CONC_LEFTOVER"
+if [ "$CONC_LEFTOVER" != "0" ]; then
+    { echo ".lake orphans $CONC_CAT all confirm"; echo ".quit"; } | cli_run "$TMP/conc_orphans_confirm.log"
+    assert_status_zero "$TMP/conc_orphans_confirm.log" "$?"
+    assert_re "$TMP/conc_orphans_confirm.log" "^Deleted $CONC_LEFTOVER objects? from "
+    ok "deleted the $CONC_LEFTOVER leftover data object(s)"
+else
+    assert_contains "$TMP/conc_orphans.log" "Nothing to orphans"
+    ok "no leftover from the losing writers"
 fi
-LEFTOVER_MAX=$((FINAL - 1 + RACE_CONFLICTS + CLAIMS - UNIQUE_VERSIONS))
-if [ "$DATA_COUNT" -gt "$LEFTOVER_MAX" ]; then
-    fail "more data objects ($DATA_COUNT) than referenced + possible leftovers ($LEFTOVER_MAX)"
-fi
-assert_listing_count "$CONC_KEYS" "conc/" "$((3 + FINAL + (FINAL - 1) + DATA_COUNT))"
-ok "conc/data: $DATA_COUNT object(s), $((DATA_COUNT - (FINAL - 1))) unreferenced leftover(s) from conflicted writers"
+{ echo ".lake orphans $CONC_CAT all dry-run"; echo ".quit"; } | cli_run "$TMP/conc_orphans_after.log"
+assert_status_zero "$TMP/conc_orphans_after.log" "$?"
+assert_contains "$TMP/conc_orphans_after.log" "Nothing to orphans"
+ok "a second dry-run finds no orphan (cleanup is exact and idempotent)"
+
+CONC_KEYS="$(list_keys "conc/")" || fail "listing conc/ after cleanup failed"
+DATA_COUNT="$(printf '%s\n' "$CONC_KEYS" | grep -cE '^conc/data/')"
+[ "$DATA_COUNT" = "$((FINAL - 1))" ] \
+    || fail "after cleanup conc/data has $DATA_COUNT object(s); every version above the empty v1 owns exactly one"
+assert_listing_count "$CONC_KEYS" "conc/" "$((1 + FINAL - 1))"
+printf '%s\n' "$CONC_KEYS" | grep -E '^conc/data/' | sed 's|^conc/||' >"$TMP/conc_objects.txt"
+{ echo ".lake versions $CONC_CAT"; echo ".lake files $CONC_CAT all"; echo ".quit"; } | cli_run "$TMP/conc_after.log"
+assert_status_zero "$TMP/conc_after.log" "$?"
+python3 - "$TMP/conc_after.log" "$TMP/conc_objects.txt" "$FINAL" <<'PY' || fail "cleanup disturbed the catalog"
+import re, sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+objects = {l.strip() for l in open(sys.argv[2], encoding="utf-8") if l.strip()}
+final = int(sys.argv[3])
+versions = [int(m.group(1)) for m in re.finditer(r"^(\d+)( \(current\))?$", text, re.M)]
+listed = {m.group(1) for m in re.finditer(r"^(data/\S+): ", text, re.M)}
+summary = re.search(r"^(\d+) files? \((\d+) referenced, (\d+) unreferenced\)$", text, re.M)
+problems = []
+if versions != list(range(1, final + 1)):
+    problems.append(f".lake versions listed {versions}, expected 1..{final}")
+if f"{final} (current)" not in text:
+    problems.append(f".lake versions did not mark {final} as current")
+if len(objects) != final - 1:
+    problems.append(f"the bucket holds {len(objects)} data object(s), expected {final - 1}")
+if summary is None:
+    problems.append("no `.lake files all` summary line found")
+else:
+    total, referenced, unreferenced = (int(x) for x in summary.groups())
+    if (total, referenced, unreferenced) != (1, 1, 0):
+        problems.append(f"after cleanup expected 1 file (1 referenced, 0 unreferenced), got {total}/{referenced}/{unreferenced}")
+if not listed <= objects:
+    problems.append(f"listed but missing from the bucket: {sorted(listed - objects)[:4]}")
+if problems:
+    print("after cleanup:", file=sys.stderr)
+    for p in problems:
+        print("  " + p, file=sys.stderr)
+    sys.exit(1)
+print(f"  ok: cleanup left versions 1..{final} and their {final - 1} data files intact")
+PY
 
 # --- concurrency (b): a slow save deterministically loses one version ------
 step "concurrency (b): slow save vs quick save for the same next version on $CONFLICT"
 note "the slow writer opens the lake at v2 and encodes $SLOWROWS rows; the quick"
-note "writer publishes v3 while it is busy. Exactly one of them may win v3; the"
-note "loser must get a documented write conflict (this is deterministic by"
-note "construction: the winner's snapshot is already published when the slow"
-note "writer gets to its own snapshot PUT — no atomicity needed for that PUT)."
+note "writer publishes v3 while it is busy. Exactly one of them may win v3: the"
+note "catalog transaction rejects the other one's commit with the moved-head"
+note "conflict (deterministic once the quick writer's commit lands first)."
 note "SLOWROWS is sized so the slow save is still in flight when the quick"
 note "writer reads the catalog even on a fast local server (measured: a local"
 note "RustFS saves 400k rows in ~0.1s, which was too short)."
@@ -1291,10 +1327,10 @@ wait "$SLOW_PID"
 # python block below classifies its log (exactly one error: the documented
 # write conflict). The exit file is kept for diagnostics only.
 
-python3 - "$TMP" <<'PY' || fail "the slow-save conflict did not behave as documented (see above)"
+python3 - "$TMP" "${CONFLICT_FORMS[@]}" <<'PY' || fail "the slow-save conflict did not behave as documented (see above)"
 import os, re, sys
 
-tmp = sys.argv[1]
+tmp, conflict_forms = sys.argv[1], tuple(sys.argv[2:])
 logs = {name: open(os.path.join(tmp, f"conflict_{name}.log"), encoding="utf-8", errors="replace").read()
         for name in ("slow", "quick")}
 saved = {name: [int(v) for v in re.findall(r"^Saved lake version (\d+)\b", text, re.M)]
@@ -1327,9 +1363,7 @@ if len(errors[loser]) != 1:
     print(f"{loser}: expected one error line, got {errors[loser]}", file=sys.stderr)
     sys.exit(1)
 message = errors[loser][0]
-if "write conflict at" not in message or not any(
-    p in message for p in ("snapshot 3 already exists", "another writer published version", "changed while this save was in flight")
-):
+if "write conflict at" not in message or not any(p in message for p in conflict_forms):
     print(f"{loser}: unexpected conflict message: {message}", file=sys.stderr)
     sys.exit(1)
 with open(os.path.join(tmp, "conflict.state"), "w", encoding="utf-8") as f:
@@ -1339,27 +1373,35 @@ print(f"  ok: the {loser} save got the documented conflict: {message[:110]}")
 PY
 WINNER="$(sed -n 's/^winner=//p' "$TMP/conflict.state")"
 
-s3curl -fsS --max-time 30 -o "$TMP/conflict_catalog.json" "$ENDPOINT/$BUCKET/conflict/catalog.json" || fail "fetching conflict/catalog.json failed"
-s3curl -fsS --max-time 30 -o "$TMP/conflict_snapshot.json" "$ENDPOINT/$BUCKET/conflict/snapshots/3.json" \
-    || fail "fetching conflict/snapshots/3.json failed"
-cmp -s "$TMP/conflict_catalog.json" "$TMP/conflict_snapshot.json" \
-    || fail "conflict: catalog.json is not byte-identical to snapshots/3.json"
-ok "catalog.json == snapshots/3.json (bytes; single claimant; enforced)"
+CONFLICT_KEYS="$(list_keys "conflict/")" || fail "listing conflict/ failed"
+if printf '%s\n' "$CONFLICT_KEYS" | grep -qE 'conflict/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
+    fail "catalog metadata must not be written to S3: $CONFLICT_KEYS"
+fi
+printf '%s\n' "$CONFLICT_KEYS" | grep -qE '^conflict/data/main\.(tslow|tquick)/[0-9a-f-]+\.(pink|pinkdel)$' \
+    || fail "the conflict run's data objects are missing"
+ok "conflict/: data objects only, no catalog metadata (a loser's upload, if any, is a documented orphan)"
 
-{ echo ".lake versions $CONFLICT_CAT"; echo ".lake tables $CONFLICT_CAT"; echo ".lake open $CONFLICT_CAT"; echo ".quit"; } \
+{ echo ".lake versions $CONFLICT_CAT"; echo ".lake info $CONFLICT_CAT"; echo ".lake tables $CONFLICT_CAT"; echo ".lake open $CONFLICT_CAT"; echo ".quit"; } \
     | cli_run "$TMP/conflict_state.log"
 assert_status_zero "$TMP/conflict_state.log" "$?"
 assert_re "$TMP/conflict_state.log" '^3 \(current\)$'
 assert_no_match "$TMP/conflict_state.log" '^4'
+assert_contains "$TMP/conflict_state.log" "snapshots:       3 (1, 2, 3)"
 assert_re "$TMP/conflict_state.log" '^main\.t'"$WINNER"' \([0-9]+ rows\)$'
-assert_re "$TMP/conflict_state.log" "^Opened lake version 3 in .* \(1 table\) from s3://$BUCKET/conflict$"
+assert_contains "$TMP/conflict_state.log" "(1 table) from $CONFLICT_CAT"
 
 # --- refusal ---------------------------------------------------------------
-step "refusal: second .lake save and a planted stray snapshot on $REFUSE"
-note "the CLI opens a fresh lake handle per .lake save, so a stale-handle"
-note "conflict is not reachable from the REPL; a second save publishes a new"
-note "version (documented full-snapshot semantics), and the CLI-reachable"
-note "conflict is the snapshot-exists refusal asserted below."
+step "refusal: an s3:// URL is a data location, not a lake"
+note "since wave 103 a lake's catalog is a database (pink:<path>, sqlite:,"
+note "postgres://); an s3:// location alone is refused with a pointer to the"
+note "split form. A second .lake save in the same session reopens the catalog"
+note "and publishes the next version (full-snapshot semantics)."
+
+{ echo ".lake open $REFUSE"; echo ".lake save $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_s3.log"
+[ "$?" != "0" ] || fail "opening a lake by an s3:// location alone must fail"
+assert_contains "$TMP/refuse_s3.log" "is a data location, not a lake catalog"
+assert_contains "$TMP/refuse_s3.log" ".lake save pink:lake.pink data $REFUSE"
+ok "s3:// alone is refused as a lake (both .lake open and .lake save)"
 
 {
     echo ".import $CSV t"
@@ -1375,32 +1417,24 @@ assert_re "$TMP/refuse_twice.log" '^2$'
 assert_re "$TMP/refuse_twice.log" '^3 \(current\)$'
 ok "a second .lake save in the same session published version 3 (no stale view)"
 
-# Plant an unpublished stray at exactly the next version: the save must
-# refuse to replace it instead of clobbering (either an existing snapshot or a
-# crash leftover).
-s3curl -fsS --max-time 30 -X PUT --data-binary 'not a manifest' \
-    "$ENDPOINT/$BUCKET/refuse/snapshots/4.json" -o /dev/null || fail "planting the stray snapshot failed"
-ok "planted stray refuse/snapshots/4.json"
-
-{ echo ".lake save $REFUSE_CAT data $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_stray.log"
-# The refusal is the expected outcome: since wave 40b the CLI exits 1 after a
-# failed statement in a piped script; the message asserts below pin it.
-assert_contains "$TMP/refuse_stray.log" "Error: write conflict at"
-assert_contains "$TMP/refuse_stray.log" "snapshot 4 already exists"
-assert_contains "$TMP/refuse_stray.log" "refusing to replace a published version"
-
 { echo ".lake versions $REFUSE_CAT"; echo ".quit"; } | cli_run "$TMP/refuse_versions.log"
 assert_status_zero "$TMP/refuse_versions.log" "$?"
 assert_re "$TMP/refuse_versions.log" '^3 \(current\)$'
 assert_no_match "$TMP/refuse_versions.log" '^4'
-ok "the unpublished stray is not advertised (.lake versions stays 1..3)"
+ok "the refused s3:// attempt published nothing (.lake versions stays 1..3)"
 
-s3curl -fsS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/refuse/snapshots/4.json" -o /dev/null \
-    || fail "removing the stray snapshot failed"
 { echo ".lake save $REFUSE_CAT data $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_retry.log"
 assert_status_zero "$TMP/refuse_retry.log" "$?"
 assert_re "$TMP/refuse_retry.log" '^Saved lake version 4 in '
-ok "after removing the stray, the next save published version 4"
+ok "the split form still publishes: version 4"
+
+REFUSE_KEYS="$(list_keys "refuse/")" || fail "listing refuse/ failed"
+if printf '%s\n' "$REFUSE_KEYS" | grep -qE 'refuse/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
+    fail "catalog metadata must not be written to S3: $REFUSE_KEYS"
+fi
+printf '%s\n' "$REFUSE_KEYS" | grep -qxF "refuse/lake-data.json" \
+    || fail "the refuse/ ownership marker is missing"
+ok "refuse/: data + the lake-data.json marker only"
 
 # --- summary ---------------------------------------------------------------
 step "summary"
@@ -1411,29 +1445,24 @@ else
     printf '  signatures:    not verified by this endpoint (unsigned accepted; reported, not asserted — see s3_docker_notes.md)\n'
 fi
 if [ "$STRICT" = "1" ]; then
-    printf '  enforcement:   STRICT — one winner per version and catalog == snapshot bytes are hard assertions\n'
+    printf '  enforcement:   STRICT — SigV4 asserted; catalog/race assertions are hard failures everywhere\n'
 else
-    printf '  enforcement:   lenient — duplicate race publications reported as the measured s3mock limitation\n'
+    printf '  enforcement:   lenient — SigV4 reported, not asserted; catalog/race assertions are hard failures everywhere\n'
 fi
-printf '  roundtrip:     version 2, 3 rows round-tripped through a fresh process; 4 objects listed over REST\n'
-if [ "$DUPES" = "0" ]; then
-    printf '  concurrency:   race: 9 attempts, %s claims, %s conflict(s), one winner per version;\n' "$CLAIMS" "$RACE_CONFLICTS"
-else
-    printf '  concurrency:   race: 9 attempts, %s claims, %s conflict(s), %s duplicate claim(s) — server non-atomic;\n' \
-        "$CLAIMS" "$RACE_CONFLICTS" "$DUPES"
-fi
-printf '                 slow-vs-quick: exactly one winner of v3 (the %s save), loser conflicted; catalog == snapshots/3.json\n' "$WINNER"
-printf '                 settle save after the race: version %s alone; catalog == snapshots/%s.json\n' "$FINAL" "$FINAL"
-printf '  refusal:       second save -> v3 (new version); stray snapshot -> write conflict; removed -> v4\n'
+printf '  roundtrip:     version 2, 3 rows round-tripped through a fresh process; 2 objects on S3\n'
+printf '                 (the lake-data.json owner marker + one data object)\n'
+printf '  concurrency:   race: 9 attempts, %s claims, %s conflict(s), %s duplicate claim(s);\n' \
+    "$CLAIMS" "$RACE_CONFLICTS" "$DUPES"
+printf '                 versions 1..%s gapless; head = final claimant table; settle save -> v%s\n' \
+    "$RACE_FINAL" "$FINAL"
+printf '                 slow-vs-quick: exactly one winner of v3 (the %s save), loser conflicted\n' "$WINNER"
+printf '                 conc/data: %s retained file(s); %s leftover(s) from losing writers cleaned\n' \
+    "$((FINAL - 1))" "$CONC_LEFTOVER"
+printf '  refusal:       s3:// alone refused (not a catalog); second save -> v3; split form -> v4\n'
 if [ "$ENC_SUPPORTED" = "1" ]; then
     printf '  encrypted:     PINKDB_KEY save/commit/open/attach round trip; ciphertext-only objects;\n'
-    printf '                 catalog == snapshot bytes under encryption; no/wrong key refused; a plaintext\n'
-    printf '                 lake is never rewritten\n'
+    printf '                 sealed catalog; no/wrong key refused; a plaintext lake is never rewritten\n'
 else
     printf '  encrypted:     SKIPPED (this CLI build has no `encryption` feature)\n'
 fi
-printf '\nALL CHECKS PASSED'
-if [ "$DUPES" != "0" ]; then
-    printf ' (the exactly-one-winner race assertion is not enforced on this non-atomic server)'
-fi
-printf '\n'
+printf '\nALL CHECKS PASSED\n'

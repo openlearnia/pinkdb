@@ -1,10 +1,9 @@
 //! Wave 88: mixed lakes — one catalog holding tables in different data-file
 //! formats.
 //!
-//! The dev-dependency enables pink-lake's `vortexlake` feature, so this test
-//! builds with both the built-in Vortex provider and the Parquet provider in
-//! one process. It covers the plan's mixed-lake contract: three tables in
-//! `pink`, `vortex` and `parquet` round-trip through save/open; attach answers
+//! The built-in `.pink` provider and the Parquet provider share one process,
+//! so this test covers the plan's mixed-lake contract: tables in `pink` and
+//! `parquet` round-trip through save/open; attach answers
 //! the same COUNT/MIN/MAX facts as open for each table; appends keep each
 //! table's format even when the handle's write format differs; a
 //! whole-store save with a different handle default keeps every existing
@@ -39,11 +38,7 @@ fn cleanup(dir: &Path) {
 
 fn register_providers() {
     register().unwrap();
-    assert!(
-        pink_lake::format::lake_format("vortex").is_some(),
-        "the mixed-lake test needs pink-lake's `vortexlake` feature (enabled by this crate's \
-         dev-dependency)"
-    );
+    assert!(pink_lake::format::lake_format("pink").is_some());
     assert!(pink_lake::format::lake_format(FORMAT_ID).is_some());
 }
 
@@ -81,7 +76,6 @@ fn add_table(db: &mut PinkDb, name: &str, start: i32, count: i32) {
 fn mixed_store() -> PinkDb {
     let mut db = PinkDb::new();
     add_table(&mut db, "as_pink", 0, 3);
-    add_table(&mut db, "as_vortex", 100, 3);
     add_table(&mut db, "as_parquet", 200, 3);
     db
 }
@@ -181,7 +175,7 @@ fn assert_no_pin_field(catalog: &serde_json::Value) {
 }
 
 /// Every table of the mixed store answers the same COUNT/MIN/MAX facts from
-/// `.lake attach` (manifest blocks + Vortex footers) as from `.lake open`.
+/// `.lake attach` (manifest statistics blocks) as from `.lake open`.
 fn assert_open_attach_agree(lake: &Lake, tables: &[&str]) {
     let attachment = lake.attach(None).unwrap();
     let mut attached = PinkDb::new();
@@ -206,20 +200,17 @@ fn mixed_formats_round_trip_appends_and_pins() {
     let lake_dir = dir.join("lake");
     let source = mixed_store();
 
-    // Save three tables, each with its own per-table choice. The handle's
-    // write format stays at the build default (vortex in this test build), so
-    // the pink and parquet choices must win.
+    // Save two tables, each with its own per-table choice. The handle's
+    // write format stays at the build default (`pink`), so the parquet choice
+    // must win for its table.
     let mut lake = Lake::create(&lake_dir).unwrap();
     lake.set_table_format("main", "as_pink", "pink").unwrap();
-    lake.set_table_format("main", "as_vortex", "vortex")
-        .unwrap();
     lake.set_table_format("main", "as_parquet", FORMAT_ID)
         .unwrap();
     lake.write_from_store_report(&source).unwrap();
 
     let catalog = read_catalog(&lake_dir);
     assert_format(&catalog, "main.as_pink", "pink", "pink");
-    assert_format(&catalog, "main.as_vortex", "vortex", "vortex");
     assert_format(&catalog, "main.as_parquet", FORMAT_ID, "parquet");
     assert_no_pin_field(&catalog);
 
@@ -227,25 +218,23 @@ fn mixed_formats_round_trip_appends_and_pins() {
     let reopened = Lake::open(&lake_dir).unwrap();
     let opened = reopened.load(None).unwrap();
     assert_store_equal(&source, &opened, "mixed lake open");
-    assert_open_attach_agree(&reopened, &["as_pink", "as_vortex", "as_parquet"]);
+    assert_open_attach_agree(&reopened, &["as_pink", "as_parquet"]);
 
     // Appends keep each table's format, whatever the handle's write
-    // format says (set here to parquet, which differs from pink and vortex).
+    // format says (set here to parquet, which differs from pink).
     let mut lake = Lake::open(&lake_dir).unwrap();
     lake.set_write_format(FORMAT_ID).unwrap();
     lake.set_data_inlining_row_limit(0);
     let mut commit = Commit::new();
     commit.append("main.as_pink", rows_table(10, 2));
-    commit.append("main.as_vortex", rows_table(110, 2));
     commit.append("main.as_parquet", rows_table(210, 2));
     let report = lake.commit(&commit).unwrap();
     assert!(report.committed, "{report:?}");
-    assert_eq!(report.data_files, 3, "{report:?}");
+    assert_eq!(report.data_files, 2, "{report:?}");
 
     let catalog = read_catalog(&lake_dir);
     for (key, id, extension) in [
         ("main.as_pink", "pink", "pink"),
-        ("main.as_vortex", "vortex", "vortex"),
         ("main.as_parquet", FORMAT_ID, "parquet"),
     ] {
         assert_eq!(entry_format(&catalog, key), id, "{catalog}");
@@ -257,14 +246,14 @@ fn mixed_formats_round_trip_appends_and_pins() {
     }
     let reopened = Lake::open(&lake_dir).unwrap();
     let appended = reopened.load(None).unwrap();
-    for table in ["as_pink", "as_vortex", "as_parquet"] {
+    for table in ["as_pink", "as_parquet"] {
         assert_eq!(
             appended.table_in("main", table).unwrap().num_rows(),
             5,
             "{table}"
         );
     }
-    assert_open_attach_agree(&reopened, &["as_pink", "as_vortex", "as_parquet"]);
+    assert_open_attach_agree(&reopened, &["as_pink", "as_parquet"]);
 
     // A commit that creates a table honors the handle's per-table choice
     // (the handle-wide write format would have said parquet).
@@ -287,7 +276,6 @@ fn mixed_formats_round_trip_appends_and_pins() {
     lake.write_from_store_report(&store).unwrap();
     let catalog = read_catalog(&lake_dir);
     assert_format(&catalog, "main.as_pink", "pink", "pink");
-    assert_format(&catalog, "main.as_vortex", "vortex", "vortex");
     assert_format(&catalog, "main.as_parquet", FORMAT_ID, "parquet");
     assert_format(&catalog, "main.committed", "pink", "pink");
     // The different handle default re-encoded none of them.
@@ -306,7 +294,6 @@ fn mixed_formats_round_trip_appends_and_pins() {
     let catalog = read_catalog(&lake_dir);
     assert_format(&catalog, "main.fresh", "pink", "pink");
     assert_format(&catalog, "main.as_pink", "pink", "pink");
-    assert_format(&catalog, "main.as_vortex", "vortex", "vortex");
     assert_format(&catalog, "main.as_parquet", FORMAT_ID, "parquet");
     assert_format(&catalog, "main.committed", "pink", "pink");
     assert_no_pin_field(&catalog);
@@ -317,7 +304,7 @@ fn mixed_formats_round_trip_appends_and_pins() {
     // last: the catalog is deliberately left with a broken entry.)
     pink_lake::catalog_set_table_format(
         &format!("pink:{}", lake_dir.display()),
-        "main.as_vortex",
+        "main.as_parquet",
         "no-such-format",
     )
     .unwrap();
@@ -325,8 +312,8 @@ fn mixed_formats_round_trip_appends_and_pins() {
     let unavailable = lake.unavailable_tables().unwrap();
     let broken = unavailable
         .iter()
-        .find(|u| u.table == "main.as_vortex")
-        .unwrap_or_else(|| panic!("main.as_vortex must be unavailable: {unavailable:?}"));
+        .find(|u| u.table == "main.as_parquet")
+        .unwrap_or_else(|| panic!("main.as_parquet must be unavailable: {unavailable:?}"));
     assert_eq!(broken.format, "no-such-format");
     assert!(
         matches!(broken.error, LakeError::UnknownFormat { .. }),
@@ -335,7 +322,7 @@ fn mixed_formats_round_trip_appends_and_pins() {
     );
     let loaded = lake.load(None).unwrap();
     assert!(
-        !loaded.list_tables().contains(&"as_vortex".to_string()),
+        !loaded.list_tables().contains(&"as_parquet".to_string()),
         "the unreadable table is skipped"
     );
     assert_eq!(
@@ -346,14 +333,14 @@ fn mixed_formats_round_trip_appends_and_pins() {
     let attachment = lake.attach(None).unwrap();
     let text = attachment
         .lake
-        .load("main", "as_vortex")
+        .load("main", "as_parquet")
         .unwrap_err()
         .to_string();
-    assert!(text.contains("main.as_vortex"), "{text}");
+    assert!(text.contains("main.as_parquet"), "{text}");
     assert!(text.contains("no-such-format"), "{text}");
     let mut lake = Lake::open(&lake_dir).unwrap();
     let err = lake
-        .merge_adjacent_files(Some("main.as_vortex"), &MergeSettings::default())
+        .merge_adjacent_files(Some("main.as_parquet"), &MergeSettings::default())
         .unwrap_err();
     assert!(matches!(err, LakeError::UnknownFormat { .. }), "{err:?}");
 
@@ -370,11 +357,11 @@ fn rewrite_converts_one_table_and_reads_agree() {
     add_table(&mut source, "u", 100, 4);
 
     let mut lake = Lake::create(&lake_dir).unwrap();
-    lake.set_table_format("main", "t", "vortex").unwrap();
+    lake.set_table_format("main", "t", "pink").unwrap();
     lake.set_table_format("main", "u", FORMAT_ID).unwrap();
     lake.write_from_store_report(&source).unwrap();
     let reopened = Lake::open(&lake_dir).unwrap();
-    assert_format(&read_catalog(&lake_dir), "main.t", "vortex", "vortex");
+    assert_format(&read_catalog(&lake_dir), "main.t", "pink", "pink");
     assert_open_attach_agree(&reopened, &["t", "u"]);
 
     // Give the table a second file and a positional delete, so the conversion
@@ -405,7 +392,7 @@ fn rewrite_converts_one_table_and_reads_agree() {
         5
     );
 
-    // Convert `t` from vortex to parquet in one maintenance version.
+    // Convert `t` from pink to parquet in one maintenance version.
     let report = lake.rewrite_table_format("main", "t", FORMAT_ID).unwrap();
     assert!(report.committed, "{report:?}");
     assert_eq!(report.files_processed(), 2, "{report:?}");

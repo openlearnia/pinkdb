@@ -86,8 +86,8 @@ impl LocalStorage {
     /// a unique `<name>.<uuid>.tmp` sibling, fsync, rename over `rel`, then
     /// a best-effort parent-directory fsync. A crash before the rename
     /// leaves only an unreferenced `.tmp` file. Used by the catalog and by
-    /// v2 Vortex data files; the snapshot path refuses to replace an
-    /// existing version.
+    /// data files; the snapshot path refuses to replace an existing
+    /// version.
     fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
         let path = self.checked_path(rel)?;
         self.ensure_parent(&path)?;

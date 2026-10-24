@@ -1,13 +1,11 @@
 //! Per-file zone maps and file pruning (wave 66; the deferred lake-scan
 //! stage 3).
 //!
-//! Every data file a v4 lake publishes carries a **zone map**: the exact
-//! per-column `(null count, min, max)` facts of the rows it holds. For a
-//! `.pink` file those facts ride in the CRC-protected per-file statistics
-//! block the manifest already publishes; for a Vortex file they are
-//! published in the same catalog block (cross-checked against the file's own
-//! footer at attach). A file written before wave 66 simply has no catalog
-//! zone map and can never be pruned — never a guess.
+//! Every data file a lake publishes carries a **zone map**: the exact
+//! per-column `(null count, min, max)` facts of the rows it holds. Those
+//! facts ride in the CRC-protected per-file statistics block the catalog
+//! already publishes. A file written without a zone map can never be pruned
+//! — never a guess.
 //!
 //! A scan with simple `WHERE` conjuncts may then **skip whole data files
 //! without decoding them**: a file is pruned when the zone map proves no row

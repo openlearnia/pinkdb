@@ -195,9 +195,8 @@ fn sweep_dir(base: &Path, min_age: std::time::Duration) {
 
 /// One backend of lake objects: a local directory or an S3 bucket+prefix.
 ///
-/// All paths are lake-relative (`catalog.json`, `snapshots/<v>.json`,
-/// `data/<table>/<uuid>.vortex`); [`Storage::abs`] turns one into the
-/// backend's absolute form for error messages.
+/// All paths are lake-relative (`data/<table>/<uuid>.pink`); [`Storage::abs`]
+/// turns one into the backend's absolute form for error messages.
 ///
 /// `Send + Sync` because one handle is shared (`Arc`) with an attached-lake
 /// handle the engine may read through from more than one thread.
@@ -274,9 +273,8 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
     /// [`Storage::put`] for content produced by `fill` into a sink, with the
     /// same atomicity; returns the bytes written. The default buffers the
     /// whole object (object storage needs it for one PUT); the local backend
-    /// streams it straight into its fsynced temp file. Used by the
-    /// `vortexlake` writer; a lean build's v1 writer puts whole buffers.
-    #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
+    /// streams it straight into its fsynced temp file.
+    #[allow(dead_code)]
     fn put_streamed(
         &self,
         rel: &str,
@@ -316,12 +314,11 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
     /// loader uses this: the engine opens files by path.
     fn local_copy(&self, rel: &str, context: &str) -> Result<LocalCopy>;
 
-    /// The object's real filesystem path, when the backend is local: the
-    /// footer-only attach opens a data file with positioned reads through
-    /// this. Object storage answers `None` (no ranged reads in this build),
-    /// and the caller falls back to reading the whole object. Used by the
-    /// `vortexlake` (attach/Vortex) read paths only.
-    #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
+    /// The object's real filesystem path, when the backend is local: a
+    /// projected read opens a data file with positioned reads through this.
+    /// Object storage answers `None` (no ranged reads in this build), and the
+    /// caller falls back to reading the whole object.
+    #[allow(dead_code)]
     fn local_path(&self, _rel: &str) -> Option<PathBuf> {
         None
     }

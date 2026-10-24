@@ -21,7 +21,7 @@ opens need only the catalog.</p>
 
 <pre class="code" data-lang="text"><code>mylake.pink                          catalog database
 mylake.pink.files/data/&lt;table&gt;/…     immutable data files
-                                     (.pink, Vortex or Parquet)</code></pre>
+                                     (.pink or Parquet)</code></pre>
 
 <p>Metadata and data may live apart: a catalog on local disk or Postgres, data on
 S3. A lone <code>s3://…</code> URL is <em>not</em> a lake — always give the catalog
@@ -61,8 +61,6 @@ typed snapshots, not a rendered manifest.</p>
 <ul>
   <li><code>.pink</code> (<code>PINKDB06</code>) is always available and carries a
   statistics block per file.</li>
-  <li>Vortex with the <code>vortexlake</code> feature: footer-only attach and
-  ranged reads.</li>
   <li>Parquet with the <code>parquetlake</code> feature (and DuckDB interop).</li>
 </ul>
 

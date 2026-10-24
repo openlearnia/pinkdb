@@ -1,13 +1,11 @@
 //! CLI coverage for the `pinklake` feature: `.lake save/open/versions/
-//! tables/info` end to end over v1 `.pink` data files (no Vortex),
-//! `.lake attach` over the published statistics block, the refusal of a
-//! stats-less v1 lake and of a v2/v3 Vortex lake, and the `s3` variant.
+//! tables/info` end to end over `.pink` data files, `.lake attach` over the
+//! published statistics block, and the `s3` variant.
 //!
-//! This file only compiles when `pinklake` is on and `vortexlake` (the
-//! Vortex-enabled feature) is not; the feature-on behavior is covered by
-//! `tests/lake.rs` and `tests/lake_s3.rs`.
+//! `tests/lake.rs` covers the broader CLI surface; this file focuses on the
+//! statistics-only attach and the saved shapes.
 
-#![cfg(all(feature = "pinklake", not(feature = "vortexlake")))]
+#![cfg(feature = "pinklake")]
 
 #[cfg(feature = "s3")]
 #[path = "../../pink-lake/src/mock_s3.rs"]
@@ -109,7 +107,7 @@ fn data_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `.lake save` publishes a v1 lake (no Vortex anywhere), `.lake open` loads
+/// `.lake save` publishes a `.pink` lake, `.lake open` loads
 /// it back, and the metadata commands describe it.
 #[test]
 fn lean_save_open_versions_tables_info() {
@@ -156,17 +154,17 @@ fn lean_save_open_versions_tables_info() {
     }
     cleanup(&dir);
 
-    // The `--features pinklake` help describes the pinklake build and
-    // offers `.lake attach` (over the v1 statistics block).
+    // The `--features pinklake` help describes the lake build and offers
+    // `.lake attach` (statistics-only).
     let help = run(".help\n.quit\n");
     assert!(help.contains(".lake save"), "{help}");
-    assert!(help.contains("pinklake build"), "{help}");
+    assert!(help.contains("catalog format_version 7"), "{help}");
     assert!(
         help.contains(".lake attach "),
         "help must offer attach in a pinklake build (statistics-only):\n{help}"
     );
     assert!(
-        !help.contains("needs the `pinklake` or `vortexlake` feature"),
+        !help.contains("needs the `pinklake` feature"),
         "help must not claim the lake commands are missing:\n{help}"
     );
 }
@@ -319,10 +317,6 @@ fn lean_s3_save_open_roundtrip() {
         "expected `.pink` objects: {keys:?}"
     );
     cleanup(&dir);
-    assert!(
-        !keys.iter().any(|k| k.ends_with(".vortex")),
-        "a lean build must write no Vortex objects: {keys:?}"
-    );
 }
 
 /// `.lake partition` in the lean build (wave 66): `.pink` commits split by
@@ -406,7 +400,7 @@ fn lean_maintenance_merge_expire_cleanup() {
     assert!(out.contains("Deleted 2 objects from"), "{out}");
     assert!(out.contains("Opened lake version 4"), "{out}");
     assert!(!out.contains("Error:"), "{out}");
-    // The consolidated data file is a lean `.pink` file; no Vortex anywhere.
+    // The consolidated data file is a `.pink` file.
     let data: Vec<String> =
         std::fs::read_dir(PathBuf::from(format!("{}.files", lake.display())).join("data/main.t"))
             .unwrap()

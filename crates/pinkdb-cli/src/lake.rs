@@ -1,9 +1,8 @@
 //! `.lake` dot-commands: snapshot the in-memory store into a pinkdb lake and
 //! load versions back.
 //!
-//! Built with the `vortexlake` feature (Vortex data files, format_version 4,
-//! `.lake attach` over footers) or `pinklake` (`.pink` data files,
-//! format_version 4, `.lake attach` over the published statistics blocks).
+//! Built with the `pinklake` feature (`.pink` data files, catalog
+//! format_version 7, `.lake attach` over the published statistics blocks).
 //!
 //! The lake itself lives in the `pink-lake` crate; this module is only the
 //! REPL surface. A lake is a catalog (`pink:`, `sqlite:` or `postgres://`)
@@ -275,8 +274,8 @@ fn writables() -> MutexGuard<'static, BTreeMap<String, WritableAttachment>> {
 
 /// The session's `.lake format <id>` choice: the data-file format every
 /// subsequent full save / commit / inlined flush writes. `None` keeps the
-/// build default (`vortex` with `vortexlake`, else `pink`). Per session, not
-/// persisted (a lake's existing files keep their entry's format).
+/// build default (`.pink`). Per session, not persisted (a lake's existing
+/// files keep their entry's format).
 static WRITE_FORMAT: Mutex<Option<String>> = Mutex::new(None);
 
 /// The session's `.lake format <id> for <db.table>` choices (wave 88):
@@ -316,23 +315,15 @@ fn table_format_choices() -> BTreeMap<String, String> {
 }
 
 /// The build's default write format, matching `pink-lake`'s choice.
-fn default_write_format_id() -> &'static str {
-    if cfg!(feature = "vortexlake") {
-        "vortex"
-    } else {
-        "pink"
-    }
-}
-
 fn current_write_format_id() -> String {
-    chosen_write_format().unwrap_or_else(|| default_write_format_id().to_string())
+    chosen_write_format().unwrap_or_else(|| "pink".to_string())
 }
 
 /// The ids this binary has providers for. The lake registry is keyed and has
-/// no listing API; these are the three ids any pinkdb build can register
-/// (`pink` always, `vortex` with `vortexlake`, `parquet` with `parquetlake`).
+/// no listing API; these are the ids any pinkdb build can register (`pink`
+/// always, `parquet` with `parquetlake`).
 fn registered_format_ids() -> Vec<&'static str> {
-    ["pink", "vortex", "parquet"]
+    ["pink", "parquet"]
         .into_iter()
         .filter(|id| pink_lake::format::lake_format(id).is_some())
         .collect()
@@ -431,25 +422,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
     }
 }
 
-/// The `data <location>` option in usage text: offered only by a build that
-/// accepts a SQL catalog (the same rule as [`HINT`]).
-#[cfg(any(
-    feature = "pinklake",
-    feature = "vortexlake",
-    feature = "catalog-sqlite",
-    feature = "catalog-postgres"
-))]
-macro_rules! data_opt {
-    () => {
-        " [data <dir|s3://…>]"
-    };
-}
-#[cfg(not(any(
-    feature = "pinklake",
-    feature = "vortexlake",
-    feature = "catalog-sqlite",
-    feature = "catalog-postgres"
-)))]
+/// The `data <location>` option in usage text (the same rule as [`HINT`]).
 macro_rules! data_opt {
     () => {
         " [data <dir|s3://…>]"
@@ -799,10 +772,9 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
 /// attach the lake.
 ///
 /// The default (`read-only`) attach reads the published statistics only: a
-/// Vortex data file contributes its footer, metadata segment and stored
-/// statistics; a `.pink` file contributes its manifest statistics block (no
-/// data file is opened). No column data is decoded; the one table a query
-/// actually scans materializes lazily on first use.
+/// `.pink` file contributes its catalog statistics block (no data file is
+/// opened). No column data is decoded; the one table a query actually scans
+/// materializes lazily on first use.
 ///
 /// `write` opens the lake for incremental writes (see the module docs):
 /// every table of the pinned version is materialized into the session store
@@ -889,13 +861,8 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
     match lake.attach(version) {
         Ok(report) => match db.attach_lake(report.lake) {
             Ok(tables) => {
-                let shape = if report.statistics_only {
-                    "statistics-only"
-                } else {
-                    "footer-only"
-                };
                 println!(
-                    "Attached {dir_shown} version {} in {:.3}s ({} table{}, {shape})",
+                    "Attached {dir_shown} version {} in {:.3}s ({} table{}, statistics-only)",
                     report.version,
                     t0.elapsed().as_secs_f64(),
                     tables.len(),
@@ -903,22 +870,9 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
                 );
                 warn_unavailable_tables(&lake, version, "reading it will fail");
                 if report.encrypted {
-                    if report.statistics_only {
-                        println!(
-                            "Note: the lake is encrypted; attach unsealed the manifests and \
-                             their statistics blocks and read no data file."
-                        );
-                    } else {
-                        println!(
-                            "Note: the lake is encrypted: attach read the whole ciphertext of \
-                             each Vortex data file and unsealed it (queries still skip the \
-                             decode; ranged footer reads for encrypted files are a follow-up)."
-                        );
-                    }
-                } else if report.remote {
                     println!(
-                        "Note: object storage: attach read each Vortex data file's footer and \
-                         metadata with ranged requests (no whole-object download)."
+                        "Note: the lake is encrypted; attach unsealed the catalog and its \
+                         statistics blocks and read no data file."
                     );
                 }
                 if report.requests > 0 {

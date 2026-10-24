@@ -11,16 +11,17 @@
 //! | `COUNT(*)` | 0 | 0 |
 //! | `SELECT i, g` | 2 | the object twice (722 438 B) |
 //!
-//! After wave 98b the attach reads two footer ranges instead of the object,
-//! and the query reads only the projected segments (asserted below). The
-//! request count of the scan rises because footer/metadata reads are now
-//! small separate ranges; bytes are what the plan targets.
+//! Attach now reads only the catalog's statistics blocks (no data-file
+//! request), and the query reads the `.pink` footer plus only the projected
+//! column chunks it needs (asserted below). The request count of the scan
+//! rises because footer and chunk reads are small separate ranges; bytes are
+//! what the plan targets.
 //!
 //! The fixture is deliberately ordinary: one table, one data file, four
 //! columns, 20 000 rows. `COUNT(*)` must stay metadata-only (no data-file
 //! request at all); the two-column query is the one that has to read data.
 
-#![cfg(all(feature = "s3", feature = "vortexlake"))]
+#![cfg(feature = "s3")]
 #[path = "common/local_lake.rs"]
 mod local_lake;
 use local_lake::*;
@@ -130,56 +131,53 @@ fn measure(
     )
 }
 
-/// The bytes of one lake's Vortex data file (the whole-object baseline).
+/// The bytes of one lake's `.pink` data file (the whole-object baseline).
 fn data_file_bytes(mock: &MockS3, prefix: &str) -> usize {
     mock.keys()
         .iter()
-        .filter(|key| key.starts_with(prefix) && key.ends_with(".vortex"))
+        .filter(|key| key.starts_with(prefix) && key.ends_with(".pink"))
         .map(|key| mock.object(key).unwrap().len())
         .sum()
 }
 
 #[test]
-fn vortex_lake_attach_and_queries_use_the_ranged_read_path() {
+fn pink_lake_attach_and_queries_use_the_ranged_read_path() {
     let mock = MockS3::start();
-    save_fixture(&mock, "fast/vortex");
-    let file_bytes = data_file_bytes(&mock, "fast/vortex");
+    save_fixture(&mock, "fast/pink");
+    let file_bytes = data_file_bytes(&mock, "fast/pink");
     assert!(file_bytes > 100_000, "the fixture must be a real file");
-    eprintln!("vortex data file: {file_bytes} B");
+    eprintln!("pink data file: {file_bytes} B");
 
-    // `COUNT(*)` is answered from the pinned statistics: attach reads the
-    // manifest plus each file's footer, and the query reads no data.
+    // `COUNT(*)` is answered from the published statistics: attach reads no
+    // data file at all, and the query reads none either.
     let (open_count, attach_count, query_count, open_stats, attach_stats, query_stats, count_rows) =
-        measure(&mock, "fast/vortex", "SELECT COUNT(*) FROM main.t;");
+        measure(&mock, "fast/pink", "SELECT COUNT(*) FROM main.t;");
     eprintln!(
-        "vortex attach+count(*): open={open_count} req/{} B attach={attach_count} req/{} B \
+        "pink attach+count(*): open={open_count} req/{} B attach={attach_count} req/{} B \
          query={query_count} req/{} B",
         open_stats.1, attach_stats.1, query_stats.1
     );
     assert_eq!(count_rows, vec![vec![Value::Bigint(20_000)]]);
     assert_eq!(open_count, 0, "the catalog is local, not object storage");
     assert_eq!(
-        attach_count, 2,
-        "attach: the two footer ranges of the one Vortex file"
+        attach_count, 0,
+        "attach reads the catalog's statistics blocks, not a data file"
     );
+    assert_eq!(attach_stats.1, 0, "attach downloads no data-file bytes");
     assert_eq!(query_count, 0, "COUNT(*) must not read a data file");
-    assert!(
-        attach_stats.1 < file_bytes as u64,
-        "attach reads footers, not the object: {} vs {file_bytes}",
-        attach_stats.1
-    );
 
-    // A two-column scan reads only the projected segments, not the object.
+    // A two-column scan reads only the footer plus the projected chunks, not
+    // the whole object.
     let (open_scan, attach_scan, query_scan, open_stats, attach_stats, query_stats, scan_rows) =
-        measure(&mock, "fast/vortex", "SELECT i, g FROM main.t;");
+        measure(&mock, "fast/pink", "SELECT i, g FROM main.t;");
     eprintln!(
-        "vortex attach+2col: open={open_scan} req/{} B attach={attach_scan} req/{} B \
+        "pink attach+2col: open={open_scan} req/{} B attach={attach_scan} req/{} B \
          query={query_scan} req/{} B",
         open_stats.1, attach_stats.1, query_stats.1
     );
     assert_eq!(scan_rows.len(), 20_000);
     assert_eq!(open_scan, 0);
-    assert_eq!(attach_scan, 2);
+    assert_eq!(attach_scan, 0);
     assert!(query_scan >= 1, "the scan reads at least one data range");
     assert!(
         query_stats.1 < file_bytes as u64,
@@ -187,7 +185,7 @@ fn vortex_lake_attach_and_queries_use_the_ranged_read_path() {
         query_stats.1
     );
     // Every value and its order match the eager load exactly.
-    let loaded = open_s3_lake(mock_config(&mock, "fast/vortex"))
+    let loaded = open_s3_lake(mock_config(&mock, "fast/pink"))
         .unwrap()
         .load(None)
         .unwrap();

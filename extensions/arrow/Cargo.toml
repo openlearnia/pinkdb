@@ -12,8 +12,8 @@ license = "MIT"
 # (`pinkdb::filefmt`), this crate implements it over arrow-rs, and the host
 # (the CLI's `arrow` feature, or an embedder) registers it at store creation.
 # Arrow crates are pinned to the 59.x line already in the workspace lock
-# (vortex-array 0.88 depends on arrow-* 59.3.0), so a `vortexlake`-enabled
-# build shares those compile units instead of duplicating them.
+# (the parquet extension pins arrow-* 59.3.0), so a build that enables both
+# shares those compile units instead of duplicating them.
 [dependencies]
 pinkdb = { path = "../../crates/pinkdb" }
 # Remote files (`remote` feature): the shared https/SigV4 transport.

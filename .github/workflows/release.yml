@@ -224,7 +224,7 @@ jobs:
           the tag. Verify downloads against SHA256SUMS (and the per-asset
           .sha256 sidecars): https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG
 
-          Install: sh install.sh [--version $VERSION] [--variant default|lean|pinklake|pinklake-s3|vortexlake|vortexlake-s3]
+          Install: sh install.sh [--version $VERSION] [--variant default|lean|pinklake|pinklake-s3]
           EOF
           args=(--title "pinkdb $VERSION" --notes-file release-notes.md)
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then

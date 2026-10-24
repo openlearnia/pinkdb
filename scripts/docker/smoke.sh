@@ -22,7 +22,7 @@ usage() {
 Usage: scripts/docker/smoke.sh --image IMAGE --variant default|lake
 
   --image NAME    the locally built image to exercise
-  --variant NAME  default (pinklake CLI) or lake (vortex/parquet CLI)
+  --variant NAME  default (pinklake CLI) or lake (parquet CLI)
   -h, --help      show this help
 EOF
 }
@@ -149,7 +149,7 @@ printf '%s\n' "$answer" | grep -q 'true' ||
 step "rows survived a container restart"
 
 if [ "$variant" = lake ]; then
-    # `pinklake` / `vortexlake` CLI: publish a lake snapshot into /data and
+    # The lake CLI: publish a lake snapshot into /data and
     # open it back in the same session.
     lake_out=$(docker run --rm -v "$volume:/data" "$image" pinkdb \
         -c "CREATE TABLE lake_smoke (id INTEGER)" \

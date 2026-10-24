@@ -174,8 +174,8 @@ pub struct AttachedTable {
     /// Exact row count of the table's single data file, cross-checked
     /// against the manifest at attach time.
     pub rows: u64,
-    /// Column names and types, in scan order (the file's own `pinkdb.table`
-    /// schema, validated against the Vortex dtypes at attach).
+    /// Column names and types, in scan order (the table's schema, validated
+    /// against the data file at attach).
     pub schema: Vec<(String, DataType)>,
     /// Per-column statistics in `schema` order.
     pub stats: Vec<ColumnStats>,

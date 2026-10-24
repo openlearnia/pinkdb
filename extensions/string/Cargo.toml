@@ -32,8 +32,8 @@ abi-exports = []
 [dependencies]
 pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
 # The regex engine. RE2-style / linear-time (no backtracking), the same
-# engine family DuckDB uses (RE2), and already in the workspace lock file via
-# vortex/bindgen — this adds a direct dependency edge, not a new crate.
+# engine family DuckDB uses (RE2); it adds a direct dependency edge, not a new
+# crate.
 regex = "1.13"
 
 [dev-dependencies]

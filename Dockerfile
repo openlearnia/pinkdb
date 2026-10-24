@@ -13,12 +13,8 @@
 # variants (tls + async-server); the CLI also gets client + tls so remote mode
 # (`pinkdb --host`) and encrypted remote sessions work out of the box.
 #
-# The musl candidate is built natively on Alpine. The default variant is fully
-# static. The lake variant is dynamically linked against musl on purpose: its
-# C++ dependency (custom-labels via vortex-io) uses bindgen, which dlopen()s
-# libclang and therefore cannot run in a fully static build script. Alpine
-# ships musl and the image adds libgcc/libstdc++ for that variant, so this has
-# no portability cost.
+# The musl candidate is built natively on Alpine and both variants are fully
+# static.
 
 ARG RUST_VERSION=1.97
 ARG RUNTIME=musl
@@ -84,17 +80,12 @@ ENV CARGO_INCREMENTAL=0 \
     CARGO_TERM_COLOR=always
 
 # build-essential: ring's C/assembly. pkg-config: optional native probes.
-# libclang is only needed by the lake variant (bindgen in custom-labels via
-# vortex-io), so keep it out of the default image's build.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
         pkg-config; \
-    if [ "$VARIANT" = "lake" ]; then \
-        apt-get install -y --no-install-recommends libclang-dev; \
-    fi; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -108,7 +99,7 @@ RUN --mount=type=cache,id=cargo-target-glibc-${VARIANT}-${TARGETARCH},target=/ap
     set -eux; \
     case "$VARIANT" in \
         default) cli_features="client,tls,pinklake,s3" ;; \
-        lake)    cli_features="client,tls,vortexlake,s3,parquetlake" ;; \
+        lake)    cli_features="client,tls,pinklake,s3,parquetlake" ;; \
         *) echo "unknown VARIANT=$VARIANT (expected default or lake)" >&2; exit 2 ;; \
     esac; \
     cargo build --release --locked -p pinkdb-server --features tls,async-server; \
@@ -117,9 +108,8 @@ RUN --mount=type=cache,id=cargo-target-glibc-${VARIANT}-${TARGETARCH},target=/ap
     cp target/release/pinkdb-server target/release/pinkdb /out/; \
     cp /etc/ssl/certs/ca-certificates.crt /out/ca-certificates.crt
 
-# musl: Alpine, where gcc/g++ target musl natively (no cross toolchain, and
-# the C++ in vortex works). The default variant stays fully static; the lake
-# variant is dynamic so its bindgen build script can dlopen libclang.
+# musl: Alpine, where gcc/g++ target musl natively (no cross toolchain).
+# Both variants are fully static.
 FROM rust:${RUST_VERSION}-alpine AS builder-musl
 
 ARG TARGETARCH
@@ -128,17 +118,12 @@ ARG VARIANT
 ENV CARGO_INCREMENTAL=0 \
     CARGO_TERM_COLOR=always
 
-# build-base: gcc/g++/make for ring and the C++ crate. clang18-libclang is the
-# lake variant's bindgen dependency (Alpine has no unversioned clang package
-# on 3.24).
+# build-base: gcc/g++/make for ring and other C dependencies.
 RUN set -eux; \
     apk add --no-cache \
         build-base \
         ca-certificates \
-        pkgconfig; \
-    if [ "$VARIANT" = "lake" ]; then \
-        apk add --no-cache clang18-libclang; \
-    fi
+        pkgconfig
 
 WORKDIR /app
 COPY --from=fetch /usr/local/cargo/registry /usr/local/cargo/registry
@@ -149,11 +134,10 @@ COPY . .
 RUN --mount=type=cache,id=cargo-target-musl-${VARIANT}-${TARGETARCH},target=/app/target \
     set -eux; \
     case "$VARIANT" in \
-        default) cli_features="client,tls,pinklake,s3"; rustflags="" ;; \
-        lake)    cli_features="client,tls,vortexlake,s3,parquetlake"; rustflags="-C target-feature=-crt-static" ;; \
+        default) cli_features="client,tls,pinklake,s3" ;; \
+        lake)    cli_features="client,tls,pinklake,s3,parquetlake" ;; \
         *) echo "unknown VARIANT=$VARIANT (expected default or lake)" >&2; exit 2 ;; \
     esac; \
-    if [ -n "$rustflags" ]; then export RUSTFLAGS="$rustflags"; fi; \
     cargo build --release --locked -p pinkdb-server --features tls,async-server; \
     cargo build --release --locked -p pinkdb-cli --features "$cli_features"; \
     mkdir -p /out; \
@@ -166,17 +150,10 @@ FROM builder-${RUNTIME} AS builder
 # The musl candidate: Alpine gives a POSIX shell for the entrypoint, a
 # writable /data for the non-root user and ca-certificates for s3:// / https://
 # reads — a few MB more than scratch, still far below the glibc candidate.
-# The lake variant is the only dynamically linked one, so only it needs the
-# unwinder and the C++ runtime (custom-labels).
 FROM alpine:3.22 AS runtime-musl
-
-ARG VARIANT
 
 RUN set -eux; \
     apk add --no-cache ca-certificates; \
-    if [ "$VARIANT" = "lake" ]; then \
-        apk add --no-cache libgcc libstdc++; \
-    fi; \
     addgroup -g 10001 -S pinkdb; \
     adduser -u 10001 -S -D -G pinkdb -h /data -s /sbin/nologin pinkdb; \
     mkdir -p /data; \

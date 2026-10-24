@@ -4,10 +4,9 @@
 //! manifests, the row-level diff behind `.lake commit`, multi-file readers,
 //! and DuckLake's writer-retry settings.
 //!
-//! Format-agnostic on purpose: the suite runs in a default (lean `.pink`)
-//! build and in a `vortexlake` build, and the data-file extension follows
-//! the build. Everything else — the catalog shape, the manifest invariants,
-//! the commit semantics — is identical.
+//! Format-agnostic on purpose: the suite runs over the built-in `.pink`
+//! data format. The catalog shape, the manifest invariants and the commit
+//! semantics are what it pins.
 #[path = "common/local_lake.rs"]
 mod local_lake;
 use local_lake::*;
@@ -21,9 +20,6 @@ use pinkdb::{DataTable, PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "vortexlake")]
-const EXT: &str = "vortex";
-#[cfg(not(feature = "vortexlake"))]
 const EXT: &str = "pink";
 
 fn scratch(tag: &str) -> PathBuf {

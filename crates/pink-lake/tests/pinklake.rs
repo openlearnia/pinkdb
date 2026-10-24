@@ -1,12 +1,11 @@
-//! Lean (`vortexlake`-less) lake tests: `.pink` (PINKDB06) is the data-file
-//! format this build reads and writes. The statistics block is written by
-//! every save here and is what `.lake attach` reads without opening a data
-//! file; queries that need data read only the projected column chunks.
+//! `.pink` (PINKDB06) lake tests: the data-file format every build reads and
+//! writes. The statistics block is written by every save here and is what
+//! `.lake attach` reads without opening a data file; queries that need data
+//! read only the projected column chunks.
 //!
-//! `vortexlake` builds run `tests/lake.rs` instead; the two files pin the
-//! same contract from opposite sides.
+//! `tests/lake.rs` pins the broader public API; this file focuses on the
+//! statistics-only attach and the on-disk shapes.
 
-#![cfg(not(feature = "vortexlake"))]
 #[path = "common/local_lake.rs"]
 mod local_lake;
 use local_lake::*;
@@ -280,29 +279,6 @@ fn lean_save_is_deterministic_for_the_same_store() {
     cleanup(&dir);
 }
 
-/// Wave 88 rule 5: a lake with a Vortex entry **opens** in a lean build; that
-/// table is unavailable (every read/write of it is the feature error) and the
-/// rest of the lake still works.
-#[test]
-fn a_vortex_entry_is_a_per_table_feature_error() {
-    let dir = scratch("vortex_entry");
-    let lake_dir = dir.join("lake");
-    let mut db = PinkDb::new();
-    db.execute("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
-        .unwrap();
-    save_store_lake(&db, &lake_dir).unwrap();
-    pink_lake::catalog_set_table_format(&catalog_url(&lake_dir), "main.t", "vortex").unwrap();
-    let lake = open_lake(&lake_dir).unwrap();
-    let unavailable = lake.unavailable_tables().unwrap();
-    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
-    assert_eq!(unavailable[0].table, "main.t");
-    assert!(
-        unavailable[0].message().contains("vortex"),
-        "{unavailable:?}"
-    );
-    cleanup(&dir);
-}
-
 #[cfg(feature = "s3")]
 #[test]
 fn lean_s3_v4_roundtrip() {
@@ -321,11 +297,7 @@ fn lean_s3_v4_roundtrip() {
     let keys = mock.keys();
     assert!(
         keys.iter().any(|k| k.ends_with(".pink")),
-        "lean data files are `.pink` objects: {keys:?}"
-    );
-    assert!(
-        !keys.iter().any(|k| k.ends_with(".vortex")),
-        "a lean build writes no Vortex objects: {keys:?}"
+        "data files are `.pink` objects: {keys:?}"
     );
 
     lake.load(None).unwrap();
@@ -453,7 +425,7 @@ fn lean_attach_fast_paths_decode_nothing_and_fallbacks_decode_once() {
     let lake = open_lake(&lake_dir).unwrap();
     let report = lake.attach(None).unwrap();
     assert_eq!(report.format_version, 7);
-    assert!(!report.remote, "a `.pink` attach reads no data file");
+    assert_eq!(report.requests, 0, "a `.pink` attach reads no data file");
     let mut attached = PinkDb::new();
     attached.attach_lake(report.lake.clone()).unwrap();
     let mut opened = lake.load(None).unwrap();
@@ -522,9 +494,9 @@ fn lean_s3_attach_answers_from_statistics() {
 
     let reopened = open_s3_lake(config).unwrap();
     let report = reopened.attach(None).unwrap();
-    assert!(
-        !report.remote,
-        "a v1 attach reads no data file, so it is never a remote read"
+    assert_eq!(
+        report.requests, 0,
+        "attach reads no data file, so it issues no transport request"
     );
     let mut attached = PinkDb::new();
     attached.attach_lake(report.lake.clone()).unwrap();

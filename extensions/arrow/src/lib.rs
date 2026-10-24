@@ -25,7 +25,7 @@
 //! **extension package** ([`package`]/[`register_package`], wave 86), which
 //! activates per store through `LOAD EXTENSION 'arrow'`. The CLI wires it
 //! behind the opt-in `arrow` cargo feature, so the default binary stays lean
-//! — the same model as the `vortexlake` lake build. (Wave 70/71 unification:
+//! — the same model as the `parquetlake` lake build. (Wave 70/71 unification:
 //! both file-format crates now share this one read surface; see
 //! `extensions/parquet`.)
 //!

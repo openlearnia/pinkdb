@@ -1,15 +1,14 @@
 //! The v1 `.pink` statistics block, and the one exactness gate both lake
 //! formats share.
 //!
-//! A lean (`vortexlake`-less) save writes one engine `.pink` data file per
-//! table. Those files carry no statistics section (the engine format is
-//! frozen), so the writer publishes the exact per-column statistics it
-//! collected during the encode ([`pinkdb::PinkDb::to_pink_bytes_with_stats`])
-//! inside the manifest's table entry — `catalog.json` and
-//! `snapshots/<v>.json` are byte-identical by construction, so the statistics
-//! are published atomically with the data-file reference. `.lake attach`
-//! reads the block and answers exact `COUNT`/`COUNT(col)`/`MIN`/`MAX` from it
-//! without opening a data file at all.
+//! A save writes one engine `.pink` data file per table. The file's footer
+//! carries per-row-group statistics, but attach must not have to read a data
+//! file, so the writer also publishes the exact per-column statistics it
+//! collected during the encode
+//! ([`pinkdb::PinkDb::to_pink_bytes_with_stats`]) in the catalog row of each
+//! file. `.lake attach` reads those blocks and answers exact
+//! `COUNT`/`COUNT(col)`/`MIN`/`MAX` from them without opening a data file at
+//! all.
 //!
 //! # Integrity
 //!
@@ -26,8 +25,8 @@
 //! # Exactness
 //!
 //! [`serve_column_stats`] is the single place a raw proven statistic becomes
-//! an attachable [`ColumnStats`], used by both this block and the Vortex
-//! footer path (`vortex_file::column_stats`): a DOUBLE min/max needs an exact
+//! an attachable [`ColumnStats`], used by this block and the `.pink` footer
+//! path: a DOUBLE min/max needs an exact
 //! `NaNCount == 0` (the engine's comparator sorts NaN above every other
 //! double, and a min/max statistic excludes NaN, so it bounds neither `MAX`
 //! nor a `>`/`= NaN` zone-map test) and a nonzero value
@@ -106,9 +105,8 @@ impl StatsBlock {
     /// collected during the encode. `key` is the flat `db.table` catalog key,
     /// `file` the lake-relative path of the one data file.
     ///
-    /// Every build writes blocks now: a `vortexlake` build still appends
-    /// `.pink` files to a pinklake lake's v4 entries, and those carry per-file
-    /// blocks.
+    /// Every save/append writes per-file blocks; a file published without one
+    /// cannot be attached.
     pub(crate) fn from_saved(key: &str, file: &str, saved: &SavedTableStats) -> Result<Self> {
         let mut columns = Vec::with_capacity(saved.columns.len());
         for col in &saved.columns {
@@ -276,7 +274,7 @@ fn decode_option(
 
 /// The one exactness gate: given what a format proved about one column,
 /// decide which parts the executor may serve. Shared by the `.pink` stats
-/// block and the Vortex footer path so the two cannot drift.
+/// block and footer path so the two cannot drift.
 ///
 /// - `null_count` passes through (the format layer only supplies an exact
 ///   count);

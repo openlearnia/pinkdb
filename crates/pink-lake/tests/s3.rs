@@ -3,17 +3,15 @@
 //! percent-encoded table names, conditional-write conflict paths, the
 //! safe-by-default refusal of endpoints without conditional writes (and the
 //! explicit single-writer opt-in with its interleaving tests), error mapping,
-//! lost responses, the v1 `.pink` bridge, and virtual-hosted addressing.
-//! Every request is verified by the mock's own SigV4 implementation
-//! (canonical request + HMAC chain recomputed from the received bytes). The
-//! `PINKDB_S3_LIVE=1` test at the bottom talks to a real bucket (e.g.
-//! Cloudflare R2) and is skipped by default.
+//! lost responses, and virtual-hosted addressing. Every request is verified
+//! by the mock's own SigV4 implementation (canonical request + HMAC chain
+//! recomputed from the received bytes). The `PINKDB_S3_LIVE=1` test at the
+//! bottom talks to a real bucket (e.g. Cloudflare R2) and is skipped by
+//! default.
 //!
-//! `s3` + `vortexlake` builds: the suite pins v3 (Vortex) lake behavior.
-//! The lean `s3`-only (v1 `.pink`-over-S3) behavior is covered by
-//! `tests/pinklake.rs`.
+//! `s3` builds: the suite pins the `.pink`-over-S3 lake behavior.
 
-#![cfg(all(feature = "s3", feature = "vortexlake"))]
+#![cfg(feature = "s3")]
 
 #[path = "../src/mock_s3.rs"]
 mod mock_s3;
@@ -153,14 +151,14 @@ fn full_cycle_create_save_open_versions_tables() {
     assert_eq!(v1.list_databases(), vec!["main"]);
     assert!(v1.list_tables().is_empty());
 
-    // A v2 data file is one Vortex object per table under data/<key>/.
+    // A save writes one `.pink` object per table under data/<key>/.
     let keys = mock.keys();
     for key in &keys {
         assert!(key.starts_with("lakes/mine/"), "{key}");
     }
     assert_eq!(
         keys.iter()
-            .filter(|k| k.contains("/data/") && k.ends_with(".vortex"))
+            .filter(|k| k.contains("/data/") && k.ends_with(".pink"))
             .count(),
         3,
         "{keys:?}"
@@ -173,10 +171,7 @@ fn full_cycle_create_save_open_versions_tables() {
     assert_eq!(lake.write_from_store(&db).unwrap(), 3);
     assert_eq!(lake.versions().unwrap(), vec![1, 2, 3]);
     assert_eq!(
-        mock.keys()
-            .iter()
-            .filter(|k| k.ends_with(".vortex"))
-            .count(),
+        mock.keys().iter().filter(|k| k.ends_with(".pink")).count(),
         6
     );
     // The store still round-trips from the new version.
@@ -266,7 +261,7 @@ fn prefixes_and_percent_encoded_table_names_round_trip() {
     assert!(
         data_keys
             .iter()
-            .any(|k| k.contains("/data/main.a%2Fb/") && k.ends_with(".vortex")),
+            .any(|k| k.contains("/data/main.a%2Fb/") && k.ends_with(".pink")),
         "{data_keys:?}"
     );
     assert!(
@@ -318,7 +313,7 @@ fn error_mapping_not_found_auth_and_missing_data() {
     let victim = mock
         .keys()
         .into_iter()
-        .find(|k| k.contains("/data/") && k.ends_with(".vortex"))
+        .find(|k| k.contains("/data/") && k.ends_with(".pink"))
         .expect("a data object");
     mock.remove_object(&victim);
     let missing = lake.missing_data_files().unwrap();
@@ -697,12 +692,11 @@ fn ambiguous_failures_retry_only_idempotent_requests() {
     assert_eq!(lake.current_version(), 3);
 }
 
-/// Attach over object storage: footer-only descriptors (the objects are read
-/// whole — no ranged reads in this build — but never decoded), fast paths
-/// answered from the statistics, and lazy materialization matching the
-/// eager load bit-exactly.
+/// Attach over object storage: statistics-only descriptors (no data object
+/// is read, let alone decoded), fast paths answered from the statistics, and
+/// lazy materialization matching the eager load bit-exactly.
 #[test]
-fn attach_over_s3_is_footer_only_and_matches_load() {
+fn attach_over_s3_is_statistics_only_and_matches_load() {
     let mock = MockS3::start();
     let dir = scratch("attach");
     let db = small_store();
@@ -713,7 +707,10 @@ fn attach_over_s3_is_footer_only_and_matches_load() {
     let mut lake = open_s3_lake(mock_config(&mock, "test-bucket", "attach")).unwrap();
     lake.set_data_inlining_row_limit(0);
     let report = lake.attach(None).unwrap();
-    assert!(report.remote, "object storage has no ranged reads here");
+    assert_eq!(
+        report.requests, 0,
+        "attach reads the local catalog, never a data object"
+    );
     assert_eq!(report.tables, 3);
     let loaded = lake.load(None).unwrap();
 
@@ -884,8 +881,8 @@ fn maintenance_age_gate_reads_last_modified_over_s3() {
     let mut lake = s3_appended_lake(&mock, prefix, &[&[(1, "a")], &[(2, "b")]]);
 
     // Two unreferenced leftovers: one backdated, one fresh.
-    let old_key = format!("{prefix}/data/main.t/crashed.vortex");
-    let young_key = format!("{prefix}/data/main.t/fresh.vortex");
+    let old_key = format!("{prefix}/data/main.t/crashed.pink");
+    let young_key = format!("{prefix}/data/main.t/fresh.pink");
     mock.put_object(&old_key, b"crashed writer leftover");
     mock.put_object(&young_key, b"fresh leftover");
     let old_secs = std::time::SystemTime::now()
@@ -905,13 +902,9 @@ fn maintenance_age_gate_reads_last_modified_over_s3() {
     assert!(
         report
             .paths
-            .contains(&"data/main.t/crashed.vortex".to_string())
+            .contains(&"data/main.t/crashed.pink".to_string())
     );
-    assert!(
-        !report
-            .paths
-            .contains(&"data/main.t/fresh.vortex".to_string())
-    );
+    assert!(!report.paths.contains(&"data/main.t/fresh.pink".to_string()));
 
     // `all` skips the gate and lists both.
     let report = lake
