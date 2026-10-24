@@ -5,7 +5,9 @@ the committed differential corpus (171 probes) runs against both engines and mus
 match. This page is the quick reference for what the dialect accepts, what it
 differs on, and what is intentionally absent — the reasoning behind every row lives
 in the <a href="{{root}}docs/sql.html">SQL reference</a> and the
-<a href="{{root}}docs/roadmap.html">roadmap</a>.</p>
+<a href="{{root}}docs/roadmap.html">roadmap</a>. The exhaustive form-by-form matrix —
+supported, divergent, and every refusal with its exact error, batch by batch —
+is <a href="https://github.com/openlearnia/pinkdb/blob/main/docs/sql-conformance.md" rel="noopener">docs/sql-conformance.md</a>.</p>
 
 <h2>Statements</h2>
 
@@ -48,14 +50,24 @@ in the <a href="{{root}}docs/sql.html">SQL reference</a> and the
     <tr><td><code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code> joins</td><td>✅</td><td>multi-way and composite conditions (<code>ON a = b AND c = d</code>); conditions can be arbitrary expressions (equality takes the hash fast path)</td></tr>
     <tr><td><code>JOIN … USING (…)</code>, <code>NATURAL JOIN</code></td><td>✗</td><td>rejected with a parse error</td></tr>
     <tr><td>Subqueries: scalar, <code>IN</code>, <code>EXISTS</code></td><td>✅</td><td><strong>uncorrelated only</strong> — correlated subqueries are rejected (the main deliberate gap)</td></tr>
-    <tr><td><code>WITH</code> (CTEs), column aliases</td><td>✅</td><td><code>WITH RECURSIVE</code> is not supported</td></tr>
+    <tr><td><code>WITH</code> (CTEs), column aliases</td><td>✅</td><td></td></tr>
+    <tr><td><code>WITH RECURSIVE r(…)</code></td><td>✅</td><td>anchor <code>UNION [ALL]</code> step, evaluated semi-naively (the step sees the rows the last round added; <code>UNION</code> also drops rows already produced); bounded at 100 000 iterations / 10 000 000 rows — both are errors, so runaway recursion cannot hang</td></tr>
     <tr><td>Window functions</td><td>✅</td><td><code>ROW_NUMBER</code>, <code>RANK</code>, <code>DENSE_RANK</code>, <code>LAG</code>, <code>LEAD</code>, <code>NTILE</code>, <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, aggregates <code>OVER</code>; <code>PARTITION BY</code>/<code>ORDER BY</code>, <code>ROWS</code> and <code>RANGE</code> frames (validated; no nesting; SELECT list and <code>ORDER BY</code> only)</td></tr>
-    <tr><td><code>QUALIFY</code></td><td>✗</td><td>filter with a subquery over the windowed result or re-select</td></tr>
+    <tr><td><code>QUALIFY expr</code></td><td>✅</td><td>after <code>WINDOW</code>, before <code>ORDER BY</code>; may name select aliases, aggregates and window functions</td></tr>
+    <tr><td>Named <code>WINDOW w AS (…)</code> clauses</td><td>✅</td><td><code>OVER w</code> resolves them; a window that builds on another window is refused (wave 95c)</td></tr>
+    <tr><td>Aggregate <code>FILTER (WHERE …)</code></td><td>✅</td><td>with <code>DISTINCT</code> too; on a window aggregate it is refused (wave 95c)</td></tr>
+    <tr><td><code>DISTINCT ON (…)</code></td><td>✅</td><td>first row per key in <code>ORDER BY</code> order; the key need not be selected</td></tr>
+    <tr><td><code>VALUES (…), (…)</code> and <code>TABLE t</code> as queries</td><td>✅</td><td>standalone, in <code>FROM</code> with column aliases (<code>(VALUES …) t(x, y)</code>), or as an <code>INSERT</code> source; column names <code>col0</code>, <code>col1</code>, … without aliases</td></tr>
+    <tr><td><code>FETCH FIRST n ROWS ONLY</code>, <code>OFFSET n ROWS</code></td><td>✅</td><td><code>LIMIT</code> and <code>FETCH FIRST</code> together are refused</td></tr>
     <tr><td><code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT</code> <code>[ALL]</code></td><td>✅</td><td>numeric type unification; a trailing <code>ORDER BY</code>/<code>LIMIT</code> applies to the whole set (branch-level clauses need parentheses and are unsupported)</td></tr>
-    <tr><td><code>GROUP BY</code> / <code>HAVING</code> / <code>COUNT(DISTINCT …)</code> / <code>DISTINCT</code></td><td>✅</td><td><code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code> are not supported</td></tr>
+    <tr><td><code>GROUP BY</code> / <code>HAVING</code> / <code>COUNT(DISTINCT …)</code> / <code>DISTINCT</code></td><td>✅</td><td></td></tr>
+    <tr><td><code>GROUPING SETS</code> / <code>ROLLUP</code> / <code>CUBE</code> + <code>GROUPING()</code></td><td>✅</td><td>DuckDB's set order and big-endian mask (<code>GROUPING(a, b) = 2·g(a) + g(b)</code>); plain keys cross-product with the sets; implemented as a union of aggregates, so <code>HAVING</code>/<code>ORDER BY</code>/<code>LIMIT</code> apply once</td></tr>
     <tr><td><code>ORDER BY … [NULLS FIRST|LAST]</code>, positional</td><td>✅</td><td>general expressions must be select aliases, positions or GROUP BY keys; the engine default is <code>NULLS LAST</code></td></tr>
-    <tr><td><code>LIMIT</code> / <code>OFFSET</code></td><td>✅</td><td></td></tr>
-    <tr><td><code>PIVOT</code>/<code>UNPIVOT</code>/<code>TABLESAMPLE</code>/<code>LATERAL</code></td><td>✗</td><td>not scheduled</td></tr>
+    <tr><td><code>LIMIT</code> / <code>OFFSET</code></td><td>✅</td><td><code>OFFSET n ROW|ROWS</code> accepted</td></tr>
+    <tr><td><code>PIVOT</code>/<code>UNPIVOT</code></td><td>✗</td><td>not scheduled</td></tr>
+    <tr><td><code>TABLESAMPLE</code>, <code>LATERAL</code></td><td>✗</td><td>refused with a <code>wave 95c</code> error</td></tr>
+    <tr><td><code>INSERT … ON CONFLICT</code>/<code>OR REPLACE</code>, <code>UPDATE … FROM</code>, <code>DELETE … USING</code>, <code>RETURNING</code>, <code>MERGE</code>, data-modifying CTEs</td><td>✗</td><td>refused with a <code>wave 95b</code> error (the DML batch)</td></tr>
+    <tr><td><code>WITHIN GROUP</code> (ordered-set aggregates), <code>FOR UPDATE</code>/<code>SHARE</code>, <code>AT TIME ZONE</code>, row constructors, list literals, JSON mutators, <code>SET VARIABLE</code>/<code>$name</code></td><td>✗</td><td>refused with a <code>wave 95c</code> error</td></tr>
     <tr><td><code>AT (VERSION =&gt; n)</code> / <code>AT (TIMESTAMP =&gt; ts)</code></td><td>✅ lake-only</td><td>attached lake tables (literal targets, capped at the attached version); store tables, CTEs and views are refused — DuckDB silently ignores <code>AT</code> on CTEs, pinkdb errors</td></tr>
   </tbody>
 </table>
@@ -75,10 +87,13 @@ in the <a href="{{root}}docs/sql.html">SQL reference</a> and the
     <tr><td><code>DATE</code>, <code>TIMESTAMP</code>/<code>DATETIME</code></td><td>✅</td><td>naive timestamps in microseconds, no time zone</td></tr>
     <tr><td><code>INTERVAL</code></td><td>✅</td><td>months + days + microseconds; literal form is <code>INTERVAL '1 day 2 hours'</code>; month-end clamping like DuckDB</td></tr>
     <tr><td>String literals <code>'…'</code>, quoted identifiers <code>"…"</code></td><td>✅</td><td><code>''</code>/<code>""</code> escapes; <code>--</code> and <code>/* */</code> comments</td></tr>
-    <tr><td><code>CAST(x AS t)</code> and <code>x::t</code></td><td>✅</td><td><code>TRY_CAST</code> is not supported</td></tr>
+    <tr><td><code>CAST(x AS t)</code> and <code>x::t</code></td><td>✅</td><td></td></tr>
+    <tr><td><code>TRY_CAST(x AS t)</code></td><td>✅</td><td><code>NULL</code> when the cast fails, for every target type (a conversion that does not exist is still an error)</td></tr>
     <tr><td>DECIMAL literals</td><td>~</td><td>write <code>CAST('12.34' AS DECIMAL(6, 2))</code>; bare numeric literals with a decimal point are <code>DOUBLE</code> (DuckDB's auto-DECIMAL typing is a follow-up)</td></tr>
     <tr><td>Parameters <code>?</code></td><td>✅</td><td>through the prepare/bind API, server protocol v6 and FFI (no SQL <code>PREPARE</code>)</td></tr>
-    <tr><td><code>ILIKE</code>, <code>SIMILAR TO</code>, <code>LIKE … ESCAPE</code></td><td>✗</td><td><code>LIKE</code>/<code>NOT LIKE</code> with <code>%</code>/<code>_</code> only</td></tr>
+    <tr><td><code>LIKE</code>/<code>NOT LIKE</code>, <code>LIKE … ESCAPE</code>, <code>SIMILAR TO</code></td><td>✅</td><td><code>ESCAPE</code> takes one character (or <code>''</code>); <code>SIMILAR TO</code> is the fully anchored regex DuckDB 2.0 actually implements (<code>%</code>/<code>_</code> are literals there) — literals, <code>.</code>, classes, <code>* + ? {m,n}</code>, groups, alternation, <code>^ $</code></td></tr>
+    <tr><td><code>ILIKE</code></td><td>✗</td><td>use <code>LOWER(x) LIKE …</code></td></tr>
+    <tr><td><code>IS [NOT] DISTINCT FROM</code>, subscripts <code>v['a']</code>/<code>v[0]</code>/<code>v.a</code>, <code>s[2]</code>/<code>s[2:4]</code></td><td>✅</td><td>NULL-safe equality; subscripts are 1-based like DuckDB (missing key or out-of-range is <code>NULL</code>, index 0 is an error); string slices count characters, negative bounds count from the end</td></tr>
     <tr><td><code>SMALLINT</code>/<code>TINYINT</code>/<code>U*</code> integers, <code>TIME</code>, <code>TIMESTAMPTZ</code>, <code>BLOB</code>, <code>UUID</code>, nested types (<code>LIST</code>/<code>STRUCT</code>/<code>MAP</code>), <code>ENUM</code></td><td>✗</td><td>not implemented</td></tr>
   </tbody>
 </table>
@@ -92,12 +107,18 @@ in the <a href="{{root}}docs/sql.html">SQL reference</a> and the
   behave like DuckDB.</li>
   <li><strong><code>JOIN … USING</code> and <code>NATURAL JOIN</code> are parse
   errors</strong> — write the <code>ON</code> condition.</li>
-  <li><strong>Three-part column references</strong> (<code>db.table.col</code>) are
-  not supported — alias the table (<code>SELECT x.col FROM db.table AS x</code>).</li>
+  <li><strong>Three-part column references</strong> (<code>db.table.col</code>) work
+  since wave 94 (aliases still hide the original table name), which means a
+  nested VARIANT path has to be spelled <code>js.a['b']</code> rather than
+  <code>v.js.a</code> (that reads as database <code>v</code>).</li>
   <li><strong><code>AT</code> on CTEs:</strong> DuckDB silently ignores it; pinkdb
   refuses (a wrong-answer trap avoided on purpose).</li>
-  <li><strong><code>ILIKE</code>, <code>TRY_CAST</code>, <code>SIMILAR TO</code>,
-  <code>LIKE … ESCAPE</code></strong> are absent (use <code>LOWER(x) LIKE …</code>).</li>
+  <li><strong><code>ILIKE</code></strong> is absent (use <code>LOWER(x) LIKE …</code>);
+  <code>SIMILAR TO</code> follows DuckDB 2.0's anchored-regex behaviour, so a
+  malformed repetition such as <code>a{1,2,3}</code> is literal text here and an
+  error there, and <code>SIMILAR TO … ESCAPE</code> is refused by both.</li>
+  <li><strong><code>1.e2</code></strong> is a parse error (write
+  <code>1.0e2</code>); DuckDB reads it as a float.</li>
   <li><strong>EXPLAIN</strong> prints pinkdb's plan format, not DuckDB's tree
   rendering.</li>
   <li><strong>Extension surfaces differ</strong>: no SQL <code>COPY</code>,

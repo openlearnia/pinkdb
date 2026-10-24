@@ -364,6 +364,18 @@ pub enum LogicalPlan {
         name: String,
         query: Box<LogicalPlan>,
         body: Box<LogicalPlan>,
+        /// `WITH RECURSIVE`: after `query` (the anchor), `name` is re-bound to
+        /// the rows the step produced last iteration, until the step produces
+        /// none. See [`RecursiveStep`].
+        recursive: Option<Box<RecursiveStep>>,
+    },
+    /// Constant rows — `VALUES (…), (…)` — as a query, in a `FROM` clause or
+    /// as an `INSERT` source. Every row has `names.len()` expressions,
+    /// evaluated against [`LogicalPlan::SingleRow`] (an empty scope).
+    Values {
+        rows: Vec<Vec<BoundExpr>>,
+        names: Vec<String>,
+        types: Vec<DataType>,
     },
     /// Window functions: output is input columns ++ one column per window.
     /// Partition/order/arg expressions address the input (scan-relative, or
@@ -414,6 +426,10 @@ pub enum LogicalPlan {
     },
     Distinct {
         input: Box<LogicalPlan>,
+        /// `DISTINCT ON (keys)`: the 0-based input column indices that must be
+        /// distinct (the executor keeps the first row per key in input order).
+        /// `None` = plain `DISTINCT` over every column.
+        on: Option<Vec<usize>>,
     },
     Sort {
         input: Box<LogicalPlan>,
@@ -430,6 +446,38 @@ pub enum LogicalPlan {
         offset: usize,
     },
 }
+
+/// The recurring half of a `WITH RECURSIVE` CTE.
+///
+/// The executor starts from the anchor rows, then re-evaluates `step` with the
+/// CTE name bound to the rows the previous iteration added (the *delta*), and
+/// appends the result. `UNION` (`all: false`) also removes rows already in the
+/// result; `UNION ALL` keeps duplicates. Iteration stops when a step adds no
+/// rows, when `MAX_RECURSIVE_ROWS` result rows exist, or after
+/// `MAX_RECURSIVE_ITERATIONS` iterations — the last two are errors, so a
+/// runaway recursion (a forgotten predicate) never hangs the engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveStep {
+    pub step: Box<LogicalPlan>,
+    /// `UNION ALL` between the anchor and the step (`false` = `UNION`).
+    pub all: bool,
+}
+
+impl RecursiveStep {
+    /// Rebuild with a transformed step plan (used by the optimizer passes,
+    /// which must rewrite every nested plan).
+    pub fn map(self, f: &dyn Fn(LogicalPlan) -> LogicalPlan) -> RecursiveStep {
+        RecursiveStep {
+            step: Box::new(f(*self.step)),
+            all: self.all,
+        }
+    }
+}
+
+/// Iteration cap for `WITH RECURSIVE` (each iteration evaluates the step once).
+pub const MAX_RECURSIVE_ITERATIONS: usize = 100_000;
+/// Result-row cap for `WITH RECURSIVE`.
+pub const MAX_RECURSIVE_ROWS: usize = 10_000_000;
 
 /// One bound `ALTER TABLE` operation (wave 65). `ADD COLUMN`'s default is a
 /// bound constant expression (evaluated once at execution).
@@ -497,6 +545,7 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
             | LogicalPlan::Aggregate { .. }
             | LogicalPlan::Project { .. }
             | LogicalPlan::Distinct { .. }
+            | LogicalPlan::Values { .. }
             | LogicalPlan::Sort { .. }
             | LogicalPlan::Limit { .. }
             | LogicalPlan::Offset { .. }
@@ -884,6 +933,11 @@ pub(crate) fn collect_tables_read(
                 expr_tables_read(e, default_db, out);
             }
         }
+        LogicalPlan::Values { rows, .. } => {
+            for e in rows.iter().flatten() {
+                expr_tables_read(e, default_db, out);
+            }
+        }
         LogicalPlan::Update {
             db,
             table,
@@ -979,7 +1033,7 @@ pub(crate) fn collect_tables_read(
                 expr_tables_read(e, default_db, out);
             }
         }
-        LogicalPlan::Distinct { input } | LogicalPlan::Limit { input, .. } => {
+        LogicalPlan::Distinct { input, .. } | LogicalPlan::Limit { input, .. } => {
             collect_tables_read(input, default_db, out);
         }
         LogicalPlan::Offset { input, .. } => {
@@ -1092,9 +1146,13 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
             contains_table_function(input)
                 || keys
                     .iter()
-                    .chain(aggs.iter().filter_map(|a| a.arg.as_ref()))
+                    .chain(
+                        aggs.iter()
+                            .flat_map(|a| a.arg.iter().chain(a.filter.iter())),
+                    )
                     .any(expr_contains_table_function)
         }
+        LogicalPlan::Values { rows, .. } => rows.iter().flatten().any(expr_contains_table_function),
         LogicalPlan::Project { input, exprs, .. } => {
             contains_table_function(input) || exprs.iter().any(expr_contains_table_function)
         }
@@ -1102,7 +1160,7 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
             contains_table_function(input)
                 || keys.iter().any(|(e, _)| expr_contains_table_function(e))
         }
-        LogicalPlan::Distinct { input }
+        LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. } => contains_table_function(input),
         LogicalPlan::SetOp { left, right, .. } => {
@@ -1340,6 +1398,7 @@ fn walk_scan_filters(
         // holds no child plan to analyze.
         LogicalPlan::Scan { db: None, .. }
         | LogicalPlan::SingleRow
+        | LogicalPlan::Values { .. }
         | LogicalPlan::Begin
         | LogicalPlan::Commit
         | LogicalPlan::Rollback
@@ -1479,7 +1538,7 @@ fn walk_scan_filters(
                 walk_expr_subquery_filters(e, out);
             }
         }
-        LogicalPlan::Distinct { input } => walk_scan_filters(input, &[], out),
+        LogicalPlan::Distinct { input, .. } => walk_scan_filters(input, &[], out),
     }
 }
 
@@ -1789,15 +1848,19 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
         LogicalPlan::Aggregate { input, keys, aggs } => {
             children.push(input);
             exprs.extend(keys.iter());
-            exprs.extend(aggs.iter().filter_map(|a| a.arg.as_ref()));
+            exprs.extend(
+                aggs.iter()
+                    .flat_map(|a| a.arg.iter().chain(a.filter.iter())),
+            );
         }
+        LogicalPlan::Values { rows, .. } => exprs.extend(rows.iter().flatten()),
         LogicalPlan::Project {
             input, exprs: es, ..
         } => {
             children.push(input);
             exprs.extend(es.iter());
         }
-        LogicalPlan::Distinct { input } => children.push(input),
+        LogicalPlan::Distinct { input, .. } => children.push(input),
         LogicalPlan::Sort { input, keys } => {
             children.push(input);
             exprs.extend(keys.iter().map(|(e, _)| e));
@@ -1909,6 +1972,12 @@ fn walk_scan_projections(
         // Unqualified scans name CTE outputs (binder-resolved), not tables;
         // the CTE's own query is walked through `LogicalPlan::Cte`.
         LogicalPlan::Scan { db: None, .. } | LogicalPlan::SingleRow => {}
+        // Constant rows hold no scan: their expressions are the whole input.
+        LogicalPlan::Values { rows, .. } => {
+            for e in rows.iter().flatten() {
+                collect_expr_projections(e, &mut Needed::Cols(Vec::new()), out);
+            }
+        }
         // Wave 71: a file scan always decodes every column (no projection
         // pushdown into an IPC file yet), and COPY reads its whole table.
         LogicalPlan::CopyTo { .. } => {}
@@ -1928,6 +1997,9 @@ fn walk_scan_projections(
             for a in aggs {
                 if let Some(e) = &a.arg {
                     collect_expr_projections(e, &mut need, out);
+                }
+                if let Some(f) = &a.filter {
+                    collect_expr_projections(f, &mut need, out);
                 }
             }
             walk_scan_projections(input, &need, out);
@@ -1982,7 +2054,7 @@ fn walk_scan_projections(
         // every column of both sides; `Join` assembles all columns of both
         // sides; a `Cte` query's output is materialized once and reused by
         // the body. Nothing is lost by decoding in full.
-        LogicalPlan::Distinct { input } => walk_scan_projections(input, &Needed::All, out),
+        LogicalPlan::Distinct { input, .. } => walk_scan_projections(input, &Needed::All, out),
         LogicalPlan::SetOp { left, right, .. } => {
             walk_scan_projections(left, &Needed::All, out);
             walk_scan_projections(right, &Needed::All, out);

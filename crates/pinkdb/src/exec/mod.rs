@@ -25,7 +25,8 @@ use window::eval_window;
 
 use crate::attached::{AttachedTable, PruneOp};
 use crate::plan::{
-    AlterTablePlan, LogicalPlan, agg_output_schema, compare_values, win_output_schema,
+    AlterTablePlan, LogicalPlan, MAX_RECURSIVE_ITERATIONS, MAX_RECURSIVE_ROWS, agg_output_schema,
+    compare_values, win_output_schema,
 };
 use crate::sql::ast::{BinaryOp, JoinKind, SortSpec};
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, common_numeric};
@@ -2421,6 +2422,28 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types: vec![DataType::Varchar],
             })
         }
+        LogicalPlan::Values { rows, names, types } => {
+            // Constant rows: each expression evaluates against the empty
+            // one-row scope, so only literals (and casts of them) are legal
+            // here — the binder guarantees it.
+            let scope = DataChunk {
+                columns: Vec::new(),
+                num_rows: 1,
+            };
+            let mut cols: Vec<Vector> = types.iter().map(|t| Vector::new_empty(*t)).collect();
+            for row in rows {
+                for (i, expr) in row.iter().enumerate() {
+                    let v = eval_expr(expr, &scope, cx)?;
+                    cols[i].push_value(v.get(0))?;
+                }
+            }
+            let chunk = DataChunk::new(cols)?;
+            Ok(Output {
+                chunks: vec![chunk],
+                names: names.clone(),
+                types: types.clone(),
+            })
+        }
         LogicalPlan::SingleRow => Ok(Output {
             // One row, zero columns: literals evaluate to 1-row vectors.
             chunks: vec![DataChunk {
@@ -2502,31 +2525,41 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             })
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
+            // `FILTER (WHERE …)` is not modeled by the fused paths below, which
+            // read whole columns; a filtered aggregate takes the general path.
+            let filtered = aggs.iter().any(|a| a.filter.is_some());
             // Fused join→aggregate: feed joined rows straight into per-group
             // accumulators without ever materializing them. All fusibility
             // checks are static, so a blocked shape falls through without
             // having evaluated anything.
-            if let Some(out) = fused_join_aggregate(cx, input, keys, aggs)? {
+            if !filtered
+                && let Some(out) = fused_join_aggregate(cx, input, keys, aggs)?
+            {
                 return Ok(out);
             }
             // Attached-lake statistics: an exact COUNT/COUNT(col)/MIN/MAX
             // over a plain attached table is answered from the data file's
             // footer without decoding it; every other shape falls through and
             // materializes the table on first use.
-            if let Some(out) = attached_stats_aggregate(cx, input, keys, aggs)? {
+            if !filtered
+                && let Some(out) = attached_stats_aggregate(cx, input, keys, aggs)?
+            {
                 return Ok(out);
             }
             // Streaming scan→aggregate (wave 98c): fold a table function's or
             // an attached/in-memory scan's chunks as they are decoded, so a
             // remote file never lands in memory whole.
-            if let Some(out) = fused_scan_aggregate(cx, input, keys, aggs)? {
+            if !filtered
+                && let Some(out) = fused_scan_aggregate(cx, input, keys, aggs)?
+            {
                 return Ok(out);
             }
             // Fast path: pure COUNT(*) with no keys counts rows — no data
             // touched at all. Over a Filter, count the predicate's TRUE rows
             // per chunk straight away: the filtered chunks are never
             // materialized (no selection vector, no gathered columns).
-            if keys.is_empty()
+            if !filtered
+                && keys.is_empty()
                 && !aggs.is_empty()
                 && aggs
                     .iter()
@@ -2638,8 +2671,72 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types: types.clone(),
             })
         }
-        LogicalPlan::Cte { name, query, body } => {
-            let out = eval(cx, query)?;
+        LogicalPlan::Cte {
+            name,
+            query,
+            body,
+            recursive,
+        } => {
+                let mut out = eval(cx, query)?;
+            if let Some(step) = recursive {
+                // Semi-naive iteration: `name` is bound to the rows the last
+                // step added. `UNION` (not `UNION ALL`) also drops rows the
+                // result already holds, tracked as it grows so each round is
+                // linear rather than a rescan of everything produced so far.
+                // Both bounds are errors, so a runaway recursion (a forgotten
+                // predicate) never hangs the engine.
+                let mut seen: FastSet<Vec<u8>> = FastSet::default();
+                if !step.all {
+                    retain_new(&out.chunks, &mut seen);
+                }
+                let mut delta = out.clone();
+                let mut iterations = 0usize;
+                loop {
+                    if iterations >= MAX_RECURSIVE_ITERATIONS {
+                        return Err(PinkDbError::Execution(format!(
+                            "recursive CTE \"{name}\" still produced rows after \
+                             {MAX_RECURSIVE_ITERATIONS} iterations"
+                        )));
+                    }
+                    iterations += 1;
+                    let mut ctes = cx.ctes.clone();
+                    ctes.insert(name.clone(), delta);
+                    let child = Cx {
+                        db: cx.db,
+                        ctes,
+                        memo: cx.memo.clone(),
+                        projections: cx.projections.clone(),
+                        prunes: cx.prunes.clone(),
+                        budget: cx.budget.clone(),
+                    };
+                    let produced = eval(&child, &step.step)?;
+                    let fresh = if step.all {
+                        produced.chunks
+                    } else {
+                        retain_new(&produced.chunks, &mut seen)
+                    };
+                    if fresh.iter().all(|c| c.num_rows() == 0) {
+                        break;
+                    }
+                    let rows = out
+                        .chunks
+                        .iter()
+                        .chain(fresh.iter())
+                        .map(|c| c.num_rows())
+                        .sum::<usize>();
+                    if rows > MAX_RECURSIVE_ROWS {
+                        return Err(PinkDbError::Execution(format!(
+                            "recursive CTE \"{name}\" passed {MAX_RECURSIVE_ROWS} rows"
+                        )));
+                    }
+                    delta = Output {
+                        chunks: fresh.clone(),
+                        names: produced.names,
+                        types: produced.types,
+                    };
+                    out.chunks.extend(fresh);
+                }
+            }
             let mut ctes = cx.ctes.clone();
             ctes.insert(name.clone(), out);
             let child = Cx {
@@ -2672,9 +2769,12 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types,
             })
         }
-        LogicalPlan::Distinct { input } => {
+        LogicalPlan::Distinct { input, on } => {
             let inner = eval(cx, input)?;
-            let chunks = distinct(cx, &inner.chunks)?;
+            let chunks = match on {
+                Some(keys) => distinct_on(cx, &inner.chunks, keys)?,
+                None => distinct(cx, &inner.chunks)?,
+            };
             Ok(Output {
                 chunks,
                 names: inner.names,
@@ -3003,7 +3103,7 @@ fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
         LogicalPlan::SingleRow => Some(1),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Window { input, .. } => estimate_rows(cx, input),
         LogicalPlan::Limit { input, limit } => Some(estimate_rows(cx, input)?.min(*limit as u64)),
@@ -3011,6 +3111,7 @@ fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
             Some(estimate_rows(cx, left)?.saturating_add(estimate_rows(cx, right)?))
         }
         LogicalPlan::Cte { body, .. } => estimate_rows(cx, body),
+        LogicalPlan::Values { rows, .. } => Some(rows.len().max(1) as u64),
         _ => None,
     }
 }
@@ -3678,6 +3779,8 @@ fn expr_is_total(e: &BoundExpr) -> bool {
                     && expr_is_total(right)
             }
             BinaryOp::Modulo => false,
+            // The binder desugars both into total comparisons.
+            BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom => false,
         },
         BoundExpr::Cast { .. } => false,
         BoundExpr::Coalesce { args, .. } => args.iter().all(expr_is_total),
@@ -4257,6 +4360,34 @@ fn distinct(cx: &Cx, chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {
     Ok(out)
 }
 
+/// `DISTINCT ON (keys)`: keep the first row of each key tuple, in input order
+/// (the binder sorts first, so "first" is the query's `ORDER BY` winner).
+fn distinct_on(cx: &Cx, chunks: &[DataChunk], keys: &[usize]) -> Result<Vec<DataChunk>> {
+    let mut seen: FastSet<Vec<u8>> = FastSet::default();
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    for chunk in chunks {
+        cx.check_deadline()?;
+        let mut keep = Vec::new();
+        for row in 0..chunk.num_rows() {
+            buf.clear();
+            for &k in keys {
+                let col = chunk.columns.get(k).ok_or_else(|| {
+                    PinkDbError::Execution(format!("DISTINCT ON column {k} is out of range"))
+                })?;
+                col.encode_into(&mut buf, row);
+            }
+            if seen.insert(buf.clone()) {
+                keep.push(row);
+            }
+        }
+        if !keep.is_empty() {
+            out.push(chunk.gather(&keep));
+        }
+    }
+    Ok(out)
+}
+
 // ---------- sort ----------
 
 /// One sort's order-preserving key encoding: every input row's keys packed
@@ -4831,6 +4962,27 @@ enum SetOpKind {
 }
 
 /// Encode one row of `chunk` (all columns, in order) into `buf`.
+/// Keep the rows of `chunks` that are not in `seen` (encoding each row once),
+/// adding them to `seen` as they are kept: the `UNION` half of a recursive CTE.
+fn retain_new(chunks: &[DataChunk], seen: &mut FastSet<Vec<u8>>) -> Vec<DataChunk> {
+    let mut buf = Vec::new();
+    let mut out = Vec::new();
+    for chunk in chunks {
+        let mut keep = Vec::new();
+        for i in 0..chunk.num_rows() {
+            buf.clear();
+            encode_row_from_chunk(&mut buf, chunk, i);
+            if seen.insert(buf.clone()) {
+                keep.push(i);
+            }
+        }
+        if !keep.is_empty() {
+            out.push(chunk.gather(&keep));
+        }
+    }
+    out
+}
+
 fn encode_row_from_chunk(buf: &mut Vec<u8>, chunk: &DataChunk, i: usize) {
     for col in &chunk.columns {
         col.encode_into(buf, i);
@@ -5380,13 +5532,24 @@ fn explain_into(
             }
         }
         LogicalPlan::SingleRow => "SingleRow".to_string(),
+        LogicalPlan::Values { rows, .. } => format!("Values ({} rows)", rows.len()),
         LogicalPlan::Filter { input, predicate } => {
             children.push(input);
             format!("Filter {}", expr_text(predicate))
         }
-        LogicalPlan::Cte { name, query, body } => {
+        LogicalPlan::Cte {
+            name,
+            query,
+            body,
+            recursive,
+        } => {
             out.push(format!("{pad}Cte {name}"));
             explain_into(query, depth + 1, prunes, projections, out);
+            if let Some(step) = recursive {
+                let quant = if step.all { "UNION ALL" } else { "UNION" };
+                out.push(format!("{pad}Recursive step ({quant})"));
+                explain_into(&step.step, depth + 1, prunes, projections, out);
+            }
             explain_into(body, depth + 1, prunes, projections, out);
             return;
         }
@@ -5451,7 +5614,7 @@ fn explain_into(
             children.push(input);
             format!("Project [{}]", names.join(", "))
         }
-        LogicalPlan::Distinct { input } => {
+        LogicalPlan::Distinct { input, .. } => {
             children.push(input);
             "Distinct".to_string()
         }
@@ -5529,6 +5692,8 @@ fn expr_text(e: &BoundExpr) -> String {
                 BinaryOp::Like => "LIKE",
                 BinaryOp::NotLike => "NOT LIKE",
                 BinaryOp::Concat => "||",
+                BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
+                BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
             };
             format!("({} {sym} {})", expr_text(left), expr_text(right))
         }
@@ -5632,6 +5797,8 @@ impl<'p> Stream<'p> {
                 (StreamKind::Scan { plan, chunks: None }, names, types)
             }
             LogicalPlan::SingleRow => (StreamKind::SingleRow(false), Vec::new(), Vec::new()),
+            // Constant rows are cheap to materialize: no streaming form.
+            LogicalPlan::Values { .. } => return Ok(None),
             LogicalPlan::Filter { input, predicate } => {
                 let Some(input) = Stream::build(cx, input)? else {
                     return Ok(None);

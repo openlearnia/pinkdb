@@ -1014,6 +1014,15 @@ pub(crate) fn fold_chunk(
             None => Ok(None),
         })
         .collect::<Result<_>>()?;
+    // `FILTER (WHERE …)`: one keep mask per filtered aggregate, so the mask is
+    // evaluated once for the chunk and `accumulate` just skips rows.
+    let keeps: Vec<Option<Vec<bool>>> = aggs
+        .iter()
+        .map(|a| match &a.filter {
+            Some(pred) => keep_mask(eval_agg_vec(pred, chunk, cx)?.v()).map(Some),
+            None => Ok(None),
+        })
+        .collect::<Result<_>>()?;
     // Pass 1: one group id per row (first-seen order).
     let gids = group_ids(partial, &key_vecs, aggs, chunk.num_rows());
     // Pass 2: each aggregate runs as one typed loop over the chunk.
@@ -1021,7 +1030,13 @@ pub(crate) fn fold_chunk(
     // row gives every accumulator the same rows in the same order — results
     // are bit-identical.
     for (j, av) in arg_vecs.iter().enumerate() {
-        accumulate(&mut partial.groups, &gids, j, av.as_ref().map(|v| v.v()));
+        accumulate(
+            &mut partial.groups,
+            &gids,
+            j,
+            av.as_ref().map(|v| v.v()),
+            keeps[j].as_deref(),
+        );
     }
     Ok(())
 }
@@ -1380,10 +1395,39 @@ fn group_ids(
 /// group slots: the payload type is matched once per chunk, NULL cells are
 /// skipped (`update(None)` is a no-op for every accumulator), and MIN/MAX
 /// plus non-numeric cells keep the exact `update_vec` comparison path.
-fn accumulate(groups: &mut [(Vec<u8>, Group)], gids: &[usize], j: usize, arg: Option<&Vector>) {
+/// `FILTER (WHERE pred)` as a per-row keep mask: only TRUE rows pass (a NULL
+/// predicate is not TRUE, matching `WHERE`).
+fn keep_mask(pred: &Vector) -> Result<Vec<bool>> {
+    if pred.dtype() != DataType::Boolean {
+        return Err(PinkDbError::Type(
+            "FILTER needs a BOOLEAN expression".to_string(),
+        ));
+    }
+    let mut keep = Vec::with_capacity(pred.len());
+    let VectorData::Boolean(bits) = pred.data() else {
+        unreachable!("BOOLEAN dtype implies BOOLEAN layout")
+    };
+    for (i, &is_true) in bits.iter().enumerate() {
+        keep.push(is_true && pred.is_valid(i));
+    }
+    Ok(keep)
+}
+
+fn accumulate(
+    groups: &mut [(Vec<u8>, Group)],
+    gids: &[usize],
+    j: usize,
+    arg: Option<&Vector>,
+    keep: Option<&[bool]>,
+) {
+    // A filtered-out row contributes nothing to this aggregate: it must not
+    // reach the accumulator at all, which is what `count(*) FILTER` needs.
+    let keep = |i: usize| keep.is_none_or(|k| k[i]);
     let Some(v) = arg else {
-        for &g in gids {
-            groups[g].1.accs[j].count_star();
+        for (i, &g) in gids.iter().enumerate() {
+            if keep(i) {
+                groups[g].1.accs[j].count_star();
+            }
         }
         return;
     };
@@ -1396,28 +1440,30 @@ fn accumulate(groups: &mut [(Vec<u8>, Group)], gids: &[usize], j: usize, arg: Op
     match v.data() {
         VectorData::Int32(d) if !generic => {
             for (i, &g) in gids.iter().enumerate() {
-                if v.is_valid(i) {
+                if keep(i) && v.is_valid(i) {
                     groups[g].1.accs[j].add_int(d[i] as i64);
                 }
             }
         }
         VectorData::Int64(d) if !generic => {
             for (i, &g) in gids.iter().enumerate() {
-                if v.is_valid(i) {
+                if keep(i) && v.is_valid(i) {
                     groups[g].1.accs[j].add_int(d[i]);
                 }
             }
         }
         VectorData::Float64(d) if !generic => {
             for (i, &g) in gids.iter().enumerate() {
-                if v.is_valid(i) {
+                if keep(i) && v.is_valid(i) {
                     groups[g].1.accs[j].add_f64(d[i]);
                 }
             }
         }
         _ => {
             for (i, &g) in gids.iter().enumerate() {
-                groups[g].1.accs[j].update_vec(v, i);
+                if keep(i) {
+                    groups[g].1.accs[j].update_vec(v, i);
+                }
             }
         }
     }

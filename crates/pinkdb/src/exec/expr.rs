@@ -2093,6 +2093,73 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
             v => Err(PinkDbError::Execution(format!("sign of {v}"))),
         },
         ScalarFunc::Power => Ok(Value::Double(as_f64(&row[0])?.powf(as_f64(&row[1])?))),
+        // `v['a']`: the member with that name. A miss (absent key, or a base
+        // that is not an object) is SQL NULL — DuckDB agrees.
+        ScalarFunc::VariantField => match (&row[0], &row[1]) {
+            (Value::Variant(v), Value::Varchar(key)) => Ok(match v.object_get(key) {
+                Some(x) => Value::Variant(std::sync::Arc::new(x.clone())),
+                None => Value::Null,
+            }),
+            (v, key) => Err(PinkDbError::Execution(format!(
+                "a VARIANT field of {v} with key {key}"
+            ))),
+        },
+        // `v[1]`: the element at a 1-based index (DuckDB's convention).
+        ScalarFunc::VariantIndex => match (&row[0], &row[1]) {
+            (Value::Variant(v), idx) => {
+                let i = as_i64(idx)?;
+                if i == 0 {
+                    return Err(PinkDbError::Execution(
+                        "Extracting index 0 from VARIANT(ARRAY) is invalid, indexes are 1-based"
+                            .to_string(),
+                    ));
+                }
+                if i < 0 {
+                    return Err(PinkDbError::Execution(format!(
+                        "a VARIANT index must be positive, got {i}"
+                    )));
+                }
+                Ok(match v.array_get(i as usize - 1) {
+                    Some(x) => Value::Variant(std::sync::Arc::new(x.clone())),
+                    None => Value::Null,
+                })
+            }
+            (v, idx) => Err(PinkDbError::Execution(format!(
+                "a VARIANT index of {v} by {idx}"
+            ))),
+        },
+        // `s[from:to]`: 1-based, inclusive, negative counts from the end.
+        ScalarFunc::StringSlice => match &row[0] {
+            Value::Varchar(text) => {
+                let chars: Vec<char> = text.chars().collect();
+                let from = as_i64(&row[1])?;
+                let to = as_i64(&row[2])?;
+                Ok(Value::Varchar(string_slice(&chars, from, to)))
+            }
+            v => Err(PinkDbError::Execution(format!("slicing {v}"))),
+        },
+        // `TRY_CAST(x AS t)`: a NULL instead of an error.
+        ScalarFunc::TryCast => match cast_value(row[0].clone(), dtype) {
+            Ok(v) => Ok(v),
+            Err(_) => Ok(Value::Null),
+        },
+        ScalarFunc::LikeEscape => match (&row[0], &row[1], &row[2]) {
+            (Value::Varchar(s), Value::Varchar(pat), Value::Varchar(esc)) => {
+                let escape = escape_char(esc)?;
+                Ok(Value::Boolean(like_match_escape(s, pat, escape)))
+            }
+            (s, pat, esc) => Err(PinkDbError::Execution(format!(
+                "like_escape of {s}, {pat} and {esc}"
+            ))),
+        },
+        ScalarFunc::SimilarTo => match (&row[0], &row[1]) {
+            (Value::Varchar(s), Value::Varchar(pat)) => {
+                Ok(Value::Boolean(crate::regex::full_match(pat, s)?))
+            }
+            (s, pat) => Err(PinkDbError::Execution(format!(
+                "SIMILAR TO of {s} and {pat}"
+            ))),
+        },
         ScalarFunc::VariantExtract => match (&row[0], &row[1]) {
             (Value::Variant(v), Value::Varchar(path)) => {
                 let steps = crate::variant::parse_path(path)?;
@@ -2257,30 +2324,94 @@ fn eval_like(
 
 /// Classic `%`/`_` wildcard match (iterative backtracking over chars).
 fn like_match(s: &str, pat: &str) -> bool {
+    like_match_escape(s, pat, None)
+}
+
+/// One pattern atom: a literal char, "any char" (`_`), or "any run" (`%`).
+enum LikeAtom {
+    Any,
+    Lit(char),
+    Many,
+}
+
+/// The atom at `pi` and how many pattern chars it spans. An escape char makes
+/// the next char literal (a trailing escape is a literal escape).
+fn like_atom(p: &[char], pi: usize, escape: Option<char>) -> Option<(usize, LikeAtom)> {
+    let c = *p.get(pi)?;
+    if Some(c) == escape {
+        return Some(match p.get(pi + 1) {
+            Some(&lit) => (2, LikeAtom::Lit(lit)),
+            None => (1, LikeAtom::Lit(c)),
+        });
+    }
+    Some(match c {
+        '_' => (1, LikeAtom::Any),
+        '%' => (1, LikeAtom::Many),
+        c => (1, LikeAtom::Lit(c)),
+    })
+}
+
+/// `%`/`_` wildcard match with an optional escape char (`LIKE … ESCAPE '\'`).
+/// The escape must be a single char or none; the binder checks that.
+fn like_match_escape(s: &str, pat: &str, escape: Option<char>) -> bool {
     let s: Vec<char> = s.chars().collect();
     let p: Vec<char> = pat.chars().collect();
     let (mut si, mut pi) = (0usize, 0usize);
     let (mut star, mut mark) = (None, 0usize);
     while si < s.len() {
-        if pi < p.len() && (p[pi] == '_' || p[pi] == s[si]) {
-            si += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == '%' {
-            star = Some(pi);
-            mark = si;
-            pi += 1;
-        } else if let Some(st) = star {
-            pi = st + 1;
-            mark += 1;
-            si = mark;
-        } else {
-            return false;
+        match like_atom(&p, pi, escape) {
+            Some((len, LikeAtom::Any)) => {
+                si += 1;
+                pi += len;
+            }
+            Some((len, LikeAtom::Lit(c))) if c == s[si] => {
+                si += 1;
+                pi += len;
+            }
+            Some((len, LikeAtom::Many)) => {
+                star = Some(pi);
+                mark = si;
+                pi += len;
+            }
+            _ => match star {
+                Some(st) => {
+                    pi = st + 1;
+                    mark += 1;
+                    si = mark;
+                }
+                None => return false,
+            },
         }
     }
-    while pi < p.len() && p[pi] == '%' {
+    while matches!(like_atom(&p, pi, escape), Some((_, LikeAtom::Many))) {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// `s[from:to]` over chars: 1-based, inclusive, negative = from the end, and
+/// clamped — an inverted or empty range is the empty string (DuckDB).
+fn string_slice(chars: &[char], from: i64, to: i64) -> String {
+    let n = chars.len() as i64;
+    let resolve = |i: i64| if i < 0 { n + i + 1 } else { i };
+    let start = resolve(from).max(1);
+    let end = resolve(to).min(n);
+    if end < start {
+        return String::new();
+    }
+    chars[(start - 1) as usize..end as usize].iter().collect()
+}
+
+/// The `ESCAPE` char of `LIKE … ESCAPE`: none, or exactly one char.
+fn escape_char(esc: &str) -> Result<Option<char>> {
+    let mut chars = esc.chars();
+    match (chars.next(), chars.next()) {
+        (None, _) => Ok(None),
+        (Some(c), None) => Ok(Some(c)),
+        _ => Err(PinkDbError::Execution(
+            "Invalid escape string. Escape string must be empty or one character.".to_string(),
+        )),
+    }
 }
 
 /// Elementwise `CAST` (NULL in → NULL out).

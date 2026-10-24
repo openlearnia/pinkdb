@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use super::ast::*;
 use crate::attached::AtSpec;
-use crate::plan::{AlterTablePlan, LogicalPlan};
+use crate::plan::{AlterTablePlan, LogicalPlan, RecursiveStep};
 use crate::storage::{
     DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
 };
@@ -97,6 +97,22 @@ pub enum ScalarFunc {
     /// `variant_extract(v, path)` — the value at a JSONPath (`'a.b[0]'` or
     /// `'$.a[0]'`); SQL NULL when the path is missing.
     VariantExtract,
+    /// `v['a']` / `v.a` on a VARIANT: one field by name, NULL when absent.
+    VariantField,
+    /// `v[1]` on a VARIANT: one element by 1-based index, NULL when out of
+    /// range.
+    VariantIndex,
+    /// `s[from:to]` (and `s[i]` as `s[i:i]`) on a VARCHAR: 1-based, inclusive,
+    /// negative counts from the end, out-of-range clamps, `from > to` is empty.
+    StringSlice,
+    /// `TRY_CAST(x AS T)`: `x` cast to `T`, NULL when the cast fails.
+    TryCast,
+    /// `like_escape(s, pattern, escape)` — the desugared `LIKE ... ESCAPE`.
+    LikeEscape,
+    /// `similar_to(s, pattern)` — the desugared `SIMILAR TO`. DuckDB 2.0
+    /// treats the pattern as a fully anchored regex (`%`/`_` are literal),
+    /// and so does this.
+    SimilarTo,
 }
 
 impl ScalarFunc {
@@ -134,6 +150,8 @@ impl ScalarFunc {
             "variant_type" => ScalarFunc::VariantType,
             "variant_keys" => ScalarFunc::VariantKeys,
             "variant_extract" => ScalarFunc::VariantExtract,
+            "like_escape" => ScalarFunc::LikeEscape,
+            "similar_to" => ScalarFunc::SimilarTo,
             _ => return None,
         })
     }
@@ -156,6 +174,9 @@ pub struct BoundAgg {
     pub dtype: DataType,
     /// `COUNT(DISTINCT x)` (the only DISTINCT aggregate supported).
     pub distinct: bool,
+    /// `FILTER (WHERE pred)`: rows where the predicate is not TRUE are
+    /// skipped by this aggregate (the other aggregates still see them).
+    pub filter: Option<BoundExpr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1027,6 +1048,16 @@ struct Binder<'a> {
     in_window: bool,
     /// Windows collected from the SELECT list (deduped, like aggregates).
     windows: Vec<BoundWindow>,
+    /// `WINDOW w AS (...)` definitions of the current select body, by
+    /// lowercased name, for `OVER w`.
+    named_windows: HashMap<String, OverClause>,
+    /// Master `GROUP BY` key list when the body has GROUPING SETS / ROLLUP /
+    /// CUBE: every expression those name becomes an aggregate key, and
+    /// `GROUPING(...)` resolves its arguments against this list.
+    grouping_keys: Option<Vec<Expr>>,
+    /// One entry per distinct `GROUPING(...)` argument list, holding indices
+    /// into `grouping_keys`. Each is materialised as a constant key column.
+    group_masks: Vec<Vec<usize>>,
     /// Visible CTEs: (name, output schema). CTEs shadow catalog tables.
     ctes: Vec<(String, Vec<(String, DataType)>)>,
     /// Session-local views referenced while binding this statement. Shared
@@ -1065,6 +1096,9 @@ impl<'a> Binder<'a> {
             allow_win: true,
             in_window: false,
             windows: Vec::new(),
+            named_windows: HashMap::new(),
+            grouping_keys: None,
+            group_masks: Vec::new(),
             // A statement trigger's `REFERENCING … TABLE` relations are
             // visible to the body it runs, exactly like a CTE (wave 100).
             ctes: db
@@ -1106,6 +1140,11 @@ impl<'a> Binder<'a> {
             allow_win: true,
             in_window: false,
             windows: Vec::new(),
+            named_windows: self.named_windows.clone(),
+            // A subquery body has its own GROUP BY, so it starts without a
+            // grouping-set context (`GROUPING()` there needs its own).
+            grouping_keys: None,
+            group_masks: Vec::new(),
             ctes: self.ctes.clone(),
             views_used: Rc::clone(&self.views_used),
             dynamic_functions_used: Rc::clone(&self.dynamic_functions_used),
@@ -1189,6 +1228,53 @@ impl<'a> Binder<'a> {
         let l = self.bind_expr(left, aggs, allow_agg)?;
         let r = self.bind_expr(right, aggs, allow_agg)?;
         Ok((l, r))
+    }
+
+    /// `a IS [NOT] DISTINCT FROM b` — equality that treats NULL as a value:
+    /// `COALESCE(a = b, FALSE) OR (a IS NULL AND b IS NULL)`. That is total
+    /// (never NULL) and needs no executor support; `IS DISTINCT FROM` negates
+    /// it (`NULL vs NULL` → distinct is false, `x vs NULL` → true).
+    fn bind_is_distinct(
+        &mut self,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        let l = self.bind_expr(left, aggs, allow_agg)?;
+        let r = self.bind_expr(right, aggs, allow_agg)?;
+        comparison_ok(BinaryOp::Eq, l.dtype(), r.dtype())?;
+        let is_null = |e: &BoundExpr| BoundExpr::IsNull {
+            expr: Box::new(e.clone()),
+            negated: false,
+        };
+        let both_null = BoundExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(is_null(&l)),
+            right: Box::new(is_null(&r)),
+            dtype: DataType::Boolean,
+        };
+        let equal = BoundExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(l),
+            right: Box::new(r),
+            dtype: DataType::Boolean,
+        };
+        let same = BoundExpr::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(BoundExpr::Coalesce {
+                args: vec![equal, BoundExpr::Literal(Value::Boolean(false))],
+                dtype: DataType::Boolean,
+            }),
+            right: Box::new(both_null),
+            dtype: DataType::Boolean,
+        };
+        Ok(if op == BinaryOp::IsNotDistinctFrom {
+            same
+        } else {
+            BoundExpr::Not(Box::new(same))
+        })
     }
 
     /// The type a bare `?` operand takes from the other side's type `ctx`:
@@ -1435,10 +1521,45 @@ impl<'a> Binder<'a> {
                 {
                     return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
                 }
-                let (index, dtype) = self.lookup_column(db.as_deref(), table.as_deref(), name)?;
+                let (index, dtype) = match self.lookup_column(db.as_deref(), table.as_deref(), name)
+                {
+                    Ok(hit) => hit,
+                    Err(e) => {
+                        // `v.a` where `v` is a VARIANT *column*, not a table:
+                        // the qualifier lookup failed, so fold a field access
+                        // over the column instead. (Wave 94's db.table.column
+                        // form wins whenever it resolves, so a three-part name
+                        // never changes meaning.)
+                        if db.is_none()
+                            && let Some(qualifier) = table
+                            && let Ok((index, DataType::Variant)) =
+                                self.lookup_column(None, None, qualifier)
+                        {
+                            let mut acc = BoundExpr::Column {
+                                index,
+                                dtype: DataType::Variant,
+                            };
+                            for part in name.split('.') {
+                                acc = BoundExpr::Scalar {
+                                    func: ScalarFunc::VariantField,
+                                    args: vec![
+                                        acc,
+                                        BoundExpr::Literal(Value::Varchar(part.to_string())),
+                                    ],
+                                    dtype: DataType::Variant,
+                                };
+                            }
+                            return Ok(acc);
+                        }
+                        return Err(e);
+                    }
+                };
                 Ok(BoundExpr::Column { index, dtype })
             }
             Expr::Binary { op, left, right } => {
+                if matches!(op, BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom) {
+                    return self.bind_is_distinct(*op, left, right, aggs, allow_agg);
+                }
                 let (l, r) = self.bind_binary_operands(*op, left, right, aggs, allow_agg)?;
                 let dtype = match op {
                     BinaryOp::And | BinaryOp::Or => {
@@ -1545,7 +1666,8 @@ impl<'a> Binder<'a> {
                 name,
                 args,
                 distinct,
-            } => self.bind_function(name, args, *distinct, aggs, allow_agg),
+                filter,
+            } => self.bind_function(name, args, *distinct, filter.as_deref(), aggs, allow_agg),
             Expr::NamedArg { .. } => Err(PinkDbError::Parse(
                 "named arguments are only supported in a macro call".to_string(),
             )),
@@ -1554,7 +1676,16 @@ impl<'a> Binder<'a> {
                 args,
                 over,
                 distinct,
-            } => self.bind_window(name, args, over, *distinct, aggs, allow_agg),
+                filter,
+            } => self.bind_window(
+                name,
+                args,
+                over,
+                *distinct,
+                filter.as_deref(),
+                aggs,
+                allow_agg,
+            ),
             Expr::Coalesce(args) => {
                 let mut bound = Vec::with_capacity(args.len());
                 for a in args {
@@ -1583,6 +1714,83 @@ impl<'a> Binder<'a> {
                 Ok(BoundExpr::Coalesce {
                     args,
                     dtype: common,
+                })
+            }
+            Expr::TryCast { expr, dtype } => {
+                // Like CAST, but a failing conversion is a NULL instead of an
+                // error — including for types CAST itself refuses outright
+                // (`check_cast`), so the executor decides.
+                self.pin_parameter(expr, *dtype)?;
+                let bound = self.bind_expr(expr, aggs, allow_agg)?;
+                Ok(BoundExpr::Scalar {
+                    func: ScalarFunc::TryCast,
+                    args: vec![bound],
+                    dtype: *dtype,
+                })
+            }
+            Expr::Subscript { base, index } => {
+                let base = self.bind_expr(base, aggs, allow_agg)?;
+                let index = self.bind_expr(index, aggs, allow_agg)?;
+                match base.dtype() {
+                    // `v['a']` / `v[1]`: a VARIANT member, by name or by
+                    // (1-based) position.
+                    DataType::Variant => {
+                        if matches!(
+                            index.dtype(),
+                            DataType::Integer | DataType::Bigint | DataType::Double
+                        ) {
+                            Ok(BoundExpr::Scalar {
+                                func: ScalarFunc::VariantIndex,
+                                args: vec![base, index],
+                                dtype: DataType::Variant,
+                            })
+                        } else if index.dtype() == DataType::Varchar {
+                            Ok(BoundExpr::Scalar {
+                                func: ScalarFunc::VariantField,
+                                args: vec![base, index],
+                                dtype: DataType::Variant,
+                            })
+                        } else {
+                            Err(PinkDbError::Type(format!(
+                                "a VARIANT subscript needs a field name or an integer index, not {}",
+                                index.dtype()
+                            )))
+                        }
+                    }
+                    // `s[1]` is `s[1:1]`: a single character.
+                    DataType::Varchar => Ok(BoundExpr::Scalar {
+                        func: ScalarFunc::StringSlice,
+                        args: vec![base, index.clone(), index],
+                        dtype: DataType::Varchar,
+                    }),
+                    t => Err(PinkDbError::Type(format!(
+                        "subscripting a {t} is not supported (wave 95c): only VARCHAR and VARIANT \
+                         have subscripts"
+                    ))),
+                }
+            }
+            Expr::Slice { base, from, to } => {
+                let base = self.bind_expr(base, aggs, allow_agg)?;
+                if base.dtype() != DataType::Varchar {
+                    return Err(PinkDbError::Type(format!(
+                        "slicing a {} is not supported (wave 95c): only VARCHAR slices",
+                        base.dtype()
+                    )));
+                }
+                // An absent bound is "from the first" / "to the last"; the
+                // scalar clamps, so i32::MAX is a safe stand-in for the end.
+                let mut bind_bound = |bound: &Option<Box<Expr>>, default: i64| match bound {
+                    None => {
+                        Ok::<BoundExpr, PinkDbError>(BoundExpr::Literal(Value::Bigint(default)))
+                    }
+                    Some(e) => self.bind_expr(e, aggs, allow_agg),
+                };
+                let from = bind_bound(from, 1)?;
+                let to = bind_bound(to, i32::MAX as i64)?;
+                Ok(BoundExpr::Scalar {
+                    func: ScalarFunc::StringSlice,
+                    args: vec![base, from, to],
+                    dtype: DataType::Varchar,
                 })
             }
             Expr::Cast { expr, dtype } => {
@@ -1705,12 +1913,14 @@ impl<'a> Binder<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_window(
         &mut self,
         name: &str,
         args: &[Expr],
-        over: &OverClause,
+        over: &OverSpec,
         distinct: bool,
+        filter: Option<&Expr>,
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
@@ -1730,6 +1940,24 @@ impl<'a> Binder<'a> {
                 "nested window functions are not supported in v1".to_string(),
             ));
         }
+        if filter.is_some() {
+            return Err(PinkDbError::Execution(
+                "FILTER on a window function is not supported (wave 95c)".to_string(),
+            ));
+        }
+        // A named window resolves to its definition; `WINDOW w AS (...)` sits
+        // before the select list, so `binder.named_windows` is already filled.
+        let named;
+        let over = match over {
+            OverSpec::Inline(over) => over,
+            OverSpec::Named(n) => {
+                let Some(spec) = self.named_windows.get(&n.to_ascii_lowercase()) else {
+                    return Err(PinkDbError::Catalog(format!("window \"{n}\" not found")));
+                };
+                named = spec.clone();
+                &named
+            }
+        };
         // Resolve the function first (arity checks mirror the agg path).
         let kind: WindowKind = if let Some(wf) = WindowFunc::from_name(name) {
             if args.iter().any(|a| a == &Expr::Star) {
@@ -2010,18 +2238,64 @@ impl<'a> Binder<'a> {
         result.map(Some)
     }
 
+    /// `GROUPING(a, b)`: 1 for every argument the current grouping set omits,
+    /// big-endian (the first argument is the high bit) — DuckDB's bit order.
+    ///
+    /// Binds to a placeholder column; the aggregate stage emits the mask as a
+    /// per-branch constant key, so every clause above (HAVING, ORDER BY,
+    /// QUALIFY, the select list) just reads a column.
+    fn bind_grouping(&mut self, args: &[Expr]) -> Result<BoundExpr> {
+        let master = self.grouping_keys.clone().ok_or_else(|| {
+            PinkDbError::Execution(
+                "GROUPING() is only allowed with GROUPING SETS, ROLLUP or CUBE".to_string(),
+            )
+        })?;
+        let mut idx = Vec::with_capacity(args.len());
+        for a in args {
+            let pos = master.iter().position(|m| m == a).ok_or_else(|| {
+                PinkDbError::Execution(format!(
+                    "GROUPING() argument must be a GROUP BY expression, got {}",
+                    default_name(a)
+                ))
+            })?;
+            idx.push(pos);
+        }
+        let slot = match self.group_masks.iter().position(|m| *m == idx) {
+            Some(slot) => slot,
+            None => {
+                self.group_masks.push(idx);
+                self.group_masks.len() - 1
+            }
+        };
+        Ok(BoundExpr::Column {
+            index: GROUPING_SENTINEL + slot,
+            dtype: DataType::Bigint,
+        })
+    }
+
     fn bind_function(
         &mut self,
         name: &str,
         args: &[Expr],
         distinct: bool,
+        filter: Option<&Expr>,
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
+        // `GROUPING` is grouping-set syntax, not a function: resolve it before
+        // macros and the aggregate/scalar tables.
+        if name.eq_ignore_ascii_case("grouping") {
+            return self.bind_grouping(args);
+        }
         // Wave 77: a stored macro shadows every built-in of the same name
         // (DuckDB's rule: `CREATE MACRO abs(x) AS 42` wins). Expansion is a
         // pure AST splice into the caller's bind — invoker rights, call-site
         // types, and no generated SQL.
+        if filter.is_some() && AggFunc::from_name(name).is_none() {
+            return Err(PinkDbError::Execution(format!(
+                "FILTER is only supported on aggregate functions, not \"{name}\""
+            )));
+        }
         if let Some(bound) = self.bind_scalar_macro(name, args, distinct, aggs, allow_agg)? {
             return Ok(bound);
         }
@@ -2068,12 +2342,27 @@ impl<'a> Binder<'a> {
                 }
                 Some(a)
             };
+            let filter = match filter {
+                None => None,
+                // The predicate sees the aggregate's own input scope: columns
+                // and group keys, never another aggregate.
+                Some(pred) => {
+                    let bound = self.bind_expr(pred, aggs, false)?;
+                    if bound.dtype() != DataType::Boolean {
+                        return Err(PinkDbError::Type(
+                            "FILTER needs a BOOLEAN expression".to_string(),
+                        ));
+                    }
+                    Some(bound)
+                }
+            };
             let dtype = agg_dtype(func, arg.as_ref().map(|a| a.dtype()))?;
             let agg = BoundAgg {
                 func,
                 arg,
                 dtype,
                 distinct,
+                filter,
             };
             // Dedupe identical aggregates so `SUM(x), SUM(x)` computes once.
             let index = match aggs.iter().position(|a| a == &agg) {
@@ -2468,6 +2757,90 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
             }
             Ok(DataType::Variant)
         }
+        // `v['a']` / `v.a`: the member named by a VARCHAR key.
+        ScalarFunc::VariantField => {
+            arity(&[2])?;
+            if args[0].dtype() != DataType::Variant {
+                return Err(PinkDbError::Type(format!(
+                    "a VARIANT field needs a VARIANT base, got {}",
+                    args[0].dtype()
+                )));
+            }
+            if args[1].dtype() != DataType::Varchar {
+                return Err(PinkDbError::Type(
+                    "a VARIANT field name must be VARCHAR".to_string(),
+                ));
+            }
+            Ok(DataType::Variant)
+        }
+        // `v[1]`: the element at a 1-based index.
+        ScalarFunc::VariantIndex => {
+            arity(&[2])?;
+            if args[0].dtype() != DataType::Variant {
+                return Err(PinkDbError::Type(format!(
+                    "a VARIANT index needs a VARIANT base, got {}",
+                    args[0].dtype()
+                )));
+            }
+            if !matches!(
+                args[1].dtype(),
+                DataType::Integer | DataType::Bigint | DataType::Double
+            ) && !matches!(args[1], BoundExpr::Literal(Value::Null))
+            {
+                return Err(PinkDbError::Type(
+                    "a VARIANT index must be an integer".to_string(),
+                ));
+            }
+            Ok(DataType::Variant)
+        }
+        // `s[from:to]`: VARCHAR in, VARCHAR out.
+        ScalarFunc::StringSlice => {
+            arity(&[3])?;
+            if args[0].dtype() != DataType::Varchar {
+                return Err(PinkDbError::Type(
+                    "slicing needs a VARCHAR base".to_string(),
+                ));
+            }
+            for bound in &args[1..] {
+                if !matches!(
+                    bound.dtype(),
+                    DataType::Integer | DataType::Bigint | DataType::Double
+                ) && !matches!(bound, BoundExpr::Literal(Value::Null))
+                {
+                    return Err(PinkDbError::Type(
+                        "slice bounds must be integers".to_string(),
+                    ));
+                }
+            }
+            Ok(DataType::Varchar)
+        }
+        // `TRY_CAST(x AS t)`: a NULL instead of an error.
+        ScalarFunc::TryCast => {
+            arity(&[1])?;
+            Ok(args[0].dtype())
+        }
+        ScalarFunc::LikeEscape => {
+            arity(&[3])?;
+            for a in args {
+                if a.dtype() != DataType::Varchar {
+                    return Err(PinkDbError::Type(
+                        "like_escape needs VARCHAR on all three arguments".to_string(),
+                    ));
+                }
+            }
+            Ok(DataType::Boolean)
+        }
+        ScalarFunc::SimilarTo => {
+            arity(&[2])?;
+            for a in args {
+                if a.dtype() != DataType::Varchar {
+                    return Err(PinkDbError::Type(
+                        "SIMILAR TO needs VARCHAR on both sides".to_string(),
+                    ));
+                }
+            }
+            Ok(DataType::Boolean)
+        }
         ScalarFunc::Substr => {
             arity(&[2, 3])?;
             if args[0].dtype() != DataType::Varchar {
@@ -2698,6 +3071,8 @@ fn default_name(expr: &Expr) -> String {
                 BinaryOp::Like => "LIKE",
                 BinaryOp::NotLike => "NOT LIKE",
                 BinaryOp::Concat => "||",
+                BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
+                BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
             };
             format!("({} {sym} {})", default_name(left), default_name(right))
         }
@@ -2728,6 +3103,7 @@ fn default_name(expr: &Expr) -> String {
             name,
             args,
             distinct,
+            ..
         } => {
             let inner: Vec<String> = args
                 .iter()
@@ -2771,6 +3147,15 @@ fn default_name(expr: &Expr) -> String {
             format!("coalesce({})", inner.join(", "))
         }
         Expr::Cast { expr, dtype } => format!("cast({} as {dtype})", default_name(expr)),
+        Expr::TryCast { expr, dtype } => format!("try_cast({} as {dtype})", default_name(expr)),
+        Expr::Subscript { base, index } => {
+            format!("{}[{}]", default_name(base), default_name(index))
+        }
+        Expr::Slice { base, from, to } => {
+            let bound =
+                |e: &Option<Box<Expr>>| e.as_ref().map(|e| default_name(e)).unwrap_or_default();
+            format!("{}[{}:{}]", default_name(base), bound(from), bound(to))
+        }
         Expr::NamedArg { name, expr } => format!("{name} := {}", default_name(expr)),
         Expr::Case {
             branches, else_, ..
@@ -2795,9 +3180,181 @@ fn default_name(expr: &Expr) -> String {
 /// Every aggregate-free fragment of `expr` that references a column must
 /// equal a GROUP BY key. Pure constants (no columns) and aggregate results
 /// are always fine.
+/// Placeholder column index for `GROUPING(...)`. The aggregate stage replaces
+/// it with a constant key column, so it never denotes a real input column.
+const GROUPING_SENTINEL: usize = usize::MAX / 2;
+
+/// The subsets one `GROUP BY` item contributes, as indices into `master`.
+///
+/// `ROLLUP(a, b)` yields the prefixes longest first (`{a,b}`, `{a}`, `{}`),
+/// `CUBE(a, b)` every subset from all-keys down to none, `GROUPING SETS (...)`
+/// exactly as written — DuckDB's row order for each.
+fn group_set_indices(master: &[Expr], item: &GroupSet) -> Result<Vec<Vec<usize>>> {
+    let resolve = |e: &Expr| -> Result<usize> {
+        master.iter().position(|m| m == e).ok_or_else(|| {
+            PinkDbError::Execution(format!(
+                "GROUPING SETS expression must be a GROUP BY expression, got {}",
+                default_name(e)
+            ))
+        })
+    };
+    Ok(match item {
+        GroupSet::Sets(list) => list
+            .iter()
+            .map(|set| set.iter().map(&resolve).collect::<Result<Vec<_>>>())
+            .collect::<Result<Vec<_>>>()?,
+        GroupSet::Rollup(exprs) => {
+            let mut idx = exprs.iter().map(&resolve).collect::<Result<Vec<_>>>()?;
+            let mut out = Vec::with_capacity(idx.len() + 1);
+            out.push(idx.clone());
+            while idx.pop().is_some() {
+                out.push(idx.clone());
+            }
+            out
+        }
+        GroupSet::Cube(exprs) => {
+            // A cube over n expressions is 2^n aggregates; refuse the sizes
+            // whose plan could never run rather than allocating it.
+            if exprs.len() > 12 {
+                return Err(PinkDbError::Execution(
+                    "CUBE over more than 12 expressions is not supported".to_string(),
+                ));
+            }
+            let idx = exprs.iter().map(&resolve).collect::<Result<Vec<_>>>()?;
+            let mut out = Vec::with_capacity(1 << idx.len());
+            for mask in (0..(1u32 << idx.len())).rev() {
+                out.push(
+                    idx.iter()
+                        .enumerate()
+                        .filter(|(i, _): &(usize, &usize)| mask & (1 << (idx.len() - 1 - i)) != 0)
+                        .map(|(_, &k)| k)
+                        .collect(),
+                );
+            }
+            out
+        }
+    })
+}
+
+/// Expand a `GROUP BY` list into the ordered key-index sets the aggregate
+/// stage runs: plain keys are in every set, then each grouping-set item
+/// contributes its own subsets, crossed left to right in written order.
+fn expand_grouping_sets(
+    master: &[Expr],
+    plain: usize,
+    items: &[GroupSet],
+) -> Result<Vec<Vec<usize>>> {
+    let mut sets: Vec<Vec<usize>> = vec![(0..plain).collect()];
+    for item in items {
+        let own = group_set_indices(master, item)?;
+        let mut next = Vec::with_capacity(sets.len() * own.len());
+        for base in &sets {
+            for extra in &own {
+                let mut set = base.clone();
+                set.extend(extra.iter().copied());
+                next.push(set);
+            }
+        }
+        sets = next;
+    }
+    Ok(sets)
+}
+
+/// Give every registered `GROUPING(...)` mask a key slot. The aggregate stage
+/// emits one constant column per mask after the real keys; calling this after
+/// each clause that may register a new mask keeps `keys` in step.
+fn sync_grouping_keys(keys: &mut Vec<BoundExpr>, binder: &Binder) {
+    let Some(master) = &binder.grouping_keys else {
+        return;
+    };
+    debug_assert!(keys.len() >= master.len(), "master keys bind before masks");
+    for slot in keys.len().saturating_sub(master.len())..binder.group_masks.len() {
+        keys.push(BoundExpr::Column {
+            index: GROUPING_SENTINEL + slot,
+            dtype: DataType::Bigint,
+        });
+    }
+}
+
+/// A typed NULL: an omitted grouping-set key still needs the key column's type
+/// so every branch of the union has one output schema.
+fn typed_null(dtype: DataType) -> BoundExpr {
+    BoundExpr::Cast {
+        expr: Box::new(BoundExpr::Literal(Value::Null)),
+        dtype,
+    }
+}
+
+/// Big-endian mask for one `GROUPING(...)` argument list in one set: 1 for
+/// every argument the set omits, the first argument being the high bit.
+/// A zero-argument `GROUPING()` is 1 for the grand total only.
+fn grouping_mask(args: &[usize], set: &[usize]) -> i64 {
+    if args.is_empty() {
+        return i64::from(set.is_empty());
+    }
+    let mut mask = 0i64;
+    for (i, k) in args.iter().enumerate() {
+        if !set.contains(k) {
+            mask |= 1 << (args.len() - 1 - i);
+        }
+    }
+    mask
+}
+
+/// The aggregate stage for GROUPING SETS / ROLLUP / CUBE: one plain
+/// [`LogicalPlan::Aggregate`] per set, unioned with `UNION ALL`. Omitted keys
+/// become typed NULLs and each mask slot a constant, so every branch emits the
+/// same `[keys..., aggs...]` columns and the clauses above see one ordinary
+/// aggregate output.
+fn grouping_set_plan(
+    input: LogicalPlan,
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+    sets: &[Vec<usize>],
+    group_masks: &[Vec<usize>],
+) -> LogicalPlan {
+    let real = keys.len() - group_masks.len();
+    // Branch output is `[keys..., aggs...]`: the union needs every column's
+    // type, not just the keys'.
+    let mut types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
+    types.extend(aggs.iter().map(|a| a.dtype));
+    let mut out: Option<LogicalPlan> = None;
+    for set in sets {
+        let mut branch_keys = Vec::with_capacity(keys.len());
+        for (i, k) in keys.iter().enumerate().take(real) {
+            branch_keys.push(if set.contains(&i) {
+                k.clone()
+            } else {
+                typed_null(k.dtype())
+            });
+        }
+        for args in group_masks {
+            branch_keys.push(BoundExpr::Literal(Value::Bigint(grouping_mask(args, set))));
+        }
+        let agg = LogicalPlan::Aggregate {
+            input: Box::new(input.clone()),
+            keys: branch_keys,
+            aggs: aggs.to_vec(),
+        };
+        out = Some(match out {
+            None => agg,
+            Some(left) => LogicalPlan::SetOp {
+                op: SetOp::UnionAll,
+                left: Box::new(left),
+                right: Box::new(agg),
+                types: types.clone(),
+            },
+        });
+    }
+    out.expect("GROUP BY expands to at least one set")
+}
+
 fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
     if expr.is_aggregate_free() {
-        if expr.has_column_ref() && !keys.contains(expr) {
+        // An aggregate-free expression is valid when every column fragment in
+        // it is a group key — the same test `rebase_to_keys` applies, so
+        // `SELECT g = 'p' ... GROUP BY g` and `HAVING grouping(g) = 0` work.
+        if expr.has_column_ref() && rebase_to_keys(expr, keys).is_none() {
             return Err(PinkDbError::Execution(
                 "SELECT/HAVING expression must be an aggregate or appear in GROUP BY".to_string(),
             ));
@@ -2862,16 +3419,26 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
         if !expr.has_column_ref() {
             return Some(expr.clone());
         }
-        return keys
-            .iter()
-            .position(|k| k == expr)
-            .map(|pos| BoundExpr::Column {
+        // The expression itself may be the key (a computed key like `upper(b)`).
+        if let Some(pos) = keys.iter().position(|k| k == expr) {
+            return Some(BoundExpr::Column {
                 index: pos,
                 dtype: expr.dtype(),
             });
+        }
     }
     Some(match expr {
         BoundExpr::AggRef { .. } => expr.clone(),
+        // A key (or a constant leaf) inside an expression over keys: a key
+        // becomes its output column, `NULL` and other constants pass through.
+        BoundExpr::Column { dtype, .. } => {
+            let pos = keys.iter().position(|k| k == expr)?;
+            BoundExpr::Column {
+                index: pos,
+                dtype: *dtype,
+            }
+        }
+        BoundExpr::Literal(_) => expr.clone(),
         BoundExpr::Not(e) => BoundExpr::Not(Box::new(rebase_to_keys(e, keys)?)),
         BoundExpr::Negate { expr: e, dtype } => BoundExpr::Negate {
             expr: Box::new(rebase_to_keys(e, keys)?),
@@ -2949,7 +3516,6 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
         BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. }
         | BoundExpr::WindowRef { .. } => expr.clone(),
-        _ => return None,
     })
 }
 
@@ -3980,15 +4546,26 @@ fn expr_has_subquery(expr: &Expr) -> bool {
         Expr::Unary { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
+        | Expr::TryCast { expr, .. }
         | Expr::NamedArg { expr, .. } => expr_has_subquery(expr),
+        Expr::Subscript { base, index } => expr_has_subquery(base) || expr_has_subquery(index),
+        Expr::Slice { base, from, to } => {
+            expr_has_subquery(base)
+                || from.as_ref().is_some_and(|e| expr_has_subquery(e))
+                || to.as_ref().is_some_and(|e| expr_has_subquery(e))
+        }
         Expr::Between {
             expr, low, high, ..
         } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
-        Expr::Function { args, .. } | Expr::Coalesce(args) => args.iter().any(expr_has_subquery),
+        Expr::Function { args, filter, .. } => {
+            args.iter().any(expr_has_subquery)
+                || filter.as_ref().is_some_and(|f| expr_has_subquery(f))
+        }
+        Expr::Coalesce(args) => args.iter().any(expr_has_subquery),
         Expr::Window { args, over, .. } => {
             args.iter().any(expr_has_subquery)
-                || over.partition.iter().any(expr_has_subquery)
-                || over.order.iter().any(|i| expr_has_subquery(&i.expr))
+                || over.partition().iter().any(expr_has_subquery)
+                || over.order().iter().any(|i| expr_has_subquery(&i.expr))
         }
         Expr::Case { branches, else_ } => {
             branches
@@ -5479,16 +6056,21 @@ fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Logi
         let wrapper = Select {
             with: Vec::new(),
             distinct: false,
+            distinct_on: None,
             projections: vec![Projection::Star],
             from: Some(FromClause {
                 source: FromSource::Derived(Box::new(head)),
                 alias: Some("__setop".to_string()),
+                col_aliases: None,
                 at: None,
                 joins: Vec::new(),
             }),
             where_clause: None,
             group_by: Vec::new(),
+            group_sets: Vec::new(),
             having: None,
+            qualify: None,
+            windows: Vec::new(),
             order_by,
             limit,
             offset,
@@ -5676,10 +6258,15 @@ pub(crate) fn plan_schema(
             }
         }
         LogicalPlan::SingleRow => Ok(Vec::new()),
+        LogicalPlan::Values { names, types, .. } => Ok(names
+            .iter()
+            .cloned()
+            .zip(types.iter().copied())
+            .collect()),
         // A file source's schema is the schema the binder read from the
         // file at bind time — carried in the plan, so no second read.
         LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. } => plan_schema(db, default_db, ctes, input),
@@ -5766,7 +6353,12 @@ pub(crate) fn plan_schema(
                 .map(|((n, _), t)| (n, t))
                 .collect())
         }
-        LogicalPlan::Cte { name, query, body } => {
+        LogicalPlan::Cte {
+            name,
+            query,
+            body,
+            ..
+        } => {
             let mut inner: Vec<(String, Vec<(String, DataType)>)> = ctes.to_vec();
             inner.push((name.clone(), plan_schema(db, default_db, ctes, query)?));
             plan_schema(db, default_db, &inner, body)
@@ -5904,9 +6496,106 @@ fn bind_source(
     binder: &mut Binder,
     source: &FromSource,
     alias: &Option<String>,
+    col_aliases: &Option<Vec<String>>,
+    at: Option<AtSpec>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    let (mut scope, plan) = bind_source_raw(db, binder, source, alias, at)?;
+    // `t(x, y)`: rename the source's columns positionally. `VALUES` supplies
+    // its own `col0…` names, so this is also how `(VALUES …) t(x, y)` names
+    // them.
+    if let Some(cols) = col_aliases {
+        if cols.len() != scope.columns.len() {
+            return Err(PinkDbError::Type(format!(
+                "column alias list has {} entries but the source has {} columns",
+                cols.len(),
+                scope.columns.len()
+            )));
+        }
+        for (slot, name) in scope.columns.iter_mut().zip(cols) {
+            slot.0 = name.clone();
+        }
+    }
+    Ok((scope, plan))
+}
+
+/// Bind one `FROM` source with an empty alias/scope handling.
+fn bind_source_raw(
+    db: &PinkDb,
+    binder: &mut Binder,
+    source: &FromSource,
+    alias: &Option<String>,
     at: Option<AtSpec>,
 ) -> Result<(ScopeTable, LogicalPlan)> {
     match source {
+        // `(VALUES (1,'a'), (2,'b'))`: constant rows, `col0…` names (renamed
+        // by a column alias list), one common type per column.
+        FromSource::Values(rows) => {
+            let width = rows.first().map(|r| r.len()).unwrap_or(0);
+            let mut bound: Vec<Vec<BoundExpr>> = Vec::with_capacity(rows.len());
+            let mut types: Vec<Option<DataType>> = vec![None; width];
+            for row in rows {
+                if row.len() != width {
+                    return Err(PinkDbError::Type(format!(
+                        "VALUES rows need {width} columns, this one has {}",
+                        row.len()
+                    )));
+                }
+                let mut cells = Vec::with_capacity(width);
+                for (i, expr) in row.iter().enumerate() {
+                    let cell = binder.child().bind_expr(expr, &mut Vec::new(), false)?;
+                    if cell.has_column_ref() || cell.has_subquery() {
+                        return Err(PinkDbError::Type(
+                            "VALUES can only hold constants (no column references or \
+                             subqueries)"
+                                .to_string(),
+                        ));
+                    }
+                    types[i] = fold_result_common(types[i], &cell)?;
+                    cells.push(cell);
+                }
+                bound.push(cells);
+            }
+            let types: Vec<DataType> = types
+                .into_iter()
+                .map(|t| t.unwrap_or(DataType::Varchar))
+                .collect();
+            // Unify each column: a mixed `VALUES (1), ('x')` column takes the
+            // common type, and every cell is cast to it here so the executor
+            // pushes values into one typed vector.
+            for row in bound.iter_mut() {
+                for (cell, t) in row.iter_mut().zip(&types) {
+                    if cell.dtype() != *t {
+                        check_cast(cell.dtype(), *t)?;
+                        *cell = BoundExpr::Cast {
+                            expr: Box::new(std::mem::replace(
+                                cell,
+                                BoundExpr::Literal(Value::Null),
+                            )),
+                            dtype: *t,
+                        };
+                    }
+                }
+            }
+            let names: Vec<String> = (0..width).map(|i| format!("col{i}")).collect();
+            let scope = ScopeTable {
+                name: alias
+                    .clone()
+                    .unwrap_or_else(|| "values".to_string())
+                    .to_ascii_lowercase(),
+                original: None,
+                db: None,
+                is_alias: alias.is_some(),
+                columns: names.iter().cloned().zip(types.iter().copied()).collect(),
+            };
+            Ok((
+                scope,
+                LogicalPlan::Values {
+                    rows: bound,
+                    names,
+                    types,
+                },
+            ))
+        }
         FromSource::Table { db: qdb, name } => {
             // CTEs shadow everything — but only unqualified names.
             if qdb.is_none()
@@ -6163,8 +6852,12 @@ fn bind_select_with(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
 /// Bind the WITH clause of `sel`: each CTE in order (seeing previous +
 /// ancestor CTEs), pushed onto `binder.ctes` so the caller's body — including
 /// every UNION branch — can reference them. Pair with [`wrap_ctes`].
-fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<(String, LogicalPlan)>> {
-    let mut cte_plans: Vec<(String, LogicalPlan)> = Vec::new();
+/// A bound CTE: its lowercased name, the body plan, and — for `WITH
+/// RECURSIVE` — the step that keeps extending it.
+type CtePlan = (String, LogicalPlan, Option<Box<RecursiveStep>>);
+
+fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<CtePlan>> {
+    let mut cte_plans: Vec<CtePlan> = Vec::new();
     for cte in &sel.with {
         if binder
             .ctes
@@ -6177,25 +6870,114 @@ fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<(Stri
             )));
         }
         let mut child = binder.child();
-        let query = bind_select_in(db, &mut child, &cte.query)?;
-        let mut schema = plan_schema(db, &child.default_db, &binder.ctes, &query)?;
-        if let Some(cols) = &cte.cols {
-            if cols.len() != schema.len() {
+        // `WITH RECURSIVE x AS (anchor UNION [ALL] step)`: bind the anchor
+        // first, publish its schema as `x`, then bind the step against it.
+        let (query, recursive) = if cte.recursive && !cte.query.unions.is_empty() {
+            let mut anchor_sel = (*cte.query).clone();
+            let unions = std::mem::take(&mut anchor_sel.unions);
+            if unions.len() != 1 {
                 return Err(PinkDbError::Execution(format!(
-                    "CTE \"{}\" has {} columns but {} aliases",
-                    cte.name,
-                    schema.len(),
-                    cols.len()
+                    "recursive CTE \"{}\" takes exactly one UNION [ALL] step",
+                    cte.name
                 )));
             }
-            for (s, c) in schema.iter_mut().zip(cols.iter()) {
-                s.0 = c.clone();
+            let (op, step_sel) = unions.into_iter().next().expect("length checked");
+            let all = match op {
+                SetOp::UnionAll => true,
+                SetOp::Union => false,
+                other => {
+                    return Err(PinkDbError::Execution(format!(
+                        "recursive CTE \"{}\" must join its anchor and step with UNION or \
+                         UNION ALL, not {other:?}",
+                        cte.name
+                    )));
+                }
+            };
+            let anchor = bind_select_with(db, &mut child, &anchor_sel)?;
+            let schema = cte_schema(db, binder, &child, cte, &anchor)?;
+            child
+                .ctes
+                .push((cte.name.to_ascii_lowercase(), schema.clone()));
+            // Later CTEs of the same WITH and the body below see it too.
+            binder
+                .ctes
+                .push((cte.name.to_ascii_lowercase(), schema.clone()));
+            let step = bind_select_with(db, &mut child, &step_sel)?;
+            // The step must produce the anchor's columns: cast each one onto
+            // the anchor's type so the growing result keeps one schema.
+            let step_schema = plan_schema(db, &child.default_db, &child.ctes, &step)?;
+            if step_schema.len() != schema.len() {
+                return Err(PinkDbError::Execution(format!(
+                    "recursive CTE \"{}\" step has {} columns, its anchor has {}",
+                    cte.name,
+                    step_schema.len(),
+                    schema.len()
+                )));
             }
-        }
-        binder.ctes.push((cte.name.to_ascii_lowercase(), schema));
-        cte_plans.push((cte.name.to_ascii_lowercase(), query));
+            let mut exprs = Vec::with_capacity(schema.len());
+            for (i, (_, want)) in schema.iter().enumerate() {
+                let have = step_schema[i].1;
+                let col = BoundExpr::Column {
+                    index: i,
+                    dtype: have,
+                };
+                exprs.push(if have == *want {
+                    col
+                } else {
+                    check_cast(have, *want)?;
+                    BoundExpr::Cast {
+                        expr: Box::new(col),
+                        dtype: *want,
+                    }
+                });
+            }
+            let names = schema.iter().map(|(n, _)| n.clone()).collect();
+            let step = LogicalPlan::Project {
+                input: Box::new(step),
+                exprs,
+                names,
+            };
+            (
+                anchor,
+                Some(Box::new(RecursiveStep {
+                    step: Box::new(step),
+                    all,
+                })),
+            )
+        } else {
+            let query = bind_select_in(db, &mut child, &cte.query)?;
+            let schema = cte_schema(db, binder, &child, cte, &query)?;
+            binder.ctes.push((cte.name.to_ascii_lowercase(), schema));
+            (query, None)
+        };
+        cte_plans.push((cte.name.to_ascii_lowercase(), query, recursive));
     }
     Ok(cte_plans)
+}
+
+/// Output schema of one CTE body, renamed by its `(col, ...)` alias list.
+fn cte_schema(
+    db: &PinkDb,
+    binder: &Binder,
+    child: &Binder,
+    cte: &CteDef,
+    query: &LogicalPlan,
+) -> Result<Vec<(String, DataType)>> {
+    let mut schema = plan_schema(db, &child.default_db, &binder.ctes, query)?;
+    if let Some(cols) = &cte.cols {
+        if cols.len() != schema.len() {
+            return Err(PinkDbError::Execution(format!(
+                "CTE \"{}\" has {} columns but {} aliases",
+                cte.name,
+                schema.len(),
+                cols.len()
+            )));
+        }
+        for (s, c) in schema.iter_mut().zip(cols.iter()) {
+            s.0 = c.clone();
+        }
+    }
+    Ok(schema)
 }
 
 /// Wrap `plan` in the Cte nodes from [`bind_ctes`] (reverse order) and pop
@@ -6203,15 +6985,16 @@ fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<(Stri
 fn wrap_ctes(
     binder: &mut Binder,
     cte_base: usize,
-    cte_plans: Vec<(String, LogicalPlan)>,
+    cte_plans: Vec<CtePlan>,
     plan: LogicalPlan,
 ) -> LogicalPlan {
     let mut plan = plan;
-    for (name, query) in cte_plans.into_iter().rev() {
+    for (name, query, recursive) in cte_plans.into_iter().rev() {
         plan = LogicalPlan::Cte {
             name,
             query: Box::new(query),
             body: Box::new(plan),
+            recursive,
         };
     }
     binder.ctes.truncate(cte_base);
@@ -6222,12 +7005,26 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     // FROM (+ left-deep join chain). Returns the base plan and left width.
     let mut base: LogicalPlan;
     if let Some(from) = &sel.from {
-        let (left, left_plan) = bind_source(db, binder, &from.source, &from.alias, from.at)?;
+        let (left, left_plan) = bind_source(
+            db,
+            binder,
+            &from.source,
+            &from.alias,
+            &from.col_aliases,
+            from.at,
+        )?;
         let mut left_cols = left.columns.len();
         base = left_plan;
         binder.tables.push(left);
         for join in &from.joins {
-            let (right, right_plan) = bind_source(db, binder, &join.source, &join.alias, join.at)?;
+            let (right, right_plan) = bind_source(
+                db,
+                binder,
+                &join.source,
+                &join.alias,
+                &join.col_aliases,
+                join.at,
+            )?;
             // The same effective name twice is refused, except for two
             // unaliased base tables from *different* databases
             // (`FROM db1.t JOIN db2.t`, wave 94): those stay in scope and a
@@ -6295,6 +7092,32 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         {
             binder.aliases.insert(a.to_ascii_lowercase(), expr.clone());
         }
+    }
+    // `WINDOW w AS (...)` definitions of this body: `OVER w` resolves here,
+    // after the definitions (they may follow the projections that use them).
+    for (name, spec) in &sel.windows {
+        binder
+            .named_windows
+            .insert(name.to_ascii_lowercase(), spec.clone());
+    }
+    // GROUPING SETS / ROLLUP / CUBE: every expression a grouping-set item
+    // names becomes an aggregate key, so all branches emit the same key
+    // columns. `GROUPING(...)` resolves its arguments against this list, so it
+    // must exist before the select list binds.
+    let mut master_ast: Vec<Expr> = sel.group_by.clone();
+    if !sel.group_sets.is_empty() {
+        for item in &sel.group_sets {
+            let exprs: Vec<&Expr> = match item {
+                GroupSet::Rollup(list) | GroupSet::Cube(list) => list.iter().collect(),
+                GroupSet::Sets(sets) => sets.iter().flatten().collect(),
+            };
+            for e in exprs {
+                if !master_ast.contains(e) {
+                    master_ast.push(e.clone());
+                }
+            }
+        }
+        binder.grouping_keys = Some(master_ast.clone());
     }
 
     // WHERE (aggregates forbidden; aliases NOT visible here — standard SQL
@@ -6473,10 +7296,27 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         let mut no_aggs = Vec::new();
         keys.push(binder.bind_expr(g, &mut no_aggs, false)?);
     }
+    // Grouping-set expressions join the aggregate keys, in master order.
+    for g in &master_ast[sel.group_by.len()..] {
+        let mut no_aggs = Vec::new();
+        keys.push(binder.bind_expr(g, &mut no_aggs, false)?);
+    }
     binder.allow_win = true;
+    sync_grouping_keys(&mut keys, binder);
+    let group_sets = if sel.group_sets.is_empty() {
+        None
+    } else {
+        Some(expand_grouping_sets(
+            &master_ast,
+            sel.group_by.len(),
+            &sel.group_sets,
+        )?)
+    };
 
-    // HAVING forces aggregation (single-group when no GROUP BY).
-    let is_agg = !aggs.is_empty() || !keys.is_empty() || sel.having.is_some();
+    // HAVING forces aggregation (single-group when no GROUP BY), and so do
+    // grouping sets, even one that names no key (`GROUPING SETS (())`).
+    let is_agg =
+        !aggs.is_empty() || !keys.is_empty() || sel.having.is_some() || group_sets.is_some();
     if is_agg {
         for (e, _) in &select {
             validate_grouped(e, &keys)?;
@@ -6498,9 +7338,33 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 "HAVING needs a BOOLEAN expression".to_string(),
             ));
         }
+        // HAVING may introduce a `GROUPING(...)` mask: give it its key slot
+        // before validating against the key list.
+        sync_grouping_keys(&mut keys, binder);
         // HAVING without aggregation (`SELECT a ... HAVING ...`) is rejected:
         // without GROUP BY, fragments can't validate.
         validate_grouped(h, &keys)?;
+    }
+
+    // QUALIFY filters rows after the window stage but below the projection, so
+    // it sees select aliases and window functions (DuckDB's clause order is
+    // WINDOW ... QUALIFY ... ORDER BY). Aggregates ride on the query's own
+    // aggregation, exactly like HAVING.
+    let mut qualify = sel
+        .qualify
+        .as_ref()
+        .map(|e| binder.bind_expr(e, &mut aggs, is_agg))
+        .transpose()?;
+    if let Some(q) = &qualify {
+        if q.dtype() != DataType::Boolean {
+            return Err(PinkDbError::Type(
+                "QUALIFY needs a BOOLEAN expression".to_string(),
+            ));
+        }
+        sync_grouping_keys(&mut keys, binder);
+        if is_agg {
+            validate_grouped(q, &keys)?;
+        }
     }
 
     // Windows collected from the SELECT list. Their args/partition/order
@@ -6528,6 +7392,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         .map(|(e, n)| (resolve_agg_refs(e, num_keys), n))
         .collect();
     let mut having = having.map(|h| resolve_agg_refs(h, num_keys));
+    qualify = qualify.map(|q| resolve_agg_refs(q, num_keys));
     for w in windows.iter_mut() {
         w.arg = w.arg.take().map(|a| resolve_agg_refs(a, num_keys));
         w.partition = std::mem::take(&mut w.partition)
@@ -6549,6 +7414,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             .map(|(e, n)| (rebase_to_keys(&e, &keys).expect("validated"), n))
             .collect();
         having = having.map(|h| rebase_to_keys(&h, &keys).expect("validated"));
+        qualify = qualify.map(|q| rebase_to_keys(&q, &keys).expect("validated"));
         for w in windows.iter_mut() {
             // Window fields address the Aggregate output too.
             if let Some(a) = w.arg.take() {
@@ -6565,6 +7431,9 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         }
     }
     let keys_for_order = keys.clone();
+    // Aggregate output width, unchanged by grouping sets (every branch emits
+    // all keys and all aggregates).
+    let agg_width = keys.len() + aggs.len();
 
     // Scan / join → filter → aggregate → having-filter → window.
     let mut plan = base;
@@ -6575,10 +7444,13 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         };
     }
     if is_agg {
-        plan = LogicalPlan::Aggregate {
-            input: Box::new(plan),
-            keys,
-            aggs,
+        plan = match &group_sets {
+            Some(sets) => grouping_set_plan(plan, &keys, &aggs, sets, &binder.group_masks),
+            None => LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                keys,
+                aggs,
+            },
         };
         if let Some(h) = having {
             plan = LogicalPlan::Filter {
@@ -6590,19 +7462,22 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     // Windows see the aggregate output (or the scan). Their results append
     // after `input_cols` columns; select items rebase onto those positions.
     // (HAVING sits below, so it never holds WindowRefs.)
-    let input_cols = match &plan {
-        LogicalPlan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
-        LogicalPlan::Filter { input, .. } => match &**input {
-            LogicalPlan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
-            _ => scan_width(binder),
-        },
-        _ => scan_width(binder),
+    let input_cols = if is_agg {
+        agg_width
+    } else {
+        scan_width(binder)
     };
     if !windows.is_empty() {
         plan = LogicalPlan::Window {
             input: Box::new(plan),
             windows,
             input_cols,
+        };
+    }
+    if let Some(pred) = qualify.map(|q| resolve_window_refs(q, input_cols)) {
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: pred,
         };
     }
     // NOTE: select items are rebound below (resolve_window_refs) once the
@@ -6702,6 +7577,45 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         }
     }
 
+    // DISTINCT ON (...) keys become hidden columns: DuckDB lets them stay out
+    // of the select list, but the dedupe below reads them as input columns.
+    let mut on_keys: Vec<usize> = Vec::new();
+    for e in sel.distinct_on.iter().flatten() {
+        let mut no_aggs = Vec::new();
+        binder.allow_win = false;
+        let bound = binder.bind_expr(e, &mut no_aggs, false)?;
+        binder.allow_win = true;
+        if !no_aggs.is_empty() {
+            return Err(PinkDbError::Execution(
+                "aggregates in DISTINCT ON must use a select alias or position in v1".to_string(),
+            ));
+        }
+        let scoped = if is_agg {
+            rebase_to_keys(&bound, &keys_for_order).ok_or_else(|| {
+                PinkDbError::Execution(
+                    "DISTINCT ON expression must be an alias, position, or GROUP BY key in v1"
+                        .to_string(),
+                )
+            })?
+        } else {
+            bound
+        };
+        on_keys.push(match proj_exprs.iter().position(|p| p == &scoped) {
+            Some(idx) => idx,
+            None => {
+                proj_exprs.push(scoped);
+                proj_names.push(format!("__on{}", on_keys.len()));
+                proj_exprs.len() - 1
+            }
+        });
+    }
+    let has_on = !on_keys.is_empty();
+    if has_on && sel.distinct {
+        return Err(PinkDbError::Parse(
+            "DISTINCT and DISTINCT ON cannot be combined".to_string(),
+        ));
+    }
+
     plan = LogicalPlan::Project {
         input: Box::new(plan),
         exprs: proj_exprs,
@@ -6715,6 +7629,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         }
         plan = LogicalPlan::Distinct {
             input: Box::new(plan),
+            on: None,
         };
     }
     if !sort_keys.is_empty() {
@@ -6722,18 +7637,26 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             input: Box::new(plan),
             keys: sort_keys,
         };
-        if hidden > 0 {
-            plan = LogicalPlan::Project {
-                input: Box::new(plan),
-                exprs: (0..visible)
-                    .map(|i| BoundExpr::Column {
-                        index: i,
-                        dtype: visible_dtypes[i],
-                    })
-                    .collect(),
-                names: visible_names,
-            };
-        }
+    }
+    // DISTINCT ON keeps the first row per key in the ORDER BY order, so the
+    // dedupe sits above the sort (plain DISTINCT shrinks before sorting).
+    if has_on {
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+            on: Some(on_keys),
+        };
+    }
+    if hidden > 0 || has_on {
+        plan = LogicalPlan::Project {
+            input: Box::new(plan),
+            exprs: (0..visible)
+                .map(|i| BoundExpr::Column {
+                    index: i,
+                    dtype: visible_dtypes[i],
+                })
+                .collect(),
+            names: visible_names,
+        };
     }
     if let Some(n) = sel.offset {
         plan = LogicalPlan::Offset {
@@ -6865,7 +7788,7 @@ mod tests {
             LogicalPlan::Project { input, .. }
             | LogicalPlan::Filter { input, .. }
             | LogicalPlan::Sort { input, .. }
-            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Limit { input, .. } => has_nested_loop_join(input),
             _ => false,
         }
@@ -6877,7 +7800,7 @@ mod tests {
             LogicalPlan::Project { input, .. }
             | LogicalPlan::Filter { input, .. }
             | LogicalPlan::Sort { input, .. }
-            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Limit { input, .. } => has_multi_key_join(input),
             _ => false,
         }

@@ -8,6 +8,50 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-25
+### Wave 95a — SQL dialect completeness, batch 1 ✅
+- **The matrix first.** `docs/sql-conformance.md`
+  lists every query form row 95 scopes, each checked by running it against
+  DuckDB 2.0.0: supported (same answer), divergent (and how), or refused with
+  the exact error — and each assigned to batch 95a, 95b or 95c. Row 95 is
+  large, so 95a is the query forms, 95b the DML forms, 95c the rest.
+- **New query forms.** `QUALIFY`; `TRY_CAST(expr AS type)` (NULL on failure,
+  every target type); subscripts `v['a']`, `v[0]`, `v.a` and string
+  `'hello'[2]` / `'hello'[2:4]` (1-based, negative from the end, like DuckDB);
+  `IS [NOT] DISTINCT FROM`; `VALUES` as a query, in `FROM` with column aliases
+  and as the column-name source (`col0`, `col1`, …), plus `TABLE t`;
+  `FETCH FIRST n ROWS ONLY` and `OFFSET … ROWS`; `LIKE … ESCAPE`; `SIMILAR TO`
+  as the fully anchored regex DuckDB actually implements (a hand-written NFA in
+  `crates/pinkdb/src/regex.rs` — no new dependency); `DISTINCT ON (…)`
+  (first row per key in `ORDER BY` order); aggregate `FILTER (WHERE …)`, also
+  with `DISTINCT`; named `WINDOW w AS (…)` clauses; `GROUPING SETS`, `ROLLUP`,
+  `CUBE` with `GROUPING()`/`GROUPING(a, b)` (big-endian mask, DuckDB's set
+  order); `WITH RECURSIVE` (semi-naive iteration, `UNION` de-duplicating,
+  `UNION ALL` not; bounded at 100 000 iterations and 10 000 000 rows — both
+  are errors, so a runaway recursion cannot hang the engine); and
+  `UNION`/`INTERSECT`/`EXCEPT` `ALL` are covered by the corpus now.
+- **Everything else fails by name.** Every form 95b/95c will add is recognised
+  and refused with a `wave 95b`/`wave 95c` sentence (`MERGE`, `ON CONFLICT`,
+  `RETURNING`, `UPDATE … FROM`, `DELETE … USING`, data-modifying CTEs,
+  `LATERAL`, `WITHIN GROUP`, `TABLESAMPLE`, `FOR UPDATE`/`SHARE`,
+  `AT TIME ZONE`, row constructors, list literals, `FILTER` on a window, a
+  window built on a window, VARIANT slicing, `SET VARIABLE`, `$name`), and the
+  refusal is reported on its own instead of inside peg's expected-token list.
+- **Plan and EXPLAIN.** `LogicalPlan` gained `Values`, a `recursive` step on
+  `Cte` and an `on` column subset on `Distinct`; `EXPLAIN` prints `Values (n
+  rows)` and `Recursive step (UNION ALL)`, and every new form shows its
+  operator (`Window` for `QUALIFY`, `Distinct` for `DISTINCT ON`, …).
+- **Tests.** `crates/pinkdb/tests/sql_conformance.rs`: 25 shared-corpus cases
+  pinned to DuckDB's answers and re-measured on DuckDB when
+  `/tmp/duckdb-2.0.0/duckdb` exists, the EXPLAIN shapes, the 95b/95c refusals,
+  and the pinkdb-only shapes (VARIANT subscripts, grouping masks, recursion
+  bounds). A `SELECT 1.e2` regression from the new `.field` postfix is a parse
+  error again.
+- **No regression.** Interleaved A/B against HEAD `1d199fb` on a
+  1 000 000-row TPC-H-shaped store (release: TPC-H Q1 0.012 → 0.012 s, Q6
+  0.007 → 0.007 s, group/sort 0.131 → 0.132 s; medians of six runs,
+  `bench/wave95_perf/`).
+
 ## 2026-10-24
 ### Wave 101a — the `VARIANT` type core ✅
 - **The type.** `VARIANT` is now a column type: one column, any shape per row —

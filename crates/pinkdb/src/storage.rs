@@ -2814,6 +2814,7 @@ mod tests {
         let query = Select {
             with: Vec::new(),
             distinct: false,
+            distinct_on: None,
             projections: vec![Projection::Expr {
                 expr: Expr::Literal(Value::Integer(1)),
                 alias: None,
@@ -2821,7 +2822,10 @@ mod tests {
             from: None,
             where_clause: None,
             group_by: Vec::new(),
+            group_sets: Vec::new(),
             having: None,
+            qualify: None,
+            windows: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,

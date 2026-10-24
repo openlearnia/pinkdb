@@ -223,7 +223,7 @@ enum NodeRef<'a> {
     Cte(&'a ast::CteDef),
     Join(&'a ast::JoinClause),
     Order(&'a ast::OrderItem),
-    Over(&'a ast::OverClause),
+    Over(&'a ast::OverSpec),
 }
 
 /// Maximum root-to-leaf node count, via an explicit worklist (no recursion).
@@ -351,8 +351,19 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                 }
                 ast::Expr::Unary { expr, .. }
                 | ast::Expr::IsNull { expr, .. }
-                | ast::Expr::Cast { expr, .. } => {
+                | ast::Expr::Cast { expr, .. }
+                | ast::Expr::TryCast { expr, .. } => {
                     work.push((NodeRef::Expr(expr), child));
+                }
+                ast::Expr::Subscript { base, index } => {
+                    work.push((NodeRef::Expr(base), child));
+                    work.push((NodeRef::Expr(index), child));
+                }
+                ast::Expr::Slice { base, from, to } => {
+                    work.push((NodeRef::Expr(base), child));
+                    for bound in [from, to].into_iter().flatten() {
+                        work.push((NodeRef::Expr(bound), child));
+                    }
                 }
                 ast::Expr::Between {
                     expr, low, high, ..
@@ -361,17 +372,25 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                     work.push((NodeRef::Expr(low), child));
                     work.push((NodeRef::Expr(high), child));
                 }
-                ast::Expr::Function { args, .. } => {
+                ast::Expr::Function { args, filter, .. } => {
                     for arg in args {
                         work.push((NodeRef::Expr(arg), child));
+                    }
+                    if let Some(filter) = filter {
+                        work.push((NodeRef::Expr(filter), child));
                     }
                 }
                 ast::Expr::NamedArg { expr, .. } => {
                     work.push((NodeRef::Expr(expr), child));
                 }
-                ast::Expr::Window { args, over, .. } => {
+                ast::Expr::Window {
+                    args, over, filter, ..
+                } => {
                     for arg in args {
                         work.push((NodeRef::Expr(arg), child));
+                    }
+                    if let Some(filter) = filter {
+                        work.push((NodeRef::Expr(filter), child));
                     }
                     work.push((NodeRef::Over(over), child));
                 }
@@ -432,7 +451,7 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
             NodeRef::Order(item) => {
                 work.push((NodeRef::Expr(&item.expr), child));
             }
-            NodeRef::Over(over) => {
+            NodeRef::Over(ast::OverSpec::Inline(over)) => {
                 for e in &over.partition {
                     work.push((NodeRef::Expr(e), child));
                 }
@@ -440,6 +459,7 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                     work.push((NodeRef::Order(item), child));
                 }
             }
+            NodeRef::Over(ast::OverSpec::Named(_)) => {}
         }
     }
     Ok(max)
@@ -474,11 +494,15 @@ fn empty_select() -> ast::Select {
     ast::Select {
         with: Vec::new(),
         distinct: false,
+        distinct_on: None,
         projections: Vec::new(),
         from: None,
         where_clause: None,
         group_by: Vec::new(),
+        group_sets: Vec::new(),
         having: None,
+        qualify: None,
+        windows: Vec::new(),
         order_by: Vec::new(),
         limit: None,
         offset: None,
@@ -619,8 +643,19 @@ fn take_expr_children(
         }
         ast::Expr::Unary { expr, .. }
         | ast::Expr::IsNull { expr, .. }
-        | ast::Expr::Cast { expr, .. } => {
+        | ast::Expr::Cast { expr, .. }
+        | ast::Expr::TryCast { expr, .. } => {
             exprs.push(std::mem::replace(&mut **expr, null_expr()));
+        }
+        ast::Expr::Subscript { base, index } => {
+            exprs.push(std::mem::replace(&mut **base, null_expr()));
+            exprs.push(std::mem::replace(&mut **index, null_expr()));
+        }
+        ast::Expr::Slice { base, from, to } => {
+            exprs.push(std::mem::replace(&mut **base, null_expr()));
+            for bound in [from, to].into_iter().flatten() {
+                exprs.push(std::mem::replace(&mut **bound, null_expr()));
+            }
         }
         ast::Expr::Between {
             expr, low, high, ..
@@ -629,15 +664,27 @@ fn take_expr_children(
             exprs.push(std::mem::replace(&mut **low, null_expr()));
             exprs.push(std::mem::replace(&mut **high, null_expr()));
         }
-        ast::Expr::Function { args, .. } => exprs.append(args),
+        ast::Expr::Function { args, filter, .. } => {
+            exprs.append(args);
+            if let Some(filter) = filter {
+                exprs.push(std::mem::replace(&mut **filter, null_expr()));
+            }
+        }
         ast::Expr::NamedArg { expr, .. } => {
             exprs.push(std::mem::replace(&mut **expr, null_expr()));
         }
-        ast::Expr::Window { args, over, .. } => {
+        ast::Expr::Window {
+            args, over, filter, ..
+        } => {
             exprs.append(args);
-            exprs.append(&mut over.partition);
-            for item in over.order.drain(..) {
-                exprs.push(item.expr);
+            if let Some(filter) = filter {
+                exprs.push(std::mem::replace(&mut **filter, null_expr()));
+            }
+            for e in over.partition_mut() {
+                exprs.push(std::mem::replace(e, null_expr()));
+            }
+            for item in over.order_mut() {
+                exprs.push(std::mem::replace(&mut item.expr, null_expr()));
             }
         }
         ast::Expr::ScalarSubquery(query) | ast::Expr::Exists { query, .. } => {

@@ -430,11 +430,23 @@ pub struct RefTable {
 pub struct Select {
     pub with: Vec<CteDef>,
     pub distinct: bool,
+    /// `DISTINCT ON (a, b)` — keep the first row per key in ORDER BY order.
+    /// `None` for a plain `DISTINCT` (`distinct` flag) or no dedupe at all.
+    pub distinct_on: Option<Vec<Expr>>,
     pub projections: Vec<Projection>,
     pub from: Option<FromClause>,
     pub where_clause: Option<Expr>,
     pub group_by: Vec<Expr>,
+    /// `ROLLUP(...)`, `CUBE(...)` and `GROUPING SETS (...)` items, in written
+    /// order after the plain keys. Empty = one plain grouping set.
+    pub group_sets: Vec<GroupSet>,
     pub having: Option<Expr>,
+    /// `QUALIFY <cond>` — a filter over the window results, evaluated before
+    /// the select list is projected, so it sees select aliases.
+    pub qualify: Option<Expr>,
+    /// `WINDOW w AS (...)` definitions, in written order; `OVER w` refers to
+    /// one by name.
+    pub windows: Vec<(String, OverClause)>,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<usize>,
     /// `OFFSET <n>`: skip the first `n` rows (valid alone or with LIMIT).
@@ -454,6 +466,21 @@ pub enum SetOp {
     IntersectAll,
     Except,
     ExceptAll,
+}
+
+/// One `GROUP BY` item that expands to several grouping sets.
+///
+/// The plain expressions of a `GROUP BY` list form the first item and the
+/// sets of every such item are combined as a cross product, in written order
+/// (`GROUP BY a, ROLLUP(b)` groups by `{a,b}` and `{a}`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupSet {
+    /// `ROLLUP(a, b)` → `{a,b}`, `{a}`, `{}`.
+    Rollup(Vec<Expr>),
+    /// `CUBE(a, b)` → every subset of the keys.
+    Cube(Vec<Expr>),
+    /// `GROUPING SETS ((a, b), (a), ())` exactly as written.
+    Sets(Vec<Vec<Expr>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -482,6 +509,9 @@ pub struct CteDef {
     /// `WITH w(a, b) AS ...` renames the output columns.
     pub cols: Option<Vec<String>>,
     pub query: Box<Select>,
+    /// `WITH RECURSIVE`: `query` must be `anchor UNION [ALL] step`, and the
+    /// step may reference `name` (the previous iteration's rows).
+    pub recursive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -502,6 +532,9 @@ pub enum FromSource {
     /// (`FROM 'file.parquet'`). The binder offers the path to every
     /// registered source's `bind_path` hook.
     Path(String),
+    /// A `VALUES` list in FROM position: `(VALUES (1,'a'), (2,'b')) t(x,y)`.
+    /// Rows may be empty (`VALUES ()` is a one-row, zero-column relation).
+    Values(Vec<Vec<Expr>>),
 }
 
 /// One argument of a [`FromSource::Function`] call, as parsed: an expression
@@ -516,6 +549,9 @@ pub struct TableFunctionCallArg {
 pub struct FromClause {
     pub source: FromSource,
     pub alias: Option<String>,
+    /// `(VALUES ...) AS t(a, b)` / `FROM t AS x(a, b)`: renamed output
+    /// columns, positionally.
+    pub col_aliases: Option<Vec<String>>,
     /// `AT (VERSION => n)` / `AT (TIMESTAMP => ts)`, written after the alias
     /// (`FROM t AS x AT (VERSION => 1)`), DuckLake's shape. Only table
     /// references may carry one.
@@ -543,6 +579,8 @@ pub struct JoinClause {
     pub kind: JoinKind,
     pub source: FromSource,
     pub alias: Option<String>,
+    /// `JOIN (VALUES …) v(x, y)`: positional column aliases for the source.
+    pub col_aliases: Option<Vec<String>>,
     /// `AT (...)` after this join's table reference (see [`FromClause::at`]).
     pub at: Option<crate::attached::AtSpec>,
     /// `ON` condition; `None` for CROSS JOIN, which has no condition.
@@ -583,6 +621,49 @@ pub struct OverClause {
     pub order: Vec<OrderItem>,
     /// `None` = default frame (whole partition, or cumulative with ORDER BY).
     pub frame: Option<FrameSpec>,
+}
+
+/// What `OVER` names: an inline specification (`OVER (PARTITION BY ...)`) or
+/// a named window from the query's `WINDOW` clause (`OVER w`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OverSpec {
+    Inline(OverClause),
+    Named(String),
+}
+
+impl OverSpec {
+    /// The inline spec, if this is not a reference to a named window.
+    pub fn inline(&self) -> Option<&OverClause> {
+        match self {
+            OverSpec::Inline(over) => Some(over),
+            OverSpec::Named(_) => None,
+        }
+    }
+
+    /// The `PARTITION BY` expressions (empty for a named window, whose
+    /// definition the binder resolves).
+    pub fn partition(&self) -> &[Expr] {
+        self.inline().map_or(&[], |over| &over.partition)
+    }
+
+    /// The `ORDER BY` items (empty for a named window).
+    pub fn order(&self) -> &[OrderItem] {
+        self.inline().map_or(&[], |over| &over.order)
+    }
+
+    pub fn partition_mut(&mut self) -> &mut [Expr] {
+        match self {
+            OverSpec::Inline(over) => &mut over.partition,
+            OverSpec::Named(_) => &mut [],
+        }
+    }
+
+    pub fn order_mut(&mut self) -> &mut [OrderItem] {
+        match self {
+            OverSpec::Inline(over) => &mut over.order,
+            OverSpec::Named(_) => &mut [],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -669,6 +750,8 @@ pub enum Expr {
         /// `f(DISTINCT x)` — only `COUNT(DISTINCT x)` is supported (checked
         /// in the binder).
         distinct: bool,
+        /// `f(...) FILTER (WHERE cond)` — aggregates only.
+        filter: Option<Box<Expr>>,
     },
     /// `name := expr` (also `name => expr`) inside a function call's argument
     /// list (wave 77). Only macro calls consume these; the binder refuses one
@@ -681,10 +764,12 @@ pub enum Expr {
     Window {
         name: String,
         args: Vec<Expr>,
-        over: OverClause,
+        over: OverSpec,
         /// Parsed for a clear binder error (DISTINCT windows are not
         /// supported, matching DuckDB).
         distinct: bool,
+        /// `f(...) FILTER (WHERE cond) OVER (...)` — aggregate windows only.
+        filter: Option<Box<Expr>>,
     },
     /// `(SELECT ...)` — uncorrelated scalar subquery (exactly 1 row × 1 col;
     /// 0 rows → NULL).
@@ -706,6 +791,23 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         dtype: crate::types::DataType,
+    },
+    /// `TRY_CAST(x AS type)` — NULL when the cast would fail.
+    TryCast {
+        expr: Box<Expr>,
+        dtype: crate::types::DataType,
+    },
+    /// `base[index]` — a VARIANT field/array element, a VARCHAR character or
+    /// a list element (see the binder for the accepted base types).
+    Subscript {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// `base[from:to]` — a 1-based, inclusive VARCHAR slice.
+    Slice {
+        base: Box<Expr>,
+        from: Option<Box<Expr>>,
+        to: Option<Box<Expr>>,
     },
     /// `CASE [op] WHEN c THEN v ... [ELSE e] END` (simple form desugared
     /// to `op = c` in the parser; missing ELSE is NULL).
@@ -732,6 +834,10 @@ pub enum BinaryOp {
     Or,
     Like,
     NotLike,
+    /// `a IS DISTINCT FROM b` — NULL-safe inequality (NULLs are equal to
+    /// each other and distinct from every value).
+    IsDistinctFrom,
+    IsNotDistinctFrom,
     /// `a || b` — strict string concatenation (NULL if either side is NULL).
     Concat,
 }

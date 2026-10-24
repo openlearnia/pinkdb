@@ -140,8 +140,9 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
             input: Box::new(apply_indexes(db, *input)),
             offset,
         },
-        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+        LogicalPlan::Distinct { input, on } => LogicalPlan::Distinct {
             input: Box::new(apply_indexes(db, *input)),
+            on,
         },
         LogicalPlan::Window {
             input,
@@ -196,10 +197,16 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
             right: Box::new(apply_indexes(db, *right)),
             types,
         },
-        LogicalPlan::Cte { name, query, body } => LogicalPlan::Cte {
+        LogicalPlan::Cte {
+            name,
+            query,
+            body,
+            recursive,
+        } => LogicalPlan::Cte {
             name,
             query: Box::new(apply_indexes(db, *query)),
             body: Box::new(apply_indexes(db, *body)),
+            recursive: recursive.map(|r| Box::new(r.map(&|p: LogicalPlan| apply_indexes(db, p)))),
         },
         LogicalPlan::Explain { plan } => LogicalPlan::Explain {
             plan: Box::new(apply_indexes(db, *plan)),
@@ -332,8 +339,9 @@ fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(drop_count_star_projections(*input)),
             offset,
         },
-        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+        LogicalPlan::Distinct { input, on } => LogicalPlan::Distinct {
             input: Box::new(drop_count_star_projections(*input)),
+            on,
         },
         LogicalPlan::Window {
             input,
@@ -344,10 +352,16 @@ fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
             windows,
             input_cols,
         },
-        LogicalPlan::Cte { name, query, body } => LogicalPlan::Cte {
+        LogicalPlan::Cte {
+            name,
+            query,
+            body,
+            recursive,
+        } => LogicalPlan::Cte {
             name,
             query: Box::new(drop_count_star_projections(*query)),
             body: Box::new(drop_count_star_projections(*body)),
+            recursive: recursive.map(|r| Box::new(r.map(&drop_count_star_projections))),
         },
         LogicalPlan::SetOp {
             op,
@@ -600,13 +614,28 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             exprs: exprs.into_iter().map(|e| fold_expr(&cx, e)).collect(),
             names,
         },
-        LogicalPlan::Cte { name, query, body } => LogicalPlan::Cte {
+        LogicalPlan::Cte {
+            name,
+            query,
+            body,
+            recursive,
+        } => LogicalPlan::Cte {
             name,
             query: Box::new(fold_plan(db, *query)),
             body: Box::new(fold_plan(db, *body)),
+            recursive: recursive.map(|r| Box::new(r.map(&|p| fold_plan(db, p)))),
         },
-        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+        LogicalPlan::Distinct { input, on } => LogicalPlan::Distinct {
             input: Box::new(fold_plan(db, *input)),
+            on,
+        },
+        LogicalPlan::Values { rows, names, types } => LogicalPlan::Values {
+            rows: rows
+                .into_iter()
+                .map(|row| row.into_iter().map(|e| fold_expr(&cx, e)).collect())
+                .collect(),
+            names,
+            types,
         },
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
             input: Box::new(fold_plan(db, *input)),
@@ -991,14 +1020,14 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             },
             true,
         ),
-        LogicalPlan::Distinct { input: inner } => {
+        LogicalPlan::Distinct { input: inner, on } => {
             // Pushing the filter below a DISTINCT evaluates the predicate on
             // every input row instead of once per distinct row: an impure
             // dynamic call would change its call count, so it stays above.
-            if pred.contains_dynamic_scalar() {
+            if pred.contains_dynamic_scalar() || on.is_some() {
                 return (
                     LogicalPlan::Filter {
-                        input: Box::new(LogicalPlan::Distinct { input: inner }),
+                        input: Box::new(LogicalPlan::Distinct { input: inner, on }),
                         predicate: pred,
                     },
                     false,
@@ -1010,6 +1039,7 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                         input: inner,
                         predicate: pred,
                     }),
+                    on,
                 },
                 true,
             )
@@ -1407,13 +1437,20 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
         },
         // Filters push within the body and within the query independently —
         // never across the CTE boundary (different scopes).
-        LogicalPlan::Cte { name, query, body } => LogicalPlan::Cte {
+        LogicalPlan::Cte {
+            name,
+            query,
+            body,
+            recursive,
+        } => LogicalPlan::Cte {
             name,
             query: Box::new(pushdown(*query)),
             body: Box::new(pushdown(*body)),
+            recursive: recursive.map(|r| Box::new(r.map(&|p| pushdown(p)))),
         },
-        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+        LogicalPlan::Distinct { input, on } => LogicalPlan::Distinct {
             input: Box::new(pushdown(*input)),
+            on,
         },
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
             input: Box::new(pushdown(*input)),
@@ -1502,7 +1539,7 @@ fn plan_width(db: &crate::storage::PinkDb, plan: &LogicalPlan) -> Option<usize> 
         } => db.table_in(dbname, table).ok().map(|t| t.num_cols()),
         LogicalPlan::SingleRow => Some(0),
         LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. } => plan_width(db, input),
@@ -1548,7 +1585,7 @@ fn column_origin(
             })
         }
         LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. } => column_origin(db, input, index),
@@ -1818,10 +1855,11 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
                 keys,
             }
         }
-        LogicalPlan::Distinct { input } => {
+        LogicalPlan::Distinct { input, on } => {
             let inner = pass_live(db, &input, live);
             LogicalPlan::Distinct {
                 input: Box::new(elim(db, *input, &inner)),
+                on,
             }
         }
         LogicalPlan::Limit { input, limit } => {
@@ -1961,10 +1999,16 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
                 types,
             }
         }
-        LogicalPlan::Cte { name, query, body } => LogicalPlan::Cte {
+        LogicalPlan::Cte {
+            name,
+            query,
+            body,
+            recursive,
+        } => LogicalPlan::Cte {
             name,
             query: Box::new(elim(db, *query, &Live::All)),
             body: Box::new(elim(db, *body, live)),
+            recursive: recursive.map(|r| Box::new(r.map(&|p| elim(db, p, &Live::All)))),
         },
         LogicalPlan::InsertSelect {
             db: qdb,
@@ -2262,6 +2306,7 @@ mod tests {
             arg: None,
             dtype: T::Bigint,
             distinct: false,
+            filter: None,
         }
     }
 

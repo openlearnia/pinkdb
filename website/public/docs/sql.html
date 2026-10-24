@@ -246,13 +246,25 @@ second committer with a write-conflict error instead of a silent lost update.</p
   | <span class="tok-k">FROM</span> a <span class="tok-k">JOIN</span> b <span class="tok-k">ON</span> ... <span class="tok-k">JOIN</span> c <span class="tok-k">ON</span> ...   <span class="tok-c">-- multi-way (n-ary) joins</span>
   | <span class="tok-k">FROM</span> db1.t                    <span class="tok-c">-- qualified tables resolve in that database</span>
   | <span class="tok-k">FROM</span> (<span class="tok-k">SELECT</span> ...) <span class="tok-k">AS</span> s         <span class="tok-c">-- derived tables (alias required)</span>
-  | <span class="tok-k">WITH</span> w <span class="tok-k">AS</span> (<span class="tok-k">SELECT</span> ...) ...     <span class="tok-c">-- CTEs, incl. WITH w(a, b) AS column aliases</span>
-<span class="tok-k">WHERE</span> expr                        <span class="tok-c">-- IS [NOT] NULL, BETWEEN, IN (subquery|list), EXISTS</span>
-<span class="tok-k">GROUP</span> <span class="tok-k">BY</span> ... <span class="tok-k">HAVING</span> ...
+  | <span class="tok-k">FROM</span> (<span class="tok-k">VALUES</span> (<span class="tok-n">1</span>,<span class="tok-s">'a'</span>), (<span class="tok-n">2</span>,<span class="tok-s">'b'</span>)) t(x, y)  <span class="tok-c">-- VALUES, column aliases optional</span>
+  | <span class="tok-k">FROM</span> <span class="tok-s">'file.csv'</span> / read_csv(...) <span class="tok-c">-- extension table functions (waves 70-75)</span>
+  | <span class="tok-k">WITH</span> [RECURSIVE] w <span class="tok-k">AS</span> (<span class="tok-k">SELECT</span> ...) ...  <span class="tok-c">-- CTEs, incl. WITH w(a, b) AS column</span>
+                                  <span class="tok-c">-- aliases; RECURSIVE needs an anchor plus a</span>
+                                  <span class="tok-c">-- UNION [ALL] step (bounded, see below)</span>
+[WINDOW w <span class="tok-k">AS</span> (<span class="tok-k">PARTITION</span> <span class="tok-k">BY</span> ... <span class="tok-k">ORDER</span> <span class="tok-k">BY</span> ...), ...]
+<span class="tok-k">WHERE</span> expr                        <span class="tok-c">-- IS [NOT] NULL, IS [NOT] DISTINCT FROM,</span>
+                                  <span class="tok-c">-- BETWEEN, IN (subquery|list), EXISTS</span>
+<span class="tok-k">GROUP</span> <span class="tok-k">BY</span> ... | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)   <span class="tok-k">HAVING</span> ...
+QUALIFY expr                      <span class="tok-c">-- after WINDOW, before ORDER BY</span>
 <span class="tok-k">ORDER</span> <span class="tok-k">BY</span> expr [<span class="tok-k">ASC</span>|<span class="tok-k">DESC</span>] [<span class="tok-k">NULLS</span> <span class="tok-k">FIRST</span>|<span class="tok-k">NULLS</span> <span class="tok-k">LAST</span>], ...   <span class="tok-c">-- ORDER BY 2 positional</span>
-<span class="tok-k">LIMIT</span> n [<span class="tok-k">OFFSET</span> m];
+<span class="tok-k">LIMIT</span> n | FETCH <span class="tok-k">FIRST</span>|NEXT n ROW|<span class="tok-k">ROWS</span> ONLY | <span class="tok-k">OFFSET</span> n [ROW|<span class="tok-k">ROWS</span>];
+
+<span class="tok-k">SELECT</span> <span class="tok-k">DISTINCT</span> <span class="tok-k">ON</span> (expr, ...) ...  <span class="tok-c">-- first row per key in ORDER BY order</span>
+<span class="tok-k">SELECT</span> ... <span class="tok-k">TABLE</span> t;                 <span class="tok-c">-- the whole table (plus any trailing clauses)</span>
+<span class="tok-k">VALUES</span> (<span class="tok-n">1</span>, <span class="tok-s">'a'</span>), (<span class="tok-n">2</span>, <span class="tok-s">'b'</span>);          <span class="tok-c">-- column names col0, col1, ...</span>
 
 COUNT(<span class="tok-k">DISTINCT</span> x)                 <span class="tok-c">-- inside aggregates</span>
+SUM(x) FILTER (<span class="tok-k">WHERE</span> ...)         <span class="tok-c">-- filtered aggregates</span>
 <span class="tok-k">SELECT</span> ... <span class="tok-k">UNION</span> [<span class="tok-k">ALL</span>|<span class="tok-k">DISTINCT</span>] <span class="tok-k">SELECT</span> ...
 <span class="tok-k">SELECT</span> ... INTERSECT [<span class="tok-k">ALL</span>] <span class="tok-k">SELECT</span> ...
 <span class="tok-k">SELECT</span> ... EXCEPT [<span class="tok-k">ALL</span>] <span class="tok-k">SELECT</span> ...
@@ -276,11 +288,25 @@ SHOW TABLES;  DESCRIBE t;         <span class="tok-c">-- introspection</span></c
 <ul>
   <li>Derived tables in <code>FROM</code> (alias required), including inside CTEs,
   views and other subqueries.</li>
+  <li><code>VALUES</code> in <code>FROM</code> with column aliases
+  (<code>(VALUES (1, 'a'), (2, 'b')) t(x, y)</code>), standalone
+  (<code>VALUES (1, 'a'), (2, 'b')</code> — the columns are <code>col0</code>,
+  <code>col1</code>, …) and as an <code>INSERT</code> source. Cells must be
+  constants; each column takes the common type of its cells.</li>
+  <li><code>TABLE t</code> is shorthand for <code>SELECT * FROM t</code> and takes
+  the same trailing <code>ORDER BY</code>/<code>LIMIT</code>.</li>
   <li>Scalar subqueries, <code>IN (subquery)</code> and <code>EXISTS (subquery)</code>
   — uncorrelated only; correlated subqueries are rejected.</li>
   <li><code>WITH w AS (...)</code> plus <code>WITH w(a, b) AS (...)</code> column
   aliases. CTEs shadow unqualified names only; a qualified name never resolves to a
   CTE.</li>
+  <li><code>WITH RECURSIVE r(i) AS (anchor UNION [ALL] step)</code>, evaluated
+  semi-naively: the step sees the rows the previous round added, <code>UNION</code>
+  (not <code>ALL</code>) also drops rows already produced, iteration stops when the
+  step adds nothing, the step's columns are cast to the anchor's types, and
+  recursion is bounded at 100 000 iterations and 10 000 000 rows — both are errors
+  (<code>recursive CTE "r" still produced rows after 100000 iterations</code>), so a
+  forgotten predicate cannot hang the engine.</li>
 </ul>
 
 <h3>Set operations and views</h3>
@@ -321,7 +347,17 @@ as a follow-up wave.</p>
 <ul>
   <li>Aggregates: <code>COUNT(*)</code> / <code>COUNT(x)</code> /
   <code>COUNT(DISTINCT x)</code>, <code>SUM</code>, <code>AVG</code>,
-  <code>MIN</code>, <code>MAX</code>.</li>
+  <code>MIN</code>, <code>MAX</code>, each with an optional
+  <code>FILTER (WHERE ...)</code> (<code>SUM(x) FILTER (WHERE x &gt; 0)</code>);
+  filtered rows contribute nothing, not a zero.</li>
+  <li><code>GROUP BY GROUPING SETS (...)</code>, <code>ROLLUP (...)</code> and
+  <code>CUBE (...)</code>, with <code>GROUPING(x)</code> /
+  <code>GROUPING(x, y)</code> / <code>GROUPING()</code> to tell summary rows from
+  detail rows (big-endian mask, DuckDB's set order: <code>GROUPING(a, b) =
+  2 * g(a) + g(b)</code>; the zero-argument form is <code>0</code> for detail rows
+  and <code>1</code> for the grand total). Plain group keys cross-product with the
+  sets, and <code>HAVING</code>/<code>ORDER BY</code>/<code>LIMIT</code> apply once
+  to the combined result.</li>
   <li>Window functions: <code>ROW_NUMBER</code>, <code>RANK</code>,
   <code>DENSE_RANK</code>, <code>LAG</code>, <code>LEAD</code>,
   <code>NTILE</code>, <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, and
@@ -329,8 +365,17 @@ as a follow-up wave.</p>
   <code>ORDER BY</code> / <code>ROWS</code> and <code>RANGE</code> frames (frames
   are validated; no nesting). The default frame is cumulative with
   <code>ORDER BY</code> and whole-partition without it.</li>
-  <li>Window functions are allowed in the SELECT list and <code>ORDER BY</code> only
-  (not in <code>WHERE</code>/<code>GROUP BY</code>/<code>HAVING</code>).</li>
+  <li>Named windows: <code>WINDOW w AS (PARTITION BY g ORDER BY a)</code> then
+  <code>OVER w</code> (also <code>sum(a) OVER w</code>; several definitions in one
+  clause). A window that builds on another window is refused.</li>
+  <li><code>QUALIFY expr</code> filters on the window output, so
+  <code>QUALIFY row_number() OVER (PARTITION BY g ORDER BY a) = 1</code> and
+  <code>... WINDOW w AS (...) QUALIFY s &gt; 10</code> (with <code>s</code> a select
+  alias) need no extra subquery. It runs after <code>WINDOW</code> and before
+  <code>ORDER BY</code>.</li>
+  <li>Window functions are allowed in the SELECT list, <code>ORDER BY</code> and
+  <code>QUALIFY</code> (not in <code>WHERE</code>/<code>GROUP BY</code>/
+  <code>HAVING</code>).</li>
   <li>Aggregates in <code>ORDER BY</code> need a select alias or position; general
   <code>ORDER BY</code> expressions must be aliases, positions, or GROUP BY
   keys.</li>
@@ -349,10 +394,25 @@ as a follow-up wave.</p>
   <li><code>CAST(x AS type)</code>: the numeric tower both ways (including
   <code>DECIMAL</code> and <code>INTERVAL</code> from/to text), bool ↔ numeric,
   varchar parse/format, date ↔ timestamp; bad input and out-of-range narrowing
-  error.</li>
-  <li><code>COALESCE(a, b, ...)</code>, <code>NULLIF(a, b)</code>, and
-  <code>LIKE</code>/<code>NOT LIKE</code> with <code>%</code>/<code>_</code>
-  patterns.</li>
+  error. <code>TRY_CAST(x AS type)</code> is the same cast but returns
+  <code>NULL</code> when it would fail, for every target type; a conversion that
+  does not exist at all is still an error.</li>
+  <li><code>COALESCE(a, b, ...)</code>, <code>NULLIF(a, b)</code>,
+  <code>IS [NOT] DISTINCT FROM</code> (NULL-safe equality: two NULLs are not
+  distinct), and <code>LIKE</code>/<code>NOT LIKE</code> with
+  <code>%</code>/<code>_</code> patterns — plus <code>LIKE p ESCAPE 'x'</code>
+  (one escape character, or <code>''</code> for none) and <code>SIMILAR TO</code>,
+  which is the fully anchored regular expression DuckDB 2.0 really implements
+  (<code>%</code> and <code>_</code> are literals there; use <code>.*</code>),
+  supporting <code>.</code>, <code>[...]</code>/<code>[^...]</code> classes,
+  <code>* + ? {m,n}</code>, groups, alternation and <code>^</code>/<code>$</code>.
+  <code>like_escape(s, p, esc)</code> is also a scalar function.</li>
+  <li>Subscripts: <code>v['a']</code>, <code>v[0]</code> and <code>v.a</code> on a
+  <code>VARIANT</code> (1-based array indices, 0 is an error, a missing key or an
+  out-of-range index is <code>NULL</code>, chains like
+  <code>payload.b[2]</code> work), and <code>s[2]</code> /
+  <code>s[2:4]</code> / <code>s[-1]</code> on a <code>VARCHAR</code>
+  (character-wise, negative counts from the end, out-of-range clamps).</li>
   <li>Dates and timestamps: <code>year</code>, <code>month</code>, <code>day</code>,
   <code>hour</code>, <code>minute</code>, <code>second</code>,
   <code>date_trunc(part, x)</code> (with DuckDB part aliases like
@@ -550,8 +610,10 @@ it and never affects other sessions: the shared store is untouched.</p>
   <code>FROM</code>/<code>JOIN</code>, <code>INSERT</code>, <code>UPDATE</code>,
   <code>DELETE</code>, <code>CREATE TABLE</code>, <code>DROP TABLE</code>,
   <code>CREATE VIEW</code> and <code>DROP VIEW</code>.</li>
-  <li>Three-part column references (<code>db.table.col</code>) are not supported —
-  use an alias (<code>SELECT x.col FROM db.table AS x</code>).</li>
+  <li>Three-part column references (<code>db.table.col</code>) resolve since wave
+  94. One consequence: a nested <code>VARIANT</code> path is spelled
+  <code>js.a['b']</code>, because <code>v.js.a</code> reads as database
+  <code>v</code>.</li>
   <li>Views are per-database and session-local: created in the current database and
   resolved there, with their bodies resolving unqualified names in that
   database.</li>
@@ -664,6 +726,21 @@ SHOW MATERIALIZED VIEWS;               <span class="tok-c">-- schedule, last ref
 <ul>
   <li><strong>Correlated subqueries</strong> are rejected (uncorrelated subqueries
   and <code>EXISTS</code> work).</li>
+  <li><strong>DML forms</strong> — <code>INSERT … ON CONFLICT</code> (and
+  <code>INSERT OR REPLACE</code> / <code>REPLACE INTO</code>),
+  <code>UPDATE … FROM</code>, <code>DELETE … USING</code>,
+  <code>RETURNING</code>, <code>MERGE</code> and data-modifying CTEs — are
+  refused with a <code>wave 95b</code> error naming the form.</li>
+  <li><strong>Query forms</strong> — <code>LATERAL</code>, ordered-set aggregates
+  (<code>WITHIN GROUP</code>), <code>TABLESAMPLE</code>,
+  <code>FOR UPDATE</code>/<code>SHARE</code>, <code>AT TIME ZONE</code>, row
+  constructors, list literals and the <code>LIST</code> type, <code>FILTER</code> on
+  a window aggregate, a window built on another window, slicing a
+  <code>VARIANT</code>, the JSON mutators (<code>json_set</code>,
+  <code>json_insert</code>, <code>json_replace</code>, <code>json_remove</code>)
+  and <code>SET VARIABLE</code>/<code>$name</code> — are refused with a
+  <code>wave 95c</code> error. None of them degrades into a generic syntax
+  error.</li>
   <li><strong>Indexes</strong> (<code>CREATE INDEX</code>), <strong>materialized
   views</strong> and <strong>stored procedures</strong> are planned
   (waves 42–44).</li>
@@ -679,6 +756,7 @@ SHOW MATERIALIZED VIEWS;               <span class="tok-c">-- schedule, last ref
 
 <ul class="next-links">
   <li><a href="../docs/dialect">SQL dialect →</a></li>
+  <li><a href="https://github.com/openlearnia/pinkdb/blob/main/docs/sql-conformance.md" rel="noopener">Conformance matrix →</a></li>
   <li><a href="../docs/cli">CLI &amp; REPL →</a></li>
   <li><a href="../docs/persistence">Persistence →</a></li>
 </ul>

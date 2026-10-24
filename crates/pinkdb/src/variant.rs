@@ -83,6 +83,27 @@ impl Variant {
         Ok(Variant::Object(fields.into()))
     }
 
+    /// The member called `key`, or `None` when this is not an object or has
+    /// no such key (the caller turns that into SQL NULL).
+    pub fn object_get(&self, key: &str) -> Option<&Variant> {
+        match self {
+            Variant::Object(fields) => fields
+                .binary_search_by(|(k, _)| k.as_ref().cmp(key))
+                .ok()
+                .map(|i| &fields[i].1),
+            _ => None,
+        }
+    }
+
+    /// The element at a 0-based index, or `None` when this is not an array or
+    /// the index is past the end.
+    pub fn array_get(&self, index: usize) -> Option<&Variant> {
+        match self {
+            Variant::Array(items) => items.get(index),
+            _ => None,
+        }
+    }
+
     fn check_depth(&self, depth: usize) -> Result<()> {
         if depth > MAX_DEPTH {
             return Err(too_deep());

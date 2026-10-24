@@ -264,6 +264,7 @@ pub(crate) fn substitute_expr(
             name,
             args: call_args,
             distinct,
+            filter,
         } => Expr::Function {
             name: name.clone(),
             args: call_args
@@ -271,38 +272,52 @@ pub(crate) fn substitute_expr(
                 .map(|a| substitute_expr(a, args, used))
                 .collect::<Result<_>>()?,
             distinct: *distinct,
+            filter: match filter {
+                Some(f) => Some(Box::new(substitute_expr(f, args, used)?)),
+                None => None,
+            },
         },
         Expr::Window {
             name,
             args: call_args,
             over,
             distinct,
+            filter,
         } => Expr::Window {
             name: name.clone(),
             args: call_args
                 .iter()
                 .map(|a| substitute_expr(a, args, used))
                 .collect::<Result<_>>()?,
-            over: crate::sql::ast::OverClause {
-                partition: over
-                    .partition
-                    .iter()
-                    .map(|e| substitute_expr(e, args, used))
-                    .collect::<Result<_>>()?,
-                order: over
-                    .order
-                    .iter()
-                    .map(|item| {
-                        Ok(crate::sql::ast::OrderItem {
-                            expr: substitute_expr(&item.expr, args, used)?,
-                            desc: item.desc,
-                            nulls_first: item.nulls_first,
-                        })
+            over: match over {
+                crate::sql::ast::OverSpec::Named(n) => crate::sql::ast::OverSpec::Named(n.clone()),
+                crate::sql::ast::OverSpec::Inline(over) => {
+                    crate::sql::ast::OverSpec::Inline(crate::sql::ast::OverClause {
+                        partition: over
+                            .partition
+                            .iter()
+                            .map(|e| substitute_expr(e, args, used))
+                            .collect::<Result<_>>()?,
+                        order: over
+                            .order
+                            .iter()
+                            .map(|item| {
+                                Ok(crate::sql::ast::OrderItem {
+                                    expr: substitute_expr(&item.expr, args, used)?,
+                                    desc: item.desc,
+                                    nulls_first: item.nulls_first,
+                                })
+                            })
+                            .collect::<Result<_>>()?,
+                        frame: over.frame.clone(),
                     })
-                    .collect::<Result<_>>()?,
-                frame: over.frame.clone(),
+                }
             },
             distinct: *distinct,
+            filter: match filter {
+                Some(f) => Some(Box::new(substitute_expr(f, args, used)?)),
+                None => None,
+            },
         },
         Expr::Coalesce(items) => Expr::Coalesce(
             items
@@ -313,6 +328,25 @@ pub(crate) fn substitute_expr(
         Expr::Cast { expr, dtype } => Expr::Cast {
             expr: Box::new(substitute_expr(expr, args, used)?),
             dtype: *dtype,
+        },
+        Expr::TryCast { expr, dtype } => Expr::TryCast {
+            expr: Box::new(substitute_expr(expr, args, used)?),
+            dtype: *dtype,
+        },
+        Expr::Subscript { base, index } => Expr::Subscript {
+            base: Box::new(substitute_expr(base, args, used)?),
+            index: Box::new(substitute_expr(index, args, used)?),
+        },
+        Expr::Slice { base, from, to } => Expr::Slice {
+            base: Box::new(substitute_expr(base, args, used)?),
+            from: match from {
+                Some(e) => Some(Box::new(substitute_expr(e, args, used)?)),
+                None => None,
+            },
+            to: match to {
+                Some(e) => Some(Box::new(substitute_expr(e, args, used)?)),
+                None => None,
+            },
         },
         Expr::Case { branches, else_ } => Expr::Case {
             branches: branches
@@ -375,10 +409,20 @@ pub(crate) fn substitute_select(
                     name: cte.name.clone(),
                     cols: cte.cols.clone(),
                     query: Box::new(substitute_select(&cte.query, args, used)?),
+                    recursive: cte.recursive,
                 })
             })
             .collect::<Result<_>>()?,
         distinct: select.distinct,
+        distinct_on: match &select.distinct_on {
+            Some(items) => Some(
+                items
+                    .iter()
+                    .map(|e| substitute_expr(e, args, used))
+                    .collect::<Result<_>>()?,
+            ),
+            None => None,
+        },
         projections: select
             .projections
             .iter()
@@ -407,6 +451,43 @@ pub(crate) fn substitute_select(
             Some(e) => Some(substitute_expr(e, args, used)?),
             None => None,
         },
+        group_sets: select
+            .group_sets
+            .iter()
+            .map(|set| substitute_group_set(set, args, used))
+            .collect::<Result<_>>()?,
+        qualify: match &select.qualify {
+            Some(e) => Some(substitute_expr(e, args, used)?),
+            None => None,
+        },
+        windows: select
+            .windows
+            .iter()
+            .map(|(name, spec)| {
+                Ok((
+                    name.clone(),
+                    crate::sql::ast::OverClause {
+                        partition: spec
+                            .partition
+                            .iter()
+                            .map(|e| substitute_expr(e, args, used))
+                            .collect::<Result<_>>()?,
+                        order: spec
+                            .order
+                            .iter()
+                            .map(|item| {
+                                Ok(crate::sql::ast::OrderItem {
+                                    expr: substitute_expr(&item.expr, args, used)?,
+                                    desc: item.desc,
+                                    nulls_first: item.nulls_first,
+                                })
+                            })
+                            .collect::<Result<_>>()?,
+                        frame: spec.frame.clone(),
+                    },
+                ))
+            })
+            .collect::<Result<_>>()?,
         order_by: select
             .order_by
             .iter()
@@ -437,6 +518,7 @@ fn substitute_from(
     Ok(FromClause {
         source: substitute_source(&from.source, args, used)?,
         alias: from.alias.clone(),
+        col_aliases: from.col_aliases.clone(),
         at: from.at,
         joins: from
             .joins
@@ -446,6 +528,7 @@ fn substitute_from(
                     kind: join.kind,
                     source: substitute_source(&join.source, args, used)?,
                     alias: join.alias.clone(),
+                    col_aliases: join.col_aliases.clone(),
                     at: join.at,
                     on: match &join.on {
                         Some(e) => Some(substitute_expr(e, args, used)?),
@@ -482,8 +565,36 @@ fn substitute_source(
                 })
                 .collect::<Result<_>>()?,
         }),
+        FromSource::Values(rows) => Ok(FromSource::Values(
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| substitute_expr(e, args, used))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<_>>()?,
+        )),
         FromSource::Table { .. } | FromSource::Path(_) => Ok(source.clone()),
     }
+}
+
+fn substitute_group_set(
+    set: &crate::sql::ast::GroupSet,
+    args: &HashMap<String, Expr>,
+    used: &std::cell::Cell<usize>,
+) -> Result<crate::sql::ast::GroupSet> {
+    use crate::sql::ast::GroupSet;
+    let map = |items: &Vec<Expr>| -> Result<Vec<Expr>> {
+        items
+            .iter()
+            .map(|e| substitute_expr(e, args, used))
+            .collect()
+    };
+    Ok(match set {
+        GroupSet::Rollup(items) => GroupSet::Rollup(map(items)?),
+        GroupSet::Cube(items) => GroupSet::Cube(map(items)?),
+        GroupSet::Sets(sets) => GroupSet::Sets(sets.iter().map(map).collect::<Result<Vec<_>>>()?),
+    })
 }
 
 /// Count cloned argument nodes (they count against the same budget as the
@@ -498,7 +609,22 @@ fn count_expr(expr: &Expr, used: &std::cell::Cell<usize>) -> Result<()> {
         Expr::Unary { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
+        | Expr::TryCast { expr, .. }
         | Expr::NamedArg { expr, .. } => count_expr(expr, used),
+        Expr::Subscript { base, index } => {
+            count_expr(base, used)?;
+            count_expr(index, used)
+        }
+        Expr::Slice { base, from, to } => {
+            count_expr(base, used)?;
+            if let Some(from) = from {
+                count_expr(from, used)?;
+            }
+            if let Some(to) = to {
+                count_expr(to, used)?;
+            }
+            Ok(())
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -516,11 +642,13 @@ fn count_expr(expr: &Expr, used: &std::cell::Cell<usize>) -> Result<()> {
             for a in args {
                 count_expr(a, used)?;
             }
-            for e in &over.partition {
-                count_expr(e, used)?;
-            }
-            for item in &over.order {
-                count_expr(&item.expr, used)?;
+            if let crate::sql::ast::OverSpec::Inline(over) = over {
+                for e in &over.partition {
+                    count_expr(e, used)?;
+                }
+                for item in &over.order {
+                    count_expr(&item.expr, used)?;
+                }
             }
             Ok(())
         }
@@ -594,6 +722,14 @@ fn count_source(source: &FromSource, used: &std::cell::Cell<usize>) -> Result<()
             }
             Ok(())
         }
+        FromSource::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    count_expr(e, used)?;
+                }
+            }
+            Ok(())
+        }
         FromSource::Table { .. } | FromSource::Path(_) => Ok(()),
     }
 }
@@ -626,7 +762,21 @@ fn collect_expr_calls(expr: &Expr, out: &mut HashSet<String>) {
         Expr::Unary { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
+        | Expr::TryCast { expr, .. }
         | Expr::NamedArg { expr, .. } => collect_expr_calls(expr, out),
+        Expr::Subscript { base, index } => {
+            collect_expr_calls(base, out);
+            collect_expr_calls(index, out);
+        }
+        Expr::Slice { base, from, to } => {
+            collect_expr_calls(base, out);
+            if let Some(from) = from {
+                collect_expr_calls(from, out);
+            }
+            if let Some(to) = to {
+                collect_expr_calls(to, out);
+            }
+        }
         Expr::Between {
             expr, low, high, ..
         } => {
@@ -638,11 +788,13 @@ fn collect_expr_calls(expr: &Expr, out: &mut HashSet<String>) {
             for a in args {
                 collect_expr_calls(a, out);
             }
-            for e in &over.partition {
-                collect_expr_calls(e, out);
-            }
-            for item in &over.order {
-                collect_expr_calls(&item.expr, out);
+            if let crate::sql::ast::OverSpec::Inline(over) = over {
+                for e in &over.partition {
+                    collect_expr_calls(e, out);
+                }
+                for item in &over.order {
+                    collect_expr_calls(&item.expr, out);
+                }
             }
         }
         Expr::Coalesce(args) => {
@@ -716,6 +868,13 @@ fn collect_source_calls(source: &FromSource, out: &mut HashSet<String>) {
             out.insert(name.to_ascii_lowercase());
             for a in args {
                 collect_expr_calls(&a.expr, out);
+            }
+        }
+        FromSource::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    collect_expr_calls(e, out);
+                }
             }
         }
         FromSource::Table { .. } | FromSource::Path(_) => {}

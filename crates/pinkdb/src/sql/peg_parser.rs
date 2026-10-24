@@ -38,12 +38,33 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
 pub(crate) fn parse_prepared(sql: &str) -> Result<(Vec<Statement>, Vec<usize>)> {
     super::check_nesting_depth(sql)?;
     reject_nul_in_quoted_identifier(sql)?;
-    let mut out =
-        peg_sql::statements(sql).map_err(|e| PinkDbError::Parse(format!("parse error: {e}")))?;
+    let mut out = peg_sql::statements(sql).map_err(|e| {
+        let msg = e.to_string();
+        PinkDbError::Parse(match refusal_in(&msg) {
+            // A `{?}` refusal is a whole message: peg lists it next to the
+            // tokens it expected, which reads like a syntax error.
+            Some(why) => why.to_string(),
+            None => format!("parse error: {msg}"),
+        })
+    })?;
     // Post-parse depth guard (shared with the pre-parse nesting cap).
     super::check_ast_depth(&mut out)?;
     let offsets = renumber_parameters(&mut out)?;
     Ok((out, offsets))
+}
+
+/// The `... is not supported (wave 9Nb)` sentence a `{?}` refusal put into
+/// peg's expected-token list, if any.
+fn refusal_in(msg: &str) -> Option<&str> {
+    let at = msg.find("not supported (wave ")?;
+    let start = msg[..at].rfind(", ").map_or(0, |i| i + 2);
+    let tail = &msg[start..];
+    let tail = match tail.find("expected one of ") {
+        Some(i) => &tail[i + "expected one of ".len()..],
+        None => tail,
+    };
+    let end = tail.find(", ").unwrap_or(tail.len());
+    Some(tail[..end].trim())
 }
 
 /// Renumber every [`Expr::Parameter`] payload from a source byte offset to
@@ -210,6 +231,14 @@ fn check_source_positions(source: &FromSource) -> Result<()> {
             }
             Ok(())
         }
+        FromSource::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    check_expr_positions(e)?;
+                }
+            }
+            Ok(())
+        }
         FromSource::Table { .. } | FromSource::Path(_) => Ok(()),
     }
 }
@@ -225,8 +254,20 @@ fn check_expr_positions(expr: &Expr) -> Result<()> {
             check_expr_positions(left)?;
             check_expr_positions(right)
         }
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
-            check_expr_positions(expr)
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::TryCast { expr, .. } => check_expr_positions(expr),
+        Expr::Subscript { base, index } => {
+            check_expr_positions(base)?;
+            check_expr_positions(index)
+        }
+        Expr::Slice { base, from, to } => {
+            check_expr_positions(base)?;
+            for bound in [from, to].into_iter().flatten() {
+                check_expr_positions(bound)?;
+            }
+            Ok(())
         }
         Expr::Between {
             expr, low, high, ..
@@ -235,21 +276,35 @@ fn check_expr_positions(expr: &Expr) -> Result<()> {
             check_expr_positions(low)?;
             check_expr_positions(high)
         }
-        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+        Expr::Function { args, filter, .. } => {
+            for a in args {
+                check_expr_positions(a)?;
+            }
+            if let Some(filter) = filter {
+                check_expr_positions(filter)?;
+            }
+            Ok(())
+        }
+        Expr::Coalesce(args) => {
             for a in args {
                 check_expr_positions(a)?;
             }
             Ok(())
         }
         Expr::NamedArg { expr, .. } => check_expr_positions(expr),
-        Expr::Window { args, over, .. } => {
+        Expr::Window {
+            args, over, filter, ..
+        } => {
             for a in args {
                 check_expr_positions(a)?;
             }
-            for e in &over.partition {
+            if let Some(filter) = filter {
+                check_expr_positions(filter)?;
+            }
+            for e in over.partition() {
                 check_expr_positions(e)?;
             }
-            for item in &over.order {
+            for item in over.order() {
                 check_expr_positions(&item.expr)?;
             }
             Ok(())
@@ -280,8 +335,17 @@ fn expr_contains_parameter(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } => {
             expr_contains_parameter(left) || expr_contains_parameter(right)
         }
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
-            expr_contains_parameter(expr)
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::TryCast { expr, .. } => expr_contains_parameter(expr),
+        Expr::Subscript { base, index } => {
+            expr_contains_parameter(base) || expr_contains_parameter(index)
+        }
+        Expr::Slice { base, from, to } => {
+            expr_contains_parameter(base)
+                || from.as_ref().is_some_and(|e| expr_contains_parameter(e))
+                || to.as_ref().is_some_and(|e| expr_contains_parameter(e))
         }
         Expr::Between {
             expr, low, high, ..
@@ -290,15 +354,20 @@ fn expr_contains_parameter(expr: &Expr) -> bool {
                 || expr_contains_parameter(low)
                 || expr_contains_parameter(high)
         }
-        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+        Expr::Function { args, filter, .. } => {
             args.iter().any(expr_contains_parameter)
+                || filter.as_ref().is_some_and(|f| expr_contains_parameter(f))
         }
+        Expr::Coalesce(args) => args.iter().any(expr_contains_parameter),
         Expr::NamedArg { expr, .. } => expr_contains_parameter(expr),
-        Expr::Window { args, over, .. } => {
+        Expr::Window {
+            args, over, filter, ..
+        } => {
             args.iter().any(expr_contains_parameter)
-                || over.partition.iter().any(expr_contains_parameter)
+                || filter.as_ref().is_some_and(|f| expr_contains_parameter(f))
+                || over.partition().iter().any(expr_contains_parameter)
                 || over
-                    .order
+                    .order()
                     .iter()
                     .any(|item| expr_contains_parameter(&item.expr))
         }
@@ -352,6 +421,7 @@ fn source_contains_parameter(source: &FromSource) -> bool {
     match source {
         FromSource::Derived(query) => select_contains_parameter(query),
         FromSource::Function { args, .. } => args.iter().any(|a| expr_contains_parameter(&a.expr)),
+        FromSource::Values(rows) => rows.iter().flatten().any(expr_contains_parameter),
         FromSource::Table { .. } | FromSource::Path(_) => false,
     }
 }
@@ -459,6 +529,13 @@ fn collect_source_offsets(source: &FromSource, out: &mut Vec<usize>) {
                 collect_expr_offsets(&a.expr, out);
             }
         }
+        FromSource::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    collect_expr_offsets(e, out);
+                }
+            }
+        }
         FromSource::Table { .. } | FromSource::Path(_) => {}
     }
 }
@@ -471,8 +548,19 @@ fn collect_expr_offsets(expr: &Expr, out: &mut Vec<usize>) {
             collect_expr_offsets(left, out);
             collect_expr_offsets(right, out);
         }
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
-            collect_expr_offsets(expr, out)
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::TryCast { expr, .. } => collect_expr_offsets(expr, out),
+        Expr::Subscript { base, index } => {
+            collect_expr_offsets(base, out);
+            collect_expr_offsets(index, out);
+        }
+        Expr::Slice { base, from, to } => {
+            collect_expr_offsets(base, out);
+            for bound in [from, to].into_iter().flatten() {
+                collect_expr_offsets(bound, out);
+            }
         }
         Expr::Between {
             expr, low, high, ..
@@ -481,20 +569,33 @@ fn collect_expr_offsets(expr: &Expr, out: &mut Vec<usize>) {
             collect_expr_offsets(low, out);
             collect_expr_offsets(high, out);
         }
-        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+        Expr::Function { args, filter, .. } => {
+            for a in args {
+                collect_expr_offsets(a, out);
+            }
+            if let Some(filter) = filter {
+                collect_expr_offsets(filter, out);
+            }
+        }
+        Expr::Coalesce(args) => {
             for a in args {
                 collect_expr_offsets(a, out);
             }
         }
         Expr::NamedArg { expr, .. } => collect_expr_offsets(expr, out),
-        Expr::Window { args, over, .. } => {
+        Expr::Window {
+            args, over, filter, ..
+        } => {
             for a in args {
                 collect_expr_offsets(a, out);
             }
-            for e in &over.partition {
+            if let Some(filter) = filter {
+                collect_expr_offsets(filter, out);
+            }
+            for e in over.partition() {
                 collect_expr_offsets(e, out);
             }
-            for item in &over.order {
+            for item in over.order() {
                 collect_expr_offsets(&item.expr, out);
             }
         }
@@ -616,6 +717,13 @@ fn apply_source_ranks(source: &mut FromSource, offsets: &[usize]) {
                 apply_expr_ranks(&mut a.expr, offsets);
             }
         }
+        FromSource::Values(rows) => {
+            for row in rows.iter_mut() {
+                for e in row.iter_mut() {
+                    apply_expr_ranks(e, offsets);
+                }
+            }
+        }
         FromSource::Table { .. } | FromSource::Path(_) => {}
     }
 }
@@ -631,8 +739,19 @@ fn apply_expr_ranks(expr: &mut Expr, offsets: &[usize]) {
             apply_expr_ranks(left, offsets);
             apply_expr_ranks(right, offsets);
         }
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
-            apply_expr_ranks(expr, offsets)
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::TryCast { expr, .. } => apply_expr_ranks(expr, offsets),
+        Expr::Subscript { base, index } => {
+            apply_expr_ranks(base, offsets);
+            apply_expr_ranks(index, offsets);
+        }
+        Expr::Slice { base, from, to } => {
+            apply_expr_ranks(base, offsets);
+            for bound in [from, to].into_iter().flatten() {
+                apply_expr_ranks(bound, offsets);
+            }
         }
         Expr::Between {
             expr, low, high, ..
@@ -641,20 +760,33 @@ fn apply_expr_ranks(expr: &mut Expr, offsets: &[usize]) {
             apply_expr_ranks(low, offsets);
             apply_expr_ranks(high, offsets);
         }
-        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+        Expr::Function { args, filter, .. } => {
+            for a in args {
+                apply_expr_ranks(a, offsets);
+            }
+            if let Some(filter) = filter {
+                apply_expr_ranks(filter, offsets);
+            }
+        }
+        Expr::Coalesce(args) => {
             for a in args {
                 apply_expr_ranks(a, offsets);
             }
         }
         Expr::NamedArg { expr, .. } => apply_expr_ranks(expr, offsets),
-        Expr::Window { args, over, .. } => {
+        Expr::Window {
+            args, over, filter, ..
+        } => {
             for a in args {
                 apply_expr_ranks(a, offsets);
             }
-            for e in over.partition.iter_mut() {
+            if let Some(filter) = filter {
+                apply_expr_ranks(filter, offsets);
+            }
+            for e in over.partition_mut() {
                 apply_expr_ranks(e, offsets);
             }
-            for item in over.order.iter_mut() {
+            for item in over.order_mut() {
                 apply_expr_ranks(&mut item.expr, offsets);
             }
         }
@@ -703,6 +835,10 @@ enum CmpTail {
     IsNull {
         negated: bool,
     },
+    IsDistinct {
+        negated: bool,
+        right: Expr,
+    },
     Between {
         negated: bool,
         low: Expr,
@@ -719,11 +855,94 @@ enum CmpTail {
     Like {
         negated: bool,
         right: Expr,
+        escape: Option<Expr>,
+    },
+    SimilarTo {
+        negated: bool,
+        right: Expr,
     },
     Binary {
         op: BinaryOp,
         right: Expr,
     },
+}
+
+/// A postfix applied to a primary expression, left to right: `::TYPE`, a
+/// subscript (`v['a']`, `v[1]`) or a slice (`s[1:3]`).
+///
+/// [`Expr::Subscript`]/[`Expr::Slice`] carry no type information (the engine
+/// has no LIST type): the binder resolves them against the base's type.
+enum PostfixOp {
+    Cast(crate::types::DataType),
+    Index(Expr),
+    Slice(Option<Expr>, Option<Expr>),
+    /// `.field` after a non-identifier primary (`(expr).a`).
+    Field(String),
+}
+
+/// The trailing clauses every query form accepts (`ORDER BY`, `LIMIT`,
+/// `OFFSET`, `FETCH FIRST`), with `FETCH` folded into `limit`.
+/// `e12` / `E5`: the token a float literal's exponent turns into when the
+/// mantissa has no digits after the dot (`1.e2`).
+fn is_exponent_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('e' | 'E'))
+        && chars.clone().next().is_some()
+        && chars.all(|c| c.is_ascii_digit())
+}
+
+struct QueryTail {
+    order_by: Vec<OrderItem>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// One `GROUP BY` item as written (see [`GroupSet`]).
+enum GroupItem {
+    Plain(Expr),
+    Set(GroupSet),
+}
+
+/// `VALUES (..), (..)` as a query: a star projection over a row-list source,
+/// which names the columns `col0`, `col1`, ... (DuckDB's names).
+fn values_select(rows: Vec<Vec<Expr>>, tail: QueryTail) -> Select {
+    Select {
+        with: Vec::new(),
+        distinct: false,
+        distinct_on: None,
+        projections: vec![Projection::Star],
+        from: Some(FromClause {
+            source: FromSource::Values(rows),
+            alias: None,
+            col_aliases: None,
+            at: None,
+            joins: Vec::new(),
+        }),
+        where_clause: None,
+        group_by: Vec::new(),
+        group_sets: Vec::new(),
+        having: None,
+        qualify: None,
+        windows: Vec::new(),
+        order_by: tail.order_by,
+        limit: tail.limit,
+        offset: tail.offset,
+        unions: Vec::new(),
+    }
+}
+
+/// `TABLE t` — `SELECT * FROM t` with the same trailing clauses.
+fn table_select(db: Option<String>, name: String, tail: QueryTail) -> Select {
+    Select {
+        from: Some(FromClause {
+            source: FromSource::Table { db, name },
+            alias: None,
+            col_aliases: None,
+            at: None,
+            joins: Vec::new(),
+        }),
+        ..values_select(Vec::new(), tail)
+    }
 }
 
 fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
@@ -744,11 +963,46 @@ fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
             query,
             negated,
         },
-        CmpTail::Like { negated, right } => Expr::Binary {
+        CmpTail::Like {
+            negated,
+            right,
+            escape,
+        } => match escape {
+            None => Expr::Binary {
+                op: if negated {
+                    BinaryOp::NotLike
+                } else {
+                    BinaryOp::Like
+                },
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            // `LIKE ... ESCAPE` desugars to the scalar `like_escape(str,
+            // pattern, escape)`; `NOT` of NULL stays NULL.
+            Some(escape) => negate_if(
+                negated,
+                Expr::Function {
+                    name: "like_escape".to_string(),
+                    args: vec![left, right, escape],
+                    distinct: false,
+                    filter: None,
+                },
+            ),
+        },
+        CmpTail::SimilarTo { negated, right } => negate_if(
+            negated,
+            Expr::Function {
+                name: "similar_to".to_string(),
+                args: vec![left, right],
+                distinct: false,
+                filter: None,
+            },
+        ),
+        CmpTail::IsDistinct { negated, right } => Expr::Binary {
             op: if negated {
-                BinaryOp::NotLike
+                BinaryOp::IsNotDistinctFrom
             } else {
-                BinaryOp::Like
+                BinaryOp::IsDistinctFrom
             },
             left: Box::new(left),
             right: Box::new(right),
@@ -758,6 +1012,17 @@ fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
             left: Box::new(left),
             right: Box::new(right),
         },
+    }
+}
+
+fn negate_if(negated: bool, e: Expr) -> Expr {
+    if negated {
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(e),
+        }
+    } else {
+        e
     }
 }
 
@@ -848,6 +1113,8 @@ peg::parser! {
         rule dot() = "." !['0'..='9'] ws()
         rule lparen() = "(" ws()
         rule rparen() = ")" ws()
+        rule lbracket() = "[" ws()
+        rule rbracket() = "]" ws()
         rule star() = "*" ws()
         rule plus() = "+" ws()
         // `-` never starts a token when it opens a `--` line comment.
@@ -990,9 +1257,25 @@ peg::parser! {
             / show_stmt()
             / describe_stmt()
             / explain_stmt()
+            / merge_stmt()
+            / set_variable_stmt()
             / select_statement()
 
-        rule select_statement() -> Statement = s:select() { Statement::Select(s) }
+        rule select_statement() -> Statement = s:query() { Statement::Select(s) }
+
+        /// A query form that can stand alone or be parenthesized: a `SELECT`
+        /// (with CTEs), a `VALUES` row list, or `TABLE t`. All three bind to
+        /// a [`Select`], so every consumer (EXPLAIN, CTE bodies, derived
+        /// tables, scalar subqueries) accepts them uniformly.
+        rule query() -> Select = select() / values_query() / table_query()
+
+        rule values_query() -> Select
+            = kw(Keyword::Values) rows:values_rows() tail:query_tail() { values_select(rows, tail) }
+
+        rule values_rows() -> Vec<Vec<Expr>> = rows:insert_rows() { rows }
+
+        rule table_query() -> Select
+            = kw(Keyword::Table) t:table_ref() tail:query_tail() { table_select(t.0, t.1, tail) }
 
         /// A non-reserved word matched case-insensitively (used for syntax
         /// words that must stay usable as identifiers: SHOW, TABLES, IF,
@@ -1051,9 +1334,9 @@ peg::parser! {
               }
             / word("describe") t:table_ref() { Statement::Describe { db: t.0, name: t.1 } }
 
-        /// `EXPLAIN <select>` — the plain (optimized) plan text.
+        /// `EXPLAIN <query>` — the plain (optimized) plan text.
         rule explain_stmt() -> Statement
-            = word("explain") q:select() { Statement::Explain(Box::new(q)) }
+            = word("explain") q:query() { Statement::Explain(Box::new(q)) }
 
         /// `CHECKPOINT` — matched as a word, not a reserved keyword, so
         /// `checkpoint` stays usable as a table or column name.
@@ -1514,9 +1797,38 @@ peg::parser! {
               }
 
         rule insert() -> Statement
-            = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? source:insert_source() {
+            = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? source:insert_source()
+              dml_tail() {
                   Statement::Insert { db: t.0, table: t.1, columns, source }
               }
+            / kw(Keyword::Insert) word("or") word("replace") {?
+                  Err("INSERT OR REPLACE is not supported (wave 95b): use INSERT ... ON CONFLICT when it lands")
+              }
+            / word("replace") kw(Keyword::Into) {?
+                  Err("REPLACE INTO is not supported (wave 95b): use INSERT ... ON CONFLICT when it lands")
+              }
+
+        /// `ON CONFLICT ...`, `ON DUPLICATE KEY ...`, `RETURNING ...`, an
+        /// `UPDATE ... FROM` or a `DELETE ... USING` suffix: recognised only to
+        /// name the missing feature (wave 95b) instead of raising a bare parse
+        /// error.
+        rule dml_tail() -> ()
+            = word("on") word("conflict") {?
+                  Err("INSERT ... ON CONFLICT is not supported (wave 95b)")
+              }
+            / word("on") word("duplicate") {?
+                  Err("INSERT ... ON DUPLICATE KEY UPDATE is not supported (wave 95b)")
+              }
+            / word("returning") {?
+                  Err("RETURNING is not supported (wave 95b)")
+              }
+            / word("from") {?
+                  Err("UPDATE ... FROM is not supported (wave 95b)")
+              }
+            / word("using") {?
+                  Err("DELETE ... USING is not supported (wave 95b)")
+              }
+            / { () }
 
         rule insert_source() -> InsertSource
             = kw(Keyword::Values) rows:insert_rows() { InsertSource::Values(rows) }
@@ -1534,7 +1846,7 @@ peg::parser! {
 
         rule update() -> Statement
             = kw(Keyword::Update) t:table_ref() kw(Keyword::Set) first:set_item() rest:(comma() s:set_item() { s })*
-              where_:where_clause()? {
+              where_:where_clause()? dml_tail() {
                   let mut sets = vec![first];
                   sets.extend(rest);
                   Statement::Update { db: t.0, table: t.1, sets, where_clause: where_ }
@@ -1554,8 +1866,21 @@ peg::parser! {
               }
 
         rule delete() -> Statement
-            = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() where_:where_clause()? {
+            = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() where_:where_clause()? dml_tail() {
                   Statement::Delete { db: t.0, table: t.1, where_clause: where_ }
+              }
+
+        /// `MERGE ...`: recognised only to name the missing feature.
+        rule merge_stmt() -> Statement
+            = word("merge") {?
+                  Err("MERGE is not supported (wave 95b)")
+              }
+
+        /// `SET VARIABLE name = expr` and the `$name` shorthand that reads it
+        /// back are both refused by name (see also `primary`).
+        rule set_variable_stmt() -> Statement
+            = kw(Keyword::Set) word("variable") {?
+                  Err("SET VARIABLE is not supported (wave 95c): use a parameter or a table")
               }
 
         /// `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71).
@@ -1683,35 +2008,85 @@ peg::parser! {
             / { false }
 
         rule select_body() -> Select
-            = with:with_clause()? kw(Keyword::Select) distinct:opt_kw(Keyword::Distinct) projections:projection_list()
+            = with:with_clause()? kw(Keyword::Select) distinct:distinct_clause() projections:projection_list()
               from:from_clause()? where_:where_clause()? group:group_by_clause()? having:having_clause()?
-              order:order_by_clause()? limit:limit_clause()? offset:offset_clause()? {
+              windows:window_clause()? qualify:qualify_clause()? tail:query_tail() {
+                  let (distinct, distinct_on) = distinct;
+                  let (group_by, group_sets) = group.unwrap_or_default();
                   Select {
-                      with: with.unwrap_or_default(),
+                      with: with.map(|w| w.1).unwrap_or_default(),
                       distinct,
+                      distinct_on,
                       projections,
                       from,
                       where_clause: where_,
-                      group_by: group.unwrap_or_default(),
+                      group_by,
+                      group_sets,
                       having,
-                      order_by: order.unwrap_or_default(),
-                      limit,
-                      offset,
+                      qualify,
+                      windows: windows.unwrap_or_default(),
+                      order_by: tail.order_by,
+                      limit: tail.limit,
+                      offset: tail.offset,
                       unions: Vec::new(),
                   }
               }
 
-        rule with_clause() -> Vec<CteDef>
-            = kw(Keyword::With) first:cte_def() rest:(comma() c:cte_def() { c })* {
-                  let mut ctes = vec![first];
-                  ctes.extend(rest);
-                  ctes
+        /// The clauses every query form may end with, in grammar order.
+        /// `LIMIT` and `FETCH FIRST` are the same thing spelled two ways;
+        /// DuckDB refuses both at once, and so does this.
+        rule query_tail() -> QueryTail
+            = order:order_by_clause()? limit:limit_clause()? offset:offset_clause()? fetch:fetch_clause()? for_clause()? {?
+                  if limit.is_some() && fetch.is_some() {
+                      Err("LIMIT cannot be combined with FETCH FIRST")
+                  } else {
+                      Ok(QueryTail {
+                          order_by: order.unwrap_or_default(),
+                          limit: limit.or(fetch),
+                          offset,
+                      })
+                  }
               }
 
-        rule cte_def() -> CteDef
-            = name:ident() cols:col_name_list()? kw(Keyword::As) lparen() query:select() rparen() {
-                  CteDef { name, cols, query: Box::new(query) }
+        /// `FOR UPDATE` / `FOR SHARE` — parsed to give a clear diagnostic: the
+        /// engine has no row locks and DuckDB 2.0 rejects the clause too.
+        rule for_clause()
+            = word("for") (word("update") / word("share") / word("no") word("key") word("update")) {?
+                  Err("SELECT ... FOR UPDATE/SHARE is not supported (wave 95c): the engine has no row locks")
               }
+
+        /// `DISTINCT`, `DISTINCT ON (a, b)` or neither.
+        rule distinct_clause() -> (bool, Option<Vec<Expr>>)
+            = kw(Keyword::Distinct) word("on") lparen() l:expr_list() rparen() { (false, Some(l)) }
+            / kw(Keyword::Distinct) { (true, None) }
+            / { (false, None) }
+
+        rule with_clause() -> (bool, Vec<CteDef>)
+            = kw(Keyword::With) recursive:recursive_flag() first:cte_def() rest:(comma() c:cte_def() { c })* {
+                  let mut ctes = vec![first];
+                  ctes.extend(rest);
+                  for cte in &mut ctes {
+                      cte.recursive = recursive;
+                  }
+                  (recursive, ctes)
+              }
+
+        rule recursive_flag() -> bool
+            = word("recursive") { true }
+            / { false }
+
+        rule cte_def() -> CteDef
+            = name:ident() cols:col_name_list()? kw(Keyword::As) lparen() query:cte_body() rparen() {
+                  CteDef { name, cols, query: Box::new(query), recursive: false }
+              }
+
+        /// A CTE body is a query; `INSERT`/`UPDATE`/`DELETE` are recognised to
+        /// name the missing feature (wave 95b) instead of a bare parse error.
+        rule cte_body() -> Select
+            = (kw(Keyword::Insert) / kw(Keyword::Update) / kw(Keyword::Delete)) {?
+                  Err("data-modifying CTEs (INSERT/UPDATE/DELETE inside WITH) are not supported (wave 95b)")
+              }
+            / query()
 
         /// A bare `*` and a two-part `t.*` are whole-list-only in v1 (a
         /// mid-list one is rejected). A three-part `db.t.*` is an ordinary
@@ -1739,30 +2114,53 @@ peg::parser! {
                   }
               }
 
-        /// `[AS] alias` — a bare alias must be a non-keyword identifier.
+        /// `[AS] alias` — a bare alias must be a non-keyword identifier, and
+        /// must not be a word that starts a trailing clause (`SELECT a FROM t
+        /// QUALIFY ...`, `... WINDOW w AS ...`, `... FETCH FIRST n ROWS`,
+        /// `... FOR UPDATE`, `... TABLESAMPLE 10`). Without `AS` those words
+        /// stay clause keywords; with `AS` they are ordinary aliases.
         rule alias() -> String
             = kw(Keyword::As) name:ident() { name }
-            / name:ident() { name }
+            / name:ident() {?
+                  if matches!(
+                      name.to_ascii_lowercase().as_str(),
+                      "qualify" | "window" | "fetch" | "for" | "tablesample" | "lateral"
+                  ) {
+                      Err("identifier")
+                  } else {
+                      Ok(name)
+                  }
+              }
 
         rule from_clause() -> FromClause
-            = kw(Keyword::From) source:from_source() suffix:source_suffix() joins:(j:join_clause() { j })* {?
-                  let (alias, at) = suffix;
+            = kw(Keyword::From) source:from_source() suffix:source_suffix() _ts:tablesample_check() joins:(j:join_clause() { j })* {?
+                  let (alias, col_aliases, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
                   } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
-                      Ok(FromClause { source, alias, at, joins })
+                      Ok(FromClause { source, alias, col_aliases, at, joins })
                   }
               }
 
         rule from_source() -> FromSource
-            = lparen() q:select() rparen() { FromSource::Derived(Box::new(q)) }
+            = word("lateral") lparen() query() rparen() {?
+                  Err("LATERAL is not supported (wave 95c)")
+              }
+            / lparen() q:query() rparen() { FromSource::Derived(Box::new(q)) }
             / name:ident() lparen() args:table_function_args() rparen() {
                   FromSource::Function { name, args }
               }
             / s:string_lit() { FromSource::Path(s) }
             / t:table_ref() { FromSource::Table { db: t.0, name: t.1 } }
+
+        /// `TABLESAMPLE` after a FROM/join source: parsed only to refuse it
+        /// with a diagnostic instead of a confusing "expected end of
+        /// statement" error (the bare-alias rule keeps the word unclaimed).
+        rule tablesample_check() -> bool
+            = word("tablesample") {? Err("TABLESAMPLE is not supported (wave 95c)") }
+            / { true }
 
         /// The argument list of a table-function FROM source: literals only
         /// (the binder evaluates them), optionally named with `:=` or `=>`.
@@ -1789,17 +2187,17 @@ peg::parser! {
             = ":" ws() "=" ws()
             / "=" ws() ">" ws()
 
-        /// A from/join source's `[alias] [AT (...)]` suffix, in either legal
-        /// order of appearance: `t AT (...)` (no alias) or `t [AS] alias
-        /// [AT (...)]`. DuckLake's shape is exactly this — an alias after the
-        /// `AT` clause is a syntax error there and here. PEG tries the bare
-        /// `AT` case first so a table named like the clause's keyword can
-        /// still take `AT` as its own alias when no parenthesized target
-        /// follows.
-        rule source_suffix() -> (Option<String>, Option<crate::attached::AtSpec>)
-            = at:at_clause() { (None, Some(at)) }
-            / alias:alias() at:at_clause()? { (Some(alias), at) }
-            / { (None, None) }
+        /// A from/join source's `[alias [(cols)]] [AT (...)]` suffix, in
+        /// either legal order of appearance: `t AT (...)` (no alias) or `t
+        /// [AS] alias [(cols)] [AT (...)]`. DuckLake's shape is exactly this
+        /// — an alias after the `AT` clause is a syntax error there and here.
+        /// PEG tries the bare `AT` case first so a table named like the
+        /// clause's keyword can still take `AT` as its own alias when no
+        /// parenthesized target follows.
+        rule source_suffix() -> (Option<String>, Option<Vec<String>>, Option<crate::attached::AtSpec>)
+            = at:at_clause() { (None, None, Some(at)) }
+            / alias:alias() cols:col_name_list()? at:at_clause()? { (Some(alias), cols, at) }
+            / { (None, None, None) }
 
         /// `AT (VERSION => n)` / `AT (TIMESTAMP => TIMESTAMP '<literal>')`.
         /// `AT`, `VERSION` and `TIMESTAMP`'s inner literal are matched as
@@ -1836,24 +2234,24 @@ peg::parser! {
         /// condition binds against every table to its left plus its own
         /// right-hand source (multi-way joins are left-deep).
         rule join_clause() -> JoinClause
-            = kw(Keyword::Cross) kw(Keyword::Join) source:from_source() suffix:source_suffix() {?
-                  let (alias, at) = suffix;
+            = kw(Keyword::Cross) kw(Keyword::Join) source:from_source() suffix:source_suffix() _ts:tablesample_check() {?
+                  let (alias, col_aliases, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
                   } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
-                      Ok(JoinClause { kind: JoinKind::Cross, source, alias, at, on: None })
+                      Ok(JoinClause { kind: JoinKind::Cross, source, alias, col_aliases, at, on: None })
                   }
               }
-            / kind:join_kind() source:from_source() suffix:source_suffix() kw(Keyword::On) on:expr() {?
-                  let (alias, at) = suffix;
+            / kind:join_kind() source:from_source() suffix:source_suffix() _ts:tablesample_check() kw(Keyword::On) on:expr() {?
+                  let (alias, col_aliases, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
                   } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
-                      Ok(JoinClause { kind, source, alias, at, on: Some(on) })
+                      Ok(JoinClause { kind, source, alias, col_aliases, at, on: Some(on) })
                   }
               }
 
@@ -1865,11 +2263,76 @@ peg::parser! {
             / kw(Keyword::Full) kw(Keyword::Outer)? kw(Keyword::Join) { JoinKind::Full }
 
         rule where_clause() -> Expr = kw(Keyword::Where) e:expr() { e }
-        rule group_by_clause() -> Vec<Expr> = kw(Keyword::Group) kw(Keyword::By) l:expr_list() { l }
+
+        /// `GROUP BY` items: plain expressions plus `ROLLUP`, `CUBE` and
+        /// `GROUPING SETS`, in written order. The plain expressions and the
+        /// set items are cross-producted at bind time (`GROUP BY a, ROLLUP(b)`
+        /// groups by `{a,b}` and `{a}`).
+        rule group_by_clause() -> (Vec<Expr>, Vec<GroupSet>)
+            = kw(Keyword::Group) kw(Keyword::By) items:group_item_list() {
+                  let mut plain = Vec::new();
+                  let mut sets = Vec::new();
+                  for item in items {
+                      match item {
+                          GroupItem::Plain(e) => plain.push(e),
+                          GroupItem::Set(s) => sets.push(s),
+                      }
+                  }
+                  (plain, sets)
+              }
+
+        rule group_item_list() -> Vec<GroupItem>
+            = first:group_item() rest:(comma() g:group_item() { g })* {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        rule group_item() -> GroupItem
+            = word("rollup") lparen() l:expr_list() rparen() { GroupItem::Set(GroupSet::Rollup(l)) }
+            / word("cube") lparen() l:expr_list() rparen() { GroupItem::Set(GroupSet::Cube(l)) }
+            / word("grouping") word("sets") lparen() s:grouping_sets() rparen() { GroupItem::Set(GroupSet::Sets(s)) }
+            / e:expr() { GroupItem::Plain(e) }
+
+        rule grouping_sets() -> Vec<Vec<Expr>>
+            = first:grouping_set() rest:(comma() s:grouping_set() { s })* {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        /// One parenthesized grouping set; `()` is the grand total.
+        rule grouping_set() -> Vec<Expr> = lparen() l:expr_list()? rparen() { l.unwrap_or_default() }
+
+        /// `QUALIFY <cond>` filters over window results, after `WINDOW`.
+        rule qualify_clause() -> Expr = word("qualify") e:expr() { e }
+
+        /// `WINDOW w AS (...) [, ...]` — named window definitions.
+        rule window_clause() -> Vec<(String, OverClause)>
+            = word("window") first:window_def() rest:(comma() d:window_def() { d })* {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        rule window_def() -> (String, OverClause)
+            = name:ident() kw(Keyword::As) lparen() spec:window_spec() rparen() { (name, spec) }
+            / name:ident() kw(Keyword::As) lparen() base:ident() ws() {?
+                  Err("a window that builds on another window is not supported (wave 95c)")
+              }
+
         rule having_clause() -> Expr = kw(Keyword::Having) e:expr() { e }
         rule order_by_clause() -> Vec<OrderItem> = kw(Keyword::Order) kw(Keyword::By) l:order_list() { l }
         rule limit_clause() -> usize = kw(Keyword::Limit) n:nonneg_integer() { n }
-        rule offset_clause() -> usize = kw(Keyword::Offset) n:nonneg_integer() { n }
+
+        /// `OFFSET n [ROW|ROWS]`.
+        rule offset_clause() -> usize
+            = kw(Keyword::Offset) n:nonneg_integer() (kw(Keyword::Row) / kw(Keyword::Rows))? { n }
+
+        /// `FETCH FIRST|NEXT n ROW|ROWS ONLY` — the standard spelling of LIMIT.
+        rule fetch_clause() -> usize
+            = word("fetch") (word("first") / word("next")) n:nonneg_integer()
+              (kw(Keyword::Row) / kw(Keyword::Rows)) word("only") { n }
 
         rule expr_list() -> Vec<Expr>
             = first:expr() rest:(comma() e:expr() { e })* {
@@ -1950,15 +2413,26 @@ peg::parser! {
 
         rule comparison_tail() -> CmpTail
             = kw(Keyword::Is) neg:opt_kw(Keyword::Not) kw(Keyword::Null) { CmpTail::IsNull { negated: neg } }
+            / kw(Keyword::Is) neg:opt_kw(Keyword::Not) word("distinct") kw(Keyword::From) right:concat_expr() {
+                  CmpTail::IsDistinct { negated: neg, right }
+              }
             / neg:not_flag() kw(Keyword::Between) low:concat_expr() kw(Keyword::And) high:concat_expr() {
                   CmpTail::Between { negated: neg, low, high }
               }
             / neg:not_flag() kw(Keyword::In) lparen() t:in_tail(neg) { t }
-            / neg:not_flag() kw(Keyword::Like) right:concat_expr() { CmpTail::Like { negated: neg, right } }
+            / neg:not_flag() kw(Keyword::Like) right:concat_expr() escape:escape_clause()? {
+                  CmpTail::Like { negated: neg, right, escape }
+              }
+            / neg:not_flag() word("similar") word("to") right:concat_expr() {
+                  CmpTail::SimilarTo { negated: neg, right }
+              }
             / op:cmp_op() right:concat_expr() { CmpTail::Binary { op, right } }
 
+        /// `ESCAPE '<one char>'` after a `LIKE` pattern.
+        rule escape_clause() -> Expr = word("escape") e:concat_expr() { e }
+
         rule in_tail(negated: bool) -> CmpTail
-            = q:select() rparen() { CmpTail::InSubquery { negated, query: Box::new(q) } }
+            = q:query() rparen() { CmpTail::InSubquery { negated, query: Box::new(q) } }
             / items:expr_list()? rparen() { CmpTail::InList { negated, items: items.unwrap_or_default() } }
 
         rule not_flag() -> bool
@@ -1988,16 +2462,50 @@ peg::parser! {
             / plus() e:unary() { Expr::Unary { op: UnaryOp::Plus, expr: Box::new(e) } }
             / cast_postfix()
 
-        /// Postgres-style `x::TYPE` casts, chained left to right. `::` binds
-        /// tighter than any operator (it sits under `unary`, so `-x::INT` is
-        /// `-(x::INT)` and `a || b::VARCHAR` casts only `b`).
+        /// Postgres-style `x::TYPE` casts and subscript/slice postfixes,
+        /// chained left to right. They bind tighter than any operator (they
+        /// sit under `unary`, so `-x::INT` is `-(x::INT)`, `a || b::VARCHAR`
+        /// casts only `b`, and `v['a'][1]` subscripts the field first).
         rule cast_postfix() -> Expr
-            = e:primary() rest:(dcolon() ty:type_name() { ty })* {
-                  rest.into_iter().fold(e, |expr, dtype| Expr::Cast {
-                      expr: Box::new(expr),
-                      dtype,
+            = e:primary() rest:(op:postfix_op() { op })* {
+                  rest.into_iter().fold(e, |expr, op| match op {
+                      PostfixOp::Cast(dtype) => Expr::Cast { expr: Box::new(expr), dtype },
+                      PostfixOp::Index(i) => Expr::Subscript { base: Box::new(expr), index: Box::new(i) },
+                      PostfixOp::Slice(from, to) => Expr::Slice {
+                          base: Box::new(expr),
+                          from: from.map(Box::new),
+                          to: to.map(Box::new),
+                      },
+                      // `(expr).a` is a field lookup by name: the same node a
+                      // `v['a']` subscript builds, so the binder sees one
+                      // shape for both spellings.
+                      PostfixOp::Field(field) => Expr::Subscript {
+                          base: Box::new(expr),
+                          index: Box::new(Expr::Literal(Value::Varchar(field))),
+                      },
                   })
               }
+
+        rule postfix_op() -> PostfixOp
+            = dcolon() ty:type_name() { PostfixOp::Cast(ty) }
+            / dot() f:ident() {? if is_exponent_name(&f) {
+                  // `1.e2` is a float in DuckDB; this engine's number literal
+                  // needs digits before the exponent, so name the fix instead
+                  // of reading `.e2` as a VARIANT field.
+                  Err("a number with an exponent needs digits after the dot (write 1.0e2)")
+              } else {
+                  Ok(PostfixOp::Field(f))
+              }
+            }
+            / lbracket() i:expr() rbracket() { PostfixOp::Index(i) }
+            / lbracket() from:slice_bound()? slice_sep() to:slice_bound()? rbracket() { PostfixOp::Slice(from, to) }
+            / word("at") word("time") word("zone") {?
+                  Err("AT TIME ZONE is not supported (wave 95c): cast to TIMESTAMP and use date_trunc instead")
+              }
+
+        rule slice_bound() -> Expr = e:expr() { e }
+
+        rule slice_sep() = ":" !":" ws()
 
         rule dcolon() = "::" ws()
 
@@ -2012,13 +2520,43 @@ peg::parser! {
             / parameter()
             / interval_literal()
             / cast_expr()
+            / try_cast_expr()
+            / list_literal()
+            / dollar_name()
             / case_expr()
             / star() { Expr::Star }
             / exists_expr()
             / extract_call()
-            / lparen() q:select() rparen() { Expr::ScalarSubquery(Box::new(q)) }
+            / lparen() q:query() rparen() { Expr::ScalarSubquery(Box::new(q)) }
+            / lparen() _a:expr() comma() _b:expr() (comma() _c:expr())* rparen() {?
+                  Err("row constructors are not supported (wave 95c): use VALUES or separate columns")
+              }
             / lparen() e:expr() rparen() { e }
             / ident_expr()
+
+        /// `$name` — the variable shorthand that reads a `SET VARIABLE` back.
+        /// `$$...$$` is a string literal and is matched earlier, so `$` here
+        /// can only start a variable name.
+        rule dollar_name() -> Expr
+            = "$" ws() name:ident_raw() ws() {?
+                  let _ = name;
+                  Err("the `$name` variable shorthand is not supported (wave 95c): use SET VARIABLE/getvariable")
+              }
+
+        /// `TRY_CAST(x AS type)` — NULL instead of an error when the value
+        /// does not fit the type.
+        rule try_cast_expr() -> Expr
+            = word("try_cast") lparen() e:expr() kw(Keyword::As) ty:type_name() rparen() {
+                  Expr::TryCast { expr: Box::new(e), dtype: ty }
+              }
+
+        /// `[1, 2, 3]`. The engine has no LIST type, so the literal is parsed
+        /// only to give a diagnostic instead of a bare parse error.
+        rule list_literal() -> Expr
+            = lbracket() items:expr_list()? rbracket() {?
+                  let _ = items;
+                  Err("list literals are not supported (wave 95c): the engine has no LIST type")
+              }
 
         /// `?` — a positional prepared-statement parameter. The payload is the
         /// placeholder's byte offset in the input (see [`Expr::Parameter`]);
@@ -2039,6 +2577,7 @@ peg::parser! {
                       name: "extract".to_string(),
                       args: vec![Expr::Literal(Value::Varchar(part)), e],
                       distinct: false,
+                      filter: None,
                   }
               }
 
@@ -2111,7 +2650,7 @@ peg::parser! {
         rule case_else() -> Box<Expr> = kw(Keyword::Else) e:expr() { Box::new(e) }
 
         rule exists_expr() -> Expr
-            = kw(Keyword::Exists) lparen() q:select() rparen() {
+            = kw(Keyword::Exists) lparen() q:query() rparen() {
                   Expr::Exists { query: Box::new(q), negated: false }
               }
 
@@ -2197,12 +2736,24 @@ peg::parser! {
             / s:ident() {? if s.eq_ignore_ascii_case("coalesce") { Err("non-COALESCE function name") } else { Ok(s) } }
 
         rule fn_call() -> Expr
-            = name:non_coalesce_name() lparen() distinct:distinct_flag() args:fn_args() rparen() over:over_clause()? {
+            = name:non_coalesce_name() lparen() distinct:distinct_flag() args:fn_args() rparen()
+              filter:filter_clause()? within_group_check()? over:over_clause()? {
                   match over {
-                      Some(over) => Expr::Window { name, args, over, distinct },
-                      None => Expr::Function { name, args, distinct },
+                      Some(over) => Expr::Window { name, args, over, distinct, filter: filter.map(Box::new) },
+                      None => Expr::Function { name, args, distinct, filter: filter.map(Box::new) },
                   }
               }
+
+        /// `FILTER (WHERE cond)` after an aggregate call.
+        rule filter_clause() -> Expr = word("filter") lparen() kw(Keyword::Where) e:expr() rparen() { e }
+
+        /// `WITHIN GROUP (ORDER BY ...)` (ordered-set aggregates): parsed only
+        /// to refuse it with a diagnostic.
+        rule within_group_check() -> bool
+            = word("within") word("group") lparen() order_by_clause() rparen() {?
+                  Err("ordered-set aggregates (WITHIN GROUP) are not supported (wave 95c)")
+              }
+            / { true }
 
         /// `DISTINCT` before a function call's first argument.
         rule distinct_flag() -> bool
@@ -2239,9 +2790,17 @@ peg::parser! {
 
         // ---------- window clauses ----------
 
-        rule over_clause() -> OverClause
-            = kw(Keyword::Over) lparen() partition:partition_clause()? order:order_by_clause()? frame:frame_clause()?
-              rparen() {
+        rule over_clause() -> OverSpec
+            = kw(Keyword::Over) name:ident() { OverSpec::Named(name) }
+            / kw(Keyword::Over) lparen() spec:window_spec() rparen() { OverSpec::Inline(spec) }
+            / kw(Keyword::Over) lparen() name:ident() partition_clause()? order_by_clause()? frame_clause()? rparen() {?
+                  let _ = name;
+                  Err("a window that builds on another window is not supported (wave 95c)")
+              }
+
+        /// The inside of `OVER (...)` and of a `WINDOW w AS (...)` definition.
+        rule window_spec() -> OverClause
+            = partition:partition_clause()? order:order_by_clause()? frame:frame_clause()? {
                   OverClause {
                       partition: partition.unwrap_or_default(),
                       order: order.unwrap_or_default(),
@@ -3254,9 +3813,9 @@ mod tests {
         "SELECT a/*x",
         "SELECT 5.;",
         "SELECT 1.5.6;",
-        "SELECT 1.e2;",
         "SELECT t.5;",
         "SELECT 5.e2;",
+        "SELECT 1.e2;",
         "SELECT 99999999999999999999;",
         "SELECT -9223372036854775808;",
         "SELECT 1 LIMIT 1e2;",
@@ -3314,7 +3873,6 @@ mod tests {
         "CREATE VIEW v AS SELECT;",
         "FROM t SELECT 1;",
         "SELECT 1; SELECT;",
-        "SELECT DISTINCT ON (a) b FROM t;",
         "SELECT 1e+;",
         "SELECT 1e-;",
         // Multi-database syntax errors.
@@ -4047,6 +4605,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(name, "rank");
+                let OverSpec::Inline(over) = over else {
+                    panic!("expected an inline window spec")
+                };
                 assert_eq!(over.partition.len(), 1);
                 assert_eq!(over.order.len(), 1);
                 assert!(over.order[0].desc);
@@ -4073,6 +4634,9 @@ mod tests {
                 expr: Expr::Window { over, .. },
                 ..
             } => {
+                let OverSpec::Inline(over) = over else {
+                    panic!("expected an inline window spec")
+                };
                 let frame = over.frame.as_ref().expect("frame parsed");
                 assert_eq!(frame.mode, FrameMode::Range);
                 assert_eq!(frame.start, FrameBound::Preceding(1));
@@ -4088,6 +4652,9 @@ mod tests {
                 expr: Expr::Window { over, .. },
                 ..
             } => {
+                let OverSpec::Inline(over) = over else {
+                    panic!("expected an inline window spec")
+                };
                 let frame = over.frame.as_ref().expect("frame parsed");
                 assert_eq!(frame.mode, FrameMode::Rows);
                 assert_eq!(frame.start, FrameBound::Preceding(2));

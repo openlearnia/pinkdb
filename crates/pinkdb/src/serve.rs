@@ -310,6 +310,7 @@ fn source_scans_files(source: &crate::sql::ast::FromSource) -> bool {
     use crate::sql::ast::FromSource;
     match source {
         FromSource::Function { .. } | FromSource::Path(_) => true,
+        FromSource::Values(_) => false,
         FromSource::Derived(select) => select_scans_files(select),
         FromSource::Table { .. } => false,
     }

@@ -223,16 +223,30 @@ FROM t [<join> u ON <cond>] ...    -- multi-way; INNER / LEFT [OUTER] / RIGHT [O
                                    -- (>, <, >=, <=, !=) run over a nested loop
   | FROM db1.t                    -- qualified tables resolve in that database
   | FROM (SELECT ...) AS s         -- derived tables (alias required)
-  | WITH w AS (SELECT ...) ...     -- CTEs, incl. WITH w(a, b) AS column aliases
-WHERE expr                        -- incl. IS [NOT] NULL, BETWEEN,
-                                  -- IN (subquery|list), EXISTS (subquery)
-GROUP BY ... HAVING ...
+  | FROM (VALUES (1,'a'),(2,'b')) t(x, y)  -- VALUES: in FROM, standalone, or
+  | TABLE t                        -- `VALUES …` / `TABLE t` as a query
+  | WITH [RECURSIVE] w AS (SELECT ...) ...   -- CTEs, incl. WITH w(a, b) column
+                                   -- aliases; RECURSIVE iterates the
+                                   -- UNION [ALL] step (bounded, see below)
+[WINDOW w AS (PARTITION BY … ORDER BY …), ...]
+WHERE expr                        -- incl. IS [NOT] NULL, IS [NOT] DISTINCT FROM,
+                                  -- BETWEEN, IN (subquery|list), EXISTS (subquery)
+GROUP BY [DISTINCT] expr, ... | GROUPING SETS (…), ROLLUP (…), CUBE (…)
+  HAVING ...                      -- GROUPING(x) / GROUPING() mark the set
+QUALIFY expr                      -- after WINDOW, before ORDER BY
 ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...  -- default NULLS LAST both ways;
                                                   -- ORDER BY 2 is positional
-LIMIT n [OFFSET m] | OFFSET m;
+LIMIT n | FETCH FIRST|NEXT n ROW|ROWS ONLY | OFFSET n [ROW|ROWS]
 <query> UNION|INTERSECT|EXCEPT [ALL] <query>      -- INTERSECT binds tighter
+SELECT DISTINCT ON (expr, ...) ...                -- first row per key, in ORDER BY order
 -- Scalar subqueries `(SELECT ...)` anywhere an expression goes
 -- (uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL).
+-- Expressions: CAST / TRY_CAST (NULL on failure), `x IS [NOT] DISTINCT FROM y`,
+-- `s LIKE p [ESCAPE e]`, `s SIMILAR TO regex`, subscripts `v['a']`, `v[0]`,
+-- `v.a`, `s[2]`, `s[2:4]`; aggregates may take `FILTER (WHERE …)`.
+-- Over a few hundred forms either answer or refuse by name: the full matrix of
+-- what is supported, what differs from DuckDB 2.0 and what is refused with an
+-- exact error is [docs/sql-conformance.md](docs/sql-conformance.md).
 ```
 
 ### VARIANT (wave 101a)
@@ -253,6 +267,7 @@ INSERT INTO events VALUES
   (4, NULL);                                -- SQL NULL is no value
 SELECT typeof(payload), variant_type(payload), variant_keys(payload) FROM events;
 SELECT variant_extract(payload, 'b[1]') FROM events;   -- 2.5
+SELECT payload['a'], payload.b[2] FROM events;         -- 1, "x" (1-based)
 SELECT CAST(payload AS VARCHAR) FROM events;           -- JSON text
 ```
 
@@ -268,7 +283,7 @@ rounds a fractional number half away from zero; when the shape does not fit the
 cast errors with the kind and the value
 (`cannot CAST VARIANT(VARCHAR) value "hi" to INTEGER`). A JSON null reads as
 SQL `NULL` for every target except `VARCHAR`, which keeps the text `null`.
-There is no `TRY_CAST` in pinkdb, so a failing cast is an error.
+`TRY_CAST(v AS type)` is the NULL-returning form of that cast.
 
 Unlike DuckDB, `VARCHAR → VARIANT` **parses JSON** rather than copying the
 string, so `'{"a":1}'::VARIANT` is the object; this is what gives the type a
@@ -280,8 +295,10 @@ Functions: `typeof(v)` (`'VARIANT'`), `variant_type(v)` (`NULL`, `BOOL`,
 `OBJECT`), `variant_keys(v)` (an object's keys as JSON array text —
 `'["a","b"]'` — because pinkdb has no list type yet) and
 `variant_extract(v, path)` with 0-based JSONPath (`'a.b[1]'`, `'$.a[0]'`;
-a missing path is SQL `NULL`). There is no subscript operator, so
-`payload['a']` does not parse. The JSON extension's functions
+a missing path is SQL `NULL`). Subscripts reach inside a value without
+JSONPath: `payload['a']`, `payload.a`, `payload['b'][2]`, `payload.b[1]` —
+1-based like DuckDB, a missing key or an out-of-range index is SQL `NULL`.
+The JSON extension's functions
 (`json_extract`, `json_array_length`, `json_valid`, …) accept a `VARIANT`
 and see its JSON text.
 
