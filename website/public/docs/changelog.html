@@ -189,6 +189,16 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-24">2026-10-24<a class="anchor" href="#2026-10-24" aria-label="Permalink: 2026-10-24">#</a></h2>
+<h3>Wave 99 — agent-friendly CLI mode ✅</h3>
+<ul>
+<li><strong>Agent mode</strong> turns on with <code>-agent</code>, or automatically when stdout is not a terminal and one of <code>AI_AGENT</code>, <code>CLAUDECODE</code>, <code>CLAUDE_CODE</code>, <code>PI_AGENT</code>, <code>OPENCODE</code>, <code>CODEX_SANDBOX</code>, <code>CURSOR_AGENT</code> or <code>GEMINI_CLI</code> is set. A flag wins over the environment; <code>-no-agent</code> and <code>PINKDB_AGENT_MODE=0</code> force it off, and an interactive terminal never enables it by itself. One line on stderr announces the mode.</li>
+<li>Results are compact Markdown tables with types in the header, <code>NULL</code> for nulls, control characters escaped, and explicit truncation notices such as <code>… 1,234 more rows (1,284 total); 3 columns hidden: a, b, c</code>. Defaults are 100 rows, 32 columns and 500 characters per cell.</li>
+<li>Errors are one line of JSON on stderr (<code>{"error": …,"kind": "parse", "position": 6}</code>), with byte offsets for parse errors. Exit codes are unchanged.</li>
+<li>A runaway-query guard (default 1,000,000 rows and 30,000 ms per statement) cancels the statement cleanly and leaves the session usable. Before a scan the engine estimates as expensive (default 100,000 rows) the CLI prints one cost hint on stderr naming the estimate and whether a remote scan is involved.</li>
+<li>The formatter, error encoder and scan estimate live in the reusable <code>pinkdb::agent</code> engine module (<code>crates/pinkdb/src/agent.rs</code>); the guard is exposed as <code>PinkDb::execute_with_limits</code>. <code>.help agent</code> documents flags, caps, settings (<code>PINKDB_AGENT_DISPLAY_ROWS</code>, <code>_COLUMNS</code>, <code>_CELL_CHARS</code>, <code>PINKDB_AGENT_SCAN_ROWS</code>, <code>_TIMEOUT_MS</code>, <code>_HINT_ROWS</code>) and <code>.agent</code>.</li>
+<li>Measured on a locally generated TPC-H-style dataset (10,000-row tables, 10 queries, one 10,000-row result and one error): normal output 485,403 B / 10,114 lines, agent output 4,162 B / 180 lines — 99.1% fewer bytes and 98.2% fewer lines for the same answers and exit code.</li>
+</ul>
+<h2 id="2026-10-24-2">2026-10-24<a class="anchor" href="#2026-10-24-2" aria-label="Permalink: 2026-10-24">#</a></h2>
 <h3>Wave 104 — the legacy lake data format removed ✅</h3>
 <ul>
 <li><strong>Breaking:</strong> a lake whose catalog names the removed columnar data format no longer opens, with a clear message asking for a re-save with an older build. There is no reader and no converter. <code>.pink</code> (<code>PINKDB06</code>) and Parquet (the <code>parquetlake</code> provider, for DuckDB interop) remain.</li>
@@ -196,7 +206,7 @@ progress log</a>.</p>
 <li>Leftover wave-103 crypto removed: PNKLAKE1 version-1 reading and the Argon2id KDF path. Per-file keys are raw, and <code>argon2</code> is no longer a pink-lake dependency.</li>
 <li>Size (release, Apple Silicon): <code>pinkdb-cli --features pinklake,s3,encryption</code> is <strong>8,780,560 B</strong>, down 41,632 B from the same build at HEAD; the removed full-lake build was <strong>51,407,280 B</strong>. The dependency tree is 109 lines (was 422 with the old format, 110 for HEAD <code>pinklake</code>), pink-lake is 51,714 → 47,865 <code>.rs</code> lines across the crate (−7.4%; <code>src/</code> 26,598 → 23,183, −12.8%), and a clean debug build takes 12.95 → 13.69 s (noise: the removed feature was already off in the <code>pinklake</code> set).</li>
 </ul>
-<h2 id="2026-10-24-2">2026-10-24<a class="anchor" href="#2026-10-24-2" aria-label="Permalink: 2026-10-24">#</a></h2>
+<h2 id="2026-10-24-3">2026-10-24<a class="anchor" href="#2026-10-24-3" aria-label="Permalink: 2026-10-24">#</a></h2>
 <h3>Wave 103 — Lake catalogs are databases (DuckLake v1.1 tables) ✅</h3>
 <ul>
 <li><strong>The catalog is always a database.</strong> A lake is a <code>pink:&lt;path&gt;</code> durable pinkdb catalog (default), <code>sqlite:&lt;path&gt;</code> (<code>catalog-sqlite</code>) or <code>postgres://…</code> (<code>catalog-postgres</code>), all using DuckLake v1.1's <code>ducklake_*</code> tables with <code>begin_snapshot</code>/<code>end_snapshot</code>. Commits insert a typed delta and one snapshot row instead of rewriting <code>catalog.json</code>/<code>snapshots/</code>; <code>count(*)</code> is <code>SUM(record_count)</code>, and time travel, expire, cleanup, CDC, replication state and statistics read the same rows. DuckDB's <code>ducklake</code> extension can attach the SQLite/Postgres catalogs, and pinkdb opens DuckDB-written DuckLakes.</li>
@@ -206,7 +216,7 @@ progress log</a>.</p>
 <li><strong>Fix after review:</strong> file statistics were resolved against the column's *current* name, so a file written before a RENAME lost its old physical column when attach rebuilt the zone map. Statistics now resolve through the <code>ducklake_column</code> definition visible at the file's <code>begin_snapshot</code>; a v1 file projects through the rename at head, and time travel to v1 sees its original names and rows. Positional deletes keep addressing the same rows across ADD/DROP COLUMN. The schema, time-travel, replication, S3, encryption, corruption and attach-error tests deleted in the first pass were restored (and the schema/ replication ones run on both <code>pink:</code> and <code>sqlite:</code>).</li>
 <li>Result at 10,000 files: catalog transaction stays flat (pink 7.1–9.8 ms, sqlite 0.7 ms), pink catalog 3.43 MB with statistics, attach + <code>count(*)</code> 184 ms. Data formats (<code>.pink</code>, Parquet) and the S3 data path are unchanged.</li>
 </ul>
-<h2 id="2026-10-24-3">2026-10-24<a class="anchor" href="#2026-10-24-3" aria-label="Permalink: 2026-10-24">#</a></h2>
+<h2 id="2026-10-24-4">2026-10-24<a class="anchor" href="#2026-10-24-4" aria-label="Permalink: 2026-10-24">#</a></h2>
 <h3>Wave 98c — streaming remote scans, a smaller Parquet writer, CSV read-ahead, an optional file cache ✅</h3>
 <ul>
 <li><code>COPY … TO '….parquet'</code> and Parquet lake files are now Snappy-compressed and dictionary-encoded like DuckDB's. TPC-H SF1 <code>lineitem</code> is 238 MB instead of 388 MB (DuckDB writes 205 MB) and takes 3.7 s instead of 3.4 s. A column whose dictionary grows past its chunk budget falls back to plain pages for that chunk. DuckDB reads the files (an interop test checks it).</li>
@@ -681,6 +691,7 @@ progress log</a>.</p>
   <li><a href="#2026-10-24">2026-10-24</a></li>
   <li><a href="#2026-10-24-2">2026-10-24</a></li>
   <li><a href="#2026-10-24-3">2026-10-24</a></li>
+  <li><a href="#2026-10-24-4">2026-10-24</a></li>
   <li><a href="#2026-10-23">2026-10-23</a></li>
   <li><a href="#2026-10-22">2026-10-22</a></li>
   <li><a href="#2026-10-21">2026-10-21</a></li>

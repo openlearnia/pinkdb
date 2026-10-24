@@ -479,6 +479,25 @@ end of input runs as if terminated, and `;` is recognized outside strings and
 comments (`SELECT 1; -- note` completes; `SELECT ';'` does not).
 `.read <file.sql>` runs a script in the current session.
 
+**Agent mode** (`-agent`; also automatic when stdout is not a terminal and
+`AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE`, `PI_AGENT`, `OPENCODE`,
+`CODEX_SANDBOX`, `CURSOR_AGENT` or `GEMINI_CLI` is set) is for scripts driven
+by an AI agent. Results become compact Markdown tables (`| name:TYPE |`, with
+`NULL` for nulls and escaped control characters), capped at 100 rows, 32
+columns and 500 characters per cell; anything cut is reported explicitly, e.g.
+`… 1,234 more rows (1,284 total); 3 columns hidden: a, b, c`. Errors are one
+line of JSON on stderr with a `kind` and, for parse errors, a byte `position`.
+A runaway guard (1,000,000 rows and 30,000 ms per statement by default)
+cancels a statement cleanly and leaves the session usable, and a statement
+whose inputs total at least 100,000 estimated rows gets one cost hint on
+stderr naming the estimate and whether a remote scan is involved. `-no-agent`
+and `PINKDB_AGENT_MODE=0` force the mode off (an interactive terminal never
+enables it automatically). `.help agent` lists the flags, `.agent rows|cols|
+cell|budget|timeout|hint` adjusts the display and budgets, and the
+`PINKDB_AGENT_DISPLAY_ROWS`, `_COLUMNS`, `_CELL_CHARS`,
+`PINKDB_AGENT_SCAN_ROWS`, `_TIMEOUT_MS` and `_HINT_ROWS` environment
+variables set the defaults.
+
 REPL dot-commands: `.help`, `.quit` / `.exit`, `.read`, `.timer`, `.databases`, `.tables`,
 `.schema <t|v>` (accepts `db.table`; views show their output columns),
 `.import <file.csv> [table]` (table defaults to the file stem; `db.table`

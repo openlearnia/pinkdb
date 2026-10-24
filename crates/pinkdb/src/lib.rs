@@ -37,6 +37,7 @@
 // playground module lints the core for wasm32).
 #![cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
 
+pub mod agent;
 pub mod attached;
 pub mod crypto;
 pub mod csv;
@@ -143,7 +144,21 @@ impl PinkDb {
     /// The embedded session's current database (`USE`) applies to every later
     /// statement in the same string; unqualified names resolve against it.
     pub fn execute(&mut self, sql: &str) -> types::Result<Vec<QueryResult>> {
-        self.execute_inner(sql, None)
+        self.execute_inner(sql, None, None)
+    }
+
+    /// Like [`PinkDb::execute`], with an explicit per-statement budget
+    /// ([`ExecLimits`]) for the agent-mode runaway guard (wave 99).
+    ///
+    /// The limits apply to each statement of the batch: the deadline starts
+    /// before binding, and the row/byte caps bound materialization. The
+    /// embedded default ([`PinkDb::execute`]) stays unbounded.
+    pub fn execute_with_limits(
+        &mut self,
+        sql: &str,
+        limits: ExecLimits,
+    ) -> types::Result<Vec<QueryResult>> {
+        self.execute_inner(sql, None, Some(limits))
     }
 
     /// Parse and run every statement like [`PinkDb::execute`], also returning
@@ -158,7 +173,18 @@ impl PinkDb {
         sql: &str,
     ) -> types::Result<Vec<(QueryResult, QueryProfile)>> {
         let mut profiles = Vec::new();
-        let results = self.execute_inner(sql, Some(&mut profiles))?;
+        let results = self.execute_inner(sql, Some(&mut profiles), None)?;
+        Ok(results.into_iter().zip(profiles).collect())
+    }
+
+    /// [`PinkDb::execute_profiled`] under per-statement [`ExecLimits`].
+    pub fn execute_profiled_with_limits(
+        &mut self,
+        sql: &str,
+        limits: ExecLimits,
+    ) -> types::Result<Vec<(QueryResult, QueryProfile)>> {
+        let mut profiles = Vec::new();
+        let results = self.execute_inner(sql, Some(&mut profiles), Some(limits))?;
         Ok(results.into_iter().zip(profiles).collect())
     }
 
@@ -171,6 +197,7 @@ impl PinkDb {
         &mut self,
         sql: &str,
         mut profiles: Option<&mut Vec<QueryProfile>>,
+        limits: Option<ExecLimits>,
     ) -> types::Result<Vec<QueryResult>> {
         let profiling = profiles.is_some();
         self.ensure_wal_healthy()?;
@@ -217,6 +244,15 @@ impl PinkDb {
             // `total` starts at bind start; the statement's share of `parse`
             // is added below (only the first statement carries it).
             let stmt_start = profiling.then(std::time::Instant::now);
+            // One budget per statement (wave 99): the deadline starts before
+            // binding, matching the `Connection` path. `None` is the
+            // historical zero-cost path.
+            let budget =
+                limits.map(|limits| std::sync::Arc::new(exec::ExecBudget::new(Some(&limits))));
+            let run_plan = |db: &mut PinkDb, plan: &plan::LogicalPlan| match &budget {
+                Some(budget) => exec::run_with_budget(db, plan, budget.clone()),
+                None => exec::run(db, plan),
+            };
             let bind_start = profiling.then(std::time::Instant::now);
             let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &session_db)?;
             // The runner (not the binder) holds the per-statement source text;
@@ -288,7 +324,7 @@ impl PinkDb {
                     sets.canonicalize();
                     let base = self.capture_base()?;
                     // The execution span no other writer waits for.
-                    let first = exec::run(self, &plan)?;
+                    let first = run_plan(self, &plan)?;
                     // Past this point a failure must not leave the uncommitted
                     // effect observable: without the lease it cannot be undone,
                     // so the handle fail-stops (see `poison_uncommitted`).
@@ -326,7 +362,7 @@ impl PinkDb {
                         if plan::writes_tables(&p) {
                             self.refuse_logged_attached_reads(&p)?;
                         }
-                        (exec::run(self, &p)?, p, d)
+                        (run_plan(self, &p)?, p, d)
                     };
                     // Session transitions are applied before WAL logging so the
                     // log record carries the post-statement session database.
@@ -389,7 +425,7 @@ impl PinkDb {
                 // Wave 83: a `CALL` outside a transaction may `COMMIT`/`ROLLBACK`
                 // in its body (the flag never outlives this statement).
                 self.standalone_call = !self.in_transaction();
-                let result = exec::run(self, &plan);
+                let result = run_plan(self, &plan);
                 self.standalone_call = false;
                 let result = result?;
                 // Wave 44: a `CALL`'s actual touched set joins the open

@@ -390,6 +390,46 @@ Run Time (s): real 0.000</code></pre></div>
 <p>At most 10&nbsp;000 rows are printed; longer results end with a
 <code>(N more rows)</code> note.</p>
 
+<h2 id="agent-mode">Agent mode<a class="anchor" href="#agent-mode" aria-label="Permalink: Agent mode">#</a></h2>
+
+<p><code>-agent</code> switches the CLI into output meant for an AI agent
+driving it. It also turns on automatically when stdout is not a terminal and
+one of <code>AI_AGENT</code>, <code>CLAUDECODE</code>,
+<code>CLAUDE_CODE</code>, <code>PI_AGENT</code>, <code>OPENCODE</code>,
+<code>CODEX_SANDBOX</code>, <code>CURSOR_AGENT</code> or
+<code>GEMINI_CLI</code> is set. <code>-no-agent</code> and
+<code>PINKDB_AGENT_MODE=0</code> force it off, a flag wins over the
+environment, and an interactive terminal never enables it by itself. One line
+on stderr announces the mode.</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>| region:VARCHAR | avg:DOUBLE |
+|---|---|
+| west | 175.0 |
+| east | NULL |
+… 1,234 more rows (1,284 total); 3 columns hidden: a, b, c</code></pre></div>
+
+<p>Results are compact Markdown tables with the type in each header,
+<code>NULL</code> for nulls and escaped control characters. The default caps
+are 100 rows, 32 columns and 500 characters per cell, and every truncation is
+reported with the hidden counts and the true totals. Errors are one line of
+JSON on stderr (<code>{"error":"…","kind":"parse","position":6}</code>); exit
+codes are unchanged.</p>
+
+<p>A runaway-query guard (1,000,000 rows and 30,000&nbsp;ms per statement by
+default) cancels a statement cleanly and leaves the session usable. A
+statement whose inputs total at least 100,000 estimated rows gets one cost
+hint on stderr naming the estimate and whether a remote scan is involved —
+it never blocks or prompts.</p>
+
+<p><code>.help agent</code> lists the mode, flags, caps and environment
+variables; <code>.agent rows|cols|cell|budget|timeout|hint</code> changes the
+display caps and budgets for the session. The defaults can also be set with
+<code>PINKDB_AGENT_DISPLAY_ROWS</code>,
+<code>PINKDB_AGENT_DISPLAY_COLUMNS</code>,
+<code>PINKDB_AGENT_CELL_CHARS</code>, <code>PINKDB_AGENT_SCAN_ROWS</code>,
+<code>PINKDB_AGENT_TIMEOUT_MS</code> and <code>PINKDB_AGENT_HINT_ROWS</code>
+(0 turns a cap, budget or hint off).</p>
+
 <h2 id="scripting">Scripting<a class="anchor" href="#scripting" aria-label="Permalink: Scripting">#</a></h2>
 
 <p>Piped input and <code>-c COMMAND</code> (repeatable) follow sqlite3/duckdb
@@ -519,6 +559,7 @@ credentials — <code>--user</code>/<code>--password</code> (or
   <li><a href="#build-and-run">Build and run</a></li>
   <li><a href="#dot-commands">Dot-commands</a></li>
   <li><a href="#output-and-timing">Output and timing</a></li>
+  <li><a href="#agent-mode">Agent mode</a></li>
   <li><a href="#scripting">Scripting</a></li>
   <li><a href="#environment-variables">Environment variables</a></li>
   <li><a href="#remote-mode">Remote mode</a></li>

@@ -102,6 +102,10 @@
 # The script is not wired into the test suite (it needs Docker).
 
 set -u -o pipefail
+# The harness asserts the CLI's human output (box tables, plain errors); when
+# it is run from a coding agent's shell (AI_AGENT, CLAUDECODE, ...) the CLI
+# would otherwise switch to agent mode (wave 99).
+export PINKDB_AGENT_MODE=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"

@@ -9,6 +9,36 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-24
+### Wave 99 — agent-friendly CLI mode ✅
+- **Agent mode** turns on with `-agent`, or automatically when stdout is not
+  a terminal and one of `AI_AGENT`, `CLAUDECODE`, `CLAUDE_CODE`, `PI_AGENT`,
+  `OPENCODE`, `CODEX_SANDBOX`, `CURSOR_AGENT` or `GEMINI_CLI` is set. A flag
+  wins over the environment; `-no-agent` and `PINKDB_AGENT_MODE=0` force it
+  off, and an interactive terminal never enables it by itself. One line on
+  stderr announces the mode.
+- Results are compact Markdown tables with types in the header, `NULL` for
+  nulls, control characters escaped, and explicit truncation notices such as
+  `… 1,234 more rows (1,284 total); 3 columns hidden: a, b, c`. Defaults are
+  100 rows, 32 columns and 500 characters per cell.
+- Errors are one line of JSON on stderr (`{"error": …,"kind": "parse",
+  "position": 6}`), with byte offsets for parse errors. Exit codes are
+  unchanged.
+- A runaway-query guard (default 1,000,000 rows and 30,000 ms per statement)
+  cancels the statement cleanly and leaves the session usable. Before a scan
+  the engine estimates as expensive (default 100,000 rows) the CLI prints one
+  cost hint on stderr naming the estimate and whether a remote scan is
+  involved.
+- The formatter, error encoder and scan estimate live in the reusable
+  `pinkdb::agent` engine module (`crates/pinkdb/src/agent.rs`); the guard is
+  exposed as `PinkDb::execute_with_limits`. `.help agent` documents flags,
+  caps, settings (`PINKDB_AGENT_DISPLAY_ROWS`, `_COLUMNS`, `_CELL_CHARS`,
+  `PINKDB_AGENT_SCAN_ROWS`, `_TIMEOUT_MS`, `_HINT_ROWS`) and `.agent`.
+- Measured on a locally generated TPC-H-style dataset (10,000-row tables,
+  10 queries, one 10,000-row result and one error): normal output 485,403 B /
+  10,114 lines, agent output 4,162 B / 180 lines — 99.1% fewer bytes and
+  98.2% fewer lines for the same answers and exit code.
+
+## 2026-10-24
 ### Wave 104 — the legacy lake data format removed ✅
 - **Breaking:** a lake whose catalog names the removed columnar data format
   no longer opens, with a clear message asking for a re-save with an older

@@ -1,0 +1,6 @@
+# Processes cargo runs (tests, `cargo run`) see pinkdb's human CLI output even
+# when cargo itself runs inside a coding agent's shell (AI_AGENT, CLAUDECODE,
+# ...): CLI fixtures assert that output. Agent-mode tests pass `-agent` or
+# remove this variable. See `resolve_agent_mode` in crates/pinkdb-cli.
+[env]
+PINKDB_AGENT_MODE = "0"

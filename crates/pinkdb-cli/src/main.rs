@@ -29,13 +29,64 @@ static ALLOW_LOAD_EXTENSION: AtomicBool = AtomicBool::new(false);
 /// The directory every extension load is confined to (`--extension-root`).
 static EXTENSION_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
+/// Agent mode (wave 99): on for a detected agent session or `-agent`, off
+/// otherwise. Read by the renderer and the error path.
+static AGENT: AtomicBool = AtomicBool::new(false);
+
+/// Display caps for agent-mode tables (`.agent rows/cols/cell`, env).
+static AGENT_DISPLAY: Mutex<pinkdb::agent::AgentDisplay> =
+    Mutex::new(pinkdb::agent::AgentDisplay::DEFAULT);
+
+/// Per-statement runaway guard and cost-hint threshold (`0` = off).
+#[derive(Clone, Copy)]
+struct AgentBudget {
+    max_rows: usize,
+    timeout_ms: u64,
+    hint_rows: u64,
+}
+
+const DEFAULT_AGENT_BUDGET: AgentBudget = AgentBudget {
+    max_rows: 1_000_000,
+    timeout_ms: 30_000,
+    hint_rows: 100_000,
+};
+
+static AGENT_BUDGET: Mutex<AgentBudget> = Mutex::new(DEFAULT_AGENT_BUDGET);
+
+fn agent_mode() -> bool {
+    AGENT.load(Ordering::Relaxed)
+}
+
+fn agent_display() -> pinkdb::agent::AgentDisplay {
+    *AGENT_DISPLAY.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn agent_budget() -> AgentBudget {
+    *AGENT_BUDGET.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The engine limits for one agent-mode statement (`0` disables a limit).
+fn agent_limits() -> pinkdb::ExecLimits {
+    let budget = agent_budget();
+    pinkdb::ExecLimits {
+        statement_timeout: (budget.timeout_ms > 0)
+            .then(|| Duration::from_millis(budget.timeout_ms)),
+        max_result_rows: (budget.max_rows > 0).then_some(budget.max_rows),
+        max_result_bytes: None,
+    }
+}
+
 /// Report a failed statement or command: `Error: …` on stderr, and remember
 /// it for the exit status.
 macro_rules! cli_error {
     ($($arg:tt)*) => {{
         $crate::HAD_ERROR.store(true, ::std::sync::atomic::Ordering::Relaxed);
         let message = format!($($arg)*);
-        eprintln!("Error: {}", pinkdb::sanitize_terminal(&message));
+        if $crate::agent_mode() {
+            eprintln!("{}", pinkdb::agent::error_json(&message, "cli", None));
+        } else {
+            eprintln!("Error: {}", pinkdb::sanitize_terminal(&message));
+        }
     }};
 }
 
@@ -180,9 +231,177 @@ fn cmd_parquet(db: &PinkDb, arg: &str) {
     }
 }
 
+/// Markers a coding agent's environment exports (DuckDB 2.0's list plus the
+/// names pinkdb's own host uses).
+const AGENT_MARKERS: [&str; 8] = [
+    "AI_AGENT",
+    "CLAUDECODE",
+    "CLAUDE_CODE",
+    "PI_AGENT",
+    "OPENCODE",
+    "CODEX_SANDBOX",
+    "CURSOR_AGENT",
+    "GEMINI_CLI",
+];
+
+/// The first set, non-empty agent marker.
+fn agent_marker() -> Option<&'static str> {
+    AGENT_MARKERS
+        .iter()
+        .copied()
+        .find(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Decide agent mode once at startup: the flags win, then an explicit
+/// `PINKDB_AGENT_MODE=0`, then auto-detection (non-TTY stdout plus a marker
+/// or `PINKDB_AGENT_MODE=1`). An interactive terminal is never auto-enabled,
+/// as the brief requires; `Some(reason)` is the line announced on stderr.
+///
+/// The workspace's `.cargo/config.toml` sets `PINKDB_AGENT_MODE=0` for every
+/// process cargo runs, so agent markers inherited by a test harness never
+/// change the output its fixtures assert; tests of agent mode itself pass
+/// `-agent` or remove that variable.
+fn resolve_agent_mode(flag: Option<bool>) -> Option<String> {
+    if let Some(on) = flag {
+        return on.then(|| "-agent was given".to_string());
+    }
+    let mode = std::env::var("PINKDB_AGENT_MODE").unwrap_or_default();
+    let mode = mode.trim().to_ascii_lowercase();
+    if matches!(mode.as_str(), "0" | "false" | "off" | "no") {
+        return None;
+    }
+    if std::io::stdout().is_terminal() {
+        return None;
+    }
+    if matches!(mode.as_str(), "1" | "true" | "on" | "yes") {
+        return Some("PINKDB_AGENT_MODE is set and stdout is not a terminal".to_string());
+    }
+    if let Some(marker) = agent_marker() {
+        return Some(format!("{marker} is set and stdout is not a terminal"));
+    }
+    None
+}
+
+/// Apply the agent environment overrides (`.agent` can change them later).
+fn configure_agent_from_env() {
+    fn number(name: &str) -> Option<usize> {
+        std::env::var(name).ok()?.trim().parse().ok()
+    }
+    {
+        let mut display = AGENT_DISPLAY.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = number("PINKDB_AGENT_DISPLAY_ROWS") {
+            display.max_rows = n;
+        }
+        if let Some(n) = number("PINKDB_AGENT_DISPLAY_COLUMNS") {
+            display.max_columns = n;
+        }
+        if let Some(n) = number("PINKDB_AGENT_CELL_CHARS") {
+            display.max_cell_chars = n;
+        }
+    }
+    let mut budget = AGENT_BUDGET.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(n) = number("PINKDB_AGENT_SCAN_ROWS") {
+        budget.max_rows = n;
+    }
+    if let Some(n) = number("PINKDB_AGENT_TIMEOUT_MS") {
+        budget.timeout_ms = n as u64;
+    }
+    if let Some(n) = number("PINKDB_AGENT_HINT_ROWS") {
+        budget.hint_rows = n as u64;
+    }
+}
+
+/// `.agent` with no arguments lists the active settings; each setting takes
+/// one non-negative number (`0` = no cap / off).
+fn agent_settings_command(rest: &str) {
+    let mut words = rest.split_whitespace();
+    let Some(key) = words.next() else {
+        let display = agent_display();
+        let budget = agent_budget();
+        println!(
+            "Agent mode: {} (rows {}, columns {}, cell {}, guard {} rows / {} ms, hint {})",
+            if agent_mode() { "on" } else { "off" },
+            display.max_rows,
+            display.max_columns,
+            display.max_cell_chars,
+            budget.max_rows,
+            budget.timeout_ms,
+            budget.hint_rows
+        );
+        println!(
+            "Usage: .agent [rows N | cols N | cell N | budget N | timeout MS | hint N] (0 = all/off)"
+        );
+        return;
+    };
+    let parsed = match words.next().map(str::parse::<u64>) {
+        Some(Ok(value)) if words.next().is_none() => value,
+        _ => {
+            println!(
+                "Usage: .agent [rows N | cols N | cell N | budget N | timeout MS | hint N] (0 = all/off)"
+            );
+            return;
+        }
+    };
+    let value = parsed.min(usize::MAX as u64) as usize;
+    let mut display = AGENT_DISPLAY.lock().unwrap_or_else(|p| p.into_inner());
+    let mut budget = AGENT_BUDGET.lock().unwrap_or_else(|p| p.into_inner());
+    match key {
+        "rows" => display.max_rows = value,
+        "cols" | "columns" => display.max_columns = value,
+        "cell" => display.max_cell_chars = value,
+        "budget" => budget.max_rows = value,
+        "timeout" => budget.timeout_ms = value as u64,
+        "hint" => budget.hint_rows = value as u64,
+        _ => {
+            println!("Unknown .agent setting {key:?}");
+            return;
+        }
+    }
+    println!("Agent setting updated: {key} {parsed}");
+}
+
+/// `.help agent`: the mode, its caps, the guard, and how to change them.
+fn print_help_agent() {
+    let display = agent_display();
+    let budget = agent_budget();
+    println!("Agent mode: compact output for an AI agent driving pinkdb.");
+    println!(
+        "  on: -agent, or stdout is not a terminal and one of {} is set;",
+        AGENT_MARKERS.join(", ")
+    );
+    println!("      PINKDB_AGENT_MODE=1 does the same. Never auto-enabled on a terminal.");
+    println!("  off: -no-agent, PINKDB_AGENT_MODE=0, or no marker.");
+    println!("  output: results are Markdown tables; NULL is the literal NULL; control");
+    println!("          characters are escaped. Errors are one line of JSON on stderr:");
+    println!(
+        "          {{\"error\":\"…\",\"kind\":\"parse|catalog|type|parameter|execution|io|csv\",\"position\":N}}."
+    );
+    println!(
+        "  caps: {} rows, {} columns, {} chars per cell; hidden rows/columns are reported",
+        display.max_rows, display.max_columns, display.max_cell_chars
+    );
+    println!("        with the totals, e.g. `… 1,234 more rows (1,284 total)`.");
+    println!(
+        "  runaway guard: {} rows and {} ms per statement (0 = off); a hit cancels the",
+        budget.max_rows, budget.timeout_ms
+    );
+    println!("        statement cleanly and leaves the session usable.");
+    println!(
+        "  cost hint: one stderr line before a statement estimated at >= {} scanned rows",
+        budget.hint_rows
+    );
+    println!("        (0 = never), naming a remote scan when one is involved.");
+    println!("  settings: .agent [rows N | cols N | cell N | budget N | timeout MS | hint N]");
+    println!("  env: PINKDB_AGENT_MODE=1|0, PINKDB_AGENT_DISPLAY_ROWS,");
+    println!("       PINKDB_AGENT_DISPLAY_COLUMNS, PINKDB_AGENT_CELL_CHARS,");
+    println!("       PINKDB_AGENT_SCAN_ROWS, PINKDB_AGENT_TIMEOUT_MS, PINKDB_AGENT_HINT_ROWS");
+    println!("  flags: -agent / -no-agent force the mode (a flag wins over the environment).");
+}
+
 fn print_help() {
     println!("Dot-commands:");
-    println!("  .help                  show this help");
+    println!("  .help                  show this help (.help agent: agent mode)");
+    println!("  .agent [setting N]     show/change agent-mode caps and guard");
     println!("  .quit | .exit          leave the shell");
     println!("  .read <file.sql>       run SQL and dot-commands from a file");
     println!("  .timer on|off          print each statement's run time with a phase breakdown");
@@ -799,6 +1018,35 @@ impl LocalSession {
         self.run_sql_with(sql, true)
     }
 
+    /// Run one string through the engine, under the agent-mode statement
+    /// budget when the mode is on.
+    fn execute_sql(
+        &mut self,
+        sql: &str,
+        profiled: bool,
+    ) -> Result<(Vec<QueryResult>, Vec<QueryProfile>), pinkdb::PinkDbError> {
+        if agent_mode() {
+            let limits = agent_limits();
+            return match profiled {
+                true => self
+                    .db
+                    .execute_profiled_with_limits(sql, limits)
+                    .map(|pairs| pairs.into_iter().unzip()),
+                false => self
+                    .db
+                    .execute_with_limits(sql, limits)
+                    .map(|results| (results, Vec::new())),
+            };
+        }
+        match profiled {
+            true => self
+                .db
+                .execute_profiled(sql)
+                .map(|pairs| pairs.into_iter().unzip()),
+            false => self.db.execute(sql).map(|results| (results, Vec::new())),
+        }
+    }
+
     /// Execute one SQL string, maintaining the transaction buffer and
     /// retrying a conflicting COMMIT (bounded). When a retry succeeds only
     /// the transaction's outcome is reported (the earlier attempt's
@@ -811,13 +1059,7 @@ impl LocalSession {
     ) -> Result<(Vec<QueryResult>, Vec<QueryProfile>), pinkdb::PinkDbError> {
         let was = self.db.in_transaction();
         let pre_db = self.db.current_db().to_string();
-        let executed = match profiled {
-            true => self
-                .db
-                .execute_profiled(sql)
-                .map(|pairs| pairs.into_iter().unzip()),
-            false => self.db.execute(sql).map(|results| (results, Vec::new())),
-        };
+        let executed = self.execute_sql(sql, profiled);
         match executed {
             Ok((results, profiles)) => {
                 let now = self.db.in_transaction();
@@ -861,22 +1103,13 @@ impl LocalSession {
                         // The conflict is reported (the engine aborted the
                         // transaction with that error), then the retry runs;
                         // only a retry that exhausts the budget fails the run.
-                        eprintln!("Error: {last}");
+                        print_sql_error(&last, sql);
                         eprintln!(
                             "Retrying the transaction after a cross-process write conflict \
                              (attempt {attempt}/{})",
                             self.txn_retries
                         );
-                        let retried = match profiled {
-                            true => self
-                                .db
-                                .execute_profiled(&retry_sql)
-                                .map(|pairs| pairs.into_iter().unzip()),
-                            false => self
-                                .db
-                                .execute(&retry_sql)
-                                .map(|results| (results, Vec::new())),
-                        };
+                        let retried = self.execute_sql(&retry_sql, profiled);
                         match retried {
                             Ok((mut results, mut profiles)) => {
                                 self.txn_pre_db = None;
@@ -944,6 +1177,14 @@ fn run_dot(session: &mut Session, line: &str) -> bool {
     };
     // Session-independent commands (local and remote alike).
     match cmd {
+        ".help" if rest == "agent" => {
+            print_help_agent();
+            return true;
+        }
+        ".agent" => {
+            agent_settings_command(rest);
+            return true;
+        }
         ".timer" => {
             match rest {
                 "on" => {
@@ -1154,7 +1395,8 @@ fn run_dot_remote(line: &str) -> bool {
 #[cfg(feature = "client")]
 fn print_help_remote() {
     println!("Dot-commands (remote mode):");
-    println!("  .help                  show this help");
+    println!("  .help                  show this help (.help agent: agent mode)");
+    println!("  .agent [setting N]     show/change agent-mode caps and guard");
     println!("  .quit | .exit          leave the shell");
     println!("  .read <file.sql>       run SQL and dot-commands from a file");
     println!("  .timer on|off          print each statement's run time with a phase breakdown");
@@ -1167,21 +1409,9 @@ fn print_help_remote() {
 }
 
 fn display_value(v: &Value) -> String {
-    match v {
-        Value::Null => "NULL".to_string(),
-        // DuckDB prints `1.0`, not `1`.
-        Value::Double(x) => {
-            if x.fract() == 0.0 && x.is_finite() && x.abs() < 1e15 {
-                format!("{x:.1}")
-            } else {
-                format!("{x}")
-            }
-        }
-        // Stored text is untrusted: never emit raw control characters (a
-        // terminal escape sequence in a row would inject output).
-        Value::Varchar(s) => pinkdb::sanitize_terminal(s),
-        _ => v.to_string(),
-    }
+    // The shared engine implementation: the agent renderer uses the same
+    // value text, so the two formats cannot drift.
+    pinkdb::agent::display_value(v)
 }
 
 /// Formats a `SELECT` result as the DuckDB-style box table: header names,
@@ -1402,14 +1632,63 @@ fn render_results_into(out: &mut String, results: &[QueryResult]) {
                 }
             }
             QueryResult::Selected { names, types, rows } => {
-                if rows.is_empty() {
-                    let _ = writeln!(out, "(no rows)");
+                if agent_mode() {
+                    // The Markdown renderer is the shared engine formatter
+                    // (wave 105 reuses it); a zero-row result keeps its
+                    // header so the schema stays visible.
+                    let table = pinkdb::agent::format_table(names, types, rows, agent_display());
+                    let _ = writeln!(out, "{table}");
+                } else {
+                    if rows.is_empty() {
+                        let _ = writeln!(out, "(no rows)");
+                    }
+                    let table = format_select(names, types, rows);
+                    let _ = writeln!(out, "{table}");
                 }
-                let table = format_select(names, types, rows);
-                let _ = writeln!(out, "{table}");
             }
         }
     }
+}
+
+/// Print a failed statement: the historical `Error: …` line, or one JSON
+/// line in agent mode (`position` is a parse-error byte offset when known).
+fn print_sql_error(error: &pinkdb::PinkDbError, sql: &str) {
+    if agent_mode() {
+        eprintln!("{}", pinkdb::agent::error_json_for(error, sql));
+    } else {
+        eprintln!("Error: {}", pinkdb::sanitize_terminal(&error.to_string()));
+    }
+}
+
+/// [`print_sql_error`] plus the failed-run marker for the exit status.
+fn report_sql_error(error: &pinkdb::PinkDbError, sql: &str) {
+    HAD_ERROR.store(true, Ordering::Relaxed);
+    print_sql_error(error, sql);
+}
+
+/// One stderr line when the bound plan's inputs are estimated at or above the
+/// hint threshold. This never prompts or blocks. The estimate is a lower
+/// bound (each input table once), so it never names a cheap statement.
+fn print_cost_hint(db: &PinkDb, sql: &str) {
+    let threshold = agent_budget().hint_rows;
+    if threshold == 0 {
+        return;
+    }
+    let Some(estimate) = pinkdb::agent::estimate_scan(db, sql) else {
+        return;
+    };
+    if estimate.rows < threshold {
+        return;
+    }
+    let scan = if estimate.remote {
+        "remote scan"
+    } else {
+        "local scan"
+    };
+    eprintln!(
+        "agent hint: estimated {} rows scanned ({scan}); PINKDB_AGENT_HINT_ROWS=0 disables hints",
+        pinkdb::agent::format_count(estimate.rows)
+    );
 }
 
 /// Run one SQL string in the session's mode (local or remote) and print the
@@ -1426,18 +1705,21 @@ fn run_sql_session(session: &mut Session, sql: &str) {
     let mut profiles: Option<Vec<QueryProfile>> = None;
     match session {
         Session::Local(local) => {
+            if agent_mode() {
+                print_cost_hint(&local.db, sql);
+            }
             if timer {
                 match local.run_sql_profiled(sql) {
                     Ok((results, ps)) => {
                         render_results(&results);
                         profiles = Some(ps);
                     }
-                    Err(e) => cli_error!("{e}"),
+                    Err(e) => report_sql_error(&e, sql),
                 }
             } else {
                 match local.run_sql(sql) {
                     Ok(results) => render_results(&results),
-                    Err(e) => cli_error!("{e}"),
+                    Err(e) => report_sql_error(&e, sql),
                 }
             }
         }
@@ -1524,6 +1806,9 @@ struct Opts {
     /// `--extension-root PATH`: confine every extension load to this
     /// directory.
     extension_root: Option<String>,
+    /// `-agent` / `-no-agent`: force agent mode on or off (the flag wins over
+    /// `PINKDB_AGENT_MODE` and auto-detection).
+    agent: Option<bool>,
     /// `--file-cache DIR`: keep remote byte ranges on disk between queries
     /// (wave 98c). Off unless given; `PINKDB_EXTERNAL_FILE_CACHE=1` and its
     /// `_DIR`/`_BYTES` variables do the same without the flag.
@@ -1534,6 +1819,8 @@ fn print_usage() {
     println!("Usage: pinkdb [--host HOST:PORT] [--user NAME] [--password PASS] [-c COMMAND]...");
     println!();
     println!("  -V, --version      print the version and exit");
+    println!("  -agent | -no-agent force agent-friendly output on/off (compact Markdown");
+    println!("                     tables, JSON errors; auto for a non-TTY agent session)");
     println!("  -c COMMAND         run SQL or a dot-command, then exit (repeatable)");
     println!("  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)");
     if cfg!(feature = "client") {
@@ -1577,6 +1864,7 @@ fn parse_args() -> Result<Opts, String> {
         tls_insecure: false,
         allow_load_extension: false,
         extension_root: None,
+        agent: None,
         file_cache: None,
     };
     let mut args = std::env::args().skip(1);
@@ -1638,6 +1926,8 @@ fn parse_args() -> Result<Opts, String> {
             other if other.starts_with("--tls-ca-cert=") => {
                 opts.tls_ca_cert = Some(other["--tls-ca-cert=".len()..].to_string());
             }
+            "-agent" | "--agent" => opts.agent = Some(true),
+            "-no-agent" | "--no-agent" => opts.agent = Some(false),
             "-c" => {
                 let value = args.next().ok_or("-c requires a command")?;
                 opts.commands.push(value);
@@ -1789,7 +2079,7 @@ fn build_session(opts: &Opts, key: Option<EncryptionKey>) -> Session {
             match Client::connect(&host) {
                 Ok(client) => remote_session(client, opts),
                 Err(e) => {
-                    eprintln!("Error: cannot connect to {host}: {e}");
+                    cli_error!("cannot connect to {host}: {e}");
                     std::process::exit(1);
                 }
             }
@@ -1827,7 +2117,7 @@ fn open_tls_session(host: &str, opts: &Opts) -> Option<Session> {
     match Client::connect_tls(host, &tls_server_name(host), trust) {
         Ok(client) => Some(remote_session(client, opts)),
         Err(e) => {
-            eprintln!("Error: cannot connect to {host} over TLS: {e}");
+            cli_error!("cannot connect to {host} over TLS: {e}");
             std::process::exit(1);
         }
     }
@@ -1852,7 +2142,7 @@ fn remote_session(mut client: Client, opts: &Opts) -> Session {
                 eprintln!("pinkdb: logged in as {name}");
             }
             Err(e) => {
-                eprintln!("Error: cannot log in as {user}: {e}");
+                cli_error!("cannot log in as {user}: {e}");
                 std::process::exit(1);
             }
         }
@@ -1914,6 +2204,15 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Agent mode (wave 99): decide once, before the session exists and before
+    // any error can be reported, then announce it in one stderr line.
+    configure_agent_from_env();
+    if let Some(reason) = resolve_agent_mode(opts.agent) {
+        AGENT.store(true, Ordering::Relaxed);
+        eprintln!(
+            "pinkdb agent mode on: {reason}; -no-agent turns it off, .help agent explains the output"
+        );
+    }
     // The extension policy of this session: `LOAD EXTENSION` is off unless
     // the operator asked for it (the flag or the environment variable), and
     // every load is confined to the extension root when one is configured.
@@ -1958,7 +2257,7 @@ fn main() {
             Err(e) => {
                 // A set-but-non-UTF-8 PINKDB_KEY must not silently fall back to
                 // plaintext.
-                eprintln!("Error: {e}");
+                cli_error!("{e}");
                 std::process::exit(2);
             }
         },
