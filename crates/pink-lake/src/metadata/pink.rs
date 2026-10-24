@@ -78,6 +78,13 @@ pub(crate) fn open_keyed(
             None => PinkDb::open_durable_with_options(&path.to_string_lossy(), options),
         };
         let (db, _) = opened.map_err(|e| map_error(url, e))?;
+        // Every process that opens the catalog replays its WAL, so the WAL
+        // must stay small: a catalog commit logs ~14 KB, and at the engine's
+        // default 64 MiB threshold 1,000 commits left 14 MB of WAL that cost
+        // 0.7 s of replay on every attach (0.02 s after a checkpoint). A
+        // 1 MiB threshold bounds replay to roughly 70 commits; the checkpoint
+        // rewrites only the catalog file (0.4 MB at 1,000 data files).
+        db.set_auto_checkpoint_bytes(Some(CATALOG_AUTO_CHECKPOINT_BYTES));
         let connection = PinkConnection {
             db: Arc::new(Mutex::new(db)),
             url: url.to_string(),
@@ -90,6 +97,10 @@ pub(crate) fn open_keyed(
         Ok(Box::new(connection))
     })
 }
+
+/// The WAL size that triggers an automatic checkpoint of a `.pink` catalog
+/// (see `open`): small, because every open replays the WAL.
+pub(crate) const CATALOG_AUTO_CHECKPOINT_BYTES: u64 = 1024 * 1024;
 
 /// The catalog busy timeout: the same variable the SQLite adapter honours,
 /// with the engine's `PINKDB_BUSY_TIMEOUT_MS` as the fallback so a test or a

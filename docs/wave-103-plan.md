@@ -281,3 +281,27 @@ Still undone: the PNKLAKE1 v1 read branch and Argon2id KDF remain in
 `crypto.rs` (per-file keys are raw, but the legacy/passphrase path was not
 excised), and the supervisor notify/pause/resume lifecycle test was reduced to
 the verified start/stop path after its polling raced the supervisor.
+
+## Benchmark: catalog local, data on R2 (2026-10-24, after waves 103 and 104)
+
+Harness: `/tmp/r2bench/v8/` (`save.sh` and `bench.py`), release `pinkdb --features pinklake,s3,parquetlake,catalog-sqlite`, DuckDB 2.0. TPC-H SF1, Cloudflare R2 bucket `pinkdb-bench`, data under `lakes/v8/`. Both systems now use the same model: a local catalog and data on R2. Before wave 103, pinkdb also kept its catalog on R2, as JSON.
+
+TPC-H SF1, median of 3 runs:
+
+| query | DuckLake | pinkdb `.pink` lake (pink catalog) | pinkdb `.pink` lake (sqlite catalog) | pinkdb Parquet lake | pinkdb `.pink`, catalog JSON on R2 (2026-10-22) |
+|---|---|---|---|---|---|
+| attach + `count(*)` | 0.07 s | **0.02 s** | 0.01 s | 0.02 s | 2.05 s |
+| attach + Q6 | 2.16 s | 2.35 s | 3.21 s | 5.00 s | 4.56 s |
+| attach + Q1 | 2.29 s | 2.56 s | 2.39 s | 4.99 s | 4.25 s |
+
+1,000 one-row commits (16 columns, inlining off, one data file per commit on R2):
+
+| | DuckLake | pinkdb (`pink:` catalog) |
+|---|---|---|
+| commit (first 20 → last 20) | 700 → 606 ms | 356 → 342 ms (median 380 ms, p95 544 ms with catalog checkpoints) |
+| attach + `count(*)` after 1,000 commits | 0.07 s | 0.73 s → **0.05 s** with the catalog WAL fix |
+
+Findings:
+- **Bug found and fixed:** the `.pink` catalog only auto-checkpointed at the engine's 64 MiB WAL default. A catalog commit logs ~14 KB, so after 1,000 commits the catalog was 14 MB of WAL, replayed (0.7 s of CPU) on every open. Catalog databases now checkpoint at 1 MiB (`CATALOG_AUTO_CHECKPOINT_BYTES`, test `the_catalog_wal_is_checkpointed_as_commits_accumulate`).
+- **Parquet lake is ~2× slower:** pinkdb's Parquet writer has no compression or dictionary encoding, so its files are 673 MB against DuckDB's ~310 MB for the same data. Folded into wave 98c.
+- **WAL volume:** ~14 KB of WAL per catalog commit is a lot for a one-row commit; worth shrinking (fewer statements per commit, or logging the delta compactly) in a later engine or catalog pass.

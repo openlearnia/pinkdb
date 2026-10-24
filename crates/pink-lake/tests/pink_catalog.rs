@@ -553,3 +553,65 @@ fn sqlite_and_pink_catalogs_are_equivalent() {
 
     catalog_suite::cleanup(&dir);
 }
+
+/// A `.pink` catalog keeps its WAL small: every process that opens the
+/// catalog replays the WAL, so commits must trigger checkpoints long before
+/// the engine's 64 MiB default. After 300 single-row commits (inlining off,
+/// one data file each) the WAL stays near the 1 MiB catalog threshold and the
+/// checkpointed main file holds the catalog.
+#[test]
+fn the_catalog_wal_is_checkpointed_as_commits_accumulate() {
+    use std::sync::Arc;
+
+    use pink_lake::Commit;
+    use pinkdb::{DataTable, DataType, PinkDb, Value};
+
+    let dir = catalog_suite::scratch("wal-bound");
+    let catalog_path = dir.join("catalog.pink");
+    let catalog = format!("pink:{}", catalog_path.display());
+    let mut lake = Lake::create_with_catalog(&catalog, dir.join("data").to_str().unwrap()).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE main.t (i INTEGER, s VARCHAR);")
+        .unwrap();
+    db.table_mut_in("main", "t")
+        .unwrap()
+        .append_row(vec![Value::Integer(0), Value::Varchar("v0".into())])
+        .unwrap();
+    assert_eq!(lake.write_from_store(&db).unwrap(), 2);
+    for i in 1..=300 {
+        let mut table = DataTable::new(
+            "t".to_string(),
+            vec![
+                ("i".to_string(), DataType::Integer),
+                ("s".to_string(), DataType::Varchar),
+            ],
+        )
+        .unwrap();
+        table
+            .append_row(vec![Value::Integer(i), Value::Varchar(format!("v{i}"))])
+            .unwrap();
+        let mut commit = Commit::new();
+        commit.append("main.t", Arc::new(table));
+        lake.commit(&commit).unwrap();
+    }
+    drop(lake);
+    let wal = std::fs::metadata(format!("{}.wal", catalog_path.display()))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    // One threshold plus at most one commit's worth of log past it.
+    assert!(
+        wal < 2 * 1024 * 1024,
+        "the catalog WAL grew to {wal} bytes; it must be checkpointed near 1 MiB"
+    );
+    assert!(
+        std::fs::metadata(&catalog_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+            > 0,
+        "the checkpointed catalog lives in the main file"
+    );
+    let lake = Lake::open_with_catalog(&catalog, None).unwrap();
+    assert_eq!(lake.current_version(), 302);
+    catalog_suite::cleanup(&dir);
+}
