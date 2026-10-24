@@ -404,6 +404,8 @@ fn outcome_line(result: &QueryResult) -> String {
         QueryResult::Checkpointed => "Checkpointed".to_string(),
         QueryResult::CreatedProcedure { name: proc } => format!("Created procedure {}", name(proc)),
         QueryResult::DroppedProcedure { name: proc } => format!("Dropped procedure {}", name(proc)),
+        QueryResult::CreatedTrigger { name: trig } => format!("Created trigger {}", name(trig)),
+        QueryResult::DroppedTrigger { name: trig } => format!("Dropped trigger {}", name(trig)),
         QueryResult::CreatedMacro { name: macro_ } => format!("Created macro {}", name(macro_)),
         QueryResult::DroppedMacro { name: macro_ } => format!("Dropped macro {}", name(macro_)),
         QueryResult::CreatedUser { name: user } => format!("Created user {}", name(user)),

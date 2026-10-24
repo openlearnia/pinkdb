@@ -1586,6 +1586,12 @@ fn render_results_into(out: &mut String, results: &[QueryResult]) {
             QueryResult::DroppedProcedure { name } => {
                 let _ = writeln!(out, "Procedure {} dropped.", clean(name));
             }
+            QueryResult::CreatedTrigger { name } => {
+                let _ = writeln!(out, "Trigger {} created.", clean(name));
+            }
+            QueryResult::DroppedTrigger { name } => {
+                let _ = writeln!(out, "Trigger {} dropped.", clean(name));
+            }
             QueryResult::CreatedMacro { name } => {
                 let _ = writeln!(out, "Macro {} created.", clean(name));
             }
@@ -2805,6 +2811,8 @@ mod tests {
             QueryResult::AlteredTable { name: n() },
             QueryResult::CreatedProcedure { name: n() },
             QueryResult::DroppedProcedure { name: n() },
+            QueryResult::CreatedTrigger { name: n() },
+            QueryResult::DroppedTrigger { name: n() },
             QueryResult::CreatedMacro { name: n() },
             QueryResult::DroppedMacro { name: n() },
             QueryResult::CreatedUser { name: n() },

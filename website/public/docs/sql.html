@@ -485,6 +485,45 @@ CALL bump(<span class="tok-n">5</span>);
   follow-up.</li>
 </ul>
 
+<h2 id="triggers">Triggers<a class="anchor" href="#triggers" aria-label="Permalink: Triggers">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">CREATE</span> TRIGGER audit AFTER <span class="tok-k">INSERT</span> <span class="tok-k">OR</span> <span class="tok-k">DELETE</span> <span class="tok-k">ON</span> sales
+  FOR EACH ROW EXECUTE <span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> audit_log <span class="tok-k">VALUES</span> (<span class="tok-s">'change'</span>);
+<span class="tok-k">CREATE</span> TRIGGER stamp BEFORE <span class="tok-k">UPDATE</span> OF total <span class="tok-k">ON</span> sales
+  FOR EACH ROW <span class="tok-k">WHEN</span> (NEW.total &lt; <span class="tok-n">0</span>)
+  EXECUTE DO $$ <span class="tok-k">BEGIN</span> <span class="tok-k">SET</span> NEW.total = <span class="tok-n">0</span>; <span class="tok-k">END</span> $$;
+<span class="tok-k">CREATE</span> TRIGGER totals AFTER <span class="tok-k">UPDATE</span> <span class="tok-k">ON</span> sales
+  REFERENCING OLD <span class="tok-k">TABLE</span> <span class="tok-k">AS</span> o NEW <span class="tok-k">TABLE</span> <span class="tok-k">AS</span> n FOR EACH STATEMENT
+  EXECUTE PROCEDURE recount(n);
+<span class="tok-k">DROP</span> TRIGGER audit <span class="tok-k">ON</span> sales;
+SHOW TRIGGERS <span class="tok-k">ON</span> sales;</code></pre></div>
+
+<ul>
+  <li><code>{BEFORE|AFTER}</code> × <code>{INSERT|UPDATE [OF cols]|DELETE}</code> ×
+  <code>{ROW|STATEMENT}</code>, with several events per trigger
+  (<code>INSERT OR UPDATE</code>) and a <code>WHEN</code> condition.</li>
+  <li><code>FOR EACH ROW</code> (the default) exposes <code>OLD</code> and
+  <code>NEW</code> as columns in <code>WHEN</code> and in the body; a
+  <code>BEFORE</code> row trigger may assign <code>NEW.col</code> and the table
+  stores the modified image. <code>OLD</code> is read-only, and v1 has no
+  row-skipping.</li>
+  <li><code>FOR EACH STATEMENT</code> exposes <code>REFERENCING OLD TABLE AS
+  o NEW TABLE AS n</code> as read-only relations (<code>FROM o</code>);
+  transition tables are <code>AFTER</code>-only.</li>
+  <li>Triggers run inside the firing statement's transaction — an error rolls
+  back the whole statement — and in creation order. A trigger's own DML fires
+  triggers, bounded at 16 levels.</li>
+  <li>Creating one needs <code>CREATE</code> on the database; bodies run with
+  <strong>invoker</strong> rights, so a trigger cannot exceed the firing user's
+  privileges.</li>
+  <li>Definitions persist in <code>.pink</code> files and replay from the WAL
+  by re-executing the firing statement, so its triggers fire again exactly
+  once.</li>
+  <li>Refused: triggers on views and attached lake tables,
+  <code>RETURNING</code> on triggered tables, and trigger DDL inside a
+  transaction.</li>
+</ul>
+
 <h2 id="materialized-views">Materialized views<a class="anchor" href="#materialized-views" aria-label="Permalink: Materialized views">#</a></h2>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">CREATE</span> MATERIALIZED <span class="tok-k">VIEW</span> totals REFRESH EVERY INTERVAL <span class="tok-s">'5 minutes'</span> <span class="tok-k">AS</span>
@@ -551,6 +590,7 @@ SHOW MATERIALIZED VIEWS;               <span class="tok-c">-- schedule, last ref
   <li><a href="#three-valued-logic">Three-valued logic</a></li>
   <li><a href="#databases-and-sessions">Databases and sessions</a></li>
   <li><a href="#stored-procedures">Stored procedures</a></li>
+  <li><a href="#triggers">Triggers</a></li>
   <li><a href="#materialized-views">Materialized views</a></li>
   <li><a href="#not-supported-yet">Not supported yet</a></li>
 </ul>

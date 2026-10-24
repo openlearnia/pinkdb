@@ -205,6 +205,29 @@ pub enum LogicalPlan {
         name: String,
         if_exists: bool,
     },
+    /// `CREATE [OR REPLACE] TRIGGER …` (wave 100): store the parsed
+    /// definition in the table's database catalog. The definition carries the
+    /// `CREATE TRIGGER` source text (persisted in `.pink`, like a macro's);
+    /// the executor refuses an empty one.
+    CreateTrigger {
+        db: Option<String>,
+        /// Boxed: a whole statement (`TriggerDef::action`) makes the
+        /// definition much larger than the other variants' payloads.
+        def: Box<crate::trigger::TriggerDef>,
+        or_replace: bool,
+    },
+    /// `DROP TRIGGER [IF EXISTS] [db.]name [ON table]`.
+    DropTrigger {
+        db: Option<String>,
+        name: String,
+        table: Option<String>,
+        if_exists: bool,
+    },
+    /// `SHOW TRIGGERS [ON table]`.
+    ShowTriggers {
+        db: Option<String>,
+        table: Option<String>,
+    },
     /// `CALL name(args...)` (wave 44): run the stored procedure. The
     /// arguments were bound as constant expressions; the definition is
     /// resolved against the catalog at execution (a rebind after a lease
@@ -485,6 +508,7 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
             | LogicalPlan::ShowDatabases
             | LogicalPlan::ShowMaterializedViews { .. }
             | LogicalPlan::ShowMacros { .. }
+            | LogicalPlan::ShowTriggers { .. }
             | LogicalPlan::Describe { .. }
             | LogicalPlan::DescribeMacro { .. }
             | LogicalPlan::Explain { .. }
@@ -531,6 +555,20 @@ pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> Logical
             if_not_exists,
             source: source.unwrap_or_default().to_string(),
         },
+        // Wave 100: a trigger definition is persisted as its `CREATE TRIGGER`
+        // text, for the same reason a macro's definition is.
+        LogicalPlan::CreateTrigger {
+            db,
+            mut def,
+            or_replace,
+        } => {
+            def.source = source.unwrap_or_default().to_string();
+            LogicalPlan::CreateTrigger {
+                db,
+                def,
+                or_replace,
+            }
+        }
         other => other,
     }
 }
@@ -596,6 +634,11 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             // order.
             | LogicalPlan::CreateMacro { .. }
             | LogicalPlan::DropMacro { .. }
+            // Wave 100: trigger DDL mutates the catalog. A *fired* trigger is
+            // never logged on its own: the WAL holds the statement that fired
+            // it, and replay re-fires the trigger deterministically.
+            | LogicalPlan::CreateTrigger { .. }
+            | LogicalPlan::DropTrigger { .. }
             // Wave 48: user/role DDL and grants mutate the store's RBAC
             // catalog, so a durable store logs and replays them. A
             // `CREATE/ALTER USER` is logged in its `PASSWORD_HASH` form —
@@ -638,6 +681,10 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
         // transaction merge does not carry, exactly like a procedure's.
         LogicalPlan::CreateMacro { .. } => "CREATE MACRO",
         LogicalPlan::DropMacro { .. } => "DROP MACRO",
+        // Wave 100: a trigger definition is catalog metadata the per-table
+        // transaction merge does not carry, exactly like a procedure's.
+        LogicalPlan::CreateTrigger { .. } => "CREATE TRIGGER",
+        LogicalPlan::DropTrigger { .. } => "DROP TRIGGER",
         // Wave 48: RBAC objects live in the store's catalog, which the
         // per-table transaction merge does not carry (exactly like a
         // procedure definition or a database). Refusing them inside a
@@ -776,7 +823,15 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::CreateProcedure { .. }
         | LogicalPlan::DropProcedure { .. }
         | LogicalPlan::CreateMacro { .. }
-        | LogicalPlan::DropMacro { .. } => {}
+        | LogicalPlan::DropMacro { .. }
+        | LogicalPlan::DropTrigger { .. }
+        | LogicalPlan::ShowTriggers { .. } => {}
+        // Wave 100: trigger DDL names an existing table, so it reads it — a
+        // concurrent DROP TABLE then conflicts instead of leaving a trigger
+        // pointing at a vanished table.
+        LogicalPlan::CreateTrigger { def, .. } => {
+            out.insert((def.db.to_ascii_lowercase(), def.table.to_ascii_lowercase()));
+        }
         // A materialized view's defining query is part of the statement: the
         // backing table is computed from exactly these reads.
         LogicalPlan::CreateMaterializedView { query, .. } => {
@@ -1100,6 +1155,9 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         | LogicalPlan::DropProcedure { .. }
         | LogicalPlan::CreateMacro { .. }
         | LogicalPlan::DropMacro { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. }
+        | LogicalPlan::ShowTriggers { .. }
         | LogicalPlan::ShowMacros { .. }
         | LogicalPlan::DescribeMacro { .. }
         | LogicalPlan::CreateUser { .. }
@@ -1312,6 +1370,9 @@ fn walk_scan_filters(
         | LogicalPlan::DropMaterializedView { .. }
         | LogicalPlan::CreateProcedure { .. }
         | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. }
+        | LogicalPlan::ShowTriggers { .. }
         // Wave 48: RBAC statements hold no child plan to analyze.
         | LogicalPlan::CreateUser { .. }
         | LogicalPlan::AlterUser { .. }
@@ -1633,6 +1694,9 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
         | LogicalPlan::DropProcedure { .. }
         | LogicalPlan::CreateMacro { .. }
         | LogicalPlan::DropMacro { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. }
+        | LogicalPlan::ShowTriggers { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::DropMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedViews { .. }
@@ -2021,6 +2085,9 @@ fn walk_scan_projections(
         | LogicalPlan::DropProcedure { .. }
         | LogicalPlan::CreateMacro { .. }
         | LogicalPlan::DropMacro { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. }
+        | LogicalPlan::ShowTriggers { .. }
         // Wave 48: RBAC statements scan no table.
         | LogicalPlan::CreateUser { .. }
         | LogicalPlan::AlterUser { .. }

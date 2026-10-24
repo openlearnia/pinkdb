@@ -197,9 +197,10 @@ impl PinkDb {
         crate::db::record_writes(plan, default_db, &mut out, &mut HashSet::new());
         // Wave 44: a `CALL`'s writes are the ones its statements actually
         // performed, recorded by the executor (the plan cannot name them).
-        if matches!(plan, LogicalPlan::Call { .. }) {
-            out.extend(self.proc_frame.writes());
-        }
+        // Wave 100: so are a trigger body's, which take the same path — the
+        // guard is gone, and a plan that fired no triggers leaves the set
+        // unchanged (the frame is reset per statement).
+        out.extend(self.proc_frame.writes());
         if let LogicalPlan::RefreshMaterializedViews { db } = plan {
             let target = db.as_deref().unwrap_or(default_db);
             for name in self.materialized_view_names_in(target) {
@@ -261,9 +262,9 @@ impl PinkDb {
         // frame's payload; read before it (the transaction path's
         // pre-execution pass), it is empty and the post-execution pass
         // (`PinkDb::note_proc_frame_in_txn`) adds the real set.
-        if matches!(plan, LogicalPlan::Call { .. }) {
-            sets.extend(&self.proc_frame.touched());
-        }
+        // Wave 100: likewise a trigger body's reads and writes; see
+        // `plan_writes_of`.
+        sets.extend(&self.proc_frame.touched());
         for (db, table) in self.mv_reads_of(plan, default_db) {
             sets.add_table(&db, &table);
         }

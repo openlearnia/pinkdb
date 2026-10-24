@@ -391,6 +391,64 @@ rebuild (`--features js`). Native targets only for now: the engine compiles
 for wasm32 but is not yet verified there. The SQL procedural language needs
 no feature and is always available.
 
+### Triggers
+
+```sql
+CREATE [OR REPLACE] TRIGGER name {BEFORE|AFTER} {INSERT|UPDATE [OF col, ...]|DELETE} [OR ...]
+  ON table [REFERENCING OLD TABLE AS o NEW TABLE AS n]
+  [FOR EACH {ROW|STATEMENT}] [WHEN (cond)]
+  EXECUTE {PROCEDURE p(args) | <one statement>};
+DROP TRIGGER [IF EXISTS] name [ON table];
+SHOW TRIGGERS [ON table];          -- name, table, timing, events, level
+```
+
+A trigger's action is one statement (or a `CALL`), run in the same transaction
+as the statement that fired it: an error in the body undoes the whole
+statement, including in autocommit. Several triggers on one event run in
+creation order — all `BEFORE` ones before the row change, all `AFTER` ones
+after it, `ROW` triggers row by row and `STATEMENT` triggers once.
+
+* `FOR EACH ROW` (the default) fires once per changed row and may read `OLD`
+  and `NEW` as columns (`NEW.n`, `OLD.id`) in `WHEN` and in the body. A
+  `BEFORE ROW` trigger may assign `NEW.<col>` with `SET NEW.col = expr` (in a
+  procedure body or a `DO $$ … $$` block), and the table stores the modified
+  image; `AFTER` triggers and the trigger's own logging see it too. `OLD` is
+  read-only. Neither `OLD` nor `NEW` exists for `INSERT`
+  (`OLD`) or `DELETE` (`NEW`), and returning nothing does **not** skip the row:
+  v1 has no skip signal, and a `BEFORE` trigger cannot cancel the change.
+* `FOR EACH STATEMENT` fires once per statement; `OLD`/`NEW` are not defined,
+  `WHEN` is evaluated once, and `REFERENCING OLD TABLE AS o NEW TABLE AS n`
+  exposes the statement's rows as read-only relations (`FROM o`). Transition
+  tables are `AFTER ... FOR EACH STATEMENT` only — at `BEFORE` time the rows do
+  not exist yet, so they are refused.
+* `UPDATE OF a, b` narrows the trigger to updates that write `a` or `b`.
+* Triggers are statement-atomic and nest: a trigger's own DML fires triggers
+  too, at most 16 levels deep (a deeper cascade fails with a clear error and
+  rolls the statement back). There is no per-trigger on/off switch in v1.
+* `CREATE`/`DROP TRIGGER` need the `CREATE` privilege on the database, like
+  table DDL. Trigger bodies run with **invoker** rights — the firing user's
+  privileges, re-checked on every body statement — so a trigger can never be
+  used to write a table its firer could not write. `SHOW TRIGGERS` is a
+  metadata read. `CALL`s inside a body keep invoker rights.
+* Definitions live per database in the `.pink` file, in creation order, and
+  replay from the WAL: only the **firing statement** is logged, never the
+  trigger's effects, and replay re-executes that statement so its triggers fire
+  again exactly once. That makes a trigger's body deterministic by
+  construction: a volatile extension function is already refused in any
+  logged statement (binder), so `now()`/`random()`-style bodies cannot make a
+  replay diverge.
+* Materialized views refresh for triggered writes like for any change, and a
+  trigger's writes join the firing statement's MVCC touched set (a concurrent
+  writer conflicts on them). `CREATE`/`DROP TRIGGER` are refused inside a
+  transaction, like the other catalog DDL that a per-table transaction merge
+  cannot undo.
+* Unsupported in v1, refused with a clear error: triggers on views and on
+  attached lake tables (`REFERENCING` there), `RETURNING` on a triggered table
+  (the engine has no `RETURNING` at all), and `INSTEAD OF` / row-skipping
+  before-triggers. `.lake commit` of a writable attachment publishes a
+  trigger's data effects, but trigger definitions are session-local and are not
+  written into a lake.
+
 ### Databases
 
 Databases are named, case-insensitive namespaces (`main` by default). A

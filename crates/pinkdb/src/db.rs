@@ -762,6 +762,7 @@ impl Connection {
                 // Wave 48: an authenticated session is checked in every
                 // transaction state too (the snapshot carries the RBAC
                 // catalog as of BEGIN).
+                txn.work.session_principal = self.principal.clone();
                 enforce(self.principal.as_deref(), &txn.work, &plan, &pre)?;
                 // A durable transaction logs its mutating statements: one
                 // that reads an attached lake table could never replay (the
@@ -980,6 +981,7 @@ impl Connection {
         if let Some(p) = profile.as_deref_mut() {
             p.bind += bind_start.map(|s| s.elapsed()).unwrap_or_default();
         }
+        shared.session_principal = self.principal.clone();
         enforce(self.principal.as_deref(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
@@ -998,6 +1000,7 @@ impl Connection {
             let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
             budget.check_deadline()?;
             let plan = crate::plan::with_mv_source(plan, sql_text);
+            shared.session_principal = self.principal.clone();
             enforce(self.principal.as_deref(), &shared, &plan, pre)?;
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
@@ -1086,6 +1089,7 @@ impl Connection {
         let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
         budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
+        shared.session_principal = self.principal.clone();
         enforce(self.principal.as_deref(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;

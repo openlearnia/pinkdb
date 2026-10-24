@@ -1065,7 +1065,9 @@ impl<'a> BodyParser<'a> {
                 }
                 "set" => {
                     let (name, expr) = parse_set(self.name, base, rest)?;
-                    if !self.is_declared(&name) {
+                    // `NEW.<col>` / `OLD.<col>` are a trigger's row images,
+                    // not block variables: they need no DECLARE.
+                    if !name.contains('.') && !self.is_declared(&name) {
                         return Err(self.err(
                             base,
                             format!(
@@ -1210,7 +1212,7 @@ impl<'a> BodyParser<'a> {
         }
         // A bare assignment (`x := expr` / `"x" := expr`).
         if let Some((name, expr)) = try_parse_bare_assign(self.name, base, text)? {
-            if !self.is_declared(&name) {
+            if !name.contains('.') && !self.is_declared(&name) {
                 return Err(self.err(
                     base,
                     format!(
@@ -1391,9 +1393,22 @@ fn parse_declare(name: &str, off: usize, rest: &str) -> Result<(String, DataType
     Ok((var, dtype, default))
 }
 
+/// An assignment target: a variable name, or `new.<col>` / `old.<col>` for a
+/// trigger body's row images (wave 100).
+fn parse_target<'t>(name: &str, off: usize, text: &'t str) -> Result<(String, &'t str)> {
+    let (first, after) = parse_ident_at(name, off, text)?;
+    match after.trim_start().strip_prefix('.') {
+        Some(rest) => {
+            let (second, after) = parse_ident_at(name, off, rest)?;
+            Ok((format!("{first}.{second}"), after))
+        }
+        None => Ok((first, after)),
+    }
+}
+
 /// `SET <name> (= | :=) <expr>` (the `SET` keyword already consumed).
 fn parse_set(name: &str, off: usize, rest: &str) -> Result<(String, Expr)> {
-    let (var, after) = parse_ident_at(name, off, rest)?;
+    let (var, after) = parse_target(name, off, rest)?;
     let after = ident_end(name, off, &var, after)?.trim_start();
     let Some((_, expr_text)) = split_assign_op(after) else {
         return Err(PinkDbError::Parse(format!(
@@ -1412,7 +1427,7 @@ fn parse_set(name: &str, off: usize, rest: &str) -> Result<(String, Expr)> {
 /// assignment: an ordinary SQL statement (`EXPLAIN SELECT … WHERE a = 1`)
 /// can hold a top-level `=` in its text, a `:=` never.
 fn try_parse_bare_assign(name: &str, off: usize, text: &str) -> Result<Option<(String, Expr)>> {
-    let Ok((var, after)) = parse_ident_at(name, off, text) else {
+    let Ok((var, after)) = parse_target(name, off, text) else {
         return Ok(None);
     };
     let after = after.trim_start();
@@ -2117,11 +2132,32 @@ fn exec_stmts(db: &mut PinkDb, frame: &mut Frame, stmts: &[ProcStmt]) -> Result<
                 });
             }
             ProcStmtKind::Assign { name, expr } => {
-                let Some(var) = frame.lookup(name) else {
-                    return Err(frame.err(stmt.off, format!("variable \"{name}\" is not in scope")));
+                // A dotted target (`NEW.col`) is a trigger row image, not a
+                // frame variable (wave 100); the scope lives on the store, so
+                // even a nested procedure call still sees it.
+                let row_target = name.contains('.');
+                let dtype = match frame.lookup(name) {
+                    Some(var) if !row_target => Some(var.dtype),
+                    _ if row_target => None,
+                    _ => {
+                        return Err(
+                            frame.err(stmt.off, format!("variable \"{name}\" is not in scope"))
+                        );
+                    }
                 };
-                let dtype = var.dtype;
                 let v = eval_expr_value(db, frame, stmt.off, expr, "SET")?;
+                let Some(dtype) = dtype else {
+                    match crate::trigger::assign_row_column(db, name, v) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(
+                                frame.err(stmt.off, format!("variable \"{name}\" is not in scope"))
+                            );
+                        }
+                        Err(e) => return Err(frame.err(stmt.off, e)),
+                    }
+                    return Ok(Flow::Normal);
+                };
                 let v = crate::storage::DataTable::coerce(v, dtype).map_err(|e| {
                     frame.err(
                         stmt.off,
@@ -2232,7 +2268,7 @@ fn exec_stmts(db: &mut PinkDb, frame: &mut Frame, stmts: &[ProcStmt]) -> Result<
 /// stack first, and in a recursive caller that temporary would stay in the
 /// frame for every nested block and `CALL` level.
 #[inline(never)]
-fn boxed_snapshot(db: &PinkDb) -> Box<PinkDb> {
+pub(crate) fn boxed_snapshot(db: &PinkDb) -> Box<PinkDb> {
     Box::new(db.clone())
 }
 
@@ -2317,7 +2353,9 @@ fn bind_constant(
     expr: &Expr,
     what: &str,
 ) -> Result<crate::sql::binder::BoundExpr> {
-    let slots = crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(frame.variables());
+    let mut variables = crate::trigger::trigger_variables(db);
+    variables.extend(frame.variables());
+    let slots = crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(variables);
     let (bound, dynamic) =
         crate::sql::binder::bind_constant_expr_tracked(db, &frame.db_name, expr, Some(slots))
             .map_err(|e| frame.err(off, format!("{what}: {e}")))?;
@@ -2376,7 +2414,9 @@ fn exec_sql(
     off: usize,
     sql: &Statement,
 ) -> Result<(QueryResult, bool)> {
-    let slots = crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(frame.variables());
+    let mut variables = crate::trigger::trigger_variables(db);
+    variables.extend(frame.variables());
+    let slots = crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(variables);
     let db_name = frame.db_name.clone();
     run_call_statement(db, &db_name, slots, sql, |msg| frame.err(off, msg))
 }
@@ -2404,6 +2444,18 @@ pub(crate) fn run_call_statement(
              callbacks are opaque (impure or nondeterministic), so a durable store cannot \
              replay this call — run the statement outside the procedure instead",
         ));
+    }
+    // Invoker rights (wave 100): a trigger body runs with the privileges of
+    // the user whose statement fired it, never a definer's. A `CALL` plan is
+    // skipped — `CALL` is admin-only, and a trigger that calls a procedure
+    // must not need ADMIN; the procedure's own statements reach this function
+    // too, so they are checked here against the same principal.
+    if let Some(principal) = db.trigger_invoker.clone()
+        && !principal.is_empty()
+        && !matches!(plan, LogicalPlan::Call { .. })
+    {
+        crate::rbac::check_statement(db, &principal, &plan, db_name)
+            .map_err(|e| err(&e.to_string()))?;
     }
     // The whole call is logged on a durable store: a statement that reads a
     // session-local lake could not replay.

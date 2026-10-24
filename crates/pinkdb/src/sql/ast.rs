@@ -192,6 +192,44 @@ pub enum Statement {
         name: String,
         args: Vec<Expr>,
     },
+    /// `CREATE [OR REPLACE] TRIGGER name {BEFORE|AFTER} <event>[ OR …] ON table
+    /// [REFERENCING OLD TABLE AS o NEW TABLE AS n] [FOR EACH {ROW|STATEMENT}]
+    /// [WHEN (cond)] EXECUTE {PROCEDURE p(args) | <statement>}` (wave 100).
+    ///
+    /// The action is an ordinary statement: `EXECUTE PROCEDURE p(args)` is a
+    /// [`Statement::Call`], so there is no second action kind. The trigger
+    /// lives in the table's database; `name` is unqualified.
+    CreateTrigger {
+        db: Option<String>,
+        name: String,
+        /// The table the trigger fires on.
+        table: String,
+        timing: crate::trigger::TriggerTiming,
+        /// The events it fires for, in written order (`INSERT OR UPDATE`).
+        events: Vec<crate::trigger::TriggerEvent>,
+        /// The `OF` column list of an `UPDATE OF a, b` event.
+        update_columns: Vec<String>,
+        level: crate::trigger::TriggerLevel,
+        /// `REFERENCING OLD TABLE AS <name>` — an AFTER STATEMENT relation.
+        old_table: Option<String>,
+        /// `REFERENCING NEW TABLE AS <name>` — an AFTER STATEMENT relation.
+        new_table: Option<String>,
+        when: Option<Expr>,
+        action: Box<Statement>,
+        or_replace: bool,
+    },
+    /// `DROP TRIGGER [IF EXISTS] name [ON table]` (wave 100).
+    DropTrigger {
+        db: Option<String>,
+        name: String,
+        table: Option<String>,
+        if_exists: bool,
+    },
+    /// `SHOW TRIGGERS [ON table]` (wave 100).
+    ShowTriggers {
+        db: Option<String>,
+        table: Option<String>,
+    },
     /// `DO '<body>'` (wave 83): run an anonymous SQL procedural block
     /// (`BEGIN ... END`, the procedure-body language) once — atomic like a
     /// `CALL`, no parameters, no transaction control. It is also how a

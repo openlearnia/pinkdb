@@ -690,12 +690,12 @@ fn newer_formats_and_unknown_flags_are_refused() {
         .to_string();
     assert!(e.contains("newer pinkdb") && e.contains("format v7"), "{e}");
 
-    // An as-yet-unknown footer flag bit (bit 7) is refused even with a
+    // An as-yet-unknown footer flag bit (bit 8) is refused even with a
     // valid footer CRC.
     let mut flagged = good;
     let (footer_at, footer_len) = pinkdb::persist::footer_span(&flagged).unwrap();
     let flags_at = footer_at as usize + 4;
-    let flags = u32::from_le_bytes(flagged[flags_at..flags_at + 4].try_into().unwrap()) | 0x80;
+    let flags = u32::from_le_bytes(flagged[flags_at..flags_at + 4].try_into().unwrap()) | 0x100;
     flagged[flags_at..flags_at + 4].copy_from_slice(&flags.to_le_bytes());
     let footer = flagged[footer_at as usize..(footer_at + footer_len) as usize].to_vec();
     let n = flagged.len();

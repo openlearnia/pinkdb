@@ -177,6 +177,12 @@ const FLAG_RBAC: u32 = 0x20;
 /// must already be in the catalog when that rebind runs.
 const FLAG_MACROS: u32 = 0x40;
 
+/// Wave 100: the file carries a per-database trigger section. Each trigger is
+/// stored as the `CREATE TRIGGER …` text it was created from — a definition is
+/// re-parsed on load, exactly like a macro or a materialized view, so nothing
+/// is duplicated between the catalog and the file.
+const FLAG_TRIGGERS: u32 = 0x80;
+
 /// Column-default value tags (one byte per non-NULL default).
 const VD_BOOL: u8 = 0;
 const VD_I32: u8 = 1;
@@ -2761,6 +2767,7 @@ struct DbDir {
     macros: Vec<crate::macros::MacroDef>,
     materialized_views: Vec<crate::storage::MaterializedViewDef>,
     procedures: Vec<crate::procedure::ProcedureDef>,
+    triggers: Vec<crate::trigger::TriggerDef>,
 }
 
 /// The parsed footer of a `PINKDB06` file.
@@ -3043,6 +3050,7 @@ impl PinkDb {
         });
         let with_mvs = self.has_materialized_views();
         let with_procedures = self.has_procedures();
+        let with_triggers = self.has_triggers();
         let with_macros = self.has_macros();
         let with_rbac = self.has_rbac_data();
         let with_indexes = self.list_databases().iter().any(|db| {
@@ -3058,6 +3066,7 @@ impl PinkDb {
             | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 }
             | if with_indexes { FLAG_INDEXES } else { 0 }
             | if with_procedures { FLAG_PROCEDURES } else { 0 }
+            | if with_triggers { FLAG_TRIGGERS } else { 0 }
             | if with_macros { FLAG_MACROS } else { 0 }
             | if with_rbac { FLAG_RBAC } else { 0 };
 
@@ -3105,6 +3114,13 @@ impl PinkDb {
                         .into_iter()
                         .map(|(_, d)| d)
                         .collect()
+                } else {
+                    Vec::new()
+                },
+                // Creation order is the firing order, so the slice is written
+                // as stored — never sorted.
+                triggers: if with_triggers {
+                    self.triggers_in(dbname).to_vec()
                 } else {
                     Vec::new()
                 },
@@ -3164,6 +3180,9 @@ impl PinkDb {
             }
             if with_procedures {
                 write_procedure_defs(&mut fw, &dbdir.procedures);
+            }
+            if with_triggers {
+                write_trigger_defs(&mut fw, &dbdir.triggers);
             }
         }
         if with_rbac {
@@ -3410,6 +3429,11 @@ impl PinkDb {
             }
             for def in &dbdir.procedures {
                 db.procedures_insert_in(&dbdir.name, def.name.to_ascii_lowercase(), def.clone())?;
+            }
+            // Triggers last: a definition is only used when a statement fires
+            // it, so its table must be loaded first (it already is).
+            for def in &dbdir.triggers {
+                db.triggers_insert_in(&dbdir.name, def.clone())?;
             }
         }
         if let Some(rbac) = footer.rbac {
@@ -4111,6 +4135,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
             | FLAG_INDEXES
             | FLAG_PROCEDURES
             | FLAG_MACROS
+            | FLAG_TRIGGERS
             | FLAG_RBAC)
         != 0
     {
@@ -4124,6 +4149,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
     let macros = flags & FLAG_MACROS != 0;
     let mvs = flags & FLAG_MATERIALIZED_VIEWS != 0;
     let procedures = flags & FLAG_PROCEDURES != 0;
+    let triggers = flags & FLAG_TRIGGERS != 0;
     let rbac = flags & FLAG_RBAC != 0;
 
     let n_dbs = r.u32()? as usize;
@@ -4250,12 +4276,18 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
         } else {
             Vec::new()
         };
+        let dtriggers = if triggers {
+            read_trigger_defs(&mut r, &name)?
+        } else {
+            Vec::new()
+        };
         databases.push(DbDir {
             name,
             tables,
             macros: dmacros,
             materialized_views: dmvs,
             procedures: dprocs,
+            triggers: dtriggers,
         });
     }
     let rbac = if rbac { Some(read_rbac(&mut r)?) } else { None };
@@ -4821,6 +4853,54 @@ fn write_procedure_defs(w: &mut Writer, defs: &[crate::procedure::ProcedureDef])
         }
         w.str(&def.source);
     }
+}
+
+/// Encode one database's trigger section: the count, then per trigger (in
+/// creation order, which is the firing order) `name, source text`. Everything
+/// else is re-derived by re-parsing `source` on load.
+fn write_trigger_defs(w: &mut Writer, defs: &[crate::trigger::TriggerDef]) {
+    w.u32(defs.len() as u32);
+    for def in defs {
+        w.str(&def.name);
+        w.str(&def.source);
+    }
+}
+
+/// Decode one database's trigger section, re-parsing each `CREATE TRIGGER`
+/// text. A body that no longer parses is a corrupt file (it parsed when the
+/// trigger was created).
+fn read_trigger_defs(r: &mut Reader, dbname: &str) -> Result<Vec<crate::trigger::TriggerDef>> {
+    let n = r.u32()? as usize;
+    // Each trigger costs at least 8 bytes (two empty strings' length prefixes).
+    if n > r.remaining() / 8 + 1 {
+        return r.err("trigger count exceeds the remaining file");
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        let source = r.str()?;
+        let mut statements = crate::sql::parse_statements(&source).map_err(|e| {
+            PinkDbError::Execution(format!(
+                "corrupt file: trigger \"{name}\" does not parse: {e}"
+            ))
+        })?;
+        let stmt = match statements.len() {
+            1 => statements.remove(0),
+            _ => {
+                return Err(PinkDbError::Execution(format!(
+                    "corrupt file: trigger \"{name}\" is not one statement"
+                )));
+            }
+        };
+        let mut def = crate::trigger::def_from_statement(dbname, &stmt).map_err(|e| {
+            PinkDbError::Execution(format!(
+                "corrupt file: trigger \"{name}\" does not parse: {e}"
+            ))
+        })?;
+        def.source = source;
+        out.push(def);
+    }
+    Ok(out)
 }
 
 /// Decode one database's stored-procedure section. A SQL body is re-parsed

@@ -943,6 +943,19 @@ pub struct DbCatalog {
     /// own namespace: a macro may share a name with a table or view, exactly
     /// like DuckDB (a scalar/table macro name is one namespace).
     pub(crate) macros: HashMap<String, crate::macros::MacroDef>,
+    /// Triggers (wave 100) in **creation order**: that order is the firing
+    /// order, so it must survive a save/open round trip and a WAL replay.
+    pub(crate) triggers: Vec<crate::trigger::TriggerDef>,
+}
+
+impl DbCatalog {
+    /// Trigger definitions are only ever replaced by `OR REPLACE` or removed
+    /// by `DROP TRIGGER`: the list is short, so a linear scan is the lookup.
+    fn trigger_index(&self, name: &str) -> Option<usize> {
+        self.triggers
+            .iter()
+            .position(|t| t.name.eq_ignore_ascii_case(name))
+    }
 }
 
 /// A store of databases.
@@ -1091,6 +1104,28 @@ pub struct PinkDb {
     /// RBAC section + replayed from the WAL; an empty catalog is the
     /// documented "no users: every connection is trusted" state.
     pub(crate) rbac: crate::rbac::RbacCatalog,
+    /// The row images and transition tables a trigger body sees (wave 100),
+    /// installed by [`crate::trigger`] while the body runs and read back by
+    /// the binder (as `NEW`/`OLD` variables and `FROM <alias>`). Never
+    /// persisted, never serialized.
+    pub(crate) trigger_scope: Option<crate::trigger::TriggerScope>,
+    /// The rows an `AFTER STATEMENT` trigger's transition tables need, filled
+    /// by the DML arms of the statement that is firing and drained before the
+    /// trigger runs. `None` = no AFTER STATEMENT trigger is waiting, so a
+    /// writing statement does not pay for the copy.
+    pub(crate) trigger_capture: Option<Vec<(Vec<Value>, Vec<Value>)>>,
+    /// The trigger nesting depth of the statement currently executing (0
+    /// outside a trigger): bounds recursion. Never persisted.
+    pub(crate) trigger_depth: usize,
+    /// The authenticated user of the statement currently executing (wave 100):
+    /// a trigger body is checked against *this* principal — invoker rights, not
+    /// the definer's. `None` is a trusted embedded session.
+    pub(crate) session_principal: Option<String>,
+    /// While a trigger body (or anything it calls) runs: the principal every
+    /// statement it binds is checked against — invoker rights, never a
+    /// definer's. `None` outside a trigger body; an empty string is a trigger
+    /// fired by a trusted embedded session, which skips the check.
+    pub(crate) trigger_invoker: Option<String>,
     /// Registered `COPY … (FORMAT <name>)` write sinks (wave 71): a sink
     /// resolves by name or by the target path's extension. Process/store-level
     /// like loadable extensions — never persisted, shared by store clones,
@@ -1179,6 +1214,13 @@ impl Clone for PinkDb {
             proc_depth: self.proc_depth,
             standalone_call: self.standalone_call,
             proc_frame: self.proc_frame.clone(),
+            // A trigger body owns these fields while it runs; a snapshot only
+            // records the depth it was taken at.
+            trigger_scope: self.trigger_scope.clone(),
+            trigger_capture: self.trigger_capture.clone(),
+            trigger_depth: self.trigger_depth,
+            session_principal: self.session_principal.clone(),
+            trigger_invoker: self.trigger_invoker.clone(),
             rbac: self.rbac.clone(),
             file_formats: self.file_formats.clone(),
             loaded_packages: self.loaded_packages.clone(),
@@ -1255,6 +1297,11 @@ impl PinkDb {
             proc_depth: 0,
             standalone_call: false,
             proc_frame: crate::procedure::ProcFrame::default(),
+            trigger_scope: None,
+            trigger_capture: None,
+            trigger_depth: 0,
+            session_principal: None,
+            trigger_invoker: None,
             rbac: crate::rbac::RbacCatalog::default(),
             // Process-global sinks (`filefmt::register_global_file_format`)
             // seed every store constructed after the registration.
@@ -1582,6 +1629,59 @@ impl PinkDb {
         self.databases.values().any(|c| !c.procedures.is_empty())
     }
 
+    /// Every trigger of `db`, in creation order. A borrowed slice so the
+    /// trigger-free write path pays no allocation at all.
+    pub(crate) fn triggers_in(&self, db: &str) -> &[crate::trigger::TriggerDef] {
+        static EMPTY: &[crate::trigger::TriggerDef] = &[];
+        match self.databases.get(&Self::db_key(db)) {
+            Some(cat) => &cat.triggers,
+            None => EMPTY,
+        }
+    }
+
+    /// A stored trigger of `db` by name (case-insensitive).
+    pub(crate) fn trigger_in(&self, db: &str, name: &str) -> Result<&crate::trigger::TriggerDef> {
+        self.catalog(db)?
+            .triggers
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                PinkDbError::Catalog(format!("trigger \"{name}\" not found in database \"{db}\""))
+            })
+    }
+
+    /// Install (or replace) one trigger, keeping creation order: `OR REPLACE`
+    /// overwrites in place, so a replaced trigger keeps its firing position.
+    pub(crate) fn triggers_insert_in(
+        &mut self,
+        db: &str,
+        def: crate::trigger::TriggerDef,
+    ) -> Result<()> {
+        let cat = self.catalog_mut(db)?;
+        match cat.trigger_index(&def.name) {
+            Some(i) => cat.triggers[i] = def,
+            None => cat.triggers.push(def),
+        }
+        Ok(())
+    }
+
+    /// Remove one trigger (the caller checks existence for `IF EXISTS`).
+    pub(crate) fn triggers_remove_in(
+        &mut self,
+        db: &str,
+        name: &str,
+    ) -> Option<crate::trigger::TriggerDef> {
+        let cat = self.databases.get_mut(&Self::db_key(db))?;
+        let i = cat.trigger_index(name)?;
+        Some(cat.triggers.remove(i))
+    }
+
+    /// Does any database hold a trigger? (Cheap gate for the `.pink` flags
+    /// word.)
+    pub(crate) fn has_triggers(&self) -> bool {
+        self.databases.values().any(|c| !c.triggers.is_empty())
+    }
+
     /// A stored macro of `db` by name (case-insensitive).
     pub fn macro_in(&self, db: &str, name: &str) -> Result<&crate::macros::MacroDef> {
         self.catalog(db)?
@@ -1742,10 +1842,23 @@ impl PinkDb {
         let frame = std::mem::take(&mut self.proc_frame);
         let depth = self.proc_depth;
         let standalone = self.standalone_call;
+        // A trigger body is running *now*, so its scope, capture buffer and
+        // depth belong to the live statement, not to the snapshot taken
+        // before it started.
+        let trigger_scope = self.trigger_scope.take();
+        let trigger_capture = self.trigger_capture.take();
+        let trigger_depth = self.trigger_depth;
+        let principal = self.session_principal.clone();
+        let invoker = self.trigger_invoker.take();
         self.proc_snapshot_restore(snap);
         self.proc_frame = frame;
         self.proc_depth = depth;
         self.standalone_call = standalone;
+        self.trigger_scope = trigger_scope;
+        self.trigger_capture = trigger_capture;
+        self.trigger_depth = trigger_depth;
+        self.session_principal = principal;
+        self.trigger_invoker = invoker;
     }
 
     /// True while a `BEGIN..COMMIT/ROLLBACK` block is open.

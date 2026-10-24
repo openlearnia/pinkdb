@@ -2319,3 +2319,58 @@ fn attach_errors_are_clear_and_never_panic() {
     assert!(out.contains("│ 3 "), "{out}");
     cleanup(&dir);
 }
+
+/// Triggers on a read-only attachment are refused; a writable attachment
+/// publishes a trigger's effects with `.lake commit`, and the lake itself
+/// carries no trigger definitions (data only).
+#[test]
+fn lake_attachments_refuse_and_publish_trigger_effects() {
+    let dir = scratch("trigger");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER);\nCREATE TABLE log (msg VARCHAR);\n\
+         INSERT INTO t VALUES (1);\n.lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+
+    // Read-only: the attached table cannot be the target of a trigger.
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         CREATE TRIGGER tr AFTER INSERT ON t EXECUTE INSERT INTO log VALUES ('x');\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains("triggers are not supported on attached lake tables"),
+        "{out}"
+    );
+
+    // Writable: the trigger fires, the effects are part of the commit.
+    let out = run(&format!(
+        ".lake attach {lake} write\n\
+         CREATE TRIGGER tr AFTER INSERT ON t EXECUTE INSERT INTO log VALUES ('x');\n\
+         INSERT INTO t VALUES (2);\n\
+         .lake commit {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Trigger tr created."), "{out}");
+    assert!(
+        out.contains("+2 rows"),
+        "the trigger's insert is committed:\n{out}"
+    );
+
+    // A reopened lake has both rows and no trigger definition.
+    let out = run(&format!(
+        ".lake open {lake}\nSELECT COUNT(*) FROM t;\nSELECT COUNT(*) FROM log;\n\
+         SHOW TRIGGERS;\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("│ 2 "), "{out}");
+    assert!(out.contains("│ 1 "), "{out}");
+    assert!(
+        !out.contains("tr:VARCHAR"),
+        "a lake carries no triggers:\n{out}"
+    );
+    cleanup(&dir);
+}

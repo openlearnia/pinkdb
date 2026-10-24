@@ -1036,6 +1036,12 @@ peg::parser! {
             / word("show") word("databases") { Statement::ShowDatabases }
             / word("show") word("materialized") word("views") { Statement::ShowMaterializedViews }
             / word("show") word("macros") { Statement::ShowMacros }
+            / word("show") word("triggers") t:trigger_on_table()? {
+                  Statement::ShowTriggers {
+                      db: t.as_ref().and_then(|t| t.0.clone()),
+                      table: t.map(|t| t.1),
+                  }
+              }
 
         /// `DESCRIBE <table>`: DuckDB-shaped column metadata. `DESCRIBE MACRO
         /// <name>` (wave 77) reports one macro's function metadata.
@@ -1217,6 +1223,28 @@ peg::parser! {
                   }
               }
 
+            / kw(Keyword::Create) orr:or_replace() word("trigger") name:ident()
+              timing:trigger_timing() events:trigger_events() word("on") t:table_ref()
+              refer:trigger_referencing()? level:trigger_level()? when:trigger_when()?
+              word("execute") action:trigger_action() {
+                  let (events, update_columns) = events;
+                  let (old_table, new_table) = refer.unwrap_or((None, None));
+                  Statement::CreateTrigger {
+                      db: t.0,
+                      name,
+                      table: t.1,
+                      timing,
+                      events,
+                      update_columns,
+                      level: level.unwrap_or(crate::trigger::TriggerLevel::Row),
+                      old_table,
+                      new_table,
+                      when,
+                      action: Box::new(action),
+                      or_replace: orr,
+                  }
+              }
+
         /// `OR REPLACE` on `CREATE PROCEDURE`.
         rule or_replace() -> bool
             = word("or") word("replace") { true }
@@ -1231,6 +1259,78 @@ peg::parser! {
                   out.extend(rest);
                   out
               }
+
+        /// The `BEFORE` / `AFTER` timing of a trigger (wave 100).
+        rule trigger_timing() -> crate::trigger::TriggerTiming
+            = word("before") { crate::trigger::TriggerTiming::Before }
+            / word("after") { crate::trigger::TriggerTiming::After }
+
+        /// The event list: `INSERT`, `UPDATE [OF a, b]`, `DELETE`, joined by
+        /// `OR`. The `OF` column list rides back with the events because it
+        /// narrows every `UPDATE` of the definition.
+        rule trigger_events() -> (Vec<crate::trigger::TriggerEvent>, Vec<String>)
+            = first:trigger_event() rest:(word("or") e:trigger_event() { e })* {
+                  let mut events = vec![first.0];
+                  let mut columns = first.1;
+                  for (e, c) in rest {
+                      events.push(e);
+                      columns.extend(c);
+                  }
+                  (events, columns)
+              }
+
+        rule trigger_event() -> (crate::trigger::TriggerEvent, Vec<String>)
+            = word("insert") { (crate::trigger::TriggerEvent::Insert, Vec::new()) }
+            / word("update") cols:trigger_update_columns()? {
+                  (crate::trigger::TriggerEvent::Update, cols.unwrap_or_default())
+              }
+            / word("delete") { (crate::trigger::TriggerEvent::Delete, Vec::new()) }
+
+        rule trigger_update_columns() -> Vec<String>
+            = word("of") first:ident() rest:(comma() c:ident() { c })* {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        /// `REFERENCING OLD TABLE AS o NEW TABLE AS n` — the transition
+        /// tables of an `AFTER STATEMENT` trigger.
+        rule trigger_referencing() -> (Option<String>, Option<String>)
+            = word("referencing") o:trigger_old_table()? n:trigger_new_table()? {?
+                  if o.is_none() && n.is_none() {
+                      Err("OLD TABLE and/or NEW TABLE")
+                  } else {
+                      Ok((o, n))
+                  }
+              }
+
+        rule trigger_old_table() -> String
+            = word("old") word("table") kw(Keyword::As) name:ident() { name }
+
+        rule trigger_new_table() -> String
+            = word("new") word("table") kw(Keyword::As) name:ident() { name }
+
+        /// `FOR EACH ROW` / `FOR EACH STATEMENT`; ROW is the default.
+        rule trigger_level() -> crate::trigger::TriggerLevel
+            = word("for") word("each") word("row") { crate::trigger::TriggerLevel::Row }
+            / word("for") word("each") word("statement") {
+                  crate::trigger::TriggerLevel::Statement
+              }
+
+        rule trigger_when() -> Expr
+            = word("when") lparen() e:expr() rparen() { e }
+
+        /// `EXECUTE PROCEDURE p(args)` is a `CALL`; anything else is the
+        /// single statement the trigger runs directly.
+        rule trigger_action() -> Statement
+            = word("procedure") t:table_ref() args:call_args() {
+                  Statement::Call { db: t.0, name: t.1, args }
+              }
+            / s:statement() { s }
+
+        /// The `ON <table>` of `DROP TRIGGER` / `SHOW TRIGGERS`.
+        rule trigger_on_table() -> (Option<String>, String)
+            = word("on") t:table_ref() { t }
 
         /// A macro's parameter list (wave 77): `(a, b := 10)` or `()`.
         /// Parameters are untyped, like DuckDB's; a declared type is parsed
@@ -1503,6 +1603,14 @@ peg::parser! {
             / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { db: t.0, name: t.1 } }
             / kw(Keyword::Drop) word("procedure") ife:if_exists() t:table_ref() { Statement::DropProcedure { db: t.0, name: t.1, if_exists: ife } }
             / kw(Keyword::Drop) word("macro") ife:if_exists() t:table_ref() { Statement::DropMacro { db: t.0, name: t.1, if_exists: ife } }
+            / kw(Keyword::Drop) word("trigger") ife:if_exists() name:ident() t:trigger_on_table()? {
+                  Statement::DropTrigger {
+                      db: t.as_ref().and_then(|t| t.0.clone()),
+                      name,
+                      table: t.map(|t| t.1),
+                      if_exists: ife,
+                  }
+              }
         /// `ALTER TABLE` (wave 65). `alter`, `add`, `column`, `rename` and
         /// `default` are matched as words, not reserved keywords, so they stay
         /// usable as table/column names (`to` too: `RENAME COLUMN a TO to`).

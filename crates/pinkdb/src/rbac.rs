@@ -1223,6 +1223,7 @@ fn read_checked(plan: &LogicalPlan) -> bool {
             | LogicalPlan::ShowTables { .. }
             | LogicalPlan::ShowDatabases
             | LogicalPlan::ShowMaterializedViews { .. }
+            | LogicalPlan::ShowTriggers { .. }
             | LogicalPlan::Describe { .. }
             | LogicalPlan::Use { .. }
             | LogicalPlan::Begin
@@ -1340,6 +1341,12 @@ pub(crate) fn check_statement(
         // table privileges (see `check_statement`'s read pass).
         | LogicalPlan::CreateMacro { db, .. }
         | LogicalPlan::DropMacro { db, .. }
+        // Wave 100: defining or dropping a trigger is table DDL: it needs the
+        // same CREATE on the database `ALTER TABLE` and index DDL need. The
+        // body runs with the *invoker's* table privileges, not the definer's
+        // (`procedure::run_call_statement` re-checks every body statement).
+        | LogicalPlan::CreateTrigger { db, .. }
+        | LogicalPlan::DropTrigger { db, .. }
         | LogicalPlan::CreateTableAs { db, .. }
         | LogicalPlan::CreateMaterializedView { db, .. }
         | LogicalPlan::RefreshMaterializedView { db, .. }

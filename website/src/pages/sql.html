@@ -304,6 +304,45 @@ DROP PROCEDURE bump;</code></pre>
   follow-up.</li>
 </ul>
 
+<h2>Triggers</h2>
+
+<pre class="code" data-lang="sql"><code>CREATE TRIGGER audit AFTER INSERT OR DELETE ON sales
+  FOR EACH ROW EXECUTE INSERT INTO audit_log VALUES ('change');
+CREATE TRIGGER stamp BEFORE UPDATE OF total ON sales
+  FOR EACH ROW WHEN (NEW.total &lt; 0)
+  EXECUTE DO $$ BEGIN SET NEW.total = 0; END $$;
+CREATE TRIGGER totals AFTER UPDATE ON sales
+  REFERENCING OLD TABLE AS o NEW TABLE AS n FOR EACH STATEMENT
+  EXECUTE PROCEDURE recount(n);
+DROP TRIGGER audit ON sales;
+SHOW TRIGGERS ON sales;</code></pre>
+
+<ul>
+  <li><code>{BEFORE|AFTER}</code> × <code>{INSERT|UPDATE [OF cols]|DELETE}</code> ×
+  <code>{ROW|STATEMENT}</code>, with several events per trigger
+  (<code>INSERT OR UPDATE</code>) and a <code>WHEN</code> condition.</li>
+  <li><code>FOR EACH ROW</code> (the default) exposes <code>OLD</code> and
+  <code>NEW</code> as columns in <code>WHEN</code> and in the body; a
+  <code>BEFORE</code> row trigger may assign <code>NEW.col</code> and the table
+  stores the modified image. <code>OLD</code> is read-only, and v1 has no
+  row-skipping.</li>
+  <li><code>FOR EACH STATEMENT</code> exposes <code>REFERENCING OLD TABLE AS
+  o NEW TABLE AS n</code> as read-only relations (<code>FROM o</code>);
+  transition tables are <code>AFTER</code>-only.</li>
+  <li>Triggers run inside the firing statement's transaction — an error rolls
+  back the whole statement — and in creation order. A trigger's own DML fires
+  triggers, bounded at 16 levels.</li>
+  <li>Creating one needs <code>CREATE</code> on the database; bodies run with
+  <strong>invoker</strong> rights, so a trigger cannot exceed the firing user's
+  privileges.</li>
+  <li>Definitions persist in <code>.pink</code> files and replay from the WAL
+  by re-executing the firing statement, so its triggers fire again exactly
+  once.</li>
+  <li>Refused: triggers on views and attached lake tables,
+  <code>RETURNING</code> on triggered tables, and trigger DDL inside a
+  transaction.</li>
+</ul>
+
 <h2>Materialized views</h2>
 
 <pre class="code" data-lang="sql"><code>CREATE MATERIALIZED VIEW totals REFRESH EVERY INTERVAL '5 minutes' AS

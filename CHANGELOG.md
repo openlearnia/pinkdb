@@ -9,6 +9,59 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-24
+### Wave 100 — Triggers ✅
+- **Triggers.** `CREATE [OR REPLACE] TRIGGER name {BEFORE|AFTER}
+  {INSERT|UPDATE [OF col, …]|DELETE} [OR …] ON table [REFERENCING OLD TABLE
+  AS o NEW TABLE AS n] [FOR EACH {ROW|STATEMENT}] [WHEN (cond)] EXECUTE
+  {PROCEDURE p(args) | <statement>}`, `DROP TRIGGER [IF EXISTS] name [ON
+  table]` and `SHOW TRIGGERS [ON table]`. Bodies run through the stored
+  procedure machinery (`ParamSlots` + `run_call_statement`), so each body
+  statement is bound, optimized and executed like any other statement.
+- **Semantics.** Triggers of one event fire in creation order; every BEFORE
+  trigger runs before the row change and every AFTER trigger after it.
+  `OLD.col` / `NEW.col` are available in `WHEN` and in the body; a BEFORE ROW
+  trigger may assign `NEW.col` (the assignment is coerced to the column type
+  and the written value is what lands in the table), `OLD` is read-only, and
+  there is no row-skipping signal in v1 — returning from a BEFORE ROW trigger
+  always lets the change through. `REFERENCING OLD TABLE / NEW TABLE` are
+  readable relations (ordinary CTEs to the body, so any query shape works) and
+  are accepted on AFTER STATEMENT triggers only. `UPDATE OF` narrows to the
+  columns the statement assigns. Recursion is bounded at 16 levels with a
+  clear error; a trigger error rolls back the whole firing statement,
+  including in autocommit.
+- **Replay.** The WAL still logs the firing statement and nothing else, so a
+  replay re-executes it and the triggers fire again exactly once; a trigger
+  is never logged separately, which is what keeps replay from double-counting.
+  Volatile extension functions are already refused in logged statements, so
+  bodies are deterministic; `now()`/`random()` are not builtins in pinkdb.
+- **Persistence.** Definitions live in a new `.pink` footer section under
+  flags bit `0x80`, written as their `CREATE TRIGGER` text in creation order
+  so a reopen reproduces the firing order. A file without the bit has no
+  triggers; no old format is read or converted.
+- **RBAC.** Creating or dropping a trigger needs `CREATE` on the database —
+  the same requirement as `ALTER TABLE` and the index DDL. Bodies run with
+  **invoker** rights: every body statement is re-checked against the firing
+  user, so a low-privilege user cannot use a trigger to write a table they
+  cannot write. `SHOW TRIGGERS` is a metadata read available to any user.
+- **Interactions.** Trigger-written tables join the statement's MVCC touched
+  set (a concurrent writer conflicts instead of silently losing), materialized
+  views refresh for triggered changes like any other change, and `.lake commit`
+  of a writable attachment publishes trigger effects with the rest of the
+  session's writes. Trigger definitions are not carried into a lake (it stores
+  data).
+- **Refused, clearly.** Triggers on views, on attached lake tables, on a
+  missing table, `REFERENCING` on a ROW trigger or a BEFORE trigger, unknown
+  `UPDATE OF` columns, and `RETURNING` on a triggered table (pinkdb has no
+  `RETURNING`). `CREATE`/`DROP TRIGGER` inside a transaction is refused like
+  the other catalog DDL.
+- **No cost without triggers.** The DML fast path is untouched: the trigger
+  check is one empty-slice lookup and the batch insert/update/delete code is
+  byte-identical when a table has no triggers. 1,048,576-row `INSERT …
+  SELECT` 34.4–34.8 ms (HEAD 34.1–34.3 ms) and bulk `UPDATE` 19.9–20.4 ms
+  (HEAD 20.3–20.5 ms) — both within run-to-run noise.
+- 39 trigger integration tests plus an ignored crash/replay child, a CLI lake
+  test, and the full gate set green (workspace 1,796 tests / 156 suites).
+
 ### Wave 105 — agent bridge: MCP server, no model code ✅
 - **A store is an MCP server.** `pinkdb --mcp <file.pink>` loads the
   `pinkdb-mcp` extension from the install directory and serves one MCP

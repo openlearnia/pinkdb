@@ -265,6 +265,14 @@ pub enum QueryResult {
     DroppedProcedure {
         name: String,
     },
+    /// `CREATE TRIGGER` (wave 100).
+    CreatedTrigger {
+        name: String,
+    },
+    /// `DROP TRIGGER` (wave 100).
+    DroppedTrigger {
+        name: String,
+    },
     /// `CREATE MACRO` (wave 77).
     CreatedMacro {
         name: String,
@@ -322,11 +330,45 @@ pub enum QueryResult {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Output {
     chunks: Vec<DataChunk>,
     names: Vec<String>,
     types: Vec<DataType>,
+}
+
+impl Output {
+    /// The output's column schema, for a relation that was never a catalog
+    /// table: a trigger's transition table (`REFERENCING … TABLE`).
+    pub(crate) fn schema(&self) -> Vec<(String, DataType)> {
+        self.names
+            .iter()
+            .cloned()
+            .zip(self.types.iter().copied())
+            .collect()
+    }
+}
+
+/// Build a one-chunk output from materialized rows — how a trigger's
+/// transition table reaches the executor (`FROM <alias>`).
+pub(crate) fn output_from_rows(
+    schema: &[(String, DataType)],
+    rows: &[Vec<Value>],
+) -> Result<Output> {
+    let mut columns = Vec::with_capacity(schema.len());
+    for (i, (_, dtype)) in schema.iter().enumerate() {
+        let mut vector = Vector::with_capacity(*dtype, rows.len());
+        for row in rows {
+            vector.push_value(row.get(i).cloned().unwrap_or(Value::Null))?;
+        }
+        columns.push(vector);
+    }
+    let chunk = DataChunk::new(columns)?;
+    Ok(Output {
+        chunks: vec![chunk],
+        names: schema.iter().map(|(n, _)| n.clone()).collect(),
+        types: schema.iter().map(|(_, t)| *t).collect(),
+    })
 }
 
 /// Per-statement execution context: the database, visible CTE outputs
@@ -364,9 +406,17 @@ impl<'a> Cx<'a> {
 
     /// A context sharing one statement's resource budget.
     pub(crate) fn with_budget(db: &'a PinkDb, budget: std::sync::Arc<ExecBudget>) -> Self {
+        // A trigger body's `FROM <transition alias>` resolves through the CTE
+        // map, exactly like a CTE (wave 100).
+        let mut ctes: HashMap<String, Output> = HashMap::new();
+        if let Some(scope) = &db.trigger_scope {
+            for (alias, out) in &scope.tables {
+                ctes.insert(alias.to_ascii_lowercase(), out.clone());
+            }
+        }
         Self {
             db,
-            ctes: HashMap::new(),
+            ctes,
             memo: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             // No projection bound: every attached-lake scan materializes in
             // full (the pre-projection behavior).
@@ -511,6 +561,76 @@ pub(crate) fn run_with_budget(
     plan: &LogicalPlan,
     budget: std::sync::Arc<ExecBudget>,
 ) -> Result<QueryResult> {
+    // Wave 100: a table with triggers takes the trigger-wrapped path; every
+    // other statement pays one lookup of an empty trigger slice.
+    // A `CALL` recurses through this function; dispatch it before the
+    // statement match so one nesting level does not hold `run_plain`'s frame.
+    if let LogicalPlan::Call {
+        db: qdb,
+        name,
+        args,
+        inline,
+    } = plan
+    {
+        return run_call_plan(db, qdb, name, args, inline, &budget);
+    }
+    if let Some((target, table, event)) = crate::trigger::plan_dml(plan, db.current_db())
+        && crate::trigger::has_triggers(db, &target, &table)
+    {
+        return crate::trigger::run_with_triggers(db, plan, &budget, &target, &table, event);
+    }
+    run_plain(db, plan, budget)
+}
+
+/// One `CALL` (or `DO`): evaluate the constant arguments, then run the
+/// procedure. Split out of `run_plain` because a nested call recurses through
+/// it: the recursion then does not carry the statement executor's frame, which
+/// keeps the documented 32-level call depth inside a default thread stack.
+fn run_call_plan(
+    db: &mut PinkDb,
+    qdb: &Option<String>,
+    name: &str,
+    args: &[crate::sql::binder::BoundExpr],
+    inline: &Option<Box<crate::procedure::ProcedureDef>>,
+    budget: &std::sync::Arc<ExecBudget>,
+) -> Result<QueryResult> {
+    let target = resolve_db(db, qdb);
+    // The arguments are constant expressions: evaluate them against an empty
+    // single-row chunk, exactly like an ALTER default.
+    let single = DataChunk {
+        columns: Vec::new(),
+        num_rows: 1,
+    };
+    let mut values = Vec::with_capacity(args.len());
+    {
+        let cx = Cx::with_budget(db, budget.clone());
+        for arg in args {
+            let v = eval_expr(arg, &single, &cx)?;
+            if v.len() != 1 {
+                return Err(PinkDbError::Execution(
+                    "a CALL argument did not evaluate to one value".to_string(),
+                ));
+            }
+            values.push(v.get(0));
+        }
+    }
+    // `DO` (wave 83) runs its own definition.
+    if let Some(def) = inline {
+        return crate::procedure::execute_do(db, &target, def);
+    }
+    // Resolve the definition now (the binder did too, but the catalog may have
+    // been refreshed between bind and execution).
+    let def = db.procedure_in(&target, name)?.clone();
+    crate::procedure::execute_call(db, &target, &def, values)
+}
+
+/// The statement executor without trigger handling: `run_with_budget` is the
+/// entry point that wraps this with any triggers the statement fires.
+pub(crate) fn run_plain(
+    db: &mut PinkDb,
+    plan: &LogicalPlan,
+    budget: std::sync::Arc<ExecBudget>,
+) -> Result<QueryResult> {
     budget.check_deadline()?;
     match plan {
         LogicalPlan::CreateTable {
@@ -622,10 +742,7 @@ pub(crate) fn run_with_budget(
                     DataTable::coerce(v.clone(), *t)?;
                 }
             }
-            let t = db.table_mut_in(&target, table)?;
-            for values in staged {
-                t.append_row(values)?;
-            }
+            crate::trigger::insert_rows(db, &target, table, staged, &budget)?;
             Ok(QueryResult::Inserted { count })
         }
         LogicalPlan::InsertSelect {
@@ -667,10 +784,7 @@ pub(crate) fn run_with_budget(
                 }
             }
             let count = staged.len();
-            let t = db.table_mut_in(&target, table)?;
-            for values in staged {
-                t.append_row(values)?;
-            }
+            crate::trigger::insert_rows(db, &target, table, staged, &budget)?;
             Ok(QueryResult::Inserted { count })
         }
         LogicalPlan::Update {
@@ -709,10 +823,7 @@ pub(crate) fn run_with_budget(
                     }
                 }
             }
-            let t = db.table_mut_in(&target, table)?;
-            for (ci, writes) in per_chunk.iter().enumerate() {
-                t.update_rows(ci, writes)?;
-            }
+            crate::trigger::update_rows(db, &target, table, per_chunk, &budget)?;
             Ok(QueryResult::Updated { count })
         }
         LogicalPlan::Delete {
@@ -741,11 +852,7 @@ pub(crate) fn run_with_budget(
                     });
                 }
             }
-            let mut count = 0usize;
-            let t = db.table_mut_in(&target, table)?;
-            for ci in (0..drops.len()).rev() {
-                count += t.delete_from_chunk(ci, &drops[ci])?;
-            }
+            let count = crate::trigger::delete_rows(db, &target, table, drops, &budget)?;
             Ok(QueryResult::Deleted { count })
         }
         LogicalPlan::Begin => {
@@ -1191,6 +1298,57 @@ pub(crate) fn run_with_budget(
             db.procedures_remove_in(&target, &name.to_ascii_lowercase());
             Ok(QueryResult::DroppedProcedure { name: name.clone() })
         }
+        LogicalPlan::CreateTrigger {
+            db: qdb,
+            def,
+            or_replace,
+        } => {
+            let target = resolve_db(db, qdb);
+            let mut def = (**def).clone();
+            def.db = target.clone();
+            // A trigger shares the callable/catalog name space with nothing —
+            // it is looked up per table — but two triggers of one table with
+            // the same name would make `DROP TRIGGER` ambiguous.
+            if db.trigger_in(&target, &def.name).is_ok() && !*or_replace {
+                return Err(PinkDbError::Catalog(format!(
+                    "trigger \"{}\" already exists in database \"{target}\" (use CREATE OR \
+                     REPLACE TRIGGER to replace it)",
+                    def.name
+                )));
+            }
+            crate::trigger::validate(db, &def)?;
+            let name = def.name.clone();
+            db.triggers_insert_in(&target, def)?;
+            Ok(QueryResult::CreatedTrigger { name })
+        }
+        LogicalPlan::DropTrigger {
+            db: qdb,
+            name,
+            table,
+            if_exists,
+        } => {
+            let target = resolve_db(db, qdb);
+            let existing = db.trigger_in(&target, name).ok().cloned();
+            let Some(existing) = existing else {
+                if *if_exists {
+                    return Ok(QueryResult::DroppedTrigger { name: name.clone() });
+                }
+                return Err(PinkDbError::Catalog(format!(
+                    "trigger \"{name}\" not found in database \"{target}\""
+                )));
+            };
+            if let Some(table) = table
+                && !existing.table.eq_ignore_ascii_case(table)
+            {
+                return Err(PinkDbError::Catalog(format!(
+                    "trigger \"{name}\" is on table \"{}\" in database \"{target}\", not \
+                     \"{table}\"",
+                    existing.table
+                )));
+            }
+            db.triggers_remove_in(&target, &name.to_ascii_lowercase());
+            Ok(QueryResult::DroppedTrigger { name: name.clone() })
+        }
         LogicalPlan::CreateUser {
             name,
             password_hash,
@@ -1309,36 +1467,7 @@ pub(crate) fn run_with_budget(
             name,
             args,
             inline,
-        } => {
-            let target = resolve_db(db, qdb);
-            // The arguments are constant expressions: evaluate them against
-            // an empty single-row chunk, exactly like an ALTER default.
-            let single = DataChunk {
-                columns: Vec::new(),
-                num_rows: 1,
-            };
-            let mut values = Vec::with_capacity(args.len());
-            {
-                let cx = Cx::with_budget(db, budget.clone());
-                for arg in args {
-                    let v = eval_expr(arg, &single, &cx)?;
-                    if v.len() != 1 {
-                        return Err(PinkDbError::Execution(
-                            "a CALL argument did not evaluate to one value".to_string(),
-                        ));
-                    }
-                    values.push(v.get(0));
-                }
-            }
-            // `DO` (wave 83) runs its own definition.
-            if let Some(def) = inline {
-                return crate::procedure::execute_do(db, &target, def);
-            }
-            // Resolve the definition now (the binder did too, but the catalog
-            // may have been refreshed between bind and execution).
-            let def = db.procedure_in(&target, name)?.clone();
-            crate::procedure::execute_call(db, &target, &def, values)
-        }
+        } => run_call_plan(db, qdb, name, args, inline, &budget),
         LogicalPlan::CreateMacro {
             db: qdb,
             name,
@@ -1978,6 +2107,8 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         // reaches the row evaluator.
         | LogicalPlan::CreateProcedure { .. }
         | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. }
         | LogicalPlan::Call { .. }
         // Wave 77: macro DDL is handled by `run`.
         | LogicalPlan::CreateMacro { .. }
@@ -2083,6 +2214,50 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     "parameters".to_string(),
                 ],
                 types: vec![DataType::Varchar, DataType::Varchar, DataType::Varchar],
+            })
+        }
+        LogicalPlan::ShowTriggers { db: qdb, table } => {
+            let target = resolve_db(cx.db, qdb);
+            let defs: Vec<&crate::trigger::TriggerDef> = cx
+                .db
+                .triggers_in(&target)
+                .iter()
+                .filter(|d| table.as_ref().is_none_or(|t| d.table.eq_ignore_ascii_case(t)))
+                .collect();
+            let mut name = Vector::with_capacity(DataType::Varchar, defs.len());
+            let mut tbl = Vector::with_capacity(DataType::Varchar, defs.len());
+            let mut timing = Vector::with_capacity(DataType::Varchar, defs.len());
+            let mut events = Vector::with_capacity(DataType::Varchar, defs.len());
+            let mut level = Vector::with_capacity(DataType::Varchar, defs.len());
+            for def in &defs {
+                name.push_valid(Value::Varchar(def.name.clone()))?;
+                tbl.push_valid(Value::Varchar(def.table.clone()))?;
+                timing.push_valid(Value::Varchar(def.timing.as_str().to_string()))?;
+                events.push_valid(Value::Varchar(
+                    def.events
+                        .iter()
+                        .map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" OR "),
+                ))?;
+                level.push_valid(Value::Varchar(def.level.as_str().to_string()))?;
+            }
+            Ok(Output {
+                chunks: vec![DataChunk::new(vec![name, tbl, timing, events, level])?],
+                names: vec![
+                    "name".to_string(),
+                    "table".to_string(),
+                    "timing".to_string(),
+                    "events".to_string(),
+                    "level".to_string(),
+                ],
+                types: vec![
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                ],
             })
         }
         LogicalPlan::DescribeMacro { db: qdb, name } => {
@@ -5057,6 +5232,15 @@ fn explain_into(
         }
         LogicalPlan::CreateProcedure { name, .. } => format!("CreateProcedure {name}"),
         LogicalPlan::DropProcedure { name, .. } => format!("DropProcedure {name}"),
+        LogicalPlan::CreateTrigger { db, def, .. } => {
+            format!("CreateTrigger {}", qualify(db, &def.name))
+        }
+        LogicalPlan::DropTrigger { db, name, .. } => {
+            format!("DropTrigger {}", qualify(db, name))
+        }
+        LogicalPlan::ShowTriggers { db, .. } => {
+            format!("ShowTriggers {}", db.as_deref().unwrap_or(""))
+        }
         LogicalPlan::CreateMacro { db, name, .. } => {
             format!("CreateMacro {}", qualify(db, name))
         }

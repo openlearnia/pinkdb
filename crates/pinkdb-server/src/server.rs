@@ -1480,6 +1480,8 @@ pub(crate) fn send_result<S: FrameSink + ?Sized>(
         }
         QueryResult::CreatedProcedure { name } => done(w, DoneKind::Created, 0, name),
         QueryResult::DroppedProcedure { name } => done(w, DoneKind::DroppedTable, 0, name),
+        QueryResult::CreatedTrigger { name } => done(w, DoneKind::Created, 0, name),
+        QueryResult::DroppedTrigger { name } => done(w, DoneKind::DroppedTable, 0, name),
         QueryResult::CreatedMacro { name } => done(w, DoneKind::Created, 0, name),
         QueryResult::DroppedMacro { name } => done(w, DoneKind::DroppedTable, 0, name),
         // A JavaScript body's `print` lines are not carried by the protocol

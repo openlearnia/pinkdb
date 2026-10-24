@@ -79,6 +79,7 @@ pub mod storage;
 pub mod table_source;
 /// Terminal-safe rendering for untrusted identifiers and values.
 pub mod text;
+pub mod trigger;
 pub mod types;
 pub mod vector;
 pub mod wal;
@@ -516,6 +517,8 @@ fn result_facts(result: &QueryResult) -> (u64, u32, &'static str) {
         QueryResult::Checkpointed => (0, 0, "Checkpointed"),
         QueryResult::CreatedProcedure { .. } => (0, 0, "CreatedProcedure"),
         QueryResult::DroppedProcedure { .. } => (0, 0, "DroppedProcedure"),
+        QueryResult::CreatedTrigger { .. } => (0, 0, "CreatedTrigger"),
+        QueryResult::DroppedTrigger { .. } => (0, 0, "DroppedTrigger"),
         QueryResult::CreatedMacro { .. } => (0, 0, "CreatedMacro"),
         QueryResult::DroppedMacro { .. } => (0, 0, "DroppedMacro"),
         QueryResult::Called { .. } => (0, 0, "Called"),

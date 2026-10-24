@@ -1042,7 +1042,19 @@ impl<'a> Binder<'a> {
             allow_win: true,
             in_window: false,
             windows: Vec::new(),
-            ctes: Vec::new(),
+            // A statement trigger's `REFERENCING … TABLE` relations are
+            // visible to the body it runs, exactly like a CTE (wave 100).
+            ctes: db
+                .trigger_scope
+                .as_ref()
+                .map(|scope| {
+                    scope
+                        .tables
+                        .iter()
+                        .map(|(alias, out)| (alias.clone(), out.schema()))
+                        .collect()
+                })
+                .unwrap_or_default(),
             views_used: Rc::new(RefCell::new(Vec::new())),
             dynamic_functions_used: Rc::new(RefCell::new(Vec::new())),
             params: None,
@@ -1364,6 +1376,18 @@ impl<'a> Binder<'a> {
                 if db.is_none()
                     && table.is_none()
                     && let Some(value) = self.params.as_ref().and_then(|slots| slots.variable(name))
+                {
+                    return Ok(BoundExpr::Literal(value));
+                }
+                // Wave 100: `NEW.col` / `OLD.col` in a trigger body resolve
+                // to the firing row's values, bound as literals — the row
+                // image lives on the store, not in a table scope.
+                if db.is_none()
+                    && let Some(qualifier) = table
+                    && let Some(value) = self
+                        .params
+                        .as_ref()
+                        .and_then(|slots| slots.variable(&format!("{qualifier}.{name}")))
                 {
                     return Ok(BoundExpr::Literal(value));
                 }
@@ -3539,6 +3563,39 @@ fn bind_tracked_plan(
             name: name.clone(),
             if_exists: *if_exists,
         }),
+        Statement::CreateTrigger {
+            db: qdb,
+            or_replace,
+            ..
+        } => {
+            let target = Binder::new(db, default_db).resolve_db(qdb)?;
+            // The plan carries the definition, not the statement, so execution,
+            // the `.pink` footer and the WAL all see one shape.
+            let def = crate::trigger::def_from_statement(&target, stmt)?;
+            empty(LogicalPlan::CreateTrigger {
+                db: Some(target),
+                def: Box::new(def),
+                or_replace: *or_replace,
+            })
+        }
+        Statement::DropTrigger {
+            db: qdb,
+            name,
+            table,
+            if_exists,
+        } => empty(LogicalPlan::DropTrigger {
+            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            name: name.clone(),
+            table: table.clone(),
+            if_exists: *if_exists,
+        }),
+        Statement::ShowTriggers { db: qdb, table } => {
+            let target = Binder::new(db, default_db).resolve_db(qdb)?;
+            empty(LogicalPlan::ShowTriggers {
+                db: Some(target),
+                table: table.clone(),
+            })
+        }
         Statement::Call {
             db: qdb,
             name,
@@ -5599,6 +5656,10 @@ pub(crate) fn plan_schema(
         | LogicalPlan::CreateMacro { .. }
         | LogicalPlan::DropMacro { .. }
         | LogicalPlan::DescribeMacro { .. }
+        // Wave 100: trigger DDL likewise.
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. }
+        | LogicalPlan::ShowTriggers { .. }
         // Wave 48: neither do RBAC statements.
         | LogicalPlan::CreateUser { .. }
         | LogicalPlan::AlterUser { .. }
