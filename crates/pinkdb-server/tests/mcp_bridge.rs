@@ -4,8 +4,8 @@
 //! The bridge is an ordinary extension: the test builds `pinkdb-mcp` and
 //! points the server at the cdylib, then speaks JSON-RPC over HTTP to it.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -63,11 +63,6 @@ fn bridge_library() -> PathBuf {
     );
 }
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-    listener.local_addr().expect("local address").port()
-}
-
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("pinkdb-server-mcp-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -112,23 +107,60 @@ fn spawn(args: &[&str], envs: &[(&str, &str)]) -> Server {
     Server(command.spawn().expect("spawn pinkdb-server"))
 }
 
-/// Wait until the bridge's listener accepts connections.
-fn wait_for_bridge(port: u16, server: &mut Server) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        if let Some(status) = server.0.try_wait().expect("poll the server") {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = server.0.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr);
+/// The port the bridge bound, from its `listening on http://…` line.
+///
+/// `--mcp-port 0` lets the kernel pick it: a port reserved here could be taken
+/// by a parallel test between the check and the bridge's bind, and the client
+/// would then reach the wrong server. Lines stream through the channel and are
+/// drained after the port arrives, so the server never blocks on a full pipe
+/// and a slow start reports what it did print.
+fn bridge_port(server: &mut Server) -> u16 {
+    let stderr = server.0.stderr.take().expect("the server's stderr");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        for line in reader.by_ref().lines() {
+            let Ok(line) = line else { break };
+            if sender.send(line).is_err() {
+                break;
             }
-            panic!("the server exited ({status}) before the bridge was up: {stderr}");
         }
-        std::thread::sleep(Duration::from_millis(50));
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = String::new();
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            panic!("the server never announced the bridge's port; it printed:\n{seen}");
+        };
+        match receiver.recv_timeout(left) {
+            Ok(line) => {
+                if let Some((_, rest)) = line.split_once("listening on http://")
+                    && let Some((_, digits)) = rest.rsplit_once(':')
+                {
+                    // Another thread sharing stderr can interleave into this
+                    // line; the port still ends at the first non-digit.
+                    let digits: String = digits
+                        .trim()
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect();
+                    if let Ok(port) = digits.parse() {
+                        return port;
+                    }
+                }
+                seen.push_str(&line);
+                seen.push('\n');
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the server exited before announcing the bridge's port; it printed:\n{seen}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the server never announced the bridge's port; it printed:\n{seen}")
+            }
+        }
     }
-    panic!("the bridge never listened on 127.0.0.1:{port}");
 }
 
 /// One JSON-RPC message over the bridge's streamable HTTP transport.
@@ -197,7 +229,6 @@ fn a_store_with_users_refuses_an_unauthenticated_bridge() {
     let path = store.display().to_string();
     seed(&store, &["CREATE USER agent PASSWORD 'secret'"]);
 
-    let port = free_port();
     let mut server = spawn(
         &[
             "--file",
@@ -207,7 +238,7 @@ fn a_store_with_users_refuses_an_unauthenticated_bridge() {
             "--mcp-extension",
             bridge_library().to_str().expect("a UTF-8 path"),
             "--mcp-port",
-            &port.to_string(),
+            "0",
         ],
         &[],
     );
@@ -247,7 +278,6 @@ fn the_bridge_serves_the_servers_store_read_only() {
         ],
     );
 
-    let port = free_port();
     let mut server = spawn(
         &[
             "--file",
@@ -257,11 +287,11 @@ fn the_bridge_serves_the_servers_store_read_only() {
             "--mcp-extension",
             bridge_library().to_str().expect("a UTF-8 path"),
             "--mcp-port",
-            &port.to_string(),
+            "0",
         ],
         &[],
     );
-    wait_for_bridge(port, &mut server);
+    let port = bridge_port(&mut server);
     initialize(port);
 
     let (is_error, text) = tool(
@@ -302,7 +332,6 @@ fn a_logged_in_bridge_serves_the_store() {
         ],
     );
 
-    let port = free_port();
     let mut server = spawn(
         &[
             "--file",
@@ -312,13 +341,13 @@ fn a_logged_in_bridge_serves_the_store() {
             "--mcp-extension",
             bridge_library().to_str().expect("a UTF-8 path"),
             "--mcp-port",
-            &port.to_string(),
+            "0",
             "--mcp-user",
             "agent",
         ],
         &[("PINKDB_MCP_PASSWORD", "secret")],
     );
-    wait_for_bridge(port, &mut server);
+    let port = bridge_port(&mut server);
     initialize(port);
 
     let (is_error, text) = tool(port, 2, "query", json!({"sql": "SELECT 1 AS n"}));

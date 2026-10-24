@@ -199,7 +199,9 @@ fn usage() -> &'static str {
      \x20                        every statement under this server's login and grants,\n\
      \x20                        read-only (the model brings the reasoning; no LLM\n\
      \x20                        code runs here). Needs libpinkdb_mcp.<ext>.\n\
-     \x20 --mcp-port PORT        the bridge's loopback port (default 7801)\n\
+     \x20 --mcp-port PORT        the bridge's loopback port, 0 to let the OS pick
+\
+     \x20                        (default 7801)\n\
      \x20 --mcp-user NAME        the store user the bridge logs in as; with users\n\
      \x20                        defined this is required, and PINKDB_MCP_PASSWORD\n\
      \x20                        holds its password (an unauthenticated bridge would\n\
@@ -687,7 +689,7 @@ fn start_mcp(db: Database, path: &str, port: u16, user: Option<&str>) -> Result<
     }
     let transport = format!("http:127.0.0.1:{port}");
     eprintln!(
-        "pinkdb mcp: bridging this store on http://127.0.0.1:{port} ({}, read-only)",
+        "pinkdb mcp: bridging this store ({}, read-only)",
         match user {
             Some(user) if db.has_users() => format!("as {user}"),
             _ => "trusted".to_string(),

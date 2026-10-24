@@ -57,14 +57,28 @@ pub fn is_loopback(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Bind the loopback listener `description` names, with the `http://<address>`
+/// URL to announce. The reported address is the one the kernel bound, not the
+/// requested one: on port `0` only it knows the port.
+fn listen(description: &str) -> Result<(TcpListener, String), String> {
+    let requested = bind_address(description)?;
+    let listener = TcpListener::bind(&requested)
+        .map_err(|error| format!("cannot listen on {requested}: {error}"))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|error| format!("cannot read the address bound for {requested}: {error}"))?;
+    Ok((listener, format!("http://{bound}")))
+}
+
 /// Serve every incoming connection until the listener fails.
 pub fn serve<H: Host>(server: &mut Server<H>, description: &str) -> Result<(), String> {
-    let address = bind_address(description)?;
-    let listener = TcpListener::bind(&address)
-        .map_err(|error| format!("cannot listen on {address}: {error}"))?;
-    // Stderr only: stdout is the protocol on the stdio transport and this
-    // line tells a test (or an operator) which port `:0` picked.
-    eprintln!("pinkdb mcp: listening on http://{address}");
+    let (listener, url) = listen(description)?;
+    // Stderr only: stdout is the protocol on the stdio transport and this line
+    // tells a client (or a test) which port `:0` picked. One write, because the
+    // host's other threads share stderr: a line split across writes can
+    // interleave into something a reader cannot parse.
+    let line = format!("pinkdb mcp: listening on {url}\n");
+    let _ = std::io::stderr().write_all(line.as_bytes());
     for connection in listener.incoming() {
         let stream = match connection {
             Ok(stream) => stream,
@@ -173,4 +187,23 @@ fn respond(
     stream
         .flush()
         .map_err(|e| format!("cannot write the response: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listen;
+
+    /// A client cannot connect to `:0`; the announced URL must carry the
+    /// port the kernel picked.
+    #[test]
+    fn serving_on_port_zero_announces_the_bound_port() {
+        let (_listener, url) = listen("http:127.0.0.1:0").expect("bind an ephemeral port");
+        let (_, port) = url
+            .rsplit_once(':')
+            .unwrap_or_else(|| panic!("no port in {url:?}"));
+        let port: u16 = port
+            .parse()
+            .unwrap_or_else(|_| panic!("no port in {url:?}"));
+        assert_ne!(port, 0, "{url}");
+    }
 }

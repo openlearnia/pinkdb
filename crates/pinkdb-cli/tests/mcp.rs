@@ -6,10 +6,9 @@
 //! asks `PINKDB_MCP_LIB` or the workspace target directory for it.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -482,25 +481,7 @@ fn lake_tools_read_a_catalog() {
 #[test]
 fn http_transport_round_trips_the_protocol() {
     let fixture = Fixture::new("http", FIXTURE);
-    let port = free_port();
-    let child = Command::new(cli())
-        .args(["--allow-load-extension"])
-        .args(["-c", &format!(".open {}", fixture.store.display())])
-        .args([
-            "-c",
-            &format!("LOAD EXTENSION '{}'", bridge_path().display()),
-        ])
-        .args([
-            "-c",
-            &format!(".mcp serve http 127.0.0.1:{port} allow-files"),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn an HTTP session");
-    let mut guard = ChildGuard(child);
-    wait_for_port(port, &mut guard.0);
+    let (_session, port) = serve_http(&fixture.store, "allow-files");
 
     let reply = http_post(
         port,
@@ -560,25 +541,7 @@ fn http_transport_round_trips_the_protocol() {
 #[test]
 fn allow_writes_lets_the_same_statements_through() {
     let fixture = Fixture::new("writes", FIXTURE);
-    let port = free_port();
-    let child = Command::new(cli())
-        .args(["--allow-load-extension"])
-        .args(["-c", &format!(".open {}", fixture.store.display())])
-        .args([
-            "-c",
-            &format!("LOAD EXTENSION '{}'", bridge_path().display()),
-        ])
-        .args([
-            "-c",
-            &format!(".mcp serve http 127.0.0.1:{port} allow-writes"),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn a write-enabled session");
-    let mut guard = ChildGuard(child);
-    wait_for_port(port, &mut guard.0);
+    let (_session, port) = serve_http(&fixture.store, "allow-writes");
     http_initialize(port);
 
     for (id, sql, expected) in [
@@ -645,28 +608,68 @@ impl Drop for ChildGuard {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-    listener.local_addr().expect("local address").port()
+/// Start a session that serves `store` over HTTP under `policy`. The port is
+/// 0 so the kernel picks one: a port reserved in the test could be taken by a
+/// parallel test between the check and the child's bind, and the client would
+/// then reach the wrong server. The guard keeps the session alive.
+fn serve_http(store: &Path, policy: &str) -> (ChildGuard, u16) {
+    let child = Command::new(cli())
+        .args(["--allow-load-extension"])
+        .args(["-c", &format!(".open {}", store.display())])
+        .args([
+            "-c",
+            &format!("LOAD EXTENSION '{}'", bridge_path().display()),
+        ])
+        .args(["-c", &format!(".mcp serve http 127.0.0.1:0 {policy}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn an HTTP session");
+    let mut guard = ChildGuard(child);
+    let port = listening_port(&mut guard.0);
+    (guard, port)
 }
 
-/// Wait until the serving session listens on `port`.
-fn wait_for_port(port: u16, child: &mut Child) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        if let Some(status) = child.try_wait().expect("poll the session") {
-            let mut stderr = String::new();
-            if let Some(mut pipe) = child.stderr.take() {
-                let _ = pipe.read_to_string(&mut stderr);
+/// The port the session bound, read from its `listening on http://…` line.
+/// Stderr keeps being drained on the reading thread afterwards, so the
+/// session never blocks on a full pipe.
+fn listening_port(child: &mut Child) -> u16 {
+    let stderr = child.stderr.take().expect("the session's stderr");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut seen = String::new();
+        let mut port = None;
+        for line in reader.by_ref().lines() {
+            let Ok(line) = line else { break };
+            if let Some((_, rest)) = line.split_once("listening on http://")
+                && let Some((_, digits)) = rest.rsplit_once(':')
+            {
+                // Another thread sharing stderr can interleave into this line;
+                // the port still ends at the first non-digit.
+                let digits: String = digits
+                    .trim()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                port = digits.parse().ok();
+                if port.is_some() {
+                    break;
+                }
             }
-            panic!("the session exited ({status}) before serving: {stderr}");
+            seen.push_str(&line);
+            seen.push('\n');
         }
-        std::thread::sleep(Duration::from_millis(50));
+        let _ = sender.send((port, seen));
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+    });
+    match receiver.recv_timeout(Duration::from_secs(30)) {
+        Ok((Some(port), _)) => port,
+        Ok((None, seen)) => panic!("the session never announced its port: {seen}"),
+        Err(error) => panic!("the session never announced its port: {error}"),
     }
-    panic!("nothing listened on 127.0.0.1:{port}");
 }
 
 fn http_post(port: u16, message: &Value) -> Value {
