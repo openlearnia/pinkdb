@@ -28,7 +28,18 @@ fn cli() -> &'static str {
 }
 
 /// The bridge cdylib, built by `cargo build -p pinkdb-mcp`.
+/// The bridge library, resolved (and built if missing) **once per test
+/// binary**. Tests run in parallel: when several each ran `cargo build -p
+/// pinkdb-mcp`, the concurrent builds re-linked the cdylib under each
+/// other, so a path one test had just found vanished before its child could
+/// `dlopen` it ("No such file or directory"). The lock makes one thread
+/// build while the others wait for its answer.
 fn bridge_library() -> PathBuf {
+    static BRIDGE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BRIDGE.get_or_init(resolve_bridge_library).clone()
+}
+
+fn resolve_bridge_library() -> PathBuf {
     let name = if cfg!(target_os = "macos") {
         "libpinkdb_mcp.dylib"
     } else if cfg!(target_os = "windows") {
