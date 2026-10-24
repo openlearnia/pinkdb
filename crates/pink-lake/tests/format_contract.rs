@@ -7,6 +7,8 @@
 //! and would otherwise compile — and warn about — this module without using
 //! it. `crates/pink-lake-parquet/tests/format_contract.rs` includes the very
 //! same file.
+#[path = "common/local_lake.rs"]
+mod local_lake;
 
 #[path = "common/format_contract.rs"]
 mod format_contract;

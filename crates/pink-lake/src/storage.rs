@@ -38,7 +38,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::crypto::{self, Crypto};
-use crate::local::CATALOG_FILE;
 use crate::{LakeError, Result};
 
 /// What [`Storage::head`] found at a lake-relative path.
@@ -76,88 +75,6 @@ pub(crate) struct StorageStats {
     pub(crate) requests: u64,
     pub(crate) bytes: u64,
     pub(crate) wait_nanos: u64,
-}
-
-/// An opaque storage version tag.
-///
-/// For S3 this is the object's `ETag` **including its quotes** (sent back
-/// verbatim as `If-Match: <etag>`); for local files it is the file's identity
-/// (byte length + modification time in nanoseconds); for a SQL catalog it is
-/// the row's monotonically bumped `tag` column. A tag is captured by
-/// [`Storage::read_tagged`] when the lake reads a manifest and is required to
-/// still match when the same manifest is replaced.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VersionTag(pub(crate) String);
-
-/// The publish scope of one metadata publication (wave 96a).
-///
-/// [`Storage::begin_publish`] opens it before a publishing path's sequence of
-/// metadata calls; [`PublishScope::commit`] makes the sequence durable and
-/// dropping it rolls the sequence back. The default scope is a no-op — local
-/// storage and object storage keep their per-object atomicity, which is the
-/// publication protocol they have always had. A SQL catalog overrides it with
-/// one transaction, so the commit delta, the snapshot, the catalog CAS and the
-/// highest marker land atomically or not at all.
-///
-/// **Invariant:** data files are written *before* the scope opens. An
-/// abandoned publication can therefore only leave unreferenced data objects,
-/// which `delete_orphaned_files` already removes; it can never leave a
-/// catalog that references a partially written file.
-pub(crate) struct PublishScope {
-    finish: Option<Box<dyn FnOnce(bool) -> Result<()> + Send>>,
-}
-
-impl fmt::Debug for PublishScope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PublishScope")
-            .field("open", &self.finish.is_some())
-            .finish()
-    }
-}
-
-impl PublishScope {
-    /// The no-op scope of a backend whose objects are individually atomic.
-    pub(crate) fn noop() -> Self {
-        Self { finish: None }
-    }
-
-    /// A scope whose `finish(true)` commits and `finish(false)` rolls back.
-    #[cfg_attr(
-        not(any(feature = "catalog-sqlite", feature = "catalog-postgres")),
-        allow(dead_code)
-    )]
-    pub(crate) fn new(finish: Box<dyn FnOnce(bool) -> Result<()> + Send>) -> Self {
-        Self {
-            finish: Some(finish),
-        }
-    }
-
-    /// Make the scope's metadata sequence durable. Consumes the scope so a
-    /// committed scope is never rolled back by its own drop.
-    pub(crate) fn commit(mut self) -> Result<()> {
-        match self.finish.take() {
-            Some(finish) => finish(true),
-            None => Ok(()),
-        }
-    }
-}
-
-impl Drop for PublishScope {
-    fn drop(&mut self) {
-        if let Some(finish) = self.finish.take() {
-            // A rollback failure cannot be reported from `drop`; the caller's
-            // original error (or early return) is what matters.
-            let _ = finish(false);
-        }
-    }
-}
-
-impl VersionTag {
-    /// The tag as it goes on the wire (an S3 `If-Match` value).
-    #[cfg(feature = "s3")]
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// A local path to one lake object.
@@ -317,14 +234,6 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
         }
     }
 
-    /// Read the `moved.json` retirement marker, bypassing any encryption
-    /// decorator (wave 96a): the marker is always plaintext metadata, written
-    /// by `migrate_catalog` without a key, and read only on the
-    /// missing-catalog error path. The default is an ordinary optional read.
-    fn read_moved_optional(&self, context: &str) -> Result<Option<Vec<u8>>> {
-        self.read_optional(crate::MOVED_FILE, context)
-    }
-
     /// Read a byte window of one object: `offset..offset+len`. The default
     /// falls back to a whole read (and slices); the local and S3 backends
     /// implement positioned reads. Callers gate on [`Storage::ranged_reads`]
@@ -352,13 +261,9 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
         StorageStats::default()
     }
 
-    /// [`Storage::read`] plus the version tag for a later conditional
-    /// replace. The tag must come from the same read the caller reasons
-    /// about.
-    fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)>;
-
     /// Create the directory `rel` (and parents) — a no-op for object
     /// storage, which has no directories.
+    #[allow(dead_code)]
     fn create_dir(&self, rel: &str) -> Result<()>;
 
     /// Atomically replace one object: locally a unique fsynced temp file
@@ -383,20 +288,9 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
         Ok(bytes.len() as u64)
     }
 
-    /// Publish `bytes` **only if `rel` does not exist yet**: `Ok(false)` when
-    /// it already existed (locally a hard link, so an existing file or
-    /// planted symlink is never replaced; over S3 `If-None-Match: *` →
-    /// HTTP 412).
-    fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<bool>;
-
-    /// Replace `rel` **only if it still carries `expected`**: `Ok(false)`
-    /// when the tag changed (over S3 `If-Match: <etag>`; locally the file
-    /// identity is re-checked). A concurrent writer's change is never
-    /// silently clobbered.
-    fn put_if_match(&self, rel: &str, bytes: &[u8], expected: &VersionTag) -> Result<bool>;
-
     /// File names directly under `rel`, sorted. A missing location reads as
     /// empty; subdirectories are not listed.
+    #[allow(dead_code)]
     fn list(&self, rel: &str) -> Result<Vec<String>>;
 
     /// Every *file* under `rel`, recursively, as paths **relative to
@@ -438,134 +332,23 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
         Ok(!matches!(self.head(rel)?, Head::Missing))
     }
 
-    /// Open the publish scope around one metadata publication (wave 96a): the
-    /// caller writes its data files first, then begins the scope, then runs
-    /// its existing metadata calls and commits. The default is a no-op (the
-    /// per-object atomic protocol); the SQL catalog store overrides it with a
-    /// real transaction. Decorators must forward it.
-    fn begin_publish(&self) -> Result<PublishScope> {
-        Ok(PublishScope::noop())
-    }
-
-    /// The typed metadata backend, when the catalog is a SQL database. A
-    /// commit that has one applies its delta directly through
-    /// [`crate::metadata::MetadataStore`] instead of rendering and parsing a
-    /// whole `catalog.json`. Decorators that seal metadata (the encryption
-    /// layer) deliberately do not forward this: a keyed SQL catalog keeps the
-    /// compatibility-object path.
-    fn metadata_store(&self) -> Option<Arc<dyn crate::metadata::MetadataStore>> {
-        None
-    }
-
-    /// Whether the catalog lives separately from the data location (wave
-    /// 96a: a `sqlite:` catalog). Only such a lake writes and verifies the
-    /// `lake-data.json` ownership marker; the default object-store layout is
-    /// untouched and pays no extra request. Decorators forward it.
-    fn catalog_split(&self) -> bool {
-        false
-    }
-
-    /// Restore `snapshots/<version>.json` to the authoritative
-    /// `catalog.json` bytes after a degraded (check-then-put) race left a
-    /// *published* snapshot replaced: catalog and snapshot are byte-identical
-    /// by construction, so the catalog bytes are the repair. `bytes` is the
-    /// catalog manifest the caller just read. The local backend and
-    /// conditional-write endpoints have nothing to repair and do nothing.
-    fn reconcile_snapshot(&self, _version: u64, _bytes: &[u8]) -> Result<()> {
-        Ok(())
-    }
-
-    /// Whether this backend is currently using the explicit degraded
-    /// check-then-put fallback (only possible over S3, and only after the
-    /// endpoint rejected conditional writes in opt-in mode). The lake then
-    /// verifies the catalog replace and repairs the snapshot pair; local
-    /// storage and conditional-write endpoints answer `false`.
-    fn uses_degraded_fallback(&self) -> bool {
-        false
-    }
-
-    /// Whether this storage seals every object at rest (an encrypted lake
-    /// session). The default is `false`; the encryption decorator overrides
-    /// it. Used for reporting (`.lake attach`) and for the attach layer's
-    /// whole-object-read accounting — never to change what is read.
+    /// Whether this storage seals every object at rest (per-file-key lake).
     fn encrypted(&self) -> bool {
         false
     }
 
     /// The random 256-bit key one just-written data/delete file was sealed
-    /// with. A keyed SQL lake records it in that file's `encryption_key`
-    /// catalog column; every other backend has no per-file key. `None` for a
-    /// path this session did not write.
-    #[allow(dead_code)] // part of the storage surface; `FileKeyStorage` overrides it
+    /// with.
+    #[allow(dead_code)]
     fn object_key(&self, _rel: &str) -> Option<Vec<u8>> {
         None
     }
 
-    /// Seal one version's manifest **once**, so the exact ciphertext bytes
-    /// can be published as both `snapshots/<version>.json` and
-    /// `catalog.json` — the byte-identity invariant every published version
-    /// keeps. A plaintext backend (or a keyless session) returns the bytes
-    /// unchanged. The decorator's write methods recognize the container magic
-    /// and store already-sealed bytes as-is, so this is the one seam where
-    /// "seal once, publish twice" is expressed.
-    fn seal_manifest(&self, plain: &[u8], _lake_id: &str, _version: u64) -> Result<Vec<u8>> {
-        Ok(plain.to_vec())
-    }
-
-    /// Pin the lake identity every manifest this session reads must carry
-    /// (M-7). The plaintext backends ignore it; the encryption decorator
-    /// checks container bindings against it.
-    fn set_manifest_lake_id(&self, _lake_id: Option<String>) {}
-
-    /// Publish the authenticated highest-version marker. Plaintext backends
-    /// store the bytes as-is; the encryption decorator binds them to
-    /// `(lake_id, version)`.
-    fn put_highest(&self, rel: &str, bytes: &[u8], _lake_id: &str, _version: u64) -> Result<()> {
-        self.put(rel, bytes)
-    }
-
-    /// Read and authenticate the highest-version marker. The default is a
-    /// plain read; the encryption decorator verifies the container binding.
-    fn read_highest(&self, rel: &str, context: &str, _lake_id: &str) -> Result<Vec<u8>> {
-        self.read(rel, context)
-    }
-
-    /// [`Storage::read_highest`] for a marker that may legitimately be
-    /// missing (`None`). One GET on object storage; the default maps the
-    /// backend's not-found to `None` so a missing marker still gets the
-    /// caller's clear "highest.json is missing" error.
-    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
-    fn read_highest_optional(
-        &self,
-        rel: &str,
-        context: &str,
-        lake_id: &str,
-    ) -> Result<Option<Vec<u8>>> {
-        match self.read_highest(rel, context, lake_id) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(LakeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     /// Best-effort narrow pre-existing artifacts to 0600 (M-5). The local
     /// backend overrides this; object storage has no file modes.
+    #[allow(dead_code)]
     fn tighten_existing(&self) -> Result<()> {
         Ok(())
-    }
-
-    /// [`Storage::read`] plus the object's **stored** bytes as the backend
-    /// holds them (raw ciphertext for an encrypted session). Only the create
-    /// adoption path uses it: when a concurrent create won the
-    /// `snapshots/1.json` link, the catalog must be published from the
-    /// snapshot's *exact stored bytes*, not from a fresh encryption (which
-    /// would mint a different container and break the byte-identity
-    /// invariant). The plaintext copy is what the caller validates.
-    fn read_with_stored(&self, rel: &str, context: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-        let bytes = self.read(rel, context)?;
-        Ok((bytes.clone(), bytes))
     }
 }
 
@@ -596,514 +379,13 @@ fn slice_range(bytes: &[u8], offset: u64, len: u64, path: &Path) -> Result<Vec<u
     Ok(bytes[start..end].to_vec())
 }
 
-/// The version encoded in `snapshots/<v>.json`, if `rel` is a canonical
-/// snapshot name.
-fn snapshot_version(rel: &str) -> Option<u64> {
-    let stem = rel.strip_prefix("snapshots/")?.strip_suffix(".json")?;
-    crate::canonical_version_number(stem)
-}
-
-/// A pre-v6 encrypted manifest has the empty binding: refuse it with a clean
-/// upgrade message instead of an opaque authentication failure.
-fn legacy_manifest_error(path: &Path) -> LakeError {
-    LakeError::Corrupt {
-        path: path.to_path_buf(),
-        message: "pre-v6 encrypted lake manifest (no lake-id/version binding); this build \
-                  refuses the weaker-bound format — create a new keyed lake (or load and \
-                  re-save it with a pre-M-7 build)"
-            .to_string(),
-    }
-}
-
-/// Cross-check a decrypted manifest's `(lake_id, version)` against the
-/// container binding it authenticated under (M-7).
-fn check_manifest_binding(
-    path: &Path,
-    plain: &[u8],
-    binding: &str,
-    lake_id: &str,
-    version: u64,
-) -> Result<()> {
-    let value: serde_json::Value =
-        serde_json::from_slice(plain).map_err(|e| LakeError::Corrupt {
-            path: path.to_path_buf(),
-            message: format!("manifest does not parse: {e}"),
-        })?;
-    let got_id = value.get("lake_id").and_then(|v| v.as_str());
-    let got_version = value.get("version").and_then(|v| v.as_u64());
-    if got_id != Some(lake_id) || got_version != Some(version) {
-        return Err(LakeError::Tampered {
-            path: path.to_path_buf(),
-            message: format!(
-                "the manifest container is bound to (lake {lake_id}, version {version}), but \
-                 its payload declares (lake {}, version {})",
-                got_id.unwrap_or("<none>"),
-                got_version.map_or_else(|| "<none>".to_string(), |v| v.to_string())
-            ),
-        });
-    }
-    let expected = crate::manifest_binding(lake_id, version);
-    if binding != expected {
-        return Err(LakeError::Tampered {
-            path: path.to_path_buf(),
-            message: "manifest container binding is inconsistent".to_string(),
-        });
-    }
-    Ok(())
-}
-
 /// The lake-relative-path → container domain/binding mapping every encrypted
 /// object is sealed and opened under (see the `crypto` module docs).
 fn crypto_domain(rel: &str) -> (crypto::Domain, &str) {
-    if rel == CATALOG_FILE || rel.starts_with("snapshots/") {
-        // Unreachable for plaintext manifests (`sealed` refuses them and
-        // `plain` handles the pair explicitly with a `(lake_id, version)`
-        // binding); kept as a defensive fallback for any future caller.
-        (crypto::Domain::Manifest, "")
-    } else if rel == crate::HIGHEST_FILE {
-        (crypto::Domain::Highest, rel)
-    } else if rel.starts_with("commits/") {
-        (crypto::Domain::Commit, rel)
-    } else if rel.ends_with(".pinkdel") {
+    if rel.ends_with(".pinkdel") || rel.ends_with("-delete.parquet") {
         (crypto::Domain::DeleteFile, rel)
     } else {
         (crypto::Domain::DataFile, rel)
-    }
-}
-
-/// The at-rest encryption decorator: the single choke point every lake object
-/// passes through, so commits, deletes, time travel, attach and the retry
-/// paths all get encryption without knowing it.
-///
-/// - **Keyed session** (`crypto.is_some()`): every object the lake writes
-///   (that is not already a `PNKLAKE1` container — the once-per-version
-///   manifest `seal_manifest` mints) is sealed on the way to the backend, and
-///   every object it reads is authenticated and unsealed first. A keyed read
-///   of a plaintext object fails closed (`NotEncrypted`): a key is never
-///   silently ignored.
-/// - **Keyless session** (`crypto.is_none()`): reads and writes pass through
-///   unchanged — *except* that a read of a `PNKLAKE1` container fails closed
-///   with [`LakeError::Encrypted`] (or the "rebuild with the encryption
-///   feature" hint in a build without it), never a JSON parse error.
-///
-/// Branch/conditional semantics are untouched: `put_new` and `put_if_match`
-/// evaluate their conditions on the *sealed* bytes exactly as they would on
-/// plaintext (the ciphertext is the object). `read_tagged` returns the
-/// backend's version tag for the stored object — the caller's later
-/// conditional replace still reasons about the object it actually read.
-#[derive(Debug)]
-pub(crate) struct CryptoStorage {
-    inner: Arc<dyn Storage>,
-    crypto: Option<Arc<Crypto>>,
-    /// The lake identity every manifest container must be bound to (M-7).
-    /// Set from `lake.json` before the catalog is read; `None` while a
-    /// pre-v6 lake is being recognised.
-    manifest_lake_id: std::sync::RwLock<Option<String>>,
-}
-
-impl CryptoStorage {
-    /// Wrap `inner`. `key = None` is a plaintext session (the decorator still
-    /// recognizes containers to fail closed); `Some(key)` is a keyed session
-    /// — and in a build without the `encryption` feature this is the clear
-    /// "not compiled in" error, before any storage is touched.
-    pub(crate) fn new(inner: Arc<dyn Storage>, key: Option<crypto::EncryptionKey>) -> Result<Self> {
-        let crypto = match key {
-            Some(key) => Some(Arc::new(Crypto::new(key)?)),
-            None => None,
-        };
-        Ok(Self {
-            inner,
-            crypto,
-            manifest_lake_id: std::sync::RwLock::new(None),
-        })
-    }
-
-    /// The plaintext of one stored object: unsealed (and authenticated) for a
-    /// keyed session, as-is for a keyless one. Both directions fail closed —
-    /// see the type docs.
-    fn plain(&self, rel: &str, stored: Vec<u8>) -> Result<Vec<u8>> {
-        let path = self.inner.abs(rel);
-        match &self.crypto {
-            Some(crypto) => {
-                if !crypto::is_container(&stored) {
-                    return Err(crypto::not_encrypted_error(&path));
-                }
-                // M-7: manifest containers are bound to `(lake_id, version)`,
-                // not the empty binding. `catalog.json` carries its version
-                // inside the (public, authenticated) header binding; a
-                // snapshot's version is in its file name. Both are
-                // cross-checked against the decrypted JSON, so a container
-                // re-sealed for another version/lake cannot be substituted.
-                if rel == CATALOG_FILE {
-                    let header_binding = crypto.container_binding(&path, &stored)?;
-                    let (id, version) = crate::parse_manifest_binding(&header_binding)
-                        .ok_or_else(|| legacy_manifest_error(&path))?;
-                    let expected = self
-                        .manifest_lake_id
-                        .read()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone();
-                    if let Some(expected) = expected
-                        && expected != id
-                    {
-                        return Err(LakeError::Tampered {
-                            path,
-                            message: format!(
-                                "catalog.json is bound to lake {id}, not to this lake \
-                                 ({expected}); a manifest from another lake was substituted"
-                            ),
-                        });
-                    }
-                    let plain =
-                        crypto.open(&path, crypto::Domain::Manifest, &header_binding, &stored)?;
-                    check_manifest_binding(&path, &plain, &header_binding, id, version)?;
-                    return Ok(plain);
-                }
-                if let Some(version) = snapshot_version(rel) {
-                    let id = self
-                        .manifest_lake_id
-                        .read()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone()
-                        .ok_or_else(|| legacy_manifest_error(&path))?;
-                    let binding = crate::manifest_binding(&id, version);
-                    let plain = crypto.open(&path, crypto::Domain::Manifest, &binding, &stored)?;
-                    check_manifest_binding(&path, &plain, &binding, &id, version)?;
-                    return Ok(plain);
-                }
-                let (domain, binding) = crypto_domain(rel);
-                crypto.open(&path, domain, binding, &stored)
-            }
-            None => {
-                if crypto::is_container(&stored) {
-                    return Err(crypto::encrypted_error(&path));
-                }
-                Ok(stored)
-            }
-        }
-    }
-
-    /// The stored bytes of one object the lake is about to write: sealed for
-    /// a keyed session — unless the bytes already are a `PNKLAKE1` container
-    /// (the once-per-version manifest, or the snapshot bytes a create adopted
-    /// for the catalog), which are published as-is so the shared bytes stay
-    /// byte-identical.
-    fn sealed(&self, rel: &str, bytes: &[u8]) -> Result<Vec<u8>> {
-        // A plaintext manifest must go through `seal_manifest`, the one seam
-        // that knows `(lake_id, version)`; falling back to the empty binding
-        // here would silently restore the pre-M-7 surface.
-        if (rel == CATALOG_FILE || rel.starts_with("snapshots/"))
-            && !crypto::is_container(bytes)
-            && self.crypto.is_some()
-        {
-            return Err(LakeError::Internal {
-                message: "a manifest must be sealed through Storage::seal_manifest \
-                          (lake_id/version binding)"
-                    .to_string(),
-            });
-        }
-        match &self.crypto {
-            None => Ok(bytes.to_vec()),
-            Some(crypto) => {
-                // An explicit "already sealed" marker for the one seam that
-                // hands over ciphertext (`seal_manifest`: seal once, publish
-                // twice). Only manifest bytes can arrive pre-sealed, and no
-                // current writer produces non-container bytes beginning with
-                // the magic, so this cannot silently skip encrypting real data.
-                if crypto::is_container(bytes) {
-                    return Ok(bytes.to_vec());
-                }
-                let path = self.inner.abs(rel);
-                let (domain, binding) = crypto_domain(rel);
-                crypto.seal(&path, domain, binding, bytes)
-            }
-        }
-    }
-}
-
-impl Storage for CryptoStorage {
-    fn abs(&self, rel: &str) -> PathBuf {
-        self.inner.abs(rel)
-    }
-
-    fn head(&self, rel: &str) -> Result<Head> {
-        self.inner.head(rel)
-    }
-
-    fn stat(&self, rel: &str) -> Result<Option<ObjectInfo>> {
-        // The stored object's facts (ciphertext size for an encrypted
-        // session): maintenance reasons about *objects*, never plaintext.
-        self.inner.stat(rel)
-    }
-
-    fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>> {
-        let stored = self.inner.read(rel, context)?;
-        self.plain(rel, stored)
-    }
-
-    fn read_optional(&self, rel: &str, context: &str) -> Result<Option<Vec<u8>>> {
-        match self.inner.read_optional(rel, context)? {
-            Some(stored) => Ok(Some(self.plain(rel, stored)?)),
-            None => Ok(None),
-        }
-    }
-
-    fn read_moved_optional(&self, context: &str) -> Result<Option<Vec<u8>>> {
-        // The retirement marker is not a lake artifact: it stays plaintext so
-        // an open of a migrated-away location can report where the lake went
-        // without (or before) a key.
-        self.inner.read_optional(crate::MOVED_FILE, context)
-    }
-
-    fn read_range(&self, rel: &str, offset: u64, len: u64, context: &str) -> Result<Vec<u8>> {
-        if self.crypto.is_some() {
-            return Err(LakeError::Internal {
-                message: format!(
-                    "ranged reads of the sealed object {rel} are not supported; \
-                     the caller must fall back to Storage::read"
-                ),
-            });
-        }
-        let bytes = self.inner.read_range(rel, offset, len, context)?;
-        // A keyless session never hands out ciphertext: the container magic
-        // is at offset 0 only, and a range that does not include it cannot be
-        // a container's footer either (callers only reach this over a
-        // plaintext lake; a keyless open of an encrypted one already failed
-        // at the catalog).
-        if offset == 0 && bytes.starts_with(crypto::ENC_MAGIC) {
-            return Err(crypto::encrypted_error(&self.inner.abs(rel)));
-        }
-        Ok(bytes)
-    }
-
-    fn ranged_reads(&self) -> bool {
-        self.crypto.is_none() && self.inner.ranged_reads()
-    }
-
-    fn stats(&self) -> StorageStats {
-        self.inner.stats()
-    }
-
-    fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
-        let (stored, tag) = self.inner.read_tagged(rel, context)?;
-        Ok((self.plain(rel, stored)?, tag))
-    }
-
-    fn read_with_stored(&self, rel: &str, context: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-        let stored = self.inner.read(rel, context)?;
-        let plain = self.plain(rel, stored.clone())?;
-        Ok((plain, stored))
-    }
-
-    fn create_dir(&self, rel: &str) -> Result<()> {
-        self.inner.create_dir(rel)
-    }
-
-    fn put(&self, rel: &str, bytes: &[u8]) -> Result<()> {
-        self.inner.put(rel, &self.sealed(rel, bytes)?)
-    }
-
-    fn put_streamed(
-        &self,
-        rel: &str,
-        fill: &mut dyn FnMut(&mut (dyn std::io::Write + Send)) -> Result<()>,
-    ) -> Result<u64> {
-        match &self.crypto {
-            None => self.inner.put_streamed(rel, fill),
-            Some(crypto) => {
-                let path = self.inner.abs(rel);
-                let (domain, binding) = crypto_domain(rel);
-                self.inner.put_streamed(rel, &mut |sink| {
-                    let mut sealed = crypto.sealing_writer(&path, domain, binding, sink)?;
-                    fill(&mut sealed)?;
-                    sealed.finish()
-                })
-            }
-        }
-    }
-
-    fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
-        self.inner.put_new(rel, &self.sealed(rel, bytes)?)
-    }
-
-    fn put_if_match(&self, rel: &str, bytes: &[u8], expected: &VersionTag) -> Result<bool> {
-        self.inner
-            .put_if_match(rel, &self.sealed(rel, bytes)?, expected)
-    }
-
-    fn list(&self, rel: &str) -> Result<Vec<String>> {
-        self.inner.list(rel)
-    }
-
-    fn list_recursive(&self, rel: &str) -> Result<Vec<String>> {
-        self.inner.list_recursive(rel)
-    }
-
-    fn delete(&self, rel: &str) -> Result<()> {
-        self.inner.delete(rel)
-    }
-
-    fn local_copy(&self, rel: &str, context: &str) -> Result<LocalCopy> {
-        match &self.crypto {
-            None => {
-                let copy = self.inner.local_copy(rel, context)?;
-                // Fail closed before the engine opens a ciphertext file as if
-                // it were a `.pink` one: the first 8 bytes are the magic.
-                if let Some(head) = read_magic(copy.path())
-                    && &head == crypto::ENC_MAGIC
-                {
-                    return Err(crypto::encrypted_error(&self.inner.abs(rel)));
-                }
-                Ok(copy)
-            }
-            Some(_) => {
-                // The engine opens `.pink` files by path, so unseal to a
-                // private, owner-only temp copy the caller drops when done; the
-                // plaintext exists on disk only for as long as the engine takes
-                // to load it, and other local users cannot read it. (Stage 1:
-                // whole-file. The engine's loader holds the whole store in
-                // memory anyway, so no streaming is lost.)
-                let bytes = self.read(rel, context)?;
-                let (dir, path) = private_temp_dir().map_err(|e| LakeError::Io {
-                    context: format!("creating a private temp dir for the decrypted copy of {rel}"),
-                    source: e,
-                })?;
-                if let Err(e) = write_private(&path, &bytes) {
-                    let _ = std::fs::remove_dir_all(&dir);
-                    return Err(LakeError::Io {
-                        context: format!("writing the decrypted temp copy {}", path.display()),
-                        source: e,
-                    });
-                }
-                Ok(LocalCopy::Temp { file: path, dir })
-            }
-        }
-    }
-
-    fn local_path(&self, rel: &str) -> Option<PathBuf> {
-        match &self.crypto {
-            // Encrypted objects are containers: a positioned footer read of
-            // the ciphertext is meaningless. `None` makes the Vortex attach
-            // paths read the whole object through `read` (unsealed first) —
-            // the documented stage-1 cost; footer-range reads over
-            // decrypted segments are the follow-up.
-            Some(_) => None,
-            None => self.inner.local_path(rel),
-        }
-    }
-
-    fn reconcile_snapshot(&self, version: u64, bytes: &[u8]) -> Result<()> {
-        if !self.inner.uses_degraded_fallback() {
-            return self.inner.reconcile_snapshot(version, bytes);
-        }
-        match &self.crypto {
-            None => self.inner.reconcile_snapshot(version, bytes),
-            Some(_) => {
-                // The repair must republish the catalog's *stored* bytes (the
-                // caller's `bytes` are the decrypted copy; sealing them again
-                // would mint a different container and break
-                // catalog == snapshot).
-                let context = format!("reading {}", self.inner.abs(CATALOG_FILE).display());
-                let stored = self.inner.read(CATALOG_FILE, &context)?;
-                let stored = if crypto::is_container(&stored) {
-                    stored
-                } else {
-                    bytes.to_vec()
-                };
-                self.inner.reconcile_snapshot(version, &stored)
-            }
-        }
-    }
-
-    fn uses_degraded_fallback(&self) -> bool {
-        self.inner.uses_degraded_fallback()
-    }
-
-    fn encrypted(&self) -> bool {
-        self.crypto.is_some()
-    }
-
-    fn object_key(&self, rel: &str) -> Option<Vec<u8>> {
-        self.inner.object_key(rel)
-    }
-
-    fn seal_manifest(&self, plain: &[u8], lake_id: &str, version: u64) -> Result<Vec<u8>> {
-        match &self.crypto {
-            None => Ok(plain.to_vec()),
-            Some(crypto) => {
-                let path = self.inner.abs(CATALOG_FILE);
-                crypto.seal(
-                    &path,
-                    crypto::Domain::Manifest,
-                    &crate::manifest_binding(lake_id, version),
-                    plain,
-                )
-            }
-        }
-    }
-
-    fn set_manifest_lake_id(&self, lake_id: Option<String>) {
-        *self
-            .manifest_lake_id
-            .write()
-            .unwrap_or_else(|p| p.into_inner()) = lake_id;
-    }
-
-    fn put_highest(&self, rel: &str, bytes: &[u8], lake_id: &str, version: u64) -> Result<()> {
-        match &self.crypto {
-            None => self.inner.put(rel, bytes),
-            Some(crypto) => {
-                let path = self.inner.abs(rel);
-                let sealed = crypto.seal(
-                    &path,
-                    crypto::Domain::Highest,
-                    &crate::manifest_binding(lake_id, version),
-                    bytes,
-                )?;
-                self.inner.put(rel, &sealed)
-            }
-        }
-    }
-
-    fn read_highest(&self, rel: &str, context: &str, lake_id: &str) -> Result<Vec<u8>> {
-        let stored = self.inner.read(rel, context)?;
-        match &self.crypto {
-            None => Ok(stored),
-            Some(crypto) => {
-                let path = self.inner.abs(rel);
-                if !crypto::is_container(&stored) {
-                    return Err(crypto::not_encrypted_error(&path));
-                }
-                let binding = crypto.container_binding(&path, &stored)?;
-                let (id, version) = crate::parse_manifest_binding(&binding)
-                    .ok_or_else(|| legacy_manifest_error(&path))?;
-                if id != lake_id {
-                    return Err(LakeError::Tampered {
-                        path,
-                        message: format!(
-                            "highest.json is bound to lake {id}, not to this lake ({lake_id})"
-                        ),
-                    });
-                }
-                let plain = crypto.open(&path, crypto::Domain::Highest, &binding, &stored)?;
-                check_manifest_binding(&path, &plain, &binding, id, version)?;
-                Ok(plain)
-            }
-        }
-    }
-
-    fn tighten_existing(&self) -> Result<()> {
-        self.inner.tighten_existing()
-    }
-
-    fn begin_publish(&self) -> Result<PublishScope> {
-        // The scope covers the *stored* metadata sequence (sealed bytes); the
-        // decorator itself has nothing transactional to add.
-        self.inner.begin_publish()
-    }
-
-    fn catalog_split(&self) -> bool {
-        self.inner.catalog_split()
     }
 }
 
@@ -1255,16 +537,6 @@ impl Storage for FileKeyStorage {
         false
     }
 
-    fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
-        let (stored, tag) = self.inner.read_tagged(rel, context)?;
-        Ok((self.open(rel, &stored)?, tag))
-    }
-
-    fn read_with_stored(&self, rel: &str, context: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-        let stored = self.inner.read(rel, context)?;
-        Ok((self.open(rel, &stored)?, stored))
-    }
-
     fn create_dir(&self, rel: &str) -> Result<()> {
         self.inner.create_dir(rel)
     }
@@ -1284,16 +556,6 @@ impl Storage for FileKeyStorage {
         let sealed = self.seal(rel, &plain)?;
         self.inner.put(rel, &sealed)?;
         Ok(sealed.len() as u64)
-    }
-
-    fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
-        let sealed = self.seal(rel, bytes)?;
-        self.inner.put_new(rel, &sealed)
-    }
-
-    fn put_if_match(&self, rel: &str, bytes: &[u8], expected: &VersionTag) -> Result<bool> {
-        let sealed = self.seal(rel, bytes)?;
-        self.inner.put_if_match(rel, &sealed, expected)
     }
 
     fn list(&self, rel: &str) -> Result<Vec<String>> {
@@ -1344,26 +606,10 @@ impl Storage for FileKeyStorage {
         self.key_for(rel).map(|key| key.to_vec())
     }
 
+    #[allow(dead_code)]
     fn tighten_existing(&self) -> Result<()> {
         self.inner.tighten_existing()
     }
-
-    fn begin_publish(&self) -> Result<PublishScope> {
-        self.inner.begin_publish()
-    }
-
-    fn catalog_split(&self) -> bool {
-        self.inner.catalog_split()
-    }
-}
-
-/// The first 8 bytes of a file, when it has that many.
-fn read_magic(path: &Path) -> Option<[u8; 8]> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut magic = [0u8; 8];
-    file.read_exact(&mut magic).ok()?;
-    Some(magic)
 }
 
 /// A parsed lake location: a local directory path, an `s3://` URL, or a SQL
@@ -1557,191 +803,6 @@ mod tests {
         assert!(matches!(err, LakeError::BadLocation { .. }), "{err:?}");
     }
 
-    /// A keyless session never hands out ciphertext: a `PNKLAKE1` object is
-    /// the "open it with a key" error (or the rebuild hint in a build without
-    /// the `encryption` feature), never raw bytes.
-    #[test]
-    fn keyless_reads_of_containers_fail_closed() {
-        let dir = std::env::temp_dir().join(format!(
-            "pink_lake_crypto_storage_{}_{}",
-            std::process::id(),
-            crate::fresh_id()
-        ));
-        std::fs::create_dir_all(dir.join("data/t")).unwrap();
-        std::fs::write(dir.join("catalog.json"), b"PNKLAKE1 not for you").unwrap();
-        let inner: Arc<dyn Storage> = Arc::new(crate::local::LocalStorage::new(&dir));
-        let storage = CryptoStorage::new(inner, None).unwrap();
-
-        let err = storage
-            .read(CATALOG_FILE, "reading catalog.json")
-            .unwrap_err();
-        assert!(matches!(err, LakeError::Encrypted { .. }), "{err:?}");
-        assert!(err.to_string().contains("the lake is encrypted"), "{err}");
-        #[cfg(not(feature = "encryption"))]
-        assert!(
-            err.to_string().contains("encryption"),
-            "a feature-off build must name the missing feature: {err}"
-        );
-
-        // A keyless `seal_manifest` is the identity (plaintext lakes keep
-        // byte-identical manifests) and `local_copy` refuses the container
-        // before the engine could open it as a `.pink` file.
-        assert_eq!(
-            storage.seal_manifest(b"{\"v\":1}", "id", 1).unwrap(),
-            b"{\"v\":1}"
-        );
-        let err = storage
-            .local_copy(CATALOG_FILE, "loading catalog.json")
-            .unwrap_err();
-        assert!(matches!(err, LakeError::Encrypted { .. }), "{err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A keyed session seals and unseals every object, and the "seal once per
-    /// version" contract: `seal_manifest` output published to both objects is
-    /// byte-identical (the decorator stores already-sealed bytes as-is).
-    #[cfg(feature = "encryption")]
-    #[test]
-    fn keyed_storage_seals_once_and_reads_back_through_every_path() {
-        use crate::crypto::EncryptionKey;
-
-        let dir = std::env::temp_dir().join(format!(
-            "pink_lake_crypto_keyed_{}_{}",
-            std::process::id(),
-            crate::fresh_id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let inner: Arc<dyn Storage> = Arc::new(crate::local::LocalStorage::new(&dir));
-        let storage = CryptoStorage::new(
-            inner,
-            Some(EncryptionKey::from_passphrase("storage-level test key")),
-        )
-        .unwrap();
-        assert!(storage.encrypted());
-
-        // The manifest pair: sealed once, published twice, byte-identical.
-        let plain = b"{\n  \"format_version\": 6,\n  \"lake_id\": \
-                     \"0123456789abcdef0123456789abcdef\",\n  \"version\": 4\n}\n";
-        let sealed = storage
-            .seal_manifest(plain, "0123456789abcdef0123456789abcdef", 4)
-            .unwrap();
-        assert!(sealed.starts_with(b"PNKLAKE1"));
-        assert!(storage.put_new("snapshots/1.json", &sealed).unwrap());
-        assert!(storage.put_new(CATALOG_FILE, &sealed).unwrap());
-        assert_eq!(
-            std::fs::read(dir.join(CATALOG_FILE)).unwrap(),
-            std::fs::read(dir.join("snapshots/1.json")).unwrap()
-        );
-        assert_ne!(std::fs::read(dir.join(CATALOG_FILE)).unwrap(), plain);
-        assert_eq!(storage.read(CATALOG_FILE, "reading").unwrap(), plain);
-        let (plain_read, stored) = storage.read_with_stored(CATALOG_FILE, "reading").unwrap();
-        assert_eq!(plain_read, plain);
-        assert_eq!(stored, sealed);
-
-        // Plaintext writes are sealed on the way through (data files, delete
-        // files, commit deltas), and reads unseal them.
-        storage.put("data/t/x.pink", b"data bytes").unwrap();
-        let raw = std::fs::read(dir.join("data/t/x.pink")).unwrap();
-        assert!(raw.starts_with(b"PNKLAKE1"), "the data file must be sealed");
-        assert_eq!(
-            storage.read("data/t/x.pink", "reading").unwrap(),
-            b"data bytes"
-        );
-        // A container sealed for another path does not open here (binding).
-        std::fs::create_dir_all(dir.join("data/u")).unwrap();
-        std::fs::write(dir.join("data/u/y.pink"), &raw).unwrap();
-        let err = storage.read("data/u/y.pink", "reading").unwrap_err();
-        assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
-        // A keyed read of a plaintext object is refused, never guessed at.
-        std::fs::write(dir.join("data/plain.pink"), b"not sealed").unwrap();
-        let err = storage.read("data/plain.pink", "reading").unwrap_err();
-        assert!(matches!(err, LakeError::NotEncrypted { .. }), "{err:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Bytes that merely start with the container magic are the explicit
-    /// "already sealed" marker: stored as-is (not double-sealed) and then
-    /// refused by a keyed read (never guessed at).
-    #[cfg(feature = "encryption")]
-    #[test]
-    fn a_pnklake1_object_is_stored_as_is_and_then_fails_closed() {
-        use crate::crypto::EncryptionKey;
-        let dir = std::env::temp_dir().join(format!(
-            "pink_lake_sealed_marker_{}_{}",
-            std::process::id(),
-            crate::fresh_id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let inner: Arc<dyn Storage> = Arc::new(crate::local::LocalStorage::new(&dir));
-        let storage = CryptoStorage::new(inner, Some(EncryptionKey::from_raw([3u8; 32]))).unwrap();
-        let mut fake = crate::crypto::ENC_MAGIC.to_vec();
-        fake.extend_from_slice(b"not a real container");
-        storage.put("data/t/x.pink", &fake).unwrap();
-        assert_eq!(
-            std::fs::read(dir.join("data/t/x.pink")).unwrap(),
-            fake,
-            "the marker must pass through unsealed"
-        );
-        let err = storage.read("data/t/x.pink", "reading").unwrap_err();
-        assert!(
-            matches!(err, LakeError::WrongKey { .. } | LakeError::Tampered { .. }),
-            "{err:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Wave 98b: the local backend serves real positioned reads, and the
-    /// encryption decorator refuses ranges of a sealed object (callers fall
-    /// back to a whole read).
-    #[test]
-    fn ranged_reads_are_positioned_and_sealed_objects_refuse_them() {
-        let dir = std::env::temp_dir().join(format!(
-            "pink_lake_ranged_{}_{}",
-            std::process::id(),
-            crate::fresh_id()
-        ));
-        std::fs::create_dir_all(dir.join("data/t")).unwrap();
-        std::fs::write(dir.join("data/t/x.pink"), b"0123456789").unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(crate::local::LocalStorage::new(&dir));
-        assert!(storage.ranged_reads());
-        assert_eq!(
-            storage
-                .read_range("data/t/x.pink", 2, 4, "reading")
-                .unwrap(),
-            b"2345"
-        );
-        assert_eq!(
-            storage
-                .read_range("data/t/x.pink", 8, 2, "reading")
-                .unwrap(),
-            b"89"
-        );
-        assert_eq!(storage.stats().requests, 0);
-
-        #[cfg(feature = "encryption")]
-        {
-            let keyed = CryptoStorage::new(
-                Arc::clone(&storage),
-                Some(crypto::EncryptionKey::from_passphrase("ranged test key")),
-            )
-            .unwrap();
-            assert!(!keyed.ranged_reads());
-            assert!(keyed.read_range("data/t/x.pink", 0, 2, "reading").is_err());
-        }
-        // A keyless session passes plaintext ranges through.
-        let plain = CryptoStorage::new(Arc::clone(&storage), None).unwrap();
-        assert!(plain.ranged_reads());
-        assert_eq!(
-            plain.read_range("data/t/x.pink", 1, 3, "reading").unwrap(),
-            b"123"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A staging copy of decrypted (or downloaded) plaintext lives in a private
-    /// 0700 directory as a 0600 file, and the whole directory is removed when
-    /// the `LocalCopy` drops.
-    #[cfg(unix)]
     #[test]
     fn staging_copies_are_owner_only_and_removed_on_drop() {
         use std::os::unix::fs::PermissionsExt;

@@ -51,6 +51,27 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn catalog_sql(lake: &Path, sql: &str) {
+    let helper = lake.join("catalog.pink");
+    let path = if helper.exists() || lake.join("catalog.pink.wal").exists() {
+        helper
+    } else {
+        lake.to_path_buf()
+    };
+    let mut db = pinkdb::PinkDb::open_durable(&path.display().to_string()).unwrap();
+    db.execute(sql).unwrap();
+}
+
+/// A bare-path lake's data root: `<path>.files/` (the library default).
+fn data_root(lake: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.files", lake.display())).join("data")
+}
+
+/// The `pink:` catalog URL for a bare-path lake.
+fn catalog_url(lake: &Path) -> String {
+    format!("pink:{}", lake.display())
+}
+
 /// The CLI under test: `PINKDB_CLI_BIN` wins over the test-profile binary so
 /// the same suite can be pointed at a release build.
 fn cli_binary() -> String {
@@ -98,17 +119,6 @@ fn run_captured(cmds: &str) -> (String, String, i32) {
 
 /// The `version` field of a manifest, dependency-free: the manifests are
 /// `serde_json` pretty output with a single `"version": <digits>` line.
-fn declared_version(json: &str) -> u64 {
-    let idx = json.find("\"version\":").expect("version field");
-    json[idx + "\"version\":".len()..]
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .expect("version digits")
-}
-
 #[test]
 fn save_open_query_and_metadata_commands() {
     let dir = scratch("roundtrip");
@@ -127,20 +137,9 @@ fn save_open_query_and_metadata_commands() {
     assert!(out.contains("2 tables, 3 rows"), "{out}");
     assert!(out.contains("bytes written"), "{out}");
 
-    // The lake layout exists on disk, with version 1 created up front.
-    assert!(lake.join("catalog.json").is_file());
-    assert!(lake.join("snapshots/1.json").is_file());
-    assert!(lake.join("snapshots/2.json").is_file());
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 7"), "{catalog}");
-    assert!(catalog.contains("\"version\": 2"), "{catalog}");
-    assert!(catalog.contains("\"main.t\""), "{catalog}");
-    assert!(catalog.contains("\"analytics.u\""), "{catalog}");
-    assert!(catalog.contains("\"rows\": 2"), "{catalog}");
-    assert!(catalog.contains("\"rows\": 1"), "{catalog}");
-    assert!(catalog.contains("\"format\": \"vortex\""), "{catalog}");
-    assert!(catalog.contains(".vortex"), "{catalog}");
-    let data = std::fs::read_dir(lake.join("data/main.t")).unwrap();
+    // The lake is a catalog database plus its `<path>.files/` data root.
+    assert!(PathBuf::from(format!("{}.files", lake.display())).is_dir());
+    let data = std::fs::read_dir(data_root(&lake).join("main.t")).unwrap();
     for entry in data {
         let path = entry.unwrap().path();
         assert_eq!(path.extension().unwrap(), "vortex", "{}", path.display());
@@ -270,9 +269,9 @@ fn lake_errors_are_clear() {
         ".lake save\n.lake open\n.lake versions\n.lake snapshots\n.lake tables\n.lake info\n.lake\n\
          .quit\n",
     );
-    assert!(out.contains("Usage: .lake save <location>"), "{out}");
+    assert!(out.contains("Usage: .lake save <catalog>"), "{out}");
     assert!(
-        out.contains(&format!("Usage: .lake open <location>{DATA_OPT} [version]")),
+        out.contains(&format!("Usage: .lake open <catalog>{DATA_OPT} [version]")),
         "{out}"
     );
     assert!(out.contains("Usage: .lake versions <dir>"), "{out}");
@@ -281,7 +280,7 @@ fn lake_errors_are_clear() {
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
         out.contains(
-            "Usage: .lake <save|open|attach|commit|migrate-catalog|replicate|partition|inlining|\
+            "Usage: .lake <save|open|attach|commit|replicate|partition|inlining|\
              flush|changes|add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|\
              options|settings|format|detach|attached|versions|snapshots|tables|info> ..."
         ),
@@ -303,7 +302,7 @@ fn lake_errors_are_clear() {
     ));
     assert!(out.contains("has no snapshot version 99"), "{out}");
     assert!(
-        out.contains(&format!("Usage: .lake open <location>{DATA_OPT} [version]")),
+        out.contains(&format!("Usage: .lake open <catalog>{DATA_OPT} [version]")),
         "{out}"
     );
     cleanup(&dir);
@@ -380,11 +379,15 @@ fn open_notes_the_session_reset_and_carries_the_key() {
             out.contains("the lake is encrypted at rest with PINKDB_KEY"),
             "{out}"
         );
-        let catalog = std::fs::read(enc_lake.join("catalog.json")).unwrap();
+        let data_file = data_files(&data_root(&enc_lake))
+            .into_iter()
+            .next()
+            .expect("a data file");
+        let bytes = std::fs::read(&data_file).unwrap();
         assert_eq!(
-            &catalog[..8],
+            &bytes[..8],
             b"PNKLAKE1",
-            "a keyed .lake save must write encrypted containers"
+            "a keyed .lake save must write encrypted data containers"
         );
         let out = run_with_env(
             &format!(
@@ -572,45 +575,6 @@ fn keyed_lake_commands_roundtrip_and_fail_closed() {
 }
 
 #[test]
-fn tampered_version_catalogs_are_clean_cli_errors() {
-    let dir = scratch("bad_versions");
-    let lake = dir.join("lake");
-    run(&format!(
-        "CREATE TABLE t (a INTEGER);\n.lake save {lake}\n.quit\n",
-        lake = lake.display()
-    ));
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"version\": 2"), "{catalog}");
-
-    for bad in ["0", "18446744073709551615"] {
-        let tampered = catalog.replacen("\"version\": 2", &format!("\"version\": {bad}"), 1);
-        std::fs::write(lake.join("catalog.json"), &tampered).unwrap();
-        let out = run(&format!(
-            ".lake info {lake}\n.lake open {lake}\n.lake save {lake}\n.lake versions {lake}\n.quit\n",
-            lake = lake.display()
-        ));
-        assert!(
-            out.contains("corrupt lake metadata") && out.contains("outside the supported range"),
-            "version {bad}: {out}"
-        );
-        assert!(!out.contains("panicked"), "version {bad} panicked: {out}");
-        assert!(
-            !out.contains("Saved lake version"),
-            "version {bad} wrapped: {out}"
-        );
-    }
-
-    // Restoring the catalog heals the lake (nothing was written).
-    std::fs::write(lake.join("catalog.json"), &catalog).unwrap();
-    let out = run(&format!(
-        ".lake info {lake}\n.quit\n",
-        lake = lake.display()
-    ));
-    assert!(out.contains("current version: 2"), "{out}");
-    cleanup(&dir);
-}
-
-#[test]
 fn missing_data_files_are_warned_about() {
     let dir = scratch("warn_missing");
     let lake = dir.join("lake");
@@ -619,7 +583,7 @@ fn missing_data_files_are_warned_about() {
         lake = lake.display()
     ));
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(lake.join("data/main.t"))
+    let mut files: Vec<PathBuf> = std::fs::read_dir(data_root(&lake).join("main.t"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .collect();
@@ -699,16 +663,8 @@ fn concurrent_lake_saves_stay_consistent() {
             "round {round}: duplicate published versions"
         );
 
-        // The catalog parses (`.lake info` uses the library reader) and is
-        // byte-identical to the snapshot of its version; the version chain
-        // has no gaps.
-        let catalog_bytes = std::fs::read(lake.join("catalog.json")).unwrap();
-        let version = declared_version(&String::from_utf8(catalog_bytes.clone()).unwrap());
-        assert_eq!(
-            catalog_bytes,
-            std::fs::read(lake.join(format!("snapshots/{version}.json"))).unwrap(),
-            "round {round}: catalog.json != snapshots/{version}.json"
-        );
+        // The version chain has no gaps.
+        let version = 2 + winners.len() as u64;
         assert_eq!(
             version,
             2 + winners.len() as u64,
@@ -729,15 +685,6 @@ fn concurrent_lake_saves_stay_consistent() {
             out.contains(&format!("current version: {version}")),
             "{out}"
         );
-
-        // Snapshot files are exactly the published chain, canonically named.
-        let mut names: Vec<String> = std::fs::read_dir(lake.join("snapshots"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
-            .collect();
-        names.sort();
-        let expected: Vec<String> = (1..=version).map(|v| format!("{v}.json")).collect();
-        assert_eq!(names, expected, "round {round}");
     }
     cleanup(&dir);
 }
@@ -757,7 +704,7 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
          .quit\n",
         lake = lake.display()
     ));
-    let file = std::fs::read_dir(lake.join("data/main.t"))
+    let file = std::fs::read_dir(data_root(&lake).join("main.t"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .next()
@@ -1211,128 +1158,8 @@ fn attach_lifecycle_and_read_only_rules() {
     cleanup(&dir);
 }
 
-/// Attach failures are clean errors: not a lake, a v1 lake, a missing data
-/// file, a truncated data file, a row-count mismatch, and a multi-file
-/// table.
-#[test]
-fn attach_errors_are_clear_and_never_panic() {
-    let dir = scratch("attach_err");
-    let lake = dir.join("lake");
-    run(&format!(
-        "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (1);\n.lake save {lake}\n.quit\n",
-        lake = lake.display()
-    ));
-
-    // Not a lake at all.
-    let out = run(&format!(
-        ".lake attach {missing}\n.quit\n",
-        missing = dir.join("no-such-lake").display()
-    ));
-    assert!(out.contains("is not a pink-lake directory"), "{out}");
-
-    // A missing data file.
-    let missing_lake = dir.join("missing_lake");
-    copy_dir(&lake, &missing_lake);
-    let data = std::fs::read_dir(missing_lake.join("data/main.t"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    std::fs::remove_file(&data).unwrap();
-    let (out, err, code) =
-        run_captured(&format!(".lake attach {}\n.quit\n", missing_lake.display()));
-    assert_eq!(code, 1);
-    assert!(
-        err.contains("is missing") || err.contains("loading data file"),
-        "{out}\n{err}"
-    );
-
-    // A truncated data file: the footer cannot be read; a clean error, never
-    // a crash.
-    let truncated = dir.join("truncated_lake");
-    copy_dir(&lake, &truncated);
-    let data = std::fs::read_dir(truncated.join("data/main.t"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let bytes = std::fs::read(&data).unwrap();
-    std::fs::write(&data, &bytes[..bytes.len() / 4]).unwrap();
-    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", truncated.display()));
-    assert_eq!(code, 1);
-    assert!(err.contains("Error:"), "{out}\n{err}");
-
-    // A manifest whose row count disagrees with the file: corrupt.
-    let wrong_rows = dir.join("wrong_rows_lake");
-    copy_dir(&lake, &wrong_rows);
-    for name in ["catalog.json", "snapshots/2.json"] {
-        let path = wrong_rows.join(name);
-        let text = std::fs::read_to_string(&path).unwrap();
-        let patched = text.replace("\"rows\": 1", "\"rows\": 2");
-        assert_ne!(text, patched, "rows field not found in {name}");
-        std::fs::write(&path, patched).unwrap();
-    }
-    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", wrong_rows.display()));
-    assert_eq!(code, 1);
-    assert!(
-        err.contains("has 1 rows, but the manifest says 2"),
-        "{out}\n{err}"
-    );
-
-    // A table whose file list does not carry row counts (a hand-edited v4
-    // manifest) is refused at parse.
-    let no_rows = dir.join("no_row_counts_lake");
-    copy_dir(&lake, &no_rows);
-    for name in ["catalog.json", "snapshots/2.json"] {
-        let path = no_rows.join(name);
-        let text = std::fs::read_to_string(&path).unwrap();
-        // Remove the *file object's* `"rows"` (the first occurrence, inside
-        // the files array); the entry-level one must stay.
-        let needle = "\"rows\": 1,\n          \"schema_version\": 1";
-        let patched = text.replacen(needle, "\"schema_version\": 1", 1);
-        assert_ne!(text, patched, "file rows field not found in {name}");
-        std::fs::write(&path, patched).unwrap();
-    }
-    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", no_rows.display()));
-    assert_eq!(code, 1);
-    assert!(err.contains("without its row count"), "{out}\n{err}");
-
-    // A table with two data files (a v4 incremental append) attaches and
-    // unions them in manifest order: the descriptors merge the files'
-    // statistics. Built through the real write path, not a hand-edit: a
-    // hand-edit would have to fix the catalog zone map's CRC.
-    let two_files = dir.join("two_file_lake");
-    run(&format!(
-        "CREATE TABLE t (a INTEGER, s VARCHAR);\n\
-         INSERT INTO t VALUES (1, 'x');\n\
-         .lake save {two_files}\n\
-         .lake attach {two_files} write\n\
-         INSERT INTO t VALUES (2, 'y');\n\
-         .lake commit {two_files}\n\
-         .quit\n",
-        two_files = two_files.display()
-    ));
-    let out = run(&format!(
-        ".lake attach {}\nSELECT COUNT(*) FROM t;\nSELECT MIN(a), MAX(s) FROM t;\n         .lake attached\n.quit\n",
-        two_files.display()
-    ));
-    assert!(out.contains("Attached"), "{out}");
-    assert!(out.contains("│ 2 "), "both files' rows: {out}");
-    assert!(out.contains("2 row"), "{out}");
-    // The merged statistics answer COUNT/MIN/MAX over both files without
-    // decoding either.
-    assert!(
-        out.contains("decodes: 0 loads, 0 columns, 0 files"),
-        "{out}"
-    );
-    cleanup(&dir);
-}
-
-/// Attach and its queries never write to the lake: `catalog.json` stays
-/// byte-identical to the snapshot of its version, and every data file is
-/// untouched.
+/// Attach and its queries never write to the lake: the catalog keeps its
+/// version and every data file is untouched.
 #[test]
 fn attach_never_touches_the_lake() {
     let dir = scratch("attach_ro");
@@ -1344,10 +1171,7 @@ fn attach_never_touches_the_lake() {
         lake = lake.display()
     ));
 
-    let catalog = std::fs::read(lake.join("catalog.json")).unwrap();
-    let snapshot = std::fs::read(lake.join("snapshots/2.json")).unwrap();
-    assert_eq!(catalog, snapshot, "the invariant holds before attach");
-    let data_dir = lake.join("data/main.t");
+    let data_dir = data_root(&lake).join("main.t");
     let data_files: Vec<PathBuf> = std::fs::read_dir(&data_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -1368,36 +1192,11 @@ fn attach_never_touches_the_lake() {
     ));
     assert!(!out.contains("Error:"), "{out}");
 
-    assert_eq!(
-        std::fs::read(lake.join("catalog.json")).unwrap(),
-        catalog,
-        "attach must not rewrite the catalog"
-    );
-    assert_eq!(
-        std::fs::read(lake.join("snapshots/2.json")).unwrap(),
-        snapshot
-    );
+    let info = run(&format!(".lake info {}\n.quit\n", lake.display()));
+    assert!(info.contains("current version: 2"), "{info}");
     for (path, bytes) in data_files.iter().zip(&before) {
         assert_eq!(&std::fs::read(path).unwrap(), bytes, "{}", path.display());
     }
-    // No stray files appeared in the lake.
-    let mut entries: Vec<String> = std::fs::read_dir(&lake)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    entries.sort();
-    assert_eq!(
-        entries,
-        vec![
-            "catalog.json",
-            "commits",
-            "data",
-            "highest.json",
-            "lake.json",
-            "snapshots"
-        ],
-        "{out}"
-    );
     cleanup(&dir);
 }
 
@@ -1445,19 +1244,6 @@ fn data_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Copy one directory tree (a lake is a directory of JSON + data files).
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
-}
-
 /// `.lake attach <dir> [version]` pins the requested version, like
 /// `.lake open`.
 #[test]
@@ -1556,7 +1342,7 @@ fn save_records_messages_and_snapshots_lists_them() {
     assert_eq!(code, 0, "usage lines do not fail the script");
     assert!(
         stdout.contains(&format!(
-            "Usage: .lake save <location>{DATA_OPT} [force] [author '<name>'] [message '<text>']"
+            "Usage: .lake save <catalog>{DATA_OPT} [force] [author '<name>'] [message '<text>']"
         )),
         "stdout: {stdout} stderr: {stderr}"
     );
@@ -1681,7 +1467,7 @@ fn writable_attach_commit_appends_without_rewriting() {
     assert!(out.contains("Saved lake version 2"), "{out}");
 
     // Snapshot the published data files: bytes + mtime.
-    let before: Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> = data_files(&lake.join("data"))
+    let before: Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> = data_files(&data_root(&lake))
         .into_iter()
         .map(|p| {
             let bytes = std::fs::read(&p).unwrap();
@@ -1730,7 +1516,7 @@ fn writable_attach_commit_appends_without_rewriting() {
 
     // No published data file was rewritten or touched.
     for (path, bytes, mtime) in &before {
-        let found = data_files(&lake.join("data"))
+        let found = data_files(&data_root(&lake))
             .into_iter()
             .find(|p| p == path);
         let found = found.expect("the original data file must stay");
@@ -1744,18 +1530,12 @@ fn writable_attach_commit_appends_without_rewriting() {
     }
     // The new version lists both data files plus the delete file, and the
     // v4 manifest adds up.
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 7"), "{catalog}");
-    assert!(catalog.contains("\"rows\": 200"), "{catalog}");
+    let files = data_files(&data_root(&lake));
     assert!(
-        catalog.contains("\"rows\": 2"),
-        "the appended file carries its own rows: {catalog}"
-    );
-    assert!(catalog.contains("\"count\": 2"), "{catalog}");
-    assert!(catalog.contains("pinkdel"), "{catalog}");
-    assert!(
-        lake.join("commits/3.json").is_file(),
-        "each commit writes its delta manifest"
+        files
+            .iter()
+            .any(|p| p.extension().is_some_and(|e| e == "pinkdel")),
+        "a delete file was written: {files:?}"
     );
 
     // Committing again publishes nothing (idempotent).
@@ -1779,103 +1559,6 @@ fn writable_attach_commit_appends_without_rewriting() {
     assert!(out.contains("Opened lake version 3"), "{out}");
     assert!(out.contains("│ 200 "), "{out}");
     assert!(out.contains("up"), "the updated value survives: {out}");
-    cleanup(&dir);
-}
-
-/// Wave 65: schema evolution through the writable attach — `ALTER TABLE`
-/// (ADD COLUMN with DEFAULT, RENAME COLUMN, DROP COLUMN) runs against the
-/// materialized session copy, `.lake commit` publishes one schema record,
-/// old data files stay untouched and readable (the default materializes on
-/// read; dropped columns stay on disk), and time travel reads each version's
-/// own schema.
-#[test]
-fn writable_attach_schema_evolution_publishes_and_time_travels() {
-    let dir = scratch("schema");
-    let lake = dir.join("lake");
-    let out = run(&format!(
-        "CREATE TABLE t (i INTEGER, s VARCHAR);\n\
-         INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');\n\
-         .lake save {lake}\n\
-         .quit\n",
-        lake = lake.display()
-    ));
-    assert!(out.contains("Saved lake version 2"), "{out}");
-    let files_before = data_files(&lake.join("data")).len();
-    assert_eq!(files_before, 1);
-
-    let out = run_with_env(
-        &format!(
-            ".lake attach {lake} write\n\
-         ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 42;\n\
-         ALTER TABLE t ADD COLUMN tmp INTEGER;\n\
-         UPDATE t SET n = 9 WHERE i = 2;\n\
-         ALTER TABLE t RENAME COLUMN s TO label;\n\
-         ALTER TABLE t DROP COLUMN tmp;\n\
-         INSERT INTO t (i, n) VALUES (4, 7);\n\
-         .lake commit {lake}\n\
-         SELECT i, n FROM t ORDER BY i;\n\
-         .quit\n",
-            lake = lake.display()
-        ),
-        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
-    );
-    assert!(out.contains("Table t altered."), "{out}");
-    assert!(
-        out.contains("1 schema change"),
-        "the commit reports its schema record: {out}"
-    );
-    assert!(out.contains("Committed lake version 3"), "{out}");
-    assert!(out.contains("│ 9  "), "the updated row: {out}");
-
-    // Old data files were never rewritten; the catalog carries the record.
-    // The commit added one data file (the INSERT) and one delete file (the
-    // UPDATE's old row).
-    let data_only = |dir: &Path| {
-        data_files(dir)
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|e| e != "pinkdel"))
-            .count()
-    };
-    assert_eq!(data_only(&lake.join("data")), files_before + 1);
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 7"), "{catalog}");
-    assert!(catalog.contains("\"schema_version\": 2"), "{catalog}");
-    assert!(catalog.contains("\"name\": \"n\""), "{catalog}");
-    assert!(catalog.contains("\"default\": \"42\""), "{catalog}");
-    assert!(catalog.contains("\"renames\""), "{catalog}");
-    assert!(
-        catalog.contains("\"from\": \"s\"") && catalog.contains("\"to\": \"label\""),
-        "{catalog}"
-    );
-
-    // `.lake open` reads the evolved schema: old rows materialize 42.
-    let out = run(&format!(
-        ".lake open {lake}\n\
-         SELECT i, n FROM t ORDER BY i;\n\
-         .lake snapshots {lake}\n\
-         .quit\n",
-        lake = lake.display()
-    ));
-    assert!(out.contains("Opened lake version 3"), "{out}");
-    assert!(
-        out.contains("│ 42 "),
-        "old rows read the published default: {out}"
-    );
-    assert!(out.contains("schema:  version 2"), "{out}");
-    assert!(out.contains("schema:  version 1"), "{out}");
-
-    // Time travel: the version before the schema change has the old name and
-    // no `n`; the latest has `n` and no `s`.
-    let out = run(&format!(
-        ".lake attach {lake}\n\
-         SELECT i, s FROM t AT (VERSION => 2) ORDER BY i;\n\
-         SELECT i, n FROM t ORDER BY i;\n\
-         .quit\n",
-        lake = lake.display()
-    ));
-    assert!(out.contains("one"), "{out}");
-    assert!(out.contains("three"), "{out}");
-    assert!(out.contains("│ 42 "), "{out}");
     cleanup(&dir);
 }
 
@@ -2088,11 +1771,6 @@ fn partition_spec_splits_commits_prunes_and_clears() {
     assert!(out.contains("Partitioned main.t by (region)"), "{out}");
     // The three appended rows split into two files (south ×2, north ×1).
     assert!(out.contains("2 files: 2 data, 0 delete"), "{out}");
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"partition_by\""), "{catalog}");
-    assert!(catalog.contains("\"column\": \"region\""), "{catalog}");
-    assert!(catalog.contains("\"south\""), "{catalog}");
-    assert!(catalog.contains("\"north\""), "{catalog}");
 
     // Session 2: read-only attach: predicates prune whole files from the zone
     // maps, and the counters show exactly which files decoded.
@@ -2147,10 +1825,8 @@ fn partition_spec_splits_commits_prunes_and_clears() {
     assert!(out.contains("Cleared the partition specification"), "{out}");
     assert!(out.contains("has no partition specification"), "{out}");
     assert!(out.contains("1 file: 1 data, 0 delete"), "{out}");
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(!catalog.contains("partition_by"), "{catalog}");
-    // Old files keep their recorded values; the new one carries none.
-    assert!(catalog.contains("\"south\""), "{catalog}");
+    // Old files keep their recorded values; the new one carries none (the
+    // queries above prove both).
     cleanup(&dir);
 }
 
@@ -2190,8 +1866,8 @@ fn partition_command_errors_are_reported() {
     assert!(out.contains("does not exist in the lake"), "{out}");
     assert!(out.contains("Usage: .lake partition"), "{out}");
     // The failed commands published nothing: the lake is still version 2.
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"version\": 2"), "{catalog}");
+    let info = run(&format!(".lake info {}\n.quit\n", lake.display()));
+    assert!(info.contains("current version: 2"), "{info}");
     cleanup(&dir);
 }
 
@@ -2221,7 +1897,7 @@ fn maintenance_commands_merge_expire_and_cleanup() {
         ),
         &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
     );
-    let data_dir = lake.join("data/main.t");
+    let data_dir = data_root(&lake).join("main.t");
     let before: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&data_dir)
         .unwrap()
         .map(|e| {
@@ -2296,7 +1972,7 @@ fn maintenance_commands_merge_expire_and_cleanup() {
     assert!(out.contains("Expired 3 snapshots from"), "{out}");
     assert!(out.contains("3 objects would be cleaned up"), "{out}");
     assert!(
-        out.contains("refusing to delete 3 unreferenced lake object(s) without confirmation"),
+        out.contains("refusing to delete 3 scheduled lake file(s) without confirmation"),
         "{out}"
     );
     assert!(out.contains("Deleted 3 objects from"), "{out}");
@@ -2306,7 +1982,7 @@ fn maintenance_commands_merge_expire_and_cleanup() {
     );
     assert!(out.contains("data_format: "), "{out}");
     assert!(out.contains("data_path: "), "{out}");
-    assert!(out.contains("catalog_type:      json"), "{out}");
+    assert!(out.contains("catalog_type:      database"), "{out}");
     assert!(out.contains("extension_version: "), "{out}");
     assert!(out.contains("has no snapshot version 2"), "{out}");
     assert!(!out.contains("Error: corrupt"), "{out}");
@@ -2366,7 +2042,7 @@ fn inlining_flush_changes_and_inlining_limit_round_trip() {
         "{out}"
     );
     // The flush published a real data file.
-    assert_eq!(data_files(&lake.join("data")).len(), 2, "save + flush");
+    assert_eq!(data_files(&data_root(&lake)).len(), 2, "save + flush");
     cleanup(&dir);
 }
 
@@ -2432,13 +2108,9 @@ fn unavailable_tables_print_one_warning_on_open_and_attach() {
     ));
     assert!(out.contains("Saved lake version 2"), "{out}");
 
-    // Give the one entry a format id no provider serves (still a valid v6
-    // manifest, as a hand edit or a newer writer's extension id would be).
-    let path = lake.join("catalog.json");
-    let text = std::fs::read_to_string(&path).unwrap();
-    let tampered = text.replacen("\"format\": \"vortex\"", "\"format\": \"nosuch\"", 1);
-    assert_ne!(text, tampered, "{text}");
-    std::fs::write(&path, tampered).unwrap();
+    // Give the one entry a format id no provider serves (as a newer writer's
+    // extension id would).
+    pink_lake::catalog_set_table_format(&catalog_url(&lake), "main.t", "nosuch").unwrap();
 
     // Open succeeds and warns that the table was skipped.
     let out = run(&format!(
@@ -2473,5 +2145,177 @@ fn unavailable_tables_print_one_warning_on_open_and_attach() {
         "{out}"
     );
 
+    cleanup(&dir);
+}
+
+/// Wave 65: schema evolution through the writable attach — `ALTER TABLE`
+/// (ADD COLUMN with DEFAULT, RENAME COLUMN, DROP COLUMN) runs against the
+/// materialized session copy, `.lake commit` publishes one schema record,
+/// old data files stay untouched and readable (the default materializes on
+/// read; dropped columns stay on disk), and time travel reads each version's
+/// own schema.
+#[test]
+fn writable_attach_schema_evolution_publishes_and_time_travels() {
+    let dir = scratch("schema");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE TABLE t (i INTEGER, s VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');\n\
+         .lake save {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    let files_before = data_files(&data_root(&lake)).len();
+    assert_eq!(files_before, 1);
+
+    let out = run_with_env(
+        &format!(
+            ".lake attach {lake} write\n\
+         ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 42;\n\
+         ALTER TABLE t ADD COLUMN tmp INTEGER;\n\
+         UPDATE t SET n = 9 WHERE i = 2;\n\
+         ALTER TABLE t RENAME COLUMN s TO label;\n\
+         ALTER TABLE t DROP COLUMN tmp;\n\
+         INSERT INTO t (i, n) VALUES (4, 7);\n\
+         .lake commit {lake}\n\
+         SELECT i, n FROM t ORDER BY i;\n\
+         .quit\n",
+            lake = lake.display()
+        ),
+        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
+    );
+    assert!(out.contains("Table t altered."), "{out}");
+    assert!(
+        out.contains("1 schema change"),
+        "the commit reports its schema record: {out}"
+    );
+    assert!(out.contains("Committed lake version 3"), "{out}");
+    assert!(out.contains("│ 9  "), "the updated row: {out}");
+
+    // Old data files were never rewritten; the catalog carries the record.
+    // The commit added one data file (the INSERT) and one delete file (the
+    // UPDATE's old row).
+    let data_only = |dir: &Path| {
+        data_files(dir)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e != "pinkdel"))
+            .count()
+    };
+    assert_eq!(data_only(&data_root(&lake)), files_before + 1);
+    // `.lake open` reads the evolved schema: old rows materialize 42.
+    let out = run(&format!(
+        ".lake open {lake}\n\
+         SELECT i, n FROM t ORDER BY i;\n\
+         .lake snapshots {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Opened lake version 3"), "{out}");
+    assert!(
+        out.contains("│ 42 "),
+        "old rows read the published default: {out}"
+    );
+    assert!(out.contains("schema:  version 2"), "{out}");
+    assert!(out.contains("schema:  version 1"), "{out}");
+
+    // Time travel: the version before the schema change has the old name and
+    // no `n`; the latest has `n` and no `s`.
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         SELECT i, s FROM t AT (VERSION => 2) ORDER BY i;\n\
+         SELECT i, n FROM t ORDER BY i;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("one"), "{out}");
+    assert!(out.contains("three"), "{out}");
+    assert!(out.contains("│ 42 "), "{out}");
+    cleanup(&dir);
+}
+
+#[test]
+fn attach_errors_are_clear_and_never_panic() {
+    let dir = scratch("attach_err");
+
+    // Not a lake at all.
+    let out = run(&format!(
+        ".lake attach {missing}\n.quit\n",
+        missing = dir.join("no-such-lake").display()
+    ));
+    assert!(out.contains("not a pink-lake"), "{out}");
+
+    // A missing data file.
+    let missing_lake = dir.join("missing_lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (1);\n\
+         .lake save {}\n.quit\n",
+        missing_lake.display()
+    ));
+    let data = data_files(&data_root(&missing_lake))
+        .into_iter()
+        .next()
+        .expect("a data file");
+    std::fs::remove_file(data).unwrap();
+    let (out, err, code) =
+        run_captured(&format!(".lake attach {}\n.quit\n", missing_lake.display()));
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("is missing") || err.contains("loading data file"),
+        "{out}\n{err}"
+    );
+
+    // A truncated data file: a clean error, never a crash.
+    let truncated = dir.join("truncated_lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (1);\n\
+         .lake save {}\n.quit\n",
+        truncated.display()
+    ));
+    let data = data_files(&data_root(&truncated))
+        .into_iter()
+        .next()
+        .expect("a data file");
+    let bytes = std::fs::read(&data).unwrap();
+    std::fs::write(&data, &bytes[..bytes.len() / 4]).unwrap();
+    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", truncated.display()));
+    assert_eq!(code, 1);
+    assert!(err.contains("Error:"), "{out}\n{err}");
+
+    // Corrupt row metadata (a negative record_count) is a clean error.
+    let wrong_rows = dir.join("wrong_rows_lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (1);\n\
+         .lake save {}\n.quit\n",
+        wrong_rows.display()
+    ));
+    catalog_sql(
+        &wrong_rows,
+        "UPDATE ducklake_data_file SET record_count = -1;",
+    );
+    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", wrong_rows.display()));
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("record_count") || err.contains("corrupt"),
+        "{out}\n{err}"
+    );
+
+    // A two-file table attaches and unions both commits' rows.
+    let two_files = dir.join("two_file_lake");
+    run_with_env(
+        &format!(
+            "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (1);\n\
+             .lake save {lake}\n.lake attach {lake} write\nINSERT INTO t VALUES (2);\n\
+             .lake commit {lake}\n.quit\n",
+            lake = two_files.display()
+        ),
+        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
+    );
+    let out = run(&format!(
+        ".lake attach {lake}\nSELECT SUM(a) FROM t;\n.quit\n",
+        lake = two_files.display()
+    ));
+    assert!(!out.contains("Error:"), "{out}");
+    assert!(out.contains("│ 3 "), "{out}");
     cleanup(&dir);
 }

@@ -58,9 +58,34 @@ fn rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
     }
 }
 
+fn s3_catalog(config: &pink_lake::S3Config) -> String {
+    let sanitize = |text: &str| -> String {
+        text.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    };
+    let dir = std::env::temp_dir()
+        .join("pinkdb-s3-catalogs")
+        .join(std::process::id().to_string())
+        .join(sanitize(&config.bucket))
+        .join(sanitize(&config.prefix));
+    std::fs::create_dir_all(&dir).ok();
+    format!("pink:{}", dir.join("catalog.pink").display())
+}
+
+fn create_s3_lake(config: pink_lake::S3Config) -> pink_lake::Result<Lake> {
+    let catalog = s3_catalog(&config);
+    Lake::create_with_catalog_s3(&catalog, config)
+}
+
+fn open_s3_lake(config: pink_lake::S3Config) -> pink_lake::Result<Lake> {
+    let catalog = s3_catalog(&config);
+    Lake::open_with_catalog_s3(&catalog, config)
+}
+
 fn save_fixture(mock: &MockS3, prefix: &str) {
     pink_lake_parquet::register().unwrap();
-    let mut lake = Lake::create_s3(mock_config(mock, prefix)).unwrap();
+    let mut lake = create_s3_lake(mock_config(mock, prefix)).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.set_write_format("parquet").unwrap();
     lake.write_from_store(&fast_store()).unwrap();
@@ -82,7 +107,7 @@ fn measure(
     Vec<Vec<Value>>,
 ) {
     let before = mock.requests().len();
-    let lake = Lake::open_s3(mock_config(mock, prefix)).unwrap();
+    let lake = open_s3_lake(mock_config(mock, prefix)).unwrap();
     let after_open = mock.requests().len();
     let open_stats = lake.transport_stats();
     let report = lake.attach(None).unwrap();
@@ -133,13 +158,10 @@ fn parquet_lake_attach_and_queries_use_the_ranged_read_path() {
         attach_stats.1, query_stats.1
     );
     assert_eq!(count_rows, vec![vec![Value::Bigint(20_000)]]);
+    assert_eq!(open_count, 0, "the catalog is local, not object storage");
     assert_eq!(
-        open_count, 5,
-        "open: identity HEAD, then lake.json+catalog, then highest+snapshot"
-    );
-    assert_eq!(
-        attach_count, 1,
-        "attach: one manifest GET, no data-file request (no existence HEAD)"
+        attach_count, 0,
+        "statistics come from the catalog; attach reads no object"
     );
     assert_eq!(query_count, 0, "COUNT(*) must not read a data file");
     assert!(
@@ -156,8 +178,8 @@ fn parquet_lake_attach_and_queries_use_the_ranged_read_path() {
         attach_stats.1, query_stats.1
     );
     assert_eq!(scan_rows.len(), 20_000);
-    assert_eq!(open_scan, 5);
-    assert_eq!(attach_scan, 1);
+    assert_eq!(open_scan, 0);
+    assert_eq!(attach_scan, 0);
     assert!(query_scan >= 1, "the scan reads at least one data range");
     assert!(
         query_stats.1 < file_bytes as u64,
@@ -165,7 +187,7 @@ fn parquet_lake_attach_and_queries_use_the_ranged_read_path() {
         query_stats.1
     );
     // Every value and its order match the eager load exactly.
-    let loaded = Lake::open_s3(mock_config(&mock, "fast/parquet"))
+    let loaded = open_s3_lake(mock_config(&mock, "fast/parquet"))
         .unwrap()
         .load(None)
         .unwrap();

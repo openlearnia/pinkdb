@@ -9,6 +9,8 @@
 //! locks) live in `catalog_store/postgres.rs` and run without a server.
 
 #![cfg(feature = "catalog-postgres")]
+#[path = "common/local_lake.rs"]
+mod local_lake;
 
 #[cfg(feature = "s3")]
 #[path = "../src/mock_s3.rs"]

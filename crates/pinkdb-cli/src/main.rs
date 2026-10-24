@@ -239,9 +239,6 @@ fn print_help() {
         println!(
             "  .lake commit {LAKE}        publish the writable attach as one incremental version"
         );
-        println!("  .lake migrate-catalog <from> to <to> [data <location>]");
-        println!("                                copy metadata byte-for-byte to a catalog and");
-        println!("                                retire the source (password never printed)");
         println!("  .lake partition {LAKE} <t> by (<key>, ...) | clear");
         println!("                                set/clear a table's partition spec (identity or");
         println!("                                bucket(N, col)); new writes split per value set");

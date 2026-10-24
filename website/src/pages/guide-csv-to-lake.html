@@ -36,10 +36,13 @@ pinkdb&gt; .lake info mylake
 pinkdb&gt; .lake versions mylake
 pinkdb&gt; .lake tables mylake</code></pre>
 
-<p>Each save is a <strong>full snapshot</strong>: fresh immutable data files, a new
-<code>snapshots/&lt;version&gt;.json</code>, then a replaced
-<code>catalog.json</code>. The first save of an empty store creates version 1 and
-publishes version 2 with your data.</p>
+<p>Each save is a <strong>full snapshot</strong>: fresh immutable data files and one
+catalog transaction. The catalog is a <code>pink:</code> database by default
+(<code>mylake</code> means <code>pink:mylake</code>, with data in
+<code>mylake.files/</code>); use <code>sqlite:</code> or <code>postgres://</code>
+for a shared catalog, and <code>data &lt;dir|s3://…&gt;</code> to keep data
+elsewhere. The first save of an empty store creates version 1 and publishes
+version 2 with your data.</p>
 
 <h2>4. Reopen in a fresh process</h2>
 
@@ -50,7 +53,8 @@ pinkdb&gt; SELECT COUNT(*) FROM sales;
 pinkdb&gt; .lake open mylake 2      -- an earlier published version, if you have one</code></pre>
 
 <p><code>.lake open</code> replaces the in-memory store with a published version and
-resets the session database to <code>main</code>.</p>
+resets the session database to <code>main</code>. A bare path is a
+<code>pink:</code> catalog; <code>.lake open mylake 2</code> time-travels.</p>
 
 <h2>5. Attach read-only (the fast path)</h2>
 

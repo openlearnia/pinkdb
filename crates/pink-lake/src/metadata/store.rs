@@ -392,23 +392,6 @@ impl SqlMetadataStore {
         })
     }
 
-    /// A compatibility no-op: the manifest's logical content is derived from
-    /// the snapshot rows, so there is nothing separate to store.
-    pub(crate) fn put_commit_manifest(&self, version: u64, _bytes: &[u8]) -> Result<bool> {
-        Ok(!self.snapshot_exists(version)?)
-    }
-
-    /// A compatibility no-op (see [`Self::put_commit_manifest`]).
-    pub(crate) fn replace_commit_manifest(&self, _version: u64, _bytes: &[u8]) -> Result<()> {
-        Ok(())
-    }
-
-    /// Whether a commit manifest exists: any real commit snapshot (pinkdb
-    /// version 2+) has one, derived on demand.
-    pub(crate) fn commit_manifest_exists(&self, version: u64) -> Result<bool> {
-        Ok(version > 1 && self.snapshot_exists(version)?)
-    }
-
     /// Whether a snapshot row exists for this pinkdb version.
     pub(crate) fn snapshot_exists(&self, version: u64) -> Result<bool> {
         let sid = snapshot_id(version)?;
@@ -440,6 +423,15 @@ impl SqlMetadataStore {
     /// The latest pinkdb version.
     pub(crate) fn head_version(&self) -> Result<Option<u64>> {
         self.with_conn(head_version_conn)
+    }
+    /// Execute one SQL statement on the catalog database (tests mutate rows
+    /// directly to simulate corruption or a lost cursor update).
+    pub(crate) fn execute_sql(&self, sql: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(sql, params![])
+                .map(|_| ())
+                .map_err(|e| sql_error("executing catalog SQL", e))
+        })
     }
 
     /// Expire snapshots and everything only they could see (DuckLake's
@@ -518,6 +510,29 @@ impl SqlMetadataStore {
         })
     }
 
+    pub(crate) fn set_table_format(&self, key: &str, format: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            let sid = head_snapshot_id(conn)?.ok_or_else(|| LakeError::NotALake {
+                path: PathBuf::from("catalog"),
+            })?;
+            let table = find_table(conn, key, sid)?.ok_or_else(|| LakeError::Corrupt {
+                path: PathBuf::from("catalog"),
+                message: format!("table \"{key}\" is not in the catalog"),
+            })?;
+            update_or_insert(
+                conn,
+                "writing a table format",
+                "UPDATE pinkdb_table SET format = ?2 WHERE table_id = ?1",
+                params![table.table_id, format],
+                "INSERT INTO pinkdb_table
+                 (table_id, catalog_key, table_id_hex, format, inlined_limit,
+                  table_schema_version)
+                 VALUES (?1, ?2, NULL, ?3, NULL, 0)",
+                params![table.table_id, key, format],
+            )
+        })
+    }
+
     pub(crate) fn is_encrypted(&self) -> Result<bool> {
         self.with_conn(|conn| {
             let value: Option<String> = conn
@@ -563,16 +578,6 @@ impl SqlMetadataStore {
         })
     }
 
-    /// The version numbers with a commit-delta manifest, ascending: every
-    /// real commit snapshot. Snapshot 0 (pinkdb version 1) is the create.
-    pub(crate) fn commit_versions(&self) -> Result<Vec<u64>> {
-        Ok(self
-            .snapshot_versions()?
-            .into_iter()
-            .filter(|version| *version > 1)
-            .collect())
-    }
-
     // ---------- opaque side objects ----------
 
     pub(crate) fn put_object(&self, rel: &str, bytes: &[u8], replace: bool) -> Result<bool> {
@@ -607,19 +612,6 @@ impl SqlMetadataStore {
                 |row| row.get(0),
             )
             .map_err(|e| sql_error("reading a catalog object", e))
-        })
-    }
-
-    pub(crate) fn object_exists(&self, rel: &str) -> Result<bool> {
-        self.with_conn(|conn| {
-            let found: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM pinkdb_object WHERE path = ?1",
-                    params![rel],
-                    |row| row.get(0),
-                )
-                .map_err(|e| sql_error("checking a catalog object", e))?;
-            Ok(found.is_some())
         })
     }
 
@@ -797,6 +789,14 @@ impl MetadataStore for SqlMetadataStore {
 
     fn head_version(&self) -> Result<Option<u64>> {
         SqlMetadataStore::head_version(self)
+    }
+
+    fn snapshot_versions(&self) -> Result<Vec<u64>> {
+        SqlMetadataStore::snapshot_versions(self)
+    }
+
+    fn snapshot_exists(&self, version: u64) -> Result<bool> {
+        SqlMetadataStore::snapshot_exists(self, version)
     }
 
     fn head(&self) -> Result<Option<Catalog>> {
@@ -2466,9 +2466,9 @@ fn load_files(
         // The visible data-file ids are already in hand; filtering the
         // statistics rows by them in Rust avoids two joins in pinkdb's query
         // engine (the join dominated a 1,000-file attach).
-        let visible: std::collections::HashSet<i64> = rows
+        let visible: std::collections::HashMap<i64, i64> = rows
             .iter()
-            .filter_map(|row| row.as_ref().ok().map(|row| row.0))
+            .filter_map(|row| row.as_ref().ok().map(|row| (row.0, row.7)))
             .collect();
         Some(load_stats_blocks(conn, table.table_id, &visible)?)
     } else {
@@ -2490,6 +2490,15 @@ fn load_files(
             footer_len,
             footer_crc,
         ) = row.map_err(|e| sql_error("reading data files", e))?;
+        if record_count.is_some_and(|rows| rows < 0) {
+            return Err(LakeError::Corrupt {
+                path: PathBuf::from(&table.table_key),
+                message: format!(
+                    "data file \"{path}\" has a negative record_count ({})",
+                    record_count.unwrap()
+                ),
+            });
+        }
         let composed = compose_path(&table.schema_path, &table.table_path, &path);
         let stats = if with_stats {
             build_stats_block(
@@ -2500,7 +2509,7 @@ fn load_files(
                     .as_mut()
                     .and_then(|blocks| blocks.remove(&file_id))
                     .unwrap_or_default(),
-            )
+            )?
         } else {
             None
         };
@@ -2551,15 +2560,19 @@ type StatRow = (
 fn load_stats_blocks(
     conn: &dyn SqlConnection,
     table_id: i64,
-    visible: &std::collections::HashSet<i64>,
+    visible: &std::collections::HashMap<i64, i64>,
 ) -> Result<std::collections::HashMap<i64, Vec<StatRow>>> {
-    // Column ids are few; one small query gives name/type/order. The
-    // statistics query then has no joins at all, and the visible-file filter
-    // is already in memory.
+    // A statistics row is keyed by column id, and a rename reuses the id for
+    // the new name. The file's bytes still carry the name from the schema
+    // epoch it was written under, so resolve each stat against the column
+    // definition visible at that file's begin snapshot — not the column's
+    // current name.
     let stmt = conn
         .prepare(
-            "SELECT column_id, column_order, column_name, column_type
-             FROM ducklake_column WHERE table_id = ?1",
+            "SELECT column_id, column_order, column_name, column_type,
+                    begin_snapshot, end_snapshot
+             FROM ducklake_column WHERE table_id = ?1
+             ORDER BY begin_snapshot, column_id",
         )
         .map_err(|e| sql_error("reading statistics columns", e))?;
     let columns = stmt
@@ -2569,14 +2582,21 @@ fn load_stats_blocks(
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         })
         .map_err(|e| sql_error("reading statistics columns", e))?;
-    let mut column_map: std::collections::HashMap<i64, (i64, String, String)> =
+    type ColumnHistory = Vec<(i64, Option<i64>, i64, String, String)>;
+    let mut column_history: std::collections::HashMap<i64, ColumnHistory> =
         std::collections::HashMap::new();
     for row in columns {
-        let (id, order, name, ty) = row.map_err(|e| sql_error("reading statistics columns", e))?;
-        column_map.insert(id, (order, name, ty));
+        let (id, order, name, ty, begin, end) =
+            row.map_err(|e| sql_error("reading statistics columns", e))?;
+        column_history
+            .entry(id)
+            .or_default()
+            .push((begin, end, order, name, ty));
     }
     let stmt = conn
         .prepare(
@@ -2602,10 +2622,19 @@ fn load_stats_blocks(
     for row in rows {
         let (file_id, column_id, nulls, min, max, contains_nan) =
             row.map_err(|e| sql_error("reading file statistics", e))?;
-        if !visible.contains(&file_id) {
+        let Some(file_begin) = visible.get(&file_id) else {
             continue;
-        }
-        let Some((order, name, ty)) = column_map.get(&column_id) else {
+        };
+        let Some(history) = column_history.get(&column_id) else {
+            continue;
+        };
+        let Some((order, name, ty)) = history
+            .iter()
+            .find(|(begin, end, _, _, _)| {
+                begin <= file_begin && end.is_none_or(|end| end > *file_begin)
+            })
+            .map(|(_, _, order, name, ty)| (order, name, ty))
+        else {
             continue;
         };
         staged.entry(file_id).or_default().push((
@@ -2627,19 +2656,34 @@ fn build_stats_block(
     composed: &str,
     record_count: Option<i64>,
     rows: Vec<StatRow>,
-) -> Option<StatsBlock> {
+) -> Result<Option<StatsBlock>> {
     if rows.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut columns = Vec::with_capacity(rows.len());
     for (name, column_type, nulls, min, max, contains_nan) in rows {
         let dtype = pink_dtype(&column_type);
+        let column_name = name.clone();
+        let decode_stat = |value: Option<String>| -> Result<Option<String>> {
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            ducklake_to_canonical(dtype, &value)
+                .map(Some)
+                .ok_or_else(|| LakeError::Corrupt {
+                    path: PathBuf::from(composed),
+                    message: format!(
+                        "table \"{table_key}\": column \"{column_name}\" has a statistic \
+                         \"{value}\" that does not decode as {dtype:?}"
+                    ),
+                })
+        };
         columns.push(stats::StatsColumn {
             name,
             dtype: stats::dtype_name(dtype),
             nulls: nulls.map(i64_to_u64).unwrap_or(0),
-            min: min.and_then(|v| ducklake_to_canonical(dtype, &v)),
-            max: max.and_then(|v| ducklake_to_canonical(dtype, &v)),
+            min: decode_stat(min)?,
+            max: decode_stat(max)?,
             nan: (dtype == pinkdb::DataType::Double)
                 .then_some(contains_nan.unwrap_or(0).max(0) as u64),
         });
@@ -2658,7 +2702,7 @@ fn build_stats_block(
     // the dominant cost at 10,000 files — and protect against nothing the
     // catalog read did not already establish.
     let _ = &mut block;
-    Some(block)
+    Ok(Some(block))
 }
 
 fn load_file_stats(
@@ -2674,8 +2718,12 @@ fn load_file_stats(
             "SELECT c.column_name, c.column_type, s.null_count, s.min_value, s.max_value,
                     s.contains_nan
              FROM ducklake_file_column_stats s
+             JOIN ducklake_data_file f
+               ON f.data_file_id = s.data_file_id
              JOIN ducklake_column c
                ON c.table_id = s.table_id AND c.column_id = s.column_id
+              AND c.begin_snapshot <= f.begin_snapshot
+              AND (c.end_snapshot IS NULL OR c.end_snapshot > f.begin_snapshot)
              WHERE s.data_file_id = ?1 AND s.table_id = ?2
              ORDER BY c.column_order",
         )
@@ -2698,7 +2746,7 @@ fn load_file_stats(
     }
     // Re-seal the reconstructed block exactly as the writer did, so `.pink`
     // attach can still verify it. The CRC covers the table key and path.
-    Ok(build_stats_block(table_key, composed, record_count, rows))
+    build_stats_block(table_key, composed, record_count, rows)
 }
 
 fn load_partition_values(
@@ -3279,6 +3327,9 @@ fn commit_delta_in_conn(
     let mut next_file_id = state.next_file_id.max(0);
     let mut changes: Vec<String> = Vec::new();
 
+    // Tables whose columns began or ended at this snapshot: exactly these get
+    // a `ducklake_schema_versions` row, as DuckLake writes.
+    let mut altered_tables: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
     for (key, delta) in &change.manifest.tables {
         let runtime = &delta.runtime;
         let (schema_name, table_name) = split_key(key)?;
@@ -3349,7 +3400,14 @@ fn commit_delta_in_conn(
         let stub = entry_from_meta(meta);
 
         // Schema and partition records.
-        sync_columns(conn, &row, None, &stub, sid)?;
+        // A column change on an existing table is DuckLake's `altered_table`
+        // (a created table's columns are part of `created_table`).
+        if sync_columns(conn, &row, None, &stub, sid)? {
+            altered_tables.insert(row.table_id);
+            if !runtime.created {
+                changes.push(format!("altered_table:{}", row.table_id));
+            }
+        }
         if delta.partition_changed {
             sync_partition_spec(conn, &row, &stub, sid, &mut changes)?;
         }
@@ -3577,13 +3635,7 @@ fn commit_delta_in_conn(
                 }
                 continue;
             };
-            if delta.runtime.created
-                || delta
-                    .runtime
-                    .meta
-                    .as_ref()
-                    .is_some_and(|m| m.columns.is_some())
-            {
+            if delta.runtime.created || altered_tables.contains(&row.table_id) {
                 conn.execute(
                     "INSERT INTO ducklake_schema_versions
                      (begin_snapshot, schema_version, table_id) VALUES (?1, ?2, ?3)",
@@ -4153,11 +4205,14 @@ fn sync_columns(
     base: Option<&TableEntry>,
     target: &TableEntry,
     sid: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let target_columns = target.columns.as_deref().unwrap_or(&[]);
     if target_columns.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
+    // Whether any `ducklake_column` row began or ended at `sid` (DuckLake's
+    // `altered_table` and a `ducklake_schema_versions` row follow from it).
+    let mut altered = false;
     let mut live: Vec<(i64, i64, String, String)> = Vec::new(); // id, order, name, type
     {
         let stmt = conn
@@ -4209,6 +4264,7 @@ fn sync_columns(
                 // A type change: end the old row and insert the new type
                 // under the same column id.
                 end_column(conn, row.table_id, existing.0, sid)?;
+                altered = true;
                 insert_column(
                     conn,
                     row,
@@ -4228,6 +4284,10 @@ fn sync_columns(
         {
             consumed.insert(rename.from.clone());
             end_column(conn, row.table_id, existing.0, sid)?;
+            altered = true;
+            // The renamed column keeps its epoch: it is the same column id,
+            // so a file written before the rename still holds its values and
+            // the rename map translates the physical name.
             insert_column(
                 conn,
                 row,
@@ -4264,11 +4324,13 @@ fn sync_columns(
             column,
             sid,
         )?;
+        altered = true;
         consumed.insert(column.name.clone());
     }
     for column in &live {
         if !consumed.contains(&column.2) && !target_names.contains(column.2.as_str()) {
             end_column(conn, row.table_id, column.0, sid)?;
+            altered = true;
         }
     }
     // Persist the pink rename log even when the columns already match.
@@ -4286,7 +4348,7 @@ fn sync_columns(
         )?;
     }
     let _ = base;
-    Ok(())
+    Ok(altered)
 }
 
 fn end_column(conn: &dyn SqlConnection, table_id: i64, column_id: i64, sid: i64) -> Result<()> {

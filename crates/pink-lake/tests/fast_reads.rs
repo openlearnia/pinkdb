@@ -21,12 +21,15 @@
 //! request at all); the two-column query is the one that has to read data.
 
 #![cfg(all(feature = "s3", feature = "vortexlake"))]
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 #[path = "../src/mock_s3.rs"]
 mod mock_s3;
 
 use mock_s3::MockS3;
-use pink_lake::{Lake, S3Config};
+use pink_lake::S3Config;
 use pinkdb::{PinkDb, QueryResult, Value};
 
 fn mock_config(mock: &MockS3, prefix: &str) -> S3Config {
@@ -73,7 +76,7 @@ fn rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
 }
 
 fn save_fixture(mock: &MockS3, prefix: &str) {
-    let mut lake = Lake::create_s3(mock_config(mock, prefix)).unwrap();
+    let mut lake = create_s3_lake(mock_config(mock, prefix)).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&fast_store()).unwrap();
 }
@@ -95,7 +98,7 @@ fn measure(
     Vec<Vec<Value>>,
 ) {
     let before = mock.requests().len();
-    let lake = Lake::open_s3(mock_config(mock, prefix)).unwrap();
+    let lake = open_s3_lake(mock_config(mock, prefix)).unwrap();
     let after_open = mock.requests().len();
     let open_stats = lake.transport_stats();
     let report = lake.attach(None).unwrap();
@@ -154,13 +157,10 @@ fn vortex_lake_attach_and_queries_use_the_ranged_read_path() {
         open_stats.1, attach_stats.1, query_stats.1
     );
     assert_eq!(count_rows, vec![vec![Value::Bigint(20_000)]]);
+    assert_eq!(open_count, 0, "the catalog is local, not object storage");
     assert_eq!(
-        open_count, 5,
-        "open: identity HEAD, then lake.json+catalog, then highest+snapshot"
-    );
-    assert_eq!(
-        attach_count, 3,
-        "attach: manifest GET + two ranged footer reads (no existence HEAD)"
+        attach_count, 2,
+        "attach: the two footer ranges of the one Vortex file"
     );
     assert_eq!(query_count, 0, "COUNT(*) must not read a data file");
     assert!(
@@ -178,8 +178,8 @@ fn vortex_lake_attach_and_queries_use_the_ranged_read_path() {
         open_stats.1, attach_stats.1, query_stats.1
     );
     assert_eq!(scan_rows.len(), 20_000);
-    assert_eq!(open_scan, 5);
-    assert_eq!(attach_scan, 3);
+    assert_eq!(open_scan, 0);
+    assert_eq!(attach_scan, 2);
     assert!(query_scan >= 1, "the scan reads at least one data range");
     assert!(
         query_stats.1 < file_bytes as u64,
@@ -187,7 +187,7 @@ fn vortex_lake_attach_and_queries_use_the_ranged_read_path() {
         query_stats.1
     );
     // Every value and its order match the eager load exactly.
-    let loaded = Lake::open_s3(mock_config(&mock, "fast/vortex"))
+    let loaded = open_s3_lake(mock_config(&mock, "fast/vortex"))
         .unwrap()
         .load(None)
         .unwrap();

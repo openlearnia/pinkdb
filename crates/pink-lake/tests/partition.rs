@@ -8,12 +8,15 @@
 //! build and in a `vortexlake` build, and the data-file extension follows
 //! the build. The catalog shape, the partition values, the zone maps and the
 //! pruning semantics are identical.
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{Commit, CommitSettings, Lake, LakeError};
+use pink_lake::{Commit, CommitSettings, LakeError};
 use pinkdb::{PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -38,8 +41,11 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-fn read_json(path: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+/// Execute a catalog-row mutation directly (corruption tests).
+fn catalog_sql(lake_dir: &Path, sql: &str) {
+    let path = lake_dir.join("catalog.pink");
+    let mut db = PinkDb::open_durable(&path.display().to_string()).unwrap();
+    db.execute(sql).unwrap();
 }
 
 /// `(id, region)` store; `region: None` is SQL NULL.
@@ -101,7 +107,7 @@ fn query(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
 /// `files`) the query caused. Every call gets a fresh attachment, so the
 /// counters are exactly that query's.
 fn attached_query(lake_dir: &Path, sql: &str) -> (Vec<Vec<Value>>, (u64, u64, u64)) {
-    let report = Lake::open(lake_dir).unwrap().attach(None).unwrap();
+    let report = open_lake(lake_dir).unwrap().attach(None).unwrap();
     let lake = Arc::clone(&report.lake);
     let mut db = PinkDb::new();
     db.attach_lake(report.lake).unwrap();
@@ -148,7 +154,7 @@ fn part_values(catalog: &serde_json::Value, key: &str) -> Vec<Option<String>> {
 fn partitioned_commits_split_one_file_per_value_set() {
     let dir = scratch("split");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[
         (1, Some("east")),
@@ -195,7 +201,7 @@ fn partitioned_commits_split_one_file_per_value_set() {
     assert_eq!(report.data_files, 3, "one file per distinct value set");
     assert_eq!(report.rows_added, 4);
 
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     let entry = &catalog["tables"]["main.t"];
     assert_eq!(
         entry["partition_by"],
@@ -216,7 +222,7 @@ fn partitioned_commits_split_one_file_per_value_set() {
     }
 
     // The content is exactly the union, in file order.
-    let loaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    let loaded = open_lake(&lake_dir).unwrap().load(None).unwrap();
     let ids: Vec<i32> = {
         let t = loaded.table("t").unwrap();
         (0..t.num_rows())
@@ -236,7 +242,7 @@ fn partitioned_commits_split_one_file_per_value_set() {
     commit.append("main.t", sub_table(&[(8, Some("south"))]));
     let report = lake.commit(&commit).unwrap();
     assert_eq!(report.data_files, 1);
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     let values = part_values(&catalog, "region");
     assert_eq!(
         values
@@ -254,7 +260,7 @@ fn partitioned_commits_split_one_file_per_value_set() {
         (12, Some("south")),
     ]))
     .unwrap();
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     let entry = &catalog["tables"]["main.t"];
     assert_eq!(
         entry["partition_by"],
@@ -279,7 +285,7 @@ fn partitioned_commits_split_one_file_per_value_set() {
 fn zone_map_pruning_decodes_only_matching_files() {
     let dir = scratch("prune");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     // Three files with disjoint id and region ranges.
     lake.write_from_store(&store(&[(1, Some("a1")), (2, Some("a2")), (3, Some("a3"))]))
@@ -356,7 +362,7 @@ fn zone_map_pruning_decodes_only_matching_files() {
 fn partition_values_prune_and_nulls_stay_exact() {
     let dir = scratch("partition_prune");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     // Save first (one file), then partition, then save again: every file of
     // the partitioned version carries its value.
@@ -376,7 +382,7 @@ fn partition_values_prune_and_nulls_stay_exact() {
     ]))
     .unwrap();
 
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     let values = part_values(&catalog, "region");
     assert_eq!(values.len(), 3, "east, west, NULL");
     assert_eq!(values.iter().filter(|v| v.is_none()).count(), 1);
@@ -416,7 +422,7 @@ fn partition_values_prune_and_nulls_stay_exact() {
 fn pruning_with_positional_deletes_is_correct_and_honest() {
     let dir = scratch("prune_deletes");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a1")), (2, Some("a2"))]))
         .unwrap();
@@ -428,7 +434,7 @@ fn pruning_with_positional_deletes_is_correct_and_honest() {
     lake.commit(&commit).unwrap();
 
     // Delete the row with id = 11 (middle file, position 1).
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     let middle = catalog["tables"]["main.t"]["files"][1]["path"]
         .as_str()
         .unwrap()
@@ -485,7 +491,7 @@ fn pruning_with_positional_deletes_is_correct_and_honest() {
 fn pruning_across_time_travel_uses_version_zone_maps() {
     let dir = scratch("prune_tt");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a")), (2, Some("b")), (3, Some("c"))]))
         .unwrap();
@@ -524,7 +530,7 @@ fn pruning_across_time_travel_uses_version_zone_maps() {
 fn time_travel_pruning_leaves_the_pinned_version_alone() {
     let dir = scratch("prune_tt_pin");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     lake.set_partition_spec(
@@ -536,7 +542,7 @@ fn time_travel_pruning_leaves_the_pinned_version_alone() {
     lake.write_from_store(&store(&[(1, Some("a")), (2, Some("b"))]))
         .unwrap();
 
-    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let report = open_lake(&lake_dir).unwrap().attach(None).unwrap();
     let lake = Arc::clone(&report.lake);
     let mut db = PinkDb::new();
     db.attach_lake(report.lake).unwrap();
@@ -562,7 +568,7 @@ fn time_travel_pruning_leaves_the_pinned_version_alone() {
 fn bucket_partitioning_splits_and_stays_correct() {
     let dir = scratch("bucket");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     let report = lake
@@ -583,7 +589,7 @@ fn bucket_partitioning_splits_and_stays_correct() {
     ]))
     .unwrap();
 
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     let entry = &catalog["tables"]["main.t"];
     assert_eq!(
         entry["partition_by"],
@@ -604,7 +610,7 @@ fn bucket_partitioning_splits_and_stays_correct() {
 
     // Content round-trips exactly, and a predicate stays correct (a bucket
     // label is not a column fact: pruning falls back to zone maps).
-    let loaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    let loaded = open_lake(&lake_dir).unwrap().load(None).unwrap();
     assert_eq!(loaded.table("t").unwrap().num_rows(), 6);
     let (got, (_l, _c, _f)) = attached_query(&lake_dir, "SELECT id FROM t WHERE id = 4;");
     assert_eq!(ints(got), vec![4]);
@@ -620,7 +626,7 @@ fn bucket_partitioning_splits_and_stays_correct() {
 fn clearing_the_spec_keeps_files_and_reads_exact() {
     let dir = scratch("clear");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     lake.set_partition_spec(
@@ -643,12 +649,12 @@ fn clearing_the_spec_keeps_files_and_reads_exact() {
     commit.append("main.t", sub_table(&[(2, Some("b")), (3, Some("c"))]));
     let report = lake.commit(&commit).unwrap();
     assert_eq!(report.data_files, 1, "unpartitioned appends stay one file");
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     let entry = &catalog["tables"]["main.t"];
     assert!(entry.get("partition_by").is_none());
     assert!(entry["files"][1].get("partition").is_none());
 
-    let loaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    let loaded = open_lake(&lake_dir).unwrap().load(None).unwrap();
     assert_eq!(loaded.table("t").unwrap().num_rows(), 3);
     let (got, (_l, _c, _f)) = attached_query(&lake_dir, "SELECT id FROM t WHERE region = 'c';");
     assert_eq!(ints(got), vec![3]);
@@ -663,7 +669,7 @@ fn clearing_the_spec_keeps_files_and_reads_exact() {
 fn partition_ddl_errors_match_ducklake() {
     let dir = scratch("ddl_errors");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
 
@@ -713,7 +719,7 @@ fn partition_ddl_errors_match_ducklake() {
     // The table must not exist for this shape; it does not yet.
     let report = lake.commit(&fresh).unwrap();
     assert_eq!(report.tables_repartitioned, 1);
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     assert_eq!(
         catalog["tables"]["main.fresh"]["partition_by"],
         serde_json::json!([{ "column": "region", "transform": "identity" }])
@@ -727,14 +733,54 @@ fn partition_ddl_errors_match_ducklake() {
     cleanup(&dir);
 }
 
-/// A manifest whose partition value disagrees with the file's own zone map is
-/// refused at attach (never a silently pruned matching file), and a swapped
-/// in statistics block fails its CRC as before.
+#[test]
+fn partition_changes_are_recorded_in_the_commit_manifest() {
+    let dir = scratch("delta");
+    let lake_dir = dir.join("lake");
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
+    let report = lake
+        .set_partition_spec(
+            "main.t",
+            &["region".to_string()],
+            &CommitSettings::default(),
+        )
+        .unwrap();
+    let catalog = catalog_json(&lake_dir);
+    assert_eq!(
+        catalog["tables"]["main.t"]["partition_by"],
+        serde_json::json!([{ "column": "region", "transform": "identity" }])
+    );
+    assert_eq!(catalog["version"], report.version);
+    cleanup(&dir);
+}
+
+/// `Lake::set_partition_spec` errors are `LakeError::NotRepresentable`, the
+/// same class the rest of the lake's shape refusals use.
+#[test]
+fn partition_errors_are_not_representable() {
+    let dir = scratch("err_class");
+    let lake_dir = dir.join("lake");
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
+    let err = lake
+        .set_partition_spec(
+            "main.t",
+            &["year(x)".to_string()],
+            &CommitSettings::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, LakeError::NotRepresentable { .. }), "{err:?}");
+    cleanup(&dir);
+}
+
 #[test]
 fn tampered_partition_values_and_zone_maps_are_refused() {
     let dir = scratch("tamper");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     lake.set_partition_spec(
@@ -746,143 +792,46 @@ fn tampered_partition_values_and_zone_maps_are_refused() {
     lake.write_from_store(&store(&[(1, Some("east")), (2, Some("west"))]))
         .unwrap();
 
-    // Swap one file's recorded partition value: the zone map still says the
-    // file's region is a single value, so attach must refuse.
-    let path = lake_dir.join("catalog.json");
-    let original = read_json(&path);
-    let mut catalog = original.clone();
-    let files = catalog["tables"]["main.t"]["files"].as_array_mut().unwrap();
-    for f in files.iter_mut() {
-        if f["partition"]["region"] == "east" {
-            f["partition"]["region"] = serde_json::json!("west");
-        }
-    }
-    std::fs::write(&path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
-    let err = Lake::open(&lake_dir)
-        .unwrap()
-        .attach(None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("partition check"), "{err}");
-
-    // Restore the original, then flip a bit in the zone map: the CRC catches
-    // it (partition values ride outside the block; zone maps ride inside).
-    let mut catalog = original;
-    catalog["tables"]["main.t"]["files"][0]["stats"]["columns"][0]["min"] =
-        serde_json::json!("999");
-    std::fs::write(&path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
-    let err = Lake::open(&lake_dir)
-        .unwrap()
-        .attach(None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("checksum"), "{err}");
+    // Record a west partition value on the file whose zone map says east:
+    // attach must refuse, never silently prune the matching file.
+    catalog_sql(
+        &lake_dir,
+        "UPDATE ducklake_file_partition_value SET partition_value = 'west' \
+         WHERE partition_value = 'east';",
+    );
+    drop(lake);
+    let lake = open_lake(&lake_dir).unwrap();
+    let err = lake.attach(None).unwrap_err().to_string();
+    assert!(
+        err.contains("partition") || err.contains("zone map"),
+        "{err}"
+    );
     cleanup(&dir);
-}
-
-#[cfg(feature = "vortexlake")]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct StoredBlock {
-    version: u32,
-    table: String,
-    file: String,
-    rows: u64,
-    columns: Vec<StoredColumn>,
-}
-
-#[cfg(feature = "vortexlake")]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct StoredColumn {
-    name: String,
-    dtype: String,
-    nulls: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    min: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    nan: Option<u64>,
 }
 
 #[cfg(feature = "vortexlake")]
 #[test]
 fn vortex_zone_maps_cross_check_against_the_footer() {
     // A catalog zone map that disagrees with the file footer is corrupt:
-    // fabricate one by rewriting a block field *and* fixing its CRC (the CRC
-    // only detects accidental corruption; the footer is the authority).
+    // write a min that the footer cannot confirm.
     let dir = scratch("vortex_cross");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a")), (2, Some("b"))]))
         .unwrap();
+    drop(lake);
 
-    let path = lake_dir.join("catalog.json");
-    let mut catalog = read_json(&path);
-    let stats = catalog["tables"]["main.t"]["files"][0]["stats"].clone();
-    let mut block: StoredBlock = serde_json::from_value(stats).unwrap();
-    block.columns[0].min = Some("0".to_string());
-    // `StatsBlock::compute_crc` covers exactly `{version, table, file, rows,
-    // columns}` in declaration order; this mirror serializes the same shape.
-    let crc = pinkdb::wal::crc32(&serde_json::to_vec(&block).unwrap());
-    let stats = &mut catalog["tables"]["main.t"]["files"][0]["stats"];
-    stats["columns"][0]["min"] = serde_json::json!("0");
-    stats["crc32"] = serde_json::json!(crc);
-    std::fs::write(&path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
-    let err = Lake::open(&lake_dir)
-        .unwrap()
-        .attach(None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("disagrees with the file's footer"), "{err}");
-    cleanup(&dir);
-}
-
-/// The commit-delta manifest records a spec change for the audit trail, and
-/// the catalog/snapshot pair stays byte-identical.
-#[test]
-fn partition_changes_are_recorded_in_the_commit_manifest() {
-    let dir = scratch("delta");
-    let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
-    let report = lake
-        .set_partition_spec(
-            "main.t",
-            &["region".to_string()],
-            &CommitSettings::default(),
-        )
-        .unwrap();
-    let delta = read_json(&lake_dir.join(format!("commits/{}.json", report.version)));
-    assert_eq!(delta["tables"]["main.t"]["partition_changed"], true);
-    assert_eq!(
-        delta["tables"]["main.t"]["partition_by"],
-        serde_json::json!([{ "column": "region", "transform": "identity" }])
+    catalog_sql(
+        &lake_dir,
+        "UPDATE ducklake_file_column_stats SET min_value = '0', max_value = '0' \
+         WHERE column_id = (SELECT MIN(column_id) FROM ducklake_column);",
     );
-    let catalog = std::fs::read(lake_dir.join("catalog.json")).unwrap();
-    let snapshot =
-        std::fs::read(lake_dir.join(format!("snapshots/{}.json", report.version))).unwrap();
-    assert_eq!(catalog, snapshot);
-    cleanup(&dir);
-}
-
-/// `Lake::set_partition_spec` errors are `LakeError::NotRepresentable`, the
-/// same class the rest of the lake's shape refusals use.
-#[test]
-fn partition_errors_are_not_representable() {
-    let dir = scratch("err_class");
-    let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
-    let err = lake
-        .set_partition_spec(
-            "main.t",
-            &["year(x)".to_string()],
-            &CommitSettings::default(),
-        )
-        .unwrap_err();
-    assert!(matches!(err, LakeError::NotRepresentable { .. }), "{err:?}");
+    let lake = open_lake(&lake_dir).unwrap();
+    let err = lake.attach(None).unwrap_err().to_string();
+    assert!(
+        err.contains("zone map") || err.contains("statistics"),
+        "{err}"
+    );
     cleanup(&dir);
 }

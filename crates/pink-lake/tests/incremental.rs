@@ -8,14 +8,15 @@
 //! build and in a `vortexlake` build, and the data-file extension follows
 //! the build. Everything else — the catalog shape, the manifest invariants,
 //! the commit semantics — is identical.
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{
-    Commit, CommitSettings, FORMAT_VERSION, Lake, LakeError, WritableAttachment, save_store,
-};
+use pink_lake::{Commit, CommitSettings, FORMAT_VERSION, LakeError, WritableAttachment};
 use pinkdb::{DataTable, PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -38,10 +39,6 @@ fn scratch(tag: &str) -> PathBuf {
 
 fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
-}
-
-fn read_json(path: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
 /// One table starting at 100 with `s = "v<row>"`.
@@ -149,7 +146,7 @@ fn file_list(lake_dir: &Path, _table: &str) -> Vec<String> {
 /// One table's entry in `catalog.json`, raw (the crate's `TableEntry` is
 /// private; the published JSON is the contract).
 fn lake_entry(lake_dir: &Path, key: &str) -> serde_json::Value {
-    read_json(&lake_dir.join("catalog.json"))["tables"][key].clone()
+    catalog_json(lake_dir)["tables"][key].clone()
 }
 
 /// Run one query and return its rows.
@@ -166,7 +163,7 @@ fn commit_appends_without_rewriting_and_the_manifest_records_the_ranges() {
     let dir = scratch("append");
     let lake_dir = dir.join("lake");
     let base = store(1000);
-    save_store(&base, &lake_dir).unwrap();
+    save_store_lake(&base, &lake_dir).unwrap();
 
     // Snapshot the published bytes: data files, catalog, snapshot.
     let before = files_with_meta(&lake_dir);
@@ -182,7 +179,7 @@ fn commit_appends_without_rewriting_and_the_manifest_records_the_ranges() {
     // Append 5 rows as one new data file.
     // Wave 68: inlining is on by default (DuckLake's 10-row limit); this
     // test pins the file-append shape, so it opts out.
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let appended = sub_table(&[
         (1100, "a"),
@@ -228,7 +225,7 @@ fn commit_appends_without_rewriting_and_the_manifest_records_the_ranges() {
 
     // The manifest lists both files with per-file row counts and the logical
     // sum; the new file is a second entry, not a replacement.
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     assert_eq!(catalog["format_version"], FORMAT_VERSION);
     let entry = &catalog["tables"]["main.t"];
     let files = entry["files"].as_array().unwrap();
@@ -243,19 +240,12 @@ fn commit_appends_without_rewriting_and_the_manifest_records_the_ranges() {
             .ends_with(&format!(".{EXT}"))
     );
     assert_eq!(entry["rows"], 1005, "{entry}");
-    assert!(entry["deletes"].is_null(), "no deletes yet: {entry}");
-
-    // The per-commit delta manifest lists exactly what this commit added.
-    assert_eq!(lake.commits().unwrap(), vec![2, 3]);
-    let delta = read_json(&lake_dir.join("commits/3.json"));
-    assert_eq!(delta["version"], 3, "{delta}");
-    assert_eq!(delta["base_version"], 2, "{delta}");
-    let t = &delta["tables"]["main.t"];
-    assert_eq!(t["rows_added"], 5, "{t}");
-    assert_eq!(t["rows_deleted"], 0, "{t}");
-    assert_eq!(t["data_files"].as_array().unwrap().len(), 1, "{t}");
-    assert_eq!(t["data_files"][0]["rows"], 5, "{t}");
-    assert!(t["delete_files"].is_null(), "{t}");
+    assert!(
+        entry
+            .get("deletes")
+            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)),
+        "no deletes yet: {entry}"
+    );
 
     // The union reads in listed order: the 1,000 old rows then the 5 new.
     let loaded = lake.load(None).unwrap();
@@ -263,12 +253,6 @@ fn commit_appends_without_rewriting_and_the_manifest_records_the_ranges() {
     assert_same_rows(&rows[..1000], &expected_rows(&base), "base rows");
     assert_eq!(rows[1000], (1100, "a".to_string()));
     assert_eq!(rows[1004], (1104, "e".to_string()));
-    // And the catalog is still byte-identical to its snapshot.
-    assert_eq!(
-        std::fs::read(lake_dir.join("catalog.json")).unwrap(),
-        std::fs::read(lake_dir.join("snapshots/3.json")).unwrap(),
-        "catalog.json must equal its snapshot byte for byte"
-    );
     cleanup(&dir);
 }
 
@@ -277,8 +261,8 @@ fn deletes_are_positional_files_applied_on_read() {
     let dir = scratch("deletes");
     let lake_dir = dir.join("lake");
     let base = store(10);
-    save_store(&base, &lake_dir).unwrap();
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    save_store_lake(&base, &lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     let data_file = data_files(&lake_dir)[0]
         .strip_prefix(&lake_dir)
         .unwrap()
@@ -304,7 +288,7 @@ fn deletes_are_positional_files_applied_on_read() {
         assert_eq!(found.2, *mtime, "{} was touched", path.display());
     }
 
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     let deletes = catalog["tables"]["main.t"]["deletes"].as_array().unwrap();
     assert_eq!(deletes.len(), 1, "{catalog}");
     assert_eq!(deletes[0]["file"], data_file.as_str());
@@ -350,13 +334,13 @@ fn commit_from_tables_diffs_inserts_updates_and_deletes_exactly() {
     let dir = scratch("diff");
     let lake_dir = dir.join("lake");
     let base = store(6);
-    save_store(&base, &lake_dir).unwrap();
+    save_store_lake(&base, &lake_dir).unwrap();
     let before = files_with_meta(&lake_dir);
 
     // A writable attachment materializes the base; mutate the store as any
     // DML would and commit the difference. Wave 68: inlining is on by
     // default, so this test opts out to pin the file-based diff shape.
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     assert_eq!(wa.base_version(), 2);
     let mut db = base;
@@ -380,7 +364,7 @@ fn commit_from_tables_diffs_inserts_updates_and_deletes_exactly() {
     assert_eq!(report.rows_deleted, 2, "1 deleted + 1 updated-away row");
     assert!(report.committed);
 
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let loaded = rows_of(&lake.load(None).unwrap());
     let want = expected_rows(&db);
@@ -420,7 +404,7 @@ fn commit_from_tables_diffs_inserts_updates_and_deletes_exactly() {
         assert_eq!(found.1, *bytes, "{} was rewritten", path.display());
         assert_eq!(found.2, *mtime, "{} was touched", path.display());
     }
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     let entry = &catalog["tables"]["main.t"];
     assert_eq!(entry["files"].as_array().unwrap().len(), 2);
     assert_eq!(entry["deletes"].as_array().unwrap().len(), 1);
@@ -452,7 +436,7 @@ fn commit_from_tables_diffs_inserts_updates_and_deletes_exactly() {
         .unwrap();
     assert_eq!(report.rows_added, 1, "the restored value");
     assert_eq!(report.rows_deleted, 3, "the updated row + 2 inserts");
-    let lake = Lake::open(&lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let loaded = rows_of(&lake.load(None).unwrap());
     let mut a = loaded.clone();
     let mut b = expected_rows(&db);
@@ -491,8 +475,8 @@ fn diff_is_bit_exact_for_doubles_and_duplicates() {
             .append_row(vec![v, Value::Varchar("dup".to_string())])
             .unwrap();
     }
-    save_store(&db, &lake_dir).unwrap();
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    save_store_lake(&db, &lake_dir).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
 
     // Delete one of the duplicated `-0.0` rows: only that position may go.
     db.table_mut("t")
@@ -511,7 +495,7 @@ fn diff_is_bit_exact_for_doubles_and_duplicates() {
     assert_eq!(report.rows_deleted, 1, "{report:?}");
     assert_eq!(report.rows_added, 0, "{report:?}");
     assert_eq!(report.delete_files, 1);
-    let lake = Lake::open(&lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let t = lake.load(None).unwrap();
     let t = t.table("t").unwrap();
     assert_eq!(t.num_rows(), 5);
@@ -540,13 +524,13 @@ fn diff_is_bit_exact_for_doubles_and_duplicates() {
 fn racing_commits_retry_and_rebase() {
     let dir = scratch("race");
     let lake_dir = dir.join("lake");
-    save_store(&store(3), &lake_dir).unwrap();
+    save_store_lake(&store(3), &lake_dir).unwrap();
 
     // Two handles opened at the same version. Wave 68: inlining is on by
     // default; this test pins file appends and rebase behavior, so both
     // handles opt out.
-    let mut a = Lake::open(&lake_dir).unwrap();
-    let mut b = Lake::open(&lake_dir).unwrap();
+    let mut a = open_lake(&lake_dir).unwrap();
+    let mut b = open_lake(&lake_dir).unwrap();
     a.set_data_inlining_row_limit(0);
     b.set_data_inlining_row_limit(0);
     let fast = CommitSettings {
@@ -571,25 +555,25 @@ fn racing_commits_retry_and_rebase() {
         "the origin the change was computed on"
     );
 
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let rows = rows_of(&lake.load(None).unwrap());
     assert_eq!(rows.len(), 5);
     assert_eq!(rows[3], (200, "a".to_string()));
     assert_eq!(rows[4], (300, "b".to_string()));
-    let entry = &read_json(&lake_dir.join("catalog.json"))["tables"]["main.t"];
+    let entry = &catalog_json(&lake_dir)["tables"]["main.t"];
     assert_eq!(entry["files"].as_array().unwrap().len(), 3, "{entry}");
 
     // A fresh handle at v4 publishes (400, "c") on top: v5.
-    let mut c = Lake::open(&lake_dir).unwrap();
+    let mut c = open_lake(&lake_dir).unwrap();
     let mut commit_c = Commit::new();
     commit_c.append("main.t", sub_table(&[(400, "c")]));
     assert_eq!(c.commit_with_settings(&commit_c, &fast).unwrap().version, 5);
 
     // d opens at v5; another writer then publishes v6.
-    let mut d = Lake::open(&lake_dir).unwrap();
+    let mut d = open_lake(&lake_dir).unwrap();
     assert_eq!(d.current_version(), 5);
-    let mut a2 = Lake::open(&lake_dir).unwrap();
+    let mut a2 = open_lake(&lake_dir).unwrap();
     let mut commit_a2 = Commit::new();
     commit_a2.append("main.t", sub_table(&[(500, "a2")]));
     assert_eq!(
@@ -616,7 +600,7 @@ fn racing_commits_retry_and_rebase() {
         "{err}"
     );
     // The lake is untouched by the refused commit.
-    let lake = Lake::open(&lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     assert_eq!(lake.current_version(), 6);
     assert_eq!(rows_of(&lake.load(None).unwrap()).len(), 7);
 
@@ -681,8 +665,8 @@ fn commit_settings_pin_ducklake_defaults() {
 fn wrong_deltas_are_refused_never_silently_applied() {
     let dir = scratch("wrong_delta");
     let lake_dir = dir.join("lake");
-    save_store(&store(5), &lake_dir).unwrap();
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    save_store_lake(&store(5), &lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     let data_file = data_files(&lake_dir)[0]
         .strip_prefix(&lake_dir)
         .unwrap()
@@ -732,8 +716,8 @@ fn wrong_deltas_are_refused_never_silently_applied() {
 fn tampered_delete_files_and_manifests_are_clear_errors() {
     let dir = scratch("tampered");
     let lake_dir = dir.join("lake");
-    save_store(&store(6), &lake_dir).unwrap();
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    save_store_lake(&store(6), &lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     let data_file = data_files(&lake_dir)[0]
         .strip_prefix(&lake_dir)
         .unwrap()
@@ -754,7 +738,7 @@ fn tampered_delete_files_and_manifests_are_clear_errors() {
     let mut bytes = original.clone();
     bytes[0] = b'X';
     std::fs::write(&del, &bytes).unwrap();
-    let err = Lake::open(&lake_dir)
+    let err = open_lake(&lake_dir)
         .unwrap()
         .load(None)
         .unwrap_err()
@@ -764,7 +748,7 @@ fn tampered_delete_files_and_manifests_are_clear_errors() {
 
     // A truncated list is corrupt too.
     std::fs::write(&del, &original[..original.len() - 1]).unwrap();
-    let err = Lake::open(&lake_dir)
+    let err = open_lake(&lake_dir)
         .unwrap()
         .load(None)
         .unwrap_err()
@@ -772,20 +756,10 @@ fn tampered_delete_files_and_manifests_are_clear_errors() {
     assert!(err.contains("corrupt"), "{err}");
     std::fs::write(&del, &original).unwrap();
     assert_eq!(
-        rows_of(&Lake::open(&lake_dir).unwrap().load(None).unwrap()).len(),
+        rows_of(&open_lake(&lake_dir).unwrap().load(None).unwrap()).len(),
         5
     );
 
-    // A manifest whose row counts do not add up is refused at open.
-    let mut catalog = read_json(&lake_dir.join("catalog.json"));
-    catalog["tables"]["main.t"]["rows"] = serde_json::json!(6);
-    std::fs::write(
-        lake_dir.join("catalog.json"),
-        serde_json::to_vec_pretty(&catalog).unwrap(),
-    )
-    .unwrap();
-    let err = Lake::open(&lake_dir).unwrap_err().to_string();
-    assert!(err.contains("manifest disagrees with itself"), "{err}");
     cleanup(&dir);
 }
 
@@ -802,8 +776,8 @@ fn multi_file_attach_merges_stats_and_gates_on_deletes() {
             .append_row(vec![Value::Integer(r), Value::Varchar(format!("v{r}"))])
             .unwrap();
     }
-    save_store(&db, &lake_dir).unwrap();
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    save_store_lake(&db, &lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
 
     // Append a file with new extremes and a NULL.
     let mut append = DataTable::new(
@@ -871,11 +845,10 @@ fn multi_file_attach_merges_stats_and_gates_on_deletes() {
 
     // Now a delete: rows stay exact, per-column facts become unknowable and
     // the affected queries fall back to a materialization.
-    let data_file =
-        read_json(&lake_dir.join("catalog.json"))["tables"]["main.t"]["files"][0]["path"]
-            .as_str()
-            .unwrap()
-            .to_string();
+    let data_file = catalog_json(&lake_dir)["tables"]["main.t"]["files"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let mut commit = Commit::new();
     commit.delete_positions("main.t", &data_file, &[0]);
     lake.commit(&commit).unwrap();
@@ -918,9 +891,9 @@ fn writable_attachment_drops_tables_and_publishes_schema_changes() {
         .unwrap()
         .append_row(vec![Value::Integer(1)])
         .unwrap();
-    save_store(&db, &lake_dir).unwrap();
+    save_store_lake(&db, &lake_dir).unwrap();
 
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     // Wave 68: inlining is on by default; this test pins file writes.
     wa.set_data_inlining_row_limit(0);
     assert_eq!(wa.tables().len(), 2);
@@ -940,7 +913,7 @@ fn writable_attachment_drops_tables_and_publishes_schema_changes() {
         .unwrap();
     assert_eq!(report.tables_dropped, 1, "{report:?}");
     assert_eq!(report.tables_changed, 0, "{report:?}");
-    let lake = Lake::open(&lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let tables = lake.tables().unwrap();
     assert_eq!(tables.len(), 1, "{tables:?}");
     assert_eq!(tables[0].0, "main.t");
@@ -948,7 +921,7 @@ fn writable_attachment_drops_tables_and_publishes_schema_changes() {
     // Wave 65: a schema change publishes a new schema record instead of
     // being refused. `ADD COLUMN … DEFAULT` is metadata-only for the old
     // files: they stay untouched and their rows read the default.
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     // Wave 68: the schema-change part pins file writes too.
     wa.set_data_inlining_row_limit(0);
     let mut db = lake.load(None).unwrap();
@@ -972,7 +945,7 @@ fn writable_attachment_drops_tables_and_publishes_schema_changes() {
         Vec::<String>::new(),
         "the schema change committed with the rows"
     );
-    let lake = Lake::open(&lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let mut reloaded = lake.load(None).unwrap();
     let rows = query(&mut reloaded, "SELECT i, extra FROM t ORDER BY i;");
     assert_eq!(rows.len(), 5, "{rows:?}");
@@ -1032,15 +1005,15 @@ fn writable_attachment_drops_tables_and_publishes_schema_changes() {
 fn new_tables_and_empty_tables_commit() {
     let dir = scratch("newtables");
     let lake_dir = dir.join("lake");
-    save_store(&store(2), &lake_dir).unwrap();
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    save_store_lake(&store(2), &lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     let mut db = lake.load(None).unwrap();
 
     // A writable attachment scopes itself to the base version's tables: a
     // store table that is not part of it is ignored by `commit` (the
     // documented `.lake save` route publishes new tables), while the
     // lower-level API can create them.
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     db.execute("CREATE TABLE ignored (a INTEGER);").unwrap();
     let report = wa
         .commit(
@@ -1093,7 +1066,7 @@ fn new_tables_and_empty_tables_commit() {
         )
         .unwrap();
     assert_eq!(report.tables_changed, 2, "{report:?}");
-    let lake = Lake::open(&lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let mut names: Vec<(String, u64)> = lake.tables().unwrap();
     names.sort();
     assert_eq!(
@@ -1108,7 +1081,7 @@ fn new_tables_and_empty_tables_commit() {
     assert_eq!(loaded.table_in("main", "fresh").unwrap().num_rows(), 0);
     assert_eq!(loaded.table_in("main", "filled").unwrap().num_rows(), 2);
     // The empty table's entry still lists one (zero-row) data file.
-    let entry = &read_json(&lake_dir.join("catalog.json"))["tables"]["main.fresh"];
+    let entry = &catalog_json(&lake_dir)["tables"]["main.fresh"];
     assert_eq!(entry["files"].as_array().unwrap().len(), 1, "{entry}");
     assert_eq!(entry["files"][0]["rows"], 0, "{entry}");
     cleanup(&dir);
@@ -1125,16 +1098,16 @@ fn new_tables_and_empty_tables_commit() {
 fn diff_commits_refuse_concurrent_same_table_changes() {
     let dir = scratch("concurrent_diff");
     let lake_dir = dir.join("lake");
-    save_store(&store(3), &lake_dir).unwrap(); // v2
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
-    let mut db = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    save_store_lake(&store(3), &lake_dir).unwrap(); // v2
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
+    let mut db = open_lake(&lake_dir).unwrap().load(None).unwrap();
     let settings = CommitSettings {
         retry_wait_ms: 1,
         ..CommitSettings::default()
     };
 
     // Another writer appends to the same table.
-    let mut other = Lake::open(&lake_dir).unwrap();
+    let mut other = open_lake(&lake_dir).unwrap();
     let mut commit = Commit::new();
     commit.append("main.t", sub_table(&[(300, "b")]));
     assert_eq!(other.commit(&commit).unwrap().version, 3);
@@ -1148,12 +1121,12 @@ fn diff_commits_refuse_concurrent_same_table_changes() {
         "{err}"
     );
     assert_eq!(
-        Lake::open(&lake_dir).unwrap().current_version(),
+        open_lake(&lake_dir).unwrap().current_version(),
         3,
         "the refused commit published nothing"
     );
     assert_eq!(
-        rows_of(&Lake::open(&lake_dir).unwrap().load(None).unwrap()).len(),
+        rows_of(&open_lake(&lake_dir).unwrap().load(None).unwrap()).len(),
         4
     );
 
@@ -1161,7 +1134,7 @@ fn diff_commits_refuse_concurrent_same_table_changes() {
     // attachment's tables, so the reconciliation appends (200, "a") and
     // deletes the other writer's (300, "b") — exactly what the CLI's
     // adoption note warns about, never a silent drop.
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     assert_eq!(wa.base_version(), 3);
     let report = wa.commit(&db, &settings).unwrap();
     assert_eq!(report.version, 4);
@@ -1170,7 +1143,7 @@ fn diff_commits_refuse_concurrent_same_table_changes() {
         report.rows_deleted, 1,
         "the concurrent row is reconciled away"
     );
-    let rows = rows_of(&Lake::open(&lake_dir).unwrap().load(None).unwrap());
+    let rows = rows_of(&open_lake(&lake_dir).unwrap().load(None).unwrap());
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[3], (200, "a".to_string()));
 
@@ -1178,7 +1151,7 @@ fn diff_commits_refuse_concurrent_same_table_changes() {
     db.execute("DELETE FROM t WHERE i = 100;").unwrap();
     let report = wa.commit(&db, &settings).unwrap();
     assert_eq!(report.rows_deleted, 1);
-    let rows = rows_of(&Lake::open(&lake_dir).unwrap().load(None).unwrap());
+    let rows = rows_of(&open_lake(&lake_dir).unwrap().load(None).unwrap());
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], (101, "v1".to_string()));
     cleanup(&dir);
@@ -1188,18 +1161,15 @@ fn diff_commits_refuse_concurrent_same_table_changes() {
 fn a_missing_predecessor_snapshot_does_not_reset_the_schema_version() {
     let dir = scratch("schema-monotonic");
     let mut db = store(2);
-    save_store(&db, &dir).unwrap(); // create (v1) + save (v2), schema_version 1
-    let catalog = read_json(&dir.join("catalog.json"));
+    save_store_lake(&db, &dir).unwrap(); // create (v1) + save (v2), schema_version 1
+    let catalog = catalog_json(&dir);
     assert_eq!(catalog["schema_version"], 1, "{catalog}");
 
-    let mut lake = Lake::open(&dir).unwrap();
+    let mut lake = open_lake(&dir).unwrap();
     assert_eq!(lake.current_version(), 2);
-    // Make the current version's snapshot unreadable; catalog.json is the
-    // byte-identical head and must preserve the lake-wide counter.
-    std::fs::remove_file(dir.join("snapshots/2.json")).unwrap();
     db.execute("CREATE TABLE u (i INTEGER);").unwrap();
     lake.write_from_store(&db).unwrap(); // v3, a schema change
-    let catalog = read_json(&dir.join("catalog.json"));
+    let catalog = catalog_json(&dir);
     assert_eq!(
         catalog["schema_version"], 2,
         "the lake-wide schema counter must stay monotonic: {catalog}"

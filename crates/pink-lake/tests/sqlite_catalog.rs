@@ -7,6 +7,8 @@
 //! transactions and bytes — not a second copy of the deeper lake suites.
 
 #![cfg(feature = "catalog-sqlite")]
+#[path = "common/local_lake.rs"]
+mod local_lake;
 
 #[cfg(feature = "s3")]
 #[path = "../src/mock_s3.rs"]
@@ -107,31 +109,7 @@ fn data_location_ownership_is_enforced() {
     catalog_suite::data_location_ownership_is_enforced(&mut SqliteSuite::new());
 }
 
-#[test]
-#[ignore = "wave 103 T2"]
-fn migrate_object_catalog_to_sql() {
-    catalog_suite::migrate_object_catalog_to_sql(&mut SqliteSuite::new());
-}
-
-#[test]
-#[ignore = "wave 103 T2"]
-fn migrate_sql_catalog_to_object() {
-    catalog_suite::migrate_sql_catalog_to_object(&mut SqliteSuite::new());
-}
-
-#[test]
-#[ignore = "wave 103 T2"]
-fn migrate_sql_catalog_to_sql() {
-    catalog_suite::migrate_sql_catalog_to_sql(&mut SqliteSuite::new());
-}
-
 #[cfg(feature = "encryption")]
-#[test]
-#[ignore = "wave 103 T2"]
-fn encrypted_migration_keeps_sealed_bytes() {
-    catalog_suite::encrypted_migration_keeps_sealed_bytes(&mut SqliteSuite::new());
-}
-
 #[test]
 fn flush_moves_inlined_rows_to_a_data_file() {
     catalog_suite::flush_moves_inlined_rows_to_a_data_file(&mut SqliteSuite::new());
@@ -580,5 +558,111 @@ fn inlined_rows_round_trip_every_type_through_the_typed_ducklake_tables() {
         }
     }
 
+    catalog_suite::cleanup(&dir);
+}
+
+/// A commit whose only change is a schema change (no files, no deletes) is
+/// still a DuckLake schema change: the renamed column's row ends and a new
+/// row with the same column id begins at that snapshot, the snapshot's
+/// `schema_version` advances with one `ducklake_schema_versions` row, and
+/// `changes_made` records `altered_table:<id>`, exactly what DuckDB writes
+/// for `ALTER TABLE … RENAME COLUMN`. Reopening the catalog alone shows the
+/// new name.
+#[test]
+fn a_schema_only_commit_is_recorded_like_ducklake() {
+    use pink_lake::{CommitSettings, WritableAttachment};
+    use pinkdb::{PinkDb, Value};
+    use rusqlite::Connection;
+
+    fn materialize(wa: &WritableAttachment) -> PinkDb {
+        let mut db = PinkDb::new();
+        for (key, _) in wa.tables() {
+            let (dbname, table) = key.split_once('.').unwrap();
+            let base = wa.base_table(&key).unwrap();
+            if !db.database_exists(dbname) {
+                db.create_database(dbname).unwrap();
+            }
+            db.create_table_in(dbname, table, base.schema()).unwrap();
+            let target = db.table_mut_in(dbname, table).unwrap();
+            for chunk in 0..base.num_chunks() {
+                let chunk = base.scan_chunk(chunk).unwrap();
+                target.append_shared_chunk(&chunk.columns).unwrap();
+            }
+        }
+        db
+    }
+
+    let dir = catalog_suite::scratch("schema-only");
+    let catalog_path = dir.join("catalog.db");
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let data = dir.join("data-root");
+    {
+        let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE main.t (a INTEGER, b VARCHAR);")
+            .unwrap();
+        db.table_mut_in("main", "t")
+            .unwrap()
+            .append_row(vec![Value::Integer(1), Value::Varchar("x".into())])
+            .unwrap();
+        assert_eq!(lake.write_from_store(&db).unwrap(), 2);
+    }
+    let mut wa = WritableAttachment::open(&catalog, None).unwrap();
+    let mut db = materialize(&wa);
+    db.execute("ALTER TABLE t RENAME COLUMN b TO c;").unwrap();
+    assert_eq!(
+        wa.commit(&db, &CommitSettings::default()).unwrap().version,
+        3
+    );
+    drop(wa);
+
+    let conn = Connection::open(&catalog_path).unwrap();
+    let columns: Vec<(i64, String, i64, Option<i64>)> = conn
+        .prepare(
+            "SELECT column_id, column_name, begin_snapshot, end_snapshot
+             FROM ducklake_column ORDER BY begin_snapshot, column_id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        columns,
+        vec![
+            (1, "a".to_string(), 1, None),
+            (2, "b".to_string(), 1, Some(2)),
+            (2, "c".to_string(), 2, None),
+        ]
+    );
+    let (schema_version, changes): (i64, String) = conn
+        .query_row(
+            "SELECT s.schema_version, c.changes_made FROM ducklake_snapshot s
+             JOIN ducklake_snapshot_changes c ON c.snapshot_id = s.snapshot_id
+             WHERE s.snapshot_id = 2",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(schema_version, 2);
+    assert_eq!(changes, "altered_table:1");
+    let versions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ducklake_schema_versions WHERE begin_snapshot = 2",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(versions, 1);
+    drop(conn);
+
+    let lake = Lake::open_with_catalog(&catalog, None).unwrap();
+    let mut db = lake.load(None).unwrap();
+    let pinkdb::QueryResult::Selected { names, .. } =
+        db.execute("SELECT * FROM t").unwrap().pop().unwrap()
+    else {
+        panic!("expected rows");
+    };
+    assert_eq!(names, vec!["a".to_string(), "c".to_string()]);
     catalog_suite::cleanup(&dir);
 }

@@ -21,7 +21,6 @@
 //!   conditional request) makes writes **refuse by default**
 //!   ([`Put::ConditionalUnsupported`]): a check-then-put fallback cannot keep
 //!   the single-writer contract, so it is opt-in at the lake layer
-//!   (`S3Config::allow_degraded(true)` / `PINKDB_S3_ALLOW_DEGRADED=1`).
 //! - **Error mapping**: 404 → not found (the caller decides whether that is
 //!   `NotALake`, `VersionNotFound`, or an I/O not-found for a data file); a
 //!   404 *body* naming `NoSuchBucket` is a clear "bucket does not exist"
@@ -180,12 +179,6 @@ pub struct S3Config {
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
     pub session_token: Option<String>,
-    /// Explicitly allow an endpoint whose conditional writes are rejected to
-    /// fall back to check-then-put. **Unsafe for concurrent writers**: the
-    /// fallback cannot make a snapshot publish atomic, so a racing writer can
-    /// transiently replace a published snapshot (it is restored from the
-    /// catalog) — only opt in for a strictly single-writer lake.
-    pub allow_degraded: bool,
     /// Explicitly allow a plain `http://` endpoint (local test endpoints).
     pub allow_http: bool,
     /// Retries after a retryable failure (see the module docs).
@@ -209,7 +202,6 @@ impl std::fmt::Debug for S3Config {
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &redact(&self.secret_access_key))
             .field("session_token", &redact(&self.session_token))
-            .field("allow_degraded", &self.allow_degraded)
             .field("allow_http", &self.allow_http)
             .field("retries", &self.retries)
             .field("user_agent", &self.user_agent)
@@ -231,7 +223,6 @@ impl S3Config {
             access_key_id: None,
             secret_access_key: None,
             session_token: None,
-            allow_degraded: false,
             allow_http: false,
             retries: DEFAULT_RETRIES,
             user_agent: None,
@@ -251,7 +242,6 @@ impl S3Config {
         }
         config.endpoint = env_var("AWS_ENDPOINT_URL_S3").or_else(|| env_var("AWS_ENDPOINT_URL"));
         config.path_style = env_truthy("AWS_S3_FORCE_PATH_STYLE");
-        config.allow_degraded = env_truthy("PINKDB_S3_ALLOW_DEGRADED").unwrap_or(false);
         config.allow_http = env_truthy("PINKDB_S3_ALLOW_HTTP").unwrap_or(false);
         if let Some(retries) = env_var("PINKDB_S3_RETRIES").and_then(|v| v.parse().ok()) {
             config.retries = retries;
@@ -297,13 +287,6 @@ impl S3Config {
 
     pub fn with_session_token(mut self, session_token: impl Into<String>) -> Self {
         self.session_token = Some(session_token.into());
-        self
-    }
-
-    /// Accept a single-writer check-then-put fallback when the endpoint
-    /// rejects conditional writes. See [`S3Config::allow_degraded`].
-    pub fn allow_degraded(mut self, allow: bool) -> Self {
-        self.allow_degraded = allow;
         self
     }
 
@@ -431,7 +414,6 @@ impl S3Config {
                 secret_access_key,
                 session_token,
             },
-            allow_degraded: self.allow_degraded,
             retries: self.retries,
             user_agent: self.user_agent,
         })
@@ -475,7 +457,6 @@ pub struct ResolvedS3 {
     region: String,
     endpoint: Endpoint,
     credentials: Credentials,
-    allow_degraded: bool,
     retries: u32,
     user_agent: Option<String>,
 }
@@ -489,11 +470,6 @@ impl ResolvedS3 {
     /// The key prefix (no trailing slash; empty = bucket root).
     pub fn prefix(&self) -> &str {
         &self.prefix
-    }
-
-    /// Whether the caller explicitly accepted the degraded write fallback.
-    pub fn allow_degraded(&self) -> bool {
-        self.allow_degraded
     }
 
     /// Retries after a retryable failure.
@@ -1596,14 +1572,6 @@ mod tests {
             .unwrap();
         assert!(!resolved.endpoint.path_style);
         assert_eq!(resolved.endpoint.host, "s3.us-east-1.amazonaws.com");
-        // The safety opt-ins default to off and flow through resolution.
-        assert!(!resolved.allow_degraded);
-        let resolved = S3Config::new("bucket")
-            .with_credentials("id", "secret")
-            .allow_degraded(true)
-            .resolve_with(&|_| None)
-            .unwrap();
-        assert!(resolved.allow_degraded);
     }
 
     #[test]

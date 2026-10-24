@@ -239,15 +239,6 @@ impl PartitionKey {
         self.transform == "identity"
     }
 
-    /// Structurally valid: a non-empty column and a transform this build
-    /// understands (`identity`, or `bucket(N)` with `N >= 1`).
-    pub(crate) fn is_valid(&self) -> bool {
-        !self.column.is_empty()
-            && !self.column.contains('(')
-            && !self.column.contains(',')
-            && (self.is_identity() || matches!(self.bucket(), Some(n) if n >= 1))
-    }
-
     /// The canonical key text a file's `partition` map is keyed by:
     /// the bare column for identity, `bucket(N, column)` otherwise.
     pub(crate) fn key_text(&self) -> String {
@@ -648,6 +639,22 @@ impl FileRef {
     /// The file's recorded footer location (wave 102): where its footer is,
     /// how long it is and the CRC32C the file's trailer records for it.
     /// `None` for a format whose footer the lake does not locate this way.
+    /// The recorded footer offset (formats that publish one).
+    pub(crate) fn footer_offset(&self) -> Option<u64> {
+        match self {
+            FileRef::Path(_) => None,
+            FileRef::Entry { footer_offset, .. } => *footer_offset,
+        }
+    }
+
+    /// The recorded footer length (formats that publish one).
+    pub(crate) fn footer_len(&self) -> Option<u64> {
+        match self {
+            FileRef::Path(_) => None,
+            FileRef::Entry { footer_len, .. } => *footer_len,
+        }
+    }
+
     pub(crate) fn footer_location(&self) -> Option<crate::format::FooterLocation> {
         match self {
             FileRef::Path(_) => None,

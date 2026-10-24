@@ -9,12 +9,15 @@
 //! one row group exactly.
 
 #![cfg(feature = "s3")]
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 #[path = "../src/mock_s3.rs"]
 mod mock_s3;
 
 use mock_s3::MockS3;
-use pink_lake::{Lake, S3Config};
+use pink_lake::S3Config;
 use pinkdb::{PinkDb, QueryResult, Value};
 
 const ROWS: i64 = 200_000;
@@ -88,7 +91,7 @@ fn pink_range_bytes(mock: &MockS3, from: usize) -> usize {
 /// One fresh attach + query; returns the data requests the query issued
 /// (attach itself must issue none) and the result rows.
 fn attached_query(mock: &MockS3, prefix: &str, sql: &str) -> ((usize, usize), Vec<Vec<Value>>) {
-    let lake = Lake::open_s3(mock_config(mock, prefix)).unwrap();
+    let lake = open_s3_lake(mock_config(mock, prefix)).unwrap();
     let before_attach = mock.requests().len();
     let report = lake.attach(None).unwrap();
     assert_eq!(
@@ -109,22 +112,30 @@ fn pink_lake_reads_only_projected_chunks_of_surviving_row_groups() {
     let prefix = "lakes/pink";
     let mut source = store();
     {
-        let mut lake = Lake::create_s3(mock_config(&mock, prefix)).unwrap();
+        let mut lake = create_s3_lake(mock_config(&mock, prefix)).unwrap();
         lake.set_write_format("pink").unwrap();
         lake.set_data_inlining_row_limit(0);
         lake.write_from_store(&source).unwrap();
     }
 
     // The catalog records the data file's footer location (format_version 7).
-    let catalog: serde_json::Value =
-        serde_json::from_slice(&mock.object(&format!("{prefix}/catalog.json")).unwrap()).unwrap();
-    assert_eq!(catalog["format_version"], 7, "{catalog}");
-    let file = &catalog["tables"]["main.t"]["files"][0];
-    assert_eq!(catalog["tables"]["main.t"]["format"], "pink", "{catalog}");
-    assert!(file["footer_offset"].is_u64(), "{file}");
-    assert!(file["footer_len"].is_u64(), "{file}");
+    let lake = open_s3_lake(mock_config(&mock, prefix)).unwrap();
+    assert_eq!(lake.format_version(), 7);
+    assert_eq!(
+        lake.table_format_name("main.t").unwrap().as_deref(),
+        Some("pink")
+    );
+    let info = lake
+        .list_files(Some("main.t"), None, false)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one data file");
+    let file_path = info.path.clone();
+    assert!(info.footer_offset.is_some());
+    assert!(info.footer_len.is_some());
     let file_len = mock
-        .object(&format!("{prefix}/{}", file["path"].as_str().unwrap()))
+        .object(&format!("{prefix}/{}", file_path))
         .unwrap()
         .len();
 
@@ -177,13 +188,13 @@ fn attach_never_probes_data_files_and_a_missing_file_fails_at_first_read() {
     let mock = MockS3::start();
     let prefix = "lakes/no-probe";
     {
-        let mut lake = Lake::create_s3(mock_config(&mock, prefix)).unwrap();
+        let mut lake = create_s3_lake(mock_config(&mock, prefix)).unwrap();
         lake.set_write_format("pink").unwrap();
         lake.set_data_inlining_row_limit(0);
         lake.write_from_store(&store()).unwrap();
     }
 
-    let lake = Lake::open_s3(mock_config(&mock, prefix)).unwrap();
+    let lake = open_s3_lake(mock_config(&mock, prefix)).unwrap();
     let before_attach = mock.requests().len();
     let report = lake.attach(None).unwrap();
     let data_touches: Vec<String> = mock.requests()[before_attach..]
@@ -205,7 +216,7 @@ fn attach_never_probes_data_files_and_a_missing_file_fails_at_first_read() {
         .find(|key| key.starts_with(&format!("{prefix}/data/")) && key.ends_with(".pink"))
         .expect("the lake has a .pink data object");
     mock.remove_object(&data_key);
-    let lake = Lake::open_s3(mock_config(&mock, prefix)).unwrap();
+    let lake = open_s3_lake(mock_config(&mock, prefix)).unwrap();
     let report = lake.attach(None).unwrap();
     let mut db = PinkDb::new();
     db.attach_lake(report.lake).unwrap();

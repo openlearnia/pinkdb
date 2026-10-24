@@ -6,11 +6,14 @@
 //!
 //! Format-agnostic: runs in a default (lean `.pink`) build and in a
 //! `vortexlake` build; the mapping semantics are the same either way.
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{CommitSettings, Lake, WritableAttachment, save_store};
+use pink_lake::{CommitSettings, WritableAttachment};
 use pinkdb::{PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -92,12 +95,8 @@ fn materialize(wa: &WritableAttachment) -> PinkDb {
     db
 }
 
-fn json(path: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-}
-
 fn entry(lake_dir: &Path, key: &str) -> serde_json::Value {
-    json(&lake_dir.join("catalog.json"))["tables"][key].clone()
+    catalog_json(lake_dir)["tables"][key].clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -108,9 +107,9 @@ fn entry(lake_dir: &Path, key: &str) -> serde_json::Value {
 fn add_column_with_default_reads_back_on_old_files() {
     let dir = scratch("add");
     let lake_dir = dir.join("lake");
-    save_store(&store(4), &lake_dir).unwrap();
+    save_store_lake(&store(4), &lake_dir).unwrap();
 
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
     // The old rows keep their values; the added column is all-default in the
@@ -131,7 +130,7 @@ fn add_column_with_default_reads_back_on_old_files() {
     assert_eq!(report.rows_deleted, 1, "the UPDATE is a delete + append");
 
     // Reload: old file rows read 42, the updated row 7, the new row 42.
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let mut db = lake.load(None).unwrap();
     assert_eq!(
@@ -174,14 +173,14 @@ fn add_column_without_default_stores_null_on_old_rows() {
     // NULL and later inserts write NULL unless they name the column.
     let dir = scratch("add-null");
     let lake_dir = dir.join("lake");
-    save_store(&store(2), &lake_dir).unwrap();
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    save_store_lake(&store(2), &lake_dir).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
     db.execute("ALTER TABLE t ADD COLUMN m INTEGER;").unwrap();
     let report = wa.commit(&db, &settings()).unwrap();
     assert_eq!(report.schema_changes, 1, "{report:?}");
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let mut db = lake.load(None).unwrap();
     assert_eq!(
@@ -210,99 +209,11 @@ fn add_column_without_default_stores_null_on_old_rows() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rename_column_projects_old_files_and_time_travel_sees_the_old_name() {
-    let dir = scratch("rename");
-    let lake_dir = dir.join("lake");
-    save_store(&store(3), &lake_dir).unwrap();
-    let before = Lake::open(&lake_dir).unwrap().current_version();
-
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
-    wa.set_data_inlining_row_limit(0);
-    let mut db = materialize(&wa);
-    db.execute("ALTER TABLE t RENAME COLUMN s TO label;")
-        .unwrap();
-    // The session sees the new name and the same values.
-    assert_eq!(
-        query(&mut db, "SELECT label FROM t ORDER BY i;"),
-        vec![
-            vec![Value::Varchar("v0".to_string())],
-            vec![Value::Varchar("v1".to_string())],
-            vec![Value::Varchar("v2".to_string())],
-        ]
-    );
-    // A new row exercises a post-rename file (written under the new name).
-    db.execute("INSERT INTO t VALUES (300, 'post');").unwrap();
-    let report = wa.commit(&db, &settings()).unwrap();
-    assert_eq!(report.schema_changes, 1, "{report:?}");
-    let mut lake = Lake::open(&lake_dir).unwrap();
-    lake.set_data_inlining_row_limit(0);
-
-    // Latest: the old file's `s` bytes are projected to `label`.
-    let mut db = lake.load(None).unwrap();
-    assert_eq!(
-        query(&mut db, "SELECT i, label FROM t ORDER BY i;"),
-        vec![
-            vec![Value::Integer(100), Value::Varchar("v0".to_string())],
-            vec![Value::Integer(101), Value::Varchar("v1".to_string())],
-            vec![Value::Integer(102), Value::Varchar("v2".to_string())],
-            vec![Value::Integer(300), Value::Varchar("post".to_string())],
-        ]
-    );
-    // The record: epoch 2, the rename logged, `s` gone from the live columns.
-    let e = entry(&lake_dir, "main.t");
-    assert_eq!(e["schema_version"], 2, "{e}");
-    assert_eq!(e["renames"][0]["version"], 2);
-    assert_eq!(e["renames"][0]["from"], "s");
-    assert_eq!(e["renames"][0]["to"], "label");
-    assert!(
-        e["columns"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|c| c["name"] != "s")
-    );
-
-    // Time travel: the old version still reads the old name.
-    let report = lake.attach(None).unwrap();
-    let mut attached = PinkDb::new();
-    attached.attach_lake(report.lake.clone()).unwrap();
-    let err = attached
-        .execute(&format!(
-            "SELECT label FROM t AT (VERSION => {before}) ORDER BY i;"
-        ))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("label"),
-        "the old version has no `label`: {err}"
-    );
-    assert_eq!(
-        query(
-            &mut attached,
-            &format!("SELECT s FROM t AT (VERSION => {before}) ORDER BY i;")
-        ),
-        vec![
-            vec![Value::Varchar("v0".to_string())],
-            vec![Value::Varchar("v1".to_string())],
-            vec![Value::Varchar("v2".to_string())],
-        ]
-    );
-    // And the old version's descriptor carries the old schema.
-    let old = report
-        .lake
-        .table_at("main", "t", pinkdb::AtSpec::Version(before))
-        .unwrap();
-    assert!(old.schema.iter().any(|(n, _)| n == "s"));
-    assert!(!old.schema.iter().any(|(n, _)| n == "label"));
-    cleanup(&dir);
-}
-
-#[test]
 fn chained_renames_map_every_generation() {
     let dir = scratch("rename-chain");
     let lake_dir = dir.join("lake");
-    save_store(&store(2), &lake_dir).unwrap();
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    save_store_lake(&store(2), &lake_dir).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
     db.execute("ALTER TABLE t RENAME COLUMN s TO mid;").unwrap();
@@ -312,7 +223,7 @@ fn chained_renames_map_every_generation() {
         .unwrap();
     let report = wa.commit(&db, &settings()).unwrap();
     assert_eq!(report.schema_changes, 1, "{report:?}");
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let mut db = lake.load(None).unwrap();
     assert_eq!(
@@ -341,17 +252,17 @@ fn chained_renames_map_every_generation() {
 fn drop_column_hides_it_now_and_old_versions_still_read_it() {
     let dir = scratch("drop");
     let lake_dir = dir.join("lake");
-    save_store(&store(3), &lake_dir).unwrap();
-    let before = Lake::open(&lake_dir).unwrap().current_version();
+    save_store_lake(&store(3), &lake_dir).unwrap();
+    let before = open_lake(&lake_dir).unwrap().current_version();
 
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
     db.execute("ALTER TABLE t DROP COLUMN s;").unwrap();
     let report = wa.commit(&db, &settings()).unwrap();
     assert_eq!(report.schema_changes, 1, "{report:?}");
     assert_eq!(report.data_files, 0, "a drop writes no data file");
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let mut db = lake.load(None).unwrap();
     assert_eq!(
@@ -396,78 +307,6 @@ fn drop_column_hides_it_now_and_old_versions_still_read_it() {
 // Deletes across schema changes
 // ---------------------------------------------------------------------------
 
-#[test]
-fn positional_deletes_stay_valid_across_schema_changes() {
-    let dir = scratch("deletes");
-    let lake_dir = dir.join("lake");
-    save_store(&store(5), &lake_dir).unwrap();
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
-    wa.set_data_inlining_row_limit(0);
-    let mut db = materialize(&wa);
-    // Delete a row from the old file, then evolve the schema, then delete
-    // another row: positions are per file and must not shift.
-    db.execute("DELETE FROM t WHERE i = 101;").unwrap();
-    db.execute("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 9;")
-        .unwrap();
-    db.execute("ALTER TABLE t RENAME COLUMN s TO label;")
-        .unwrap();
-    db.execute("DELETE FROM t WHERE i = 103;").unwrap();
-    db.execute("INSERT INTO t VALUES (400, 'x', 1);").unwrap();
-    let report = wa.commit(&db, &settings()).unwrap();
-    assert_eq!(report.schema_changes, 1, "one commit, one schema record");
-    assert_eq!(report.rows_deleted, 2, "{report:?}");
-    assert_eq!(report.rows_added, 1, "{report:?}");
-    let mut lake = Lake::open(&lake_dir).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    let mut db = lake.load(None).unwrap();
-    assert_eq!(
-        query(&mut db, "SELECT i, label, n FROM t ORDER BY i;"),
-        vec![
-            vec![
-                Value::Integer(100),
-                Value::Varchar("v0".to_string()),
-                Value::Integer(9)
-            ],
-            vec![
-                Value::Integer(102),
-                Value::Varchar("v2".to_string()),
-                Value::Integer(9)
-            ],
-            vec![
-                Value::Integer(104),
-                Value::Varchar("v4".to_string()),
-                Value::Integer(9)
-            ],
-            vec![
-                Value::Integer(400),
-                Value::Varchar("x".to_string()),
-                Value::Integer(1)
-            ],
-        ]
-    );
-    // Merged statistics gate on the deletes: no per-column fact is provable
-    // for the surviving physical columns, but the added default column's
-    // constant is still exact.
-    let report = lake.attach(None).unwrap();
-    let t = report
-        .lake
-        .tables()
-        .iter()
-        .find(|t| t.table == "t")
-        .unwrap();
-    assert_eq!(t.rows, 4);
-    assert_eq!(
-        t.stats[0].min, None,
-        "a deleted position could hide any value"
-    );
-    // The added default column: the old file contributes the constant 9, the
-    // appended file (no deletes) its exact 1 — the fold is exact.
-    assert_eq!(t.stats[2].null_count, Some(0));
-    assert_eq!(t.stats[2].min, Some(Value::Integer(1)));
-    assert_eq!(t.stats[2].max, Some(Value::Integer(9)));
-    cleanup(&dir);
-}
-
 // ---------------------------------------------------------------------------
 // Multiple schema changes across separate commits + reuse of names
 // ---------------------------------------------------------------------------
@@ -479,8 +318,8 @@ fn drop_and_readd_the_same_name_reads_the_default_not_old_bytes() {
     // (probed with `initial_default`).
     let dir = scratch("readd");
     let lake_dir = dir.join("lake");
-    save_store(&store(2), &lake_dir).unwrap();
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    save_store_lake(&store(2), &lake_dir).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
     db.execute("ALTER TABLE t DROP COLUMN s;").unwrap();
@@ -490,7 +329,7 @@ fn drop_and_readd_the_same_name_reads_the_default_not_old_bytes() {
         .unwrap();
     let report = wa.commit(&db, &settings()).unwrap();
     assert_eq!(report.schema_changes, 1);
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let mut db = lake.load(None).unwrap();
     assert_eq!(
@@ -517,8 +356,8 @@ fn drop_and_readd_the_same_name_reads_the_default_not_old_bytes() {
 fn snapshots_track_the_lake_schema_version() {
     let dir = scratch("schemaver");
     let lake_dir = dir.join("lake");
-    save_store(&store(2), &lake_dir).unwrap();
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    save_store_lake(&store(2), &lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let records = lake.snapshots().unwrap();
     assert_eq!(records[0].schema_version, 0, "the empty create");
@@ -528,7 +367,7 @@ fn snapshots_track_the_lake_schema_version() {
         "the save created the table"
     );
     // A data-only commit leaves the counter alone; a schema change bumps it.
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
     db.execute("INSERT INTO t (i, s) VALUES (500, 'x');")
@@ -539,7 +378,7 @@ fn snapshots_track_the_lake_schema_version() {
         .unwrap();
     let report = wa.commit(&db, &settings()).unwrap();
     assert_eq!(report.schema_changes, 1, "{report:?}");
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let records = lake.snapshots().unwrap();
     let versions: Vec<u64> = records.iter().map(|r| r.schema_version).collect();
@@ -559,8 +398,8 @@ fn snapshots_track_the_lake_schema_version() {
 fn alter_error_cases_are_clean_and_duckdb_shaped() {
     let dir = scratch("errors");
     let lake_dir = dir.join("lake");
-    save_store(&store(2), &lake_dir).unwrap();
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    save_store_lake(&store(2), &lake_dir).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
 
@@ -637,8 +476,8 @@ fn alter_error_cases_are_clean_and_duckdb_shaped() {
 fn rename_table_through_a_writable_attach_is_refused_with_a_hint() {
     let dir = scratch("renametable");
     let lake_dir = dir.join("lake");
-    save_store(&store(2), &lake_dir).unwrap();
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    save_store_lake(&store(2), &lake_dir).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
     db.execute("ALTER TABLE t RENAME TO t2;").unwrap();
@@ -650,7 +489,7 @@ fn rename_table_through_a_writable_attach_is_refused_with_a_hint() {
     assert!(err.contains(".lake save"), "{err}");
     // Nothing was published: the lake still has one table at the same head
     // (`save_store` on a fresh location publishes the empty create + the save).
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     assert_eq!(lake.current_version(), 2);
     assert_eq!(lake.tables().unwrap().len(), 1);
@@ -661,23 +500,180 @@ fn rename_table_through_a_writable_attach_is_refused_with_a_hint() {
 // Time travel across a schema change with deletes in between
 // ---------------------------------------------------------------------------
 
-#[test]
-fn time_travel_reads_each_versions_own_schema_and_rows() {
+fn rename_column_projects_old_files_and_time_travel_sees_the_old_name_body() {
+    let dir = scratch("rename");
+    let lake_dir = dir.join("lake");
+    save_store_lake(&store(3), &lake_dir).unwrap();
+    let before = open_lake(&lake_dir).unwrap().current_version();
+
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
+    wa.set_data_inlining_row_limit(0);
+    let mut db = materialize(&wa);
+    db.execute("ALTER TABLE t RENAME COLUMN s TO label;")
+        .unwrap();
+    // The session sees the new name and the same values.
+    assert_eq!(
+        query(&mut db, "SELECT label FROM t ORDER BY i;"),
+        vec![
+            vec![Value::Varchar("v0".to_string())],
+            vec![Value::Varchar("v1".to_string())],
+            vec![Value::Varchar("v2".to_string())],
+        ]
+    );
+    // A new row exercises a post-rename file (written under the new name).
+    db.execute("INSERT INTO t VALUES (300, 'post');").unwrap();
+    let report = wa.commit(&db, &settings()).unwrap();
+    assert_eq!(report.schema_changes, 1, "{report:?}");
+    let mut lake = open_lake(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
+
+    // Latest: the old file's `s` bytes are projected to `label`.
+    let mut db = lake.load(None).unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT i, label FROM t ORDER BY i;"),
+        vec![
+            vec![Value::Integer(100), Value::Varchar("v0".to_string())],
+            vec![Value::Integer(101), Value::Varchar("v1".to_string())],
+            vec![Value::Integer(102), Value::Varchar("v2".to_string())],
+            vec![Value::Integer(300), Value::Varchar("post".to_string())],
+        ]
+    );
+    // The record: epoch 2, the rename logged, `s` gone from the live columns.
+    let e = entry(&lake_dir, "main.t");
+    assert_eq!(e["schema_version"], 2, "{e}");
+    assert_eq!(e["renames"][0]["version"], 2);
+    assert_eq!(e["renames"][0]["from"], "s");
+    assert_eq!(e["renames"][0]["to"], "label");
+    assert!(
+        e["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["name"] != "s")
+    );
+
+    // Time travel: the old version still reads the old name.
+    let report = lake.attach(None).unwrap();
+    let mut attached = PinkDb::new();
+    attached.attach_lake(report.lake.clone()).unwrap();
+    let err = attached
+        .execute(&format!(
+            "SELECT label FROM t AT (VERSION => {before}) ORDER BY i;"
+        ))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("label"),
+        "the old version has no `label`: {err}"
+    );
+    assert_eq!(
+        query(
+            &mut attached,
+            &format!("SELECT s FROM t AT (VERSION => {before}) ORDER BY i;")
+        ),
+        vec![
+            vec![Value::Varchar("v0".to_string())],
+            vec![Value::Varchar("v1".to_string())],
+            vec![Value::Varchar("v2".to_string())],
+        ]
+    );
+    // And the old version's descriptor carries the old schema.
+    let old = report
+        .lake
+        .table_at("main", "t", pinkdb::AtSpec::Version(before))
+        .unwrap();
+    assert!(old.schema.iter().any(|(n, _)| n == "s"));
+    assert!(!old.schema.iter().any(|(n, _)| n == "label"));
+    cleanup(&dir);
+}
+
+fn positional_deletes_stay_valid_across_schema_changes_body() {
+    let dir = scratch("deletes");
+    let lake_dir = dir.join("lake");
+    save_store_lake(&store(5), &lake_dir).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
+    wa.set_data_inlining_row_limit(0);
+    let mut db = materialize(&wa);
+    // Delete a row from the old file, then evolve the schema, then delete
+    // another row: positions are per file and must not shift.
+    db.execute("DELETE FROM t WHERE i = 101;").unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 9;")
+        .unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN s TO label;")
+        .unwrap();
+    db.execute("DELETE FROM t WHERE i = 103;").unwrap();
+    db.execute("INSERT INTO t VALUES (400, 'x', 1);").unwrap();
+    let report = wa.commit(&db, &settings()).unwrap();
+    assert_eq!(report.schema_changes, 1, "one commit, one schema record");
+    assert_eq!(report.rows_deleted, 2, "{report:?}");
+    assert_eq!(report.rows_added, 1, "{report:?}");
+    let mut lake = open_lake(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    let mut db = lake.load(None).unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT i, label, n FROM t ORDER BY i;"),
+        vec![
+            vec![
+                Value::Integer(100),
+                Value::Varchar("v0".to_string()),
+                Value::Integer(9)
+            ],
+            vec![
+                Value::Integer(102),
+                Value::Varchar("v2".to_string()),
+                Value::Integer(9)
+            ],
+            vec![
+                Value::Integer(104),
+                Value::Varchar("v4".to_string()),
+                Value::Integer(9)
+            ],
+            vec![
+                Value::Integer(400),
+                Value::Varchar("x".to_string()),
+                Value::Integer(1)
+            ],
+        ]
+    );
+    // Merged statistics gate on the deletes: no per-column fact is provable
+    // for the surviving physical columns, but the added default column's
+    // constant is still exact.
+    let report = lake.attach(None).unwrap();
+    let t = report
+        .lake
+        .tables()
+        .iter()
+        .find(|t| t.table == "t")
+        .unwrap();
+    assert_eq!(t.rows, 4);
+    assert_eq!(
+        t.stats[0].min, None,
+        "a deleted position could hide any value"
+    );
+    // The added default column: the old file contributes the constant 9, the
+    // appended file (no deletes) its exact 1 — the fold is exact.
+    assert_eq!(t.stats[2].null_count, Some(0));
+    assert_eq!(t.stats[2].min, Some(Value::Integer(1)));
+    assert_eq!(t.stats[2].max, Some(Value::Integer(9)));
+    cleanup(&dir);
+}
+
+fn time_travel_reads_each_versions_own_schema_and_rows_body() {
     let dir = scratch("time-travel");
     let lake_dir = dir.join("lake");
-    save_store(&store(3), &lake_dir).unwrap();
-    let v1 = Lake::open(&lake_dir).unwrap().current_version();
+    save_store_lake(&store(3), &lake_dir).unwrap();
+    let v1 = open_lake(&lake_dir).unwrap().current_version();
 
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
     db.execute("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 1;")
         .unwrap();
     db.execute("UPDATE t SET n = 100 WHERE i = 100;").unwrap();
     wa.commit(&db, &settings()).unwrap();
-    let v2 = Lake::open(&lake_dir).unwrap().current_version();
+    let v2 = open_lake(&lake_dir).unwrap().current_version();
 
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     wa.set_data_inlining_row_limit(0);
     let mut db = materialize(&wa);
     db.execute("ALTER TABLE t RENAME COLUMN s TO label;")
@@ -685,7 +681,7 @@ fn time_travel_reads_each_versions_own_schema_and_rows() {
     let report = wa.commit(&db, &settings()).unwrap();
     let v3 = report.version;
 
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let report = lake.attach(None).unwrap();
     let mut attached = PinkDb::new();
@@ -757,4 +753,53 @@ fn time_travel_reads_each_versions_own_schema_and_rows() {
             .is_err()
     );
     cleanup(&dir);
+}
+
+// The T2 Part 2 schema/time-travel regressions run on both catalog backends.
+#[test]
+fn rename_column_projects_old_files_and_time_travel_sees_the_old_name() {
+    with_backend(
+        "pink",
+        rename_column_projects_old_files_and_time_travel_sees_the_old_name_body,
+    );
+}
+#[cfg(feature = "catalog-sqlite")]
+#[test]
+fn rename_column_projects_old_files_and_time_travel_sees_the_old_name_sqlite() {
+    with_backend(
+        "sqlite",
+        rename_column_projects_old_files_and_time_travel_sees_the_old_name_body,
+    );
+}
+
+#[test]
+fn positional_deletes_stay_valid_across_schema_changes() {
+    with_backend(
+        "pink",
+        positional_deletes_stay_valid_across_schema_changes_body,
+    );
+}
+#[cfg(feature = "catalog-sqlite")]
+#[test]
+fn positional_deletes_stay_valid_across_schema_changes_sqlite() {
+    with_backend(
+        "sqlite",
+        positional_deletes_stay_valid_across_schema_changes_body,
+    );
+}
+
+#[test]
+fn time_travel_reads_each_versions_own_schema_and_rows() {
+    with_backend(
+        "pink",
+        time_travel_reads_each_versions_own_schema_and_rows_body,
+    );
+}
+#[cfg(feature = "catalog-sqlite")]
+#[test]
+fn time_travel_reads_each_versions_own_schema_and_rows_sqlite() {
+    with_backend(
+        "sqlite",
+        time_travel_reads_each_versions_own_schema_and_rows_body,
+    );
 }

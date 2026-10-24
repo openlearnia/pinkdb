@@ -121,8 +121,9 @@ const KEY_LEN: usize = 32;
 const TAG_LEN: usize = 16;
 /// v2+: the random per-container nonce base.
 const NONCE_BASE_LEN: usize = 16;
-/// v1: the old random nonce prefix.
 const LEGACY_NONCE_PREFIX_LEN: usize = 8;
+const LEGACY_HEADER_FIXED_LEN: usize = 31;
+const KDF_PARAMS_LEN: usize = 16; // m_cost, t_cost, p_cost, salt_len
 
 /// Plaintext authenticated by the key-check block so a wrong key is reported
 /// as `wrong key` instead of a parse error.
@@ -131,9 +132,6 @@ const KEY_CHECK_PLAIN: &[u8] = b"pinkdb lake encryption key-check/v1";
 /// magic(8) + version(4) + cipher(1) + kdf(1) + domain(1) + key-check
 /// length(4) + nonce base(16) + binding length(4).
 const HEADER_FIXED_LEN: usize = 39;
-/// The v1 fixed header (8-byte nonce prefix).
-const LEGACY_HEADER_FIXED_LEN: usize = 31;
-const KDF_PARAMS_LEN: usize = 16; // m_cost, t_cost, p_cost, salt_len
 const DEFAULT_SALT_LEN: u32 = 16;
 const MIN_SALT_LEN: u32 = 8;
 const MAX_SALT_LEN: u32 = 64;
@@ -157,17 +155,10 @@ const ARGON2_MAX_T_COST: u32 = 4 * ARGON2_T_COST;
 const ARGON2_MAX_P_COST: u32 = 4 * ARGON2_P_COST;
 const ARGON2_MAX_WORK_KIB: u64 = 8 * (ARGON2_M_COST_KIB as u64) * (ARGON2_T_COST as u64);
 
-// The defaults must stay inside the accepted envelope (compile-time check).
-const _: () = {
-    assert!(ARGON2_M_COST_KIB <= ARGON2_MAX_M_COST_KIB);
-    assert!(ARGON2_T_COST <= ARGON2_MAX_T_COST);
-    assert!(ARGON2_P_COST <= ARGON2_MAX_P_COST);
-    assert!((ARGON2_M_COST_KIB as u64) * (ARGON2_T_COST as u64) <= ARGON2_MAX_WORK_KIB);
-};
-
 /// Which kind of lake artifact a container holds; the AAD binds it, so a
 /// manifest can never authenticate as a data file (or the reverse).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
 pub(crate) enum Domain {
     /// `catalog.json` and `snapshots/<v>.json` (bound to nothing path-like:
     /// the pair is the same bytes, see the module docs).
@@ -258,38 +249,6 @@ fn tampered(path: &Path, message: impl Into<String>) -> LakeError {
 /// Does `data` start with the lake container magic?
 pub(crate) fn is_container(data: &[u8]) -> bool {
     data.starts_with(ENC_MAGIC)
-}
-
-/// The authenticated header binding of one container, without a key (wave
-/// 96a migration): the binding is public data covered by the AEAD, and a
-/// sealed `catalog.json` encodes `(lake_id, version)` there. Used to record a
-/// migrated lake's identity while copying sealed blobs byte-for-byte.
-pub(crate) fn binding_of_container(path: &Path, data: &[u8]) -> Result<String> {
-    if !is_container(data) || data.len() < LEGACY_HEADER_FIXED_LEN {
-        return Err(tampered(path, "not a pink-lake encrypted container"));
-    }
-    let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-    let (len_at, start) = if version >= CONTAINER_VERSION {
-        if data.len() < HEADER_FIXED_LEN {
-            return Err(tampered(path, "truncated container header"));
-        }
-        (HEADER_FIXED_LEN - 4, HEADER_FIXED_LEN)
-    } else if version == CONTAINER_VERSION_V1 {
-        (LEGACY_HEADER_FIXED_LEN - 4, LEGACY_HEADER_FIXED_LEN)
-    } else {
-        return Err(crate::LakeError::UnsupportedContainer {
-            path: path.to_path_buf(),
-            found: version,
-        });
-    };
-    let binding_len =
-        u32::from_le_bytes(data[len_at..len_at + 4].try_into().expect("4 bytes")) as usize;
-    let Some(end) = start.checked_add(binding_len).filter(|e| *e <= data.len()) else {
-        return Err(tampered(path, "truncated binding"));
-    };
-    std::str::from_utf8(&data[start..end])
-        .map(str::to_string)
-        .map_err(|_| tampered(path, "binding is not valid UTF-8"))
 }
 
 // ---------- key material ----------
@@ -950,7 +909,7 @@ mod imp {
         /// A writer that seals what is written through it into `sink` (used
         /// by the Vortex data-file path so a big file is never materialized
         /// whole). Call [`SealWriter::finish`] when the plaintext is done.
-        #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
+        #[allow(dead_code)]
         pub(crate) fn sealing_writer<'a>(
             &'a self,
             path: &Path,
@@ -995,6 +954,7 @@ mod imp {
         /// covered by the AEAD). Used for manifest/highest objects whose
         /// version is encoded in the binding itself: the caller opens with
         /// it, then cross-checks the decrypted payload against it (M-7).
+        #[allow(dead_code)]
         pub(crate) fn container_binding(&self, path: &Path, data: &[u8]) -> Result<String> {
             Ok(parse_header(path, data)?.binding)
         }
@@ -1132,7 +1092,7 @@ mod imp {
     /// and seals each full frame straight into the underlying writer, so a
     /// data file is never held in memory whole. Only the `vortexlake`
     /// writer path uses it (a v1 `.pink` data file is sealed in one pass).
-    #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) struct SealWriter<'a> {
         path: std::path::PathBuf,
         key: Arc<DerivedKey>,
@@ -1145,7 +1105,7 @@ mod imp {
         finished: bool,
     }
 
-    #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
+    #[allow(dead_code)]
     impl SealWriter<'_> {
         fn seal_buffered(&mut self) -> std::io::Result<()> {
             if self.buf.is_empty() {

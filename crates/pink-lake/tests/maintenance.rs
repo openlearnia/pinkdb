@@ -7,6 +7,9 @@
 //! build, everything else — the catalog shape, the compaction semantics, the
 //! statistics/pruning contract — is identical. The S3-mock and encrypted
 //! variants live in `tests/s3.rs` and `tests/encryption.rs`.
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,12 +45,8 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-fn read_json(path: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-}
-
 fn catalog(dir: &Path) -> serde_json::Value {
-    read_json(&dir.join("catalog.json"))
+    catalog_json(dir)
 }
 
 fn entry(dir: &Path, key: &str) -> serde_json::Value {
@@ -145,7 +144,7 @@ fn store(rows: &[(i32, &str)]) -> PinkDb {
 /// A lake whose table `main.t` is built from one appended file per chunk
 /// (the first append creates the table).
 fn appended_lake(dir: &Path, chunks: &[&[(i32, &str)]]) -> Lake {
-    let mut lake = Lake::open_or_create(dir).unwrap();
+    let mut lake = open_or_create_lake(dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     for chunk in chunks {
         let mut commit = Commit::new();
@@ -167,7 +166,7 @@ fn query(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
 /// `lake_dir`, with the decode counters (`loads`, `columns`, `files`) the
 /// query caused.
 fn attached_query(lake_dir: &Path, sql: &str) -> (Vec<Vec<Value>>, (u64, u64, u64)) {
-    let report = Lake::open(lake_dir).unwrap().attach(None).unwrap();
+    let report = open_lake(lake_dir).unwrap().attach(None).unwrap();
     let lake = Arc::clone(&report.lake);
     let mut db = PinkDb::new();
     db.attach_lake(report.lake).unwrap();
@@ -196,7 +195,7 @@ fn as_i64(value: &Value) -> i64 {
 
 /// All rows of `main.t` in scan order (`(id, s)`).
 fn scan_rows(lake_dir: &Path, version: Option<u64>) -> Vec<(i32, String)> {
-    let db = Lake::open(lake_dir).unwrap().load(version).unwrap();
+    let db = open_lake(lake_dir).unwrap().load(version).unwrap();
     let t = db.table("t").unwrap();
     (0..t.num_rows())
         .map(|r| {
@@ -267,13 +266,16 @@ fn merge_consolidates_files_and_leaves_sources_byte_identical() {
     // Every earlier version still loads, with its own (unmerged) file list.
     assert_eq!(scan_rows(&lake_dir, Some(version_before)), rows_before);
 
-    // The commit delta records the audit trail: compacted sources + the new
-    // file (never `replaced`).
-    let delta = read_json(&lake_dir.join(format!("commits/{}.json", report.version)));
-    let table = &delta["tables"]["main.t"];
-    assert_eq!(table["compacted_files"].as_array().unwrap().len(), 3);
-    assert_eq!(table["data_files"].as_array().unwrap().len(), 1);
-    assert!(table.get("replaced").is_none(), "{table}");
+    // The merged version lists one data file (the sources are ended, not
+    // replaced), and the old version still lists them.
+    assert_eq!(report.files_processed(), 3);
+    assert_eq!(report.files_created(), 1);
+    assert_eq!(
+        lake.list_files(Some("main.t"), Some(report.version), false)
+            .unwrap()
+            .len(),
+        1
+    );
 
     // A second merge finds nothing (one file per group).
     let again = lake
@@ -433,9 +435,14 @@ fn merge_skips_delete_bearing_files_and_rewrite_materializes_them() {
         .collect();
     old_ids.sort_unstable();
     assert_eq!(old_ids, vec![1, 2, 4, 5, 6]);
-    let delta = read_json(&lake_dir.join(format!("commits/{}.json", report.version)));
-    let table = &delta["tables"]["main.t"];
-    assert_eq!(table["removed_delete_files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        lake.list_files(Some("main.t"), None, false)
+            .unwrap()
+            .iter()
+            .filter(|f| f.delete_file.is_some())
+            .count(),
+        0
+    );
     cleanup(&dir);
 }
 
@@ -443,7 +450,7 @@ fn merge_skips_delete_bearing_files_and_rewrite_materializes_them() {
 fn merge_never_mixes_partition_values() {
     let dir = scratch("merge-partitions");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     // Partitioned table: one file per value set per commit; two commits per
     // value gives each value a two-file group.
@@ -504,13 +511,13 @@ fn merge_skips_across_schema_epochs() {
     let dir = scratch("merge-epochs");
     let lake_dir = dir.join("lake");
     // Epoch 1: a saved table (one file, epoch 1).
-    pink_lake::save_store(&store(&[(1, "a")]), &lake_dir).unwrap();
+    save_store_lake(&store(&[(1, "a")]), &lake_dir).unwrap();
 
     // A writable attach runs `ALTER TABLE … ADD COLUMN n` (epoch 2); an
     // append right after carries epoch 2. Wave 68: inlining is on by
     // default; this fixture pins file epochs, so every handle opts out.
     {
-        let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+        let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
         wa.set_data_inlining_row_limit(0);
         wa.set_data_inlining_row_limit(0);
         let mut db = materialize(&wa);
@@ -518,7 +525,7 @@ fn merge_skips_across_schema_epochs() {
             .unwrap();
         wa.commit(&db, &CommitSettings::default()).unwrap();
     }
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.set_data_inlining_row_limit(0);
     let mut commit = Commit::new();
@@ -527,7 +534,7 @@ fn merge_skips_across_schema_epochs() {
 
     // Another ALTER (epoch 3) and two appends under it.
     {
-        let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+        let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
         wa.set_data_inlining_row_limit(0);
         wa.set_data_inlining_row_limit(0);
         let mut db = materialize(&wa);
@@ -535,7 +542,7 @@ fn merge_skips_across_schema_epochs() {
             .unwrap();
         wa.commit(&db, &CommitSettings::default()).unwrap();
     }
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     lake.set_data_inlining_row_limit(0);
     for (id, s) in [(3, "c"), (4, "d")] {
@@ -710,7 +717,7 @@ fn merge_respects_size_filters_and_max_compacted_files() {
     // call, the other untouched.
     let dir2 = scratch("merge-cap");
     let lake_dir2 = dir2.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir2).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir2).unwrap();
     lake.set_data_inlining_row_limit(0);
     let mut commit = Commit::new();
     commit.set_partition("main.t", &["s"]).unwrap();
@@ -803,9 +810,7 @@ fn expire_snapshots_dry_run_then_versions_with_clean_time_travel_errors() {
         .unwrap();
     assert_eq!(report.version_numbers(), vec![2, 3]);
     assert!(report.dry_run);
-    assert!(report.bytes > 0);
-    assert!(lake_dir.join("snapshots/2.json").exists());
-    assert!(lake_dir.join("commits/2.json").exists());
+    assert!(lake.load(Some(2)).is_ok());
     assert_eq!(lake.versions().unwrap(), vec![1, 2, 3, 4, 5]);
 
     // Real run: the two snapshots and their commit deltas are gone.
@@ -863,7 +868,7 @@ fn expire_never_touches_the_current_version() {
         })
         .unwrap();
     assert!(report.versions.is_empty());
-    assert!(lake_dir.join(format!("snapshots/{current}.json")).exists());
+    assert!(lake.load(Some(current)).is_ok());
 
     // retain_last alone protects the newest N; with N = 1 only the current
     // survives.
@@ -975,7 +980,7 @@ fn expire_rule_errors_match_ducklake() {
         "{err}"
     );
     // The rule was refused before anything was touched.
-    assert!(lake_dir.join("snapshots/1.json").exists());
+    assert!(lake.load(Some(1)).is_ok());
     cleanup(&dir);
 }
 
@@ -1103,7 +1108,7 @@ fn cleanup_protects_referenced_objects_and_strays_outside_data() {
     backdate(&outside, 9 * 86_400);
 
     let report = lake
-        .cleanup_old_files(&CleanupSettings {
+        .delete_orphaned_files(&CleanupSettings {
             all: true,
             dry_run: true,
             ..CleanupSettings::default()
@@ -1121,7 +1126,7 @@ fn cleanup_protects_referenced_objects_and_strays_outside_data() {
     let young = lake_dir.join("data/main.t/young.pink.tmp");
     std::fs::write(&young, b"fresh leftover").unwrap();
     let report = lake
-        .cleanup_old_files(&CleanupSettings {
+        .delete_orphaned_files(&CleanupSettings {
             dry_run: true,
             ..CleanupSettings::default()
         })
@@ -1134,7 +1139,7 @@ fn cleanup_protects_referenced_objects_and_strays_outside_data() {
     );
     let epoch_cutoff = pinkdb::types::parse_iso8601_utc("1970-01-01T00:00:01Z").unwrap();
     let report = lake
-        .cleanup_old_files(&CleanupSettings {
+        .delete_orphaned_files(&CleanupSettings {
             older_than_micros: Some(epoch_cutoff),
             dry_run: true,
             ..CleanupSettings::default()
@@ -1149,7 +1154,7 @@ fn cleanup_protects_referenced_objects_and_strays_outside_data() {
     let future = format_iso(SystemTime::now() + Duration::from_secs(3600));
     let future = pinkdb::types::parse_iso8601_utc(&future).unwrap();
     let report = lake
-        .cleanup_old_files(&CleanupSettings {
+        .delete_orphaned_files(&CleanupSettings {
             older_than_micros: Some(future),
             dry_run: true,
             ..CleanupSettings::default()
@@ -1171,7 +1176,7 @@ fn cleanup_protects_referenced_objects_and_strays_outside_data() {
     // Confirmed deletion removes exactly the in-data leftovers; the
     // outside-data stray and every referenced file stay.
     let report = lake
-        .cleanup_old_files(&CleanupSettings {
+        .delete_orphaned_files(&CleanupSettings {
             older_than_micros: Some(future),
             confirm: true,
             ..CleanupSettings::default()
@@ -1276,7 +1281,7 @@ fn list_files_reports_rows_sizes_partitions_and_unreferenced_objects() {
 fn table_info_options_and_settings_report_exact_facts() {
     let dir = scratch("info");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     let mut commit = Commit::new();
     commit.set_partition("main.t", &["s"]).unwrap();
@@ -1318,7 +1323,7 @@ fn table_info_options_and_settings_report_exact_facts() {
     #[cfg(not(feature = "vortexlake"))]
     assert_eq!(value("data_format"), "pink");
     let settings = lake.settings();
-    assert_eq!(settings.catalog_type, "json");
+    assert_eq!(settings.catalog_type, "database");
     assert_eq!(settings.data_path, lake_dir.display().to_string());
     assert_eq!(settings.extension_version, env!("CARGO_PKG_VERSION"));
     cleanup(&dir);

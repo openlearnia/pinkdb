@@ -1,15 +1,15 @@
 <h1>Guide: S3 / R2 lakes</h1>
 
-<p class="doc-meta">Put a lake in object storage and read it back: AWS S3, Cloudflare
-R2, MinIO or any S3-compatible endpoint, using the blocking SigV4 client behind the
-optional <code>s3</code> feature.</p>
+<p class="doc-meta">Keep the catalog on local disk (or SQLite/Postgres) and the
+data files in S3, R2 or MinIO, using the SigV4 client behind the optional
+<code>s3</code> feature.</p>
 
 <h2>1. Build with lake + S3</h2>
 
-<pre class="code" data-lang="sh"><code># pinklake over object storage (7.23 MB binary)
+<pre class="code" data-lang="sh"><code># .pink data files over object storage
 cargo build --release -p pinkdb-cli --features pinklake,s3
 
-# vortexlake over object storage (~49.8 MB binary)
+# Vortex data files over object storage
 cargo build --release -p pinkdb-cli --features vortexlake,s3
 # `--features s3` alone adds the storage client but no `.lake` commands</code></pre>
 
@@ -23,81 +23,70 @@ export AWS_SECRET_ACCESS_KEY=&lt;r2-token-secret&gt;
 export AWS_ENDPOINT_URL=https://&lt;account&gt;.r2.cloudflarestorage.com
 export AWS_REGION=auto</code></pre>
 
-<p>For AWS S3 the endpoint/region variables are optional (the client derives them).
-MinIO uses its own endpoint URL plus path-style addressing, which is the default
-with a custom endpoint (<code>AWS_S3_FORCE_PATH_STYLE=1</code> forces it). A dotted
-bucket name needs path-style addressing.</p>
+<p>For AWS S3 the endpoint/region variables are optional. MinIO uses its endpoint
+plus path-style addressing (<code>AWS_S3_FORCE_PATH_STYLE=1</code> forces it).</p>
 
 <div class="callout warn">
   <span class="callout-title">The bucket must already exist</span>
-  <p>pinkdb never creates buckets. Create <code>my-bucket</code> (and an R2/S3 API
-  token with read/write access) first; an unknown bucket fails with
+  <p>pinkdb never creates buckets. An unknown bucket fails with
   <code>the bucket does not exist (or is not visible to these credentials)</code>.</p>
 </div>
 
 <h2>3. Save, list, reopen</h2>
 
-<pre class="code" data-lang="sql"><code>pinkdb&gt; .import sales_1m.csv sales
-pinkdb&gt; .lake save s3://my-bucket/lakes/demo
-pinkdb&gt; .lake versions s3://my-bucket/lakes/demo
-pinkdb&gt; .lake tables   s3://my-bucket/lakes/demo
-pinkdb&gt; .lake info     s3://my-bucket/lakes/demo</code></pre>
+<p>The catalog is a database, so give it a location and point <code>data</code> at
+the bucket. A bare <code>s3://…</code> URL is only a data location.</p>
 
-<pre class="code" data-lang="sh"><code># a fresh process, reading straight from the bucket
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .import sales_1m.csv sales
+pinkdb&gt; .lake save pink:/srv/lakes/demo.pink data s3://my-bucket/lakes/demo
+pinkdb&gt; .lake versions pink:/srv/lakes/demo.pink
+pinkdb&gt; .lake tables   pink:/srv/lakes/demo.pink
+pinkdb&gt; .lake info     pink:/srv/lakes/demo.pink</code></pre>
+
+<pre class="code" data-lang="sh"><code># a fresh process, catalog on disk and data in the bucket
 ./target/release/pinkdb
 </code></pre>
 
-<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake open   s3://my-bucket/lakes/demo
-pinkdb&gt; .lake attach s3://my-bucket/lakes/demo
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake open   pink:/srv/lakes/demo.pink
+pinkdb&gt; .lake attach pink:/srv/lakes/demo.pink
 pinkdb&gt; SELECT COUNT(*) FROM sales;   -- statistics fast path, 0 column decodes</code></pre>
 
-<p>Every write is a single atomic <code>PutObject</code>; a reader sees the old or
-the new bytes, never a mix. Snapshot publication is create-only
-(<code>If-None-Match: *</code>) and the catalog replace is conditional
-(<code>If-Match: &lt;etag&gt;</code>), so two racing saves cannot fork the version
-chain — on AWS S3 and R2 those conditionals are evaluated atomically with the
-write.</p>
+<p>For a lake shared by several machines, put the catalog in Postgres instead:
+<code>.lake save postgres://user@host/db?schema=sales data s3://bucket/sales</code>.
+Publication is one catalog transaction, so racing writers get the documented
+conflict/rebase behaviour without conditional object writes.</p>
 
 <h2>4. The same lake from Rust</h2>
 
-<pre class="code" data-lang="rust"><code>use pink_lake::{Lake, save_store_url};
-use pinkdb::PinkDb;
+<pre class="code" data-lang="rust"><code>use pink_lake::Lake;
 
-let mut db = PinkDb::new();
-db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")?;
+let mut lake = Lake::create_with_catalog(
+    "sqlite:/srv/lakes/demo.db",
+    "s3://my-bucket/lakes/demo",
+)?;
+lake.write_from_store(&amp;db)?;
 
-let version = save_store_url(&amp;db, "s3://my-bucket/lakes/demo")?;
-let mut lake = Lake::open_url("s3://my-bucket/lakes/demo")?;
+let mut lake = Lake::open_with_catalog("sqlite:/srv/lakes/demo.db", None)?;
 let tables = lake.tables()?;
 
-// explicit configuration instead of the environment:
-// let config = S3Config::new("my-bucket").with_prefix("lakes/demo")
-//     .with_region("auto").with_endpoint(endpoint).with_credentials(key, secret);
-// let lake = Lake::open_s3(config)?;</code></pre>
+// explicit S3 configuration for tests/tools:
+// let lake = Lake::create_s3(
+//     S3Config::new("my-bucket").with_prefix("lakes/demo")
+//         .with_region("auto").with_endpoint(endpoint)
+//         .with_credentials(key, secret))?;</code></pre>
 
 <h2>Gotchas</h2>
 
 <ul>
-  <li><strong>One <code>PutObject</code> per object</strong> — no multipart uploads,
-  so a single table's data file must be ≤5&nbsp;GiB; the client refuses larger
-  bodies before sending. No lifecycle rules, no server-side copy, no lake-side GC:
-  old versions stay, exactly like local.</li>
-  <li><strong>Concurrent writers are unsupported unless the endpoint enforces
-  conditionals.</strong> AWS S3 and R2 do. On an endpoint that rejects conditional
-  writes (HTTP 501 or <code>NotImplemented</code>), writes are refused by default;
-  <code>PINKDB_S3_ALLOW_DEGRADED=1</code> accepts a check-then-put fallback that is
-  <em>single-writer only</em>.</li>
-  <li><strong>Retries are conservative.</strong> <code>429</code>/<code>503</code> are
-  retried for every request; transport errors only for idempotent requests. An
-  ambiguous conditional PUT is never retried — after a failure, reopen the lake and
-  check <code>.lake versions</code> before retrying.</li>
-  <li><strong>Requests time out after 120 s</strong> (connect + transfer), and the
-  host clock must be within S3's ~15-minute SigV4 skew.</li>
-  <li><strong>Lake data is plaintext</strong>: <code>PINKDB_KEY</code> does not
-  encrypt lake objects. Credentials come only from the environment or an explicit
-  <code>S3Config</code>.</li>
-  <li><code>PINKDB_S3_ALLOW_HTTP=1</code> permits a plain <code>http://</code>
-  endpoint for local test servers — never for real credentials.</li>
+  <li><strong>One <code>PutObject</code> per data file</strong> — no multipart
+  uploads, so one file must be ≤5&nbsp;GiB; larger bodies are refused before
+  sending. Old versions stay until <code>.lake expire</code>/<code>cleanup</code>.</li>
+  <li><strong>Conditional object writes are gone.</strong> Only data files are
+  written to S3; the catalog transaction is the single-writer guard, so an
+  endpoint no longer needs conditional PUT support.</li>
+  <li><strong>Retries are conservative.</strong> <code>429</code>/<code>503</code>
+  are retried with backoff; a body is never replayed when the request may have
+  succeeded.</li>
 </ul>
 
 <ul class="next-links">

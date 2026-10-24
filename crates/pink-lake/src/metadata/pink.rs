@@ -47,13 +47,6 @@ use super::dialect::Dialect;
 use super::store::SqlMetadataStore;
 use crate::{LakeError, Result};
 
-/// Open (or create) the one lake in `path`, durably: `SyncPolicy::Sync`
-/// fsyncs a committed catalog transaction before the commit returns, so a
-/// snapshot that the lake reported is on disk after a crash.
-pub(crate) fn open(url: &str, path: &Path, create: bool) -> Result<SqlMetadataStore> {
-    open_keyed(url, path, create, None)
-}
-
 /// Open the `pink:` catalog, optionally with the engine's at-rest key: a
 /// keyed lake may keep its catalog database itself encrypted (`PINKENC1`).
 /// The DuckLake rows are still plaintext *inside* that container; the engine

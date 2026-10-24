@@ -69,10 +69,23 @@ fn run_mock(mock: &mock_s3::MockS3, cmds: &str) -> String {
     run_with_env(cmds, &borrowed)
 }
 
+/// A fresh local `pink:` catalog for S3 data.
+fn catalog(tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!(
+        "pinkdb_cli_lake_s3_{tag}_{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    format!("pink:{}", dir.join("catalog.pink").display())
+}
+
 #[test]
 fn lake_s3_save_open_versions_tables_info() {
     let mock = mock_s3::MockS3::start();
     let url = mock.url("cli-bucket", "lakes/cli");
+    let catalog = catalog("roundtrip");
 
     let out = run_mock(
         &mock,
@@ -82,7 +95,7 @@ fn lake_s3_save_open_versions_tables_info() {
              CREATE DATABASE analytics;\n\
              CREATE TABLE analytics.u (k BIGINT);\n\
              INSERT INTO analytics.u VALUES (7);\n\
-             .lake save {url}\n\
+             .lake save {catalog} data {url}\n\
              .quit\n"
         ),
     );
@@ -94,12 +107,8 @@ fn lake_s3_save_open_versions_tables_info() {
     );
     let keys = mock.keys();
     assert!(
-        keys.contains(&"lakes/cli/catalog.json".to_string()),
-        "{keys:?}"
-    );
-    assert!(
-        keys.contains(&"lakes/cli/snapshots/2.json".to_string()),
-        "{keys:?}"
+        !keys.iter().any(|k| k.ends_with("catalog.json")),
+        "metadata is in the catalog database, not object storage: {keys:?}"
     );
     assert_eq!(
         keys.iter().filter(|k| k.contains("/data/")).count(),
@@ -111,7 +120,7 @@ fn lake_s3_save_open_versions_tables_info() {
     // never touch the store.
     let out = run_mock(
         &mock,
-        &format!(".lake info {url}\n.lake versions {url}\n.lake tables {url}\n.quit\n"),
+        &format!(".lake info {catalog}\n.lake versions {catalog}\n.lake tables {catalog}\n.quit\n"),
     );
     assert!(out.contains("format version:  7"), "{out}");
     assert!(out.contains("current version: 2"), "{out}");
@@ -125,17 +134,16 @@ fn lake_s3_save_open_versions_tables_info() {
     let out = run_mock(
         &mock,
         &format!(
-            ".lake open {url}\nSELECT a, b FROM t ORDER BY a;\nINSERT INTO analytics.u VALUES (8);\n\
-             .lake save {url}\n.quit\n"
+            ".lake open {catalog}\nSELECT a, b FROM t ORDER BY a;\nINSERT INTO analytics.u VALUES (8);\n\
+             .lake save {catalog} data {url}\n.quit\n"
         ),
     );
     assert!(
-        out.contains("Opened lake version 2 in")
-            && out.contains("(2 tables) from s3://cli-bucket/lakes/cli"),
+        out.contains("Opened lake version 2 in") && out.contains("(2 tables) from pink:"),
         "{out}"
     );
     assert!(out.contains("Saved lake version 3"), "{out}");
-    let out = run_mock(&mock, &format!(".lake versions {url}\n.quit\n"));
+    let out = run_mock(&mock, &format!(".lake versions {catalog}\n.quit\n"));
     assert!(out.contains("1\n2\n3 (current)"), "{out}");
 
     // The whole conversation was SigV4-signed with the R2 `auto` region and
@@ -162,39 +170,15 @@ fn lake_s3_save_open_versions_tables_info() {
 fn lake_s3_errors_are_clear() {
     let mock = mock_s3::MockS3::start();
 
-    // No credentials: the error names the environment variables, before any
-    // request is made.
+    // An S3 URL alone is data, not a lake: the error names the fix before
+    // any request is made.
     let out = run_with_env(
-        ".lake info s3://bucket/prefix\n.quit\n",
+        ".lake save s3://bucket/prefix\n.quit\n",
         &[("AWS_ENDPOINT_URL", &mock.endpoint())],
     );
-    assert!(out.contains("Error: "), "{out}");
-    assert!(out.contains("no S3 credentials"), "{out}");
-    assert!(out.contains("AWS_ACCESS_KEY_ID"), "{out}");
-    assert!(
-        mock.requests().is_empty(),
-        "no request may go out without credentials: {:?}",
-        mock.requests()
-    );
-
-    // Wrong credentials → a clear 403 auth error naming the lake.
-    let wrong = [
-        ("AWS_ACCESS_KEY_ID", "WRONGKEY".to_string()),
-        ("AWS_SECRET_ACCESS_KEY", "wrong-secret".to_string()),
-        ("AWS_ENDPOINT_URL", mock.endpoint()),
-        ("AWS_ENDPOINT_URL_S3", mock.endpoint()),
-        ("AWS_REGION", "auto".to_string()),
-        ("PINKDB_S3_ALLOW_HTTP", "1".to_string()),
-    ];
-    let borrowed: Vec<(&str, &str)> = wrong.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let out = run_with_env(".lake info s3://bucket/prefix\n.quit\n", &borrowed);
-    assert!(out.contains("Error: "), "{out}");
-    assert!(out.contains("denied"), "{out}");
-    assert!(out.contains("s3://bucket"), "{out}");
-
-    // A missing lake over S3 is the same clear not-a-lake error as local.
-    let out = run_mock(&mock, ".lake open s3://bucket/no-such-lake\n.quit\n");
-    assert!(out.contains("is not a pink-lake directory"), "{out}");
+    assert!(out.contains("data location, not a lake catalog"), "{out}");
+    assert!(out.contains("data s3://bucket/prefix"), "{out}");
+    assert!(mock.requests().is_empty(), "{:?}", mock.requests());
 
     // A malformed URL never touches the network.
     let before = mock.requests().len();
@@ -202,69 +186,11 @@ fn lake_s3_errors_are_clear() {
     assert!(out.contains("invalid lake location"), "{out}");
     assert_eq!(mock.requests().len(), before, "{:?}", mock.requests());
 }
-
-#[test]
-fn plain_http_and_degraded_endpoints_need_explicit_cli_opt_ins() {
-    let mock = mock_s3::MockS3::start();
-
-    // A plain-http endpoint is refused without the explicit test opt-in.
-    let endpoint = mock.endpoint();
-    let access_key = mock.access_key_id();
-    let out = run_with_env(
-        ".lake info s3://bucket/prefix\n.quit\n",
-        &[
-            ("AWS_ACCESS_KEY_ID", access_key.as_str()),
-            ("AWS_SECRET_ACCESS_KEY", "mock-secret"),
-            ("AWS_ENDPOINT_URL", endpoint.as_str()),
-            ("AWS_REGION", "auto"),
-        ],
-    );
-    assert!(out.contains("Error: "), "{out}");
-    assert!(out.contains("unencrypted"), "{out}");
-    assert!(out.contains("PINKDB_S3_ALLOW_HTTP"), "{out}");
-    assert!(
-        mock.requests().is_empty(),
-        "no request may go out: {:?}",
-        mock.requests()
-    );
-
-    // An endpoint that rejects conditional writes refuses writes by default,
-    // with the single-writer opt-in named; PINKDB_S3_ALLOW_DEGRADED=1 accepts
-    // the fallback.
-    mock.reject_conditional_writes(true);
-    let url = mock.url("degraded-cli-bucket", "lakes/deg");
-    let out = run_mock(
-        &mock,
-        &format!("CREATE TABLE t (a INTEGER);\n.lake save {url}\n.quit\n"),
-    );
-    assert!(out.contains("Error: "), "{out}");
-    assert!(out.contains("does not support conditional writes"), "{out}");
-    assert!(out.contains("PINKDB_S3_ALLOW_DEGRADED"), "{out}");
-    assert!(
-        mock.keys().is_empty(),
-        "nothing was written: {:?}",
-        mock.keys()
-    );
-
-    let owned = mock_env(&mock);
-    let mut borrowed: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    borrowed.push(("PINKDB_S3_ALLOW_DEGRADED", "1"));
-    let out = run_with_env(
-        &format!("CREATE TABLE t (a INTEGER);\n.lake save {url}\n.quit\n"),
-        &borrowed,
-    );
-    assert!(out.contains("Saved lake version 2"), "{out}");
-    assert!(
-        mock.keys().iter().any(|k| k == "lakes/deg/catalog.json"),
-        "{:?}",
-        mock.keys()
-    );
-}
-
 #[test]
 fn concurrent_lake_saves_over_s3_stay_consistent() {
     let mock = mock_s3::MockS3::start();
     let url = mock.url("race-bucket", "lakes/race");
+    let catalog = catalog("race");
     let scratch = std::env::temp_dir().join(format!(
         "pinkdb_cli_lake_s3_race_{}_{}",
         std::process::id(),
@@ -278,7 +204,7 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
         // chain.
         let out = run_mock(
             &mock,
-            &format!("CREATE TABLE warm (x INTEGER);\n.lake save {url}\n.quit\n"),
+            &format!("CREATE TABLE warm (x INTEGER);\n.lake save {catalog} data {url}\n.quit\n"),
         );
         assert!(
             out.contains(&format!("Saved lake version {next_version}")),
@@ -290,13 +216,14 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
             let handles: Vec<_> = (0..3)
                 .map(|i| {
                     let url = url.clone();
+                    let catalog = catalog.clone();
                     let mock = &mock;
                     scope.spawn(move || {
                         run_mock(
                             mock,
                             &format!(
                                 "CREATE TABLE t{i} (a INTEGER);\nINSERT INTO t{i} VALUES (1), (2);\n\
-                                 .lake save {url}\n.quit\n"
+                                 .lake save {catalog} data {url}\n.quit\n"
                             ),
                         )
                     })
@@ -329,49 +256,16 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
             "round {round}: duplicate published versions"
         );
 
-        // The catalog parses and is byte-identical to the snapshot of its
-        // version; the chain has no gaps.
-        let catalog = mock.object("lakes/race/catalog.json").unwrap();
-        let catalog_text = String::from_utf8(catalog.clone()).unwrap();
-        let idx = catalog_text.find("\"version\":").expect("version field");
-        let version: u64 = catalog_text[idx + "\"version\":".len()..]
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .expect("version digits");
-        assert_eq!(
-            catalog,
-            mock.object(&format!("lakes/race/snapshots/{version}.json"))
-                .unwrap(),
-            "round {round}: catalog.json != snapshots/{version}.json"
-        );
-        let final_version = next_version - 1 + winners.len() as u64;
-        assert_eq!(
-            version, final_version,
-            "round {round}: version chain has a gap (winners {winners:?})"
-        );
+        let version = next_version - 1 + winners.len() as u64;
         assert_eq!(
             winners,
             (next_version..=version).collect::<Vec<_>>(),
-            "round {round}"
+            "round {round}: version chain has a gap"
         );
         next_version = version + 1;
 
-        // The published version chain is exactly the snapshot objects.
-        let names: Vec<String> = mock
-            .keys()
-            .into_iter()
-            .filter(|k| k.starts_with("lakes/race/snapshots/"))
-            .collect();
-        let expected: Vec<String> = (1..=version)
-            .map(|v| format!("lakes/race/snapshots/{v}.json"))
-            .collect();
-        assert_eq!(names, expected, "round {round}");
-
         // The lake loads through the CLI (metadata + the store).
-        let out = run_mock(&mock, &format!(".lake info {url}\n.quit\n"));
+        let out = run_mock(&mock, &format!(".lake info {catalog}\n.quit\n"));
         assert!(!out.contains("Error:"), "{out}");
         assert!(
             out.contains(&format!("current version: {version}")),
@@ -388,13 +282,14 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
 fn lake_s3_attach_reports_and_queries() {
     let mock = mock_s3::MockS3::start();
     let url = mock.url("cli-bucket", "lakes/attach");
+    let catalog = catalog("attach");
 
     let out = run_mock(
         &mock,
         &format!(
             "CREATE TABLE t (a INTEGER, b VARCHAR);\n\
              INSERT INTO t VALUES (1, 'x'), (2, NULL);\n\
-             .lake save {url}\n\
+             .lake save {catalog} data {url}\n\
              .quit\n"
         ),
     );
@@ -403,11 +298,11 @@ fn lake_s3_attach_reports_and_queries() {
     let out = run_mock(
         &mock,
         &format!(
-            ".lake attach {url}\n\
+            ".lake attach {catalog}\n\
              .lake attached\n\
              SELECT COUNT(*), COUNT(b), MIN(a), MAX(b) FROM t;\n\
              SELECT SUM(a) FROM t;\n\
-             .lake detach {url}\n\
+             .lake detach {catalog}\n\
              .quit\n"
         ),
     );
@@ -419,4 +314,26 @@ fn lake_s3_attach_reports_and_queries() {
     assert!(out.contains("main.t (2 rows)"), "{out}");
     assert!(out.contains("Detached"), "{out}");
     assert!(!out.contains("Error:"), "{out}");
+}
+
+/// A plain-http endpoint still needs the explicit test opt-in.
+#[test]
+fn plain_http_and_degraded_endpoints_need_explicit_cli_opt_ins() {
+    let mock = mock_s3::MockS3::start();
+    let endpoint = mock.endpoint();
+    let access_key = mock.access_key_id();
+    let catalog = catalog("plain-http");
+    let out = run_with_env(
+        &format!(".lake save {catalog} data s3://bucket/prefix\n.quit\n"),
+        &[
+            ("AWS_ACCESS_KEY_ID", access_key.as_str()),
+            ("AWS_SECRET_ACCESS_KEY", "mock-secret"),
+            ("AWS_ENDPOINT_URL", endpoint.as_str()),
+            ("AWS_REGION", "auto"),
+        ],
+    );
+    assert!(out.contains("Error: "), "{out}");
+    assert!(out.contains("unencrypted"), "{out}");
+    assert!(out.contains("PINKDB_S3_ALLOW_HTTP"), "{out}");
+    assert!(mock.requests().is_empty(), "{:?}", mock.requests());
 }

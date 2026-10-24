@@ -13,13 +13,16 @@
 //!   registered through the public seam works end to end: save → reopen →
 //!   open → attach (`COUNT`/`MIN`/`MAX` equal to `open`) → append → merge
 //!   maintenance, with the catalog and the files carrying the new id.
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pink_lake::format::{DataFile, EncodedFile, LakeFormat, register_lake_format};
-use pink_lake::{Commit, Lake, LakeError, MergeSettings, save_store};
+use pink_lake::{Commit, LakeError, MergeSettings};
 use pinkdb::persist::SavedTableStats;
 use pinkdb::{DataTable, DataType, PinkDb, QueryResult, Value};
 
@@ -38,10 +41,6 @@ fn scratch(tag: &str) -> PathBuf {
 
 fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
-}
-
-fn read_json(path: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
 fn query(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
@@ -199,21 +198,21 @@ fn an_unknown_format_refuses_only_its_own_table() {
     let dir = scratch("unknown");
     let lake_dir = dir.join("lake");
     let source = two_table_store(4);
-    save_store(&source, &lake_dir).unwrap();
+    save_store_lake(&source, &lake_dir).unwrap();
 
     // Pin a format id no provider can serve. The catalog keeps its version
     // and lake id, so the manifest is otherwise a valid v6 head.
-    let catalog_path = lake_dir.join("catalog.json");
-    let mut catalog = read_json(&catalog_path);
     assert!(
-        catalog["tables"]["main.u"]["format"].is_string(),
-        "{catalog}"
+        open_lake(&lake_dir)
+            .unwrap()
+            .table_format_name("main.u")
+            .unwrap()
+            .is_some()
     );
-    catalog["tables"]["main.u"]["format"] = serde_json::json!("nosuch");
-    std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+    pink_lake::catalog_set_table_format(&catalog_url(&lake_dir), "main.u", "nosuch").unwrap();
 
     // Open succeeds; only the readable table materializes.
-    let lake = Lake::open(&lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let loaded = lake.load(None).unwrap();
     assert_eq!(loaded.list_tables(), vec!["t".to_string()]);
     assert_eq!(loaded.table("t").unwrap().num_rows(), 4);
@@ -261,7 +260,7 @@ fn an_unknown_format_refuses_only_its_own_table() {
     }
 
     // A targeted maintenance/rewrite/commit fails with the provider error.
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     let err = lake
         .merge_adjacent_files(Some("main.u"), &MergeSettings::default())
         .unwrap_err();
@@ -285,18 +284,24 @@ fn an_unknown_format_refuses_only_its_own_table() {
     // A full save carries the entry forward verbatim: same file list, same
     // pin flag — the store has no table under that key.
     let store = lake.load(None).unwrap();
-    let before = read_json(&catalog_path);
+    let before = lake.table_info().unwrap();
     let report = lake.write_from_store_report(&store).unwrap();
     assert_eq!(report.version, 3);
-    let after = read_json(&catalog_path);
-    assert_eq!(after["tables"]["main.u"]["format"], "nosuch", "{after}");
-    for field in ["files", "rows", "stats", "format_pinned"] {
-        assert_eq!(
-            after["tables"]["main.u"][field], before["tables"]["main.u"][field],
-            "carried field {field}: {after}"
-        );
+    assert_eq!(
+        lake.table_format_name("main.u").unwrap().as_deref(),
+        Some("nosuch")
+    );
+    let after = lake.table_info().unwrap();
+    for field in ["rows", "file_count", "schema_version"] {
+        let pick = |infos: &[pink_lake::TableInfo]| {
+            infos
+                .iter()
+                .find(|i| i.table == "main.u")
+                .map(|i| format!("{i:?}"))
+        };
+        assert_eq!(pick(&after).is_some(), pick(&before).is_some(), "{field}");
     }
-    let reloaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    let reloaded = open_lake(&lake_dir).unwrap().load(None).unwrap();
     assert_eq!(reloaded.table("t").unwrap().num_rows(), 4);
 
     // A store that has the key would replace data this build cannot read:
@@ -331,7 +336,7 @@ fn a_registered_provider_is_used_end_to_end() {
 
     // Save a fresh lake under the test provider.
     let original = store(5);
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     lake.set_write_format("pinkwrap").unwrap();
     assert!(!lake.attach(None).is_err(), "an empty lake still attaches");
     let report = lake.write_from_store_report(&original).unwrap();
@@ -339,18 +344,20 @@ fn a_registered_provider_is_used_end_to_end() {
 
     // The catalog pins the id, the file is `*.pinkwrap`, and its bytes start
     // with the provider's header.
-    let catalog = read_json(&lake_dir.join("catalog.json"));
-    let entry = &catalog["tables"]["main.t"];
-    assert_eq!(entry["format"], "pinkwrap", "{entry}");
-    let files = entry["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1, "{entry}");
-    let rel = files[0]["path"].as_str().unwrap();
+    let lake_now = open_lake(&lake_dir).unwrap();
+    assert_eq!(
+        lake_now.table_format_name("main.t").unwrap().as_deref(),
+        Some("pinkwrap")
+    );
+    let files = lake_now.list_files(Some("main.t"), None, false).unwrap();
+    assert_eq!(files.len(), 1);
+    let rel = files[0].path.as_str();
     assert!(rel.ends_with(".pinkwrap"), "{rel}");
-    let on_disk = std::fs::read(lake_dir.join(rel)).unwrap();
+    let on_disk = std::fs::read(data_dir(&lake_dir).join(rel)).unwrap();
     assert_eq!(&on_disk[..4], HEADER, "the provider's header is on disk");
 
     // Reopen and load through the provider.
-    let reopened = Lake::open(&lake_dir).unwrap();
+    let reopened = open_lake(&lake_dir).unwrap();
     let loaded = reopened.load(None).unwrap();
     assert_eq!(
         loaded.table("t").unwrap().num_rows(),
@@ -380,7 +387,7 @@ fn a_registered_provider_is_used_end_to_end() {
 
     // Append through a commit: the handle's chosen provider writes the new
     // file. Inlining is disabled so the rows become a data file.
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.set_write_format("pinkwrap").unwrap();
     lake.set_data_inlining_row_limit(0);
     let appended = sub_table(&[
@@ -393,43 +400,47 @@ fn a_registered_provider_is_used_end_to_end() {
     commit.append("main.t", appended);
     let report = lake.commit(&commit).unwrap();
     assert_eq!(report.version, 3);
-    let catalog = read_json(&lake_dir.join("catalog.json"));
-    let entry = &catalog["tables"]["main.t"];
-    assert_eq!(entry["format"], "pinkwrap", "{entry}");
-    let files = entry["files"].as_array().unwrap();
-    assert_eq!(files.len(), 2, "the append added one file: {entry}");
-    for file in files {
-        let rel = file["path"].as_str().unwrap();
+    let lake_now = open_lake(&lake_dir).unwrap();
+    assert_eq!(
+        lake_now.table_format_name("main.t").unwrap().as_deref(),
+        Some("pinkwrap")
+    );
+    let files = lake_now.list_files(Some("main.t"), None, false).unwrap();
+    assert_eq!(files.len(), 2, "the append added one file");
+    for file in &files {
+        let rel = file.path.as_str();
         assert!(rel.ends_with(".pinkwrap"), "{rel}");
-        let bytes = std::fs::read(lake_dir.join(rel)).unwrap();
+        let bytes = std::fs::read(data_dir(&lake_dir).join(rel)).unwrap();
         assert_eq!(&bytes[..4], HEADER, "{rel}");
     }
 
     // The appended rows load through the provider.
-    let loaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    let loaded = open_lake(&lake_dir).unwrap().load(None).unwrap();
     assert_eq!(loaded.table("t").unwrap().num_rows(), 9);
 
     // Maintenance: merge the two files into one, re-encoded by the entry's
     // own provider.
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     let report = lake
         .merge_adjacent_files(Some("main.t"), &MergeSettings::default())
         .unwrap();
     assert!(report.committed, "two same-epoch files are mergeable");
     assert_eq!(report.files_processed(), 2);
     assert_eq!(report.files_created(), 1);
-    let catalog = read_json(&lake_dir.join("catalog.json"));
-    let entry = &catalog["tables"]["main.t"];
-    assert_eq!(entry["format"], "pinkwrap", "{entry}");
-    let files = entry["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1, "the merge consolidated the files: {entry}");
-    let rel = files[0]["path"].as_str().unwrap();
+    let lake_now = open_lake(&lake_dir).unwrap();
+    assert_eq!(
+        lake_now.table_format_name("main.t").unwrap().as_deref(),
+        Some("pinkwrap")
+    );
+    let files = lake_now.list_files(Some("main.t"), None, false).unwrap();
+    assert_eq!(files.len(), 1, "the merge consolidated the files");
+    let rel = files[0].path.as_str();
     assert!(rel.ends_with(".pinkwrap"), "{rel}");
-    let bytes = std::fs::read(lake_dir.join(rel)).unwrap();
+    let bytes = std::fs::read(data_dir(&lake_dir).join(rel)).unwrap();
     assert_eq!(&bytes[..4], HEADER, "{rel}");
 
     // ... and the merged file answers exactly what the open path holds.
-    let loaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    let loaded = open_lake(&lake_dir).unwrap().load(None).unwrap();
     assert_eq!(loaded.table("t").unwrap().num_rows(), 9);
     let mut opened = loaded;
     assert_eq!(
@@ -454,14 +465,11 @@ fn a_registered_provider_is_used_end_to_end() {
 fn a_vortex_entry_is_unavailable_per_table_in_a_lean_build() {
     let dir = scratch("vortex_unavailable");
     let lake_dir = dir.join("lake");
-    save_store(&store(3), &lake_dir).unwrap();
+    save_store_lake(&store(3), &lake_dir).unwrap();
 
-    let catalog_path = lake_dir.join("catalog.json");
-    let mut catalog = read_json(&catalog_path);
-    catalog["tables"]["main.t"]["format"] = serde_json::json!("vortex");
-    std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+    pink_lake::catalog_set_table_format(&catalog_url(&lake_dir), "main.t", "vortex").unwrap();
 
-    let lake = Lake::open(&lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let unavailable = lake.unavailable_tables().unwrap();
     assert_eq!(unavailable.len(), 1, "{unavailable:?}");
     assert_eq!(unavailable[0].table, "main.t");

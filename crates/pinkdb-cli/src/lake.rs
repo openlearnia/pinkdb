@@ -6,11 +6,10 @@
 //! format_version 4, `.lake attach` over the published statistics blocks).
 //!
 //! The lake itself lives in the `pink-lake` crate; this module is only the
-//! REPL surface. Locations are local directories, or `s3://bucket/prefix`
-//! URLs when the `s3` feature is built (AWS S3, Cloudflare R2; credentials
-//! and endpoint come from the usual `AWS_*` environment; the safety opt-ins
-//! `PINKDB_S3_ALLOW_HTTP` and `PINKDB_S3_ALLOW_DEGRADED` work exactly as the
-//! library documents).
+//! REPL surface. A lake is a catalog (`pink:`, `sqlite:` or `postgres://`)
+//! plus data on local disk or, with the `s3` feature, `s3://bucket/prefix`
+//! (credentials/endpoint from the usual `AWS_*` environment; a plain-http
+//! test endpoint additionally needs `PINKDB_S3_ALLOW_HTTP`).
 //!
 //! # SQL catalogs (wave 96a)
 //!
@@ -298,9 +297,8 @@ fn supervisors() -> MutexGuard<'static, BTreeMap<String, Supervisor>> {
 /// The resolved location that keys [`SUPERVISORS`] (the same string the
 /// supervisor's registry and `catch_up`'s status hook use).
 fn supervisor_key(dir: &str) -> Option<String> {
-    open_lake(dir)
-        .ok()
-        .map(|lake| lake.path().display().to_string())
+    // The supervisor registry is keyed by the location it was started with.
+    open_lake(dir).ok().map(|_| dir.to_string())
 }
 
 fn chosen_write_format() -> Option<String> {
@@ -402,7 +400,6 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "open" => cmd_open(db, rest),
         "attach" => cmd_attach(db, rest),
         "commit" => cmd_commit(db, rest),
-        "migrate-catalog" => cmd_migrate_catalog(rest),
         "replicate" => cmd_replicate(db, rest),
         "partition" => cmd_partition(db, rest),
         "inlining" => cmd_inlining(rest),
@@ -426,7 +423,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
         "" => println!(
-            "Usage: .lake <save|open|attach|commit|migrate-catalog|replicate|partition|inlining|flush|changes|\
+            "Usage: .lake <save|open|attach|commit|replicate|partition|inlining|flush|changes|\
              add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
              settings|format|detach|attached|versions|snapshots|tables|info> ..."
         ),
@@ -455,14 +452,14 @@ macro_rules! data_opt {
 )))]
 macro_rules! data_opt {
     () => {
-        ""
+        " [data <dir|s3://…>]"
     };
 }
 
 /// The `.lake save` usage line (kept in one place: the argument parser and
 /// both of its error paths print it).
 const SAVE_USAGE: &str = concat!(
-    "Usage: .lake save <location>",
+    "Usage: .lake save <catalog>",
     data_opt!(),
     " [force] [author '<name>'] [message '<text>']"
 );
@@ -663,10 +660,10 @@ fn warn_unavailable_tables(lake: &Lake, version: Option<u64>, outcome: &str) {
     }
 }
 
-/// `.lake open <location> [data <dir|s3://…>] [version]`: replace the
+/// `.lake open <catalog> [data <dir|s3://…>] [version]`: replace the
 /// in-memory store with the lake's latest (or the given) version.
 fn cmd_open(db: &mut PinkDb, arg: &str) {
-    const USAGE: &str = concat!("Usage: .lake open <location>", data_opt!(), " [version]");
+    const USAGE: &str = concat!("Usage: .lake open <catalog>", data_opt!(), " [version]");
     let Some((dir, mut rest)) = take_token(arg) else {
         println!("{USAGE}{HINT}");
         return;
@@ -815,7 +812,7 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
 /// schema mismatch is refused.
 fn cmd_attach(db: &mut PinkDb, arg: &str) {
     const USAGE: &str = concat!(
-        "Usage: .lake attach <location>",
+        "Usage: .lake attach <catalog>",
         data_opt!(),
         " [version] [read-only|write]"
     );
@@ -1126,18 +1123,18 @@ fn schema_text(schema: &[(String, pinkdb::DataType)]) -> String {
         .join(", ")
 }
 
-/// `.lake commit <dir>`: publish the writable attachment's changes as one
+/// `.lake commit <catalog>`: publish the writable attachment's changes as one
 /// incremental lake version (appended data files + positional delete files;
 /// no published file is rewritten). The commit retries a conflicting publish
 /// with the DuckLake-parity settings (see the module docs) and is idempotent:
 /// committing with nothing to publish is a no-op.
 fn cmd_commit(db: &mut PinkDb, arg: &str) {
     let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake commit <dir>{HINT}");
+        println!("Usage: .lake commit <catalog>{HINT}");
         return;
     };
     if !rest.trim().is_empty() {
-        println!("Usage: .lake commit <dir>{HINT}");
+        println!("Usage: .lake commit <catalog>{HINT}");
         return;
     }
     let dir = unquote(&dir);
@@ -1238,68 +1235,6 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
         }
     }
     writables().insert(dir, wa);
-}
-
-/// `.lake migrate-catalog <from> to <to> [data <location>]`: copy every
-/// metadata object byte-for-byte to the target catalog and retire the source
-/// (wave 96a). Both locations are redacted before printing, so a Postgres
-/// password can never reach the terminal.
-fn cmd_migrate_catalog(arg: &str) {
-    const USAGE: &str = "Usage: .lake migrate-catalog <from> to <to> [data <location>]";
-    let Some((from, rest)) = take_token(arg) else {
-        println!("{USAGE}");
-        return;
-    };
-    let Some((separator, rest)) = take_token(rest) else {
-        println!("{USAGE}");
-        return;
-    };
-    if separator != "to" {
-        cli_error!("expected `to` between the source and target locations. {USAGE}");
-        return;
-    }
-    let Some((to, mut rest)) = take_token(rest) else {
-        println!("{USAGE}");
-        return;
-    };
-    let mut data = None;
-    loop {
-        let tail = rest.trim_start();
-        if tail.is_empty() {
-            break;
-        }
-        let Some((option, after)) = take_token(tail) else {
-            break;
-        };
-        if option != "data" {
-            cli_error!("unknown migrate-catalog option {option:?}. {USAGE}");
-            return;
-        }
-        let Some((value, after)) = take_value(after) else {
-            cli_error!("`data` needs a location. {USAGE}");
-            return;
-        };
-        data = Some(value);
-        rest = after;
-    }
-    match Lake::migrate_catalog(&from, &to, data.as_deref()) {
-        Ok(report) => {
-            let retired = if report.source_retired {
-                "source retired"
-            } else {
-                "source left in place"
-            };
-            println!(
-                "Migrated catalog {} -> {}: {} metadata object{}, {} bytes; {retired}",
-                pink_lake::redact_location(&from),
-                pink_lake::redact_location(&to),
-                report.objects,
-                plural(report.objects),
-                report.bytes
-            );
-        }
-        Err(e) => cli_error!("{e}"),
-    }
 }
 
 /// Set the save-conflict baseline for a location that was never `.lake

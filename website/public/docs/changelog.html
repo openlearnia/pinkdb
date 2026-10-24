@@ -188,6 +188,16 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-24">2026-10-24<a class="anchor" href="#2026-10-24" aria-label="Permalink: 2026-10-24">#</a></h2>
+<h3>Wave 103 — Lake catalogs are databases (DuckLake v1.1 tables) ✅</h3>
+<ul>
+<li><strong>The catalog is always a database.</strong> A lake is a <code>pink:&lt;path&gt;</code> durable pinkdb catalog (default), <code>sqlite:&lt;path&gt;</code> (<code>catalog-sqlite</code>) or <code>postgres://…</code> (<code>catalog-postgres</code>), all using DuckLake v1.1's <code>ducklake_*</code> tables with <code>begin_snapshot</code>/<code>end_snapshot</code>. Commits insert a typed delta and one snapshot row instead of rewriting <code>catalog.json</code>/<code>snapshots/</code>; <code>count(*)</code> is <code>SUM(record_count)</code>, and time travel, expire, cleanup, CDC, replication state and statistics read the same rows. DuckDB's <code>ducklake</code> extension can attach the SQLite/Postgres catalogs, and pinkdb opens DuckDB-written DuckLakes.</li>
+<li><strong>Locations.</strong> A bare path means <code>pink:&lt;path&gt;</code> with data in <code>&lt;path&gt;.files/</code>. A catalog records its data location, so <code>.lake open &lt;catalog&gt;</code> is enough. <code>s3://…</code> alone is no longer a lake: pass a catalog and <code>data s3://…</code> (<code>.lake save pink:lake.pink data s3://bucket/prefix</code>), or use a <code>postgres://</code> catalog for multi-machine lakes. <code>.lake migrate-catalog</code> is removed.</li>
+<li><strong>Per-file encryption</strong> stays: each data/delete file is a PNKLAKE1 raw-key container with its own random 256-bit key recorded in the catalog; a <code>pink:</code> catalog may itself be engine-encrypted. Manifest sealing, the passphrase-derived lake key, <code>highest.json</code>, <code>lake.json</code>, <code>moved.json</code> and the degraded/conditional metadata-write paths are gone.</li>
+<li><strong>Breaking:</strong> lakes saved by an older build in the JSON layout do not open. There is no converter; re-save them with an older build (for example <code>.lake open &lt;old&gt;</code> then <code>.lake save pink:new.pink</code>) before opening with this build.</li>
+<li><strong>Fix after review:</strong> file statistics were resolved against the column's *current* name, so a file written before a RENAME lost its old physical column when attach rebuilt the zone map. Statistics now resolve through the <code>ducklake_column</code> definition visible at the file's <code>begin_snapshot</code>; a v1 file projects through the rename at head, and time travel to v1 sees its original names and rows. Positional deletes keep addressing the same rows across ADD/DROP COLUMN. The schema, time-travel, replication, S3, encryption, corruption and attach-error tests deleted in the first pass were restored (and the schema/ replication ones run on both <code>pink:</code> and <code>sqlite:</code>).</li>
+<li>Result at 10,000 files: catalog transaction stays flat (pink 7.1–9.8 ms, sqlite 0.7 ms), pink catalog 3.43 MB with statistics, attach + <code>count(*)</code> 184 ms. Data formats (<code>.pink</code>, Vortex, Parquet) and the S3 data path are unchanged.</li>
+</ul>
 <h2 id="2026-10-23">2026-10-23<a class="anchor" href="#2026-10-23" aria-label="Permalink: 2026-10-23">#</a></h2>
 <h3>Wave 96a (part 2) — Postgres catalogs and catalog migration ✅</h3>
 <ul>
@@ -650,6 +660,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-24">2026-10-24</a></li>
   <li><a href="#2026-10-23">2026-10-23</a></li>
   <li><a href="#2026-10-22">2026-10-22</a></li>
   <li><a href="#2026-10-21">2026-10-21</a></li>

@@ -7,6 +7,8 @@
 //! the same SQL core as the SQLite backend; the assertions here are about
 //! durability, transactions and equivalence, not a second copy of the deeper
 //! lake suites.
+#[path = "common/local_lake.rs"]
+mod local_lake;
 
 #[cfg(feature = "s3")]
 #[path = "../src/mock_s3.rs"]
@@ -106,31 +108,7 @@ fn data_location_ownership_is_enforced() {
     catalog_suite::data_location_ownership_is_enforced(&mut PinkSuite::new());
 }
 
-#[test]
-#[ignore = "wave 103 T2"]
-fn migrate_object_catalog_to_sql() {
-    catalog_suite::migrate_object_catalog_to_sql(&mut PinkSuite::new());
-}
-
-#[test]
-#[ignore = "wave 103 T2"]
-fn migrate_sql_catalog_to_object() {
-    catalog_suite::migrate_sql_catalog_to_object(&mut PinkSuite::new());
-}
-
-#[test]
-#[ignore = "wave 103 T2"]
-fn migrate_sql_catalog_to_sql() {
-    catalog_suite::migrate_sql_catalog_to_sql(&mut PinkSuite::new());
-}
-
 #[cfg(feature = "encryption")]
-#[test]
-#[ignore = "wave 103 T2"]
-fn encrypted_migration_keeps_sealed_bytes() {
-    catalog_suite::encrypted_migration_keeps_sealed_bytes(&mut PinkSuite::new());
-}
-
 #[test]
 fn flush_moves_inlined_rows_to_a_data_file() {
     catalog_suite::flush_moves_inlined_rows_to_a_data_file(&mut PinkSuite::new());
@@ -219,6 +197,143 @@ fn reopen_after_drop_keeps_the_head() {
 /// version, the same snapshot list and the same change data. Volatile facts
 /// (publish time, lake/table identity, data-root paths) are normalized; the
 /// rows, files, statistics and deltas are compared exactly.
+/// The race writer's environment variable: `<catalog>|<commits>|<first value>`.
+/// When set, [`race_writer_child`] is one racing writer process; otherwise it
+/// is a no-op, so the ordinary test run skips it.
+const RACE_WRITER_ENV: &str = "PINK_LAKE_RACE_WRITER";
+
+/// One racing writer, run as a child process by
+/// [`four_writers_race_on_one_pink_catalog`] (this test binary re-executed
+/// with `--exact race_writer_child`). It uses the typed `Commit` path, the one
+/// with DuckLake's automatic retry/rebase loop, and prints one
+/// `COMMITTED <version> <retries>` line per landed commit.
+#[test]
+fn race_writer_child() {
+    use std::sync::Arc;
+
+    use pink_lake::{Commit, CommitSettings};
+    use pinkdb::{DataTable, DataType, Value};
+
+    let Ok(spec) = std::env::var(RACE_WRITER_ENV) else {
+        return;
+    };
+    let mut fields = spec.split('|');
+    let catalog = fields.next().unwrap();
+    let commits: i32 = fields.next().unwrap().parse().unwrap();
+    let first: i32 = fields.next().unwrap().parse().unwrap();
+    let mut lake = Lake::open_with_catalog(catalog, None).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    let settings = CommitSettings {
+        max_retry_count: 100,
+        retry_backoff: 1.0,
+        retry_wait_ms: 1,
+    };
+    for i in 0..commits {
+        let mut table =
+            DataTable::new("t".to_string(), vec![("a".to_string(), DataType::Integer)]).unwrap();
+        table.append_row(vec![Value::Integer(first + i)]).unwrap();
+        let mut commit = Commit::new();
+        commit.append("main.t", Arc::new(table));
+        let report = lake.commit_with_settings(&commit, &settings).unwrap();
+        println!("COMMITTED {} {}", report.version, report.retries);
+    }
+}
+
+/// Four OS processes race one `pink:` catalog with 25 commits each, five
+/// rounds.
+///
+/// pinkdb does not enforce PRIMARY KEY, so snapshot uniqueness rests on the
+/// engine's COMMIT-time read/write-set validation (every catalog commit reads
+/// and writes `ducklake_snapshot`). The snapshot ids must be exactly the
+/// contiguous range, no commit may be lost, and every writer must land
+/// directly or through the retryable conflict path.
+#[test]
+fn four_writers_race_on_one_pink_catalog() {
+    use std::process::{Command, Stdio};
+
+    use pinkdb::{PinkDb, QueryResult, Value};
+
+    fn integers(db: &mut PinkDb, sql: &str) -> Vec<i64> {
+        let QueryResult::Selected { rows, .. } = db.execute(sql).unwrap().pop().unwrap() else {
+            panic!("expected rows from {sql}");
+        };
+        rows.into_iter()
+            .map(|row| match &row[0] {
+                Value::Integer(v) => i64::from(*v),
+                Value::Bigint(v) => *v,
+                other => panic!("expected an integer, got {other:?}"),
+            })
+            .collect()
+    }
+
+    let exe = std::env::current_exe().unwrap();
+    let mut total_retries = 0u64;
+    for round in 0..5 {
+        let dir = catalog_suite::scratch(&format!("race{round}"));
+        let catalog_path = dir.join("catalog.pink");
+        let catalog = format!("pink:{}", catalog_path.display());
+        {
+            let mut lake =
+                Lake::create_with_catalog(&catalog, dir.join("data").to_str().unwrap()).unwrap();
+            let mut db = PinkDb::new();
+            db.execute("CREATE TABLE main.t (a INTEGER); INSERT INTO main.t VALUES (-1);")
+                .unwrap();
+            assert_eq!(lake.write_from_store(&db).unwrap(), 2);
+        }
+
+        let children: Vec<_> = (0..4)
+            .map(|writer| {
+                Command::new(&exe)
+                    .args(["race_writer_child", "--exact", "--nocapture"])
+                    .env(RACE_WRITER_ENV, format!("{catalog}|25|{}", writer * 25))
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn race writer")
+            })
+            .collect();
+        let mut landed = 0usize;
+        let mut retries = 0u64;
+        for (writer, child) in children.into_iter().enumerate() {
+            let output = child.wait_with_output().expect("wait for race writer");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "race writer {writer} failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for rest in stdout.lines().filter_map(|l| l.strip_prefix("COMMITTED ")) {
+                let mut fields = rest.split_whitespace();
+                fields.next().expect("version");
+                retries += fields.next().expect("retries").parse::<u64>().unwrap();
+                landed += 1;
+            }
+        }
+        assert_eq!(landed, 100, "round {round}: every commit must land");
+        total_retries += retries;
+
+        {
+            let lake = Lake::open_with_catalog(&catalog, None).unwrap();
+            assert_eq!(lake.current_version(), 102, "round {round}");
+            let mut db = lake.load(None).unwrap();
+            assert_eq!(integers(&mut db, "SELECT count(*) FROM t"), vec![101]);
+        }
+        let mut db = PinkDb::open_durable(catalog_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            integers(
+                &mut db,
+                "SELECT snapshot_id FROM ducklake_snapshot ORDER BY snapshot_id"
+            ),
+            (0..102).collect::<Vec<_>>(),
+            "round {round}: snapshot ids must be contiguous with no duplicates"
+        );
+        drop(db);
+        println!("race round {round}: 100 commits landed, {retries} retries");
+        catalog_suite::cleanup(&dir);
+    }
+    println!("race total: 500 commits landed, {total_retries} retries");
+}
+
 #[cfg(feature = "catalog-sqlite")]
 #[test]
 fn sqlite_and_pink_catalogs_are_equivalent() {
@@ -404,17 +519,14 @@ fn sqlite_and_pink_catalogs_are_equivalent() {
     assert_eq!(pink.current_version(), 6);
 
     for version in 1..=6u64 {
-        // The rendered snapshot is the engine-facing catalog this version
-        // loads (`Lake::load` materializes the same rows).
-        let rel = format!("snapshots/{version}.json");
-        let a = pink_lake::catalog_stored_bytes(&sqlite_catalog, &rel)
+        let a = pink_lake::catalog_snapshot_json(&sqlite_catalog, version)
             .unwrap()
             .unwrap();
-        let b = pink_lake::catalog_stored_bytes(&pink_catalog, &rel)
+        let b = pink_lake::catalog_snapshot_json(&pink_catalog, version)
             .unwrap()
             .unwrap();
-        let mut a: serde_json::Value = serde_json::from_slice(&a).unwrap();
-        let mut b: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let mut a = a;
+        let mut b = b;
         normalize(&mut a, &sqlite_data);
         normalize(&mut b, &pink_data);
         assert_eq!(a, b, "catalog at version {version}");
@@ -439,158 +551,5 @@ fn sqlite_and_pink_catalogs_are_equivalent() {
         "changes(main.u, 2, head)"
     );
 
-    // The derived commit manifests are the same logical delta too.
-    for version in 2..=6u64 {
-        let rel = format!("commits/{version}.json");
-        let a = pink_lake::catalog_stored_bytes(&sqlite_catalog, &rel)
-            .unwrap()
-            .unwrap();
-        let b = pink_lake::catalog_stored_bytes(&pink_catalog, &rel)
-            .unwrap()
-            .unwrap();
-        let mut a: serde_json::Value = serde_json::from_slice(&a).unwrap();
-        let mut b: serde_json::Value = serde_json::from_slice(&b).unwrap();
-        normalize(&mut a, &sqlite_data);
-        normalize(&mut b, &pink_data);
-        assert_eq!(a, b, "{rel}");
-    }
-
     catalog_suite::cleanup(&dir);
-}
-
-/// The race writer's environment variable: `<catalog>|<commits>|<first value>`.
-/// When set, [`race_writer_child`] is one racing writer process; otherwise it
-/// is a no-op, so the ordinary test run skips it.
-const RACE_WRITER_ENV: &str = "PINK_LAKE_RACE_WRITER";
-
-/// One racing writer, run as a child process by
-/// [`four_writers_race_on_one_pink_catalog`] (this test binary re-executed
-/// with `--exact race_writer_child`). It uses the typed `Commit` path, the one
-/// with DuckLake's automatic retry/rebase loop, and prints one
-/// `COMMITTED <version> <retries>` line per landed commit.
-#[test]
-fn race_writer_child() {
-    use std::sync::Arc;
-
-    use pink_lake::{Commit, CommitSettings};
-    use pinkdb::{DataTable, DataType, Value};
-
-    let Ok(spec) = std::env::var(RACE_WRITER_ENV) else {
-        return;
-    };
-    let mut fields = spec.split('|');
-    let catalog = fields.next().unwrap();
-    let commits: i32 = fields.next().unwrap().parse().unwrap();
-    let first: i32 = fields.next().unwrap().parse().unwrap();
-    let mut lake = Lake::open_with_catalog(catalog, None).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    let settings = CommitSettings {
-        max_retry_count: 100,
-        retry_backoff: 1.0,
-        retry_wait_ms: 1,
-    };
-    for i in 0..commits {
-        let mut table =
-            DataTable::new("t".to_string(), vec![("a".to_string(), DataType::Integer)]).unwrap();
-        table.append_row(vec![Value::Integer(first + i)]).unwrap();
-        let mut commit = Commit::new();
-        commit.append("main.t", Arc::new(table));
-        let report = lake.commit_with_settings(&commit, &settings).unwrap();
-        println!("COMMITTED {} {}", report.version, report.retries);
-    }
-}
-
-/// Four OS processes race one `pink:` catalog with 25 commits each, five
-/// rounds.
-///
-/// pinkdb does not enforce PRIMARY KEY, so snapshot uniqueness rests on the
-/// engine's COMMIT-time read/write-set validation (every catalog commit reads
-/// and writes `ducklake_snapshot`). The snapshot ids must be exactly the
-/// contiguous range, no commit may be lost, and every writer must land
-/// directly or through the retryable conflict path.
-#[test]
-fn four_writers_race_on_one_pink_catalog() {
-    use std::process::{Command, Stdio};
-
-    use pinkdb::{PinkDb, QueryResult, Value};
-
-    fn integers(db: &mut PinkDb, sql: &str) -> Vec<i64> {
-        let QueryResult::Selected { rows, .. } = db.execute(sql).unwrap().pop().unwrap() else {
-            panic!("expected rows from {sql}");
-        };
-        rows.into_iter()
-            .map(|row| match &row[0] {
-                Value::Integer(v) => i64::from(*v),
-                Value::Bigint(v) => *v,
-                other => panic!("expected an integer, got {other:?}"),
-            })
-            .collect()
-    }
-
-    let exe = std::env::current_exe().unwrap();
-    let mut total_retries = 0u64;
-    for round in 0..5 {
-        let dir = catalog_suite::scratch(&format!("race{round}"));
-        let catalog_path = dir.join("catalog.pink");
-        let catalog = format!("pink:{}", catalog_path.display());
-        {
-            let mut lake =
-                Lake::create_with_catalog(&catalog, dir.join("data").to_str().unwrap()).unwrap();
-            let mut db = PinkDb::new();
-            db.execute("CREATE TABLE main.t (a INTEGER); INSERT INTO main.t VALUES (-1);")
-                .unwrap();
-            assert_eq!(lake.write_from_store(&db).unwrap(), 2);
-        }
-
-        let children: Vec<_> = (0..4)
-            .map(|writer| {
-                Command::new(&exe)
-                    .args(["race_writer_child", "--exact", "--nocapture"])
-                    .env(RACE_WRITER_ENV, format!("{catalog}|25|{}", writer * 25))
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("spawn race writer")
-            })
-            .collect();
-        let mut landed = 0usize;
-        let mut retries = 0u64;
-        for (writer, child) in children.into_iter().enumerate() {
-            let output = child.wait_with_output().expect("wait for race writer");
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success(),
-                "race writer {writer} failed: {stdout}\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            for rest in stdout.lines().filter_map(|l| l.strip_prefix("COMMITTED ")) {
-                let mut fields = rest.split_whitespace();
-                fields.next().expect("version");
-                retries += fields.next().expect("retries").parse::<u64>().unwrap();
-                landed += 1;
-            }
-        }
-        assert_eq!(landed, 100, "round {round}: every commit must land");
-        total_retries += retries;
-
-        {
-            let lake = Lake::open_with_catalog(&catalog, None).unwrap();
-            assert_eq!(lake.current_version(), 102, "round {round}");
-            let mut db = lake.load(None).unwrap();
-            assert_eq!(integers(&mut db, "SELECT count(*) FROM t"), vec![101]);
-        }
-        let mut db = PinkDb::open_durable(catalog_path.to_str().unwrap()).unwrap();
-        assert_eq!(
-            integers(
-                &mut db,
-                "SELECT snapshot_id FROM ducklake_snapshot ORDER BY snapshot_id"
-            ),
-            (0..102).collect::<Vec<_>>(),
-            "round {round}: snapshot ids must be contiguous with no duplicates"
-        );
-        drop(db);
-        println!("race round {round}: 100 commits landed, {retries} retries");
-        catalog_suite::cleanup(&dir);
-    }
-    println!("race total: 500 commits landed, {total_retries} retries");
 }

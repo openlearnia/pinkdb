@@ -18,6 +18,18 @@ use pinkdb::{DataTable, DataType, PinkDb, QueryResult, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+fn read_catalog(lake_dir: &Path) -> serde_json::Value {
+    let url = format!("pink:{}", lake_dir.display());
+    let lake = Lake::open(lake_dir).unwrap();
+    let mut tables = serde_json::Map::new();
+    for info in lake.table_info().unwrap() {
+        if let Some(entry) = pink_lake::catalog_table_json(&url, &info.table).unwrap() {
+            tables.insert(info.table.clone(), entry);
+        }
+    }
+    serde_json::json!({ "tables": tables })
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "pink_lake_parquet_{tag}_{}_{}",
@@ -274,7 +286,8 @@ fn parquet_files(dir: &Path) -> Vec<PathBuf> {
         }
     }
     let mut out = Vec::new();
-    walk(&dir.join("data"), &mut out);
+    let data_root = PathBuf::from(format!("{}.files", dir.display())).join("data");
+    walk(&data_root, &mut out);
     out.sort();
     out
 }
@@ -304,8 +317,7 @@ fn save_reopen_open_and_attach_agree_for_every_type() {
 
     // The catalog pins the provider on every table and every data file is a
     // `.parquet` file.
-    let catalog: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(lake_dir.join("catalog.json")).unwrap()).unwrap();
+    let catalog = read_catalog(&lake_dir);
     for key in ["main.t", "main.empty", "main.big", "analytics.u"] {
         assert_eq!(catalog["tables"][key]["format"], FORMAT_ID, "{catalog}");
         let files = catalog["tables"][key]["files"].as_array().unwrap();
@@ -420,8 +432,7 @@ fn commit_append_and_merge_maintenance_stay_parquet() {
     );
     let report = lake.commit(&commit).unwrap();
     assert_eq!(report.version, 3);
-    let catalog: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(lake_dir.join("catalog.json")).unwrap()).unwrap();
+    let catalog = read_catalog(&lake_dir);
     assert_eq!(
         catalog["tables"]["main.t"]["format"], FORMAT_ID,
         "{catalog}"
@@ -447,8 +458,7 @@ fn commit_append_and_merge_maintenance_stay_parquet() {
     assert_eq!(report.files_processed(), 2);
     assert_eq!(report.files_created(), 1);
 
-    let catalog: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(lake_dir.join("catalog.json")).unwrap()).unwrap();
+    let catalog = read_catalog(&lake_dir);
     assert_eq!(
         catalog["tables"]["main.t"]["format"], FORMAT_ID,
         "{catalog}"

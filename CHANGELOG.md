@@ -8,6 +8,47 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-24
+### Wave 103 — Lake catalogs are databases (DuckLake v1.1 tables) ✅
+- **The catalog is always a database.** A lake is a `pink:<path>` durable
+  pinkdb catalog (default), `sqlite:<path>` (`catalog-sqlite`) or
+  `postgres://…` (`catalog-postgres`), all using DuckLake v1.1's
+  `ducklake_*` tables with `begin_snapshot`/`end_snapshot`. Commits insert a
+  typed delta and one snapshot row instead of rewriting
+  `catalog.json`/`snapshots/`; `count(*)` is `SUM(record_count)`, and
+  time travel, expire, cleanup, CDC, replication state and statistics read
+  the same rows. DuckDB's `ducklake` extension can attach the SQLite/Postgres
+  catalogs, and pinkdb opens DuckDB-written DuckLakes.
+- **Locations.** A bare path means `pink:<path>` with data in
+  `<path>.files/`. A catalog records its data location, so
+  `.lake open <catalog>` is enough. `s3://…` alone is no longer a lake: pass
+  a catalog and `data s3://…` (`.lake save pink:lake.pink data
+  s3://bucket/prefix`), or use a `postgres://` catalog for multi-machine
+  lakes. `.lake migrate-catalog` is removed.
+- **Per-file encryption** stays: each data/delete file is a PNKLAKE1
+  raw-key container with its own random 256-bit key recorded in the
+  catalog; a `pink:` catalog may itself be engine-encrypted. Manifest
+  sealing, the passphrase-derived lake key, `highest.json`, `lake.json`,
+  `moved.json` and the degraded/conditional metadata-write paths are gone.
+- **Breaking:** lakes saved by an older build in the JSON layout do not open.
+  There is no converter; re-save them with an older build (for example
+  `.lake open <old>` then `.lake save pink:new.pink`) before opening with this
+  build.
+- **Fix after review:** file statistics were resolved against the column's
+  *current* name, so a file written before a RENAME lost its old physical
+  column when attach rebuilt the zone map. Statistics now resolve through the
+  `ducklake_column` definition visible at the file's `begin_snapshot`; a v1
+  file projects through the rename at head, and time travel to v1 sees its
+  original names and rows. Positional deletes keep addressing the same rows
+  across ADD/DROP COLUMN. The schema, time-travel, replication, S3,
+  encryption, corruption and attach-error tests deleted in the first pass were
+  restored (and the schema/ replication ones run on both `pink:` and
+  `sqlite:`).
+- Result at 10,000 files: catalog transaction stays flat (pink 7.1–9.8 ms,
+  sqlite 0.7 ms), pink catalog 3.43 MB with statistics, attach + `count(*)`
+  184 ms. Data formats (`.pink`, Vortex, Parquet) and the S3 data path are
+  unchanged.
+
 ## 2026-10-23
 ### Wave 96a (part 2) — Postgres catalogs and catalog migration ✅
 - A lake's metadata can now live in **Postgres**, not just SQLite or the

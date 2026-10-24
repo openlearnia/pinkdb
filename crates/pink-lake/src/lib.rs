@@ -389,7 +389,6 @@
 //! conditional writes (`If-None-Match: *`, `If-Match: <etag>`), which AWS
 //! S3 / Cloudflare R2 evaluate atomically with the write commit. An endpoint
 //! that rejects conditionals refuses the write
-//! ([`LakeError::UnsupportedEndpoint`]) unless the single-writer degraded
 //! fallback is explicitly opted into — see the `s3` feature docs and the
 //! README.
 //!
@@ -437,15 +436,10 @@
 //!   non-default `s3` feature, an S3 bucket and key prefix.
 //!   `Lake::open_url("s3://bucket/prefix")` (and
 //!   [`save_store_url`]) accept either; without the feature an `s3://`
-//!   location is a clear [`LakeError::FeatureMissing`]. Over S3 the
-//!   snapshot `put_new` is `If-None-Match: *` and the catalog replace is
-//!   `If-Match: <etag>`, so AWS S3 / Cloudflare R2 evaluate conflict
-//!   detection atomically with the write; an endpoint that rejects
-//!   conditional writes refuses the write with
-//!   [`LakeError::UnsupportedEndpoint`] unless the unsafe single-writer
-//!   fallback is explicitly accepted (see `S3Config::allow_degraded`).
-//!   Single-PUT objects only: no multipart, so one table
-//!   file must be ≤ 5 GiB (see the README).
+//!   location is a clear [`LakeError::FeatureMissing`]. The catalog is the
+//!   single-writer guard, so S3 holds only data objects and needs no
+//!   conditional PUT support. Single-PUT objects only: no multipart, so one
+//!   data file must be ≤ 5 GiB (see the README).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -467,7 +461,6 @@ mod inlined;
 mod local;
 mod maintenance;
 mod metadata;
-mod migrate;
 #[cfg(test)]
 mod mock_s3;
 mod ranged;
@@ -486,8 +479,6 @@ pub mod replication;
 
 pub use attach::AttachmentReport;
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
-use catalog_store::CatalogStore;
-use catalog_store::SplitStorage;
 pub use cdc::{ChangeKind, ChangeRow};
 pub use crypto::EncryptionKey;
 pub use incremental::{
@@ -499,10 +490,8 @@ pub use maintenance::{
     ExpireSettings, LakeFileInfo, LakeOption, LakeSettings, MergeSettings, RewriteSettings,
     TableCompaction, TableInfo,
 };
-pub use migrate::MigrateReport;
-use migrate::missing_catalog_error;
 pub use snapshot::{ChangeSummary, SnapshotInfo};
-use storage::{CryptoStorage, Head, Location, Storage, VersionTag};
+use storage::{Head, Location, Storage};
 
 #[cfg(feature = "s3")]
 pub use s3::{DEFAULT_RETRIES, S3Config};
@@ -577,29 +566,15 @@ pub const MIN_FORMAT_VERSION: u32 = 7;
 /// [`LakeError::FeatureMissing`].
 pub const MAX_FORMAT_VERSION: u32 = 7;
 
-/// The `lake.json` identity format this build writes.
-pub(crate) const LAKE_ID_FORMAT: u32 = 1;
-
 /// The lake-relative name of the identity object (M-7). Created once, never
 /// replaced.
 pub(crate) const LAKE_FILE: &str = "lake.json";
-
-/// The lake-relative name of the authenticated highest-published-version
-/// marker (M-7). Rewritten after every successful catalog replacement.
-pub(crate) const HIGHEST_FILE: &str = "highest.json";
 
 /// The data-root ownership marker of a split lake (wave 96a): `{"lake_id": …}`.
 /// Written at create and verified only by the destructive maintenance paths,
 /// so two catalogs pointed at one data location can never delete each other's
 /// files. The default object-store layout never writes or reads it.
 pub(crate) const LAKE_DATA_FILE: &str = "lake-data.json";
-
-/// The retirement marker a migrated-away object-store catalog leaves at its
-/// root (wave 96a): `{"moved_to": "<redacted target>", "lake_id": …,
-/// "moved_at": …}`. Plaintext even for an encrypted source; `catalog.json` is
-/// deleted only after it is written, and an open that finds no catalog reads
-/// it to report where the lake went instead of `NotALake`.
-pub(crate) const MOVED_FILE: &str = "moved.json";
 
 /// The largest manifest `version` this build reads or writes.
 ///
@@ -658,13 +633,6 @@ pub enum LakeError {
     /// Object storage denied the request (HTTP 403): credentials, bucket
     /// permissions, or a wrong endpoint.
     Auth { path: PathBuf, message: String },
-    /// The object-storage endpoint cannot support a safe write: it rejects
-    /// the conditional writes the single-writer contract needs and the
-    /// unsafe degraded fallback was not explicitly accepted. Writes are
-    /// refused; reads still work. Opt in with `S3Config::allow_degraded(true)`
-    /// (or `PINKDB_S3_ALLOW_DEGRADED=1` on the `s3://` URL path) to accept a
-    /// single-writer guarantee with a small race window.
-    UnsupportedEndpoint { path: PathBuf, message: String },
     /// Filesystem failure, with the operation that failed.
     Io {
         context: String,
@@ -784,13 +752,6 @@ impl fmt::Display for LakeError {
                 write!(
                     f,
                     "object storage access error at {}: {message}",
-                    path.display()
-                )
-            }
-            LakeError::UnsupportedEndpoint { path, message } => {
-                write!(
-                    f,
-                    "unsupported object-storage endpoint at {}: {message}",
                     path.display()
                 )
             }
@@ -917,9 +878,11 @@ pub struct SaveReport {
 #[derive(Debug)]
 pub struct Lake {
     root: PathBuf,
+    /// The data location (objects only; the catalog is `store`).
     storage: Arc<dyn Storage>,
-    /// The lake's random 128-bit identity (hex), recorded in every v6
-    /// manifest and in `lake.json`/`highest.json` (M-7).
+    /// The catalog database (DuckLake tables).
+    store: Arc<dyn crate::metadata::MetadataStore>,
+    /// The lake's random 128-bit identity (hex).
     lake_id: String,
     format_version: u32,
     version: u64,
@@ -948,78 +911,77 @@ pub struct Lake {
     table_format_choices: BTreeMap<String, FileFormat>,
 }
 
+/// One inlined row version, as [`Lake::inlined_records`] returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlinedRecord {
+    pub row_id: u64,
+    pub begin: u64,
+    pub end: Option<u64>,
+    pub flushed: bool,
+    pub columns: Vec<String>,
+    pub values: Vec<Option<String>>,
+}
+
 impl Lake {
-    /// Create a new lake at `dir`: the directory (and parents) plus an empty
-    /// catalog at snapshot version 1 (a manifest of this build's
-    /// [`FORMAT_VERSION`]) and its snapshot. Fails if `dir` already holds a
-    /// lake.
-    ///
-    /// The empty version-1 snapshot is *linked* into place (never replaced).
-    /// If a concurrent or crashed create already left a valid empty version-1
-    /// snapshot, it is adopted instead of rewritten — both concurrent creates
-    /// can only end with exactly one version-1 catalog, byte-identical to its
-    /// snapshot, and the loser retries [`Lake::open`] via
-    /// [`Lake::open_or_create`].
+    /// Every inlined row version of one table (diagnostics; the typed
+    /// DuckLake inlined tables are the only copy).
+    pub fn inlined_records(&self, key: &str) -> Result<Vec<InlinedRecord>> {
+        let Some(entry) = self.store.table(key, None)? else {
+            return Ok(Vec::new());
+        };
+        Ok(entry
+            .inlined
+            .into_iter()
+            .map(|row| InlinedRecord {
+                row_id: row.row_id,
+                begin: row.begin,
+                end: row.end,
+                flushed: row.flushed,
+                columns: row.columns,
+                values: row.values,
+            })
+            .collect())
+    }
+}
+
+impl Lake {
+    /// Create a lake at a bare path: a `pink:<path>` catalog database with
+    /// its default data location `<path>.files/`.
     pub fn create(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with(Arc::new(LocalStorage::new(dir.as_ref())), None)
+        Self::create_url(&dir.as_ref().to_string_lossy())
     }
 
-    /// [`Lake::create`] with at-rest encryption: every artifact this lake
-    /// ever publishes — catalog, snapshots, commit deltas, data files, delete
-    /// files — is sealed into a `PNKLAKE1` container under `key` (see the
-    /// `crypto` module docs for the format and the KDF policy; one Argon2id
-    /// derivation per session). Reading the lake then requires the same key;
-    /// a wrong key fails closed and a keyless open refuses.
+    /// [`Lake::create`] with per-file-key encryption (and an engine-encrypted
+    /// `pink:` catalog database).
     pub fn create_with_key(dir: impl AsRef<Path>, key: EncryptionKey) -> Result<Self> {
-        Self::create_with(Arc::new(LocalStorage::new(dir.as_ref())), Some(key))
+        Self::create_url_with_key(&dir.as_ref().to_string_lossy(), key)
     }
 
-    /// Create a lake at a location string: a local directory, or an
-    /// `s3://bucket/prefix` URL when the `s3` feature is built (a clear
-    /// [`LakeError::FeatureMissing`] otherwise). S3 credentials, endpoint and
-    /// region come from the usual environment variables (`AWS_ACCESS_KEY_ID`,
-    /// `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_ENDPOINT_URL`/
-    /// `AWS_ENDPOINT_URL_S3`, `AWS_REGION`/`AWS_DEFAULT_REGION`,
-    /// `AWS_S3_FORCE_PATH_STYLE`), and the safety opt-ins
-    /// `PINKDB_S3_ALLOW_HTTP` (plain-http test endpoints) and
-    /// `PINKDB_S3_ALLOW_DEGRADED` (single-writer fallback on endpoints
-    /// without conditional writes); use `Lake::create_s3` (with the `s3`
-    /// feature) for explicit configuration.
+    /// Create a lake from a location: a bare path (a `pink:<path>` catalog),
+    /// `pink:<path>`, `sqlite:<path>` or `postgres://…`. `pink:` and
+    /// `sqlite:` default their data location to `<path>.files/`; Postgres
+    /// needs an explicit data location (`Lake::create_with_catalog`). An
+    /// `s3://` URL alone is not a lake: data on S3 needs a catalog database.
     pub fn create_url(location: &str) -> Result<Self> {
-        let parsed = Location::parse(location)?;
-        if is_catalog_location(&parsed) {
-            return Err(catalog_needs_data(location, "create"));
-        }
-        Self::create_with(storage_for(parsed)?, None)
+        let (catalog, data) = default_catalog_split(location, "create")?;
+        Self::create_with_catalog_keyed(&catalog, &data, None)
     }
 
-    /// [`Lake::create_url`] with at-rest encryption (local directory or
-    /// `s3://bucket/prefix`): a keyed create in a build without the
-    /// `encryption` feature fails before touching any storage.
+    /// [`Lake::create_url`] with per-file-key encryption.
     pub fn create_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
-        let parsed = Location::parse(location)?;
-        if is_catalog_location(&parsed) {
-            return Err(catalog_needs_data(location, "create"));
-        }
-        Self::create_with(storage_for(parsed)?, Some(key))
+        let (catalog, data) = default_catalog_split(location, "create")?;
+        Self::create_with_catalog_keyed(&catalog, &data, Some(key))
     }
 
-    /// Create a lake whose metadata lives in `catalog_url` (`sqlite:<path>`)
-    /// and whose data files live at `data_location` (a local directory or an
-    /// `s3://bucket/prefix` URL). The data location is recorded in
-    /// `pink_lake_meta`, so [`Lake::open_url`] needs only the catalog URL
-    /// afterwards.
-    ///
-    /// The data location must be empty: an existing full lake
-    /// (`catalog.json`/`lake.json`) or any `data/` object is refused, and a
-    /// `lake-data.json` owner marker is written at the data root for
-    /// maintenance (wave 96a).
+    /// Create a lake whose metadata lives in `catalog_url` and whose data
+    /// files live at `data_location` (a local directory or `s3://…`). The
+    /// data location is recorded in the catalog, so [`Lake::open_url`] needs
+    /// only the catalog location afterwards.
     pub fn create_with_catalog(catalog_url: &str, data_location: &str) -> Result<Self> {
         Self::create_with_catalog_keyed(catalog_url, data_location, None)
     }
 
-    /// [`Lake::create_with_catalog`] with at-rest encryption (the same key
-    /// semantics as [`Lake::create_with_key`]).
+    /// [`Lake::create_with_catalog`] with per-file-key encryption.
     pub fn create_with_catalog_with_key(
         catalog_url: &str,
         data_location: &str,
@@ -1034,57 +996,37 @@ impl Lake {
         key: Option<EncryptionKey>,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
-        // Wave 103 T2: every SQL catalog is created directly in the DuckLake
-        // tables, keyed or not. A keyed lake's metadata rows stay plaintext;
-        // the data files get per-file keys and (for `pink:`) the catalog
-        // database itself may be engine-encrypted.
-        if matches!(
+        if !matches!(
             catalog_location,
             Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
         ) {
-            // Refuse a data location that already belongs to a lake *before*
-            // the catalog database is created, so a rejected create leaves
-            // nothing behind.
-            let data = data_storage(data_location)?;
-            ensure_data_location_free(&*data, data_location)?;
-            if let Some(store) = catalog_store::open_metadata_store_keyed(
-                catalog_url,
-                &catalog_location,
-                true,
-                key.as_ref(),
-            )? {
-                return Self::create_sql_catalog(catalog_url, store, data_location, key.as_ref());
-            }
+            return Err(LakeError::BadLocation {
+                location: redact_location(catalog_url),
+                message: "a lake catalog must be `pink:<path>`, `sqlite:<path>` or \
+                          `postgres://…`; `s3://…` is a data location, not a catalog"
+                    .to_string(),
+            });
         }
         let data = data_storage(data_location)?;
-        // Refuse a data location that already belongs to a lake *before* the
-        // catalog file is created, so a rejected create leaves nothing behind.
+        let Some(store) = catalog_store::open_metadata_store_keyed(
+            catalog_url,
+            &catalog_location,
+            true,
+            key.as_ref(),
+        )?
+        else {
+            return Err(catalog_feature_missing(catalog_url, &catalog_location));
+        };
+        if crate::metadata::MetadataStore::head_version(&store)?.is_some() {
+            return Err(LakeError::AlreadyALake {
+                path: PathBuf::from(redact_location(catalog_url)),
+            });
+        }
         ensure_data_location_free(&*data, data_location)?;
-        let catalog = catalog_store::open_catalog(catalog_url, &catalog_location, true)?;
-        let storage: Arc<dyn Storage> =
-            Arc::new(SplitStorage::new(Arc::clone(&catalog), Arc::clone(&data)));
-        let lake = Self::create_with(storage, key)?;
-        // The split's two facts live in the catalog, not in an object. Write
-        // them after the create transaction committed: the catalog is the
-        // authoritative metadata store, and a crash between the two leaves a
-        // lake whose data location must be passed explicitly on open (never a
-        // lake pointing at the wrong data).
-        catalog.set_data_location(data_location)?;
-        catalog.set_lake_id(&lake.lake_id)?;
-        // The ownership marker is a *data* object, written through the lake's
-        // storage so a keyed lake seals it like every other data artifact.
-        lake.storage
-            .put(LAKE_DATA_FILE, &data_ownership_json(&lake.lake_id)?)?;
-        Ok(lake)
+        Self::create_sql_catalog(catalog_url, store, data_location, key.as_ref())
     }
 
-    /// Create a SQL-catalog lake directly on the DuckLake tables.
-    ///
-    /// The store seeds `ducklake_metadata` (`version`, `created_by`,
-    /// `data_path`, `encrypted`), snapshot 0 (`created_schema:"main"`) and the
-    /// pink side rows in one transaction; the handle starts at pink version 1,
-    /// which *is* snapshot 0 (see [`crate::metadata`]). Shared by the `.pink`
-    /// database, SQLite and Postgres.
+    /// Create a catalog lake directly on the DuckLake tables.
     fn create_sql_catalog(
         catalog_url: &str,
         store: catalog_store::SqlMetadataStore,
@@ -1092,6 +1034,16 @@ impl Lake {
         key: Option<&EncryptionKey>,
     ) -> Result<Self> {
         let data = data_storage(data_location)?;
+        Self::create_sql_catalog_data(catalog_url, store, data_location, data, key)
+    }
+
+    fn create_sql_catalog_data(
+        catalog_url: &str,
+        store: catalog_store::SqlMetadataStore,
+        data_location: &str,
+        data: Arc<dyn Storage>,
+        key: Option<&EncryptionKey>,
+    ) -> Result<Self> {
         let lake_id = fresh_lake_id()?;
         let manifest = Catalog {
             format_version: FORMAT_VERSION,
@@ -1111,19 +1063,13 @@ impl Lake {
             &manifest,
         )?;
         crate::metadata::MetadataStore::set_encrypted(&store, key.is_some())?;
-        // A shared handle so the data decorator can resolve a file's key from
-        // the catalog after the catalog facade takes its own share.
-        let shared = Arc::new(store);
-        let data = keyed_data_storage(data, Arc::clone(&shared))?;
-        let catalog: Arc<dyn CatalogStore> = Arc::new(catalog_store::SqlCatalog::from_store(
-            catalog_url,
-            (*shared).clone(),
-        ));
-        let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(catalog, data));
-        let root = storage.abs("");
+        let store = Arc::new(store);
+        let data = keyed_data_storage(data, Arc::clone(&store))?;
+        let root = data.abs("");
         let lake = Self {
             root,
-            storage,
+            storage: data,
+            store,
             lake_id,
             format_version: FORMAT_VERSION,
             version: 1,
@@ -1132,151 +1078,42 @@ impl Lake {
             write_format_choice: None,
             table_format_choices: BTreeMap::new(),
         };
-        // The ownership marker is a *data* object: it lives at the data root,
-        // never in the catalog.
         lake.storage
             .put(LAKE_DATA_FILE, &data_ownership_json(&lake.lake_id)?)?;
+        let _ = catalog_url;
         Ok(lake)
     }
 
-    fn create_with(inner: Arc<dyn Storage>, key: Option<EncryptionKey>) -> Result<Self> {
-        let storage: Arc<dyn Storage> = Arc::new(CryptoStorage::new(inner, key)?);
-        let root = storage.abs("");
-        if storage.exists(CATALOG_FILE)? {
-            return Err(LakeError::AlreadyALake { path: root });
-        }
-        storage.create_dir("")?;
-        // Wave 96a: one publish scope around the whole identity + manifest
-        // sequence. On a SQL catalog the identity, the version-1 snapshot, the
-        // catalog and highest.json land in one transaction (or not at all);
-        // on the object-store layout every primitive is already atomic, so
-        // the default scope is a no-op and the request sequence is unchanged.
-        let publish = storage.begin_publish()?;
-        // M-7: one random 128-bit identity per lake, fixed for its lifetime.
-        // An interrupted create may already have written it; adopt that id
-        // instead of minting a second one.
-        let lake_id = match read_identity(&*storage, &root)? {
-            Some(id) => id,
-            None => {
-                let id = fresh_lake_id()?;
-                storage.put_new(LAKE_FILE, &identity_json(&id)?)?;
-                id
-            }
-        };
-        storage.set_manifest_lake_id(Some(lake_id.clone()));
-        let manifest = Catalog {
-            format_version: FORMAT_VERSION,
-            lake_id: Some(lake_id.clone()),
-            updated: time::iso8601_utc(SystemTime::now()),
-            version: 1,
-            tables: BTreeMap::new(),
-            author: None,
-            commit_message: None,
-            changes: None,
-            schema_version: 0,
-        };
-        let plain = manifest_json(&manifest, &root)?;
-        // Seal the manifest **once**: the same bytes are published as the
-        // snapshot and as the catalog (the byte-identity invariant of every
-        // published version). A keyless create seals nothing.
-        let bytes = storage.seal_manifest(&plain, &lake_id, 1)?;
-        // Adopt (do not rewrite) an empty version-1 snapshot a concurrent or
-        // interrupted create already put there: the catalog must stay
-        // byte-identical to the snapshot of its version, so the *stored*
-        // bytes are what gets republished (sealing the adopted plaintext
-        // again would mint a different container).
-        let bytes = if storage.put_new("snapshots/1.json", &bytes)? {
-            bytes
-        } else {
-            let rel = "snapshots/1.json";
-            let path = storage.abs(rel);
-            let (existing, stored) =
-                storage.read_with_stored(rel, &format!("reading {}", path.display()))?;
-            let parsed = read_manifest(&path, &existing).map_err(|e| LakeError::Conflict {
-                path: path.clone(),
-                message: format!(
-                    "snapshots/1.json exists but does not parse ({e}); refusing to adopt it"
-                ),
-            })?;
-            if parsed.version != 1 || !parsed.tables.is_empty() {
-                return Err(LakeError::Conflict {
-                    path,
-                    message: "snapshots/1.json exists but is not the empty version 1 snapshot; \
-                              refusing to adopt it"
-                        .to_string(),
-                });
-            }
-            stored
-        };
-        if !storage.put_new(CATALOG_FILE, &bytes)? {
-            return Err(LakeError::AlreadyALake { path: root });
-        }
-        // Publish the rollback marker *after* the catalog: a crash between
-        // the two leaves a catalog without a marker (refused at open), never
-        // a marker above the authoritative catalog (which would look like a
-        // rollback).
-        storage.put_highest(HIGHEST_FILE, &highest_json(&lake_id, 1)?, &lake_id, 1)?;
-        publish.commit()?;
-        Ok(Self {
-            root,
-            storage,
-            lake_id,
-            format_version: FORMAT_VERSION,
-            version: 1,
-            pending_commit: None,
-            inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
-            write_format_choice: None,
-            table_format_choices: BTreeMap::new(),
-        })
-    }
-
-    /// Open an existing lake: `dir/catalog.json` must exist and parse.
+    /// Open a lake at a bare path: a `pink:<path>` catalog.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with(Arc::new(LocalStorage::new(dir.as_ref())), None)
+        Self::open_url(&dir.as_ref().to_string_lossy())
     }
 
-    /// [`Lake::open`] with at-rest encryption: the catalog and every artifact
-    /// read must be `PNKLAKE1` containers under `key`. A plaintext lake is
-    /// refused ([`LakeError::NotEncrypted`], so a key can never be silently
-    /// ignored), and a wrong key fails with [`LakeError::WrongKey`] at the
-    /// catalog before anything else is read.
+    /// [`Lake::open`] with per-file-key encryption.
     pub fn open_with_key(dir: impl AsRef<Path>, key: EncryptionKey) -> Result<Self> {
-        Self::open_with(Arc::new(LocalStorage::new(dir.as_ref())), Some(key))
+        Self::open_url_with_key(&dir.as_ref().to_string_lossy(), key)
     }
 
-    /// Open a lake at a location string: a local directory, or an
-    /// `s3://bucket/prefix` URL when the `s3` feature is built (see
-    /// [`Lake::create_url`] for the environment variables). Use
-    /// `Lake::open_s3` (with the `s3` feature) for explicit S3
-    /// configuration.
+    /// Open a lake by its catalog location. A bare path means `pink:<path>`;
+    /// `s3://…` alone is not a lake.
     pub fn open_url(location: &str) -> Result<Self> {
-        match Location::parse(location)? {
-            parsed if is_catalog_location(&parsed) => {
-                Self::open_with_catalog_keyed(location, None, None)
-            }
-            parsed => Self::open_with(storage_for(parsed)?, None),
-        }
+        let catalog = open_catalog_location(location, "open")?;
+        Self::open_with_catalog_keyed(&catalog, None, None)
     }
 
-    /// [`Lake::open_url`] with at-rest encryption.
+    /// [`Lake::open_url`] with per-file-key encryption.
     pub fn open_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
-        match Location::parse(location)? {
-            parsed if is_catalog_location(&parsed) => {
-                Self::open_with_catalog_keyed(location, None, Some(key))
-            }
-            parsed => Self::open_with(storage_for(parsed)?, Some(key)),
-        }
+        let catalog = open_catalog_location(location, "open")?;
+        Self::open_with_catalog_keyed(&catalog, None, Some(key))
     }
 
-    /// Open the lake whose metadata lives in `catalog_url` (`sqlite:<path>`).
-    /// The data location comes from `pink_lake_meta` unless
-    /// `data_location` is given, which overrides it for this session (a moved
-    /// bucket or directory); opening never rewrites the recorded location.
+    /// Open the lake whose metadata lives in `catalog_url`. The data location
+    /// comes from the catalog unless `data_location` overrides it.
     pub fn open_with_catalog(catalog_url: &str, data_location: Option<&str>) -> Result<Self> {
         Self::open_with_catalog_keyed(catalog_url, data_location, None)
     }
 
-    /// [`Lake::open_with_catalog`] with at-rest encryption.
+    /// [`Lake::open_with_catalog`] with per-file-key encryption.
     pub fn open_with_catalog_with_key(
         catalog_url: &str,
         data_location: Option<&str>,
@@ -1291,62 +1128,18 @@ impl Lake {
         key: Option<EncryptionKey>,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
-        // Wave 103 T2: every SQL catalog opens directly from the DuckLake
-        // tables, keyed or not. The rendered compatibility objects
-        // (`lake.json`, `highest.json`, `catalog.json`) exist too, but going
-        // through them would add a JSON round trip to every open and would
-        // require a side row for catalogs DuckDB created.
-        if matches!(
-            catalog_location,
-            Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
-        ) && let Some(store) = catalog_store::open_metadata_store_keyed(
+        let Some(store) = catalog_store::open_metadata_store_keyed(
             catalog_url,
             &catalog_location,
             false,
             key.as_ref(),
-        )? {
-            return Self::open_sql_catalog(catalog_url, store, data_location, key.as_ref());
-        }
-        let catalog = catalog_store::open_catalog(catalog_url, &catalog_location, false)?;
-        // A migrated-away SQL catalog keeps its rows and records the target in
-        // `pink_lake_meta.moved_to`; opening the source reports that instead
-        // of pretending the lake vanished.
-        if let Some(moved_to) = catalog.moved_to()? {
-            return Err(LakeError::CatalogMoved {
-                path: PathBuf::from(redact_location(catalog_url)),
-                moved_to,
-            });
-        }
-        let recorded = catalog.data_location()?;
-        let Some(data_location) = data_location.map(str::to_string).or(recorded) else {
-            // No record yet: distinguish an empty catalog (create it with a
-            // data location) from one whose metadata lost its data location.
-            if catalog.exists(CATALOG_FILE)? {
-                return Err(LakeError::Corrupt {
-                    path: PathBuf::from(redact_location(catalog_url)),
-                    message: "the catalog has no pink_lake_meta.data_location; pass an explicit \
-                              data location (Lake::open_with_catalog / `.lake open <catalog> data \
-                              <location>`)"
-                        .to_string(),
-                });
-            }
-            return Err(LakeError::NotALake {
-                path: PathBuf::from(redact_location(catalog_url)),
-            });
+        )?
+        else {
+            return Err(catalog_feature_missing(catalog_url, &catalog_location));
         };
-        let data = data_storage(&data_location)?;
-        let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(Arc::clone(&catalog), data));
-        Self::open_with(storage, key)
+        Self::open_sql_catalog(catalog_url, store, data_location, key.as_ref())
     }
 
-    /// Open a SQL-catalog lake directly from the DuckLake tables (`.pink`,
-    /// SQLite or Postgres).
-    ///
-    /// A catalog written by DuckDB has no pink side row for its snapshots;
-    /// the first open adopts a lake identity into `pinkdb_lake` (the only
-    /// fact DuckLake has no column for), so every later load and commit has
-    /// one. `data_location` overrides the recorded `ducklake_metadata.data_path`
-    /// for this session, exactly like the object-store split open.
     fn open_sql_catalog(
         catalog_url: &str,
         store: catalog_store::SqlMetadataStore,
@@ -1354,39 +1147,49 @@ impl Lake {
         key: Option<&EncryptionKey>,
     ) -> Result<Self> {
         let encrypted = crate::metadata::MetadataStore::is_encrypted(&store)?;
+        if encrypted && key.is_none() {
+            return Err(LakeError::Encrypted {
+                path: PathBuf::from(redact_location(catalog_url)),
+                message: "the catalog's data files are encrypted; open it with the lake's key"
+                    .to_string(),
+            });
+        }
         if !encrypted && key.is_some() {
-            // A key supplied for a plaintext SQL catalog would be silently
-            // ignored (SQLite/Postgres keep the per-file keys in the catalog);
-            // refuse rather than pretend it protects anything. A keyed
-            // `pink:` database is already opened (or refused) by the engine.
             return Err(LakeError::NotEncrypted {
                 path: PathBuf::from(redact_location(catalog_url)),
                 message: "the catalog's data files are plaintext; open it without a key"
                     .to_string(),
             });
         }
-        if let Some(moved_to) = store.moved_to()? {
-            return Err(LakeError::CatalogMoved {
+        let recorded = store.data_location()?;
+        let Some(data_location) = data_location
+            .map(str::to_string)
+            .or(recorded)
+            .or_else(|| default_data_for_catalog(catalog_url))
+        else {
+            return Err(LakeError::Corrupt {
                 path: PathBuf::from(redact_location(catalog_url)),
-                moved_to,
+                message: "the catalog has no recorded data location; pass one explicitly"
+                    .to_string(),
             });
-        }
+        };
+        let data = data_storage(&data_location)?;
+        Self::open_sql_catalog_data(catalog_url, store, &data_location, data, key)
+    }
+
+    fn open_sql_catalog_data(
+        catalog_url: &str,
+        store: catalog_store::SqlMetadataStore,
+        data_location: &str,
+        data: Arc<dyn Storage>,
+        _key: Option<&EncryptionKey>,
+    ) -> Result<Self> {
         let Some(mut manifest) = store.head_catalog()? else {
             return Err(LakeError::NotALake {
                 path: PathBuf::from(redact_location(catalog_url)),
             });
         };
-        let recorded = store.data_location()?;
-        let Some(data_location) = data_location.map(str::to_string).or(recorded) else {
-            return Err(LakeError::Corrupt {
-                path: PathBuf::from(redact_location(catalog_url)),
-                message: "the catalog has no ducklake_metadata.data_path; pass an explicit \
-                          data location (Lake::open_with_catalog / `.lake open <catalog> data \
-                          <location>`)"
-                    .to_string(),
-            });
-        };
-        let data = data_storage(&data_location)?;
+        let _ = data_location;
         let lake_id = match manifest.lake_id.clone() {
             Some(id) => id,
             None => {
@@ -1396,209 +1199,18 @@ impl Lake {
                 id
             }
         };
-        let shared = Arc::new(store);
-        let data = keyed_data_storage(data, Arc::clone(&shared))?;
-        let catalog: Arc<dyn CatalogStore> = Arc::new(catalog_store::SqlCatalog::from_store(
-            catalog_url,
-            (*shared).clone(),
-        ));
-        let storage: Arc<dyn Storage> = Arc::new(SplitStorage::new(catalog, data));
-        let root = storage.abs("");
-        Ok(Self {
-            root,
-            storage,
-            lake_id,
-            format_version: manifest.format_version,
-            version: manifest.version,
-            pending_commit: None,
-            inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
-            write_format_choice: None,
-            table_format_choices: BTreeMap::new(),
-        })
-    }
-
-    fn open_with(inner: Arc<dyn Storage>, key: Option<EncryptionKey>) -> Result<Self> {
-        let storage: Arc<dyn Storage> = Arc::new(CryptoStorage::new(inner, key)?);
-        let root = storage.abs("");
-        storage.tighten_existing()?;
-        // Wave 98b: the identity and catalog are independent objects. The
-        // identity is HEAD-probed first (a credentials failure keeps the
-        // historical `AccessDenied` shape), then fetched concurrently with the
-        // catalog. A keyed session reads the identity first: its lake id is
-        // the binding every manifest is authenticated under, and setting it
-        // before the catalog is unsealed keeps the M-7 check exactly where it
-        // was.
-        let (identity, manifest) = if storage.encrypted() {
-            let identity = read_identity(&*storage, &root)?;
-            if let Some(id) = &identity {
-                storage.set_manifest_lake_id(Some(id.clone()));
-            }
-            let manifest = read_catalog(&*storage, &root)?;
-            (identity, manifest)
-        } else {
-            // The identity probe keeps its historical HEAD: a credentials
-            // failure is the same `AccessDenied` open always reported (a GET
-            // would surface `SignatureDoesNotMatch` first). A present
-            // identity is then fetched concurrently with the catalog.
-            match storage.head(LAKE_FILE)? {
-                Head::Missing => {
-                    let manifest = match storage.read_optional(
-                        CATALOG_FILE,
-                        &format!("reading {}", storage.abs(CATALOG_FILE).display()),
-                    )? {
-                        Some(bytes) => parse_catalog(&root, &bytes)?,
-                        None => return Err(missing_catalog_error(&*storage, &root)?),
-                    };
-                    (None, manifest)
-                }
-                Head::NotAFile => {
-                    return Err(LakeError::Corrupt {
-                        path: storage.abs(LAKE_FILE),
-                        message: format!(
-                            "{} is not a regular file",
-                            storage.abs(LAKE_FILE).display()
-                        ),
-                    });
-                }
-                Head::File => {
-                    let paths = [LAKE_FILE, CATALOG_FILE];
-                    let mut fetched = map_bounded(&paths, parallel_limit(), |rel| {
-                        storage
-                            .read_optional(rel, &format!("reading {}", storage.abs(rel).display()))
-                    })
-                    .into_iter();
-                    let identity = match fetched.next().expect("two objects fetched") {
-                        Ok(Some(bytes)) => Some(parse_identity(&*storage, &bytes)?),
-                        Ok(None) => None,
-                        Err(e) => return Err(e),
-                    };
-                    if let Some(id) = &identity {
-                        storage.set_manifest_lake_id(Some(id.clone()));
-                    }
-                    let manifest = match fetched.next().expect("two objects fetched") {
-                        Ok(Some(bytes)) => parse_catalog(&root, &bytes)?,
-                        Ok(None) => return Err(missing_catalog_error(&*storage, &root)?),
-                        Err(e) => return Err(e),
-                    };
-                    (identity, manifest)
-                }
-            }
-        };
-        let lake_id = match manifest.lake_id.clone() {
-            Some(id) => {
-                match &identity {
-                    Some(expected) if expected == &id => {}
-                    Some(expected) => {
-                        return Err(LakeError::Corrupt {
-                            path: root.join(CATALOG_FILE),
-                            message: format!(
-                                "catalog.json declares lake {id}, but lake.json identifies \
-                                 this lake as {expected} (a manifest from another lake was \
-                                 substituted)"
-                            ),
-                        });
-                    }
-                    None => {
-                        return Err(LakeError::Corrupt {
-                            path: root.join(LAKE_FILE),
-                            message: "catalog.json is a v6+ manifest, but lake.json is missing \
-                                      (the lake identity was removed)"
-                                .to_string(),
-                        });
-                    }
-                }
-                id
-            }
-            None => {
-                // A plaintext pre-v6 lake opens and is upgraded on its next
-                // save. A keyed pre-v6 lake cannot be authenticated safely:
-                // its manifest containers carry the empty binding.
-                if storage.encrypted() {
-                    return Err(LakeError::Corrupt {
-                        path: root.join(CATALOG_FILE),
-                        message: "this is a pre-v6 encrypted lake: its manifest containers \
-                                  carry no lake-id/version binding and this build refuses to \
-                                  open a weaker-bound format; create a new keyed lake (or \
-                                  load and re-save it with a pre-M-7 build)"
-                            .to_string(),
-                    });
-                }
-                match identity {
-                    Some(id) => id,
-                    None => fresh_lake_id()?,
-                }
-            }
-        };
-        if manifest.format_version >= 6 {
-            // The authenticated highest-version marker and the snapshot of
-            // this version are independent objects: fetch them concurrently
-            // (wave 98b), then validate in the historical order (highest
-            // first, then the snapshot pair).
-            let snapshot_rel = format!("snapshots/{}.json", manifest.version);
-            let snapshot_context = format!("reading {}", storage.abs(&snapshot_rel).display());
-            let (highest, snapshot_read) = std::thread::scope(|scope| {
-                let highest = scope.spawn(|| read_highest(&*storage, &lake_id));
-                let snapshot =
-                    scope.spawn(|| storage.read_optional(&snapshot_rel, &snapshot_context));
-                (
-                    highest.join().expect("highest.json reader panicked"),
-                    snapshot.join().expect("snapshot reader panicked"),
-                )
-            });
-            // The authenticated highest-version marker: a catalog below it is
-            // a rollback. A catalog *above* it is the narrow crash window
-            // between the catalog replace and the marker write; heal it.
-            let highest = highest?;
-            if manifest.version < highest {
-                return Err(LakeError::Corrupt {
-                    path: root.join(CATALOG_FILE),
-                    message: format!(
-                        "rollback detected: catalog.json declares version {}, but the \
-                         authenticated highest.json records version {highest} (restore the \
-                         catalog at version {highest} or later)",
-                        manifest.version
-                    ),
-                });
-            }
-            if manifest.version > highest {
-                storage.put_highest(
-                    HIGHEST_FILE,
-                    &highest_json(&lake_id, manifest.version)?,
-                    &lake_id,
-                    manifest.version,
-                )?;
-            }
-            // Catalog and snapshot of the same version must agree on both the
-            // version and the lake identity (M-7).
-            let snapshot_path = storage.abs(&snapshot_rel);
-            let snapshot_bytes = snapshot_read?.ok_or_else(|| LakeError::VersionNotFound {
-                path: root.clone(),
-                version: manifest.version,
-            })?;
-            let snapshot = read_manifest(&snapshot_path, &snapshot_bytes)?;
-            if snapshot.version != manifest.version {
-                return Err(LakeError::Corrupt {
-                    path: snapshot_path.clone(),
-                    message: format!(
-                        "snapshot file declares version {}, expected {}",
-                        snapshot.version, manifest.version
-                    ),
-                });
-            }
-            if snapshot.lake_id.as_deref() != Some(lake_id.as_str()) {
-                return Err(LakeError::Corrupt {
-                    path: snapshot_path,
-                    message: format!(
-                        "catalog.json version {} and its snapshot disagree on the version or \
-                         lake identity (expected {lake_id})",
-                        manifest.version
-                    ),
-                });
-            }
+        let store = Arc::new(store);
+        let data = keyed_data_storage(data, Arc::clone(&store))?;
+        data.tighten_existing()?;
+        if let Ok(Location::Pink(path)) | Ok(Location::Sqlite(path)) = Location::parse(catalog_url)
+        {
+            crate::local::tighten_catalog(&path);
         }
+        let root = data.abs("");
         Ok(Self {
             root,
-            storage,
+            storage: data,
+            store,
             lake_id,
             format_version: manifest.format_version,
             version: manifest.version,
@@ -1646,30 +1258,13 @@ impl Lake {
     /// [`Lake::open_url`] when the location already holds a lake, else
     /// [`Lake::create_url`].
     pub fn open_or_create_url(location: &str) -> Result<Self> {
-        let parsed = Location::parse(location)?;
-        if is_catalog_location(&parsed) {
-            return match Self::open_url(location) {
-                Ok(lake) => Ok(lake),
-                Err(LakeError::NotALake { .. }) => match &parsed {
-                    // DuckLake's `DATA_PATH` default: a fresh SQL catalog
-                    // keeps its data next to the database, `<catalog>.files/`.
-                    Location::Pink(path) | Location::Sqlite(path) => {
-                        Self::create_with_catalog(location, &default_catalog_data_location(path))
-                    }
-                    _ => Err(catalog_needs_data(location, "save")),
-                },
-                Err(e) => Err(e),
-            };
-        }
-        match Self::open_with(storage_for(parsed.clone())?, None) {
+        match Self::open_url(location) {
             Ok(lake) => Ok(lake),
-            Err(LakeError::NotALake { .. }) => {
-                match Self::create_with(storage_for(parsed)?, None) {
-                    Ok(lake) => Ok(lake),
-                    Err(LakeError::AlreadyALake { .. }) => Self::open_url(location),
-                    Err(e) => Err(e),
-                }
-            }
+            Err(LakeError::NotALake { .. }) => match Self::create_url(location) {
+                Ok(lake) => Ok(lake),
+                Err(LakeError::AlreadyALake { .. }) => Self::open_url(location),
+                Err(e) => Err(e),
+            },
             Err(e) => Err(e),
         }
     }
@@ -1677,18 +1272,10 @@ impl Lake {
     /// [`Lake::open_or_create_url`] with at-rest encryption (see
     /// [`Lake::open_or_create_with_key`] for the plaintext-lake refusal).
     pub fn open_or_create_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
-        let parsed = Location::parse(location)?;
-        if is_catalog_location(&parsed) {
-            return match Self::open_url_with_key(location, key) {
-                Ok(lake) => Ok(lake),
-                Err(LakeError::NotALake { .. }) => Err(catalog_needs_data(location, "save")),
-                Err(e) => Err(e),
-            };
-        }
-        match Self::open_with(storage_for(parsed.clone())?, Some(key.clone())) {
+        match Self::open_url_with_key(location, key.clone()) {
             Ok(lake) => Ok(lake),
             Err(LakeError::NotALake { .. }) => {
-                match Self::create_with(storage_for(parsed)?, Some(key.clone())) {
+                match Self::create_url_with_key(location, key.clone()) {
                     Ok(lake) => Ok(lake),
                     Err(LakeError::AlreadyALake { .. }) => Self::open_url_with_key(location, key),
                     Err(e) => Err(e),
@@ -1698,60 +1285,69 @@ impl Lake {
         }
     }
 
-    /// Create a lake from explicit [`S3Config`] (endpoint, region,
-    /// credentials, bucket/prefix) instead of the environment.
-    #[cfg(feature = "s3")]
-    pub fn create_s3(config: S3Config) -> Result<Self> {
-        Self::create_with(Arc::new(s3::S3Storage::new(config)?), None)
+    /// The data-file format id pinned for one table (`pink`, `vortex`,
+    /// `parquet`), if the table exists.
+    pub fn table_format_name(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .store
+            .table(key, None)?
+            .map(|entry| entry.format().id().to_string()))
     }
 
-    /// [`Lake::create_s3`] with at-rest encryption.
-    #[cfg(feature = "s3")]
-    pub fn create_s3_with_key(config: S3Config, key: EncryptionKey) -> Result<Self> {
-        Self::create_with(Arc::new(s3::S3Storage::new(config)?), Some(key))
+    /// The table's column record `(name, type, added-at epoch)`, when it has
+    /// one. Diagnostics only.
+    pub fn table_columns(&self, key: &str) -> Result<Option<Vec<(String, String, u64)>>> {
+        Ok(self.store.table(key, None)?.and_then(|entry| {
+            entry.columns.map(|columns| {
+                columns
+                    .into_iter()
+                    .map(|c| (c.name, c.dtype, c.added))
+                    .collect()
+            })
+        }))
     }
 
-    /// Open a lake from explicit [`S3Config`].
+    /// Create a lake whose **data** is the configured S3 bucket/prefix and
+    /// whose catalog is `catalog_url` (a `pink:`, `sqlite:` or Postgres
+    /// catalog). This is the explicit-config counterpart of
+    /// [`Lake::create_with_catalog`] (which reads credentials from the
+    /// environment).
     #[cfg(feature = "s3")]
-    pub fn open_s3(config: S3Config) -> Result<Self> {
-        Self::open_with(Arc::new(s3::S3Storage::new(config)?), None)
-    }
-
-    /// [`Lake::open_s3`] with at-rest encryption.
-    #[cfg(feature = "s3")]
-    pub fn open_s3_with_key(config: S3Config, key: EncryptionKey) -> Result<Self> {
-        Self::open_with(Arc::new(s3::S3Storage::new(config)?), Some(key))
-    }
-
-    /// [`Lake::open_s3`] when the bucket/prefix already holds a lake, else
-    /// [`Lake::create_s3`].
-    #[cfg(feature = "s3")]
-    pub fn open_or_create_s3(config: S3Config) -> Result<Self> {
-        match Self::open_s3(config.clone()) {
-            Ok(lake) => Ok(lake),
-            Err(LakeError::NotALake { .. }) => match Self::create_s3(config.clone()) {
-                Ok(lake) => Ok(lake),
-                Err(LakeError::AlreadyALake { .. }) => Self::open_s3(config),
-                Err(e) => Err(e),
-            },
-            Err(e) => Err(e),
+    pub fn create_with_catalog_s3(catalog_url: &str, config: S3Config) -> Result<Self> {
+        let location = Location::parse(catalog_url)?;
+        if !matches!(
+            location,
+            Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
+        ) {
+            return Err(LakeError::BadLocation {
+                location: redact_location(catalog_url),
+                message: "the first argument is the lake catalog, not the data location"
+                    .to_string(),
+            });
         }
+        let data_location = s3_location(&config);
+        let data: Arc<dyn Storage> = Arc::new(s3::S3Storage::new(config)?);
+        let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, true, None)?
+            .ok_or_else(|| catalog_feature_missing(catalog_url, &location))?;
+        if crate::metadata::MetadataStore::head_version(&store)?.is_some() {
+            return Err(LakeError::AlreadyALake {
+                path: PathBuf::from(redact_location(catalog_url)),
+            });
+        }
+        ensure_data_location_free(&*data, &data_location)?;
+        Self::create_sql_catalog_data(catalog_url, store, &data_location, data, None)
     }
 
-    /// [`Lake::open_or_create_s3`] with at-rest encryption.
+    /// Open a lake whose data is the configured S3 bucket/prefix and whose
+    /// catalog is `catalog_url`.
     #[cfg(feature = "s3")]
-    pub fn open_or_create_s3_with_key(config: S3Config, key: EncryptionKey) -> Result<Self> {
-        match Self::open_s3_with_key(config.clone(), key.clone()) {
-            Ok(lake) => Ok(lake),
-            Err(LakeError::NotALake { .. }) => {
-                match Self::create_s3_with_key(config.clone(), key.clone()) {
-                    Ok(lake) => Ok(lake),
-                    Err(LakeError::AlreadyALake { .. }) => Self::open_s3_with_key(config, key),
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
+    pub fn open_with_catalog_s3(catalog_url: &str, config: S3Config) -> Result<Self> {
+        let location = Location::parse(catalog_url)?;
+        let data_location = s3_location(&config);
+        let data: Arc<dyn Storage> = Arc::new(s3::S3Storage::new(config)?);
+        let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
+            .ok_or_else(|| catalog_feature_missing(catalog_url, &location))?;
+        Self::open_sql_catalog_data(catalog_url, store, &data_location, data, None)
     }
 
     /// The lake location: a directory path or the `s3://bucket/prefix` URL.
@@ -1822,13 +1418,26 @@ impl Lake {
     /// like [`Lake::versions`].
     pub fn snapshots(&self) -> Result<Vec<SnapshotInfo>> {
         let mut out = Vec::new();
+        let mut previous: Option<Catalog> = None;
         for version in self.versions()? {
-            match manifest_for(&*self.storage, &self.root, Some(version)) {
-                Ok((manifest, path)) => {
+            match manifest_for(&*self.store, &self.root, Some(version)) {
+                Ok((mut manifest, path)) => {
                     if self.check_lake_id(&manifest, &path).is_err() {
                         continue;
                     }
+                    // SQL catalogs persist the typed tables, not the audit
+                    // summary; derive it from the adjacent manifests so the
+                    // record matches a save-time summary.
+                    if manifest.changes.is_none()
+                        && let Some(previous) = &previous
+                    {
+                        manifest.changes = Some(snapshot::ChangeSummary::diff(
+                            &previous.tables,
+                            &manifest.tables,
+                        ));
+                    }
                     let time_micros = time::parse_iso8601_utc(&manifest.updated);
+                    previous = Some(manifest.clone());
                     out.push(SnapshotInfo::of(&manifest, time_micros));
                 }
                 Err(LakeError::Io { source, .. })
@@ -1853,7 +1462,7 @@ impl Lake {
     /// silently missing version; one deleted between listing and reading is
     /// skipped.
     pub fn versions(&self) -> Result<Vec<u64>> {
-        published_versions(&*self.storage, self.version)
+        published_versions(&*self.store, self.version)
     }
 
     /// The current version's tables: `(db.table, rows)`, sorted by name.
@@ -1982,22 +1591,12 @@ impl Lake {
     /// delete files it added); the snapshot manifests stay authoritative for
     /// loading.
     pub fn commits(&self) -> Result<Vec<u64>> {
-        let mut out = Vec::new();
-        for name in self.storage.list("commits")? {
-            let Some(v) = name
-                .strip_suffix(".json")
-                .and_then(canonical_version_number)
-            else {
-                continue;
-            };
-            if v < 1 || v > self.version {
-                continue;
-            }
-            out.push(v);
-        }
-        out.sort_unstable();
-        out.dedup();
-        Ok(out)
+        Ok(self
+            .store
+            .snapshot_versions()?
+            .into_iter()
+            .filter(|version| *version > 1 && *version <= self.version)
+            .collect())
     }
 
     /// Referenced data files that are missing (or not a valid `data/…` path):
@@ -2043,9 +1642,6 @@ impl Lake {
         // Fail fast on a handle another writer has already outdated (before
         // any data file is written).
         self.ensure_catalog_unchanged()?;
-        // M-7: a plaintext pre-v6 lake gets its identity here, before the
-        // manifest that records it is built.
-        self.ensure_identity()?;
         let version = self
             .version
             .checked_add(1)
@@ -2054,10 +1650,6 @@ impl Lake {
                 path: self.root.clone(),
                 version: self.version,
             })?;
-        let snapshot_rel = format!("snapshots/{version}.json");
-        if self.storage.exists(&snapshot_rel)? {
-            return Err(self.snapshot_exists_error(version));
-        }
         // The previous version's manifest, read before the data loop: a full
         // save **preserves the partitioning** of a table that is saved again
         // under the same key (the store itself has no partition concept), so
@@ -2068,19 +1660,14 @@ impl Lake {
         // predecessor must not silently reset the lake-wide monotonic
         // `schema_version` (or drop a partition spec). If even the catalog
         // cannot be read, the save fails loudly.
-        let previous = match manifest_for(&*self.storage, &self.root, Some(self.version)) {
-            Ok((manifest, _)) => Some(manifest),
-            Err(_) => Some(crate::read_catalog(&*self.storage, &self.root)?),
-        };
+        let previous = manifest_for(&*self.store, &self.root, Some(self.version))
+            .ok()
+            .map(|(manifest, _)| manifest);
         // The head catalog is the authoritative entry set. A table this build
         // cannot read is carried forward verbatim when the store has no table
         // under its key; a store table under that key would replace data this
         // build cannot read, so the save is refused (wave 88, rule 5).
-        let head = if self.storage.metadata_store().is_some() {
-            manifest_for(&*self.storage, &self.root, None)?.0
-        } else {
-            crate::read_catalog(&*self.storage, &self.root)?
-        };
+        let head = manifest_for(&*self.store, &self.root, None)?.0;
         let head_path = self.storage.abs(CATALOG_FILE);
         let mut store_keys: BTreeSet<String> = BTreeSet::new();
         for dbname in db.list_databases() {
@@ -2110,7 +1697,7 @@ impl Lake {
             }
             carried.push((key.clone(), entry.clone()));
         }
-        let has_carried = !carried.is_empty();
+        let _has_carried = !carried.is_empty();
         let mut tables: BTreeMap<String, TableEntry> = BTreeMap::new();
         let mut deltas: BTreeMap<String, catalog::TableDelta> = BTreeMap::new();
         let mut bytes_written = 0u64;
@@ -2194,7 +1781,10 @@ impl Lake {
                 tables.insert(
                     key,
                     TableEntry {
-                        files,
+                        files: files
+                            .iter()
+                            .map(|file| file.with_schema_version(Some(1)))
+                            .collect(),
                         rows: src.num_rows() as u64,
                         // Wave 89: a save preserves the table identity of the
                         // same key (a dropped + recreated table was dropped by
@@ -2234,58 +1824,49 @@ impl Lake {
         // rewrote is replaced in place, and a table the store no longer has is
         // dropped. (An unreadable carried entry, if any, uses the full-catalog
         // compatibility path below.)
-        let sql_store = self.storage.metadata_store();
-        let delta_save = sql_store.is_some() && !has_carried;
-        if delta_save {
-            for (key, entry) in &tables {
-                if let Some(delta) = deltas.get_mut(key) {
-                    delta.runtime = catalog::TableRuntime {
-                        meta: Some(catalog::TableMeta::from_entry(entry)),
-                        created: !head.tables.contains_key(key),
-                        dropped: false,
+        for (key, entry) in &tables {
+            if let Some(delta) = deltas.get_mut(key) {
+                delta.runtime = catalog::TableRuntime {
+                    meta: Some(catalog::TableMeta::from_entry(entry)),
+                    created: !head.tables.contains_key(key),
+                    dropped: false,
+                    kind: catalog::DeltaKind::Save,
+                    inlined_rows: Vec::new(),
+                    inlined_ends: Vec::new(),
+                };
+            }
+        }
+        for key in head.tables.keys() {
+            if tables.contains_key(key) {
+                continue;
+            }
+            deltas
+                .entry(key.clone())
+                .or_insert_with(|| catalog::TableDelta {
+                    runtime: catalog::TableRuntime {
+                        meta: None,
+                        created: false,
+                        dropped: true,
                         kind: catalog::DeltaKind::Save,
                         inlined_rows: Vec::new(),
                         inlined_ends: Vec::new(),
-                    };
-                }
-            }
-            for key in head.tables.keys() {
-                if tables.contains_key(key) {
-                    continue;
-                }
-                deltas
-                    .entry(key.clone())
-                    .or_insert_with(|| catalog::TableDelta {
-                        runtime: catalog::TableRuntime {
-                            meta: None,
-                            created: false,
-                            dropped: true,
-                            kind: catalog::DeltaKind::Save,
-                            inlined_rows: Vec::new(),
-                            inlined_ends: Vec::new(),
-                        },
-                        data_files: Vec::new(),
-                        delete_files: Vec::new(),
-                        rows_added: 0,
-                        rows_deleted: 0,
-                        replaced: false,
-                        partition_changed: false,
-                        partition_by: None,
-                        compacted_files: Vec::new(),
-                        removed_delete_files: Vec::new(),
-                        rows_inlined: 0,
-                        inlined_ended: 0,
-                        inlined_flushed: 0,
-                        inlined_limit: None,
-                        inlining_changed: false,
-                    });
-            }
+                    },
+                    data_files: Vec::new(),
+                    delete_files: Vec::new(),
+                    rows_added: 0,
+                    rows_deleted: 0,
+                    replaced: false,
+                    partition_changed: false,
+                    partition_by: None,
+                    compacted_files: Vec::new(),
+                    removed_delete_files: Vec::new(),
+                    rows_inlined: 0,
+                    inlined_ended: 0,
+                    inlined_flushed: 0,
+                    inlined_limit: None,
+                    inlining_changed: false,
+                });
         }
-        // The per-version record: the author/message [`Lake::set_commit_message`]
-        // recorded for this save (kept pending until the save succeeds below),
-        // and the change summary — the diff against the previous version's
-        // manifest (read above). A previous manifest that was unavailable
-        // means the summary is simply absent.
         let (author, commit_message) = match &self.pending_commit {
             Some((author, message)) => (author.clone(), message.clone()),
             None => (None, None),
@@ -2305,20 +1886,6 @@ impl Lake {
             changes,
             schema_version,
         };
-        let plain = if delta_save {
-            Vec::new()
-        } else {
-            manifest_json(&manifest, &self.root)?
-        };
-        // Seal the manifest **once**: the exact same bytes are published as
-        // `snapshots/<version>.json` and as `catalog.json`, so the
-        // byte-identity invariant survives encryption. A keyless save seals
-        // nothing. A SQL catalog applies its rows directly and stores neither.
-        let bytes = if delta_save {
-            Vec::new()
-        } else {
-            self.storage.seal_manifest(&plain, &self.lake_id, version)?
-        };
         let commit_manifest = catalog::CommitManifest {
             format_version: FORMAT_VERSION,
             version,
@@ -2326,56 +1893,19 @@ impl Lake {
             updated: manifest.updated.clone(),
             tables: deltas,
         };
-        let commit_bytes = commit_manifest_json(&commit_manifest)?;
         let table_count = manifest.tables.len();
-        if delta_save {
-            let change = crate::metadata::CatalogChange {
-                catalog: None,
-                manifest: commit_manifest,
-                schema_version: manifest.schema_version,
-                format_version: manifest.format_version,
-                updated: manifest.updated.clone(),
-                lake_id: manifest.lake_id.clone(),
-                author: manifest.author.clone(),
-                commit_message: manifest.commit_message.clone(),
-            };
-            self.publish_sql_commit(change)?;
-            bytes_written += commit_bytes.len() as u64;
-            self.pending_commit = None;
-            return Ok(SaveReport {
-                version,
-                tables: table_count,
-                rows,
-                bytes_written,
-            });
-        }
-        // Same publication order as a commit: the delta manifest, the
-        // snapshot, then the catalog. Wave 96a: the whole metadata sequence
-        // is one publish scope (data files were written above, before it
-        // opened), so a SQL catalog publishes it atomically.
-        let publish = self.storage.begin_publish()?;
-        let commit_rel = format!("commits/{version}.json");
-        if !self.storage.put_new(&commit_rel, &commit_bytes)? {
-            let snapshot_exists = self.storage.exists(&snapshot_rel)?;
-            if snapshot_exists {
-                return Err(self.snapshot_exists_error(version));
-            }
-            // A stray delta from a crashed attempt that never linked its
-            // snapshot: the snapshot is authoritative, so heal it.
-            self.storage.put(&commit_rel, &commit_bytes)?;
-        }
-        bytes_written += commit_bytes.len() as u64;
-        // Create-only, never replace: an existing snapshot version is a
-        // published version (or an unpublished stray the caller must remove).
-        // Locally a hard link; over S3 `If-None-Match: *` — the condition
-        // evaluates on the *sealed* bytes exactly as it would on plaintext.
-        if !self.storage.put_new(&snapshot_rel, &bytes)? {
-            return Err(self.snapshot_exists_error(version));
-        }
-        bytes_written += bytes.len() as u64;
-        self.replace_catalog(version, &plain, &bytes, "save")?;
-        publish.commit()?;
-        bytes_written += bytes.len() as u64;
+        let change = crate::metadata::CatalogChange {
+            catalog: None,
+            manifest: commit_manifest,
+            schema_version: manifest.schema_version,
+            format_version: manifest.format_version,
+            updated: manifest.updated.clone(),
+            lake_id: manifest.lake_id.clone(),
+            author: manifest.author.clone(),
+            commit_message: manifest.commit_message.clone(),
+        };
+        self.publish_sql_commit(change)?;
+        self.pending_commit = None;
         Ok(SaveReport {
             version,
             tables: table_count,
@@ -2670,94 +2200,12 @@ impl Lake {
         ))
     }
 
-    /// Replace `catalog.json` with the manifest of `version` after re-checking
-    /// that the catalog still declares the version this handle is based on
-    /// (so a concurrent publication can never produce a catalog that
-    /// disagrees with the snapshot of its version), with the degraded
-    /// (check-then-put) endpoint reconciliation. Updates this handle.
-    ///
-    /// `plain` is the manifest as written (`snapshots/<version>.json`'s
-    /// logical content) and `sealed` the exact bytes published there; for a
-    /// keyless lake they are the same bytes. The conditional replace sends
-    /// the *sealed* bytes, while the degraded-path verification compares the
-    /// decrypted catalog against `plain` (the bytes a reader sees).
-    fn replace_catalog(
-        &mut self,
-        version: u64,
-        plain: &[u8],
-        sealed: &[u8],
-        what: &str,
-    ) -> Result<()> {
-        // M-7: a plaintext pre-v6 lake has no identity object yet; create it
-        // before the catalog that names it (the manifest bytes already carry
-        // `lake_id`). Every publishing path funnels through here.
-        self.ensure_identity()?;
-        // Re-check that the catalog is still the version our snapshot was
-        // taken from, right before replacing it, and replace it
-        // conditionally: `If-Match: <etag>` over S3 (a 412 is the conflict
-        // below), a file-identity re-check locally.
-        let catalog_tag = self.ensure_catalog_unchanged()?;
-        if !self
-            .storage
-            .put_if_match(CATALOG_FILE, sealed, &catalog_tag)?
-        {
-            return Err(LakeError::Conflict {
-                path: self.storage.abs(CATALOG_FILE),
-                message: format!(
-                    "catalog.json changed while this {what} was in flight (this handle is \
-                     based on version {}); reopen the lake",
-                    self.version
-                ),
-            });
-        }
-        // A degraded (check-then-put) endpoint cannot make the replace
-        // atomic, so verify what actually got published before reporting
-        // success: read the catalog back, and if another writer's catalog is
-        // authoritative now, report the conflict and restore the snapshot
-        // pair from the winning bytes. If ours landed, repair
-        // `snapshots/<version>.json` in case a racing writer replaced it
-        // between its PUT and this replace. No-op (and no extra requests) on
-        // local storage and conditional-write endpoints.
-        if self.storage.uses_degraded_fallback() {
-            let path = self.storage.abs(CATALOG_FILE);
-            let (current, _) = self
-                .storage
-                .read_tagged(CATALOG_FILE, &format!("reading {}", path.display()))?;
-            if current != plain {
-                let winner = read_manifest(&path, &current)?;
-                self.storage.reconcile_snapshot(winner.version, &current)?;
-                return Err(LakeError::Conflict {
-                    path,
-                    message: format!(
-                        "catalog.json changed while this {what} was in flight (this handle \
-                         is based on version {}); reopen the lake",
-                        self.version
-                    ),
-                });
-            }
-            self.storage.reconcile_snapshot(version, plain)?;
-        }
-        // M-7: publish the authenticated highest-version marker only after
-        // the catalog replacement succeeded. A later open refuses a catalog
-        // below it; a crash between the two is the narrow window healed at
-        // open (catalog above marker, never the reverse).
-        self.write_highest(version)?;
-        self.version = version;
-        // The commit record is published; a later save without a new
-        // `set_commit_message` must not repeat it.
-        self.pending_commit = None;
-        // A publish writes this build's format (v4), so a handle that opened
-        // an older-format lake reports the new format afterwards.
-        self.format_version = FORMAT_VERSION;
-        Ok(())
-    }
-
     /// The manifest for the latest version (`None`) or one snapshot, with the
     /// path it was read from (for error attribution). The lake identity is
     /// cross-checked here, so a snapshot substituted from another lake (same
     /// key) is refused even when it parses.
     fn manifest(&self, version: Option<u64>) -> Result<(Catalog, PathBuf)> {
-        let (manifest, path) = manifest_for(&*self.storage, &self.root, version)?;
+        let (manifest, path) = manifest_for(&*self.store, &self.root, version)?;
         self.check_lake_id(&manifest, &path)?;
         Ok((manifest, path))
     }
@@ -2780,137 +2228,23 @@ impl Lake {
         Ok(())
     }
 
-    /// Write (or repair) `lake.json` before publishing a v6 manifest. A
-    /// plaintext pre-v6 lake has no identity yet; its first save creates one
-    /// here. A concurrent creator that won the create-only write is adopted.
-    fn ensure_identity(&mut self) -> Result<()> {
-        match read_identity(&*self.storage, &self.root)? {
-            Some(id) => {
-                if id != self.lake_id {
-                    self.lake_id = id;
-                }
-                Ok(())
-            }
-            None => {
-                let bytes = identity_json(&self.lake_id)?;
-                if !self.storage.put_new(LAKE_FILE, &bytes)? {
-                    let id = read_identity(&*self.storage, &self.root)?.ok_or_else(|| {
-                        LakeError::Corrupt {
-                            path: self.root.join(LAKE_FILE),
-                            message: "lake.json appeared and disappeared while creating the \
-                                      lake identity"
-                                .to_string(),
-                        }
-                    })?;
-                    self.lake_id = id;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// Publish `highest.json` for `version`, refusing to move it backwards.
-    fn write_highest(&self, version: u64) -> Result<()> {
-        if self.storage.exists(HIGHEST_FILE)? {
-            let current = read_highest(&*self.storage, &self.lake_id)?;
-            if version < current {
-                return Err(LakeError::Conflict {
-                    path: self.root.join(HIGHEST_FILE),
-                    message: format!(
-                        "refusing to move the highest published version backwards ({} -> \
-                         {version})",
-                        current
-                    ),
-                });
-            }
-        }
-        self.storage.put_highest(
-            HIGHEST_FILE,
-            &highest_json(&self.lake_id, version)?,
-            &self.lake_id,
-            version,
-        )
-    }
-
-    /// A save-time conflict: `snapshots/<version>.json` is already there.
-    fn snapshot_exists_error(&self, version: u64) -> LakeError {
-        LakeError::Conflict {
-            path: self.storage.abs(&format!("snapshots/{version}.json")),
-            message: format!(
-                "snapshot {version} already exists; refusing to replace a published version \
-                 (if catalog.json still points at version {} it was never published — \
-                 remove the stray snapshot and retry)",
-                self.version
-            ),
-        }
-    }
-
     /// The catalog must still declare the version this handle was opened or
-    /// last saved from; anything else means another writer published. Returns
-    /// the catalog's version tag for the conditional replace that follows.
-    fn ensure_catalog_unchanged(&self) -> Result<VersionTag> {
-        if let Some(store) = self.storage.metadata_store() {
-            let head = store.head_version()?;
-            if head != Some(self.version) {
-                return Err(LakeError::Conflict {
-                    path: self.storage.abs(CATALOG_FILE),
-                    message: format!(
-                        "another writer published version {} (this handle is based on version \
-                         {}); reopen the lake",
-                        head.map(|v| v.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                        self.version
-                    ),
-                });
-            }
-            return Ok(VersionTag(format!("v{}", self.version)));
-        }
-        let path = self.storage.abs(CATALOG_FILE);
-        // A directory-shaped catalog (local) still proceeds to the read and
-        // its I/O error, exactly as before; only a missing file is the
-        // conflict below.
-        if matches!(self.storage.head(CATALOG_FILE)?, Head::Missing) {
+    /// last saved from; anything else means another writer published.
+    fn ensure_catalog_unchanged(&self) -> Result<()> {
+        let head = self.store.head_version()?;
+        if head != Some(self.version) {
             return Err(LakeError::Conflict {
-                path,
+                path: self.root.join("catalog"),
                 message: format!(
-                    "catalog.json is missing (this handle is based on version {}); reopen the lake",
+                    "another writer published version {} (this handle is based on version \
+                     {}); reopen the lake",
+                    head.map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
                     self.version
                 ),
             });
         }
-        let (bytes, tag) = self
-            .storage
-            .read_tagged(CATALOG_FILE, &format!("reading {}", path.display()))?;
-        let current = read_manifest(&path, &bytes)?;
-        if current.version != self.version {
-            // A degraded endpoint's check-then-put window can let this save
-            // overwrite a *published* snapshot (`snapshots/<current.version>`
-            // written from the catalog of the writer it raced). The catalog
-            // is authoritative and byte-identical to its snapshot by
-            // construction, so repair the pair before reporting the
-            // conflict. Local storage and conditional-write endpoints have
-            // nothing to repair (the default implementation is a no-op).
-            self.storage
-                .reconcile_snapshot(current.version, &bytes)
-                .map_err(|e| LakeError::Conflict {
-                    path: path.clone(),
-                    message: format!(
-                        "another writer published version {} (this handle is based on version \
-                         {}); reopen the lake — and the catalog/snapshot pair could not be \
-                         reconciled afterwards ({e})",
-                        current.version, self.version
-                    ),
-                })?;
-            return Err(LakeError::Conflict {
-                path,
-                message: format!(
-                    "another writer published version {} (this handle is based on version {}); \
-                     reopen the lake",
-                    current.version, self.version
-                ),
-            });
-        }
-        Ok(tag)
+        Ok(())
     }
 
     /// Build a [`PinkDb`] from a manifest by loading every referenced data
@@ -3154,19 +2488,16 @@ pub fn save_store_url_with_key(db: &PinkDb, location: &str, key: EncryptionKey) 
     Lake::open_or_create_url_with_key(location, key)?.write_from_store(db)
 }
 
-/// [`save_store_url`] with explicit [`S3Config`] (bucket/prefix/endpoint/
-/// region/credentials) instead of the environment.
 #[cfg(feature = "s3")]
 pub fn save_store_s3(db: &PinkDb, config: S3Config) -> Result<u64> {
     validate_store(db)?;
-    Lake::open_or_create_s3(config)?.write_from_store(db)
-}
-
-/// [`save_store_s3`] with at-rest encryption.
-#[cfg(feature = "s3")]
-pub fn save_store_s3_with_key(db: &PinkDb, config: S3Config, key: EncryptionKey) -> Result<u64> {
-    validate_store(db)?;
-    Lake::open_or_create_s3_with_key(config, key)?.write_from_store(db)
+    let (catalog, _) = s3_test_catalog(&config);
+    let mut lake = match Lake::open_with_catalog_s3(&catalog, config.clone()) {
+        Ok(lake) => lake,
+        Err(LakeError::NotALake { .. }) => Lake::create_with_catalog_s3(&catalog, config)?,
+        Err(e) => return Err(e),
+    };
+    lake.write_from_store(db)
 }
 
 /// The storage backend for a parsed location: local always, S3 only with the
@@ -3226,9 +2557,136 @@ fn data_storage(location: &str) -> Result<Arc<dyn Storage>> {
     storage_for(parsed)
 }
 
-/// Wrap a SQL lake's data half in per-file-key encryption when the catalog's
-/// `encrypted` row says the files are sealed. The resolver reads a file's key
-/// from its catalog row (for a file written by an earlier process).
+/// The default data location for a catalog path: DuckLake's `DATA_PATH`
+/// default, a sibling `<catalog path>.files/` directory.
+fn default_catalog_data_location(path: &Path) -> String {
+    format!("{}.files", path.display())
+}
+
+/// Resolve a lake location to its catalog URL for an **open**: a bare path
+/// becomes `pink:<path>`; an explicit catalog is used as given. The data
+/// location comes from the catalog (its recorded path, else the default).
+fn open_catalog_location(location: &str, verb: &str) -> Result<String> {
+    match Location::parse(location)? {
+        Location::Pink(_) | Location::Sqlite(_) => Ok(location.to_string()),
+        Location::Postgres(_) => {
+            #[cfg(not(feature = "catalog-postgres"))]
+            {
+                Err(catalog_feature_missing(
+                    location,
+                    &Location::Postgres(location.to_string()),
+                ))
+            }
+            #[cfg(feature = "catalog-postgres")]
+            {
+                let _ = verb;
+                Ok(location.to_string())
+            }
+        }
+        Location::Local(path) => Ok(format!("pink:{}", path.display())),
+        Location::S3 { .. } => Err(LakeError::BadLocation {
+            location: redact_location(location),
+            message: format!(
+                "`s3://…` is a data location, not a lake catalog; {verb} a catalog and put the \
+                 data there, e.g. `.lake save pink:lake.pink data {location}` (or use a \
+                 `postgres://` catalog for multi-machine lakes)"
+            ),
+        }),
+    }
+}
+
+/// Split a lake location into `(catalog URL, default data location)`. A bare
+/// path becomes `pink:<path>`; `pink:`/`sqlite:` default data to
+/// `<path>.files/`; Postgres has no filesystem path and needs an explicit
+/// data location; `s3://` alone is data, not a catalog.
+fn default_catalog_split(location: &str, verb: &str) -> Result<(String, String)> {
+    match Location::parse(location)? {
+        Location::Pink(path) => Ok((location.to_string(), default_catalog_data_location(&path))),
+        Location::Sqlite(path) => Ok((location.to_string(), default_catalog_data_location(&path))),
+        Location::Postgres(_) => {
+            #[cfg(not(feature = "catalog-postgres"))]
+            {
+                Err(catalog_feature_missing(
+                    location,
+                    &Location::Postgres(location.to_string()),
+                ))
+            }
+            #[cfg(feature = "catalog-postgres")]
+            {
+                Err(catalog_needs_data(location, verb))
+            }
+        }
+        Location::S3 { .. } => Err(LakeError::BadLocation {
+            location: redact_location(location),
+            message: format!(
+                "`s3://…` is a data location, not a lake catalog; {verb} a catalog and put \
+                 the data there, e.g. `.lake save pink:lake.pink data {location}` (or use a \
+                 `postgres://` catalog for multi-machine lakes)"
+            ),
+        }),
+        Location::Local(path) => Ok((
+            format!("pink:{}", path.display()),
+            default_catalog_data_location(&path),
+        )),
+    }
+}
+
+/// The default data location for an explicit catalog URL whose rows carry no
+/// data path (a DuckDB-created catalog opened without one cannot be guessed
+/// for Postgres).
+fn default_data_for_catalog(catalog_url: &str) -> Option<String> {
+    match Location::parse(catalog_url).ok()? {
+        Location::Pink(path) | Location::Sqlite(path) => Some(default_catalog_data_location(&path)),
+        _ => None,
+    }
+}
+
+fn catalog_feature_missing(catalog_url: &str, location: &Location) -> LakeError {
+    let feature = match location {
+        Location::Sqlite(_) => "catalog-sqlite",
+        Location::Postgres(_) => "catalog-postgres",
+        _ => "catalog",
+    };
+    LakeError::FeatureMissing {
+        feature,
+        message: format!(
+            "the location {} is a SQL catalog; rebuild with the `{feature}` feature",
+            redact_location(catalog_url)
+        ),
+    }
+}
+
+#[cfg(feature = "s3")]
+fn s3_location(config: &S3Config) -> String {
+    if config.prefix.is_empty() {
+        format!("s3://{}", config.bucket)
+    } else {
+        format!("s3://{}/{}", config.bucket, config.prefix)
+    }
+}
+
+#[cfg(feature = "s3")]
+fn s3_test_catalog(config: &S3Config) -> (String, String) {
+    let sanitize = |text: &str| -> String {
+        text.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    };
+    let dir = std::env::temp_dir()
+        .join("pinkdb-s3-catalogs")
+        .join(format!("{}", std::process::id()))
+        .join(sanitize(&config.bucket))
+        .join(sanitize(&config.prefix));
+    std::fs::create_dir_all(&dir).ok();
+    let catalog = format!("pink:{}", dir.join("catalog.pink").display());
+    let data = if config.prefix.is_empty() {
+        format!("s3://{}", config.bucket)
+    } else {
+        format!("s3://{}/{}", config.bucket, config.prefix)
+    };
+    (catalog, data)
+}
+
 fn keyed_data_storage(
     data: Arc<dyn Storage>,
     store: Arc<catalog_store::SqlMetadataStore>,
@@ -3249,14 +2707,9 @@ fn keyed_data_storage(
     )))
 }
 
-/// The DuckLake default data location for a SQL catalog (`.pink` or SQLite):
-/// a sibling `<catalog path>.files/` directory (DuckLake's `DATA_PATH` default).
-fn default_catalog_data_location(path: &Path) -> String {
-    format!("{}.files/", path.display())
-}
-
 /// The clear "a SQL catalog needs a data location" error used by the existing
 /// URL entry points (`create_url`, `open_or_create_url` on a missing catalog).
+#[cfg_attr(not(feature = "catalog-postgres"), allow(dead_code))]
 fn catalog_needs_data(location: &str, verb: &str) -> LakeError {
     let shown = redact_location(location);
     LakeError::BadLocation {
@@ -3411,36 +2864,6 @@ pub fn last_commit_rows_touched() -> u64 {
     crate::metadata::store::last_commit_rows_touched()
 }
 
-/// The stored bytes of one catalog object, bypassing any decorator (wave 96a
-/// tests): an encrypted lake's row holds the sealed blob, a plaintext lake's
-/// the JSON. Not part of the supported API.
-#[doc(hidden)]
-pub fn catalog_stored_bytes(catalog_url: &str, rel: &str) -> Result<Option<Vec<u8>>> {
-    let location = Location::parse(catalog_url)?;
-    let store = catalog_store::open_catalog(catalog_url, &location, false)?;
-    let context = format!("reading {catalog_url}#{rel}");
-    store.read_optional(rel, &context)
-}
-
-/// [`catalog_stored_bytes`] for a keyed lake (a `pink:` catalog database may
-/// itself be engine-encrypted). Not part of the supported API.
-#[doc(hidden)]
-pub fn catalog_stored_bytes_keyed(
-    catalog_url: &str,
-    rel: &str,
-    key: Option<EncryptionKey>,
-) -> Result<Option<Vec<u8>>> {
-    let location = Location::parse(catalog_url)?;
-    let Some(store) =
-        catalog_store::open_metadata_store_keyed(catalog_url, &location, false, key.as_ref())?
-    else {
-        return catalog_stored_bytes(catalog_url, rel);
-    };
-    let catalog = catalog_store::SqlCatalog::from_store(catalog_url, store);
-    let context = format!("reading {catalog_url}#{rel}");
-    Storage::read_optional(&catalog, rel, &context)
-}
-
 /// Every per-file encryption key recorded in a SQL catalog (diagnostics and
 /// tests: prove each file carries its own 256-bit key). `key` opens a `pink:`
 /// catalog database that is itself engine-encrypted. Not part of the
@@ -3459,122 +2882,111 @@ pub fn catalog_encryption_keys(
     crate::metadata::MetadataStore::file_keys(&store)
 }
 
+/// Execute one SQL statement on a catalog database (tests only).
+#[doc(hidden)]
+pub fn catalog_execute(catalog_url: &str, sql: &str) -> Result<()> {
+    let location = Location::parse(catalog_url)?;
+    let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
+        .ok_or_else(|| LakeError::NotALake {
+            path: PathBuf::from(redact_location(catalog_url)),
+        })?;
+    store.execute_sql(sql)
+}
+
+/// One catalog version's typed `Catalog` as JSON (diagnostics/tests): the
+/// same model `MetadataStore::load(version)` returns, never a rendered object.
+#[doc(hidden)]
+pub fn catalog_snapshot_json(catalog_url: &str, version: u64) -> Result<Option<serde_json::Value>> {
+    let location = Location::parse(catalog_url)?;
+    let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
+        .ok_or_else(|| LakeError::NotALake {
+            path: PathBuf::from(redact_location(catalog_url)),
+        })?;
+    match crate::metadata::MetadataStore::load(&store, Some(version))? {
+        Some(catalog) => {
+            serde_json::to_value(&catalog)
+                .map(Some)
+                .map_err(|e| LakeError::Internal {
+                    message: format!("rendering catalog version {version}: {e}"),
+                })
+        }
+        None => Ok(None),
+    }
+}
+
+/// One table's typed catalog entry rendered as the engine model's JSON shape
+/// (diagnostics/tests). Not part of the supported API.
+#[doc(hidden)]
+pub fn catalog_table_json(catalog_url: &str, key: &str) -> Result<Option<serde_json::Value>> {
+    let location = Location::parse(catalog_url)?;
+    let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
+        .ok_or_else(|| LakeError::NotALake {
+            path: PathBuf::from(redact_location(catalog_url)),
+        })?;
+    match store.table(key, None)? {
+        Some(entry) => serde_json::to_value(&entry)
+            .map(Some)
+            .map_err(|e| LakeError::Internal {
+                message: format!("rendering table {key}: {e}"),
+            }),
+        None => Ok(None),
+    }
+}
+
+/// Force one table's catalog `format` id (tests inject an unknown or another
+/// provider: the catalog rows are the only source of truth now). Not part of
+/// the supported API.
+#[doc(hidden)]
+pub fn catalog_set_table_format(catalog_url: &str, key: &str, format: &str) -> Result<()> {
+    let location = Location::parse(catalog_url)?;
+    let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
+        .ok_or_else(|| LakeError::NotALake {
+            path: PathBuf::from(redact_location(catalog_url)),
+        })?;
+    store.set_table_format(key, format)
+}
+
 /// The manifest for the latest version (`None`) or one snapshot, with the path
 /// it was read from (for error attribution). Free function so an attachment —
 /// which holds only the storage and the root, not the [`Lake`] handle — can
 /// read arbitrary versions for time travel.
 pub(crate) fn manifest_for(
-    storage: &dyn Storage,
+    store: &dyn crate::metadata::MetadataStore,
     root: &Path,
     version: Option<u64>,
 ) -> Result<(Catalog, PathBuf)> {
-    // A SQL catalog is not a tree of JSON objects: build the engine model
-    // straight from the typed rows instead of rendering `catalog.json` or
-    // `snapshots/<v>.json` and parsing it back.
-    if let Some(store) = storage.metadata_store() {
-        let Some(catalog) = store.load(version)? else {
-            return Err(match version {
-                Some(version) => LakeError::VersionNotFound {
-                    path: root.to_path_buf(),
-                    version,
-                },
-                None => LakeError::NotALake {
-                    path: root.to_path_buf(),
-                },
-            });
-        };
-        let rel = match version {
-            None => CATALOG_FILE.to_string(),
-            Some(v) => format!("snapshots/{v}.json"),
-        };
-        let abs = storage.abs(&rel);
-        return Ok((catalog, abs));
-    }
-    match version {
-        None => {
-            let manifest = read_catalog(storage, root)?;
-            Ok((manifest, root.join(CATALOG_FILE)))
-        }
-        Some(v) => {
-            let rel = format!("snapshots/{v}.json");
-            let path = storage.abs(&rel);
-            let Some(bytes) =
-                storage.read_optional(&rel, &format!("reading {}", path.display()))?
-            else {
-                return Err(LakeError::VersionNotFound {
-                    path: root.to_path_buf(),
-                    version: v,
-                });
-            };
-            let manifest = read_manifest(&path, &bytes)?;
-            if manifest.version != v {
-                return Err(LakeError::Corrupt {
-                    path,
-                    message: format!(
-                        "snapshot file declares version {}, expected {v}",
-                        manifest.version
-                    ),
-                });
-            }
-            Ok((manifest, path))
-        }
-    }
+    let Some(catalog) = store.load(version)? else {
+        return Err(match version {
+            Some(version) => LakeError::VersionNotFound {
+                path: root.to_path_buf(),
+                version,
+            },
+            None => LakeError::NotALake {
+                path: root.to_path_buf(),
+            },
+        });
+    };
+    let rel = match version {
+        None => "catalog".to_string(),
+        Some(v) => format!("snapshot {v}"),
+    };
+    Ok((catalog, root.join(rel)))
 }
 
 /// The published snapshot versions at or below `up_to`, ascending (see
 /// [`Lake::versions`] for exactly what counts as published). Free function so
 /// attachments can list versions without a [`Lake`] handle.
-pub(crate) fn published_versions(storage: &dyn Storage, up_to: u64) -> Result<Vec<u64>> {
-    let mut out = Vec::new();
-    for name in storage.list("snapshots")? {
-        let Some(v) = name
-            .strip_suffix(".json")
-            .and_then(canonical_version_number)
-        else {
-            continue;
-        };
-        if v < 1 || v > up_to {
-            continue;
-        }
-        let rel = format!("snapshots/{name}");
-        let path = storage.abs(&rel);
-        let bytes = match storage.read(&rel, &format!("reading {}", path.display())) {
-            Ok(bytes) => bytes,
-            Err(LakeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        match read_manifest(&path, &bytes) {
-            Ok(manifest) if manifest.version == v => out.push(v),
-            _ => continue,
-        }
-    }
-    out.sort_unstable();
-    out.dedup();
-    Ok(out)
+pub(crate) fn published_versions(
+    store: &dyn crate::metadata::MetadataStore,
+    up_to: u64,
+) -> Result<Vec<u64>> {
+    Ok(store
+        .snapshot_versions()?
+        .into_iter()
+        .filter(|v| *v >= 1 && *v <= up_to)
+        .collect())
 }
 
-/// The AEAD binding of a manifest (`catalog.json` / `snapshots/<v>.json`)
-/// and of the `highest.json` marker: the lake identity and the published
-/// version, not the path (the catalog and its snapshot are byte-identical,
-/// so they must share one binding). M-7.
-pub(crate) fn manifest_binding(lake_id: &str, version: u64) -> String {
-    format!("lake:{lake_id}:{version}")
-}
-
-/// Parse `lake:<32 hex>:<version>`; `None` for the legacy empty binding or
-/// any other shape.
-pub(crate) fn parse_manifest_binding(binding: &str) -> Option<(&str, u64)> {
-    let rest = binding.strip_prefix("lake:")?;
-    let (id, version) = rest.rsplit_once(':')?;
-    if !is_lake_id(id) {
-        return None;
-    }
-    Some((id, version.parse().ok()?))
-}
-
-/// A lake id is exactly 32 lowercase hex characters (128 bits).
 pub(crate) fn is_lake_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -3596,35 +3008,6 @@ pub(crate) fn fresh_lake_id() -> Result<String> {
     Ok(out)
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct LakeIdentity {
-    lake_format: u32,
-    lake_id: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct HighestVersion {
-    lake_format: u32,
-    lake_id: String,
-    version: u64,
-}
-
-fn identity_json(lake_id: &str) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec_pretty(&LakeIdentity {
-        lake_format: LAKE_ID_FORMAT,
-        lake_id: lake_id.to_string(),
-    })
-    .map_err(|e| LakeError::Internal {
-        message: format!("serializing lake identity: {e}"),
-    })?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
-/// The data-root ownership marker of a split lake (wave 96a):
-/// `{"lake_id": "<32 hex>"}`. It is a data object (routed to the data
-/// location, sealed for a keyed lake), written at create and verified only by
-/// the destructive maintenance paths.
 fn data_ownership_json(lake_id: &str) -> Result<Vec<u8>> {
     #[derive(serde::Serialize)]
     struct DataOwnership<'a> {
@@ -3658,535 +3041,6 @@ pub(crate) fn parse_data_owner(bytes: &[u8], path: &Path) -> Result<String> {
         });
     }
     Ok(owner.lake_id)
-}
-
-fn highest_json(lake_id: &str, version: u64) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec_pretty(&HighestVersion {
-        lake_format: LAKE_ID_FORMAT,
-        lake_id: lake_id.to_string(),
-        version,
-    })
-    .map_err(|e| LakeError::Internal {
-        message: format!("serializing highest.json: {e}"),
-    })?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
-/// Read `lake.json`, or `None` when this is a pre-v6 lake (the file did not
-/// exist before M-7). One GET over object storage; the default local path
-/// still checks `head` first so a directory named `lake.json` is refused the
-/// same way it always was.
-fn read_identity(storage: &dyn Storage, _root: &Path) -> Result<Option<String>> {
-    let path = storage.abs(LAKE_FILE);
-    match storage.read_optional(LAKE_FILE, &format!("reading {}", path.display()))? {
-        Some(bytes) => Ok(Some(parse_identity(storage, &bytes)?)),
-        None => Ok(None),
-    }
-}
-
-/// Parse and validate one `lake.json` payload.
-fn parse_identity(storage: &dyn Storage, bytes: &[u8]) -> Result<String> {
-    let path = storage.abs(LAKE_FILE);
-    let identity: LakeIdentity = serde_json::from_slice(bytes).map_err(|e| LakeError::Corrupt {
-        path: path.clone(),
-        message: format!("lake.json does not parse: {e}"),
-    })?;
-    if identity.lake_format != LAKE_ID_FORMAT {
-        return Err(LakeError::Unsupported {
-            path,
-            found: identity.lake_format,
-        });
-    }
-    if !is_lake_id(&identity.lake_id) {
-        return Err(LakeError::Corrupt {
-            path,
-            message: "lake.json carries an invalid lake_id (expected 32 lowercase hex \
-                      characters)"
-                .to_string(),
-        });
-    }
-    Ok(identity.lake_id)
-}
-
-/// Read and validate `highest.json` for `lake_id`. A missing or unreadable
-/// marker is a hard error for a v6 lake: accepting the catalog without it
-/// would silently restore the rollback surface M-7 closes.
-fn read_highest(storage: &dyn Storage, lake_id: &str) -> Result<u64> {
-    let path = storage.abs(HIGHEST_FILE);
-    let bytes = storage.read_highest_optional(
-        HIGHEST_FILE,
-        &format!("reading {}", path.display()),
-        lake_id,
-    )?;
-    let Some(bytes) = bytes else {
-        return Err(LakeError::Corrupt {
-            path,
-            message: "highest.json is missing (the authenticated rollback marker was \
-                      removed); refusing to open"
-                .to_string(),
-        });
-    };
-    let highest: HighestVersion =
-        serde_json::from_slice(&bytes).map_err(|e| LakeError::Corrupt {
-            path: path.clone(),
-            message: format!("highest.json does not parse: {e}"),
-        })?;
-    if highest.lake_format != LAKE_ID_FORMAT {
-        return Err(LakeError::Unsupported {
-            path,
-            found: highest.lake_format,
-        });
-    }
-    if highest.lake_id != lake_id {
-        return Err(LakeError::Corrupt {
-            path: path.clone(),
-            message: format!(
-                "highest.json belongs to lake {}, not to this lake ({lake_id})",
-                highest.lake_id
-            ),
-        });
-    }
-    if highest.version < 1 || highest.version > MAX_VERSION {
-        return Err(LakeError::Corrupt {
-            path,
-            message: format!(
-                "highest.json version {} is outside the supported range 1..={MAX_VERSION}",
-                highest.version
-            ),
-        });
-    }
-    Ok(highest.version)
-}
-
-/// Read and validate `catalog.json`. One GET over object storage (a 404 is
-/// the absence); the local default still checks `head` first.
-fn read_catalog(storage: &dyn Storage, root: &Path) -> Result<Catalog> {
-    let path = storage.abs(CATALOG_FILE);
-    match storage.read_optional(CATALOG_FILE, &format!("reading {}", path.display()))? {
-        Some(bytes) => parse_catalog(root, &bytes),
-        // An encrypted lake reads the catalog through this path, so a retired
-        // source must still report `CatalogMoved` rather than `NotALake`.
-        None => Err(missing_catalog_error(storage, root)?),
-    }
-}
-
-/// Parse and validate one `catalog.json` payload.
-fn parse_catalog(root: &Path, bytes: &[u8]) -> Result<Catalog> {
-    let path = root.join(CATALOG_FILE);
-    read_manifest(&path, bytes)
-}
-
-/// Parse + validate one manifest (`catalog.json` or a snapshot). The version
-/// must be in `1..=MAX_VERSION`: `0` is not a version this writer ever
-/// publishes, and a value at the top wraps `version + 1` — both are corrupt
-/// metadata, reported as a clean [`LakeError::Corrupt`] (this path is plain
-/// JSON, no Vortex decode involved).
-///
-/// `format_version` must be in [`MIN_FORMAT_VERSION`]`..=`[`FORMAT_VERSION`]`.
-/// Per-version shape rules (all violations are [`LakeError::Corrupt`], never
-/// a silent downgrade):
-///
-/// - **v1**: entries are `.pink` files as plain string paths; an entry must
-///   not declare `"format": "vortex"`, may carry one entry-level `stats`
-///   block, and must not carry `deletes`.
-/// - **v2/v3**: entries are `.vortex` files as plain string paths and must
-///   declare `"format": "vortex"`; no `stats`, no `deletes`.
-/// - **v4**: entries must declare `"format"` (`"pink"` or `"vortex"`), list
-///   their files as objects with exact row counts, and may carry positional
-///   delete files. `stats` lives per `.pink` file (never on the entry, never
-///   on a Vortex file), every delete must target one of the entry's files,
-///   and the logical row count must equal `sum(files.rows) -
-///   sum(deletes.count)`.
-///
-/// A build without `vortexlake` refuses a **v2/v3** manifest (all-Vortex by
-/// definition) with a clear [`LakeError::FeatureMissing`] at this very first
-/// parse, before any data file is touched. A v4–v6 entry whose format id has
-/// no provider — `vortex` without `vortexlake`, or an unknown id — does
-/// **not** refuse the lake: the catalog parses, and the per-table door
-/// ([`Lake::unavailable_tables`], [`Lake::load`], attach and the write paths)
-/// refuses only that table (wave 88, rule 5). Corrupt format/version
-/// combinations still refuse the lake here.
-fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
-    let manifest: Catalog = serde_json::from_slice(bytes).map_err(|e| LakeError::Corrupt {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    if manifest.format_version < MIN_FORMAT_VERSION || manifest.format_version > MAX_FORMAT_VERSION
-    {
-        return Err(LakeError::Unsupported {
-            path: path.to_path_buf(),
-            found: manifest.format_version,
-        });
-    }
-    if manifest.version < 1 || manifest.version > MAX_VERSION {
-        return Err(LakeError::Corrupt {
-            path: path.to_path_buf(),
-            message: format!(
-                "version {} is outside the supported range 1..={MAX_VERSION}",
-                manifest.version
-            ),
-        });
-    }
-    // M-7: v6 manifests carry the lake identity; older manifests never do.
-    if manifest.format_version >= 6 {
-        match manifest.lake_id.as_deref() {
-            Some(id) if is_lake_id(id) => {}
-            Some(id) => {
-                return Err(LakeError::Corrupt {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "format_version 6 manifest carries an invalid lake_id {id:?} \
-                         (expected 32 lowercase hex characters)"
-                    ),
-                });
-            }
-            None => {
-                return Err(LakeError::Corrupt {
-                    path: path.to_path_buf(),
-                    message: "format_version 6 manifest has no lake_id (the lake identity is \
-                              mandatory from v6)"
-                        .to_string(),
-                });
-            }
-        }
-    }
-    // An older manifest may carry the field (a hand-edited or future-additive
-    // fixture); only v6 requires it. It is ignored below v6, where the lake is
-    // upgraded on its next save.
-    let v = manifest.format_version;
-    let corrupt = |message: String| LakeError::Corrupt {
-        path: path.to_path_buf(),
-        message,
-    };
-    // A build without `vortexlake` refuses a v2/v3 manifest (all-Vortex by
-    // definition) at this very first parse, before any data file is touched,
-    // with a feature error — never a corrupt-file one. A v4–v6 entry naming
-    // an unavailable format stays a per-table matter (wave 88, rule 5), so it
-    // is not refused here.
-    #[cfg(not(feature = "vortexlake"))]
-    if (2..=3).contains(&v) {
-        return Err(LakeError::FeatureMissing {
-            feature: "vortexlake",
-            message: format!(
-                "{} is a format_version {v} lake (Vortex data files); this build was built \
-                 without Vortex format support — rebuild with the `vortexlake` feature \
-                 (for the CLI: `cargo build -p pinkdb-cli --features vortexlake`)",
-                path.display(),
-            ),
-        });
-    }
-    for (key, entry) in &manifest.tables {
-        if v != 1 && entry.stats.is_some() {
-            return Err(corrupt(format!(
-                "table \"{key}\" declares an entry-level statistics block in a format_version \
-                 {v} manifest (statistics blocks belong to v1 `.pink` entries; v4 `.pink` \
-                 files carry their own per-file block, and Vortex statistics live in the \
-                 data file's footer)"
-            )));
-        }
-        if v < 4 && !entry.deletes.is_empty() {
-            return Err(corrupt(format!(
-                "table \"{key}\" declares positional delete files in a format_version {v} \
-                 manifest (deletes are part of the v4 incremental format)"
-            )));
-        }
-        if v < 4 && entry.partition_by.is_some() {
-            return Err(corrupt(format!(
-                "table \"{key}\" declares a partition specification in a format_version {v} \
-                 manifest (partitioning is part of the v4 incremental format)"
-            )));
-        }
-        if v < 4 && (!entry.inlined.is_empty() || entry.inlined_limit.is_some()) {
-            return Err(corrupt(format!(
-                "table \"{key}\" declares inlined rows in a format_version {v} manifest \
-                 (inlining is part of the v4 incremental format)"
-            )));
-        }
-        if !entry.inlined.is_empty() && entry.columns.is_none() {
-            return Err(corrupt(format!(
-                "table \"{key}\" carries inlined rows but no schema record (inlined rows are \
-                 read through the v5 `columns`/`renames` mapping)"
-            )));
-        }
-        if let Some(keys) = &entry.partition_by {
-            if keys.is_empty() {
-                return Err(corrupt(format!(
-                    "table \"{key}\" declares an empty partition specification (a partitioned \
-                     table lists at least one partition key)"
-                )));
-            }
-            for spec_key in keys {
-                if !spec_key.is_valid() {
-                    return Err(corrupt(format!(
-                        "table \"{key}\" declares partition key column \"{}\" with an unknown \
-                         transform \"{}\" (this build understands \"identity\" and \
-                         \"bucket(N)\")",
-                        spec_key.column, spec_key.transform
-                    )));
-                }
-            }
-            for (i, spec_key) in keys.iter().enumerate() {
-                if keys[..i]
-                    .iter()
-                    .any(|k| k.key_text() == spec_key.key_text())
-                {
-                    return Err(corrupt(format!(
-                        "table \"{key}\" partitions on \"{}\" twice (every partition key must \
-                         be unique)",
-                        spec_key.key_text()
-                    )));
-                }
-            }
-        }
-        match (v, entry.format.as_ref().map(FileFormat::id)) {
-            (1, Some(crate::format::VORTEX_FORMAT_ID)) => {
-                return Err(corrupt(format!(
-                    "table \"{key}\" declares a vortex data file in a format_version 1 \
-                     manifest (version 1 data files are engine `.pink` bytes)"
-                )));
-            }
-            (1, Some(id)) if id != crate::format::PINK_FORMAT_ID => {
-                return Err(corrupt(format!(
-                    "table \"{key}\" declares data-file format \"{id}\" in a format_version 1 \
-                     manifest (version 1 data files are engine `.pink` bytes)"
-                )));
-            }
-            (2 | 3, None) => {
-                return Err(corrupt(format!(
-                    "table \"{key}\" does not declare a data file format (a format_version \
-                     {v} entry requires `\"format\": \"vortex\"`)"
-                )));
-            }
-            (2 | 3, Some(crate::format::PINK_FORMAT_ID)) => {
-                return Err(corrupt(format!(
-                    "table \"{key}\" declares a pink data file in a format_version {v} \
-                     manifest (Vortex-era writers emit Vortex only; `.pink` data files are \
-                     format_version 1)"
-                )));
-            }
-            (2 | 3, Some(id)) if id != crate::format::VORTEX_FORMAT_ID => {
-                return Err(corrupt(format!(
-                    "table \"{key}\" declares data-file format \"{id}\" in a format_version {v} \
-                     manifest (Vortex-era writers emit Vortex only)"
-                )));
-            }
-            (4..=7, None) => {
-                return Err(corrupt(format!(
-                    "table \"{key}\" does not declare a data file format (a format_version {v} \
-                     entry requires `\"format\"`: \"pink\" or \"vortex\")"
-                )));
-            }
-            // A v4–v6 id with no provider is no longer a whole-lake error:
-            // open/attach list the table, `Lake::load` skips it, and every
-            // read or targeted write of it fails with the provider error
-            // (wave 88, rule 5). The id is deliberately resolved later, per
-            // table, so this build can still carry the entry forward.
-            (4..=7, Some(_)) => {}
-            _ => {}
-        }
-    }
-    for (key, entry) in &manifest.tables {
-        for file in &entry.files {
-            match (v, file) {
-                (1..=3, FileRef::Entry { .. }) => {
-                    return Err(corrupt(format!(
-                        "table \"{key}\" lists a data file as an object in a format_version \
-                         {v} manifest (only v4 entries carry per-file row counts)"
-                    )));
-                }
-                (4..=7, FileRef::Path(_)) => {
-                    return Err(corrupt(format!(
-                        "table \"{key}\" lists a data file without its row count (a \
-                         format_version {v} entry lists files as {{\"path\", \"rows\"}} \
-                         objects)"
-                    )));
-                }
-                (
-                    4..=7,
-                    FileRef::Entry {
-                        path: rel,
-                        stats: _stats,
-                        partition,
-                        ..
-                    },
-                ) => {
-                    validate_rel_path(rel)?;
-                    // A statistics block may ride on a `.pink` file (its
-                    // per-file statistics) or on a Vortex file (the
-                    // catalog-published zone map, cross-checked against the
-                    // footer at attach). Files written before wave 66 (Vortex
-                    // without a block) stay valid, as do `.pink` files whose
-                    // block was never published (attach refuses those with the
-                    // clear "no statistics" message).
-                    if let Some(partition) = partition {
-                        for pkey in partition.keys() {
-                            if crate::catalog::PartitionKey::parse(pkey).is_err() {
-                                return Err(corrupt(format!(
-                                    "table \"{key}\": data file \"{rel}\" carries a partition \
-                                     key \"{pkey}\" that is not a column name or bucket(N, column)"
-                                )));
-                            }
-                        }
-                    }
-                }
-                (1..=3, FileRef::Path(rel)) => validate_rel_path(rel)?,
-                _ => {}
-            }
-        }
-        if v >= 4 {
-            if entry.files.is_empty() && entry.inlined.is_empty() {
-                return Err(corrupt(format!(
-                    "table \"{key}\" has no data files (a format_version {v} table always lists \
-                     at least one, unless it holds inlined rows)"
-                )));
-            }
-            // Wave 68: the inlined row history, validated structurally. Row
-            // ids are unique and below the counter; every record carries the
-            // version pair a change-data read consumes; values are positional
-            // against the row's own column list. The value encoding itself is
-            // decoded lazily, where a failure names the exact row.
-            let mut seen_rows: BTreeMap<u64, u64> = BTreeMap::new();
-            for row in &entry.inlined {
-                if row.values.len() != row.columns.len() {
-                    return Err(corrupt(format!(
-                        "table \"{key}\": inlined row {} holds {} values for {} columns",
-                        row.row_id,
-                        row.values.len(),
-                        row.columns.len()
-                    )));
-                }
-                if row.schema_version < 1 {
-                    return Err(corrupt(format!(
-                        "table \"{key}\": inlined row {} declares schema version 0 (a recorded \
-                         row is written under a schema epoch of at least 1)",
-                        row.row_id
-                    )));
-                }
-                if row.begin < 1 || row.begin > manifest.version {
-                    return Err(corrupt(format!(
-                        "table \"{key}\": inlined row {} begins at version {}, outside \
-                         1..={}",
-                        row.row_id, row.begin, manifest.version
-                    )));
-                }
-                if let Some(end) = row.end
-                    && (end < row.begin || end > manifest.version)
-                {
-                    return Err(corrupt(format!(
-                        "table \"{key}\": inlined row {} ends at version {end}, outside \
-                             {}..={}",
-                        row.row_id, row.begin, manifest.version
-                    )));
-                }
-                if row.flushed && row.end.is_none() {
-                    return Err(corrupt(format!(
-                        "table \"{key}\": inlined row {} is marked flushed but has no end \
-                         version (a flush writes the end that materialized it)",
-                        row.row_id
-                    )));
-                }
-                if let Some(begin) = seen_rows.get(&row.row_id)
-                    && *begin == row.begin
-                {
-                    return Err(corrupt(format!(
-                        "table \"{key}\": inlined row {} appears twice for version {}",
-                        row.row_id, row.begin
-                    )));
-                }
-                seen_rows.insert(row.row_id, row.begin);
-            }
-            if entry.next_row_id > 0 {
-                for row in &entry.inlined {
-                    if row.row_id >= entry.next_row_id {
-                        return Err(corrupt(format!(
-                            "table \"{key}\": inlined row id {} is at or beyond the table's \
-                             next_row_id {}",
-                            row.row_id, entry.next_row_id
-                        )));
-                    }
-                }
-            }
-            let data_rows = entry.data_rows().ok_or_else(|| {
-                corrupt(format!(
-                    "table \"{key}\" overflows u64 rows across its data files"
-                ))
-            })?;
-            let deleted = entry.deleted_rows().ok_or_else(|| {
-                corrupt(format!(
-                    "table \"{key}\" overflows u64 rows across its delete files"
-                ))
-            })?;
-            let live_inlined = entry.live_inlined_rows();
-            if data_rows < deleted {
-                return Err(corrupt(format!(
-                    "table \"{key}\" declares {} rows, but its files hold {data_rows} rows and \
-                     its delete files drop {deleted} (the manifest disagrees with itself)",
-                    entry.rows
-                )));
-            }
-            let implied = (data_rows - deleted).checked_add(live_inlined);
-            if implied != Some(entry.rows) {
-                return Err(if live_inlined == 0 {
-                    corrupt(format!(
-                        "table \"{key}\" declares {} rows, but its files hold {data_rows} rows \
-                         and its delete files drop {deleted} (the manifest disagrees with \
-                         itself)",
-                        entry.rows
-                    ))
-                } else {
-                    corrupt(format!(
-                        "table \"{key}\" declares {} rows, but its files hold {data_rows} rows, \
-                         its delete files drop {deleted} and {live_inlined} inlined row{} live \
-                         (the manifest disagrees with itself)",
-                        entry.rows,
-                        if live_inlined == 1 { "" } else { "s" }
-                    ))
-                });
-            }
-            for d in &entry.deletes {
-                validate_rel_path(&d.path)?;
-                if !entry.files.iter().any(|f| f.path() == d.file) {
-                    return Err(corrupt(format!(
-                        "table \"{key}\": delete file \"{}\" targets \"{}\", which is not one \
-                         of the table's data files",
-                        d.path, d.file
-                    )));
-                }
-            }
-        }
-    }
-    Ok(manifest)
-}
-
-/// Serialize a manifest (pretty JSON + trailing newline).
-fn manifest_json(manifest: &Catalog, path: &Path) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|e| LakeError::Internal {
-        message: format!("serializing {}: {e}", path.display()),
-    })?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
-/// Serialize a commit delta manifest (pretty JSON + trailing newline).
-fn commit_manifest_json(manifest: &catalog::CommitManifest) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|e| LakeError::Internal {
-        message: format!("serializing a commit manifest: {e}"),
-    })?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
-/// Canonical snapshot file stem: a decimal `u64` with no sign, whitespace,
-/// leading `+`, or leading zero (`0` itself is never a version). `01.json`,
-/// `1e3.json`, ` 1.json` and friends are not versions of this lake.
-fn canonical_version_number(stem: &str) -> Option<u64> {
-    let digits = !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit());
-    let canonical = digits && (stem.len() == 1 || !stem.starts_with('0'));
-    if !canonical {
-        return None;
-    }
-    stem.parse().ok()
 }
 
 /// Flat catalog key → `(database, table)`, splitting on the FIRST dot (a
@@ -4568,46 +3422,6 @@ mod tests {
         let snapshot = PathBuf::from("snapshots/2.json");
         let err = split_key("nodot", &snapshot).unwrap_err().to_string();
         assert!(err.contains("snapshots/2.json"), "{err}");
-    }
-
-    #[test]
-    fn a_bad_file_partition_key_names_the_table_not_the_key() {
-        let catalog = serde_json::json!({
-            "format_version": 7,
-            "lake_id": "0123456789abcdef0123456789abcdef",
-            "version": 2,
-            "updated": "2026-01-01T00:00:00.000Z",
-            "tables": {
-                "main.t": {
-                    "format": "pink",
-                    "rows": 1,
-                    "files": [{
-                        "path": "data/main.t/f.pink",
-                        "rows": 1,
-                        "partition": { "year(ts)": "x" }
-                    }]
-                }
-            }
-        });
-        let bytes = serde_json::to_vec(&catalog).unwrap();
-        let err = read_manifest(Path::new("catalog.json"), &bytes)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("table \"main.t\""), "{err}");
-        assert!(err.contains("year(ts)"), "{err}");
-    }
-
-    #[test]
-    fn canonical_version_numbers_reject_lookalikes() {
-        assert_eq!(canonical_version_number("1"), Some(1));
-        assert_eq!(canonical_version_number("42"), Some(42));
-        assert_eq!(
-            canonical_version_number("18446744073709551615"),
-            Some(u64::MAX)
-        );
-        for bad in ["", "0x1", "01", "007", "+1", "-1", " 1", "1 ", "1e3", "١"] {
-            assert_eq!(canonical_version_number(bad), None, "{bad:?}");
-        }
     }
 
     #[test]

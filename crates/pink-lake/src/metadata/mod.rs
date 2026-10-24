@@ -107,6 +107,12 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// The latest pinkdb version (`None` for a catalog with no snapshots).
     fn head_version(&self) -> Result<Option<u64>>;
 
+    /// Every snapshot version, ascending.
+    fn snapshot_versions(&self) -> Result<Vec<u64>>;
+
+    /// Whether one snapshot version exists.
+    fn snapshot_exists(&self, version: u64) -> Result<bool>;
+
     /// Build the engine-facing head catalog, **with every table loaded**.
     ///
     /// Lake-wide operations (flush, merge/rewrite, add-files) and any caller

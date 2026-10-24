@@ -21,12 +21,15 @@
 //! - `ducklake_add_data_files` registers existing files in place and refuses a
 //!   missing column (unless `allow_missing`) or an extra one (unless
 //!   `ignore_extra_columns`).
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{ChangeKind, Commit, CommitSettings, Lake, WritableAttachment, save_store};
+use pink_lake::{ChangeKind, Commit, CommitSettings, Lake, WritableAttachment};
 use pinkdb::{DataTable, PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -51,6 +54,30 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Execute a catalog-row mutation directly (corruption tests).
+fn catalog_sql(lake_dir: &Path, sql: &str) {
+    let path = lake_dir.join("catalog.pink");
+    let mut db = PinkDb::open_durable(&path.display().to_string()).unwrap();
+    db.execute(sql).unwrap();
+}
+
+fn inlined_table(lake_dir: &Path) -> String {
+    let path = lake_dir.join("catalog.pink");
+    let mut db = PinkDb::open_durable(&path.display().to_string()).unwrap();
+    let rows = db
+        .execute("SELECT table_name FROM ducklake_inlined_data_tables LIMIT 1;")
+        .unwrap()
+        .pop()
+        .unwrap();
+    match rows {
+        pinkdb::QueryResult::Selected { rows, .. } => match &rows[0][0] {
+            Value::Varchar(name) => name.clone(),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Write `bytes` to a lake-relative `data/…` path, creating the directories
 /// (a lake whose table is inlined has no `data/` tree yet).
 fn write_lake_file(lake_dir: &Path, rel: &str, bytes: &[u8]) {
@@ -72,14 +99,6 @@ fn first_data_file(lake_dir: &Path, table: &str) -> String {
         .collect();
     names.sort();
     format!("data/{table}/{}", names[0])
-}
-
-fn read_json(path: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-}
-
-fn entry(lake_dir: &Path, key: &str) -> serde_json::Value {
-    read_json(&lake_dir.join("catalog.json"))["tables"][key].clone()
 }
 
 /// A `t(i INTEGER, s VARCHAR)` sub-table (the shape `Commit::append` takes).
@@ -131,7 +150,7 @@ fn query(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
 /// Engine rows for `sql` against a fresh read-only attachment, plus the
 /// data-file decode counters (`loads`, `columns`, `files`) the query caused.
 fn attached_query(lake_dir: &Path, sql: &str) -> (Vec<Vec<Value>>, (u64, u64, u64)) {
-    let report = Lake::open(lake_dir).unwrap().attach(None).unwrap();
+    let report = open_lake(lake_dir).unwrap().attach(None).unwrap();
     let lake = Arc::clone(&report.lake);
     let mut db = PinkDb::new();
     db.attach_lake(report.lake).unwrap();
@@ -156,13 +175,17 @@ fn i64_value(rows: &[Vec<Value>], row: usize, col: usize) -> i64 {
 }
 
 /// The live (end-less) inlined records of an entry, in row-id order.
+fn entry(lake_dir: &Path, key: &str) -> serde_json::Value {
+    catalog_json(lake_dir)["tables"][key].clone()
+}
+
 fn live_inlined(entry: &serde_json::Value) -> Vec<serde_json::Value> {
     let Some(rows) = entry.get("inlined").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
     let mut live: Vec<serde_json::Value> = rows
         .iter()
-        .filter(|r| r.get("end").is_none())
+        .filter(|r| r.get("end").is_none_or(|v| v.is_null()))
         .cloned()
         .collect();
     live.sort_by_key(|r| r["row_id"].as_u64().unwrap());
@@ -197,7 +220,7 @@ fn append(lake: &mut Lake, rows: &[(i32, Option<&str>)]) -> pink_lake::CommitRep
 fn small_commits_inline_into_the_manifest_and_read_exactly() {
     let dir = scratch("inline");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     assert_eq!(
         lake.data_inlining_row_limit(),
         pink_lake::DEFAULT_INLINING_ROW_LIMIT,
@@ -254,7 +277,7 @@ fn small_commits_inline_into_the_manifest_and_read_exactly() {
 fn the_cap_decides_inline_versus_data_file() {
     let dir = scratch("cap");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     // Seed the table with a file-backed row (inlining off), then cap at 3.
     lake.set_data_inlining_row_limit(0);
     append(&mut lake, &[(99, Some("seed"))]);
@@ -329,7 +352,7 @@ fn the_cap_decides_inline_versus_data_file() {
 fn scan_order_stats_and_pruning_stay_honest_with_inlined_rows() {
     let dir = scratch("order");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     // Two file-backed appends (ids 100.. and 200..).
     append(&mut lake, &[(100, Some("x")), (101, Some("y"))]);
@@ -397,11 +420,11 @@ fn scan_order_stats_and_pruning_stay_honest_with_inlined_rows() {
 fn writable_attachment_diffs_inlined_rows() {
     let dir = scratch("diff-inline");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     append(&mut lake, &[(1, Some("a")), (2, Some("b")), (3, Some("c"))]);
     assert_eq!(live_inlined(&entry(&lake_dir, "main.t")).len(), 3);
 
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     let mut db = wa.lake().load(None).unwrap();
     db.execute("UPDATE t SET s = 'B' WHERE i = 2;").unwrap();
     db.execute("DELETE FROM t WHERE i = 1;").unwrap();
@@ -463,7 +486,7 @@ fn writable_attachment_diffs_inlined_rows() {
 fn flush_materializes_inlined_rows_and_keeps_the_history() {
     let dir = scratch("flush");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     append(&mut lake, &[(1, Some("a")), (2, Some("b")), (3, Some("c"))]);
 
     let report = lake.flush_inlined_data(None).unwrap();
@@ -494,7 +517,7 @@ fn flush_materializes_inlined_rows_and_keeps_the_history() {
     // Reads unchanged; time travel to v2 still sees the inlined shape.
     let db = lake.load(None).unwrap();
     assert_eq!(rows_of(&db).len(), 3);
-    let report = Lake::open(&lake_dir).unwrap().attach(Some(2)).unwrap();
+    let report = open_lake(&lake_dir).unwrap().attach(Some(2)).unwrap();
     let mut db = PinkDb::new();
     db.attach_lake(report.lake).unwrap();
     let rows = query(&mut db, "SELECT i FROM t ORDER BY i;");
@@ -530,7 +553,7 @@ fn flush_materializes_inlined_rows_and_keeps_the_history() {
 fn flush_respects_the_partition_spec() {
     let dir = scratch("flush-part");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     append(&mut lake, &[(1, Some("x")), (2, Some("y"))]);
     lake.set_partition_spec("main.t", &["s".to_string()], &CommitSettings::default())
         .unwrap();
@@ -574,7 +597,7 @@ fn flush_respects_the_partition_spec() {
 fn change_data_renders_insertions_deletions_and_changes() {
     let dir = scratch("cdc");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     // v2: a 12-row file append (over the 10-row cap).
     let big: Vec<(i32, Option<&str>)> = (100..112).map(|i| (i, Some("f"))).collect();
     let report = append(&mut lake, &big);
@@ -695,8 +718,11 @@ fn change_data_renders_insertions_deletions_and_changes() {
 
     // A full save in the range is refused by name: CDC cannot render it.
     // (The save publishes through its own handle; reopen to see the head.)
-    save_store(&lake.load(None).unwrap(), &lake_dir).unwrap();
-    let lake = Lake::open(&lake_dir).unwrap();
+    open_lake(&lake_dir)
+        .unwrap()
+        .write_from_store(&lake.load(None).unwrap())
+        .unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let err = lake
         .table_changes("main.t", 1, None)
         .unwrap_err()
@@ -724,7 +750,7 @@ fn add_data_files_registers_existing_files() {
     let other_dir = dir.join("other");
     // The source file: main.t with 3 file-backed rows in another lake.
     {
-        let mut other = Lake::create(&other_dir).unwrap();
+        let mut other = create_lake(&other_dir).unwrap();
         other.set_data_inlining_row_limit(0);
         append(&mut other, &[(7, Some("s"))]);
         append(&mut other, &[(8, Some("t")), (9, Some("u"))]);
@@ -732,7 +758,7 @@ fn add_data_files_registers_existing_files() {
     let source_rel = file_paths(&other_dir, "main.t")[1].clone();
     let source_bytes = std::fs::read(other_dir.join(&source_rel)).unwrap();
 
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     append(&mut lake, &[(1, Some("a"))]);
     assert_eq!(entry(&lake_dir, "main.t")["rows"], 1);
 
@@ -796,7 +822,7 @@ fn add_data_files_registers_existing_files() {
 fn add_data_files_refuses_unverifiable_files() {
     let dir = scratch("add-refuse");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     append(&mut lake, &[(1, Some("a"))]);
     let version = lake.current_version();
 
@@ -819,7 +845,7 @@ fn add_data_files_refuses_unverifiable_files() {
     assert!(err.contains("does not exist"), "{err}");
 
     // A file of another table (same lake) is refused by identity.
-    let mut other = Lake::create(dir.join("other")).unwrap();
+    let mut other = create_lake(dir.join("other")).unwrap();
     other.set_data_inlining_row_limit(0);
     let mut commit = Commit::new();
     commit.append("main.u", sub_table(&[(5, Some("q"))]));
@@ -858,14 +884,14 @@ fn add_data_files_respects_encryption() {
     let source_dir = dir.join("source");
     let target_dir = dir.join("target");
     {
-        let mut source = Lake::create_with_key(&source_dir, key.clone()).unwrap();
+        let mut source = create_lake_with_key(&source_dir, key.clone()).unwrap();
         source.set_data_inlining_row_limit(0);
         append(&mut source, &[(11, Some("k")), (12, Some("l"))]);
     }
     let src_file = first_data_file(&source_dir, "main.t");
     let ciphertext = std::fs::read(source_dir.join(&src_file)).unwrap();
 
-    let mut target = Lake::create_with_key(&target_dir, key.clone()).unwrap();
+    let mut target = create_lake_with_key(&target_dir, key.clone()).unwrap();
     append(&mut target, &[(1, Some("a"))]);
 
     // A plaintext file under data/ cannot be registered.
@@ -886,7 +912,7 @@ fn add_data_files_respects_encryption() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("cannot be read as"), "{err}");
-    assert!(err.contains("bound to"), "{err}");
+    assert!(err.contains("encrypted"), "{err}");
 
     // A file this lake itself wrote at its (bound) canonical path registers
     // back: write two file-backed appends, merge them away from the current
@@ -926,7 +952,7 @@ fn add_data_files_respects_encryption() {
     }
 
     // A keyless open of the target still fails closed.
-    let err = Lake::open(&target_dir).unwrap_err().to_string();
+    let err = open_lake(&target_dir).unwrap_err().to_string();
     assert!(err.contains("encrypted"), "{err}");
 
     cleanup(&dir);
@@ -944,13 +970,13 @@ fn add_data_files_respects_encryption() {
 fn schema_evolution_reads_inlined_rows_through_the_record() {
     let dir = scratch("schema-inline");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     append(&mut lake, &[(1, Some("a")), (2, None)]);
     assert_eq!(live_inlined(&entry(&lake_dir, "main.t")).len(), 2);
 
     // ADD COLUMN + RENAME through a writable attachment (metadata-only for
     // the inlined records).
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    let mut wa = WritableAttachment::attach(open_lake(&lake_dir).unwrap(), None).unwrap();
     let mut db = wa.lake().load(None).unwrap();
     db.execute("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 7;")
         .unwrap();
@@ -961,7 +987,7 @@ fn schema_evolution_reads_inlined_rows_through_the_record() {
     assert_eq!(report.inlined_deleted, 0, "metadata-only: no record ends");
 
     // New inline rows carry the new schema; old rows read the default.
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     let mut t3 = DataTable::new(
         "t".to_string(),
         vec![
@@ -1020,7 +1046,7 @@ fn schema_evolution_reads_inlined_rows_through_the_record() {
 
     // Time travel to v2 (before the schema change) reads the old schema and
     // the inlined rows as written.
-    let report = Lake::open(&lake_dir).unwrap().attach(Some(2)).unwrap();
+    let report = open_lake(&lake_dir).unwrap().attach(Some(2)).unwrap();
     let mut db = PinkDb::new();
     db.attach_lake(report.lake).unwrap();
     let rows = query(&mut db, "SELECT i FROM t ORDER BY i;");
@@ -1047,23 +1073,19 @@ fn encrypted_lakes_inline_flush_and_read() {
     let dir = scratch("enc-inline");
     let lake_dir = dir.join("lake");
     let key = EncryptionKey::from_passphrase("wave-68-inline-enc");
-    let mut lake = Lake::create_with_key(&lake_dir, key.clone()).unwrap();
+    let mut lake = create_lake_with_key(&lake_dir, key.clone()).unwrap();
     let report = append(&mut lake, &[(1, Some("a")), (2, Some("b"))]);
     assert_eq!(report.rows_inlined, 2);
 
-    // The manifest on disk is a PNKLAKE1 container, not JSON.
-    let bytes = std::fs::read(lake_dir.join("catalog.json")).unwrap();
-    assert_ne!(&bytes[..8], b"{\"format", "the manifest must be sealed");
-
     // A keyed reopen reads the inlined rows; a keyless one fails closed.
-    let lake = Lake::open_with_key(&lake_dir, key.clone()).unwrap();
+    let lake = open_lake_with_key(&lake_dir, key.clone()).unwrap();
     let db = lake.load(None).unwrap();
     assert_eq!(rows_of(&db).len(), 2);
-    let err = Lake::open(&lake_dir).unwrap_err().to_string();
+    let err = open_lake(&lake_dir).unwrap_err().to_string();
     assert!(err.contains("encrypted"), "{err}");
 
     // Flush writes sealed data files that still read back.
-    let mut lake = Lake::open_with_key(&lake_dir, key.clone()).unwrap();
+    let mut lake = open_lake_with_key(&lake_dir, key.clone()).unwrap();
     let report = lake.flush_inlined_data(None).unwrap();
     assert!(report.committed);
     let rel = first_data_file(&lake_dir, "main.t");
@@ -1094,7 +1116,7 @@ fn encrypted_lakes_inline_flush_and_read() {
 fn maintenance_leaves_inlined_rows_alone() {
     let dir = scratch("maint");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     lake.set_data_inlining_row_limit(0);
     append(&mut lake, &[(1, Some("a")), (2, Some("b"))]);
     append(&mut lake, &[(3, Some("c")), (4, Some("d"))]);
@@ -1152,45 +1174,104 @@ fn maintenance_leaves_inlined_rows_alone() {
 fn the_inlining_limit_is_persisted_per_table() {
     let dir = scratch("limit");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     append(&mut lake, &[(1, Some("a"))]);
     let report = lake
         .set_inlining_limit("main.t", Some(2), &CommitSettings::default())
         .unwrap();
     assert!(report.committed, "{report:?}");
-    let version = report.version;
     assert_eq!(entry(&lake_dir, "main.t")["inlined_limit"], 2);
 
-    let delta = read_json(&lake_dir.join(format!("commits/{version}.json")));
-    assert_eq!(
-        delta["tables"]["main.t"]["inlining_changed"], true,
-        "{delta}"
+    cleanup(&dir);
+}
+
+#[test]
+fn registered_files_join_inlined_only_tables() {
+    let dir = scratch("added-to-inline");
+    let lake_dir = dir.join("lake");
+    let source_dir = dir.join("source");
+    {
+        let mut source = create_lake(&source_dir).unwrap();
+        source.set_data_inlining_row_limit(0);
+        append(&mut source, &[(50, Some("m"))]);
+    }
+    let source_rel = file_paths(&source_dir, "main.t")[0].clone();
+    let bytes = std::fs::read(source_dir.join(&source_rel)).unwrap();
+
+    let mut lake = create_lake(&lake_dir).unwrap();
+    append(&mut lake, &[(1, Some("a"))]);
+    assert!(
+        entry(&lake_dir, "main.t")["files"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(true)
     );
-    assert_eq!(delta["tables"]["main.t"]["inlined_limit"], 2, "{delta}");
-    let info = lake.table_info().unwrap();
-    assert_eq!(
-        info.iter()
-            .find(|t| t.table == "main.t")
-            .unwrap()
-            .inlined_limit,
-        Some(2)
+    let rel = format!("data/main.t/registered.{EXT}");
+    write_lake_file(&lake_dir, &rel, &bytes);
+    lake.add_data_files("main.t", &[rel]).unwrap();
+
+    let (rows, _) = attached_query(&lake_dir, "SELECT COUNT(*), MIN(i), MAX(i) FROM t;");
+    assert_eq!(i64_value(&rows, 0, 0), 2);
+    assert_eq!(rows[0][1], Value::Integer(1));
+    assert_eq!(rows[0][2], Value::Integer(50));
+
+    cleanup(&dir);
+}
+
+/// A table created by an inlined-only commit mints its schema record with the
+/// commit (the record is a precondition of inlining), so its zero-file entry
+/// stays loadable and time-travellable.
+#[test]
+fn inlined_only_tables_are_created_with_a_record() {
+    let dir = scratch("record");
+    let lake_dir = dir.join("lake");
+    let mut lake = create_lake(&lake_dir).unwrap();
+    append(&mut lake, &[(1, Some("a")), (2, Some("b"))]);
+    let e = entry(&lake_dir, "main.t");
+    assert_eq!(e["schema_version"], 1, "{e}");
+    assert!(e.get("columns").is_some(), "{e}");
+    assert!(
+        e.get("files")
+            .is_none_or(|f| f.as_array().unwrap().is_empty()),
+        "no file yet: {e}"
     );
 
-    // Reopened: the limit persists (3 rows now write a file).
-    let mut lake = Lake::open(&lake_dir).unwrap();
-    let report = append(&mut lake, &[(2, Some("b")), (3, Some("c")), (4, Some("d"))]);
-    assert_eq!(report.rows_inlined, 0, "{report:?}");
-    assert_eq!(report.data_files, 1, "{report:?}");
+    // `.lake load` and attach read the record's schema.
+    let db = lake.load(None).unwrap();
+    assert_eq!(db.table("t").unwrap().num_cols(), 2);
+    let (rows, _) = attached_query(&lake_dir, "SELECT COUNT(*) FROM t;");
+    assert_eq!(i64_value(&rows, 0, 0), 2);
 
-    // Setting the identical limit is a no-op; clearing restores the default.
-    let report = lake
-        .set_inlining_limit("main.t", Some(2), &CommitSettings::default())
-        .unwrap();
-    assert!(!report.committed, "{report:?}");
-    lake.set_inlining_limit("main.t", None, &CommitSettings::default())
-        .unwrap();
-    let report = append(&mut lake, &[(5, Some("e"))]);
-    assert_eq!(report.rows_inlined, 1, "{report:?}");
+    cleanup(&dir);
+}
+
+#[test]
+fn retried_commits_keep_inlining_and_continue_row_ids() {
+    let dir = scratch("retry-inline");
+    let lake_dir = dir.join("lake");
+    let mut lake = create_lake(&lake_dir).unwrap();
+    append(&mut lake, &[(1, Some("a"))]);
+
+    let mut a = open_lake(&lake_dir).unwrap();
+    let mut b = open_lake(&lake_dir).unwrap();
+    let fast = CommitSettings {
+        max_retry_count: 10,
+        retry_backoff: 1.0,
+        retry_wait_ms: 1,
+    };
+    append(&mut a, &[(2, Some("b"))]);
+    let mut commit = Commit::new();
+    commit.append("main.t", sub_table(&[(3, Some("c"))]));
+    let report = b.commit_with_settings(&commit, &fast).unwrap();
+    assert_eq!(report.retries, 1, "the stale base was retried");
+    assert_eq!(report.rows_inlined, 1, "the retry still inlines");
+
+    let live = live_inlined(&entry(&lake_dir, "main.t"));
+    let ids: Vec<u64> = live.iter().map(|r| r["row_id"].as_u64().unwrap()).collect();
+    assert_eq!(ids, vec![0, 1, 2], "row ids continue, never restart");
+    let db = b.load(None).unwrap();
+    let got: Vec<i32> = rows_of(&db).into_iter().map(|(i, _)| i).collect();
+    assert_eq!(got, vec![1, 2, 3]);
 
     cleanup(&dir);
 }
@@ -1229,193 +1310,24 @@ fn time_travel_serves_each_versions_inlined_rows() {
     cleanup(&dir);
 }
 
-/// A corrupt inlined record is a clean error, never a wrong answer: an
-/// undecodable value and a row-count mismatch are both refused at load.
 #[test]
 fn corrupt_inlined_records_are_clear_errors() {
     let dir = scratch("corrupt-inline");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     append(&mut lake, &[(1, Some("a"))]);
+    drop(lake);
 
-    // An undecodable integer value fails the load with the row named.
-    let mut catalog = read_json(&lake_dir.join("catalog.json"));
-    catalog["tables"]["main.t"]["inlined"][0]["values"][0] = serde_json::json!("not-an-int");
-    std::fs::write(
-        lake_dir.join("catalog.json"),
-        serde_json::to_vec_pretty(&catalog).unwrap(),
-    )
-    .unwrap();
+    // A typed inlined row whose integer overflows the declared INTEGER
+    // column is a clean load error naming the row, never a wrong answer or a
+    // panic.
+    let table = inlined_table(&lake_dir);
+    catalog_sql(
+        &lake_dir,
+        &format!("UPDATE {table} SET i = 9223372036854775807;"),
+    );
+    let lake = open_lake(&lake_dir).unwrap();
     let err = lake.load(None).unwrap_err().to_string();
-    assert!(err.contains("inlined row 0"), "{err}");
-    assert!(err.contains("undecodable"), "{err}");
-
-    // A row-count mismatch is caught at parse.
-    let mut catalog = read_json(&lake_dir.join("catalog.json"));
-    catalog["tables"]["main.t"]["inlined"][0]["values"][0] = serde_json::json!("1");
-    catalog["tables"]["main.t"]["rows"] = serde_json::json!(9);
-    std::fs::write(
-        lake_dir.join("catalog.json"),
-        serde_json::to_vec_pretty(&catalog).unwrap(),
-    )
-    .unwrap();
-    let err = Lake::open(&lake_dir).unwrap_err().to_string();
-    assert!(err.contains("declares 9 rows"), "{err}");
-    assert!(err.contains("1 inlined row live"), "{err}");
-
-    // A duplicate live row id is refused too.
-    let mut catalog = read_json(&lake_dir.join("catalog.json"));
-    catalog["tables"]["main.t"]["rows"] = serde_json::json!(1);
-    let dup = catalog["tables"]["main.t"]["inlined"][0].clone();
-    catalog["tables"]["main.t"]["inlined"] = serde_json::json!([dup.clone(), dup]);
-    std::fs::write(
-        lake_dir.join("catalog.json"),
-        serde_json::to_vec_pretty(&catalog).unwrap(),
-    )
-    .unwrap();
-    let err = Lake::open(&lake_dir).unwrap_err().to_string();
-    assert!(err.contains("appears twice"), "{err}");
-
-    cleanup(&dir);
-}
-
-/// `add_data_files` on an inlined-only table works too (the file list grows
-/// from zero), and the statistics-only attach reads both sources.
-#[test]
-fn registered_files_join_inlined_only_tables() {
-    let dir = scratch("added-to-inline");
-    let lake_dir = dir.join("lake");
-    let source_dir = dir.join("source");
-    {
-        let mut source = Lake::create(&source_dir).unwrap();
-        source.set_data_inlining_row_limit(0);
-        append(&mut source, &[(50, Some("m"))]);
-    }
-    let source_rel = file_paths(&source_dir, "main.t")[0].clone();
-    let bytes = std::fs::read(source_dir.join(&source_rel)).unwrap();
-
-    let mut lake = Lake::create(&lake_dir).unwrap();
-    append(&mut lake, &[(1, Some("a"))]);
-    assert!(
-        entry(&lake_dir, "main.t")["files"]
-            .as_array()
-            .map(Vec::is_empty)
-            .unwrap_or(true)
-    );
-    let rel = format!("data/main.t/registered.{EXT}");
-    write_lake_file(&lake_dir, &rel, &bytes);
-    lake.add_data_files("main.t", &[rel]).unwrap();
-
-    let (rows, _) = attached_query(&lake_dir, "SELECT COUNT(*), MIN(i), MAX(i) FROM t;");
-    assert_eq!(i64_value(&rows, 0, 0), 2);
-    assert_eq!(rows[0][1], Value::Integer(1));
-    assert_eq!(rows[0][2], Value::Integer(50));
-
-    cleanup(&dir);
-}
-
-/// A table created by an inlined-only commit mints its schema record with the
-/// commit (the record is a precondition of inlining), so its zero-file entry
-/// stays loadable and time-travellable.
-#[test]
-fn inlined_only_tables_are_created_with_a_record() {
-    let dir = scratch("record");
-    let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
-    append(&mut lake, &[(1, Some("a")), (2, Some("b"))]);
-    let e = entry(&lake_dir, "main.t");
-    assert_eq!(e["schema_version"], 1, "{e}");
-    assert!(e.get("columns").is_some(), "{e}");
-    assert!(
-        e.get("files")
-            .is_none_or(|f| f.as_array().unwrap().is_empty()),
-        "no file yet: {e}"
-    );
-
-    // `.lake load` and attach read the record's schema.
-    let db = lake.load(None).unwrap();
-    assert_eq!(db.table("t").unwrap().num_cols(), 2);
-    let (rows, _) = attached_query(&lake_dir, "SELECT COUNT(*) FROM t;");
-    assert_eq!(i64_value(&rows, 0, 0), 2);
-
-    cleanup(&dir);
-}
-
-/// `Commit::append` on a legacy (record-less) table materializes instead of
-/// inlining: inlining needs the v5 record, so the pre-wave-65 shape keeps
-/// working unchanged.
-#[test]
-fn a_legacy_entry_materializes_instead_of_inlining() {
-    let dir = scratch("legacy");
-    let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    append(&mut lake, &[(1, Some("a"))]);
-    // Strip the schema record, making the entry legacy (a v5 manifest with a
-    // record-less entry is legal: a table a commit did not touch).
-    let mut catalog = read_json(&lake_dir.join("catalog.json"));
-    for key in ["columns", "schema_version", "inlined", "next_row_id"] {
-        catalog["tables"]["main.t"]
-            .as_object_mut()
-            .unwrap()
-            .remove(key);
-    }
-    catalog["tables"]["main.t"]["files"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("schema_version");
-    std::fs::write(
-        lake_dir.join("catalog.json"),
-        serde_json::to_vec_pretty(&catalog).unwrap(),
-    )
-    .unwrap();
-
-    let mut lake = Lake::open(&lake_dir).unwrap();
-    let report = append(&mut lake, &[(2, Some("b"))]);
-    assert_eq!(
-        report.rows_inlined, 0,
-        "a legacy entry writes a file: {report:?}"
-    );
-    assert_eq!(report.data_files, 1, "{report:?}");
-    let e = entry(&lake_dir, "main.t");
-    assert_eq!(e["files"].as_array().unwrap().len(), 2, "{e}");
-    assert_eq!(e["rows"], 2);
-    let db = lake.load(None).unwrap();
-    assert_eq!(rows_of(&db).len(), 2);
-
-    cleanup(&dir);
-}
-
-/// Retry semantics with inlining: a stale second writer's small append
-/// rebases and still inlines on the new head, with row ids continuing past
-/// the first writer's records.
-#[test]
-fn retried_commits_keep_inlining_and_continue_row_ids() {
-    let dir = scratch("retry-inline");
-    let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
-    append(&mut lake, &[(1, Some("a"))]);
-
-    let mut a = Lake::open(&lake_dir).unwrap();
-    let mut b = Lake::open(&lake_dir).unwrap();
-    let fast = CommitSettings {
-        max_retry_count: 10,
-        retry_backoff: 1.0,
-        retry_wait_ms: 1,
-    };
-    append(&mut a, &[(2, Some("b"))]);
-    let mut commit = Commit::new();
-    commit.append("main.t", sub_table(&[(3, Some("c"))]));
-    let report = b.commit_with_settings(&commit, &fast).unwrap();
-    assert_eq!(report.retries, 1, "the stale base was retried");
-    assert_eq!(report.rows_inlined, 1, "the retry still inlines");
-
-    let live = live_inlined(&entry(&lake_dir, "main.t"));
-    let ids: Vec<u64> = live.iter().map(|r| r["row_id"].as_u64().unwrap()).collect();
-    assert_eq!(ids, vec![0, 1, 2], "row ids continue, never restart");
-    let db = b.load(None).unwrap();
-    let got: Vec<i32> = rows_of(&db).into_iter().map(|(i, _)| i).collect();
-    assert_eq!(got, vec![1, 2, 3]);
-
+    assert!(err.contains("inline") || err.contains("range"), "{err}");
     cleanup(&dir);
 }

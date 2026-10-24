@@ -2,6 +2,8 @@
 //! rebuild hint (`FeatureMissing`), never a parse or I/O error. The split
 //! catalogs themselves are covered by `tests/sqlite_catalog.rs` and
 //! `tests/postgres_catalog.rs`.
+#[path = "common/local_lake.rs"]
+mod local_lake;
 
 #[cfg(any(not(feature = "catalog-sqlite"), not(feature = "catalog-postgres")))]
 use pink_lake::{Lake, LakeError};

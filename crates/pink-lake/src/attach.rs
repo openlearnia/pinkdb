@@ -251,6 +251,7 @@ impl AttachedEntry {
 #[derive(Debug)]
 pub(crate) struct LakeAttachment {
     location: String,
+    store: Arc<dyn crate::metadata::MetadataStore>,
     storage: Arc<dyn Storage>,
     root: std::path::PathBuf,
     /// The lake identity this attachment's manifests must carry (M-7).
@@ -635,10 +636,10 @@ impl LakeAttachment {
         if let Some(index) = &*guard {
             return Ok(Arc::clone(index));
         }
-        let versions = published_versions(&*self.storage, self.pinned).map_err(catalog_error)?;
+        let versions = published_versions(&*self.store, self.pinned).map_err(catalog_error)?;
         let mut index = Vec::with_capacity(versions.len());
         for version in versions {
-            match manifest_for(&*self.storage, &self.root, Some(version)) {
+            match manifest_for(&*self.store, &self.root, Some(version)) {
                 Ok((manifest, _))
                     if self.lake_id.is_none()
                         || manifest.format_version < 6
@@ -708,6 +709,7 @@ impl LakeAttachment {
             return Ok(VersionView::Built(Arc::clone(view)));
         }
         let (attachment, _) = build_from(
+            &self.store,
             &self.storage,
             &self.root,
             Some(version),
@@ -1432,20 +1434,27 @@ pub(crate) fn build(
     lake: &Lake,
     version: Option<u64>,
 ) -> Result<(Arc<LakeAttachment>, AttachmentReport)> {
-    build_from(&lake.storage, lake.path(), version, Some(&lake.lake_id))
+    build_from(
+        &lake.store,
+        &lake.storage,
+        lake.path(),
+        version,
+        Some(&lake.lake_id),
+    )
 }
 
 /// [`build`] without a [`Lake`] handle: the storage root and the version to
 /// pin. Time-travel views are built through this same function, so a version
 /// query validates exactly like `.lake attach <dir> <version>`.
 pub(crate) fn build_from(
+    store: &Arc<dyn crate::metadata::MetadataStore>,
     storage: &Arc<dyn Storage>,
     root: &std::path::Path,
     version: Option<u64>,
     lake_id: Option<&str>,
 ) -> Result<(Arc<LakeAttachment>, AttachmentReport)> {
     let stats_before = storage.stats();
-    let (manifest, manifest_path) = manifest_for(&**storage, root, version)?;
+    let (manifest, manifest_path) = manifest_for(&**store, root, version)?;
     if let Some(expected) = lake_id
         && manifest.format_version >= 6
         && manifest.lake_id.as_deref() != Some(expected)
@@ -1971,6 +1980,7 @@ pub(crate) fn build_from(
         tables.push(attached);
     }
     let attachment = Arc::new(LakeAttachment {
+        store: Arc::clone(store),
         location: root.display().to_string(),
         storage: Arc::clone(storage),
         root,
@@ -2628,9 +2638,10 @@ mod tests {
         let mut writer = Lake::create(&lake_dir).unwrap();
         writer.set_write_format("pink").unwrap();
         writer.write_from_store(&fixture_store()).unwrap();
+        let data_root = writer.path().to_path_buf();
         drop(writer);
-        // Remove every data file the manifest references.
-        let removed = walk(&lake_dir.join("data"));
+        // Remove every data file the catalog references.
+        let removed = walk(&data_root.join("data"));
         for entry in &removed {
             std::fs::remove_file(entry).unwrap();
         }

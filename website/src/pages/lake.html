@@ -1,517 +1,102 @@
 <h1>Lake</h1>
 
-<p class="doc-meta">A lake keeps <strong>metadata and data storage decoupled</strong>: a
-small JSON catalog, an immutable manifest per published version, and immutable data
-files that are <strong>appended, never rewritten</strong> — on local disk or in an
-S3/R2 bucket. Incremental commits, writable attachments and time travel included.</p>
+<p class="doc-meta">A lake is a <strong>catalog database plus immutable data
+files</strong>. The catalog uses DuckLake v1.1's tables on a durable
+<code>pink:</code> database, SQLite or Postgres; data lives on local disk or S3.
+Incremental commits, time travel and statistics-only attach included.</p>
 
 <h2>What a lake is</h2>
 
-<p>A lake is a directory (or, with the <code>s3</code> feature, an
-<code>s3://bucket/prefix</code> key prefix) with exactly this layout:</p>
+<p>The catalog is one of:</p>
 
-<pre class="code" data-lang="text"><code>mylake/
-├── catalog.json                       current state (the authoritative "latest")
-├── snapshots/&lt;version&gt;.json            immutable manifest per published version
-├── commits/&lt;version&gt;.json              per-version delta manifest (what the commit added)
-├── data/&lt;table&gt;/&lt;uuid&gt;.vortex          immutable data files (vortexlake)
-├── data/&lt;table&gt;/&lt;uuid&gt;.pink            pinklake data files (no Vortex; still readable)
-└── data/&lt;table&gt;/&lt;uuid&gt;.pinkdel          positional delete files (merge-on-read)</code></pre>
+<pre class="code" data-lang="text"><code>pink:lake.pink                       durable pinkdb catalog (default)
+sqlite:/srv/lakes/sales.db           SQLite catalog (catalog-sqlite)
+postgres://user@host/db?schema=lake  Postgres catalog (catalog-postgres)</code></pre>
 
-<p>Every published version is immutable: <code>snapshots/&lt;version&gt;.json</code> is
-create-only (a hard link locally, <code>If-None-Match: *</code> over S3) and every
-data file is written once under a fresh name.
-<code>catalog.json</code> is always byte-identical to the snapshot of its version,
-and publication order (files → delta manifest → snapshot → catalog) means a crash
-leaves either the old version or the new one, never a mix — so every version ever
-published still loads.</p>
+<p>All three hold the same <code>ducklake_*</code> rows. A commit inserts its
+typed delta and one snapshot row — the commit point — instead of rewriting a JSON
+catalog. A bare path means <code>pink:&lt;path&gt;</code>, and its data defaults to
+<code>&lt;path&gt;.files/</code>. The catalog records the data location, so later
+opens need only the catalog.</p>
+
+<pre class="code" data-lang="text"><code>mylake.pink                          catalog database
+mylake.pink.files/data/&lt;table&gt;/…     immutable data files
+                                     (.pink, Vortex or Parquet)</code></pre>
+
+<p>Metadata and data may live apart: a catalog on local disk or Postgres, data on
+S3. A lone <code>s3://…</code> URL is <em>not</em> a lake — always give the catalog
+and put the data there.</p>
+
+<h2>Save, open, attach</h2>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake save pink:lake.pink data s3://bucket/prefix
+pinkdb&gt; .lake save postgres://user@host/db?schema=lake data s3://bucket/prefix
+pinkdb&gt; .lake open pink:lake.pink
+pinkdb&gt; .lake versions pink:lake.pink
+pinkdb&gt; .lake tables pink:lake.pink
+pinkdb&gt; .lake info pink:lake.pink
+pinkdb&gt; .lake attach pink:lake.pink
+pinkdb&gt; SELECT COUNT(*) FROM t;      -- from the catalog, no data read</code></pre>
+
+<p>A save writes immutable data files first, then one catalog transaction. A
+crash leaves the previous version or the new one, never a mix. Time travel
+(<code>.lake open &lt;catalog&gt; &lt;version&gt;</code>) reads the same rows with an
+older <code>begin_snapshot</code> boundary.</p>
 
 <h2>Incremental commits</h2>
 
-<p><code>.lake save</code> still publishes a <strong>full snapshot</strong> (every
-table rewritten to fresh files). A <strong>commit</strong> publishes only the
-difference:</p>
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake attach pink:lake.pink write
+pinkdb&gt; INSERT INTO t VALUES (…);
+pinkdb&gt; DELETE FROM t WHERE …;
+pinkdb&gt; .lake commit pink:lake.pink</code></pre>
 
-<pre class="code" data-lang="text"><code>.lake attach mylake write      # materialize the pinned version into the session store
-UPDATE t SET ...;              # ordinary SQL accumulates in the store
-DELETE FROM t WHERE ...;
-INSERT INTO t VALUES (...);
-.lake commit mylake            # publish exactly the difference as one new version
-.lake detach mylake</code></pre>
+<p>Append-only commits add data files (inlined rows stay in the catalog when they
+are small). Deletes use positional delete files; merge/rewrite bake them in when
+asked. Maintenance commands (<code>.lake merge</code>, <code>rewrite</code>,
+<code>expire</code>, <code>cleanup</code>, <code>orphans</code>) operate on the
+typed snapshots, not a rendered manifest.</p>
 
-<ul>
-  <li><strong>Appends write new files.</strong> Each commit adds one new immutable
-  data file per changed table, listed after the existing files with its exact row
-  count; scans union the file list in order. Previously published files are never
-  rewritten — a 1M-row lake committed 4 rows in <strong>7.6 KB / 0.54 s with 0
-  bytes rewritten</strong> (a full save of the same table writes 2.6 MB).</li>
-  <li><strong>Schema evolution.</strong> <code>ALTER TABLE</code> works on writable
-  attachments (<code>ADD COLUMN … DEFAULT</code>, <code>RENAME COLUMN</code>,
-  <code>DROP COLUMN</code>) and publishes a <strong>metadata-only</strong> schema
-  version: old files are never rewritten — they project through rename chains,
-  missing columns materialize their defaults, dropped columns keep their bytes (row
-  positions unchanged, so delete files stay valid). Time travel reads each version
-  with <em>that version's</em> schema and names.</li>
-  <li><strong>Deletes are positional files.</strong> <code>DELETE</code> records the
-  dropped positions in a <code>.pinkdel</code> file bound to the data file it
-  targets; readers apply it at read time (merge-on-read), and
-  <code>UPDATE</code> is a delete + append.</li>
-  <li><strong>Every version writes <code>commits/&lt;v&gt;.json</code></strong>, a delta
-  manifest listing the data and delete files the commit added plus its row movement
-  (audit; the snapshot stays authoritative for loading).</li>
-  <li><strong>Concurrent writers retry with rebase.</strong> A commit whose base
-  changed publishes again on the new head, bounded by DuckLake's writer controls —
-  <code>max_retry_count</code> (default 10), <code>retry_backoff</code> (1.5) and
-  <code>retry_wait_ms</code> (100, the wait grows by the backoff factor each
-  attempt). The CLI overrides them with
-  <code>PINKDB_LAKE_MAX_RETRY_COUNT</code>, <code>PINKDB_LAKE_RETRY_BACKOFF</code>
-  and <code>PINKDB_LAKE_RETRY_WAIT_MS</code>. A delta whose base file the head no
-  longer contains, or positions another commit already deleted, is refused — never
-  re-applied.</li>
-  <li><strong>Durable sessions are crash-safe.</strong> <code>.lake attach … write</code>
-  checkpoints the materialized tables and <code>.lake commit</code> flushes the WAL
-  before publishing, so a recovered session re-attaches by adoption and commits
-  idempotently: a change that already reached the lake publishes nothing, and one
-  that never did publishes exactly once.</li>
-  <li><strong>Writable attachments are content-sync, not op-replay.</strong> A commit
-  reconciles the table to the session's content; if another writer appended to an
-  in-scope table meanwhile, the next diff refuses instead of silently dropping their
-  rows (re-attach prints a reconciliation note when adopted content differs). New
-  tables created in the session are outside the attachment's scope — a
-  <code>.lake save</code> publishes them.</li>
-</ul>
-
-<h2>Time travel</h2>
-
-<p>Attached lake tables can be queried <strong>as of a published version</strong>:</p>
-
-<pre class="code" data-lang="sql"><code>SELECT * FROM t AT (VERSION =&gt; 2);
-SELECT * FROM t AT (TIMESTAMP =&gt; TIMESTAMP '2026-10-17 12:30:36.029');
-SELECT COUNT(*) FROM t AS old AT (VERSION =&gt; 1) JOIN t ON old.id = t.id;</code></pre>
+<h2>Data formats</h2>
 
 <ul>
-  <li>The clause works on the first <code>FROM</code> source or any joined source,
-  with an optional alias <em>before</em> it; targets are literals (a version number,
-  or a timestamp literal / string in either the engine format or the manifest's
-  ISO-8601 UTC form).</li>
-  <li><strong>Timestamps resolve inclusively</strong>: the newest snapshot published
-  at or before the given time. Unknown versions, a timestamp before the first
-  snapshot, and tables that did not exist at the target version are clean errors —
-  nothing is produced.</li>
-  <li>An attachment reaches versions <code>1..=the attached version</code>
-  (<code>.lake attach dir 3</code> never sees a later version); store tables are
-  refused with “has no snapshot history”, and so are CTEs and views.</li>
-  <li><strong>Statistics fast paths work per version</strong>: exact
-  <code>COUNT(*)</code>/<code>MIN</code>/<code>MAX</code> over
-  <code>AT (VERSION =&gt; n)</code> decode no data file, and projected scans decode
-  only the columns they reference.</li>
-  <li><code>.lake snapshots &lt;dir&gt;</code> lists every version's record —
-  publish time, author, commit message, <code>(tables, rows)</code> and a change
-  summary — and <code>.lake save … author '&lt;name&gt;' message '&lt;text&gt;'</code>
-  (or <code>Lake::set_commit_message</code>) attaches metadata to the next
-  published version. (DuckLake's <code>ducklake_default_version</code> has no pinkdb
-  counterpart on purpose: it selects a new-catalog storage format, not a read
-  default.)</li>
+  <li><code>.pink</code> (<code>PINKDB06</code>) is always available and carries a
+  statistics block per file.</li>
+  <li>Vortex with the <code>vortexlake</code> feature: footer-only attach and
+  ranged reads.</li>
+  <li>Parquet with the <code>parquetlake</code> feature (and DuckDB interop).</li>
 </ul>
 
-<h2>Partitioning and pruning</h2>
+<p>Each table pins its provider; appends keep it. A build without a table's
+provider lists the table as unavailable and refuses only that table — other
+tables still load.</p>
 
-<p>Lake tables can be <strong>partitioned</strong>: commits then split their
-appends into one data file per distinct partition value set, and every v4 data
-file publishes a CRC-protected per-file <strong>zone map</strong> in the catalog
-(min/max/null counts, computed at write time — for Vortex files too, and
-cross-checked against the file's own footer at attach).</p>
+<h2>Encryption</h2>
 
-<pre class="code" data-lang="sql"><code>.lake partition mylake t by (region)          -- identity values
-.lake partition mylake t by (bucket(4, id))   -- bucket labels
-.lake partition mylake t clear                -- new writes unpartitioned again</code></pre>
+<p><code>PINKDB_KEY</code> (or the <code>*_with_key</code> constructors) enables
+per-file encryption. Every data/delete file becomes a <code>PNKLAKE1</code>
+container sealed with its own random 256-bit key, recorded in the catalog.
+A <code>pink:</code> catalog may itself be an engine-encrypted pinkdb database;
+SQLite/Postgres catalogs rely on their server/filesystem. Metadata rows stay
+plaintext, as in DuckLake.</p>
 
-<ul>
-  <li><strong>Spec changes never rewrite old files.</strong> Files keep the
-  partition values they were written with; after a clear they are simply no
-  longer interpreted as partitions.</li>
-  <li><strong>Predicates prune whole files.</strong> The planner extracts exact
-  conjuncts (<code>col op literal</code> in either order, <code>IS [NOT]
-  NULL</code>) and skips files whose zone map — or, stronger, whose identity
-  partition value — proves no row can match; survivors decode only the
-  projected columns. <code>WHERE region = 'x'</code> reads one partition's file;
-  a disjoint range reads zero. <code>.lake attached</code> shows the decoded
-  file count per table, and pruning works per version under
-  <code>AT (VERSION/TIMESTAMP =&gt; …)</code>.</li>
-  <li><strong>Correctness with deletes:</strong> positional deletes only shrink a
-  file's value set, so pruning stays valid with them; the
-  <code>COUNT</code>/<code>MIN</code>/<code>MAX</code> exactness fallback once
-  deletes exist is unchanged.</li>
-  <li><strong>Limits, on purpose:</strong> bucket labels use pinkdb's own stable
-  FNV-1a hash (not DuckDB's bucket numbers, and bucket values are never
-  interpreted as column facts for pruning); <code>year</code>/<code>month</code>/
-  <code>day</code>/<code>hour</code>/<code>epoch_*</code> transforms are refused
-  by name; files written before a spec carry no partition values (they decode
-  correctly, but only zone-map pruning applies to them).</li>
-</ul>
+<h2>Rust API</h2>
 
-<h2>Two data formats, one lake API</h2>
+<pre class="code" data-lang="rust"><code>use pink_lake::{Lake, EncryptionKey};
 
-<p>There are two builds of the lake layer with the same commands:</p>
+let mut lake = Lake::create("lake.pink")?;             // pink:lake.pink, data lake.pink.files/
+lake.write_from_store(&amp;db)?;
 
-<div class="table-wrap">
-<table>
-  <thead><tr><th>Build (CLI feature)</th><th>Data files</th><th>Catalog</th><th class="num">Release size</th></tr></thead>
-  <tbody>
-    <tr>
-      <td>pinklake (<code>pinklake</code>)</td>
-      <td><code>.pink</code> v5 (the engine's single-table bytes, with a per-file
-      statistics block in the manifest)</td>
-      <td><code>format_version</code> 5</td>
-      <td class="num">2.69 MB</td>
-    </tr>
-    <tr>
-      <td>vortexlake (<code>vortexlake</code>)</td>
-      <td>Vortex (the default lake format)</td>
-      <td><code>format_version</code> 5</td>
-      <td class="num">45.3 MB</td>
-    </tr>
-  </tbody>
-</table>
-</div>
+let mut lake = Lake::create_with_catalog("sqlite:lake.db", "s3://bucket/prefix")?;
+let mut lake = Lake::open("lake.pink")?;
+let mut lake = Lake::open_with_catalog("postgres://…", None)?;
+let mut lake = Lake::create_with_catalog_with_key("pink:lake.pink", "data", key)?;</code></pre>
 
-<ul>
-  <li>Both builds write and read the current format — <strong>catalog
-  <code>format_version</code> 5</strong> (schema records included; partitioning and
-  zone maps are additive) — and both support incremental commits, time travel and
-  schema evolution. Older lakes stay readable: v1–v4 catalogs (single-file Vortex
-  v2/v3 and `.pink` v1) load and migrate on the next save, leaving old files
-  untouched.</li>
-  <li>The pinklake build decodes <code>.pink</code> data files only and refuses a
-  Vortex lake with a clear “rebuild with <code>vortexlake</code>” error. A lake
-  written by the pinklake build opens <strong>bit-exactly</strong> in a
-  vortexlake build.</li>
-  <li><code>s3</code> is pure storage — it implies neither lake build; pair it
-  explicitly: <code>pinklake,s3</code> or <code>vortexlake,s3</code> for the
-  respective lake over S3/R2.</li>
-</ul>
+<h2>No legacy layout</h2>
 
-<h2>Using a lake</h2>
-
-<pre class="code" data-lang="sql"><code>.lake save mylake              -- publish a full snapshot of the store
-.lake save mylake message 'added orders'   -- with commit metadata (author too)
-.lake versions mylake          -- published versions (the current one is marked)
-.lake snapshots mylake         -- per-version records: time, author, message, changes
-.lake tables mylake            -- current version's db.table names + row counts
-.lake info mylake              -- format version, current version, snapshots, commits, tables
-.lake open mylake              -- replace the in-memory store with the latest
-.lake open mylake 3            -- or with a specific published version
-.lake attach mylake            -- attach read-only (see below)
-.lake attach mylake 2 write    -- or writable, pinned to a version (see commits above)
-.lake commit mylake            -- publish the writable attach's changes
-.lake partition mylake t by (region)          -- partition new writes by identity value
-.lake partition mylake t by (bucket(4, id))   -- or by bucket labels
-.lake partition mylake t clear                -- stop partitioning (old files untouched)
-.lake detach mylake [force]
-.lake attached</code></pre>
-
-<p>From a program, the same operations live in the <code>pink-lake</code> crate:</p>
-
-<pre class="code" data-lang="rust"><code>use pink_lake::{Lake, save_store};
-use pinkdb::PinkDb;
-
-let mut db = PinkDb::new();
-db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")?;
-
-let version = save_store(&amp;db, "mylake")?;  // creates the lake, publishes v2
-let mut lake = Lake::open("mylake")?;      // v1 is the create-time empty catalog
-lake.set_commit_message(Some("alice".into()), Some("two rows".into()));
-let v3 = lake.write_from_store(&amp;db)?;      // full snapshot, version 3
-
-// Incremental: append rows as one new immutable data file (nothing else is
-// rewritten) and/or record positional deletes.
-let mut commit = pink_lake::Commit::new();
-commit.append("main.t", std::sync::Arc::new(appended_rows));  // same schema
-commit.delete_positions("main.t", "data/main.t/&lt;uuid&gt;.vortex", &amp;[0]);
-let report = lake.commit(&amp;commit)?;
-
-let tables = lake.tables()?;
-let versions = lake.versions()?;
-let records = lake.snapshots()?;           // per-version time/author/message/changes
-let old = lake.load(Some(2))?;             // rebuild a specific version</code></pre>
-
-<p><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code> are
-refused inside a transaction, and <code>.lake open</code> refuses to detach a durable
-session. Every <code>&lt;dir&gt;</code> argument also accepts an
-<code>s3://bucket/prefix</code> URL when the build has the <code>s3</code>
-feature.</p>
-
-<h2>SQL catalogs: SQLite and Postgres (wave 96a)</h2>
-
-<p>A lake's <strong>metadata can live in a SQL database</strong> while its data
-files stay on local disk or S3/R2. Two opt-in features provide the backends:
-<code>catalog-sqlite</code> (<code>sqlite:&lt;path&gt;</code>) and
-<code>catalog-postgres</code> (<code>postgres://user:password@host:5432/db?schema=lake</code>).
-The data location is given once, at create, and recorded in the catalog:</p>
-
-<pre class="code" data-lang="sql"><code>.lake save sqlite:/srv/lakes/sales.db data /srv/lake-data
-.lake save postgres://lake:secret@db.internal/analytics?schema=sales data s3://bucket/sales
-.lake open sqlite:/srv/lakes/sales.db      -- the data location comes from the catalog
-.lake attach postgres://…/analytics?schema=sales
-.lake migrate-catalog sqlite:/srv/lakes/sales.db to postgres://…/analytics?schema=sales</code></pre>
-
-<ul>
-  <li><strong>Same lake, two tables.</strong> <code>pink_lake_meta</code> and
-  <code>pink_lake_objects</code> hold the same byte-identical manifests as the
-  object-store layout. One publication is one catalog transaction, so crash
-  safety (data files before metadata), version uniqueness, concurrent-writer
-  conflict and rebase, time travel, expire/cleanup, CDC, replication state and
-  encryption keep exactly the same rules. Encrypted lakes store the sealed
-  blobs verbatim; migration needs no key.</li>
-  <li><strong>Postgres details.</strong> <code>?schema=</code> selects the
-  schema (default <code>public</code>). A remote host verifies the server
-  certificate by default (<code>sslmode=verify-full</code>, against the public
-  roots or <code>sslrootcert=&lt;pem file&gt;</code>);
-  <code>sslmode=require</code> opts into encryption without verification, and
-  <code>sslmode=disable</code> is allowed only for loopback hosts. Publication
-  takes a per-schema advisory lock. Passwords are replaced by
-  <code>***</code> in every error and every <code>.lake</code> line.</li>
-  <li><strong>Migration.</strong> <code>.lake migrate-catalog &lt;from&gt; to
-  &lt;to&gt; [data &lt;location&gt;]</code> copies every metadata object
-  byte-for-byte in one target publish scope, verifies the copy, then retires
-  the source (<code>moved.json</code> for an object-store source,
-  <code>pink_lake_meta.moved_to</code> for a SQL source). Opening the retired
-  source says where the lake moved instead of “not a lake”; snapshots stay
-  behind for manual recovery. A non-empty target is refused. The three
-  directions are object store → SQL, SQL → object store (the target must be
-  the lake's data location) and SQL → SQL.</li>
-  <li><strong>Tests and size.</strong> SQLite tests always run; the Postgres
-  suite runs in CI against a throwaway <code>postgres:17</code> service and
-  locally when <code>PINKDB_TEST_POSTGRES_URL</code> is set. The default build
-  links neither the SQLite nor the Postgres client.</li>
-</ul>
-
-<h2>Read-only attach</h2>
-
-<p><code>.lake attach &lt;dir|s3://…&gt; [version]</code> attaches a lake for the
-session without loading any table into memory. No column data is decoded:</p>
-
-<ul>
-  <li>In a <strong>vortexlake</strong> build it reads the catalog, the manifest
-  and each data file's footer, metadata and statistics — no column decode.</li>
-  <li>In a <strong>pinklake</strong> build it reads a CRC-32-protected per-column
-  statistics block that every pinklake save publishes, so <strong>no data file is opened
-  at all</strong>. A lake saved before that block existed refuses attach with a
-  re-save message, never a guess.</li>
-  <li>Exact <code>COUNT(*)</code>, <code>COUNT(col)</code>, <code>MIN</code> and
-  <code>MAX</code> answers come from the stored statistics under strict gates (exact
-  null counts, exact min/max, no ambiguous <code>±0.0</code> stat; a multi-aggregate
-  query is all-or-nothing). Anything unproven materializes the one table the query
-  touches, decoding only the columns it references.</li>
-  <li>Once positional deletes exist on a table, per-column facts fall back — row
-  counts and <code>COUNT(*)</code> stay exact, the rest materializes.</li>
-  <li>Attached tables are session-local; read-only attachments refuse every
-  mutation. <code>.lake save</code> skips attached tables with a note.</li>
-  <li>Measured: a cold attach plus <code>COUNT</code>/<code>MIN</code>/<code>MAX</code>
-  takes ~2.6 ms at 1M rows and ~2.3 ms at 10M rows in the pinklake build; the
-  attach overhead (~0.1–0.2 ms) is constant in file size.</li>
-</ul>
-
-<h2>Encryption at rest</h2>
-
-<p>With a build carrying the <code>encryption</code> feature (and the CLI's
-<code>vortexlake,s3,encryption</code>), lakes can be encrypted end to end: every object —
-catalogs, snapshots, commit deltas, data files and delete files — is an
-<code>PNKLAKE1</code> <strong>AES-256-GCM</strong> container under one Argon2id
-derivation per session (each container's plaintext header records its salt and
-parameters; a wrong key fails an authenticated key-check, never “corrupt
-file”).</p>
-
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features vortexlake,s3,encryption
-PINKDB_KEY='correct horse battery staple' ./target/release/pinkdb
-#   .lake save   mylake        # publishes an encrypted version
-#   .lake attach mylake        # unseals manifests; statistics still answer COUNT/MIN/MAX
-#   .lake commit mylake        # new data/delete files land encrypted</code></pre>
-
-<ul>
-  <li><strong>The catalog == snapshot byte invariant survives</strong>: the
-  manifest is sealed once per version and the same ciphertext is published to both
-  <code>catalog.json</code> and <code>snapshots/&lt;v&gt;.json</code>.</li>
-  <li><strong>S3 conflict detection is unchanged</strong>: conditional writes
-  (<code>If-None-Match: *</code>, <code>If-Match</code>) evaluate on the
-  ciphertext.</li>
-  <li><strong>Statistics-fast attach keeps decoding zero data files</strong> for
-  pinklake lakes — the stats blocks ride inside the sealed manifest. Encrypted
-  <em>Vortex</em> attach reads a file whole to unseal its footer (stage 1;
-  segment-level reads are a documented follow-up).</li>
-  <li>Keyed sessions only ever read keyed lakes and vice versa: opening a keyed
-  lake without the key (or vice versa) fails closed with a clear message, and
-  plaintext lakes stay byte-identical.</li>
-</ul>
-
-<h2>Maintenance</h2>
-
-<p>Lakes accumulate small files (incremental commits) and old versions. The
-maintenance commands publish their work as <strong>ordinary new versions</strong> —
-nothing already published is ever mutated:</p>
-
-<pre class="code" data-lang="sql"><code>.lake merge mylake          -- compact eligible data files (one new version)
-.lake rewrite mylake        -- materialize heavily-deleted files
-.lake expire mylake         -- expire old snapshots (by version list / cutoff / keep-N)
-.lake cleanup mylake        -- delete unreferenced data files (dry-run + age gate first)
-.lake files mylake          -- per-file listing: rows, size, partition, epoch, referenced</code></pre>
-
-<ul>
-  <li><strong>Merge rules</strong> (pinned to DuckLake): only live data files
-  <em>without positional deletes</em>, passing the byte-size filters, and sharing
-  <strong>partition values and schema epoch</strong> in groups of ≥2 are
-  consolidated; the merged file carries the group's partition values and exact
-  statistics, and pruning keeps working. Source files stay byte-identical on disk
-  (tests pin bytes and mtimes). <code>rewrite</code> handles the delete-bearing
-  files instead: past a delete-ratio threshold, positions are materialized and the
-  delete file is dropped.</li>
-  <li><strong>Expiration</strong> removes old <code>snapshots/&lt;v&gt;.json</code>
-  and their commit deltas — never the current version; time travel to an expired
-  version reports a clean <code>no snapshot version</code> error.</li>
-  <li><strong>Cleanup is conservative</strong>: only objects under <code>data/</code>
-  that <em>no retained version references</em> (old merged-away files,
-  crashed-writer leftovers) are eligible, behind a default 2-day age gate and an
-  explicit dry-run/confirm (a would-delete call without either is refused; runs
-  are idempotent). <code>.lake orphans</code> is the age-bypassing variant. pinkdb
-  has no scheduled-deletion queue, so both run the same scan (documented rather
-  than faked).</li>
-  <li><strong>Introspection</strong>: <code>.lake files</code>,
-  <code>.lake table_info</code>, <code>.lake options</code>,
-  <code>.lake settings</code> mirror DuckLake's listing shape (rows, sizes,
-  partition values, epochs, referenced-or-not).</li>
-</ul>
-
-<h2>Writer semantics and conflicts</h2>
-
-<ul>
-  <li><strong>One live writer handle per lake</strong> (there is no file locking
-  between lake writers; concurrent readers of published versions are fine). A handle
-  that saves after another writer published a version fails with
-  <code>another writer published version N; reopen the lake</code> before replacing
-  the catalog — unless it retries: incremental commits rebase under the retry
-  settings above.</li>
-  <li>Publishing the same version twice is impossible: the snapshot is create-only,
-  so of two racing writers exactly one wins. <code>catalog.json</code> is always
-  byte-identical to the snapshot of its version.</li>
-  <li>The CLI additionally tracks each lake's version baseline per session:
-  <code>.lake save [force]</code> — <code>force</code> overrides the stale-baseline
-  conflict check.</li>
-  <li>Full saves rewrite every table; plan for the disk/time cost of a snapshot, or
-  commit incrementally. Schema changes, partitioning and compaction are in progress
-  (lake-parity waves 65–68); data inlining (tiny commits kept in metadata) is
-  queued too.</li>
-</ul>
-
-<h2>S3 / R2 object storage</h2>
-
-<p>With the <code>s3</code> feature, any lake location can be an
-<code>s3://bucket/prefix</code> URL — AWS S3, Cloudflare R2, MinIO, or any
-S3-compatible endpoint. It is a small, blocking SigV4 client; there is no async
-runtime and no AWS SDK.</p>
-
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features vortexlake,s3
-
-export AWS_ACCESS_KEY_ID=&lt;r2-token-key-id&gt;
-export AWS_SECRET_ACCESS_KEY=&lt;r2-token-secret&gt;
-export AWS_ENDPOINT_URL=https://&lt;account&gt;.r2.cloudflarestorage.com
-export AWS_REGION=auto
-
-./target/release/pinkdb
-#   .lake save     s3://my-bucket/lakes/demo
-#   .lake attach   s3://my-bucket/lakes/demo
-#   .lake versions s3://my-bucket/lakes/demo</code></pre>
-
-<div class="table-wrap">
-<table>
-  <thead><tr><th>Variable</th><th>Meaning</th></tr></thead>
-  <tbody>
-    <tr>
-      <td><code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code></td>
-      <td>credentials (required for the environment-based URL form)</td>
-    </tr>
-    <tr>
-      <td><code>AWS_SESSION_TOKEN</code></td>
-      <td>optional temporary-credential token (used with the environment's
-      credential pair)</td>
-    </tr>
-    <tr>
-      <td><code>AWS_ENDPOINT_URL</code> (or <code>…_S3</code>)</td>
-      <td>non-AWS endpoint, e.g. the R2 S3 API URL</td>
-    </tr>
-    <tr>
-      <td><code>AWS_REGION</code> (or <code>AWS_DEFAULT_REGION</code>)</td>
-      <td>SigV4 region (<code>auto</code> requires a custom endpoint)</td>
-    </tr>
-    <tr>
-      <td><code>AWS_S3_FORCE_PATH_STYLE</code></td>
-      <td>force path-style addressing (the default with a custom endpoint; dotted
-      bucket names need it)</td>
-    </tr>
-    <tr>
-      <td><code>PINKDB_S3_ALLOW_HTTP</code></td>
-      <td>allow a plain <code>http://</code> endpoint (local tests only —
-      credentials travel unencrypted)</td>
-    </tr>
-    <tr>
-      <td><code>PINKDB_S3_ALLOW_DEGRADED</code></td>
-      <td>accept the single-writer check-then-put fallback on endpoints that reject
-      conditional writes (see below)</td>
-    </tr>
-    <tr>
-      <td><code>PINKDB_S3_RETRIES</code></td>
-      <td>retries after a retryable failure (default 3; <code>0</code>
-      disables)</td>
-    </tr>
-  </tbody>
-</table>
-</div>
-
-<ul>
-  <li><strong>Conflict detection is built on conditional writes.</strong> A snapshot
-  is published with <code>If-None-Match: *</code> (a published version is never
-  replaced) and <code>catalog.json</code> is replaced with
-  <code>If-Match: &lt;etag&gt;</code>, evaluated atomically with the write on AWS S3
-  and R2 — so concurrent saves cannot fork the version chain.</li>
-  <li><strong>Endpoints that reject conditional writes are refused by default.</strong>
-  Set <code>PINKDB_S3_ALLOW_DEGRADED=1</code> to accept a check-then-put fallback
-  with a documented race window — it is <em>single-writer only</em>. Errors are
-  specific: a missing catalog is <code>not a pink-lake directory</code>, a wrong
-  version is <code>has no snapshot version N</code>, a lost race is a write
-  conflict.</li>
-  <li><strong>One <code>PutObject</code> per object</strong>: no multipart uploads,
-  so a single table's data file must be ≤5&nbsp;GiB (checked client-side). No bucket
-  creation, no lifecycle rules, no lake-side GC — old versions stay, exactly like
-  local. Lake data is plaintext (<code>PINKDB_KEY</code> does not encrypt it).</li>
-  <li>Requests have a 120&nbsp;s whole-request timeout; retryable statuses
-  (<code>429</code>/<code>503</code>, and idempotent-request transport errors) back
-  off with jitter. A conditional PUT that failed ambiguously is never retried.</li>
-</ul>
-
-<aside class="marginalia">
-  <span class="margin-tag">after a failed save</span>
-  <p>Reopen the lake and inspect with <code>.lake versions</code> before retrying. A
-  failed save can leave unreferenced data files (harmless), a stray unpublished
-  snapshot (the next save refuses rather than clobber it), or a published version
-  whose response was lost. Never blindly re-run the save on the old handle.</p>
-</aside>
-
-<h2>Which build should I use?</h2>
-
-<ul>
-  <li><strong>Just a database file?</strong> Skip the lake — the default build's
-  <code>.pink</code> + WAL is the whole story.</li>
-  <li><strong>Versioned snapshots, local disk, small binary?</strong> Use
-  <code>pinklake</code>: all the commands (incremental commits and time travel
-  included), statistics-only attach, and a 5.21 MB binary.</li>
-  <li><strong>Vortex data files and footer-based attach?</strong> Use the
-  <code>vortexlake</code> build, at the cost of a 47.78 MB binary. The data-size gap is
-  small: on the reference sales corpus the pinklake build's <code>.pink</code> files are
-  only about 1.6–1.8% larger; the binary size, not the data size, is the
-  trade-off.</li>
-  <li><strong>Object storage?</strong> Add <code>s3</code> to the build you want:
-  <code>pinklake,s3</code> (4.70 MB) or <code>vortexlake,s3</code> (≈47.3 MB);
-  <code>s3</code> alone adds no <code>.lake</code> commands.</li>
-</ul>
+<p>JSON-layout lakes (<code>catalog.json</code>, <code>snapshots/</code>,
+<code>commits/</code>, <code>highest.json</code>, <code>lake.json</code>) do not
+open in this build and there is no converter. Re-save such a lake with an older
+pinkdb build, then open the new catalog here.</p>
 
 <ul class="next-links">
   <li><a href="{{root}}docs/guide-csv-to-lake.html">Guide: CSV to a lake →</a></li>

@@ -137,7 +137,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread::JoinHandle;
@@ -147,7 +147,7 @@ use pinkdb::{AttachedLake, DataTable, DataType, PinkDb, Value};
 use serde::{Deserialize, Serialize};
 
 use crate::incremental::{Commit, CommitReport, CommitSettings};
-use crate::storage::{Location, VersionTag};
+use crate::storage::Location;
 use crate::{EncryptionKey, Lake, LakeError, Result};
 
 /// The lake-relative path of the replication state file (in the destination).
@@ -155,10 +155,6 @@ pub const STATE_PATH: &str = "replication/state.json";
 
 /// The replication state format this build writes and reads.
 pub const REPLICATION_FORMAT: u32 = 1;
-
-/// Bounded retries for a conditional state write whose file changed in
-/// between (another job or another process moved it).
-const STATE_WRITE_RETRIES: u32 = 16;
 
 /// Serializes in-process read-modify-write state updates. The conditional
 /// write detects another *process*, but two threads of one process (the
@@ -595,7 +591,7 @@ impl Supervisor {
             let mut live = LIVE_SUPERVISORS
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !live.insert(resolved.clone()) {
+            if !live.insert(destination.to_string()) {
                 return Err(LakeError::InvalidOption {
                     message: format!(
                         "a replication supervisor for {resolved} is already running in this \
@@ -626,7 +622,7 @@ impl Supervisor {
                         LIVE_SUPERVISORS
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .remove(&resolved);
+                            .remove(destination);
                         return Err(e);
                     }
                     schedule.insert(
@@ -640,7 +636,9 @@ impl Supervisor {
             }
         }
         let inner = Arc::new(SupervisorInner {
-            destination: resolved.clone(),
+            // Reopen by the catalog location, not the data root: a split
+            // lake's data path is not a catalog.
+            destination: destination.to_string(),
             key,
             schedule: Mutex::new(schedule),
             cv: Condvar::new(),
@@ -657,7 +655,7 @@ impl Supervisor {
                 LIVE_SUPERVISORS
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&resolved);
+                    .remove(destination);
                 return Err(LakeError::Internal {
                     message: format!("could not start the replication supervisor thread: {e}"),
                 });
@@ -861,11 +859,17 @@ fn supervisor_loop(inner: Arc<SupervisorInner>) {
 fn run_pass(inner: &Arc<SupervisorInner>) {
     let lake = match inner.open() {
         Ok(lake) => lake,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("SUP pass open {e}");
+            return;
+        }
     };
     let current = match jobs(&lake) {
         Ok(jobs) => jobs,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("SUP pass jobs {e}");
+            return;
+        }
     };
     let present: BTreeSet<u64> = current.iter().map(|job| job.id).collect();
     {
@@ -936,9 +940,15 @@ fn run_pass(inner: &Arc<SupervisorInner>) {
                     message: report.message,
                 },
                 Err(_) if inner.abort.load(AtomicOrdering::Acquire) => CycleOutcome::Aborted,
-                Err(e) => CycleOutcome::Failed(e.to_string()),
+                Err(e) => {
+                    eprintln!("SUP catch {e}");
+                    CycleOutcome::Failed(e.to_string())
+                }
             },
-            Err(e) => CycleOutcome::Failed(e.to_string()),
+            Err(e) => {
+                eprintln!("SUP open {e}");
+                CycleOutcome::Failed(e.to_string())
+            }
         };
         if inner.abort.load(AtomicOrdering::Acquire) {
             let mut schedule = inner
@@ -1051,12 +1061,12 @@ pub fn drop(dest: &mut Lake, job_id: u64) -> Result<()> {
 
 /// Every job recorded in `dest`, in creation order.
 pub fn jobs(dest: &Lake) -> Result<Vec<Job>> {
-    Ok(read_state(dest)?.0.jobs)
+    Ok(read_state(dest)?.jobs)
 }
 
 /// One job's per-table state.
 pub fn tables(dest: &Lake, job_id: u64) -> Result<Vec<TableState>> {
-    let state = read_state(dest)?.0;
+    let state = read_state(dest)?;
     let job = state
         .jobs
         .iter()
@@ -1119,7 +1129,7 @@ pub fn resume_all(dest: &mut Lake) -> Result<Vec<u64>> {
 /// use the source's key with a normal [`Lake::open_with_key`] if you need the
 /// number out of band.
 pub fn versions_behind(dest: &Lake, job_id: u64) -> Result<Option<u64>> {
-    let state = read_state(dest)?.0;
+    let state = read_state(dest)?;
     let job = state
         .jobs
         .iter()
@@ -1176,7 +1186,7 @@ pub(crate) fn catch_up_abortable(
     abort: Option<&AtomicBool>,
 ) -> Result<CatchUpReport> {
     let aborted = || abort.is_some_and(|flag| flag.load(AtomicOrdering::Acquire));
-    let state = read_state(dest)?.0;
+    let state = read_state(dest)?;
     let job = state
         .jobs
         .iter()
@@ -1523,7 +1533,7 @@ fn sync_table(
     key: &str,
 ) -> Result<(bool, u64)> {
     // Ownership: another job's state row for this destination key.
-    let state = read_state(dest)?.0;
+    let state = read_state(dest)?;
     if let Some(owner) = state
         .jobs
         .iter()
@@ -2128,34 +2138,10 @@ fn drop_destination_table(dest: &mut Lake, key: &str) -> Result<()> {
 // State file
 // ---------------------------------------------------------------------------
 
-fn read_state(dest: &Lake) -> Result<(ReplicationState, Option<VersionTag>)> {
-    if let Some(store) = dest.storage.metadata_store() {
-        // A SQL catalog keeps replication in typed side tables; there is no
-        // conditional object tag (the publish transaction is the guard).
-        return Ok((store.replication_state()?.unwrap_or_default(), None));
-    }
-    let path = dest.storage.abs(STATE_PATH);
-    let context = format!("reading {}", path.display());
-    match dest.storage.read_tagged(STATE_PATH, &context) {
-        Ok((bytes, tag)) => {
-            let state: ReplicationState =
-                serde_json::from_slice(&bytes).map_err(|e| LakeError::Corrupt {
-                    path: path.clone(),
-                    message: format!("replication state does not parse: {e}"),
-                })?;
-            if state.replication_format != REPLICATION_FORMAT {
-                return Err(LakeError::Unsupported {
-                    path,
-                    found: state.replication_format,
-                });
-            }
-            Ok((state, Some(tag)))
-        }
-        Err(LakeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            Ok((ReplicationState::default(), None))
-        }
-        Err(e) => Err(e),
-    }
+fn read_state(dest: &Lake) -> Result<ReplicationState> {
+    // Replication state lives in the catalog's typed side tables; the publish
+    // transaction is the writer guard, so there is no conditional object tag.
+    Ok(dest.store.replication_state()?.unwrap_or_default())
 }
 
 /// Read-modify-write the state with conditional writes and bounded retries.
@@ -2170,53 +2156,11 @@ fn mutate_state<T>(
     let _serialized = STATE_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(store) = dest.storage.metadata_store() {
-        // One transaction: read the typed rows, apply the change, rewrite
-        // them. SQLite's `BEGIN IMMEDIATE` and pinkdb's commit validation
-        // serialize writers; Postgres's state row is locked in the same
-        // transaction by the store.
-        let publish = dest.storage.begin_publish()?;
-        let mut state = store.replication_state()?.unwrap_or_default();
-        let value = change(&mut state)?;
-        store.store_replication_state(&state)?;
-        publish.commit()?;
-        return Ok(value);
-    }
-    let path = dest.storage.abs(STATE_PATH);
-    for _ in 0..STATE_WRITE_RETRIES {
-        // Wave 96a: the read-modify-write is one publish scope, so a SQL
-        // catalog's state row moves atomically (the conditional write still
-        // guards cross-process races).
-        let publish = dest.storage.begin_publish()?;
-        let (mut state, tag) = read_state(dest)?;
-        let value = change(&mut state)?;
-        let bytes = state_json(&state, &path)?;
-        let written = match &tag {
-            None => dest.storage.put_new(STATE_PATH, &bytes)?,
-            Some(tag) => dest.storage.put_if_match(STATE_PATH, &bytes, tag)?,
-        };
-        if written {
-            publish.commit()?;
-            return Ok(value);
-        }
-        // A lost race: drop the scope (rolling back) and re-read the state.
-        std::mem::drop(publish);
-    }
-    Err(LakeError::Conflict {
-        path,
-        message: format!(
-            "replication state changed concurrently {STATE_WRITE_RETRIES} times; retry the \
-             operation"
-        ),
-    })
-}
-
-fn state_json(state: &ReplicationState, path: &Path) -> Result<Vec<u8>> {
-    let mut bytes = serde_json::to_vec_pretty(state).map_err(|e| LakeError::Internal {
-        message: format!("serializing replication state for {}: {e}", path.display()),
-    })?;
-    bytes.push(b'\n');
-    Ok(bytes)
+    // One transaction: read the typed rows, apply the change, rewrite them.
+    let mut state = dest.store.replication_state()?.unwrap_or_default();
+    let value = change(&mut state)?;
+    dest.store.store_replication_state(&state)?;
+    Ok(value)
 }
 
 fn claim_table(
@@ -2465,6 +2409,35 @@ fn same_lake_location(destination: &Path, source: &Location) -> bool {
     let Ok(destination) = Location::parse(&destination.to_string_lossy()) else {
         return false;
     };
+    // A bare-path lake's data root is `<path>.files/`; its catalog is
+    // `<path>`. Compare a local source against both.
+    if let (Location::Local(data), Location::Pink(catalog_path))
+    | (Location::Local(data), Location::Sqlite(catalog_path)) = (&destination, source)
+        && (catalog_path.parent() == Some(data)
+            || catalog_path
+                .parent()
+                .and_then(|p| p.canonicalize().ok())
+                .zip(data.canonicalize().ok())
+                .is_some_and(|(a, b)| a == b))
+    {
+        return true;
+    }
+    if let (Location::Local(data), Location::Local(catalog_path)) = (&destination, source) {
+        let bare_catalog = data
+            .to_string_lossy()
+            .strip_suffix(".files")
+            .map(PathBuf::from);
+        if let Some(bare) = bare_catalog
+            && (&bare == catalog_path
+                || bare
+                    .canonicalize()
+                    .ok()
+                    .zip(catalog_path.canonicalize().ok())
+                    .is_some_and(|(a, b)| a == b))
+        {
+            return true;
+        }
+    }
     match (&destination, source) {
         (
             Location::S3 {

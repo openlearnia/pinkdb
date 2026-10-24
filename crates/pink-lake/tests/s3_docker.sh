@@ -788,9 +788,15 @@ ENC_KEY="wave-57-s3-passphrase"
 CONC="s3://$BUCKET/conc"
 CONFLICT="s3://$BUCKET/conflict"
 REFUSE="s3://$BUCKET/refuse"
+ITEST_CAT="pink:$TMP/itest.pink"
+ENC_CAT="pink:$TMP/enc.pink"
+ENC_PLAIN_CAT="pink:$TMP/enc-plain.pink"
+CONC_CAT="pink:$TMP/conc.pink"
+CONFLICT_CAT="pink:$TMP/conflict.pink"
+REFUSE_CAT="pink:$TMP/refuse.pink"
 
 # --- roundtrip -------------------------------------------------------------
-step "roundtrip: typed CSV -> .lake save $ITEST -> fresh process .lake open + SELECT"
+step "roundtrip: typed CSV -> .lake save $ITEST_CAT data $ITEST -> fresh process .lake open + SELECT"
 CSV="$TMP/roundtrip.csv"
 cat >"$CSV" <<'CSV'
 b,i,g,d,v,dt,ts
@@ -802,10 +808,10 @@ note "csv: $CSV (BOOLEAN, INTEGER, BIGINT, DOUBLE, VARCHAR, DATE, TIMESTAMP; NUL
 
 {
     echo ".import $CSV t"
-    echo ".lake save $ITEST"
-    echo ".lake versions $ITEST"
-    echo ".lake tables $ITEST"
-    echo ".lake info $ITEST"
+    echo ".lake save $ITEST_CAT data $ITEST"
+    echo ".lake versions $ITEST_CAT"
+    echo ".lake tables $ITEST_CAT"
+    echo ".lake info $ITEST_CAT"
     echo ".quit"
 } | cli_run "$TMP/roundtrip_save.log"
 assert_status_zero "$TMP/roundtrip_save.log" "$?"
@@ -817,13 +823,13 @@ assert_contains "$TMP/roundtrip_save.log" "lake: $ITEST"
 assert_re "$TMP/roundtrip_save.log" '^1$'
 assert_re "$TMP/roundtrip_save.log" '^2 \(current\)$'
 assert_contains "$TMP/roundtrip_save.log" "main.t (3 rows)"
-assert_contains "$TMP/roundtrip_save.log" "format version:  6"
+assert_contains "$TMP/roundtrip_save.log" "format version:  7"
 assert_contains "$TMP/roundtrip_save.log" "current version: 2"
 assert_contains "$TMP/roundtrip_save.log" "snapshots:       2 (1, 2)"
 assert_contains "$TMP/roundtrip_save.log" "tables (1):"
 
 {
-    echo ".lake open $ITEST"
+    echo ".lake open $ITEST_CAT"
     echo "SELECT * FROM t ORDER BY i;"
     echo ".quit"
 } | cli_run "$TMP/roundtrip_open.log"
@@ -872,28 +878,17 @@ print("  ok: values and types match exactly (3 rows, incl. NULL row, -0.0, multi
 print("  ok: types row: " + ", ".join(types))
 PY
 
-# Published objects, listed over the REST API (signed for the strict servers).
+# Published objects, listed over the REST API (signed for the strict servers):
+# the catalog is a local pinkdb database; S3 holds only data files.
 KEYS="$(list_keys "itest/")" || fail "listing itest/ failed"
-printf '%s\n' "$KEYS" | grep -qxF "itest/catalog.json" || fail "itest/catalog.json is missing"
-printf '%s\n' "$KEYS" | grep -qxF "itest/snapshots/1.json" || fail "itest/snapshots/1.json is missing"
-printf '%s\n' "$KEYS" | grep -qxF "itest/snapshots/2.json" || fail "itest/snapshots/2.json is missing"
-printf '%s\n' "$KEYS" | grep -qE '^itest/data/main\.t/[0-9a-f-]+\.vortex$' \
-    || fail "the roundtrip's Vortex data object is missing"
-printf '%s\n' "$KEYS" | grep -qxF "itest/commits/2.json" \
-    || fail "itest/commits/2.json (the v2 delta manifest) is missing"
-printf '%s\n' "$KEYS" | grep -qxF "itest/lake.json" \
-    || fail "itest/lake.json (the v6 lake identity) is missing"
-printf '%s\n' "$KEYS" | grep -qxF "itest/highest.json" \
-    || fail "itest/highest.json (the rollback marker) is missing"
-assert_listing_count "$KEYS" "itest/" 7
-note "keys: $(printf '%s ' $KEYS)"
-
-# catalog.json == snapshots/<version>.json (bytes), fetched + cmp.
-s3curl -fsS --max-time 30 -o "$TMP/rt_catalog.json" "$ENDPOINT/$BUCKET/itest/catalog.json" || fail "fetching catalog.json failed"
-s3curl -fsS --max-time 30 -o "$TMP/rt_snapshot.json" "$ENDPOINT/$BUCKET/itest/snapshots/2.json" || fail "fetching snapshots/2.json failed"
-cmp -s "$TMP/rt_catalog.json" "$TMP/rt_snapshot.json" \
-    || fail "catalog.json is not byte-identical to snapshots/2.json"
-ok "catalog.json == snapshots/2.json (bytes; enforced)"
+printf '%s\n' "$KEYS" | grep -qE '^itest/data/main\.t/[0-9a-f-]+\.(vortex|pink|parquet)$' \
+    || fail "the roundtrip's data object is missing"
+if printf '%s\n' "$KEYS" | grep -qE 'itest/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
+    fail "metadata objects must not be written to S3 anymore: $KEYS"
+fi
+[ -f "$TMP/itest.pink" ] || [ -f "$TMP/itest.pink.wal" ] \
+    || fail "the local pink catalog is missing"
+ok "S3 holds data only; the catalog is the local pink: database"
 
 # --- encrypted roundtrip (PINKDB_KEY) --------------------------------------
 step "encrypted roundtrip: .lake save/open/attach with PINKDB_KEY on $ENC"
@@ -921,7 +916,7 @@ if [ "$ENC_SUPPORTED" = "1" ]; then
 
 {
     echo ".import $CSV t"
-    echo ".lake save $ENC"
+    echo ".lake save $ENC_CAT data $ENC"
     echo ".quit"
 } | cli_run_keyed "$TMP/enc_save.log" "$ENC_KEY"
 assert_status_zero "$TMP/enc_save.log" "$?"
@@ -929,47 +924,26 @@ assert_re "$TMP/enc_save.log" '^Saved lake version 2 in .* \(1 table, 3 rows, [0
 assert_contains "$TMP/enc_save.log" "the lake is encrypted at rest with PINKDB_KEY"
 ok "keyed save reported the encrypted lake"
 
-# The catalog object is a container, not JSON, and equals its snapshot.
-s3curl -fsS --max-time 30 -o "$TMP/enc_catalog.bin" "$ENDPOINT/$BUCKET/enc/catalog.json" \
-    || fail "fetching enc/catalog.json failed"
-s3curl -fsS --max-time 30 -o "$TMP/enc_snapshot.bin" "$ENDPOINT/$BUCKET/enc/snapshots/2.json" \
-    || fail "fetching enc/snapshots/2.json failed"
-[ "$(head -c 8 "$TMP/enc_catalog.bin")" = "PNKLAKE1" ] \
-    || fail "enc/catalog.json is not a PNKLAKE1 container"
-cmp -s "$TMP/enc_catalog.bin" "$TMP/enc_snapshot.bin" \
-    || fail "encrypted catalog.json is not byte-identical to snapshots/2.json"
-python3 - "$TMP/enc_catalog.bin" <<'PY' || fail "the encrypted catalog parses as JSON (it must not)"
-import json, sys
-try:
-    json.load(open(sys.argv[1]))
-except Exception:
-    print("  ok: the ciphertext does not parse as JSON")
-    sys.exit(0)
-sys.exit(1)
-PY
+# Only data objects live on S3, each a PNKLAKE1 container.
 ENC_KEYS="$(list_keys "enc/")" || fail "listing enc/ failed"
-printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.vortex$' \
+printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.(vortex|pink|parquet)$' \
     || fail "the encrypted roundtrip's data object is missing"
-printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/commits/2.json" \
-    || fail "enc/commits/2.json (the v2 delta manifest) is missing"
-printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/lake.json" \
-    || fail "enc/lake.json (the v6 lake identity) is missing"
-printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/highest.json" \
-    || fail "enc/highest.json (the rollback marker) is missing"
 for k in $(printf '%s\n' "$ENC_KEYS" | grep -E '^enc/data/'); do
     s3curl -fsS --max-time 30 -o "$TMP/enc_data.bin" "$ENDPOINT/$BUCKET/$k" \
         || fail "fetching $k failed"
     [ "$(head -c 8 "$TMP/enc_data.bin")" = "PNKLAKE1" ] \
         || fail "$k is not a PNKLAKE1 container"
 done
-assert_listing_count "$ENC_KEYS" "enc/" 7
-ok "every enc/ object is ciphertext (catalog, snapshots, commit delta, data; identity + highest markers present)"
+if printf '%s\n' "$ENC_KEYS" | grep -qE 'enc/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
+    fail "encrypted metadata must not be written to S3: $ENC_KEYS"
+fi
+ok "every enc/ data object is a PNKLAKE1 container"
 
 # A fresh process with the key opens and queries the encrypted lake.
 {
-    echo ".lake open $ENC"
+    echo ".lake open $ENC_CAT"
     echo "SELECT i, v FROM t ORDER BY i;"
-    echo ".lake tables $ENC"
+    echo ".lake tables $ENC_CAT"
     echo ".quit"
 } | cli_run_keyed "$TMP/enc_open.log" "$ENC_KEY"
 assert_status_zero "$TMP/enc_open.log" "$?"
@@ -979,7 +953,7 @@ assert_contains "$TMP/enc_open.log" "main.t (3 rows)"
 
 # Attach unseals the footer without a decode.
 {
-    echo ".lake attach $ENC"
+    echo ".lake attach $ENC_CAT"
     echo "SELECT COUNT(*) FROM t;"
     echo ".quit"
 } | cli_run_keyed "$TMP/enc_attach.log" "$ENC_KEY"
@@ -989,10 +963,10 @@ assert_contains "$TMP/enc_attach.log" "the lake is encrypted: attach read the wh
 # The conditional ciphertext CAS is unchanged: a keyed incremental commit on
 # the encrypted prefix publishes a delete file + new data file as containers.
 {
-    echo ".lake attach $ENC write"
+    echo ".lake attach $ENC_CAT write"
     echo "DELETE FROM t WHERE i = 1;"
     echo "INSERT INTO t VALUES (true, 4, 40, 0.5, 'delta', NULL, NULL);"
-    echo ".lake commit $ENC"
+    echo ".lake commit $ENC_CAT"
     echo ".quit"
 } | cli_run_keyed "$TMP/enc_commit.log" "$ENC_KEY"
 assert_status_zero "$TMP/enc_commit.log" "$?"
@@ -1000,27 +974,17 @@ assert_contains "$TMP/enc_commit.log" "Committed lake version 3"
 ENC_KEYS="$(list_keys "enc/")" || fail "listing enc/ failed"
 printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.pinkdel$' \
     || fail "the encrypted commit's delete file is missing"
-printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/lake.json" \
-    || fail "enc/lake.json (the v6 lake identity) is missing"
-printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/highest.json" \
-    || fail "enc/highest.json (the rollback marker) is missing"
 for k in $(printf '%s\n' "$ENC_KEYS" | grep -E '^enc/data/'); do
     s3curl -fsS --max-time 30 -o "$TMP/enc_data.bin" "$ENDPOINT/$BUCKET/$k" \
         || fail "fetching $k failed"
     [ "$(head -c 8 "$TMP/enc_data.bin")" = "PNKLAKE1" ] \
         || fail "$k is not a PNKLAKE1 container"
 done
-s3curl -fsS --max-time 30 -o "$TMP/enc_catalog3.bin" "$ENDPOINT/$BUCKET/enc/catalog.json" \
-    || fail "fetching enc/catalog.json failed"
-s3curl -fsS --max-time 30 -o "$TMP/enc_snapshot3.bin" "$ENDPOINT/$BUCKET/enc/snapshots/3.json" \
-    || fail "fetching enc/snapshots/3.json failed"
-cmp -s "$TMP/enc_catalog3.bin" "$TMP/enc_snapshot3.bin" \
-    || fail "encrypted catalog.json is not byte-identical to snapshots/3.json after the commit"
-ok "the encrypted commit's catalog == snapshot bytes and data files are ciphertext"
+ok "the encrypted commit's data and delete files are ciphertext"
 
 # No key: refused (fail closed, never a plaintext guess).
 {
-    echo ".lake open $ENC"
+    echo ".lake open $ENC_CAT"
     echo ".quit"
 } | cli_run "$TMP/enc_nokey.log"
 [ "$?" != "0" ] || fail "opening an encrypted lake without a key must fail"
@@ -1028,7 +992,7 @@ assert_contains "$TMP/enc_nokey.log" "the lake is encrypted"
 
 # Wrong key: refused, distinguished from corruption.
 {
-    echo ".lake open $ENC"
+    echo ".lake open $ENC_CAT"
     echo ".quit"
 } | cli_run_keyed "$TMP/enc_wrongkey.log" "$ENC_KEY-wrong"
 [ "$?" != "0" ] || fail "opening an encrypted lake with a wrong key must fail"
@@ -1037,23 +1001,20 @@ assert_contains "$TMP/enc_wrongkey.log" "wrong key at"
 # A keyed save onto a plaintext lake is refused, never silently rewritten.
 {
     echo ".import $CSV t"
-    echo ".lake save $ENC_PLAIN"
+    echo ".lake save $ENC_PLAIN_CAT data $ENC_PLAIN"
     echo ".quit"
 } | cli_run "$TMP/enc_plain_save.log"
 assert_status_zero "$TMP/enc_plain_save.log" "$?"
 {
-    echo ".lake save $ENC_PLAIN"
+    echo ".lake save $ENC_PLAIN_CAT data $ENC_PLAIN"
     echo ".quit"
 } | cli_run_keyed "$TMP/enc_plain_keyed.log" "$ENC_KEY"
 [ "$?" != "0" ] || fail "a keyed save onto a plaintext lake must fail"
 assert_contains "$TMP/enc_plain_keyed.log" "not an encrypted pink-lake container"
-s3curl -fsS --max-time 30 -o "$TMP/enc_plain_catalog.json" "$ENDPOINT/$BUCKET/enc-plain/catalog.json" \
-    || fail "fetching enc-plain/catalog.json failed"
-python3 - "$TMP/enc_plain_catalog.json" <<'PY' || fail "the plaintext lake's catalog is not JSON (it was rewritten?)"
-import json, sys
-json.load(open(sys.argv[1]))
-print("  ok: the plaintext lake's catalog is still plain JSON")
-PY
+[ -f "$TMP/enc-plain.pink" ] || [ -f "$TMP/enc-plain.pink.wal" ] \
+    || fail "the plaintext lake's local catalog is missing"
+ok "keyed open of a plaintext lake refused, and the plaintext lake is untouched"
+
 ok "keyed open of a plaintext lake refused, and the plaintext lake is untouched"
 
 fi # ENC_SUPPORTED
@@ -1061,7 +1022,7 @@ fi # ENC_SUPPORTED
 # --- concurrency (a): 3 writers x 3 rounds ---------------------------------
 step "concurrency (a): 3 writers x 3 rounds on $CONC (one distinct table each)"
 
-{ echo "CREATE TABLE warm (x INTEGER);"; echo "INSERT INTO warm VALUES (1);"; echo ".lake save $CONC"; echo ".quit"; } \
+{ echo "CREATE TABLE warm (x INTEGER);"; echo "INSERT INTO warm VALUES (1);"; echo ".lake save $CONC_CAT data $CONC"; echo ".quit"; } \
     | cli_run "$TMP/conc_seed.log"
 assert_status_zero "$TMP/conc_seed.log" "$?"
 assert_contains "$TMP/conc_seed.log" "Saved lake version 2"
@@ -1085,7 +1046,7 @@ for r in 1 2 3; do
         (
             # Race barrier: every writer blocks until all three are started.
             while [ ! -e "$GO" ]; do sleep 0.01; done
-            { echo ".import $TMP/writer$i.csv t$i"; echo ".lake save $CONC"; echo ".quit"; } \
+            { echo ".import $TMP/writer$i.csv t$i"; echo ".lake save $CONC_CAT data $CONC"; echo ".quit"; } \
                 | cli_run "$TMP/conc_r${r}_w${i}.log"
             echo "$?" >"$TMP/conc_r${r}_w${i}.exit"
         ) &
@@ -1193,33 +1154,14 @@ DUPES="$(sed -n 's/^duplicates=//p' "$TMP/conc.state")"
 RACE_FINAL_CLAIMANTS="$(sed -n 's/^final_claimants=//p' "$TMP/conc.state")"
 note "final race version: $FINAL ($CLAIMS claims, $RACE_CONFLICTS conflicts, $DUPES duplicate claim(s), $RACE_FINAL_CLAIMANTS claimant(s))"
 
-# The raced catalog must name a snapshot that exists and is byte-identical:
-# on an atomic-conditional server that is a hard invariant (the one-winner
-# snapshot PUT is what the catalog's If-Match replace published, and neither
-# can be overwritten); on s3mock it is reported as the measured limitation.
-step "race byte check: catalog.json vs the snapshot it names"
-RACE_CATALOG="$TMP/conc_race_catalog.json"
-RACE_CATALOG_V=""
-if s3curl -fsS --max-time 30 -o "$RACE_CATALOG" "$ENDPOINT/$BUCKET/conc/catalog.json"; then
-    RACE_CATALOG_V="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$RACE_CATALOG" 2>/dev/null)" || RACE_CATALOG_V=""
-fi
-if [ -n "$RACE_CATALOG_V" ] \
-    && s3curl -fsS --max-time 30 -o "$TMP/conc_race_snapshot.json" "$ENDPOINT/$BUCKET/conc/snapshots/$RACE_CATALOG_V.json" \
-    && cmp -s "$RACE_CATALOG" "$TMP/conc_race_snapshot.json"; then
-    ok "catalog.json == snapshots/$RACE_CATALOG_V.json (bytes)"
-else
-    if [ "$STRICT" = "1" ]; then
-        fail "race: catalog.json is not byte-identical to the snapshot it names (catalog version ${RACE_CATALOG_V:-unreadable})"
-    fi
-    warn "race: catalog.json vs snapshots/${RACE_CATALOG_V:-?}.json mismatch (non-atomic server; reported, not enforced — see s3_docker_notes.md)"
-fi
-
+# The catalog is one database transaction, so the raced chain has exactly one
+# row per claimed version; the CLI check below reads the typed rows back.
 # Reopen and continue (the documented recovery after a conflict): one fresh
 # save settles the chain. Its version has exactly one claimant by
 # construction, so the catalog/snapshot byte-equality below is enforced even
 # on a server with non-atomic conditionals.
 step "settle save after the race (reopen and continue)"
-{ echo ".lake info $CONC"; echo "CREATE TABLE settle (x INTEGER);"; echo "INSERT INTO settle VALUES (7);"; echo ".lake save $CONC"; echo ".quit"; } \
+{ echo ".lake info $CONC_CAT"; echo "CREATE TABLE settle (x INTEGER);"; echo "INSERT INTO settle VALUES (7);"; echo ".lake save $CONC_CAT data $CONC"; echo ".quit"; } \
     | cli_run "$TMP/conc_settle.log"
 assert_status_zero "$TMP/conc_settle.log" "$?"
 CATALOG_V="$(sed -n 's/.*current version: \([0-9][0-9]*\).*/\1/p' "$TMP/conc_settle.log" | head -1)"
@@ -1234,7 +1176,7 @@ assert_re "$TMP/conc_settle.log" '^Saved lake version [0-9]+ in .* \(1 table, 1 
 ok "reopened after the race; the settle save published version $SAVED_V alone"
 FINAL="$SAVED_V"
 
-{ echo ".lake versions $CONC"; echo ".lake info $CONC"; echo ".lake tables $CONC"; echo ".quit"; } \
+{ echo ".lake versions $CONC_CAT"; echo ".lake info $CONC_CAT"; echo ".lake tables $CONC_CAT"; echo ".quit"; } \
     | cli_run "$TMP/conc_metadata.log"
 assert_status_zero "$TMP/conc_metadata.log" "$?"
 assert_contains "$TMP/conc_metadata.log" "current version: $FINAL"
@@ -1324,13 +1266,13 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
         f.write(f"{k},quick-{k}\n")
 PY
 
-{ echo "CREATE TABLE warm (x INTEGER);"; echo "INSERT INTO warm VALUES (1);"; echo ".lake save $CONFLICT"; echo ".quit"; } \
+{ echo "CREATE TABLE warm (x INTEGER);"; echo "INSERT INTO warm VALUES (1);"; echo ".lake save $CONFLICT_CAT data $CONFLICT"; echo ".quit"; } \
     | cli_run "$TMP/conflict_seed.log"
 assert_status_zero "$TMP/conflict_seed.log" "$?"
 assert_contains "$TMP/conflict_seed.log" "Saved lake version 2"
 
 (
-    { echo ".import $TMP/slow.csv tslow"; echo ".lake save $CONFLICT"; echo ".quit"; } \
+    { echo ".import $TMP/slow.csv tslow"; echo ".lake save $CONFLICT_CAT data $CONFLICT"; echo ".quit"; } \
         | cli_run "$TMP/conflict_slow.log"
     echo "$?" >"$TMP/conflict_slow.exit"
 ) &
@@ -1340,7 +1282,7 @@ SLOW_PID=$!
 # enough that the slow writer has not published v3 yet. With SLOWROWS sized
 # to ~1s of encoding the window is wide on any local server.
 sleep 0.3
-{ echo ".import $TMP/quick.csv tquick"; echo ".lake save $CONFLICT"; echo ".quit"; } \
+{ echo ".import $TMP/quick.csv tquick"; echo ".lake save $CONFLICT_CAT data $CONFLICT"; echo ".quit"; } \
     | cli_run "$TMP/conflict_quick.log"
 assert_status_zero "$TMP/conflict_quick.log" "$?"
 wait "$SLOW_PID"
@@ -1404,7 +1346,7 @@ cmp -s "$TMP/conflict_catalog.json" "$TMP/conflict_snapshot.json" \
     || fail "conflict: catalog.json is not byte-identical to snapshots/3.json"
 ok "catalog.json == snapshots/3.json (bytes; single claimant; enforced)"
 
-{ echo ".lake versions $CONFLICT"; echo ".lake tables $CONFLICT"; echo ".lake open $CONFLICT"; echo ".quit"; } \
+{ echo ".lake versions $CONFLICT_CAT"; echo ".lake tables $CONFLICT_CAT"; echo ".lake open $CONFLICT_CAT"; echo ".quit"; } \
     | cli_run "$TMP/conflict_state.log"
 assert_status_zero "$TMP/conflict_state.log" "$?"
 assert_re "$TMP/conflict_state.log" '^3 \(current\)$'
@@ -1421,9 +1363,9 @@ note "conflict is the snapshot-exists refusal asserted below."
 
 {
     echo ".import $CSV t"
-    echo ".lake save $REFUSE"
-    echo ".lake save $REFUSE"
-    echo ".lake versions $REFUSE"
+    echo ".lake save $REFUSE_CAT data $REFUSE"
+    echo ".lake save $REFUSE_CAT data $REFUSE"
+    echo ".lake versions $REFUSE_CAT"
     echo ".quit"
 } | cli_run "$TMP/refuse_twice.log"
 assert_status_zero "$TMP/refuse_twice.log" "$?"
@@ -1440,14 +1382,14 @@ s3curl -fsS --max-time 30 -X PUT --data-binary 'not a manifest' \
     "$ENDPOINT/$BUCKET/refuse/snapshots/4.json" -o /dev/null || fail "planting the stray snapshot failed"
 ok "planted stray refuse/snapshots/4.json"
 
-{ echo ".lake save $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_stray.log"
+{ echo ".lake save $REFUSE_CAT data $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_stray.log"
 # The refusal is the expected outcome: since wave 40b the CLI exits 1 after a
 # failed statement in a piped script; the message asserts below pin it.
 assert_contains "$TMP/refuse_stray.log" "Error: write conflict at"
 assert_contains "$TMP/refuse_stray.log" "snapshot 4 already exists"
 assert_contains "$TMP/refuse_stray.log" "refusing to replace a published version"
 
-{ echo ".lake versions $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_versions.log"
+{ echo ".lake versions $REFUSE_CAT"; echo ".quit"; } | cli_run "$TMP/refuse_versions.log"
 assert_status_zero "$TMP/refuse_versions.log" "$?"
 assert_re "$TMP/refuse_versions.log" '^3 \(current\)$'
 assert_no_match "$TMP/refuse_versions.log" '^4'
@@ -1455,7 +1397,7 @@ ok "the unpublished stray is not advertised (.lake versions stays 1..3)"
 
 s3curl -fsS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/refuse/snapshots/4.json" -o /dev/null \
     || fail "removing the stray snapshot failed"
-{ echo ".lake save $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_retry.log"
+{ echo ".lake save $REFUSE_CAT data $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_retry.log"
 assert_status_zero "$TMP/refuse_retry.log" "$?"
 assert_re "$TMP/refuse_retry.log" '^Saved lake version 4 in '
 ok "after removing the stray, the next save published version 4"

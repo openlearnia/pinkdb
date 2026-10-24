@@ -351,6 +351,11 @@ pub struct LakeFileInfo {
     pub partition: Option<BTreeMap<String, Option<String>>>,
     /// The schema epoch the file was written under (v5 entries).
     pub schema_version: Option<u64>,
+    /// The row id of the file's first row, when recorded.
+    pub row_id_start: Option<u64>,
+    /// The recorded footer offset/length, for formats that publish one.
+    pub footer_offset: Option<u64>,
+    pub footer_len: Option<u64>,
     /// The delete file paired with this data file, if any (one row per
     /// delete file of the data file).
     pub delete_file: Option<String>,
@@ -393,6 +398,8 @@ pub struct TableInfo {
     /// Wave 68: the table's persisted `data_inlining_row_limit` (`None` =
     /// the handle default applies).
     pub inlined_limit: Option<u64>,
+    /// The next row id the table will assign.
+    pub next_row_id: u64,
 }
 
 /// One catalog fact, as [`Lake::options`] lists it (`ducklake_options`'s
@@ -686,7 +693,7 @@ impl Lake {
                 Some((author, message)) => (author.clone(), message.clone()),
                 None => (None, None),
             };
-            let changes = manifest_for(&*self.storage, &self.root, Some(head.version))
+            let changes = manifest_for(&*self.store, &self.root, Some(head.version))
                 .ok()
                 .map(|(previous, _)| {
                     crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
@@ -704,7 +711,6 @@ impl Lake {
                 changes,
                 schema_version,
             };
-            let snapshot_plain = crate::manifest_json(&new_catalog, &self.root)?;
             let commit_manifest = CommitManifest {
                 format_version: FORMAT_VERSION,
                 version,
@@ -712,23 +718,15 @@ impl Lake {
                 updated: crate::time::iso8601_utc(SystemTime::now()),
                 tables: deltas,
             };
-            let commit_bytes = crate::commit_manifest_json(&commit_manifest)?;
             let report = CompactionReport {
                 version,
                 committed: true,
                 retries: attempt,
                 tables: report_tables,
                 skipped,
-                bytes_written: files_bytes
-                    + commit_bytes.len() as u64
-                    + 2 * snapshot_plain.len() as u64,
+                bytes_written: files_bytes,
             };
-            match self.publish_catalog_version(
-                &new_catalog,
-                commit_manifest,
-                &commit_bytes,
-                &snapshot_plain,
-            ) {
+            match self.publish_catalog_version(&new_catalog, commit_manifest, &[], &[]) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -1159,40 +1157,10 @@ impl Lake {
                 victims.push(info);
             }
         }
-        let mut bytes = 0u64;
-        for info in &victims {
-            let snapshot_rel = format!("snapshots/{}.json", info.version);
-            let commit_rel = format!("commits/{}.json", info.version);
-            bytes += self
-                .storage
-                .stat(&snapshot_rel)?
-                .map(|i| i.size)
-                .unwrap_or(0);
-            bytes += self.storage.stat(&commit_rel)?.map(|i| i.size).unwrap_or(0);
-        }
+        let bytes = 0u64;
         if !settings.dry_run {
-            // Wave 96a: the metadata deletes are one publish scope (a SQL
-            // catalog removes the delta + snapshot rows in one transaction).
-            let publish = self.storage.begin_publish()?;
-            if let Some(store) = self.storage.metadata_store() {
-                // DuckLake semantics: the snapshot rows and every catalog row
-                // no remaining snapshot can see go in one transaction; their
-                // files move to `files_scheduled_for_deletion`.
-                let versions: Vec<u64> = victims.iter().map(|info| info.version).collect();
-                store.expire_snapshots(&versions)?;
-            } else {
-                for info in &victims {
-                    let snapshot_rel = format!("snapshots/{}.json", info.version);
-                    let commit_rel = format!("commits/{}.json", info.version);
-                    // Delta first, then the snapshot: a crash in between leaves
-                    // a snapshot without its audit delta (harmless — the
-                    // snapshot stays authoritative), never a delta pretending a
-                    // version exists its snapshot cannot load.
-                    self.delete_if_present(&commit_rel)?;
-                    self.delete_if_present(&snapshot_rel)?;
-                }
-            }
-            publish.commit()?;
+            let versions: Vec<u64> = victims.iter().map(|info| info.version).collect();
+            self.store.expire_snapshots(&versions)?;
         }
         Ok(ExpireReport {
             versions: victims,
@@ -1207,10 +1175,7 @@ impl Lake {
     /// the same scan (pinkdb has no scheduled-deletion queue; the module
     /// docs explain).
     pub fn cleanup_old_files(&mut self, settings: &CleanupSettings) -> Result<CleanupReport> {
-        if self.storage.metadata_store().is_some() {
-            return self.cleanup_scheduled(settings);
-        }
-        self.cleanup(settings)
+        self.cleanup_scheduled(settings)
     }
 
     /// DuckLake's `ducklake_delete_orphaned_files`: the same
@@ -1227,10 +1192,7 @@ impl Lake {
     /// unreferenced-object scan.
     fn cleanup_scheduled(&mut self, settings: &CleanupSettings) -> Result<CleanupReport> {
         self.ensure_catalog_unchanged()?;
-        let store = self
-            .storage
-            .metadata_store()
-            .expect("caller checked the catalog has a metadata store");
+        let store = &*self.store;
         let cutoff = settings
             .older_than_micros
             .unwrap_or_else(|| now_micros() - DEFAULT_RETENTION_SECS * 1_000_000);
@@ -1285,9 +1247,7 @@ impl Lake {
                 ),
             });
         }
-        if self.storage.catalog_split() {
-            self.verify_data_owner()?;
-        }
+        self.verify_data_owner()?;
         let mut ids = Vec::new();
         for (path, _, id) in &found {
             if path.starts_with("data/") {
@@ -1307,20 +1267,14 @@ impl Lake {
     fn cleanup(&mut self, settings: &CleanupSettings) -> Result<CleanupReport> {
         // Single-writer guard before anything is deleted.
         self.ensure_catalog_unchanged()?;
-        let referenced: BTreeSet<String> = if let Some(store) = self.storage.metadata_store() {
-            let mut paths: BTreeSet<String> = store.referenced_file_paths()?.into_iter().collect();
-            // A scheduled file is still protected by the retention window;
-            // `cleanup_old_files` is the function that removes it.
-            for (_, path) in store.scheduled_files()? {
-                paths.insert(path.clone());
-                if !path.starts_with("data/") {
-                    paths.insert(format!("data/{path}"));
-                }
+        let mut referenced: BTreeSet<String> =
+            self.store.referenced_file_paths()?.into_iter().collect();
+        for (_, path) in self.store.scheduled_files()? {
+            referenced.insert(path.clone());
+            if !path.starts_with("data/") {
+                referenced.insert(format!("data/{path}"));
             }
-            paths
-        } else {
-            self.referenced_paths()?
-        };
+        }
         let cutoff = settings
             .older_than_micros
             .unwrap_or_else(|| now_micros() - DEFAULT_RETENTION_SECS * 1_000_000);
@@ -1374,9 +1328,7 @@ impl Lake {
         // catalogs pointed at one data location can never remove each other's
         // files. The default object-store layout has no marker and pays no
         // extra read here.
-        if self.storage.catalog_split() {
-            self.verify_data_owner()?;
-        }
+        self.verify_data_owner()?;
         for path in &paths {
             self.delete_if_present(path)?;
         }
@@ -1437,7 +1389,7 @@ impl Lake {
         let (catalog, _) = self.manifest(None)?;
         collect(&catalog);
         for version in self.versions()? {
-            if let Ok((manifest, _)) = manifest_for(&*self.storage, &self.root, Some(version)) {
+            if let Ok((manifest, _)) = manifest_for(&*self.store, &self.root, Some(version)) {
                 collect(&manifest);
             }
         }
@@ -1496,6 +1448,9 @@ impl Lake {
                         size_bytes: size,
                         partition: file.partition().cloned(),
                         schema_version: file.schema_version(),
+                        row_id_start: file.row_id_start(),
+                        footer_offset: file.footer_offset(),
+                        footer_len: file.footer_len(),
                         delete_file: None,
                         delete_file_rows: None,
                         referenced: true,
@@ -1509,6 +1464,9 @@ impl Lake {
                             size_bytes: size,
                             partition: file.partition().cloned(),
                             schema_version: file.schema_version(),
+                            row_id_start: file.row_id_start(),
+                            footer_offset: file.footer_offset(),
+                            footer_len: file.footer_len(),
                             delete_file: Some(delete.path.clone()),
                             delete_file_rows: Some(delete.count),
                             referenced: true,
@@ -1535,6 +1493,9 @@ impl Lake {
                     size_bytes: size,
                     partition: None,
                     schema_version: None,
+                    row_id_start: None,
+                    footer_offset: None,
+                    footer_len: None,
                     delete_file: None,
                     delete_file_rows: None,
                     referenced: false,
@@ -1579,6 +1540,7 @@ impl Lake {
                 inlined_rows: entry.live_inlined_rows(),
                 inlined_history: entry.inlined.len() as u64,
                 inlined_limit: entry.inlined_limit,
+                next_row_id: entry.next_row_id,
             });
         }
         Ok(out)
@@ -1637,7 +1599,7 @@ impl Lake {
     /// `catalog_type`, `extension_version`, `data_path`.
     pub fn settings(&self) -> LakeSettings {
         LakeSettings {
-            catalog_type: "json".to_string(),
+            catalog_type: "database".to_string(),
             extension_version: env!("CARGO_PKG_VERSION").to_string(),
             data_path: self.storage.abs("").display().to_string(),
         }

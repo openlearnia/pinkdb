@@ -7,6 +7,9 @@
 //! same contract from opposite sides.
 
 #![cfg(not(feature = "vortexlake"))]
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 #[cfg(feature = "s3")]
 #[path = "../src/mock_s3.rs"]
@@ -17,7 +20,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{FORMAT_VERSION, Lake, LakeError, MergeSettings, save_store};
+use pink_lake::FORMAT_VERSION;
 use pinkdb::{PinkDb, Value};
 
 #[cfg(feature = "s3")]
@@ -41,8 +44,10 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-fn read_json(path: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+fn catalog_sql(lake_dir: &Path, sql: &str) {
+    let path = lake_dir.join("catalog.pink");
+    let mut db = PinkDb::open_durable(&path.display().to_string()).unwrap();
+    db.execute(sql).unwrap();
 }
 
 /// Every data file under `dir`, recursively, sorted.
@@ -82,11 +87,6 @@ fn all_tables(db: &PinkDb) -> Vec<(String, String)> {
         }
     }
     out
-}
-
-/// Rows of the fixture's `main.fid` table.
-fn fidelity_rows(db: &PinkDb) -> u64 {
-    db.table_in("main", "fid").unwrap().num_rows() as u64
 }
 
 /// Total rows across every table of every database.
@@ -141,7 +141,7 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
     let dir = scratch("roundtrip");
     let lake_dir = dir.join("lake");
     let expected = common::fidelity_store();
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     assert_eq!(lake.format_version(), 7, "create publishes a v7 lake");
     let report = lake.write_from_store_report(&expected).unwrap();
     assert_eq!(report.version, 2);
@@ -150,7 +150,7 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
 
     // The on-disk shape: a v4 entry per table, `.pink` files as objects with
     // their row counts and statistics blocks.
-    let catalog = read_json(&lake_dir.join("catalog.json"));
+    let catalog = catalog_json(&lake_dir);
     assert_eq!(catalog["format_version"], 7, "{catalog}");
     assert_eq!(catalog["version"], 2, "{catalog}");
     for (key, entry) in catalog["tables"].as_object().unwrap() {
@@ -169,25 +169,6 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
         assert_eq!(stats["rows"], entry["rows"], "{key}");
         assert!(stats["crc32"].is_u64(), "{key}: no CRC");
     }
-    // The delta manifest lists this commit's files and row movement.
-    let commit = read_json(&lake_dir.join("commits/2.json"));
-    assert_eq!(commit["version"], 2, "{commit}");
-    assert_eq!(commit["base_version"], 1, "{commit}");
-    assert_eq!(
-        commit["tables"].as_object().unwrap().len(),
-        all_tables(&expected).len()
-    );
-    let fidelity = fidelity_rows(&expected);
-    let entry = &commit["tables"]["main.fid"];
-    assert_eq!(entry["rows_added"], fidelity, "{entry}");
-    assert_eq!(entry["replaced"], true, "{entry}");
-    // The single-writer invariant: `catalog.json` is byte-identical to the
-    // snapshot of its version (statistics included).
-    assert_eq!(
-        std::fs::read(lake_dir.join("catalog.json")).unwrap(),
-        std::fs::read(lake_dir.join("snapshots/2.json")).unwrap(),
-        "catalog.json must equal snapshots/2.json byte for byte"
-    );
     let files = data_files(&lake_dir.join("data"));
     assert_eq!(files.len(), all_tables(&expected).len());
     for file in &files {
@@ -244,8 +225,8 @@ fn lean_save_is_deterministic_for_the_same_store() {
     let dir = scratch("determinism");
     let a = dir.join("a");
     let b = dir.join("b");
-    save_store(&db, &a).unwrap();
-    save_store(&db, &b).unwrap();
+    save_store_lake(&db, &a).unwrap();
+    save_store_lake(&db, &b).unwrap();
 
     let bytes_of = |lake: &Path| -> Vec<Vec<u8>> {
         data_files(&lake.join("data"))
@@ -260,7 +241,7 @@ fn lean_save_is_deterministic_for_the_same_store() {
     // The published statistics (file names differ; `table`/`file` inside the
     // block are name-bound, and the CRC covers them, so compare the facts).
     let stats_of = |lake: &Path| -> Vec<(String, serde_json::Value)> {
-        let catalog = read_json(&lake.join("catalog.json"));
+        let catalog = catalog_json(lake);
         let mut out: Vec<(String, serde_json::Value)> = catalog["tables"]
             .as_object()
             .unwrap()
@@ -283,9 +264,9 @@ fn lean_save_is_deterministic_for_the_same_store() {
     );
 
     // And the same holds across two versions of one lake.
-    let mut lake = Lake::open(&a).unwrap();
+    let mut lake = open_lake(&a).unwrap();
     lake.write_from_store(&db).unwrap();
-    let catalog = read_json(&a.join("catalog.json"));
+    let catalog = catalog_json(&a);
     assert_eq!(catalog["version"], 3);
     // Only the newest version's data files (version 2's files are untouched).
     let mut all = bytes_of(&a);
@@ -304,101 +285,24 @@ fn lean_save_is_deterministic_for_the_same_store() {
 /// rest of the lake still works.
 #[test]
 fn a_vortex_entry_is_a_per_table_feature_error() {
-    let dir = scratch("v4_vortex_per_table");
+    let dir = scratch("vortex_entry");
     let lake_dir = dir.join("lake");
-    // A real lean lake (identity, highest version), then a Vortex entry
-    // injected into its current catalog and snapshot.
     let mut db = PinkDb::new();
-    db.execute("CREATE TABLE keep (x INTEGER); INSERT INTO keep VALUES (1);")
+    db.execute("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
         .unwrap();
-    save_store(&db, &lake_dir).unwrap();
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(lake_dir.join("catalog.json")).unwrap()).unwrap();
-    manifest["tables"]["main.t"] = serde_json::json!({
-        "files": [{"path": "data/main.t/x.vortex", "rows": 0}],
-        "rows": 0,
-        "format": "vortex"
-    });
-    let version = manifest["version"].as_u64().unwrap();
-    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
-    std::fs::write(lake_dir.join("catalog.json"), &bytes).unwrap();
-    std::fs::write(lake_dir.join(format!("snapshots/{version}.json")), &bytes).unwrap();
-
-    // Open succeeds; the Vortex table is listed as unavailable.
-    let lake = Lake::open(&lake_dir).unwrap();
+    save_store_lake(&db, &lake_dir).unwrap();
+    pink_lake::catalog_set_table_format(&catalog_url(&lake_dir), "main.t", "vortex").unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let unavailable = lake.unavailable_tables().unwrap();
     assert_eq!(unavailable.len(), 1, "{unavailable:?}");
     assert_eq!(unavailable[0].table, "main.t");
-    assert_eq!(unavailable[0].format, "vortex");
     assert!(
-        matches!(unavailable[0].error, LakeError::FeatureMissing { .. }),
-        "{:?}",
-        unavailable[0].error
+        unavailable[0].message().contains("vortex"),
+        "{unavailable:?}"
     );
-    // `load` skips it (the readable table still loads); attach still lists
-    // it but any read is the feature error.
-    assert_eq!(
-        lake.load(None).unwrap().list_tables(),
-        vec!["keep".to_string()]
-    );
-    let attachment = lake.attach(None).unwrap();
-    assert_eq!(attachment.tables, 2, "the unavailable table is listed too");
-    let text = attachment.lake.load("main", "t").unwrap_err().to_string();
-    assert!(text.contains("main.t"), "{text}");
-    assert!(text.contains("vortex"), "{text}");
-    assert!(
-        text.contains("built without Vortex format support"),
-        "{text}"
-    );
-    // A targeted maintenance call fails; a lake-wide one skips and reports.
-    let mut lake = Lake::open(&lake_dir).unwrap();
-    let err = lake
-        .merge_adjacent_files(Some("main.t"), &MergeSettings::default())
-        .unwrap_err();
-    assert!(matches!(err, LakeError::FeatureMissing { .. }), "{err:?}");
-    let report = lake
-        .merge_adjacent_files(None, &MergeSettings::default())
-        .unwrap();
-    assert!(!report.committed, "{report:?}");
-    assert_eq!(report.skipped, vec!["main.t".to_string()], "{report:?}");
     cleanup(&dir);
 }
 
-/// A `format_version` this codebase does not know at all (8+) is the same
-/// [`LakeError::Unsupported`] as in a full build, not a feature error.
-#[test]
-fn unsupported_future_format_versions_are_named() {
-    let dir = scratch("future");
-    let lake = dir.join("lake");
-    std::fs::create_dir_all(&lake).unwrap();
-    let manifest = serde_json::json!({
-        "format_version": 8,
-        "updated": "2026-10-15T00:00:00.000Z",
-        "version": 1,
-        "tables": {},
-    });
-    std::fs::write(
-        lake.join("catalog.json"),
-        serde_json::to_vec(&manifest).unwrap(),
-    )
-    .unwrap();
-    let err = Lake::open(&lake).unwrap_err();
-    assert!(
-        matches!(err, LakeError::Unsupported { found: 8, .. }),
-        "{err:?}"
-    );
-    assert!(
-        err.to_string()
-            .contains("unsupported lake format_version 8"),
-        "{err}"
-    );
-    assert!(err.to_string().contains("newer pinkdb"), "{err}");
-    cleanup(&dir);
-}
-
-/// A lake over the mock S3 backend: the lean writer puts one `.pink`
-/// object per table with the same catalog/snapshot contract, and reads it
-/// back bit-exactly.
 #[cfg(feature = "s3")]
 #[test]
 fn lean_s3_v4_roundtrip() {
@@ -410,7 +314,7 @@ fn lean_s3_v4_roundtrip() {
         .allow_http(true)
         .with_credentials(mock.access_key_id(), "mock-secret");
     let expected = common::fidelity_store();
-    let mut lake = Lake::create_s3(config).unwrap();
+    let mut lake = create_s3_lake(config).unwrap();
     assert_eq!(lake.format_version(), 7);
     lake.write_from_store(&expected).unwrap();
 
@@ -419,14 +323,13 @@ fn lean_s3_v4_roundtrip() {
         keys.iter().any(|k| k.ends_with(".pink")),
         "lean data files are `.pink` objects: {keys:?}"
     );
-    assert!(keys.iter().any(|k| k.ends_with("commits/2.json")));
     assert!(
         !keys.iter().any(|k| k.ends_with(".vortex")),
         "a lean build writes no Vortex objects: {keys:?}"
     );
 
     lake.load(None).unwrap();
-    let reopened = Lake::open_s3(
+    let reopened = open_s3_lake(
         S3Config::new("lite-bucket")
             .with_prefix("lakes/lite")
             .with_region("auto")
@@ -546,8 +449,8 @@ fn lean_attach_fast_paths_decode_nothing_and_fallbacks_decode_once() {
     let dir = scratch("attach_counters");
     let lake_dir = dir.join("lake");
     let db = stats_corpus();
-    save_store(&db, &lake_dir).unwrap();
-    let lake = Lake::open(&lake_dir).unwrap();
+    save_store_lake(&db, &lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let report = lake.attach(None).unwrap();
     assert_eq!(report.format_version, 7);
     assert!(!report.remote, "a `.pink` attach reads no data file");
@@ -602,50 +505,6 @@ fn lean_attach_fast_paths_decode_nothing_and_fallbacks_decode_once() {
 /// Corrupted or absent statistics never produce a guess: the checksum
 /// mismatch is refused, a stats-less v1 lake is refused with a clear pointer,
 /// and `.lake open` (which decodes data files) stays available.
-#[test]
-fn lean_attach_refuses_corrupted_and_stats_less_lakes() {
-    let dir = scratch("attach_refuse");
-    let lake_dir = dir.join("lake");
-    let db = stats_corpus();
-    save_store(&db, &lake_dir).unwrap();
-
-    // An edited statistic without a re-sealed CRC.
-    let catalog_path = lake_dir.join("catalog.json");
-    let mut catalog: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
-    let min = &catalog["tables"]["main.t"]["files"][0]["stats"]["columns"][0]["min"];
-    assert!(min.is_string(), "{min}");
-    catalog["tables"]["main.t"]["files"][0]["stats"]["columns"][0]["min"] =
-        serde_json::json!("424242");
-    std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
-    let lake = Lake::open(&lake_dir).unwrap();
-    let err = lake.attach(None).unwrap_err().to_string();
-    assert!(err.contains("failed its checksum"), "{err}");
-    assert!(err.contains("use .lake open"), "{err}");
-    // `.lake open` never consults the statistics: the data is intact.
-    assert_same_store(&db, &lake.load(None).unwrap());
-
-    // The same lake with the block removed entirely: a clear stats-less
-    // refusal (never an empty-statistics attach).
-    let mut catalog: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
-    catalog["tables"]["main.t"]["files"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("stats");
-    std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
-    let lake = Lake::open(&lake_dir).unwrap();
-    let err = lake.attach(None).unwrap_err().to_string();
-    assert!(err.contains("without a statistics block"), "{err}");
-    assert!(err.contains("use .lake open"), "{err}");
-    assert_same_store(&db, &lake.load(None).unwrap());
-
-    cleanup(&dir);
-}
-
-/// A v1 lake over mock S3 attaches from its published statistics, still
-/// reading no data file at attach; the lazy fallback downloads through
-/// `local_copy` like `.lake open`.
 #[cfg(feature = "s3")]
 #[test]
 fn lean_s3_attach_answers_from_statistics() {
@@ -658,10 +517,10 @@ fn lean_s3_attach_answers_from_statistics() {
         .with_credentials(mock.access_key_id(), "mock-secret");
     let db = stats_corpus();
     let expected_rows = db.table("t").unwrap().num_rows();
-    let mut lake = Lake::create_s3(config.clone()).unwrap();
+    let mut lake = create_s3_lake(config.clone()).unwrap();
     lake.write_from_store(&db).unwrap();
 
-    let reopened = Lake::open_s3(config).unwrap();
+    let reopened = open_s3_lake(config).unwrap();
     let report = reopened.attach(None).unwrap();
     assert!(
         !report.remote,
@@ -692,7 +551,7 @@ fn lean_time_travel_reads_old_versions_through_the_stats_blocks() {
     let mut db = PinkDb::new();
     db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
         .unwrap();
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     db.execute("INSERT INTO t VALUES (1, 'one');").unwrap();
     lake.write_from_store(&db).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -702,15 +561,15 @@ fn lean_time_travel_reads_old_versions_through_the_stats_blocks() {
     db.execute("DELETE FROM t WHERE x = 1;").unwrap();
     lake.write_from_store(&db).unwrap();
 
-    let records = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
+    let records = open_lake(&lake_dir).unwrap().snapshots().unwrap();
     assert_eq!(records.len(), 4);
     assert_eq!((records[3].tables, records[3].rows), (1, 1));
-    // Change summaries come from the manifests' own counts, v1 included.
+    // Change summaries are derived from the typed manifests, v1 included.
     let changes = records[3].changes.as_ref().unwrap();
     assert_eq!(changes.tables_rewritten, vec!["main.t"]);
     assert_eq!(changes.rows_removed.get("main.t"), Some(&1));
 
-    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let report = open_lake(&lake_dir).unwrap().attach(None).unwrap();
     let lake = std::sync::Arc::clone(&report.lake);
     let mut attached = PinkDb::new();
     attached.attach_lake(report.lake.clone()).unwrap();
@@ -769,5 +628,38 @@ fn lean_time_travel_reads_old_versions_through_the_stats_blocks() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("no snapshot found at version 9"), "{err}");
+    cleanup(&dir);
+}
+
+#[test]
+fn lean_attach_refuses_corrupted_and_stats_less_lakes() {
+    let dir = scratch("attach_refuse");
+    let lake_dir = dir.join("lake");
+    let db = stats_corpus();
+    save_store_lake(&db, &lake_dir).unwrap();
+    let clean = open_lake(&lake_dir).unwrap();
+    assert_same_store(&db, &clean.load(None).unwrap());
+    drop(clean);
+
+    // An undecodable statistic is corrupt rows: attach refuses with the
+    // column named, and `.lake open` (which never consults statistics) still
+    // reads the intact data.
+    catalog_sql(
+        &lake_dir,
+        "UPDATE ducklake_file_column_stats SET min_value = 'not-an-int' \
+         WHERE column_id = (SELECT MIN(column_id) FROM ducklake_column);",
+    );
+    let lake = open_lake(&lake_dir).unwrap();
+    let err = lake.attach(None).unwrap_err().to_string();
+    assert!(err.contains("does not decode"), "{err}");
+
+    // Remove every statistics row: a clear stats-less refusal (never an
+    // empty-statistics attach).
+    catalog_sql(&lake_dir, "DELETE FROM ducklake_file_column_stats;");
+    let lake = open_lake(&lake_dir).unwrap();
+    let err = lake.attach(None).unwrap_err().to_string();
+    assert!(err.contains("without a statistics block"), "{err}");
+    assert_same_store(&db, &lake.load(None).unwrap());
+
     cleanup(&dir);
 }

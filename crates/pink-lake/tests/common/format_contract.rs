@@ -464,7 +464,24 @@ fn assert_store_equal(format_id: &str, what: &str, want: &PinkDb, got: &PinkDb) 
 }
 
 fn read_catalog(lake_dir: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(lake_dir.join("catalog.json")).unwrap()).unwrap()
+    let lake = pink_lake::Lake::open(lake_dir).unwrap();
+    let mut tables = serde_json::Map::new();
+    for info in lake.table_info().unwrap() {
+        let files = lake
+            .list_files(Some(&info.table), None, false)
+            .unwrap()
+            .into_iter()
+            .map(|file| serde_json::json!({ "path": file.path }))
+            .collect::<Vec<_>>();
+        tables.insert(
+            info.table.clone(),
+            serde_json::json!({
+                "format": lake.table_format_name(&info.table).unwrap(),
+                "files": files,
+            }),
+        );
+    }
+    serde_json::json!({ "tables": tables })
 }
 
 fn assert_entry_format(label: &str, catalog: &serde_json::Value, key: &str, id: &str) {

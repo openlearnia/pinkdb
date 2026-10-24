@@ -88,6 +88,8 @@ jobs:
               cargo test -p pink-lake --features s3,vortexlake,encryption
               cargo test -p pink-lake --features catalog-sqlite
               cargo test -p pink-lake --features catalog-sqlite,s3,encryption
+              cargo test -p pink-lake --test replication_catalogs
+              cargo test -p pink-lake --features catalog-sqlite --test replication_catalogs
           - name: cli-lake
             run: |
               cargo test -p pinkdb-cli --features vortexlake,s3
@@ -177,7 +179,10 @@ jobs:
       - name: Postgres catalog suite (every catalog feature)
         run: cargo test -p pink-lake --features catalog-postgres,catalog-sqlite,s3,encryption
 
-      - name: CLI Postgres catalog and migration
+      - name: Replication on every SQL catalog
+        run: cargo test -p pink-lake --features catalog-postgres,catalog-sqlite --test replication_catalogs
+
+      - name: CLI Postgres catalog
         run: cargo test -p pinkdb-cli --features pinklake,s3,catalog-sqlite,catalog-postgres
 
       # The default build must stay lean even after the feature tests above.
@@ -214,7 +219,7 @@ jobs:
           cargo clippy --all-targets -p pink-lake --features s3,vortexlake,encryption -- -D warnings
           cargo clippy --all-targets -p pink-lake --features catalog-sqlite,s3,encryption -- -D warnings
           cargo clippy --all-targets -p pink-lake --features catalog-postgres -- -D warnings
-          cargo clippy --all-targets -p pink-lake --features catalog-postgres,catalog-sqlite,s3,encryption -- -D warnings
+          cargo clippy --all-targets -p pink-lake --features catalog-sqlite,catalog-postgres,s3,encryption,vortexlake -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,catalog-sqlite -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,catalog-sqlite,catalog-postgres -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features tls -- -D warnings

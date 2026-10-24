@@ -6,6 +6,9 @@
 //! `tests/pinklake.rs`.
 
 #![cfg(feature = "vortexlake")]
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 mod common;
 
@@ -13,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{FORMAT_VERSION, Lake, LakeError, save_store, validate_store};
+use pink_lake::{FORMAT_VERSION, LakeError, validate_store};
 use pinkdb::{CHUNK_SIZE, DataTable, DataType, PinkDb, Value, Vector};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -32,6 +35,17 @@ fn scratch(tag: &str) -> PathBuf {
 
 fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The helper catalog's `pink:` database path.
+fn catalog_path(lake_dir: &Path) -> PathBuf {
+    lake_dir.join("catalog.pink")
+}
+
+/// Execute a catalog-row mutation directly (corruption tests).
+fn catalog_sql(lake_dir: &Path, sql: &str) {
+    let mut db = PinkDb::open_durable(&catalog_path(lake_dir).display().to_string()).unwrap();
+    db.execute(sql).unwrap();
 }
 
 /// A store with all types, NULLs, NaN payloads, `-0.0`, a multi-chunk table,
@@ -134,14 +148,6 @@ fn assert_same_store(a: &PinkDb, b: &PinkDb) {
     }
 }
 
-fn read_json(path: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-}
-
-fn write_json(path: &Path, value: &serde_json::Value) {
-    std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
-}
-
 /// Every lake data file (`*.pink` or `*.vortex`) under `dir`, recursively.
 fn data_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -164,121 +170,10 @@ fn data_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn snapshot_roundtrip_is_bit_exact() {
-    let dir = scratch("bit_exact");
-    let db = fixture_store();
-    let original_bytes = store_bytes(&db, &dir, "original");
-
-    let mut lake = Lake::create(&dir).unwrap();
-    assert_eq!(lake.current_version(), 1, "create publishes an empty v1");
-    assert_eq!(lake.versions().unwrap(), vec![1]);
-    let report = lake.write_from_store_report(&db).unwrap();
-    assert_eq!(report.version, 2);
-    assert_eq!(report.tables, 5);
-    assert_eq!(report.rows, 3 + (CHUNK_SIZE as u64 + 100) + 1 + 2);
-    assert!(report.bytes_written > 0);
-
-    // Catalog shape: v4, one Vortex file per table, `format` declared.
-    let catalog = read_json(&dir.join("catalog.json"));
-    assert_eq!(catalog["format_version"], FORMAT_VERSION);
-    assert_eq!(
-        FORMAT_VERSION, 7,
-        "v7 records each .pink file's footer location"
-    );
-    assert_eq!(catalog["version"], 2);
-    let updated = catalog["updated"].as_str().unwrap();
-    assert_eq!(updated.len(), 24, "ISO-8601 millis: {updated}");
-    assert!(updated.ends_with('Z'), "{updated}");
-    let tables = catalog["tables"].as_object().unwrap();
-    let mut keys: Vec<&String> = tables.keys().collect();
-    keys.sort();
-    assert_eq!(
-        keys,
-        vec![
-            "analytics.a.b",
-            "analytics.u",
-            "main.big",
-            "main.empty",
-            "main.t"
-        ]
-    );
-    for (key, entry) in tables {
-        assert_eq!(entry["format"], "vortex", "{key}");
-        let files = entry["files"].as_array().unwrap();
-        assert_eq!(
-            files.len(),
-            1,
-            "the writer emits one file per table ({key})"
-        );
-        let rel = files[0]["path"].as_str().unwrap();
-        assert!(rel.starts_with("data/"), "{rel}");
-        assert!(rel.ends_with(".vortex"), "{rel}");
-        assert!(dir.join(rel).is_file(), "{rel} missing");
-        assert_eq!(files[0]["rows"], entry["rows"], "{key}");
-        // Wave 66: a Vortex file also carries a catalog-published zone map
-        // (CRC-protected, cross-checked against the footer at attach).
-        let stats = &files[0]["stats"];
-        assert_eq!(stats["table"], key.as_str(), "{key}");
-        assert_eq!(stats["file"], rel, "{key}");
-        assert_eq!(stats["rows"], entry["rows"], "{key}");
-        assert!(stats["crc32"].is_u64(), "{key}: no CRC");
-    }
-    assert!(dir.join("snapshots/1.json").is_file());
-    assert!(dir.join("snapshots/2.json").is_file());
-    assert_eq!(data_files(&dir.join("data")).len(), 5);
-    assert!(
-        data_files(&dir.join("data"))
-            .iter()
-            .all(|p| p.extension().unwrap() == "vortex")
-    );
-
-    // Latest load is value- and byte-exact.
-    let loaded = lake.load(None).unwrap();
-    assert_same_store(&db, &loaded);
-    assert_eq!(store_bytes(&loaded, &dir, "loaded"), original_bytes);
-    // NaN payload and -0.0 survive explicitly.
-    let t = loaded.table("t").unwrap();
-    match t.get(2, 3).unwrap() {
-        Value::Double(x) => assert_eq!(x.to_bits(), 0x7ff8_0000_dead_beef),
-        other => panic!("expected the NaN payload, got {other:?}"),
-    }
-    assert_eq!(t.get(0, 3), Some(Value::Double(-0.0)));
-    assert!(matches!(
-        t.get(0, 3),
-        Some(Value::Double(x)) if x.to_bits() == (-0.0f64).to_bits()
-    ));
-    // The empty table keeps its schema and no data chunks.
-    let empty = loaded.table("empty").unwrap();
-    assert_eq!(empty.num_rows(), 0);
-    assert_eq!(
-        empty.schema(),
-        vec![
-            ("x".to_string(), DataType::Integer),
-            ("y".to_string(), DataType::Varchar)
-        ]
-    );
-    assert_eq!(empty.num_chunks(), db.table("empty").unwrap().num_chunks());
-    // Multi-chunk table intact.
-    assert_eq!(loaded.table("big").unwrap().num_rows(), CHUNK_SIZE + 100);
-    assert_eq!(loaded.table("big").unwrap().num_chunks(), 2);
-    // The dotted table name restored inside `analytics`.
-    assert_eq!(
-        loaded.table_in("analytics", "a.b").unwrap().get(1, 0),
-        Some(Value::Double(-0.0))
-    );
-
-    // Version 1 is the create-time empty catalog.
-    let v1 = lake.load(Some(1)).unwrap();
-    assert_eq!(v1.list_databases(), vec!["main"]);
-    assert!(v1.list_tables().is_empty());
-    cleanup(&dir);
-}
-
-#[test]
 fn versions_accumulate_and_old_versions_stay_loadable() {
     let dir = scratch("versions");
     let mut db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     assert_eq!(lake.write_from_store(&db).unwrap(), 2);
     let v2_bytes = store_bytes(&db, &dir, "v2");
 
@@ -345,332 +240,6 @@ fn versions_accumulate_and_old_versions_stay_loadable() {
 }
 
 #[test]
-fn crash_leftovers_are_ignored() {
-    let dir = scratch("stray");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    assert_eq!(lake.write_from_store(&db).unwrap(), 2);
-
-    // A crashed save would leave exactly this kind of debris — none of it is
-    // reachable from any manifest.
-    std::fs::write(dir.join("data/main.t/deadbeef.pink"), b"junk").unwrap();
-    std::fs::create_dir_all(dir.join("data/ghost/e/")).unwrap();
-    std::fs::write(dir.join("data/ghost/e/stray.pink"), b"junk").unwrap();
-    std::fs::write(dir.join("snapshots/2.json.tmp"), b"half-written").unwrap();
-    std::fs::write(dir.join("catalog.json.tmp"), b"half-written").unwrap();
-    // A snapshot above the catalog's version (interrupted publish).
-    let mut stray: serde_json::Value = read_json(&dir.join("catalog.json"));
-    stray["version"] = serde_json::json!(99);
-    write_json(&dir.join("snapshots/99.json"), &stray);
-    std::fs::write(dir.join("snapshots/garbage.json"), b"not json").unwrap();
-
-    let lake = Lake::open(&dir).unwrap();
-    assert_eq!(lake.current_version(), 2);
-    assert_eq!(lake.versions().unwrap(), vec![1, 2], "99 is not published");
-    let loaded = lake.load(None).unwrap();
-    assert_same_store(&db, &loaded);
-    assert_eq!(lake.tables().unwrap().len(), 5);
-
-    // The next save publishes version 3 (it never touches the stray 99).
-    let mut lake = lake;
-    assert_eq!(lake.write_from_store(&db).unwrap(), 3);
-    assert_eq!(lake.versions().unwrap(), vec![1, 2, 3]);
-    assert_eq!(read_json(&dir.join("snapshots/3.json"))["version"], 3);
-    assert_same_store(&db, &lake.load(None).unwrap());
-    cleanup(&dir);
-}
-
-#[test]
-fn manifest_without_catalog_keeps_the_previous_version() {
-    let dir = scratch("catalog_stale");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    assert_eq!(lake.write_from_store(&db).unwrap(), 2);
-    let v2_bytes = store_bytes(&db, &dir, "v2");
-
-    // Simulate a crash between "snapshot manifest written" and
-    // "catalog.json replaced": v3's manifest exists, the catalog still
-    // says v2.
-    let mut v3: serde_json::Value = read_json(&dir.join("snapshots/2.json"));
-    v3["version"] = serde_json::json!(3);
-    write_json(&dir.join("snapshots/3.json"), &v3);
-
-    let lake = Lake::open(&dir).unwrap();
-    assert_eq!(lake.current_version(), 2, "the catalog is authoritative");
-    assert_eq!(lake.versions().unwrap(), vec![1, 2]);
-    assert_eq!(
-        store_bytes(&lake.load(None).unwrap(), &dir, "prev"),
-        v2_bytes
-    );
-
-    // The leftover manifest is self-contained (its data files were written
-    // first), so an explicit load works — it is ignored, not corrupt.
-    let explicit = lake.load(Some(3)).unwrap();
-    assert_eq!(store_bytes(&explicit, &dir, "explicit"), v2_bytes);
-
-    // A retry refuses to replace the (never published) stray: a save never
-    // replaces an existing snapshots/<v>.json.
-    let mut lake = lake;
-    let err = lake.write_from_store(&db).unwrap_err();
-    assert!(matches!(&err, LakeError::Conflict { .. }), "{err:?}");
-    let msg = err.to_string();
-    assert!(msg.contains("snapshot 3 already exists"), "{msg}");
-    assert!(msg.contains("refusing to replace"), "{msg}");
-    assert!(msg.contains("never published"), "{msg}");
-    assert_eq!(lake.current_version(), 2, "nothing was published");
-
-    // Deleting the unpublished stray (the documented recovery) lets the
-    // retry publish v3.
-    std::fs::remove_file(dir.join("snapshots/3.json")).unwrap();
-    assert_eq!(lake.write_from_store(&db).unwrap(), 3);
-    assert_eq!(read_json(&dir.join("snapshots/3.json"))["version"], 3);
-    cleanup(&dir);
-}
-
-#[test]
-fn corrupt_metadata_is_a_clear_error_not_a_panic() {
-    let dir = scratch("corrupt");
-    let db = fixture_store();
-
-    // Not JSON at all.
-    let mut lake = Lake::create(&dir).unwrap();
-    std::fs::write(dir.join("catalog.json"), b"not json").unwrap();
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("catalog.json"), "{err}");
-    // A live handle refuses to publish over the corrupted catalog (the
-    // pre-save check reads the same file), instead of silently clobbering
-    // whatever is there.
-    let err = lake.write_from_store(&db).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    // Removing the unreadable catalog lets open_or_create heal the lake from
-    // its empty v1 snapshot.
-    std::fs::remove_file(dir.join("catalog.json")).unwrap();
-    let mut lake = Lake::open_or_create(&dir).unwrap();
-    assert_eq!(lake.current_version(), 1);
-
-    // A valid catalog whose table references a path outside data/.
-    lake.write_from_store(&db).unwrap();
-    let mut evil = read_json(&dir.join("catalog.json"));
-    evil["tables"]["main.t"]["files"] = serde_json::json!([{"path": "../evil.pink", "rows": 3}]);
-    write_json(&dir.join("catalog.json"), &evil);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("under data/"), "{err}");
-
-    // An absolute path is refused too.
-    let mut abs = read_json(&dir.join("catalog.json"));
-    abs["tables"]["main.t"]["files"] = serde_json::json!([{"path": "/etc/passwd", "rows": 3}]);
-    write_json(&dir.join("catalog.json"), &abs);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("under data/"), "{err}");
-
-    // The current catalog, restored after each tampering below.
-    std::fs::write(dir.join("catalog.json"), serde_json::to_vec(&abs).unwrap()).unwrap();
-    let mut base = read_json(&dir.join("catalog.json"));
-    base["tables"]["main.t"]["files"] =
-        read_json(&dir.join("snapshots/2.json"))["tables"]["main.t"]["files"].clone();
-
-    // A newer format_version is named, not misparsed.
-    let mut future = base.clone();
-    future["format_version"] = serde_json::json!(8);
-    write_json(&dir.join("catalog.json"), &future);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("unsupported lake format_version 8"), "{err}");
-    assert!(err.contains("newer pinkdb"), "{err}");
-
-    // Every older catalog is refused outright (wave 102: no legacy readers).
-    for old in [1u32, 4, 6] {
-        let mut older = base.clone();
-        older["format_version"] = serde_json::json!(old);
-        write_json(&dir.join("catalog.json"), &older);
-        let err = Lake::open(&dir).unwrap_err().to_string();
-        assert!(
-            err.contains(&format!("unsupported lake format_version {old}")),
-            "{err}"
-        );
-        assert!(err.contains("older pinkdb"), "{err}");
-    }
-
-    // An entry must declare its data-file format; a missing one is corrupt
-    // metadata, not a silent `.pink` default.
-    let mut no_format = base.clone();
-    no_format["tables"]["main.t"]
-        .as_object_mut()
-        .unwrap()
-        .remove("format");
-    write_json(&dir.join("catalog.json"), &no_format);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("does not declare a data file format"), "{err}");
-
-    // A missing field is corrupt, not defaulted.
-    write_json(
-        &dir.join("catalog.json"),
-        &serde_json::json!({"format_version": 7, "version": 2, "tables": {}}),
-    );
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-
-    // A snapshot whose declared version disagrees with its file name.
-    write_json(&dir.join("catalog.json"), &base);
-    let mut wrong = base.clone();
-    wrong["version"] = serde_json::json!(7);
-    write_json(&dir.join("snapshots/5.json"), &wrong);
-    let lake = Lake::open(&dir).unwrap();
-    let err = lake.load(Some(5)).unwrap_err().to_string();
-    assert!(err.contains("declares version 7, expected 5"), "{err}");
-
-    // A referenced data file that does not exist.
-    let mut missing = base.clone();
-    missing["tables"]["main.t"]["files"][0]["path"] = serde_json::json!("data/main.t/missing.pink");
-    write_json(&dir.join("catalog.json"), &missing);
-    let lake = Lake::open(&dir).unwrap();
-    let err = lake.load(None).unwrap_err().to_string();
-    assert!(err.contains("missing.pink"), "{err}");
-    cleanup(&dir);
-}
-
-#[test]
-fn save_store_creates_open_or_create_and_errors_are_clear() {
-    let dir = scratch("create");
-    let missing = dir.join("nested/lake-here");
-    let db = fixture_store();
-
-    // A fresh (even missing-parent) directory becomes a lake.
-    assert_eq!(save_store(&db, &missing).unwrap(), 2);
-    assert_eq!(save_store(&db, &missing).unwrap(), 3);
-    let lake = Lake::open(&missing).unwrap();
-    assert_eq!(lake.current_version(), 3);
-    assert_eq!(lake.load(None).unwrap().table("t").unwrap().num_rows(), 3);
-
-    // create refuses an existing lake; open refuses a non-lake.
-    let err = Lake::create(&missing).unwrap_err().to_string();
-    assert!(err.contains("already a pink-lake directory"), "{err}");
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("not a pink-lake directory"), "{err}");
-    assert!(err.contains("no catalog.json"), "{err}");
-    cleanup(&dir);
-}
-
-#[test]
-fn a_table_entry_can_list_several_data_files() {
-    let dir = scratch("multifile");
-    let other = scratch("multifile-src");
-    let mut db = PinkDb::new();
-    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
-        .unwrap();
-    for i in 0..3 {
-        db.table_mut("t")
-            .unwrap()
-            .append_row(vec![Value::Integer(i), Value::Varchar(format!("v{i}"))])
-            .unwrap();
-    }
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap();
-
-    // A second lake with the same schema; graft its data file into the first.
-    let mut lake2 = Lake::create(&other).unwrap();
-    let mut db2 = PinkDb::new();
-    db2.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
-        .unwrap();
-    for i in 3..6 {
-        db2.table_mut("t")
-            .unwrap()
-            .append_row(vec![Value::Integer(i), Value::Varchar(format!("v{i}"))])
-            .unwrap();
-    }
-    lake2.write_from_store(&db2).unwrap();
-    let src = data_files(&other.join("data"));
-    assert_eq!(src.len(), 1);
-    let grafted_name = src[0].file_name().unwrap().to_str().unwrap().to_string();
-    let files_dir = dir.join("data/main.t");
-    std::fs::copy(&src[0], files_dir.join(&grafted_name)).unwrap();
-
-    let mut catalog = read_json(&dir.join("catalog.json"));
-    let existing = catalog["tables"]["main.t"]["files"][0].clone();
-    catalog["tables"]["main.t"]["files"] = serde_json::json!([
-        existing,
-        {"path": format!("data/main.t/{grafted_name}"), "rows": 3}
-    ]);
-    catalog["tables"]["main.t"]["rows"] = serde_json::json!(6);
-    write_json(&dir.join("catalog.json"), &catalog);
-    write_json(&dir.join("snapshots/2.json"), &catalog);
-
-    let lake = Lake::open(&dir).unwrap();
-    let loaded = lake.load(None).unwrap();
-    assert_eq!(loaded.table("t").unwrap().num_rows(), 6);
-    assert_eq!(
-        loaded.table("t").unwrap().get(4, 1),
-        Some(Value::Varchar("v4".into()))
-    );
-
-    // A row count that disagrees with the files is corrupt (caught at parse:
-    // the v4 manifest must add up).
-    catalog["tables"]["main.t"]["rows"] = serde_json::json!(999);
-    write_json(&dir.join("catalog.json"), &catalog);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("declares 999 rows"), "{err}");
-    assert!(err.contains("hold 6 rows"), "{err}");
-
-    cleanup(&dir);
-    cleanup(&other);
-}
-
-#[test]
-fn files_with_mismatched_table_names_are_rejected() {
-    let dir = scratch("mismatch");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap();
-
-    // Point main.t's catalog entry at the data file of analytics.u (with a
-    // row count that satisfies the manifest, so only the file's own identity
-    // can catch the swap).
-    let mut catalog = read_json(&dir.join("catalog.json"));
-    let u_file = catalog["tables"]["analytics.u"]["files"][0]["path"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let t_rows = catalog["tables"]["main.t"]["rows"].as_u64().unwrap();
-    catalog["tables"]["main.t"]["files"] = serde_json::json!([{"path": u_file, "rows": t_rows}]);
-    write_json(&dir.join("catalog.json"), &catalog);
-
-    let lake = Lake::open(&dir).unwrap();
-    let err = lake.load(None).unwrap_err().to_string();
-    assert!(err.contains("data file holds analytics.u"), "{err}");
-    cleanup(&dir);
-}
-
-#[test]
-fn same_schema_equal_rows_swaps_are_detected_by_identity() {
-    let dir = scratch("identity_swap");
-    let mut db = PinkDb::new();
-    db.execute("CREATE TABLE a (x INTEGER);").unwrap();
-    db.execute("CREATE TABLE b (x INTEGER);").unwrap();
-    db.execute("INSERT INTO a VALUES (1);").unwrap();
-    db.execute("INSERT INTO b VALUES (2);").unwrap();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap();
-
-    // Point `main.a` at `main.b`'s data file: name, schema and row count all
-    // match, so only the `pinkdb.table` identity can reject the swap.
-    let mut catalog = read_json(&dir.join("catalog.json"));
-    let b_file = catalog["tables"]["main.b"]["files"][0]["path"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    catalog["tables"]["main.a"]["files"] = serde_json::json!([{"path": b_file, "rows": 1}]);
-    write_json(&dir.join("catalog.json"), &catalog);
-
-    let lake = Lake::open(&dir).unwrap();
-    let err = lake.load(None).unwrap_err().to_string();
-    assert!(err.contains("data file holds main.b"), "{err}");
-    assert!(err.contains("catalog says \"main.a\""), "{err}");
-    cleanup(&dir);
-}
-
-#[test]
 fn database_names_with_a_dot_are_refused_cleanly() {
     let dir = scratch("dotted_db");
     let mut db = PinkDb::new();
@@ -678,7 +247,7 @@ fn database_names_with_a_dot_are_refused_cleanly() {
     db.execute("CREATE DATABASE \"a.b\";").unwrap();
     db.execute("CREATE TABLE \"a.b\".u (y INTEGER);").unwrap();
 
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     let err = lake.write_from_store(&db).unwrap_err().to_string();
     assert!(err.contains("contains \".\""), "{err}");
     assert!(err.contains("db.table"), "{err}");
@@ -698,7 +267,7 @@ fn table_names_stay_inside_the_data_directory() {
     db.execute("CREATE TABLE \"..\" (x INTEGER);").unwrap();
     db.execute("INSERT INTO \"odd name\" VALUES (1);").unwrap();
 
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
     assert_same_store(&db, &loaded);
@@ -724,7 +293,7 @@ fn empty_databases_and_dropped_main_are_documented_v1_limits() {
     db.execute("DROP DATABASE main;").unwrap();
     db.execute("CREATE DATABASE empty;").unwrap();
 
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
     // `only` is rebuilt; a dropped `main` and an empty database are not.
@@ -736,202 +305,6 @@ fn empty_databases_and_dropped_main_are_documented_v1_limits() {
         loaded.table_in("only", "t").unwrap().get(0, 0),
         Some(Value::Integer(5))
     );
-    cleanup(&dir);
-}
-
-#[test]
-fn tampered_versions_are_clean_errors_never_a_wrap() {
-    let dir = scratch("version_range");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap(); // v2
-
-    // `version: 0` and `version: u64::MAX` are corrupt, not wrapped or
-    // panicked on. This must hold in debug (overflow checks on) and release
-    // (wrap possible if unchecked) builds alike.
-    for bad in [0u64, u64::MAX] {
-        let mut cat = read_json(&dir.join("catalog.json"));
-        cat["version"] = serde_json::json!(bad);
-        write_json(&dir.join("catalog.json"), &cat);
-        let err = Lake::open(&dir).unwrap_err().to_string();
-        assert!(err.contains("corrupt lake metadata"), "{err}");
-        assert!(err.contains("outside the supported range 1..="), "{err}");
-        assert!(err.contains(&bad.to_string()), "{err}");
-    }
-
-    // The cap itself (`u64::MAX - 1`) still loads, but cannot be incremented.
-    // A coherent fixture now needs the catalog, its snapshot and the
-    // highest-version marker (M-7); a lone tampered catalog is refused.
-    let ceiling = u64::MAX - 1;
-    let mut cat = read_json(&dir.join("catalog.json"));
-    cat["version"] = serde_json::json!(ceiling);
-    write_json(&dir.join("catalog.json"), &cat);
-    let mut snap = cat.clone();
-    write_json(&dir.join(format!("snapshots/{ceiling}.json")), &snap);
-    let mut highest = read_json(&dir.join("highest.json"));
-    highest["version"] = serde_json::json!(ceiling);
-    write_json(&dir.join("highest.json"), &highest);
-    let _ = &mut snap;
-    let mut lake = Lake::open(&dir).unwrap();
-    assert_eq!(lake.current_version(), ceiling);
-    let catalog_before = std::fs::read(dir.join("catalog.json")).unwrap();
-    let err = lake.write_from_store(&db).unwrap_err();
-    assert!(matches!(&err, LakeError::Overflow { .. }), "{err:?}");
-    let msg = err.to_string();
-    assert!(msg.contains("version overflow"), "{msg}");
-    assert!(msg.contains("cannot be incremented"), "{msg}");
-    assert_eq!(lake.current_version(), ceiling, "the handle stays put");
-    assert_eq!(
-        std::fs::read(dir.join("catalog.json")).unwrap(),
-        catalog_before,
-        "a refused save publishes nothing"
-    );
-
-    // Snapshot manifests are validated the same way...
-    let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap["version"] = serde_json::json!(u64::MAX);
-    write_json(&dir.join("snapshots/2.json"), &snap);
-    let err = lake.load(Some(2)).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("snapshots/2.json"), "{err}");
-    // ...and the unwritable snapshot is not listed as published.
-    assert_eq!(lake.versions().unwrap(), vec![1, ceiling]);
-
-    // `load(Some(v))` for a version with no snapshot is a clean not-found,
-    // never a surprise read.
-    let err = lake.load(Some(ceiling - 1)).unwrap_err().to_string();
-    assert!(err.contains("has no snapshot version"), "{err}");
-    cleanup(&dir);
-}
-
-#[test]
-fn stale_handles_conflict_instead_of_forking_the_version_chain() {
-    let dir = scratch("stale_handle");
-    let db = fixture_store();
-    let mut a = Lake::create(&dir).unwrap();
-    a.write_from_store(&db).unwrap(); // v2
-    let mut b = Lake::open(&dir).unwrap(); // sees v2
-    a.write_from_store(&db).unwrap(); // v3
-
-    let data_files_before = data_files(&dir.join("data")).len();
-    let snap3 = std::fs::read(dir.join("snapshots/3.json")).unwrap();
-    let err = b.write_from_store(&db).unwrap_err();
-    assert!(matches!(&err, LakeError::Conflict { .. }), "{err:?}");
-    let msg = err.to_string();
-    assert!(msg.contains("write conflict"), "{msg}");
-    assert!(msg.contains("another writer published version 3"), "{msg}");
-    assert!(msg.contains("reopen the lake"), "{msg}");
-    assert_eq!(b.current_version(), 2, "the stale handle does not advance");
-    assert_eq!(
-        data_files(&dir.join("data")).len(),
-        data_files_before,
-        "a stale save writes no data files"
-    );
-    assert_eq!(
-        std::fs::read(dir.join("snapshots/3.json")).unwrap(),
-        snap3,
-        "published snapshots stay byte-identical"
-    );
-
-    // Reopening picks up the published version and the chain continues.
-    let mut b = Lake::open(&dir).unwrap();
-    assert_eq!(b.current_version(), 3);
-    assert_eq!(b.write_from_store(&db).unwrap(), 4);
-    assert_eq!(a.load(Some(3)).unwrap().table("t").unwrap().num_rows(), 3);
-    cleanup(&dir);
-}
-
-#[test]
-fn rollback_resave_refuses_to_replace_a_published_snapshot() {
-    let dir = scratch("rollback");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap(); // v2
-    let v2_catalog = std::fs::read(dir.join("catalog.json")).unwrap();
-    lake.write_from_store(&db).unwrap(); // v3
-    let v3_snapshot = std::fs::read(dir.join("snapshots/3.json")).unwrap();
-
-    // M-7: "roll back" by restoring the v2 catalog over the v3 one is
-    // refused at open, because highest.json records version 3. The marker is
-    // what makes the rollback visible; without it the old handle would have
-    // tried (and failed) to replace the published v3 snapshot.
-    std::fs::write(dir.join("catalog.json"), &v2_catalog).unwrap();
-    let err = Lake::open(&dir).unwrap_err();
-    assert!(matches!(&err, LakeError::Corrupt { .. }), "{err:?}");
-    let msg = err.to_string();
-    assert!(msg.contains("rollback detected"), "{msg}");
-    assert!(msg.contains("highest.json records version 3"), "{msg}");
-    // The authoritative v3 catalog and its snapshot are untouched.
-    assert_eq!(
-        std::fs::read(dir.join("snapshots/3.json")).unwrap(),
-        v3_snapshot,
-        "the published snapshot is never rewritten by a rollback attempt"
-    );
-    assert_eq!(
-        std::fs::read(dir.join("catalog.json")).unwrap(),
-        v2_catalog,
-        "the refused open leaves the rolled-back catalog untouched"
-    );
-    let _ = lake;
-    cleanup(&dir);
-}
-
-#[test]
-fn a_catalog_without_tables_is_corrupt_not_an_empty_lake() {
-    let dir = scratch("no_tables");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap();
-    let good_catalog = std::fs::read(dir.join("catalog.json")).unwrap();
-
-    let mut cat = read_json(&dir.join("catalog.json"));
-    cat.as_object_mut().unwrap().remove("tables");
-    write_json(&dir.join("catalog.json"), &cat);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("tables"), "{err}");
-
-    // The same missing field in a snapshot is corrupt too. The catalog of
-    // the same version is cross-checked at open (M-7), so the corruption is
-    // caught there rather than only at a later time-travel load.
-    std::fs::write(dir.join("catalog.json"), &good_catalog).unwrap();
-    let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap.as_object_mut().unwrap().remove("tables");
-    write_json(&dir.join("snapshots/2.json"), &snap);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("tables"), "{err}");
-    cleanup(&dir);
-}
-
-#[test]
-fn versions_lists_only_valid_canonical_snapshots() {
-    let dir = scratch("versions_list");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap(); // v1, v2
-    let one = std::fs::read(dir.join("snapshots/1.json")).unwrap();
-
-    // Non-canonical names are not versions: `01.json` must not list as 1,
-    // and `manifest(Some(1))` never reads it either.
-    std::fs::write(dir.join("snapshots/01.json"), &one).unwrap();
-    std::fs::write(dir.join("snapshots/1e1.json"), &one).unwrap();
-    std::fs::write(dir.join("snapshots/1.json.bak"), &one).unwrap();
-    assert_eq!(lake.versions().unwrap(), vec![1, 2]);
-
-    // A corrupt manifest is skipped, not listed (and load names the file).
-    std::fs::write(dir.join("snapshots/1.json"), b"not json").unwrap();
-    assert_eq!(lake.versions().unwrap(), vec![2]);
-    let err = lake.load(Some(1)).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("snapshots/1.json"), "{err}");
-
-    // A manifest declaring a different version than its name is skipped.
-    std::fs::write(dir.join("snapshots/1.json"), &one).unwrap();
-    let mut wrong = read_json(&dir.join("snapshots/2.json"));
-    wrong["version"] = serde_json::json!(7);
-    write_json(&dir.join("snapshots/2.json"), &wrong);
-    assert_eq!(lake.versions().unwrap(), vec![1]);
     cleanup(&dir);
 }
 
@@ -948,7 +321,7 @@ fn save_rejects_unrepresentable_stores_before_creating_a_lake() {
         .unwrap();
     let err = validate_store(&dotted).unwrap_err().to_string();
     assert!(err.contains("contains \".\""), "{err}");
-    let err = save_store(&dotted, &lake_dir).unwrap_err().to_string();
+    let err = save_store_lake(&dotted, &lake_dir).unwrap_err().to_string();
     assert!(err.contains("contains \".\""), "{err}");
     assert!(
         !lake_dir.join("catalog.json").exists(),
@@ -964,7 +337,7 @@ fn save_rejects_unrepresentable_stores_before_creating_a_lake() {
         .unwrap();
     let err = validate_store(&long).unwrap_err().to_string();
     assert!(err.contains("over the 200-byte limit"), "{err}");
-    let err = save_store(&long, &lake_dir).unwrap_err().to_string();
+    let err = save_store_lake(&long, &lake_dir).unwrap_err().to_string();
     assert!(err.contains("over the 200-byte limit"), "{err}");
     assert!(!lake_dir.join("catalog.json").exists());
     assert!(validate_store(&PinkDb::new()).is_ok());
@@ -975,120 +348,19 @@ fn save_rejects_unrepresentable_stores_before_creating_a_lake() {
     ok.execute(&format!("CREATE TABLE \"{name}\" (x INTEGER);"))
         .unwrap();
     assert!(validate_store(&ok).is_ok());
-    assert_eq!(save_store(&ok, &lake_dir).unwrap(), 2);
-    let lake = Lake::open(&lake_dir).unwrap();
+    assert_eq!(save_store_lake(&ok, &lake_dir).unwrap(), 2);
+    let lake = open_lake(&lake_dir).unwrap();
     assert_eq!(lake.load(None).unwrap().list_tables().len(), 1);
     cleanup(&dir);
 }
 
 #[cfg(unix)]
-#[test]
-fn a_failed_data_write_keeps_the_published_version() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = scratch("perm_fail");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap(); // v2
-    let catalog_before = std::fs::read(dir.join("catalog.json")).unwrap();
-
-    // Make one data directory read-only so the next save's data-file write
-    // fails mid-save. The rename/fsync machinery must leave v2 published.
-    let t_dir = dir.join("data/main.t");
-    std::fs::set_permissions(&t_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    if std::fs::write(t_dir.join("probe"), b"x").is_ok() {
-        // Running as root (or on a filesystem ignoring mode bits): the
-        // failure cannot be injected, so there is nothing to assert.
-        std::fs::remove_file(t_dir.join("probe")).ok();
-        std::fs::set_permissions(&t_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        cleanup(&dir);
-        return;
-    }
-    let err = lake.write_from_store(&db).unwrap_err().to_string();
-    assert!(err.contains("lake I/O error"), "{err}");
-    assert_eq!(lake.current_version(), 2);
-    assert_eq!(
-        std::fs::read(dir.join("catalog.json")).unwrap(),
-        catalog_before,
-        "a failed save does not touch the catalog"
-    );
-    assert_eq!(lake.versions().unwrap(), vec![1, 2]);
-
-    // Restoring permissions recovers; v3 publishes and loads.
-    std::fs::set_permissions(&t_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(lake.write_from_store(&db).unwrap(), 3);
-    assert_same_store(&db, &lake.load(None).unwrap());
-    cleanup(&dir);
-}
-
 #[cfg(unix)]
-#[test]
-fn a_catalog_rename_failure_keeps_the_previous_catalog_authoritative() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = scratch("catalog_fail");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap(); // v2
-    let catalog_before = std::fs::read(dir.join("catalog.json")).unwrap();
-
-    // The lake root read-only (subdirectories stay writable) fails exactly
-    // the last step of a save: data files and the v3 snapshot publish, the
-    // catalog replacement does not. This is the crash window between
-    // "snapshot linked" and "catalog replaced", injected without a crash.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    if std::fs::write(dir.join("probe"), b"x").is_ok() {
-        std::fs::remove_file(dir.join("probe")).ok();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        cleanup(&dir);
-        return;
-    }
-    let err = lake.write_from_store(&db).unwrap_err().to_string();
-    assert!(err.contains("lake I/O error"), "{err}");
-    assert_eq!(lake.current_version(), 2);
-    assert_eq!(
-        std::fs::read(dir.join("catalog.json")).unwrap(),
-        catalog_before,
-        "the previous catalog stayed authoritative"
-    );
-    assert!(
-        dir.join("snapshots/3.json").is_file(),
-        "the stray manifest is there"
-    );
-    assert_eq!(
-        lake.versions().unwrap(),
-        vec![1, 2],
-        "an unpublished stray is not listed"
-    );
-    assert!(
-        lake.load(Some(3)).is_ok(),
-        "the stray manifest is self-contained"
-    );
-
-    // The documented recovery: delete the unpublished stray, retry.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::remove_file(dir.join("snapshots/3.json")).unwrap();
-    assert_eq!(lake.write_from_store(&db).unwrap(), 3);
-    assert_same_store(&db, &lake.load(None).unwrap());
-    cleanup(&dir);
-}
-
-#[test]
-fn a_directory_named_catalog_json_is_corrupt_not_io_noise() {
-    let dir = scratch("catalog_dir");
-    std::fs::create_dir_all(dir.join("catalog.json")).unwrap();
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("not a regular file"), "{err}");
-    assert!(!err.contains("os error"), "{err}");
-    cleanup(&dir);
-}
-
 #[test]
 fn missing_data_files_are_reported_but_metadata_still_reads() {
     let dir = scratch("missing_files");
     let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     lake.write_from_store(&db).unwrap();
     assert!(lake.missing_data_files().unwrap().is_empty());
 
@@ -1110,92 +382,12 @@ fn missing_data_files_are_reported_but_metadata_still_reads() {
 }
 
 #[test]
-fn error_paths_point_at_the_manifest_that_is_wrong() {
-    let dir = scratch("error_paths");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap();
-
-    // A snapshot with a flat key that is not `db.table` names the snapshot.
-    let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap["tables"] = serde_json::json!({
-        "nodot": {"files": [{"path": "data/x.vortex", "rows": 1}], "rows": 1, "format": "vortex"}
-    });
-    write_json(&dir.join("snapshots/2.json"), &snap);
-    let err = lake.load(Some(2)).unwrap_err().to_string();
-    assert!(err.contains("snapshots/2.json"), "{err}");
-    assert!(err.contains("not \"db.table\""), "{err}");
-
-    // "no data files" in a snapshot names the snapshot, not the lake root.
-    let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap["tables"] = serde_json::json!({"main.t": {"files": [], "rows": 0, "format": "vortex"}});
-    write_json(&dir.join("snapshots/2.json"), &snap);
-    let err = lake.load(Some(2)).unwrap_err().to_string();
-    assert!(err.contains("snapshots/2.json"), "{err}");
-    assert!(err.contains("no data files"), "{err}");
-
-    // A snapshot row-count mismatch names the snapshot too.
-    let file = read_json(&dir.join("catalog.json"))["tables"]["main.t"]["files"][0].clone();
-    let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap["tables"]["main.t"] =
-        serde_json::json!({"files": [file], "rows": 999, "format": "vortex"});
-    write_json(&dir.join("snapshots/2.json"), &snap);
-    let err = lake.load(Some(2)).unwrap_err().to_string();
-    assert!(err.contains("snapshots/2.json"), "{err}");
-    assert!(err.contains("declares 999 rows"), "{err}");
-
-    // The same catalog-level mismatch names catalog.json.
-    let mut cat = read_json(&dir.join("catalog.json"));
-    cat["tables"]["main.t"]["rows"] = serde_json::json!(999);
-    write_json(&dir.join("catalog.json"), &cat);
-    let err = lake.load(None).unwrap_err().to_string();
-    assert!(err.contains("catalog.json"), "{err}");
-    assert!(err.contains("declares 999 rows"), "{err}");
-    cleanup(&dir);
-}
-
-#[test]
-fn an_interrupted_create_is_healed_not_bricked() {
-    let dir = scratch("interrupted_create");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap(); // v2
-
-    // Simulate a crash between the v1 snapshot link and the catalog link,
-    // on a lake whose title catalog was then removed: the empty v1 snapshot
-    // is adopted, byte-identical, instead of rewritten or refused.
-    let catalog = std::fs::read(dir.join("catalog.json")).unwrap();
-    std::fs::remove_file(dir.join("catalog.json")).unwrap();
-    let lake = Lake::open_or_create(&dir).unwrap();
-    assert_eq!(lake.current_version(), 1);
-    assert_eq!(
-        std::fs::read(dir.join("catalog.json")).unwrap(),
-        std::fs::read(dir.join("snapshots/1.json")).unwrap(),
-        "catalog and its snapshot are byte-identical"
-    );
-    std::fs::write(dir.join("catalog.json"), &catalog).unwrap();
-
-    // A snapshots/1.json that is not the empty v1 (tampered) is refused with
-    // a clear conflict, never adopted.
-    let bad = scratch("bad_adopt");
-    std::fs::create_dir_all(bad.join("snapshots")).unwrap();
-    let mut cat = read_json(&dir.join("catalog.json"));
-    cat["tables"] = serde_json::json!({"main.t": {"files": ["data/main.t/x.pink"], "rows": 1}});
-    write_json(&bad.join("snapshots/1.json"), &cat);
-    let err = Lake::open_or_create(&bad).unwrap_err();
-    assert!(matches!(&err, LakeError::Conflict { .. }), "{err:?}");
-    assert!(err.to_string().contains("refusing to adopt"), "{err}");
-    cleanup(&bad);
-    cleanup(&dir);
-}
-
-#[test]
 fn vortex_roundtrip_preserves_every_bit_pattern() {
     let dir = scratch("vortex_bits");
     let db = common::fidelity_store();
     let original_bytes = store_bytes(&db, &dir, "original");
 
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     assert_eq!(lake.format_version(), 7, "create publishes a v7 lake");
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
@@ -1257,7 +449,7 @@ fn vortex_roundtrip_preserves_every_bit_pattern() {
 fn a_corrupt_vortex_data_file_is_a_clear_error() {
     let dir = scratch("vortex_corrupt");
     let db = common::fidelity_store();
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     lake.write_from_store(&db).unwrap();
 
     let victim = data_files(&dir.join("data/main.fid"))
@@ -1267,72 +459,13 @@ fn a_corrupt_vortex_data_file_is_a_clear_error() {
     // Truncate it to a prefix: not a Vortex file anymore.
     let bytes = std::fs::read(&victim).unwrap();
     std::fs::write(&victim, &bytes[..bytes.len() / 2]).unwrap();
-    let lake = Lake::open(&dir).unwrap();
+    let lake = open_lake(&dir).unwrap();
     let err = lake.load(None).unwrap_err().to_string();
     assert!(err.contains("not a valid Vortex file"), "{err}");
     assert!(err.contains("main.fid"), "{err}");
 
     // Metadata still reads; only a load fails.
     assert!(lake.tables().unwrap().iter().any(|(k, _)| k == "main.fid"));
-    cleanup(&dir);
-}
-
-#[test]
-fn catalog_format_fields_are_validated() {
-    let dir = scratch("format_fields");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap();
-    let good = std::fs::read(dir.join("catalog.json")).unwrap();
-
-    // `format_version` 0 and `u32::MAX` are unsupported, never guessed at.
-    for bad in [0u32, u32::MAX] {
-        let mut cat = read_json(&dir.join("catalog.json"));
-        cat["format_version"] = serde_json::json!(bad);
-        write_json(&dir.join("catalog.json"), &cat);
-        let err = Lake::open(&dir).unwrap_err().to_string();
-        assert!(
-            err.contains(&format!("unsupported lake format_version {bad}")),
-            "format_version {bad}: {err}"
-        );
-    }
-
-    // A v4–v6 format id with no provider is a **per-table** refusal (wave
-    // 88, rule 5): the lake still opens, the table is listed as unavailable,
-    // and only a read/write of it fails. It is never silently treated as one
-    // of the known formats.
-    std::fs::write(dir.join("catalog.json"), &good).unwrap();
-    let mut cat = read_json(&dir.join("catalog.json"));
-    cat["tables"]["main.t"]["format"] = serde_json::json!("parquet");
-    write_json(&dir.join("catalog.json"), &cat);
-    let lake = Lake::open(&dir).unwrap();
-    let unavailable = lake.unavailable_tables().unwrap();
-    assert!(
-        unavailable
-            .iter()
-            .any(|u| u.table == "main.t" && u.format == "parquet"),
-        "{unavailable:?}"
-    );
-    assert!(
-        !lake
-            .load(None)
-            .unwrap()
-            .list_tables()
-            .contains(&"t".to_string()),
-        "the unreadable table is skipped"
-    );
-    assert!(lake.attach(None).is_ok(), "attach lists the table");
-
-    // A `format` of the wrong JSON type is corrupt too.
-    let mut cat = read_json(&dir.join("catalog.json"));
-    cat["tables"]["main.t"]["format"] = serde_json::json!(3);
-    write_json(&dir.join("catalog.json"), &cat);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-
-    // The untouched catalog still opens (the tampering was on disk only).
-    std::fs::write(dir.join("catalog.json"), &good).unwrap();
-    assert_eq!(Lake::open(&dir).unwrap().current_version(), 2);
     cleanup(&dir);
 }
 
@@ -1408,7 +541,7 @@ fn extreme_values_and_chunk_shapes_roundtrip() {
         }
     }
 
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
     assert_same_store(&db, &loaded);
@@ -1480,7 +613,7 @@ fn csv_import_chunk_boundaries_roundtrip() {
     };
     assert_eq!(sizes(db.table("t").unwrap()), vec![CHUNK_SIZE, 123]);
 
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
     assert_same_store(&db, &loaded);
@@ -1532,7 +665,7 @@ fn v3_round_trip_accepts_scan_chunks_above_the_old_cap() {
             offset += rows;
         }
     }
-    let mut lake = Lake::create(&dir).unwrap();
+    let mut lake = create_lake(&dir).unwrap();
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
     assert_same_store(&db, &loaded);
@@ -1578,8 +711,8 @@ fn attach_of_the_fidelity_store_matches_the_loaded_store() {
     let dir = scratch("attach_fidelity");
     let lake_dir = dir.join("lake");
     let db = common::fidelity_store();
-    save_store(&db, &lake_dir).unwrap();
-    let lake = Lake::open(&lake_dir).unwrap();
+    save_store_lake(&db, &lake_dir).unwrap();
+    let lake = open_lake(&lake_dir).unwrap();
     let report = lake.attach(None).unwrap();
     assert_eq!(report.version, 2);
     assert_eq!(report.format_version, FORMAT_VERSION);
@@ -1647,7 +780,7 @@ fn attach_of_the_fidelity_store_matches_the_loaded_store() {
         .schema
         .clone();
     let mut mut_attached = attached_db;
-    let mut mut_loaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    let mut mut_loaded = open_lake(&lake_dir).unwrap().load(None).unwrap();
     let mut queries = vec![
         "SELECT COUNT(*) FROM main.fid;".to_string(),
         "SELECT COUNT(*) FROM big;".to_string(),
@@ -1683,19 +816,19 @@ fn attach_of_the_fidelity_store_matches_the_loaded_store() {
 fn attach_is_pinned_to_the_requested_version() {
     let dir = scratch("attach_pinned");
     let lake_dir = dir.join("lake");
-    let lake = Lake::open_or_create(&lake_dir).unwrap();
+    let lake = open_or_create_lake(&lake_dir).unwrap();
     let mut db = PinkDb::new();
     db.execute("CREATE TABLE t (a INTEGER);").unwrap();
     db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
     let mut lake = {
         drop(lake);
-        Lake::open(&lake_dir).unwrap()
+        open_lake(&lake_dir).unwrap()
     };
     lake.write_from_store(&db).unwrap(); // version 2: 2 rows
     db.execute("INSERT INTO t VALUES (3);").unwrap();
     lake.write_from_store(&db).unwrap(); // version 3: 3 rows
 
-    let older = Lake::open(&lake_dir).unwrap().attach(Some(2)).unwrap();
+    let older = open_lake(&lake_dir).unwrap().attach(Some(2)).unwrap();
     let mut attached = PinkDb::new();
     attached.attach_lake(older.lake).unwrap();
     assert_eq!(
@@ -1703,103 +836,13 @@ fn attach_is_pinned_to_the_requested_version() {
         vec![vec![Value::Bigint(2)]],
         "the attachment is pinned to version 2"
     );
-    let latest = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let latest = open_lake(&lake_dir).unwrap().attach(None).unwrap();
     let mut attached = PinkDb::new();
     attached.attach_lake(latest.lake).unwrap();
     assert_eq!(
         select_rows(&mut attached, "SELECT COUNT(*) FROM t;"),
         vec![vec![Value::Bigint(3)]]
     );
-    cleanup(&dir);
-}
-
-/// Attach refusals: not a lake, a v1 lake, a missing data file, a row-count
-/// mismatch, and a two-file table.
-#[test]
-fn attach_refusals_are_clean_errors() {
-    // Not a lake.
-    let dir = scratch("attach_refuse");
-    let missing = dir.join("nope");
-    let err = Lake::open(&missing).unwrap_err().to_string();
-    assert!(err.contains("is not a pink-lake directory"), "{err}");
-
-    // A missing data file.
-    let lake_dir = dir.join("lake");
-    let db = common::fidelity_store();
-    save_store(&db, &lake_dir).unwrap();
-    for path in data_files(&lake_dir) {
-        std::fs::remove_file(&path).unwrap();
-    }
-    let lake = Lake::open(&lake_dir).unwrap();
-    let err = lake.attach(None).unwrap_err().to_string();
-    assert!(
-        err.contains("is missing") || err.contains("loading data file"),
-        "{err}"
-    );
-
-    // A row-count mismatch (the manifest lies about the file).
-    let lake_dir = dir.join("wrong_rows");
-    save_store(&db, &lake_dir).unwrap();
-    let mut catalog = read_json(&lake_dir.join("catalog.json"));
-    let key = catalog["tables"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .next()
-        .unwrap()
-        .clone();
-    let rows = catalog["tables"][&key]["rows"].as_u64().unwrap();
-    catalog["tables"][&key]["rows"] = serde_json::json!(rows + 1);
-    write_json(&lake_dir.join("catalog.json"), &catalog);
-    let err = Lake::open(&lake_dir).unwrap_err().to_string();
-    assert!(err.contains("manifest disagrees with itself"), "{err}");
-    assert!(
-        err.contains(&format!("declares {} rows", rows + 1)),
-        "{err}"
-    );
-
-    // A multi-file table (the v4 append shape) attaches: the descriptors
-    // merge the files' statistics, and materialization unions them in order.
-    let lake_dir = dir.join("two_files");
-    save_store(&db, &lake_dir).unwrap();
-    let files = data_files(&lake_dir);
-    let data_dir = files[0].parent().unwrap().to_path_buf();
-    let second = data_dir.join("second.vortex");
-    std::fs::copy(&files[0], &second).unwrap();
-    let rel_second = second
-        .strip_prefix(&lake_dir)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let mut catalog = read_json(&lake_dir.join("catalog.json"));
-    let key = catalog["tables"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .next()
-        .unwrap()
-        .clone();
-    let first_file = catalog["tables"][&key]["files"][0].clone();
-    let first_rows = first_file["rows"].as_u64().unwrap();
-    catalog["tables"][&key]["files"] = serde_json::json!([
-        first_file,
-        {"path": rel_second, "rows": first_rows}
-    ]);
-    catalog["tables"][&key]["rows"] = serde_json::json!(first_rows * 2);
-    write_json(&lake_dir.join("catalog.json"), &catalog);
-    let lake = Lake::open(&lake_dir).unwrap();
-    let report = lake.attach(None).unwrap();
-    let attached = report.lake;
-    let table = attached
-        .tables()
-        .iter()
-        .find(|t| format!("{}.{}", t.db, t.table) == key)
-        .unwrap();
-    assert_eq!(table.rows, first_rows * 2, "the manifest's logical rows");
-    // The union materializes in file order (the copied file appended).
-    let union_rows = attached.load(&table.db, &table.table).unwrap();
-    assert_eq!(union_rows.num_rows() as u64, first_rows * 2);
-    assert_eq!(union_rows.get(0, 0), union_rows.get(first_rows as usize, 0));
     cleanup(&dir);
 }
 
@@ -1814,7 +857,7 @@ fn time_travel_lake(tag: &str) -> (PathBuf, PathBuf, Vec<pink_lake::SnapshotInfo
     let mut db = PinkDb::new();
     db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
         .unwrap();
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
     db.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two');")
         .unwrap();
     lake.write_from_store(&db).unwrap();
@@ -1824,7 +867,7 @@ fn time_travel_lake(tag: &str) -> (PathBuf, PathBuf, Vec<pink_lake::SnapshotInfo
     std::thread::sleep(std::time::Duration::from_millis(5));
     db.execute("INSERT INTO t VALUES (4, 'four');").unwrap();
     lake.write_from_store(&db).unwrap();
-    let records = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
+    let records = open_lake(&lake_dir).unwrap().snapshots().unwrap();
     (dir, lake_dir, records)
 }
 
@@ -1848,7 +891,7 @@ fn time_travel_reads_exact_old_versions() {
         records.iter().map(|r| r.version).collect::<Vec<_>>(),
         vec![1, 2, 3, 4]
     );
-    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let report = open_lake(&lake_dir).unwrap().attach(None).unwrap();
     assert_eq!(report.version, 4);
     let mut db = PinkDb::new();
     db.attach_lake(report.lake.clone()).unwrap();
@@ -1943,7 +986,7 @@ fn time_travel_timestamp_resolves_inclusively() {
             .time
             .clone()
     };
-    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let report = open_lake(&lake_dir).unwrap().attach(None).unwrap();
     let mut db = PinkDb::new();
     db.attach_lake(report.lake.clone()).unwrap();
 
@@ -2022,7 +1065,7 @@ fn time_travel_timestamp_resolves_inclusively() {
 #[test]
 fn time_travel_unknown_versions_are_clean_errors() {
     let (dir, lake_dir, _) = time_travel_lake("tt_unknown");
-    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let report = open_lake(&lake_dir).unwrap().attach(None).unwrap();
     let mut db = PinkDb::new();
     db.attach_lake(report.lake.clone()).unwrap();
     for sql in [
@@ -2056,7 +1099,7 @@ fn time_travel_unknown_versions_are_clean_errors() {
     // A table that did not exist at the target version is named in the error.
     let mut db2 = PinkDb::new();
     db2.execute("CREATE TABLE later (y INTEGER);").unwrap();
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = open_lake(&lake_dir).unwrap();
     lake.write_from_store(&db2).unwrap();
     let report = lake.attach(None).unwrap();
     let mut db3 = PinkDb::new();
@@ -2075,7 +1118,7 @@ fn time_travel_unknown_versions_are_clean_errors() {
 #[test]
 fn time_travel_stats_fast_paths_do_not_decode() {
     let (dir, lake_dir, _) = time_travel_lake("tt_stats");
-    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let report = open_lake(&lake_dir).unwrap().attach(None).unwrap();
     let lake = Arc::clone(&report.lake);
     let mut db = PinkDb::new();
     db.attach_lake(report.lake.clone()).unwrap();
@@ -2122,7 +1165,7 @@ fn time_travel_stats_fast_paths_do_not_decode() {
 #[test]
 fn time_travel_is_capped_at_the_attached_version() {
     let (dir, lake_dir, _) = time_travel_lake("tt_capped");
-    let report = Lake::open(&lake_dir).unwrap().attach(Some(2)).unwrap();
+    let report = open_lake(&lake_dir).unwrap().attach(Some(2)).unwrap();
     assert_eq!(report.version, 2);
     let mut db = PinkDb::new();
     db.attach_lake(report.lake.clone()).unwrap();
@@ -2148,6 +1191,142 @@ fn time_travel_is_capped_at_the_attached_version() {
     cleanup(&dir);
 }
 
+#[test]
+fn save_store_creates_open_or_create_and_errors_are_clear() {
+    let dir = scratch("create");
+    let missing = dir.join("nested/lake-here");
+    let db = fixture_store();
+
+    // A fresh (even missing-parent) directory becomes a lake.
+    assert_eq!(save_store_lake(&db, &missing).unwrap(), 2);
+    assert_eq!(save_store_lake(&db, &missing).unwrap(), 3);
+    let lake = open_lake(&missing).unwrap();
+    assert_eq!(lake.current_version(), 3);
+    assert_eq!(lake.load(None).unwrap().table("t").unwrap().num_rows(), 3);
+
+    // create refuses an existing lake; open refuses a non-lake.
+    let err = create_lake(&missing).unwrap_err().to_string();
+    assert!(err.contains("already a pink-lake"), "{err}");
+    let err = open_lake(&dir).unwrap_err().to_string();
+    assert!(err.contains("not a pink-lake"), "{err}");
+    cleanup(&dir);
+}
+
+#[test]
+fn a_table_entry_can_list_several_data_files() {
+    let dir = scratch("multifile");
+    let other = scratch("multifile-src");
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+        .unwrap();
+    for i in 0..3 {
+        db.table_mut("t")
+            .unwrap()
+            .append_row(vec![Value::Integer(i), Value::Varchar(format!("v{i}"))])
+            .unwrap();
+    }
+    let mut lake = create_lake(&dir).unwrap();
+    lake.write_from_store(&db).unwrap();
+
+    // A second lake with the same schema; graft its data file into the first.
+    let mut lake2 = create_lake(&other).unwrap();
+    let mut db2 = PinkDb::new();
+    db2.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+        .unwrap();
+    for i in 3..6 {
+        db2.table_mut("t")
+            .unwrap()
+            .append_row(vec![Value::Integer(i), Value::Varchar(format!("v{i}"))])
+            .unwrap();
+    }
+    lake2.write_from_store(&db2).unwrap();
+    let src = data_files(&other.join("data"));
+    assert_eq!(src.len(), 1);
+    let grafted_name = src[0].file_name().unwrap().to_str().unwrap().to_string();
+    let files_dir = dir.join("data/main.t");
+    std::fs::copy(&src[0], files_dir.join(&grafted_name)).unwrap();
+
+    // Register the copied file through the public seam: the entry now lists
+    // two data files and reads their union in order.
+    let rel = format!("data/main.t/{grafted_name}");
+    let mut lake = open_lake(&dir).unwrap();
+    lake.add_data_files("main.t", &[rel]).unwrap();
+    let loaded = lake.load(None).unwrap();
+    assert_eq!(loaded.table("t").unwrap().num_rows(), 6);
+    assert_eq!(
+        loaded.table("t").unwrap().get(4, 1),
+        Some(Value::Varchar("v4".into()))
+    );
+
+    cleanup(&dir);
+    cleanup(&other);
+}
+
+#[test]
+fn stale_handles_conflict_instead_of_forking_the_version_chain() {
+    let dir = scratch("stale_handle");
+    let db = fixture_store();
+    let mut a = create_lake(&dir).unwrap();
+    a.write_from_store(&db).unwrap(); // v2
+    let mut b = open_lake(&dir).unwrap(); // sees v2
+    a.write_from_store(&db).unwrap(); // v3
+
+    let data_files_before = data_files(&dir.join("data")).len();
+    let err = b.write_from_store(&db).unwrap_err();
+    assert!(matches!(&err, LakeError::Conflict { .. }), "{err:?}");
+    let msg = err.to_string();
+    assert!(msg.contains("write conflict"), "{msg}");
+    assert!(msg.contains("another writer published version 3"), "{msg}");
+    assert!(msg.contains("reopen the lake"), "{msg}");
+    assert_eq!(b.current_version(), 2, "the stale handle does not advance");
+    assert_eq!(
+        data_files(&dir.join("data")).len(),
+        data_files_before,
+        "a stale save writes no data files"
+    );
+
+    // Reopening picks up the published version and the chain continues.
+    let mut b = open_lake(&dir).unwrap();
+    assert_eq!(b.current_version(), 3);
+    assert_eq!(b.write_from_store(&db).unwrap(), 4);
+    assert_eq!(a.load(Some(3)).unwrap().table("t").unwrap().num_rows(), 3);
+    cleanup(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_data_write_keeps_the_published_version() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch("perm_fail");
+    let db = fixture_store();
+    let mut lake = create_lake(&dir).unwrap();
+    lake.write_from_store(&db).unwrap(); // v2
+
+    // Make one data directory read-only so the next save's data-file write
+    // fails mid-save. The rename/fsync machinery must leave v2 published.
+    let t_dir = dir.join("data/main.t");
+    std::fs::set_permissions(&t_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(t_dir.join("probe"), b"x").is_ok() {
+        // Running as root (or on a filesystem ignoring mode bits): the
+        // failure cannot be injected, so there is nothing to assert.
+        std::fs::remove_file(t_dir.join("probe")).ok();
+        std::fs::set_permissions(&t_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cleanup(&dir);
+        return;
+    }
+    let err = lake.write_from_store(&db).unwrap_err().to_string();
+    assert!(err.contains("lake I/O error"), "{err}");
+    assert_eq!(lake.current_version(), 2);
+    assert_eq!(lake.versions().unwrap(), vec![1, 2]);
+
+    // Restoring permissions recovers; v3 publishes and loads.
+    std::fs::set_permissions(&t_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(lake.write_from_store(&db).unwrap(), 3);
+    assert_same_store(&db, &lake.load(None).unwrap());
+    cleanup(&dir);
+}
+
 /// Commit messages and change summaries are recorded per version, cleared
 /// after the save that publishes them, and survive a reopen.
 #[test]
@@ -2155,7 +1334,7 @@ fn snapshot_records_carry_messages_and_change_summaries() {
     let dir = scratch("snapshot_records");
     let lake_dir = dir.join("lake");
     let mut db = PinkDb::new();
-    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut lake = open_or_create_lake(&lake_dir).unwrap();
 
     // Version 2: two tables, an author and a message.
     db.execute("CREATE TABLE t (x INTEGER);").unwrap();
@@ -2177,7 +1356,7 @@ fn snapshot_records_carry_messages_and_change_summaries() {
     lake.write_from_store(&db).unwrap();
 
     // Reopened from disk, the records are exactly what each save recorded.
-    let records = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
+    let records = open_lake(&lake_dir).unwrap().snapshots().unwrap();
     assert_eq!(records.len(), 4);
     assert_eq!(records[0].version, 1);
     assert_eq!(records[0].author, None);
@@ -2219,25 +1398,16 @@ fn snapshot_records_carry_messages_and_change_summaries() {
         assert!(record.time_micros.is_some(), "{}", record.time);
     }
 
-    // The record is in the manifest JSON itself (additive fields next to the
-    // pre-wave-64 shape).
-    let catalog = read_json(&lake_dir.join("catalog.json"));
-    assert_eq!(catalog["commit_message"], "drop u");
-    assert_eq!(catalog["author"], "bob");
-    assert_eq!(catalog["changes"]["tables_dropped"][0], "main.u");
     // A save that fails keeps the pending record for the retry — and
     // publishes nothing.
-    let mut stale = Lake::open(&lake_dir).unwrap();
-    Lake::open(&lake_dir)
-        .unwrap()
-        .write_from_store(&db)
-        .unwrap();
+    let mut stale = open_lake(&lake_dir).unwrap();
+    open_lake(&lake_dir).unwrap().write_from_store(&db).unwrap();
     stale.set_commit_message(Some("carol".to_string()), Some("retry me".to_string()));
     assert!(
         stale.write_from_store(&db).is_err(),
         "stale handle conflicts"
     );
-    let records_after = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
+    let records_after = open_lake(&lake_dir).unwrap().snapshots().unwrap();
     assert_eq!(records_after.len(), 5);
     assert_eq!(records_after[3].message.as_deref(), Some("drop u"));
     assert_eq!(records_after[4].message, None, "the winner records nothing");
@@ -2250,53 +1420,104 @@ fn snapshot_records_carry_messages_and_change_summaries() {
     cleanup(&dir);
 }
 
-/// A snapshot whose publish time does not parse (a hand-edited/tampered
-/// manifest) is still a version — `AT (VERSION => n)` reads it — but it is
-/// excluded from `AT (TIMESTAMP => …)` resolution rather than guessed at, and
-/// `snapshots()` reports `time_micros: None` with the raw string.
+/// Attach refusals: not a lake, a v1 lake, a missing data file, a row-count
+/// mismatch, and a two-file table.
 #[test]
-fn unparseable_snapshot_times_are_listed_but_never_guessed_at() {
-    let (dir, lake_dir, records) = time_travel_lake("tt_bad_time");
-    let v4 = lake_dir.join("snapshots/4.json");
-    let original_time = records[3].time.clone();
-    let tampered = std::fs::read_to_string(&v4)
-        .unwrap()
-        .replace(&original_time, "not-a-time");
-    assert_ne!(tampered, std::fs::read_to_string(&v4).unwrap());
-    std::fs::write(&v4, tampered).unwrap();
+fn attach_refusals_are_clean_errors() {
+    // Not a lake.
+    let dir = scratch("attach_refuse");
+    let missing = dir.join("nope");
+    let err = open_lake(&missing).unwrap_err().to_string();
+    assert!(err.contains("not a pink-lake"), "{err}");
 
-    let records = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
-    assert_eq!(records.len(), 4);
-    assert_eq!(records[3].time, "not-a-time");
-    assert_eq!(records[3].time_micros, None);
-    // The rest of the record is untouched by the tampered time.
-    assert!(records[3].changes.is_some());
-
-    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
-    let mut db = PinkDb::new();
-    db.attach_lake(report.lake.clone()).unwrap();
-    // The version still resolves and reads its four rows.
-    assert_eq!(
-        try_rows(&mut db, "SELECT COUNT(*) FROM t AT (VERSION => 4);").unwrap(),
-        vec![vec![Value::Bigint(4)]]
-    );
-    // The timestamp the tampered manifest used to carry no longer resolves to
-    // v4: the newest *parseable* snapshot at or before it is v3.
-    let err = try_rows(
-        &mut db,
-        &format!(
-            "SELECT COUNT(*) FROM t AT (TIMESTAMP => TIMESTAMP '{}');",
-            original_time.replace('T', " ").trim_end_matches('Z')
-        ),
-    );
-    match err {
-        Ok(rows) => assert_eq!(
-            rows,
-            vec![vec![Value::Bigint(3)]],
-            "an unparseable time must be skipped, not guessed"
-        ),
-        Err(e) => panic!("{e}"),
+    // A missing data file.
+    let lake_dir = dir.join("lake");
+    let db = fixture_store();
+    save_store_lake(&db, &lake_dir).unwrap();
+    for path in data_files(&lake_dir.join("data")) {
+        std::fs::remove_file(&path).unwrap();
     }
+    let lake = open_lake(&lake_dir).unwrap();
+    let err = lake.attach(None).unwrap_err().to_string();
+    assert!(
+        err.contains("is missing") || err.contains("loading data file"),
+        "{err}"
+    );
+
+    // A row-count mismatch: the catalog's record_count is negative (corrupt
+    // rows are a clean error, never a panic). A lifted file is detected by
+    // the loader when the file's actual rows disagree.
+    let lake_dir = dir.join("wrong_rows");
+    save_store_lake(&db, &lake_dir).unwrap();
+    catalog_sql(
+        &lake_dir,
+        "UPDATE ducklake_data_file SET record_count = -1;",
+    );
+    let err = open_lake(&lake_dir)
+        .and_then(|lake| lake.attach(None))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("corrupt") || err.contains("record"), "{err}");
+
+    // A two-file table attaches: the descriptors merge the files' statistics,
+    // and materialization unions them in order.
+    let lake_dir = dir.join("two_files");
+    save_store_lake(&db, &lake_dir).unwrap();
+    let files: Vec<PathBuf> = data_files(&lake_dir.join("data"))
+        .into_iter()
+        .filter(|p| p.parent().is_some_and(|d| d.ends_with("main.t")))
+        .collect();
+    assert_eq!(files.len(), 1);
+    let mut lake = open_lake(&lake_dir).unwrap();
+    let data_dir = files[0].parent().unwrap().to_path_buf();
+    let ext = files[0]
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("pink");
+    let second = data_dir.join(format!("second.{ext}"));
+    std::fs::copy(&files[0], &second).unwrap();
+    let rel_second = second
+        .strip_prefix(&lake_dir)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let key = "main.t".to_string();
+    let original = lake
+        .load(None)
+        .unwrap()
+        .table_in("main", "t")
+        .unwrap()
+        .num_rows() as u64;
+    lake.add_data_files(&key, &[rel_second]).unwrap();
+    let report = lake.attach(None).unwrap();
+    let attached = report.lake;
+    let table = attached
+        .tables()
+        .iter()
+        .find(|t| format!("{}.{}", t.db, t.table) == key)
+        .unwrap();
+    let first_rows = files.len() as u64; // one file per original table
+    assert_eq!(table.rows, original * 2, "both files are listed");
+    let union_rows = attached.load(&table.db, &table.table).unwrap();
+    assert_eq!(union_rows.num_rows() as u64, original * 2);
+    let _ = first_rows;
+    cleanup(&dir);
+}
+
+#[test]
+fn an_interrupted_create_is_healed_not_bricked() {
+    let dir = scratch("interrupted_create");
+    let db = fixture_store();
+    // A create that died after the catalog database file appeared but before
+    // its first transaction leaves an empty `pink:` DB. Opening it as a lake
+    // says "not a lake"; open-or-create initializes it instead of bricking.
+    let catalog = catalog_path(&dir);
+    std::fs::create_dir_all(dir.clone()).unwrap();
+    drop(PinkDb::open_durable(&catalog.display().to_string()).unwrap());
+    let mut lake = open_or_create_lake(&dir).unwrap();
+    assert_eq!(lake.current_version(), 1);
+    assert_eq!(lake.write_from_store(&db).unwrap(), 2);
+    assert_eq!(lake.load(None).unwrap().table("t").unwrap().num_rows(), 3);
     cleanup(&dir);
 }
 
@@ -2324,7 +1545,7 @@ fn lake_artifacts_are_owner_only_and_existing_ones_are_tightened() {
 
     let dir = scratch("artifact_modes");
     let db = fixture_store();
-    save_store(&db, &dir).unwrap();
+    save_store_lake(&db, &dir).unwrap();
 
     let mut files = Vec::new();
     files_under(&dir, &mut files);
@@ -2339,71 +1560,71 @@ fn lake_artifacts_are_owner_only_and_existing_ones_are_tightened() {
     }
 
     // A pre-fix lake: chmod the catalog and one data file to 0644, then open.
-    let catalog = dir.join("catalog.json");
-    let data = data_files(&dir).into_iter().next().unwrap();
+    let catalog = {
+        let wal = PathBuf::from(format!("{}.wal", catalog_path(&dir).display()));
+        if wal.exists() {
+            wal
+        } else {
+            catalog_path(&dir)
+        }
+    };
+    let data = data_files(&dir.join("data")).into_iter().next().unwrap();
     std::fs::set_permissions(&catalog, std::fs::Permissions::from_mode(0o644)).unwrap();
     std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let _lake = Lake::open(&dir).unwrap();
+    let _lake = open_lake(&dir).unwrap();
     assert_eq!(mode(&catalog), 0o600, "catalog was not tightened on open");
     assert_eq!(mode(&data), 0o600, "data file was not tightened on open");
     cleanup(&dir);
 }
 
-/// M-7 (plaintext): the lake identity binds the catalog/snapshots to one
-/// lake; a same-version manifest from another lake is refused, and the id is
-/// stable across opens.
 #[test]
-fn plaintext_lake_identity_refuses_cross_lake_substitution() {
-    let dir = scratch("identity_plain");
-    let a = dir.join("a");
-    let b = dir.join("b");
+fn corrupt_metadata_is_a_clear_error_not_a_panic() {
     let db = fixture_store();
-    let mut lake_a = Lake::create(&a).unwrap();
-    lake_a.write_from_store(&db).unwrap();
-    let id_a = lake_a.lake_id().to_string();
-    assert_eq!(id_a.len(), 32);
-    assert!(id_a.bytes().all(|c| c.is_ascii_hexdigit()));
-    assert_eq!(Lake::open(&a).unwrap().lake_id(), id_a);
 
-    let mut lake_b = Lake::create(&b).unwrap();
-    lake_b.write_from_store(&db).unwrap();
-    assert_ne!(lake_b.lake_id(), id_a);
-
-    std::fs::copy(b.join("catalog.json"), a.join("catalog.json")).unwrap();
-    let err = Lake::open(&a).unwrap_err();
-    assert!(matches!(err, LakeError::Corrupt { .. }), "{err:?}");
-    assert!(err.to_string().contains("another lake"), "{err}");
-
-    // Restore A's catalog and swap only its same-version snapshot.
-    let good = std::fs::read(a.join("snapshots/2.json")).unwrap();
-    std::fs::write(a.join("catalog.json"), &good).unwrap();
-    Lake::open(&a).unwrap();
-    std::fs::copy(b.join("snapshots/2.json"), a.join("snapshots/2.json")).unwrap();
-    let err = Lake::open(&a).unwrap_err();
-    assert!(matches!(err, LakeError::Corrupt { .. }), "{err:?}");
+    // A negative record count is corrupt rows, not a saturating zero.
+    let dir = scratch("corrupt_rows");
+    save_store_lake(&db, &dir).unwrap();
+    catalog_sql(&dir, "UPDATE ducklake_data_file SET record_count = -1;");
+    let err = open_lake(&dir)
+        .and_then(|lake| lake.load(None))
+        .unwrap_err()
+        .to_string();
     assert!(
-        err.to_string().contains("another lake") || err.to_string().contains("snapshot disagree"),
+        err.contains("corrupt") && err.contains("record_count"),
         "{err}"
     );
-    cleanup(&dir);
-}
 
-/// M-7: the snapshot file name and the manifest's declared version must
-/// agree (catalog.version == its snapshot's version).
-#[test]
-fn snapshot_version_must_match_its_file() {
-    let dir = scratch("snapshot_version");
-    let db = fixture_store();
-    let mut lake = Lake::create(&dir).unwrap();
-    lake.write_from_store(&db).unwrap(); // v2
-    let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap["version"] = serde_json::json!(3);
-    write_json(&dir.join("snapshots/2.json"), &snap);
-    let err = Lake::open(&dir).unwrap_err();
-    assert!(matches!(err, LakeError::Corrupt { .. }), "{err:?}");
+    // A data-file path that escapes the table directory is refused.
+    let dir = scratch("corrupt_escape");
+    save_store_lake(&db, &dir).unwrap();
+    catalog_sql(&dir, "UPDATE ducklake_data_file SET path = '../evil.pink';");
+    let err = open_lake(&dir)
+        .and_then(|lake| lake.attach(None))
+        .unwrap_err()
+        .to_string();
     assert!(
-        err.to_string().contains("declares version 3, expected 2"),
+        err.contains("corrupt") || err.contains("evil.pink"),
         "{err}"
     );
-    cleanup(&dir);
+
+    // An unknown file format is a per-table refusal, never a panic.
+    let dir = scratch("corrupt_format");
+    save_store_lake(&db, &dir).unwrap();
+    catalog_sql(&dir, "UPDATE pinkdb_table SET format = 'no-such-format';");
+    let lake = open_lake(&dir).unwrap();
+    let unavailable = lake.unavailable_tables().unwrap();
+    assert!(
+        unavailable.iter().any(|t| t.format == "no-such-format"),
+        "{unavailable:?}"
+    );
+
+    // A referenced data file that does not exist is a clean load error.
+    let dir = scratch("corrupt_missing");
+    save_store_lake(&db, &dir).unwrap();
+    catalog_sql(&dir, "UPDATE ducklake_data_file SET path = 'missing.pink';");
+    let err = open_lake(&dir)
+        .and_then(|lake| lake.load(None))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("missing.pink"), "{err}");
 }

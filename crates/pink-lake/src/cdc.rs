@@ -61,14 +61,11 @@
 //! (expired by `expire_snapshots`) or a cleaned delete/data file makes the
 //! read a clean error naming the object, never a silently partial answer.
 
-use std::path::Path;
-
 use pinkdb::{DataTable, Value};
 
 use crate::catalog::{CommitManifest, DeleteRef, TableEntry};
 use crate::local::CATALOG_FILE;
 use crate::schema::TableSchema;
-use crate::storage::Storage;
 use crate::{Lake, LakeError, Result, only_table, split_key, validate_rel_path};
 
 /// What one [`ChangeRow`] is: the row version was added (`Insert`) or ended
@@ -237,7 +234,7 @@ impl Lake {
         }
         // The per-version audit trail: `commits/<v>.json`.
         for version in start..=end {
-            let Some(delta) = read_commit_manifest(&*self.storage, &self.root, version)? else {
+            let Some(delta) = read_commit_manifest(&*self.store, version)? else {
                 // Version 1 is the empty create manifest and never carries a
                 // delta; anything else missing was expired or cleaned.
                 if version == 1 {
@@ -476,7 +473,7 @@ impl Lake {
         if version <= 1 {
             return Ok(false);
         }
-        match crate::manifest_for(&*self.storage, &self.root, Some(version - 1)) {
+        match crate::manifest_for(&*self.store, &self.root, Some(version - 1)) {
             Ok((manifest, _)) => Ok(manifest.tables.contains_key(table)),
             Err(LakeError::VersionNotFound { .. }) | Err(LakeError::Io { .. }) => {
                 Err(LakeError::Corrupt {
@@ -526,29 +523,23 @@ fn validate_commit_paths(manifest: &CommitManifest) -> Result<()> {
     Ok(())
 }
 
-/// Read one `commits/<v>.json`; `None` when the object does not exist.
+/// Read one commit's typed delta (derived from the DuckLake rows); `None`
+/// when the version has no commit row.
 fn read_commit_manifest(
-    storage: &dyn Storage,
-    _root: &Path,
+    store: &dyn crate::metadata::MetadataStore,
     version: u64,
 ) -> Result<Option<CommitManifest>> {
-    let rel = format!("commits/{version}.json");
-    let path = storage.abs(&rel);
-    let bytes = match storage.read(&rel, &format!("reading {}", path.display())) {
-        Ok(bytes) => bytes,
-        Err(LakeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
-        }
-        Err(e) => return Err(e),
+    let Some(bytes) = store.commit_manifest(version)? else {
+        return Ok(None);
     };
     let manifest: CommitManifest =
         serde_json::from_slice(&bytes).map_err(|e| LakeError::Corrupt {
-            path: path.clone(),
+            path: std::path::PathBuf::from(format!("commit {version}")),
             message: e.to_string(),
         })?;
     if manifest.version != version {
         return Err(LakeError::Corrupt {
-            path,
+            path: std::path::PathBuf::from(format!("commit {version}")),
             message: format!(
                 "commit manifest declares version {}, but its name says {version}",
                 manifest.version

@@ -12,11 +12,13 @@
 //! time for both formats on the current machine. `vortexlake` builds only.
 
 #![cfg(feature = "vortexlake")]
+#[path = "common/local_lake.rs"]
+mod local_lake;
+use local_lake::*;
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use pink_lake::Lake;
 use pinkdb::PinkDb;
 
 fn scratch(tag: &str) -> PathBuf {
@@ -64,7 +66,7 @@ fn measure_sales_1m_vortex_vs_pink() {
 
     let dir = scratch("1m");
     let lake = dir.join("vortex_lake");
-    let mut lake = Lake::create(&lake).unwrap();
+    let mut lake = create_lake(&lake).unwrap();
     let t = Instant::now();
     let report = lake.write_from_store_report(&db).unwrap();
     let save_vortex = t.elapsed();
@@ -125,7 +127,7 @@ fn measure_incremental_append_rewrites_zero_bytes() {
     let rows = pinkdb::csv::import_csv(&mut db, csv.to_str().unwrap(), None).unwrap();
     let dir = scratch("1m_append");
     let lake_dir = dir.join("lake");
-    let mut lake = Lake::create(&lake_dir).unwrap();
+    let mut lake = create_lake(&lake_dir).unwrap();
     let t = Instant::now();
     lake.write_from_store(&db).unwrap();
     let save = t.elapsed();

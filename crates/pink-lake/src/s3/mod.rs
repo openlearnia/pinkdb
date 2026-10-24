@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use pinkdb_httpfs::s3::{Condition, Get, ListPage, Put, ResolvedS3, S3Client};
 use pinkdb_httpfs::{ConfigError, Error as HttpfsError};
 
-use crate::storage::{Head, LocalCopy, ObjectInfo, Storage, StorageStats, VersionTag};
+use crate::storage::{Head, LocalCopy, ObjectInfo, Storage, StorageStats};
 use crate::{LakeError, Result};
 
 pub use pinkdb_httpfs::{DEFAULT_RETRIES, S3Config};
@@ -49,13 +49,6 @@ const MAX_LIST_PAGES: usize = 10_000;
 /// `PINKDB_HTTPFS_PARALLELISM` (0/1 = one part at a time).
 const DOWNLOAD_PART_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The message every refused degraded write carries. The task of the client
-/// is to be safe by default: a check-then-put fallback cannot keep the
-/// single-writer contract, so it needs an explicit opt-in.
-const DEGRADED_HINT: &str = "this endpoint does not support conditional writes; concurrent-safe \
-    saves are unavailable. Set PINKDB_S3_ALLOW_DEGRADED=1 (or S3Config::allow_degraded(true)) to \
-    accept a SINGLE-WRITER guarantee with a small race window";
-
 /// One S3 backend rooted at `s3://bucket/prefix`.
 #[derive(Debug)]
 pub(crate) struct S3Storage {
@@ -64,13 +57,6 @@ pub(crate) struct S3Storage {
     root: PathBuf,
     /// The object-key prefix (no trailing slash; empty = bucket root).
     prefix: String,
-    /// Set once the endpoint has proven it does not honor conditional
-    /// headers. In the default mode later writes refuse
-    /// ([`LakeError::UnsupportedEndpoint`]); with the explicit opt-in they
-    /// use the single-writer check-then-put fallback.
-    degraded: AtomicBool,
-    /// Whether the degraded fallback is explicitly accepted.
-    allow_degraded: bool,
     /// Set once a request has succeeded, so a later 404 does not have to
     /// probe whether the *bucket* is the missing thing.
     bucket_confirmed: AtomicBool,
@@ -105,68 +91,8 @@ impl S3Storage {
             client: S3Client::from_resolved(resolved),
             prefix: resolved.prefix().to_string(),
             root,
-            degraded: AtomicBool::new(false),
-            allow_degraded: resolved.allow_degraded(),
             bucket_confirmed: AtomicBool::new(false),
             list_page_cap: MAX_LIST_PAGES,
-        }
-    }
-
-    /// The refusal every write gets when the endpoint rejects conditionals
-    /// and the degraded fallback was not explicitly accepted.
-    fn unsupported_conditional_error(&self) -> LakeError {
-        LakeError::UnsupportedEndpoint {
-            path: self.root.clone(),
-            message: DEGRADED_HINT.to_string(),
-        }
-    }
-
-    /// Before a write: refuse when the endpoint is known to reject
-    /// conditional writes and the fallback is not explicitly allowed.
-    fn check_write_allowed(&self) -> Result<()> {
-        if self.degraded.load(Ordering::Relaxed) && !self.allow_degraded {
-            return Err(self.unsupported_conditional_error());
-        }
-        Ok(())
-    }
-
-    /// Note that the endpoint cannot do conditional writes; in the default
-    /// mode that is a hard error, in opt-in mode it selects the fallback.
-    fn note_conditional_unsupported(&self) -> Result<()> {
-        self.degraded.store(true, Ordering::Relaxed);
-        if self.allow_degraded {
-            Ok(())
-        } else {
-            Err(self.unsupported_conditional_error())
-        }
-    }
-
-    /// A degraded fallback write replaced/overwrote an object in a way the
-    /// read-back could not confirm: the caller must treat it as a conflict.
-    fn degraded_conflict(&self, rel: &str, detail: &str) -> LakeError {
-        LakeError::Conflict {
-            path: self.abs(rel),
-            message: format!(
-                "{detail}; the endpoint does not support conditional writes, so this fallback is \
-                 only safe for a single writer (reopen the lake and check `.lake versions`)"
-            ),
-        }
-    }
-
-    /// After a degraded fallback PUT: read the object back and compare the
-    /// bytes. A mismatch means another writer replaced it in the window — a
-    /// conflict, never a silent success.
-    fn verify_written(&self, key: &str, rel: &str, bytes: &[u8]) -> Result<()> {
-        match self.client.get_object(key) {
-            Ok(Get::Found { bytes: current, .. }) if current == bytes => Ok(()),
-            Ok(Get::Found { .. }) => Err(self.degraded_conflict(
-                rel,
-                "the object changed again between this write and its read-back",
-            )),
-            Ok(Get::NotFound) => {
-                Err(self.degraded_conflict(rel, "the object disappeared right after this write"))
-            }
-            Err(e) => Err(self.map(&format!("GET s3://{}/{key}", self.client.bucket()), e)),
         }
     }
 
@@ -555,27 +481,12 @@ impl Storage for S3Storage {
         }
     }
 
-    fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
-        let (bytes, etag) = self.read_parallel(rel, context)?;
-        match etag {
-            Some(etag) => Ok((bytes, VersionTag(etag))),
-            None => Err(self.map(
-                context,
-                HttpfsError::Protocol {
-                    context: context.to_string(),
-                    message: "response carried no ETag; conditional writes are impossible".into(),
-                },
-            )),
-        }
-    }
-
     fn create_dir(&self, _rel: &str) -> Result<()> {
         // Object storage has no directories: a prefix is just key text.
         Ok(())
     }
 
     fn put(&self, rel: &str, bytes: &[u8]) -> Result<()> {
-        self.check_write_allowed()?;
         let context = format!("PUT {}", self.abs(rel).display());
         match self
             .client
@@ -592,146 +503,6 @@ impl Storage for S3Storage {
                     message: "an unconditional PUT reported a precondition failure".into(),
                 },
             )),
-            Err(e) => Err(self.map(&context, e)),
-        }
-    }
-
-    fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
-        self.check_write_allowed()?;
-        let key = self.key(rel);
-        let context = format!("PUT {}", self.abs(rel).display());
-        if !self.degraded.load(Ordering::Relaxed) {
-            match self.client.put_object(&key, bytes, Condition::IfNoneMatch) {
-                Ok(Put::Written) => {
-                    self.bucket_confirmed.store(true, Ordering::Relaxed);
-                    return Ok(true);
-                }
-                Ok(Put::PreconditionFailed) => {
-                    self.bucket_confirmed.store(true, Ordering::Relaxed);
-                    return Ok(false);
-                }
-                Ok(Put::ConditionalUnsupported) => {
-                    self.note_conditional_unsupported()?;
-                }
-                Err(e) => return Err(self.map(&context, e)),
-            }
-        }
-        // Explicit single-writer fallback (the endpoint rejects
-        // `If-None-Match: *`): check-then-put, then read back and
-        // byte-compare, with the documented window.
-        match self.client.head_object(&key) {
-            Ok(true) => Ok(false),
-            Ok(false) => match self.client.put_object(&key, bytes, Condition::None) {
-                Ok(Put::Written) => {
-                    self.verify_written(&key, rel, bytes)?;
-                    Ok(true)
-                }
-                Ok(_) => Err(self.map(
-                    &context,
-                    HttpfsError::Protocol {
-                        context: context.clone(),
-                        message: "unconditional PUT was not written".into(),
-                    },
-                )),
-                Err(e) => Err(self.map(&context, e)),
-            },
-            Err(e) => Err(self.map(&context, e)),
-        }
-    }
-
-    fn put_if_match(&self, rel: &str, bytes: &[u8], expected: &VersionTag) -> Result<bool> {
-        self.check_write_allowed()?;
-        let key = self.key(rel);
-        let context = format!("PUT {}", self.abs(rel).display());
-        if !self.degraded.load(Ordering::Relaxed) {
-            match self
-                .client
-                .put_object(&key, bytes, Condition::IfMatch(expected.as_str()))
-            {
-                Ok(Put::Written) => {
-                    self.bucket_confirmed.store(true, Ordering::Relaxed);
-                    return Ok(true);
-                }
-                Ok(Put::PreconditionFailed) => {
-                    self.bucket_confirmed.store(true, Ordering::Relaxed);
-                    return Ok(false);
-                }
-                Ok(Put::ConditionalUnsupported) => {
-                    self.note_conditional_unsupported()?;
-                }
-                Err(e) => return Err(self.map(&context, e)),
-            }
-        }
-        // Explicit single-writer fallback: compare the current ETag, PUT,
-        // then read back and byte-compare (documented check-then-put window).
-        match self.client.get_object(&key) {
-            Ok(Get::Found {
-                etag: Some(current),
-                ..
-            }) => {
-                if current != expected.as_str() {
-                    return Ok(false);
-                }
-                match self.client.put_object(&key, bytes, Condition::None) {
-                    Ok(Put::Written) => {
-                        self.verify_written(&key, rel, bytes)?;
-                        Ok(true)
-                    }
-                    Ok(_) => Err(self.map(
-                        &context,
-                        HttpfsError::Protocol {
-                            context: context.clone(),
-                            message: "unconditional PUT was not written".into(),
-                        },
-                    )),
-                    Err(e) => Err(self.map(&context, e)),
-                }
-            }
-            Ok(Get::Found { etag: None, .. }) => Err(self.map(
-                &context,
-                HttpfsError::Protocol {
-                    context: context.clone(),
-                    message: "response carried no ETag; conditional writes are impossible".into(),
-                },
-            )),
-            // Gone since the read: the caller's catalog was replaced.
-            Ok(Get::NotFound) => Ok(false),
-            Err(e) => Err(self.map(&context, e)),
-        }
-    }
-
-    fn uses_degraded_fallback(&self) -> bool {
-        self.allow_degraded && self.degraded.load(Ordering::Relaxed)
-    }
-
-    /// The degraded-mode repair: catalog and snapshot are byte-identical by
-    /// construction, so if a racing writer's snapshot replace slipped
-    /// through, restore `snapshots/<version>.json` from the authoritative
-    /// `catalog.json` bytes. A no-op on conditional-write endpoints and
-    /// without the degraded opt-in.
-    fn reconcile_snapshot(&self, version: u64, bytes: &[u8]) -> Result<()> {
-        if !self.uses_degraded_fallback() {
-            return Ok(());
-        }
-        let rel = format!("snapshots/{version}.json");
-        let key = self.key(&rel);
-        let context = format!("GET {}", self.abs(&rel).display());
-        match self.client.get_object(&key) {
-            Ok(Get::Found { bytes: current, .. }) if current == bytes => Ok(()),
-            Ok(Get::Found { .. }) | Ok(Get::NotFound) => {
-                let put_context = format!("PUT {}", self.abs(&rel).display());
-                match self.client.put_object(&key, bytes, Condition::None) {
-                    Ok(Put::Written) => Ok(()),
-                    Ok(_) => Err(self.map(
-                        &put_context,
-                        HttpfsError::Protocol {
-                            context: put_context.clone(),
-                            message: "unconditional PUT was not written".into(),
-                        },
-                    )),
-                    Err(e) => Err(self.map(&put_context, e)),
-                }
-            }
             Err(e) => Err(self.map(&context, e)),
         }
     }
@@ -895,7 +666,6 @@ impl Storage for S3Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn storage(mock: &crate::mock_s3::MockS3, bucket: &str, prefix: &str) -> S3Storage {
         storage_with_secret(mock, bucket, prefix, "mock-secret")
@@ -914,23 +684,6 @@ mod tests {
                 .with_endpoint(mock.endpoint())
                 .allow_http(true)
                 .with_credentials(mock.access_key_id(), secret),
-        )
-        .unwrap()
-    }
-
-    fn storage_allow_degraded(
-        mock: &crate::mock_s3::MockS3,
-        bucket: &str,
-        prefix: &str,
-    ) -> S3Storage {
-        S3Storage::new(
-            S3Config::new(bucket)
-                .with_prefix(prefix)
-                .with_region("auto")
-                .with_endpoint(mock.endpoint())
-                .allow_http(true)
-                .allow_degraded(true)
-                .with_credentials(mock.access_key_id(), "mock-secret"),
         )
         .unwrap()
     }
@@ -977,112 +730,6 @@ mod tests {
         assert!(err.to_string().contains("auto"), "{err}");
     }
 
-    /// Direct backend-level coverage (no `Lake`): the exact trait surface the
-    /// lake relies on, including `delete` and `local_copy`.
-    #[test]
-    fn storage_trait_roundtrip_over_the_mock() {
-        let mock = crate::mock_s3::MockS3::start();
-        let storage = storage(&mock, "ops-bucket", "ops");
-
-        assert_eq!(storage.head("catalog.json").unwrap(), Head::Missing);
-        storage.create_dir("").unwrap(); // a no-op over object storage
-        assert_eq!(storage.abs(""), PathBuf::from("s3://ops-bucket/ops"));
-        assert_eq!(
-            storage.abs("snapshots/2.json"),
-            PathBuf::from("s3://ops-bucket/ops/snapshots/2.json")
-        );
-
-        // put replaces; put_new is create-only, and the object key carries
-        // the prefix.
-        storage.put("snapshots/1.json", b"one").unwrap();
-        assert_eq!(
-            storage.read("snapshots/1.json", "reading one").unwrap(),
-            b"one"
-        );
-        assert_eq!(mock.object("ops/snapshots/1.json").unwrap(), b"one");
-        assert!(!storage.put_new("snapshots/1.json", b"two").unwrap());
-        assert_eq!(
-            storage.read("snapshots/1.json", "reading one").unwrap(),
-            b"one",
-            "put_new never replaces"
-        );
-        assert!(storage.put_new("snapshots/2.json", b"two").unwrap());
-
-        // read_tagged + put_if_match: a stale tag is rejected, the fresh one
-        // lands.
-        storage.put("catalog.json", b"cat-1").unwrap();
-        let (bytes, tag) = storage
-            .read_tagged("catalog.json", "reading catalog.json")
-            .unwrap();
-        assert_eq!(bytes, b"cat-1");
-        assert!(
-            storage
-                .put_if_match("catalog.json", b"cat-2", &tag)
-                .unwrap()
-        );
-        assert_eq!(
-            storage
-                .read("catalog.json", "reading catalog.json")
-                .unwrap(),
-            b"cat-2"
-        );
-        assert!(
-            !storage
-                .put_if_match("catalog.json", b"cat-3", &tag)
-                .unwrap()
-        );
-        assert_eq!(
-            storage
-                .read("catalog.json", "reading catalog.json")
-                .unwrap(),
-            b"cat-2",
-            "a stale conditional replace does not land"
-        );
-
-        // head / list: files only, direct children only.
-        assert_eq!(storage.head("catalog.json").unwrap(), Head::File);
-        assert_eq!(
-            storage.list("snapshots").unwrap(),
-            vec!["1.json".to_string(), "2.json".to_string()]
-        );
-        assert_eq!(
-            storage.list("").unwrap(),
-            vec!["catalog.json".to_string()],
-            "a directory is not a file name"
-        );
-
-        // local_copy materializes a temp file, removed on drop.
-        let copy_path = {
-            let copy = storage.local_copy("catalog.json", "reading").unwrap();
-            let path = copy.path().to_path_buf();
-            assert_eq!(std::fs::read(&path).unwrap(), b"cat-2");
-            path
-        };
-        assert!(!copy_path.exists(), "the temp copy is removed on drop");
-
-        // delete is idempotent (S3 DELETE of a missing key is success).
-        storage.delete("snapshots/2.json").unwrap();
-        assert!(!mock.keys().contains(&"ops/snapshots/2.json".to_string()));
-        storage.delete("snapshots/2.json").unwrap();
-
-        // 403 anywhere is the lake's Auth error.
-        mock.set_deny(403);
-        let err = storage.head("catalog.json").unwrap_err();
-        assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
-        let err = storage
-            .read("catalog.json", "loading data file \"x\"")
-            .unwrap_err();
-        assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
-        assert!(
-            err.to_string().contains("AccessDenied"),
-            "the GET body carries the S3 code: {err}"
-        );
-        let err = storage.delete("catalog.json").unwrap_err();
-        assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
-    }
-
-    /// A fabricated signature (right access key, wrong secret) is rejected by
-    /// the mock's HMAC recomputation, not accepted structurally.
     #[test]
     fn fabricated_signature_is_rejected() {
         let mock = crate::mock_s3::MockS3::start();
@@ -1122,30 +769,6 @@ mod tests {
         assert!(mock.verified_requests() >= 1);
     }
 
-    /// The read and write body cap refuses over-sized objects with a clear
-    /// error (a small cap stands in for the 5 GiB single-PUT limit).
-    #[test]
-    fn object_size_cap_refuses_large_reads_and_writes() {
-        let mock = crate::mock_s3::MockS3::start();
-        mock.put_object("ops/big", &[7u8; 32]);
-        let mut storage = storage(&mock, "ops-bucket", "ops");
-        storage.client.set_max_object_bytes(16);
-
-        let err = storage
-            .read("big", "reading data file \"big\"")
-            .unwrap_err();
-        assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
-        assert!(err.to_string().contains("16-byte object cap"), "{err}");
-
-        let err = storage.put("small", &[0u8; 17]).unwrap_err();
-        assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
-        assert!(err.to_string().contains("capped at 16 bytes"), "{err}");
-        assert!(mock.keys().iter().all(|k| k != "ops/small"));
-    }
-
-    /// A large whole-object read is several concurrent range requests (wave
-    /// 98b), reassembled in order; a small object stays one request. The
-    /// bytes are exactly what one GET returned before.
     #[test]
     fn whole_object_reads_use_concurrent_parts() {
         let mock = crate::mock_s3::MockS3::start();
@@ -1180,11 +803,6 @@ mod tests {
                 "PINKDB_HTTPFS_PARALLELISM=1 is one whole GET: {ranges:?}"
             );
         }
-
-        // The tagged read runs the same download and keeps the object's ETag.
-        let (tagged, tag) = storage.read_tagged("big", "reading big").unwrap();
-        assert_eq!(tagged, bytes);
-        assert!(tag.0.starts_with('"'), "{tag:?}");
 
         // A small object is still one range request.
         mock.put_object("ops/small", b"tiny");
@@ -1237,123 +855,5 @@ mod tests {
         // The existing bucket still reads as a lake-less prefix.
         let real = storage(&mock, "real-bucket", "lake");
         assert_eq!(real.head("catalog.json").unwrap(), Head::Missing);
-    }
-
-    /// 400 `InvalidArgument` (not a conditional-support rejection) must not
-    /// make degradation sticky; the sticky flag is only for 501 and 400
-    /// `InvalidRequest`/`NotImplemented` on conditional requests.
-    #[test]
-    fn only_conditional_rejection_codes_degrade() {
-        let mock = crate::mock_s3::MockS3::start();
-        let storage = storage(&mock, "ops-bucket", "ops");
-
-        mock.set_conditional_rejection(400, "InvalidArgument");
-        let err = storage.put_new("k1", b"v").unwrap_err();
-        assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
-        assert_eq!(mock.conditional_rejections(), 1);
-        // Not sticky: the next write probes conditionals again and succeeds.
-        mock.clear_conditional_rejection();
-        assert!(storage.put_new("k1", b"v").unwrap());
-        assert_eq!(mock.conditional_attempts(), 2, "it probed again");
-    }
-
-    /// Default refusal: 501/`InvalidRequest` on a conditional write refuses
-    /// every later write with the opt-in hint, without touching the object.
-    #[test]
-    fn conditional_rejection_refuses_writes_by_default() {
-        let mock = crate::mock_s3::MockS3::start();
-        let storage = storage(&mock, "ops-bucket", "ops");
-
-        mock.set_conditional_rejection(400, "InvalidRequest");
-        let err = storage.put_new("k1", b"v").unwrap_err();
-        assert!(
-            matches!(err, LakeError::UnsupportedEndpoint { .. }),
-            "{err:?}"
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("does not support conditional writes"), "{msg}");
-        assert!(msg.contains("PINKDB_S3_ALLOW_DEGRADED"), "{msg}");
-        assert!(msg.contains("SINGLE-WRITER"), "{msg}");
-        assert!(mock.keys().is_empty(), "no object was written");
-
-        // Sticky: even an unconditional write refuses without a new probe.
-        let attempts = mock.conditional_attempts();
-        let err = storage.put("k2", b"v").unwrap_err();
-        assert!(
-            matches!(err, LakeError::UnsupportedEndpoint { .. }),
-            "{err:?}"
-        );
-        assert_eq!(mock.conditional_attempts(), attempts);
-        assert_eq!(mock.conditional_rejections(), 1);
-        assert!(mock.keys().is_empty());
-
-        // The refusal is about writes: reads still work.
-        mock.put_object("ops/catalog.json", b"cat");
-        assert_eq!(storage.read("catalog.json", "reading").unwrap(), b"cat");
-    }
-
-    /// Opt-in fallback: check-then-put with the read-back byte compare, and
-    /// the sticky degradation stops re-probing.
-    #[test]
-    fn degraded_opt_in_falls_back_and_verifies_read_back() {
-        let mock = crate::mock_s3::MockS3::start();
-        mock.reject_conditional_writes(true);
-        let storage = storage_allow_degraded(&mock, "ops-bucket", "ops");
-
-        assert!(storage.put_new("k1", b"v").unwrap());
-        assert_eq!(mock.conditional_rejections(), 1, "one probe, then sticky");
-        assert_eq!(storage.read("k1", "reading").unwrap(), b"v");
-        assert!(
-            !storage.put_new("k1", b"v2").unwrap(),
-            "create-only still holds"
-        );
-        assert_eq!(mock.conditional_rejections(), 1, "no second probe");
-
-        storage.put("catalog.json", b"cat-1").unwrap();
-        let (_, tag) = storage.read_tagged("catalog.json", "reading").unwrap();
-        assert!(
-            storage
-                .put_if_match("catalog.json", b"cat-2", &tag)
-                .unwrap()
-        );
-        assert!(
-            !storage
-                .put_if_match("catalog.json", b"cat-3", &tag)
-                .unwrap()
-        );
-        assert_eq!(storage.read("catalog.json", "reading").unwrap(), b"cat-2");
-    }
-
-    /// A replacement landing between a degraded PUT and its read-back is a
-    /// conflict, never a silent success (the reviewer's interleaving at the
-    /// storage level).
-    #[test]
-    fn degraded_read_back_catches_a_replacement() {
-        let mock = crate::mock_s3::MockS3::start();
-        mock.reject_conditional_writes(true);
-        mock.hold_next_request("GET", "snapshots/9.json");
-        let result = std::thread::scope(|scope| {
-            let mock_ref = &mock;
-            let writer = scope.spawn(move || {
-                let storage = storage_allow_degraded(mock_ref, "ops-bucket", "ops");
-                storage.put_new("snapshots/9.json", b"AAAA")
-            });
-            assert!(
-                mock.wait_until_hold_reached(Duration::from_secs(10)),
-                "the read-back did not arrive"
-            );
-            // Another writer replaces the object while the read-back is held.
-            mock.put_object("ops/snapshots/9.json", b"BBBB");
-            mock.release_hold();
-            writer.join().unwrap()
-        });
-        let err = result.expect_err("the read-back must conflict");
-        assert!(matches!(err, LakeError::Conflict { .. }), "{err:?}");
-        assert!(err.to_string().contains("read-back"), "{err}");
-        assert_eq!(
-            mock.object("ops/snapshots/9.json").unwrap(),
-            b"BBBB",
-            "the other writer's bytes stand"
-        );
     }
 }

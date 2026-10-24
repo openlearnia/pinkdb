@@ -133,7 +133,15 @@ fn assert_store_equal(a: &PinkDb, b: &PinkDb, what: &str) {
 }
 
 fn read_catalog(lake_dir: &Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(lake_dir.join("catalog.json")).unwrap()).unwrap()
+    let url = format!("pink:{}", lake_dir.display());
+    let lake = Lake::open(lake_dir).unwrap();
+    let mut tables = serde_json::Map::new();
+    for info in lake.table_info().unwrap() {
+        if let Some(entry) = pink_lake::catalog_table_json(&url, &info.table).unwrap() {
+            tables.insert(info.table.clone(), entry);
+        }
+    }
+    serde_json::json!({ "tables": tables })
 }
 
 fn entry_format(catalog: &serde_json::Value, key: &str) -> String {
@@ -307,15 +315,12 @@ fn mixed_formats_round_trip_appends_and_pins() {
     // 88, rule 5): the lake opens, the other tables stay readable, the table
     // is listed as unavailable, and reads of it fail naming the id. (Done
     // last: the catalog is deliberately left with a broken entry.)
-    let path = lake_dir.join("catalog.json");
-    let text = std::fs::read_to_string(&path).unwrap();
-    let tampered = text.replacen(
-        "\"format\": \"vortex\"",
-        "\"format\": \"no-such-format\"",
-        1,
-    );
-    assert_ne!(text, tampered, "the fixture has a vortex entry");
-    std::fs::write(&path, tampered).unwrap();
+    pink_lake::catalog_set_table_format(
+        &format!("pink:{}", lake_dir.display()),
+        "main.as_vortex",
+        "no-such-format",
+    )
+    .unwrap();
     let lake = Lake::open(&lake_dir).unwrap();
     let unavailable = lake.unavailable_tables().unwrap();
     let broken = unavailable

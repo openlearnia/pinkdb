@@ -142,12 +142,9 @@ fn lean_save_open_versions_tables_info() {
     assert!(out.contains("│ 1       │ x       │"), "{out}");
     assert!(out.contains("│ 2       │ NULL    │"), "{out}");
 
-    // The on-disk shape: a v6 catalog, no `format` fields, `.pink` data
-    // files with the engine's own magic.
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 7"), "{catalog}");
-    assert!(catalog.contains("\"format\": \"pink\""), "{catalog}");
-    let files = data_files(&lake.join("data"));
+    // The on-disk shape: a v7 catalog (the `.lake tables` line above says
+    // so) and `.pink` data files with the engine's own magic.
+    let files = data_files(&PathBuf::from(format!("{}.files", lake.display())).join("data"));
     assert_eq!(files.len(), 2);
     for file in &files {
         assert_eq!(file.extension().unwrap(), "pink");
@@ -293,54 +290,22 @@ fn lean_attach_answers_equal_open_and_in_memory() {
     cleanup(&dir);
 }
 
-/// A corrupted statistics block is refused fail-closed (never a guess).
-///
-/// Both cases are decided by the catalog alone (`.lake attach` never reads a
-/// data file), so they hold whatever the data files' format is.
-#[test]
-fn lean_attach_refuses_stats_less_and_corrupted_lakes() {
-    let dir = scratch("attach_refuse");
-
-    // A corrupted statistics block on a freshly saved lake.
-    let tampered = dir.join("tampered");
-    run(&format!(
-        "CREATE TABLE fid (i INTEGER);\n\
-         INSERT INTO fid VALUES (1), (5), (9);\n\
-         .lake save {}\n\
-         .quit\n",
-        tampered.display()
-    ));
-
-    let catalog_path = tampered.join("catalog.json");
-    let text = std::fs::read_to_string(&catalog_path).unwrap();
-    let fid = text.find("\"main.fid\"").expect("main.fid in catalog");
-    let min_at = fid + text[fid..].find("\"min\": \"").expect("a min statistic") + 8;
-    let min_end = min_at + text[min_at..].find('"').expect("min value end");
-    let tampered_text = format!("{}{}{}", &text[..min_at], "999999999", &text[min_end..]);
-    assert_ne!(tampered_text, text, "the edit must change the manifest");
-    std::fs::write(&catalog_path, tampered_text).unwrap();
-
-    let out = run(&format!(".lake attach {}\n.quit\n", tampered.display()));
-    assert!(out.contains("failed its checksum"), "{out}");
-    assert!(out.contains("use .lake open"), "{out}");
-
-    cleanup(&dir);
-}
-
 /// The pinklake build over mock S3: `.lake save`/`open` work against
 /// `s3://bucket/prefix` and the data files are `.pink` objects.
 #[cfg(feature = "s3")]
 #[test]
 fn lean_s3_save_open_roundtrip() {
     let mock = mock_s3::MockS3::start();
+    let dir = scratch("s3");
+    let catalog = format!("pink:{}", dir.join("catalog.pink").display());
     let url = mock.url("cli-lite-bucket", "lakes/lite");
     let out = run_mock(
         &mock,
         &format!(
             "CREATE TABLE t (a INTEGER, b VARCHAR);\n\
              INSERT INTO t VALUES (1, 'x'), (2, NULL);\n\
-             .lake save {url}\n\
-             .lake open {url}\n\
+             .lake save {catalog} data {url}\n\
+             .lake open {catalog}\n\
              SELECT b FROM t ORDER BY a;\n\
              .quit\n"
         ),
@@ -353,6 +318,7 @@ fn lean_s3_save_open_roundtrip() {
         keys.iter().any(|k| k.ends_with(".pink")),
         "expected `.pink` objects: {keys:?}"
     );
+    cleanup(&dir);
     assert!(
         !keys.iter().any(|k| k.ends_with(".vortex")),
         "a lean build must write no Vortex objects: {keys:?}"
@@ -384,10 +350,6 @@ fn lean_partition_splits_commits_and_prunes() {
     );
     assert!(out.contains("Partitioned main.t by (region)"), "{out}");
     assert!(out.contains("2 files: 2 data, 0 delete"), "{out}");
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"partition_by\""), "{catalog}");
-    assert!(catalog.contains(".pink"), "{catalog}");
-    assert!(!catalog.contains(".vortex"), "{catalog}");
 
     // Read-only attach: a partitioned predicate decodes only the surviving
     // files (the v2 file plus the matching partition file).
@@ -445,14 +407,60 @@ fn lean_maintenance_merge_expire_cleanup() {
     assert!(out.contains("Opened lake version 4"), "{out}");
     assert!(!out.contains("Error:"), "{out}");
     // The consolidated data file is a lean `.pink` file; no Vortex anywhere.
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains(".pink"), "{catalog}");
-    assert!(!catalog.contains(".vortex"), "{catalog}");
-    let data: Vec<String> = std::fs::read_dir(lake.join("data/main.t"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-        .collect();
+    let data: Vec<String> =
+        std::fs::read_dir(PathBuf::from(format!("{}.files", lake.display())).join("data/main.t"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
     assert_eq!(data.len(), 1, "{data:?}");
     assert!(data[0].ends_with(".pink"), "{data:?}");
+    cleanup(&dir);
+}
+
+fn catalog_sql(lake_dir: &Path, sql: &str) {
+    let helper = lake_dir.join("catalog.pink");
+    let path = if helper.exists() || lake_dir.join("catalog.pink.wal").exists() {
+        helper
+    } else {
+        lake_dir.to_path_buf()
+    };
+    let mut db = pinkdb::PinkDb::open_durable(&path.display().to_string()).unwrap();
+    db.execute(sql).unwrap();
+}
+
+#[test]
+fn lean_attach_refuses_stats_less_and_corrupted_lakes() {
+    let dir = scratch("attach_refuse");
+
+    // A corrupted (undecodable) statistic is refused fail-closed and names
+    // the column; `.lake open` still reads the data.
+    let tampered = dir.join("tampered");
+    run(&format!(
+        "CREATE TABLE fid (i INTEGER);\n\
+         INSERT INTO fid VALUES (1), (5), (9);\n\
+         .lake save {}\n\
+         .quit\n",
+        tampered.display()
+    ));
+    catalog_sql(
+        &tampered,
+        "UPDATE ducklake_file_column_stats SET min_value = 'not-an-int' \
+         WHERE column_id = (SELECT MIN(column_id) FROM ducklake_column);",
+    );
+    let out = run(&format!(".lake attach {}\n.quit\n", tampered.display()));
+    assert!(out.contains("does not decode"), "{out}");
+
+    // No statistics rows at all: a clear stats-less refusal.
+    let blank = dir.join("stats_less");
+    run(&format!(
+        "CREATE TABLE fid (i INTEGER);\nINSERT INTO fid VALUES (1);\n\
+         .lake save {}\n.quit\n",
+        blank.display()
+    ));
+    catalog_sql(&blank, "DELETE FROM ducklake_file_column_stats;");
+    let out = run(&format!(".lake attach {}\n.quit\n", blank.display()));
+    assert!(out.contains("without a statistics block"), "{out}");
+    assert!(out.contains("use .lake open"), "{out}");
+
     cleanup(&dir);
 }

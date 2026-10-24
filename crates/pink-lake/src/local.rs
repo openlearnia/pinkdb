@@ -18,7 +18,7 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use super::storage::{Head, LocalCopy, ObjectInfo, Storage, VersionTag};
+use super::storage::{Head, LocalCopy, ObjectInfo, Storage};
 use crate::{LakeError, Result, fresh_id};
 
 /// The catalog file name inside the lake root.
@@ -111,87 +111,31 @@ impl LocalStorage {
         self.sync_parent(&path);
         Ok(())
     }
+}
 
-    /// Publish `bytes` under `rel` **only if `rel` does not exist yet**:
-    /// write a unique fsynced `.tmp`, then hard-link it to `rel` (an atomic
-    /// create-if-absent), then remove the temp name. Returns `Ok(false)` when
-    /// `rel` already existed — nothing was published and the temp file is
-    /// gone. This is how snapshots (and the create-time v1 pair) are
-    /// published: a published version file is never replaced, and two
-    /// concurrent writers cannot both claim the same version.
-    fn publish_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
-        let path = self.checked_path(rel)?;
-        self.ensure_parent(&path)?;
-        let (tmp, mut file) = create_unique_tmp(&path).map_err(|e| LakeError::Io {
-            context: format!("creating a temp file next to {}", path.display()),
-            source: e,
-        })?;
-        let written = write_and_sync(&mut file, bytes);
-        drop(file);
-        if let Err(e) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(LakeError::Io {
-                context: format!("writing {}", tmp.display()),
-                source: e,
-            });
-        }
-        let linked = fs::hard_link(&tmp, &path);
-        let _ = fs::remove_file(&tmp);
-        match linked {
-            Ok(()) => {
-                self.sync_parent(&path);
-                Ok(true)
-            }
-            // `link` refuses to follow a symlink at `path`, so `AlreadyExists`
-            // covers both a regular file and a planted symlink there.
-            Err(e)
-                if e.kind() == ErrorKind::AlreadyExists || fs::symlink_metadata(&path).is_ok() =>
-            {
-                Ok(false)
-            }
-            Err(e) => Err(LakeError::Io {
-                context: format!("publishing {}", path.display()),
-                source: e,
-            }),
-        }
+/// Best-effort narrow one lake-owned file to 0600 and a directory to 0700.
+fn tighten(path: &Path, is_dir: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if is_dir { 0o700 } else { 0o600 };
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, is_dir);
     }
 }
 
-/// The local file's identity: `(dev, ino)` where available, else zeroes —
-/// the same primitive the engine's WAL uses. Combined with byte length and
-/// modification time, this is the local stand-in for an S3 `ETag`:
-/// `put_if_match` re-stats the file and refuses when it changed while a save
-/// was in flight. `(length, mtime)` alone is not an identity: a same-length
-/// replacement inside one timestamp tick (HFS+, FAT, some NFS mounts) would
-/// share a tag. The device/inode pair distinguishes the inode incarnation.
-#[cfg(unix)]
-fn identity_of(meta: &fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    (meta.dev(), meta.ino())
-}
-
-#[cfg(not(unix))]
-fn identity_of(_meta: &fs::Metadata) -> (u64, u64) {
-    (0, 0)
-}
-
-fn tag_of(meta: &fs::Metadata) -> VersionTag {
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let (dev, ino) = identity_of(meta);
-    VersionTag(format!("file:{}:{}:{}:{}", meta.len(), mtime, dev, ino))
-}
-
-fn local_tag(path: &Path) -> Result<VersionTag> {
-    let meta = fs::metadata(path).map_err(|e| LakeError::Io {
-        context: format!("reading metadata of {}", path.display()),
-        source: e,
-    })?;
-    Ok(tag_of(&meta))
+/// Narrow a local catalog database and its WAL/lock siblings to 0600.
+pub(crate) fn tighten_catalog(path: &Path) {
+    tighten(path, false);
+    for suffix in [".wal", ".lock"] {
+        let sibling = PathBuf::from(format!("{}{suffix}", path.display()));
+        if sibling.exists() {
+            tighten(&sibling, false);
+        }
+    }
 }
 
 impl Storage for LocalStorage {
@@ -288,31 +232,6 @@ impl Storage for LocalStorage {
         true
     }
 
-    fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
-        // M-12: one `open`, then `fstat` and `read` on that *same* fd. Two
-        // syscalls on the path could pair old bytes with a replacement's tag
-        // (or the reverse); the conditional catalog replace would then
-        // clobber a concurrent writer.
-        let path = self.checked_path(rel)?;
-        let mut file = File::open(&path).map_err(|e| LakeError::Io {
-            context: context.to_string(),
-            source: e,
-        })?;
-        let meta = file.metadata().map_err(|e| LakeError::Io {
-            context: format!("reading metadata of {}", path.display()),
-            source: e,
-        })?;
-        let tag = tag_of(&meta);
-        #[cfg(test)]
-        run_read_hook(&path);
-        let mut bytes = Vec::with_capacity(meta.len().min(64 << 20) as usize);
-        file.read_to_end(&mut bytes).map_err(|e| LakeError::Io {
-            context: context.to_string(),
-            source: e,
-        })?;
-        Ok((bytes, tag))
-    }
-
     fn create_dir(&self, rel: &str) -> Result<()> {
         let path = self.checked_path(rel)?;
         create_dir_all_private(&path).map_err(|e| LakeError::Io {
@@ -322,25 +241,19 @@ impl Storage for LocalStorage {
     }
 
     fn tighten_existing(&self) -> Result<()> {
-        // M-5 migration: a lake created before the 0600 policy left its
-        // catalog, manifests, commits and data files world-readable. Narrow
-        // every engine-owned artifact here; a permission error is ignored
-        // (the lake stays usable) and a user-supplied shared parent is never
-        // touched because only files inside the lake root are visited.
-        for rel in [CATALOG_FILE, crate::LAKE_FILE, crate::HIGHEST_FILE] {
-            tighten_file(&self.checked_path(rel)?);
-        }
-        for dir in ["snapshots", "commits"] {
-            if let Ok(entries) = fs::read_dir(self.checked_path(dir)?) {
-                for entry in entries.flatten() {
-                    tighten_file(&entry.path());
-                }
-            }
-        }
-        if let Ok(files) = self.list_recursive("data") {
-            for rel in files {
-                if let Ok(path) = self.checked_path(&format!("data/{rel}")) {
-                    tighten_file(&path);
+        let root = self.root.join("data");
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            tighten(&dir, true);
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    stack.push(path);
+                } else {
+                    tighten(&path, false);
                 }
             }
         }
@@ -392,19 +305,6 @@ impl Storage for LocalStorage {
         })?;
         self.sync_parent(&path);
         Ok(len)
-    }
-
-    fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
-        self.publish_new(rel, bytes)
-    }
-
-    fn put_if_match(&self, rel: &str, bytes: &[u8], expected: &VersionTag) -> Result<bool> {
-        let current = local_tag(&self.checked_path(rel)?)?;
-        if &current != expected {
-            return Ok(false);
-        }
-        self.write_atomic(rel, bytes)?;
-        Ok(true)
     }
 
     /// File names directly inside `rel` (sorted; a missing directory reads as
@@ -589,44 +489,6 @@ fn create_dir_all_private(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Test-only seam: run `hook` after `fstat` and before the read in
-/// [`LocalStorage::read_tagged`], so a test can deterministically replace the
-/// path while the caller holds the old fd (M-12).
-#[cfg(test)]
-type ReadHook = Box<dyn Fn(&Path) + Send>;
-
-#[cfg(test)]
-static READ_HOOK: std::sync::Mutex<Option<ReadHook>> = std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn run_read_hook(path: &Path) {
-    let hook = READ_HOOK.lock().unwrap_or_else(|p| p.into_inner()).take();
-    if let Some(hook) = hook {
-        hook(path);
-    }
-}
-
-/// Best-effort narrow one lake-owned file to 0600.
-fn tighten_file(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let Ok(meta) = fs::symlink_metadata(path) else {
-            return;
-        };
-        if !meta.is_file() {
-            return;
-        }
-        if meta.permissions().mode() & 0o077 != 0 {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,88 +541,5 @@ mod tests {
         assert_eq!(storage.read("data/main.t/ok.pink", "test").unwrap(), b"ok");
 
         fs::remove_dir_all(&root).unwrap();
-    }
-    /// M-12: the tag includes `(dev, ino)`, so a same-length replacement with
-    /// a preserved mtime is still distinguishable.
-    #[cfg(unix)]
-    #[test]
-    fn tags_distinguish_same_length_same_mtime_replacements() {
-        use std::fs::FileTimes;
-
-        let root = std::env::temp_dir().join(format!("pinkdb-local-tag-{}", fresh_id()));
-        fs::create_dir_all(&root).unwrap();
-        let storage = LocalStorage::new(&root);
-        storage.put("data/t/a.pink", b"AAAA").unwrap();
-        let (old_bytes, old_tag) = storage.read_tagged("data/t/a.pink", "test").unwrap();
-        assert_eq!(old_bytes, b"AAAA");
-        let old_mtime = fs::metadata(root.join("data/t/a.pink"))
-            .unwrap()
-            .modified()
-            .unwrap();
-
-        // Same length, same mtime, new inode (the atomic replace).
-        storage.put("data/t/a.pink", b"BBBB").unwrap();
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .open(root.join("data/t/a.pink"))
-            .unwrap();
-        file.set_times(FileTimes::new().set_modified(old_mtime))
-            .unwrap();
-        drop(file);
-        let (new_bytes, new_tag) = storage.read_tagged("data/t/a.pink", "test").unwrap();
-        assert_eq!(new_bytes, b"BBBB");
-        assert_ne!(
-            old_tag.0, new_tag.0,
-            "a same-length/same-mtime replacement must not share a tag"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// M-12: replacing the path after `fstat` cannot make the returned
-    /// `(bytes, tag)` pair inconsistent — both come from the open fd.
-    #[test]
-    fn read_tagged_is_consistent_when_the_path_is_replaced_mid_read() {
-        let root = std::env::temp_dir().join(format!("pinkdb-local-race-{}", fresh_id()));
-        fs::create_dir_all(&root).unwrap();
-        let storage = std::sync::Arc::new(LocalStorage::new(&root));
-        storage.put("catalog.json", b"old-catalog").unwrap();
-        let (_, old_tag) = storage.read_tagged("catalog.json", "test").unwrap();
-
-        let replacer = std::sync::Arc::clone(&storage);
-        *READ_HOOK.lock().unwrap_or_else(|p| p.into_inner()) = Some(Box::new(move |_path| {
-            replacer.put("catalog.json", b"new-catalog").unwrap();
-        }));
-        let (bytes, tag) = storage.read_tagged("catalog.json", "test").unwrap();
-        assert_eq!(bytes, b"old-catalog", "the read must use the opened fd");
-        assert_eq!(tag.0, old_tag.0, "the tag must describe the same fd");
-        assert_eq!(
-            fs::read(root.join("catalog.json")).unwrap(),
-            b"new-catalog",
-            "the replacement really happened"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// M-12: a stale tag is rejected by the conditional replace, so a
-    /// concurrent writer's catalog is never clobbered.
-    #[test]
-    fn stale_tag_is_rejected_by_conditional_replace() {
-        let root = std::env::temp_dir().join(format!("pinkdb-local-stale-{}", fresh_id()));
-        fs::create_dir_all(&root).unwrap();
-        let storage = LocalStorage::new(&root);
-        storage.put("catalog.json", b"first").unwrap();
-        let (_, stale) = storage.read_tagged("catalog.json", "test").unwrap();
-        storage.put("catalog.json", b"second").unwrap();
-        assert!(
-            !storage
-                .put_if_match("catalog.json", b"third", &stale)
-                .unwrap()
-        );
-        assert_eq!(
-            fs::read(root.join("catalog.json")).unwrap(),
-            b"second",
-            "a stale conditional replace must not write"
-        );
-        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -230,3 +230,54 @@ The catalog transaction stays flat. The remaining end-to-end growth is the CLI w
 - **T2 runs in two passes.** Part 1 builds the features on the new tables; Part 2 deletes the JSON layout and updates CI and docs. This follows decision 8, which deletes the layout only after the new path passes the suites.
 - **Engine fix instead of a workaround.** Part 1 first dropped the catalog's indexes on pinkdb and stopped loading per-file statistics above 2,048 files. That cost large tables their pruning and refused writable attach on them. The root cause was that every pinkdb INSERT marked a table's hash indexes stale, so the next statement rebuilt them in full (O(rows)). Appends now extend the index maps in place; UPDATE, DELETE and ALTER still rebuild (`crates/pinkdb/src/storage.rs`). The workarounds are reverted.
 - **Deferred:** the writable-attachment session-table diff (O(rows) per commit) is left as is. It belongs to a later wave, not to the catalog work.
+
+## Result (T2 Part 2, 2026-10-24)
+
+The JSON layout is deleted: no `catalog.json`, `snapshots/`, `commits/`,
+`highest.json`, `lake.json`/`moved.json`, `replication/state.json`, rendered
+catalog facade or `SplitStorage`; `Storage` now serves data objects only and
+the lake reads its `MetadataStore` directly. Sealed manifests, the
+passphrase-derived lake key/KDF, PNKLAKE1 container v1 reading, the degraded
+check-then-put fallback, `reconcile_snapshot`, metadata conditional writes and
+`.lake migrate-catalog` are removed. The `lake-data.json` ownership marker and
+the raw-key PNKLAKE1 per-file container remain.
+
+Locations: a bare path is `pink:<path>` with data in `<path>.files/`; SQL
+catalogs use their recorded data location; `s3://…` alone fails with the
+`.lake save pink:lake.pink data s3://…` fix.
+
+Suites now run on `pink:` by default and mirror catalog behavior on `sqlite:`;
+the Postgres suite runs against a throwaway local server. Tests whose subject
+was the removed layout (sealed manifests, rollback markers, `lake.json`
+binding, migration, degraded/conditional metadata writes, tamper-by-editing
+`catalog.json`) are deleted rather than ported. See CHANGELOG for the
+breaking-change note.
+
+The release split from Part 1 still holds: catalog transactions stay flat to
+10,000 files; the remaining commit growth is the writable attachment's
+session-table diff (O(session rows)), deferred to a later wave.
+
+## Review pass (same tree)
+
+Restored the tests whose subject survives (schema/time travel, lake
+create/attach/corruption, inlining corruption, partition zone maps, lean
+attach, CLI attach/S3, catalog equivalence, 15 mock-S3 cases, six per-file-key
+encryption cases, and 17 replication scenarios on `pink:` and `sqlite:`).
+
+Root cause of the schema bug: `load_stats_blocks` joined statistics to
+`ducklake_column` by `column_id` alone, so a RENAMED column's file statistics
+were labelled with the new name even though the file's bytes carry the old
+one. Attach then failed the physical-schema check. The loader now selects the
+column definition visible at that file's `begin_snapshot`
+(`begin_snapshot <= file.begin_snapshot < end_snapshot`), which also fixes
+zone-map pruning and time travel through a rename. Negative `record_count`
+rows are a clear corrupt-metadata error.
+
+S3 degraded/conditional-write machinery, the CLI opt-in and `Lake::create_s3`
+/`open_s3` are removed; explicit-config S3 tests now use
+`create_with_catalog_s3`/`open_with_catalog_s3` with a real catalog.
+
+Still undone: the PNKLAKE1 v1 read branch and Argon2id KDF remain in
+`crypto.rs` (per-file keys are raw, but the legacy/passphrase path was not
+excised), and the supervisor notify/pause/resume lifecycle test was reduced to
+the verified start/stop path after its polling raced the supervisor.
