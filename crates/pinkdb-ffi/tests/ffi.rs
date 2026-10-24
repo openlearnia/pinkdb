@@ -15,6 +15,15 @@ fn last_error() -> String {
     }
 }
 
+fn last_error_class() -> String {
+    let p = pinkdb_last_error_class();
+    if p.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+    }
+}
+
 fn exec(h: *mut PinkHandle, sql: &str) -> *mut PinkResult {
     let c = CString::new(sql).unwrap();
     let r = pinkdb_execute(h, c.as_ptr(), sql.len());
@@ -113,6 +122,58 @@ fn errors_and_guards_through_the_c_abi() {
     let r = exec(h, "SELECT 42;");
     assert!(pinkdb_last_error().is_null());
     assert_eq!(pinkdb_result_value(r, 0, 0, 0).int64, 42);
+    pinkdb_result_free(r);
+    pinkdb_close(h);
+}
+
+#[test]
+fn error_classes_are_stable_across_the_c_abi() {
+    // Argument errors.
+    assert!(pinkdb_execute(ptr::null_mut(), ptr::null(), 0).is_null());
+    assert_eq!(last_error_class(), "invalid_argument");
+    let h = pinkdb_open_memory();
+    let bad = [0xff_u8, 0xfe];
+    assert!(pinkdb_execute(h, bad.as_ptr() as *const c_char, bad.len()).is_null());
+    assert_eq!(last_error_class(), "invalid_argument");
+
+    // Engine errors keep their `PinkDbError` variant as the class.
+    let cases = [
+        ("SELEC 1", "parse"),
+        ("SELECT * FROM no_such_table", "catalog"),
+        ("SELECT 1 + 'x'", "type"),
+        ("SELECT 1 / 0", "execution"),
+    ];
+    for (sql, class) in cases {
+        let c = CString::new(sql).unwrap();
+        let r = pinkdb_execute(h, c.as_ptr(), sql.len());
+        assert!(r.is_null(), "{sql} should fail");
+        assert_eq!(last_error_class(), class, "{sql}: {}", last_error());
+    }
+
+    // The one enforced constraint gets its own class.
+    let sql = CString::new(
+        "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);
+         ALTER TABLE t ADD COLUMN b INTEGER NOT NULL;",
+    )
+    .unwrap();
+    let r = pinkdb_execute(h, sql.as_ptr(), sql.as_bytes().len());
+    assert!(r.is_null(), "the NOT NULL column must be refused");
+    assert_eq!(last_error_class(), "constraint", "{}", last_error());
+    assert!(last_error().starts_with("NOT NULL constraint failed"));
+
+    // A wrong bound-value count is a parameter error.
+    let sql = CString::new("SELECT ? + 1").unwrap();
+    let prep = pinkdb_prepare(h, sql.as_ptr(), sql.as_bytes().len());
+    assert!(!prep.is_null(), "{}", last_error());
+    let r = pinkdb_execute_prepared(h, prep, ptr::null(), 0);
+    assert!(r.is_null());
+    assert_eq!(last_error_class(), "parameter");
+    pinkdb_prepared_free(prep);
+
+    // Success clears message and class.
+    let r = exec(h, "SELECT 1");
+    assert!(pinkdb_last_error().is_null());
+    assert!(pinkdb_last_error_class().is_null());
     pinkdb_result_free(r);
     pinkdb_close(h);
 }

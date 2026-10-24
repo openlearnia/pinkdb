@@ -38,7 +38,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
-use pinkdb::{DataType, PinkDb, QueryProfile, QueryResult, Value};
+use pinkdb::{DataType, PinkDb, PinkDbError, QueryProfile, QueryResult, Value};
 
 /// ABI version reported by [`pinkdb_abi_version`].
 pub const PINKDB_ABI_VERSION: u32 = 1;
@@ -105,16 +105,60 @@ pub const PINKDB_TYPE_VARIANT: i32 = 10;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_ERROR_CLASS: std::cell::Cell<Option<&'static CStr>> =
+        const { std::cell::Cell::new(None) };
 }
 
-fn set_error(msg: &str) {
+// The class names are part of the ABI: bindings map them onto their own
+// exception hierarchies, so they are stable, lower-case identifiers.
+const CLASS_PARSE: &CStr = c"parse";
+const CLASS_CATALOG: &CStr = c"catalog";
+const CLASS_TYPE: &CStr = c"type";
+const CLASS_PARAMETER: &CStr = c"parameter";
+const CLASS_EXECUTION: &CStr = c"execution";
+const CLASS_CONSTRAINT: &CStr = c"constraint";
+const CLASS_IO: &CStr = c"io";
+const CLASS_CSV: &CStr = c"csv";
+const CLASS_INVALID_ARGUMENT: &CStr = c"invalid_argument";
+const CLASS_INTERNAL: &CStr = c"internal";
+
+fn set_error(class: &'static CStr, msg: &str) {
     // Interior NULs cannot live in a CString; escape them for display.
     let sanitized = msg.replace('\0', "\\0");
     LAST_ERROR.with(|e| *e.borrow_mut() = CString::new(sanitized).ok());
+    LAST_ERROR_CLASS.with(|c| c.set(Some(class)));
+}
+
+/// Record an engine error, keeping the `PinkDbError` variant as the class.
+/// The one enforced constraint (a NOT NULL column added to a non-empty table
+/// without a default) is an `Execution` error with a fixed prefix; give it
+/// its own class so drivers can raise an integrity error.
+fn set_engine_error(e: &PinkDbError) {
+    // Same stable kinds the CLI's JSON contract uses (`pinkdb::agent`), plus
+    // "constraint" for the one enforced constraint. Drivers map these onto
+    // their own exception hierarchies.
+    let class = if matches!(e, PinkDbError::Execution(msg)
+        if msg.starts_with("NOT NULL constraint failed"))
+    {
+        CLASS_CONSTRAINT
+    } else {
+        match pinkdb::agent::error_kind(e) {
+            "parse" => CLASS_PARSE,
+            "catalog" => CLASS_CATALOG,
+            "type" => CLASS_TYPE,
+            "parameter" => CLASS_PARAMETER,
+            "execution" => CLASS_EXECUTION,
+            "io" => CLASS_IO,
+            "csv" => CLASS_CSV,
+            _ => CLASS_INTERNAL,
+        }
+    };
+    set_error(class, &e.to_string());
 }
 
 fn clear_error() {
     LAST_ERROR.with(|e| *e.borrow_mut() = None);
+    LAST_ERROR_CLASS.with(|c| c.set(None));
 }
 
 /// Last error on this thread (NULL when none). The pointer stays valid until
@@ -122,6 +166,17 @@ fn clear_error() {
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_last_error() -> *const c_char {
     LAST_ERROR.with(|e| match &*e.borrow() {
+        Some(s) => s.as_ptr(),
+        None => ptr::null(),
+    })
+}
+
+/// Class of the last error on this thread (NULL when none): one of `parse`,
+/// `catalog`, `type`, `parameter`, `execution`, `constraint`, `io`, `csv`,
+/// `invalid_argument`, `internal`. Static string; never freed.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_last_error_class() -> *const c_char {
+    LAST_ERROR_CLASS.with(|c| match c.get() {
         Some(s) => s.as_ptr(),
         None => ptr::null(),
     })
@@ -536,7 +591,7 @@ pub struct PinkHandle {
 
 fn c_path(path: *const c_char) -> Option<String> {
     if path.is_null() {
-        set_error("null path");
+        set_error(CLASS_INVALID_ARGUMENT, "null path");
         return None;
     }
     // SAFETY: non-null and required by the API contract to be a NUL-terminated
@@ -544,7 +599,7 @@ fn c_path(path: *const c_char) -> Option<String> {
     match unsafe { CStr::from_ptr(path) }.to_str() {
         Ok(s) => Some(s.to_string()),
         Err(_) => {
-            set_error("path is not valid UTF-8");
+            set_error(CLASS_INVALID_ARGUMENT, "path is not valid UTF-8");
             None
         }
     }
@@ -564,11 +619,14 @@ pub extern "C" fn pinkdb_open(path: *const c_char) -> *mut PinkHandle {
             profiling: false,
         })),
         Ok(Err(e)) => {
-            set_error(&e.to_string());
+            set_engine_error(&e);
             ptr::null_mut()
         }
         Err(_) => {
-            set_error("internal error: panicked while opening the database");
+            set_error(
+                CLASS_INTERNAL,
+                "internal error: panicked while opening the database",
+            );
             ptr::null_mut()
         }
     }
@@ -587,7 +645,10 @@ pub extern "C" fn pinkdb_open_memory() -> *mut PinkHandle {
     })) {
         Ok(handle) => Box::into_raw(handle),
         Err(_) => {
-            set_error("internal error: panicked while opening the database");
+            set_error(
+                CLASS_INTERNAL,
+                "internal error: panicked while opening the database",
+            );
             ptr::null_mut()
         }
     }
@@ -610,7 +671,10 @@ fn into_boxed_result(build: impl FnOnce() -> PinkResult) -> *mut PinkResult {
     match catch_unwind(AssertUnwindSafe(build)) {
         Ok(result) => Box::into_raw(Box::new(result)),
         Err(_) => {
-            set_error("internal error: building the result panicked");
+            set_error(
+                CLASS_INTERNAL,
+                "internal error: building the result panicked",
+            );
             ptr::null_mut()
         }
     }
@@ -629,7 +693,7 @@ pub extern "C" fn pinkdb_execute(
     sql_len: usize,
 ) -> *mut PinkResult {
     if handle.is_null() {
-        set_error("null handle");
+        set_error(CLASS_INVALID_ARGUMENT, "null handle");
         return ptr::null_mut();
     }
     // SAFETY: the caller guarantees (ptr, len) validity for the call.
@@ -644,11 +708,11 @@ pub extern "C" fn pinkdb_execute(
         match catch_unwind(AssertUnwindSafe(|| h.db.execute_profiled(text))) {
             Ok(Ok(pairs)) => into_boxed_result(|| build_profiled_result(pairs)),
             Ok(Err(e)) => {
-                set_error(&e.to_string());
+                set_engine_error(&e);
                 ptr::null_mut()
             }
             Err(_) => {
-                set_error("internal error: statement panicked");
+                set_error(CLASS_INTERNAL, "internal error: statement panicked");
                 ptr::null_mut()
             }
         }
@@ -656,11 +720,11 @@ pub extern "C" fn pinkdb_execute(
         match catch_unwind(AssertUnwindSafe(|| h.db.execute(text))) {
             Ok(Ok(results)) => into_boxed_result(|| build_result(results)),
             Ok(Err(e)) => {
-                set_error(&e.to_string());
+                set_engine_error(&e);
                 ptr::null_mut()
             }
             Err(_) => {
-                set_error("internal error: statement panicked");
+                set_error(CLASS_INTERNAL, "internal error: statement panicked");
                 ptr::null_mut()
             }
         }
@@ -677,7 +741,7 @@ pub extern "C" fn pinkdb_execute(
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_set_profiling(handle: *mut PinkHandle, enabled: i32) -> i32 {
     if handle.is_null() {
-        set_error("null handle");
+        set_error(CLASS_INVALID_ARGUMENT, "null handle");
         return 0;
     }
     clear_error();
@@ -703,7 +767,7 @@ pub extern "C" fn pinkdb_set_profiling(handle: *mut PinkHandle, enabled: i32) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_set_allow_sql_load_extension(handle: *mut PinkHandle, allow: i32) -> i32 {
     if handle.is_null() {
-        set_error("null handle");
+        set_error(CLASS_INVALID_ARGUMENT, "null handle");
         return 0;
     }
     clear_error();
@@ -728,7 +792,10 @@ unsafe fn sql_utf8<'a>(sql: *const c_char, sql_len: usize) -> Option<&'a str> {
     // below sound; the NULL/non-zero-length check runs first.
     unsafe {
         if sql.is_null() && sql_len > 0 {
-            set_error("null sql pointer with non-zero length");
+            set_error(
+                CLASS_INVALID_ARGUMENT,
+                "null sql pointer with non-zero length",
+            );
             return None;
         }
         let bytes: &[u8] = if sql_len == 0 {
@@ -741,7 +808,7 @@ unsafe fn sql_utf8<'a>(sql: *const c_char, sql_len: usize) -> Option<&'a str> {
         match std::str::from_utf8(bytes) {
             Ok(t) => Some(t),
             Err(_) => {
-                set_error("SQL is not valid UTF-8");
+                set_error(CLASS_INVALID_ARGUMENT, "SQL is not valid UTF-8");
                 None
             }
         }
@@ -767,7 +834,7 @@ pub extern "C" fn pinkdb_prepare(
     sql_len: usize,
 ) -> *mut PinkPrepared {
     if handle.is_null() {
-        set_error("null handle");
+        set_error(CLASS_INVALID_ARGUMENT, "null handle");
         return ptr::null_mut();
     }
     // SAFETY: the caller guarantees (ptr, len) validity for the call.
@@ -781,11 +848,11 @@ pub extern "C" fn pinkdb_prepare(
     match catch_unwind(AssertUnwindSafe(|| h.db.prepare(text))) {
         Ok(Ok(stmt)) => Box::into_raw(Box::new(PinkPrepared { stmt })),
         Ok(Err(e)) => {
-            set_error(&e.to_string());
+            set_engine_error(&e);
             ptr::null_mut()
         }
         Err(_) => {
-            set_error("internal error: prepare panicked");
+            set_error(CLASS_INTERNAL, "internal error: prepare panicked");
             ptr::null_mut()
         }
     }
@@ -825,15 +892,18 @@ pub extern "C" fn pinkdb_execute_prepared(
     value_count: usize,
 ) -> *mut PinkResult {
     if handle.is_null() {
-        set_error("null handle");
+        set_error(CLASS_INVALID_ARGUMENT, "null handle");
         return ptr::null_mut();
     }
     if prepared.is_null() {
-        set_error("null prepared statement");
+        set_error(CLASS_INVALID_ARGUMENT, "null prepared statement");
         return ptr::null_mut();
     }
     if values.is_null() && value_count > 0 {
-        set_error("null values pointer with non-zero count");
+        set_error(
+            CLASS_INVALID_ARGUMENT,
+            "null values pointer with non-zero count",
+        );
         return ptr::null_mut();
     }
     // L-7: `value_count` arrives from the caller before the array can be
@@ -843,9 +913,12 @@ pub extern "C" fn pinkdb_execute_prepared(
     const MAX_BOUND_VALUES: usize = 65_536;
     let expected = unsafe { &*prepared }.stmt.parameter_count();
     if value_count > MAX_BOUND_VALUES {
-        set_error(&format!(
-            "value_count {value_count} exceeds the maximum of {MAX_BOUND_VALUES} bound values"
-        ));
+        set_error(
+            CLASS_INVALID_ARGUMENT,
+            &format!(
+                "value_count {value_count} exceeds the maximum of {MAX_BOUND_VALUES} bound values"
+            ),
+        );
         return ptr::null_mut();
     }
     if value_count != expected {
@@ -860,7 +933,7 @@ pub extern "C" fn pinkdb_execute_prepared(
                  were provided for: {value_count}"
             )
         };
-        set_error(&message);
+        set_error(CLASS_PARAMETER, &message);
         return ptr::null_mut();
     }
     let mut bound: Vec<pinkdb::Value> = Vec::with_capacity(value_count);
@@ -871,7 +944,7 @@ pub extern "C" fn pinkdb_execute_prepared(
         match value_from_pink(raw) {
             Ok(v) => bound.push(v),
             Err(msg) => {
-                set_error(&format!("value {i}: {msg}"));
+                set_error(CLASS_INVALID_ARGUMENT, &format!("value {i}: {msg}"));
                 return ptr::null_mut();
             }
         }
@@ -890,11 +963,11 @@ pub extern "C" fn pinkdb_execute_prepared(
         })) {
             Ok(Ok(pairs)) => into_boxed_result(|| build_profiled_result(pairs)),
             Ok(Err(e)) => {
-                set_error(&e.to_string());
+                set_engine_error(&e);
                 ptr::null_mut()
             }
             Err(_) => {
-                set_error("internal error: statement panicked");
+                set_error(CLASS_INTERNAL, "internal error: statement panicked");
                 ptr::null_mut()
             }
         }
@@ -904,11 +977,11 @@ pub extern "C" fn pinkdb_execute_prepared(
         })) {
             Ok(Ok(result)) => into_boxed_result(|| build_result(vec![result])),
             Ok(Err(e)) => {
-                set_error(&e.to_string());
+                set_engine_error(&e);
                 ptr::null_mut()
             }
             Err(_) => {
-                set_error("internal error: statement panicked");
+                set_error(CLASS_INTERNAL, "internal error: statement panicked");
                 ptr::null_mut()
             }
         }

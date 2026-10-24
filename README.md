@@ -1425,7 +1425,7 @@ make -C crates/pinkdb-ffi hello   # compiles and runs the C example
 - Header: `crates/pinkdb-ffi/include/pinkdb.h` (ABI v1; `pinkdb_abi_version()`).
 - Handles (`pinkdb_open` for durable files, `pinkdb_open_memory`) are not
   thread-safe — use one per thread. Errors are thread-local
-  (`pinkdb_last_error`).
+  (`pinkdb_last_error`), with a stable class in `pinkdb_last_error_class`.
 - `pinkdb_execute(handle, sql, len)` takes UTF-8 bytes (embedded NULs allowed)
   and returns a result that round-trips every statement kind and value type:
   typed `pink_value` by value, with VARCHAR text borrowed from the result.
@@ -1433,8 +1433,9 @@ make -C crates/pinkdb-ffi hello   # compiles and runs the C example
   `pinkdb_close`; the full contract (pointers, threading, text lifetimes) is in
   the header.
 
-Artifacts: `libpinkdb_ffi.dylib` ≈ 1.70 MB, `libpinkdb_ffi.a` ≈ 15.5 MB (build
-archive); nothing is added to the `pinkdb` binary.
+Artifacts (release, macOS arm64): `libpinkdb_ffi.dylib` ≈ 3.5 MB,
+`libpinkdb_ffi.a` ≈ 26 MB (build archive); nothing is added to the `pinkdb`
+binary.
 
 ## Extensions (loadable)
 
@@ -1938,16 +1939,90 @@ Semantics and persistence:
 cargo test -p pinkdb-ext-loader   # compiles the C test extensions with cc
 ```
 
+## Language bindings
+
+`bindings/node`, `bindings/python` and `bindings/go` wrap the same C ABI v1
+(`crates/pinkdb-ffi`) and all three run the shared, language-neutral corpus in
+[`bindings/conformance`](bindings/conformance) — typed parameter round trips,
+stable error classes, transactions, multiple result sets, empty results and a
+100k-row case. A binding change that breaks the corpus breaks CI.
+
+## Node.js binding (`bindings/node`)
+
+A native addon over the C ABI, built with [napi-rs](https://napi.rs) and
+statically linking `pinkdb-ffi`, so `pinkdb.node` has no runtime dependency on
+a separately built shared library. A Rust toolchain is needed at build time
+only:
+
+```sh
+cd bindings/node
+npm run build     # cargo build --release + copy the addon to build/pinkdb.node
+node --test test  # API tests plus the shared conformance corpus
+npm pack          # tarball for local use; the package is marked private
+```
+
+```js
+const { open } = require('@pinkdb/pinkdb');
+
+const db = open('/tmp/data.pink');   // open() with no path is in-memory
+db.run("CREATE TABLE t (i INTEGER, s VARCHAR)");
+db.run("INSERT INTO t VALUES (?, ?)", [1, 'héllo']);
+db.query('SELECT i, s FROM t WHERE i = ?', [1]);   // [{ i: 1, s: 'héllo' }]
+
+const insert = db.prepare('INSERT INTO t VALUES (?, ?)');
+insert.run([2, null]);
+for (const row of db.prepare('SELECT i FROM t ORDER BY i').iterate()) {
+  console.log(row.i);
+}
+db.close();
+```
+
+`run(sql, params?)` returns one result per `;`-separated statement
+(`kind`, `columns`, `columnTypes`, `rows`, `rowCount`, `affected`, `name`);
+`query(sql, params?)` returns row objects; `prepare(sql)` gives
+`run(params)` (metadata), `all(params)` (rows) and `iterate(params?)` (a lazy
+row iterator over the native result). Transactions are explicit (`begin()`,
+`commit()`, `rollback()`). Values map to `null`, `boolean`, `number` (INTEGER/
+DOUBLE), `BigInt` (BIGINT), `string` (VARCHAR, and DATE/TIMESTAMP/DECIMAL/
+INTERVAL as canonical text); errors are `PinkdbError` with `.class`. The
+addon checks `pinkdb_abi_version()` when it loads. See
+`bindings/node/README.md` for the full tables.
+
 ## Python binding (`bindings/python`)
 
-A thin, dependency-free wrapper over the C ABI, implemented with the standard
-library `ctypes` module (no `cffi`, no pip installs, no build step for the
-package itself — the roadmap's `cffi` wording is a deliberate deviation here;
-the binding model is the same). Build the shared library first:
+A dependency-free wrapper over the C ABI, implemented with the standard
+library `ctypes` module (no `cffi` — the roadmap's `cffi` wording is a
+deliberate deviation here; the binding model is the same). It is both a
+**PEP 249 (DB-API 2.0)** driver and the thin native wrapper. A wheel bundles
+`libpinkdb_ffi`, so `pip install` needs no Rust toolchain. From a checkout,
+build the shared library first:
 
 ```sh
 cargo build --release -p pinkdb-ffi
 ```
+
+```python
+import pinkdb
+
+connection = pinkdb.connect_memory()   # or pinkdb.connect("data.pink")
+cursor = connection.cursor()
+cursor.execute("CREATE TABLE t (x INTEGER, s VARCHAR)")
+cursor.executemany("INSERT INTO t VALUES (?, ?)", [(1, "héllo"), (2, None)])
+cursor.execute("SELECT x, s FROM t ORDER BY x")
+cursor.fetchall()                      # [(1, 'héllo'), (2, None)]
+connection.commit()
+connection.close()
+```
+
+`paramstyle` is `"qmark"`, exceptions map from the native error class
+(`ProgrammingError`, `IntegrityError`, `OperationalError`, …), and
+`description`/`rowcount`/`fetchone`/`fetchmany`/`fetchall` follow PEP 249.
+The engine is autocommit until `BEGIN`, so `execute()` does not open an
+implicit transaction; `commit()`/`rollback()` are explicit and are no-ops
+when no transaction is open (documented deviation). A wheel:
+`python3 -m pip wheel . --no-deps -w dist` in `bindings/python`.
+
+### Native API
 
 ```python
 import pinkdb
@@ -1969,10 +2044,12 @@ with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
 - `affected` (INSERT/UPDATE/DELETE) and `name` (view/table/database/`USE`/
   extension).
 
-Values map to `None`/`bool`/`int`/`float`/`str`/`datetime.date`/naive-UTC
-`datetime.datetime`; errors raise `pinkdb.Error` with the message from
-`pinkdb_last_error` and leave the handle usable. The library is located via
-`PINKDB_FFI_LIB` (full dylib/so path) or, by default, the repo-relative
+Results are materialized (the DB-API `Cursor` above is the row-at-a-time
+path), and `prepare()` returns a reusable `Statement`. Values map to `None`/`bool`/`int`/`float`/`str`/`datetime.date`/
+naive-UTC `datetime.datetime` (and `decimal.Decimal` for DECIMAL); errors
+raise `pinkdb.Error` with the message from `pinkdb_last_error` and leave the
+handle usable. The library is located via `PINKDB_FFI_LIB` (full dylib/so
+path), next to the installed package (a wheel), or the repo-relative
 `target/release/libpinkdb_ffi.{dylib,so}`.
 
 ```sh
@@ -1984,10 +2061,15 @@ PINKDB_FFI_LIB="$PWD/target/release/libpinkdb_ffi.dylib" \
 ## Go binding (`bindings/go`)
 
 A cgo wrapper over the same C ABI v1 (module
-`github.com/openlearnia/pinkdb/bindings/go`). Build the shared library first:
+`github.com/openlearnia/pinkdb/bindings/go`). The module carries its own copy
+of the C declarations, so `go get` works without the pinkdb checkout; only the
+library is needed at link time:
 
 ```sh
-cargo build --release -p pinkdb-ffi
+cargo build --release -p pinkdb-ffi   # inside a checkout: links target/release
+# elsewhere:
+export PINKDB_LIB_DIR=/opt/pinkdb/lib
+export CGO_LDFLAGS="-L$PINKDB_LIB_DIR -Wl,-rpath,$PINKDB_LIB_DIR"
 ```
 
 ```go
@@ -2010,11 +2092,13 @@ fmt.Println(results[2].Kind, results[2].Rows) // selected [[1 héllo] [<nil> <ni
 
 `Execute` returns materialized `[]Result`s (`Kind`, `Columns`, `ColumnTypes`,
 `Rows`, `Affected`, `Name`); values map to `nil`/`bool`/`int64`/`float64`/
-`string`/UTC `time.Time`, and errors carry the native `pinkdb_last_error`
-message. All native calls are serialized behind a per-`DB` mutex (the C
-handle itself is single-threaded), `Close` is idempotent, and use after close
-returns `ErrClosed`. See `bindings/go/README.md` for the value-mapping table
-and linking notes.
+`string`/UTC `time.Time`, and native errors are `*pinkdb.Error` with a stable
+`Class` (`parse`, `catalog`, `type`, `parameter`, `execution`, `constraint`,
+`io`, `csv`, `invalid_argument`, `internal`). Results are materialized, not
+streamed — a row iterator is a follow-up. All native calls are serialized
+behind a per-`DB` mutex (the C handle itself is single-threaded), `Close` is
+idempotent, and use after close returns `ErrClosed`. See
+`bindings/go/README.md` for the value-mapping table and linking notes.
 
 ```sh
 cd bindings/go && go test ./...
@@ -2239,7 +2323,7 @@ only:
 
 | Workflow | Trigger | Jobs / steps |
 |---|---|---|
-| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,encryption`, `pinkdb-cli --features pinklake` / `pinklake,s3` / `s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + the C/C++, Go and Rust SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the whole workspace on Rust 1.97 (the edition-2024 MSRV); `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
+| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,encryption`, `pinkdb-cli --features pinklake` / `pinklake,s3` / `s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, the Node addon build + `node --test` + `npm pack --dry-run`, and `gofmt` + `go vet` + `go test -race`; `python-wheel` — builds the wheel, installs it into a fresh venv and runs the conformance corpus from the installed package; `sdk-smokes` — `make -C ext-sdk/c` + the C/C++, Go and Rust SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the whole workspace on Rust 1.97 (the edition-2024 MSRV); `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
 | `release.yml` | push of a `v*` tag, or manual dispatch with a version | `prepare` (tag/version/Cargo.toml match + matrix), one `build` matrix job per CLI/server variant × platform (build → `scripts/release/smoke.sh` → tarball + `.sha256`, no secrets), then one `publish` job (`contents: write`) that downloads all 28 artifacts, regenerates and validates `SHA256SUMS`, refuses an existing release, and uploads the GitHub release |
 | `deploy-docs.yml` | push to `main` touching `website/**` (or the workflow itself), manual dispatch | `python3 website/build.py`, then `wrangler deploy` from `website/` (the `pinkdb-docs` Worker) |
 | `publish-extensions.yml` | push of a `v*` tag, or manual dispatch | builds the extension catalog in a per-platform matrix (C/C++, Go and Rust SDKs plus `extensions/*/Makefile`s; `file` architecture check; native SDK smokes), fans in to one publish job that fetches the live catalog, skips already-published coordinates, publishes with `ext-repo/publish.sh` (wrangler → R2), signs the catalog, deploys the Worker exactly once, then verifies the local/live signature and artifacts through it |

@@ -1,0 +1,23 @@
+[package]
+name = "pinkdb-node"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# The Node addon links the pinkdb C ABI statically, so the published .node file
+# has no runtime dependency on a separately installed libpinkdb_ffi.
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi6"] }
+napi-derive = "2"
+pinkdb = { path = "../../../crates/pinkdb" }
+pinkdb-ffi = { path = "../../../crates/pinkdb-ffi" }
+
+[build-dependencies]
+napi-build = "2"
+
+[lib]
+crate-type = ["cdylib"]
+
+# A separate workspace: the addon is built by cargo directly, not as a member of
+# the pinkdb workspace, so the engine's dependency graph stays untouched.
+[workspace]

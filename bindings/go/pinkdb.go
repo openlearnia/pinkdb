@@ -5,11 +5,12 @@
 //
 //	cargo build --release -p pinkdb-ffi
 //
-// The cgo directives below resolve the ABI header and the workspace
-// target/release directory relative to this package, so a repo checkout needs
-// no environment variables: the linker finds libpinkdb_ffi there and the
-// release dylib/so is found again at run time through an rpath to the same
-// directory.
+// The C declarations are carried in this package rather than included from
+// crates/pinkdb-ffi/include/pinkdb.h, so the module compiles from the Go
+// module cache outside a pinkdb checkout. The cgo directives point at the
+// workspace target/release directory relative to this package, so a repo
+// checkout needs no environment variables; elsewhere set PINKDB_LIB_DIR and
+// CGO_LDFLAGS (see the preamble).
 //
 // A *DB wraps one native handle. The C ABI's handles are single-threaded:
 // this package serializes every native call with a per-DB mutex, so a single
@@ -21,10 +22,63 @@
 package pinkdb
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../crates/pinkdb-ffi/include
 #cgo LDFLAGS: -L${SRCDIR}/../../target/release -Wl,-rpath,${SRCDIR}/../../target/release -lpinkdb_ffi
 #include <stdlib.h>
-#include "pinkdb.h"
+#include <stdint.h>
+#include <stddef.h>
+
+// The subset of the pinkdb C ABI v1 this package uses, declared here instead
+// of including crates/pinkdb-ffi/include/pinkdb.h: that header lives outside
+// the Go module, so a module downloaded with `go get` would not have it. The
+// declarations are checked against the real header by abi_test.go when the
+// repository checkout is present.
+//
+// To link a library that is not in a pinkdb checkout, point cgo at it:
+//
+//	export PINKDB_LIB_DIR=/path/to/lib
+//	export CGO_LDFLAGS="-L$PINKDB_LIB_DIR -Wl,-rpath,$PINKDB_LIB_DIR"
+typedef struct pinkdb_handle pinkdb_handle;
+typedef struct pinkdb_result pinkdb_result;
+typedef struct pinkdb_prepared pinkdb_prepared;
+
+// pink_value is passed by value; text_ptr/text_len is the VARCHAR,
+// DECIMAL and INTERVAL payload and is not NUL-terminated.
+typedef struct pink_value {
+	int32_t type_tag;
+	int32_t is_null;
+	int64_t int64;
+	double double_;
+	const char *text_ptr;
+	size_t text_len;
+} pink_value;
+
+uint32_t pinkdb_abi_version(void);
+pinkdb_handle *pinkdb_open(const char *path);
+pinkdb_handle *pinkdb_open_memory(void);
+void pinkdb_close(pinkdb_handle *handle);
+const char *pinkdb_last_error(void);
+const char *pinkdb_last_error_class(void);
+int32_t pinkdb_set_allow_sql_load_extension(pinkdb_handle *handle, int32_t allow);
+pinkdb_result *pinkdb_execute(pinkdb_handle *handle, const char *sql, size_t sql_len);
+pinkdb_prepared *pinkdb_prepare(pinkdb_handle *handle, const char *sql, size_t sql_len);
+size_t pinkdb_prepared_parameter_count(const pinkdb_prepared *prepared);
+void pinkdb_prepared_free(pinkdb_prepared *prepared);
+pinkdb_result *pinkdb_execute_prepared(
+	pinkdb_handle *handle, const pinkdb_prepared *prepared,
+	const pink_value *values, size_t value_count);
+void pinkdb_result_free(pinkdb_result *result);
+size_t pinkdb_result_statement_count(const pinkdb_result *result);
+int32_t pinkdb_result_kind(const pinkdb_result *result, size_t statement);
+size_t pinkdb_result_column_count(const pinkdb_result *result, size_t statement);
+const char *pinkdb_result_column_name(
+	const pinkdb_result *result, size_t statement, size_t column);
+int32_t pinkdb_result_column_type(
+	const pinkdb_result *result, size_t statement, size_t column);
+size_t pinkdb_result_row_count(const pinkdb_result *result, size_t statement);
+pink_value pinkdb_result_value(
+	const pinkdb_result *result, size_t statement, size_t row, size_t column);
+size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement);
+const char *pinkdb_result_name(const pinkdb_result *result, size_t statement);
 */
 import "C"
 
@@ -612,15 +666,33 @@ func checkABI() error {
 	return nil
 }
 
-// nativeError copies the thread-local pinkdb_last_error into a Go error. The
-// caller must keep the goroutine locked to its OS thread, since the message
-// only exists on the thread that made the failing call.
+// Error is a failure reported by the pinkdb C ABI. Class is the stable error
+// class from pinkdb_last_error_class. It is one of "parse", "catalog",
+// "type", "parameter", "execution", "constraint", "io", "csv",
+// "invalid_argument" or "internal"; check it with errors.As:
+//
+//	var pinkdbErr *pinkdb.Error
+//	if errors.As(err, &pinkdbErr) && pinkdbErr.Class == "parse" { ... }
+type Error struct {
+	Class   string
+	Message string
+}
+
+func (e *Error) Error() string { return e.Message }
+
+// nativeError copies the thread-local pinkdb_last_error and its class into a
+// Go error. The caller must keep the goroutine locked to its OS thread, since
+// both only exist on the thread that made the failing call.
 func nativeError() error {
 	msg := C.pinkdb_last_error()
 	if msg == nil {
-		return errors.New("pinkdb: native call failed without an error message")
+		return &Error{Class: "internal", Message: "pinkdb: native call failed without an error message"}
 	}
-	return errors.New(C.GoString(msg))
+	class := "internal"
+	if cls := C.pinkdb_last_error_class(); cls != nil {
+		class = C.GoString(cls)
+	}
+	return &Error{Class: class, Message: C.GoString(msg)}
 }
 
 // materialize snapshots every statement of a pinkdb_result into Results before

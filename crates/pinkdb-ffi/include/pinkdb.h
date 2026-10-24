@@ -10,7 +10,8 @@
  *   `pinkdb_*_free` function (`pinkdb_result_free`, `pinkdb_prepared_free`
  *   and `pinkdb_close`). Never free the same pointer twice.
  * - Text pointers (`pinkdb_result_column_name`, `pinkdb_result_name`,
- *   `pinkdb_result_profile_kind`, `pink_value.text_ptr`, `pinkdb_last_error`)
+ *   `pinkdb_result_profile_kind`, `pink_value.text_ptr`, `pinkdb_last_error`,
+ *   `pinkdb_last_error_class`)
  *   borrow from their owning result/handle/thread and stay valid only until
  *   that owner is freed or the next FFI call on the same thread. Copy them if
  *   you need them longer. `text_ptr` is followed by a NUL byte but may contain
@@ -27,7 +28,8 @@
  *   NULL pointer with a non-zero length, or invalid UTF-8, is an error.
  * - Error reporting: functions that return a pointer return NULL on failure;
  *   index/kind accessors return 0/-1 for out-of-range indices; call
- *   `pinkdb_last_error` for the message.
+ *   `pinkdb_last_error` for the message and `pinkdb_last_error_class` for its
+ *   class.
  */
 
 #ifndef PINKDB_H
@@ -296,6 +298,27 @@ const char *pinkdb_result_profile_kind(const pinkdb_result *result,
  * call on this thread succeeded. Valid until the next FFI call on this
  * thread. */
 const char *pinkdb_last_error(void);
+
+/* Class of the last error on the calling thread (NUL-terminated), or NULL
+ * when the last call succeeded. One of:
+ *
+ *   "parse"            the SQL text did not parse
+ *   "catalog"          a table/column/database/function does not exist
+ *   "type"             a type error (conversion, arithmetic, ...)
+ *   "parameter"        wrong bound-parameter count, untypable NULL, ...
+ *   "execution"        the statement failed while running
+ *   "constraint"       a constraint refused the statement
+ *   "io"               a filesystem/WAL error
+ *   "csv"              a CSV import/export error
+ *   "invalid_argument" the caller passed a bad argument (NULL handle, invalid
+ *                      UTF-8, a value that cannot be bound, ...)
+ *   "internal"         a caught panic; the handle is still usable
+ *
+ * The string is static: never free it, and it stays valid across later calls
+ * (unlike pinkdb_last_error). Drivers map these classes onto their own
+ * exception hierarchies. New classes may be added in later ABI versions;
+ * treat an unknown class as "internal". */
+const char *pinkdb_last_error_class(void);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bindings — pinkdb</title>
-<meta name="description" content="Embed pinkdb from Rust, C, Python or Go through the pinkdb-ffi C ABI, with minimal examples and links to the full API pages.">
+<meta name="description" content="Embed pinkdb from Rust, C, Node.js, Python or Go through the pinkdb-ffi C ABI, with minimal examples, the shared conformance corpus and links to the full API pages.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
@@ -12,7 +12,7 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
 <meta property="og:title" content="Bindings — pinkdb">
-<meta property="og:description" content="Embed pinkdb from Rust, C, Python or Go through the pinkdb-ffi C ABI, with minimal examples and links to the full API pages.">
+<meta property="og:description" content="Embed pinkdb from Rust, C, Node.js, Python or Go through the pinkdb-ffi C ABI, with minimal examples, the shared conformance corpus and links to the full API pages.">
 <meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/bindings.html">
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
@@ -182,8 +182,8 @@
 <h1>Bindings</h1>
 
 <p class="doc-meta">Use pinkdb from another language through the C ABI
-(<code>pinkdb-ffi</code>), or natively from Rust. Python and Go ship dependency-free
-wrappers over that same ABI.</p>
+(<code>pinkdb-ffi</code>), or natively from Rust. Node, Python and Go ship
+wrappers over that same ABI, and all three run one shared conformance corpus.</p>
 
 <div class="table-wrap">
 <table>
@@ -202,14 +202,20 @@ wrappers over that same ABI.</p>
       <td><a href="../docs/api-c">C API →</a></td>
     </tr>
     <tr>
+      <td>Node.js</td>
+      <td>native addon (napi-rs), statically links <code>pinkdb-ffi</code></td>
+      <td>shipped</td>
+      <td><a href="../docs/bindings.html#node-js">examples below</a></td>
+    </tr>
+    <tr>
       <td>Python</td>
-      <td><code>ctypes</code> over the C ABI — no pip installs</td>
+      <td><code>ctypes</code> over the C ABI; PEP 249 (DB-API 2.0); wheel bundles the library</td>
       <td>shipped</td>
       <td><a href="../docs/api-python">Python API →</a></td>
     </tr>
     <tr>
       <td>Go</td>
-      <td><code>cgo</code> over the C ABI</td>
+      <td><code>cgo</code> over the C ABI; self-contained module</td>
       <td>shipped</td>
       <td><a href="../docs/api-go">Go API →</a></td>
     </tr>
@@ -220,18 +226,19 @@ wrappers over that same ABI.</p>
       <td><a href="../docs/api-c">C API →</a></td>
     </tr>
     <tr>
-      <td>JS / wasm, Node, Java</td>
+      <td>Java / JDBC, .NET, ADBC, ODBC</td>
       <td>—</td>
-      <td>deferred (not scheduled yet)</td>
+      <td>follow-ups (not scheduled yet)</td>
       <td><a href="../docs/roadmap">Roadmap →</a></td>
     </tr>
   </tbody>
 </table>
 </div>
 
-<h2 id="build-the-native-library-first">Build the native library first<a class="anchor" href="#build-the-native-library-first" aria-label="Permalink: Build the native library first">#</a></h2>
+<h2 id="build-the-native-library">Build the native library<a class="anchor" href="#build-the-native-library" aria-label="Permalink: Build the native library">#</a></h2>
 
-<p>The Python and Go bindings, and any direct C use, need the shared library:</p>
+<p>Any direct C use, and the Python and Go bindings from a source checkout,
+need the shared library:</p>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-ffi
 <span class="tok-c"># -&gt; target/release/libpinkdb_ffi.dylib  (or .so / .dll)</span>
@@ -239,8 +246,14 @@ wrappers over that same ABI.</p>
 
 <p>Nothing is added to the <code>pinkdb</code> binary. The C ABI is the only
 embedding crate that contains <code>unsafe</code>; the core stays zero-unsafe.
-Measured artifacts: <code>libpinkdb_ffi.dylib</code> ≈ 1.70 MB,
-<code>libpinkdb_ffi.a</code> ≈ 15.5 MB (build archive).</p>
+Measured artifacts (release, macOS arm64): <code>libpinkdb_ffi.dylib</code>
+≈ 3.5 MB, <code>libpinkdb_ffi.a</code> ≈ 26 MB (build archive).</p>
+
+<p>A Python wheel bundles the shared library and a Node addon statically links
+it, so <code>pip install</code> and <code>npm run build</code> produce
+artifacts that need no separate library at run time. Go links the library
+(<code>cargo build --release -p pinkdb-ffi</code>, or
+<code>PINKDB_LIB_DIR</code> plus <code>CGO_LDFLAGS</code> outside a checkout).</p>
 
 <h2 id="c-abi-in-one-example">C ABI in one example<a class="anchor" href="#c-abi-in-one-example" aria-label="Permalink: C ABI in one example">#</a></h2>
 
@@ -259,18 +272,47 @@ pinkdb_close(db);</code></pre></div>
 <strong>not thread-safe</strong> (use one per thread; serialize calls), and errors are
 thread-local (<code>pinkdb_last_error()</code>).</p>
 
+<h2 id="node-js">Node.js</h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">JS</span></div><pre class="code" data-lang="js"><code>const { open } = require('@pinkdb/pinkdb');
+
+const db = open('/tmp/data.pink');   // open() with no path is in-memory
+db.run("CREATE TABLE t (i INTEGER, s VARCHAR)");
+db.run("INSERT INTO t VALUES (?, ?)", [1, 'héllo']);
+db.query('SELECT i, s FROM t WHERE i = ?', [1]);   // [{ i: 1, s: 'héllo' }]
+
+for (const row of db.prepare('SELECT i FROM t ORDER BY i').iterate()) {
+  console.log(row.i);
+}
+db.close();</code></pre></div>
+
+<p>A native addon built with napi-rs; <code>run</code> returns one result per
+statement, <code>query</code> returns row objects, <code>prepare</code> gives
+<code>run</code>/<code>all</code>/<code>iterate</code>, and errors are
+<code>PinkdbError</code> with a stable <code>class</code>. Build it with
+<code>cd bindings/node &amp;&amp; npm run build</code>; the package is marked
+private (a <code>npm pack</code> tarball for local use, not a registry
+publish).</p>
+
 <h2 id="python">Python<a class="anchor" href="#python" aria-label="Permalink: Python">#</a></h2>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Python</span></div><pre class="code" data-lang="python"><code><span class="tok-k">import</span> pinkdb
 
-<span class="tok-k">with</span> pinkdb.connect_memory() <span class="tok-k">as</span> db:            <span class="tok-c"># or pinkdb.connect("data.pink")</span>
-    db.execute(<span class="tok-s">"CREATE TABLE t (x INTEGER, s VARCHAR);"</span>)
-    db.execute(<span class="tok-s">"INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);"</span>)
-    result = db.execute(<span class="tok-s">"SELECT x, s FROM t ORDER BY x;"</span>)[<span class="tok-n">0</span>]
-    <span class="tok-k">print</span>(result.kind, result.rows)  <span class="tok-c"># selected [[1, 'héllo'], [None, None]]</span></code></pre></div>
+connection = pinkdb.connect_memory()   <span class="tok-c"># or pinkdb.connect("data.pink")</span>
+cursor = connection.cursor()
+cursor.execute(<span class="tok-s">"CREATE TABLE t (x INTEGER, s VARCHAR)"</span>)
+cursor.executemany(<span class="tok-s">"INSERT INTO t VALUES (?, ?)"</span>, [(<span class="tok-n">1</span>, <span class="tok-s">"héllo"</span>), (<span class="tok-n">2</span>, <span class="tok-k">None</span>)])
+cursor.execute(<span class="tok-s">"SELECT x, s FROM t ORDER BY x"</span>)
+<span class="tok-k">print</span>(cursor.fetchall())               <span class="tok-c"># [(1, 'héllo'), (2, None)]</span>
+connection.close()</code></pre></div>
 
-<p>Standard-library <code>ctypes</code> only; values map to Python types, errors raise
-<code>pinkdb.Error</code>. See the
+<p>Standard-library <code>ctypes</code> below a <strong>PEP 249 (DB-API 2.0)</strong>
+layer: <code>connect</code>/<code>Connection</code>/<code>Cursor</code>,
+<code>paramstyle = "qmark"</code>, the exception hierarchy and the type
+objects. A wheel bundles the shared library
+(<code>python3 -m pip wheel . --no-deps -w dist</code> in
+<code>bindings/python</code>); the native <code>Database</code>/<code>Statement</code>
+API is still exported. See the
 <a href="../docs/api-python">Python API</a>.</p>
 
 <h2 id="go">Go<a class="anchor" href="#go" aria-label="Permalink: Go">#</a></h2>
@@ -293,8 +335,20 @@ results, <span class="tok-k">err</span> := db.Execute(
 fmt.Println(results[<span class="tok-n">2</span>].Kind, results[<span class="tok-n">2</span>].Rows) <span class="tok-c">// selected [[1 héllo] [&lt;nil&gt; &lt;nil&gt;]]</span></code></pre></div>
 
 <p><code>cgo</code> and the Go standard library only; one <code>*DB</code> is safe to
-share between goroutines (calls are serialized). See the
+share between goroutines (calls are serialized) and native errors are
+<code>*pinkdb.Error</code> with a stable <code>Class</code>. The module carries
+its own C declarations, so <code>go get</code> works without this checkout —
+only the library is needed at link time. See the
 <a href="../docs/api-go">Go API</a>.</p>
+
+<h2 id="one-conformance-corpus">One conformance corpus<a class="anchor" href="#one-conformance-corpus" aria-label="Permalink: One conformance corpus">#</a></h2>
+
+<p><code>bindings/conformance/corpus.json</code> is language-neutral: the Node,
+Python and Go bindings each run it in CI. It covers every SQL type's round
+trip (NULLs, extremes, unicode, DECIMAL, DATE/TIMESTAMP), positional
+parameters, stable error classes, transactions and autocommit, multiple and
+empty result sets, and a 100k-row case that the Node and Python bindings read
+one row at a time.</p>
 
 <h2 id="rust">Rust<a class="anchor" href="#rust" aria-label="Permalink: Rust">#</a></h2>
 
@@ -308,9 +362,11 @@ share between goroutines (calls are serialized). See the
 <p>Start with the <a href="../docs/api-rust">Rust API</a> or the
 <a href="../docs/guide-embedding">embedding guide</a>.</p>
 
-<p class="doc-meta">A standalone Go module and a Python wheel are planned; today the
-Python package lives in <code>bindings/python</code> and the Go module is
-<code>github.com/openlearnia/pinkdb/bindings/go</code>.</p>
+<p class="doc-meta">The Python wheel is not on PyPI and the Node package is not
+on npm yet: both build from <code>bindings/</code> and are marked private. The
+Go module is <code>github.com/openlearnia/pinkdb/bindings/go</code>; JDBC,
+.NET and an ADBC driver are follow-ups on the
+<a href="../docs/roadmap">roadmap</a>.</p>
 
 <ul class="next-links">
   <li><a href="../docs/api-c">C API →</a></li>
@@ -326,10 +382,11 @@ Python package lives in <code>bindings/python</code> and the Go module is
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
-  <li><a href="#build-the-native-library-first">Build the native library first</a></li>
+  <li><a href="#build-the-native-library">Build the native library</a></li>
   <li><a href="#c-abi-in-one-example">C ABI in one example</a></li>
   <li><a href="#python">Python</a></li>
   <li><a href="#go">Go</a></li>
+  <li><a href="#one-conformance-corpus">One conformance corpus</a></li>
   <li><a href="#rust">Rust</a></li>
 </ul>
 <p class="toc-top"><a href="#main">Back to top &#8593;</a></p>

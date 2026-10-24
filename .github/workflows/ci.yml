@@ -331,9 +331,10 @@ jobs:
       - name: python3 bench/duckdiff.py
         run: python3 bench/duckdiff.py
 
-  # C ABI down to both language bindings: Python (ctypes) and Go (cgo).
+  # C ABI down to every language binding: Python (ctypes), Node (napi-rs) and
+  # Go (cgo). Each one runs the shared corpus in bindings/conformance.
   bindings:
-    name: python + go bindings
+    name: python + node + go bindings
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -357,6 +358,20 @@ jobs:
       - name: python3 -m unittest discover -s bindings/python/tests
         run: python3 -m unittest discover -s bindings/python/tests -v
 
+      - name: install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      # The addon statically links pinkdb-ffi, so cargo rebuilds it here; the
+      # corpus is the same file the Python and Go jobs run.
+      - name: node --test (build the addon, run the corpus, check npm pack)
+        working-directory: bindings/node
+        run: |
+          npm run build
+          node --test test
+          npm pack --dry-run
+
       - name: install Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
@@ -369,6 +384,49 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
           go test -race ./...
+
+  # The Python wheel must work without the checkout: this builds it, installs
+  # it into a fresh venv, and runs the corpus with the installed package from
+  # a directory that cannot shadow it.
+  python-wheel:
+    name: python wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: bindings
+
+      - name: build the wheel
+        working-directory: bindings/python
+        run: |
+          python3 -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install --upgrade pip setuptools wheel
+          /tmp/wheel-venv/bin/pip wheel . --no-deps --no-build-isolation -w dist
+
+      - name: install the wheel and check it is self-contained
+        run: |
+          /tmp/wheel-venv/bin/pip install --force-reinstall bindings/python/dist/*.whl
+          cd /tmp
+          /tmp/wheel-venv/bin/python - <<'PY'
+          import pathlib
+          import pinkdb
+
+          library = pathlib.Path(pinkdb.library_path).resolve()
+          assert "site-packages" in library.parts, library
+          assert pinkdb.abi_version() == 1, pinkdb.abi_version()
+          print("installed wheel loads", library)
+          PY
+          PINKDB_CONFORMANCE="$GITHUB_WORKSPACE/bindings/conformance/corpus.json" \
+            /tmp/wheel-venv/bin/python -m unittest discover \
+            -s "$GITHUB_WORKSPACE/bindings/python/tests" -p 'test_conformance.py' -v
 
   # The three extension SDKs, end to end: each smoke script builds the release
   # CLI and runs a deterministic LOAD EXTENSION session against the compared

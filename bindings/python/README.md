@@ -1,11 +1,16 @@
 # pinkdb Python binding
 
-A thin, dependency-free Python wrapper over the pinkdb C ABI
+A dependency-free Python wrapper over the pinkdb C ABI
 (`crates/pinkdb-ffi/include/pinkdb.h`, ABI v1), implemented with the standard
-library `ctypes` module only. The roadmap originally called for `cffi`; this
-package deliberately uses `ctypes` instead so it installs with zero
-dependencies and no compiler/build step (same thin-wrapper model — every
-exported C function is bound directly).
+library `ctypes` module only. It has two layers:
+
+- a **PEP 249 (DB-API 2.0)** module: `connect()`, `Connection`, `Cursor`,
+  `paramstyle = "qmark"`, the exception hierarchy and the type objects;
+- the **native wrapper** below it: `Database.execute`, `prepare()`/`Statement`
+  and materialized `Result`s, still exported unchanged.
+
+A wheel bundles `libpinkdb_ffi` inside the package, so `pip install` needs no
+Rust toolchain and no separately built library.
 
 ## Build the C ABI first
 
@@ -17,7 +22,8 @@ The package looks for the shared library in this order:
 
 1. `PINKDB_FFI_LIB` — full path to `libpinkdb_ffi.dylib` /
    `libpinkdb_ffi.so`, or `libpinkdb_ffi.dll` on Windows;
-2. `<repo>/target/release/libpinkdb_ffi.dylib` (or `.so` / `.dll`),
+2. next to the package itself — where a wheel puts its bundled copy;
+3. `<repo>/target/release/libpinkdb_ffi.dylib` (or `.so` / `.dll`),
    computed relative to this package's location.
 
 If neither exists, importing `pinkdb` raises a `pinkdb.Error` telling you to
@@ -25,7 +31,81 @@ run the build above (or to set `PINKDB_FFI_LIB`). Importing also fails with
 `pinkdb.Error` when the file it loads is not a pinkdb-ffi library (it lacks
 the `pinkdb_*` symbols) or reports an ABI version other than 1.
 
-## Usage
+## Build a wheel
+
+```sh
+cd bindings/python
+python3 -m pip wheel . --no-deps -w dist
+python3 -m pip install dist/pinkdb-*.whl
+```
+
+`setup.py` runs `cargo build --release -p pinkdb-ffi` and copies the shared
+library into the `pinkdb` package, so the wheel is self-contained and
+platform-specific (not a pure-Python wheel). Set `PINKDB_FFI_LIB` to an
+existing library to skip the cargo step. Build wheels on the platform and
+Python version you target; there is no cross-compilation.
+
+## DB-API 2.0 usage
+
+```python
+import pinkdb
+
+connection = pinkdb.connect("data.pink")     # or pinkdb.connect_memory()
+try:
+    cursor = connection.cursor()
+    cursor.execute("CREATE TABLE t (x INTEGER, s VARCHAR)")
+    cursor.executemany("INSERT INTO t VALUES (?, ?)", [(1, "héllo"), (2, None)])
+    cursor.execute("SELECT x, s FROM t ORDER BY x")
+    cursor.description   # [('x', 2, None, None, None, None, None), ...]
+    cursor.fetchone()    # (1, 'héllo')
+    cursor.fetchall()    # [(2, None)]
+    connection.commit()
+finally:
+    connection.close()
+```
+
+`pinkdb.apilevel == "2.0"`, `pinkdb.paramstyle == "qmark"`,
+`pinkdb.threadsafety == 2` (a module and a connection may be shared between
+threads, a cursor may not).
+
+`Cursor` supports `execute`, `executemany`, `fetchone`, `fetchmany`,
+`fetchall`, iteration, `description`, `rowcount`, `arraysize`, `close`, and
+the no-op `setinputsizes`/`setoutputsizes`. `execute` prepares the statement
+first, so a multi-statement string is refused before anything runs. Rows are
+tuples in `description` order, fetched one at a time from the native result:
+the 100k-row conformance case streams without materializing the rows in
+Python.
+
+**Autocommit deviation.** The engine is in autocommit mode until `BEGIN`
+(and refuses some catalog DDL inside a transaction), so `execute()` does not
+open an implicit transaction the way PEP 249 expects. `commit()` and
+`rollback()` are explicit and are no-ops when no transaction is open. A
+script that never calls `BEGIN` never holds a transaction.
+
+### Exceptions
+
+All DB-API exceptions are also `pinkdb.Error`, and each carries
+`pinkdb_class` — the stable class from the C ABI:
+
+| Exception | `pinkdb_class` | When |
+|---|---|---|
+| `InterfaceError` | `invalid_argument` | closed connection or cursor, unsupported parameter |
+| `ProgrammingError` | `parse`, `catalog`, `type`, `parameter` | bad SQL, unknown object, wrong parameter count/type |
+| `IntegrityError` | `constraint` | a `NOT NULL` constraint rejected the row |
+| `OperationalError` | `execution`, `io` | runtime or I/O failure (`COMMIT` with no transaction, division by zero) |
+| `DataError` | `csv` | CSV import failure |
+| `InternalError` | `internal` | engine invariant violated; report it as a bug |
+| `NotSupportedError` | — | `callproc()`: pinkdb has no stored procedures |
+
+### Type objects
+
+`description` carries the integer C ABI type tag, comparable to the standard
+type objects: `STRING` (`VARCHAR`), `NUMBER` (`INTEGER`, `BIGINT`, `DOUBLE`,
+`DECIMAL`), `DATETIME` (`DATE`, `TIMESTAMP`), `ROWID` and `BINARY` (both
+empty: ABI v1 has no row ids or BLOBs). `INTERVAL` has a tag but no PEP 249
+group.
+
+## Native usage
 
 ```python
 import pinkdb
@@ -42,7 +122,9 @@ with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
 ```
 
 `Database.execute(sql)` runs one or more `;`-separated statements and returns
-a list of `Result` objects, one per statement:
+a list of `Result` objects, one per statement (this is the materializing
+layer; `Connection` in the DB-API section above is the same class plus
+`cursor()`/`commit()`/`rollback()`):
 
 > **Security.** The SQL statement `LOAD EXTENSION '<path>'` makes the host
 > process load and run a native library from a path the SQL text names. It is
@@ -145,8 +227,18 @@ PINKDB_FFI_LIB="$PWD/target/release/libpinkdb_ffi.dylib" \
     python3 -m unittest discover -s bindings/python/tests -v
 ```
 
-No pip installs are required: the tests only need the build above and the
-Python standard library. The suite covers the prepared-statement wrapper
+`tests/test_conformance.py` runs the shared corpus in
+[`bindings/conformance`](../conformance) — the same cases the Node and Go
+bindings run — through the DB-API layer. To check an installed wheel, run it
+from outside the checkout with the wheel's interpreter:
+
+```sh
+cd /tmp && python -m unittest discover -s <repo>/bindings/python/tests \
+    -p 'test_conformance.py' -v
+```
+
+No pip installs are required for the source tests: they only need the build
+above and the Python standard library. The suite covers the prepared-statement wrapper
 too: per-type parameter round trips, repeated execution with different
 values, NULLs, wrong arity/type errors with the exact native messages,
 prepare-time errors, close/use-after-close and copy semantics, a prepared

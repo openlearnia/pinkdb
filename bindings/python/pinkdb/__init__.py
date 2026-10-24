@@ -54,7 +54,29 @@ import threading
 from pathlib import Path
 
 __all__ = [
+    # DB-API 2.0 (PEP 249) exceptions and type objects
+    "Warning",
     "Error",
+    "InterfaceError",
+    "DatabaseError",
+    "DataError",
+    "OperationalError",
+    "IntegrityError",
+    "ProgrammingError",
+    "InternalError",
+    "NotSupportedError",
+    "DBAPITypeObject",
+    "STRING",
+    "BINARY",
+    "NUMBER",
+    "DATETIME",
+    "ROWID",
+    "Connection",
+    "Cursor",
+    "apilevel",
+    "paramstyle",
+    "threadsafety",
+    # native API
     "Database",
     "Result",
     "Statement",
@@ -129,8 +151,73 @@ _EPOCH_DATETIME = _datetime.datetime(1970, 1, 1)
 _ABI_VERSION = 1
 
 
+class Warning(Exception):  # noqa: A001 - the name PEP 249 requires
+    """A database warning (PEP 249). PinkDB does not issue any yet."""
+
+
 class Error(Exception):
-    """An error reported by the pinkdb C ABI (see ``pinkdb_last_error``)."""
+    """An error reported by the pinkdb C ABI (see ``pinkdb_last_error``).
+
+    ``pinkdb_class`` is the stable error class from
+    ``pinkdb_last_error_class``: ``parse``, ``catalog``, ``type``,
+    ``parameter``, ``execution``, ``constraint``, ``io``, ``csv``,
+    ``invalid_argument`` or ``internal``. Errors raised for bad Python
+    arguments carry ``"invalid_argument"``.
+    """
+
+    def __init__(self, message: str, pinkdb_class: str = "invalid_argument"):
+        super().__init__(message)
+        self.pinkdb_class = pinkdb_class
+
+
+# PEP 249 exception hierarchy. Every DB-API error is also a pinkdb.Error, so
+# code written against the low-level API keeps catching everything.
+class InterfaceError(Error):
+    """A problem with the driver itself (closed connection, bad parameter)."""
+
+
+class DatabaseError(Error):
+    """A database-level failure; the parent of the specific PEP 249 errors."""
+
+
+class DataError(DatabaseError):
+    """A value could not be stored or decoded (CSV import failures)."""
+
+
+class OperationalError(DatabaseError):
+    """A runtime failure: I/O, division by zero, no transaction in progress."""
+
+
+class IntegrityError(DatabaseError):
+    """A constraint rejected the statement (``NOT NULL``)."""
+
+
+class ProgrammingError(DatabaseError):
+    """Bad SQL or a bad use of the API: parse, catalog, type, parameter."""
+
+
+class InternalError(DatabaseError):
+    """An engine invariant was violated; please report it as a bug."""
+
+
+class NotSupportedError(DatabaseError):
+    """The operation does not exist in pinkdb (stored procedures)."""
+
+
+# C ABI error class -> PEP 249 exception. Keep in sync with
+# crates/pinkdb-ffi/include/pinkdb.h.
+_EXCEPTIONS_BY_CLASS = {
+    "invalid_argument": InterfaceError,
+    "parse": ProgrammingError,
+    "catalog": ProgrammingError,
+    "type": ProgrammingError,
+    "parameter": ProgrammingError,
+    "constraint": IntegrityError,
+    "execution": OperationalError,
+    "io": OperationalError,
+    "csv": DataError,
+    "internal": InternalError,
+}
 
 
 class _PinkValue(ctypes.Structure):
@@ -155,13 +242,22 @@ def _candidate_library_paths():
     override = os.environ.get("PINKDB_FFI_LIB")
     if override:
         return [Path(override)]
+    # A wheel bundles the library inside the package; prefer it so an installed
+    # wheel never picks up a stale build from a source checkout.
+    package_dir = Path(__file__).resolve().parent
+    candidates = [
+        package_dir / "libpinkdb_ffi.dylib",
+        package_dir / "libpinkdb_ffi.so",
+        package_dir / "pinkdb_ffi.dll",
+    ]
     # <repo>/bindings/python/pinkdb/__init__.py -> parents[3] is <repo>.
     release_dir = Path(__file__).resolve().parents[3] / "target" / "release"
-    return [
+    candidates += [
         release_dir / "libpinkdb_ffi.dylib",
         release_dir / "libpinkdb_ffi.so",
         release_dir / "libpinkdb_ffi.dll",
     ]
+    return candidates
 
 
 def _find_library() -> str:
@@ -266,6 +362,7 @@ def _bind(lib: ctypes.CDLL, path: str) -> None:
     )
     declare("pinkdb_result_name", [ctypes.c_void_p, ctypes.c_size_t], ctypes.c_char_p)
     declare("pinkdb_last_error", [], ctypes.c_char_p)
+    declare("pinkdb_last_error_class", [], ctypes.c_char_p)
 
 
 library_path = _find_library()
@@ -295,6 +392,21 @@ def _last_error(lib: ctypes.CDLL) -> str:
     if message is None:
         return "unknown pinkdb error"
     return message.decode("utf-8", "replace")
+
+
+def _last_error_class(lib: ctypes.CDLL) -> str:
+    """The stable class of the error the last native call reported."""
+    pinkdb_class = lib.pinkdb_last_error_class()
+    if pinkdb_class is None:
+        return "internal"
+    return pinkdb_class.decode("utf-8", "replace")
+
+
+def _native_error(lib: ctypes.CDLL) -> Error:
+    """Build the PEP 249 exception matching the last native failure."""
+    pinkdb_class = _last_error_class(lib)
+    exception = _EXCEPTIONS_BY_CLASS.get(pinkdb_class, DatabaseError)
+    return exception(_last_error(lib), pinkdb_class=pinkdb_class)
 
 
 def _value_to_python(v: _PinkValue):
@@ -607,10 +719,10 @@ class Database:
             raise Error(f"sql is not encodable as UTF-8: {exc}") from exc
         with self._lock:
             if self._handle is None:
-                raise Error("database is closed")
+                raise InterfaceError("database is closed")
             result_ptr = self._lib.pinkdb_execute(self._handle, data, len(data))
             if not result_ptr:
-                raise Error(_last_error(self._lib))
+                raise _native_error(self._lib)
             try:
                 return _snapshot(self._lib, result_ptr)
             finally:
@@ -634,12 +746,12 @@ class Database:
             raise TypeError("allow must be a bool")
         with self._lock:
             if self._handle is None:
-                raise Error("database is closed")
+                raise InterfaceError("database is closed")
             rc = self._lib.pinkdb_set_allow_sql_load_extension(
                 self._handle, 1 if allow else 0
             )
             if not rc:
-                raise Error(_last_error(self._lib))
+                raise _native_error(self._lib)
 
     def prepare(self, sql: str) -> "Statement":
         """Parse one SQL statement with ``?`` placeholders into a reusable
@@ -659,10 +771,10 @@ class Database:
             raise Error(f"sql is not encodable as UTF-8: {exc}") from exc
         with self._lock:
             if self._handle is None:
-                raise Error("database is closed")
+                raise InterfaceError("database is closed")
             prepared = self._lib.pinkdb_prepare(self._handle, data, len(data))
             if not prepared:
-                raise Error(_last_error(self._lib))
+                raise _native_error(self._lib)
             try:
                 parameter_count = int(
                     self._lib.pinkdb_prepared_parameter_count(prepared)
@@ -756,9 +868,9 @@ class Statement:
         """
         with self._db._lock:
             if self._closed:
-                raise Error("statement is closed")
+                raise InterfaceError("statement is closed")
             if self._db._handle is None:
-                raise Error("database is closed")
+                raise InterfaceError("database is closed")
             values, keepalive = _bind_parameters(params)
             # ``keepalive`` holds the buffers behind VARCHAR text_ptr values;
             # both it and ``values`` live until this call returns.
@@ -767,7 +879,7 @@ class Statement:
                 self._db._handle, self._prepared, array, len(values)
             )
             if not result_ptr:
-                raise Error(_last_error(self._db._lib))
+                raise _native_error(self._db._lib)
             try:
                 results = _snapshot(self._db._lib, result_ptr)
             finally:
@@ -840,7 +952,7 @@ def _encode_path(path) -> bytes:
     return data
 
 
-def connect(path) -> Database:
+def connect(path) -> "Connection":
     """Open a durable pinkdb database (checkpoint + WAL) at ``path``.
 
     ``path`` is a ``str``, ``bytes`` or ``os.PathLike``. Raises
@@ -851,13 +963,348 @@ def connect(path) -> Database:
     raw = _encode_path(path)
     handle = _LIB.pinkdb_open(raw)
     if not handle:
-        raise Error(_last_error(_LIB))
-    return Database(_LIB, handle)
+        raise _native_error(_LIB)
+    return Connection(_LIB, handle)
 
 
-def connect_memory() -> Database:
+def connect_memory() -> "Connection":
     """Open a fresh, empty in-memory pinkdb database."""
     handle = _LIB.pinkdb_open_memory()
     if not handle:  # documented never to fail; stay safe anyway
-        raise Error(_last_error(_LIB))
-    return Database(_LIB, handle)
+        raise _native_error(_LIB)
+    return Connection(_LIB, handle)
+
+
+# ----- DB-API 2.0 (PEP 249) -----
+#
+# The native API above (Database, Statement, Result) materializes every row.
+# The DB-API layer is a thin, lazy cursor on top of it: it keeps the native
+# pinkdb_result alive and converts one row per fetch, which lets a 100k-row
+# result be read without building 100k Python rows up front.
+#
+# Deviation from PEP 249: a connection is in autocommit mode until BEGIN, so
+# execute() does not open an implicit transaction (the engine refuses some
+# catalog DDL inside one) and commit()/rollback() with no open transaction are
+# no-ops instead of errors.
+
+apilevel = "2.0"
+paramstyle = "qmark"
+# The module and a Connection may be shared between threads (the handle is
+# serialized by a lock); a Cursor must not be shared.
+threadsafety = 2
+
+
+class DBAPITypeObject:
+    """A PEP 249 type object: equal to the C ABI type tags it groups.
+
+    ``description`` carries the integer tag, so ``cursor.description[0][1] ==
+    NUMBER`` is true for every numeric column.
+    """
+
+    __slots__ = ("name", "type_codes")
+
+    def __init__(self, name: str, *type_codes: int):
+        self.name = name
+        self.type_codes = frozenset(type_codes)
+
+    def __eq__(self, other):
+        if isinstance(other, DBAPITypeObject):
+            return self is other
+        return other in self.type_codes
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __repr__(self):
+        return f"<pinkdb type object {self.name}>"
+
+
+STRING = DBAPITypeObject("STRING", _TYPE_VARCHAR)
+#: ABI v1 has no BLOB type, so nothing compares equal to BINARY yet.
+BINARY = DBAPITypeObject("BINARY")
+NUMBER = DBAPITypeObject("NUMBER", _TYPE_INTEGER, _TYPE_BIGINT, _TYPE_DOUBLE, _TYPE_DECIMAL)
+DATETIME = DBAPITypeObject("DATETIME", _TYPE_DATE, _TYPE_TIMESTAMP)
+ROWID = DBAPITypeObject("ROWID")
+
+
+class Cursor:
+    """A DB-API 2.0 cursor over one connection.
+
+    ``execute`` prepares the statement (so a multi-statement string is
+    refused before it runs) and keeps the native result for lazy fetching.
+    Rows are tuples in ``description`` order; date/timestamp cells are
+    :class:`datetime.date` / :class:`datetime.datetime` and DECIMAL cells are
+    :class:`decimal.Decimal`.
+    """
+
+    def __init__(self, connection: "Connection"):
+        self._connection = connection
+        self._lib = connection._lib
+        self._result = None
+        self._columns = []
+        self._type_tags = []
+        self._kind = None
+        self._row_count = 0
+        self._row_index = 0
+        self._affected = 0
+        self._closed = False
+        #: Rows ``fetchmany()`` returns when called without a size.
+        self.arraysize = 1
+
+    @property
+    def connection(self) -> "Connection":
+        return self._connection
+
+    @property
+    def description(self):
+        """``(name, type_code, display_size, internal_size, precision, scale,
+        null_ok)`` per column, or ``None`` when the last statement produced no
+        result set."""
+        if self._kind != "selected":
+            return None
+        return [
+            (name, tag, None, None, None, None, None)
+            for name, tag in zip(self._columns, self._type_tags)
+        ]
+
+    @property
+    def rowcount(self) -> int:
+        """Rows produced by a SELECT or changed by DML; ``-1`` before any
+        statement."""
+        if self._kind is None:
+            return -1
+        return self._row_count if self._kind == "selected" else self._affected
+
+    @property
+    def lastrowid(self):
+        """pinkdb has no implicit row ids, so this is always ``None``."""
+        return None
+
+    def execute(self, operation: str, parameters=None) -> "Cursor":
+        """Run one statement with ``?`` placeholders and keep its rows for
+        fetching. Returns the cursor."""
+        if not isinstance(operation, str):
+            raise TypeError("operation must be a str")
+        if isinstance(parameters, dict):
+            raise ProgrammingError(
+                "pinkdb uses the qmark paramstyle: pass a sequence of "
+                "parameters, not a mapping"
+            )
+        params = () if parameters is None else tuple(parameters)
+        self._check_open()
+        self._close_result()
+        with self._connection._lock:
+            handle = self._connection._handle
+            if handle is None:
+                raise InterfaceError("connection is closed")
+            try:
+                data = operation.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ProgrammingError(
+                    f"statement is not encodable as UTF-8: {exc}"
+                ) from exc
+            prepared = self._lib.pinkdb_prepare(handle, data, len(data))
+            if not prepared:
+                raise _native_error(self._lib)
+            try:
+                try:
+                    values, keepalive = _bind_parameters(params)
+                except TypeError as exc:
+                    raise ProgrammingError(str(exc)) from exc
+                # ``keepalive`` owns the buffers behind VARCHAR text_ptr
+                # values; both it and ``values`` live until the call returns.
+                array = (_PinkValue * len(values))(*values) if values else None
+                result = self._lib.pinkdb_execute_prepared(
+                    handle, prepared, array, len(values)
+                )
+                if not result:
+                    raise _native_error(self._lib)
+            finally:
+                self._lib.pinkdb_prepared_free(prepared)
+            self._adopt(result)
+        return self
+
+    def executemany(self, operation: str, seq_of_parameters) -> "Cursor":
+        """Run ``operation`` once per parameter sequence and set ``rowcount``
+        to the total of affected (or selected) rows."""
+        if not isinstance(operation, str):
+            raise TypeError("operation must be a str")
+        self._check_open()
+        total = 0
+        executed = False
+        for parameters in seq_of_parameters:
+            self.execute(operation, parameters)
+            executed = True
+            total += self.rowcount
+        self._close_result()
+        if executed:
+            # Keep the total visible through rowcount, but no rows to fetch.
+            self._affected = total
+            self._kind = "executemany"
+        return self
+
+    def fetchone(self):
+        """The next row as a tuple, or ``None`` when the result is exhausted."""
+        self._check_open()
+        result = self._require_result()
+        if self._row_index >= self._row_count:
+            return None
+        row = tuple(
+            _value_to_python(
+                self._lib.pinkdb_result_value(result, 0, self._row_index, col)
+            )
+            for col in range(len(self._columns))
+        )
+        self._row_index += 1
+        return row
+
+    def fetchmany(self, size=None) -> list:
+        """Up to ``size`` rows (``arraysize`` when omitted)."""
+        if size is None:
+            size = self.arraysize
+        if not isinstance(size, int) or isinstance(size, bool):
+            raise TypeError("size must be an int")
+        if size < 0:
+            raise ValueError("size must not be negative")
+        rows = []
+        for _ in range(size):
+            row = self.fetchone()
+            if row is None:
+                break
+            rows.append(row)
+        return rows
+
+    def fetchall(self) -> list:
+        """Every remaining row."""
+        rows = []
+        while True:
+            row = self.fetchone()
+            if row is None:
+                return rows
+            rows.append(row)
+
+    def setinputsizes(self, sizes) -> None:
+        """No-op: the ABI resolves parameter types from the bound values."""
+
+    def setoutputsizes(self, sizes) -> None:
+        """No-op: result cell types come from the statement's columns."""
+
+    def callproc(self, procname, parameters=None):
+        raise NotSupportedError("pinkdb has no stored procedures")
+
+    def close(self) -> None:
+        """Free the native result. Idempotent."""
+        if not self._closed:
+            self._closed = True
+            self._close_result()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+    def __enter__(self) -> "Cursor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - interpreter shutdown races
+            pass
+
+    def __repr__(self) -> str:
+        state = "closed" if self._closed else "open"
+        return f"<pinkdb.Cursor ({state}, {self.rowcount} rows)>"
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise InterfaceError("cursor is closed")
+
+    def _require_result(self):
+        if self._result is None or self._kind != "selected":
+            raise InterfaceError("the last statement produced no result set")
+        return self._result
+
+    def _close_result(self) -> None:
+        result = self._result
+        if result is not None:
+            self._result = None
+            self._lib.pinkdb_result_free(result)
+        self._columns = []
+        self._type_tags = []
+        self._kind = None
+        self._row_count = 0
+        self._row_index = 0
+        self._affected = 0
+
+    def _adopt(self, result) -> None:
+        """Take ownership of a native result and read its shape once."""
+        if self._lib.pinkdb_result_statement_count(result) != 1:
+            self._lib.pinkdb_result_free(result)
+            raise Error(  # pragma: no cover - FFI invariant
+                "internal error: a cursor statement produced more than one result"
+            )
+        kind_tag = self._lib.pinkdb_result_kind(result, 0)
+        self._kind = _STMT_KINDS.get(kind_tag, "unknown")
+        if kind_tag == 0:
+            column_count = self._lib.pinkdb_result_column_count(result, 0)
+            for col in range(column_count):
+                name = self._lib.pinkdb_result_column_name(result, 0, col)
+                self._columns.append(name.decode("utf-8") if name is not None else "")
+                self._type_tags.append(
+                    self._lib.pinkdb_result_column_type(result, 0, col)
+                )
+            self._row_count = self._lib.pinkdb_result_row_count(result, 0)
+        else:
+            self._affected = int(self._lib.pinkdb_result_affected(result, 0))
+        self._result = result
+        self._row_index = 0
+
+
+class Connection(Database):
+    """A DB-API 2.0 connection: a :class:`Database` plus cursors and
+    transaction control.
+
+    The connection is in autocommit mode until ``BEGIN``; ``commit()`` and
+    ``rollback()`` are explicit and are no-ops when no transaction is open.
+    Use this class as a context manager to close the handle on exit.
+    """
+
+    __slots__ = ()
+
+    def cursor(self) -> Cursor:
+        """Create a new cursor on this connection."""
+        if self._handle is None:
+            raise InterfaceError("connection is closed")
+        return Cursor(self)
+
+    def commit(self) -> None:
+        """Commit the open transaction; a no-op when none is open."""
+        try:
+            self.execute("COMMIT")
+        except OperationalError as exc:
+            if "no transaction in progress" not in str(exc):
+                raise
+
+    def rollback(self) -> None:
+        """Roll back the open transaction; a no-op when none is open."""
+        try:
+            self.execute("ROLLBACK")
+        except OperationalError as exc:
+            if "no transaction in progress" not in str(exc):
+                raise
+
+    def __repr__(self) -> str:
+        state = "closed" if self._handle is None else "open"
+        return f"<pinkdb.Connection ({state})>"

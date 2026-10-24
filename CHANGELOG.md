@@ -55,6 +55,50 @@ one-liners below.
   into typed sub-columns and statistics on shredded paths. The plan for it,
   the full tag table, the semantics and every deliberate difference from
   DuckDB are written in `docs/wave-101-plan.md`.
+### Wave 92 — Language bindings: Node.js, Python DB-API 2.0, Go ✅
+- **One conformance corpus.** `bindings/conformance/corpus.json` is the
+  language-neutral contract every binding is tested against: every SQL type's
+  round trip (including NULLs, unicode, bigint extremes, NaN/±Infinity,
+  DECIMAL, DATE and TIMESTAMP), positional parameters, a stable error class
+  for parse/catalog/type/parameter/execution/constraint failures, explicit
+  transactions and autocommit, multi-statement batches with several result
+  sets, empty results, and a 100k-row stream that must not be materialized.
+- **Node.js** (`bindings/node`): a napi-rs addon that links `pinkdb-ffi`
+  statically, so the `.node` file has no runtime library dependency.
+  `open(path?)` / `close()`, `run(sql, params?)` for batches, `query(sql,
+  params?)` for row objects, `prepare()` with `run`/`all`/`iterate`, explicit
+  `begin`/`commit`/`rollback`, `PinkdbError` carrying a `.class`, and the
+  `pinkdb_abi_version` gate at load. BIGINT maps to `BigInt`, DECIMAL and
+  INTERVAL to their canonical strings, DATE/TIMESTAMP to strings. Builds with
+  plain `cargo` through a small copy step; `npm pack` works, nothing is
+  published.
+- **Python** (`bindings/python`): the `ctypes` binding is now also a PEP 249
+  DB-API 2.0 driver — `connect()`, `Connection`, `Cursor` with
+  `execute`/`executemany`/`fetchone`/`fetchmany`/`fetchall`, `description`,
+  `rowcount`, `qmark` parameters, the standard exception hierarchy mapped from
+  the C ABI's error class, and the type objects. Cursors fetch one row at a
+  time: the 100k-row case peaks at about a kilobyte of Python allocations.
+  Transactions are explicit, matching DuckDB: DDL is refused inside them, so
+  there is no implicit `BEGIN`.
+- **A real wheel.** `pip wheel . --no-deps -w dist` compiles `libpinkdb_ffi`
+  and bundles it in `pinkdb/`, producing a platform wheel that installs and
+  runs without a local build (`PINKDB_FFI_LIB` skips the compile).
+- **Go** (`bindings/go`): the module is usable outside the checkout — the cgo
+  preamble carries the ABI declarations instead of pointing at the header, and
+  the library location comes from `PINKDB_LIB_DIR`/`CGO_LDFLAGS` (with the
+  in-repo `target/release` as the convenience default). Errors now keep their
+  class in `*pinkdb.Error`, and an ABI test checks the carried declarations
+  against `pinkdb.h` whenever the checkout is present.
+- **C ABI.** `pinkdb_last_error_class()` returns the stable error class next
+  to the message (additive to ABI v1), so bindings no longer parse text to
+  tell a parse error from a constraint violation. The engine and default CLI
+  binaries are unchanged.
+- **CI.** The bindings job now builds and tests the Node addon, the corpus and
+  `npm pack`; Go keeps `gofmt`/`vet`/`-race`; a new `python-wheel` job builds
+  the wheel, installs it into a throwaway venv, and runs the corpus from the
+  installed package.
+
+## 2026-10-24
 ### Wave 100 — Triggers ✅
 - **Triggers.** `CREATE [OR REPLACE] TRIGGER name {BEFORE|AFTER}
   {INSERT|UPDATE [OF col, …]|DELETE} [OR …] ON table [REFERENCING OLD TABLE

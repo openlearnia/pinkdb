@@ -265,8 +265,9 @@ PAGES = {
         "nav": "bindings",
         "title": "Bindings — pinkdb",
         "description": (
-            "Embed pinkdb from Rust, C, Python or Go through the pinkdb-ffi "
-            "C ABI, with minimal examples and links to the full API pages."
+            "Embed pinkdb from Rust, C, Node.js, Python or Go through the "
+            "pinkdb-ffi C ABI, with minimal examples, the shared conformance "
+            "corpus and links to the full API pages."
         ),
     },
     "api-rust.html": {

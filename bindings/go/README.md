@@ -13,9 +13,26 @@ cargo build --release -p pinkdb-ffi
 ```
 
 This writes `target/release/libpinkdb_ffi.dylib` (or `.so` on Linux) plus the
-static archive. The `#cgo` directives in `pinkdb.go` resolve the ABI header
-and the workspace `target/release` directory relative to this package, so a
-repo checkout needs no environment variables at build or run time.
+static archive.
+
+The module is self-contained: the C ABI declarations it needs are carried in
+`pinkdb.go` (not included from `crates/pinkdb-ffi/include/pinkdb.h`), so
+`go get github.com/openlearnia/pinkdb/bindings/go` works, and `abi_test.go`
+checks those declarations against the real header when a checkout is
+present. Only the library itself has to be found at link time:
+
+```sh
+# inside a pinkdb checkout: the default cgo flag points at ../../target/release
+cargo build --release -p pinkdb-ffi && go test ./...
+
+# anywhere else: point cgo at the directory holding libpinkdb_ffi
+export PINKDB_LIB_DIR=/opt/pinkdb/lib
+export CGO_LDFLAGS="-L$PINKDB_LIB_DIR -Wl,-rpath,$PINKDB_LIB_DIR"
+```
+
+The rpath keeps the runtime lookup independent of `LD_LIBRARY_PATH` /
+`DYLD_LIBRARY_PATH`. A static link is possible by pointing `CGO_LDFLAGS` at
+`libpinkdb_ffi.a`, but the binding is tested against the shared library.
 
 ## Quick start
 
@@ -168,10 +185,42 @@ DATE day count or TIMESTAMP microsecond count that overflows `time.Time`'s
 internal `int64` seconds representation ever reach the binding, the
 conversion returns `ErrOutOfRange` instead of a wrong calendar value. Every
 `int64` microsecond timestamp produced by the engine converts exactly.
-Errors from the native library are returned verbatim (the message from
-`pinkdb_last_error`) and leave the handle usable.
+### Errors
+
+Native failures come back as `*pinkdb.Error`, whose `Error()` is the message
+from `pinkdb_last_error` and whose `Class` is the stable class from
+`pinkdb_last_error_class`:
+
+| `Class` | Meaning | Typical Go check |
+|---|---|---|
+| `parse` | SQL does not parse | `ProgrammingError`-style: fix the SQL |
+| `catalog` | unknown table/column/object | |
+| `type` | type mismatch in an expression | |
+| `parameter` | wrong count, or a `NULL` with no inferable type | |
+| `execution` | runtime failure (division by zero, `COMMIT` with no transaction) | |
+| `constraint` | a `NOT NULL` constraint rejected a row | |
+| `io` / `csv` | storage or import failure | |
+| `invalid_argument` | the binding or caller passed something the ABI rejects | |
+| `internal` | engine invariant violated; report it as a bug | |
+
+```go
+var pinkdbErr *pinkdb.Error
+if errors.As(err, &pinkdbErr) && pinkdbErr.Class == "parse" {
+	// ...
+}
+```
+
+`ErrClosed`, `ErrStmtClosed` and `ErrOutOfRange` are separate sentinel errors
+for the wrapper's own state; every error from the native library is a
+`*pinkdb.Error`. A failed statement leaves the handle usable, and the message
+is copied before the next native call on the thread replaces it.
 
 ## Limitations
+
+Results are materialized: `Execute` and `Stmt.Execute` copy every row into
+Go slices before returning, so a very large SELECT costs memory proportional
+to its result. There is no row iterator yet (the Node and Python bindings
+have one); use `LIMIT` for large tables until that follow-up lands.
 
 ABI v1 returns column names and object/session names (`Columns`, `Name`) as
 NUL-terminated C strings, so an **identifier containing a NUL byte is
@@ -203,9 +252,19 @@ cd bindings/go
 gofmt -l .        # must print nothing
 go vet ./...
 go test ./...
+go test -race ./...
 ```
 
-The tests cover all value types (NULLs, empty/multibyte/embedded-NUL strings,
+`conformance_test.go` runs the shared corpus in
+[`bindings/conformance`](../conformance) — the same cases the Python and Node
+bindings run, including typed parameter round trips, stable error classes,
+transactions, multiple result sets and the 100k-row case. It reads
+`../conformance/corpus.json` and skips (rather than fails) when the module is
+built outside a checkout; set `PINKDB_CONFORMANCE` to run it from a copy.
+`abi_test.go` checks the package's ABI declarations against the real
+`pinkdb.h` and skips the same way.
+
+The remaining tests cover all value types (NULLs, empty/multibyte/embedded-NUL strings,
 `-0.0`, `NaN`/`±Inf`, i32/i64 extremes), DATE/TIMESTAMP boundaries including
 pre-epoch values and the out-of-range mapping, all statement kinds with
 `Affected`/`Name`, exact native error messages plus a still-usable handle,

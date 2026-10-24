@@ -1,0 +1,670 @@
+{
+  "corpus_version": 1,
+  "abi_version": 1,
+  "description": "Language-neutral pinkdb binding conformance corpus. See README.md for the schema and the value encoding.",
+  "cases": [
+    {
+      "name": "select_literals",
+      "description": "Every SQL type as a literal: column type tags, NULLs, extremes, unicode, canonical DECIMAL/INTERVAL text.",
+      "setup": [],
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT NULL AS n, CAST(NULL AS VARCHAR) AS ns, true AS t, false AS f, 1 AS i, CAST(1 AS BIGINT) AS big, 1.5 AS d, 'hi' AS s",
+          "expect": {
+            "columns": ["n", "ns", "t", "f", "i", "big", "d", "s"],
+            "types": ["integer", "varchar", "boolean", "boolean", "integer", "bigint", "double", "varchar"],
+            "rows": [
+              [null, null, ["boolean", true], ["boolean", false], ["integer", 1], ["bigint", "1"], ["double", "1.5"], ["varchar", "hi"]]
+            ]
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT CAST('9223372036854775807' AS BIGINT) AS hi, CAST('-9223372036854775808' AS BIGINT) AS lo, CAST('NaN' AS DOUBLE) AS nan, CAST('Infinity' AS DOUBLE) AS inf, CAST('-Infinity' AS DOUBLE) AS ninf, 1e300 AS big",
+          "expect": {
+            "columns": ["hi", "lo", "nan", "inf", "ninf", "big"],
+            "types": ["bigint", "bigint", "double", "double", "double", "double"],
+            "rows": [
+              [["bigint", "9223372036854775807"], ["bigint", "-9223372036854775808"], ["double", "NaN"], ["double", "Infinity"], ["double", "-Infinity"], ["double", "1e300"]]
+            ]
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT 'héllo, 世界 🚀' AS u, 'it''s \"quoted\" ünïcode' AS q, 'line1\nline2\ttab' AS c, '' AS empty",
+          "expect": {
+            "columns": ["u", "q", "c", "empty"],
+            "types": ["varchar", "varchar", "varchar", "varchar"],
+            "rows": [
+              [["varchar", "héllo, 世界 🚀"], ["varchar", "it's \"quoted\" ünïcode"], ["varchar", "line1\nline2\ttab"], ["varchar", ""]]
+            ]
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT CAST('999999999999999.999' AS DECIMAL(18,3)) AS a, CAST('-0.005' AS DECIMAL(6,2)) AS b, CAST('0.000' AS DECIMAL(6,3)) AS c, INTERVAL '1 day 2 hours' AS i1, INTERVAL '-3 months' AS i2, INTERVAL '0 seconds' AS i3",
+          "expect": {
+            "columns": ["a", "b", "c", "i1", "i2", "i3"],
+            "types": ["decimal", "decimal", "decimal", "interval", "interval", "interval"],
+            "rows": [
+              [["decimal", "999999999999999.999"], ["decimal", "-0.01"], ["decimal", "0.000"], ["interval", "1 day 02:00:00"], ["interval", "-3 months"], ["interval", "00:00:00"]]
+            ]
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT DATE '1969-12-31' AS d1, DATE '9999-12-31' AS d2, TIMESTAMP '1969-12-31 23:59:59.999999' AS t1, TIMESTAMP '9999-12-31 23:59:59.999999' AS t2, TIMESTAMP '2024-01-15 10:00:00.120000' AS t3",
+          "expect": {
+            "columns": ["d1", "d2", "t1", "t2", "t3"],
+            "types": ["date", "date", "timestamp", "timestamp", "timestamp"],
+            "rows": [
+              [["date", "1969-12-31"], ["date", "9999-12-31"], ["timestamp", "1969-12-31 23:59:59.999999"], ["timestamp", "9999-12-31 23:59:59.999999"], ["timestamp", "2024-01-15 10:00:00.120000"]]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "types_roundtrip",
+      "description": "All nine types through a table and back: typed binds into every column, NULLs, extremes, unicode and canonical DECIMAL/INTERVAL text.",
+      "setup": ["CREATE TABLE t (id INTEGER, b BOOLEAN, i INTEGER, big BIGINT, d DOUBLE, s VARCHAR, dt DATE, ts TIMESTAMP, dec DECIMAL(18,3), iv INTERVAL)"],
+      "steps": [
+        {
+          "op": "exec_prepared",
+          "sql": "INSERT INTO t (id, b, i, big, d, s, dt, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "params": [["integer", 1], ["boolean", true], ["integer", 2147483647], ["bigint", "9223372036854775807"], ["double", "1.5"], ["varchar", "héllo, 世界 🚀"], ["date", "2024-01-15"], ["timestamp", "2024-01-15 10:00:00.123456"]],
+          "expect": [
+            {
+              "kind": "inserted",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "exec_prepared",
+          "sql": "INSERT INTO t (id, b, i, big, d, s, dt, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "params": [["integer", 2], ["boolean", false], ["integer", -2147483648], ["bigint", "-9223372036854775808"], ["double", "-2.5"], ["varchar", ""], ["date", "1969-12-31"], ["timestamp", "1969-12-31 23:59:59.999999"]],
+          "expect": [
+            {
+              "kind": "inserted",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "exec_prepared",
+          "sql": "INSERT INTO t (id, b, i, big, d, s, dt, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "params": [["integer", 3], null, null, null, null, null, null, null],
+          "expect": [
+            {
+              "kind": "inserted",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "exec_prepared",
+          "sql": "INSERT INTO t (id, b, i, big, d, s, dt, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "params": [["integer", 4], ["boolean", true], ["integer", 0], ["bigint", "42"], ["double", "NaN"], ["varchar", "it's \"quoted\" ünïcode\nline2\ttab"], ["date", "9999-12-31"], ["timestamp", "9999-12-31 23:59:59.999999"]],
+          "expect": [
+            {
+              "kind": "inserted",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "exec",
+          "sql": "UPDATE t SET dec = CAST('999999999999999.999' AS DECIMAL(18,3)), iv = INTERVAL '1 day 2 hours' WHERE id = 1",
+          "expect": [
+            {
+              "kind": "updated",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "exec",
+          "sql": "UPDATE t SET dec = CAST('-123.456' AS DECIMAL(18,3)), iv = INTERVAL '-3 months' WHERE id = 2",
+          "expect": [
+            {
+              "kind": "updated",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "exec",
+          "sql": "UPDATE t SET dec = CAST('-0.005' AS DECIMAL(18,3)), iv = INTERVAL '0 seconds' WHERE id = 4",
+          "expect": [
+            {
+              "kind": "updated",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "sql": "SELECT id, b, i, big, d, s, dt, ts, dec, iv FROM t ORDER BY id",
+          "expect": {
+            "columns": ["id", "b", "i", "big", "d", "s", "dt", "ts", "dec", "iv"],
+            "types": ["integer", "boolean", "integer", "bigint", "double", "varchar", "date", "timestamp", "decimal", "interval"],
+            "rows": [
+              [["integer", 1], ["boolean", true], ["integer", 2147483647], ["bigint", "9223372036854775807"], ["double", "1.5"], ["varchar", "héllo, 世界 🚀"], ["date", "2024-01-15"], ["timestamp", "2024-01-15 10:00:00.123456"], ["decimal", "999999999999999.999"], ["interval", "1 day 02:00:00"]],
+              [["integer", 2], ["boolean", false], ["integer", -2147483648], ["bigint", "-9223372036854775808"], ["double", "-2.5"], ["varchar", ""], ["date", "1969-12-31"], ["timestamp", "1969-12-31 23:59:59.999999"], ["decimal", "-123.456"], ["interval", "-3 months"]],
+              [["integer", 3], null, null, null, null, null, null, null, null, null],
+              [["integer", 4], ["boolean", true], ["integer", 0], ["bigint", "42"], ["double", "NaN"], ["varchar", "it's \"quoted\" ünïcode\nline2\ttab"], ["date", "9999-12-31"], ["timestamp", "9999-12-31 23:59:59.999999"], ["decimal", "-0.005"], ["interval", "00:00:00"]]
+            ]
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT id FROM t WHERE s = ?",
+          "params": [["varchar", "héllo, 世界 🚀"]],
+          "expect": {
+            "columns": ["id"],
+            "types": ["integer"],
+            "rows": [
+              [["integer", 1]]
+            ]
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT id FROM t WHERE big = ?",
+          "params": [["bigint", "9223372036854775807"]],
+          "expect": {
+            "columns": ["id"],
+            "types": ["integer"],
+            "rows": [
+              [["integer", 1]]
+            ]
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT id FROM t WHERE dt = ?",
+          "params": [["date", "9999-12-31"]],
+          "expect": {
+            "columns": ["id"],
+            "types": ["integer"],
+            "rows": [
+              [["integer", 4]]
+            ]
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT id FROM t WHERE ts > ? ORDER BY id",
+          "params": [["timestamp", "2024-01-01 00:00:00.000000"]],
+          "expect": {
+            "columns": ["id"],
+            "types": ["integer"],
+            "rows": [
+              [["integer", 1]],
+              [["integer", 4]]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "prepared_params",
+      "description": "Prepared statements: typed positional parameters in every bindable type, NULL parameters and every type with no bindable parameter (DECIMAL, INTERVAL) bound as text through CAST.",
+      "setup": ["CREATE TABLE p (id INTEGER, i INTEGER, big BIGINT, d DOUBLE, s VARCHAR, dt DATE, ts TIMESTAMP, b BOOLEAN)"],
+      "steps": [
+        {
+          "op": "exec_prepared",
+          "sql": "INSERT INTO p VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "params": [["integer", 1], ["integer", 7], ["bigint", "9223372036854775807"], ["double", "2.5"], ["varchar", "ünïcode"], ["date", "2024-02-29"], ["timestamp", "2024-02-29 12:34:56.789012"], ["boolean", true]],
+          "expect": [
+            {
+              "kind": "inserted",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "exec_prepared",
+          "sql": "INSERT INTO p VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "params": [["integer", 2], null, null, null, null, null, null, null],
+          "expect": [
+            {
+              "kind": "inserted",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "sql": "SELECT id, i, big, d, s, dt, ts, b FROM p ORDER BY id",
+          "expect": {
+            "columns": ["id", "i", "big", "d", "s", "dt", "ts", "b"],
+            "types": ["integer", "integer", "bigint", "double", "varchar", "date", "timestamp", "boolean"],
+            "rows": [
+              [["integer", 1], ["integer", 7], ["bigint", "9223372036854775807"], ["double", "2.5"], ["varchar", "ünïcode"], ["date", "2024-02-29"], ["timestamp", "2024-02-29 12:34:56.789012"], ["boolean", true]],
+              [["integer", 2], null, null, null, null, null, null, null]
+            ]
+          }
+        },
+        {
+          "op": "prepared_query",
+          "sql": "SELECT id FROM p WHERE s = ?",
+          "params": [["varchar", "ünïcode"]],
+          "expect": {
+            "columns": ["id"],
+            "types": ["integer"],
+            "rows": [
+              [["integer", 1]]
+            ]
+          }
+        },
+        {
+          "op": "prepared_query",
+          "sql": "SELECT ? + 1 AS n",
+          "params": [["integer", 41]],
+          "expect": {
+            "columns": ["n"],
+            "types": ["integer"],
+            "rows": [
+              [["integer", 42]]
+            ]
+          }
+        },
+        {
+          "op": "prepared_query",
+          "sql": "SELECT ? AS s",
+          "params": [["varchar", "bound"]],
+          "expect": {
+            "columns": ["s"],
+            "types": ["varchar"],
+            "rows": [
+              [["varchar", "bound"]]
+            ]
+          }
+        },
+        {
+          "op": "prepared_query",
+          "sql": "SELECT CAST(? AS DECIMAL(6,2)) AS d",
+          "params": [["varchar", "12.345"]],
+          "expect": {
+            "columns": ["d"],
+            "types": ["decimal"],
+            "rows": [
+              [["decimal", "12.35"]]
+            ]
+          }
+        },
+        {
+          "op": "prepared_query",
+          "sql": "SELECT CAST(? AS INTERVAL) AS iv",
+          "params": [["varchar", "1 day 2 hours"]],
+          "expect": {
+            "columns": ["iv"],
+            "types": ["interval"],
+            "rows": [
+              [["interval", "1 day 02:00:00"]]
+            ]
+          }
+        },
+        {
+          "op": "prepared_query",
+          "sql": "SELECT CAST(? AS DATE) AS dt, CAST(? AS TIMESTAMP) AS ts",
+          "params": [["varchar", "2024-01-15"], ["varchar", "2024-01-15 10:00:00.123456"]],
+          "expect": {
+            "columns": ["dt", "ts"],
+            "types": ["date", "timestamp"],
+            "rows": [
+              [["date", "2024-01-15"], ["timestamp", "2024-01-15 10:00:00.123456"]]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "errors",
+      "description": "Each error class with a stable class name. Messages are only matched by substring.",
+      "setup": ["CREATE TABLE c (a INTEGER)", "INSERT INTO c VALUES (1)"],
+      "steps": [
+        {
+          "op": "error",
+          "sql": "SELEC 1",
+          "class": "parse",
+          "message_contains": "parse error"
+        },
+        {
+          "op": "error",
+          "sql": "SELECT * FROM no_such_table",
+          "class": "catalog",
+          "message_contains": "no_such_table"
+        },
+        {
+          "op": "error",
+          "sql": "DROP TABLE no_such_table",
+          "class": "catalog",
+          "message_contains": "no_such_table"
+        },
+        {
+          "op": "error",
+          "sql": "SELECT 1 + 'x'",
+          "class": "type",
+          "message_contains": "non-numeric"
+        },
+        {
+          "op": "error",
+          "sql": "SELECT 1 / 0",
+          "class": "execution",
+          "message_contains": "division by zero"
+        },
+        {
+          "op": "error",
+          "sql": "ALTER TABLE c ADD COLUMN b INTEGER NOT NULL",
+          "class": "constraint",
+          "message_contains": "NOT NULL constraint failed"
+        },
+        {
+          "op": "error",
+          "sql": "COMMIT",
+          "class": "execution",
+          "message_contains": "no transaction"
+        },
+        {
+          "op": "error",
+          "sql": "SELECT ?",
+          "params": [],
+          "class": "parameter",
+          "message_contains": "values were not provided"
+        },
+        {
+          "op": "error",
+          "sql": "SELECT ?",
+          "params": [null],
+          "class": "parameter",
+          "message_contains": "could not determine data type"
+        }
+      ]
+    },
+    {
+      "name": "transactions",
+      "description": "Autocommit outside a transaction, and explicit BEGIN/COMMIT/ROLLBACK with their statement kinds.",
+      "setup": ["CREATE TABLE tx (a INTEGER)"],
+      "steps": [
+        {
+          "op": "exec",
+          "sql": "INSERT INTO tx VALUES (1)",
+          "expect": [
+            {
+              "kind": "inserted",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "sql": "SELECT COUNT(*) AS c FROM tx",
+          "expect": {
+            "columns": ["c"],
+            "types": ["bigint"],
+            "rows": [
+              [["bigint", "1"]]
+            ]
+          }
+        },
+        {
+          "op": "exec",
+          "sql": "BEGIN",
+          "expect": [
+            {
+              "kind": "began"
+            }
+          ]
+        },
+        {
+          "op": "exec",
+          "sql": "INSERT INTO tx VALUES (2)",
+          "expect": [
+            {
+              "kind": "inserted",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "sql": "SELECT COUNT(*) AS c FROM tx",
+          "expect": {
+            "columns": ["c"],
+            "types": ["bigint"],
+            "rows": [
+              [["bigint", "2"]]
+            ]
+          }
+        },
+        {
+          "op": "exec",
+          "sql": "ROLLBACK",
+          "expect": [
+            {
+              "kind": "rolledback"
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "sql": "SELECT COUNT(*) AS c FROM tx",
+          "expect": {
+            "columns": ["c"],
+            "types": ["bigint"],
+            "rows": [
+              [["bigint", "1"]]
+            ]
+          }
+        },
+        {
+          "op": "exec",
+          "sql": "BEGIN",
+          "expect": [
+            {
+              "kind": "began"
+            }
+          ]
+        },
+        {
+          "op": "exec",
+          "sql": "INSERT INTO tx VALUES (3)",
+          "expect": [
+            {
+              "kind": "inserted",
+              "affected": 1
+            }
+          ]
+        },
+        {
+          "op": "exec",
+          "sql": "COMMIT",
+          "expect": [
+            {
+              "kind": "committed"
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "sql": "SELECT a FROM tx ORDER BY a",
+          "expect": {
+            "columns": ["a"],
+            "types": ["integer"],
+            "rows": [
+              [["integer", 1]],
+              [["integer", 3]]
+            ]
+          }
+        },
+        {
+          "op": "exec",
+          "sql": "BEGIN; INSERT INTO tx VALUES (4); COMMIT",
+          "expect": [
+            {
+              "kind": "began"
+            },
+            {
+              "kind": "inserted",
+              "affected": 1
+            },
+            {
+              "kind": "committed"
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "sql": "SELECT a FROM tx ORDER BY a",
+          "expect": {
+            "columns": ["a"],
+            "types": ["integer"],
+            "rows": [
+              [["integer", 1]],
+              [["integer", 3]],
+              [["integer", 4]]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "multiple_result_sets",
+      "description": "One batch returns one result per statement, in order, for DDL, DML and SELECT.",
+      "setup": [],
+      "steps": [
+        {
+          "op": "exec",
+          "sql": "CREATE TABLE m (a INTEGER); INSERT INTO m VALUES (1), (2); SELECT a FROM m ORDER BY a; UPDATE m SET a = a + 10; SELECT a FROM m ORDER BY a",
+          "expect": [
+            {
+              "kind": "created"
+            },
+            {
+              "kind": "inserted",
+              "affected": 2
+            },
+            {
+              "kind": "selected",
+              "columns": ["a"],
+              "types": ["integer"],
+              "rows": [
+                [["integer", 1]],
+                [["integer", 2]]
+              ]
+            },
+            {
+              "kind": "updated",
+              "affected": 2
+            },
+            {
+              "kind": "selected",
+              "columns": ["a"],
+              "types": ["integer"],
+              "rows": [
+                [["integer", 11]],
+                [["integer", 12]]
+              ]
+            }
+          ]
+        },
+        {
+          "op": "query",
+          "sql": "SELECT COUNT(*) AS c FROM m",
+          "expect": {
+            "columns": ["c"],
+            "types": ["bigint"],
+            "rows": [
+              [["bigint", "2"]]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "empty_results",
+      "description": "Queries and DML that touch zero rows still report columns, types and zero counts.",
+      "setup": ["CREATE TABLE e (a INTEGER, b VARCHAR)"],
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT a, b FROM e",
+          "expect": {
+            "columns": ["a", "b"],
+            "types": ["integer", "varchar"],
+            "rows": []
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT a FROM e WHERE false",
+          "expect": {
+            "columns": ["a"],
+            "types": ["integer"],
+            "rows": []
+          }
+        },
+        {
+          "op": "query",
+          "sql": "SELECT COUNT(*) AS c FROM e",
+          "expect": {
+            "columns": ["c"],
+            "types": ["bigint"],
+            "rows": [
+              [["bigint", "0"]]
+            ]
+          }
+        },
+        {
+          "op": "exec",
+          "sql": "UPDATE e SET a = 1 WHERE false",
+          "expect": [
+            {
+              "kind": "updated",
+              "affected": 0
+            }
+          ]
+        },
+        {
+          "op": "exec",
+          "sql": "DELETE FROM e",
+          "expect": [
+            {
+              "kind": "deleted",
+              "affected": 0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "large_stream",
+      "description": "100k rows read one at a time. The runner consumes rows through its row-at-a-time API where the binding has one; the checksum is the sum of the first column.",
+      "setup": ["CREATE TABLE seed (i INTEGER)", "INSERT INTO seed VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)"],
+      "steps": [
+        {
+          "op": "stream",
+          "sql": "SELECT CAST(a.i*10000 + b.i*1000 + c.i*100 + d.i*10 + e.i AS BIGINT) AS i FROM seed AS a CROSS JOIN seed AS b CROSS JOIN seed AS c CROSS JOIN seed AS d CROSS JOIN seed AS e ORDER BY i",
+          "expect": {
+            "columns": ["i"],
+            "types": ["bigint"],
+            "row_count": 100000,
+            "first_rows": [
+              [["bigint", "0"]],
+              [["bigint", "1"]]
+            ],
+            "last_rows": [
+              [["bigint", "99998"]],
+              [["bigint", "99999"]]
+            ],
+            "checksum": 4999950000
+          }
+        }
+      ]
+    }
+  ]
+}
