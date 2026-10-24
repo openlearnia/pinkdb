@@ -90,6 +90,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub mod cache;
 mod fetch;
 mod http;
 #[cfg(feature = "s3")]
@@ -100,7 +101,9 @@ mod sigv4;
 mod time;
 
 mod csv_source;
+pub mod prefetch;
 
+pub use cache::CacheOptions;
 pub use csv_source::{
     Call, CsvOptions, CsvSchema, CsvSource, Encoding, SOURCE_NAME, UrlImportFetcher, claims_path,
     ensure_registered, ensure_registered_with, parse_call, register, source, source_with,
@@ -110,6 +113,7 @@ pub use csv_source::{
 pub use fetch::open_s3_with;
 pub use fetch::{Fetcher, HttpfsConfig, open, open_with};
 pub use http::{ByteRange, HttpClient};
+pub use prefetch::{Prefetch, PrefetchStats};
 #[cfg(feature = "s3")]
 pub use s3::S3Config;
 #[cfg(feature = "s3")]

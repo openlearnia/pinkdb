@@ -848,6 +848,178 @@ pub(crate) struct Partial {
     pub(crate) index: FastMap<Vec<u8>, usize>,
 }
 
+impl Partial {
+    /// A fresh partial whose local-group table is sized for `rows` rows.
+    ///
+    /// Start small: most analytic chunks hold a handful of distinct keys, and
+    /// preallocating one slot per row makes every chunk allocate (and later
+    /// free, on the merging thread) a multi-hundred-kilobyte table. A chunk
+    /// that outgrows this is high-cardinality and pays one jump to the full
+    /// size instead (see the insert in [`group_ids`]).
+    pub(crate) fn for_rows(rows: usize) -> Partial {
+        Partial {
+            groups: Vec::new(),
+            index: FastMap::with_capacity_and_hasher(
+                local_index_capacity(rows),
+                Default::default(),
+            ),
+        }
+    }
+}
+
+/// Runs a scan and hands each of its chunks to the sink it is given: the
+/// producer half of [`fold_stream`].
+type ChunkFeed<'a> = dyn FnMut(&mut dyn FnMut(DataChunk) -> Result<()>) -> Result<()> + 'a;
+
+/// Fold a streamed scan into `workers` partials in parallel — phase 1 of
+/// [`aggregate`] for a scan the executor never materializes (wave 98c).
+///
+/// `produce` runs the scan on the calling thread and blocks once `workers`
+/// chunks are queued ([`crate::PinkDb::stream_fold_workers`] decides the
+/// count); each worker applies `filters`, folds the chunk into its own
+/// [`Partial`], and the partials merge exactly as [`aggregate`]'s do. The fold
+/// owns at most `2 * workers` chunks — the queued ones plus the ones being
+/// folded — so the memory bound follows the worker count and the source's
+/// read-ahead window, never the file size.
+///
+/// Every aggregate the binder builds is order-insensitive (COUNT, SUM, AVG,
+/// MIN, MAX, COUNT(DISTINCT)), so a chunk may land on any worker: a float
+/// SUM/AVG can differ from the materialized path in its last bits, while
+/// integer and decimal sums, counts and MIN/MAX stay exact. There is no
+/// order-sensitive aggregate to keep on another path.
+pub(crate) fn fold_stream(
+    cx: &Cx,
+    filters: &[&BoundExpr],
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+    produce: &mut ChunkFeed<'_>,
+) -> Result<Vec<Partial>> {
+    let workers = crate::PinkDb::stream_fold_workers();
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<DataChunk>(workers);
+    let receiver = std::sync::Mutex::new(receiver);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let receiver = &receiver;
+                scope.spawn(move || -> Result<Partial> {
+                    let mut partial = Partial::for_rows(CHUNK_SIZE);
+                    let mut failed: Option<PinkDbError> = None;
+                    loop {
+                        let Ok(chunk) = receiver
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .recv()
+                        else {
+                            break;
+                        };
+                        let rows = chunk.num_rows();
+                        if failed.is_some() {
+                            // Keep draining, so a failed worker cannot block
+                            // the producer on a full channel. The first error
+                            // is reported once every worker has stopped.
+                            cx.db.stream_release(rows);
+                            continue;
+                        }
+                        let folded = filter_and_fold(cx, filters, keys, aggs, &mut partial, chunk);
+                        cx.db.stream_release(rows);
+                        if let Err(e) = folded {
+                            failed = Some(e);
+                        }
+                    }
+                    match failed {
+                        Some(e) => Err(e),
+                        None => Ok(partial),
+                    }
+                })
+            })
+            .collect();
+        let produced = produce(&mut |chunk| {
+            let rows = chunk.num_rows();
+            cx.db.stream_hold(rows);
+            if sender.send(chunk).is_err() {
+                // Every worker has stopped; the join below reports why.
+                cx.db.stream_release(rows);
+            }
+            Ok(())
+        });
+        drop(sender);
+        let mut partials = Vec::with_capacity(workers);
+        let mut failed: Option<PinkDbError> = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(partial)) => partials.push(partial),
+                Ok(Err(e)) => failed = failed.or(Some(e)),
+                Err(_) => {
+                    failed = failed.or(Some(PinkDbError::Execution(
+                        "a streaming aggregate worker panicked".to_owned(),
+                    )))
+                }
+            }
+        }
+        match (failed, produced) {
+            (Some(e), _) => Err(e),
+            (None, produced) => produced.map(|()| partials),
+        }
+    })
+}
+
+/// The per-chunk phase the materializing path runs, for one streamed chunk.
+fn filter_and_fold(
+    cx: &Cx,
+    filters: &[&BoundExpr],
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+    partial: &mut Partial,
+    mut chunk: DataChunk,
+) -> Result<()> {
+    for predicate in filters {
+        match super::filter_chunk(cx, predicate, &chunk)? {
+            Some(kept) => chunk = kept,
+            None => return Ok(()),
+        }
+    }
+    fold_chunk(cx, partial, &chunk, keys, aggs)
+}
+
+/// Fold one chunk into `partial` — phase 1 of [`aggregate`] for a single
+/// chunk, shared with the streaming scan→aggregate executor (wave 98c), which
+/// keeps **one** running partial and so holds one chunk at a time instead of
+/// one partial per chunk of a materialized scan.
+///
+/// Rows are read through the same `eval_agg_vec` / `group_ids` / `accumulate`
+/// calls the materialized path makes, in the same order, so groups and
+/// accumulator updates are identical.
+pub(crate) fn fold_chunk(
+    cx: &Cx,
+    partial: &mut Partial,
+    chunk: &DataChunk,
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+) -> Result<()> {
+    cx.check_deadline()?;
+    let key_vecs: Vec<EvalVec> = keys
+        .iter()
+        .map(|k| eval_agg_vec(k, chunk, cx))
+        .collect::<Result<_>>()?;
+    let arg_vecs: Vec<Option<EvalVec>> = aggs
+        .iter()
+        .map(|a| match &a.arg {
+            Some(e) => eval_agg_vec(e, chunk, cx).map(Some),
+            None => Ok(None),
+        })
+        .collect::<Result<_>>()?;
+    // Pass 1: one group id per row (first-seen order).
+    let gids = group_ids(partial, &key_vecs, aggs, chunk.num_rows());
+    // Pass 2: each aggregate runs as one typed loop over the chunk.
+    // Accumulators are independent, so feeding agg by agg instead of row by
+    // row gives every accumulator the same rows in the same order — results
+    // are bit-identical.
+    for (j, av) in arg_vecs.iter().enumerate() {
+        accumulate(&mut partial.groups, &gids, j, av.as_ref().map(|v| v.v()));
+    }
+    Ok(())
+}
+
 /// Output buffer of the integer-DISTINCT fast path: the current vector's
 /// payload in the key's own layout (narrowed on flush for INTEGER/DATE) plus
 /// the slot of the (at most one) NULL key. Buffers flush as `CHUNK_SIZE`-row
@@ -1020,40 +1192,8 @@ pub(crate) fn aggregate(
     let partials: Vec<Partial> = inputs
         .par_iter()
         .map(|chunk| {
-            cx.check_deadline()?;
-            let key_vecs: Vec<EvalVec> = keys
-                .iter()
-                .map(|k| eval_agg_vec(k, chunk, cx))
-                .collect::<Result<_>>()?;
-            let arg_vecs: Vec<Option<EvalVec>> = aggs
-                .iter()
-                .map(|a| match &a.arg {
-                    Some(e) => eval_agg_vec(e, chunk, cx).map(Some),
-                    None => Ok(None),
-                })
-                .collect::<Result<_>>()?;
-            let mut partial = Partial {
-                groups: Vec::new(),
-                // Start small: most analytic chunks hold a handful of
-                // distinct keys, and preallocating one slot per row makes
-                // every chunk allocate (and later free, on the merging
-                // thread) a multi-hundred-kilobyte table. A chunk that
-                // outgrows this is high-cardinality and pays one jump to the
-                // full size instead (see the insert below).
-                index: FastMap::with_capacity_and_hasher(
-                    local_index_capacity(chunk.num_rows()),
-                    Default::default(),
-                ),
-            };
-            // Pass 1: one group id per row (first-seen order, as before).
-            let gids = group_ids(&mut partial, &key_vecs, aggs, chunk.num_rows());
-            // Pass 2: each aggregate runs as one typed loop over the chunk.
-            // Accumulators are independent, so feeding agg by agg instead of
-            // row by row gives every accumulator the same rows in the same
-            // order — results are bit-identical.
-            for (j, av) in arg_vecs.iter().enumerate() {
-                accumulate(&mut partial.groups, &gids, j, av.as_ref().map(|v| v.v()));
-            }
+            let mut partial = Partial::for_rows(chunk.num_rows());
+            fold_chunk(cx, &mut partial, chunk, keys, aggs)?;
             Ok(partial)
         })
         .collect::<Result<_>>()?;

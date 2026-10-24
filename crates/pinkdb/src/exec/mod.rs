@@ -15,8 +15,8 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
 use aggregate::{
-    Acc, Group, HIGH_CARDINALITY_KEYS, Partial, aggregate, emit_groups, local_index_capacity,
-    merge_partials,
+    Acc, Group, HIGH_CARDINALITY_KEYS, Partial, aggregate, emit_groups, fold_stream,
+    local_index_capacity, merge_partials,
 };
 use aggregate::{EvalVec as FusedVec, eval_agg_vec as eval_fused_vec};
 use expr::{coerce_to, count_true, eval_expr, select_true};
@@ -1604,24 +1604,7 @@ fn table_function_output(
     let scan = src.scan(call, projection, prunes)?;
     let mut chunks = Vec::with_capacity(scan.chunks.len());
     for chunk in scan.chunks {
-        if chunk.columns.len() != schema.len() {
-            return Err(PinkDbError::Execution(format!(
-                "table source \"{source}\" returned a chunk with {} columns but its \
-                 bound schema has {}",
-                chunk.columns.len(),
-                schema.len()
-            )));
-        }
-        for (i, col) in chunk.columns.iter().enumerate() {
-            if !col.is_empty() && col.dtype() != schema[i].1 {
-                return Err(PinkDbError::Execution(format!(
-                    "table source \"{source}\" returned column {i} as {} but its bound \
-                     schema says {}",
-                    col.dtype().name(),
-                    schema[i].1.name()
-                )));
-            }
-        }
+        check_source_chunk(source, schema, &chunk)?;
         chunks.push(chunk);
     }
     cx.check_deadline()?;
@@ -1631,6 +1614,34 @@ fn table_function_output(
         names,
         types,
     })
+}
+
+/// Check one chunk a table source returned against the schema the binder
+/// promised: same column count, and a non-empty column's dtype as bound.
+fn check_source_chunk(
+    source: &str,
+    schema: &[(String, DataType)],
+    chunk: &DataChunk,
+) -> Result<()> {
+    if chunk.columns.len() != schema.len() {
+        return Err(PinkDbError::Execution(format!(
+            "table source \"{source}\" returned a chunk with {} columns but its \
+             bound schema has {}",
+            chunk.columns.len(),
+            schema.len()
+        )));
+    }
+    for (i, col) in chunk.columns.iter().enumerate() {
+        if !col.is_empty() && col.dtype() != schema[i].1 {
+            return Err(PinkDbError::Execution(format!(
+                "table source \"{source}\" returned column {i} as {} but its bound \
+                 schema says {}",
+                col.dtype().name(),
+                schema[i].1.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Gather output for an index scan: produce chunks containing only the rows
@@ -1895,7 +1906,11 @@ fn min_max_value(attached: &AttachedTable, index: usize, is_min: bool) -> Option
 
 /// Apply one Filter chunk: `Ok(None)` when no row passes. Shared by the
 /// materializing path and the LIMIT stream, so both produce the same chunks.
-fn filter_chunk(cx: &Cx, predicate: &BoundExpr, chunk: &DataChunk) -> Result<Option<DataChunk>> {
+pub(crate) fn filter_chunk(
+    cx: &Cx,
+    predicate: &BoundExpr,
+    chunk: &DataChunk,
+) -> Result<Option<DataChunk>> {
     cx.check_deadline()?;
     let pred = eval_expr(predicate, chunk, cx)?;
     let sel = select_true(&pred)?;
@@ -2324,6 +2339,12 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // footer without decoding it; every other shape falls through and
             // materializes the table on first use.
             if let Some(out) = attached_stats_aggregate(cx, input, keys, aggs)? {
+                return Ok(out);
+            }
+            // Streaming scan→aggregate (wave 98c): fold a table function's or
+            // an attached/in-memory scan's chunks as they are decoded, so a
+            // remote file never lands in memory whole.
+            if let Some(out) = fused_scan_aggregate(cx, input, keys, aggs)? {
                 return Ok(out);
             }
             // Fast path: pure COUNT(*) with no keys counts rows — no data
@@ -3521,7 +3542,6 @@ fn expr_is_total(e: &BoundExpr) -> bool {
         | BoundExpr::Exists { .. } => false,
     }
 }
-
 /// Try to execute `Aggregate` over `Join` or `Project over Join` without
 /// materializing the joined rows: each match feeds one row into its group's
 /// accumulators directly. Returns `Ok(None)` — before evaluating anything —
@@ -3916,6 +3936,126 @@ fn fused_join_aggregate(
         names,
         types,
     }))
+}
+
+/// Try to execute `Aggregate` over `Filter`s over a streaming leaf (a table
+/// function or an attached lake table) by folding each chunk as the scan
+/// produces it (wave 98c). The executor therefore never holds the scan's
+/// rows: a remote Parquet scan streams row groups through
+/// [`crate::table_source::TableSource::scan_stream`] into the fold, so its
+/// memory is the source's read-ahead window plus the chunks in flight, not
+/// the file.
+///
+/// Everything that needs the rows in another shape returns `Ok(None)` before
+/// evaluating anything and takes the materialized path: a bare `DISTINCT`
+/// (its output is as large as its input and has its own typed fast path), a
+/// time-travel scan (no streaming loader), any other input plan, and a leaf
+/// whose source says streaming does not pay off (see
+/// [`crate::table_source::TableSource::streams_scan`]) — a local scan is
+/// faster materialized, because that fold runs in parallel.
+fn fused_scan_aggregate(
+    cx: &Cx,
+    input: &LogicalPlan,
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+) -> Result<Option<Output>> {
+    if aggs.is_empty() {
+        return Ok(None);
+    }
+    let mut filters: Vec<&BoundExpr> = Vec::new();
+    let mut leaf = input;
+    while let LogicalPlan::Filter {
+        input: inner,
+        predicate,
+    } = leaf
+    {
+        filters.push(predicate);
+        leaf = inner;
+    }
+    filters.reverse();
+    let streams = match leaf {
+        LogicalPlan::TableFunction { source, call, .. } => cx
+            .db
+            .table_source(source)
+            .is_some_and(|src| src.streams_scan(call)),
+        // A time-travel scan has no streaming loader.
+        LogicalPlan::Scan { at: Some(_), .. } => return Ok(None),
+        LogicalPlan::Scan { db, table, .. } => {
+            let lookup = db.as_deref().unwrap_or_else(|| cx.db.current_db());
+            cx.db
+                .attached_lookup(lookup, table)
+                .is_some_and(|(_, lake)| lake.streams_scan(lookup, table))
+        }
+        _ => return Ok(None),
+    };
+    if !streams {
+        return Ok(None);
+    }
+    // Fold in parallel with the workers the materialized path uses; the fold
+    // pulls chunks from the scan through a bounded hand-off, so it holds
+    // `2 * workers` chunks, not the file.
+    let partials = fold_stream(cx, &filters, keys, aggs, &mut |sink| {
+        stream_leaf_chunks(cx, leaf, &mut |chunk| sink(chunk))
+    })?;
+    // Merge and emit through the shared post-partial phase, exactly like
+    // `aggregate()`.
+    let groups = merge_partials(partials, !keys.is_empty(), aggs);
+    let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
+    let chunks = emit_groups(groups, &key_types, aggs)?;
+    let (names, types) = agg_output_schema(keys, aggs);
+    Ok(Some(Output {
+        chunks,
+        names,
+        types,
+    }))
+}
+
+/// Push a streaming leaf's chunks into `sink` in scan order: a table function
+/// through the source's own streaming scan, an attached lake table through the
+/// lake's. The plan must be a leaf [`fused_scan_aggregate`] accepted, i.e. one
+/// its source agreed to stream.
+fn stream_leaf_chunks(
+    cx: &Cx,
+    plan: &LogicalPlan,
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<()> {
+    match plan {
+        LogicalPlan::TableFunction {
+            source,
+            call,
+            schema,
+        } => {
+            let Some(src) = cx.db.table_source(source) else {
+                return Err(PinkDbError::Execution(format!(
+                    "the table source \"{source}\" is not registered in this session (it was \
+                     unregistered after the statement was bound); re-register it and run the \
+                     statement again"
+                )));
+            };
+            let projection = cx.projections.for_scan(plan);
+            let prunes = cx.prunes.for_scan(plan);
+            let mut push = |chunk: DataChunk| {
+                check_source_chunk(source, schema, &chunk)?;
+                sink(chunk)
+            };
+            src.scan_stream(call, projection, prunes, &mut push)?;
+            cx.check_deadline()
+        }
+        LogicalPlan::Scan { db, table, .. } => {
+            let lookup = db.as_deref().unwrap_or_else(|| cx.db.current_db());
+            let Some((_, lake)) = cx.db.attached_lookup(lookup, table) else {
+                return Err(PinkDbError::Execution(format!(
+                    "the attached table \"{lookup}.{table}\" is no longer loaded in this session; \
+                     run the statement again"
+                )));
+            };
+            let projected = cx.projections.for_scan(plan);
+            let prunes = cx.prunes.for_scan(plan);
+            lake.scan_streamed(lookup, table, projected, prunes, sink)?;
+            cx.check_deadline()
+        }
+        _ => unreachable!("stream_leaf_chunks needs a leaf the fusion accepted"),
+    }
 }
 
 /// `DISTINCT`: GROUP BY every column with no aggregates — the parallel

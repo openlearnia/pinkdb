@@ -72,6 +72,43 @@ one-liners below.
   184 ms. Data formats (`.pink`, Parquet) and the S3 data path are
   unchanged.
 
+## 2026-10-24
+### Wave 98c — streaming remote scans, a smaller Parquet writer, CSV read-ahead, an optional file cache ✅
+- `COPY … TO '….parquet'` and Parquet lake files are now Snappy-compressed
+  and dictionary-encoded like DuckDB's. TPC-H SF1 `lineitem` is 238 MB
+  instead of 388 MB (DuckDB writes 205 MB) and takes 3.7 s instead of 3.4 s.
+  A column whose dictionary grows past its chunk budget falls back to plain
+  pages for that chunk. DuckDB reads the files (an interop test checks it).
+- A query that aggregates over a remote file or a lake table no longer
+  loads the table first: each decoded chunk goes straight into the
+  aggregate, folded by the same worker pool the materialized path uses, so
+  peak memory is one read-ahead window plus about two chunks per fold
+  worker, however large the file is — and the fusion costs no speed.
+  Measured with the fold pinned at two workers: the executor never held more
+  than `2n+1` chunks, 2 000 rows on a mock-S3 file of 200 row groups (80 000
+  rows) and 10 240 rows on a 60-file/180 000-row lake. A lake streams one
+  data file at a time — `.pink` files chunk by chunk — so its bound is the
+  largest data file, not the largest table.
+- No regression, measured as an interleaved A/B against HEAD (5 alternating
+  runs each, medians, local SF1): lake Q6 0.340 → 0.337 s, lake Q1
+  0.390 → 0.396 s, local `read_parquet` Q6 0.212 → 0.210 s, an HTTP-served
+  `lineitem.parquet` Q6 1.317 → 1.315 s (44.27 → 44.64 s with ranged GETs
+  forced serial). Every aggregate the binder builds is order-insensitive, so
+  chunks may be folded by any worker.
+- `read_csv('s3://…')` and `read_csv('https://…')` download 1 MiB ranges a
+  window of 8 MiB ahead of the parser, with one request in flight, so
+  parsing overlaps the download and memory stays bounded; a transient
+  mid-file error is retried.
+- An optional on-disk cache keeps remote byte ranges between queries (**off
+  by default**): `PINKDB_EXTERNAL_FILE_CACHE=1` (with
+  `PINKDB_EXTERNAL_FILE_CACHE_DIR` and `_BYTES`, default 1 GiB) or
+  `--file-cache DIR`. Ranges are keyed by URL and ETag, so a changed object
+  is never served stale; the directory is size-capped with LRU eviction,
+  entries are `0600` in a `0700` tree, and a corrupt entry is a miss.
+- Release size: the default `pinkdb-cli` is 4,183,936 B, 63,552 B larger
+  than HEAD (the streaming fold is in the engine); the rest is behind the
+  `httpfs`/`parquet` features.
+
 ## 2026-10-23
 ### Wave 96a (part 2) — Postgres catalogs and catalog migration ✅
 - A lake's metadata can now live in **Postgres**, not just SQLite or the

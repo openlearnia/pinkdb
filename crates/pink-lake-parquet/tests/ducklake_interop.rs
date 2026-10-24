@@ -620,6 +620,84 @@ fn pinkdb_parquet_deletes_apply_in_duckdb() {
 }
 
 #[test]
+fn duckdb_reads_pinkdb_written_snappy_dictionary_files() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+
+    let dir = scratch("pink-compressed-to-duckdb");
+    let catalog_path = dir.join("catalog.db");
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let data = dir.join("data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    let mut empty = PinkDb::new();
+    empty
+        .execute("CREATE TABLE main.t (i BIGINT, v VARCHAR);")
+        .unwrap();
+    lake.write_from_store(&empty).unwrap();
+    let mut table = DataTable::new(
+        "t".to_string(),
+        vec![
+            ("i".to_string(), DataType::Bigint),
+            ("v".to_string(), DataType::Varchar),
+        ],
+    )
+    .unwrap();
+    for i in 0..20_000i64 {
+        table
+            .append_row(vec![
+                Value::Bigint(i),
+                Value::Varchar(format!("region-{}", i % 16)),
+            ])
+            .unwrap();
+    }
+    let mut commit = Commit::new();
+    commit.append("main.t", Arc::new(table));
+    lake.commit(&commit).unwrap();
+    let file = lake
+        .list_files(Some("main.t"), None, false)
+        .unwrap()
+        .into_iter()
+        .find(|file| file.rows == Some(20_000))
+        .expect("the appended table has one 20,000-row data file")
+        .path;
+    drop(lake);
+    // `list_files` paths are lake-relative, and the lake root is the data
+    // directory the attachment was created with.
+    let absolute = data.join(&file);
+    let absolute = absolute.to_str().unwrap();
+
+    // `parquet_metadata` reports what DuckDB itself parses out of the footer,
+    // so this checks the file DuckDB sees, not pinkdb's own reader.
+    let script = format!(
+        "SELECT DISTINCT compression FROM parquet_metadata('{absolute}');\n\
+         SELECT DISTINCT encodings FROM parquet_metadata('{absolute}') \
+         WHERE path_in_schema = 'v';\n\
+         SELECT count(*), sum(i) FROM read_parquet('{absolute}');\n"
+    );
+    let rows = match run_duckdb(&binary, &script) {
+        Ok(rows) => rows,
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip DuckDB interop test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    };
+    assert_eq!(rows[0], "SNAPPY", "pinkdb writes Snappy pages by default");
+    assert!(
+        rows[1].contains("DICTIONARY"),
+        "the low-cardinality column must be dictionary-encoded: {}",
+        rows[1]
+    );
+    assert_eq!(rows[2], "20000,199990000");
+    cleanup(&dir);
+}
+
+#[test]
 fn a_duckdb_catalog_with_parquet_deletes_opens() {
     register().unwrap();
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

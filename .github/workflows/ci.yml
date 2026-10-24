@@ -95,6 +95,9 @@ jobs:
               cargo test -p pinkdb-cli --features pinklake,s3,encryption
               cargo test -p pinkdb-cli --features s3
               cargo test -p pinkdb-cli --features pinklake,s3,catalog-sqlite
+              # Parquet-format lakes through the CLI: three of these tests went
+              # stale after wave 103 because no job built `parquetlake` (wave 98c).
+              cargo test -p pinkdb-cli --features pinklake,s3,parquetlake
               # The default build must never link SQLite or Postgres (wave 96a).
               ! cargo tree -p pinkdb-cli -e normal | grep -qE "postgres|rusqlite"
           - name: cli-misc
@@ -220,6 +223,7 @@ jobs:
           cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,repo,client,tls,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features client,tls -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,parquetlake -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features s3 -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features async-server -- -D warnings
           cargo clippy --all-targets -p pinkdb-js --features engine -- -D warnings

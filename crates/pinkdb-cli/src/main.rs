@@ -1524,6 +1524,10 @@ struct Opts {
     /// `--extension-root PATH`: confine every extension load to this
     /// directory.
     extension_root: Option<String>,
+    /// `--file-cache DIR`: keep remote byte ranges on disk between queries
+    /// (wave 98c). Off unless given; `PINKDB_EXTERNAL_FILE_CACHE=1` and its
+    /// `_DIR`/`_BYTES` variables do the same without the flag.
+    file_cache: Option<String>,
 }
 
 fn print_usage() {
@@ -1545,6 +1549,9 @@ fn print_usage() {
     println!("                     let SQL `LOAD EXTENSION '<path>'` run: it loads and runs");
     println!("                     native code from a path the SQL names (off by default;");
     println!("                     PINKDB_ALLOW_LOAD_EXTENSION=1 does the same)");
+    println!("  --file-cache DIR   keep remote byte ranges on disk between queries");
+    println!("                     (off by default; PINKDB_EXTERNAL_FILE_CACHE=1 with");
+    println!("                     PINKDB_EXTERNAL_FILE_CACHE_DIR/_BYTES does the same)");
     println!("  --extension-root PATH");
     println!("                     confine every extension load to this directory (a path");
     println!("                     outside it, a bare library name, a `..` component and a");
@@ -1570,6 +1577,7 @@ fn parse_args() -> Result<Opts, String> {
         tls_insecure: false,
         allow_load_extension: false,
         extension_root: None,
+        file_cache: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1609,6 +1617,13 @@ fn parse_args() -> Result<Opts, String> {
             "--tls" => opts.tls = true,
             "--tls-insecure" => opts.tls_insecure = true,
             "--allow-load-extension" => opts.allow_load_extension = true,
+            "--file-cache" => {
+                let value = args.next().ok_or("--file-cache requires a directory")?;
+                opts.file_cache = Some(value);
+            }
+            other if other.starts_with("--file-cache=") => {
+                opts.file_cache = Some(other["--file-cache=".len()..].to_string());
+            }
             "--extension-root" => {
                 let value = args.next().ok_or("--extension-root requires a path")?;
                 opts.extension_root = Some(value);
@@ -1632,6 +1647,17 @@ fn parse_args() -> Result<Opts, String> {
     }
     validate_tls_args(&opts)?;
     validate_auth_args(&mut opts)?;
+    if let Some(dir) = &opts.file_cache {
+        // The transport reads the cache configuration from the environment
+        // when a source is registered, which happens after argument parsing
+        // and before any query runs.
+        // SAFETY: startup is single-threaded here; no other thread reads the
+        // environment until the source registry is built.
+        unsafe {
+            std::env::set_var("PINKDB_EXTERNAL_FILE_CACHE", "1");
+            std::env::set_var("PINKDB_EXTERNAL_FILE_CACHE_DIR", dir);
+        }
+    }
     Ok(opts)
 }
 

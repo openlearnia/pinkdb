@@ -1,7 +1,9 @@
 //! CLI coverage for the `parquetlake` feature (wave 87): `.lake format
 //! parquet` selects the provider, `.lake save` writes `.parquet` data files,
 //! `.lake open` reads them back, `.lake attach` answers from the manifest
-//! statistics, and an unknown format id is a clean error.
+//! statistics, and an unknown format id is a clean error. The on-disk checks
+//! read the published `<lake>.files/data` tree (the layout wave 102/103
+//! introduced; the JSON catalog these tests once read is gone).
 //!
 //! Only compiled when the `parquetlake` feature is on.
 
@@ -41,8 +43,14 @@ fn run(cmds: &str) -> String {
     out
 }
 
-/// Every data file under `dir/data`, recursively, sorted.
-fn data_files(dir: &Path) -> Vec<PathBuf> {
+/// The data directory a save at `lake` publishes: `<lake>.files/data`
+/// (wave 102's layout; the JSON catalog this file used to read is gone).
+fn data_root(lake: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.files", lake.display())).join("data")
+}
+
+/// Every data file under `root`, recursively, sorted.
+fn data_files(root: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -57,7 +65,7 @@ fn data_files(dir: &Path) -> Vec<PathBuf> {
         }
     }
     let mut out = Vec::new();
-    walk(&dir.join("data"), &mut out);
+    walk(root, &mut out);
     out.sort();
     out
 }
@@ -96,10 +104,10 @@ fn format_parquet_then_save_and_open_round_trips() {
     assert!(out.contains("│ 2       │ NULL    │"), "{out}");
     assert!(out.contains("│ 1        │"), "{out}");
 
-    // The lake pins the provider and stores real `.parquet` files.
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format\": \"parquet\""), "{catalog}");
-    let files = data_files(&lake);
+    // The lake pins the provider and stores real `.parquet` files. The pin
+    // itself lives in the catalog the runtime keeps (the JSON catalog was
+    // replaced in wave 103), so the files' extension and magic show it.
+    let files = data_files(&data_root(&lake));
     assert_eq!(files.len(), 2, "{files:?}");
     for file in &files {
         assert_eq!(file.extension().unwrap(), "parquet", "{file:?}");
@@ -173,27 +181,20 @@ fn per_table_format_choice_and_rewrite_conversion() {
     assert!(out.contains("│ 1        │"), "{out}");
 
     // Only `t` switched: `u` keeps the build default (`.pink` in this
-    // parquetlake build), and each table's referenced files carry its format's
-    // extension.
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert_eq!(
-        catalog.matches("\"format\": \"parquet\"").count(),
-        1,
-        "{catalog}"
-    );
-    assert_eq!(
-        catalog.matches("\"format\": \"pink\"").count(),
-        1,
-        "{catalog}"
-    );
-    let files = data_files(&lake);
+    // parquetlake build), and each table's directory carries files with its
+    // format's extension.
+    let root = data_root(&lake);
+    let files = data_files(&root);
     assert_eq!(files.len(), 2, "{files:?}");
-    let extensions: Vec<String> = files
-        .iter()
-        .map(|file| file.extension().unwrap().to_string_lossy().into_owned())
-        .collect();
-    assert!(extensions.contains(&"parquet".to_string()), "{files:?}");
-    assert!(extensions.contains(&"pink".to_string()), "{files:?}");
+    for file in &files {
+        let extension = file.extension().unwrap().to_string_lossy().into_owned();
+        let expected = if file.starts_with(root.join("main.t")) {
+            "parquet"
+        } else {
+            "pink"
+        };
+        assert_eq!(extension, expected, "{file:?}");
+    }
 
     // `.lake rewrite <dir> <table> format <id>` converts the table in one
     // maintenance version; the data survives and open still answers.
@@ -202,12 +203,16 @@ fn per_table_format_choice_and_rewrite_conversion() {
         lake = lake.display()
     ));
     assert!(out.contains("Converted main.t to format \"pink\""), "{out}");
-    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(
-        !catalog.contains("\"format\": \"parquet\""),
-        "the table moved back to pink: {catalog}"
-    );
-    assert!(catalog.contains("\"format\": \"pink\""), "{catalog}");
+    // The conversion wrote a `.pink` file for `t`. The superseded `.parquet`
+    // file stays until a vacuum, so only the new one is asserted.
+    let converted: Vec<PathBuf> = data_files(&root.join("main.t"))
+        .into_iter()
+        .filter(|file| file.extension().is_some_and(|e| e == "pink"))
+        .collect();
+    assert_eq!(converted.len(), 1, "{converted:?}");
+    assert!(pinkdb::persist::is_pinkdb06(
+        &std::fs::read(&converted[0]).unwrap()
+    ));
 
     let out = run(&format!(
         ".lake open {lake}\n\
@@ -239,7 +244,7 @@ fn an_unknown_format_is_a_clear_error_and_changes_nothing() {
     assert!(out.contains("Lake write format: pink"), "{out}");
     // The save still happened under the build default (`.pink` files).
     assert!(out.contains("Saved lake version 2"), "{out}");
-    let files = data_files(&lake);
+    let files = data_files(&data_root(&lake));
     assert_eq!(files.len(), 1, "{files:?}");
     assert_eq!(files[0].extension().unwrap(), "pink", "{files:?}");
 

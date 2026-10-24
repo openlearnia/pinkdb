@@ -18,6 +18,9 @@ use crate::s3::{Get, S3Client, S3Config};
 pub struct HttpfsConfig {
     /// Allow plain `http://` URLs and S3 endpoints (test/local only).
     pub allow_http: bool,
+    /// The on-disk range cache; `None` (the default) is off. See
+    /// [`crate::cache`] and `PINKDB_EXTERNAL_FILE_CACHE`.
+    pub cache: Option<crate::cache::CacheOptions>,
 }
 
 impl HttpfsConfig {
@@ -35,6 +38,7 @@ impl HttpfsConfig {
         };
         Self {
             allow_http: truthy("PINKDB_HTTPFS_ALLOW_HTTP"),
+            cache: crate::cache::CacheOptions::from_env(),
         }
     }
 }
@@ -53,6 +57,13 @@ pub trait Fetcher: fmt::Debug + Send + Sync {
     /// "unknown", not "empty".
     fn size(&self) -> Result<Option<u64>>;
 
+    /// The object's ETag, when the server reports one. Only the on-disk cache
+    /// needs it, and an untagged object is simply not cached, so `None` is
+    /// always an acceptable answer.
+    fn etag(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// The whole object's bytes.
     fn fetch(&self) -> Result<Vec<u8>>;
 
@@ -69,16 +80,16 @@ pub fn open(url: &str) -> Result<Box<dyn Fetcher>> {
 /// Open `url` with explicit configuration.
 pub fn open_with(url: &str, config: &HttpfsConfig) -> Result<Box<dyn Fetcher>> {
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") || lower.starts_with("http://") {
-        return Ok(Box::new(HttpFetcher {
+    let fetcher: Box<dyn Fetcher> = if lower.starts_with("https://") || lower.starts_with("http://")
+    {
+        Box::new(HttpFetcher {
             url: url.to_string(),
             client: HttpClient::new(config),
-        }));
-    }
-    if lower.starts_with("s3://") {
+        })
+    } else if lower.starts_with("s3://") {
         #[cfg(feature = "s3")]
         {
-            return open_s3(url, config);
+            open_s3(url, config)?
         }
         #[cfg(not(feature = "s3"))]
         {
@@ -89,11 +100,13 @@ pub fn open_with(url: &str, config: &HttpfsConfig) -> Result<Box<dyn Fetcher>> {
                     .to_string(),
             });
         }
-    }
-    Err(Error::Unsupported {
-        context: url.to_string(),
-        message: "expected an https://, http:// (test opt-in) or s3:// URL".to_string(),
-    })
+    } else {
+        return Err(Error::Unsupported {
+            context: url.to_string(),
+            message: "expected an https://, http:// (test opt-in) or s3:// URL".to_string(),
+        });
+    };
+    crate::cache::wrap(fetcher, config.cache.as_ref())
 }
 
 #[cfg(feature = "s3")]
@@ -102,7 +115,7 @@ fn open_s3(url: &str, config: &HttpfsConfig) -> Result<Box<dyn Fetcher>> {
     if config.allow_http {
         s3 = s3.allow_http(true);
     }
-    open_s3_with(url, s3)
+    raw_s3_fetcher(url, s3)
 }
 
 /// Open an `s3://` URL with an explicit [`S3Config`] (the bucket and key are
@@ -110,7 +123,24 @@ fn open_s3(url: &str, config: &HttpfsConfig) -> Result<Box<dyn Fetcher>> {
 /// the config supplies region/endpoint/credentials). Useful for embedders
 /// and tests that do not want environment lookups.
 #[cfg(feature = "s3")]
-pub fn open_s3_with(url: &str, mut config: S3Config) -> Result<Box<dyn Fetcher>> {
+pub fn open_s3_with(url: &str, config: S3Config) -> Result<Box<dyn Fetcher>> {
+    let options = crate::cache::CacheOptions::from_env();
+    open_s3_cached(url, config, options.as_ref())
+}
+
+/// [`open_s3_with`] with an explicit cache choice (tests, embedders).
+#[cfg(feature = "s3")]
+pub(crate) fn open_s3_cached(
+    url: &str,
+    config: S3Config,
+    cache: Option<&crate::cache::CacheOptions>,
+) -> Result<Box<dyn Fetcher>> {
+    let fetcher = raw_s3_fetcher(url, config)?;
+    crate::cache::wrap(fetcher, cache)
+}
+
+#[cfg(feature = "s3")]
+fn raw_s3_fetcher(url: &str, mut config: S3Config) -> Result<Box<dyn Fetcher>> {
     config.bucket = parse_s3_bucket(url)?.to_string();
     // The key is the whole object key; a prefix would be lake semantics.
     config.prefix.clear();
@@ -170,6 +200,10 @@ impl Fetcher for HttpFetcher {
         self.client.size(&self.url)
     }
 
+    fn etag(&self) -> Result<Option<String>> {
+        self.client.etag(&self.url)
+    }
+
     fn fetch(&self) -> Result<Vec<u8>> {
         self.client.fetch_bytes(&self.url)
     }
@@ -195,6 +229,13 @@ impl Fetcher for S3Fetcher {
 
     fn size(&self) -> Result<Option<u64>> {
         Ok(self.client.stat_object(&self.key)?.map(|meta| meta.size))
+    }
+
+    fn etag(&self) -> Result<Option<String>> {
+        Ok(self
+            .client
+            .stat_object(&self.key)?
+            .and_then(|meta| meta.etag))
     }
 
     fn fetch(&self) -> Result<Vec<u8>> {
@@ -239,7 +280,10 @@ mod tests {
     fn https_fetcher_implements_the_trait() {
         let server = TestHttpServer::start();
         server.put("/f.csv", b"x,y\n1,2\n");
-        let config = HttpfsConfig { allow_http: true };
+        let config = HttpfsConfig {
+            allow_http: true,
+            ..Default::default()
+        };
         let f = open_with(&server.url("/f.csv"), &config).unwrap();
         assert_eq!(f.url(), server.url("/f.csv"));
         assert_eq!(f.size().unwrap(), Some(8));

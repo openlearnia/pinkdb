@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use pinkdb::{DataTable, DataType, TableFunctionArg, TableFunctionCall, Value};
+use pinkdb::{DataTable, DataType, PinkDb, TableFunctionArg, TableFunctionCall, Value};
 use pinkdb_parquet::write::{WriteError, read_identity, write_table, write_table_with_identity};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -302,6 +302,152 @@ fn a_large_table_writes_multiple_row_groups_with_statistics() {
         .statistics()
         .unwrap();
     assert_eq!(stats.null_count_opt(), Some(3));
+    cleanup(&dir);
+}
+
+#[test]
+fn copy_to_writes_a_file_the_existing_reader_reads_back() {
+    let dir = scratch("copy-to");
+    let mut db = PinkDb::new();
+    pinkdb_parquet::register(&mut db);
+    db.execute("CREATE TABLE t (i INTEGER, s VARCHAR);")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'ccc');")
+        .unwrap();
+    let path = dir.join("out.parquet");
+    // `FORMAT parquet` and the extension-inferred form must both work.
+    for (file, sql) in [
+        (
+            dir.join("explicit.parquet"),
+            format!(
+                "COPY t TO '{}' (FORMAT parquet);",
+                dir.join("explicit.parquet").display()
+            ),
+        ),
+        (path.clone(), format!("COPY t TO '{}';", path.display())),
+    ] {
+        db.execute(&sql).unwrap();
+        let (schema, rows) = read_rows(
+            &file,
+            vec![
+                ("i".to_string(), DataType::Integer),
+                ("s".to_string(), DataType::Varchar),
+            ],
+        );
+        assert_eq!(schema.len(), 2);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Integer(1), Value::Varchar("a".to_string())],
+                vec![Value::Integer(2), Value::Null],
+                vec![Value::Integer(3), Value::Varchar("ccc".to_string())],
+            ],
+            "{sql}"
+        );
+    }
+    cleanup(&dir);
+}
+
+#[test]
+fn pages_are_snappy_compressed_and_dictionary_encoded() {
+    let dir = scratch("codec");
+    let schema = vec![
+        ("id".to_string(), DataType::Bigint),
+        ("region".to_string(), DataType::Varchar),
+    ];
+    let rows: Vec<Vec<Value>> = (0..10_000i64)
+        .map(|i| {
+            vec![
+                Value::Bigint(i),
+                Value::Varchar(format!("region-{}", i % 8)),
+            ]
+        })
+        .collect();
+    round_trip(&table("codec", schema, rows), &dir);
+
+    let reader =
+        SerializedFileReader::new(std::fs::File::open(dir.join("data.parquet")).unwrap()).unwrap();
+    let metadata = reader.metadata();
+    let group = metadata.row_group(0);
+    for column in 0..group.num_columns() {
+        let chunk = group.column(column);
+        assert_eq!(
+            chunk.compression(),
+            parquet::basic::Compression::SNAPPY,
+            "column {column} must be Snappy-compressed"
+        );
+        let encodings: Vec<_> = chunk.encodings().collect();
+        assert!(
+            encodings.iter().any(|e| matches!(
+                e,
+                parquet::basic::Encoding::RLE_DICTIONARY
+                    | parquet::basic::Encoding::PLAIN_DICTIONARY
+            )),
+            "column {column} must be dictionary-encoded, got {encodings:?}"
+        );
+    }
+    // The 8-value key set becomes one dictionary page on the strings column.
+    assert!(
+        metadata
+            .row_group(0)
+            .column(1)
+            .dictionary_page_offset()
+            .is_some(),
+        "the low-cardinality column must carry a dictionary page"
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn long_strings_and_high_cardinality_columns_round_trip() {
+    let dir = scratch("high-cardinality");
+    let schema = vec![
+        ("id".to_string(), DataType::Integer),
+        ("high".to_string(), DataType::Varchar),
+        ("long".to_string(), DataType::Varchar),
+    ];
+    // 40k distinct 64-byte values: the dictionary outgrows its 1 MiB page limit
+    // inside the row group, so the encoder falls back to PLAIN mid-chunk.
+    let mut rows: Vec<Vec<Value>> = (0..40_000i32)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                match i % 5 {
+                    0 => Value::Null,
+                    _ => Value::Varchar(format!("{i:064}")),
+                },
+                Value::Varchar(if i % 1_000 == 0 {
+                    format!("{}-{}", "long".repeat(20_000), i)
+                } else {
+                    format!("short-{i}")
+                }),
+            ]
+        })
+        .collect();
+    rows.push(vec![Value::Integer(-1), Value::Null, Value::Null]);
+    let (read_schema, read) = round_trip(&table("wide", schema.clone(), rows.clone()), &dir);
+    assert_eq!(read_schema, schema);
+    assert_rows_equal(&rows, &read, "long and high-cardinality strings");
+
+    // The fallback really happened: the high-cardinality chunk mixes a plain
+    // page with the dictionary it started from (a chunk that fit the limit
+    // would be dictionary-encoded throughout).
+    let reader =
+        SerializedFileReader::new(std::fs::File::open(dir.join("data.parquet")).unwrap()).unwrap();
+    let mut saw_plain = false;
+    for group in 0..reader.metadata().num_row_groups() {
+        let encodings: Vec<_> = reader
+            .metadata()
+            .row_group(group)
+            .column(1)
+            .encodings()
+            .collect();
+        saw_plain |= encodings.contains(&parquet::basic::Encoding::PLAIN);
+    }
+    assert!(
+        saw_plain,
+        "the high-cardinality column must fall back to PLAIN"
+    );
     cleanup(&dir);
 }
 

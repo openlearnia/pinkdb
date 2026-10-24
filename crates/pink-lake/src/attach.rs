@@ -99,7 +99,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pinkdb::attached::AttachedScan;
-use pinkdb::{AtSpec, AttachedLake, AttachedTable, ColumnStats, DataTable, PinkDbError, Value};
+use pinkdb::{
+    AtSpec, AttachedLake, AttachedTable, ColumnStats, DataChunk, DataTable, PinkDbError, Value,
+};
 
 use crate::catalog::{PartitionKey, TableEntry};
 use crate::format::{DataFile, LakeFormat};
@@ -210,6 +212,19 @@ impl AttachedEntry {
     fn key(&self) -> String {
         format!("{}.{}", self.db, self.table)
     }
+}
+
+/// A table with at most this many live rows is materialized and cached even
+/// when the query is an aggregate: that keeps one decode per referenced
+/// column for later statements at a bounded cost (64 chunks). A bigger table
+/// streams its data files into the fold instead, so its memory does not grow
+/// with the table (wave 98c).
+const MATERIALIZE_MAX_ROWS: u64 = 64 * pinkdb::CHUNK_SIZE as u64;
+
+/// The rows a table publishes: its data files plus the inlined rows unioned
+/// after them.
+fn live_rows(entry: &AttachedEntry) -> u64 {
+    entry.files.iter().map(|file| file.rows).sum::<u64>() + entry.inlined.len() as u64
 }
 
 /// One attached lake, as the engine sees it.
@@ -471,19 +486,7 @@ impl AttachedLake for LakeAttachment {
                 self.location
             )));
         };
-        let survivors: Vec<AttachedFile> = entry
-            .files
-            .iter()
-            .filter(|file| {
-                let facts = FileFacts {
-                    rows: file.rows,
-                    zone: file.zone.as_deref(),
-                    partition: file.partition.as_ref(),
-                };
-                !zone::file_prunes(facts, &entry.keys, &entry.schema, predicates)
-            })
-            .cloned()
-            .collect();
+        let survivors = file_survivors(&entry, predicates);
         if survivors.len() == entry.files.len() && !entry.format.prunes_row_groups() {
             // Nothing pruned and the provider cannot prune *inside* a file:
             // take the ordinary cached path, so a query whose predicates
@@ -535,6 +538,138 @@ impl AttachedLake for LakeAttachment {
             files += view.files_decoded.load(Ordering::Relaxed);
         }
         (loads, columns, files)
+    }
+
+    fn streams_scan(&self, db: &str, table: &str) -> bool {
+        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        !self.unavailable.contains_key(&key)
+            && self
+                .files
+                .get(&key)
+                .is_some_and(|entry| live_rows(entry) > MATERIALIZE_MAX_ROWS)
+    }
+
+    fn scan_streamed(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Option<&[usize]>,
+        predicates: &[pinkdb::PrunePredicate],
+        sink: &mut dyn FnMut(DataChunk) -> std::result::Result<(), PinkDbError>,
+    ) -> std::result::Result<u64, PinkDbError> {
+        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        if let Some(message) = self.unavailable.get(&key) {
+            return Err(PinkDbError::Execution(message.clone()));
+        }
+        let Some(entry) = self.files.get(&key).cloned() else {
+            return Err(PinkDbError::Catalog(format!(
+                "lake {} has no table \"{db}.{table}\"",
+                self.location
+            )));
+        };
+        let requested = self.requested_columns(&key, columns);
+        if requested.is_empty() {
+            return Err(PinkDbError::Catalog(format!(
+                "lake {} table \"{db}.{table}\" has no columns",
+                self.location
+            )));
+        }
+        // A table that fits the materializing bound keeps the session cache's
+        // economics (one decode per referenced column, reused by later
+        // statements). Above it the fold streams data files; that path neither
+        // reads nor fills the cache, since filling it is what it must not do.
+        if live_rows(&entry) <= MATERIALIZE_MAX_ROWS {
+            let scan = self.load_filtered(db, table, columns, predicates)?;
+            let mut rows = 0u64;
+            for chunk in scan.chunks() {
+                rows += chunk.num_rows() as u64;
+                sink(chunk)?;
+            }
+            return Ok(rows);
+        }
+        let survivors = file_survivors(&entry, predicates);
+        self.loads.fetch_add(1, Ordering::Relaxed);
+        self.files_decoded
+            .fetch_add(survivors.len() as u64, Ordering::Relaxed);
+        let decoded_count = if !entry.projected {
+            requested.len() as u64
+        } else {
+            requested.iter().filter(|&&w| w).count() as u64
+        };
+        self.columns_decoded
+            .fetch_add(decoded_count, Ordering::Relaxed);
+        let full = !entry.projected || requested.iter().all(|&w| w);
+        let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
+        let columns = if full { None } else { Some(&decoded[..]) };
+        // One data file at a time: the chunks of the decoded file are pushed
+        // (and dropped) before the next file is read, so the peak is one
+        // file's decode. Row groups inside a file still decode in parallel
+        // (the Parquet reader's read-ahead window).
+        let mut present: Option<Vec<bool>> = None;
+        let mut rows = 0u64;
+        for file in &survivors {
+            let (chunked, file_present) =
+                load_file(&self.storage, &self.root, &entry, file, columns, predicates)
+                    .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+            match &present {
+                None => present = Some(file_present.clone()),
+                Some(first) if *first != file_present => {
+                    return Err(PinkDbError::Execution(format!(
+                        "attached files of \"{}\" disagree on the decoded columns",
+                        entry.key()
+                    )));
+                }
+                Some(_) => {}
+            }
+            let file_scan = AttachedScan {
+                table: Arc::new(chunked),
+                present: file_present,
+            };
+            for chunk in file_scan.chunks() {
+                rows += chunk.num_rows() as u64;
+                sink(chunk)?;
+            }
+        }
+        if !entry.inlined.is_empty() {
+            let record = entry.record.as_ref().ok_or_else(|| {
+                PinkDbError::Catalog(format!(
+                    "lake {} table \"{}\" carries inlined rows but no schema record",
+                    self.location,
+                    entry.key()
+                ))
+            })?;
+            let wanted = match &present {
+                Some(present) => present.clone(),
+                None => requested_mask(entry.schema.len(), columns),
+            };
+            let (table, inlined_present) = crate::inlined::materialize_live(
+                &entry.inlined,
+                record,
+                &entry.key(),
+                &entry.table,
+                Some(&wanted),
+                &self.root.join("catalog.json"),
+            )
+            .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+            if let Some(first) = &present
+                && *first != inlined_present
+            {
+                return Err(PinkDbError::Execution(format!(
+                    "attached inlined rows of \"{}\" disagree with the files on the \
+                     decoded columns",
+                    entry.key()
+                )));
+            }
+            let inlined_scan = AttachedScan {
+                table: Arc::new(table),
+                present: inlined_present,
+            };
+            for chunk in inlined_scan.chunks() {
+                rows += chunk.num_rows() as u64;
+                sink(chunk)?;
+            }
+        }
+        Ok(rows)
     }
 
     fn table_at(
@@ -795,6 +930,28 @@ impl LakeAttachment {
 /// The requested-column mask of one table load: `None`/unprovable = every
 /// column; a projection marks exactly its indices (an empty one marks column
 /// 0, the table's chunk shape). The same rule `requested_columns` applies.
+/// The files of `entry` whose zone maps leave at least one predicate
+/// satisfiable, in manifest order. Inlined rows are **never** pruned: file
+/// pruning only skips data files.
+fn file_survivors(
+    entry: &AttachedEntry,
+    predicates: &[pinkdb::PrunePredicate],
+) -> Vec<AttachedFile> {
+    entry
+        .files
+        .iter()
+        .filter(|file| {
+            let facts = FileFacts {
+                rows: file.rows,
+                zone: file.zone.as_deref(),
+                partition: file.partition.as_ref(),
+            };
+            !zone::file_prunes(facts, &entry.keys, &entry.schema, predicates)
+        })
+        .cloned()
+        .collect()
+}
+
 fn requested_mask(n_cols: usize, columns: Option<&[usize]>) -> Vec<bool> {
     let mut wanted = match columns {
         Some(cols) if cols.iter().all(|&i| i < n_cols) => {

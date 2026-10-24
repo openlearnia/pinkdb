@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pinkdb::attached::PrunePredicate;
-use pinkdb::csv::{infer_csv_schema, parse_csv_chunks};
+use pinkdb::csv::{infer_csv_schema, parse_csv_chunks, stream_csv_chunks};
 use pinkdb::{
     DataChunk, DataType, PinkDb, PinkDbError, Result, TableFunctionArg, TableFunctionCall,
     TableScanOutput, TableSource, TableSourceStats, Vector,
@@ -224,9 +224,29 @@ pub type CsvSchema = Vec<(String, DataType)>;
 #[derive(Debug)]
 struct Cached {
     key: String,
-    bytes: Vec<u8>,
     schema: CsvSchema,
+    body: Body,
 }
+
+/// What bind kept of the file for the scan.
+#[derive(Debug)]
+enum Body {
+    /// The whole file, in memory.
+    Whole(Vec<u8>),
+    /// The file's beginning (the schema probe), for a file read in windows.
+    Stream(Vec<u8>),
+}
+
+/// Bytes a remote file must exceed to be streamed instead of read whole. Up
+/// to this much there is nothing to bound (it is the read-ahead window
+/// anyway), so a small file costs one probe and is then cached for the scan.
+const CACHE_MAX_BYTES: u64 = crate::prefetch::DEFAULT_WINDOW_BYTES;
+
+/// The schema probe: one ranged read of this many bytes. A shorter answer is
+/// the whole file. The same trade-off DuckDB's sniffer makes — a row past this
+/// window that does not fit the inferred types fails the scan with a CSV type
+/// error.
+const SNIFF_BYTES: u64 = CACHE_MAX_BYTES;
 
 /// The httpfs [`TableSource`]: one instance per store, with a one-statement
 /// fetch cache and its own counters.
@@ -256,21 +276,111 @@ impl CsvSource {
         }
     }
 
-    fn load(&self, call: &Call) -> Result<(Vec<u8>, CsvSchema)> {
-        let bytes = if is_remote(&call.path) {
-            let fetcher: Box<dyn Fetcher> = open_with(&call.path, &self.config).map_err(|e| {
-                PinkDbError::Execution(format!("cannot open \"{}\": {e}", call.path))
-            })?;
-            fetcher.fetch().map_err(|e| {
-                PinkDbError::Execution(format!("cannot read \"{}\": {e}", call.path))
-            })?
-        } else {
-            std::fs::read(&call.path).map_err(|e| {
+    fn open(&self, path: &str) -> Result<Box<dyn Fetcher>> {
+        open_with(path, &self.config)
+            .map_err(|e| PinkDbError::Execution(format!("cannot open \"{path}\": {e}")))
+    }
+
+    /// The schema, plus the file's beginning: the whole file when one probe
+    /// returned it, else the probe's bytes for the streaming scan. A local
+    /// file is always read whole (there is no window to bound).
+    fn load(&self, call: &Call) -> Result<(Body, CsvSchema)> {
+        if !is_remote(&call.path) {
+            let bytes = std::fs::read(&call.path).map_err(|e| {
                 PinkDbError::Execution(format!("cannot read CSV \"{}\": {e}", call.path))
-            })?
+            })?;
+            let schema = infer_csv_schema(&bytes)?;
+            return Ok((Body::Whole(bytes), schema));
+        }
+        let head = self
+            .open(&call.path)?
+            .fetch_range(0, SNIFF_BYTES)
+            .map_err(|e| PinkDbError::Execution(format!("cannot read \"{}\": {e}", call.path)))?;
+        let schema = infer_csv_schema(&head)?;
+        if (head.len() as u64) < SNIFF_BYTES {
+            // The probe returned less than it asked for: that was the whole
+            // file, so the scan re-parses it without another request.
+            Ok((Body::Whole(head), schema))
+        } else {
+            Ok((Body::Stream(head), schema))
+        }
+    }
+
+    /// Drop the columns `projection` did not ask for from one parsed chunk:
+    /// absent columns become empty vectors, so every chunk keeps the bound
+    /// schema's shape.
+    fn project(chunk: DataChunk, selected: &[bool], types: &[DataType]) -> DataChunk {
+        if selected.iter().all(|s| *s) {
+            return chunk;
+        }
+        let columns: Vec<Arc<Vector>> = chunk
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if selected[i] {
+                    Arc::clone(c)
+                } else {
+                    Arc::new(Vector::with_capacity(types[i], 0))
+                }
+            })
+            .collect();
+        DataChunk::projected(columns, chunk.num_rows)
+    }
+
+    /// Run one bound call's scan, handing each projected chunk to `sink` as it
+    /// is parsed. Returns the rows and the decoded column count.
+    fn scan_call(
+        &self,
+        call: &Call,
+        projection: Option<&[usize]>,
+        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<(u64, u64)> {
+        let cached = {
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match cache.as_ref() {
+                Some(entry) if entry.key == call.cache_key() => cache.take(),
+                _ => None,
+            }
         };
-        let schema = infer_csv_schema(&bytes)?;
-        Ok((bytes, schema))
+        let (body, schema) = match cached {
+            Some(entry) => (entry.body, entry.schema),
+            None => self.load(call)?,
+        };
+        let types: Vec<DataType> = schema.iter().map(|(_, t)| *t).collect();
+        let selected: Vec<bool> = match projection {
+            Some(projection) => (0..types.len()).map(|i| projection.contains(&i)).collect(),
+            None => vec![true; types.len()],
+        };
+        let decoded = selected.iter().filter(|s| **s).count() as u64;
+        let mut rows = 0u64;
+        let mut emit = |chunk: DataChunk| {
+            rows += chunk.num_rows as u64;
+            sink(Self::project(chunk, &selected, &types))
+        };
+        match body {
+            Body::Whole(bytes) => {
+                for chunk in parse_csv_chunks(&bytes, &types)? {
+                    emit(chunk)?;
+                }
+            }
+            Body::Stream(head) => {
+                let reader =
+                    crate::prefetch::Prefetch::open_after_head(self.open(&call.path)?, head);
+                stream_csv_chunks(reader, &types, &mut emit)?;
+            }
+        }
+        Ok((rows, decoded))
+    }
+
+    fn count(&self, rows: u64, decoded: u64) {
+        self.scans.fetch_add(1, Ordering::Relaxed);
+        self.rows.fetch_add(rows, Ordering::Relaxed);
+        self.files.fetch_add(1, Ordering::Relaxed);
+        self.columns.fetch_add(decoded, Ordering::Relaxed);
     }
 }
 
@@ -289,14 +399,14 @@ impl TableSource for CsvSource {
         let Some(call) = parse_call(call)? else {
             return Ok(None);
         };
-        let (bytes, schema) = self.load(&call)?;
+        let (body, schema) = self.load(&call)?;
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *cache = Some(Cached {
             key: call.cache_key(),
-            bytes,
+            body,
             schema: schema.clone(),
         });
         Ok(Some(schema))
@@ -313,59 +423,57 @@ impl TableSource for CsvSource {
                 "the httpfs CSV source does not serve {call:?}"
             )));
         };
-        let key = call.cache_key();
-        let cached = {
-            let mut cache = self
-                .cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match cache.as_ref() {
-                Some(entry) if entry.key == key => cache.take(),
-                _ => None,
-            }
-        };
-        let (bytes, schema) = match cached {
-            Some(entry) => (entry.bytes, entry.schema),
-            None => self.load(&call)?,
-        };
-        let types: Vec<DataType> = schema.iter().map(|(_, t)| *t).collect();
-        let chunks = parse_csv_chunks(&bytes, &types)?;
-
-        let selected: Vec<bool> = match projection {
-            Some(projection) => (0..types.len()).map(|i| projection.contains(&i)).collect(),
-            None => vec![true; types.len()],
-        };
-        let all = selected.iter().all(|s| *s);
-        let mut out = Vec::with_capacity(chunks.len());
-        let mut rows = 0u64;
-        for chunk in chunks {
-            rows += chunk.num_rows as u64;
-            if all {
-                out.push(chunk);
-            } else {
-                let columns: Vec<Arc<Vector>> = (0..types.len())
-                    .map(|i| {
-                        if selected[i] {
-                            chunk.columns[i].clone()
-                        } else {
-                            Arc::new(Vector::with_capacity(types[i], 0))
-                        }
-                    })
-                    .collect();
-                out.push(DataChunk::projected(columns, chunk.num_rows));
-            }
-        }
-        let decoded = selected.iter().filter(|s| **s).count() as u64;
-        self.scans.fetch_add(1, Ordering::Relaxed);
-        self.rows.fetch_add(rows, Ordering::Relaxed);
-        self.files.fetch_add(1, Ordering::Relaxed);
-        self.columns.fetch_add(decoded, Ordering::Relaxed);
+        let mut chunks = Vec::new();
+        let (rows, decoded) = self.scan_call(&call, projection, &mut |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        })?;
+        self.count(rows, decoded);
         Ok(TableScanOutput {
-            chunks: out,
+            chunks,
             files: 1,
             row_groups: 0,
             row_groups_pruned: 0,
             columns_decoded: decoded,
+        })
+    }
+
+    fn scan_stream(
+        &self,
+        call: &TableFunctionCall,
+        projection: Option<&[usize]>,
+        _filters: &[PrunePredicate],
+        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<TableScanOutput> {
+        let Some(call) = parse_call(call)? else {
+            return Err(PinkDbError::Execution(format!(
+                "the httpfs CSV source does not serve {call:?}"
+            )));
+        };
+        let (rows, decoded) = self.scan_call(&call, projection, sink)?;
+        self.count(rows, decoded);
+        Ok(TableScanOutput {
+            chunks: Vec::new(),
+            files: 1,
+            row_groups: 0,
+            row_groups_pruned: 0,
+            columns_decoded: decoded,
+        })
+    }
+
+    /// Streams exactly when bind did not keep the file whole: a local file (or
+    /// a remote one within the window) is parsed from memory anyway, and the
+    /// materialized fold runs in parallel.
+    fn streams_scan(&self, call: &TableFunctionCall) -> bool {
+        let Ok(Some(call)) = parse_call(call) else {
+            return false;
+        };
+        let cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.as_ref().is_some_and(|entry| {
+            entry.key == call.cache_key() && matches!(entry.body, Body::Stream(_))
         })
     }
 
@@ -650,7 +758,10 @@ mod tests {
             b"id,region,total\n1,west,10.5\n2,east,7\n3,west,9\n",
         );
         let mut db = PinkDb::new();
-        db.register_table_source(source_with(HttpfsConfig { allow_http: true }));
+        db.register_table_source(source_with(HttpfsConfig {
+            allow_http: true,
+            ..Default::default()
+        }));
         let url = server.url("/r/sales.csv");
         let got = rows(
             &mut db,
@@ -693,7 +804,10 @@ mod tests {
         let server = crate::test_http::TestHttpServer::start();
         server.put_status("/denied.csv", 403, b"no");
         let mut db = PinkDb::new();
-        db.register_table_source(source_with(HttpfsConfig { allow_http: true }));
+        db.register_table_source(source_with(HttpfsConfig {
+            allow_http: true,
+            ..Default::default()
+        }));
         let err = db
             .execute(&format!(
                 "SELECT * FROM read_csv('{}');",
@@ -721,7 +835,10 @@ mod tests {
         server.put("/i/sales.csv", b"id,region\n1,west\n2,east\n");
         let url = server.url("/i/sales.csv");
 
-        ensure_registered_with(HttpfsConfig { allow_http: true });
+        ensure_registered_with(HttpfsConfig {
+            allow_http: true,
+            ..Default::default()
+        });
         let mut db = PinkDb::new();
         assert_eq!(pinkdb::csv::import_csv(&mut db, &url, None).unwrap(), 2);
         assert_eq!(
@@ -751,28 +868,29 @@ mod tests {
     /// the bucket from the URL and the region/endpoint/credentials from the
     /// same environment conventions as the lake (PINKDB_S3_ALLOW_HTTP for
     /// the mock's plain-http endpoint).
+    /// Point the environment's S3 conventions at `mock` for this test.
+    /// Dropping it restores nothing, so every caller takes `global_test_lock`.
     #[cfg(feature = "s3")]
-    #[test]
-    fn remote_s3_scan_reads_through_the_shared_client() {
-        let _guard = global_test_lock();
-        struct EnvGuard;
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                // SAFETY: process-global environment mutation is serialized
-                // by GLOBAL_TEST_LOCK; see the test body.
-                unsafe {
-                    std::env::remove_var("AWS_ACCESS_KEY_ID");
-                    std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-                    std::env::remove_var("AWS_REGION");
-                    std::env::remove_var("AWS_ENDPOINT_URL_S3");
-                    std::env::remove_var("PINKDB_S3_ALLOW_HTTP");
-                }
+    struct MockEnv;
+
+    #[cfg(feature = "s3")]
+    impl Drop for MockEnv {
+        fn drop(&mut self) {
+            // SAFETY: process-global environment mutation is serialized by
+            // GLOBAL_TEST_LOCK (every caller holds it).
+            unsafe {
+                std::env::remove_var("AWS_ACCESS_KEY_ID");
+                std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+                std::env::remove_var("AWS_REGION");
+                std::env::remove_var("AWS_ENDPOINT_URL_S3");
+                std::env::remove_var("PINKDB_S3_ALLOW_HTTP");
             }
         }
-        let mock = crate::mock_s3::MockS3::start();
-        mock.put_object("data.csv", b"a,b\n1,x\n2,y\n");
-        // SAFETY: the global test lock serializes every env-mutating test in
-        // this binary; no other test reads AWS_* concurrently.
+    }
+
+    #[cfg(feature = "s3")]
+    fn mock_env(mock: &crate::mock_s3::MockS3) -> MockEnv {
+        // SAFETY: see `MockEnv`.
         unsafe {
             std::env::set_var("AWS_ACCESS_KEY_ID", mock.access_key_id());
             std::env::set_var("AWS_SECRET_ACCESS_KEY", "mock-secret");
@@ -780,7 +898,41 @@ mod tests {
             std::env::set_var("AWS_ENDPOINT_URL_S3", mock.endpoint());
             std::env::set_var("PINKDB_S3_ALLOW_HTTP", "1");
         }
-        let _env = EnvGuard;
+        MockEnv
+    }
+
+    /// A CSV body with `rows` rows and a deterministic sum.
+    #[cfg(feature = "s3")]
+    fn big_csv(rows: u32) -> (String, u64) {
+        let mut csv = String::from("id,region,total\n");
+        for i in 0..rows {
+            csv.push_str(&format!("{i:07},r{},1.5\n", i % 7));
+        }
+        let sum = u64::from(rows) * u64::from(rows - 1) / 2;
+        (csv, sum)
+    }
+
+    /// Every range the scan asked for, as `(start, end)`.
+    #[cfg(feature = "s3")]
+    fn spans(ranges: &[String]) -> Vec<(u64, u64)> {
+        let mut spans: Vec<(u64, u64)> = ranges
+            .iter()
+            .filter_map(|range| {
+                let (start, end) = range.strip_prefix("bytes=")?.split_once('-')?;
+                Some((start.parse().ok()?, end.parse().ok()?))
+            })
+            .collect();
+        spans.sort_unstable();
+        spans
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn remote_s3_scan_reads_through_the_shared_client() {
+        let _guard = global_test_lock();
+        let mock = crate::mock_s3::MockS3::start();
+        mock.put_object("data.csv", b"a,b\n1,x\n2,y\n");
+        let _env = mock_env(&mock);
 
         let mut db = PinkDb::new();
         db.register_table_source(source_with(HttpfsConfig::default()));
@@ -795,6 +947,145 @@ mod tests {
             "{:?}",
             mock.requests()
         );
+    }
+
+    /// A remote file larger than the read-ahead window is streamed: one probe
+    /// for the schema, then sequential ranged GETs that each fetch their bytes
+    /// exactly once — the parser never waits for the whole file, and memory is
+    /// the window rather than the file.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_large_remote_csv_streams_in_windows() {
+        let _guard = global_test_lock();
+        let mock = crate::mock_s3::MockS3::start();
+        let (csv, sum) = big_csv(800_000);
+        assert!(csv.len() as u64 > crate::prefetch::DEFAULT_WINDOW_BYTES);
+        mock.put_object("big.csv", csv.as_bytes());
+        let _env = mock_env(&mock);
+        let mut db = PinkDb::new();
+        db.register_table_source(source_with(HttpfsConfig::default()));
+
+        let got = rows(
+            &mut db,
+            "SELECT COUNT(*), SUM(id) FROM read_csv('s3://bucket/big.csv');",
+        );
+        assert_eq!(
+            got,
+            vec![vec![Value::Bigint(800_000), Value::Bigint(sum as i64)]]
+        );
+
+        let spans = spans(&mock.ranges());
+        // The probe is the first window; the rest follows in chunks. Every
+        // byte of the file is fetched exactly once, in order.
+        assert_eq!(
+            spans.first(),
+            Some(&(0, crate::prefetch::DEFAULT_WINDOW_BYTES - 1))
+        );
+        assert_eq!(
+            spans.last().map(|(_, end)| *end + 1),
+            Some(csv.len() as u64)
+        );
+        for pair in spans.windows(2) {
+            assert_eq!(pair[0].1 + 1, pair[1].0, "a gap or overlap: {spans:?}");
+        }
+        assert!(
+            spans.len() as u64
+                <= (csv.len() as u64).div_ceil(crate::prefetch::DEFAULT_CHUNK_BYTES) + 1,
+            "{} requests for {} bytes",
+            spans.len(),
+            csv.len()
+        );
+    }
+
+    /// With the external cache on, a second statement over the same file issues
+    /// no ranged GETs at all: every window is a cache hit.
+    /// A transient error mid-file is retried by the transport, and the
+    /// read-ahead resumes at the same offset, so a large file still parses
+    /// exactly once and completely.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_transient_error_mid_file_is_retried() {
+        let _guard = global_test_lock();
+        let mock = crate::mock_s3::MockS3::start();
+        let (csv, sum) = big_csv(800_000);
+        mock.put_object("flaky.csv", csv.as_bytes());
+        // The first range GET after the probe fails once, mid-file.
+        mock.inject_error("GET", "flaky.csv", 503, "SlowDown", "please retry", 1);
+        let _env = mock_env(&mock);
+        let mut db = PinkDb::new();
+        db.register_table_source(source_with(HttpfsConfig::default()));
+
+        let got = rows(
+            &mut db,
+            "SELECT COUNT(*), SUM(id) FROM read_csv('s3://bucket/flaky.csv');",
+        );
+        assert_eq!(
+            got,
+            vec![vec![Value::Bigint(800_000), Value::Bigint(sum as i64)]],
+            "the retried scan lost or duplicated rows"
+        );
+        let mut spans = spans(&mock.ranges());
+        let requests = spans.len();
+        spans.sort_unstable();
+        spans.dedup();
+        assert_eq!(
+            spans.last().map(|(_, end)| *end + 1),
+            Some(csv.len() as u64)
+        );
+        for pair in spans.windows(2) {
+            assert_eq!(pair[0].1 + 1, pair[1].0, "a gap or overlap: {spans:?}");
+        }
+        assert!(
+            requests > spans.len(),
+            "the injected failure was not retried: {} requests for {} ranges",
+            requests,
+            spans.len()
+        );
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn the_external_cache_serves_a_second_scan_without_requests() {
+        let _guard = global_test_lock();
+        let mock = crate::mock_s3::MockS3::start();
+        let (csv, sum) = big_csv(800_000);
+        mock.put_object("big.csv", csv.as_bytes());
+        let _env = mock_env(&mock);
+        let dir = std::env::temp_dir().join(format!(
+            "pinkdb-csv-cache-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = HttpfsConfig {
+            allow_http: false,
+            cache: Some(crate::cache::CacheOptions {
+                dir: dir.clone(),
+                capacity: 64 << 20,
+            }),
+        };
+        let mut db = PinkDb::new();
+        db.register_table_source(source_with(config));
+        let sql = "SELECT COUNT(*), SUM(id) FROM read_csv('s3://bucket/big.csv');";
+        assert_eq!(
+            rows(&mut db, sql),
+            vec![vec![Value::Bigint(800_000), Value::Bigint(sum as i64)]]
+        );
+        // Only ranged GETs count: the size HEAD carries no Range.
+        let after_first = spans(&mock.ranges()).len();
+        assert!(after_first > 1, "{:?}", mock.ranges());
+        assert_eq!(
+            rows(&mut db, sql),
+            vec![vec![Value::Bigint(800_000), Value::Bigint(sum as i64)]]
+        );
+        assert_eq!(
+            spans(&mock.ranges()).len(),
+            after_first,
+            "the cached windows were fetched again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

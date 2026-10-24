@@ -330,7 +330,7 @@ fn read_import_bytes(path: &str) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
 
-fn open_reader(data: &[u8]) -> csv::Reader<&[u8]> {
+fn open_reader<R: std::io::Read>(data: R) -> csv::Reader<R> {
     csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -338,7 +338,7 @@ fn open_reader(data: &[u8]) -> csv::Reader<&[u8]> {
         .from_reader(data)
 }
 
-fn read_headers(reader: &mut csv::Reader<&[u8]>) -> Result<Vec<String>> {
+fn read_headers<R: std::io::Read>(reader: &mut csv::Reader<R>) -> Result<Vec<String>> {
     let headers: Vec<String> = reader
         .byte_headers()
         .map_err(PinkDbError::Csv)?
@@ -371,8 +371,8 @@ fn new_chunk(types: &[DataType]) -> Vec<Vector> {
 /// Read every CSV row into `types`-shaped chunks, emitting each
 /// [`CHUNK_SIZE`]-row batch. Shared by the importer (which appends to a
 /// table) and the wave-75 `read_csv` source (which returns the chunks).
-fn read_chunks(
-    data: &[u8],
+fn read_chunks<R: std::io::Read>(
+    data: R,
     types: &[DataType],
     mut emit: impl FnMut(Vec<Vector>) -> Result<()>,
 ) -> Result<usize> {
@@ -436,6 +436,18 @@ pub fn parse_csv_chunks(data: &[u8], types: &[DataType]) -> Result<Vec<DataChunk
         Ok(())
     })?;
     Ok(chunks)
+}
+
+/// Parse CSV rows arriving from `input` (a streamed remote file), handing each
+/// [`CHUNK_SIZE`]-row chunk to `emit` as it is parsed — the bounded-memory
+/// form of [`parse_csv_chunks`] (wave 98c). Returns the row count.
+pub fn stream_csv_chunks<R: std::io::Read>(
+    input: R,
+    types: &[DataType],
+    emit: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<u64> {
+    let rows = read_chunks(input, types, |columns| emit(DataChunk::new(columns)?))?;
+    Ok(rows as u64)
 }
 
 /// Failure inside one fast-path batch.

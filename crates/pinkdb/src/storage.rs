@@ -1123,6 +1123,15 @@ pub struct PinkDb {
     /// `Disabled` at bind time and the `--allow-copy-to --copy-root` opt-in
     /// installs `Confined(root)`.
     pub(crate) copy_to_policy: crate::CopyToPolicy,
+    /// Rows the streaming scan→aggregate path (wave 98c) holds right now, and
+    /// the peak that ever reached: the executor folds the chunk a scan hands
+    /// it and drops it, so the peak stays at one chunk however large the input
+    /// is. Counters only — nothing reads them for control flow — and shared by
+    /// store clones like the scan counters they explain.
+    pub(crate) stream_buffered_rows: std::sync::atomic::AtomicUsize,
+    pub(crate) stream_peak_rows: std::sync::atomic::AtomicUsize,
+    /// Rows folded through that path so far.
+    pub(crate) stream_folded_rows: std::sync::atomic::AtomicU64,
 }
 
 impl Default for PinkDb {
@@ -1177,6 +1186,18 @@ impl Clone for PinkDb {
             package_file_formats: self.package_file_formats.clone(),
             package_dynamic_functions: self.package_dynamic_functions.clone(),
             copy_to_policy: self.copy_to_policy.clone(),
+            stream_buffered_rows: std::sync::atomic::AtomicUsize::new(
+                self.stream_buffered_rows
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            stream_peak_rows: std::sync::atomic::AtomicUsize::new(
+                self.stream_peak_rows
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            stream_folded_rows: std::sync::atomic::AtomicU64::new(
+                self.stream_folded_rows
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -1245,6 +1266,9 @@ impl PinkDb {
             package_file_formats: HashMap::new(),
             package_dynamic_functions: HashMap::new(),
             copy_to_policy: crate::CopyToPolicy::Unrestricted,
+            stream_buffered_rows: std::sync::atomic::AtomicUsize::new(0),
+            stream_peak_rows: std::sync::atomic::AtomicUsize::new(0),
+            stream_folded_rows: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

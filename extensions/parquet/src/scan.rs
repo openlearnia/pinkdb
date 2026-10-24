@@ -56,6 +56,32 @@ pub fn scan(
     projection: Option<&[usize]>,
     filters: &[PrunePredicate],
 ) -> Result<(TableScanOutput, RemoteReadStats)> {
+    let mut chunks = Vec::new();
+    let (out, stats) = scan_into(resolved, projection, filters, &mut |chunk| {
+        chunks.push(chunk);
+        Ok(())
+    })?;
+    Ok((TableScanOutput { chunks, ..out }, stats))
+}
+
+/// As [`scan`], but each chunk goes to `sink` as soon as its row group is
+/// decoded instead of being collected (wave 98c). A remote scan then holds
+/// one prefetch window and the row groups being decoded, not the file.
+pub fn scan_streamed(
+    resolved: &Resolved,
+    projection: Option<&[usize]>,
+    filters: &[PrunePredicate],
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<(TableScanOutput, RemoteReadStats)> {
+    scan_into(resolved, projection, filters, sink)
+}
+
+fn scan_into(
+    resolved: &Resolved,
+    projection: Option<&[usize]>,
+    filters: &[PrunePredicate],
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<(TableScanOutput, RemoteReadStats)> {
     let width = resolved.schema.len();
     // Which output columns to decode. A projection that names no column
     // (`COUNT(*)`) is not forced onto column 0 (wave 98a): a scan that only
@@ -76,7 +102,6 @@ pub fn scan(
     let transport = Arc::new(crate::ranged::TransportCounters::default());
 
     let mut out = TableScanOutput::default();
-    let mut chunks: Vec<DataChunk> = Vec::new();
     // One shared placeholder per absent output column.
     let placeholders: Vec<Option<Arc<Vector>>> = (0..width)
         .map(|i| (!needed[i]).then(|| Arc::new(Vector::new_empty(resolved.schema[i].1))))
@@ -98,7 +123,7 @@ pub fn scan(
         // a hive-only projection) is answered from the footer's row counts
         // and virtual columns; no reader is opened and no page is fetched.
         if !needs_file_decode(file, &plan) {
-            scan_metadata_only(file, &plan, &mut out, &mut chunks)?;
+            scan_metadata_only(file, &plan, &mut out, sink)?;
             continue;
         }
         // Ranged objects (a remote URL or a lake data file) are read through
@@ -125,10 +150,10 @@ pub fn scan(
                     file,
                     &plan,
                     &mut out,
-                    &mut chunks,
+                    sink,
                 )?;
             } else {
-                scan_reader(&reader, file, &plan, &mut out, &mut chunks)?;
+                scan_reader(&reader, file, &plan, &mut out, sink)?;
             }
             continue;
         }
@@ -146,9 +171,8 @@ pub fn scan(
                 ))
             })?;
 
-        scan_reader(&reader, file, &plan, &mut out, &mut chunks)?;
+        scan_reader(&reader, file, &plan, &mut out, sink)?;
     }
-    out.chunks = chunks;
     Ok((out, transport.snapshot()))
 }
 
@@ -194,7 +218,7 @@ fn scan_reader<R: ChunkReader + 'static>(
     file: &FileResolved,
     plan: &DecodePlan<'_>,
     out: &mut TableScanOutput,
-    chunks: &mut Vec<DataChunk>,
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
 ) -> Result<()> {
     let decoded = decoded_columns(file, plan);
     for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
@@ -205,12 +229,12 @@ fn scan_reader<R: ChunkReader + 'static>(
         out.row_groups += 1;
         let rows = rg.rows as usize;
         if decoded.is_empty() {
-            assemble_row_group(file, plan, rows, &decoded, Vec::new(), chunks)?;
+            assemble_row_group(file, plan, rows, &decoded, Vec::new(), sink)?;
             continue;
         }
         let pieces = decode_row_group(reader, rg_index, &decoded, rows, &file.meta.path)?;
         out.columns_decoded += decoded.len() as u64;
-        assemble_row_group(file, plan, rows, &decoded, pieces, chunks)?;
+        assemble_row_group(file, plan, rows, &decoded, pieces, sink)?;
     }
     Ok(())
 }
@@ -222,7 +246,7 @@ fn scan_metadata_only(
     file: &FileResolved,
     plan: &DecodePlan<'_>,
     out: &mut TableScanOutput,
-    chunks: &mut Vec<DataChunk>,
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
 ) -> Result<()> {
     for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
         if !row_group_survives(plan.resolved, file, rg_index, plan.filters) {
@@ -230,7 +254,7 @@ fn scan_metadata_only(
             continue;
         }
         out.row_groups += 1;
-        assemble_row_group(file, plan, rg.rows as usize, &[], Vec::new(), chunks)?;
+        assemble_row_group(file, plan, rg.rows as usize, &[], Vec::new(), sink)?;
     }
     Ok(())
 }
@@ -266,7 +290,7 @@ fn assemble_row_group(
     rows: usize,
     decoded: &[(usize, usize, &FileColumn)],
     mut pieces: Vec<Vec<Vector>>,
-    chunks: &mut Vec<DataChunk>,
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
 ) -> Result<()> {
     let resolved = plan.resolved;
     let placeholders = &plan.placeholders;
@@ -344,7 +368,7 @@ fn assemble_row_group(
             };
             cols.push(value);
         }
-        chunks.push(DataChunk::projected(cols, n));
+        sink(DataChunk::projected(cols, n))?;
     }
     Ok(())
 }
@@ -363,14 +387,14 @@ fn scan_remote_parallel(
     file: &FileResolved,
     plan: &DecodePlan<'_>,
     out: &mut TableScanOutput,
-    chunks: &mut Vec<DataChunk>,
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
 ) -> Result<()> {
     use crate::ranged::ByteSpan;
 
     let decoded_columns = decoded_columns(file, plan);
     let decoded = decoded_columns.as_slice();
     if decoded.is_empty() {
-        return scan_metadata_only(file, plan, out, chunks);
+        return scan_metadata_only(file, plan, out, sink);
     }
 
     // The surviving row groups and the coalesced byte ranges each needs.
@@ -462,7 +486,7 @@ fn scan_remote_parallel(
         for (index, result) in indexes.iter().zip(results) {
             let pieces = result?;
             out.columns_decoded += decoded.len() as u64;
-            assemble_row_group(file, plan, index.1, decoded, pieces, chunks)?;
+            assemble_row_group(file, plan, index.1, decoded, pieces, sink)?;
         }
 
         let starts: Vec<u64> = spans.iter().map(|span| span.start).collect();

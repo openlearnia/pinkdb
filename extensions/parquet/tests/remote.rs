@@ -52,6 +52,14 @@ impl EnvGuard {
         )
     }
 
+    /// Pin the streaming fold's worker count: the bounded-memory tests below
+    /// assert a bound of `2 * workers + 1` chunks in flight (wave 98c).
+    fn stream_workers(&mut self, workers: usize) {
+        // SAFETY: the caller holds the lock.
+        unsafe { std::env::set_var("PINKDB_STREAM_WORKERS", workers.to_string()) };
+        self.0.push("PINKDB_STREAM_WORKERS");
+    }
+
     fn s3(mock: &mock_s3::MockS3) -> (MutexGuard<'static, ()>, Self) {
         let guard = ENV_LOCK
             .lock()
@@ -812,4 +820,78 @@ fn explain_shows_the_projected_width() {
         .join("\n");
     assert!(text.contains("(0 of 7 columns)"), "{text}");
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// Wave 98c: an aggregate over a remote parquet scan folds each row group as
+/// it decodes instead of collecting the scan first. The fixture has 200 row
+/// groups / 80 000 rows and the fold runs on two workers, so the executor's own
+/// counter must stay within `2 * workers + 1` row groups in flight while the
+/// fold sees every row; the same query over the local file must agree. A plan
+/// that materializes the scan cannot hold that bound.
+#[test]
+fn aggregate_over_a_remote_scan_streams_row_groups_into_the_fold() {
+    let bytes = big_fixture(200, 400);
+    let len = bytes.len() as u64;
+    let local = write_temp("streaming.parquet", &bytes);
+    let (_lock, mut env) = EnvGuard::http_allow();
+    env.stream_workers(2);
+    let server = TestHttpServer::start();
+    server.put("/streaming.parquet", &bytes);
+    let (mut db, _source) = store_with_source();
+    // One row group per chunk, `workers` queued plus one blocked on the
+    // hand-off plus one being folded per worker.
+    let bound = (2 * pinkdb::PinkDb::stream_fold_workers() + 1) * 400;
+    let url = server.url("/streaming.parquet");
+    let query = |path: &str| {
+        format!(
+            "SELECT count(*), sum(id), sum(seq) FROM read_parquet('{path}') \
+             WHERE id % 7 <> 0;"
+        )
+    };
+
+    db.reset_stream_stats();
+    let remote = select(&mut db, &query(&url));
+    let (peak, folded) = db.stream_stats();
+    let local_rows = select(&mut db, &query(&local.display().to_string()));
+    assert_eq!(
+        remote, local_rows,
+        "the streamed rows differ from the local ones"
+    );
+    // All 80 000 ids reach the fold; the filter runs inside the fold workers,
+    // so the counter is the pre-filter count (11 429 are multiples of 7).
+    assert_eq!(
+        folded, 80_000,
+        "the fold did not see every row the scan pushed"
+    );
+    assert!(
+        peak <= bound,
+        "the fold held {peak} rows at once (bound {bound}): the scan was \
+         materialized, not streamed"
+    );
+
+    // A grouped aggregate takes the same streaming path with keys.
+    let grouped = |path: &str| {
+        format!(
+            "SELECT day, count(*), sum(seq) FROM read_parquet('{path}') \
+             GROUP BY day ORDER BY day;"
+        )
+    };
+    db.reset_stream_stats();
+    let remote = select(&mut db, &grouped(&url));
+    let (peak, _folded) = db.stream_stats();
+    assert_eq!(
+        remote,
+        select(&mut db, &grouped(&local.display().to_string()))
+    );
+    assert_eq!(remote.len(), 365);
+    assert!(peak <= bound, "the grouped fold held {peak} rows at once");
+
+    // It really was a ranged scan of the 200 row groups, not one whole fetch.
+    let gets = data_gets(&server, len);
+    assert!(
+        gets.len() > 50,
+        "only {} data GETs: the scan did not read row groups by range",
+        gets.len()
+    );
+    let _ = std::fs::remove_dir_all(local.parent().unwrap());
 }

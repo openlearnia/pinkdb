@@ -169,6 +169,20 @@ pub fn read_identity(path: &Path) -> Result<Option<(String, String)>, WriteError
     })
 }
 
+/// Dictionary page limit per column chunk. Once a chunk's dictionary outgrows
+/// it, the writer falls back to PLAIN encoding for the rest of that chunk
+/// (per column chunk, as DuckDB does), so a high-cardinality column never
+/// pays a dictionary it cannot exploit.
+pub const DICTIONARY_PAGE_LIMIT: usize = 1024 * 1024;
+
+/// The page codec. Snappy is DuckDB's Parquet default and is the reason a
+/// pinkdb-written file is comparable with a DuckDB one; a build without the
+/// codec feature (never the extension's default) writes plain pages.
+#[cfg(feature = "snap")]
+const PAGE_COMPRESSION: Compression = Compression::SNAPPY;
+#[cfg(not(feature = "snap"))]
+const PAGE_COMPRESSION: Compression = Compression::UNCOMPRESSED;
+
 fn write_table_with_key_values(
     table: &DataTable,
     key_values: Vec<KeyValue>,
@@ -179,9 +193,9 @@ fn write_table_with_key_values(
         // Chunk statistics travel in the footer (min/max/NULL count), so the
         // file is self-describing for other readers and for pruning.
         .set_statistics_enabled(EnabledStatistics::Chunk)
-        // Uncompressed is available in every build of the `parquet` crate,
-        // independent of the optional codec features.
-        .set_compression(Compression::UNCOMPRESSED);
+        .set_compression(PAGE_COMPRESSION)
+        .set_dictionary_enabled(true)
+        .set_dictionary_page_size_limit(DICTIONARY_PAGE_LIMIT);
     if !key_values.is_empty() {
         builder = builder.set_key_value_metadata(Some(key_values));
     }

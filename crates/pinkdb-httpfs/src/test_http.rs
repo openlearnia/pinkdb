@@ -34,6 +34,11 @@ struct State {
     head_unsupported: AtomicBool,
     /// `(path, remaining)` one-shot failures.
     failures: Mutex<Vec<(String, usize, u16)>>,
+    /// `(path, request number)` one-shot failures: fail that request only, so
+    /// a read-ahead test can break a chunk in the middle of a file.
+    fail_at: Mutex<Vec<(String, usize, u16)>>,
+    /// Requests served per path, for [`TestHttpServer::fail_at`].
+    served: Mutex<BTreeMap<String, usize>>,
     /// Requests currently being answered, and the high-water mark (the
     /// read-ahead concurrency tests).
     active: AtomicUsize,
@@ -66,6 +71,8 @@ impl TestHttpServer {
             range_enabled: AtomicBool::new(true),
             head_unsupported: AtomicBool::new(false),
             failures: Mutex::new(Vec::new()),
+            fail_at: Mutex::new(Vec::new()),
+            served: Mutex::new(BTreeMap::new()),
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
             delay: Mutex::new(None),
@@ -123,6 +130,16 @@ impl TestHttpServer {
                 status,
             },
         );
+    }
+
+    /// Answer request number `request` (1-based) for `path` with `status`,
+    /// once, and every other request normally.
+    pub fn fail_at(&self, path: &str, request: usize, status: u16) {
+        self.state
+            .fail_at
+            .lock()
+            .unwrap()
+            .push((path.to_string(), request, status));
     }
 
     /// Answer the next `remaining` requests for `path` with `status`, then
@@ -242,7 +259,22 @@ fn handle(mut stream: TcpStream, state: Arc<State>) {
         .to_string();
 
     // One-shot injected failures first.
-    let injected = {
+    let ordinal = {
+        let mut served = state.served.lock().unwrap();
+        let n = served.entry(path.clone()).or_insert(0);
+        *n += 1;
+        *n
+    };
+    let injected_at = {
+        let mut fail_at = state.fail_at.lock().unwrap();
+        let position = fail_at
+            .iter()
+            .position(|(p, request, _)| *p == path && *request == ordinal);
+        position.map(|index| fail_at.remove(index).2)
+    };
+    let injected = if injected_at.is_some() {
+        injected_at
+    } else {
         let mut failures = state.failures.lock().unwrap();
         if let Some(entry) = failures
             .iter_mut()

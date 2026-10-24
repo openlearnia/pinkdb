@@ -75,6 +75,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::attached::PrunePredicate;
 use crate::storage::PinkDb;
@@ -237,6 +238,44 @@ pub trait TableSource: fmt::Debug + Send + Sync {
         filters: &[PrunePredicate],
     ) -> Result<TableScanOutput>;
 
+    /// Stream a bound call's chunks into `sink` instead of collecting them
+    /// (wave 98c). The executor calls this shape for an aggregate over the
+    /// call, so a scan of a large (remote) file holds one chunk at a time
+    /// instead of the whole result.
+    ///
+    /// The sink must consume the chunk before returning; the source may drop
+    /// it right after. A source that can decode incrementally overrides this
+    /// and pushes per file/row group; the default runs [`Self::scan`] and
+    /// pushes what it returned (an empty `chunks` in the result).
+    fn scan_stream(
+        &self,
+        call: &TableFunctionCall,
+        projection: Option<&[usize]>,
+        filters: &[PrunePredicate],
+        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<TableScanOutput> {
+        let scan = self.scan(call, projection, filters)?;
+        for chunk in scan.chunks {
+            sink(chunk)?;
+        }
+        Ok(TableScanOutput {
+            chunks: Vec::new(),
+            ..scan
+        })
+    }
+
+    /// Whether [`Self::scan_stream`] pays off for a bound call (wave 98c):
+    /// the executor fuses an aggregate over a call into a fold only when it
+    /// does, and otherwise materializes the scan and folds it in parallel.
+    ///
+    /// A scan that would land in memory whole (a remote object fetched through
+    /// read-ahead) streams; a local scan is decoded once either way, so the
+    /// parallel fold is faster. The default says no.
+    fn streams_scan(&self, call: &TableFunctionCall) -> bool {
+        let _ = call;
+        false
+    }
+
     /// The source's scan counters so far (files read, row groups read and
     /// pruned, columns decoded, rows returned). The default reports zeros: a
     /// source may track nothing. Read though
@@ -352,6 +391,55 @@ impl PinkDb {
                 ..s.stats()
             })
             .collect()
+    }
+
+    /// The streaming scan→aggregate peak and total (wave 98c): `(peak rows
+    /// held in one chunk, rows folded)`. An aggregate the executor can stream
+    /// folds each chunk a scan hands it and drops it, so the peak stays at one
+    /// chunk — bounded by [`crate::CHUNK_SIZE`] — while the folded total grows
+    /// with the input. Both are zero until a statement takes that path.
+    pub fn stream_stats(&self) -> (usize, u64) {
+        (
+            self.stream_peak_rows.load(Ordering::Relaxed),
+            self.stream_folded_rows.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The workers a streaming scan→aggregate fold runs on (wave 98c): the
+    /// materialized aggregate's own parallelism, i.e. the rayon pool's thread
+    /// count, unless `PINKDB_STREAM_WORKERS` overrides it (clamped to 1..=64).
+    /// The fold holds at most `2 * workers` chunks at once, so this is the
+    /// memory bound the streaming tests assert against.
+    pub fn stream_fold_workers() -> usize {
+        std::env::var("PINKDB_STREAM_WORKERS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|workers| *workers > 0)
+            .unwrap_or_else(rayon::current_num_threads)
+            .clamp(1, 64)
+    }
+
+    /// Zero [`Self::stream_stats`] (and the in-flight count) before a
+    /// measurement.
+    pub fn reset_stream_stats(&self) {
+        self.stream_buffered_rows.store(0, Ordering::Relaxed);
+        self.stream_peak_rows.store(0, Ordering::Relaxed);
+        self.stream_folded_rows.store(0, Ordering::Relaxed);
+    }
+
+    /// Account a chunk of `rows` rows as held by a streaming fold until the
+    /// matching [`Self::stream_release`] (counter only; see
+    /// [`Self::stream_stats`]).
+    pub(crate) fn stream_hold(&self, rows: usize) {
+        let held = self.stream_buffered_rows.fetch_add(rows, Ordering::Relaxed) + rows;
+        self.stream_peak_rows.fetch_max(held, Ordering::Relaxed);
+        self.stream_folded_rows
+            .fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    /// Release [`Self::stream_hold`]'s rows.
+    pub(crate) fn stream_release(&self, rows: usize) {
+        self.stream_buffered_rows.fetch_sub(rows, Ordering::Relaxed);
     }
 }
 

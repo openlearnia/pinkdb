@@ -30,6 +30,8 @@ pub(crate) struct HttpResponse {
     pub(crate) body: Vec<u8>,
     pub(crate) content_length: Option<u64>,
     pub(crate) content_range: Option<String>,
+    /// The object version, when the server reports one.
+    pub(crate) etag: Option<String>,
 }
 
 /// A blocking HTTPS client (one connection pool).
@@ -137,17 +139,11 @@ impl HttpClient {
                     context: format!("GET {url}"),
                     message: "range end does not fit this platform's usize".to_string(),
                 })?;
-                if response.body.len() < stop {
-                    return Err(Error::Protocol {
-                        context: format!("GET {url}"),
-                        message: format!(
-                            "the server ignored the Range header and returned {} bytes, \
-                             shorter than the requested window",
-                            response.body.len()
-                        ),
-                    });
-                }
-                Ok(response.body[start..stop].to_vec())
+                // A server that ignores Range, or a window that runs past the
+                // end of the object, simply yields fewer bytes: that is a
+                // short read, not an error (readers treat it as EOF).
+                let stop = stop.min(response.body.len());
+                Ok(response.body[start.min(stop)..stop].to_vec())
             }
             404 => Err(Error::NotFound {
                 context: format!("GET {url}"),
@@ -168,6 +164,21 @@ impl HttpClient {
             }),
             // Some static hosts answer 405/501 to HEAD; the size is simply
             // unknown then, not an error.
+            405 | 501 => Ok(None),
+            other => Err(self.status_error(url, other, &response.body)),
+        }
+    }
+
+    /// The object's ETag, when the server reports one. `None` when the header
+    /// is absent or the host answers `HEAD` with 405/501.
+    pub fn etag(&self, url: &str) -> Result<Option<String>, Error> {
+        self.check_scheme(url)?;
+        let response = self.execute("HEAD", url, None)?;
+        match response.status {
+            200 => Ok(response.etag),
+            404 => Err(Error::NotFound {
+                context: format!("HEAD {url}"),
+            }),
             405 | 501 => Ok(None),
             other => Err(self.status_error(url, other, &response.body)),
         }
@@ -257,6 +268,11 @@ impl HttpClient {
             .get("content-range")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim_matches('"').to_string());
         let body = if method == "HEAD" {
             Vec::new()
         } else {
@@ -275,6 +291,7 @@ impl HttpClient {
             body,
             content_length,
             content_range,
+            etag,
         })
     }
 
@@ -313,7 +330,10 @@ mod tests {
     use crate::test_http::TestHttpServer;
 
     fn client() -> HttpClient {
-        HttpClient::new(&HttpfsConfig { allow_http: true })
+        HttpClient::new(&HttpfsConfig {
+            allow_http: true,
+            ..Default::default()
+        })
     }
 
     #[test]

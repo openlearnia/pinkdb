@@ -303,6 +303,42 @@ pub trait AttachedLake: fmt::Debug + Send + Sync {
         (0, 0, 0)
     }
 
+    /// Stream one table's chunks into `sink` instead of materializing it
+    /// (wave 98c): `columns` and `predicates` mean exactly what they do in
+    /// [`AttachedLake::load_filtered`], and the same rows arrive in the same
+    /// order. Returns the rows streamed.
+    ///
+    /// The default loads the table (through `load_filtered`) and pushes its
+    /// chunks. A lake that reads data files decodes one file, pushes its
+    /// chunks, and drops it, so a scan's memory is one file's decode however
+    /// large the table is. The sink must consume the chunk before returning.
+    fn scan_streamed(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Option<&[usize]>,
+        predicates: &[PrunePredicate],
+        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<u64> {
+        let scan = self.load_filtered(db, table, columns, predicates)?;
+        let mut rows = 0u64;
+        for chunk in scan.chunks() {
+            rows += chunk.num_rows() as u64;
+            sink(chunk)?;
+        }
+        Ok(rows)
+    }
+
+    /// Whether [`AttachedLake::scan_streamed`] pays off for a table (wave
+    /// 98c): the executor fuses an aggregate over the table into a fold only
+    /// when it does. The same rule as the lake's own: a table that fits the
+    /// materializing bound keeps its cached, one-decode-per-column read; a
+    /// bigger one streams. The default says no.
+    fn streams_scan(&self, db: &str, table: &str) -> bool {
+        let _ = (db, table);
+        false
+    }
+
     /// The descriptor of one table as of a time-travel target (`AT`), for the
     /// binder's scope: the schema and exact statistics that version's data
     /// files publish. `db`/`table` are matched case-insensitively.

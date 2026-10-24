@@ -3,7 +3,8 @@
 //! (`parquet_schema`, `parquet_metadata`, `parquet_file_metadata`,
 //! `parquet_kv_metadata`). Wave 70 of the roadmap. Wave 87 added the
 //! write half ([`write::write_table`]) that backs the lake's Parquet format
-//! provider; the SQL `COPY … (FORMAT parquet)` surface is still a follow-up.
+//! provider; wave 98c added the SQL write surface,
+//! `COPY t TO 'x.parquet' (FORMAT parquet)` ([`ParquetSink`]).
 //!
 //! # Why this is a crate, not a loadable extension
 //!
@@ -112,8 +113,8 @@
 //!
 //! # Honest limits
 //!
-//! - No SQL `COPY … (FORMAT parquet)` yet (the writer behind it exists in
-//!   [`write`]; the lake consumes that directly).
+//! - No `COPY … FROM 'x.parquet'` (reading a file is `read_parquet`/`FROM
+//!   'x.parquet'`); writing is `COPY t TO 'x.parquet' (FORMAT parquet)`.
 //! - Flat schemas only (no LIST/MAP/STRUCT, no repeated fields).
 //! - No TIME, TIMESTAMP(nanos), UUID, FLOAT16, BSON, VARIANT, GEOMETRY.
 //! - Unannotated BINARY reads as VARCHAR (α's `binary_as_string=true`);
@@ -147,8 +148,10 @@ use std::sync::Arc;
 
 use pinkdb::attached::PrunePredicate;
 use pinkdb::{
-    DataType, PinkDb, PinkDbError, Result, TableFunctionCall, TableScanOutput, TableSource,
+    DataChunk, DataTable, DataType, FileFormat, PinkDb, PinkDbError, Result, TableFunctionCall,
+    TableScanOutput, TableSource,
 };
+use std::path::Path;
 
 pub use file_meta::{ChunkInfo, ColStats, FileMeta, RowGroupMeta};
 pub use ranged::{RangeSource, RemoteReadStats};
@@ -164,9 +167,48 @@ pub fn source() -> Arc<dyn TableSource> {
     Arc::new(ParquetSource::new())
 }
 
-/// Register the parquet source on one store (embedder path). Idempotent.
+/// The parquet **write** sink: `COPY t TO 'x.parquet' (FORMAT parquet)`, and
+/// the format an extension-less `.parquet`/`.parq`/`.pq` destination resolves
+/// to. Writes through the same writer (and therefore the same Snappy +
+/// dictionary settings) as a Parquet lake data file.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ParquetSink;
+
+impl FileFormat for ParquetSink {
+    fn name(&self) -> &str {
+        SOURCE_NAME
+    }
+
+    fn extensions(&self) -> &[&str] {
+        &["parquet", "parq", "pq"]
+    }
+
+    fn write(&self, path: &Path, table: &DataTable) -> Result<()> {
+        let bytes = write::write_table(table).map_err(|e| {
+            PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
+        })?;
+        // M-3: never `File::create` at the client-named path (the helper
+        // writes a 0600 temp sibling and renames it into place).
+        pinkdb::write_atomic_private(path, |file| {
+            use std::io::Write;
+            file.write_all(&bytes).map_err(|e| {
+                PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
+            })
+        })
+    }
+}
+
+/// The host's registration handle for the write half:
+/// `db.register_file_format(pinkdb_parquet::sink())`.
+pub fn sink() -> Arc<dyn FileFormat> {
+    Arc::new(ParquetSink)
+}
+
+/// Register the parquet source and sink on one store (embedder path).
+/// Idempotent.
 pub fn register(db: &mut PinkDb) {
     db.register_table_source(source());
+    db.register_file_format(sink());
 }
 
 /// Register the parquet source **process-wide**, for every store created
@@ -179,6 +221,7 @@ pub fn register(db: &mut PinkDb) {
 /// calling it must use [`register`] per store instead. Idempotent.
 pub fn ensure_registered() {
     pinkdb::table_source::register_global_table_source(source());
+    pinkdb::filefmt::register_global_file_format(sink());
 }
 
 /// The result of one ranged parquet scan: the engine's chunks/counters, the
@@ -286,6 +329,27 @@ impl ParquetSource {
         self.cache.put(key, Arc::clone(&resolved));
         Ok(resolved)
     }
+
+    /// Book one scan's engine counters (the streaming scan passes the rows it
+    /// pushed, since it keeps no chunks).
+    fn record(&self, out: &TableScanOutput, rows: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.scans.fetch_add(1, Relaxed);
+        self.rows.fetch_add(rows, Relaxed);
+        self.files.fetch_add(out.files, Relaxed);
+        self.row_groups.fetch_add(out.row_groups, Relaxed);
+        self.pruned.fetch_add(out.row_groups_pruned, Relaxed);
+        self.columns.fetch_add(out.columns_decoded, Relaxed);
+    }
+
+    /// Book a scan's remote transport counters.
+    fn record_transport(&self, transport: &crate::ranged::RemoteReadStats) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.remote_requests.fetch_add(transport.requests, Relaxed);
+        self.remote_bytes.fetch_add(transport.bytes, Relaxed);
+        self.remote_wait_nanos
+            .fetch_add(transport.wait_nanos, Relaxed);
+    }
 }
 
 impl TableSource for ParquetSource {
@@ -329,12 +393,7 @@ impl TableSource for ParquetSource {
             Call::Scan { path, options } => {
                 let resolved = self.resolved(call, &options, &path)?;
                 let (out, transport) = scan::scan(&resolved, projection, filters)?;
-                self.remote_requests
-                    .fetch_add(transport.requests, std::sync::atomic::Ordering::Relaxed);
-                self.remote_bytes
-                    .fetch_add(transport.bytes, std::sync::atomic::Ordering::Relaxed);
-                self.remote_wait_nanos
-                    .fetch_add(transport.wait_nanos, std::sync::atomic::Ordering::Relaxed);
+                self.record_transport(&transport);
                 out
             }
             Call::Metadata { function, path } => {
@@ -349,20 +408,60 @@ impl TableSource for ParquetSource {
             }
         };
         // Counters: the source's own, read through `.parquet`/the engine API.
-        self.scans
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rows: u64 = out.chunks.iter().map(|c| c.num_rows() as u64).sum();
-        self.rows
-            .fetch_add(rows, std::sync::atomic::Ordering::Relaxed);
-        self.files
-            .fetch_add(out.files, std::sync::atomic::Ordering::Relaxed);
-        self.row_groups
-            .fetch_add(out.row_groups, std::sync::atomic::Ordering::Relaxed);
-        self.pruned
-            .fetch_add(out.row_groups_pruned, std::sync::atomic::Ordering::Relaxed);
-        self.columns
-            .fetch_add(out.columns_decoded, std::sync::atomic::Ordering::Relaxed);
+        self.record(&out, rows);
         Ok(out)
+    }
+
+    fn scan_stream(
+        &self,
+        call: &TableFunctionCall,
+        projection: Option<&[usize]>,
+        filters: &[PrunePredicate],
+        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<TableScanOutput> {
+        let Some(parsed) = self.parse(call)? else {
+            return Err(pinkdb::PinkDbError::Execution(format!(
+                "the parquet source does not serve {call:?}"
+            )));
+        };
+        let mut rows = 0u64;
+        let out = {
+            // The sink owns nothing: each chunk is folded by the caller and
+            // dropped before the next row group decodes (wave 98c).
+            let mut push = |chunk: DataChunk| {
+                rows += chunk.num_rows() as u64;
+                sink(chunk)
+            };
+            match parsed {
+                Call::Scan { path, options } => {
+                    let resolved = self.resolved(call, &options, &path)?;
+                    let (out, transport) =
+                        scan::scan_streamed(&resolved, projection, filters, &mut push)?;
+                    self.record_transport(&transport);
+                    out
+                }
+                Call::Metadata { function, path } => {
+                    for chunk in introspect::run(&function, &path)? {
+                        push(chunk)?;
+                    }
+                    TableScanOutput::default()
+                }
+            }
+        };
+        self.record(&out, rows);
+        Ok(out)
+    }
+
+    fn streams_scan(&self, call: &TableFunctionCall) -> bool {
+        // A remote object would land in memory whole; a local file is decoded
+        // once either way and folded in parallel by the materialized path,
+        // which is measurably faster than the serial fold (wave 98c).
+        let Ok(Some(Call::Scan { path, options })) = self.parse(call) else {
+            return false;
+        };
+        self.resolved(call, &options, &path)
+            .is_ok_and(|resolved| resolved.files.iter().any(|file| file.remote.is_some()))
     }
 
     fn stats(&self) -> pinkdb::TableSourceStats {
