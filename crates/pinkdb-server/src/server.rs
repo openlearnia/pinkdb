@@ -435,6 +435,12 @@ fn row_encoded_len(row: &[Value]) -> usize {
                     pinkdb::variant::encode(v, &mut scratch);
                     4 + scratch.len()
                 }
+                // Likewise an ARRAY: its wire length is the cell encoding's.
+                Value::Array(a) => {
+                    scratch.clear();
+                    scratch.extend_from_slice(&pinkdb::array::encode_cell(a));
+                    4 + scratch.len()
+                }
             }
         })
         .sum()

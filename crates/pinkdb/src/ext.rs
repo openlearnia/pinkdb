@@ -68,7 +68,7 @@
 //! the store has an extension root, a path inside that root.
 
 use crate::storage::PinkDb;
-use crate::types::{DataType, PinkDbError, Result, Value};
+use crate::types::{ArrayElem, DataType, PinkDbError, Result, Value};
 
 use pinkdb_ext_loader::linked::LinkedExtHost;
 use pinkdb_ext_loader::{ExtArg, ExtError, ExtFunction, ExtHandle, ExtValue, LinkedExtension};
@@ -103,6 +103,21 @@ pub(crate) fn ext_type_of(dtype: DataType) -> Option<ExtType> {
         // engine's VARIANT encoding — the extension sees no field names, only
         // opaque bytes, which keeps the ABI free of a second value model.
         DataType::Variant => Some(ExtType::Variant),
+        // A DOUBLE `ARRAY` is an ABI minor-5 type (tag 11, a pointer and a
+        // length over contiguous elements). INTEGER and BIGINT arrays have no
+        // ABI type: the binder's exact-type check rejects them with its usual
+        // message, so no callback ever sees one.
+        DataType::Array {
+            elem: ArrayElem::Double,
+            len,
+        } => Some(ExtType::ArrayDouble { len }),
+        // A `FLOAT` array is the minor-5 4-byte counterpart: embeddings are
+        // `f32`, so a distance kernel reads the stored elements directly.
+        DataType::Array {
+            elem: ArrayElem::Float,
+            len,
+        } => Some(ExtType::ArrayFloat { len }),
+        DataType::Array { .. } => None,
     }
 }
 
@@ -118,6 +133,14 @@ pub(crate) fn dtype_of_ext(dtype: ExtType) -> DataType {
         ExtType::Timestamp => DataType::Timestamp,
         ExtType::Interval => DataType::Interval,
         ExtType::Variant => DataType::Variant,
+        ExtType::ArrayDouble { len } => DataType::Array {
+            elem: ArrayElem::Double,
+            len,
+        },
+        ExtType::ArrayFloat { len } => DataType::Array {
+            elem: ArrayElem::Float,
+            len,
+        },
     }
 }
 
@@ -562,12 +585,12 @@ pub(crate) fn push_ext_arg<'a>(
     row: usize,
     declared: ExtType,
     variant: Option<&'a [u8]>,
-) {
+) -> Result<()> {
     if !vector.is_valid(row) {
         out.push(ExtArg::Null(declared));
-        return;
+        return Ok(());
     }
-    out.push(match vector.data() {
+    let arg = match vector.data() {
         VectorData::Boolean(v) => ExtArg::Boolean(v[row]),
         VectorData::Int32(v) => ExtArg::Integer(v[row]),
         VectorData::Int64(v) => ExtArg::Bigint(v[row]),
@@ -588,7 +611,59 @@ pub(crate) fn push_ext_arg<'a>(
         VectorData::Variant(_) => {
             ExtArg::Variant(variant.expect("a VARIANT argument is encoded before it is pushed"))
         }
-    });
+        // The engine's array vector already holds its elements contiguously,
+        // so the ABI view is a slice of it — no copy, no per-element boxing.
+        VectorData::Array {
+            elem: ArrayElem::Double,
+            len,
+            values: crate::array::ArrayElems::Floats(values),
+            valid,
+        } => {
+            let len = *len as usize;
+            let start = row * len;
+            let null_element = valid.as_deref().is_some_and(|bits| {
+                (start..start + len).any(|i| bits[i / 8] & (1 << (i % 8)) == 0)
+            });
+            if null_element {
+                // The layout has no per-element NULL channel, so a silently
+                // substituted value (or a 0.0) would be a wrong answer.
+                return Err(PinkDbError::Execution(
+                    "an ARRAY argument with a NULL element cannot cross the extension ABI; \
+                     replace it first (e.g. COALESCE(a[i], 0))"
+                        .to_string(),
+                ));
+            }
+            ExtArg::ArrayDouble(&values[start..start + len])
+        }
+        VectorData::Array {
+            elem: ArrayElem::Float,
+            len,
+            values: crate::array::ArrayElems::Floats32(values),
+            valid,
+        } => {
+            let len = *len as usize;
+            let start = row * len;
+            let null_element = valid.as_deref().is_some_and(|bits| {
+                (start..start + len).any(|i| bits[i / 8] & (1 << (i % 8)) == 0)
+            });
+            if null_element {
+                return Err(PinkDbError::Execution(
+                    "an ARRAY argument with a NULL element cannot cross the extension ABI; \
+                     replace it first (e.g. COALESCE(a[i], 0))"
+                        .to_string(),
+                ));
+            }
+            ExtArg::ArrayFloat(&values[start..start + len])
+        }
+        // Unreachable: `ext_type_of` maps only FLOAT and DOUBLE arrays to an
+        // ABI type, so the binder's exact-type check refuses any other ARRAY
+        // before a callback can run.
+        VectorData::Array { .. } => {
+            unreachable!("extensions only accept FLOAT and DOUBLE ARRAY arguments")
+        }
+    };
+    out.push(arg);
+    Ok(())
 }
 
 /// Encode one VARIANT cell for the ABI — bytes in the engine's VARIANT
@@ -695,6 +770,40 @@ pub(crate) fn ext_value_to_value(
             })?;
             Value::Variant(std::sync::Arc::new(value))
         }
+        ExtValue::ArrayDouble(values) => {
+            let len = values.len() as u32;
+            if dtype
+                != (DataType::Array {
+                    elem: ArrayElem::Double,
+                    len,
+                })
+            {
+                return Err(mismatch(ExtType::ArrayDouble { len }));
+            }
+            Value::Array(std::sync::Arc::new(crate::array::ArrayValue::new(
+                ArrayElem::Double,
+                len,
+                crate::array::ArrayElems::Floats(values),
+                None,
+            )?))
+        }
+        ExtValue::ArrayFloat(values) => {
+            let len = values.len() as u32;
+            if dtype
+                != (DataType::Array {
+                    elem: ArrayElem::Float,
+                    len,
+                })
+            {
+                return Err(mismatch(ExtType::ArrayFloat { len }));
+            }
+            Value::Array(std::sync::Arc::new(crate::array::ArrayValue::new(
+                ArrayElem::Float,
+                len,
+                crate::array::ArrayElems::Floats32(values),
+                None,
+            )?))
+        }
     })
 }
 
@@ -714,9 +823,21 @@ mod tests {
             DataType::Timestamp,
             DataType::Interval,
             DataType::Variant,
+            DataType::Array {
+                elem: ArrayElem::Double,
+                len: 3,
+            },
         ] {
             assert_eq!(dtype_of_ext(ext_type_of(dtype).unwrap()), dtype);
         }
+        // INTEGER and BIGINT arrays have no ABI type.
+        assert_eq!(
+            ext_type_of(DataType::Array {
+                elem: ArrayElem::Integer,
+                len: 3,
+            }),
+            None
+        );
         assert_eq!(
             ext_type_of(DataType::Decimal {
                 precision: 4,

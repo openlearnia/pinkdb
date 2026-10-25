@@ -22,20 +22,21 @@ use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
 pub const PINKDB_EXT_ABI_VERSION: u32 = 1;
 
-/// ABI **minor** version implemented by this loader (major 1, minor 4).
+/// ABI **minor** version implemented by this loader (major 1, minor 5).
 ///
 /// Minor 2 adds [`PinkdbHostApi::execute_statement`] and the optional
 /// `pinkdb_ext_serve` export; minor 3 adds [`ExtType::Variant`]
 /// ([`PINKDB_EXT_TYPE_VARIANT`]); minor 4 adds the optional
-/// `pinkdb_ext_command` export and [`PinkdbHostApi::execute_internal`]. All
-/// are additive, so minor 1 and minor 0 extensions are unchanged. The wire
-/// exposes the minor only indirectly (`struct_size`, symbol presence), which
-/// is why the major check stayed an equality check — and why a new *type tag*
-/// needs no `struct_size` landmark: a host only ever sends the types an
-/// extension declared, and an older host rejects an unknown tag at
-/// registration.
+/// `pinkdb_ext_command` export and [`PinkdbHostApi::execute_internal`];
+/// minor 5 adds the fixed-size array types [`ExtType::ArrayDouble`] and
+/// [`ExtType::ArrayFloat`] (wave 107a). All are additive, so minor 1 and
+/// minor 0 extensions are unchanged. The wire exposes the minor only
+/// indirectly (`struct_size`, symbol presence), which is why the major check
+/// stayed an equality check — and why a new *type tag* needs no
+/// `struct_size` landmark: a host only ever sends the types an extension
+/// declared, and an older host rejects an unknown tag at registration.
 #[cfg(not(target_arch = "wasm32"))]
-pub const PINKDB_EXT_ABI_MINOR: u32 = 4;
+pub const PINKDB_EXT_ABI_MINOR: u32 = 5;
 
 /// Maximum argument count accepted by [`crate::PinkdbHostApi::register_scalar`]
 /// and by [`crate::LinkedFunction::new`]. Kept identical for both loading
@@ -103,6 +104,36 @@ pub const PINKDB_EXT_TYPE_INTERVAL: i32 = 9;
 /// `pinkdb::variant::decode` reads. The tag number matches `pinkdb.h`'s
 /// `PINKDB_TYPE_VARIANT` (that header renders the value as JSON text).
 pub const PINKDB_EXT_TYPE_VARIANT: i32 = 10;
+/// Fixed-size array of DOUBLE (FLOAT) elements, a pointer-and-length view of
+/// `len` contiguous `double`s. The type is parametric, and the length has to
+/// travel wherever a type tag travels — an argument or return *declaration*,
+/// not just a value — so it is packed above the kind byte
+/// ([`pack_array_len`] / [`unpack_array_len`]). The low byte alone is
+/// [`PINKDB_EXT_TYPE_ARRAY_DOUBLE`], which is what an older host rejects as
+/// an unknown tag at registration. INTEGER and BIGINT arrays have no ABI
+/// type: [`ExtType::ArrayDouble`] is the only one.
+pub const PINKDB_EXT_TYPE_ARRAY_DOUBLE: i32 = 11;
+
+/// Fixed-size array of FLOAT (`f32`) elements: the 4-byte counterpart of
+/// [`PINKDB_EXT_TYPE_ARRAY_DOUBLE`], packed the same way
+/// ([`pack_array_float_len`]). Embeddings are `f32` on the wire and in storage,
+/// so a distance kernel can read a `FLOAT[N]` argument with no conversion.
+pub const PINKDB_EXT_TYPE_ARRAY_FLOAT: i32 = 12;
+
+/// Pack an array length into the ARRAY_DOUBLE tag: `(len << 8) | 11`.
+pub const fn pack_array_len(len: u32) -> i32 {
+    PINKDB_EXT_TYPE_ARRAY_DOUBLE | ((len as i32) << 8)
+}
+
+/// The array length packed by [`pack_array_len`] (0 for any other tag).
+pub const fn unpack_array_len(tag: i32) -> u32 {
+    (tag as u32) >> 8
+}
+
+/// Pack an array length into the ARRAY_FLOAT tag: `(len << 8) | 12`.
+pub const fn pack_array_float_len(len: u32) -> i32 {
+    PINKDB_EXT_TYPE_ARRAY_FLOAT | ((len as i32) << 8)
+}
 
 /// Pack an interval's three fields into the by-value ABI payload: `micros`
 /// goes in the `int64` field, `months`/`days` ride in the bits of the
@@ -353,6 +384,20 @@ pub enum ExtType {
     /// Semi-structured value, carried as pinkdb-encoded VARIANT bytes over
     /// the VARCHAR channel ([`PINKDB_EXT_TYPE_VARIANT`]).
     Variant,
+    /// A fixed-size array of `len` doubles, carried as a pointer-and-length
+    /// view over the value channel: `int64` is the element count, `text_ptr`
+    /// points at `len` contiguous `double`s and `text_len` is `len * 8`.
+    /// The engine passes no per-element boxing and no NULL elements — an
+    /// ARRAY argument holding a NULL element is refused with an error
+    /// naming the function.
+    ArrayDouble {
+        len: u32,
+    },
+    /// A fixed-size array of `len` floats (4-byte elements), carried the same
+    /// way as [`ExtType::ArrayDouble`] with `text_len == len * 4`.
+    ArrayFloat {
+        len: u32,
+    },
 }
 
 impl ExtType {
@@ -368,6 +413,8 @@ impl ExtType {
             ExtType::Timestamp => PINKDB_EXT_TYPE_TIMESTAMP,
             ExtType::Interval => PINKDB_EXT_TYPE_INTERVAL,
             ExtType::Variant => PINKDB_EXT_TYPE_VARIANT,
+            ExtType::ArrayDouble { len } => pack_array_len(len),
+            ExtType::ArrayFloat { len } => pack_array_float_len(len),
         }
     }
 
@@ -383,29 +430,37 @@ impl ExtType {
             PINKDB_EXT_TYPE_TIMESTAMP => Some(ExtType::Timestamp),
             PINKDB_EXT_TYPE_INTERVAL => Some(ExtType::Interval),
             PINKDB_EXT_TYPE_VARIANT => Some(ExtType::Variant),
+            tag if tag & 0xff == PINKDB_EXT_TYPE_ARRAY_DOUBLE => Some(ExtType::ArrayDouble {
+                len: unpack_array_len(tag),
+            }),
+            tag if tag & 0xff == PINKDB_EXT_TYPE_ARRAY_FLOAT => Some(ExtType::ArrayFloat {
+                len: unpack_array_len(tag),
+            }),
             _ => None,
         }
     }
 
-    /// DuckDB-style display name.
-    pub const fn name(self) -> &'static str {
+    /// DuckDB-style display name (`DOUBLE[3]` carries its length).
+    pub fn name(self) -> String {
         match self {
-            ExtType::Boolean => "BOOLEAN",
-            ExtType::Integer => "INTEGER",
-            ExtType::Bigint => "BIGINT",
-            ExtType::Double => "DOUBLE",
-            ExtType::Varchar => "VARCHAR",
-            ExtType::Date => "DATE",
-            ExtType::Timestamp => "TIMESTAMP",
-            ExtType::Interval => "INTERVAL",
-            ExtType::Variant => "VARIANT",
+            ExtType::Boolean => "BOOLEAN".to_string(),
+            ExtType::Integer => "INTEGER".to_string(),
+            ExtType::Bigint => "BIGINT".to_string(),
+            ExtType::Double => "DOUBLE".to_string(),
+            ExtType::Varchar => "VARCHAR".to_string(),
+            ExtType::Date => "DATE".to_string(),
+            ExtType::Timestamp => "TIMESTAMP".to_string(),
+            ExtType::Interval => "INTERVAL".to_string(),
+            ExtType::Variant => "VARIANT".to_string(),
+            ExtType::ArrayDouble { len } => format!("DOUBLE[{len}]"),
+            ExtType::ArrayFloat { len } => format!("FLOAT[{len}]"),
         }
     }
 }
 
 impl fmt::Display for ExtType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        f.write_str(&self.name())
     }
 }
 
@@ -429,6 +484,12 @@ pub enum ExtArg<'a> {
     },
     /// pinkdb-encoded VARIANT bytes, borrowed for the duration of the call.
     Variant(&'a [u8]),
+    /// `len` contiguous doubles, borrowed for the duration of the call. The
+    /// engine's ARRAY vector already stores elements contiguously, so this is
+    /// a slice of it — never a copy.
+    ArrayDouble(&'a [f64]),
+    /// `len` contiguous floats, borrowed like [`ExtArg::ArrayDouble`].
+    ArrayFloat(&'a [f32]),
 }
 
 impl ExtArg<'_> {
@@ -445,6 +506,12 @@ impl ExtArg<'_> {
             ExtArg::Timestamp(_) => ExtType::Timestamp,
             ExtArg::Interval { .. } => ExtType::Interval,
             ExtArg::Variant(_) => ExtType::Variant,
+            ExtArg::ArrayDouble(values) => ExtType::ArrayDouble {
+                len: values.len() as u32,
+            },
+            ExtArg::ArrayFloat(values) => ExtType::ArrayFloat {
+                len: values.len() as u32,
+            },
         }
     }
 
@@ -508,6 +575,24 @@ impl ExtArg<'_> {
                     0,
                 )
             }
+            // The element count rides `int64` as well as the tag, so a
+            // callback can read it without unpacking the type tag.
+            ExtArg::ArrayDouble(values) => (
+                pack_array_len(values.len() as u32),
+                0,
+                values.len() as i64,
+                0.0,
+                values.as_ptr() as *const c_char,
+                std::mem::size_of_val(values),
+            ),
+            ExtArg::ArrayFloat(values) => (
+                pack_array_float_len(values.len() as u32),
+                0,
+                values.len() as i64,
+                0.0,
+                values.as_ptr() as *const c_char,
+                std::mem::size_of_val(values),
+            ),
         };
         PinkdbExtValue {
             type_tag,
@@ -540,6 +625,11 @@ pub enum ExtValue {
     },
     /// pinkdb-encoded VARIANT bytes, copied out of extension memory.
     Variant(Vec<u8>),
+    /// Array elements copied out of extension memory; the length is the
+    /// type's, and `decode_result` checks the two agree.
+    ArrayDouble(Vec<f64>),
+    /// Array elements copied out of extension memory (4-byte elements).
+    ArrayFloat(Vec<f32>),
 }
 
 impl ExtValue {
@@ -556,6 +646,12 @@ impl ExtValue {
             ExtValue::Timestamp(_) => ExtType::Timestamp,
             ExtValue::Interval { .. } => ExtType::Interval,
             ExtValue::Variant(_) => ExtType::Variant,
+            ExtValue::ArrayDouble(values) => ExtType::ArrayDouble {
+                len: values.len() as u32,
+            },
+            ExtValue::ArrayFloat(values) => ExtType::ArrayFloat {
+                len: values.len() as u32,
+            },
         })
     }
 }

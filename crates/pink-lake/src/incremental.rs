@@ -566,6 +566,13 @@ fn mix_value(h: &mut u64, v: &Value) {
             pinkdb::variant::hash_key(v, &mut b);
             mix(h, 10, &b);
         }
+        // Likewise the canonical ARRAY key (element kind, size and the
+        // normalized element bits).
+        Value::Array(a) => {
+            let mut b = Vec::new();
+            a.hash_key(&mut b);
+            mix(h, 11, &b);
+        }
     }
 }
 

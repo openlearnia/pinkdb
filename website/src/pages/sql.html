@@ -265,6 +265,9 @@ as a follow-up wave.</p>
   <code>floor</code>, <code>sqrt</code>, <code>pow</code>/<code>power</code>,
   <code>sign</code>, <code>mod</code>, <code>greatest</code>,
   <code>least</code>.</li>
+  <li>Arrays: <code>array_value(…)</code>, <code>array_extract(a, i)</code>,
+  <code>len(a)</code>/<code>array_length(a)</code> (see
+  <a href="#array">ARRAY</a>).</li>
   <li>Strings: <code>upper</code>, <code>lower</code>, <code>length</code>,
   <code>substr</code>, <code>trim</code>/<code>ltrim</code>/<code>rtrim</code>,
   <code>replace</code>, <code>concat</code>.</li>
@@ -284,9 +287,10 @@ as a follow-up wave.</p>
   supporting <code>.</code>, <code>[...]</code>/<code>[^...]</code> classes,
   <code>* + ? {m,n}</code>, groups, alternation and <code>^</code>/<code>$</code>.
   <code>like_escape(s, p, esc)</code> is also a scalar function.</li>
-  <li>Subscripts: <code>v['a']</code>, <code>v[0]</code> and <code>v.a</code> on a
-  <code>VARIANT</code> (1-based array indices, 0 is an error, a missing key or an
-  out-of-range index is <code>NULL</code>, chains like
+  <li>Subscripts: <code>a[2]</code> on an <code>ARRAY</code> (1-based, forgiving —
+  see <a href="#array">ARRAY</a>), <code>v['a']</code>, <code>v[0]</code> and
+  <code>v.a</code> on a <code>VARIANT</code> (1-based array indices, 0 is an
+  error, a missing key or an out-of-range index is <code>NULL</code>, chains like
   <code>payload.b[2]</code> work), and <code>s[2]</code> /
   <code>s[2:4]</code> / <code>s[-1]</code> on a <code>VARCHAR</code>
   (character-wise, negative counts from the end, out-of-range clamps).</li>
@@ -324,6 +328,12 @@ as a follow-up wave.</p>
     boolean, bigint, double, decimal, varchar, date, timestamp, array or object —
     stored columnar in a binary encoding, not as text (see
     <a href="#variant">VARIANT</a>)</td></tr>
+    <tr><td><code>ARRAY</code>: <code>FLOAT[N]</code>,
+    <code>DOUBLE[N]</code>, <code>INTEGER[N]</code>, <code>BIGINT[N]</code></td>
+    <td>N numeric elements per row, stored columnar as one flat element buffer
+    plus a row bitmap; the length is part of the type, and
+    <code>FLOAT[N]</code> is 32-bit (4 bytes per element). See
+    <a href="#array">ARRAY</a></td></tr>
   </tbody>
 </table>
 </div>
@@ -357,6 +367,119 @@ auto-detects <code>YYYY-MM-DD</code> as <code>DATE</code> and
   <li>Mixed <code>DATE</code>/<code>TIMESTAMP</code> comparison is rejected;
   timestamps never mix with integers — use <code>date ± interval</code>.</li>
 </ul>
+
+<h2 id="array">ARRAY</h2>
+
+<p>A fixed-size <code>ARRAY</code> column stores N values of one numeric element
+type per row: <code>FLOAT[768]</code>, <code>DOUBLE[1536]</code>,
+<code>INTEGER[4]</code>, <code>BIGINT[2]</code>. It is where embeddings live —
+a 768-d or 1536-d vector is one flat buffer of <code>rows × N</code> elements,
+not a heap allocation per row — and it is the type the <code>vss</code> and
+<code>embeddings</code> extensions take and return. <code>FLOAT[N]</code> (and
+<code>REAL[N]</code>) stores 4-byte floats, so an embedding column costs 4
+bytes per element; pinkdb has no <code>FLOAT</code> <em>scalar</em>, so
+<code>a[i]</code> widens an element to <code>DOUBLE</code> — the one deliberate
+difference from DuckDB, which returns a <code>FLOAT</code>. The
+<code>DOUBLE[N] → FLOAT[N]</code> cast follows DuckDB 2.0: round to nearest, a
+finite value that would become infinite is an error ("out of range for
+FLOAT"), underflow is silent, and the text path parses straight to f32
+(<code>'1e40'</code> becomes <code>inf</code>).</p>
+
+<pre class="code" data-lang="sql"><code>CREATE TABLE docs (id INTEGER, v DOUBLE[3]);
+INSERT INTO docs VALUES (1, [1.0, 2.0, 3.0]), (2, [0.5, 2.0, 3.0]), (3, NULL);
+INSERT INTO docs VALUES (4, '[1.5, NULL, 3.5]');      -- VARCHAR parses
+SELECT typeof(v) FROM docs LIMIT 1;                  -- DOUBLE[3]
+SELECT v[2], array_extract(v, 2), len(v), array_length(v) FROM docs;
+SELECT array_value(id, id + 1, -7) FROM docs;        -- per row, any expressions
+SELECT v[1] FROM docs WHERE v = [1.0, 2.0, 3.0];     -- structural equality
+SELECT id FROM docs ORDER BY v LIMIT 3;              -- lexicographic</code></pre>
+
+<p><strong>Literals.</strong> <code>[a, b, c]</code> and
+<code>array_value(a, b, c)</code> are the same constructor: they build the
+array per row from any expression, columns included, and infer the element type
+with the numeric tower — all-<code>INTEGER</code> gives
+<code>INTEGER[N]</code>, a <code>BIGINT</code> or <code>DECIMAL</code> element
+widens to <code>BIGINT[N]</code>/<code>DOUBLE[N]</code>, and any
+<code>DOUBLE</code> makes it <code>DOUBLE[N]</code> (<code>[1, 2.5]</code> is a
+<code>DOUBLE[2]</code>). A <code>NULL</code> element is allowed; an empty or
+all-<code>NULL</code> literal needs a target type
+(<code>CAST([NULL, NULL] AS DOUBLE[2])</code>).</p>
+
+<p><strong>Element access.</strong> <code>a[i]</code> and
+<code>array_extract(a, i)</code> are 1-based and forgiving, like DuckDB: an
+index outside <code>1..=N</code>, a <code>NULL</code> index, a
+<code>NULL</code> array and a <code>NULL</code> element all return
+<code>NULL</code> rather than erroring. <code>len(a)</code> and
+<code>array_length(a)</code> report <code>N</code> (<code>NULL</code> for a
+<code>NULL</code> array).</p>
+
+<p><strong>Casts.</strong> <code>VARCHAR ↔ ARRAY</code>
+(<code>'[1.5, NULL]'</code> round-trips; a wrong element count or a bad element
+is a clear error), <code>ARRAY ↔ ARRAY</code> between element types at the
+<em>same</em> length (<code>INTEGER[3] → DOUBLE[3]</code>;
+<code>DOUBLE[3] → DOUBLE[4]</code> is
+<code>cannot CAST … : the array size is part of the type</code>),
+<code>ARRAY ↔ VARIANT</code> (a VARIANT array of the exact length), and
+<code>TRY_CAST</code>.</p>
+
+<p><strong>Equality, ordering and grouping.</strong> Equality is structural and
+compares elements by value across element types
+(<code>DOUBLE[3]</code> = <code>INTEGER[3]</code>), including
+<code>NULL</code> elements: two <code>NULL</code>s at the same position are
+equal, so <code>a = b</code> is not three-valued for them. One total order
+serves <code>ORDER BY</code>, <code>MIN</code> and <code>MAX</code>:
+element-wise lexicographic, with a <code>NULL</code> element sorting after every
+value at that position and a <code>NULL</code> array last, like any nullable
+column. <code>GROUP BY</code>, <code>DISTINCT</code> and join keys hash a
+canonical key that agrees with <code>=</code> by construction, so
+<code>-0.0</code>/<code>0.0</code> and every <code>NaN</code> fold together.</p>
+
+<p><strong>Persistence and encodings.</strong> <code>.pink</code> gained dtype
+tag 10 (element kind + length), default-value tag 10 and page-encoding tag 11: a
+<code>rows | layout | element bitmap | values</code> payload, row-major or
+byte-planed (whichever is smaller) behind the existing LZ frame; an
+<code>ARRAY</code> column carries no min/max statistics (an element-wise bound
+would not be a bound), only the null count. 100k × 768 pseudo-random
+<code>DOUBLE</code> rows insert in 0.31 s, scan in 0.31 s and occupy 585 MiB —
+exactly 8 bytes per element — while the same table as <code>FLOAT</code>
+occupies 292 MiB, exactly 4 bytes per element, and structured data still
+compresses (<code>sin</code> data 108×, a constant column 253×). The wire is
+protocol v13 (value tag 11, dtype tag 10, element byte 0–3); the C ABI exposes
+<code>PINKDB_TYPE_ARRAY</code> (tag 11, <code>N × 8</code> bytes of little-endian
+<code>f64</code>) and <code>PINKDB_TYPE_ARRAY_FLOAT</code> (tag 12,
+<code>N × 4</code> bytes of <code>f32</code>), each with the element count packed
+into the type tag, and never a <code>NULL</code> element — the ABI has no
+per-element NULL channel; the Node binding hands over a
+<code>Float32Array</code>/<code>Float64Array</code>, Python a
+<code>list[float]</code>, Go a <code>[]float32</code>/<code>[]float64</code>.
+Extension ABI minor 5 added <code>ExtType::ArrayFloat</code> and
+<code>ExtType::ArrayDouble</code>: borrowed pointer-plus-length views of the
+engine's element buffer with no per-element boxing.</p>
+
+<p><strong>Parquet and lakes.</strong> A column writes DuckDB 2.0's three-level
+<code>LIST</code> group (<code>v</code> OPTIONAL LIST → <code>list</code>
+REPEATED → <code>element</code> OPTIONAL), exactly N element slots per row, with
+the length in a <code>pinkdb.array.&lt;column&gt;</code> key-value entry
+(a LIST group has no length of its own). DuckDB reads our files and we read its
+<code>FLOAT[3]</code>/<code>INTEGER[3]</code> files; a variable-length list
+cannot be read back as an <code>ARRAY</code> and is refused with a message
+naming wave 107a2. <code>.pink</code> lake data files round-trip the column and
+the DuckLake catalog records it the way DuckDB records a nested type (a
+<code>list</code> parent row plus an <code>element</code> child row with
+<code>parent_column</code>, the real <code>DOUBLE[3]</code> in the
+<code>pinkdb_column</code> side row). A <code>FLOAT[N]</code> column writes an
+<code>f32</code> element leaf. DuckDB cannot create an <code>ARRAY</code>
+column in DuckLake at all, but its reader matches data-file fields by
+<code>field_id = ducklake_column.column_id</code>, so pinkdb stamps exactly
+those ids on lake data files (top-level columns and the ARRAY child alike) and
+DuckDB reads the vectors through a pinkdb lake — including after pinkdb added
+or dropped a column. Standalone <code>COPY … TO</code> files carry no ids, as
+DuckDB's own do not.</p>
+
+<p><strong>Not in this wave.</strong> A variable-length <code>LIST</code>
+(<code>T[]</code>) is a parse error that names wave 107a2, and
+<code>unnest</code>, array slicing and the functions that build arrays from
+grouped rows belong to that same follow-up.</p>
 
 <h2>VARIANT</h2>
 

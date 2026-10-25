@@ -23,7 +23,8 @@ use crate::storage::{
 };
 use crate::table_source::{TableFunctionArg, TableFunctionCall};
 use crate::types::{
-    DECIMAL_MAX_PRECISION, DataType, ExtractField, PinkDbError, Result, Value, extract_field,
+    ArrayElem, DECIMAL_MAX_PRECISION, DataType, ExtractField, PinkDbError, Result, Value,
+    extract_field,
 };
 
 // ---------- bound expressions ----------
@@ -129,6 +130,14 @@ pub enum ScalarFunc {
     JsonReplace,
     /// `json_remove(json, path)` — remove the value at the path.
     JsonRemove,
+    /// `a[i]` (and `array_extract(a, i)`): one ARRAY element by its 1-based
+    /// index. Out of range is NULL, not an error — DuckDB's rule.
+    ArrayExtract,
+    /// `array_length(a)`: the fixed element count of an ARRAY.
+    ArrayLength,
+    /// `[a, b, …]` / `array_value(a, b, …)`: build one ARRAY from a row's
+    /// scalar arguments. Not strict: a NULL argument is a NULL element.
+    ArrayValue,
 }
 
 impl ScalarFunc {
@@ -138,7 +147,7 @@ impl ScalarFunc {
             "round" => ScalarFunc::Round,
             "upper" => ScalarFunc::Upper,
             "lower" => ScalarFunc::Lower,
-            "length" => ScalarFunc::Length,
+            "length" | "len" => ScalarFunc::Length,
             "substr" => ScalarFunc::Substr,
             "year" => ScalarFunc::Year,
             "month" => ScalarFunc::Month,
@@ -166,6 +175,9 @@ impl ScalarFunc {
             "variant_type" => ScalarFunc::VariantType,
             "variant_keys" => ScalarFunc::VariantKeys,
             "variant_extract" => ScalarFunc::VariantExtract,
+            "array_value" => ScalarFunc::ArrayValue,
+            "array_extract" => ScalarFunc::ArrayExtract,
+            "array_length" => ScalarFunc::ArrayLength,
             "like_escape" => ScalarFunc::LikeEscape,
             "similar_to" => ScalarFunc::SimilarTo,
             _ => return None,
@@ -177,7 +189,11 @@ impl ScalarFunc {
     pub(crate) fn is_strict(self) -> bool {
         !matches!(
             self,
-            ScalarFunc::Concat | ScalarFunc::NullIf | ScalarFunc::Greatest | ScalarFunc::Least
+            ScalarFunc::Concat
+                | ScalarFunc::NullIf
+                | ScalarFunc::Greatest
+                | ScalarFunc::Least
+                | ScalarFunc::ArrayValue
         )
     }
 }
@@ -788,6 +804,47 @@ fn coalesce_common(a: DataType, b: DataType) -> Result<DataType> {
 }
 
 /// Whether `CAST(from AS to)` is allowed in v1.
+/// Element type and length of an ARRAY constructor: the numeric tower over
+/// the argument types (DECIMAL widens to DOUBLE, as in a CAST into a DOUBLE
+/// column) and the argument count. All-NULL arguments have no type to infer.
+fn array_ctor_dtype(args: &[BoundExpr]) -> Result<DataType> {
+    if args.is_empty() {
+        return Err(PinkDbError::Type(
+            "an ARRAY needs at least one element (a variable-length LIST is wave 107a2)"
+                .to_string(),
+        ));
+    }
+    let mut elem: Option<ArrayElem> = None;
+    for a in args {
+        let t = a.dtype();
+        if matches!(a, BoundExpr::Literal(Value::Null)) {
+            continue;
+        }
+        let e = match t {
+            DataType::Decimal { .. } => ArrayElem::Double,
+            t => ArrayElem::of(t).ok_or_else(|| {
+                PinkDbError::Type(format!(
+                    "ARRAY elements must be INTEGER, BIGINT or DOUBLE, not {t}"
+                ))
+            })?,
+        };
+        elem = Some(match elem {
+            Some(prev) => prev.max(e),
+            None => e,
+        });
+    }
+    let Some(elem) = elem else {
+        return Err(PinkDbError::Type(
+            "cannot infer the element type of an all-NULL ARRAY; cast an element, e.g. [CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE)]"
+                .to_string(),
+        ));
+    };
+    Ok(DataType::Array {
+        elem,
+        len: args.len() as u32,
+    })
+}
+
 fn check_cast(from: DataType, to: DataType) -> Result<()> {
     if from == to {
         return Ok(());
@@ -813,6 +870,16 @@ fn check_cast(from: DataType, to: DataType) -> Result<()> {
         || (from.is_numeric() && to == DataType::Boolean)
     {
         return Ok(());
+    }
+    // ARRAY: any element tower is fine, but the length is part of the type,
+    // so it has to match (DuckDB refuses a size change too).
+    if let (DataType::Array { len: a, .. }, DataType::Array { len: b, .. }) = (from, to) {
+        if a == b {
+            return Ok(());
+        }
+        return Err(PinkDbError::Type(format!(
+            "cannot CAST {from} AS {to}: the array size is part of the type",
+        )));
     }
     // Date ↔ timestamp (midnight / truncate).
     if (from == DataType::Date && to == DataType::Timestamp)
@@ -938,6 +1005,17 @@ fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
                 ))
             }
             _ => Ok(()),
+        };
+    }
+    // ARRAY: every operator is element-wise (lexicographic order, a NULL
+    // element after every value) once the shapes agree.
+    if let (DataType::Array { len: a, .. }, DataType::Array { len: b, .. }) = (l, r) {
+        return if a == b {
+            Ok(())
+        } else {
+            Err(PinkDbError::Type(format!(
+                "cannot compare {l} with {r}: the array sizes differ"
+            )))
         };
     }
     if l == DataType::Boolean && r == DataType::Boolean {
@@ -1581,6 +1659,28 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// `[a, b, c]` and `array_value(a, b, c)` bind to one constructor: the
+    /// element type is the numeric tower over the arguments (INTEGER, else
+    /// BIGINT, else DOUBLE) and the length is the argument count. Elements may
+    /// of course be NULL — that is a NULL *element*, not a NULL array.
+    fn bind_array_literal(
+        &mut self,
+        items: &[Expr],
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        let mut args = Vec::with_capacity(items.len());
+        for item in items {
+            args.push(self.bind_expr(item, aggs, allow_agg)?);
+        }
+        let dtype = array_ctor_dtype(&args)?;
+        Ok(BoundExpr::Scalar {
+            func: ScalarFunc::ArrayValue,
+            args,
+            dtype,
+        })
+    }
+
     fn bind_expr(
         &mut self,
         expr: &Expr,
@@ -1589,6 +1689,7 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundExpr> {
         match expr {
             Expr::Literal(v) => Ok(BoundExpr::Literal(v.clone())),
+            Expr::ArrayLiteral(items) => self.bind_array_literal(items, aggs, allow_agg),
             Expr::Parameter(index) => self.bind_parameter(*index),
             Expr::Star => Err(PinkDbError::Parse(
                 "`*` is only valid in the projection list or COUNT(*)".to_string(),
@@ -1867,6 +1968,23 @@ impl<'a> Binder<'a> {
                 let base = self.bind_expr(base, aggs, allow_agg)?;
                 let index = self.bind_expr(index, aggs, allow_agg)?;
                 match base.dtype() {
+                    // `a[i]`: 1-based, out of range is NULL (DuckDB).
+                    DataType::Array { elem, .. } => {
+                        if !matches!(
+                            index.dtype(),
+                            DataType::Integer | DataType::Bigint | DataType::Double
+                        ) && !matches!(&index, BoundExpr::Literal(Value::Null))
+                        {
+                            return Err(PinkDbError::Type(
+                                "an ARRAY subscript needs an integer index".to_string(),
+                            ));
+                        }
+                        Ok(BoundExpr::Scalar {
+                            func: ScalarFunc::ArrayExtract,
+                            args: vec![base, index],
+                            dtype: elem.dtype(),
+                        })
+                    }
                     // `v['a']` / `v[1]`: a VARIANT member, by name or by
                     // (1-based) position.
                     DataType::Variant => {
@@ -1941,7 +2059,12 @@ impl<'a> Binder<'a> {
                 // conversion at bind too), and the cast itself is a no-op.
                 self.pin_parameter(expr, *dtype)?;
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
-                check_cast(bound.dtype(), *dtype)?;
+                // `CAST(NULL AS t)` is legal for every `t`: a NULL literal has
+                // no type of its own, so there is nothing to check the cast
+                // against.
+                if !matches!(bound, BoundExpr::Literal(Value::Null)) {
+                    check_cast(bound.dtype(), *dtype)?;
+                }
                 Ok(BoundExpr::Cast {
                     expr: Box::new(bound),
                     dtype: *dtype,
@@ -3521,6 +3644,7 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                 && t != DataType::Timestamp
                 && t != DataType::Interval
                 && t != DataType::Variant
+                && !matches!(t, DataType::Array { .. })
             {
                 return Err(PinkDbError::Type(
                     "MIN/MAX need an orderable argument".to_string(),
@@ -3606,8 +3730,15 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
         }
         ScalarFunc::Length => {
             arity(&[1])?;
-            if args[0].dtype() != DataType::Varchar {
-                return Err(PinkDbError::Type("length needs VARCHAR".to_string()));
+            // `len` answers for both VARCHAR and ARRAY (DuckDB's alias);
+            // `array_length` below is the ARRAY-only spelling.
+            if args[0].dtype() != DataType::Varchar
+                && !matches!(args[0].dtype(), DataType::Array { .. })
+            {
+                return Err(PinkDbError::Type(format!(
+                    "length needs VARCHAR or ARRAY, got {}",
+                    args[0].dtype()
+                )));
             }
             Ok(DataType::Integer)
         }
@@ -3703,6 +3834,38 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
                 }
             }
             Ok(DataType::Varchar)
+        }
+        // `array_value(…)`: the type comes from the argument types alone.
+        ScalarFunc::ArrayValue => array_ctor_dtype(args),
+        // `a[i]`: the element type. The index is 1-based and forgiving.
+        ScalarFunc::ArrayExtract => {
+            arity(&[2])?;
+            let DataType::Array { elem, .. } = args[0].dtype() else {
+                return Err(PinkDbError::Type(format!(
+                    "array_extract needs an ARRAY argument, got {}",
+                    args[0].dtype()
+                )));
+            };
+            if !matches!(
+                args[1].dtype(),
+                DataType::Integer | DataType::Bigint | DataType::Double
+            ) && !matches!(args[1], BoundExpr::Literal(Value::Null))
+            {
+                return Err(PinkDbError::Type(
+                    "an ARRAY subscript needs an integer index".to_string(),
+                ));
+            }
+            Ok(elem.dtype())
+        }
+        ScalarFunc::ArrayLength => {
+            arity(&[1])?;
+            if !matches!(args[0].dtype(), DataType::Array { .. }) {
+                return Err(PinkDbError::Type(format!(
+                    "array_length needs an ARRAY argument, got {}",
+                    args[0].dtype()
+                )));
+            }
+            Ok(DataType::Integer)
         }
         // `TRY_CAST(x AS t)`: a NULL instead of an error.
         ScalarFunc::TryCast => {
@@ -3934,6 +4097,14 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
 fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Literal(v) => v.to_string(),
+        Expr::ArrayLiteral(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(default_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         // Only reachable when binding an unparameterized statement errors
         // first; the display name keeps `SELECT ?`-style output sensible.
         Expr::Parameter(i) => format!("?{}", i + 1),
@@ -5642,6 +5813,7 @@ fn expr_has_subquery(expr: &Expr) -> bool {
         | Expr::TryCast { expr, .. }
         | Expr::NamedArg { expr, .. } => expr_has_subquery(expr),
         Expr::Subscript { base, index } => expr_has_subquery(base) || expr_has_subquery(index),
+        Expr::ArrayLiteral(items) => items.iter().any(expr_has_subquery),
         Expr::Slice { base, from, to } => {
             expr_has_subquery(base)
                 || from.as_ref().is_some_and(|e| expr_has_subquery(e))

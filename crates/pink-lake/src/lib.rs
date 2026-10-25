@@ -1980,9 +1980,13 @@ impl Lake {
         let id = fresh_id();
         let rows = src.num_rows() as u64;
         let rel = format!("{dir}/{id}.{}", provider.extension());
+        // The catalog's column ids, before the commit that creates them: a
+        // DuckLake reader matches a nested column's children by `field_id`,
+        // and a data file is written before its columns exist.
+        let fields = self.store.field_ids(key, &src.schema())?;
         let mut saved = None;
         let written = self.storage.put_streamed(&rel, &mut |sink| {
-            saved = Some(provider.write_streamed(dbname, table, src, sink)?);
+            saved = Some(provider.write_streamed_with_fields(dbname, table, src, &fields, sink)?);
             Ok(())
         })?;
         let (saved, footer) = saved.ok_or_else(|| LakeError::Internal {

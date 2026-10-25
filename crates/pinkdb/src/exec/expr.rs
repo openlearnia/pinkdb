@@ -251,7 +251,7 @@ fn eval_dynamic_scalar(
                 )));
             };
             let encoded = variant_args.get(i).and_then(|bytes| bytes.as_deref());
-            crate::ext::push_ext_arg(&mut ext_args, v, row, arg_type, encoded);
+            crate::ext::push_ext_arg(&mut ext_args, v, row, arg_type, encoded)?;
         }
         let value = function
             .call(&ext_args)
@@ -678,6 +678,32 @@ fn eval_comparison(
                 // `variant::cmp` is the same total order (and equality) that
                 // `compare_values` uses, so `=` here agrees with GROUP BY.
                 cmp_loop(op, &l, &r, a, b, |x, y| crate::variant::cmp(x, y), &mut out)?;
+            }
+            (
+                VectorData::Array {
+                    values: a,
+                    valid: av,
+                    len,
+                    ..
+                },
+                VectorData::Array {
+                    values: b,
+                    valid: bv,
+                    ..
+                },
+            ) => {
+                // One dtype on both sides, so the slots line up: row `i` is
+                // `len` consecutive elements at offset `i * len`.
+                let n = *len as usize;
+                for i in 0..l.len() {
+                    if l.is_null(i) || r.is_null(i) {
+                        out.push_null()?;
+                        continue;
+                    }
+                    let ord =
+                        crate::array::cmp_slot(a, av.as_deref(), i * n, b, bv.as_deref(), i * n, n);
+                    out.push_bool(ord_matches(ord, op))?;
+                }
             }
             _ => unreachable!("same dtype implies same vector layout"),
         }
@@ -1613,7 +1639,7 @@ fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vec
             for v in args {
                 row.push(v.get(i));
             }
-            out.push_valid(apply_scalar_loose(func, &row)?)?;
+            out.push_valid(apply_scalar_loose(func, dtype, &row)?)?;
         }
         return Ok(out);
     }
@@ -1674,6 +1700,62 @@ fn eval_scalar_typed(func: ScalarFunc, args: &[Vector]) -> Result<Option<Vector>
                         )));
                     }
                 }
+            }
+            out
+        }
+        // `len(a)` / `array_length(a)`: one number for every row, so the
+        // generic loop would rebuild a whole array `Value` per row.
+        ScalarFunc::Length | ScalarFunc::ArrayLength
+            if args.len() == 1 && matches!(src.data(), VectorData::Array { .. }) =>
+        {
+            let VectorData::Array { len, .. } = src.data() else {
+                unreachable!("guarded above")
+            };
+            let len = *len as i32;
+            let mut out = Vector::new_empty(DataType::Integer);
+            for i in 0..src.len() {
+                if src.is_null(i) {
+                    out.push_null()?;
+                } else {
+                    out.push_int32(len)?;
+                }
+            }
+            out
+        }
+        // `a[i]`: read the element out of the flat buffer. `INTEGER` indices
+        // are the common case (`a[1]`, a vector column); other index layouts
+        // take the generic path.
+        ScalarFunc::ArrayExtract if args.len() == 2 && src.dtype().is_array() => {
+            let VectorData::Array {
+                elem,
+                len,
+                values,
+                valid: av,
+            } = src.data()
+            else {
+                unreachable!("guarded above")
+            };
+            let (elem, len) = (*elem, *len as usize);
+            let idx = &args[1];
+            let mut out = Vector::new_empty(elem.dtype());
+            match idx.data() {
+                VectorData::Int32(ix) => {
+                    for (i, index) in ix.iter().enumerate() {
+                        if src.is_null(i) || idx.is_null(i) {
+                            out.push_null()?;
+                        } else {
+                            out.push_valid(crate::array::ArrayValue::slot_elem(
+                                elem,
+                                values,
+                                av.as_deref(),
+                                i * len,
+                                len,
+                                i64::from(*index),
+                            ))?;
+                        }
+                    }
+                }
+                _ => return Ok(None),
             }
             out
         }
@@ -1790,8 +1872,34 @@ fn eval_scalar_fast(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Resul
 /// Non-strict scalar functions: NULL handling is part of the function
 /// (`concat`/`greatest`/`least` skip NULLs; `nullif` only propagates its
 /// first argument's NULL).
-fn apply_scalar_loose(func: ScalarFunc, row: &[Value]) -> Result<Value> {
+fn apply_scalar_loose(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Value> {
     match func {
+        ScalarFunc::ArrayValue => {
+            let DataType::Array { elem, len } = dtype else {
+                unreachable!("the binder types an ARRAY constructor as ARRAY")
+            };
+            let mut values = crate::array::ArrayElems::with_capacity(elem, row.len());
+            let mut valid = vec![0xFFu8; row.len().div_ceil(8)];
+            let mut any_null = false;
+            for (i, v) in row.iter().enumerate() {
+                match v {
+                    // A NULL argument is a NULL element, never a NULL array.
+                    Value::Null => {
+                        values.push_zero();
+                        valid[i / 8] &= !(1u8 << (i % 8));
+                        any_null = true;
+                    }
+                    v => values.push_elem(elem, Some(v))?,
+                }
+            }
+            let value = crate::array::ArrayValue::new(
+                elem,
+                len,
+                values,
+                any_null.then(|| valid.into_boxed_slice()),
+            )?;
+            Ok(Value::Array(std::sync::Arc::new(value)))
+        }
         ScalarFunc::Concat => {
             let mut out = String::new();
             for v in row {
@@ -1907,6 +2015,20 @@ fn div_round_half_away(v: i128, d: i128) -> i128 {
     }
 }
 
+/// The subscript of `a[i]`, as a 1-based index. Only integral numbers index an
+/// ARRAY — DuckDB refuses `a[1.5]` and so does this.
+fn array_index(v: &Value) -> Result<Option<i64>> {
+    match v {
+        Value::Integer(i) => Ok(Some(*i as i64)),
+        Value::Bigint(i) => Ok(Some(*i)),
+        Value::Double(x) if x.fract() == 0.0 => Ok(Some(*x as i64)),
+        Value::Null => Ok(None),
+        v => Err(PinkDbError::Execution(format!(
+            "an ARRAY subscript must be an integer, not {v}"
+        ))),
+    }
+}
+
 fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Value> {
     // DECIMAL keeps the numeric family (ABS/ROUND/FLOOR/CEIL/SIGN).
     if matches!(row[0], Value::Decimal(..)) {
@@ -1925,6 +2047,9 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
         }
     }
     match func {
+        // Not strict, so this only runs for a function reached through a path
+        // that skipped `apply_scalar_loose`.
+        ScalarFunc::ArrayValue => apply_scalar_loose(func, dtype, row),
         ScalarFunc::Abs => match &row[0] {
             Value::Integer(i) => i
                 .checked_abs()
@@ -1962,7 +2087,19 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
         },
         ScalarFunc::Length => match &row[0] {
             Value::Varchar(s) => Ok(Value::Integer(s.chars().count() as i32)),
+            Value::Array(a) => Ok(Value::Integer(a.len() as i32)),
             v => Err(PinkDbError::Execution(format!("length of {v}"))),
+        },
+        ScalarFunc::ArrayLength => match &row[0] {
+            Value::Array(a) => Ok(Value::Integer(a.len() as i32)),
+            v => Err(PinkDbError::Execution(format!("array_length of {v}"))),
+        },
+        ScalarFunc::ArrayExtract => match &row[0] {
+            Value::Array(a) => Ok(match array_index(&row[1])? {
+                Some(i) => a.elem_at(i),
+                None => Value::Null,
+            }),
+            v => Err(PinkDbError::Execution(format!("array_extract of {v}"))),
         },
         ScalarFunc::Year | ScalarFunc::Month | ScalarFunc::Day => {
             let days = match &row[0] {
@@ -2548,6 +2685,8 @@ fn cast_out_of_range(v: &Value, target: DataType) -> PinkDbError {
 pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
     match (v, target) {
         (v, t) if v.data_type() == Some(t) => Ok(v),
+        // A NULL literal has no type of its own, so it casts to anything.
+        (Value::Null, _) => Ok(Value::Null),
         // Every value becomes a VARIANT (VARCHAR parses as JSON text), and a
         // VARIANT converts to whatever kind its target can read — a kind
         // mismatch is an error here, which TRY_CAST turns into NULL.
@@ -2671,6 +2810,25 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
                 micros: iv.micros,
             })
             .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS INTERVAL"))),
+        // ARRAY → ARRAY: the length is part of the type, so it must match;
+        // the element tower is free, which is how an `INTEGER[3]` literal
+        // lands in a `DOUBLE[3]` column.
+        (Value::Array(a), DataType::Array { elem, len }) => {
+            if a.len() != len as usize {
+                return Err(PinkDbError::Execution(format!(
+                    "cannot CAST {} AS {}: the array size is part of the type, so it must match",
+                    a.dtype(),
+                    DataType::Array { elem, len }
+                )));
+            }
+            a.cast_to(elem)
+                .map(|v| Value::Array(std::sync::Arc::new(v)))
+        }
+        // VARCHAR → ARRAY: the `[1.0, 2.0]` text form, exact length.
+        (Value::Varchar(s), DataType::Array { elem, len }) => {
+            crate::array::ArrayValue::parse(&s, elem, len)
+                .map(|v| Value::Array(std::sync::Arc::new(v)))
+        }
         (v, t) => Err(PinkDbError::Execution(format!("cannot CAST {v} AS {t}"))),
     }
 }

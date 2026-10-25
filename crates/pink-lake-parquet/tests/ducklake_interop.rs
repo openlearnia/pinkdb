@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pink_lake::{Commit, Lake};
 use pink_lake_parquet::{FORMAT_ID, register};
-use pinkdb::{DataTable, DataType, PinkDb, QueryResult, Value};
+use pinkdb::{ArrayElem, DataTable, DataType, PinkDb, QueryResult, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -750,6 +750,309 @@ fn a_duckdb_catalog_with_parquet_deletes_opens() {
         991
     );
     drop(latest);
+
+    cleanup(&dir);
+}
+
+/// A `DOUBLE[3]` column a Parquet lake holds survives DuckDB attaching the
+/// lake: DuckLake has no fixed-size list type, so the catalog records the
+/// column as a `list` plus a child `element` column (exactly what DuckDB
+/// writes for its own `INTEGER[]`) and the Parquet file holds the three-level
+/// list group.
+///
+/// DuckDB's DuckLake reader finds those columns *by field id* (`field_id` in
+/// the Parquet schema; DuckDB's own lake files carry the `ducklake_column`
+/// id there), so a pinkdb data file has to record them — see
+/// `crate::metadata::store::planned_field_ids`. Without the ids DuckDB typed
+/// the column `double[]` but read NULL for every element.
+#[test]
+fn duckdb_reads_pinkdb_array_columns_through_the_lake() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+
+    let dir = scratch("pink-array");
+    let catalog_path = dir.join("catalog.db");
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let data = dir.join("data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(0);
+
+    let mut store = PinkDb::new();
+    store
+        .execute("CREATE TABLE main.t (id INTEGER, v DOUBLE[3]);")
+        .unwrap();
+    for (id, array) in [
+        (1, Some(vec![1.0, 2.0, 3.0])),
+        (2, None),
+        (3, Some(vec![-0.5, 0.0, 0.5])),
+    ] {
+        let value = match array {
+            Some(values) => Value::Array(Arc::new(
+                pinkdb::array::ArrayValue::from_values(
+                    ArrayElem::Double,
+                    3,
+                    &values.into_iter().map(Value::Double).collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            )),
+            None => Value::Null,
+        };
+        store
+            .table_mut_in("main", "t")
+            .unwrap()
+            .append_row(vec![Value::Integer(id), value])
+            .unwrap();
+    }
+    assert_eq!(lake.write_from_store(&store).unwrap(), 2);
+    drop(lake);
+
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH 'ducklake:sqlite:{}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n\
+         SELECT id, v IS NULL, CAST(v[1] AS DOUBLE), CAST(v[3] AS DOUBLE) FROM l.t ORDER BY id;\n\
+         SELECT count(*) FROM l.t WHERE CAST(v[2] AS DOUBLE) = 0.0;\n",
+        catalog_path.display(),
+        data.display()
+    );
+    let rows = match run_duckdb(&binary, &script) {
+        Ok(rows) => rows,
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip DuckDB interop test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    };
+    assert_eq!(
+        rows,
+        vec![
+            "1,false,1.0,3.0".to_string(),
+            "2,true,NULL,NULL".to_string(),
+            "3,false,-0.5,0.5".to_string(),
+            "1".to_string(),
+        ],
+        "DuckDB reading a pinkdb ARRAY column through the lake"
+    );
+
+    cleanup(&dir);
+}
+
+/// The lake itself holds the vectors exactly: reopening the lake pinkdb wrote
+/// rebuilds `DOUBLE[3]` (from the `pinkdb_column` side row, since the DuckLake
+/// type name is only `list`) and reads every element back.
+#[test]
+fn a_pinkdb_lake_round_trips_array_columns() {
+    let dir = scratch("pink-array-round-trip");
+    let catalog_path = dir.join("catalog.db");
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let data = dir.join("data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(0);
+
+    let mut store = PinkDb::new();
+    store
+        .execute("CREATE TABLE main.t (id INTEGER, v DOUBLE[3]);")
+        .unwrap();
+    for (id, array) in [
+        (1, Some(vec![1.0, 2.0, 3.0])),
+        (2, None),
+        (3, Some(vec![-0.5, 0.0, 0.5])),
+    ] {
+        let value = match array {
+            Some(values) => Value::Array(Arc::new(
+                pinkdb::array::ArrayValue::from_values(
+                    ArrayElem::Double,
+                    3,
+                    &values.into_iter().map(Value::Double).collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            )),
+            None => Value::Null,
+        };
+        store
+            .table_mut_in("main", "t")
+            .unwrap()
+            .append_row(vec![Value::Integer(id), value])
+            .unwrap();
+    }
+    lake.write_from_store(&store).unwrap();
+    drop(lake);
+
+    let mut lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
+    let mut db = lake.load(None).unwrap();
+    assert_eq!(
+        query(&mut db, "SELECT typeof(v) FROM t LIMIT 1")[0][0].to_string(),
+        "DOUBLE[3]"
+    );
+    assert_eq!(count(&mut db, "SELECT sum(len(v)) FROM t"), 6);
+    assert_eq!(
+        query(&mut db, "SELECT v FROM t WHERE id = 3")[0][0].to_string(),
+        "[-0.5, 0.0, 0.5]"
+    );
+    cleanup(&dir);
+}
+
+/// `field_id`s stay right after pinkdb alters the table: a column added later
+/// takes the next catalog id (its ARRAY child one more), and a dropped one
+/// leaves its id behind, so DuckDB still finds both array columns.
+#[test]
+fn duckdb_reads_arrays_after_pinkdb_added_and_dropped_columns() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("pink-array-alter");
+    let catalog_path = dir.join("catalog.db");
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let data = dir.join("data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(0);
+
+    let doubles = |values: &[f64]| {
+        Value::Array(Arc::new(
+            pinkdb::array::ArrayValue::from_values(
+                ArrayElem::Double,
+                3,
+                &values
+                    .iter()
+                    .copied()
+                    .map(Value::Double)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        ))
+    };
+    let floats = |values: &[f32]| {
+        Value::Array(Arc::new(
+            pinkdb::array::ArrayValue::from_values(
+                ArrayElem::Float,
+                3,
+                &values
+                    .iter()
+                    .copied()
+                    .map(|x| Value::Double(f64::from(x)))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        ))
+    };
+    let mut store = PinkDb::new();
+    store
+        .execute("CREATE TABLE main.t (id INTEGER, s VARCHAR, v DOUBLE[3]);")
+        .unwrap();
+    for (id, s, v) in [
+        (1, Some("a"), Some([1.0, 2.0, 3.0])),
+        (2, None, None),
+        (3, Some("c"), Some([-0.5, 0.0, 0.5])),
+    ] {
+        store
+            .table_mut_in("main", "t")
+            .unwrap()
+            .append_row(vec![
+                Value::Integer(id),
+                s.map(|s| Value::Varchar(s.to_string()))
+                    .unwrap_or(Value::Null),
+                v.map(|v| doubles(&v)).unwrap_or(Value::Null),
+            ])
+            .unwrap();
+    }
+    lake.write_from_store(&store).unwrap();
+
+    // A later version adds a 4-byte vector column and drops the VARCHAR one.
+    store
+        .execute("ALTER TABLE main.t ADD COLUMN f FLOAT[3];")
+        .unwrap();
+    store.execute("ALTER TABLE main.t DROP COLUMN s;").unwrap();
+    store
+        .table_mut_in("main", "t")
+        .unwrap()
+        .append_row(vec![
+            Value::Integer(4),
+            doubles(&[9.0, 8.0, 7.0]),
+            floats(&[0.5, -0.5, 1.5]),
+        ])
+        .unwrap();
+    lake.write_from_store(&store).unwrap();
+    drop(lake);
+
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH 'ducklake:sqlite:{}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n\
+         SELECT id, CAST(v[1] AS DOUBLE), CAST(v[3] AS DOUBLE), f IS NULL, \
+                CAST(f[2] AS DOUBLE) FROM l.t ORDER BY id;\n",
+        catalog_path.display(),
+        data.display()
+    );
+    let rows = match run_duckdb(&binary, &script) {
+        Ok(rows) => rows,
+        Err(message) if message.contains("xtension") => {
+            println!("skip DuckDB interop test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    };
+    assert_eq!(
+        rows,
+        vec![
+            "1,1.0,3.0,true,NULL".to_string(),
+            "2,NULL,NULL,true,NULL".to_string(),
+            "3,-0.5,0.5,true,NULL".to_string(),
+            "4,9.0,7.0,false,-0.5".to_string(),
+        ],
+        "DuckDB after pinkdb added and dropped columns"
+    );
+    cleanup(&dir);
+}
+
+/// The other direction: a lake DuckDB wrote. DuckDB cannot create a
+/// fixed-size ARRAY column in DuckLake at all ("unsupported type FLOAT[3]"),
+/// so the closest it can write is a variable-length LIST. Pink attaches such
+/// a lake but refuses to read the column, naming the wave that adds LIST
+/// support — never a silently wrong ARRAY.
+#[test]
+fn a_duckdb_list_column_is_refused_with_the_followup_wave() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    let dir = scratch("duckdb-list");
+    let catalog_path = dir.join("catalog.db");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH 'ducklake:sqlite:{}' AS d (DATA_PATH '{}');\n\
+         CREATE TABLE d.li (id INTEGER, v INTEGER[]);\n\
+         INSERT INTO d.li VALUES (1, [1, 2, 3]), (2, NULL);\n",
+        catalog_path.display(),
+        data.display()
+    );
+    if let Err(message) = run_duckdb(&binary, &script) {
+        if message.contains("extension") || message.contains("Extension") {
+            println!("skip DuckDB interop test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        panic!("{message}");
+    }
+
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let mut lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
+    let error = lake
+        .load(None)
+        .err()
+        .expect("a variable-length LIST column must not load as an ARRAY");
+    let text = error.to_string();
+    assert!(
+        text.contains("107a2"),
+        "the refusal must name the follow-up wave: {text}"
+    );
 
     cleanup(&dir);
 }

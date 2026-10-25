@@ -411,6 +411,168 @@ against 0.166/0.066 s for the build before this wave).
 
 A `.pink` lake data file round-trips a `VARIANT` column.
 
+### ARRAY (wave 107a)
+
+A fixed-size `ARRAY` column stores N numeric values per row: `FLOAT[768]`,
+`DOUBLE[1536]`, `INTEGER[4]`, `BIGINT[2]` — the type vector storage needs.
+`FLOAT[N]` is a real 4-byte element kind (an embedding column costs 4 bytes
+per element), and `a[i]` widens it to `DOUBLE`.
+
+```sql
+CREATE TABLE docs (id INTEGER, v DOUBLE[3]);
+INSERT INTO docs VALUES (1, [1.0, 2.0, 3.0]), (2, NULL), (3, '[1.5, NULL, 3.5]');
+SELECT typeof(v), v[2], len(v) FROM docs;      -- DOUBLE[3], 2.0, 3
+SELECT id FROM docs ORDER BY v DESC;           -- lexicographic, NULL array last
+```
+
+Values are stored columnar: one flat buffer of `rows × N` elements plus a row
+bitmap, and an element bitmap that exists only when some row has a `NULL`
+element — a 768-d embedding costs no per-row allocation. `[a, b, c]` and
+`array_value(…)` are the same per-row constructor (any expressions, columns
+included) and infer the element type with the numeric tower (`[1, 2.5]` is a
+`DOUBLE[2]`). Element access `a[i]` and `array_extract` are 1-based and
+forgiving like DuckDB (out of range, `NULL` index, `NULL` array and `NULL`
+element are all `NULL`); `len`/`array_length` report `N`. Casts run
+`VARCHAR ↔ ARRAY`, `ARRAY ↔ ARRAY` at the same length, `ARRAY ↔ VARIANT`, plus
+`TRY_CAST`.
+
+One comparator serves everything: structural equality (across element types and
+with `NULL` elements), element-wise lexicographic order with a `NULL` element
+after every value and a `NULL` array last, and a canonical hash key for
+`GROUP BY`/`DISTINCT`/joins that folds `-0.0`/`0.0` and every `NaN`. The
+binder refuses a comparison between different lengths — the size is part of
+the type.
+
+`.pink` gained dtype tag 10, default-value tag 10 and page-encoding tag 11
+(row-major or byte-planed, whichever is smaller, behind the existing LZ frame;
+no min/max statistics, only the null count). 100k × 768 pseudo-random `DOUBLE`
+rows insert in 0.31 s, scan in 0.31 s and occupy 585 MiB — exactly 8 bytes per
+element, so incompressible vectors are stored at raw size (structured data
+still compresses: `sin` values 108×, a constant column 253×). The wire is
+protocol v13; the C ABI exposes `PINKDB_TYPE_ARRAY` (element count packed into
+the type tag, raw little-endian `f64` elements, `DOUBLE[N]` only, no `NULL`
+elements), and the bindings hand over a Node `Float64Array`, a Python
+`list[float]` and a Go `[]float64`. Extension ABI **minor 5** adds
+`ExtType::ArrayDouble` — a borrowed pointer-plus-length view of the engine's
+element buffer with no per-element boxing — which the `vss` and `embeddings`
+extensions use.
+
+Parquet uses DuckDB 2.0's three-level `LIST` group in both directions (DuckDB
+reads our files, we read its `FLOAT[3]`/`INTEGER[3]` files), with the length in
+a `pinkdb.array.<column>` key-value entry and an `f32` element leaf for
+`FLOAT[N]`; a variable-length list is refused with a message naming wave 107a2.
+`.pink` lake data files round-trip the column and the DuckLake catalog records
+it the way DuckDB records a nested type (a `list` parent row plus an `element`
+child row). Lake data files stamp `field_id = ducklake_column.column_id` on
+every top-level column and on the ARRAY child, which is what DuckDB's DuckLake
+reader matches nested fields by, so DuckDB reads exact vector values through a
+pinkdb lake — including after pinkdb added or dropped a column. Standalone
+`COPY … TO` writes no ids. TPC-H Q1/Q6 are unchanged and the binaries grew
+1.1–1.6%.
+
+### ARRAY, fixed-size vectors (wave 107a)
+
+A fixed-size `ARRAY` column stores N values of one numeric element type per
+row: `FLOAT[768]`, `DOUBLE[1536]`, `INTEGER[4]`, `BIGINT[2]`. It is the engine
+prerequisite for vector storage — a 768-d or 1536-d embedding is one flat
+buffer of `rows × N` elements (4 bytes each for `FLOAT`), never a heap
+allocation per row — and the type an extension (`vss`, `embeddings`, waves
+107b/107c) takes and returns.
+
+```sql
+CREATE TABLE docs (id INTEGER, v DOUBLE[3]);
+INSERT INTO docs VALUES (1, [1.0, 2.0, 3.0]), (2, [0.5, 2.0, 3.0]), (3, NULL);
+INSERT INTO docs VALUES (4, '[1.5, NULL, 3.5]');   -- VARCHAR parses
+SELECT typeof(v) FROM docs LIMIT 1;                -- DOUBLE[3]
+SELECT v[2], array_extract(v, 2), len(v), array_length(v) FROM docs;
+SELECT array_value(id, id + 1, -7) FROM docs;      -- per row, any expressions
+SELECT id FROM docs ORDER BY v LIMIT 2;            -- lexicographic
+SELECT v[1] FROM docs WHERE v = [1.0, 2.0, 3.0];   -- structural equality
+```
+
+`FLOAT[N]` stores 32-bit floats (`REAL[N]` too) and `DOUBLE[N]` stores 64-bit
+ones; pinkdb has no `FLOAT` *scalar*, so an element read widens to `DOUBLE` —
+the one deliberate difference from DuckDB, which returns a `FLOAT`. The
+DOUBLE→FLOAT cast follows DuckDB 2.0: round to nearest, a finite value that
+would become infinite is an error ("out of range for FLOAT"), underflow is
+silent, and the text path parses straight to f32 (`'1e40'` is `inf`).
+`INTEGER[N]` and `BIGINT[N]` come free with the same machinery.
+
+* **Literals.** `[a, b, c]` and `array_value(a, b, c)` build the array per row
+  from any expression — columns included — and infer the element type with the
+  numeric tower: all-`INTEGER` is `INTEGER[N]`, a `BIGINT` or `DECIMAL` element
+  widens to `BIGINT[N]`/`DOUBLE[N]`, and any `DOUBLE` makes it `DOUBLE[N]`. A
+  `NULL` element is allowed and is stored in a row-level element bitmap that
+  exists only when some row has one. An empty or all-`NULL` literal needs a
+  target type (`[CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE)]`).
+* **Element access** `a[i]` and `array_extract(a, i)` are 1-based; an index
+  outside `1..=N`, a `NULL` index, a `NULL` array and a `NULL` element all
+  return `NULL` (DuckDB's forgiving behaviour) rather than an error.
+  `len(a)` / `array_length(a)` report `N`, `NULL` for a `NULL` array.
+* **Casts.** `VARCHAR ↔ ARRAY` (`'[1.5, NULL]'` round-trips, a wrong element
+  count or a bad element is a clear error), `ARRAY ↔ ARRAY` between element
+  types at the **same** length (`INTEGER[3] → DOUBLE[3]`; `DOUBLE[3] → DOUBLE[4]`
+  is `cannot CAST … : the array size is part of the type`), `ARRAY ↔ VARIANT`
+  (a VARIANT array of the exact length), and `TRY_CAST`.
+* **Semantics.** Equality is structural and compares elements by value across
+  element types (`DOUBLE[3]` = `INTEGER[3]`), including `NULL` elements: two
+  `NULL`s at the same position are equal, and `a = b` is not three-valued for
+  them. One total order serves `ORDER BY`/`MIN`/`MAX`: element-wise, a `NULL`
+  element sorting after every value at that position; SQL `NULL` (the whole
+  array) sorts last, like every other nullable column. `GROUP BY`/`DISTINCT`/
+  join keys hash a canonical key that agrees with `=` by construction, so
+  `-0.0`/`0.0` and every `NaN` fold together.
+* **Persistence and encodings.** `.pink` gained dtype tag 10 (element kind +
+  length), default-value tag 10, and *page* encoding tag 11: a
+  `rows | layout | element bitmap | values` payload in row-major or
+  byte-planed order (whichever is smaller) behind the existing LZ frame. On
+  100k × 768 pseudo-random `DOUBLE` rows — nothing to compress, an
+  embedding-like table — insert and scan take 0.31 s each in a release build
+  and the file is 585 MiB, i.e. exactly 8 bytes per element with no overhead;
+  the same rows as `FLOAT` take 292 MiB, exactly 4 bytes per element.
+  Structured values still compress (`sin` data 108×, a constant column 253×).
+  A `NULL` array is written as zeroed elements plus the row bitmap, so pages
+  are deterministic. WAL replay logs a `CAST('[..]' AS DOUBLE[N])` literal, and
+  asynchronous column statistics carry no min/max for an `ARRAY` (an
+  element-wise bound would not be a bound) — only the null count, exactly like
+  `VARIANT`.
+* **Boundaries.** Wire protocol v13 gained value tag 11 (the same payload the
+  page uses) and dtype tag 10 (`u8` element kind + `u32` length); the C ABI
+  exposes `PINKDB_TYPE_ARRAY` (`N × 8` bytes of `f64`) and
+  `PINKDB_TYPE_ARRAY_FLOAT` (`N × 4` bytes of `f32`), each with the packed
+  element count in the tag and no `NULL` elements (there is no per-element
+  NULL channel in the ABI); the Node binding hands a
+  `Float32Array`/`Float64Array`, Python a `list[float]`, Go a
+  `[]float32`/`[]float64`. The extension ABI (minor 5) added
+  `ExtType::ArrayFloat` and `ExtType::ArrayDouble`: an argument is a borrowed
+  `(const T* pointer, length)` view of the engine's own element buffer, a
+  result allocates `len * sizeof(T)` bytes through the host's allocator, and
+  the type tag packs `N` above the type byte so an extension can declare
+  `FLOAT[3]` as a signature.
+* **Parquet and lakes.** A `DOUBLE[N]` column writes DuckDB 2.0's three-level
+  `LIST` group (`v` OPTIONAL LIST → `list` REPEATED → `element` OPTIONAL), one
+  element slot per row and exactly N slots per row, with a
+  `pinkdb.array.<column>` key-value entry carrying the length (a LIST group has
+  no length of its own), and an `f32` element leaf for `FLOAT[N]` (an `f64` one
+  for `DOUBLE[N]`). DuckDB reads our files and we read its `FLOAT[3]`/
+  `INTEGER[3]` files; a *variable-length* list cannot be read back as an
+  `ARRAY` and is refused with a `wave 107a2` message instead of a wrong answer.
+  `.pink` lake data files round-trip the column, and the DuckLake catalog
+  records it the way DuckDB records a nested type: a parent row with
+  `column_type = 'list'` and a child row named `element` with `parent_column`,
+  while the real `DOUBLE[3]` lives in the `pinkdb_column` side row. DuckDB
+  itself cannot *create* an `ARRAY` column in DuckLake (`Failed to convert
+  DuckDB type to DuckLake - unsupported type FLOAT[3]`), but its DuckLake
+  reader maps data-file fields by `field_id = ducklake_column.column_id`, so
+  pinkdb's lake data files stamp exactly those ids (top-level columns and the
+  ARRAY child alike) and DuckDB reads the vectors through our lake — including
+  after pinkdb added or dropped a column on the same table. Standalone
+  `COPY … TO 'x.parquet'` files carry no ids, as DuckDB's own do not.
+
+A variable-length `LIST` (`T[]`), `unnest`, slicing and the DuckDB functions
+that build arrays from grouped rows are **not** in 107a: a `T[]` type is a
+parse error that names wave 107a2.
+
 ### Browser playground
 
 The docs site's **Playground** page (wave 85) runs the real engine compiled

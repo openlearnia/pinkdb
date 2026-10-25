@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pink_lake::format::{PINK_FORMAT_ID, lake_format};
 use pink_lake::{Commit, Lake};
-use pinkdb::{DataTable, DataType, PinkDb, QueryResult, Value};
+use pinkdb::{ArrayElem, DataTable, DataType, PinkDb, QueryResult, Value};
 
 /// What one provider is allowed to refuse.
 #[derive(Debug, Clone, Default)]
@@ -115,6 +115,27 @@ fn engine_types() -> Vec<(String, DataType)> {
         ),
         ("iv", DataType::Interval),
         ("vr", DataType::Variant),
+        (
+            "ar",
+            DataType::Array {
+                elem: ArrayElem::Double,
+                len: 3,
+            },
+        ),
+        (
+            "af",
+            DataType::Array {
+                elem: ArrayElem::Float,
+                len: 3,
+            },
+        ),
+        (
+            "ai",
+            DataType::Array {
+                elem: ArrayElem::Integer,
+                len: 2,
+            },
+        ),
     ])
 }
 
@@ -266,6 +287,39 @@ fn special_values(dtype: DataType) -> Vec<Value> {
                 micros: 1,
             },
         ],
+        DataType::Array { elem, len } => (0..8)
+            .map(|k| {
+                if k == 2 || k == 5 {
+                    return Value::Null;
+                }
+                let values: Vec<Value> = (0..len)
+                    .map(|j| match (elem, k, j) {
+                        // Row 3 carries one NULL element.
+                        (_, 3, 0) => Value::Null,
+                        (ArrayElem::Integer, 0, _) => Value::Integer(i32::MIN),
+                        (ArrayElem::Integer, 1, _) => Value::Integer(i32::MAX),
+                        (ArrayElem::Integer, _, j) => Value::Integer(k * 100 + j as i32),
+                        (ArrayElem::Bigint, 0, _) => Value::Bigint(i64::MIN),
+                        (ArrayElem::Bigint, 1, _) => Value::Bigint(i64::MAX),
+                        (ArrayElem::Bigint, _, j) => {
+                            Value::Bigint(-((k as i64) * 1_000_003 + j as i64))
+                        }
+                        (ArrayElem::Double, 0, _) => Value::Double(-0.0),
+                        (ArrayElem::Double, 1, _) => Value::Double(f64::MAX),
+                        (ArrayElem::Double, _, j) => Value::Double(k as f64 / 4.0 + j as f64),
+                        (ArrayElem::Float, 0, _) => Value::Double(-0.0),
+                        (ArrayElem::Float, 1, _) => Value::Double(f64::from(f32::MAX)),
+                        (ArrayElem::Float, _, j) => {
+                            Value::Double(f64::from(k as f32 / 4.0 + j as f32))
+                        }
+                    })
+                    .collect();
+                Value::Array(Arc::new(
+                    pinkdb::array::ArrayValue::from_values(elem, len, &values)
+                        .expect("an array of the declared length"),
+                ))
+            })
+            .collect(),
     }
 }
 
@@ -335,6 +389,17 @@ fn sample_value(dtype: DataType) -> Value {
             days: 2,
             micros: 3,
         },
+        DataType::Array { elem, len } => {
+            let one = match elem {
+                ArrayElem::Integer => Value::Integer(1),
+                ArrayElem::Bigint => Value::Bigint(1),
+                ArrayElem::Double | ArrayElem::Float => Value::Double(1.5),
+            };
+            Value::Array(Arc::new(
+                pinkdb::array::ArrayValue::from_values(elem, len, &vec![one; len as usize])
+                    .expect("an array of the declared length"),
+            ))
+        }
         DataType::Variant => Value::Variant(Arc::new(
             pinkdb::variant::from_json_str("\"blocked\"").expect("valid JSON"),
         )),
@@ -413,6 +478,13 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         // bit-exact, so -0.0 keeps its sign and is distinct from 0.0.
         (Value::Double(x), Value::Double(y)) => {
             (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
+        }
+        // Element-wise, with NaN elements equal to each other and NULL
+        // elements equal to NULL elements (the engine's own ordering).
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len()
+                && x.elem == y.elem
+                && pinkdb::array::ArrayValue::compare(x, y).is_eq()
         }
         _ => a == b,
     }

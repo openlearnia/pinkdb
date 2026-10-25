@@ -530,3 +530,213 @@ fn profiling_is_per_handle() {
     pinkdb_close(profiled);
     pinkdb_close(plain);
 }
+
+/// Run a statement that is expected to fail: its error message and class.
+fn exec_err(h: *mut PinkHandle, sql: &str) -> (String, String) {
+    let c = CString::new(sql).unwrap();
+    let r = pinkdb_execute(h, c.as_ptr(), sql.len());
+    assert!(r.is_null(), "expected an error for {sql:?}");
+    (last_error(), last_error_class())
+}
+
+/// The `f64` elements of an ARRAY cell.
+fn floats(v: &PinkValue) -> Vec<f64> {
+    assert_eq!(
+        v.type_tag & 0xff,
+        PINKDB_TYPE_ARRAY,
+        "not an ARRAY cell: {}",
+        v.type_tag
+    );
+    let bytes = unsafe { std::slice::from_raw_parts(v.text_ptr as *const u8, v.text_len) };
+    bytes
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+        .collect()
+}
+
+fn floats32(v: &PinkValue) -> Vec<f32> {
+    assert_eq!(
+        v.type_tag & 0xff,
+        PINKDB_TYPE_ARRAY_FLOAT,
+        "not a FLOAT ARRAY cell: {}",
+        v.type_tag
+    );
+    let bytes = unsafe { std::slice::from_raw_parts(v.text_ptr as *const u8, v.text_len) };
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// A `FLOAT[N]` cell is the 4-byte counterpart: tag 12 carries the length and
+/// the payload is N little-endian `f32`s — half the bytes of a DOUBLE array.
+#[test]
+fn float_arrays_cross_the_c_abi_as_f32_payloads() {
+    let h = pinkdb_open_memory();
+    assert!(!h.is_null());
+    pinkdb_result_free(exec(h, "CREATE TABLE t(id INTEGER, v FLOAT[2]);"));
+    pinkdb_result_free(exec(
+        h,
+        "INSERT INTO t VALUES (1, [1.5, -0.25]), (2, NULL);",
+    ));
+    let r = exec(
+        h,
+        "SELECT v, v[1], len(v), CAST('[0.1]' AS FLOAT[1])[1] FROM t ORDER BY id;",
+    );
+    assert!(!r.is_null());
+    assert_eq!(pinkdb_result_column_type(r, 0, 0), float_array_tag(2));
+    assert_eq!(array_tag_len(pinkdb_result_column_type(r, 0, 0)), 2);
+    let cell = pinkdb_result_value(r, 0, 0, 0);
+    assert_eq!(cell.type_tag, float_array_tag(2));
+    assert_eq!(cell.int64, 2, "the element count rides int64");
+    assert_eq!(cell.text_len, 8, "two 4-byte elements");
+    assert_eq!(floats32(&cell), vec![1.5f32, -0.25]);
+    // A scalar element still widens to DOUBLE, exactly.
+    let element = pinkdb_result_value(r, 0, 0, 1);
+    assert_eq!(element.type_tag, PINKDB_TYPE_DOUBLE);
+    assert_eq!(element.double, 1.5);
+    // The f32 literal keeps its narrowed value.
+    let rounded = pinkdb_result_value(r, 0, 0, 3);
+    assert_eq!(rounded.double, f64::from(0.1f32));
+    // A NULL array carries no payload and no type.
+    let null = pinkdb_result_value(r, 0, 1, 0);
+    assert_eq!(null.type_tag, PINKDB_TYPE_NULL);
+    assert_eq!(null.is_null, 1);
+    // A bound FLOAT parameter round-trips through its payload.
+    let insert = CString::new("INSERT INTO t VALUES (?, ?);").unwrap();
+    let stmt = pinkdb_prepare(h, insert.as_ptr(), insert.as_bytes().len());
+    assert!(!stmt.is_null(), "{:?}", last_error());
+    assert_eq!(pinkdb_prepared_parameter_count(stmt), 2);
+    let raw: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+    let id = PinkValue {
+        type_tag: PINKDB_TYPE_INTEGER,
+        is_null: 0,
+        int64: 3,
+        double: 0.0,
+        text_ptr: ptr::null(),
+        text_len: 0,
+    };
+    let param = PinkValue {
+        type_tag: float_array_tag(2),
+        is_null: 0,
+        int64: 2,
+        double: 0.0,
+        text_ptr: raw.as_ptr() as *const c_char,
+        text_len: raw.len(),
+    };
+    let values = [id, param];
+    let ok = pinkdb_execute_prepared(h, stmt, values.as_ptr(), 2);
+    assert!(!ok.is_null(), "bound FLOAT[2] parameter: {}", last_error());
+    pinkdb_result_free(ok);
+    let r = exec(h, "SELECT v[2] FROM t WHERE id = 3;");
+    assert_eq!(pinkdb_result_value(r, 0, 0, 0).double, 2.0);
+    // A payload of the wrong width is refused.
+    let short = PinkValue {
+        type_tag: float_array_tag(2),
+        is_null: 0,
+        int64: 2,
+        double: 0.0,
+        text_ptr: raw.as_ptr() as *const c_char,
+        text_len: 4,
+    };
+    let values = [id, short];
+    let bad = pinkdb_execute_prepared(h, stmt, values.as_ptr(), 2);
+    assert!(bad.is_null());
+    assert!(last_error().contains("payload"), "{}", last_error());
+    pinkdb_result_free(r);
+    pinkdb_close(h);
+}
+
+/// ARRAY values cross as one contiguous payload: the length rides in the tag
+/// and the elements are little-endian `f64` bytes, so no per-element boxing.
+#[test]
+fn arrays_cross_the_c_abi_as_double_payloads() {
+    let h = pinkdb_open_memory();
+    assert!(!h.is_null());
+    pinkdb_result_free(exec(h, "CREATE TABLE t(id INTEGER, v DOUBLE[3]);"));
+    pinkdb_result_free(exec(
+        h,
+        "INSERT INTO t VALUES (1, [1.5, -0.0, 2.0]), (2, NULL), (3, [4.0, 5.0, 6.0]);",
+    ));
+
+    let r = exec(h, "SELECT id, v, v[2], len(v) FROM t ORDER BY id;");
+    let column = pinkdb_result_column_type(r, 0, 1);
+    assert_eq!(column, array_tag(3));
+    assert_eq!(array_tag_len(column), 3);
+
+    let v = pinkdb_result_value(r, 0, 0, 1);
+    assert_eq!((v.type_tag, v.int64), (array_tag(3), 3));
+    let got = floats(&v);
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[0], 1.5);
+    assert_eq!(got[1].to_bits(), (-0.0f64).to_bits(), "-0.0 keeps its bits");
+    assert_eq!(got[2], 2.0);
+    // Element access and length are ordinary scalars next to the array.
+    let v = pinkdb_result_value(r, 0, 0, 2);
+    assert_eq!(
+        (v.type_tag, v.double.to_bits()),
+        (PINKDB_TYPE_DOUBLE, (-0.0f64).to_bits())
+    );
+    let v = pinkdb_result_value(r, 0, 0, 3);
+    assert_eq!((v.type_tag, v.int64), (PINKDB_TYPE_INTEGER, 3));
+
+    // A NULL cell has no value tag of its own (the column type does), and a
+    // NULL array carries no payload.
+    let v = pinkdb_result_value(r, 0, 1, 1);
+    assert_eq!(
+        (v.type_tag, v.is_null, v.text_len),
+        (PINKDB_TYPE_NULL, 1, 0)
+    );
+    let v = pinkdb_result_value(r, 0, 1, 3);
+    assert_eq!((v.type_tag, v.is_null), (PINKDB_TYPE_NULL, 1));
+
+    // A NULL element has no channel, and an INTEGER array has no payload: both
+    // are refused with a type error instead of being guessed at.
+    let (msg, class) = exec_err(h, "SELECT [1, 2, 3];");
+    assert_eq!(class, "type", "{msg}");
+    assert!(msg.contains("only FLOAT and DOUBLE arrays"), "{msg}");
+    let (msg, class) = exec_err(h, "SELECT CAST('[1.0, NULL, 3.0]' AS DOUBLE[3]);");
+    assert_eq!(class, "type", "{msg}");
+    assert!(msg.contains("NULL element"), "{msg}");
+    pinkdb_result_free(r);
+
+    // A bound parameter rebuilds the value from the packed tag alone.
+    let sql = CString::new("INSERT INTO t VALUES (4, ?);").unwrap();
+    let prep = pinkdb_prepare(h, sql.as_ptr(), sql.as_bytes().len());
+    assert!(!prep.is_null(), "{:?}", last_error());
+    let bytes: Vec<u8> = [7.0f64, 8.0, 9.0]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let param = PinkValue {
+        type_tag: array_tag(3),
+        is_null: 0,
+        int64: 3,
+        double: 0.0,
+        text_ptr: bytes.as_ptr() as *const c_char,
+        text_len: bytes.len(),
+    };
+    let r = pinkdb_execute_prepared(h, prep, &param, 1);
+    assert!(!r.is_null(), "{:?}", last_error());
+    pinkdb_result_free(r);
+    pinkdb_prepared_free(prep);
+
+    // A short payload is refused, not read past its end.
+    let prep = pinkdb_prepare(h, sql.as_ptr(), sql.as_bytes().len());
+    let short = PinkValue {
+        text_len: 16,
+        ..param
+    };
+    let r = pinkdb_execute_prepared(h, prep, &short, 1);
+    assert!(r.is_null(), "a short ARRAY payload must be refused");
+    assert!(last_error().contains("payload"), "{}", last_error());
+    pinkdb_prepared_free(prep);
+
+    let r = exec(h, "SELECT v FROM t WHERE id = 4;");
+    assert_eq!(
+        floats(&pinkdb_result_value(r, 0, 0, 0)),
+        vec![7.0, 8.0, 9.0]
+    );
+    pinkdb_result_free(r);
+    pinkdb_close(h);
+}

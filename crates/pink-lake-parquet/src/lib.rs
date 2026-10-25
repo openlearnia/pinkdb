@@ -235,6 +235,51 @@ impl LakeFormat for ParquetLakeFormat {
         })
     }
 
+    /// The lake's own writer: the same parquet encoding, with the catalog's
+    /// column ids stamped as `field_id`s so DuckLake readers find the
+    /// children of an ARRAY column.
+    fn write_streamed_with_fields(
+        &self,
+        db: &str,
+        table: &str,
+        src: &DataTable,
+        fields: &[pink_lake::format::FieldIds],
+        sink: &mut (dyn std::io::Write + Send),
+    ) -> Result<(
+        pinkdb::persist::SavedTableStats,
+        Option<pink_lake::format::FooterLocation>,
+    )> {
+        let ids: Vec<(i32, i32)> = fields
+            .iter()
+            .map(|f| {
+                (
+                    i32::try_from(f.column).unwrap_or(0),
+                    f.array_child
+                        .and_then(|child| i32::try_from(child).ok())
+                        .unwrap_or(0),
+                )
+            })
+            .collect();
+        let bytes =
+            pinkdb_parquet::write::write_table_with_identity_and_fields(src, db, table, &ids)
+                .map_err(|e| match e {
+                    pinkdb_parquet::write::WriteError::UnsupportedType { .. } => {
+                        LakeError::NotRepresentable {
+                            message: e.to_string(),
+                        }
+                    }
+                    other => LakeError::Engine {
+                        context: format!("encoding table \"{db}.{table}\" as parquet"),
+                        source: PinkDbError::Execution(other.to_string()),
+                    },
+                })?;
+        sink.write_all(&bytes).map_err(|e| LakeError::Io {
+            context: format!("writing the data file of \"{db}.{table}\""),
+            source: e,
+        })?;
+        Ok((pinkdb::persist::table_stats(db, table, src), None))
+    }
+
     fn read(&self, file: &DataFile<'_>) -> Result<PinkDb> {
         // A local plaintext file keeps its path-based reader (one open, one
         // positioned read stream — the pre-98b behavior, no regression).

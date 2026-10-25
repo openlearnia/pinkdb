@@ -426,6 +426,11 @@ pub(crate) fn dtype_name(dtype: DataType) -> String {
     if let DataType::Decimal { precision, scale } = dtype {
         return format!("decimal({precision},{scale})");
     }
+    // An ARRAY has no lowercase spelling of its own; its display name is
+    // already unambiguous (`DOUBLE[3]`).
+    if dtype.is_array() {
+        return dtype.name().to_ascii_lowercase();
+    }
     match dtype {
         DataType::Boolean => "boolean",
         DataType::Integer => "integer",
@@ -436,7 +441,7 @@ pub(crate) fn dtype_name(dtype: DataType) -> String {
         DataType::Timestamp => "timestamp",
         DataType::Interval => "interval",
         DataType::Variant => "variant",
-        DataType::Decimal { .. } => unreachable!("handled above"),
+        DataType::Decimal { .. } | DataType::Array { .. } => unreachable!("handled above"),
     }
     .to_string()
 }
@@ -448,6 +453,9 @@ pub(crate) fn dtype_from_name(name: &str) -> Option<DataType> {
         let precision: u8 = p.parse().ok()?;
         let scale: u8 = s.parse().ok()?;
         return pinkdb::types::decimal_type(precision, scale);
+    }
+    if name.contains('[') {
+        return DataType::from_sql(&name.to_ascii_uppercase());
     }
     Some(match name {
         "boolean" => DataType::Boolean,
@@ -487,6 +495,13 @@ pub(crate) fn encode_value(dtype: DataType, v: &Value) -> Option<String> {
                 micros,
             },
         ) => pinkdb::types::format_interval(*months, *days, *micros),
+        // An ARRAY has no min/max, but an inlined row still carries the whole
+        // value: its display text is exact and `decode_value` reads it back.
+        (DataType::Array { elem, len }, Value::Array(a))
+            if a.elem == elem && a.len() == len as usize =>
+        {
+            a.text()
+        }
         _ => return None,
     })
 }
@@ -532,6 +547,9 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
         DataType::Variant => {
             return None;
         }
+        DataType::Array { elem, len } => Value::Array(std::sync::Arc::new(
+            pinkdb::array::ArrayValue::parse(s, elem, len).ok()?,
+        )),
     })
 }
 

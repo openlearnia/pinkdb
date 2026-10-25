@@ -1075,6 +1075,12 @@ fn field_value(text: &str, dtype: DataType) -> Result<Value> {
                 PinkDbError::Type(format!("cannot parse \"{text}\" as TIMESTAMP"))
             })?)
         }
+        // A CSV cell for an ARRAY column is the `[a, b]` text form (what
+        // CAST and SELECT print), so a CSV export/import round-trips.
+        DataType::Array { elem, len } => Value::Array(Arc::new(
+            crate::array::ArrayValue::parse(text, elem, len)
+                .map_err(|e| PinkDbError::Type(format!("cannot parse \"{text}\" as ARRAY: {e}")))?,
+        )),
         // A CSV cell for a VARIANT column is JSON text (what CAST and SELECT
         // print), so the round trip through a CSV export/import holds.
         DataType::Variant => {

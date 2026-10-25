@@ -2692,6 +2692,10 @@ fn encode_key(value: &Value, out: &mut Vec<u8>) {
             out.push(10);
             pinkdb::variant::encode(v, out);
         }
+        Value::Array(a) => {
+            out.push(11);
+            out.extend_from_slice(&pinkdb::array::encode_cell(a));
+        }
     }
 }
 

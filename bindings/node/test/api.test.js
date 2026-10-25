@@ -70,6 +70,42 @@ test('run reports a result per statement and query returns only rows', () => {
   }
 });
 
+test('a FLOAT array arrives as a Float32Array', () => {
+  const db = openMemory();
+  try {
+    const result = db.run(
+      "SELECT CAST('[1.5, -0.25, 3]' AS FLOAT[3]) AS v, " +
+        "CAST(NULL AS FLOAT[2]) AS n, len(CAST('[1, 2]' AS FLOAT[2])) AS l",
+    )[0];
+    assert.deepEqual(result.columnTypes, ['float[3]', 'float[2]', 'integer']);
+    const value = result.rows[0].v;
+    assert.ok(value instanceof Float32Array, `expected a Float32Array, got ${value}`);
+    assert.deepEqual(Array.from(value), [1.5, -0.25, 3]);
+    assert.equal(result.rows[0].n, null);
+    assert.equal(result.rows[0].l, 2);
+  } finally {
+    db.close();
+  }
+});
+
+test('a DOUBLE array arrives as a Float64Array', () => {
+  const db = openMemory();
+  try {
+    const result = db.run(
+      "SELECT CAST('[1.5, -0.25, 3]' AS DOUBLE[3]) AS v, " +
+        "CAST(NULL AS DOUBLE[2]) AS n, len(CAST('[1, 2]' AS DOUBLE[2])) AS l",
+    )[0];
+    assert.deepEqual(result.columnTypes, ['double[3]', 'double[2]', 'integer']);
+    const value = result.rows[0].v;
+    assert.ok(value instanceof Float64Array, `expected a Float64Array, got ${value}`);
+    assert.deepEqual(Array.from(value), [1.5, -0.25, 3]);
+    assert.equal(result.rows[0].n, null);
+    assert.equal(result.rows[0].l, 2);
+  } finally {
+    db.close();
+  }
+});
+
 test('prepared statements bind parameters and expose their count', () => {
   const db = openMemory();
   try {

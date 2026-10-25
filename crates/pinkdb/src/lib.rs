@@ -38,6 +38,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
 
 pub mod agent;
+pub mod array;
 pub mod attached;
 pub mod catalog_image;
 pub mod crypto;
@@ -124,7 +125,7 @@ pub use table_source::{
     TableFunctionArg, TableFunctionCall, TableScanOutput, TableSource, TableSourceStats,
 };
 pub use text::sanitize_terminal;
-pub use types::{DataType, PinkDbError, Result, Value};
+pub use types::{ArrayElem, DataType, PinkDbError, Result, Value};
 pub use vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 pub use wal::{
     DEFAULT_AUTO_CHECKPOINT_BYTES, DurableOpenOptions, LockMode, RecoveryInfo, SyncPolicy,

@@ -262,6 +262,12 @@ fn check_expr_positions(expr: &Expr) -> Result<()> {
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::TryCast { expr, .. } => check_expr_positions(expr),
+        Expr::ArrayLiteral(items) => {
+            for item in items {
+                check_expr_positions(item)?;
+            }
+            Ok(())
+        }
         Expr::Subscript { base, index } => {
             check_expr_positions(base)?;
             check_expr_positions(index)
@@ -343,6 +349,7 @@ fn expr_contains_parameter(expr: &Expr) -> bool {
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::TryCast { expr, .. } => expr_contains_parameter(expr),
+        Expr::ArrayLiteral(items) => items.iter().any(expr_contains_parameter),
         Expr::Subscript { base, index } => {
             expr_contains_parameter(base) || expr_contains_parameter(index)
         }
@@ -559,6 +566,11 @@ fn collect_expr_offsets(expr: &Expr, out: &mut Vec<usize>) {
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::TryCast { expr, .. } => collect_expr_offsets(expr, out),
+        Expr::ArrayLiteral(items) => {
+            for item in items {
+                collect_expr_offsets(item, out);
+            }
+        }
         Expr::Subscript { base, index } => {
             collect_expr_offsets(base, out);
             collect_expr_offsets(index, out);
@@ -753,6 +765,11 @@ fn apply_expr_ranks(expr: &mut Expr, offsets: &[usize]) {
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::TryCast { expr, .. } => apply_expr_ranks(expr, offsets),
+        Expr::ArrayLiteral(items) => {
+            for item in items {
+                apply_expr_ranks(item, offsets);
+            }
+        }
         Expr::Subscript { base, index } => {
             apply_expr_ranks(base, offsets);
             apply_expr_ranks(index, offsets);
@@ -1051,6 +1068,27 @@ fn negate_if(negated: bool, e: Expr) -> Expr {
 /// (see [`crate::sql::binder`]). Keeping the shape as the plain `row(...)`
 /// call means the AST needs no row variant and a stored view or macro body
 /// re-binds through the same rewrite.
+/// The type an optional `[N]` suffix makes of `base`: no suffix is `base`
+/// itself, a suffix is a fixed-size ARRAY over it.
+fn array_of(
+    word: Option<&str>,
+    base: DataType,
+    len: Option<u32>,
+) -> std::result::Result<DataType, &'static str> {
+    match len {
+        None => Ok(base),
+        Some(len) => {
+            // The spelling decides a float array's width: `FLOAT[3]` is 4-byte
+            // elements while the scalar `FLOAT` would be `DOUBLE`.
+            let elem = word
+                .and_then(crate::types::ArrayElem::from_sql)
+                .or_else(|| crate::types::ArrayElem::of(base))
+                .ok_or("ARRAY elements must be INTEGER, BIGINT, FLOAT or DOUBLE")?;
+            crate::types::array_type(elem, len).ok_or("array length")
+        }
+    }
+}
+
 fn row_ctor(args: Vec<Expr>) -> Expr {
     Expr::Function {
         name: "row".to_string(),
@@ -1874,11 +1912,27 @@ peg::parser! {
         /// keywords. DECIMAL/NUMERIC take an optional `(p)`/`(p,s)` parameter
         /// list (`DECIMAL` alone is `DECIMAL(18,3)`, DuckDB's default).
         rule type_name() -> DataType
-            = kw(Keyword::Date) { DataType::Date }
-            / kw(Keyword::Timestamp) { DataType::Timestamp }
-            / s:ident() p:type_params() {?
-                  DataType::from_sql_params(&s, &p).ok_or("known column type")
+            = kw(Keyword::Date) arr:array_suffix() {?
+                  array_of(None, DataType::Date, arr)
               }
+            / kw(Keyword::Timestamp) arr:array_suffix() {?
+                  array_of(None, DataType::Timestamp, arr)
+              }
+            / s:ident() p:type_params() arr:array_suffix() {?
+                  let base = DataType::from_sql_params(&s, &p).ok_or("known column type")?;
+                  array_of(Some(&s), base, arr)
+              }
+
+        /// `[768]` after a type name: the fixed-size ARRAY suffix. `T[]` is
+        /// the variable-length LIST, which has no implementation yet.
+        rule array_suffix() -> Option<u32>
+            = lbracket() n:int_text() ws() rbracket() {?
+                  n.parse::<u32>().map(Some).or(Err("array length"))
+              }
+            / lbracket() ws() rbracket() {?
+                  Err("T[] is a variable-length LIST; pinkdb has fixed-size ARRAY only (wave 107a2)")
+              }
+            / { None }
 
         rule type_params() -> Vec<i64>
             = lparen() first:type_param() rest:(comma() p:type_param() { p })* rparen() {
@@ -2829,13 +2883,11 @@ peg::parser! {
                   Expr::TryCast { expr: Box::new(e), dtype: ty }
               }
 
-        /// `[1, 2, 3]`. The engine has no LIST type, so the literal is parsed
-        /// only to give a diagnostic instead of a bare parse error.
+        /// `[1, 2, 3]` — an ARRAY literal. Its element type and length are
+        /// inferred where it is used (see [`Expr::ArrayLiteral`]); the engine
+        /// has no variable-length LIST yet (wave 107a2).
         rule list_literal() -> Expr
-            = lbracket() items:expr_list()? rbracket() {?
-                  let _ = items;
-                  Err("list literals are not supported: the engine has no LIST type (needs a LIST type)")
-              }
+            = lbracket() items:(expr_list())? rbracket() { Expr::ArrayLiteral(items.unwrap_or_default()) }
 
         /// `?` — a positional prepared-statement parameter. The payload is the
         /// placeholder's byte offset in the input (see [`Expr::Parameter`]);

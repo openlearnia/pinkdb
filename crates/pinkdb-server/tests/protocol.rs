@@ -3,7 +3,7 @@
 
 use std::io::Cursor;
 
-use pinkdb::{DataType, Value};
+use pinkdb::{ArrayElem, DataType, Value};
 use pinkdb_server::protocol::{
     DoneKind, MAX_FRAME_SIZE, MAX_PREPARED_VALUES, MAX_ROWS_PER_FRAME, PROTOCOL_VERSION,
     ProtocolError, Request, Response, decode_request, decode_response, encode_request,
@@ -26,6 +26,14 @@ fn response_round_trip(response: Response) {
 /// would).
 fn variant(json: &str) -> std::sync::Arc<pinkdb::variant::Variant> {
     std::sync::Arc::new(pinkdb::variant::from_json_str(json).expect(json))
+}
+
+/// An ARRAY value from its elements; `len` is the element count.
+fn array(elem: ArrayElem, elements: &[Value]) -> std::sync::Arc<pinkdb::array::ArrayValue> {
+    std::sync::Arc::new(
+        pinkdb::array::ArrayValue::from_values(elem, elements.len() as u32, elements)
+            .expect("array value"),
+    )
 }
 
 /// Hand-build a frame (length prefix + type + body) for malformed cases.
@@ -76,11 +84,12 @@ fn requests_round_trip() {
 /// Wave 48 pins the wire surface of protocol v9: the version number, the
 /// `Login`/`LoggedIn` tags, and the seven RBAC `Done` kinds. Wave 84 adds the
 /// v10 profiling messages; wave 101a adds the VARIANT value and dtype tags;
-/// wave 95c adds the `SetVariable` `Done` kind (v12).
+/// wave 95c adds the `SetVariable` `Done` kind (v12); wave 107a adds the ARRAY
+/// value (tag 11) and dtype (tag 10) tags (v13).
 /// A change here is a protocol change and must bump [`PROTOCOL_VERSION`].
 #[test]
-fn protocol_v12_pins_the_variant_tags_and_keeps_the_v10_surface() {
-    assert_eq!(PROTOCOL_VERSION, 12);
+fn protocol_v13_pins_the_variant_tags_and_keeps_the_v10_surface() {
+    assert_eq!(PROTOCOL_VERSION, 13);
     assert_eq!(msg_type::LOGIN, 6);
     assert_eq!(msg_type::LOGGED_IN, 18);
     assert_eq!(msg_type::SET_PROFILING, 7);
@@ -247,7 +256,7 @@ fn set_profiling_rejects_a_non_boolean_byte() {
 
 #[test]
 fn result_set_round_trips_every_data_type() {
-    let names = ["b", "i", "bi", "d", "v", "dt", "ts", "va"]
+    let names = ["b", "i", "bi", "d", "v", "dt", "ts", "va", "ai", "ab", "ad"]
         .map(String::from)
         .to_vec();
     let types = vec![
@@ -259,6 +268,18 @@ fn result_set_round_trips_every_data_type() {
         DataType::Date,
         DataType::Timestamp,
         DataType::Variant,
+        DataType::Array {
+            elem: ArrayElem::Integer,
+            len: 2,
+        },
+        DataType::Array {
+            elem: ArrayElem::Bigint,
+            len: 1,
+        },
+        DataType::Array {
+            elem: ArrayElem::Double,
+            len: 768,
+        },
     ];
     response_round_trip(Response::ResultSet { names, types });
 }
@@ -323,8 +344,28 @@ fn rows_round_trip_every_value_kind_and_extremes() {
             Value::Variant(variant("[]")),
             Value::Variant(variant("{}")),
             Value::Variant(variant(r#"{"a":[1,{"b":null}]}"#)),
+            Value::Array(array(
+                ArrayElem::Integer,
+                &[Value::Integer(i32::MIN), Value::Integer(i32::MAX)],
+            )),
+            Value::Array(array(
+                ArrayElem::Double,
+                &[
+                    Value::Double(-0.0),
+                    Value::Double(f64::INFINITY),
+                    Value::Null,
+                ],
+            )),
+            Value::Array(array(
+                ArrayElem::Bigint,
+                &[
+                    Value::Bigint(i64::MIN),
+                    Value::Null,
+                    Value::Bigint(i64::MAX),
+                ],
+            )),
         ],
-        vec![Value::Null; 25],
+        vec![Value::Null; 28],
     ];
     response_round_trip(Response::Rows { rows });
 }
@@ -627,6 +668,111 @@ fn variant_rows_and_columns_use_tags_10_and_9() {
     let mut body = 1u32.to_le_bytes().to_vec();
     body.extend_from_slice(&1u32.to_le_bytes());
     body.push(10);
+    body.extend_from_slice(&9u32.to_le_bytes());
+    let err = decode_response(&frame(msg_type::ROWS, &body)).unwrap_err();
+    assert!(err.to_string().contains("truncated"), "{err}");
+}
+
+/// Wave 107a: an ARRAY rides as `u32 byte length | encoded array value` under
+/// value tag 11, and its column type under dtype tag 10 followed by
+/// `u8 element tag | u32 length`. The inner encoding is `pinkdb::array`'s
+/// business; this pins the framing.
+#[test]
+fn protocol_v13_pins_the_array_tags() {
+    let value = array(ArrayElem::Double, &[Value::Double(1.5), Value::Null]);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&pinkdb::array::encode_cell(&value));
+
+    let bytes = encode_response(&Response::Rows {
+        rows: vec![vec![Value::Array(std::sync::Arc::clone(&value))]],
+    })
+    .unwrap();
+    assert_eq!(bytes[4], msg_type::ROWS);
+    assert_eq!(&bytes[5..9], &1u32.to_le_bytes(), "one row");
+    assert_eq!(&bytes[9..13], &1u32.to_le_bytes(), "one column");
+    assert_eq!(bytes[13], 11, "ARRAY value tag");
+    assert_eq!(&bytes[14..18], &(payload.len() as u32).to_le_bytes());
+    assert_eq!(&bytes[18..], &payload[..]);
+    assert_eq!(
+        decode_response(&bytes).unwrap(),
+        Response::Rows {
+            rows: vec![vec![Value::Array(value)]],
+        }
+    );
+
+    let bytes = encode_response(&Response::ResultSet {
+        names: vec!["v".to_string(), "f".to_string()],
+        types: vec![
+            DataType::Array {
+                elem: ArrayElem::Integer,
+                len: 3,
+            },
+            DataType::Array {
+                elem: ArrayElem::Float,
+                len: 768,
+            },
+        ],
+    })
+    .unwrap();
+    assert_eq!(bytes[4], msg_type::RESULT_SET);
+    // The element kind is a byte of the dtype encoding: 0 INTEGER, 1 BIGINT,
+    // 2 DOUBLE, 3 FLOAT.
+    assert_eq!(bytes[14], 10, "ARRAY dtype tag");
+    assert_eq!(bytes[15], 0, "INTEGER element tag");
+    assert_eq!(&bytes[16..20], &3u32.to_le_bytes(), "length");
+    // Column 2 starts after column 1's `u32` name length, name, tag, element
+    // byte and `u32` length.
+    let second = 25;
+    assert_eq!(bytes[second], 10, "ARRAY dtype tag");
+    assert_eq!(bytes[second + 1], 3, "FLOAT element tag");
+    assert_eq!(&bytes[second + 2..second + 6], &768u32.to_le_bytes());
+    // A FLOAT payload is 4-byte elements: the same value round-trips.
+    let bytes = encode_response(&Response::Rows {
+        rows: vec![vec![Value::Array(std::sync::Arc::new(
+            pinkdb::array::ArrayValue::new(
+                ArrayElem::Float,
+                2,
+                pinkdb::array::ArrayElems::Floats32(vec![0.5, -0.25]),
+                None,
+            )
+            .unwrap(),
+        ))]],
+    })
+    .unwrap();
+    let Response::Rows { rows } = decode_response(&bytes).unwrap() else {
+        panic!("expected rows")
+    };
+    let Value::Array(cell) = &rows[0][0] else {
+        panic!("expected an array")
+    };
+    assert_eq!(cell.elem, ArrayElem::Float);
+    assert_eq!(cell.floats32().unwrap(), &[0.5f32, -0.25]);
+
+    // An unknown element tag, a zero length and a corrupt payload are
+    // malformed frames, not panics.
+    let mut body = 1u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(11);
+    body.extend_from_slice(&5u32.to_le_bytes());
+    body.extend_from_slice(&[9, 0, 0, 0, 0]);
+    let err = decode_response(&frame(msg_type::ROWS, &body)).unwrap_err();
+    assert!(
+        err.to_string().contains("bad ARRAY value") && err.to_string().contains("element kind"),
+        "{err}"
+    );
+
+    let mut body = 1u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(b'v');
+    body.push(10);
+    body.push(2);
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let err = decode_response(&frame(msg_type::RESULT_SET, &body)).unwrap_err();
+    assert!(err.to_string().contains("bad ARRAY length"), "{err}");
+
+    let mut body = 1u32.to_le_bytes().to_vec();
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(11);
     body.extend_from_slice(&9u32.to_le_bytes());
     let err = decode_response(&frame(msg_type::ROWS, &body)).unwrap_err();
     assert!(err.to_string().contains("truncated"), "{err}");

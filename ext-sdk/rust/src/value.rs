@@ -50,6 +50,12 @@ impl ExtArgType for Interval {
 impl ExtArgType for Variant {
     const EXT_TYPE: ExtType = ExtType::Variant;
 }
+impl<const N: usize> ExtArgType for ArrayFloat<N> {
+    const EXT_TYPE: ExtType = ExtType::ArrayFloat { len: N as u32 };
+}
+impl<const N: usize> ExtArgType for ArrayDouble<N> {
+    const EXT_TYPE: ExtType = ExtType::ArrayDouble { len: N as u32 };
+}
 /// An optional argument keeps its inner type's tag and accepts NULL.
 impl<T: ExtArgType> ExtArgType for Option<T> {
     const EXT_TYPE: ExtType = T::EXT_TYPE;
@@ -236,6 +242,40 @@ impl FromExtArg<'_> for Interval {
     }
 }
 
+impl<const N: usize> FromExtArg<'_> for ArrayFloat<N> {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<ArrayFloat<N>, String> {
+        match arg {
+            ExtArg::ArrayFloat(values) if values.len() == N => {
+                let mut out = [0.0f32; N];
+                out.copy_from_slice(values);
+                Ok(ArrayFloat(out))
+            }
+            other => Err(type_message(
+                &format!("FLOAT[{N}]"),
+                &format!("ArrayFloat<{N}>"),
+                other,
+            )),
+        }
+    }
+}
+
+impl<const N: usize> FromExtArg<'_> for ArrayDouble<N> {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<ArrayDouble<N>, String> {
+        match arg {
+            ExtArg::ArrayDouble(values) if values.len() == N => {
+                let mut out = [0.0f64; N];
+                out.copy_from_slice(values);
+                Ok(ArrayDouble(out))
+            }
+            other => Err(type_message(
+                &format!("DOUBLE[{N}]"),
+                &format!("ArrayDouble<{N}>"),
+                other,
+            )),
+        }
+    }
+}
+
 impl FromExtArg<'_> for Variant {
     fn from_ext_arg(arg: &ExtArg<'_>) -> Result<Variant, String> {
         match arg {
@@ -411,6 +451,20 @@ impl IntoExtValue for Interval {
     }
 }
 
+impl<const N: usize> IntoExtValue for ArrayFloat<N> {
+    const RET_TYPE: ExtType = ExtType::ArrayFloat { len: N as u32 };
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::ArrayFloat(self.0.to_vec()))
+    }
+}
+
+impl<const N: usize> IntoExtValue for ArrayDouble<N> {
+    const RET_TYPE: ExtType = ExtType::ArrayDouble { len: N as u32 };
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::ArrayDouble(self.0.to_vec()))
+    }
+}
+
 impl IntoExtValue for Variant {
     const RET_TYPE: ExtType = ExtType::Variant;
     fn into_ext_value(self) -> Result<ExtValue, String> {
@@ -466,6 +520,19 @@ pub struct Interval {
     /// Time part in microseconds.
     pub micros: i64,
 }
+
+/// A fixed-size `FLOAT[N]` array: `N` 4-byte elements, the shape embeddings
+/// travel in. The length is part of the type, so it is a const parameter:
+/// declare `arr: ArrayFloat<768>` and the registration carries `FLOAT[768]`.
+///
+/// The value is copied out of the host's element buffer (it borrows for the
+/// duration of the call only) — `N` elements, so the copy is bounded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArrayFloat<const N: usize>(pub [f32; N]);
+
+/// The `DOUBLE[N]` counterpart of [`ArrayFloat`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArrayDouble<const N: usize>(pub [f64; N]);
 
 /// A SQL `VARIANT`: pinkdb's own encoded bytes, carried opaquely.
 ///

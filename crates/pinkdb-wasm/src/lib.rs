@@ -133,6 +133,17 @@ fn push_value(out: &mut String, v: &Value) {
         // A VARIANT already is a JSON value, so it crosses as itself (a
         // DATE/TIMESTAMP kind prints as an ISO string, as in `to_json`).
         Value::Variant(v) => out.push_str(&v.to_json()),
+        // An ARRAY is a JSON array of its elements (NULL elements included).
+        Value::Array(a) => {
+            out.push('[');
+            for i in 0..a.len() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_value(out, &a.elem_value(i));
+            }
+            out.push(']');
+        }
         // Canonical DuckDB-style display text.
         Value::Date(_) | Value::Timestamp(_) | Value::Decimal(..) | Value::Interval { .. } => {
             push_json_string(out, &v.to_string());

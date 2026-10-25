@@ -257,6 +257,29 @@ class StatementKindTests(unittest.TestCase):
 
 
 class DecimalIntervalTests(unittest.TestCase):
+    def test_array_values_are_lists_of_floats(self):
+        with pinkdb.connect(":memory:") as conn:
+            (res,) = conn.execute(
+                "SELECT CAST('[1.5, -0.25, 3.0]' AS DOUBLE[3]) AS v, "
+                "CAST(NULL AS DOUBLE[2]) AS n, len(CAST('[1, 2]' AS DOUBLE[2])) AS l"
+            )
+            self.assertEqual(res.column_types, ["double[3]", "double[2]", "integer"])
+            self.assertEqual(res.rows[0][0], [1.5, -0.25, 3.0])
+            self.assertIsNone(res.rows[0][1])
+            self.assertEqual(res.rows[0][2], 2)
+
+    def test_float_array_values_are_lists_of_floats(self):
+        with pinkdb.connect(":memory:") as conn:
+            (res,) = conn.execute(
+                "SELECT CAST('[1.5, -0.25, 3.0]' AS FLOAT[3]) AS v, "
+                "CAST(NULL AS FLOAT[2]) AS n, len(CAST('[1, 2]' AS FLOAT[2])) AS l"
+            )
+            self.assertEqual(res.column_types, ["float[3]", "float[2]", "integer"])
+            # A FLOAT element is 4 bytes wide, so 3.0 comes back as f32 3.0.
+            self.assertEqual(res.rows[0][0], [1.5, -0.25, 3.0])
+            self.assertIsNone(res.rows[0][1])
+            self.assertEqual(res.rows[0][2], 2)
+
     def test_decimal_and_interval_values(self):
         with pinkdb.connect_memory() as db:
             res = db.execute(

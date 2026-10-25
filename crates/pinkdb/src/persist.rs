@@ -109,6 +109,8 @@ use crate::crypto::EncryptionKey;
 use crate::storage::{
     DataTable, ForeignKeyConstraint, Index, KeyConstraint, KeyKind, PinkDb, TableConstraints,
 };
+#[cfg(test)]
+use crate::types::ArrayElem;
 use crate::types::{DataType, Interval, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, Vector, VectorData};
 
@@ -194,6 +196,9 @@ const VD_TIMESTAMP: u8 = 6;
 const VD_DECIMAL: u8 = 7;
 const VD_INTERVAL: u8 = 8;
 const VD_VARIANT: u8 = 9;
+/// ARRAY rides [`crate::array::encode_cell`]'s self-describing bytes
+/// (`u32 length | element kind | elements`).
+const VD_ARRAY: u8 = 10;
 
 /// Statistics value tags in the footer's per-chunk statistics block: the
 /// same shapes as the default-value tags, plus an explicit "no value" tag
@@ -234,7 +239,12 @@ const ENC_FSST: u8 = 9;
 /// FastLanes-style bit-packing (tag 10): 1,024-value blocks, a frame of
 /// reference per block, transposed lanes (see [`enc_ints_fastlanes`]).
 const ENC_FASTLANES: u8 = 10;
+/// ARRAY (tag 11): one flat element buffer per chunk, byte-planed per
+/// element kind, with the chunk-wide NULL-element bitmap in front (see
+/// [`array_payload`]).
+const ENC_ARRAY: u8 = 11;
 
+/// The element kind byte inside an ARRAY page or schema entry.
 /// The second compression stage of a chunk frame: the codec that turns the
 /// chunk's inner payload into bytes.
 ///
@@ -603,6 +613,15 @@ fn chunk_column_stats(v: &Vector) -> ChunkColumnStats {
             max: None,
             nan_count: 0,
         },
+        // ARRAY: no min/max for the same reason as VARIANT (element-wise
+        // order, NULL elements sort last) — a bound would need the whole
+        // element comparator to prune with.
+        VectorData::Array { .. } => ChunkColumnStats {
+            null_count,
+            min: None,
+            max: None,
+            nan_count: 0,
+        },
     }
 }
 
@@ -674,6 +693,9 @@ fn dtype_tag(t: DataType) -> u8 {
         // VARIANT's payload is self-describing, so the tag carries no schema
         // parameters.
         DataType::Variant => 9,
+        // ARRAY's tag is incomplete like DECIMAL's: the schema writer stores
+        // the element kind and length immediately after it.
+        DataType::Array { .. } => 10,
     }
 }
 
@@ -2173,6 +2195,30 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
                 consider_best(&mut best, ENC_LZ_FRAME, frame);
             }
         }
+        // ARRAY: a flat element buffer per chunk. Byte-planing groups an
+        // embedding's exponent bytes together (they repeat far more than the
+        // mantissas) and the row-major layout wins on small integers, so both
+        // are built and the smaller one is written; the frame tag carries the
+        // choice. The second stage then usually shrinks the planed exponent
+        // planes further.
+        DataType::Array { .. } => {
+            let row_major = array_payload(v, 0);
+            let planed = array_payload(v, 1);
+            let plain = if planed.len() < row_major.len() {
+                planed
+            } else {
+                row_major
+            };
+            let frame = if plain.len() >= LZ_MIN_ATTEMPT {
+                enc_compressed_frame(ENC_ARRAY, &plain)
+            } else {
+                None
+            };
+            best = Some((ENC_ARRAY, plain));
+            if let Some(frame) = frame {
+                consider_best(&mut best, ENC_LZ_FRAME, frame);
+            }
+        }
         DataType::Double => {
             let values = float64_payload(v);
             let bits: Vec<u64> = values.iter().map(|x| x.to_bits()).collect();
@@ -2390,7 +2436,7 @@ fn decode_delta(r: &mut Reader, n: usize, base: i64) -> Result<Vec<i64>> {
 
 /// The error for a tag that has no meaning on this dtype (or is reserved).
 fn tag_error(dtype: DataType, tag: u8) -> PinkDbError {
-    let reserved = matches!(tag, ENC_DICT_RLE) || tag > ENC_FASTLANES;
+    let reserved = matches!(tag, ENC_DICT_RLE) || tag > ENC_ARRAY;
     if reserved {
         PinkDbError::Execution(format!(
             "unsupported .pink encoding tag {tag}; upgrade pinkdb"
@@ -2434,8 +2480,157 @@ fn variant_payload(v: &Vector) -> Vec<u8> {
     w.buf
 }
 
+/// One ARRAY chunk's PLAIN payload: `u32 rows | u8 layout | u8 element kind |
+/// u32 bitmap_len | bitmap | values`, where `layout` 1 stores the element
+/// bytes byte-planed (plane `j` holds byte `j` of every element), which is
+/// what makes embedding chunks compress. NULL rows hold zeros so the bytes
+/// stay deterministic; a NULL row's element bits are never read.
+fn array_payload(v: &Vector, layout: u8) -> Vec<u8> {
+    let VectorData::Array {
+        elem,
+        len,
+        values,
+        valid,
+    } = v.data()
+    else {
+        unreachable!("array chunk has a non-array payload")
+    };
+    let n = *len as usize;
+    let width = array_width(*elem);
+    let rows = values.len() / n;
+    let nulls = v.has_nulls();
+    let mut w = Writer::new();
+    w.u32(rows as u32);
+    w.u8(layout);
+    w.u8(elem.tag());
+    let bits = valid.as_deref().unwrap_or(&[]);
+    w.u32(bits.len() as u32);
+    if !bits.is_empty() {
+        w.bytes(bits);
+    }
+    let mut raw = Vec::with_capacity(rows * n * width);
+    for row in 0..rows {
+        let zero = nulls && !v.is_valid(row);
+        match values {
+            crate::array::ArrayElems::Ints(vals) => {
+                for &x in &vals[row * n..row * n + n] {
+                    let x = if zero { 0 } else { x };
+                    // INTEGER elements are 4 bytes wide on disk.
+                    if width == 4 {
+                        raw.extend_from_slice(&(x as i32).to_le_bytes());
+                    } else {
+                        raw.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+            }
+            crate::array::ArrayElems::Floats(vals) => {
+                for &x in &vals[row * n..row * n + n] {
+                    let x = if zero { 0.0 } else { x };
+                    raw.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+            crate::array::ArrayElems::Floats32(vals) => {
+                for &x in &vals[row * n..row * n + n] {
+                    let x = if zero { 0.0 } else { x };
+                    raw.extend_from_slice(&x.to_le_bytes());
+                }
+            }
+        }
+    }
+    if layout == 0 {
+        w.bytes(&raw);
+    } else {
+        let m = rows * n;
+        let mut planed = vec![0u8; raw.len()];
+        for i in 0..m {
+            for j in 0..width {
+                planed[j * m + i] = raw[i * width + j];
+            }
+        }
+        w.bytes(&planed);
+    }
+    w.buf
+}
+
+/// The on-disk element width of an ARRAY type.
+fn array_width(elem: crate::types::ArrayElem) -> usize {
+    match elem {
+        crate::types::ArrayElem::Integer | crate::types::ArrayElem::Float => 4,
+        crate::types::ArrayElem::Bigint | crate::types::ArrayElem::Double => 8,
+    }
+}
+
+fn decode_array_payload(r: &mut Reader, len: u32) -> Result<(VectorData, usize)> {
+    let rows = r.chunk_count("array chunk length")?;
+    let layout = r.u8()?;
+    let elem_tag = r.u8()?;
+    let elem = crate::types::ArrayElem::from_tag(elem_tag).ok_or_else(|| {
+        PinkDbError::Execution(format!("corrupt file: bad ARRAY element kind {elem_tag}"))
+    })?;
+    let bits_len = r.u32()? as usize;
+    let bits = r.take(bits_len)?;
+    let width = array_width(elem);
+    let values_len = rows * len as usize;
+    let raw = r.take(values_len * width)?;
+    let mut values = vec![0u8; raw.len()];
+    match layout {
+        0 => values.copy_from_slice(raw),
+        1 => {
+            for i in 0..values_len {
+                for j in 0..width {
+                    values[i * width + j] = raw[j * values_len + i];
+                }
+            }
+        }
+        other => {
+            return Err(PinkDbError::Execution(format!(
+                "corrupt file: bad ARRAY payload layout {other}"
+            )));
+        }
+    }
+    let mut out = match elem {
+        crate::types::ArrayElem::Double => {
+            crate::array::ArrayElems::Floats(Vec::with_capacity(values_len))
+        }
+        crate::types::ArrayElem::Integer | crate::types::ArrayElem::Bigint => {
+            crate::array::ArrayElems::Ints(Vec::with_capacity(values_len))
+        }
+        crate::types::ArrayElem::Float => {
+            crate::array::ArrayElems::Floats32(Vec::with_capacity(values_len))
+        }
+    };
+    for chunk in values.chunks_exact(width) {
+        match &mut out {
+            crate::array::ArrayElems::Ints(v) => {
+                if width == 4 {
+                    v.push(i32::from_le_bytes(chunk.try_into().unwrap()) as i64);
+                } else {
+                    v.push(i64::from_le_bytes(chunk.try_into().unwrap()));
+                }
+            }
+            crate::array::ArrayElems::Floats(v) => {
+                v.push(f64::from_le_bytes(chunk.try_into().unwrap()))
+            }
+            crate::array::ArrayElems::Floats32(v) => {
+                v.push(f32::from_le_bytes(chunk.try_into().unwrap()))
+            }
+        }
+    }
+    let valid = (!bits.is_empty()).then(|| bits.to_vec());
+    Ok((
+        VectorData::Array {
+            elem,
+            len,
+            values: out,
+            valid,
+        },
+        rows,
+    ))
+}
+
 fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorData, usize)> {
     match (dtype, tag) {
+        (DataType::Array { len, .. }, ENC_ARRAY) => decode_array_payload(r, len),
         (DataType::Variant, ENC_PLAIN) => {
             let n = r.chunk_count("variant chunk length")?;
             let mut offsets = Vec::with_capacity(n + 1);
@@ -2761,7 +2956,14 @@ fn decode_compressed_frame(dtype: DataType, r: &mut Reader) -> Result<(VectorDat
     if !(4..=LZ_MAX_RAW).contains(&raw_len) {
         return r.err("bad compressed frame length");
     }
-    if base_tag > ENC_ALP {
+    // A framed payload wraps a plain encoding: the reserved tag and the
+    // framed/entropy ones (LZ, FSST, fastlanes) cannot be a base.
+    if base_tag > ENC_ARRAY
+        || matches!(
+            base_tag,
+            ENC_DICT_RLE | ENC_LZ_FRAME | ENC_FSST | ENC_FASTLANES
+        )
+    {
         return r.err("unsupported compression base encoding");
     }
     let comp = r.take(comp_len)?;
@@ -2933,6 +3135,7 @@ fn encode_page(v: &Vector) -> EncodedPage {
 fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
     match v {
         None => w.u8(SV_NONE),
+        Some(Value::Array(_)) => w.u8(SV_NONE),
         Some(Value::Boolean(b)) => {
             w.u8(SV_BOOL);
             w.u8(*b as u8);
@@ -3312,6 +3515,10 @@ impl PinkDb {
                     if let DataType::Decimal { precision, scale } = dtype {
                         fw.u8(*precision);
                         fw.u8(*scale);
+                    }
+                    if let DataType::Array { elem, len } = dtype {
+                        fw.u8(elem.tag());
+                        fw.u32(*len);
                     }
                 }
                 if with_constraints {
@@ -4230,6 +4437,25 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
             let null = Arc::new(crate::variant::Variant::Null);
             VectorData::Variant(vec![null; rows])
         }
+        DataType::Array { elem, len } => {
+            let n = rows * len as usize;
+            VectorData::Array {
+                elem,
+                len,
+                values: match elem {
+                    crate::types::ArrayElem::Integer | crate::types::ArrayElem::Bigint => {
+                        crate::array::ArrayElems::Ints(vec![0; n])
+                    }
+                    crate::types::ArrayElem::Double => {
+                        crate::array::ArrayElems::Floats(vec![0.0; n])
+                    }
+                    crate::types::ArrayElem::Float => {
+                        crate::array::ArrayElems::Floats32(vec![0.0; n])
+                    }
+                },
+                valid: None,
+            }
+        }
     };
     // No validity words: every row reads NULL.
     Vector::from_raw(data, Vec::new())
@@ -4362,6 +4588,21 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
                         })?
                     }
                     8 => DataType::Interval,
+                    10 => {
+                        let elem_tag = r.u8()?;
+                        let elem =
+                            crate::types::ArrayElem::from_tag(elem_tag).ok_or_else(|| {
+                                PinkDbError::Execution(format!(
+                                    "corrupt file: bad ARRAY element kind {elem_tag}"
+                                ))
+                            })?;
+                        let len = r.u32()?;
+                        crate::types::array_type(elem, len).ok_or_else(|| {
+                            PinkDbError::Execution(
+                                "corrupt file: bad ARRAY element count".to_string(),
+                            )
+                        })?
+                    }
                     other => dtype_from_tag(other)?,
                 };
                 schema.push((col, dtype));
@@ -4791,6 +5032,12 @@ fn write_default_value(w: &mut Writer, v: &Value) {
             w.u32(bytes.len() as u32);
             w.bytes(&bytes);
         }
+        Value::Array(a) => {
+            let bytes = crate::array::encode_cell(a);
+            w.u8(VD_ARRAY);
+            w.u32(bytes.len() as u32);
+            w.bytes(&bytes);
+        }
     }
 }
 
@@ -4838,6 +5085,14 @@ fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<Value>>> {
                 match crate::variant::decode(bytes) {
                     Ok(v) => Value::Variant(Arc::new(v)),
                     Err(_) => return r.err("bad VARIANT default"),
+                }
+            }
+            VD_ARRAY => {
+                let n = r.u32()? as usize;
+                let bytes = r.take(n)?;
+                match crate::array::decode_cell(bytes) {
+                    Ok(v) => Value::Array(Arc::new(v)),
+                    Err(_) => return r.err("bad ARRAY default"),
                 }
             }
             other => {
@@ -5041,6 +5296,10 @@ fn write_procedure_defs(w: &mut Writer, defs: &[crate::procedure::ProcedureDef])
                 w.u8(*precision);
                 w.u8(*scale);
             }
+            if let DataType::Array { elem, len } = dtype {
+                w.u8(elem.tag());
+                w.u32(*len);
+            }
         }
         w.str(&def.source);
     }
@@ -5116,12 +5375,25 @@ fn read_procedure_defs(r: &mut Reader) -> Result<Vec<crate::procedure::Procedure
         for _ in 0..n_params {
             let pname = r.str()?;
             let tag = r.u8()?;
-            let dtype = if tag == 7 {
-                let precision = r.u8()?;
-                let scale = r.u8()?;
-                DataType::Decimal { precision, scale }
-            } else {
-                dtype_from_tag(tag)?
+            let dtype = match tag {
+                7 => {
+                    let precision = r.u8()?;
+                    let scale = r.u8()?;
+                    DataType::Decimal { precision, scale }
+                }
+                10 => {
+                    let elem_tag = r.u8()?;
+                    let elem = crate::types::ArrayElem::from_tag(elem_tag).ok_or_else(|| {
+                        PinkDbError::Execution(format!(
+                            "corrupt file: bad ARRAY element kind {elem_tag}"
+                        ))
+                    })?;
+                    let len = r.u32()?;
+                    crate::types::array_type(elem, len).ok_or_else(|| {
+                        PinkDbError::Execution("corrupt file: bad ARRAY element count".to_string())
+                    })?
+                }
+                other => dtype_from_tag(other)?,
             };
             params.push((pname, dtype));
         }
@@ -5468,6 +5740,7 @@ fn plain_payload(v: &Vector) -> Vec<u8> {
         DataType::Boolean => enc_bool_plain(&bool_payload(v)),
         DataType::Varchar => enc_strs_plain(&varchar_payload(v)),
         DataType::Variant => variant_payload(v),
+        DataType::Array { .. } => array_payload(v, 1),
         DataType::Decimal { .. } => {
             let VectorData::Decimal { values, .. } = v.data() else {
                 unreachable!()
@@ -6731,6 +7004,29 @@ mod tests {
                 days: (i as i32) % 31 - 15,
                 micros: (i as i64).wrapping_mul(1_000_003) % 86_400_000_000,
             },
+            // One NULL element on every seventh row exercises the element
+            // bitmap next to the row validity.
+            DataType::Array { elem, len } => {
+                let values: Vec<Value> = (0..len)
+                    .map(|k| {
+                        if i % 7 == 3 && k == 1 {
+                            return Value::Null;
+                        }
+                        match elem {
+                            ArrayElem::Integer => Value::Integer(i as i32 + k as i32),
+                            ArrayElem::Bigint => Value::Bigint(i as i64 - k as i64),
+                            // A FLOAT element is a `Double` cell narrowed on the
+                            // way in, exactly like the cast path.
+                            ArrayElem::Float | ArrayElem::Double => {
+                                Value::Double(i as f64 / 8.0 + f64::from(k))
+                            }
+                        }
+                    })
+                    .collect();
+                Value::Array(Arc::new(
+                    crate::array::ArrayValue::from_values(elem, len, &values).unwrap(),
+                ))
+            }
             DataType::Variant => Value::Variant(Arc::new(match i % 7 {
                 0 => crate::variant::Variant::Null,
                 1 => crate::variant::Variant::Bool(i.is_multiple_of(2)),
@@ -7633,6 +7929,25 @@ mod tests {
                         days: (r % 60) as i32,
                         micros: r as i64 % 86_400_000_000,
                     },
+                    DataType::Array { elem, len } => {
+                        let values: Vec<Value> = (0..len)
+                            .map(|k| {
+                                if r % 9 == 4 && k == 0 {
+                                    return Value::Null;
+                                }
+                                match elem {
+                                    ArrayElem::Integer => Value::Integer(r as i32 ^ k as i32),
+                                    ArrayElem::Bigint => Value::Bigint(r as i64 + k as i64),
+                                    ArrayElem::Float | ArrayElem::Double => Value::Double(
+                                        f64::from_bits(r & 0x3fef_ffff_ffff_ffff) + f64::from(k),
+                                    ),
+                                }
+                            })
+                            .collect();
+                        Value::Array(Arc::new(
+                            crate::array::ArrayValue::from_values(elem, len, &values).unwrap(),
+                        ))
+                    }
                     DataType::Variant => Value::Variant(Arc::new(match r % 5 {
                         0 => crate::variant::Variant::Null,
                         1 => crate::variant::Variant::Bool(r % 3 == 0),

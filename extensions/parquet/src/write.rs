@@ -18,6 +18,7 @@
 //! | TIMESTAMP | INT64 + TIMESTAMP(MICROS), `is_adjusted_to_utc = false` |
 //! | DECIMAL(p,s) | INT32 (p ≤ 9) / INT64 (p ≤ 18) / FIXED_LEN_BYTE_ARRAY(16) + DECIMAL(p,s) |
 //! | VARIANT | GROUP + `Variant` logical type: `metadata`, `value`, and a `typed_value` group with one typed column per shredded key ([`variant_shred`]) |
+//! | ARRAY | the three-level LIST group DuckDB 2.0 writes, whose length is only in the number of element slots per row (plus a `pinkdb.array.<name>` key-value entry) |
 //!
 //! Every column is `OPTIONAL`; NULLs travel as definition levels. INTERVAL is
 //! refused — parquet's INTERVAL is millisecond precision and pinkdb's is
@@ -44,7 +45,7 @@ use parquet::basic::{Compression, ConvertedType, LogicalType, Repetition, TimeUn
 use parquet::column::writer::ColumnWriterImpl;
 use parquet::data_type::{
     BoolType, ByteArray, ByteArrayType, DataType as ParquetDataType, DoubleType, FixedLenByteArray,
-    FixedLenByteArrayType, Int32Type, Int64Type,
+    FixedLenByteArrayType, FloatType, Int32Type, Int64Type,
 };
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -57,7 +58,7 @@ use pinkdb::variant::Variant;
 use pinkdb::variant_shred::{
     ShredKind, ShredPolicy, decode_metadata, encode_metadata, encode_value, infer_policy, shred_row,
 };
-use pinkdb::{DataTable, DataType, Value, Vector};
+use pinkdb::{ArrayElem, DataTable, DataType, Value, Vector};
 
 /// The footer key naming the database a lake data file belongs to.
 pub const DB_METADATA_KEY: &str = "pinkdb.db";
@@ -132,7 +133,7 @@ impl From<std::io::Error> for WriteError {
 /// The identity check the lake performs needs [`write_table_with_identity`];
 /// this plain form is for standalone use (tests, COPY-shaped writers).
 pub fn write_table(table: &DataTable) -> Result<Vec<u8>, WriteError> {
-    write_table_with_key_values(table, Vec::new())
+    write_table_with_key_values(table, Vec::new(), &[])
 }
 
 /// Encode `table` as one complete parquet file and record the lake identity
@@ -143,13 +144,41 @@ pub fn write_table_with_identity(
     db: &str,
     table: &str,
 ) -> Result<Vec<u8>, WriteError> {
+    write_table_with_identity_and_fields(src, db, table, &[])
+}
+
+/// [`write_table_with_identity`] with the lake's catalog column ids, so a
+/// DuckLake reader can match the children of a nested column.
+pub fn write_table_with_identity_and_fields(
+    src: &DataTable,
+    db: &str,
+    table: &str,
+    field_ids: &[(i32, i32)],
+) -> Result<Vec<u8>, WriteError> {
     write_table_with_key_values(
         src,
         vec![
             KeyValue::new(DB_METADATA_KEY.to_string(), Some(db.to_string())),
             KeyValue::new(TABLE_METADATA_KEY.to_string(), Some(table.to_string())),
         ],
+        field_ids,
     )
+}
+
+/// Encode `table` as one complete parquet file with explicit `field_id`s: one
+/// `(column, array_child)` pair per column, `0` meaning "write none".
+///
+/// The lake records `field_id` = the catalog's `ducklake_column.column_id`
+/// on every top-level column, and on an ARRAY's `element` leaf, because a
+/// DuckLake reader matches the children of a nested column by id — a parquet
+/// list has no name of its own. A standalone file (`COPY … TO`,
+/// `write_parquet`) writes none, exactly as DuckDB does there.
+pub fn write_table_with_fields(
+    table: &DataTable,
+    key_values: Vec<KeyValue>,
+    field_ids: &[(i32, i32)],
+) -> Result<Vec<u8>, WriteError> {
+    write_table_with_key_values(table, key_values, field_ids)
 }
 
 /// The lake identity stored in a parquet footer by
@@ -193,6 +222,7 @@ const PAGE_COMPRESSION: Compression = Compression::UNCOMPRESSED;
 fn write_table_with_key_values(
     table: &DataTable,
     key_values: Vec<KeyValue>,
+    field_ids: &[(i32, i32)],
 ) -> Result<Vec<u8>, WriteError> {
     let schema = table.schema();
     let policies = column_policies(table);
@@ -212,7 +242,18 @@ fn write_table_with_key_values(
             crate::variant_stats::COMPLETE_VALUE.to_string(),
         ));
     }
-    let root = build_schema(&schema, &policies)?;
+    // A parquet list group has no length of its own, so record each ARRAY
+    // column's. A DuckDB reader ignores the key; ours needs it when the file
+    // has no row groups to infer from (see `crate::schema_map::array_length`).
+    for (name, dtype) in &schema {
+        if let DataType::Array { len, .. } = dtype {
+            key_values.push(KeyValue::new(
+                crate::schema_map::array_length_key(name),
+                len.to_string(),
+            ));
+        }
+    }
+    let root = build_schema(&schema, &policies, field_ids)?;
     let mut builder = WriterProperties::builder()
         // Chunk statistics travel in the footer (min/max/NULL count), so the
         // file is self-describing for other readers and for pruning.
@@ -255,6 +296,10 @@ fn write_table_with_key_values(
                         &mut cursors[index],
                         name,
                     )?;
+                    continue;
+                }
+                if matches!(dtype, DataType::Array { .. }) {
+                    write_array_column(&mut group, dtype, rows, &mut cursors[index], name)?;
                     continue;
                 }
                 let column = group.next_column()?.ok_or_else(|| skipped(name))?;
@@ -320,6 +365,8 @@ fn physical_type(dtype: DataType, column: &str) -> Result<PhysicalType, WriteErr
         }
         // Written as the `Variant` logical type; see `write_variant_column`.
         DataType::Variant => return Err(skipped(column)),
+        // Written as the LIST group; see `write_array_column`.
+        DataType::Array { .. } => return Err(skipped(column)),
     })
 }
 
@@ -373,16 +420,25 @@ fn column_policies(table: &DataTable) -> Vec<ShredPolicy> {
 fn build_schema(
     schema: &[(String, DataType)],
     policies: &[ShredPolicy],
+    field_ids: &[(i32, i32)],
 ) -> Result<Type, WriteError> {
     let mut fields = Vec::with_capacity(schema.len());
     for (index, (name, dtype)) in schema.iter().enumerate() {
+        let ids = field_ids.get(index).copied().unwrap_or((0, 0));
         if matches!(dtype, DataType::Variant) {
             fields.push(Arc::new(variant_group(name, &policies[index])?));
+            continue;
+        }
+        if let DataType::Array { elem, .. } = dtype {
+            fields.push(Arc::new(array_group(name, *elem, ids)?));
             continue;
         }
         let physical = physical_type(*dtype, name)?;
         let mut builder =
             Type::primitive_type_builder(name, physical).with_repetition(Repetition::OPTIONAL);
+        if ids.0 != 0 {
+            builder = builder.with_id(Some(ids.0));
+        }
         match dtype {
             DataType::Boolean | DataType::Integer | DataType::Bigint | DataType::Double => {}
             DataType::Varchar => {
@@ -416,9 +472,11 @@ fn build_schema(
                     builder = builder.with_length(DECIMAL_FIXED_LEN);
                 }
             }
-            // Refused by `physical_type`, and VARIANT never reaches the flat
-            // primitive path above.
-            DataType::Interval | DataType::Variant => unreachable!("refused by physical_type"),
+            // Refused by `physical_type`, and VARIANT/ARRAY never reach the
+            // flat primitive path above.
+            DataType::Interval | DataType::Variant | DataType::Array { .. } => {
+                unreachable!("refused by physical_type")
+            }
         }
         fields.push(Arc::new(builder.build()?));
     }
@@ -576,6 +634,7 @@ fn write_column(
         // Refused in `physical_type`/`build_schema` before any row is read.
         DataType::Interval => unreachable!("interval columns are refused before writing"),
         DataType::Variant => unreachable!("variant columns use write_variant_column"),
+        DataType::Array { .. } => unreachable!("ARRAY columns use write_array_column"),
     }
     column.close()?;
     Ok(())
@@ -695,6 +754,133 @@ fn variant_group(name: &str, policy: &ShredPolicy) -> Result<Type, WriteError> {
         .with_logical_type(Some(LogicalType::variant(Some(VARIANT_SPEC_VERSION))))
         .with_fields(fields)
         .build()?)
+}
+
+// ---------------------------------------------------------------------------
+// ARRAY: the three-level LIST parquet has
+// ---------------------------------------------------------------------------
+
+/// One ARRAY column's Parquet group. Parquet has no fixed-size list type, so
+/// this is the standard three-level LIST — the same group DuckDB 2.0 writes
+/// for an `ARRAY` (its converted type is `LIST`, with no logical type):
+///
+/// ```text
+/// <name> GROUP OPTIONAL (LIST)
+///   list     GROUP REPEATED
+///     element <type> OPTIONAL
+/// ```
+fn array_group(name: &str, elem: ArrayElem, ids: (i32, i32)) -> Result<Type, WriteError> {
+    let mut element =
+        Type::primitive_type_builder("element", crate::schema_map::array_physical(elem))
+            .with_repetition(Repetition::OPTIONAL);
+    if ids.1 != 0 {
+        element = element.with_id(Some(ids.1));
+    }
+    let element = element.build()?;
+    let list = Type::group_type_builder("list")
+        .with_repetition(Repetition::REPEATED)
+        .with_fields(vec![Arc::new(element)])
+        .build()?;
+    let mut group = Type::group_type_builder(name)
+        .with_repetition(Repetition::OPTIONAL)
+        .with_converted_type(ConvertedType::LIST)
+        .with_fields(vec![Arc::new(list)]);
+    if ids.0 != 0 {
+        group = group.with_id(Some(ids.0));
+    }
+    Ok(group.build()?)
+}
+
+/// Write one ARRAY column chunk: exactly `len` level entries per row, so a
+/// reader recovers the length from `num_values` even when the row is NULL.
+/// The definition levels are 0 for a NULL array, 2 for a NULL element (the
+/// `element` leaf is OPTIONAL) and 3 for a value; the first entry of every row
+/// has repetition level 0 and the rest 1.
+fn write_array_column<W: std::io::Write + Send>(
+    group: &mut SerializedRowGroupWriter<'_, W>,
+    dtype: &DataType,
+    rows: usize,
+    cursor: &mut ColumnCursor<'_>,
+    name: &str,
+) -> Result<(), WriteError> {
+    let DataType::Array { elem, len } = *dtype else {
+        unreachable!("write_array_column is called for ARRAY columns only")
+    };
+    let len = len as usize;
+    let mut ints: Vec<i32> = Vec::new();
+    let mut longs: Vec<i64> = Vec::new();
+    let mut doubles: Vec<f64> = Vec::new();
+    let mut singles: Vec<f32> = Vec::new();
+    let mut levels: Vec<i16> = Vec::with_capacity(rows * len);
+    let mut reps: Vec<i16> = Vec::with_capacity(rows * len);
+    for _ in 0..rows {
+        let value = cursor.next();
+        let array = match &value {
+            Value::Null => None,
+            Value::Array(array) if array.elem == elem && array.len() == len => Some(array),
+            other => {
+                return Err(WriteError::InvalidValue {
+                    column: name.to_string(),
+                    message: wrong_type(other, *dtype),
+                });
+            }
+        };
+        for slot in 0..len {
+            reps.push(if slot == 0 { 0 } else { 1 });
+            let Some(element) = array else {
+                // Definition level 0: the group itself is NULL, which a
+                // parquet reader reports as a NULL list (level 1 would be an
+                // empty list).
+                levels.push(0);
+                continue;
+            };
+            if !element.is_valid(slot) {
+                levels.push(2);
+                continue;
+            }
+            levels.push(3);
+            let slot_value = element.elem_value(slot);
+            match (elem, &slot_value) {
+                (ArrayElem::Integer, Value::Integer(x)) => ints.push(*x),
+                (ArrayElem::Bigint, Value::Bigint(x)) => longs.push(*x),
+                (ArrayElem::Double, Value::Double(x)) => doubles.push(*x),
+                // A FLOAT element is narrowable exactly: the cell form holds
+                // it in a `Double`.
+                (ArrayElem::Float, Value::Double(x)) => singles.push(*x as f32),
+                _ => {
+                    return Err(WriteError::InvalidValue {
+                        column: name.to_string(),
+                        message: wrong_type(&slot_value, elem.dtype()),
+                    });
+                }
+            }
+        }
+    }
+    let mut column = group.next_column()?.ok_or_else(|| skipped(name))?;
+    match elem {
+        ArrayElem::Integer => {
+            column
+                .typed::<Int32Type>()
+                .write_batch(&ints, Some(&levels), Some(&reps))?
+        }
+        ArrayElem::Bigint => {
+            column
+                .typed::<Int64Type>()
+                .write_batch(&longs, Some(&levels), Some(&reps))?
+        }
+        ArrayElem::Double => {
+            column
+                .typed::<DoubleType>()
+                .write_batch(&doubles, Some(&levels), Some(&reps))?
+        }
+        ArrayElem::Float => {
+            column
+                .typed::<FloatType>()
+                .write_batch(&singles, Some(&levels), Some(&reps))?
+        }
+    };
+    column.close()?;
+    Ok(())
 }
 
 /// The physical type of one shredded kind.

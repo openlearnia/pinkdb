@@ -184,6 +184,22 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// data object as referenced when it matches either.
     fn referenced_file_paths(&self) -> Result<Vec<String>>;
 
+    /// The `field_id`s a data file of `key` must record for `columns`, in
+    /// column order.
+    ///
+    /// A DuckLake reader matches a nested column's children by id, so the
+    /// writer needs the catalog's `ducklake_column.column_id`s *before* the
+    /// commit that creates the columns. Backends without ids return nothing,
+    /// and their files record none.
+    fn field_ids(
+        &self,
+        key: &str,
+        columns: &[(String, pinkdb::DataType)],
+    ) -> Result<Vec<crate::format::FieldIds>> {
+        let _ = (key, columns);
+        Ok(Vec::new())
+    }
+
     /// The replication side tables as the in-memory state (`None` before the
     /// first job is created).
     fn replication_state(&self) -> Result<Option<crate::replication::ReplicationState>>;

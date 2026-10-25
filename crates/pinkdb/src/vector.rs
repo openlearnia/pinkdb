@@ -8,7 +8,8 @@
 
 use std::sync::Arc;
 
-use crate::types::{DataType, Interval, PinkDbError, Result, Value};
+use crate::array::{ArrayElems, ArrayValue};
+use crate::types::{ArrayElem, DataType, Interval, PinkDbError, Result, Value};
 
 /// Max rows per vector / chunk. DuckDB uses 2048; so do we.
 pub const CHUNK_SIZE: usize = 2048;
@@ -34,6 +35,85 @@ pub enum VectorData {
     /// VARIANT: one shared semi-structured tree per row (see
     /// [`crate::variant`]).
     Variant(Vec<Arc<crate::variant::Variant>>),
+    /// ARRAY: `rows * len` elements in one flat row-major buffer, plus an
+    /// element validity bitmap that only exists when some element is NULL
+    /// (see [`crate::array`]).
+    Array {
+        elem: ArrayElem,
+        len: u32,
+        values: ArrayElems,
+        valid: Option<Vec<u8>>,
+    },
+}
+
+/// Bit `i` of an optional element bitmap; no bitmap means every element is
+/// valid.
+fn elem_bit(bits: Option<&[u8]>, i: usize) -> bool {
+    bits.map(|m| (m[i / 8] >> (i % 8)) & 1 == 1).unwrap_or(true)
+}
+
+/// Append `n` element validity bits to a column's element bitmap, growing it
+/// only when a NULL element appears. `start` is the element count before the
+/// append; elements before it are all valid when the bitmap is absent.
+fn array_bits_append(
+    valid: &mut Option<Vec<u8>>,
+    start: usize,
+    bits: Option<&[u8]>,
+    bit_off: usize,
+    n: usize,
+) {
+    if n == 0 {
+        return;
+    }
+    let any_null = (0..n).any(|i| !elem_bit(bits, bit_off + i));
+    if valid.is_none() && !any_null {
+        return;
+    }
+    let total = start + n;
+    let need = total.div_ceil(8);
+    let mask = match valid {
+        Some(m) => {
+            m.resize(need, 0);
+            m
+        }
+        None => {
+            let mut v = vec![0xFFu8; need];
+            if !total.is_multiple_of(8) {
+                v[need - 1] = (1u8 << (total % 8)) - 1;
+            }
+            valid.insert(v)
+        }
+    };
+    for i in 0..n {
+        let idx = start + i;
+        if elem_bit(bits, bit_off + i) {
+            mask[idx / 8] |= 1u8 << (idx % 8);
+        } else {
+            mask[idx / 8] &= !(1u8 << (idx % 8));
+        }
+    }
+}
+
+/// Append one ARRAY cell to a column chunk, checking the element kind and
+/// length against the column's type.
+fn array_push_cell(
+    elem: ArrayElem,
+    len: u32,
+    values: &mut ArrayElems,
+    valid: &mut Option<Vec<u8>>,
+    cell: &ArrayValue,
+) -> Result<()> {
+    if cell.elem != elem || cell.len() != len as usize {
+        return Err(PinkDbError::Type(format!(
+            "type mismatch: cannot store {} in a {}[{len}] vector",
+            cell.dtype(),
+            elem.name()
+        )));
+    }
+    let start = values.len();
+    values.extend_from(elem, &cell.values)?;
+    array_bits_append(valid, start, cell.valid.as_deref(), 0, cell.len());
+    Ok(())
 }
 
 impl VectorData {
@@ -54,6 +134,10 @@ impl VectorData {
             },
             VectorData::Interval(_) => DataType::Interval,
             VectorData::Variant(_) => DataType::Variant,
+            VectorData::Array { elem, len, .. } => DataType::Array {
+                elem: *elem,
+                len: *len,
+            },
         }
     }
 
@@ -75,6 +159,8 @@ impl VectorData {
             VectorData::Decimal { values, .. } => values.len(),
             VectorData::Interval(v) => v.len(),
             VectorData::Variant(v) => v.len(),
+            // Rows, like every other variant; `len` is never zero.
+            VectorData::Array { len, values, .. } => values.len() / *len as usize,
         }
     }
 
@@ -94,6 +180,12 @@ impl VectorData {
             },
             DataType::Interval => VectorData::Interval(Vec::with_capacity(cap)),
             DataType::Variant => VectorData::Variant(Vec::with_capacity(cap)),
+            DataType::Array { elem, len } => VectorData::Array {
+                elem,
+                len,
+                values: ArrayElems::with_capacity(elem, cap * len as usize),
+                valid: None,
+            },
         }
     }
 }
@@ -193,6 +285,24 @@ impl Vector {
             ),
             // A constant VARIANT shares one tree across the rows.
             Value::Variant(x) => (VectorData::Variant(vec![Arc::clone(x); n]), true),
+            Value::Array(x) => {
+                let len = x.len() as u32;
+                let mut values = ArrayElems::with_capacity(x.elem, n * x.len());
+                let mut valid: Option<Vec<u8>> = None;
+                for _ in 0..n {
+                    array_push_cell(x.elem, len, &mut values, &mut valid, x)
+                        .expect("constant ARRAY vector");
+                }
+                (
+                    VectorData::Array {
+                        elem: x.elem,
+                        len,
+                        values,
+                        valid,
+                    },
+                    true,
+                )
+            }
         };
         let mut validity = vec![if all_valid { u64::MAX } else { 0 }; mask_len(n)];
         if all_valid && !n.is_multiple_of(64) {
@@ -234,6 +344,19 @@ impl Vector {
             VectorData::Decimal { values, .. } => values.push(0),
             VectorData::Interval(v) => v.push(Interval::default()),
             VectorData::Variant(v) => v.push(Arc::new(crate::variant::Variant::Null)),
+            VectorData::Array {
+                len, values, valid, ..
+            } => {
+                for _ in 0..*len {
+                    values.push_zero();
+                }
+                if let Some(mask) = valid {
+                    let start = values.len() - *len as usize;
+                    if start + *len as usize > mask.len() * 8 {
+                        mask.resize((start + *len as usize).div_ceil(8), 0);
+                    }
+                }
+            }
         }
     }
 
@@ -346,6 +469,18 @@ impl Vector {
                 micros: v[idx].micros,
             },
             VectorData::Variant(v) => Value::Variant(Arc::clone(&v[idx])),
+            VectorData::Array {
+                elem,
+                len,
+                values,
+                valid,
+            } => {
+                let n = *len as usize;
+                let cell =
+                    crate::array::cell_from_slice(*elem, values, valid.as_deref(), idx * n, n)
+                        .expect("ARRAY cell slice");
+                Value::Array(Arc::new(cell))
+            }
         }
     }
 
@@ -391,6 +526,17 @@ impl Vector {
                 micros,
             }),
             (VectorData::Variant(v), Value::Variant(x)) => v.push(x),
+            (
+                VectorData::Array {
+                    elem,
+                    len,
+                    values,
+                    valid,
+                },
+                Value::Array(x),
+            ) => {
+                array_push_cell(*elem, *len, values, valid, &x)?;
+            }
             (data, other) => {
                 return Err(PinkDbError::Type(format!(
                     "type mismatch: cannot push {other} into {:?} vector",
@@ -537,6 +683,36 @@ impl Vector {
                 // Variants share their Arc value instead of copying.
                 d.extend(s[start..start + len].iter().cloned());
             }
+            (
+                VectorData::Array {
+                    elem,
+                    len: elem_len,
+                    values: d,
+                    valid,
+                },
+                VectorData::Array {
+                    values: s,
+                    valid: svalid,
+                    ..
+                },
+            ) => {
+                let n = *elem_len as usize;
+                let base = d.len();
+                match (d, s) {
+                    (ArrayElems::Ints(d), ArrayElems::Ints(s)) => {
+                        d.extend_from_slice(&s[start * n..(start + len) * n]);
+                    }
+                    (ArrayElems::Floats(d), ArrayElems::Floats(s)) => {
+                        d.extend_from_slice(&s[start * n..(start + len) * n]);
+                    }
+                    (ArrayElems::Floats32(d), ArrayElems::Floats32(s)) => {
+                        d.extend_from_slice(&s[start * n..(start + len) * n]);
+                    }
+                    (_, _) => unreachable!("extend_from: element kind mismatch"),
+                }
+                array_bits_append(valid, base, svalid.as_deref(), start * n, len * n);
+                let _ = elem;
+            }
             _ => unreachable!("extend_from: vector dtype mismatch"),
         }
         let base = self.len;
@@ -596,6 +772,55 @@ impl Vector {
                 }
             }
             (VectorData::Variant(v), Value::Variant(x)) => v[idx] = x,
+            (
+                VectorData::Array {
+                    elem,
+                    len,
+                    values,
+                    valid,
+                },
+                Value::Array(x),
+            ) => {
+                let n = *len as usize;
+                if x.elem != *elem || x.len() != n {
+                    return Err(PinkDbError::Type(format!(
+                        "type mismatch: cannot store {} in a {}[{n}] vector",
+                        x.dtype(),
+                        elem.name()
+                    )));
+                }
+                match (values, &x.values) {
+                    (ArrayElems::Ints(d), ArrayElems::Ints(s)) => {
+                        d[idx * n..idx * n + n].copy_from_slice(s)
+                    }
+                    (ArrayElems::Floats(d), ArrayElems::Floats(s)) => {
+                        d[idx * n..idx * n + n].copy_from_slice(s)
+                    }
+                    (ArrayElems::Floats32(d), ArrayElems::Floats32(s)) => {
+                        d[idx * n..idx * n + n].copy_from_slice(s)
+                    }
+                    (_, _) => unreachable!("element kind checked above"),
+                }
+                if x.has_null_elems() || valid.is_some() {
+                    let total = self.len * n;
+                    let need = total.div_ceil(8);
+                    let mask = valid.get_or_insert_with(|| {
+                        let mut v = vec![0xFFu8; need];
+                        if !total.is_multiple_of(8) {
+                            v[need - 1] = (1u8 << (total % 8)) - 1;
+                        }
+                        v
+                    });
+                    for i in 0..n {
+                        let at = idx * n + i;
+                        if x.is_valid(i) {
+                            mask[at / 8] |= 1u8 << (at % 8);
+                        } else {
+                            mask[at / 8] &= !(1u8 << (at % 8));
+                        }
+                    }
+                }
+            }
             (_, Value::Null) => {} // placeholder stays; bit cleared below
             (data, other) => {
                 return Err(PinkDbError::Type(format!(
@@ -688,6 +913,26 @@ impl Vector {
                 buf.push(10);
                 crate::variant::hash_key(&v[idx], buf);
             }
+            // ARRAY: element kind, length, NULL-element bitmap and the
+            // normalized element values (see `array::encode_key`), so two
+            // arrays hash together exactly when `compare_values` says equal.
+            VectorData::Array {
+                elem,
+                len,
+                values,
+                valid,
+            } => {
+                buf.push(11);
+                let n = *len as usize;
+                crate::array::ArrayValue::encode_key_range(
+                    *elem,
+                    values,
+                    valid.as_deref(),
+                    idx * n,
+                    n,
+                    buf,
+                );
+            }
         }
     }
     /// Copy element `idx` from `other` into `self` (for UPDATE-adjacent
@@ -718,6 +963,41 @@ impl Vector {
             }
             (VectorData::Interval(d), VectorData::Interval(s)) => d.push(s[idx]),
             (VectorData::Variant(d), VectorData::Variant(s)) => d.push(Arc::clone(&s[idx])),
+            (
+                VectorData::Array {
+                    elem,
+                    len,
+                    values,
+                    valid,
+                },
+                VectorData::Array {
+                    elem: selem,
+                    len: slen,
+                    values: svalues,
+                    valid: svalid,
+                },
+            ) => {
+                if elem != selem || len != slen {
+                    return Err(PinkDbError::Execution(
+                        "push_from needs matching vector types".to_string(),
+                    ));
+                }
+                let n = *len as usize;
+                let start = values.len();
+                match (values, svalues) {
+                    (ArrayElems::Ints(d), ArrayElems::Ints(s)) => {
+                        d.extend_from_slice(&s[idx * n..idx * n + n]);
+                    }
+                    (ArrayElems::Floats(d), ArrayElems::Floats(s)) => {
+                        d.extend_from_slice(&s[idx * n..idx * n + n]);
+                    }
+                    (ArrayElems::Floats32(d), ArrayElems::Floats32(s)) => {
+                        d.extend_from_slice(&s[idx * n..idx * n + n]);
+                    }
+                    (_, _) => unreachable!("element kinds checked above"),
+                }
+                array_bits_append(valid, start, svalid.as_deref(), idx * n, n);
+            }
             _ => {
                 return Err(PinkDbError::Execution(
                     "push_from needs matching vector types".to_string(),

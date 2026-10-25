@@ -434,6 +434,11 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                     work.push((NodeRef::Expr(base), child));
                     work.push((NodeRef::Expr(index), child));
                 }
+                ast::Expr::ArrayLiteral(items) => {
+                    for item in items {
+                        work.push((NodeRef::Expr(item), child));
+                    }
+                }
                 ast::Expr::Slice { base, from, to } => {
                     work.push((NodeRef::Expr(base), child));
                     for bound in [from, to].into_iter().flatten() {
@@ -836,6 +841,7 @@ fn take_expr_children(
             exprs.push(std::mem::replace(&mut **base, null_expr()));
             exprs.push(std::mem::replace(&mut **index, null_expr()));
         }
+        ast::Expr::ArrayLiteral(items) => exprs.append(items),
         ast::Expr::Slice { base, from, to } => {
             exprs.push(std::mem::replace(&mut **base, null_expr()));
             for bound in [from, to].into_iter().flatten() {

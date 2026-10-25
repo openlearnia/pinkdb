@@ -1290,6 +1290,38 @@ pub fn cast(v: &Variant, target: DataType) -> Result<Value> {
         // Every other target reads a variant-null as SQL NULL, like DuckDB
         // (`json('null')::VARIANT IS NULL` is false; `::INTEGER` is NULL).
         _ if matches!(v, Variant::Null) => Ok(Value::Null),
+        // ARRAY needs the exact element count (see the plan's difference
+        // table): a JSON list of the wrong length is an error, not a NULL.
+        DataType::Array { elem, len } => match v {
+            Variant::Array(items) => {
+                if items.len() != len as usize {
+                    return Err(err(&format!("{}-element array", items.len())));
+                }
+                let mut values = crate::array::ArrayElems::with_capacity(elem, items.len());
+                let mut valid = vec![0xFFu8; items.len().div_ceil(8)];
+                let mut any_null = false;
+                for (i, item) in items.iter().enumerate() {
+                    match item {
+                        // A JSON null element is a NULL element, like DuckDB.
+                        Variant::Null => {
+                            values.push_zero();
+                            valid[i / 8] &= !(1u8 << (i % 8));
+                            any_null = true;
+                        }
+                        _ => values.push_elem(elem, Some(&cast(item, elem.dtype())?))?,
+                    }
+                }
+                let valid = any_null.then(|| valid.into_boxed_slice());
+                Ok(Value::Array(Arc::new(crate::array::ArrayValue::new(
+                    elem, len, values, valid,
+                )?)))
+            }
+            // A variant string holds the same `[a, b]` text a VARCHAR does.
+            Variant::Str(s) => Ok(Value::Array(Arc::new(crate::array::ArrayValue::parse(
+                s, elem, len,
+            )?))),
+            _ => Err(err(&format!("{v}"))),
+        },
         // A variant string converts like the VARCHAR it holds: `'"5"'`
         // reaches INTEGER as 5 (DuckDB does the same).
         DataType::Boolean => match v {
@@ -1415,6 +1447,20 @@ pub fn from_value(v: &Value) -> Result<Variant> {
             types::format_interval(*months, *days, *micros).as_str(),
         )),
         Value::Variant(x) => (**x).clone(),
+        // ARRAY: one JSON array of elements; a NULL element is the JSON null
+        // (`Variant::Null`), which is how a list with holes prints.
+        Value::Array(a) => Variant::Array(
+            (0..a.len())
+                .map(|i| {
+                    if !a.is_valid(i) {
+                        Variant::Null
+                    } else {
+                        from_value(&a.elem_value(i)).expect("ARRAY elements are scalar values")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        ),
     })
 }
 

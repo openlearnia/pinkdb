@@ -963,6 +963,10 @@ pub enum Expr {
         expr: Box<Expr>,
         dtype: crate::types::DataType,
     },
+    /// `[a, b, c]` — a fixed-size ARRAY literal. The element type and length
+    /// come from the position it lands in (a `CAST`, an INSERT, a comparison
+    /// with an ARRAY column): a bare literal has no type of its own.
+    ArrayLiteral(Vec<Expr>),
     /// `base[index]` — a VARIANT field/array element, a VARCHAR character or
     /// a list element (see the binder for the accepted base types).
     Subscript {

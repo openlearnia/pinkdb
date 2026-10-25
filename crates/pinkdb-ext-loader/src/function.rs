@@ -238,7 +238,12 @@ impl DynamicFunction {
             && out.text_len <= MAX_VARCHAR_RESULT_BYTES
             && matches!(
                 ExtType::from_tag(out.type_tag),
-                Some(ExtType::Varchar | ExtType::Variant)
+                Some(
+                    ExtType::Varchar
+                        | ExtType::Variant
+                        | ExtType::ArrayDouble { .. }
+                        | ExtType::ArrayFloat { .. }
+                )
             );
 
         if code != 0 {
@@ -287,6 +292,8 @@ impl DynamicFunction {
             ExtType::Double => ExtValue::Double(out.double),
             ExtType::Varchar => ExtValue::Varchar(self.text_result(out, tag)?),
             ExtType::Variant => ExtValue::Variant(self.text_result(out, tag)?),
+            ExtType::ArrayDouble { len } => ExtValue::ArrayDouble(self.array_result(out, len)?),
+            ExtType::ArrayFloat { len } => ExtValue::ArrayFloat(self.float_result(out, len)?),
             ExtType::Date => ExtValue::Date(out.int64 as i32),
             ExtType::Timestamp => ExtValue::Timestamp(out.int64),
             ExtType::Interval => {
@@ -298,6 +305,93 @@ impl DynamicFunction {
                 }
             }
         })
+    }
+
+    /// Copy an ARRAY result out of extension memory.
+    ///
+    /// The element count is stated twice — in the packed type tag and in
+    /// `int64` — and the byte count a third time in `text_len`; all three
+    /// must agree, so a callback that miscounts fails here rather than
+    /// reading past its buffer.
+    /// The `FLOAT[N]` counterpart of [`Self::array_result`]: `len` contiguous
+    /// `f32`s, aligned for `f32` and packed in exactly `len * 4` bytes.
+    fn float_result(&self, out: &PinkdbExtValue, len: u32) -> Result<Vec<f32>, ExtError> {
+        let bad = |message: String| ExtError::BadResult {
+            function: self.name.clone(),
+            message,
+        };
+        if out.int64 != len as i64 {
+            return Err(bad(format!(
+                "returned {} elements under a FLOAT[{len}] type",
+                out.int64
+            )));
+        }
+        let bytes = len as usize * std::mem::size_of::<f32>();
+        if out.text_len != bytes {
+            return Err(bad(format!(
+                "returned {len} elements packed in {} bytes, not {bytes}",
+                out.text_len
+            )));
+        }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if out.text_ptr.is_null() {
+            return Err(bad(format!(
+                "returned a {len}-element FLOAT array with a NULL pointer"
+            )));
+        }
+        if !(out.text_ptr as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+            return Err(bad(
+                "returned a FLOAT array whose pointer is not 4-byte aligned".to_string(),
+            ));
+        }
+        // SAFETY: as in `array_result` — the host checked the length, the
+        // pointer is non-NULL and aligned, and the bytes are copied out before
+        // the extension's allocation is freed.
+        let values =
+            unsafe { std::slice::from_raw_parts(out.text_ptr as *const f32, len as usize) };
+        Ok(values.to_vec())
+    }
+
+    fn array_result(&self, out: &PinkdbExtValue, len: u32) -> Result<Vec<f64>, ExtError> {
+        let bad = |message: String| ExtError::BadResult {
+            function: self.name.clone(),
+            message,
+        };
+        if out.int64 != len as i64 {
+            return Err(bad(format!(
+                "returned {} elements under a DOUBLE[{len}] type",
+                out.int64
+            )));
+        }
+        let bytes = len as usize * std::mem::size_of::<f64>();
+        if out.text_len != bytes {
+            return Err(bad(format!(
+                "returned {len} elements packed in {} bytes, not {bytes}",
+                out.text_len
+            )));
+        }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if out.text_ptr.is_null() {
+            return Err(bad(format!(
+                "returned a {len}-element DOUBLE array with a NULL pointer"
+            )));
+        }
+        if !(out.text_ptr as usize).is_multiple_of(std::mem::align_of::<f64>()) {
+            return Err(bad(
+                "returned a DOUBLE array whose pointer is not 8-byte aligned".to_string(),
+            ));
+        }
+        // SAFETY: the host verified the length, the pointer is non-NULL,
+        // aligned for `f64` and names an allocation the extension made with
+        // `api->alloc` (the header's contract for every text-channel payload);
+        // the bytes are copied out before `call` frees the buffer.
+        let values =
+            unsafe { std::slice::from_raw_parts(out.text_ptr as *const f64, len as usize) };
+        Ok(values.to_vec())
     }
 
     /// Copy the text-channel payload out of extension memory.

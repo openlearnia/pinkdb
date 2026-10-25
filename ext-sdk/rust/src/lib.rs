@@ -195,8 +195,8 @@ pub use pinkdb_ext_loader::{
 pub use serve::{HostSession, StatementReply};
 pub use spec::ScalarSpec;
 pub use value::{
-    Date, ExtArgType, FromExtArg, FromExtArgAt, Interval, IntoExtValue, Optional, Timestamp,
-    Variant, decode_arguments,
+    ArrayDouble, ArrayFloat, Date, ExtArgType, FromExtArg, FromExtArgAt, Interval, IntoExtValue,
+    Optional, Timestamp, Variant, decode_arguments,
 };
 
 /// Publish a linked extension in the process-global registry (wave 49);

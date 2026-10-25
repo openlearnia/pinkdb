@@ -80,6 +80,11 @@ pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             buf.push(10);
             crate::variant::hash_key(v, buf);
         }
+        // ARRAY: the canonical key (same as the vector path).
+        Value::Array(a) => {
+            buf.push(11);
+            a.hash_key(buf);
+        }
     }
 }
 
@@ -1017,6 +1022,18 @@ fn cell_value(data: &VectorData, i: usize) -> Value {
             micros: d[i].micros,
         },
         VectorData::Variant(d) => Value::Variant(std::sync::Arc::clone(&d[i])),
+        VectorData::Array {
+            elem,
+            len,
+            values,
+            valid,
+        } => {
+            let n = *len as usize;
+            Value::Array(std::sync::Arc::new(
+                crate::array::cell_from_slice(*elem, values, valid.as_deref(), i * n, n)
+                    .expect("ARRAY cell slice"),
+            ))
+        }
     }
 }
 

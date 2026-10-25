@@ -380,6 +380,64 @@ func TestDecimalIntervalAndAlteredTable(t *testing.T) {
 	}
 }
 
+func TestFloatArrayValuesAreFloat32Slices(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	res, err := db.Execute(
+		"SELECT CAST('[1.5, -0.25, 3]' AS FLOAT[3]) AS v, " +
+			"CAST(NULL AS FLOAT[2]) AS n, len(CAST('[1, 2]' AS FLOAT[2])) AS l;")
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := res[0].ColumnTypes; len(got) != 3 || got[0] != "float[3]" || got[1] != "float[2]" || got[2] != "integer" {
+		t.Fatalf("column types: %v", got)
+	}
+	values, ok := res[0].Rows[0][0].([]float32)
+	if !ok || len(values) != 3 {
+		t.Fatalf("array cell: %v (%T)", res[0].Rows[0][0], res[0].Rows[0][0])
+	}
+	for i, want := range []float32{1.5, -0.25, 3} {
+		if values[i] != want {
+			t.Fatalf("element %d = %v, want %v", i, values[i], want)
+		}
+	}
+	if res[0].Rows[0][1] != nil {
+		t.Fatalf("NULL array: %v", res[0].Rows[0][1])
+	}
+	if got := res[0].Rows[0][2]; got != int64(2) {
+		t.Fatalf("len: %v", got)
+	}
+}
+
+func TestArrayValuesAreFloatSlices(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	res, err := db.Execute(
+		"SELECT CAST('[1.5, -0.25, 3]' AS DOUBLE[3]) AS v, " +
+			"CAST(NULL AS DOUBLE[2]) AS n, len(CAST('[1, 2]' AS DOUBLE[2])) AS l;")
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := res[0].ColumnTypes; len(got) != 3 || got[0] != "double[3]" || got[1] != "double[2]" || got[2] != "integer" {
+		t.Fatalf("column types: %v", got)
+	}
+	values, ok := res[0].Rows[0][0].([]float64)
+	if !ok || len(values) != 3 {
+		t.Fatalf("array cell: %v (%T)", res[0].Rows[0][0], res[0].Rows[0][0])
+	}
+	for i, want := range []float64{1.5, -0.25, 3} {
+		if values[i] != want {
+			t.Fatalf("element %d = %v, want %v", i, values[i], want)
+		}
+	}
+	if res[0].Rows[0][1] != nil {
+		t.Fatalf("NULL array: %v", res[0].Rows[0][1])
+	}
+	if got := res[0].Rows[0][2]; got != int64(2) {
+		t.Fatalf("len: %v", got)
+	}
+}
+
 func TestErrorKeepsHandleUsable(t *testing.T) {
 	db := mustOpenMemory(t)
 	defer db.Close()

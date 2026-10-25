@@ -102,6 +102,18 @@ pub const PINKDB_TYPE_INTERVAL: i32 = 9;
 /// VARCHAR from a C-side parse — the C ABI has no slot for those kinds, so
 /// the extension ABI refuses VARIANT instead of pretending.
 pub const PINKDB_TYPE_VARIANT: i32 = 10;
+/// v1 additive: a `DOUBLE[N]` value carries its `N` in the tag itself —
+/// `PINKDB_TYPE_ARRAY | (N << 8)` — and its elements as `N * 8` little-endian
+/// `f64` bytes in `text`/`text_len`, with `int64` set to `N`. The length has to
+/// travel with the tag because the C ABI has one `type_tag` slot and no room
+/// for type parameters. INTEGER/BIGINT arrays and arrays holding NULL elements
+/// are refused (there is no per-element NULL channel here).
+pub const PINKDB_TYPE_ARRAY: i32 = 11;
+/// v1 additive: a `FLOAT[N]` value, the 4-byte counterpart of
+/// `PINKDB_TYPE_ARRAY`: the tag carries `N` (`PINKDB_TYPE_ARRAY_FLOAT |
+/// (N << 8)`) and `text`/`text_len` hold `N * 4` little-endian `f32` bytes.
+/// FLOAT is an array-only element kind here (the engine has no `FLOAT` scalar).
+pub const PINKDB_TYPE_ARRAY_FLOAT: i32 = 12;
 
 // ----- thread-local error -----
 
@@ -255,8 +267,8 @@ struct Cell {
 }
 
 impl Cell {
-    fn from_value(v: &Value) -> Cell {
-        match v {
+    fn from_value(v: &Value) -> std::result::Result<Cell, String> {
+        Ok(match v {
             Value::Null => Cell {
                 tag: PINKDB_TYPE_NULL,
                 is_null: true,
@@ -339,6 +351,52 @@ impl Cell {
                     text: Some(b),
                 }
             }
+            Value::Array(a) => {
+                let single = match a.elem {
+                    pinkdb::ArrayElem::Float => true,
+                    pinkdb::ArrayElem::Double => false,
+                    _ => {
+                        return Err(format!(
+                            "only FLOAT and DOUBLE arrays cross the C ABI; this {} column needs \
+                             a CAST (e.g. SELECT CAST(v AS VARCHAR))",
+                            a.dtype()
+                        ));
+                    }
+                };
+                if a.has_null_elems() {
+                    return Err(format!(
+                        "a {} value with a NULL element cannot cross the C ABI (there is no \
+                         per-element NULL channel); replace it first, e.g. COALESCE(v[i], 0)",
+                        a.dtype()
+                    ));
+                }
+                let width = if single { 4 } else { 8 };
+                let mut b = Vec::with_capacity(a.len() * width + 1);
+                if single {
+                    let Some(values) = a.floats32() else {
+                        unreachable!("single is set only for FLOAT arrays")
+                    };
+                    for x in values {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
+                } else if let Some(values) = a.floats() {
+                    for x in values {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+                b.push(0);
+                Cell {
+                    tag: if single {
+                        float_array_tag(a.len() as u32)
+                    } else {
+                        array_tag(a.len() as u32)
+                    },
+                    is_null: false,
+                    i: a.len() as i64,
+                    d: 0.0,
+                    text: Some(b),
+                }
+            }
             Value::Interval {
                 months,
                 days,
@@ -354,7 +412,7 @@ impl Cell {
                     text: Some(b),
                 }
             }
-        }
+        })
     }
 
     fn value(&self) -> PinkValue {
@@ -373,8 +431,30 @@ impl Cell {
     }
 }
 
+/// `PINKDB_TYPE_ARRAY | (len << 8)`: the tag carries the length.
+pub const fn array_tag(len: u32) -> i32 {
+    PINKDB_TYPE_ARRAY | ((len as i32) << 8)
+}
+
+/// The element count packed into an ARRAY tag by [`array_tag`].
+pub const fn array_tag_len(tag: i32) -> u32 {
+    (tag as u32) >> 8
+}
+
+/// `PINKDB_TYPE_ARRAY_FLOAT | (len << 8)`, the `FLOAT[N]` counterpart.
+pub const fn float_array_tag(len: u32) -> i32 {
+    PINKDB_TYPE_ARRAY_FLOAT | ((len as i32) << 8)
+}
+
 fn dtype_tag(t: DataType) -> i32 {
     match t {
+        DataType::Array { len, elem } => {
+            if elem == pinkdb::ArrayElem::Float {
+                float_array_tag(len)
+            } else {
+                array_tag(len)
+            }
+        }
         DataType::Boolean => PINKDB_TYPE_BOOLEAN,
         DataType::Integer => PINKDB_TYPE_INTEGER,
         DataType::Bigint => PINKDB_TYPE_BIGINT,
@@ -492,96 +572,101 @@ fn kind_of(r: &QueryResult) -> i32 {
     }
 }
 
-fn build_result(results: Vec<QueryResult>) -> PinkResult {
+fn build_result(results: Vec<QueryResult>) -> std::result::Result<PinkResult, String> {
     let stmts = results
         .into_iter()
-        .map(|r| match r {
-            QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
-                names: names.iter().map(|n| nul_terminated(n)).collect(),
-                types: types.into_iter().map(dtype_tag).collect(),
-                rows: rows
-                    .iter()
-                    .map(|row| row.iter().map(Cell::from_value).collect())
-                    .collect(),
-            }),
-            // `CALL` (wave 44): a call whose own result is a result set is
-            // presented as that row set (the statement stream needs no new
-            // C-ABI entry); any other call outcome is a simple statement whose
-            // count is the number of body statements it ran.
-            // A JavaScript body's `print` lines are not carried over the
-            // C ABI yet (wave 81 follow-up).
-            QueryResult::Called {
-                name,
-                statements,
-                result: Some(inner),
-                ..
-            } => match *inner {
+        .map(|r| {
+            Ok(match r {
                 QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
-                    names: names.into_iter().map(|n| nul_terminated(&n)).collect(),
+                    names: names.iter().map(|n| nul_terminated(n)).collect(),
                     types: types.into_iter().map(dtype_tag).collect(),
                     rows: rows
                         .iter()
                         .map(|row| row.iter().map(Cell::from_value).collect())
-                        .collect(),
+                        .collect::<std::result::Result<Vec<_>, _>>()?,
                 }),
-                _ => StmtData::Simple {
-                    kind: PINKDB_STMT_CREATED,
-                    count: statements,
-                    name: Some(nul_terminated(&name)),
+                // `CALL` (wave 44): a call whose own result is a result set is
+                // presented as that row set (the statement stream needs no new
+                // C-ABI entry); any other call outcome is a simple statement whose
+                // count is the number of body statements it ran.
+                // A JavaScript body's `print` lines are not carried over the
+                // C ABI yet (wave 81 follow-up).
+                QueryResult::Called {
+                    name,
+                    statements,
+                    result: Some(inner),
+                    ..
+                } => match *inner {
+                    QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
+                        names: names.into_iter().map(|n| nul_terminated(&n)).collect(),
+                        types: types.into_iter().map(dtype_tag).collect(),
+                        rows: rows
+                            .iter()
+                            .map(|row| row.iter().map(Cell::from_value).collect())
+                            .collect::<std::result::Result<Vec<_>, _>>()?,
+                    }),
+                    _ => StmtData::Simple {
+                        kind: PINKDB_STMT_CREATED,
+                        count: statements,
+                        name: Some(nul_terminated(&name)),
+                    },
                 },
-            },
-            other => {
-                let kind = kind_of(&other);
-                let (count, name) = match &other {
-                    QueryResult::Inserted { count }
-                    | QueryResult::Updated { count }
-                    | QueryResult::Deleted { count } => (*count, None),
-                    QueryResult::Called {
-                        name, statements, ..
-                    } => (*statements, Some(nul_terminated(name))),
-                    QueryResult::CreatedView { name }
-                    | QueryResult::DroppedTable { name }
-                    | QueryResult::DroppedView { name }
-                    | QueryResult::CreatedDatabase { name }
-                    | QueryResult::DroppedDatabase { name }
-                    | QueryResult::AlteredTable { name }
-                    | QueryResult::CreatedProcedure { name }
-                    | QueryResult::DroppedProcedure { name }
-                    | QueryResult::CreatedTrigger { name }
-                    | QueryResult::DroppedTrigger { name }
-                    | QueryResult::CreatedMacro { name }
-                    | QueryResult::DroppedMacro { name }
-                    | QueryResult::CreatedUser { name }
-                    | QueryResult::AlteredUser { name }
-                    | QueryResult::DroppedUser { name }
-                    | QueryResult::CreatedRole { name }
-                    | QueryResult::DroppedRole { name } => (0, Some(nul_terminated(name))),
-                    QueryResult::Granted { description } | QueryResult::Revoked { description } => {
-                        (0, Some(nul_terminated(description)))
-                    }
-                    QueryResult::Used { db } => (0, Some(nul_terminated(db))),
-                    QueryResult::SetVariable { name } => (0, Some(nul_terminated(name))),
-                    QueryResult::LoadedExtension { name } => (0, Some(nul_terminated(name))),
-                    _ => (0, None),
-                };
-                StmtData::Simple { kind, count, name }
-            }
+                other => {
+                    let kind = kind_of(&other);
+                    let (count, name) = match &other {
+                        QueryResult::Inserted { count }
+                        | QueryResult::Updated { count }
+                        | QueryResult::Deleted { count } => (*count, None),
+                        QueryResult::Called {
+                            name, statements, ..
+                        } => (*statements, Some(nul_terminated(name))),
+                        QueryResult::CreatedView { name }
+                        | QueryResult::DroppedTable { name }
+                        | QueryResult::DroppedView { name }
+                        | QueryResult::CreatedDatabase { name }
+                        | QueryResult::DroppedDatabase { name }
+                        | QueryResult::AlteredTable { name }
+                        | QueryResult::CreatedProcedure { name }
+                        | QueryResult::DroppedProcedure { name }
+                        | QueryResult::CreatedTrigger { name }
+                        | QueryResult::DroppedTrigger { name }
+                        | QueryResult::CreatedMacro { name }
+                        | QueryResult::DroppedMacro { name }
+                        | QueryResult::CreatedUser { name }
+                        | QueryResult::AlteredUser { name }
+                        | QueryResult::DroppedUser { name }
+                        | QueryResult::CreatedRole { name }
+                        | QueryResult::DroppedRole { name } => (0, Some(nul_terminated(name))),
+                        QueryResult::Granted { description }
+                        | QueryResult::Revoked { description } => {
+                            (0, Some(nul_terminated(description)))
+                        }
+                        QueryResult::Used { db } => (0, Some(nul_terminated(db))),
+                        QueryResult::SetVariable { name } => (0, Some(nul_terminated(name))),
+                        QueryResult::LoadedExtension { name } => (0, Some(nul_terminated(name))),
+                        _ => (0, None),
+                    };
+                    StmtData::Simple { kind, count, name }
+                }
+            })
         })
-        .collect();
-    PinkResult {
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    Ok(PinkResult {
         stmts,
         profiles: Vec::new(),
-    }
+    })
 }
 
 /// Build a result that also owns one profile per statement. The engine
 /// returns pairs in statement order, so the arrays line up with the
 /// statement-index accessors.
-fn build_profiled_result(pairs: Vec<(QueryResult, QueryProfile)>) -> PinkResult {
+fn build_profiled_result(
+    pairs: Vec<(QueryResult, QueryProfile)>,
+) -> std::result::Result<PinkResult, String> {
     let (results, profiles): (Vec<QueryResult>, Vec<QueryProfile>) = pairs.into_iter().unzip();
-    let mut result = build_result(results);
+    let mut result = build_result(results)?;
     result.profiles = profiles.iter().map(ProfileData::from_profile).collect();
-    result
+    Ok(result)
 }
 
 // ----- handles -----
@@ -671,9 +756,15 @@ pub extern "C" fn pinkdb_close(handle: *mut PinkHandle) {
 
 /// Box a result, refusing to unwind across the C ABI. The closure runs inside
 /// `catch_unwind` so a panic while marshaling (`build_result`) is contained too.
-fn into_boxed_result(build: impl FnOnce() -> PinkResult) -> *mut PinkResult {
+fn into_boxed_result(
+    build: impl FnOnce() -> std::result::Result<PinkResult, String>,
+) -> *mut PinkResult {
     match catch_unwind(AssertUnwindSafe(build)) {
-        Ok(result) => Box::into_raw(Box::new(result)),
+        Ok(Ok(result)) => Box::into_raw(Box::new(result)),
+        Ok(Err(message)) => {
+            set_error(CLASS_TYPE, &message);
+            ptr::null_mut()
+        }
         Err(_) => {
             set_error(
                 CLASS_INTERNAL,
@@ -1030,6 +1121,64 @@ fn value_from_pink(v: &PinkValue) -> Result<pinkdb::Value, String> {
                 .map_err(|_| format!("DATE payload {} does not fit in i32", v.int64))?,
         ),
         PINKDB_TYPE_TIMESTAMP => pinkdb::Value::Timestamp(v.int64),
+        tag if tag & 0xff == PINKDB_TYPE_ARRAY_FLOAT => {
+            let len = array_tag_len(tag);
+            let want = len as usize * std::mem::size_of::<f32>();
+            if v.text_len != want {
+                return Err(format!(
+                    "FLOAT[{len}] payload is {} bytes, not {want}",
+                    v.text_len
+                ));
+            }
+            if v.text_ptr.is_null() {
+                return Err("ARRAY payload has a NULL text pointer".to_string());
+            }
+            // SAFETY: non-null and valid for `text_len` bytes per the API
+            // contract.
+            let bytes = unsafe { std::slice::from_raw_parts(v.text_ptr as *const u8, want) };
+            let values = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            let array = pinkdb::array::ArrayValue::new(
+                pinkdb::ArrayElem::Float,
+                len,
+                pinkdb::array::ArrayElems::Floats32(values),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+            pinkdb::Value::Array(std::sync::Arc::new(array))
+        }
+        tag if tag & 0xff == PINKDB_TYPE_ARRAY => {
+            let len = array_tag_len(tag);
+            let want = len as usize * std::mem::size_of::<f64>();
+            if v.text_len != want {
+                return Err(format!(
+                    "DOUBLE[{len}] payload is {} bytes, not {want}",
+                    v.text_len
+                ));
+            }
+            if v.text_ptr.is_null() {
+                return Err("ARRAY payload has a NULL text pointer".to_string());
+            }
+            // SAFETY: non-null and valid for `text_len` bytes per the API
+            // contract.
+            let bytes = unsafe { std::slice::from_raw_parts(v.text_ptr as *const u8, want) };
+            let values = bytes
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+                .collect::<Vec<f64>>();
+            // The payload always holds exactly `len` elements, so the
+            // constructor cannot fail.
+            let array = pinkdb::array::ArrayValue::new(
+                pinkdb::ArrayElem::Double,
+                len,
+                pinkdb::array::ArrayElems::Floats(values),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+            pinkdb::Value::Array(std::sync::Arc::new(array))
+        }
         // Results carry DECIMAL/INTERVAL as text cells; binding a *parameter*
         // back is not supported in ABI v1 (cast the text in SQL).
         PINKDB_TYPE_DECIMAL | PINKDB_TYPE_INTERVAL => {

@@ -14,6 +14,11 @@
 //! | `DECIMAL(p,s)` | `Decimal128(p,s)` |
 //! | `INTERVAL` | `Interval(MonthDayNano)` (µs → ns, exact) |
 //!
+//! `ARRAY` is refused in both directions (wave 107a): Arrow's `FixedSizeList`
+//! is a *list* layout whose length lives in the field rather than in the
+//! values, and the reader would have to round-trip it through a variable
+//! length channel pinkdb does not have yet.
+//!
 //! Every field is written nullable (the engine's constraints are metadata
 //! and never enforced, so claiming non-nullability would be a lie about the
 //! data). Writes are uncompressed.
@@ -147,6 +152,13 @@ pub fn arrow_type(dtype: DataType) -> Result<ArrowType> {
             return Err(PinkDbError::Type(
                 "arrow has no VARIANT type pinkdb can write exactly; the arrow extension \
                  refuses rather than flattening it to text"
+                    .to_string(),
+            ));
+        }
+        DataType::Array { .. } => {
+            return Err(PinkDbError::Type(
+                "arrow has no fixed-size list type pinkdb can write exactly; the arrow \
+                 extension refuses rather than writing a variable-length list"
                     .to_string(),
             ));
         }

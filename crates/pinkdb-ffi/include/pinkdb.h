@@ -101,14 +101,36 @@ enum {
     PINKDB_TYPE_INTERVAL = 9,
     /* v1 additive: VARIANT renders into `text` as its JSON value. Its DATE and
        TIMESTAMP kinds print as ISO strings (they come back as VARCHAR). */
-    PINKDB_TYPE_VARIANT = 10
+    PINKDB_TYPE_VARIANT = 10,
+    /* v1 additive: a DOUBLE[N] array. The low byte is this enumerator and the
+       element count N travels in the tag itself — see PINKDB_ARRAY_TAG. */
+    PINKDB_TYPE_ARRAY = 11,
+    /* v1 additive: a FLOAT[N] array — the 4-byte counterpart of
+       PINKDB_TYPE_ARRAY. See PINKDB_ARRAY_FLOAT_TAG. */
+    PINKDB_TYPE_ARRAY_FLOAT = 12
 };
+
+/* An ARRAY's type tag: the type in the low byte, the element count above it.
+ * `PINKDB_ARRAY_LEN(tag)` recovers N. A host that predates ARRAY sees an
+ * unknown low byte instead of misreading a length as a type. */
+#define PINKDB_ARRAY_TAG(len) ((int32_t)(PINKDB_TYPE_ARRAY) | ((int32_t)(len) << 8))
+#define PINKDB_ARRAY_FLOAT_TAG(len) \
+    ((int32_t)(PINKDB_TYPE_ARRAY_FLOAT) | ((int32_t)(len) << 8))
+#define PINKDB_ARRAY_LEN(tag) (((uint32_t)(tag)) >> 8)
 
 /* One result value, passed by value.
  *
  * `int64` carries BOOLEAN (0/1), INTEGER, BIGINT, DATE (days since epoch) and
  * TIMESTAMP (microseconds since epoch). `double` carries DOUBLE. `text_ptr` /
  * `text_len` carry VARCHAR (with a trailing NUL at text_ptr[text_len]).
+ *
+ * An ARRAY value uses `type_tag = PINKDB_ARRAY_TAG(N)` (DOUBLE elements) or
+ * `PINKDB_ARRAY_FLOAT_TAG(N)` (FLOAT elements), puts N in `int64`, and hands
+ * over N * 8 (`f64`) or N * 4 (`f32`) little-endian bytes as a binary payload
+ * in `text_ptr` / `text_len` (same trailing NUL). An ARRAY with a NULL
+ * element is refused rather than silently defaulted — there is no per-element
+ * NULL channel in this struct. INTEGER/BIGINT arrays are refused too; CAST the
+ * column (e.g. `SELECT CAST(v AS VARCHAR)` or a COALESCE'd element access).
  * When `is_null` is non-zero only `type_tag` is meaningful. */
 typedef struct pink_value {
     int32_t type_tag;

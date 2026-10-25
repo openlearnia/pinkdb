@@ -658,6 +658,16 @@ impl DataTable {
                     "cannot parse \"{s}\" as INTERVAL"
                 ))),
             },
+            // ARRAY columns follow the CAST matrix: same length, any element
+            // tower, and the text/JSON spellings an INSERT or CSV gives.
+            (v @ Value::Array(_), t @ DataType::Array { .. })
+            | (v @ Value::Varchar(_), t @ DataType::Array { .. })
+            | (v @ Value::Variant(_), t @ DataType::Array { .. }) => {
+                crate::exec::expr::cast_value(v, t).map_err(|e| match e {
+                    PinkDbError::Execution(m) => PinkDbError::Type(m),
+                    e => e,
+                })
+            }
             (v, t) => Err(PinkDbError::Type(format!("cannot coerce {v} to {t}"))),
         }
     }
@@ -810,6 +820,8 @@ impl DataTable {
             // Widening into VARIANT; the other direction needs an explicit
             // CAST because it can fail per row.
             (_, DataType::Variant) => true,
+            // ARRAY: same length, element tower free (see `coerce`).
+            (DataType::Array { len: a, .. }, DataType::Array { len: b, .. }) => a == b,
             _ => false,
         }
     }

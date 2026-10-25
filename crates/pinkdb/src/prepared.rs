@@ -355,6 +355,10 @@ pub(crate) fn value_literal(value: &Value) -> Result<String> {
             }
             format!("CAST('{}' AS VARIANT)", v.to_json().replace('\'', "''"))
         }
+        // ARRAY's literal form is its `[a, b]` text, which CAST reads back
+        // through `ArrayValue::parse`. The element kind and length ride the
+        // CAST's target type, so the text carries no type of its own.
+        Value::Array(a) => format!("CAST('{}' AS {})", a.text().replace('\'', "''"), a.dtype()),
     })
 }
 

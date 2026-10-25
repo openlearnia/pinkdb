@@ -2639,6 +2639,9 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         // VARIANT: the documented cross-kind total order (`variant::cmp`),
         // which is also its equality and its hash key.
         (Value::Variant(x), Value::Variant(y)) => crate::variant::cmp(x, y),
+        // ARRAY: element-wise lexicographic, a NULL element after every
+        // value — the same order the typed `=` uses (`array::cmp_slot`).
+        (Value::Array(a), Value::Array(b)) => crate::array::ArrayValue::compare(a, b),
         // Binder rejects mixed-type comparisons; order deterministically anyway.
         _ => format!("{a:?}").cmp(&format!("{b:?}")),
     }

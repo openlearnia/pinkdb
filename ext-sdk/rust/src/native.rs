@@ -117,6 +117,16 @@ unsafe fn collect_args<'a>(
             // `text_len` readable bytes for the duration of the call.
             Some(ExtType::Varchar) => ExtArg::Varchar(unsafe { text_bytes(value) }),
             Some(ExtType::Variant) => ExtArg::Variant(unsafe { text_bytes(value) }),
+            Some(ExtType::ArrayDouble { len }) => {
+                // SAFETY: the ABI promises `len * 8` readable bytes at
+                // `text_ptr` for an ARRAY argument holding no NULL element.
+                ExtArg::ArrayDouble(unsafe { double_bytes(value, len) })
+            }
+            Some(ExtType::ArrayFloat { len }) => {
+                // SAFETY: the ABI promises `len * 4` readable bytes at
+                // `text_ptr` for an ARRAY argument holding no NULL element.
+                ExtArg::ArrayFloat(unsafe { float_bytes(value, len) })
+            }
             Some(ExtType::Date) => ExtArg::Date(value.int64 as i32),
             Some(ExtType::Timestamp) => ExtArg::Timestamp(value.int64),
             Some(ExtType::Interval) => {
@@ -158,6 +168,34 @@ unsafe fn text_bytes<'a>(value: &PinkdbExtValue) -> &'a [u8] {
     // SAFETY: promised by the caller; `text_len == 0` with a NULL or stale
     // pointer is the one case that never reads memory.
     unsafe { std::slice::from_raw_parts(value.text_ptr as *const u8, value.text_len) }
+}
+
+/// The elements of a DOUBLE array argument.
+///
+/// # Safety
+///
+/// `value.text_ptr` must point at `len * 8` readable bytes that stay readable
+/// for the returned lifetime — the ABI promises exactly that for an argument.
+unsafe fn double_bytes<'a>(value: &PinkdbExtValue, len: u32) -> &'a [f64] {
+    if len == 0 {
+        return &[];
+    }
+    // SAFETY: promised by the caller.
+    unsafe { std::slice::from_raw_parts(value.text_ptr as *const f64, len as usize) }
+}
+
+/// The elements of a FLOAT array argument.
+///
+/// # Safety
+///
+/// `value.text_ptr` must point at `len * 4` readable bytes that stay readable
+/// for the returned lifetime — the ABI promises exactly that for an argument.
+unsafe fn float_bytes<'a>(value: &PinkdbExtValue, len: u32) -> &'a [f32] {
+    if len == 0 {
+        return &[];
+    }
+    // SAFETY: promised by the caller.
+    unsafe { std::slice::from_raw_parts(value.text_ptr as *const f32, len as usize) }
 }
 
 /// Write one result value into the host-owned struct, allocating VARCHAR
@@ -208,6 +246,22 @@ fn write_result(value: ExtValue, out: &mut PinkdbExtValue) -> Result<(), String>
             out.int64 = int64;
             out.double = double;
             Ok(())
+        }
+        ExtValue::ArrayDouble(values) => {
+            out.int64 = values.len() as i64;
+            let mut bytes = Vec::with_capacity(values.len() * 8);
+            for x in &values {
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+            write_text(&bytes, out, "DOUBLE[]")
+        }
+        ExtValue::ArrayFloat(values) => {
+            out.int64 = values.len() as i64;
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for x in &values {
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+            write_text(&bytes, out, "FLOAT[]")
         }
         // VARCHAR and VARIANT share the text channel and its ownership rule.
         ExtValue::Varchar(bytes) => write_text(&bytes, out, "VARCHAR"),

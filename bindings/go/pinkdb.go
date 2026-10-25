@@ -83,6 +83,7 @@ const char *pinkdb_result_name(const pinkdb_result *result, size_t statement);
 import "C"
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -191,6 +192,12 @@ const (
 	typeTimestamp int32 = 7
 	typeDecimal   int32 = 8
 	typeInterval  int32 = 9
+	// typeArrayis a DOUBLE[N] cell: the element count packs into the tag's
+	// upper bits, the payload is N little-endian f64 values.
+	typeArray int32 = 11
+	// typeArrayFloat is a FLOAT[N] cell: 4-byte elements, count packed into
+	// the tag exactly like typeArray.
+	typeArrayFloat int32 = 12
 )
 
 var typeNames = map[int32]string{
@@ -204,6 +211,19 @@ var typeNames = map[int32]string{
 	typeTimestamp: "timestamp",
 	typeDecimal:   "decimal",
 	typeInterval:  "interval",
+}
+
+// typeName is the pinkdb type name for a column type tag.
+func typeName(tag int32) (string, bool) {
+	if tag&0xff == typeArray || tag&0xff == typeArrayFloat {
+		elem := "double"
+		if tag&0xff == typeArrayFloat {
+			elem = "float"
+		}
+		return fmt.Sprintf("%s[%d]", elem, tag>>8), true
+	}
+	name, ok := typeNames[tag]
+	return name, ok
 }
 
 // Result is one statement's outcome, materialized as Go values.
@@ -718,7 +738,7 @@ func materialize(result *C.pinkdb_result) ([]Result, error) {
 				}
 				r.Columns = append(r.Columns, C.GoString(name))
 				typeTag := int32(C.pinkdb_result_column_type(result, C.size_t(stmt), C.size_t(col)))
-				typeName, ok := typeNames[typeTag]
+				typeName, ok := typeName(typeTag)
 				if !ok {
 					return nil, fmt.Errorf("pinkdb: unknown column type tag %d (ABI mismatch?)", typeTag)
 				}
@@ -755,6 +775,34 @@ func materialize(result *C.pinkdb_result) ([]Result, error) {
 func valueToGo(v C.pink_value) (any, error) {
 	if v.is_null != 0 || int32(v.type_tag) == typeNull {
 		return nil, nil
+	}
+	if tag := int32(v.type_tag); tag&0xff == typeArrayFloat {
+		count := int(tag >> 8)
+		if v.text_ptr == nil || uint64(v.text_len) != uint64(count)*4 {
+			return nil, fmt.Errorf(
+				"pinkdb: FLOAT[%d] value is %d bytes, not the %d of its element count",
+				count, uint64(v.text_len), count*4)
+		}
+		raw := C.GoBytes(unsafe.Pointer(v.text_ptr), C.int(v.text_len))
+		values := make([]float32, count)
+		for i := range values {
+			values[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
+		}
+		return values, nil
+	}
+	if tag := int32(v.type_tag); tag&0xff == typeArray {
+		count := int(tag >> 8)
+		if v.text_ptr == nil || uint64(v.text_len) != uint64(count)*8 {
+			return nil, fmt.Errorf(
+				"pinkdb: DOUBLE[%d] value is %d bytes, not the %d of its element count",
+				count, uint64(v.text_len), count*8)
+		}
+		raw := C.GoBytes(unsafe.Pointer(v.text_ptr), C.int(v.text_len))
+		values := make([]float64, count)
+		for i := range values {
+			values[i] = math.Float64frombits(binary.LittleEndian.Uint64(raw[i*8:]))
+		}
+		return values, nil
 	}
 	switch int32(v.type_tag) {
 	case typeBoolean:

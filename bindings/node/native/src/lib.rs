@@ -10,7 +10,8 @@
 //! BOOLEAN → boolean, INTEGER → number, BIGINT → BigInt, DOUBLE → number,
 //! VARCHAR/DECIMAL/INTERVAL → string, DATE/TIMESTAMP → string in the engine's
 //! canonical form (a JS `Date` cannot carry a µs timestamp or a calendar date
-//! without a timezone assumption).
+//! without a timezone assumption), DOUBLE-based ARRAY → `Float64Array`,
+//! FLOAT-based ARRAY → `Float32Array`.
 
 use std::ffi::{CStr, c_char};
 use std::ptr;
@@ -23,9 +24,11 @@ use napi_derive::napi;
 
 use pinkdb_ffi as ffi;
 use pinkdb_ffi::{
-    PINKDB_TYPE_BIGINT, PINKDB_TYPE_BOOLEAN, PINKDB_TYPE_DATE, PINKDB_TYPE_DECIMAL, PINKDB_TYPE_DOUBLE,
-    PINKDB_TYPE_INTEGER, PINKDB_TYPE_INTERVAL, PINKDB_TYPE_NULL, PINKDB_TYPE_TIMESTAMP,
-    PINKDB_TYPE_VARCHAR, PinkHandle, PinkPrepared, PinkResult, PinkValue,
+    PINKDB_TYPE_ARRAY, PINKDB_TYPE_ARRAY_FLOAT, PINKDB_TYPE_BIGINT, PINKDB_TYPE_BOOLEAN,
+    PINKDB_TYPE_DATE,
+    PINKDB_TYPE_DECIMAL, PINKDB_TYPE_DOUBLE, PINKDB_TYPE_INTEGER, PINKDB_TYPE_INTERVAL,
+    PINKDB_TYPE_NULL, PINKDB_TYPE_TIMESTAMP, PINKDB_TYPE_VARCHAR, PinkHandle,
+    PinkPrepared, PinkResult, PinkValue, array_tag_len,
 };
 
 const KIND_NAMES: [&str; 24] = [
@@ -55,7 +58,7 @@ const KIND_NAMES: [&str; 24] = [
     "revoked",
 ];
 
-const TYPE_NAMES: [&str; 10] = [
+const TYPE_NAMES: [&str; 11] = [
     "null",
     "boolean",
     "integer",
@@ -66,14 +69,29 @@ const TYPE_NAMES: [&str; 10] = [
     "timestamp",
     "decimal",
     "interval",
+    "variant",
 ];
 
 fn kind_name(kind: i32) -> &'static str {
     KIND_NAMES.get(kind as usize).copied().unwrap_or("unknown")
 }
 
-fn type_name(tag: i32) -> &'static str {
-    TYPE_NAMES.get(tag as usize).copied().unwrap_or("unknown")
+fn type_name(tag: i32) -> String {
+    // An ARRAY packs its element count above the type byte: type 11 for
+    // `double` elements, 12 for 4-byte `float` ones.
+    if tag & 0xff == PINKDB_TYPE_ARRAY || tag & 0xff == PINKDB_TYPE_ARRAY_FLOAT {
+        let elem = if tag & 0xff == PINKDB_TYPE_ARRAY_FLOAT {
+            "float"
+        } else {
+            "double"
+        };
+        return format!("{elem}[{}]", array_tag_len(tag));
+    }
+    TYPE_NAMES
+        .get(tag as usize)
+        .copied()
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 /// Turn the C ABI's thread-local error into a napi error whose message is
@@ -140,6 +158,53 @@ fn value_to_js(env: &Env, value: &PinkValue) -> Result<JsUnknown> {
         PINKDB_TYPE_TIMESTAMP => env
             .create_string_from_std(pinkdb::types::format_timestamp(value.int64))?
             .into_unknown(),
+        // The payload is the engine's contiguous element buffer, so one copy
+        // into a `Float64Array` is the whole conversion.
+        tag if tag & 0xff == PINKDB_TYPE_ARRAY => {
+            let values: Vec<f64> = if value.text_len == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: the ABI guarantees `text_len` readable bytes at
+                // `text_ptr`, owned by the result until it is freed.
+                let bytes =
+                    unsafe { slice::from_raw_parts(value.text_ptr as *const u8, value.text_len) };
+                bytes
+                    .chunks_exact(8)
+                    .map(|c| f64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+                    .collect()
+            };
+            // `Float64Array` is the natural JS shape for a vector column; the
+            // napi2 helper that turns one into a `JsUnknown` needs a raw value.
+            let raw = unsafe {
+                <Float64Array as napi::bindgen_prelude::ToNapiValue>::to_napi_value(
+                    env.raw(),
+                    Float64Array::new(values),
+                )?
+            };
+            unsafe { <JsUnknown as napi::NapiValue>::from_raw_unchecked(env.raw(), raw) }
+        }
+        // The 4-byte counterpart, `Float32Array`.
+        tag if tag & 0xff == PINKDB_TYPE_ARRAY_FLOAT => {
+            let values: Vec<f32> = if value.text_len == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: the ABI guarantees `text_len` readable bytes at
+                // `text_ptr`, owned by the result until it is freed.
+                let bytes =
+                    unsafe { slice::from_raw_parts(value.text_ptr as *const u8, value.text_len) };
+                bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            };
+            let raw = unsafe {
+                <Float32Array as napi::bindgen_prelude::ToNapiValue>::to_napi_value(
+                    env.raw(),
+                    Float32Array::new(values),
+                )?
+            };
+            unsafe { <JsUnknown as napi::NapiValue>::from_raw_unchecked(env.raw(), raw) }
+        }
         other => return Err(local_error("internal", format!("unknown pinkdb type tag {other}"))),
     };
     Ok(js)
@@ -163,7 +228,7 @@ fn column_names(result: *const PinkResult, statement: usize) -> Result<Vec<Strin
 fn column_types(result: *const PinkResult, statement: usize) -> Vec<String> {
     let count = ffi::pinkdb_result_column_count(result, statement);
     (0..count)
-        .map(|column| type_name(ffi::pinkdb_result_column_type(result, statement, column)).to_owned())
+        .map(|column| type_name(ffi::pinkdb_result_column_type(result, statement, column)))
         .collect()
 }
 

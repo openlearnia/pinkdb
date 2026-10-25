@@ -8,7 +8,78 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
-## 2026-10-27
+## 2026-10-25
+### Wave 107a — the fixed-size `ARRAY` type ✅
+- **The type.** A column can now be `FLOAT[N]`/`REAL[N]`, `DOUBLE[N]`,
+  `INTEGER[N]` or `BIGINT[N]`. `FLOAT[N]` is a real 4-byte element kind — an
+  embedding column costs 4 bytes per element — and since pinkdb has no
+  `FLOAT` *scalar* an element read widens to `DOUBLE` (the one difference from
+  DuckDB, which returns a `FLOAT`); the `DOUBLE[N] → FLOAT[N]` cast follows
+  DuckDB 2.0 (round to nearest, a finite value that would become infinite is
+  an error, underflow is silent, text parses straight to f32).
+  Values are stored columnar — one flat buffer of `rows × N` elements plus a
+  row validity bitmap, and an element bitmap that exists only when some row has
+  a `NULL` element — so a 768-d or 1536-d embedding costs no per-row
+  allocation. `typeof` reports `DOUBLE[3]` and friends. `T[]` (a
+  variable-length `LIST`) is a parse error that names the follow-up wave 107a2.
+- **Literals and functions.** `[1.0, 2.0, 3.0]` and `array_value(…)` build an
+  array per row from any expression (columns included) and infer the element
+  type with the numeric tower; `[1, 2.5]` is a `DOUBLE[2]`. Element access
+  `a[i]` and `array_extract(a, i)` are 1-based and forgiving (out of range,
+  `NULL` index, `NULL` array and `NULL` element all give `NULL`); `len` and
+  `array_length` report `N` and `NULL` for a `NULL` array. Casts run
+  `VARCHAR ↔ ARRAY`, `ARRAY ↔ ARRAY` (same length, element type may change) and
+  `ARRAY ↔ VARIANT`, plus `TRY_CAST`; a size mismatch is an error that says the
+  size is part of the type.
+- **Semantics.** Structural equality across element types, with `NULL`
+  elements comparing structurally (two `NULL`s at one position are equal);
+  element-wise lexicographic ordering with a `NULL` element after every value
+  and a `NULL` array last, shared by `ORDER BY`, `MIN`/`MAX`,
+  `GROUP BY`/`DISTINCT` and join keys through a canonical hash key that folds
+  `-0.0`/`0.0` and every `NaN`.
+- **Persistence.** `.pink` dtype tag 10 (element kind + length, in table and
+  procedure schemas), default-value tag 10, and page-encoding tag 11: a
+  `rows | layout | element bitmap | values` payload, row-major or
+  byte-planed (whichever is smaller) behind the existing LZ frame, with no
+  min/max statistics (only the null count). Save/open, WAL replay (the value
+  literal is `CAST('[..]' AS DOUBLE[N])`) and checkpoint round-trip.
+  Measured: 100k × 768 pseudo-random `DOUBLE` rows insert in 0.31 s, scan in
+  0.31 s and occupy 585 MiB — 8 bytes per element, no overhead — while the
+  same table as `FLOAT` occupies 292 MiB, exactly 4 bytes per element, and
+  structured data still compresses (`sin` 108×, a constant column 253×).
+- **Encodings.** Wire protocol v13 (value tag 11, dtype tag 10 with the element
+  kind — 0–3, `FLOAT` appended — and length); C ABI `PINKDB_TYPE_ARRAY`
+  (`N × 8` bytes of `f64`) and `PINKDB_TYPE_ARRAY_FLOAT` (`N × 4` bytes of
+  `f32`), each with the element count packed into the type tag (`NULL`
+  elements refused with a message); Node `Float32Array`/`Float64Array`,
+  Python `list[float]`, Go `[]float32`/`[]float64`; extension ABI minor 5
+  adds `ExtType::ArrayFloat` and `ExtType::ArrayDouble`, borrowed
+  pointer-plus-length views of the engine's element buffer with no
+  per-element boxing, which the `vss` and `embeddings` extensions use.
+- **Parquet, lakes.** DuckDB 2.0's three-level `LIST` group both ways (DuckDB
+  reads our files, we read its `FLOAT[3]`/`INTEGER[3]` files), with the length
+  in a `pinkdb.array.<column>` key-value entry, an `f32` element leaf for
+  `FLOAT[N]`, and a clear refusal for a variable-length list; `.pink` lake
+  data files round-trip the column, and the DuckLake catalog records it as
+  DuckDB records a nested type (a `list` parent row plus an `element` child
+  row with `parent_column`, the real dtype in the `pinkdb_column` side row).
+  Lake data files stamp `field_id = ducklake_column.column_id` on every
+  top-level column and on the ARRAY child, which is what DuckDB's DuckLake
+  reader matches nested fields by — so DuckDB reads exact vector values
+  through a pinkdb lake, including after pinkdb added or dropped a column on
+  the same table (the ids are planned before the commit that creates them,
+  and a live column keeps its id). Standalone `COPY … TO 'x.parquet'` writes
+  no ids, as DuckDB's own files do not.
+- **Interop checks.** A DuckDB comparison test asserts both engines agree on
+  literals, subscripts, out-of-range access, `len`/`array_length`, structural
+  equality and `array_extract`.
+- **Cost.** TPC-H Q1/Q6 over a 10M-row `lineitem` are unchanged (best of 13
+  interleaved rounds against a binary built from `main`: 0.1228/0.0634 s
+  before, 0.1225/0.0633 s after); a query that does not touch an `ARRAY`
+  takes the same path as before. Release binaries: `pinkdb` 5 073 744 →
+  5 129 344 bytes (+1.10%), `pinkdb-server` 4 686 080 → 4 761 344 (+1.61%).
+  No new dependencies.
+
 ### Wave 108a — full-text search: a BM25 index with DuckDB-fts parity ✅
 - **`extensions/fts` = `pinkdb-fts`.** DuckDB's `fts` surface over pinkdb
   tables: `CALL create_fts_index(input_table, input_id, *input_values,
@@ -72,7 +143,6 @@ one-liners below.
   available offline) is a reviewer task; ingestion, `rag_search` and the MCP
   tools of row 108 remain queued.
 
-## 2026-10-25
 ### Wave 106 — `pinkdb-agent`: a data agent harness as an extension ✅
 - **An agent that lives in the store.** `pinkdb-agent` is a native extension
   (`LOAD EXTENSION 'libpinkdb_agent…'`) that runs the loop itself: it asks an

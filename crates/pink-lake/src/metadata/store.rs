@@ -444,6 +444,19 @@ impl SqlMetadataStore {
         self.with_conn(scheduled_files_conn)
     }
 
+    /// The `field_id`s a data file of `key` must record, in column order.
+    ///
+    /// A DuckLake reader matches a nested column's children by id, so the
+    /// writer needs the ids before the catalog commit — see
+    /// [`planned_field_ids`].
+    pub(crate) fn field_ids(
+        &self,
+        key: &str,
+        columns: &[(String, pinkdb::DataType)],
+    ) -> Result<Vec<crate::format::FieldIds>> {
+        self.with_conn(|conn| planned_field_ids(conn, key, columns))
+    }
+
     pub(crate) fn forget_scheduled(&self, ids: &[i64]) -> Result<()> {
         self.with_conn(|conn| {
             for id in ids {
@@ -862,6 +875,14 @@ impl MetadataStore for SqlMetadataStore {
 
     fn scheduled_files(&self) -> Result<Vec<(i64, String)>> {
         SqlMetadataStore::scheduled_files(self)
+    }
+
+    fn field_ids(
+        &self,
+        key: &str,
+        columns: &[(String, pinkdb::DataType)],
+    ) -> Result<Vec<crate::format::FieldIds>> {
+        SqlMetadataStore::field_ids(self, key, columns)
     }
 
     fn forget_scheduled(&self, ids: &[i64]) -> Result<()> {
@@ -2269,6 +2290,7 @@ fn load_columns(
               AND p.column_id = c.column_id
               AND p.begin_snapshot = c.begin_snapshot
              WHERE c.table_id = ?1
+               AND c.parent_column IS NULL
                AND c.begin_snapshot <= ?2
                AND (c.end_snapshot IS NULL OR c.end_snapshot > ?2)
              ORDER BY c.column_order, c.column_id",
@@ -2292,17 +2314,35 @@ fn load_columns(
                     .map(|(_, version)| *version)
                     .unwrap_or(1)
             });
-            Ok(ColumnEntry {
-                name: row.get(1)?,
-                dtype: side_dtype.unwrap_or_else(|| pink_type_name(&column_type)),
-                default: row.get(4)?,
-                added,
-            })
+            let has_side_dtype = side_dtype.is_some();
+            Ok((
+                ColumnEntry {
+                    name: row.get(1)?,
+                    dtype: side_dtype.unwrap_or_else(|| pink_type_name(&column_type)),
+                    default: row.get(4)?,
+                    added,
+                },
+                column_type,
+                has_side_dtype,
+            ))
         })
         .map_err(|e| sql_error("reading columns", e))?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.map_err(|e| sql_error("reading columns", e))?);
+        let (entry, column_type, has_side_dtype) =
+            row.map_err(|e| sql_error("reading columns", e))?;
+        if !has_side_dtype && matches!(column_type.as_str(), "list" | "struct" | "map") {
+            // Only a nested type reaches here without a side row: DuckDB wrote
+            // the lake. Its `list` has no length, so it cannot be a pinkdb
+            // ARRAY (wave 107a2).
+            return Err(LakeError::NotRepresentable {
+                message: format!(
+                    "lake table column \"{}\" is a variable-length {}; pinkdb reads fixed-size ARRAY columns only (a LIST is wave 107a2)",
+                    entry.name, column_type
+                ),
+            });
+        }
+        out.push(entry);
     }
     Ok(out)
 }
@@ -2318,7 +2358,7 @@ fn column_ids(
     let stmt = conn
         .prepare(
             "SELECT column_name, column_id FROM ducklake_column
-             WHERE table_id = ?1 ORDER BY begin_snapshot",
+             WHERE table_id = ?1 AND parent_column IS NULL ORDER BY begin_snapshot",
         )
         .map_err(|e| sql_error("reading column ids", e))?;
     let rows = stmt
@@ -2582,7 +2622,7 @@ fn load_files(
 
 type StatRow = (
     String,
-    String,
+    pinkdb::DataType,
     Option<i64>,
     Option<String>,
     Option<String>,
@@ -2605,10 +2645,18 @@ fn load_stats_blocks(
     // current name.
     let stmt = conn
         .prepare(
-            "SELECT column_id, column_order, column_name, column_type,
-                    begin_snapshot, end_snapshot
-             FROM ducklake_column WHERE table_id = ?1
-             ORDER BY begin_snapshot, column_id",
+            // A column's DuckLake type is a coarse physical name (`list` for
+            // an ARRAY, for instance); the side row carries the type the
+            // engine actually wrote, exactly as `load_columns` reads it.
+            "SELECT c.column_id, c.column_order, c.column_name, c.column_type,
+                    c.begin_snapshot, c.end_snapshot, p.dtype
+             FROM ducklake_column c
+             LEFT JOIN pinkdb_column p
+               ON p.table_id = c.table_id
+              AND p.column_id = c.column_id
+              AND p.begin_snapshot = c.begin_snapshot
+             WHERE c.table_id = ?1
+             ORDER BY c.begin_snapshot, c.column_id",
         )
         .map_err(|e| sql_error("reading statistics columns", e))?;
     let columns = stmt
@@ -2620,19 +2668,23 @@ fn load_stats_blocks(
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })
         .map_err(|e| sql_error("reading statistics columns", e))?;
-    type ColumnHistory = Vec<(i64, Option<i64>, i64, String, String)>;
+    type ColumnHistory = Vec<(i64, Option<i64>, i64, String, pinkdb::DataType)>;
     let mut column_history: std::collections::HashMap<i64, ColumnHistory> =
         std::collections::HashMap::new();
     for row in columns {
-        let (id, order, name, ty, begin, end) =
+        let (id, order, name, ty, begin, end, side_dtype) =
             row.map_err(|e| sql_error("reading statistics columns", e))?;
+        let dtype = side_dtype
+            .and_then(|text| crate::catalog::parse_dtype_name(&text))
+            .unwrap_or_else(|| pink_dtype(&ty));
         column_history
             .entry(id)
             .or_default()
-            .push((begin, end, order, name, ty));
+            .push((begin, end, order, name, dtype));
     }
     let stmt = conn
         .prepare(
@@ -2675,15 +2727,7 @@ fn load_stats_blocks(
         };
         staged.entry(file_id).or_default().push((
             *order,
-            (
-                name.clone(),
-                ty.clone(),
-                nulls,
-                min,
-                max,
-                contains_nan,
-                Vec::new(),
-            ),
+            (name.clone(), *ty, nulls, min, max, contains_nan, Vec::new()),
         ));
     }
     // Path statistics live in their own table (DuckLake v1.1); each row
@@ -2761,8 +2805,7 @@ fn build_stats_block(
         return Ok(None);
     }
     let mut columns = Vec::with_capacity(rows.len());
-    for (name, column_type, nulls, min, max, contains_nan, paths) in rows {
-        let dtype = pink_dtype(&column_type);
+    for (name, dtype, nulls, min, max, contains_nan, paths) in rows {
         let column_name = name.clone();
         let decode_stat = |value: Option<String>| -> Result<Option<String>> {
             let Some(value) = value else {
@@ -2816,8 +2859,10 @@ fn load_file_stats(
 ) -> Result<Option<StatsBlock>> {
     let stmt = conn
         .prepare(
+            // `c.column_type` is the coarse DuckLake name; the side row
+            // carries the type the engine wrote (see `load_stats_blocks`).
             "SELECT c.column_name, c.column_type, s.null_count, s.min_value, s.max_value,
-                    s.contains_nan
+                    s.contains_nan, p.dtype
              FROM ducklake_file_column_stats s
              JOIN ducklake_data_file f
                ON f.data_file_id = s.data_file_id
@@ -2825,6 +2870,10 @@ fn load_file_stats(
                ON c.table_id = s.table_id AND c.column_id = s.column_id
               AND c.begin_snapshot <= f.begin_snapshot
               AND (c.end_snapshot IS NULL OR c.end_snapshot > f.begin_snapshot)
+             LEFT JOIN pinkdb_column p
+               ON p.table_id = c.table_id
+              AND p.column_id = c.column_id
+              AND p.begin_snapshot = c.begin_snapshot
              WHERE s.data_file_id = ?1 AND s.table_id = ?2
              ORDER BY c.column_order",
         )
@@ -2838,6 +2887,7 @@ fn load_file_stats(
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })
         .map_err(|e| sql_error("reading file statistics", e))?;
@@ -2847,7 +2897,12 @@ fn load_file_stats(
     }
     let mut rows: Vec<StatRow> = rows
         .into_iter()
-        .map(|(name, ty, nulls, min, max, nan)| (name, ty, nulls, min, max, nan, Vec::new()))
+        .map(|(name, ty, nulls, min, max, nan, side_dtype)| {
+            let dtype = side_dtype
+                .and_then(|text| crate::catalog::parse_dtype_name(&text))
+                .unwrap_or_else(|| pink_dtype(&ty));
+            (name, dtype, nulls, min, max, nan, Vec::new())
+        })
         .collect();
     // Path statistics live in DuckLake's own table, joined to the column name
     // the file was written under.
@@ -4374,10 +4429,15 @@ fn sync_columns(
     {
         let stmt = conn
             .prepare(
+                // Only top-level columns: an ARRAY's `element` child is
+                // created by `insert_column` right after its parent, is not a
+                // column of the table, and must never be matched by name or
+                // ended by the "gone from the target" sweep below.
                 "SELECT column_id, column_order, column_name, column_type
                  FROM ducklake_column
                  WHERE table_id = ?1 AND begin_snapshot <= ?2
                    AND (end_snapshot IS NULL OR end_snapshot > ?2)
+                   AND parent_column IS NULL
                  ORDER BY column_order, column_id",
             )
             .map_err(|e| sql_error("reading live columns", e))?;
@@ -4422,7 +4482,7 @@ fn sync_columns(
                 // under the same column id.
                 end_column(conn, row.table_id, existing.0, sid)?;
                 altered = true;
-                insert_column(
+                let _ = insert_column(
                     conn,
                     row,
                     existing.0,
@@ -4445,7 +4505,7 @@ fn sync_columns(
             // The renamed column keeps its epoch: it is the same column id,
             // so a file written before the rename still holds its values and
             // the rename map translates the physical name.
-            insert_column(
+            let _ = insert_column(
                 conn,
                 row,
                 existing.0,
@@ -4471,7 +4531,7 @@ fn sync_columns(
         // An added column.
         max_column_id += 1;
         max_order += 1;
-        insert_column(
+        if let Some((child_id, child_order)) = insert_column(
             conn,
             row,
             max_column_id,
@@ -4480,7 +4540,10 @@ fn sync_columns(
             &column.dtype,
             column,
             sid,
-        )?;
+        )? {
+            max_column_id = max_column_id.max(child_id);
+            max_order = max_order.max(child_order);
+        }
         altered = true;
         consumed.insert(column.name.clone());
     }
@@ -4515,10 +4578,20 @@ fn end_column(conn: &dyn SqlConnection, table_id: i64, column_id: i64, sid: i64)
         params![sid, table_id, column_id],
     )
     .map_err(|e| sql_error("ending a column", e))?;
+    // A drop or type change takes the column's nested children with it.
+    conn.execute(
+        "UPDATE ducklake_column SET end_snapshot = ?1
+         WHERE table_id = ?2 AND parent_column = ?3 AND end_snapshot IS NULL",
+        params![sid, table_id, column_id],
+    )
+    .map_err(|e| sql_error("ending a column's children", e))?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Write one column's catalog rows and report the id and order its nested
+/// `element` row took (an ARRAY is a DuckLake `list`), so the caller's id and
+/// order sequences skip past it.
 fn insert_column(
     conn: &dyn SqlConnection,
     row: &TableRow,
@@ -4528,7 +4601,7 @@ fn insert_column(
     dtype: &str,
     column: &ColumnEntry,
     sid: i64,
-) -> Result<()> {
+) -> Result<Option<(i64, i64)>> {
     conn.execute(
         "INSERT INTO ducklake_column
          (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name,
@@ -4560,7 +4633,39 @@ fn insert_column(
         ],
     )
     .map_err(|e| sql_error("inserting a column's side row", e))?;
-    Ok(())
+    // DuckDB catalogs a nested type as child rows: `parent_column` points at
+    // the parent's id, the child is named after the type's field (`element`),
+    // and it takes the next column id and order slot. A DuckDB-written ARRAY
+    // is a `list`, so that is what the parent row says above.
+    let Some((elem, _)) = array_dtype_parts(dtype) else {
+        return Ok(None);
+    };
+    let child_id: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(column_id), 0) + 1 FROM ducklake_column WHERE table_id = ?1",
+            params![row.table_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| sql_error("allocating a nested column id", e))?
+        .unwrap_or(1);
+    let child_order = order + 1;
+    conn.execute(
+        "INSERT INTO ducklake_column
+         (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name,
+          column_type, initial_default, default_value, nulls_allowed, parent_column,
+          default_value_type, default_value_dialect)
+         VALUES (?1, ?2, NULL, ?3, ?4, 'element', ?5, NULL, NULL, 1, ?6, 'literal', 'duckdb')",
+        params![
+            child_id,
+            sid,
+            row.table_id,
+            child_order,
+            ducklake_elem_type(elem),
+            column_id
+        ],
+    )
+    .map_err(|e| sql_error("inserting a nested column", e))?;
+    Ok(Some((child_id, child_order)))
 }
 
 fn sync_partition_spec(
@@ -5213,7 +5318,8 @@ fn canonical_sql_value(
         | DataType::Varchar
         | DataType::Decimal { .. }
         | DataType::Interval
-        | DataType::Variant => match canonical_to_ducklake(dtype, canonical) {
+        | DataType::Variant
+        | DataType::Array { .. } => match canonical_to_ducklake(dtype, canonical) {
             Some(text) => SqlValue::Text(text),
             None => SqlValue::Text(canonical.to_string()),
         },
@@ -5232,6 +5338,150 @@ fn snapshot_schema_version(conn: &dyn SqlConnection, version: u64) -> Result<Opt
 }
 
 // ============================== small helpers ==============================
+
+/// The `ducklake_column.column_id`s that writing a data file for `key` must
+/// stamp as parquet `field_id`s, in `columns` order.
+///
+/// Data files are written before the catalog commit, so the ids cannot be
+/// read back afterwards: they are planned here with exactly the rule
+/// [`sync_columns`] applies. A live column of that name keeps its id (ids
+/// never move, which is what makes them safe across `DROP`/`ADD COLUMN`); a
+/// column that is not live yet takes the next id in column order, and an
+/// ARRAY takes one more for its `element` child, because `insert_column`
+/// allocates the child as `MAX(column_id) + 1` right after its parent.
+fn planned_field_ids(
+    conn: &dyn SqlConnection,
+    key: &str,
+    columns: &[(String, pinkdb::DataType)],
+) -> Result<Vec<crate::format::FieldIds>> {
+    use crate::format::FieldIds;
+    let (schema_name, table_name) = split_key(key)?;
+    let table_id: Option<i64> = conn
+        .query_row(
+            "SELECT t.table_id FROM ducklake_table t
+             JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             WHERE s.schema_name = ?1 AND t.table_name = ?2
+               AND t.begin_snapshot <= (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+               AND (t.end_snapshot IS NULL
+                    OR t.end_snapshot > (SELECT MAX(snapshot_id) FROM ducklake_snapshot))
+             ORDER BY t.table_id DESC LIMIT 1",
+            params![schema_name, table_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .flatten();
+    let Some(table_id) = table_id else {
+        // A table the catalog does not know yet: it is created by this very
+        // commit, which numbers the columns from 1 in column order.
+        return Ok(fresh_field_ids(columns, 0));
+    };
+    let mut live: std::collections::BTreeMap<String, (i64, Option<i64>)> =
+        std::collections::BTreeMap::new();
+    {
+        let stmt = conn
+            .prepare(
+                "SELECT column_name, column_id, parent_column FROM ducklake_column
+                 WHERE table_id = ?1 AND parent_column IS NULL
+                 ORDER BY column_order, column_id",
+            )
+            .map_err(|e| sql_error("reading column ids", e))?;
+        let rows = stmt
+            .query_map(params![table_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(|e| sql_error("reading column ids", e))?;
+        for row in rows {
+            let (name, id, parent) = row.map_err(|e| sql_error("reading column ids", e))?;
+            if parent.is_none() {
+                live.insert(name, (id, None));
+            }
+        }
+    }
+    // An ARRAY's child id, from the live child row (`insert_column`
+    // allocates it as `MAX(column_id) + 1`, so it is the parent's + 1, but
+    // reading it is what keeps this planner independent of that).
+    let parents: Vec<(String, i64)> = live.iter().map(|(n, (id, _))| (n.clone(), *id)).collect();
+    for (name, parent_id) in parents {
+        let child: Option<i64> = conn
+            .query_row(
+                "SELECT column_id FROM ducklake_column
+                 WHERE table_id = ?1 AND parent_column = ?2
+                 ORDER BY column_id LIMIT 1",
+                params![table_id, parent_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(child) = child
+            && let Some(entry) = live.get_mut(&name)
+        {
+            entry.1 = Some(child);
+        }
+    }
+    let max_id: i64 = conn
+        .query_row(
+            "SELECT MAX(column_id) FROM ducklake_column WHERE table_id = ?1",
+            params![table_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(|e| sql_error("reading the column id sequence", e))?
+        .flatten()
+        .unwrap_or(0)
+        .max(0);
+    let mut next = max_id;
+    let mut out = Vec::with_capacity(columns.len());
+    for (name, _) in columns {
+        if let Some((id, child)) = live.get(name) {
+            out.push(FieldIds {
+                column: *id,
+                array_child: *child,
+            });
+            continue;
+        }
+        // The same running counter `sync_columns` keeps for added columns.
+        next += 1;
+        out.push(FieldIds {
+            column: next,
+            array_child: None,
+        });
+        if columns
+            .iter()
+            .any(|(n, dtype)| n == name && matches!(dtype, pinkdb::DataType::Array { .. }))
+        {
+            next += 1;
+            out.last_mut().expect("just pushed").array_child = Some(next);
+        }
+    }
+    Ok(out)
+}
+
+/// [`planned_field_ids`] for a table the catalog does not know yet: the
+/// commit numbers its columns from 1, children included.
+fn fresh_field_ids(
+    columns: &[(String, pinkdb::DataType)],
+    start: i64,
+) -> Vec<crate::format::FieldIds> {
+    use crate::format::FieldIds;
+    let mut next = start;
+    let mut out = Vec::with_capacity(columns.len());
+    for (_, dtype) in columns {
+        next += 1;
+        let mut ids = FieldIds {
+            column: next,
+            array_child: None,
+        };
+        if matches!(dtype, pinkdb::DataType::Array { .. }) {
+            next += 1;
+            ids.array_child = Some(next);
+        }
+        out.push(ids);
+    }
+    out
+}
 
 fn split_key(key: &str) -> Result<(String, String)> {
     key.split_once('.')
@@ -5414,6 +5664,14 @@ fn ducklake_type(dtype: &str) -> String {
     if upper.starts_with("DECIMAL(") {
         return upper.to_ascii_lowercase();
     }
+    // DuckDB has no ARRAY column type in DuckLake: it refuses to create one.
+    // What it can read is the LIST shape it writes itself, so a pinkdb ARRAY
+    // is catalogued as `list` with an `element` child row (see
+    // [`insert_column`]) and DuckDB reads it back as a variable-length list.
+    if let Some((elem, _)) = array_dtype_parts(&upper) {
+        let _ = elem;
+        return "list".to_string();
+    }
     match upper.as_str() {
         "BOOLEAN" => "boolean".to_string(),
         "INTEGER" => "int32".to_string(),
@@ -5429,6 +5687,26 @@ fn ducklake_type(dtype: &str) -> String {
 
 fn pink_type_name(ducklake: &str) -> String {
     pink_dtype(ducklake).name()
+}
+
+/// `DOUBLE[3]` → `(ArrayElem::Double, 3)`, for the catalogued type text.
+fn array_dtype_parts(dtype: &str) -> Option<(pinkdb::types::ArrayElem, u32)> {
+    let upper = dtype.to_ascii_uppercase();
+    match pinkdb::DataType::from_sql(&upper)? {
+        pinkdb::DataType::Array { elem, len } => Some((elem, len)),
+        _ => None,
+    }
+}
+
+/// The DuckLake spelling of one ARRAY element type, as DuckDB writes the
+/// `element` child row of a LIST.
+fn ducklake_elem_type(elem: pinkdb::types::ArrayElem) -> &'static str {
+    match elem {
+        pinkdb::types::ArrayElem::Integer => "int32",
+        pinkdb::types::ArrayElem::Bigint => "int64",
+        pinkdb::types::ArrayElem::Float => "float32",
+        pinkdb::types::ArrayElem::Double => "float64",
+    }
 }
 
 fn pink_dtype(ducklake: &str) -> pinkdb::DataType {
@@ -5480,7 +5758,8 @@ fn canonical_to_ducklake(dtype: pinkdb::DataType, canonical: &str) -> Option<Str
         pinkdb::DataType::Varchar => canonical.to_string(),
         pinkdb::DataType::Decimal { .. }
         | pinkdb::DataType::Interval
-        | pinkdb::DataType::Variant => canonical.to_string(),
+        | pinkdb::DataType::Variant
+        | pinkdb::DataType::Array { .. } => canonical.to_string(),
     })
 }
 
@@ -5511,6 +5790,8 @@ fn ducklake_to_canonical(dtype: pinkdb::DataType, ducklake: &str) -> Option<Stri
         // VARIANT has no canonical text of its own (no min/max statistics are
         // written for it); its JSON text passes through unchanged.
         pinkdb::DataType::Variant => ducklake.to_string(),
+        // Likewise an ARRAY, which writes no statistics at all.
+        pinkdb::DataType::Array { .. } => ducklake.to_string(),
     })
 }
 

@@ -649,7 +649,7 @@ fn a_version_9_hello_is_refused() {
     match protocol::read_response(&mut reader).unwrap() {
         Response::Error { message } => {
             assert!(message.contains("protocol version mismatch"), "{message}");
-            assert!(message.contains("server speaks v12"), "{message}");
+            assert!(message.contains("server speaks v13"), "{message}");
             assert!(message.contains("asked for v9"), "{message}");
         }
         other => panic!("expected Error, got {other:?}"),

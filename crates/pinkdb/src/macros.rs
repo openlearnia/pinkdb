@@ -334,6 +334,12 @@ pub(crate) fn substitute_expr(
             expr: Box::new(substitute_expr(expr, args, used)?),
             dtype: *dtype,
         },
+        Expr::ArrayLiteral(items) => Expr::ArrayLiteral(
+            items
+                .iter()
+                .map(|item| substitute_expr(item, args, used))
+                .collect::<Result<Vec<_>>>()?,
+        ),
         Expr::Subscript { base, index } => Expr::Subscript {
             base: Box::new(substitute_expr(base, args, used)?),
             index: Box::new(substitute_expr(index, args, used)?),
@@ -628,6 +634,12 @@ fn count_expr(expr: &Expr, used: &std::cell::Cell<usize>) -> Result<()> {
         | Expr::Cast { expr, .. }
         | Expr::TryCast { expr, .. }
         | Expr::NamedArg { expr, .. } => count_expr(expr, used),
+        Expr::ArrayLiteral(items) => {
+            for item in items {
+                count_expr(item, used)?;
+            }
+            Ok(())
+        }
         Expr::Subscript { base, index } => {
             count_expr(base, used)?;
             count_expr(index, used)
@@ -783,6 +795,11 @@ fn collect_expr_calls(expr: &Expr, out: &mut HashSet<String>) {
         | Expr::Cast { expr, .. }
         | Expr::TryCast { expr, .. }
         | Expr::NamedArg { expr, .. } => collect_expr_calls(expr, out),
+        Expr::ArrayLiteral(items) => {
+            for item in items {
+                collect_expr_calls(item, out);
+            }
+        }
         Expr::Subscript { base, index } => {
             collect_expr_calls(base, out);
             collect_expr_calls(index, out);

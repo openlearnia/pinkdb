@@ -1066,7 +1066,9 @@ mod tests {
             ExtType::Timestamp,
         ] {
             assert!(
-                JS_TYPE_MAPPINGS.iter().any(|m| m.sql_type == t.name()),
+                JS_TYPE_MAPPINGS
+                    .iter()
+                    .any(|m| m.sql_type == t.name().as_str()),
                 "{} must be mapped",
                 t.name()
             );

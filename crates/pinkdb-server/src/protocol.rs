@@ -48,6 +48,7 @@
 
 use std::io::{self, Read, Write};
 
+use pinkdb::types::ArrayElem;
 use pinkdb::{DataType, Value};
 
 /// Protocol version spoken by this crate. Bump on any wire change.
@@ -80,7 +81,11 @@ use pinkdb::{DataType, Value};
 /// VARIANT rides as `u32 byte length | encoded value`.
 /// v12: [`DoneKind::SetVariable`] (tag 26) reports `SET VARIABLE`; `name` is
 /// the variable.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// v13: `ARRAY` value (tag 11) and dtype (tag 10) tags (wave 107a). A value
+/// rides as `u32 byte length | encoded cell` (the same cell encoding a `.pink`
+/// page stores, so an ARRAY crosses the wire without a per-element tag); the
+/// dtype carries an element byte and a `u32` length.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -156,6 +161,10 @@ mod value_tag {
     /// v11: `VARIANT(u32 len | encoded value)` — the same per-value encoding
     /// a `.pink` page stores.
     pub const VARIANT: u8 = 10;
+    /// v13: `ARRAY(u32 len | encoded cell)` — likewise the `.pink` cell
+    /// encoding, which carries the element kind, the size and the NULL-element
+    /// bitmap.
+    pub const ARRAY: u8 = 11;
 }
 
 /// DataType tag bytes (one per [`DataType`] variant).
@@ -173,6 +182,8 @@ mod dtype_tag {
     pub const INTERVAL: u8 = 8;
     /// v11: no parameters.
     pub const VARIANT: u8 = 9;
+    /// v13: an element byte and a `u32` length ride after the tag.
+    pub const ARRAY: u8 = 10;
 }
 
 // ---------- errors ----------
@@ -617,6 +628,11 @@ impl Response {
                         put_u8(&mut buf, *precision);
                         put_u8(&mut buf, *scale);
                     }
+                    // v13: so do ARRAY's element kind and length.
+                    if let DataType::Array { elem, len } = dtype {
+                        put_u8(&mut buf, elem.tag());
+                        put_u32(&mut buf, *len);
+                    }
                 }
             }
             Response::Rows { rows } => {
@@ -971,6 +987,12 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) -> Result<(), ProtocolError> {
             put_u32(buf, count_u32(bytes.len(), "VARIANT value")?);
             buf.extend_from_slice(&bytes);
         }
+        Value::Array(a) => {
+            put_u8(buf, value_tag::ARRAY);
+            let bytes = pinkdb::array::encode_cell(a);
+            put_u32(buf, count_u32(bytes.len(), "ARRAY value")?);
+            buf.extend_from_slice(&bytes);
+        }
     }
     Ok(())
 }
@@ -987,6 +1009,7 @@ fn dtype_byte(dtype: DataType) -> u8 {
         DataType::Decimal { .. } => dtype_tag::DECIMAL,
         DataType::Interval => dtype_tag::INTERVAL,
         DataType::Variant => dtype_tag::VARIANT,
+        DataType::Array { .. } => dtype_tag::ARRAY,
     }
 }
 
@@ -1115,6 +1138,14 @@ impl<'a> Reader<'a> {
                         .map_err(|e| ProtocolError::Malformed(format!("bad VARIANT value: {e}")))?,
                 ))
             }
+            value_tag::ARRAY => {
+                let len = self.u32(what)? as usize;
+                let bytes = self.take(len, what)?;
+                Value::Array(std::sync::Arc::new(
+                    pinkdb::array::decode_cell(bytes)
+                        .map_err(|e| ProtocolError::Malformed(format!("bad ARRAY value: {e}")))?,
+                ))
+            }
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown value tag {other}"
@@ -1144,6 +1175,15 @@ impl<'a> Reader<'a> {
             }
             dtype_tag::INTERVAL => DataType::Interval,
             dtype_tag::VARIANT => DataType::Variant,
+            dtype_tag::ARRAY => {
+                let elem = self.u8(what)?;
+                let len = self.u32(what)?;
+                let elem = ArrayElem::from_tag(elem).ok_or_else(|| {
+                    ProtocolError::Malformed(format!("bad ARRAY element tag {elem}"))
+                })?;
+                pinkdb::types::array_type(elem, len)
+                    .ok_or_else(|| ProtocolError::Malformed(format!("bad ARRAY length {len}")))?
+            }
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown data type tag {other}"

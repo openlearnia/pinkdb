@@ -813,6 +813,9 @@ fn decode_column(
     if let Some(shred) = &column.shred {
         return crate::variant_read::read_column(row_group, column.leaf, shred, rows, &column.name);
     }
+    if let DataType::Array { .. } = column.ty {
+        return read_array_column(row_group, column, rows);
+    }
     let leaf = column.leaf;
     let scale = match column.ty {
         DataType::Decimal { scale, .. } => scale,
@@ -950,6 +953,159 @@ fn decode_column(
         }
     };
     Ok(chunks)
+}
+
+/// Decode one ARRAY column chunk: `read_array_chunks` does the work, this
+/// only picks the element reader from the physical type.
+fn read_array_column(
+    row_group: &dyn RowGroupReader,
+    column: &FileColumn,
+    rows: usize,
+) -> Result<Vec<Vector>> {
+    let leaf = column.leaf;
+    let ty = column.ty;
+    let name = column.name.clone();
+    let reader = row_group.get_column_reader(leaf).map_err(|e| {
+        PinkDbError::Execution(format!("cannot read column \"{name}\" (leaf {leaf}): {e}"))
+    })?;
+    match (column.physical, reader) {
+        (parquet::basic::Type::INT32, ColumnReader::Int32ColumnReader(r)) => {
+            let mut r = get_typed_column_reader::<Int32Type>(ColumnReader::Int32ColumnReader(r));
+            read_array_chunks(&mut r, rows, ty, &name, |v| Value::Integer(*v))
+        }
+        (parquet::basic::Type::INT64, ColumnReader::Int64ColumnReader(r)) => {
+            let mut r = get_typed_column_reader::<Int64Type>(ColumnReader::Int64ColumnReader(r));
+            read_array_chunks(&mut r, rows, ty, &name, |v| Value::Bigint(*v))
+        }
+        (parquet::basic::Type::FLOAT, ColumnReader::FloatColumnReader(r)) => {
+            let mut r = get_typed_column_reader::<FloatType>(ColumnReader::FloatColumnReader(r));
+            read_array_chunks(&mut r, rows, ty, &name, |v| Value::Double(*v as f64))
+        }
+        (parquet::basic::Type::DOUBLE, ColumnReader::DoubleColumnReader(r)) => {
+            let mut r = get_typed_column_reader::<DoubleType>(ColumnReader::DoubleColumnReader(r));
+            read_array_chunks(&mut r, rows, ty, &name, |v| Value::Double(*v))
+        }
+        (physical, _) => Err(PinkDbError::Execution(format!(
+            "column \"{name}\" has physical type {physical:?}, which is not an ARRAY element type"
+        ))),
+    }
+}
+
+/// Decode a LIST-encoded ARRAY column. Every row holds exactly `len` level
+/// entries — a NULL array keeps its slots at definition level 0, a NULL element
+/// is level 1 — so rows are regrouped by the repetition level and a row of any
+/// other width is a variable-length LIST, refused rather than misread.
+fn read_array_chunks<T>(
+    reader: &mut parquet::column::reader::ColumnReaderImpl<T>,
+    rows: usize,
+    dtype: DataType,
+    column: &str,
+    convert: impl Fn(&T::T) -> Value,
+) -> Result<Vec<Vector>>
+where
+    T: parquet::data_type::DataType,
+{
+    let DataType::Array { elem, len } = dtype else {
+        unreachable!("read_array_chunks is called for ARRAY columns only")
+    };
+    let len = len as usize;
+    let mut out: Vec<Vector> = Vec::with_capacity(rows.div_ceil(CHUNK_SIZE));
+    let mut vector = Vector::with_capacity(dtype, CHUNK_SIZE.min(rows));
+    let mut in_chunk = 0usize;
+    let mut done = 0usize;
+    let mut values: Vec<T::T> = Vec::new();
+    let mut levels: Vec<i16> = Vec::new();
+    let mut reps: Vec<i16> = Vec::new();
+    // The row being assembled, one slot per element (`Value::Null` for a NULL
+    // element) and `null_row` for a NULL array. A batch can end mid-row.
+    let mut row: Vec<Value> = Vec::with_capacity(len);
+    let mut null_row = false;
+    while done < rows {
+        let want = CHUNK_SIZE.min(rows - done) * len;
+        values.clear();
+        levels.clear();
+        reps.clear();
+        let read = reader
+            .read_records(want, Some(&mut levels), Some(&mut reps), &mut values)
+            .map_err(|e| {
+                PinkDbError::Execution(format!(
+                    "cannot decode column \"{column}\" at row {done}: {e}"
+                ))
+            })?;
+        // `read_records` returns `(rows, values, levels)`; its row count is
+        // the parquet reader's own accounting, so the batch is walked by its
+        // level entries (`levels.len()`) instead. A batch may end mid-row.
+        let records = read.0;
+        if records == 0 {
+            return Err(PinkDbError::Execution(format!(
+                "column \"{column}\" ended after {done} of {rows} rows"
+            )));
+        }
+        let mut next_value = 0usize;
+        for record in 0..levels.len() {
+            let rep = reps.get(record).copied().unwrap_or(0);
+            if rep == 0 && !row.is_empty() {
+                return Err(width_error(column, row.len(), len));
+            }
+            // Definition levels are 1 for a NULL array (`v` is OPTIONAL and
+            // its `list` child REPEATED), 2 for a NULL element, 3 for a value.
+            let level = levels.get(record).copied().unwrap_or(0);
+            let value = match level {
+                0 | 1 => {
+                    if row.is_empty() {
+                        null_row = true;
+                    }
+                    Value::Null
+                }
+                2 => Value::Null,
+                _ => {
+                    let Some(value) = values.get(next_value) else {
+                        return Err(PinkDbError::Execution(format!(
+                            "column \"{column}\": a definition level has no value"
+                        )));
+                    };
+                    next_value += 1;
+                    convert(value)
+                }
+            };
+            row.push(value);
+            if row.len() > len {
+                return Err(width_error(column, row.len(), len));
+            }
+            if row.len() < len {
+                continue;
+            }
+            if null_row {
+                vector.push_null()?;
+            } else {
+                let array = pinkdb::array::ArrayValue::from_values(elem, len as u32, &row)?;
+                vector.push_value(Value::Array(std::sync::Arc::new(array)))?;
+            }
+            row.clear();
+            null_row = false;
+            in_chunk += 1;
+            done += 1;
+            if in_chunk == CHUNK_SIZE {
+                let spare = CHUNK_SIZE.min(rows - done);
+                out.push(std::mem::replace(
+                    &mut vector,
+                    Vector::with_capacity(dtype, spare),
+                ));
+                in_chunk = 0;
+            }
+        }
+    }
+    if in_chunk > 0 {
+        out.push(vector);
+    }
+    Ok(out)
+}
+
+fn width_error(column: &str, found: usize, len: usize) -> PinkDbError {
+    PinkDbError::Type(format!(
+        "column \"{column}\" holds a row of {found} elements, not the {len} of its ARRAY type; \
+         a variable-length list is not supported (wave 107a2)"
+    ))
 }
 
 fn unsupported_decode(name: &str, ty: DataType) -> PinkDbError {

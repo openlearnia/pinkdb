@@ -30,7 +30,7 @@
 
 use parquet::basic::{ConvertedType, LogicalType, TimeUnit, Type as PhysicalType};
 use parquet::schema::types::Type;
-use pinkdb::{DataType, PinkDbError, Result, Value};
+use pinkdb::{ArrayElem, DataType, PinkDbError, Result, Value};
 
 /// One leaf column of a flat parquet file.
 #[derive(Debug, Clone, PartialEq)]
@@ -165,12 +165,19 @@ fn decimal_type(precision: i32, scale: i32) -> std::result::Result<DataType, Str
 /// the first unsupported column's message.
 ///
 /// The schema root's children are the columns. A `Variant`-annotated group is
-/// the one accepted group (it is read through [`crate::variant_read`]); any
-/// other group is nested and refused (including LIST/MAP), and a repeated
-/// leaf is refused too (one column chunk would hold many values per row).
+/// the one accepted group (it is read through [`crate::variant_read`]); a
+/// `LIST` group is read as a fixed-size ARRAY (DuckDB 2.0 writes an ARRAY that
+/// way, because parquet has no fixed-size list type), and any other group is
+/// nested and refused (including MAP/STRUCT). A repeated leaf is refused too
+/// (one column chunk would hold many values per row).
+///
+/// `metadata` supplies the row-group counts an ARRAY's length is inferred
+/// from; with `None` an ARRAY column is refused, because its length cannot be
+/// recovered from the schema alone.
 pub fn map_columns(
     schema: &Type,
     descr: &parquet::schema::types::SchemaDescriptor,
+    metadata: Option<&parquet::file::metadata::ParquetMetaData>,
 ) -> Result<Vec<FileColumn>> {
     let mut out = Vec::new();
     let mut leaf = 0usize;
@@ -191,6 +198,25 @@ pub fn map_columns(
                 type_length: 0,
             });
             leaf += out.last().expect("a column was pushed").leaves;
+            continue;
+        }
+        if let Some((elem, physical)) = array_element(field) {
+            let len = array_length(field.name(), elem, leaf, metadata)?;
+            out.push(FileColumn {
+                name: field.name().to_string(),
+                ty: DataType::Array { elem, len },
+                leaf,
+                leaves: 1,
+                shred: None,
+                optional: info.has_repetition()
+                    && info.repetition() == parquet::basic::Repetition::OPTIONAL,
+                // The file's own element type: a DuckDB `FLOAT[3]` is a FLOAT
+                // leaf read as DOUBLE.
+                physical,
+                unsigned: false,
+                type_length: 0,
+            });
+            leaf += 1;
             continue;
         }
         if field.is_group() {
@@ -238,6 +264,125 @@ pub fn map_columns(
     Ok(out)
 }
 
+/// The key of the key-value pair holding one ARRAY column's length. A LIST
+/// group has no length of its own, and a file with no row groups has no
+/// `num_values` to divide, so the writer records it here.
+pub fn array_length_key(name: &str) -> String {
+    format!("pinkdb.array.{name}")
+}
+
+/// The physical type of an ARRAY column's element leaf, which is also the
+/// type of the column chunk the reader decodes.
+pub fn array_physical(elem: ArrayElem) -> PhysicalType {
+    match elem {
+        ArrayElem::Integer => PhysicalType::INT32,
+        ArrayElem::Bigint => PhysicalType::INT64,
+        ArrayElem::Float => PhysicalType::FLOAT,
+        ArrayElem::Double => PhysicalType::DOUBLE,
+    }
+}
+
+/// The element kind of a fixed-size ARRAY written as a LIST group (the shape
+/// DuckDB 2.0 writes: `<name> GROUP (LIST)`, child `list` REPEATED, child
+/// `element` primitive), or `None` for any other group.
+fn array_element(field: &Type) -> Option<(ArrayElem, PhysicalType)> {
+    if !field.is_group() {
+        return None;
+    }
+    let info = field.get_basic_info();
+    let announced = info.converted_type() == ConvertedType::LIST
+        || matches!(info.logical_type_ref(), Some(LogicalType::List));
+    if !announced || field.get_fields().len() != 1 {
+        return None;
+    }
+    let list = &field.get_fields()[0];
+    if !list.is_group() || list.get_fields().len() != 1 {
+        return None;
+    }
+    let element = &list.get_fields()[0];
+    if !element.is_primitive() {
+        return None;
+    }
+    let physical = element.get_physical_type();
+    let elem = match physical {
+        PhysicalType::INT32 => ArrayElem::Integer,
+        PhysicalType::INT64 => ArrayElem::Bigint,
+        // The leaf's width is the element width: DuckDB writes an `f32` leaf
+        // for `FLOAT[N]` and an `f64` leaf for `DOUBLE[N]`.
+        PhysicalType::FLOAT => ArrayElem::Float,
+        PhysicalType::DOUBLE => ArrayElem::Double,
+        // A list of anything else is a variable-length LIST, not an ARRAY.
+        _ => return None,
+    };
+    Some((elem, physical))
+}
+
+fn list_error(name: &str) -> PinkDbError {
+    PinkDbError::Type(format!(
+        "column \"{name}\" is a variable-length list; pinkdb reads only fixed-size ARRAY \
+         columns (a LIST is wave 107a2)"
+    ))
+}
+
+/// An ARRAY column's length, from the writer's key-value metadata or else from
+/// the file's own shape: DuckDB writes every row of an ARRAY as exactly N
+/// element slots (a NULL row keeps its N slots at definition level 0), so
+/// `num_values / num_rows` recovers N from any row group. A variable-length
+/// column makes those disagree and is refused.
+fn array_length(
+    name: &str,
+    elem: ArrayElem,
+    leaf: usize,
+    metadata: Option<&parquet::file::metadata::ParquetMetaData>,
+) -> Result<u32> {
+    let Some(metadata) = metadata else {
+        return Err(list_error(name));
+    };
+    let recorded = metadata
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kvs| {
+            let key = array_length_key(name);
+            kvs.iter()
+                .find(|kv| kv.key == key)
+                .and_then(|kv| kv.value.as_deref())
+                .and_then(|value| value.parse::<u32>().ok())
+        });
+    let len = match recorded {
+        Some(len) => len,
+        None => {
+            let mut seen: Option<i64> = None;
+            for group in metadata.row_groups() {
+                let rows = group.num_rows();
+                if rows == 0 {
+                    continue;
+                }
+                let values = group.column(leaf).num_values();
+                if values % rows != 0 {
+                    return Err(list_error(name));
+                }
+                let n = values / rows;
+                if seen.is_some_and(|seen| seen != n) {
+                    return Err(list_error(name));
+                }
+                seen = Some(n);
+            }
+            let Some(n) = seen else {
+                return Err(PinkDbError::Type(format!(
+                    "column \"{name}\" is a fixed-size ARRAY stored as a parquet list, and the \
+                     file has no rows to read its length from"
+                )));
+            };
+            u32::try_from(n).map_err(|_| list_error(name))?
+        }
+    };
+    // `array_type` is the one place that decides a length is usable.
+    if pinkdb::types::array_type(elem, len).is_none() {
+        return Err(list_error(name));
+    }
+    Ok(len)
+}
+
 /// Whether a group is annotated as the Parquet `Variant` logical type.
 pub fn is_variant(field: &Type) -> bool {
     matches!(
@@ -276,6 +421,7 @@ pub fn alpha_type_name(ty: DataType) -> Option<String> {
         | DataType::Date
         | DataType::Timestamp
         | DataType::Interval
+        | DataType::Array { .. }
         | DataType::Variant => ty.name(),
         DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
     })
@@ -470,7 +616,7 @@ mod tests {
             .unwrap();
         let descr =
             parquet::schema::types::SchemaDescriptor::new(std::sync::Arc::new(root.clone()));
-        let err = map_columns(&root, &descr).unwrap_err();
+        let err = map_columns(&root, &descr, None).unwrap_err();
         assert!(err.to_string().contains("nested"), "{err}");
     }
 

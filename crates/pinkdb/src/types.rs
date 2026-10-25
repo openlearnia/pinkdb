@@ -152,6 +152,102 @@ pub enum DataType {
     /// Semi-structured value: any of ten kinds, stored as a tagged binary
     /// encoding (see [`crate::variant`] and `docs/wave-101-plan.md`).
     Variant,
+    /// Fixed-size array of `len` elements of one kind (see [`crate::array`]
+    /// and `docs/wave-107-plan.md`). `len` is part of the type, so a column's
+    /// layout is known before a byte is read; a variable-length `LIST` is
+    /// 107a2.
+    Array {
+        elem: ArrayElem,
+        len: u32,
+    },
+}
+
+/// Element kind of an [`DataType::Array`]. A small `Copy` enum, not a boxed
+/// [`DataType`], so `DataType` itself stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ArrayElem {
+    Integer,
+    Bigint,
+    /// 32-bit float (`FLOAT[N]`). The engine has no `FLOAT` *scalar* type, so
+    /// this kind exists only inside an array: `a[i]` widens to `DOUBLE`.
+    Float,
+    Double,
+}
+
+impl ArrayElem {
+    pub fn name(self) -> &'static str {
+        match self {
+            ArrayElem::Integer => "INTEGER",
+            ArrayElem::Bigint => "BIGINT",
+            ArrayElem::Float => "FLOAT",
+            ArrayElem::Double => "DOUBLE",
+        }
+    }
+
+    /// Parse an element type name, with the same aliases as
+    /// [`DataType::from_sql`] except that `FLOAT`/`REAL` name the 32-bit kind
+    /// here: inside an array the element type is spelled, and `FLOAT[N]` is a
+    /// float column of 4-byte elements. (A *scalar* `FLOAT` is still
+    /// `DOUBLE` — the engine has no 32-bit float scalar.)
+    pub fn from_sql(s: &str) -> Option<ArrayElem> {
+        match s.to_ascii_uppercase().as_str() {
+            "INTEGER" | "INT" => Some(ArrayElem::Integer),
+            "BIGINT" | "LONG" => Some(ArrayElem::Bigint),
+            "FLOAT" | "REAL" => Some(ArrayElem::Float),
+            "DOUBLE" => Some(ArrayElem::Double),
+            _ => None,
+        }
+    }
+
+    /// The element kind of a scalar type, if it can be an ARRAY element.
+    pub fn of(t: DataType) -> Option<ArrayElem> {
+        match t {
+            DataType::Integer => Some(ArrayElem::Integer),
+            DataType::Bigint => Some(ArrayElem::Bigint),
+            DataType::Double => Some(ArrayElem::Double),
+            _ => None,
+        }
+    }
+
+    /// Bytes per element on disk and on the wire.
+    pub fn width(self) -> usize {
+        match self {
+            ArrayElem::Integer | ArrayElem::Float => 4,
+            ArrayElem::Bigint | ArrayElem::Double => 8,
+        }
+    }
+
+    /// The tag byte used by the `.pink` footer, the wire protocol and the
+    /// extension ABI. A new kind appends a tag; existing tags never move.
+    pub fn tag(self) -> u8 {
+        match self {
+            ArrayElem::Integer => 0,
+            ArrayElem::Bigint => 1,
+            ArrayElem::Float => 3,
+            ArrayElem::Double => 2,
+        }
+    }
+
+    /// Inverse of [`ArrayElem::tag`].
+    pub fn from_tag(tag: u8) -> Option<ArrayElem> {
+        match tag {
+            0 => Some(ArrayElem::Integer),
+            1 => Some(ArrayElem::Bigint),
+            2 => Some(ArrayElem::Double),
+            3 => Some(ArrayElem::Float),
+            _ => None,
+        }
+    }
+
+    /// The scalar type of one element. `FLOAT` widens to `DOUBLE`: there is
+    /// no `FLOAT` scalar, so `a[i]` is exact but wider than the stored element.
+    pub fn dtype(self) -> DataType {
+        match self {
+            ArrayElem::Integer => DataType::Integer,
+            ArrayElem::Bigint => DataType::Bigint,
+            ArrayElem::Float | ArrayElem::Double => DataType::Double,
+        }
+    }
 }
 
 impl DataType {
@@ -168,6 +264,7 @@ impl DataType {
             DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
             DataType::Interval => "INTERVAL".to_string(),
             DataType::Variant => "VARIANT".to_string(),
+            DataType::Array { elem, len } => format!("{}[{len}]", elem.name()),
         }
     }
 
@@ -175,6 +272,12 @@ impl DataType {
     /// Aliases: INT → INTEGER, TEXT/STRING → VARCHAR, FLOAT → DOUBLE,
     /// DATETIME → TIMESTAMP, NUMERIC/DEC → DECIMAL (default `(18,3)`).
     pub fn from_sql(s: &str) -> Option<DataType> {
+        // `DOUBLE[3]`: the length is the only bracket suffix a type name can
+        // carry (`DOUBLE[]` is the variable-length LIST, 107a2).
+        if let Some((base, rest)) = s.split_once('[') {
+            let len = rest.strip_suffix(']')?.trim().parse::<u32>().ok()?;
+            return array_type(ArrayElem::from_sql(base.trim())?, len);
+        }
         match s.to_ascii_uppercase().as_str() {
             "BOOLEAN" | "BOOL" => Some(DataType::Boolean),
             "INTEGER" | "INT" => Some(DataType::Integer),
@@ -218,8 +321,21 @@ impl DataType {
         }
     }
 
+    /// The element kind and length of an ARRAY, else `None`.
+    pub fn array_params(self) -> Option<(ArrayElem, u32)> {
+        match self {
+            DataType::Array { elem, len } => Some((elem, len)),
+            _ => None,
+        }
+    }
+
     /// True for the numeric types (DECIMAL included): values that support
     /// arithmetic and ordered comparison.
+    /// True for the fixed-size [`DataType::Array`] types.
+    pub fn is_array(self) -> bool {
+        matches!(self, DataType::Array { .. })
+    }
+
     pub fn is_numeric(self) -> bool {
         matches!(
             self,
@@ -234,6 +350,15 @@ impl DataType {
             _ => None,
         }
     }
+}
+
+/// An `ARRAY` type, rejecting a zero length (DuckDB's `T[0]` is legal but
+/// useless, and it would make `rows * len` unable to recover the row count).
+pub fn array_type(elem: ArrayElem, len: u32) -> Option<DataType> {
+    if len == 0 {
+        return None;
+    }
+    Some(DataType::Array { elem, len })
 }
 
 /// Validate DECIMAL parameters like DuckDB (precision 1..=38, scale ≤
@@ -275,6 +400,8 @@ pub enum Value {
     },
     /// Semi-structured value. Shared so copying a cell never copies a tree.
     Variant(std::sync::Arc<crate::variant::Variant>),
+    /// One row of a fixed-size array, shared for the same reason.
+    Array(std::sync::Arc<crate::array::ArrayValue>),
 }
 
 impl Value {
@@ -303,6 +430,10 @@ impl Value {
             }),
             Value::Interval { .. } => Some(DataType::Interval),
             Value::Variant(_) => Some(DataType::Variant),
+            Value::Array(a) => Some(DataType::Array {
+                elem: a.elem,
+                len: a.len() as u32,
+            }),
         }
     }
 }
@@ -326,6 +457,7 @@ impl fmt::Display for Value {
             } => write!(f, "{}", format_interval(*months, *days, *micros)),
             // The JSON text, so `CAST(v AS VARCHAR)` and this agree.
             Value::Variant(v) => write!(f, "{v}"),
+            Value::Array(a) => f.write_str(&a.text()),
         }
     }
 }

@@ -354,7 +354,9 @@ fn refusals_name_the_missing_feature() {
             "time zone database",
         ),
         ("SELECT (a, b) FROM t", "no STRUCT type"),
-        ("SELECT [1,2,3]", "needs a LIST type"),
+        // A fixed-size ARRAY literal parses (wave 107a); the variable-length
+        // form still names the follow-up.
+        ("CREATE TABLE listy (v DOUBLE[])", "variable-length LIST"),
         ("SELECT $nope", "Variable nope does not exist"),
         (
             "SELECT * FROM t, LATERAL (SELECT t.a) s",

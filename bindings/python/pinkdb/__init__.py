@@ -49,6 +49,7 @@ from __future__ import annotations
 import ctypes
 import datetime as _datetime
 import decimal as _decimal
+import struct as _struct
 import os
 import threading
 from pathlib import Path
@@ -130,6 +131,8 @@ _TYPE_DATE = 6
 _TYPE_TIMESTAMP = 7
 _TYPE_DECIMAL = 8
 _TYPE_INTERVAL = 9
+_TYPE_ARRAY = 11
+_TYPE_ARRAY_FLOAT = 12
 
 _TYPE_NAMES = {
     _TYPE_NULL: "null",
@@ -143,6 +146,18 @@ _TYPE_NAMES = {
     _TYPE_DECIMAL: "decimal",
     _TYPE_INTERVAL: "interval",
 }
+
+def _type_name(tag: int) -> str:
+    """The pinkdb type name for a column type tag.
+
+    An ARRAY packs its element count above the type byte: 11 for `double`
+    elements, 12 for 4-byte `float` ones.
+    """
+    if tag & 0xFF in (_TYPE_ARRAY, _TYPE_ARRAY_FLOAT):
+        elem = "float" if tag & 0xFF == _TYPE_ARRAY_FLOAT else "double"
+        return f"{elem}[{tag >> 8}]"
+    return _TYPE_NAMES.get(tag, "unknown")
+
 
 _EPOCH_DATE = _datetime.date(1970, 1, 1)
 _EPOCH_DATETIME = _datetime.datetime(1970, 1, 1)
@@ -452,6 +467,22 @@ def _value_to_python(v: _PinkValue):
             ) from exc
     # DECIMAL and INTERVAL arrive as text cells (the FFI's canonical text):
     # DECIMAL maps to an exact Decimal, INTERVAL keeps its canonical text.
+    if tag & 0xFF in (_TYPE_ARRAY, _TYPE_ARRAY_FLOAT):
+        # An ARRAY payload: N little-endian elements, the count in the tag's
+        # upper bits. NULL elements never cross the C ABI.
+        count = tag >> 8
+        single = tag & 0xFF == _TYPE_ARRAY_FLOAT
+        width = 4 if single else 8
+        if not v.text_ptr or v.text_len != count * width:
+            raise Error(
+                f"{'FLOAT' if single else 'DOUBLE'}[{count}] value is "
+                f"{v.text_len} bytes, not the {count * width} of its element "
+                "count"
+            )
+        code = "f" if single else "d"
+        return list(
+            _struct.unpack(f"<{count}{code}", ctypes.string_at(v.text_ptr, v.text_len))
+        )
     if tag in (_TYPE_DECIMAL, _TYPE_INTERVAL):
         if not v.text_ptr or v.text_len == 0:
             return "" if tag == _TYPE_INTERVAL else _decimal.Decimal(0)
@@ -640,9 +671,8 @@ def _snapshot(lib: ctypes.CDLL, result_ptr) -> list:
                 name = lib.pinkdb_result_column_name(result_ptr, stmt, col)
                 columns.append(name.decode("utf-8") if name is not None else "")
                 column_types.append(
-                    _TYPE_NAMES.get(
+                    _type_name(
                         lib.pinkdb_result_column_type(result_ptr, stmt, col),
-                        "unknown",
                     )
                 )
             nrows = lib.pinkdb_result_row_count(result_ptr, stmt)

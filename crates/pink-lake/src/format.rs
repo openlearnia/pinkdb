@@ -326,6 +326,20 @@ pub struct FileFooter {
     pub stats: Vec<ColumnStats>,
 }
 
+/// The catalog column ids a lake data file must record as parquet
+/// `field_id`s, in table-column order.
+///
+/// DuckLake readers match a nested column's children by id, so the `element`
+/// leaf of an ARRAY group needs its own `ducklake_column.column_id`; a
+/// standalone file records none (DuckDB's `COPY … TO` does the same).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldIds {
+    /// The column's `ducklake_column.column_id`.
+    pub column: i64,
+    /// The `element` child's `column_id`, for an ARRAY column.
+    pub array_child: Option<i64>,
+}
+
 /// One lake data-file format: writer, reader, and optional self-description.
 ///
 /// Providers are shared process-wide through the registry (see
@@ -368,6 +382,24 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
             source: e,
         })?;
         Ok((encoded.stats, encoded.footer))
+    }
+
+    /// [`LakeFormat::write_streamed`] with the catalog column ids the file
+    /// must record as parquet `field_id`s.
+    ///
+    /// The lake passes them so a DuckLake reader can match a nested column's
+    /// children (a parquet list has no name of its own); a format that has no
+    /// place for them ignores the hint.
+    fn write_streamed_with_fields(
+        &self,
+        db: &str,
+        table: &str,
+        src: &DataTable,
+        fields: &[FieldIds],
+        sink: &mut (dyn Write + Send),
+    ) -> Result<(SavedTableStats, Option<FooterLocation>)> {
+        let _ = fields;
+        self.write_streamed(db, table, src, sink)
     }
 
     /// Decode one data file into the one-database/one-table [`PinkDb`] store

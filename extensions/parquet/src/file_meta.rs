@@ -150,7 +150,11 @@ fn build_meta(
 ) -> Result<FileMeta> {
     let file_metadata = metadata.file_metadata();
     let schema_root: Arc<Type> = file_metadata.schema_descr().root_schema_ptr();
-    let columns = map_columns(schema_root.as_ref(), file_metadata.schema_descr())?;
+    let columns = map_columns(
+        schema_root.as_ref(),
+        file_metadata.schema_descr(),
+        Some(metadata),
+    )?;
     // Only a file whose writer shredded each VARIANT column over the whole
     // column gives sound per-path bounds (see `variant_stats`).
     let variant_complete = file_metadata.key_value_metadata().is_some_and(|kvs| {

@@ -118,6 +118,22 @@
  * VARCHAR results — the host copies `text_len` bytes and frees the buffer
  * immediately. Argument bytes are host-owned and valid only during the call.
  *
+ * ARRAY (type tags 11 and 12) is a fixed-size array, passed as a pointer and
+ * a length over contiguous elements — never a boxed array of values. Tag 11
+ * carries 8-byte `double` elements and tag 12 (`PINKDB_EXT_TYPE_ARRAY_FLOAT`)
+ * 4-byte `float` elements; both pack the length above the kind byte
+ * (`PINKDB_EXT_ARRAY_TAG` / `PINKDB_EXT_ARRAY_FLOAT_TAG`, i.e. `(len << 8) |
+ * tag`), and the element count also rides `int64`. For an argument,
+ * `text_ptr` points at the engine's own element buffer (`len * 8` or
+ * `len * 4` bytes, 8- or 4-byte aligned) and is host-owned, valid only during
+ * the call. A NULL *array* arrives with `is_null` set and no payload. An ARRAY
+ * argument that holds a NULL element is refused by the host: there is no
+ * per-element NULL channel, and a substituted value would be a wrong answer.
+ * A result allocates `len * 8` / `len * 4` bytes with `api->alloc`, 8-/4-byte
+ * aligned, and sets `int64 = len`, `text_len = len * 8` / `len * 4` and the
+ * packed tag; the host checks all three agree. Only FLOAT and DOUBLE arrays
+ * have an ABI type (INTEGER/BIGINT arrays are refused by the binder).
+ *
  * ---------------------------------------------------------------------------
  * Scalar callbacks
  * ---------------------------------------------------------------------------
@@ -288,12 +304,14 @@ extern "C" {
 #define PINKDB_EXT_ABI_VERSION 1
 /* Additive level of that major version: 2 = pinkdb_ext_serve and the
  * execute_statement host field; 3 = the VARIANT value type (tag 10);
- * 4 = pinkdb_ext_command and the execute_internal host field.
+ * 4 = pinkdb_ext_command and the execute_internal host field;
+ * 5 = the ARRAY value types (tag 11, DOUBLE elements; tag 12, FLOAT
+ *     elements).
  * Extensions that do not use them need not care; hosts compare
  * PINKDB_EXT_ABI_VERSION and probe the additions. A new type tag is safe in
  * both directions: a host only ever sends tags the extension declared, and a
  * minor-2 host rejects a VARIANT registration with a clear error. */
-#define PINKDB_EXT_ABI_MINOR 4
+#define PINKDB_EXT_ABI_MINOR 5
 
 /* Maximum number of function arguments the host accepts. */
 #define PINKDB_EXT_MAX_ARGS 64
@@ -303,8 +321,11 @@ extern "C" {
 #define PINKDB_EXT_FLAG_VOLATILE 0x1u
 
 /* Value / argument type tags (same numbering as the pinkdb C ABI). 8 is that
- * ABI's DECIMAL, which extension ABI v1 does not support; 9 is INTERVAL and
- * 10 is VARIANT (see the payload notes at the top of this header). */
+ * ABI's DECIMAL, which extension ABI v1 does not support; 9 is INTERVAL,
+ * 10 is VARIANT, 11 is ARRAY of DOUBLE and 12 is ARRAY of FLOAT (see the
+ * payload notes at the top of this header; an ARRAY tag carries its length
+ * above the kind byte, so use PINKDB_EXT_ARRAY_TAG / PINKDB_EXT_ARRAY_FLOAT_TAG
+ * rather than the bare 11 or 12). */
 enum {
     PINKDB_EXT_TYPE_NULL = 0,
     PINKDB_EXT_TYPE_BOOLEAN = 1,
@@ -315,8 +336,23 @@ enum {
     PINKDB_EXT_TYPE_DATE = 6,
     PINKDB_EXT_TYPE_TIMESTAMP = 7,
     PINKDB_EXT_TYPE_INTERVAL = 9,
-    PINKDB_EXT_TYPE_VARIANT = 10
+    PINKDB_EXT_TYPE_VARIANT = 10,
+    PINKDB_EXT_TYPE_ARRAY_DOUBLE = 11,
+    PINKDB_EXT_TYPE_ARRAY_FLOAT = 12
 };
+
+/* The type tag for a fixed-size DOUBLE array: `(len << 8) | 11`. The low byte
+ * is the kind, so a host that predates the type rejects it as an unknown tag
+ * at registration instead of misreading it. Lengths above 16,777,215 are not
+ * expressible; the engine's own ARRAY types are far below that. */
+#define PINKDB_EXT_ARRAY_TAG(len) \
+    (PINKDB_EXT_TYPE_ARRAY_DOUBLE | ((int32_t)(len) << 8))
+
+/* The type tag for a fixed-size FLOAT array (4-byte elements): `(len << 8) |
+ * 12`. Same rules as PINKDB_EXT_ARRAY_TAG; the element count is in `int64` and
+ * `text_len` must be `len * 4` for a result. */
+#define PINKDB_EXT_ARRAY_FLOAT_TAG(len) \
+    (PINKDB_EXT_TYPE_ARRAY_FLOAT | ((int32_t)(len) << 8))
 
 /* One tagged scalar value; see the layout notes at the top of this header. */
 typedef struct pinkdb_ext_value {
