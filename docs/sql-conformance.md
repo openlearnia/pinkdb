@@ -12,7 +12,7 @@ Row 95 is big, so it is split:
 | batch | scope | state |
 |---|---|---|
 | **95a** | the query forms: `QUALIFY`, `TRY_CAST`, subscripts, `IS [NOT] DISTINCT FROM`, `VALUES`/`TABLE`, `FETCH FIRST`, `LIKE … ESCAPE`, `SIMILAR TO`, `DISTINCT ON`, aggregate `FILTER`, named `WINDOW`, `GROUPING SETS`/`ROLLUP`/`CUBE` + `GROUPING()`, `WITH RECURSIVE`, set operations with `ALL` | **done** (this page) |
-| **95b** | the DML forms: `INSERT … ON CONFLICT` (and `INSERT OR REPLACE` / `REPLACE INTO`), `UPDATE … FROM`, `DELETE … USING`, `RETURNING`, `MERGE`, data-modifying CTEs, multi-row-match semantics | queued — every form is refused with a `wave 95b` error |
+| **95b** | the DML forms: `INSERT … ON CONFLICT` (and `INSERT OR REPLACE` / `INSERT OR IGNORE`), `UPDATE … FROM`, `DELETE … USING`, `RETURNING`, `MERGE`, data-modifying CTEs, primary/unique key enforcement | **done** (this page) |
 | **95c** | the rest: `LATERAL`, ordered-set aggregates (`WITHIN GROUP`), `TABLESAMPLE`, `FOR UPDATE`/`SHARE`, `AT TIME ZONE`, row constructors, list literals/`LIST`, `FILTER` on a window aggregate, windows built on another window, VARIANT slicing, the JSON mutation functions, `SET VARIABLE`/`$name` | queued — every form is refused with a `wave 95c` error |
 
 Legend: **✅ supported** (same answer as DuckDB 2.0.0 on the shared corpus) ·
@@ -43,23 +43,26 @@ Legend: **✅ supported** (same answer as DuckDB 2.0.0 on the shared corpus) ·
 | `UNION ALL` / `INTERSECT ALL` / `EXCEPT ALL` | ✅ | Multiset semantics, verified on the shared corpus. Plain `UNION`/`INTERSECT`/`EXCEPT` unchanged. |
 | `CORRESPONDING` | ✗ | `parse error` — DuckDB 2.0 also rejects `UNION CORRESPONDING`. Documented, not planned. |
 
-## DML forms — batch 2 (95b, queued)
+## DML forms — batch 2 (95b)
 
-Every one of these is refused with the wave name, so a script fails on the
-feature instead of on a misleading syntax error.
-
-| form | status | error |
+| form | status | notes (DuckDB 2.0.0 reference) |
 |---|---|---|
-| `INSERT … ON CONFLICT …` | ✗ | `INSERT ... ON CONFLICT is not supported (wave 95b)` |
-| `INSERT … ON DUPLICATE KEY UPDATE …` | ✗ | `INSERT ... ON DUPLICATE KEY UPDATE is not supported (wave 95b)` |
-| `INSERT OR REPLACE …` | ✗ | `INSERT OR REPLACE is not supported (wave 95b): use INSERT ... ON CONFLICT when it lands` |
-| `REPLACE INTO …` | ✗ | `REPLACE INTO is not supported (wave 95b): use INSERT ... ON CONFLICT when it lands` |
-| `UPDATE … FROM …` | ✗ | `UPDATE ... FROM is not supported (wave 95b)` |
-| `DELETE … USING …` | ✗ | `DELETE ... USING is not supported (wave 95b)` |
-| `RETURNING …` | ✗ | `RETURNING is not supported (wave 95b)` |
-| `MERGE INTO …` | ✗ | `MERGE is not supported (wave 95b)` |
-| data-modifying CTEs (`WITH x AS (INSERT …)`) | ✗ | `data-modifying CTEs (INSERT/UPDATE/DELETE inside WITH) are not supported (wave 95b)` |
-| `COPY` as a CTE step | ✗ | same data-modifying-CTE error |
+| `INSERT … ON CONFLICT DO NOTHING` | ✅ | The conflict target is optional; with one (`ON CONFLICT (a)`), only that constraint is checked and a hit elsewhere still errors, as in DuckDB. |
+| `INSERT … ON CONFLICT [(cols)] DO UPDATE SET … [WHERE …]` | ✅ | `excluded.col` is the proposed row and the target's own columns read the row already stored; the optional `WHERE` is evaluated on the existing row and skips the update when false. The target must be a declared `PRIMARY KEY` or `UNIQUE` constraint (same refusal as DuckDB). Within one statement a duplicated key keeps the **first** row, like DuckDB. |
+| `INSERT OR REPLACE …` | ✅ | Equivalent to `ON CONFLICT DO UPDATE SET` over the columns the statement writes; with a partial column list the unlisted columns keep their **existing** values (the DuckDB behaviour, not defaults). |
+| `INSERT OR IGNORE …` | ✅ | Equivalent to `ON CONFLICT DO NOTHING` for **every** key, not just the named one. |
+| `INSERT … ON DUPLICATE KEY UPDATE …` | ✗ | `INSERT ... ON DUPLICATE KEY UPDATE is not supported: write ON CONFLICT ... DO UPDATE SET` (DuckDB accepts the MySQL spelling; pinkdb takes the standard one only) |
+| `REPLACE INTO …` | ✗ | `REPLACE INTO is not supported (DuckDB has no REPLACE INTO): spell it INSERT OR REPLACE` (DuckDB 2.0 is a parser error too) |
+| `UPDATE t SET … FROM other WHERE …` | ✅ | The source is bound **before** the target, so `FROM`/`JOIN` columns come first in expressions. When several source rows match one target row the **last** source row wins — no error, matching DuckDB (probed; Postgres would error). |
+| `DELETE FROM t USING other WHERE …` | ✅ | Same source-first binding. A target row matched several times is still deleted once. |
+| `RETURNING …` on `INSERT`/`UPDATE`/`DELETE` | ✅ | Also on `ON CONFLICT` (returns the final row of each affected row, inserted or updated) and on `MERGE`. Projections may be `*`, plain columns, expressions and aliases. The reported image is the row **after** `BEFORE` triggers ran (DuckDB has no triggers; this is pinkdb's contract, tested). |
+| `MERGE INTO t USING s ON … WHEN MATCHED [AND …] THEN UPDATE SET … / DELETE`, `WHEN NOT MATCHED [AND …] THEN INSERT [(cols)] VALUES (…)` | ✅ | Clauses are tried in order, first match wins (DuckDB's rule). `WHEN NOT MATCHED BY SOURCE` is supported too. A target row matched by more than one source row **and** affected by a matched clause is DuckDB's error, verbatim: `MERGE INTO command cannot affect the same target row more than once. A target row matched more than one source row; ensure the source rows are deduplicated or the ON condition is unique.` The statement is atomic. |
+| data-modifying CTE: `WITH x AS (INSERT/UPDATE/DELETE … [RETURNING …]) SELECT … FROM x` | ✅ | Top level only (a nested one is refused with DuckDB's `WITH clause containing a data-modifying statement must be at the top level`); the body runs once, even when the CTE is referenced several times. |
+| `COPY` as a CTE step | ✗ | `COPY inside WITH is not supported: run COPY as its own statement` (DuckDB accepts it; `COPY … TO` is ADMIN-gated in pinkdb, and a CTE step would sidestep that check) |
+| `PRIMARY KEY` / `UNIQUE` enforcement | ✅ | **Behaviour change:** the constraints stop being metadata. `INSERT`/`UPDATE`/`MERGE`/`COPY`-free writes reject a duplicate key with DuckDB's wording (`PRIMARY KEY or UNIQUE constraint violation: duplicate key "1"` / `Duplicate key "a: 1" violates unique constraint.`), a `NULL` in a primary key with `NOT NULL constraint failed: t.a`, and a rejected statement leaves the store unchanged. A multi-column key is checked as a whole; a `UNIQUE` column accepts any number of `NULL`s. Foreign keys stay metadata (wave 41's `DESCRIBE`/join-elimination only). |
+
+A conflict target that is not backed by a key is refused like DuckDB:
+`the specified columns as conflict target are not referenced by a UNIQUE/PRIMARY KEY CONSTRAINT`.
 
 ## The rest — batch 3 (95c, queued)
 
@@ -96,6 +99,10 @@ not planned to change.
 | `LIMIT 1 FETCH FIRST 2 ROWS ONLY` | `LIMIT cannot be combined with FETCH FIRST` | syntax error |
 | `CUBE` over > 12 expressions | refused | allowed (explodes) |
 | recursive CTE without a terminating predicate | error after 100 000 iterations | loops until memory runs out |
+| `UPDATE … FROM` with several matching source rows | last source row wins (same as DuckDB) | last source row wins |
+| `MERGE … RETURNING` over several affected rows | every affected row, in clause order (matched updates/deletes, then inserts) | every affected row; the relative order is not defined by DuckDB |
+| duplicate keys in one `INSERT` | the first row wins, the rest are dropped for `ON CONFLICT`/`OR REPLACE` (DuckDB's behaviour) | first row wins |
+| a table written by a pre-95b build that already holds duplicate keys | refuses to open on WAL replay with the duplicate-key error (no silent fix-up; pre-1.0, no migration) | n/a |
 
 ## What is covered by tests
 
@@ -106,31 +113,56 @@ not planned to change.
   re-measured on DuckDB when `/tmp/duckdb-2.0.0/duckdb` exists;
 * `explain_shows_the_new_operators` — `EXPLAIN` shows `Window`, `Distinct`,
   `Values` and `Cte` + `Recursive step (UNION ALL)` for the new forms;
-* `later_waves_are_named_in_the_error` — every 95b/95c refusal above;
-* `unsupported_variants_have_precise_errors` — the fine-grained refusals
-  (multi-character escape, `FILTER` on a window, VARIANT slicing, a subscript
-  on a non-VARIANT/VARCHAR column, `LIMIT`+`FETCH`, runaway pattern);
-* `variant_subscripts_follow_duckdb_indexing`,
-  `grouping_masks_and_rollup_shapes`,
-  `recursive_cte_terminates_and_reports_a_runaway` — the pinkdb-only shapes
-  (which DuckDB spells with `json(...)` or answers identically but with a
-  different plan).
+* `batch_two_dml_forms_match_duckdb` — 25 DML cases (upserts, `RETURNING`,
+  `UPDATE … FROM`, `DELETE … USING`, `MERGE`, data-modifying CTEs), each pinned
+  to DuckDB's answer and re-measured on DuckDB when it is present (the same
+  cases run in `bench/duckdiff.py` as the `dml-*` battery);
+* `dml_errors_are_precise` — the wave-95b refusals above, each also checked to
+  be an error on DuckDB;
+* `primary_and_unique_keys_are_enforced` — duplicate key, `NULL` in a key,
+  atomic rollback of a rejected statement, and the conflict forms that accept
+  what a plain `INSERT` rejects;
+* `returning_reports_the_post_trigger_row` — a `BEFORE` trigger's rewrite of
+  `NEW` is what `RETURNING` reports (pinkdb only: DuckDB has no triggers);
+* `explain_names_the_dml_cte_forms` — `EXPLAIN` renders each DML form (the
+  conflict action, the `MERGE` clauses, the source/using join) and refuses a
+  DDL statement with a sentence;
+* `later_waves_are_named_in_the_error` — every 95c refusal above;
+* `crates/pinkdb/tests/dml_replay.rs` — a store written with `ON CONFLICT`,
+  `MERGE`, `UPDATE … FROM`, `DELETE … USING` and a data-modifying CTE is
+  dropped without a checkpoint and reopened; the WAL replays the statements
+  (found verbatim in the record) and reproduces the same rows, before and
+  after a checkpoint;
+* `crates/pinkdb/tests/rbac.rs` — `the_dml_forms_check_every_table_they_touch`:
+  `MERGE` needs the privilege of each action its clauses spell out, the
+  `UPDATE … FROM`/`DELETE … USING` source needs `SELECT`, and a data-modifying
+  CTE's target needs the write privilege;
+* `crates/pinkdb/src/serve.rs` — the read-only allowlist refuses every new
+  statement kind and a `WITH` whose body writes.
 
 ## Performance
 
-No regression for existing queries. Measured on a locally generated
-1 000 000-row `lineitem`-shaped store (`bench/wave95_perf/` holds the
-generator and the three queries), alternating the pre-change binary (a
-`git worktree` at HEAD `1d199fb` with its own `CARGO_TARGET_DIR`) and the new
-one, medians of six interleaved runs, each query timed in its own process with
-`.timer on`:
+No regression for existing DML. The wave-95b A/B ran a locally generated
+1 000 000-row keyed table (`bench/wave95b_perf/` holds the generator, the three
+workloads and `run.sh`), alternating the pre-change binary (a `git worktree` at
+HEAD `6531691` with its own `CARGO_TARGET_DIR`) and the new one, five
+interleaved rounds, each statement timed in its own process with `.timer on`,
+on a private copy of the base store:
 
-| build | Q1 (group by 2 keys, 8 aggregates) | Q6 (filter + one aggregate) | group/sort (`l_partkey`, top 20) |
+| workload | HEAD (median of 5) | this change (median of 5) | delta |
 |---|---|---|---|
-| release, HEAD | 0.012 s | 0.007 s | 0.131 s |
-| release, this change | 0.012 s | 0.007 s | 0.132 s |
-| debug, HEAD | 0.140 s | 0.063 s | 0.785 s |
-| debug, this change | 0.143 s | 0.063 s | 0.781 s |
+| `INSERT INTO t2 SELECT * FROM t` (1 M rows, PK on `t2.id`) | 0.095 s | 0.381 s | +0.286 s — the uniqueness check (~3.5 M keys/s) |
+| `UPDATE t SET v = v + 1` (1 M rows, key not written) | 0.025 s | 0.025 s | none |
+| `DELETE FROM t WHERE id % 2 = 0` (500 k rows) | 0.019 s | 0.019 s | none |
 
-The debug Q1 delta (+2 %, spread 0.136–0.146 s) is code-layout noise: the
-release build, where execution dominates, is identical.
+The insert delta is the price of enforcing the key: every staged row is hashed
+into one map per table (`crates/pinkdb/src/keys.rs`), built lazily on the first
+write after a table is opened or changed by another path and then kept in step
+with appends, updates and deletes. The first write to a large table therefore
+pays one scan to build the map (about 0.2 s for 1 M rows); later single-row
+writes in the same process are constant time — a one-row `INSERT` or
+`INSERT … ON CONFLICT` into a 1 M-row keyed table executes in under 0.1 ms
+once warm, against 0.9 s when the map was rebuilt per statement. An `UPDATE`
+that does not write a key column skips the check entirely, which is why the
+bulk update is unchanged. The 95a query A/B (Q1/Q6/group-sort) also still holds: its
+operators are untouched by wave 95b.

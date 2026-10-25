@@ -1358,19 +1358,9 @@ pub(crate) fn check_statement(
         }
         _ => {}
     }
-    // 2. Table-level privileges (writes).
-    match plan {
-        LogicalPlan::Insert { db, table, .. } | LogicalPlan::InsertSelect { db, table, .. } => {
-            check_table(store, principal, db, table, default_db, Privilege::Insert)?;
-        }
-        LogicalPlan::Update { db, table, .. } => {
-            check_table(store, principal, db, table, default_db, Privilege::Update)?;
-        }
-        LogicalPlan::Delete { db, table, .. } => {
-            check_table(store, principal, db, table, default_db, Privilege::Delete)?;
-        }
-        _ => {}
-    }
+    // 2. Table-level privileges (writes). A data-modifying CTE writes
+    //    inside the query it wraps, so the pass recurses into `WITH` bodies.
+    check_writes(store, principal, plan, default_db)?;
     // 3. Read pass: every table the statement reads needs SELECT. Includes
     //    the target of UPDATE/DELETE (both read what they write) and the
     //    source of INSERT..SELECT / CREATE TABLE AS.
@@ -1389,6 +1379,83 @@ pub(crate) fn check_statement(
                 Privilege::Select,
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Require the write privilege of every table the plan writes, including the
+/// statements inside a data-modifying CTE (wave 95b).
+fn check_writes(
+    store: &PinkDb,
+    principal: &str,
+    plan: &LogicalPlan,
+    default_db: &str,
+) -> Result<()> {
+    match plan {
+        LogicalPlan::Insert { db, table, .. } | LogicalPlan::InsertSelect { db, table, .. } => {
+            check_table(store, principal, db, table, default_db, Privilege::Insert)?;
+        }
+        LogicalPlan::Update { db, table, .. } => {
+            check_table(store, principal, db, table, default_db, Privilege::Update)?;
+        }
+        LogicalPlan::Delete { db, table, .. } => {
+            check_table(store, principal, db, table, default_db, Privilege::Delete)?;
+        }
+        // A MERGE executes the actions its clauses spell out, so it needs
+        // exactly the privileges of those actions on its target.
+        LogicalPlan::Merge {
+            db, table, clauses, ..
+        } => {
+            let (mut update, mut delete, mut insert) = (false, false, false);
+            for clause in clauses {
+                match &clause.action {
+                    crate::plan::MergeActionPlan::Update { .. } => {
+                        if !update {
+                            check_table(
+                                store,
+                                principal,
+                                db,
+                                table,
+                                default_db,
+                                Privilege::Update,
+                            )?;
+                            update = true;
+                        }
+                    }
+                    crate::plan::MergeActionPlan::Delete => {
+                        if !delete {
+                            check_table(
+                                store,
+                                principal,
+                                db,
+                                table,
+                                default_db,
+                                Privilege::Delete,
+                            )?;
+                            delete = true;
+                        }
+                    }
+                    crate::plan::MergeActionPlan::Insert { .. } => {
+                        if !insert {
+                            check_table(
+                                store,
+                                principal,
+                                db,
+                                table,
+                                default_db,
+                                Privilege::Insert,
+                            )?;
+                            insert = true;
+                        }
+                    }
+                }
+            }
+        }
+        LogicalPlan::Cte { query, body, .. } => {
+            check_writes(store, principal, query, default_db)?;
+            check_writes(store, principal, body, default_db)?;
+        }
+        _ => {}
     }
     Ok(())
 }

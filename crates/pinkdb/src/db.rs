@@ -1494,8 +1494,15 @@ pub(crate) fn record_writes(
         LogicalPlan::Insert { db, table, .. }
         | LogicalPlan::InsertSelect { db, table, .. }
         | LogicalPlan::Update { db, table, .. }
-        | LogicalPlan::Delete { db, table, .. } => {
+        | LogicalPlan::Delete { db, table, .. }
+        | LogicalPlan::Merge { db, table, .. } => {
             tables.insert(key(db, table));
+        }
+        // A data-modifying CTE writes through the statement that wraps it,
+        // and the frame must cover that table's write (wave 95b).
+        LogicalPlan::Cte { query, body, .. } => {
+            record_writes(query, default_db, tables, views);
+            record_writes(body, default_db, tables, views);
         }
         LogicalPlan::CreateTable { db, name, .. }
         | LogicalPlan::CreateTableAs { db, name, .. }

@@ -251,20 +251,46 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
         let child = depth + 1;
         match node {
             NodeRef::Statement(stmt) => match stmt {
-                ast::Statement::Insert { source, .. } => match source {
-                    ast::InsertSource::Values(rows) => {
-                        for row in rows {
-                            for e in row {
-                                work.push((NodeRef::Expr(e), child));
+                ast::Statement::Insert {
+                    source,
+                    on_conflict,
+                    returning,
+                    ..
+                } => {
+                    match source {
+                        ast::InsertSource::Values(rows) => {
+                            for row in rows {
+                                for e in row {
+                                    work.push((NodeRef::Expr(e), child));
+                                }
                             }
                         }
+                        ast::InsertSource::Select(query) => {
+                            work.push((NodeRef::Select(query), child));
+                        }
                     }
-                    ast::InsertSource::Select(query) => {
-                        work.push((NodeRef::Select(query), child));
+                    if let Some(ast::OnConflict {
+                        action: ast::OnConflictAction::DoUpdate { sets, where_clause },
+                        ..
+                    }) = on_conflict
+                    {
+                        for (_, e) in sets {
+                            work.push((NodeRef::Expr(e), child));
+                        }
+                        if let Some(e) = where_clause {
+                            work.push((NodeRef::Expr(e), child));
+                        }
                     }
-                },
+                    for p in returning.iter().flatten() {
+                        work.push((NodeRef::Projection(p), child));
+                    }
+                }
                 ast::Statement::Update {
-                    sets, where_clause, ..
+                    sets,
+                    where_clause,
+                    from,
+                    returning,
+                    ..
                 } => {
                     for (_, e) in sets {
                         work.push((NodeRef::Expr(e), child));
@@ -272,17 +298,66 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                     if let Some(e) = where_clause {
                         work.push((NodeRef::Expr(e), child));
                     }
+                    if let Some(from) = from {
+                        work.push((NodeRef::FromClause(from), child));
+                    }
+                    for p in returning.iter().flatten() {
+                        work.push((NodeRef::Projection(p), child));
+                    }
                 }
                 ast::Statement::Delete {
-                    where_clause: Some(e),
+                    where_clause,
+                    using,
+                    returning,
                     ..
                 } => {
-                    work.push((NodeRef::Expr(e), child));
+                    if let Some(e) = where_clause {
+                        work.push((NodeRef::Expr(e), child));
+                    }
+                    if let Some(using) = using {
+                        work.push((NodeRef::FromClause(using), child));
+                    }
+                    for p in returning.iter().flatten() {
+                        work.push((NodeRef::Projection(p), child));
+                    }
+                }
+                ast::Statement::Merge {
+                    using,
+                    on,
+                    clauses,
+                    returning,
+                    ..
+                } => {
+                    work.push((NodeRef::FromClause(using), child));
+                    work.push((NodeRef::Expr(on), child));
+                    for clause in clauses {
+                        if let Some(e) = &clause.condition {
+                            work.push((NodeRef::Expr(e), child));
+                        }
+                        match &clause.action {
+                            ast::MergeAction::Update { sets } => {
+                                for (_, e) in sets {
+                                    work.push((NodeRef::Expr(e), child));
+                                }
+                            }
+                            ast::MergeAction::Insert { values, .. } => {
+                                for e in values {
+                                    work.push((NodeRef::Expr(e), child));
+                                }
+                            }
+                            ast::MergeAction::Delete => {}
+                        }
+                    }
+                    for p in returning.iter().flatten() {
+                        work.push((NodeRef::Projection(p), child));
+                    }
                 }
                 ast::Statement::CreateView { query, .. }
-                | ast::Statement::CreateTableAs { query, .. }
-                | ast::Statement::Explain(query) => {
+                | ast::Statement::CreateTableAs { query, .. } => {
                     work.push((NodeRef::Select(query), child));
+                }
+                ast::Statement::Explain(inner) => {
+                    work.push((NodeRef::Statement(inner), child));
                 }
                 ast::Statement::Select(select) => {
                     work.push((NodeRef::Select(select), child));
@@ -439,9 +514,12 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                     work.push((NodeRef::Expr(expr), child));
                 }
             }
-            NodeRef::Cte(cte) => {
-                work.push((NodeRef::Select(&cte.query), child));
-            }
+            NodeRef::Cte(cte) => match &cte.query {
+                ast::CteBody::Query(query) => work.push((NodeRef::Select(query), child)),
+                // A data-modifying CTE body is a whole statement: reuse the
+                // statement walk (its child nodes carry the depth).
+                ast::CteBody::Dml(stmt) => work.push((NodeRef::Statement(stmt), child)),
+            },
             NodeRef::Join(join) => {
                 work.push((NodeRef::FromSource(&join.source), child));
                 if let Some(on) = &join.on {
@@ -472,24 +550,32 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
 fn dismantle(stmts: &mut Vec<ast::Statement>) {
     let mut exprs: Vec<ast::Expr> = Vec::new();
     let mut selects: Vec<ast::Select> = Vec::new();
+    let mut nested: Vec<ast::Statement> = Vec::new();
     for stmt in stmts.iter_mut() {
-        take_statement_children(stmt, &mut exprs, &mut selects);
+        take_statement_children(stmt, &mut exprs, &mut selects, &mut nested);
     }
     stmts.clear();
-    // Drain both worklists together: taking a `Select` apart can enqueue new
-    // expressions (and vice versa), so neither may be considered finished
-    // while the other still holds nodes.
-    while !exprs.is_empty() || !selects.is_empty() {
+    // Drain all three worklists together: taking a node apart can enqueue a
+    // node of any kind, so none may be considered finished while another
+    // still holds nodes.
+    while !exprs.is_empty() || !selects.is_empty() || !nested.is_empty() {
         while let Some(mut expr) = exprs.pop() {
             take_expr_children(&mut expr, &mut exprs, &mut selects);
         }
         if let Some(mut select) = selects.pop() {
-            take_select_children(&mut select, &mut exprs, &mut selects);
+            take_select_children(&mut select, &mut exprs, &mut selects, &mut nested);
+        }
+        if let Some(mut stmt) = nested.pop() {
+            take_statement_children(&mut stmt, &mut exprs, &mut selects, &mut nested);
         }
     }
 }
 
 /// An empty `Select`, used as the replacement when a child is moved out.
+fn empty_statement() -> ast::Statement {
+    ast::Statement::Select(empty_select())
+}
+
 fn empty_select() -> ast::Select {
     ast::Select {
         with: Vec::new(),
@@ -519,20 +605,47 @@ fn take_statement_children(
     stmt: &mut ast::Statement,
     exprs: &mut Vec<ast::Expr>,
     selects: &mut Vec<ast::Select>,
+    _nested: &mut Vec<ast::Statement>,
 ) {
     match stmt {
-        ast::Statement::Insert { source, .. } => match source {
-            ast::InsertSource::Values(rows) => {
-                for row in rows.drain(..) {
-                    exprs.extend(row);
+        ast::Statement::Insert {
+            source,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            match source {
+                ast::InsertSource::Values(rows) => {
+                    for row in rows.drain(..) {
+                        exprs.extend(row);
+                    }
+                }
+                ast::InsertSource::Select(query) => {
+                    selects.push(std::mem::replace(&mut **query, empty_select()));
                 }
             }
-            ast::InsertSource::Select(query) => {
-                selects.push(std::mem::replace(&mut **query, empty_select()));
+            if let Some(ast::OnConflict {
+                action: ast::OnConflictAction::DoUpdate { sets, where_clause },
+                ..
+            }) = on_conflict
+            {
+                for (_, e) in sets.drain(..) {
+                    exprs.push(e);
+                }
+                if let Some(e) = where_clause.take() {
+                    exprs.push(e);
+                }
             }
-        },
+            for p in returning.iter_mut().flatten() {
+                take_projection(p, exprs);
+            }
+        }
         ast::Statement::Update {
-            sets, where_clause, ..
+            sets,
+            where_clause,
+            from,
+            returning,
+            ..
         } => {
             for (_, e) in sets.drain(..) {
                 exprs.push(e);
@@ -540,16 +653,61 @@ fn take_statement_children(
             if let Some(e) = where_clause.take() {
                 exprs.push(e);
             }
+            if let Some(from) = from.take() {
+                take_from_children(*from, exprs, selects);
+            }
+            for p in returning.iter_mut().flatten() {
+                take_projection(p, exprs);
+            }
         }
-        ast::Statement::Delete { where_clause, .. } => {
+        ast::Statement::Delete {
+            where_clause,
+            using,
+            returning,
+            ..
+        } => {
             if let Some(e) = where_clause.take() {
                 exprs.push(e);
             }
+            if let Some(using) = using.take() {
+                take_from_children(*using, exprs, selects);
+            }
+            for p in returning.iter_mut().flatten() {
+                take_projection(p, exprs);
+            }
         }
-        ast::Statement::CreateView { query, .. }
-        | ast::Statement::CreateTableAs { query, .. }
-        | ast::Statement::Explain(query) => {
+        ast::Statement::Merge {
+            using,
+            on,
+            clauses,
+            returning,
+            ..
+        } => {
+            take_from_children(std::mem::replace(using, empty_from()), exprs, selects);
+            exprs.push(std::mem::replace(on, null_expr()));
+            for clause in clauses.drain(..) {
+                if let Some(e) = clause.condition {
+                    exprs.push(e);
+                }
+                match clause.action {
+                    ast::MergeAction::Update { sets } => {
+                        for (_, e) in sets {
+                            exprs.push(e);
+                        }
+                    }
+                    ast::MergeAction::Insert { values, .. } => exprs.extend(values),
+                    ast::MergeAction::Delete => {}
+                }
+            }
+            for p in returning.iter_mut().flatten() {
+                take_projection(p, exprs);
+            }
+        }
+        ast::Statement::CreateView { query, .. } | ast::Statement::CreateTableAs { query, .. } => {
             selects.push(std::mem::replace(&mut **query, empty_select()));
+        }
+        ast::Statement::Explain(inner) => {
+            _nested.push(std::mem::replace(&mut **inner, empty_statement()));
         }
         ast::Statement::Select(select) => {
             selects.push(std::mem::replace(select, empty_select()));
@@ -584,9 +742,13 @@ fn take_select_children(
     select: &mut ast::Select,
     exprs: &mut Vec<ast::Expr>,
     selects: &mut Vec<ast::Select>,
+    nested: &mut Vec<ast::Statement>,
 ) {
     for cte in select.with.drain(..) {
-        selects.push(*cte.query);
+        match cte.query {
+            ast::CteBody::Query(query) => selects.push(*query),
+            ast::CteBody::Dml(stmt) => nested.push(*stmt),
+        }
     }
     for projection in select.projections.drain(..) {
         if let ast::Projection::Expr { expr, .. } = projection {
@@ -608,6 +770,27 @@ fn take_select_children(
     }
     for (_, branch) in select.unions.drain(..) {
         selects.push(branch);
+    }
+}
+
+/// Move one projection's expression out, if it has one.
+fn take_projection(projection: &mut ast::Projection, exprs: &mut Vec<ast::Expr>) {
+    if let ast::Projection::Expr { expr, .. } = projection {
+        exprs.push(std::mem::replace(expr, null_expr()));
+    }
+}
+
+/// An empty `FromClause`, used as the replacement when a source is moved out.
+fn empty_from() -> ast::FromClause {
+    ast::FromClause {
+        source: ast::FromSource::Table {
+            db: None,
+            name: String::new(),
+        },
+        alias: None,
+        col_aliases: None,
+        at: None,
+        joins: Vec::new(),
     }
 }
 

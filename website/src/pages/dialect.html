@@ -16,7 +16,7 @@ is <a href="https://github.com/openlearnia/pinkdb/blob/main/docs/sql-conformance
   <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
   <tbody>
     <tr><td><code>SELECT</code> (joins, CTEs, windows, set operations)</td><td>✅</td><td>see the query table below</td></tr>
-    <tr><td><code>CREATE TABLE [IF NOT EXISTS]</code></td><td>✅</td><td>column and table-form constraints (<code>PRIMARY KEY</code>/<code>UNIQUE</code>/<code>NOT NULL</code>/<code>REFERENCES</code>, <code>CONSTRAINT</code> names, <code>RELY</code>/<code>[NOT] ENFORCED</code> accepted and dropped) — metadata only, never enforced</td></tr>
+    <tr><td><code>CREATE TABLE [IF NOT EXISTS]</code></td><td>✅</td><td>column and table-form constraints (<code>PRIMARY KEY</code>/<code>UNIQUE</code>/<code>NOT NULL</code>/<code>REFERENCES</code>, <code>CONSTRAINT</code> names, <code>RELY</code>/<code>[NOT] ENFORCED</code> accepted and dropped); <code>PRIMARY KEY</code>/<code>UNIQUE</code> are enforced per statement, foreign keys stay declarations</td></tr>
     <tr><td><code>CREATE TABLE … AS SELECT</code></td><td>✅</td><td>CTAS</td></tr>
     <tr><td><code>ALTER TABLE</code></td><td>✗</td><td>engine tables: not supported; lake tables get schema evolution in wave 65</td></tr>
     <tr><td><code>CREATE INDEX</code> / <code>DROP INDEX</code></td><td>✗</td><td>planned (wave 42)</td></tr>
@@ -66,7 +66,7 @@ is <a href="https://github.com/openlearnia/pinkdb/blob/main/docs/sql-conformance
     <tr><td><code>LIMIT</code> / <code>OFFSET</code></td><td>✅</td><td><code>OFFSET n ROW|ROWS</code> accepted</td></tr>
     <tr><td><code>PIVOT</code>/<code>UNPIVOT</code></td><td>✗</td><td>not scheduled</td></tr>
     <tr><td><code>TABLESAMPLE</code>, <code>LATERAL</code></td><td>✗</td><td>refused with a <code>wave 95c</code> error</td></tr>
-    <tr><td><code>INSERT … ON CONFLICT</code>/<code>OR REPLACE</code>, <code>UPDATE … FROM</code>, <code>DELETE … USING</code>, <code>RETURNING</code>, <code>MERGE</code>, data-modifying CTEs</td><td>✗</td><td>refused with a <code>wave 95b</code> error (the DML batch)</td></tr>
+    <tr><td><code>INSERT … ON CONFLICT</code>/<code>OR REPLACE</code>/<code>OR IGNORE</code>, <code>UPDATE … FROM</code>, <code>DELETE … USING</code>, <code>RETURNING</code>, <code>MERGE</code> (incl. <code>WHEN NOT MATCHED BY SOURCE</code>), data-modifying CTEs</td><td>✅</td><td>DuckDB 2.0 semantics: <code>excluded</code>, first-wins clause order, last source row wins for <code>UPDATE … FROM</code>, MERGE's multiple-match error, the body of a DML CTE runs once at the top level; <code>INSERT OR REPLACE</code> keeps unlisted columns; the MySQL spellings (<code>ON DUPLICATE KEY UPDATE</code>, <code>REPLACE INTO</code>) are refused by name</td></tr>
     <tr><td><code>WITHIN GROUP</code> (ordered-set aggregates), <code>FOR UPDATE</code>/<code>SHARE</code>, <code>AT TIME ZONE</code>, row constructors, list literals, JSON mutators, <code>SET VARIABLE</code>/<code>$name</code></td><td>✗</td><td>refused with a <code>wave 95c</code> error</td></tr>
     <tr><td><code>AT (VERSION =&gt; n)</code> / <code>AT (TIMESTAMP =&gt; ts)</code></td><td>✅ lake-only</td><td>attached lake tables (literal targets, capped at the attached version); store tables, CTEs and views are refused — DuckDB silently ignores <code>AT</code> on CTEs, pinkdb errors</td></tr>
   </tbody>

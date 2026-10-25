@@ -195,8 +195,18 @@ positional.
 CREATE TABLE t (id BIGINT, name VARCHAR, price DOUBLE);
 CREATE TABLE db1.t (...);            -- qualified: any db.table target works
 INSERT INTO t VALUES (1, 'x', 9.5), (2, NULL, 3.0);
+INSERT INTO t VALUES (1, 'y', 2.0) ON CONFLICT (id)
+  DO UPDATE SET price = excluded.price;          -- upsert; also DO NOTHING / OR REPLACE / OR IGNORE
 UPDATE t SET price = price * 1.1 WHERE id > 1;   -- SET exprs see pre-update values
+UPDATE t SET price = s.price FROM s WHERE t.id = s.id;   -- UPDATE ... FROM
 DELETE FROM t WHERE price IS NULL;               -- NULL never matches; both are statement-atomic
+DELETE FROM t USING s WHERE t.id = s.id;         -- DELETE ... USING
+MERGE INTO t USING s ON t.id = s.id              -- MERGE (first matching clause wins)
+  WHEN MATCHED THEN UPDATE SET price = s.price
+  WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.name, s.price);
+WITH x AS (DELETE FROM t WHERE price IS NULL RETURNING *)  -- data-modifying CTE
+  SELECT count(*) FROM x;
+INSERT INTO t VALUES (3, 'z', 1.0) RETURNING *;  -- final row, after BEFORE triggers
 BEGIN; UPDATE t SET price = 0; ROLLBACK;         -- flat snapshot transactions (in-memory only)
 CREATE DATABASE db1;                 -- new, empty database
 DROP DATABASE db1;                   -- last database cannot be dropped; dropping the
@@ -529,9 +539,10 @@ after it, `ROW` triggers row by row and `STATEMENT` triggers once.
   writer conflicts on them). `CREATE`/`DROP TRIGGER` are refused inside a
   transaction, like the other catalog DDL that a per-table transaction merge
   cannot undo.
+* `RETURNING` on a triggered table reports the image the `BEFORE` row triggers
+  left behind, not the one the statement proposed.
 * Unsupported in v1, refused with a clear error: triggers on views and on
-  attached lake tables (`REFERENCING` there), `RETURNING` on a triggered table
-  (the engine has no `RETURNING` at all), and `INSTEAD OF` / row-skipping
+  attached lake tables (`REFERENCING` there), and `INSTEAD OF` / row-skipping
   before-triggers. `.lake commit` of a writable attachment publishes a
   trigger's data effects, but trigger definitions are session-local and are not
   written into a lake.
@@ -593,6 +604,13 @@ database). `CREATE`/`DROP DATABASE` are refused inside a transaction.
   [(cols)] AS ...` (session-local, rebound per use), `DROP TABLE` / `DROP VIEW`
 - DDL/DML: `CREATE TABLE ...` (with `IF NOT EXISTS`), `CREATE TABLE t AS
   SELECT ...`, `DROP TABLE [IF EXISTS]`, `INSERT INTO t [(cols)] SELECT ...`,
+  `INSERT ... ON CONFLICT [(cols)] DO {NOTHING|UPDATE SET ... [WHERE ...]}` with
+  `excluded`, `INSERT OR {REPLACE|IGNORE}`, `UPDATE ... FROM`,
+  `DELETE ... USING`, `MERGE INTO ... USING ... WHEN [NOT] MATCHED ...`
+  (including `WHEN NOT MATCHED BY SOURCE`), `RETURNING` on every DML form, and
+  data-modifying CTEs (`WITH x AS (INSERT/UPDATE/DELETE ... RETURNING ...)`);
+  primary keys and unique constraints are enforced per statement (a duplicate
+  or a NULL primary key aborts it whole), foreign keys stay declarations;
   `CREATE/DROP DATABASE [IF [NOT] EXISTS]`
 - Utilities: `EXPLAIN <select>` (stable plan tree), `SHOW TABLES`,
   `SHOW DATABASES`, `DESCRIBE t` (DuckDB's column shape)

@@ -652,24 +652,36 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(fold_plan(db, *input)),
             offset,
         },
-        LogicalPlan::Insert { db, table, rows } => LogicalPlan::Insert {
+        LogicalPlan::Insert {
+            db,
+            table,
+            rows,
+            conflict,
+            returning,
+        } => LogicalPlan::Insert {
             db,
             table,
             rows: rows
                 .into_iter()
                 .map(|r| r.into_iter().map(|e| fold_expr(&cx, e)).collect())
                 .collect(),
+            conflict,
+            returning,
         },
         LogicalPlan::InsertSelect {
             db: qdb,
             table,
             columns,
             query,
+            conflict,
+            returning,
         } => LogicalPlan::InsertSelect {
             db: qdb,
             table,
             columns,
             query: Box::new(fold_plan(db, *query)),
+            conflict,
+            returning,
         },
         LogicalPlan::SetOp {
             op,
@@ -1415,11 +1427,15 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             table,
             columns,
             query,
+            conflict,
+            returning,
         } => LogicalPlan::InsertSelect {
             db,
             table,
             columns,
             query: Box::new(pushdown(*query)),
+            conflict,
+            returning,
         },
         LogicalPlan::CreateTableAs {
             db,
@@ -2015,11 +2031,15 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
             table,
             columns,
             query,
+            conflict,
+            returning,
         } => LogicalPlan::InsertSelect {
             db: qdb,
             table,
             columns,
             query: Box::new(elim(db, *query, &Live::All)),
+            conflict,
+            returning,
         },
         LogicalPlan::CreateTableAs {
             db: qdb,

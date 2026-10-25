@@ -30,6 +30,9 @@ pub enum Statement {
         table: String,
         columns: Option<Vec<String>>,
         source: InsertSource,
+        /// `ON CONFLICT …` / `INSERT OR REPLACE|IGNORE` (wave 95b).
+        on_conflict: Option<OnConflict>,
+        returning: Option<Vec<Projection>>,
     },
     Update {
         db: Option<String>,
@@ -39,11 +42,29 @@ pub enum Statement {
         /// qualifier must name this statement's own target table.
         sets: Vec<(SetTarget, Expr)>,
         where_clause: Option<Expr>,
+        /// `UPDATE … FROM <from>` (wave 95b): the source rows the SET
+        /// expressions and WHERE may also read.
+        from: Option<Box<FromClause>>,
+        returning: Option<Vec<Projection>>,
     },
     Delete {
         db: Option<String>,
         table: String,
         where_clause: Option<Expr>,
+        /// `DELETE … USING <from>` (wave 95b).
+        using: Option<Box<FromClause>>,
+        returning: Option<Vec<Projection>>,
+    },
+    /// `MERGE INTO <target> USING <source> ON <cond> <when clauses>`
+    /// (wave 95b; DuckDB 2.0's shape).
+    Merge {
+        db: Option<String>,
+        table: String,
+        alias: Option<String>,
+        using: FromClause,
+        on: Expr,
+        clauses: Vec<MergeClause>,
+        returning: Option<Vec<Projection>>,
     },
     /// `COPY <table> TO '<path>' [(FORMAT <format>)]` (wave 71): write one
     /// catalog table to a registered file format. `format: None` infers the
@@ -160,7 +181,7 @@ pub enum Statement {
         name: String,
     },
     /// `EXPLAIN <select>`: print the bound (optimized) plan.
-    Explain(Box<Select>),
+    Explain(Box<Statement>),
     /// `CREATE [OR REPLACE] PROCEDURE name(params) [LANGUAGE lang] AS <body>`
     /// (wave 44). The body is the string literal's text (preferably
     /// dollar-quoted, `$$ BEGIN ... END $$`); the binder parses it
@@ -503,15 +524,95 @@ pub struct SetTarget {
     pub column: String,
 }
 
+/// `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]` (wave 95b).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflict {
+    /// The conflict target columns; `None` matches any `PRIMARY KEY`/`UNIQUE`
+    /// constraint of the table.
+    pub columns: Option<Vec<String>>,
+    pub action: OnConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnConflictAction {
+    DoNothing,
+    DoUpdate {
+        sets: Vec<(SetTarget, Expr)>,
+        where_clause: Option<Expr>,
+    },
+    /// `INSERT OR REPLACE`: keep the row, assigning every written column from
+    /// the rejected row (`excluded`). Expanded against the target schema by
+    /// the binder, which is the only place the column list is known.
+    Replace,
+}
+
+/// One `WHEN … THEN …` clause of a `MERGE`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeClause {
+    pub matched: MergeMatch,
+    /// `WHEN MATCHED AND <cond>`: the clause applies only when it is TRUE.
+    pub condition: Option<Expr>,
+    pub action: MergeAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMatch {
+    /// `WHEN MATCHED`: a target row with at least one matching source row.
+    Matched,
+    /// `WHEN NOT MATCHED` / `WHEN NOT MATCHED BY TARGET`.
+    NotMatched,
+    /// `WHEN NOT MATCHED BY SOURCE`: a target row with no matching source.
+    NotMatchedBySource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeAction {
+    Update {
+        sets: Vec<(SetTarget, Expr)>,
+    },
+    Delete,
+    Insert {
+        /// `INSERT (a, b) VALUES (…, …)`; `None` fills every column.
+        columns: Option<Vec<String>>,
+        values: Vec<Expr>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CteDef {
     pub name: String,
     /// `WITH w(a, b) AS ...` renames the output columns.
     pub cols: Option<Vec<String>>,
-    pub query: Box<Select>,
+    pub query: CteBody,
     /// `WITH RECURSIVE`: `query` must be `anchor UNION [ALL] step`, and the
     /// step may reference `name` (the previous iteration's rows).
     pub recursive: bool,
+}
+
+/// The body of a `WITH` item: a query, or a data-modifying statement
+/// (wave 95b). SQL allows a data-modifying CTE only at the top level of a
+/// statement's `WITH` — the binder enforces that.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CteBody {
+    Query(Box<Select>),
+    Dml(Box<Statement>),
+}
+
+impl CteBody {
+    /// The query body; `None` for a data-modifying body.
+    pub fn query_select(&self) -> Option<&Select> {
+        match self {
+            CteBody::Query(q) => Some(q),
+            CteBody::Dml(_) => None,
+        }
+    }
+
+    pub fn query_select_mut(&mut self) -> Option<&mut Select> {
+        match self {
+            CteBody::Query(q) => Some(q),
+            CteBody::Dml(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

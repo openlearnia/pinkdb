@@ -160,7 +160,9 @@ fn reject_parameter_positions(stmts: &[Statement]) -> Result<()> {
                 where_clause: Some(e),
                 ..
             } => check_expr_positions(e)?,
-            Statement::Explain(query) => check_select_positions(query)?,
+            Statement::Explain(inner) => {
+                reject_parameter_positions(std::slice::from_ref(inner.as_ref()))?
+            }
             Statement::Select(query) => check_select_positions(query)?,
             _ => {}
         }
@@ -171,7 +173,9 @@ fn reject_parameter_positions(stmts: &[Statement]) -> Result<()> {
 /// Per-select clause check (nested selects recurse; each has its own clauses).
 fn check_select_positions(sel: &Select) -> Result<()> {
     for cte in &sel.with {
-        check_select_positions(&cte.query)?;
+        if let Some(q) = cte.query.query_select() {
+            check_select_positions(q)?;
+        }
     }
     for p in &sel.projections {
         if let Projection::Expr { expr, .. } = p {
@@ -387,14 +391,14 @@ fn expr_contains_parameter(expr: &Expr) -> bool {
 }
 
 fn select_contains_parameter(sel: &Select) -> bool {
-    sel.with
-        .iter()
-        .any(|cte| select_contains_parameter(&cte.query))
-        || sel.projections.iter().any(|p| match p {
-            Projection::Expr { expr, .. } => expr_contains_parameter(expr),
-            _ => false,
-        })
-        || sel.from.as_ref().is_some_and(from_contains_parameter)
+    sel.with.iter().any(|cte| {
+        cte.query
+            .query_select()
+            .is_some_and(select_contains_parameter)
+    }) || sel.projections.iter().any(|p| match p {
+        Projection::Expr { expr, .. } => expr_contains_parameter(expr),
+        _ => false,
+    }) || sel.from.as_ref().is_some_and(from_contains_parameter)
         || sel
             .where_clause
             .as_ref()
@@ -430,9 +434,10 @@ fn source_contains_parameter(source: &FromSource) -> bool {
 
 fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
     match stmt {
-        Statement::CreateTableAs { query, .. }
-        | Statement::CreateView { query, .. }
-        | Statement::Explain(query) => collect_select_offsets(query, out),
+        Statement::CreateTableAs { query, .. } | Statement::CreateView { query, .. } => {
+            collect_select_offsets(query, out)
+        }
+        Statement::Explain(inner) => collect_parameter_offsets(inner, out),
         Statement::Insert { source, .. } => match source {
             InsertSource::Values(rows) => {
                 for row in rows {
@@ -488,7 +493,9 @@ fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
 
 fn collect_select_offsets(sel: &Select, out: &mut Vec<usize>) {
     for cte in &sel.with {
-        collect_select_offsets(&cte.query, out);
+        if let Some(q) = cte.query.query_select() {
+            collect_select_offsets(q, out);
+        }
     }
     for p in &sel.projections {
         if let Projection::Expr { expr, .. } = p {
@@ -620,9 +627,10 @@ fn collect_expr_offsets(expr: &Expr, out: &mut Vec<usize>) {
 
 fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
     match stmt {
-        Statement::CreateTableAs { query, .. }
-        | Statement::CreateView { query, .. }
-        | Statement::Explain(query) => apply_select_ranks(query, offsets),
+        Statement::CreateTableAs { query, .. } | Statement::CreateView { query, .. } => {
+            apply_select_ranks(query, offsets)
+        }
+        Statement::Explain(inner) => apply_parameter_ranks(inner, offsets),
         Statement::Insert { source, .. } => match source {
             InsertSource::Values(rows) => {
                 for row in rows {
@@ -676,7 +684,9 @@ fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
 
 fn apply_select_ranks(sel: &mut Select, offsets: &[usize]) {
     for cte in sel.with.iter_mut() {
-        apply_select_ranks(&mut cte.query, offsets);
+        if let Some(q) = cte.query.query_select_mut() {
+            apply_select_ranks(q, offsets);
+        }
     }
     for p in sel.projections.iter_mut() {
         if let Projection::Expr { expr, .. } = p {
@@ -1335,8 +1345,11 @@ peg::parser! {
             / word("describe") t:table_ref() { Statement::Describe { db: t.0, name: t.1 } }
 
         /// `EXPLAIN <query>` — the plain (optimized) plan text.
+        /// `EXPLAIN <query | DML>`: what may appear inside is checked at
+        /// bind time, so a refused shape gets a sentence instead of peg's
+        /// expected-token list.
         rule explain_stmt() -> Statement
-            = word("explain") q:query() { Statement::Explain(Box::new(q)) }
+            = word("explain") s:statement() { Statement::Explain(Box::new(s)) }
 
         /// `CHECKPOINT` — matched as a word, not a reserved keyword, so
         /// `checkpoint` stays usable as a table or column name.
@@ -1798,37 +1811,56 @@ peg::parser! {
 
         rule insert() -> Statement
             = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? source:insert_source()
-              dml_tail() {
-                  Statement::Insert { db: t.0, table: t.1, columns, source }
+              oc:on_conflict()? ret:returning_clause() {
+                  Statement::Insert {
+                      db: t.0, table: t.1, columns, source, on_conflict: oc, returning: ret,
+                  }
               }
-            / kw(Keyword::Insert) word("or") word("replace") {?
-                  Err("INSERT OR REPLACE is not supported (wave 95b): use INSERT ... ON CONFLICT when it lands")
+            / kw(Keyword::Insert) word("or") mode:insert_or() kw(Keyword::Into) t:table_ref()
+              columns:col_name_list()? source:insert_source() ret:returning_clause() {
+                  Statement::Insert {
+                      db: t.0, table: t.1, columns, source,
+                      on_conflict: Some(OnConflict { columns: None, action: mode }),
+                      returning: ret,
+                  }
               }
             / word("replace") kw(Keyword::Into) {?
-                  Err("REPLACE INTO is not supported (wave 95b): use INSERT ... ON CONFLICT when it lands")
+                  Err("REPLACE INTO is not supported (DuckDB has no REPLACE INTO): spell it INSERT OR REPLACE")
               }
 
-        /// `ON CONFLICT ...`, `ON DUPLICATE KEY ...`, `RETURNING ...`, an
-        /// `UPDATE ... FROM` or a `DELETE ... USING` suffix: recognised only to
-        /// name the missing feature (wave 95b) instead of raising a bare parse
-        /// error.
-        rule dml_tail() -> ()
-            = word("on") word("conflict") {?
-                  Err("INSERT ... ON CONFLICT is not supported (wave 95b)")
+        /// `OR REPLACE` / `OR IGNORE` after `INSERT` (wave 95b).
+        rule insert_or() -> OnConflictAction
+            = word("replace") { OnConflictAction::Replace }
+            / word("ignore") { OnConflictAction::DoNothing }
+
+        /// `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]`
+        /// (wave 95b). `ON CONFLICT ON CONSTRAINT <name>` is DuckDB's own
+        /// "not implemented" form; name the columns instead.
+        rule on_conflict() -> OnConflict
+            = kw(Keyword::On) word("conflict") word("on") word("constraint") {?
+                  Err("ON CONFLICT ON CONSTRAINT is not supported: name the constraint's columns instead")
               }
-            / word("on") word("duplicate") {?
-                  Err("INSERT ... ON DUPLICATE KEY UPDATE is not supported (wave 95b)")
+            / kw(Keyword::On) word("duplicate") {?
+                  Err("INSERT ... ON DUPLICATE KEY UPDATE is not supported: write ON CONFLICT ... DO UPDATE SET")
               }
-            / word("returning") {?
-                  Err("RETURNING is not supported (wave 95b)")
+            / kw(Keyword::On) word("conflict") cols:col_name_list()? action:conflict_action() {
+                  OnConflict { columns: cols, action }
               }
-            / word("from") {?
-                  Err("UPDATE ... FROM is not supported (wave 95b)")
+
+        rule conflict_action() -> OnConflictAction
+            = word("do") word("nothing") { OnConflictAction::DoNothing }
+            / word("do") kw(Keyword::Update) kw(Keyword::Set) first:set_item()
+              rest:(comma() s:set_item() { s })* cond:where_clause()? {
+                  let mut sets = vec![first];
+                  sets.extend(rest);
+                  OnConflictAction::DoUpdate { sets, where_clause: cond }
               }
-            / word("using") {?
-                  Err("DELETE ... USING is not supported (wave 95b)")
-              }
-            / { () }
+
+        /// `RETURNING <projection list>` (wave 95b): the final rows of the
+        /// statement, after BEFORE triggers ran.
+        rule returning_clause() -> Option<Vec<Projection>>
+            = word("returning") p:projection_list() { Some(p) }
+            / { None }
 
         rule insert_source() -> InsertSource
             = kw(Keyword::Values) rows:insert_rows() { InsertSource::Values(rows) }
@@ -1846,10 +1878,13 @@ peg::parser! {
 
         rule update() -> Statement
             = kw(Keyword::Update) t:table_ref() kw(Keyword::Set) first:set_item() rest:(comma() s:set_item() { s })*
-              where_:where_clause()? dml_tail() {
+              from:from_clause()? where_:where_clause()? ret:returning_clause() {
                   let mut sets = vec![first];
                   sets.extend(rest);
-                  Statement::Update { db: t.0, table: t.1, sets, where_clause: where_ }
+                  Statement::Update {
+                      db: t.0, table: t.1, sets, where_clause: where_,
+                      from: from.map(Box::new), returning: ret,
+                  }
               }
 
         /// One `SET` target: `column`, `table.column` or `db.table.column`
@@ -1866,14 +1901,71 @@ peg::parser! {
               }
 
         rule delete() -> Statement
-            = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() where_:where_clause()? dml_tail() {
-                  Statement::Delete { db: t.0, table: t.1, where_clause: where_ }
+            = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() using:delete_using()?
+              where_:where_clause()? ret:returning_clause() {
+                  Statement::Delete {
+                      db: t.0, table: t.1, where_clause: where_,
+                      using: using.map(Box::new), returning: ret,
+                  }
               }
 
-        /// `MERGE ...`: recognised only to name the missing feature.
+        /// `USING <from list>` (wave 95b): the source rows a `DELETE` may read.
+        rule delete_using() -> FromClause
+            = word("using") f:from_list() { f }
+
+        /// `MERGE INTO target [AS alias] USING source ON cond WHEN … THEN …
+        /// [RETURNING …]` (wave 95b), DuckDB 2.0's shape. The first clause
+        /// whose match kind and condition hold wins.
         rule merge_stmt() -> Statement
-            = word("merge") {?
-                  Err("MERGE is not supported (wave 95b)")
+            = word("merge") kw(Keyword::Into) t:table_ref() alias:merge_alias()?
+              using:merge_using() kw(Keyword::On) on:expr() clauses:merge_clause()+
+              ret:returning_clause() {
+                  Statement::Merge {
+                      db: t.0, table: t.1, alias, using, on, clauses, returning: ret,
+                  }
+              }
+
+        rule merge_using() -> FromClause
+            = word("using") f:from_list() { f }
+
+        /// `[AS] alias` on the MERGE target. `USING` cannot be a bare alias.
+        rule merge_alias() -> String
+            = kw(Keyword::As) name:ident() { name }
+            / name:ident() {?
+                  if name.eq_ignore_ascii_case("using") {
+                      Err("identifier")
+                  } else {
+                      Ok(name)
+                  }
+              }
+
+        rule merge_clause() -> MergeClause
+            = kw(Keyword::When) matched:merge_match() cond:merge_condition()? kw(Keyword::Then)
+              action:merge_action() {
+                  MergeClause { matched, condition: cond, action }
+              }
+
+        rule merge_match() -> MergeMatch
+            = word("matched") { MergeMatch::Matched }
+            / kw(Keyword::Not) word("matched") word("by") word("source") {
+                  MergeMatch::NotMatchedBySource
+              }
+            / kw(Keyword::Not) word("matched") (word("by") word("target"))? {
+                  MergeMatch::NotMatched
+              }
+
+        rule merge_condition() -> Expr = kw(Keyword::And) e:expr() { e }
+
+        rule merge_action() -> MergeAction
+            = kw(Keyword::Update) kw(Keyword::Set) first:set_item()
+              rest:(comma() s:set_item() { s })* {
+                  let mut sets = vec![first];
+                  sets.extend(rest);
+                  MergeAction::Update { sets }
+              }
+            / kw(Keyword::Delete) { MergeAction::Delete }
+            / kw(Keyword::Insert) columns:col_name_list()? kw(Keyword::Values) values:insert_row() {
+                  MergeAction::Insert { columns, values }
               }
 
         /// `SET VARIABLE name = expr` and the `$name` shorthand that reads it
@@ -2077,16 +2169,21 @@ peg::parser! {
 
         rule cte_def() -> CteDef
             = name:ident() cols:col_name_list()? kw(Keyword::As) lparen() query:cte_body() rparen() {
-                  CteDef { name, cols, query: Box::new(query), recursive: false }
+                  CteDef { name, cols, query, recursive: false }
               }
 
-        /// A CTE body is a query; `INSERT`/`UPDATE`/`DELETE` are recognised to
-        /// name the missing feature (wave 95b) instead of a bare parse error.
-        rule cte_body() -> Select
-            = (kw(Keyword::Insert) / kw(Keyword::Update) / kw(Keyword::Delete)) {?
-                  Err("data-modifying CTEs (INSERT/UPDATE/DELETE inside WITH) are not supported (wave 95b)")
+        /// A CTE body is a query or a data-modifying statement (wave 95b).
+        /// SQL only allows the DML form at the top level of a `WITH`; the
+        /// binder and executor enforce that.
+        rule cte_body() -> CteBody
+            = d:insert() { CteBody::Dml(Box::new(d)) }
+            / d:update() { CteBody::Dml(Box::new(d)) }
+            / d:delete() { CteBody::Dml(Box::new(d)) }
+            / d:merge_stmt() { CteBody::Dml(Box::new(d)) }
+            / word("copy") {?
+                  Err("COPY inside WITH is not supported: run COPY as its own statement")
               }
-            / query()
+            / q:query() { CteBody::Query(Box::new(q)) }
 
         /// A bare `*` and a two-part `t.*` are whole-list-only in v1 (a
         /// mid-list one is rejected). A three-part `db.t.*` is an ordinary
@@ -2124,7 +2221,7 @@ peg::parser! {
             / name:ident() {?
                   if matches!(
                       name.to_ascii_lowercase().as_str(),
-                      "qualify" | "window" | "fetch" | "for" | "tablesample" | "lateral"
+                      "qualify" | "window" | "fetch" | "for" | "tablesample" | "lateral" | "returning"
                   ) {
                       Err("identifier")
                   } else {
@@ -2133,7 +2230,13 @@ peg::parser! {
               }
 
         rule from_clause() -> FromClause
-            = kw(Keyword::From) source:from_source() suffix:source_suffix() _ts:tablesample_check() joins:(j:join_clause() { j })* {?
+            = kw(Keyword::From) f:from_list() { f }
+
+        /// A FROM-list body: one source, its joins. `UPDATE … FROM`, `DELETE …
+        /// USING` and `MERGE … USING` share it, so all four spell a source the
+        /// same way.
+        rule from_list() -> FromClause
+            = source:from_source() suffix:source_suffix() _ts:tablesample_check() joins:(j:join_clause() { j })* {?
                   let (alias, col_aliases, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
@@ -3913,9 +4016,9 @@ mod tests {
         "SELECT \"a\0b\";",
         "CREATE TABLE \"a\0b\" (x INTEGER);",
         "SELECT 1 AS \"a\0b\";",
-        // SQL completeness syntax errors: `EXPLAIN` takes a SELECT, SHOW only
-        // knows TABLES/DATABASES, and RANGE offsets are integer literals.
-        "EXPLAIN INSERT INTO t VALUES (1);",
+        // SQL completeness syntax errors: SHOW only knows TABLES/DATABASES
+        // and RANGE offsets are integer literals. (`EXPLAIN INSERT …` is
+        // supported since wave 95b; `EXPLAIN CREATE …` is refused at bind.)
         "EXPLAIN;",
         "SHOW;",
         "SHOW TABLESS;",
@@ -4702,6 +4805,7 @@ mod tests {
                 table,
                 sets,
                 where_clause,
+                ..
             } => {
                 assert_eq!(db, None);
                 assert_eq!(table, "t");
@@ -4722,6 +4826,7 @@ mod tests {
                 db,
                 table,
                 where_clause,
+                ..
             } => {
                 assert_eq!(db, None);
                 assert_eq!(table, "t");

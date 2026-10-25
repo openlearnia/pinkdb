@@ -518,6 +518,67 @@ fn authenticated_sessions_are_checked_per_statement() {
     assert!(e.contains("needs the ADMIN privilege"), "{e}");
 }
 
+/// Wave 95b: every DML form takes the privileges of every table it reads or
+/// writes — including the source of `UPDATE … FROM` / `DELETE … USING`, the
+/// target of a `MERGE`, and a data-modifying CTE's target.
+#[test]
+fn the_dml_forms_check_every_table_they_touch() {
+    let mut db = store();
+    exec(&mut db, "CREATE TABLE u (i INTEGER, s VARCHAR);");
+    exec(&mut db, "INSERT INTO u VALUES (1, 'x');");
+    let shared = Database::from_store(db);
+    let mut alice = alice(&shared);
+
+    let merge_update = "MERGE INTO t USING u ON t.i = u.i WHEN MATCHED THEN UPDATE SET s = u.s;";
+    let merge_delete = "MERGE INTO t USING u ON t.i = u.i WHEN MATCHED THEN DELETE;";
+    let merge_insert =
+        "MERGE INTO t USING u ON t.i = u.i WHEN NOT MATCHED THEN INSERT VALUES (u.i, u.s);";
+
+    // The write privilege of each action the MERGE spells out.
+    let e = execute(&mut alice, merge_update);
+    assert!(e.contains("UPDATE privilege on table \"main.t\""), "{e}");
+    let e = execute(&mut alice, merge_delete);
+    assert!(e.contains("DELETE privilege on table \"main.t\""), "{e}");
+    let e = execute(&mut alice, merge_insert);
+    assert!(e.contains("INSERT privilege on table \"main.t\""), "{e}");
+
+    // A data-modifying CTE's target needs its write privilege.
+    let e = execute(
+        &mut alice,
+        "WITH x AS (INSERT INTO t VALUES (9, 'z') RETURNING i) SELECT * FROM x;",
+    );
+    assert!(e.contains("INSERT privilege on table \"main.t\""), "{e}");
+
+    // `UPDATE … FROM` / `DELETE … USING` also read their source.
+    admin_sql(&shared, "GRANT UPDATE ON TABLE t TO alice;");
+    let e = execute(&mut alice, "UPDATE t SET s = u.s FROM u WHERE t.i = u.i;");
+    assert!(e.contains("SELECT privilege on table \"main.t\""), "{e}");
+    admin_sql(&shared, "GRANT SELECT ON TABLE t TO alice;");
+    let e = execute(&mut alice, "UPDATE t SET s = u.s FROM u WHERE t.i = u.i;");
+    assert!(e.contains("SELECT privilege on table \"main.u\""), "{e}");
+    admin_sql(&shared, "GRANT DELETE ON TABLE t TO alice;");
+    let e = execute(&mut alice, "DELETE FROM t USING u WHERE t.i = u.i;");
+    assert!(e.contains("SELECT privilege on table \"main.u\""), "{e}");
+    let e = execute(&mut alice, merge_update);
+    assert!(e.contains("SELECT privilege on table \"main.u\""), "{e}");
+
+    // With both tables granted, every form runs.
+    admin_sql(&shared, "GRANT SELECT ON TABLE u TO alice;");
+    admin_sql(&shared, "GRANT INSERT ON TABLE t TO alice;");
+    assert!(execute(&mut alice, merge_update).is_empty());
+    assert!(execute(&mut alice, merge_insert).is_empty());
+    assert!(execute(&mut alice, "UPDATE t SET s = u.s FROM u WHERE t.i = u.i;").is_empty());
+    assert!(execute(&mut alice, "DELETE FROM t USING u WHERE t.i = u.i;").is_empty());
+    assert!(execute(&mut alice, merge_delete).is_empty());
+    assert!(
+        execute(
+            &mut alice,
+            "WITH x AS (INSERT INTO t VALUES (9, 'z') RETURNING i) SELECT * FROM x;"
+        )
+        .is_empty()
+    );
+}
+
 #[test]
 fn the_network_gate_checks_every_statement_of_a_batch() {
     let shared = Database::new();

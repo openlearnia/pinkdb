@@ -108,6 +108,12 @@ pub struct DataTable {
     /// is only ever a missed optimization — never a wrong answer. See
     /// [`DataTable::rebuild_indexes`].
     pub indexes_stale: bool,
+    /// Cached occupant of every declared PRIMARY KEY / UNIQUE value (see
+    /// [`crate::keys`]). `None` means "not built yet": the first keyed write
+    /// pays one scan and leaves the map here, so later statements are O(writes)
+    /// instead of O(rows). Every mutation that moves rows patches the map or
+    /// drops it, so a present map is exact.
+    pub(crate) key_index: Option<crate::keys::KeySpace>,
     /// Mutation stamp for optimistic-concurrency conflict detection. Drawn
     /// from a process-wide counter on creation and on every
     /// append/update/delete batch, so it is unique across tables: a table
@@ -293,6 +299,7 @@ impl DataTable {
             constraints,
             indexes: Vec::new(),
             indexes_stale: false,
+            key_index: None,
             version: next_table_version(),
         })
     }
@@ -330,6 +337,7 @@ impl DataTable {
             constraints: TableConstraints::default(),
             indexes: Vec::new(),
             indexes_stale: false,
+            key_index: None,
             version: next_table_version(),
         }
     }
@@ -458,6 +466,29 @@ impl DataTable {
         }
     }
 
+    /// Record the appended rows `start..num_rows` in the key map, if one is
+    /// built. Appends never move an earlier row, so the cache stays exact;
+    /// only `start..` needs reading.
+    fn extend_key_index(&mut self, start: usize) {
+        if self.key_index.is_none() || self.constraints.keys.is_empty() {
+            return;
+        }
+        let mut keys = self.key_index.take().expect("checked above");
+        for global in start..self.num_rows {
+            let id = crate::keys::RowId::new(global / CHUNK_SIZE, global % CHUNK_SIZE);
+            if id.chunk >= self.num_chunks() {
+                break;
+            }
+            let values: Vec<Value> = self
+                .columns
+                .iter()
+                .map(|c| c.chunks[id.chunk].get(id.row))
+                .collect();
+            keys.reserve(&values, id);
+        }
+        self.key_index = Some(keys);
+    }
+
     /// Extend every fresh index map with the rows appended in `start..num_rows`.
     ///
     /// An append-only mutation does not move earlier rows, so each map only
@@ -466,6 +497,7 @@ impl DataTable {
     /// [`Self::rebuild_indexes`] will rebuild it from the final rows. This is
     /// why a stale map is always a missed optimization, never a wrong answer.
     fn extend_indexes(&mut self, start: usize) {
+        self.extend_key_index(start);
         if self.indexes.is_empty() || self.indexes_stale || start >= self.num_rows {
             return;
         }
@@ -813,6 +845,16 @@ impl DataTable {
         if !updates.is_empty() {
             self.version = next_table_version();
             self.invalidate_indexes();
+            if self.key_index.is_some()
+                && updates.iter().any(|(col, _, _)| {
+                    self.constraints
+                        .keys
+                        .iter()
+                        .any(|k| k.columns.contains(col))
+                })
+            {
+                self.key_index = None;
+            }
         }
         Ok(())
     }
@@ -857,6 +899,7 @@ impl DataTable {
             }
         }
         self.num_rows -= removed;
+        self.key_index = None;
         if removed > 0 {
             self.version = next_table_version();
             self.invalidate_indexes();
@@ -1123,6 +1166,12 @@ pub struct PinkDb {
     /// trigger runs. `None` = no AFTER STATEMENT trigger is waiting, so a
     /// writing statement does not pay for the copy.
     pub(crate) trigger_capture: Option<Vec<(Vec<Value>, Vec<Value>)>>,
+    /// Rows of the data-modifying CTEs of the statement currently executing
+    /// (wave 95b). A CTE's writes must run before the query that reads them,
+    /// but the row evaluator cannot write; the statement entry point runs them
+    /// first and leaves their result sets here for the `Cte` plan node.
+    pub(crate) dml_cte_rows:
+        Option<std::sync::Arc<std::collections::HashMap<String, crate::exec::Output>>>,
     /// The trigger nesting depth of the statement currently executing (0
     /// outside a trigger): bounds recursion. Never persisted.
     pub(crate) trigger_depth: usize,
@@ -1227,6 +1276,7 @@ impl Clone for PinkDb {
             // records the depth it was taken at.
             trigger_scope: self.trigger_scope.clone(),
             trigger_capture: self.trigger_capture.clone(),
+            dml_cte_rows: self.dml_cte_rows.clone(),
             trigger_depth: self.trigger_depth,
             session_principal: self.session_principal.clone(),
             trigger_invoker: self.trigger_invoker.clone(),
@@ -1308,6 +1358,7 @@ impl PinkDb {
             proc_frame: crate::procedure::ProcFrame::default(),
             trigger_scope: None,
             trigger_capture: None,
+            dml_cte_rows: None,
             trigger_depth: 0,
             session_principal: None,
             trigger_invoker: None,

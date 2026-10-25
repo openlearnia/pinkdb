@@ -405,10 +405,21 @@ pub(crate) fn substitute_select(
             .with
             .iter()
             .map(|cte| {
+                let query = match &cte.query {
+                    crate::sql::ast::CteBody::Query(q) => {
+                        crate::sql::ast::CteBody::Query(Box::new(substitute_select(q, args, used)?))
+                    }
+                    // A macro body expands into a query; DML is not a query.
+                    crate::sql::ast::CteBody::Dml(_) => {
+                        return Err(PinkDbError::Parse(
+                            "a macro body cannot contain a data-modifying CTE".to_string(),
+                        ));
+                    }
+                };
                 Ok(crate::sql::ast::CteDef {
                     name: cte.name.clone(),
                     cols: cte.cols.clone(),
-                    query: Box::new(substitute_select(&cte.query, args, used)?),
+                    query,
                     recursive: cte.recursive,
                 })
             })
@@ -678,7 +689,9 @@ fn count_expr(expr: &Expr, used: &std::cell::Cell<usize>) -> Result<()> {
 fn count_select(select: &Select, used: &std::cell::Cell<usize>) -> Result<()> {
     tick(used, 1)?;
     for cte in &select.with {
-        count_select(&cte.query, used)?;
+        if let Some(q) = cte.query.query_select() {
+            count_select(q, used)?;
+        }
     }
     for p in &select.projections {
         if let Projection::Expr { expr, .. } = p {
@@ -828,7 +841,9 @@ fn collect_expr_calls(expr: &Expr, out: &mut HashSet<String>) {
 
 fn collect_select_calls(select: &Select, out: &mut HashSet<String>) {
     for cte in &select.with {
-        collect_select_calls(&cte.query, out);
+        if let Some(q) = cte.query.query_select() {
+            collect_select_calls(q, out);
+        }
     }
     for p in &select.projections {
         if let Projection::Expr { expr, .. } = p {

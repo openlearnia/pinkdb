@@ -53,6 +53,7 @@ pub mod fsutil;
 #[cfg(feature = "js")]
 pub(crate) mod js;
 /// SQL macros (wave 77): scalar/table templates expanded at bind time.
+mod keys;
 pub mod macros;
 pub(crate) mod mv;
 pub mod optimizer;

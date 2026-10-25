@@ -35,8 +35,18 @@ fn read_only_refuses_every_write_path() {
     db.execute("CREATE TABLE t (x INTEGER)").unwrap();
     let writes = [
         "INSERT INTO t VALUES (1)",
+        "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+        "INSERT OR REPLACE INTO t VALUES (1)",
+        "INSERT OR IGNORE INTO t VALUES (1)",
+        "INSERT INTO t VALUES (1) RETURNING *",
         "UPDATE t SET x = 2",
+        "UPDATE t SET x = 2 RETURNING *",
         "DELETE FROM t",
+        "DELETE FROM t RETURNING *",
+        "WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
+        "WITH x AS (UPDATE t SET x = 1 RETURNING *) SELECT * FROM x",
+        "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+        "MERGE INTO t USING t AS s ON t.x = s.x WHEN MATCHED THEN DELETE",
         "DROP TABLE t",
         "CREATE TABLE u (x INTEGER)",
         "CREATE VIEW v AS SELECT * FROM t",

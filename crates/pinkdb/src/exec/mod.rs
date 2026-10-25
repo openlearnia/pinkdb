@@ -7,6 +7,7 @@
 //! these `run_*` fns later without touching expression or storage code.)
 
 pub mod aggregate;
+pub(crate) mod dml;
 pub mod expr;
 pub(crate) mod window;
 
@@ -19,6 +20,7 @@ use aggregate::{
     local_index_capacity, merge_partials,
 };
 use aggregate::{EvalVec as FusedVec, eval_agg_vec as eval_fused_vec};
+use dml::{captured, returning_result};
 use expr::{coerce_to, count_true, eval_expr, select_true};
 use rayon::prelude::*;
 use window::eval_window;
@@ -391,6 +393,9 @@ pub(crate) struct Cx<'a> {
     /// This statement's deadline and materialization counters (M-6). Shared
     /// by every evaluation context of the statement.
     pub(crate) budget: std::sync::Arc<ExecBudget>,
+    /// The result sets of the statement's data-modifying CTEs (wave 95b),
+    /// filled by the statement entry point before the body evaluates.
+    pub(crate) dml_ctes: std::sync::Arc<HashMap<String, Output>>,
 }
 
 #[derive(Clone)]
@@ -415,6 +420,7 @@ impl<'a> Cx<'a> {
                 ctes.insert(alias.to_ascii_lowercase(), out.clone());
             }
         }
+        let dml_ctes = db.dml_cte_rows.clone().unwrap_or_default();
         Self {
             db,
             ctes,
@@ -425,6 +431,7 @@ impl<'a> Cx<'a> {
             // No pruning bound: every attached-lake scan decodes every file.
             prunes: std::sync::Arc::new(crate::plan::ScanFilters::default()),
             budget,
+            dml_ctes,
         }
     }
 
@@ -562,6 +569,23 @@ pub(crate) fn run_with_budget(
     plan: &LogicalPlan,
     budget: std::sync::Arc<ExecBudget>,
 ) -> Result<QueryResult> {
+    // A data-modifying CTE writes before the query that reads it, and the row
+    // evaluator cannot write: run those statements first, then hand their rows
+    // to the `Cte` nodes through the store's statement-scoped slot.
+    if let Some(rows) = dml::dml_cte_outputs(db, plan, &budget)? {
+        let previous = db.dml_cte_rows.replace(rows);
+        let result = run_with_budget_inner(db, plan, budget);
+        db.dml_cte_rows = previous;
+        return result;
+    }
+    run_with_budget_inner(db, plan, budget)
+}
+
+fn run_with_budget_inner(
+    db: &mut PinkDb,
+    plan: &LogicalPlan,
+    budget: std::sync::Arc<ExecBudget>,
+) -> Result<QueryResult> {
     // Wave 100: a table with triggers takes the trigger-wrapped path; every
     // other statement pays one lookup of an empty trigger slice.
     // A `CALL` recurses through this function; dispatch it before the
@@ -623,6 +647,37 @@ fn run_call_plan(
     // been refreshed between bind and execution).
     let def = db.procedure_in(&target, name)?.clone();
     crate::procedure::execute_call(db, &target, &def, values)
+}
+
+/// Run a DML body, materializing `RETURNING` from the rows it wrote.
+///
+/// The images are captured from the write funnels (not re-scanned), so they
+/// carry `BEFORE` trigger rewrites; a `DELETE` has no new image and reports
+/// the deleted row instead.
+fn finish_dml(
+    db: &mut PinkDb,
+    target: &str,
+    table: &str,
+    run: impl FnOnce(&mut PinkDb) -> Result<usize>,
+    returning: Option<&crate::plan::Returning>,
+    // `DELETE` captures its rows while scanning chunks backwards; RETURNING
+    // reports them in scan order, like DuckDB.
+    reverse: bool,
+    make: impl FnOnce(usize) -> QueryResult,
+) -> Result<QueryResult> {
+    let Some(r) = returning else {
+        return run(db).map(make);
+    };
+    let schema = db.table_in(target, table)?.schema();
+    let (_count, mut images) = captured(db, run)?;
+    if reverse {
+        images.reverse();
+    }
+    let rows: Vec<Vec<Value>> = images
+        .into_iter()
+        .map(|(old, new)| if new.is_empty() { old } else { new })
+        .collect();
+    returning_result(db, r, &schema, rows)
 }
 
 /// The statement executor without trigger handling: `run_with_budget` is the
@@ -701,6 +756,8 @@ pub(crate) fn run_plain(
             db: qdb,
             table,
             rows,
+            conflict,
+            returning,
         } => {
             let target = resolve_db(db, qdb);
             // Evaluate constant cells against an empty single-row chunk, then
@@ -728,7 +785,6 @@ pub(crate) fn run_plain(
                     staged.push(values);
                 }
             }
-            let count = staged.len();
             // Validate every row before appending any: multi-row INSERT is atomic.
             let schema = db.table_in(&target, table)?.schema();
             for values in &staged {
@@ -743,14 +799,33 @@ pub(crate) fn run_plain(
                     DataTable::coerce(v.clone(), *t)?;
                 }
             }
-            crate::trigger::insert_rows(db, &target, table, staged, &budget)?;
-            Ok(QueryResult::Inserted { count })
+            let run = |db: &mut PinkDb| -> Result<usize> {
+                match conflict {
+                    Some(cp) => dml::insert(db, &target, table, staged, Some(cp), &budget),
+                    None => {
+                        let count = staged.len();
+                        crate::trigger::insert_rows(db, &target, table, staged, &budget)?;
+                        Ok(count)
+                    }
+                }
+            };
+            finish_dml(
+                db,
+                &target,
+                table,
+                run,
+                returning.as_ref(),
+                false,
+                |count| QueryResult::Inserted { count },
+            )
         }
         LogicalPlan::InsertSelect {
             db: qdb,
             table,
             columns,
             query,
+            conflict,
+            returning,
         } => {
             let target = resolve_db(db, qdb);
             let out = {
@@ -784,77 +859,159 @@ pub(crate) fn run_plain(
                     staged.push(values);
                 }
             }
-            let count = staged.len();
-            crate::trigger::insert_rows(db, &target, table, staged, &budget)?;
-            Ok(QueryResult::Inserted { count })
+            let run = |db: &mut PinkDb| -> Result<usize> {
+                match conflict {
+                    Some(cp) => dml::insert(db, &target, table, staged, Some(cp), &budget),
+                    None => {
+                        let count = staged.len();
+                        crate::trigger::insert_rows(db, &target, table, staged, &budget)?;
+                        Ok(count)
+                    }
+                }
+            };
+            finish_dml(
+                db,
+                &target,
+                table,
+                run,
+                returning.as_ref(),
+                false,
+                |count| QueryResult::Inserted { count },
+            )
         }
         LogicalPlan::Update {
             db: qdb,
             table,
             sets,
             predicate,
+            from,
+            returning,
         } => {
             let target = resolve_db(db, qdb);
-            // Phase 1: evaluate predicates + SET exprs over current chunks
-            // (subqueries see pre-mutation state). Phase 2: write back.
-            // SET exprs evaluate against original values (simultaneous).
-            let mut per_chunk: Vec<Vec<(usize, usize, Value)>>;
-            let mut count = 0usize;
-            {
-                let cx = Cx::with_budget(db, budget.clone());
-                let t = cx.db.table_in(&target, table)?;
-                per_chunk = vec![Vec::new(); t.num_chunks()];
-                for (ci, writes) in per_chunk.iter_mut().enumerate() {
-                    // Deadline boundary: a timed-out UPDATE fails here, before
-                    // any row is written back (atomic, no partial state).
-                    cx.check_deadline()?;
-                    let chunk = t.scan_chunk(ci).ok_or_else(|| {
-                        PinkDbError::Execution("storage changed during UPDATE".to_string())
-                    })?;
-                    let targets = match predicate {
-                        Some(p) => select_true(&eval_expr(p, &chunk, &cx)?)?,
-                        None => (0..chunk.num_rows()).collect(),
-                    };
-                    count += targets.len();
-                    for (col, expr) in sets {
-                        let vals = eval_expr(expr, &chunk, &cx)?;
-                        for &r in &targets {
-                            writes.push((*col, r, vals.get(r)));
+            let run = |db: &mut PinkDb| -> Result<usize> {
+                // `UPDATE … FROM`: the source row precedes the target row in
+                // every expression's input.
+                if let Some(source) = from {
+                    return dml::update_from(
+                        db,
+                        &target,
+                        table,
+                        source,
+                        sets,
+                        predicate.as_ref(),
+                        &budget,
+                    );
+                }
+                // Phase 1: evaluate predicates + SET exprs over current chunks
+                // (subqueries see pre-mutation state). Phase 2: write back.
+                // SET exprs evaluate against original values (simultaneous).
+                let mut per_chunk: Vec<Vec<(usize, usize, Value)>>;
+                let mut count = 0usize;
+                {
+                    let cx = Cx::with_budget(db, budget.clone());
+                    let t = cx.db.table_in(&target, table)?;
+                    per_chunk = vec![Vec::new(); t.num_chunks()];
+                    for (ci, writes) in per_chunk.iter_mut().enumerate() {
+                        // Deadline boundary: a timed-out UPDATE fails here, before
+                        // any row is written back (atomic, no partial state).
+                        cx.check_deadline()?;
+                        let chunk = t.scan_chunk(ci).ok_or_else(|| {
+                            PinkDbError::Execution("storage changed during UPDATE".to_string())
+                        })?;
+                        let targets = match predicate {
+                            Some(p) => select_true(&eval_expr(p, &chunk, &cx)?)?,
+                            None => (0..chunk.num_rows()).collect(),
+                        };
+                        count += targets.len();
+                        for (col, expr) in sets {
+                            let vals = eval_expr(expr, &chunk, &cx)?;
+                            for &r in &targets {
+                                writes.push((*col, r, vals.get(r)));
+                            }
                         }
                     }
                 }
-            }
-            crate::trigger::update_rows(db, &target, table, per_chunk, &budget)?;
-            Ok(QueryResult::Updated { count })
+                crate::trigger::update_rows(db, &target, table, per_chunk, &budget)?;
+                Ok(count)
+            };
+            finish_dml(
+                db,
+                &target,
+                table,
+                run,
+                returning.as_ref(),
+                false,
+                |count| QueryResult::Updated { count },
+            )
         }
         LogicalPlan::Delete {
             db: qdb,
             table,
             predicate,
+            using,
+            returning,
         } => {
             let target = resolve_db(db, qdb);
-            // Phase 1: collect per-chunk drop lists. Phase 2: apply from the
-            // highest chunk down (emptied chunks are removed, shifting lower
-            // indices — descending order keeps them valid).
-            let mut drops: Vec<Vec<usize>>;
-            {
-                let cx = Cx::with_budget(db, budget.clone());
-                let t = cx.db.table_in(&target, table)?;
-                drops = Vec::with_capacity(t.num_chunks());
-                for ci in 0..t.num_chunks() {
-                    cx.check_deadline()?;
-                    let chunk = t.scan_chunk(ci).ok_or_else(|| {
-                        PinkDbError::Execution("storage changed during DELETE".to_string())
-                    })?;
-                    drops.push(match predicate {
-                        // Predicate TRUE ⇒ row is deleted (NULL ⇒ kept).
-                        Some(p) => select_true(&eval_expr(p, &chunk, &cx)?)?,
-                        None => (0..chunk.num_rows()).collect(),
-                    });
+            let run = |db: &mut PinkDb| -> Result<usize> {
+                if let Some(source) = using {
+                    return dml::delete_using(
+                        db,
+                        &target,
+                        table,
+                        source,
+                        predicate.as_ref(),
+                        &budget,
+                    );
                 }
-            }
-            let count = crate::trigger::delete_rows(db, &target, table, drops, &budget)?;
-            Ok(QueryResult::Deleted { count })
+                // Phase 1: collect per-chunk drop lists. Phase 2: apply from the
+                // highest chunk down (emptied chunks are removed, shifting lower
+                // indices — descending order keeps them valid).
+                let mut drops: Vec<Vec<usize>>;
+                {
+                    let cx = Cx::with_budget(db, budget.clone());
+                    let t = cx.db.table_in(&target, table)?;
+                    drops = Vec::with_capacity(t.num_chunks());
+                    for ci in 0..t.num_chunks() {
+                        cx.check_deadline()?;
+                        let chunk = t.scan_chunk(ci).ok_or_else(|| {
+                            PinkDbError::Execution("storage changed during DELETE".to_string())
+                        })?;
+                        drops.push(match predicate {
+                            // Predicate TRUE ⇒ row is deleted (NULL ⇒ kept).
+                            Some(p) => select_true(&eval_expr(p, &chunk, &cx)?)?,
+                            None => (0..chunk.num_rows()).collect(),
+                        });
+                    }
+                }
+                crate::trigger::delete_rows(db, &target, table, drops, &budget)
+            };
+            finish_dml(db, &target, table, run, returning.as_ref(), true, |count| {
+                QueryResult::Deleted { count }
+            })
+        }
+        LogicalPlan::Merge {
+            db: qdb,
+            table,
+            source,
+            on,
+            clauses,
+            returning,
+        } => {
+            let target = resolve_db(db, qdb);
+            let run = |db: &mut PinkDb| -> Result<usize> {
+                let (inserted, updated, deleted) =
+                    dml::merge(db, &target, table, source, on, clauses, &budget)?;
+                Ok(inserted + updated + deleted)
+            };
+            finish_dml(
+                db,
+                &target,
+                table,
+                run,
+                returning.as_ref(),
+                false,
+                |count| QueryResult::Updated { count },
+            )
         }
         LogicalPlan::Begin => {
             db.begin()?;
@@ -2086,6 +2243,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::InsertSelect { .. }
         | LogicalPlan::Update { .. }
         | LogicalPlan::Delete { .. }
+        | LogicalPlan::Merge { .. }
         | LogicalPlan::Begin
         | LogicalPlan::Commit
         | LogicalPlan::Rollback
@@ -2677,6 +2835,22 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             body,
             recursive,
         } => {
+            if let Some(rows) = cx.dml_ctes.get(name) {
+                // A data-modifying CTE already ran (its writes cannot happen
+                // inside `eval`); its rows are fixed for every reference.
+                let mut ctes = cx.ctes.clone();
+                ctes.insert(name.clone(), rows.clone());
+                let child = Cx {
+                    db: cx.db,
+                    ctes,
+                    memo: cx.memo.clone(),
+                    projections: cx.projections.clone(),
+                    prunes: cx.prunes.clone(),
+                    budget: cx.budget.clone(),
+                    dml_ctes: cx.dml_ctes.clone(),
+                };
+                return eval(&child, body);
+            }
                 let mut out = eval(cx, query)?;
             if let Some(step) = recursive {
                 // Semi-naive iteration: `name` is bound to the rows the last
@@ -2708,6 +2882,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         projections: cx.projections.clone(),
                         prunes: cx.prunes.clone(),
                         budget: cx.budget.clone(),
+                        dml_ctes: cx.dml_ctes.clone(),
                     };
                     let produced = eval(&child, &step.step)?;
                     let fresh = if step.all {
@@ -2746,6 +2921,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 projections: cx.projections.clone(),
                 prunes: cx.prunes.clone(),
                 budget: cx.budget.clone(),
+                dml_ctes: cx.dml_ctes.clone(),
             };
             eval(&child, body)
         }
@@ -5276,6 +5452,26 @@ fn prune_op_symbol(op: PruneOp) -> &'static str {
     }
 }
 
+/// The `ON CONFLICT` suffix `EXPLAIN` shows for an insert plan.
+fn conflict_text(plan: &LogicalPlan) -> Option<String> {
+    let conflict = match plan {
+        LogicalPlan::Insert {
+            conflict: Some(c), ..
+        }
+        | LogicalPlan::InsertSelect {
+            conflict: Some(c), ..
+        } => c,
+        _ => return None,
+    };
+    Some(
+        match conflict.action {
+            crate::plan::ConflictActionPlan::Nothing => " on conflict do nothing",
+            crate::plan::ConflictActionPlan::Update { .. } => " on conflict do update",
+        }
+        .to_string(),
+    )
+}
+
 fn explain_lines(
     plan: &LogicalPlan,
     prunes: Option<&crate::plan::ScanFilters>,
@@ -5323,8 +5519,14 @@ fn explain_into(
             let ine = if *if_not_exists { " IF NOT EXISTS" } else { "" };
             format!("CreateTableAs{ine} {}", qualify(db, name))
         }
-        LogicalPlan::Insert { db, table, rows } => {
-            format!("Insert {} ({} rows)", qualify(db, table), rows.len())
+        LogicalPlan::Insert {
+            db, table, rows, ..
+        } => {
+            let mut text = format!("Insert {} ({} rows)", qualify(db, table), rows.len());
+            if let Some(c) = conflict_text(plan) {
+                text.push_str(&c);
+            }
+            text
         }
         LogicalPlan::AlterTable { db, name, op } => {
             let what = match op {
@@ -5342,6 +5544,7 @@ fn explain_into(
             table,
             query,
             columns,
+            ..
         } => {
             children.push(query);
             format!(
@@ -5358,19 +5561,32 @@ fn explain_into(
             table,
             sets,
             predicate,
+            from,
+            ..
         } => {
             let mut s = format!("Update {} ({} sets)", qualify(db, table), sets.len());
+            if from.is_some() {
+                s.push_str(" from");
+            }
             if let Some(p) = predicate {
                 s.push_str(&format!(" where {}", expr_text(p)));
             }
             s
         }
+        LogicalPlan::Merge {
+            db, table, clauses, ..
+        } => format!("Merge {} ({} clauses)", qualify(db, table), clauses.len()),
         LogicalPlan::Delete {
             db,
             table,
             predicate,
+            using,
+            ..
         } => {
             let mut s = format!("Delete {}", qualify(db, table));
+            if using.is_some() {
+                s.push_str(" using");
+            }
             if let Some(p) = predicate {
                 s.push_str(&format!(" where {}", expr_text(p)));
             }
@@ -8744,11 +8960,24 @@ mod tests {
                 "        Scan main.wj".to_string(),
             ]
         );
-        // EXPLAIN binds but never executes: an EXPLAIN of a query against a
-        // missing table still errors at bind; a plain EXPLAIN of writes is a
-        // parse error (SELECT only).
+        // EXPLAIN binds but never executes: a query against a missing table
+        // still errors at bind, a DML statement renders its write plan, and a
+        // DDL statement is refused (it would dodge its own statement gate).
         assert!(db.execute("EXPLAIN SELECT * FROM missing;").is_err());
-        assert!(db.execute("EXPLAIN INSERT INTO wj VALUES (1, 1);").is_err());
+        let explained: String = select(&mut db, "EXPLAIN INSERT INTO wj VALUES (1, 1);")
+            .into_iter()
+            .map(|r| match r[0].clone() {
+                V::Varchar(s) => s,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(explained.contains("Insert main.wj"), "{explained}");
+        assert!(
+            db.execute("EXPLAIN CREATE TABLE nope (a INTEGER);")
+                .expect_err("EXPLAIN of DDL")
+                .to_string()
+                .contains("EXPLAIN supports a query or a DML statement")
+        );
         // SHOW TABLES: sorted names of the session database.
         db.execute("CREATE TABLE zeta (a INTEGER);").unwrap();
         db.execute("CREATE TABLE alpha (a INTEGER);").unwrap();
@@ -12498,36 +12727,47 @@ mod tests {
         assert_eq!(rows[1][3], V::Null);
     }
 
-    /// Constraints are metadata: INSERT/UPDATE never checks them (DuckDB's
-    /// informational posture). Dangling references, NULL keys, duplicate
-    /// keys, and duplicate uniques all go through.
+    /// Wave 95b enforces keys: a duplicate PRIMARY KEY/UNIQUE image is
+    /// rejected, a NULL primary-key column is NOT NULL, and an UPDATE may not
+    /// collide with another row. FOREIGN KEY references and `NOT NULL` on
+    /// non-key columns stay metadata (DuckDB enforces both; the divergence is
+    /// documented in docs/sql-conformance.md).
     #[test]
-    fn wave41_constraints_are_metadata_only() {
+    fn wave41_constraints_are_enforced_for_keys() {
         let mut db = wave41_db();
-        // Dangling foreign key value.
+        // Foreign keys are still declarations: a dangling reference loads.
         db.execute("INSERT INTO c VALUES (102, 999, 'dangling');")
             .unwrap();
-        // NULL in a NOT NULL column; duplicate primary key.
+        // NOT NULL on a non-key column is still metadata.
         db.execute("INSERT INTO c VALUES (103, NULL, NULL);")
             .unwrap();
-        db.execute("INSERT INTO c VALUES (100, 1, 'dup');").unwrap();
-        // NULL/duplicate parent keys.
-        db.execute("INSERT INTO p VALUES (NULL, 0), (1, 0);")
-            .unwrap();
-        // UPDATE into a dangling reference.
+        // Duplicate primary key, across statements and inside one insert.
+        assert!(db.execute("INSERT INTO c VALUES (100, 1, 'dup');").is_err());
+        assert!(
+            db.execute("INSERT INTO c VALUES (104, 1, 'x'), (104, 2, 'y');")
+                .is_err()
+        );
+        // A NULL primary key is NOT NULL (DuckDB's rule).
+        assert!(db.execute("INSERT INTO p VALUES (NULL, 0);").is_err());
+        // A dangling reference is fine; moving onto another row's key is not.
         db.execute("UPDATE c SET pid = 424242 WHERE cid = 100;")
             .unwrap();
+        assert!(
+            db.execute("UPDATE c SET cid = 101 WHERE cid = 100;")
+                .is_err()
+        );
         assert_eq!(
             select(&mut db, "SELECT COUNT(*) FROM c;"),
-            vec![vec![V::Bigint(5)]]
+            vec![vec![V::Bigint(4)]]
         );
-        // UNIQUE is not enforced either.
+        // UNIQUE rejects duplicates; NULLs never conflict.
         db.execute("CREATE TABLE uq (x INTEGER UNIQUE);").unwrap();
-        db.execute("INSERT INTO uq VALUES (1), (1), (NULL), (NULL);")
-            .unwrap();
+        db.execute("INSERT INTO uq VALUES (NULL), (NULL);").unwrap();
+        db.execute("INSERT INTO uq VALUES (1);").unwrap();
+        assert!(db.execute("INSERT INTO uq VALUES (1);").is_err());
         assert_eq!(
             select(&mut db, "SELECT COUNT(*) FROM uq;"),
-            vec![vec![V::Bigint(4)]]
+            vec![vec![V::Bigint(3)]]
         );
     }
 

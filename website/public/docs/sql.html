@@ -194,8 +194,18 @@ an honest list of what is not supported yet.</p>
 <span class="tok-k">CREATE</span> <span class="tok-k">TABLE</span> <span class="tok-k">IF</span> <span class="tok-k">NOT</span> <span class="tok-k">EXISTS</span> t (...);  <span class="tok-c">-- IF [NOT] EXISTS on CREATE/DROP TABLE</span>
 <span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> t <span class="tok-k">VALUES</span> (<span class="tok-n">1</span>, <span class="tok-s">'x'</span>, <span class="tok-n">9.5</span>), (<span class="tok-n">2</span>, <span class="tok-k">NULL</span>, <span class="tok-n">3.0</span>);
 <span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> t <span class="tok-k">SELECT</span> ...;            <span class="tok-c">-- INSERT ... SELECT</span>
+<span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> t <span class="tok-k">VALUES</span> (<span class="tok-n">1</span>, <span class="tok-s">'y'</span>, <span class="tok-n">2.0</span>)
+  <span class="tok-k">ON</span> CONFLICT (id) DO <span class="tok-k">UPDATE</span> <span class="tok-k">SET</span> price = excluded.price  <span class="tok-c">-- upsert (or DO NOTHING)</span>
+  RETURNING id, price;                                   <span class="tok-c">-- final rows, after triggers</span>
+<span class="tok-k">INSERT</span> <span class="tok-k">OR</span> REPLACE <span class="tok-k">INTO</span> t <span class="tok-k">VALUES</span> (<span class="tok-n">1</span>, <span class="tok-s">'y'</span>, <span class="tok-n">2.0</span>);  <span class="tok-c">-- = DO UPDATE over the given columns</span>
+<span class="tok-k">INSERT</span> <span class="tok-k">OR</span> IGNORE  <span class="tok-k">INTO</span> t <span class="tok-k">VALUES</span> (<span class="tok-n">1</span>, <span class="tok-s">'y'</span>, <span class="tok-n">2.0</span>);  <span class="tok-c">-- = DO NOTHING</span>
 <span class="tok-k">UPDATE</span> t <span class="tok-k">SET</span> price = price * <span class="tok-n">1.1</span> <span class="tok-k">WHERE</span> id &gt; <span class="tok-n">1</span>;   <span class="tok-c">-- SET exprs see pre-update values</span>
+<span class="tok-k">UPDATE</span> t <span class="tok-k">SET</span> price = s.price <span class="tok-k">FROM</span> s <span class="tok-k">WHERE</span> t.id = s.id;   <span class="tok-c">-- UPDATE ... FROM</span>
 <span class="tok-k">DELETE</span> <span class="tok-k">FROM</span> t <span class="tok-k">WHERE</span> price <span class="tok-k">IS</span> <span class="tok-k">NULL</span>;               <span class="tok-c">-- NULL never matches</span>
+<span class="tok-k">DELETE</span> <span class="tok-k">FROM</span> t USING s <span class="tok-k">WHERE</span> t.id = s.id;         <span class="tok-c">-- DELETE ... USING</span>
+MERGE <span class="tok-k">INTO</span> t USING s <span class="tok-k">ON</span> t.id = s.id              <span class="tok-c">-- MERGE</span>
+  <span class="tok-k">WHEN</span> MATCHED <span class="tok-k">THEN</span> <span class="tok-k">UPDATE</span> <span class="tok-k">SET</span> price = s.price
+  <span class="tok-k">WHEN</span> <span class="tok-k">NOT</span> MATCHED <span class="tok-k">THEN</span> <span class="tok-k">INSERT</span> <span class="tok-k">VALUES</span> (s.id, s.name, s.price);
 <span class="tok-k">BEGIN</span>; <span class="tok-k">UPDATE</span> t <span class="tok-k">SET</span> price = <span class="tok-n">0</span>; <span class="tok-k">ROLLBACK</span>;         <span class="tok-c">-- flat snapshot transactions</span>
 <span class="tok-k">CREATE</span> <span class="tok-k">DATABASE</span> db1;                 <span class="tok-c">-- new, empty database</span>
 <span class="tok-k">DROP</span> <span class="tok-k">DATABASE</span> db1;                   <span class="tok-c">-- the last database cannot be dropped</span>
@@ -219,10 +229,33 @@ optional <code>CONSTRAINT name</code> prefix):</p>
 
 <p>The declarations are validated at DDL time like DuckDB's (the referenced table
 must exist and the referenced columns must be exactly one of its PRIMARY KEY or
-UNIQUE constraints), but they are <strong>metadata only</strong>: writes never
-enforce them, and <code>DESCRIBE</code> reports them (<code>PRI</code>/<code>UNI</code>
-markers plus nullability). The optimizer uses a declared foreign key for
-conservative FK→PK join elimination — declarations are trusted, not verified.</p>
+UNIQUE constraints), and <code>DESCRIBE</code> reports them
+(<code>PRI</code>/<code>UNI</code> markers plus nullability).
+<strong><code>PRIMARY KEY</code> and <code>UNIQUE</code> are enforced</strong>:
+a duplicate, or a <code>NULL</code> in a primary key, is an error, checked per
+statement against the declared keys — so a statement that would introduce one
+aborts whole (including across the rows of a multi-row <code>INSERT</code>).
+<code>REFERENCES</code>/<code>FOREIGN KEY</code> stays a declaration: the
+optimizer trusts it for FK→PK join elimination, but writes do not check it.</p>
+
+<p>The DML forms match DuckDB 2.0. <code>ON CONFLICT [(cols)]</code> needs a
+matching declared <code>PRIMARY KEY</code>/<code>UNIQUE</code> constraint and
+<code>DO UPDATE</code> may read the proposed row as <code>excluded.col</code>;
+<code>INSERT OR REPLACE</code> is <code>DO UPDATE</code> over the columns the
+insert names, so unlisted columns keep their old values, and
+<code>INSERT OR IGNORE</code> is <code>DO NOTHING</code>. <code>RETURNING</code>
+works on <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>,
+<code>ON CONFLICT</code> and <code>MERGE</code>, and reports the final row — a
+<code>BEFORE</code> trigger's rewrite included. When several source rows match
+one target row, <code>UPDATE … FROM</code> keeps the last one in source order
+(DuckDB's behaviour), <code>DELETE … USING</code> deletes once, and
+<code>MERGE</code> refuses the statement with a "cannot affect the same target
+row more than once" error. <code>MERGE</code> clauses are tried in order and the
+first whose <code>AND</code> condition holds wins; <code>WHEN NOT MATCHED BY
+SOURCE</code> deletes target rows no source row matches. A
+<code>WITH</code> clause may hold data-modifying statements
+(<code>WITH x AS (INSERT … RETURNING …) SELECT … FROM x</code>); they run once,
+at the top level.</p>
 
 <p><code>UPDATE</code> and <code>DELETE</code> are statement-atomic: the statement
 sees the pre-update values and either applies completely or not at all.
@@ -691,9 +724,11 @@ SHOW TRIGGERS <span class="tok-k">ON</span> sales;</code></pre></div>
   <li>Definitions persist in <code>.pink</code> files and replay from the WAL
   by re-executing the firing statement, so its triggers fire again exactly
   once.</li>
-  <li>Refused: triggers on views and attached lake tables,
-  <code>RETURNING</code> on triggered tables, and trigger DDL inside a
-  transaction.</li>
+  <li><code>RETURNING</code> on a triggered table reports the image the
+  <code>BEFORE</code> row triggers left behind, not the one the statement
+  proposed.</li>
+  <li>Refused: triggers on views and attached lake tables, and trigger DDL
+  inside a transaction.</li>
 </ul>
 
 <h2 id="materialized-views">Materialized views<a class="anchor" href="#materialized-views" aria-label="Permalink: Materialized views">#</a></h2>
@@ -726,11 +761,10 @@ SHOW MATERIALIZED VIEWS;               <span class="tok-c">-- schedule, last ref
 <ul>
   <li><strong>Correlated subqueries</strong> are rejected (uncorrelated subqueries
   and <code>EXISTS</code> work).</li>
-  <li><strong>DML forms</strong> — <code>INSERT … ON CONFLICT</code> (and
-  <code>INSERT OR REPLACE</code> / <code>REPLACE INTO</code>),
-  <code>UPDATE … FROM</code>, <code>DELETE … USING</code>,
-  <code>RETURNING</code>, <code>MERGE</code> and data-modifying CTEs — are
-  refused with a <code>wave 95b</code> error naming the form.</li>
+  <li><strong>MySQL DML spellings</strong> — <code>ON DUPLICATE KEY UPDATE</code>
+  and <code>REPLACE INTO</code> are refused by name; write
+  <code>ON CONFLICT … DO UPDATE SET</code> or <code>INSERT OR REPLACE</code>.
+  <code>COPY</code> is accepted as a statement, not as a CTE step.</li>
   <li><strong>Query forms</strong> — <code>LATERAL</code>, ordered-set aggregates
   (<code>WITHIN GROUP</code>), <code>TABLESAMPLE</code>,
   <code>FOR UPDATE</code>/<code>SHARE</code>, <code>AT TIME ZONE</code>, row

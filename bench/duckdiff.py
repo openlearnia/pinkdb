@@ -150,6 +150,9 @@ def pink_tables(setup, sql):
     # is off by default: the probes that need it opt in.
     env = dict(os.environ)
     env["PINKDB_ALLOW_LOAD_EXTENSION"] = "1"
+    # A coding-agent shell sets AI_AGENT, which switches the CLI to markdown
+    # tables; the parser below reads the box form.
+    env["PINKDB_AGENT_MODE"] = "0"
     p = subprocess.run(PINKDB, input=script, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True, timeout=300,
                        env=env)
@@ -679,6 +682,8 @@ def run_small():
         raise SystemExit(f"string extension still missing at {STRING_EXT_PATH}")
     for label, sql, ordered, expect_error in QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP)
+    for label, sql, ordered, expect_error in DML_QUERIES:
+        run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in STRING_EXT_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP + "\n" + STRING_EXT_SETUP)
     for label, sql, ordered, expect_error in NAN_QUERIES:
@@ -939,6 +944,39 @@ def run_three_part():
         ok = rows_equal(prows_n, d[1], ordered)
         check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
 
+
+# ---- wave 95b: the DML forms ----
+#
+# Each case builds its own tables, so the shared SETUP's keyed tables stay
+# untouched, and ends in a SELECT (`RETURNING` is wrapped in a data-modifying
+# CTE: DuckDB supports that, and it gives the harness a statement to count).
+DML_QUERIES = [
+    ("dml-on-conflict-do-nothing", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); INSERT INTO oc VALUES (2,99) ON CONFLICT DO NOTHING; INSERT INTO oc VALUES (3,30) ON CONFLICT (a) DO NOTHING; SELECT * FROM oc ORDER BY a;", True, False),
+    ("dml-on-conflict-do-update", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); INSERT INTO oc VALUES (2,99) ON CONFLICT (a) DO UPDATE SET b = excluded.b; SELECT * FROM oc ORDER BY a;", True, False),
+    ("dml-on-conflict-reads-target", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); INSERT INTO oc VALUES (2,99) ON CONFLICT (a) DO UPDATE SET b = oc.b + 5; SELECT * FROM oc ORDER BY a;", True, False),
+    ("dml-on-conflict-where", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); INSERT INTO oc VALUES (1,99),(2,99) ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE oc.b < 15; SELECT * FROM oc ORDER BY a;", True, False),
+    ("dml-insert-or-replace", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); INSERT OR REPLACE INTO oc VALUES (2,99); SELECT * FROM oc ORDER BY a;", True, False),
+    ("dml-insert-or-ignore", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); INSERT OR IGNORE INTO oc VALUES (2,99),(4,40); SELECT * FROM oc ORDER BY a;", True, False),
+    ("dml-on-conflict-from-select", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); CREATE TABLE s2 (a INTEGER, b INTEGER); INSERT INTO s2 VALUES (2,99),(5,50); INSERT INTO oc (a,b) SELECT a,b FROM s2 ON CONFLICT (a) DO UPDATE SET b = excluded.b; SELECT * FROM oc ORDER BY a;", True, False),
+    ("dml-returning-insert", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); WITH i AS (INSERT INTO oc VALUES (5,50),(6,60) RETURNING a, b) SELECT * FROM i ORDER BY a;", True, False),
+    ("dml-returning-update", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); WITH u AS (UPDATE oc SET b = b + 1 WHERE a <= 2 RETURNING a, b) SELECT * FROM u ORDER BY a;", True, False),
+    ("dml-returning-delete", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); WITH d AS (DELETE FROM oc WHERE a = 2 RETURNING a, b) SELECT * FROM d ORDER BY a;", True, False),
+    ("dml-returning-expression", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); WITH i AS (INSERT INTO oc VALUES (7,70) RETURNING a, b * 2 AS dbl) SELECT * FROM i;", True, False),
+    ("dml-update-from", "CREATE TABLE t2 (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO t2 VALUES (1,10),(2,20),(3,30); CREATE TABLE s2 (a INTEGER, b INTEGER); INSERT INTO s2 VALUES (2,200),(3,300); UPDATE t2 SET b = s2.b FROM s2 WHERE t2.a = s2.a; SELECT * FROM t2 ORDER BY a;", True, False),
+    ("dml-update-from-last-wins", "CREATE TABLE t2 (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO t2 VALUES (1,10),(2,20); CREATE TABLE s2 (a INTEGER, b INTEGER); INSERT INTO s2 VALUES (2,100),(2,200); UPDATE t2 SET b = s2.b FROM s2 WHERE t2.a = s2.a; SELECT * FROM t2 ORDER BY a;", True, False),
+    ("dml-delete-using", "CREATE TABLE t2 (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO t2 VALUES (1,10),(2,20),(3,30); CREATE TABLE s2 (a INTEGER, b INTEGER); INSERT INTO s2 VALUES (2,0),(2,0),(3,0); DELETE FROM t2 USING s2 WHERE t2.a = s2.a; SELECT * FROM t2 ORDER BY a;", True, False),
+    ("dml-merge-upsert", "CREATE TABLE m2 (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO m2 VALUES (1,10),(2,20); CREATE TABLE src2 (id INTEGER, v INTEGER); INSERT INTO src2 VALUES (2,200),(3,30); MERGE INTO m2 USING src2 ON m2.id = src2.id WHEN MATCHED THEN UPDATE SET v = src2.v WHEN NOT MATCHED THEN INSERT VALUES (src2.id, src2.v); SELECT * FROM m2 ORDER BY id;", True, False),
+    ("dml-merge-delete", "CREATE TABLE m2 (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO m2 VALUES (1,10),(2,20); CREATE TABLE src2 (id INTEGER, v INTEGER); INSERT INTO src2 VALUES (2,200); MERGE INTO m2 USING src2 ON m2.id = src2.id WHEN MATCHED AND src2.v > 150 THEN DELETE WHEN MATCHED THEN UPDATE SET v = src2.v; SELECT * FROM m2 ORDER BY id;", True, False),
+    ("dml-merge-by-source", "CREATE TABLE m2 (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO m2 VALUES (1,10),(2,20); CREATE TABLE src2 (id INTEGER, v INTEGER); INSERT INTO src2 VALUES (1,100); MERGE INTO m2 USING src2 ON m2.id = src2.id WHEN NOT MATCHED BY SOURCE THEN DELETE; SELECT * FROM m2 ORDER BY id;", True, False),
+    ("dml-merge-multi-match", "CREATE TABLE m2 (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO m2 VALUES (2,20); CREATE TABLE src2 (id INTEGER, v INTEGER); INSERT INTO src2 VALUES (2,100),(2,200); MERGE INTO m2 USING src2 ON m2.id = src2.id WHEN MATCHED THEN UPDATE SET v = src2.v; SELECT * FROM m2 ORDER BY id;", True, True),
+    ("dml-cte-insert", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); WITH i AS (INSERT INTO oc VALUES (9,90),(10,100) RETURNING a) SELECT * FROM i ORDER BY a;", True, False),
+    ("dml-cte-update", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); WITH u AS (UPDATE oc SET b = b + 10 RETURNING a, b) SELECT * FROM u ORDER BY a;", True, False),
+    ("dml-cte-delete", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); WITH d AS (DELETE FROM oc RETURNING a) SELECT * FROM d ORDER BY a;", True, False),
+    ("dml-cte-then-select", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); WITH i AS (INSERT INTO oc VALUES (8,80) RETURNING a) SELECT * FROM oc ORDER BY a;", True, False),
+    ("dml-pk-duplicate", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(1,11); SELECT * FROM oc;", True, True),
+    ("dml-unique-duplicate", "CREATE TABLE uq (a INTEGER, b INTEGER UNIQUE); INSERT INTO uq VALUES (1,10),(2,10); SELECT * FROM uq;", True, True),
+    ("dml-pk-null", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (NULL,10); SELECT * FROM oc;", True, True),
+]
 
 def run_case(label, sql, ordered, expect_error, setup, duck_setup=SETUP):
     """`setup` is pinkdb's; DuckDB runs `duck_setup` (the shared SETUP unless

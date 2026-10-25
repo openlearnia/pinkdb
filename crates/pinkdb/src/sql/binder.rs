@@ -1017,6 +1017,9 @@ struct ScopeTable {
     db: Option<String>,
     /// True when `name` is an alias (which hides `original`, wave 94).
     is_alias: bool,
+    /// `excluded` (INSERT ... ON CONFLICT): resolves only when qualified, so
+    /// the target table keeps every unqualified name.
+    qualified_only: bool,
     columns: Vec<(String, DataType)>,
 }
 
@@ -1064,6 +1067,9 @@ struct Binder<'a> {
     /// with child scopes: a mutating statement that depends on one is
     /// refused on a durable database (the logged SQL could never replay).
     views_used: Rc<RefCell<Vec<String>>>,
+    /// True only for a statement's own binder: a data-modifying CTE is legal
+    /// there and nowhere else (DuckDB's top-level rule).
+    dml_cte_ok: bool,
     /// Extension sources referenced while binding this statement, in
     /// first-use order: dynamic-function names (lowercased registry keys) and
     /// extension-**package** names (a table function, replacement scan or
@@ -1113,6 +1119,7 @@ impl<'a> Binder<'a> {
                 })
                 .unwrap_or_default(),
             views_used: Rc::new(RefCell::new(Vec::new())),
+            dml_cte_ok: true,
             dynamic_functions_used: Rc::new(RefCell::new(Vec::new())),
             params: None,
             macro_depth: Rc::new(Cell::new(0)),
@@ -1147,6 +1154,7 @@ impl<'a> Binder<'a> {
             group_masks: Vec::new(),
             ctes: self.ctes.clone(),
             views_used: Rc::clone(&self.views_used),
+            dml_cte_ok: false,
             dynamic_functions_used: Rc::clone(&self.dynamic_functions_used),
             params: self.params.clone(),
             macro_depth: Rc::clone(&self.macro_depth),
@@ -1447,6 +1455,10 @@ impl<'a> Binder<'a> {
             let mut found: Option<(usize, DataType)> = None;
             let mut base = 0;
             for t in &self.tables {
+                if t.qualified_only {
+                    base += t.columns.len();
+                    continue;
+                }
                 for (i, (name, dtype)) in t.columns.iter().enumerate() {
                     if name.eq_ignore_ascii_case(col) {
                         if found.is_some() {
@@ -3962,33 +3974,86 @@ fn bind_tracked_plan(
             table,
             columns,
             source,
+            on_conflict,
+            returning,
         } => match source {
-            InsertSource::Values(rows) => {
-                bind_insert(db, default_db, qdb, table, columns, rows, params.clone())
-            }
-            InsertSource::Select(query) => {
-                bind_insert_select(db, default_db, qdb, table, columns, query, params.clone())
-            }
+            InsertSource::Values(rows) => bind_insert(
+                db,
+                default_db,
+                qdb,
+                table,
+                columns,
+                rows,
+                on_conflict.as_ref(),
+                returning.as_deref(),
+                params.clone(),
+            ),
+            InsertSource::Select(query) => bind_insert_select(
+                db,
+                default_db,
+                qdb,
+                table,
+                columns,
+                query,
+                on_conflict.as_ref(),
+                returning.as_deref(),
+                params.clone(),
+            ),
         },
         Statement::Update {
             db: qdb,
             table,
             sets,
+            from,
             where_clause,
+            returning,
         } => bind_update(
             db,
             default_db,
             qdb,
             table,
             sets,
+            from.as_deref(),
             where_clause,
+            returning.as_deref(),
             params.clone(),
         ),
         Statement::Delete {
             db: qdb,
             table,
+            using,
             where_clause,
-        } => bind_delete(db, default_db, qdb, table, where_clause, params.clone()),
+            returning,
+        } => bind_delete(
+            db,
+            default_db,
+            qdb,
+            table,
+            using.as_deref(),
+            where_clause,
+            returning.as_deref(),
+            params.clone(),
+        ),
+        Statement::Merge {
+            db: qdb,
+            table,
+            alias,
+            using,
+            on,
+            clauses,
+            returning,
+        } => bind_merge(
+            db,
+            default_db,
+            qdb,
+            table,
+            alias.as_deref(),
+            using,
+            on,
+            clauses,
+            returning.as_deref(),
+            params.clone(),
+        ),
         Statement::CopyTo {
             db: qdb,
             table,
@@ -4139,12 +4204,25 @@ fn bind_tracked_plan(
         Statement::Describe { db: qdb, name } => {
             bind_describe(db, default_db, qdb.as_deref(), name)
         }
-        Statement::Explain(query) => {
-            // Bind the inner query fully (errors surface here) and wrap it —
-            // EXPLAIN never executes it.
-            let mut binder = Binder::new(db, default_db).with_params(params.clone());
-            let plan = bind_select_in(db, &mut binder, query)?;
-            let dynamic = binder.dynamic_functions_used();
+        Statement::Explain(inner) => {
+            // EXPLAIN never executes its inner statement, so a DML plan is
+            // safe to render; DDL and session statements have no plan shape
+            // worth showing (and would bypass their own statement gates).
+            if !matches!(
+                **inner,
+                Statement::Select(_)
+                    | Statement::Insert { .. }
+                    | Statement::Update { .. }
+                    | Statement::Delete { .. }
+                    | Statement::Merge { .. }
+            ) {
+                return Err(PinkDbError::Parse(
+                    "EXPLAIN supports a query or a DML statement".to_string(),
+                ));
+            }
+            // Bind the inner statement fully (errors surface here) and wrap
+            // it — EXPLAIN never executes it.
+            let (plan, dynamic) = bind_tracked_plan(db, inner, default_db, params.clone())?;
             Ok((
                 LogicalPlan::Explain {
                     plan: Box::new(plan),
@@ -5007,13 +5085,16 @@ fn bind_create_view(
 /// Bind UPDATE: resolve target columns, bind SET expressions in the table
 /// scope (no aggregates, windows, or aliases), check Boolean WHERE. A bare
 /// `?` SET value takes the target column's type.
+#[allow(clippy::too_many_arguments)]
 fn bind_update(
     db: &PinkDb,
     default_db: &str,
     qdb: &Option<String>,
     table: &str,
     sets: &[(SetTarget, Expr)],
+    from: Option<&FromClause>,
     where_clause: &Option<Expr>,
+    returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
@@ -5062,13 +5143,21 @@ fn bind_update(
             )));
         }
     }
-    let mut binder = Binder::new(db, &table_db).with_params(params);
+    let mut binder = Binder::new(db, &table_db).with_params(params.clone());
     binder.allow_win = false;
+    // `UPDATE … FROM` (wave 95b) binds its sources first, so their column
+    // indices start at 0 and every expression's input row is the source row
+    // followed by the target row. The target is invisible to the sources.
+    let from_plan = match from {
+        Some(from) => Some(Box::new(bind_from_scope(db, &mut binder, from)?)),
+        None => None,
+    };
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
         original: Some(t.name.to_ascii_lowercase()),
         db: Some(table_db.clone()),
         is_alias: false,
+        qualified_only: false,
         columns: t.schema(),
     });
     let mut bound_sets = Vec::with_capacity(sets.len());
@@ -5112,25 +5201,37 @@ fn bind_update(
         ));
     }
     reject_view_dependency(db, &binder.views_used())?;
-    let dynamic_functions = binder.dynamic_functions_used();
+    let mut dynamic_functions = binder.dynamic_functions_used();
+    // A RETURNING expression may itself call an extension function.
+    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    for name in returning_dynamic {
+        if !dynamic_functions.iter().any(|n| n == &name) {
+            dynamic_functions.push(name);
+        }
+    }
     Ok((
         LogicalPlan::Update {
             db: Some(table_db),
             table: t.name.clone(),
             sets: bound_sets,
             predicate,
+            from: from_plan,
+            returning,
         },
         dynamic_functions,
     ))
 }
 
 /// Bind DELETE: Boolean WHERE over the table scope (no aggregates/windows).
+#[allow(clippy::too_many_arguments)]
 fn bind_delete(
     db: &PinkDb,
     default_db: &str,
     qdb: &Option<String>,
     table: &str,
+    using: Option<&FromClause>,
     where_clause: &Option<Expr>,
+    returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
@@ -5138,14 +5239,20 @@ fn bind_delete(
         return Err(err);
     }
     let t = db.table_in(&table_db, table)?;
-    let mut binder = Binder::new(db, &table_db).with_params(params);
+    let mut binder = Binder::new(db, &table_db).with_params(params.clone());
     binder.allow_win = false;
     binder.allow_alias = false;
+    // `DELETE … USING` binds its sources first (row = source ++ target).
+    let using_plan = match using {
+        Some(using) => Some(Box::new(bind_from_scope(db, &mut binder, using)?)),
+        None => None,
+    };
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
         original: Some(t.name.to_ascii_lowercase()),
         db: Some(table_db.clone()),
         is_alias: false,
+        qualified_only: false,
         columns: t.schema(),
     });
     let mut no_aggs = Vec::new();
@@ -5161,12 +5268,20 @@ fn bind_delete(
         ));
     }
     reject_view_dependency(db, &binder.views_used())?;
-    let dynamic_functions = binder.dynamic_functions_used();
+    let mut dynamic_functions = binder.dynamic_functions_used();
+    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    for name in returning_dynamic {
+        if !dynamic_functions.iter().any(|n| n == &name) {
+            dynamic_functions.push(name);
+        }
+    }
     Ok((
         LogicalPlan::Delete {
             db: Some(table_db),
             table: t.name.clone(),
             predicate,
+            using: using_plan,
+            returning,
         },
         dynamic_functions,
     ))
@@ -5225,6 +5340,405 @@ fn bind_copy_to(
     ))
 }
 
+/// Bind `RETURNING <projections>` (wave 95b): expressions over the
+/// statement's final row image (after BEFORE triggers ran). Only the target
+/// table's columns are in scope, so `UPDATE … FROM … RETURNING *` returns the
+/// target's columns, like DuckDB.
+fn bind_returning(
+    db: &PinkDb,
+    table_db: &str,
+    t: &DataTable,
+    projections: Option<&[Projection]>,
+    params: Option<ParamSlots>,
+) -> Result<(Option<crate::plan::Returning>, Vec<String>)> {
+    let Some(projections) = projections else {
+        return Ok((None, Vec::new()));
+    };
+    let mut binder = Binder::new(db, table_db).with_params(params);
+    binder.allow_win = false;
+    binder.allow_alias = false;
+    binder.tables.push(ScopeTable {
+        name: t.name.to_ascii_lowercase(),
+        original: Some(t.name.to_ascii_lowercase()),
+        db: Some(table_db.to_string()),
+        is_alias: false,
+        qualified_only: false,
+        columns: t.schema(),
+    });
+    let schema = t.schema();
+    let mut exprs = Vec::new();
+    let mut names = Vec::new();
+    for proj in projections {
+        match proj {
+            Projection::Star => {
+                for (i, (name, dtype)) in schema.iter().enumerate() {
+                    exprs.push(BoundExpr::Column {
+                        index: i,
+                        dtype: *dtype,
+                    });
+                    names.push(name.clone());
+                }
+            }
+            Projection::QualifiedStar { db, table } => {
+                if db
+                    .as_deref()
+                    .is_some_and(|d| !d.eq_ignore_ascii_case(table_db))
+                    || !table.eq_ignore_ascii_case(&t.name)
+                {
+                    return Err(PinkDbError::Catalog(format!(
+                        "RETURNING `{table}.*` does not match the statement's target table \
+                         \"{}\"",
+                        t.name
+                    )));
+                }
+                for (i, (name, dtype)) in schema.iter().enumerate() {
+                    exprs.push(BoundExpr::Column {
+                        index: i,
+                        dtype: *dtype,
+                    });
+                    names.push(name.clone());
+                }
+            }
+            Projection::Expr { expr, alias } => {
+                let mut aggs = Vec::new();
+                let bound = binder.bind_expr(expr, &mut aggs, false)?;
+                if !aggs.is_empty() {
+                    return Err(PinkDbError::Execution(
+                        "aggregates are not allowed in RETURNING".to_string(),
+                    ));
+                }
+                names.push(alias.clone().unwrap_or_else(|| default_name(expr)));
+                exprs.push(bound);
+            }
+        }
+    }
+    Ok((
+        Some(crate::plan::Returning { exprs, names }),
+        binder.dynamic_functions_used(),
+    ))
+}
+
+/// The column indices of an explicit `ON CONFLICT (cols)` target, in the
+/// declared constraint's order. DuckDB refuses a target that no
+/// `PRIMARY KEY`/`UNIQUE` constraint covers.
+fn conflict_target(t: &DataTable, columns: &[String]) -> Result<Vec<usize>> {
+    let mut idx = columns
+        .iter()
+        .map(|c| {
+            t.column_index(c)
+                .map_err(|_| PinkDbError::Catalog(format!("no column \"{c}\"")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    idx.sort_unstable();
+    let matched = t
+        .constraints
+        .keys
+        .iter()
+        .find(|k| {
+            let mut cols = k.columns.clone();
+            cols.sort_unstable();
+            cols == idx
+        })
+        .map(|k| k.columns.clone());
+    matched.ok_or_else(|| {
+        PinkDbError::Catalog(
+            "the specified columns as conflict target are not referenced by a UNIQUE/PRIMARY KEY \
+             CONSTRAINT"
+                .to_string(),
+        )
+    })
+}
+
+/// Bind one `SET` list: the target columns of `t`, checked for a qualifier
+/// naming some other table and for duplicates, then bound against the
+/// current scope.
+fn bind_sets(
+    binder: &mut Binder,
+    t: &DataTable,
+    own_db: &str,
+    sets: &[(SetTarget, Expr)],
+    label: &str,
+) -> Result<Vec<(usize, BoundExpr)>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(sets.len());
+    for (target, expr) in sets {
+        if let Some(qdb) = &target.db
+            && !qdb.eq_ignore_ascii_case(own_db)
+        {
+            return Err(PinkDbError::Catalog(format!(
+                "{label} SET target \"{qdb}.{}.{}\" does not match the statement's target table",
+                target.table.as_deref().unwrap_or_default(),
+                target.column
+            )));
+        }
+        if let Some(qtable) = &target.table
+            && !qtable.eq_ignore_ascii_case(&t.name)
+        {
+            return Err(PinkDbError::Catalog(format!(
+                "{label} SET target \"{qtable}.{}\" does not match the statement's target table \
+                 \"{}\"",
+                target.column, t.name
+            )));
+        }
+        if !seen.insert(target.column.to_ascii_lowercase()) {
+            return Err(PinkDbError::Catalog(format!(
+                "duplicate SET column \"{}\"",
+                target.column
+            )));
+        }
+        let idx = t
+            .column_index(&target.column)
+            .map_err(|_| PinkDbError::Catalog(format!("no column \"{}\"", target.column)))?;
+        let (_, want) = t.schema()[idx].clone();
+        binder.pin_parameter(expr, want)?;
+        let mut aggs = Vec::new();
+        let bound = binder.bind_expr(expr, &mut aggs, false)?;
+        if !aggs.is_empty() {
+            return Err(PinkDbError::Execution(format!(
+                "aggregates are not allowed in {label} SET"
+            )));
+        }
+        if !DataTable::can_coerce(bound.dtype(), want)
+            && !matches!(bound, BoundExpr::Literal(Value::Null))
+        {
+            return Err(PinkDbError::Type(format!(
+                "cannot assign {} to {want} column \"{}\"",
+                bound.dtype(),
+                target.column
+            )));
+        }
+        out.push((idx, bound));
+    }
+    Ok(out)
+}
+
+/// Bind `ON CONFLICT …` / `INSERT OR REPLACE|IGNORE`. `order` is the written
+/// column order (`INSERT OR REPLACE` assigns exactly those columns from the
+/// rejected row, keeping the rest of the existing row).
+fn bind_conflict(
+    db: &PinkDb,
+    table_db: &str,
+    t: &DataTable,
+    on_conflict: Option<&OnConflict>,
+    order: &[usize],
+    params: Option<ParamSlots>,
+) -> Result<(Option<crate::plan::ConflictPlan>, Vec<String>)> {
+    let Some(oc) = on_conflict else {
+        return Ok((None, Vec::new()));
+    };
+    let target = match &oc.columns {
+        Some(cols) => Some(conflict_target(t, cols)?),
+        None => t.constraints.primary_key().map(|k| k.columns.clone()),
+    };
+    let mut binder = Binder::new(db, table_db).with_params(params);
+    binder.allow_win = false;
+    binder.allow_alias = false;
+    binder.tables.push(ScopeTable {
+        name: t.name.to_ascii_lowercase(),
+        original: Some(t.name.to_ascii_lowercase()),
+        db: Some(table_db.to_string()),
+        is_alias: false,
+        qualified_only: false,
+        columns: t.schema(),
+    });
+    // `excluded.<col>`: the row the INSERT tried to write. It resolves only
+    // when qualified, so a bare `col` always means the stored row.
+    let width = t.schema().len();
+    binder.tables.push(ScopeTable {
+        name: "excluded".to_string(),
+        original: None,
+        db: None,
+        is_alias: true,
+        qualified_only: true,
+        columns: t.schema(),
+    });
+    let action = match &oc.action {
+        OnConflictAction::DoNothing => crate::plan::ConflictActionPlan::Nothing,
+        OnConflictAction::Replace => crate::plan::ConflictActionPlan::Update {
+            sets: order
+                .iter()
+                .map(|&i| {
+                    (
+                        i,
+                        BoundExpr::Column {
+                            index: width + i,
+                            dtype: t.schema()[i].1,
+                        },
+                    )
+                })
+                .collect(),
+            predicate: None,
+        },
+        OnConflictAction::DoUpdate { sets, where_clause } => {
+            let sets = bind_sets(&mut binder, t, table_db, sets, "ON CONFLICT DO UPDATE")?;
+            let mut no_aggs = Vec::new();
+            let predicate = where_clause
+                .as_ref()
+                .map(|e| binder.bind_expr(e, &mut no_aggs, false))
+                .transpose()?;
+            if let Some(p) = &predicate
+                && p.dtype() != DataType::Boolean
+            {
+                return Err(PinkDbError::Type(
+                    "ON CONFLICT DO UPDATE WHERE needs a BOOLEAN expression".to_string(),
+                ));
+            }
+            crate::plan::ConflictActionPlan::Update { sets, predicate }
+        }
+    };
+    Ok((
+        Some(crate::plan::ConflictPlan { target, action }),
+        binder.dynamic_functions_used(),
+    ))
+}
+
+/// Bind `MERGE INTO target USING source ON cond WHEN … THEN …`.
+#[allow(clippy::too_many_arguments)]
+fn bind_merge(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: &Option<String>,
+    table: &str,
+    alias: Option<&str>,
+    using: &FromClause,
+    on: &Expr,
+    clauses: &[MergeClause],
+    returning: Option<&[Projection]>,
+    params: Option<ParamSlots>,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    if let Some(err) = db.attached_read_only(&table_db, table) {
+        return Err(err);
+    }
+    let t = db.table_in(&table_db, table)?;
+    if clauses.is_empty() {
+        return Err(PinkDbError::Parse(
+            "MERGE needs at least one WHEN clause".to_string(),
+        ));
+    }
+    let mut binder = Binder::new(db, &table_db).with_params(params.clone());
+    binder.allow_win = false;
+    binder.allow_alias = false;
+    // The source binds first (column 0..), then the target row follows it in
+    // every expression's input row; the source cannot see the target.
+    let source = bind_from_scope(db, &mut binder, using)?;
+    let target_name = alias.unwrap_or(&t.name).to_ascii_lowercase();
+    binder.tables.push(ScopeTable {
+        name: target_name,
+        original: Some(t.name.to_ascii_lowercase()),
+        db: Some(table_db.clone()),
+        is_alias: alias.is_some(),
+        qualified_only: false,
+        columns: t.schema(),
+    });
+    let mut no_aggs = Vec::new();
+    let on = binder.bind_expr(on, &mut no_aggs, false)?;
+    if on.dtype() != DataType::Boolean {
+        return Err(PinkDbError::Type(
+            "MERGE ON needs a BOOLEAN expression".to_string(),
+        ));
+    }
+    let mut bound_clauses = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        let condition = clause
+            .condition
+            .as_ref()
+            .map(|e| binder.bind_expr(e, &mut no_aggs, false))
+            .transpose()?;
+        if let Some(c) = &condition
+            && c.dtype() != DataType::Boolean
+        {
+            return Err(PinkDbError::Type(
+                "MERGE WHEN condition needs a BOOLEAN expression".to_string(),
+            ));
+        }
+        let action = match &clause.action {
+            MergeAction::Update { sets } => crate::plan::MergeActionPlan::Update {
+                sets: bind_sets(&mut binder, t, &table_db, sets, "MERGE")?,
+            },
+            MergeAction::Delete => crate::plan::MergeActionPlan::Delete,
+            MergeAction::Insert { columns, values } => {
+                let cols: Vec<usize> = match columns {
+                    Some(cols) => {
+                        let mut seen = std::collections::HashSet::new();
+                        cols.iter()
+                            .map(|c| {
+                                if !seen.insert(c.to_ascii_lowercase()) {
+                                    return Err(PinkDbError::Catalog(format!(
+                                        "duplicate INSERT column \"{c}\""
+                                    )));
+                                }
+                                t.column_index(c)
+                                    .map_err(|_| PinkDbError::Catalog(format!("no column \"{c}\"")))
+                            })
+                            .collect::<Result<_>>()?
+                    }
+                    None => (0..t.schema().len()).collect(),
+                };
+                if values.len() != cols.len() {
+                    return Err(PinkDbError::Execution(format!(
+                        "MERGE INSERT has {} values for {} columns",
+                        values.len(),
+                        cols.len()
+                    )));
+                }
+                let mut bound = Vec::with_capacity(values.len());
+                for (expr, &col) in values.iter().zip(cols.iter()) {
+                    let (_, want) = t.schema()[col].clone();
+                    binder.pin_parameter(expr, want)?;
+                    let mut aggs = Vec::new();
+                    let e = binder.bind_expr(expr, &mut aggs, false)?;
+                    if !aggs.is_empty() {
+                        return Err(PinkDbError::Execution(
+                            "aggregates are not allowed in MERGE INSERT".to_string(),
+                        ));
+                    }
+                    if !DataTable::can_coerce(e.dtype(), want)
+                        && !matches!(e, BoundExpr::Literal(Value::Null))
+                    {
+                        return Err(PinkDbError::Type(format!(
+                            "cannot insert {} into {} column \"{}\"",
+                            e.dtype(),
+                            want,
+                            t.schema()[col].0
+                        )));
+                    }
+                    bound.push(e);
+                }
+                crate::plan::MergeActionPlan::Insert {
+                    columns: cols,
+                    values: bound,
+                }
+            }
+        };
+        bound_clauses.push(crate::plan::MergeClausePlan {
+            matched: clause.matched,
+            condition,
+            action,
+        });
+    }
+    reject_view_dependency(db, &binder.views_used())?;
+    let mut dynamic_functions = binder.dynamic_functions_used();
+    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    for name in returning_dynamic {
+        if !dynamic_functions.iter().any(|n| n == &name) {
+            dynamic_functions.push(name);
+        }
+    }
+    Ok((
+        LogicalPlan::Merge {
+            db: Some(table_db),
+            table: t.name.clone(),
+            source: Box::new(source),
+            on,
+            clauses: bound_clauses,
+            returning,
+        },
+        dynamic_functions,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn bind_insert(
     db: &PinkDb,
     default_db: &str,
@@ -5232,6 +5746,8 @@ fn bind_insert(
     table: &str,
     columns: &Option<Vec<String>>,
     rows: &[Vec<Expr>],
+    on_conflict: Option<&OnConflict>,
+    returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
@@ -5307,11 +5823,21 @@ fn bind_insert(
         bound_rows.push(bound);
     }
     reject_view_dependency(db, &views_used)?;
+    let (conflict, conflict_dynamic) =
+        bind_conflict(db, &table_db, t, on_conflict, &order, params.clone())?;
+    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    for name in conflict_dynamic.into_iter().chain(returning_dynamic) {
+        if !dynamic_functions.iter().any(|n| n == &name) {
+            dynamic_functions.push(name);
+        }
+    }
     Ok((
         LogicalPlan::Insert {
             db: Some(table_db),
             table: t.name.clone(),
             rows: bound_rows,
+            conflict,
+            returning,
         },
         dynamic_functions,
     ))
@@ -5320,6 +5846,7 @@ fn bind_insert(
 /// Bind `INSERT INTO t [(cols)] SELECT ...`: resolve the target column
 /// indices, bind the query (its own scope), and check the arity and
 /// coercibility of every projected column against the target schema.
+#[allow(clippy::too_many_arguments)]
 fn bind_insert_select(
     db: &PinkDb,
     default_db: &str,
@@ -5327,6 +5854,8 @@ fn bind_insert_select(
     table: &str,
     columns: &Option<Vec<String>>,
     query: &Select,
+    on_conflict: Option<&OnConflict>,
+    returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
@@ -5355,7 +5884,7 @@ fn bind_insert_select(
             }
         }
     }
-    let mut binder = Binder::new(db, default_db).with_params(params);
+    let mut binder = Binder::new(db, default_db).with_params(params.clone());
     let query_plan = bind_select_in(db, &mut binder, query)?;
     let source = plan_schema(db, &binder.default_db, &binder.ctes, &query_plan)?;
     if source.len() != order.len() {
@@ -5374,13 +5903,23 @@ fn bind_insert_select(
         }
     }
     reject_view_dependency(db, &binder.views_used())?;
-    let dynamic = binder.dynamic_functions_used();
+    let mut dynamic = binder.dynamic_functions_used();
+    let (conflict, conflict_dynamic) =
+        bind_conflict(db, &table_db, t, on_conflict, &order, params.clone())?;
+    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    for name in conflict_dynamic.into_iter().chain(returning_dynamic) {
+        if !dynamic.iter().any(|n| n == &name) {
+            dynamic.push(name);
+        }
+    }
     Ok((
         LogicalPlan::InsertSelect {
             db: Some(table_db),
             table: t.name.clone(),
             columns: Some(order),
             query: Box::new(query_plan),
+            conflict,
+            returning,
         },
         dynamic,
     ))
@@ -6270,12 +6809,23 @@ pub(crate) fn plan_schema(
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. } => plan_schema(db, default_db, ctes, input),
+        // A DML statement is a query scope only through `RETURNING` (a
+        // data-modifying CTE); without one it produces no rows.
+        LogicalPlan::Insert { returning, .. }
+        | LogicalPlan::InsertSelect { returning, .. }
+        | LogicalPlan::Update { returning, .. }
+        | LogicalPlan::Delete { returning, .. }
+        | LogicalPlan::Merge { returning, .. } => Ok(match returning {
+            Some(r) => r
+                .names
+                .iter()
+                .cloned()
+                .zip(r.exprs.iter().map(|e| e.dtype()))
+                .collect(),
+            None => Vec::new(),
+        }),
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateTableAs { .. }
-        | LogicalPlan::Insert { .. }
-        | LogicalPlan::InsertSelect { .. }
-        | LogicalPlan::Update { .. }
-        | LogicalPlan::Delete { .. }
         // COPY's result shape is built by the executor (a one-row Count),
         // like DESCRIBE/EXPLAIN's.
         | LogicalPlan::CopyTo { .. }
@@ -6440,6 +6990,7 @@ fn bind_table_function(
                     original: None,
                     db: None,
                     is_alias: alias.is_some(),
+                    qualified_only: false,
                     columns: schema.clone(),
                 },
                 LogicalPlan::TableFunction {
@@ -6585,6 +7136,7 @@ fn bind_source_raw(
                 original: None,
                 db: None,
                 is_alias: alias.is_some(),
+                qualified_only: false,
                 columns: names.iter().cloned().zip(types.iter().copied()).collect(),
             };
             Ok((
@@ -6621,6 +7173,7 @@ fn bind_source_raw(
                         original: None,
                         db: None,
                         is_alias: alias.is_some(),
+                        qualified_only: false,
                         columns: schema.clone(),
                     },
                     LogicalPlan::Scan {
@@ -6681,6 +7234,7 @@ fn bind_source_raw(
                         original: Some(name.to_ascii_lowercase()),
                         db: Some(lookup_db.clone()),
                         is_alias: alias.is_some(),
+                        qualified_only: false,
                         columns: schema,
                     },
                     sub,
@@ -6700,6 +7254,7 @@ fn bind_source_raw(
                     original: Some(name.to_ascii_lowercase()),
                     db: Some(lookup_db.clone()),
                     is_alias: alias.is_some(),
+                    qualified_only: false,
                     columns,
                 },
                 LogicalPlan::Scan {
@@ -6760,6 +7315,7 @@ fn bind_source_raw(
                         original: None,
                         db: None,
                         is_alias: alias.is_some(),
+                        qualified_only: false,
                         columns: schema,
                     },
                     sub,
@@ -6788,6 +7344,7 @@ fn bind_source_raw(
                             original: None,
                             db: None,
                             is_alias: alias.is_some(),
+                            qualified_only: false,
                             columns: schema.clone(),
                         },
                         LogicalPlan::TableFunction {
@@ -6825,6 +7382,7 @@ fn bind_source_raw(
                     original: None,
                     db: None,
                     is_alias: true,
+                    qualified_only: false,
                     columns: schema,
                 },
                 sub,
@@ -6869,11 +7427,46 @@ fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<CtePl
                 cte.name
             )));
         }
+        // A data-modifying CTE is bound as its own statement: the body may
+        // read catalog tables and the CTEs defined before it, never the
+        // statement's own tables. Only the statement's top-level WITH may
+        // hold one (SQL's rule, which DuckDB enforces).
+        if let CteBody::Dml(inner) = &cte.query {
+            if !binder.dml_cte_ok {
+                return Err(PinkDbError::Execution(
+                    "WITH clause containing a data-modifying statement must be at the top level"
+                        .to_string(),
+                ));
+            }
+            if cte.recursive {
+                return Err(PinkDbError::Parse(
+                    "WITH RECURSIVE cannot contain a data-modifying statement".to_string(),
+                ));
+            }
+            let (plan, dynamic) =
+                bind_tracked_plan(db, inner, &binder.default_db, binder.params.clone())?;
+            {
+                let mut used = binder.dynamic_functions_used.borrow_mut();
+                for name in dynamic {
+                    if !used.contains(&name) {
+                        used.push(name);
+                    }
+                }
+            }
+            let schema = cte_schema(db, binder, binder, cte, &plan)?;
+            binder.ctes.push((cte.name.to_ascii_lowercase(), schema));
+            cte_plans.push((cte.name.to_ascii_lowercase(), plan, None));
+            continue;
+        }
         let mut child = binder.child();
+        let body = cte
+            .query
+            .query_select()
+            .expect("non-DML CTE body is a query");
         // `WITH RECURSIVE x AS (anchor UNION [ALL] step)`: bind the anchor
         // first, publish its schema as `x`, then bind the step against it.
-        let (query, recursive) = if cte.recursive && !cte.query.unions.is_empty() {
-            let mut anchor_sel = (*cte.query).clone();
+        let (query, recursive) = if cte.recursive && !body.unions.is_empty() {
+            let mut anchor_sel = body.clone();
             let unions = std::mem::take(&mut anchor_sel.unions);
             if unions.len() != 1 {
                 return Err(PinkDbError::Execution(format!(
@@ -6945,7 +7538,7 @@ fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<CtePl
                 })),
             )
         } else {
-            let query = bind_select_in(db, &mut child, &cte.query)?;
+            let query = bind_select_in(db, &mut child, body)?;
             let schema = cte_schema(db, binder, &child, cte, &query)?;
             binder.ctes.push((cte.name.to_ascii_lowercase(), schema));
             (query, None)
@@ -7001,88 +7594,97 @@ fn wrap_ctes(
     plan
 }
 
-fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<LogicalPlan> {
-    // FROM (+ left-deep join chain). Returns the base plan and left width.
-    let mut base: LogicalPlan;
-    if let Some(from) = &sel.from {
-        let (left, left_plan) = bind_source(
+/// Bind one `FROM` clause into `binder.tables`, returning its plan.
+///
+/// Sources append to whatever scopes `binder` already holds, so a
+/// `UPDATE … FROM` / `DELETE … USING` / `MERGE … USING` source starts at
+/// column 0 and the statement's target row follows it in every expression's
+/// input row. For a SELECT the scope starts empty.
+fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Result<LogicalPlan> {
+    let (left, left_plan) = bind_source(
+        db,
+        binder,
+        &from.source,
+        &from.alias,
+        &from.col_aliases,
+        from.at,
+    )?;
+    let mut left_cols = left.columns.len();
+    let mut base = left_plan;
+    binder.tables.push(left);
+    for join in &from.joins {
+        let (right, right_plan) = bind_source(
             db,
             binder,
-            &from.source,
-            &from.alias,
-            &from.col_aliases,
-            from.at,
+            &join.source,
+            &join.alias,
+            &join.col_aliases,
+            join.at,
         )?;
-        let mut left_cols = left.columns.len();
-        base = left_plan;
-        binder.tables.push(left);
-        for join in &from.joins {
-            let (right, right_plan) = bind_source(
-                db,
-                binder,
-                &join.source,
-                &join.alias,
-                &join.col_aliases,
-                join.at,
-            )?;
-            // The same effective name twice is refused, except for two
-            // unaliased base tables from *different* databases
-            // (`FROM db1.t JOIN db2.t`, wave 94): those stay in scope and a
-            // two-part `t.c` is ambiguous; a three-part reference or an alias
-            // disambiguates. Every other duplicate keeps the old error.
-            let duplicate = binder.tables.iter().any(|t| {
-                t.name == right.name
-                    && match (&t.db, &right.db) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => true,
-                    }
-            });
-            if duplicate {
-                return Err(PinkDbError::Catalog(format!(
-                    "table name \"{}\" specified more than once (use an alias)",
-                    right.name
-                )));
-            }
-            // The right scope joins the accumulated scope before the ON
-            // condition binds, so `ON` sees the left tables ++ right table
-            // (joined-space column indices).
-            binder.tables.push(right);
-            let shape = bind_join_shape(binder, join.kind, left_cols, join.on.as_ref())?;
-            base = match shape {
-                BoundJoin::Hash {
-                    left_keys,
-                    right_keys,
-                    residual,
-                } => {
-                    let mut join = LogicalPlan::Join {
-                        kind: join.kind,
-                        left: Box::new(base),
-                        right: Box::new(right_plan),
-                        left_keys,
-                        right_keys,
-                        left_cols,
-                    };
-                    if let Some(predicate) = residual {
-                        join = LogicalPlan::Filter {
-                            input: Box::new(join),
-                            predicate,
-                        };
-                    }
-                    join
+        // The same effective name twice is refused, except for two
+        // unaliased base tables from *different* databases
+        // (`FROM db1.t JOIN db2.t`, wave 94): those stay in scope and a
+        // two-part `t.c` is ambiguous; a three-part reference or an alias
+        // disambiguates. Every other duplicate keeps the old error.
+        let duplicate = binder.tables.iter().any(|t| {
+            t.name == right.name
+                && match (&t.db, &right.db) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
                 }
-                BoundJoin::Nested { on } => LogicalPlan::NestedLoopJoin {
+        });
+        if duplicate {
+            return Err(PinkDbError::Catalog(format!(
+                "table name \"{}\" specified more than once (use an alias)",
+                right.name
+            )));
+        }
+        // The right scope joins the accumulated scope before the ON
+        // condition binds, so `ON` sees the left tables ++ right table
+        // (joined-space column indices).
+        binder.tables.push(right);
+        let shape = bind_join_shape(binder, join.kind, left_cols, join.on.as_ref())?;
+        base = match shape {
+            BoundJoin::Hash {
+                left_keys,
+                right_keys,
+                residual,
+            } => {
+                let mut join = LogicalPlan::Join {
                     kind: join.kind,
                     left: Box::new(base),
                     right: Box::new(right_plan),
-                    on,
+                    left_keys,
+                    right_keys,
                     left_cols,
-                },
-            };
-            left_cols += binder.tables.last().expect("pushed above").columns.len();
-        }
-    } else {
-        base = LogicalPlan::SingleRow;
+                };
+                if let Some(predicate) = residual {
+                    join = LogicalPlan::Filter {
+                        input: Box::new(join),
+                        predicate,
+                    };
+                }
+                join
+            }
+            BoundJoin::Nested { on } => LogicalPlan::NestedLoopJoin {
+                kind: join.kind,
+                left: Box::new(base),
+                right: Box::new(right_plan),
+                on,
+                left_cols,
+            },
+        };
+        left_cols += binder.tables.last().expect("pushed above").columns.len();
     }
+    Ok(base)
+}
+
+fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<LogicalPlan> {
+    // FROM (+ left-deep join chain).
+    let base = match &sel.from {
+        Some(from) => bind_from_scope(db, binder, from)?,
+        None => LogicalPlan::SingleRow,
+    };
 
     for proj in &sel.projections {
         if let Projection::Expr {

@@ -9,6 +9,80 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-25
+### Wave 95b — SQL dialect completeness, batch 2 (DML) ✅
+- **Upserts.** `INSERT … ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]`
+  with `excluded.col` (the proposed row) and the target table readable in the
+  `SET`/`WHERE`; `INSERT OR REPLACE` (= `DO UPDATE` over the columns the
+  statement writes, so unlisted columns keep their stored values) and
+  `INSERT OR IGNORE` (= `DO NOTHING` for every key). A conflict target must be
+  a declared `PRIMARY KEY`/`UNIQUE` constraint — DuckDB's refusal, verbatim —
+  and a duplicated key inside one statement keeps the first input row.
+  `ON DUPLICATE KEY UPDATE` and `REPLACE INTO` stay refused by name (DuckDB
+  has no `REPLACE INTO` either).
+- **Keys are enforced now.** Wave 103 left `PRIMARY KEY`/`UNIQUE` as metadata;
+  `ON CONFLICT` without enforcement is incoherent, so `INSERT`/`UPDATE`/`MERGE`
+  check every declared key per statement (`crates/pinkdb/src/keys.rs`: one hash
+  map per statement, built from the table and updated as rows are staged). A
+  duplicate — or a `NULL` in a primary key, or a multi-row insert whose rows
+  collide with each other — raises DuckDB's message and the statement leaves
+  the store unchanged. `UNIQUE` accepts any number of `NULL`s; `REFERENCES`
+  stays a declaration (`DESCRIBE`/FK→PK join elimination only). Cost, measured:
+  1 M-row `INSERT … SELECT` into a PK table 0.095 → 0.381 s (median of five,
+  ~3.5 M keys/s); a bulk `UPDATE` that does not write a key column and a
+  `DELETE` are unchanged.
+- **`UPDATE … FROM` / `DELETE … USING`.** The source is bound before the
+  target, so `FROM`/`JOIN` columns come first in expressions. Several source
+  rows matching one target row: `UPDATE … FROM` keeps the last one in source
+  order (DuckDB's answer — no error, unlike Postgres), `DELETE … USING`
+  deletes once.
+- **`RETURNING`** on `INSERT`/`UPDATE`/`DELETE`, on `ON CONFLICT` (scalar
+  subqueries in the projection included) and on `MERGE`. The rows come from the
+  write funnels, so they are the final image: a `BEFORE` row trigger's rewrite
+  of `NEW` is what `RETURNING` reports, and a `DELETE` reports its rows in scan
+  order. An `ON CONFLICT` action that stores the values already there still
+  counts as affected, like DuckDB.
+- **`MERGE INTO … USING … ON …`** with `WHEN MATCHED [AND …] THEN UPDATE SET …
+  | DELETE`, `WHEN NOT MATCHED [AND …] THEN INSERT [(cols)] VALUES (…)`,
+  `WHEN NOT MATCHED BY SOURCE [AND …]`, first matching clause wins, a target
+  row affected by more than one source row refused with DuckDB's "cannot affect
+  the same target row more than once" and the statement atomic. The source is
+  materialized once; matching is a nested loop (a `shortcut:` comment documents
+  a hash join as the upgrade path).
+- **Data-modifying CTEs.** `WITH x AS (INSERT/UPDATE/DELETE … [RETURNING …])
+  SELECT … FROM x`: the body runs once, at the top level (a nested one is
+  DuckDB's "must be at the top level" error), and its rows are served from an
+  in-memory hand-off (`db.dml_cte_outputs`) because the evaluator holds the
+  store immutably. `COPY` as a CTE step stays refused (it is ADMIN-gated as a
+  statement; a CTE step would bypass that gate).
+- **AST, parser, binder, plan, executor, EXPLAIN.** `Statement`/`LogicalPlan`
+  carry `conflict`/`returning`/`from`/`using`, plus `LogicalPlan::Merge` and a
+  `CteBody::Dml` CTE body; the AST walkers (depth guard, parameter renumbering)
+  recurse into all of them; `EXPLAIN` prints the conflict action and the MERGE
+  clauses.
+- **Durability.** The WAL logs each statement's SQL text, so every new form
+  replays by re-execution. `crates/pinkdb/tests/dml_replay.rs` writes upserts,
+  `MERGE`, `UPDATE … FROM`, `DELETE … USING` and a DML CTE, drops the process
+  without a checkpoint, reopens (replay) and compares; then checkpoints and
+  reopens again.
+- **Privileges and the MCP.** The per-statement gate sees every table: `MERGE`
+  needs the privilege of each action its clauses spell out plus `SELECT` on its
+  `USING` source, `UPDATE … FROM`/`DELETE … USING` need `SELECT` on the source,
+  a DML CTE's target needs its write privilege, and the read pass walks the CTE
+  body. The MCP read-only policy refuses every new statement kind and a `WITH`
+  whose body writes (tests in `serve.rs`).
+- **Tests.** `sql_conformance.rs` gained 25 DML cases pinned to DuckDB and
+  re-measured on DuckDB 2.0.0 (the same 25 run in `bench/duckdiff.py`, 336/336
+  passing), the error cases, key enforcement, `RETURNING` after triggers, the
+  DML-CTE `EXPLAIN`, and MERGE's multiple-match; `rbac.rs`, `dml_replay.rs` and
+  `serve.rs` cover the gates. Gates: clippy clean, workspace 1856 passed /
+  0 failed (8 ignored), `-p pinkdb` 855 (6 ignored), `-p pinkdb-cli --features
+  pinklake,s3,parquetlake` 168, wasm32 build, duckdiff 336/336.
+- **No regression** for existing DML: interleaved A/B against HEAD `6531691`
+  (own worktree + target dir), five rounds, medians —
+  `INSERT INTO t2 SELECT * FROM t` 1 M rows 0.095 → 0.381 s (the key check),
+  `UPDATE t SET v = v + 1` 1 M rows 0.025 → 0.025 s, `DELETE FROM t WHERE id %
+  2 = 0` 500 k rows 0.019 → 0.019 s (`bench/wave95b_perf/`).
+
 ### Wave 95a — SQL dialect completeness, batch 1 ✅
 - **The matrix first.** `docs/sql-conformance.md`
   lists every query form row 95 scopes, each checked by running it against
@@ -30,10 +104,8 @@ one-liners below.
   `UNION ALL` not; bounded at 100 000 iterations and 10 000 000 rows — both
   are errors, so a runaway recursion cannot hang the engine); and
   `UNION`/`INTERSECT`/`EXCEPT` `ALL` are covered by the corpus now.
-- **Everything else fails by name.** Every form 95b/95c will add is recognised
-  and refused with a `wave 95b`/`wave 95c` sentence (`MERGE`, `ON CONFLICT`,
-  `RETURNING`, `UPDATE … FROM`, `DELETE … USING`, data-modifying CTEs,
-  `LATERAL`, `WITHIN GROUP`, `TABLESAMPLE`, `FOR UPDATE`/`SHARE`,
+- **Everything else fails by name.** Every form 95c will add is recognised
+  and refused with a `wave 95c` sentence (`LATERAL`, `WITHIN GROUP`, `TABLESAMPLE`, `FOR UPDATE`/`SHARE`,
   `AT TIME ZONE`, row constructors, list literals, `FILTER` on a window, a
   window built on a window, VARIANT slicing, `SET VARIABLE`, `$name`), and the
   refusal is reported on its own instead of inside peg's expected-token list.
@@ -43,7 +115,7 @@ one-liners below.
   operator (`Window` for `QUALIFY`, `Distinct` for `DISTINCT ON`, …).
 - **Tests.** `crates/pinkdb/tests/sql_conformance.rs`: 25 shared-corpus cases
   pinned to DuckDB's answers and re-measured on DuckDB when
-  `/tmp/duckdb-2.0.0/duckdb` exists, the EXPLAIN shapes, the 95b/95c refusals,
+  `/tmp/duckdb-2.0.0/duckdb` exists, the EXPLAIN shapes, the 95c refusals,
   and the pinkdb-only shapes (VARIANT subscripts, grouping masks, recursion
   bounds). A `SELECT 1.e2` regression from the new `.field` postfix is a parse
   error again.

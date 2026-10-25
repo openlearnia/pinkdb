@@ -107,11 +107,22 @@ pub fn statement_allowed(stmt: &Statement, allow_writes: bool) -> bool {
     if allow_writes {
         return true;
     }
+    // A `WITH` whose bodies write is a `Select` on the surface, so the
+    // allowlist has to look inside it.
+    if let Statement::Select(sel) = stmt {
+        return sel
+            .with
+            .iter()
+            .all(|cte| matches!(cte.query, crate::sql::ast::CteBody::Query(_)));
+    }
+    // `EXPLAIN` is as allowed as what it explains: `EXPLAIN SELECT` stays
+    // readable, `EXPLAIN INSERT …` is a write path.
+    if let Statement::Explain(inner) = stmt {
+        return statement_allowed(inner, allow_writes);
+    }
     matches!(
         stmt,
-        Statement::Select(_)
-            | Statement::Explain(_)
-            | Statement::Describe { .. }
+        Statement::Describe { .. }
             | Statement::DescribeMacro { .. }
             | Statement::ShowTables
             | Statement::ShowDatabases
@@ -284,13 +295,16 @@ fn scans_files(db: &PinkDb, statement: &Statement) -> bool {
 fn ast_scans_files(statement: &Statement) -> bool {
     match statement {
         Statement::Select(select) => select_scans_files(select),
-        Statement::Explain(select) => select_scans_files(select),
+        Statement::Explain(inner) => ast_scans_files(inner),
         _ => false,
     }
 }
 
 fn select_scans_files(select: &crate::sql::ast::Select) -> bool {
-    select.with.iter().any(|cte| select_scans_files(&cte.query))
+    select
+        .with
+        .iter()
+        .any(|cte| cte.query.query_select().is_some_and(select_scans_files))
         || select.from.as_ref().is_some_and(from_scans_files)
         || select
             .unions
@@ -723,6 +737,12 @@ mod tests {
         let sql = "SELECT 1; EXPLAIN SELECT 1; DESCRIBE t; SHOW TABLES; SHOW DATABASES; \
                    SHOW MATERIALIZED VIEWS; SHOW MACROS; USE main; \
                    INSERT INTO t VALUES (1, 'x'); UPDATE t SET a = 1; DELETE FROM t; \
+                   INSERT INTO t VALUES (1, 'x') ON CONFLICT DO NOTHING; \
+                   INSERT OR REPLACE INTO t VALUES (1, 'x'); \
+                   INSERT INTO t VALUES (1, 'x') RETURNING *; \
+                   UPDATE t SET a = 1 FROM u WHERE t.a = u.a; \
+                   DELETE FROM t USING u WHERE t.a = u.a; \
+                   MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE; \
                    CREATE TABLE u (a INT); CREATE TABLE u AS SELECT 1; DROP TABLE t; \
                    ALTER TABLE t ADD COLUMN b INT; CREATE VIEW v AS SELECT 1; DROP VIEW v; \
                    CREATE DATABASE d; DROP DATABASE d; COPY t TO 'x.parquet'; \
@@ -769,6 +789,21 @@ mod tests {
         }
         for name in allowed {
             assert!(seen.contains(name), "the sample script has no {name}");
+        }
+    }
+
+    #[test]
+    fn a_data_modifying_cte_is_refused_read_only() {
+        // The statement parses as a `Select`, so the allowlist must look at
+        // its `WITH` bodies.
+        for sql in [
+            "WITH x AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM x",
+            "WITH x AS (UPDATE t SET a = 1 RETURNING *) SELECT * FROM x",
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+        ] {
+            let stmts = crate::sql::parse_statements(sql).unwrap();
+            assert!(!statement_allowed(&stmts[0], false), "{sql}");
+            assert!(statement_allowed(&stmts[0], true), "{sql}");
         }
     }
 

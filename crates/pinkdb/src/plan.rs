@@ -4,9 +4,62 @@
 use std::collections::HashMap;
 
 use crate::attached::AtSpec;
-use crate::sql::ast::{JoinKind, Select, SetOp, SortSpec};
+use crate::sql::ast::{JoinKind, MergeMatch, Select, SetOp, SortSpec};
 use crate::sql::binder::{BoundAgg, BoundExpr, BoundWindow};
 use crate::types::{DataType, Value};
+
+/// The rows a DML statement returns (`RETURNING`, wave 95b): the final row
+/// images, after BEFORE triggers ran.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Returning {
+    pub exprs: Vec<BoundExpr>,
+    pub names: Vec<String>,
+}
+
+/// `ON CONFLICT` (wave 95b). A conflict is a duplicate of a declared
+/// `PRIMARY KEY`/`UNIQUE` key; the executor enforces those on every write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConflictPlan {
+    /// Conflict-target column indices (`None` = any key constraint).
+    pub target: Option<Vec<usize>>,
+    pub action: ConflictActionPlan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictActionPlan {
+    Nothing,
+    Update {
+        /// `(target column, value)`; expressions address the existing row
+        /// followed by the rejected (`excluded`) row.
+        sets: Vec<(usize, BoundExpr)>,
+        /// `DO UPDATE … WHERE`: the update applies only when TRUE.
+        predicate: Option<BoundExpr>,
+    },
+}
+
+/// One resolved `WHEN … THEN …` clause of a `MERGE`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeClausePlan {
+    pub matched: MergeMatch,
+    pub condition: Option<BoundExpr>,
+    pub action: MergeActionPlan,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeActionPlan {
+    /// `(target column, value)`; expressions address the target row followed
+    /// by the matching source row.
+    Update {
+        sets: Vec<(usize, BoundExpr)>,
+    },
+    Delete,
+    Insert {
+        /// Target column indices; `values` are constants or references into
+        /// the target row ++ source row scope.
+        columns: Vec<usize>,
+        values: Vec<BoundExpr>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
@@ -44,6 +97,9 @@ pub enum LogicalPlan {
         /// One bound expr per table column per row (constants; missing
         /// columns are NULL). Evaluated against an empty single-row chunk.
         rows: Vec<Vec<BoundExpr>>,
+        /// `ON CONFLICT` / `INSERT OR REPLACE|IGNORE` (wave 95b).
+        conflict: Option<ConflictPlan>,
+        returning: Option<Returning>,
     },
     /// `INSERT INTO t [(cols)] SELECT ...`.
     InsertSelect {
@@ -52,6 +108,8 @@ pub enum LogicalPlan {
         /// Target column indices in written order (`None` = every column).
         columns: Option<Vec<usize>>,
         query: Box<LogicalPlan>,
+        conflict: Option<ConflictPlan>,
+        returning: Option<Returning>,
     },
     Update {
         db: Option<String>,
@@ -60,11 +118,31 @@ pub enum LogicalPlan {
         /// columns and evaluate simultaneously per row (pre-update values).
         sets: Vec<(usize, BoundExpr)>,
         predicate: Option<BoundExpr>,
+        /// `UPDATE … FROM` (wave 95b): extra rows appended after the target's
+        /// columns in every expression's input row.
+        from: Option<Box<LogicalPlan>>,
+        returning: Option<Returning>,
     },
     Delete {
         db: Option<String>,
         table: String,
         predicate: Option<BoundExpr>,
+        /// `DELETE … USING` (wave 95b): extra rows appended after the
+        /// target's columns in the predicate's input row.
+        using: Option<Box<LogicalPlan>>,
+        returning: Option<Returning>,
+    },
+    /// `MERGE INTO target USING source ON cond WHEN … THEN …` (wave 95b).
+    Merge {
+        db: Option<String>,
+        table: String,
+        source: Box<LogicalPlan>,
+        /// The ON condition over `[target columns, source columns]`.
+        on: BoundExpr,
+        /// In written order: the first clause whose kind and condition hold
+        /// wins (DuckDB's rule).
+        clauses: Vec<MergeClausePlan>,
+        returning: Option<Returning>,
     },
     /// `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71): write one
     /// store table to a registered file format. External side effect only —
@@ -532,36 +610,40 @@ pub struct DescribeColumn {
 /// read-only for locking: it only changes session state (the WAL record is
 /// appended through the WAL's own lock).
 pub fn is_read_only(plan: &LogicalPlan) -> bool {
-    matches!(
-        plan,
-        LogicalPlan::Scan { .. }
-            // COPY writes an external file, never the store: it can run under
-            // a read lock (and is never WAL-logged).
-            | LogicalPlan::CopyTo { .. }
-            | LogicalPlan::SingleRow
-            | LogicalPlan::Filter { .. }
-            | LogicalPlan::Join { .. }
-            | LogicalPlan::NestedLoopJoin { .. }
-            | LogicalPlan::Aggregate { .. }
-            | LogicalPlan::Project { .. }
-            | LogicalPlan::Distinct { .. }
-            | LogicalPlan::Values { .. }
-            | LogicalPlan::Sort { .. }
-            | LogicalPlan::Limit { .. }
-            | LogicalPlan::Offset { .. }
-            | LogicalPlan::Cte { .. }
-            | LogicalPlan::Window { .. }
-            | LogicalPlan::SetOp { .. }
-            | LogicalPlan::Use { .. }
-            | LogicalPlan::ShowTables { .. }
-            | LogicalPlan::ShowDatabases
-            | LogicalPlan::ShowMaterializedViews { .. }
-            | LogicalPlan::ShowMacros { .. }
-            | LogicalPlan::ShowTriggers { .. }
-            | LogicalPlan::Describe { .. }
-            | LogicalPlan::DescribeMacro { .. }
-            | LogicalPlan::Explain { .. }
-    )
+    match plan {
+        // A data-modifying CTE is only as read-only as the statement it
+        // wraps (wave 95b).
+        LogicalPlan::Cte { query, body, .. } => is_read_only(query) && is_read_only(body),
+        _ => matches!(
+            plan,
+            LogicalPlan::Scan { .. }
+                // COPY writes an external file, never the store: it can run
+                // under a read lock (and is never WAL-logged).
+                | LogicalPlan::CopyTo { .. }
+                | LogicalPlan::SingleRow
+                | LogicalPlan::Filter { .. }
+                | LogicalPlan::Join { .. }
+                | LogicalPlan::NestedLoopJoin { .. }
+                | LogicalPlan::Aggregate { .. }
+                | LogicalPlan::Project { .. }
+                | LogicalPlan::Distinct { .. }
+                | LogicalPlan::Values { .. }
+                | LogicalPlan::Sort { .. }
+                | LogicalPlan::Limit { .. }
+                | LogicalPlan::Offset { .. }
+                | LogicalPlan::Window { .. }
+                | LogicalPlan::SetOp { .. }
+                | LogicalPlan::Use { .. }
+                | LogicalPlan::ShowTables { .. }
+                | LogicalPlan::ShowDatabases
+                | LogicalPlan::ShowMaterializedViews { .. }
+                | LogicalPlan::ShowMacros { .. }
+                | LogicalPlan::ShowTriggers { .. }
+                | LogicalPlan::Describe { .. }
+                | LogicalPlan::DescribeMacro { .. }
+                | LogicalPlan::Explain { .. }
+        ),
+    }
 }
 
 /// Attach the statement's source text to a bound `CREATE MATERIALIZED VIEW`
@@ -640,6 +722,11 @@ pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> Logical
 /// it, the next record touching an extension re-loads it by path — a missing
 /// file at replay time is then a hard recovery error, never a silent drop.
 pub fn writes_tables(plan: &LogicalPlan) -> bool {
+    // A data-modifying CTE (wave 95b) must be logged like the statement it
+    // wraps, and its body may itself read tables.
+    if let LogicalPlan::Cte { query, body, .. } = plan {
+        return writes_tables(query) || writes_tables(body);
+    }
     matches!(
         plan,
         LogicalPlan::CreateTable { .. }
@@ -648,6 +735,7 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::InsertSelect { .. }
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. }
+            | LogicalPlan::Merge { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
             // Wave 79 (durability half): the hash index catalog is in-memory
@@ -925,41 +1013,32 @@ pub(crate) fn collect_tables_read(
         }
         LogicalPlan::Explain { plan } => collect_tables_read(plan, default_db, out),
         LogicalPlan::CreateTableAs { query, .. } => collect_tables_read(query, default_db, out),
-        LogicalPlan::InsertSelect { query, .. } => {
-            collect_tables_read(query, default_db, out);
-        }
-        LogicalPlan::Insert { rows, .. } => {
-            for e in rows.iter().flatten() {
-                expr_tables_read(e, default_db, out);
-            }
-        }
         LogicalPlan::Values { rows, .. } => {
             for e in rows.iter().flatten() {
                 expr_tables_read(e, default_db, out);
             }
         }
-        LogicalPlan::Update {
-            db,
-            table,
-            sets,
-            predicate,
-        } => {
-            out.insert(key(db, table));
-            for (_, e) in sets {
+        LogicalPlan::Insert { .. } | LogicalPlan::InsertSelect { .. } => {
+            let (exprs, plans) = dml_payload(plan);
+            for p in plans {
+                collect_tables_read(p, default_db, out);
+            }
+            for e in exprs {
                 expr_tables_read(e, default_db, out);
             }
-            if let Some(p) = predicate {
-                expr_tables_read(p, default_db, out);
-            }
         }
-        LogicalPlan::Delete {
-            db,
-            table,
-            predicate,
-        } => {
+        // The target is both read (scanned for the affected rows) and
+        // written; the conflict/RETURNING payloads may read more.
+        LogicalPlan::Update { db, table, .. }
+        | LogicalPlan::Delete { db, table, .. }
+        | LogicalPlan::Merge { db, table, .. } => {
             out.insert(key(db, table));
-            if let Some(p) = predicate {
-                expr_tables_read(p, default_db, out);
+            let (exprs, plans) = dml_payload(plan);
+            for p in plans {
+                collect_tables_read(p, default_db, out);
+            }
+            for e in exprs {
+                expr_tables_read(e, default_db, out);
             }
         }
         LogicalPlan::SetOp { left, right, .. } => {
@@ -1091,6 +1170,101 @@ fn expr_tables_read(
     }
 }
 
+/// The `ON CONFLICT` expressions of `c`, for the read analysis.
+fn conflict_exprs<'a>(c: &'a Option<ConflictPlan>, exprs: &mut Vec<&'a BoundExpr>) {
+    if let Some(ConflictPlan {
+        action: ConflictActionPlan::Update { sets, predicate },
+        ..
+    }) = c
+    {
+        exprs.extend(sets.iter().map(|(_, e)| e));
+        exprs.extend(predicate.as_ref());
+    }
+}
+
+/// The `RETURNING` expressions of `r`, for the read analysis.
+fn returning_exprs<'a>(r: &'a Option<Returning>, exprs: &mut Vec<&'a BoundExpr>) {
+    if let Some(r) = r {
+        exprs.extend(r.exprs.iter());
+    }
+}
+
+/// The bound expressions of a DML statement's wave-95b payloads (`ON
+/// CONFLICT`, `FROM`/`USING`, `MERGE` clauses, `RETURNING`) and the nested
+/// plans they hide. The analysis walkers below must visit all of them: a
+/// subquery or table function inside one is still a read.
+fn dml_payload(plan: &LogicalPlan) -> (Vec<&BoundExpr>, Vec<&LogicalPlan>) {
+    let mut exprs: Vec<&BoundExpr> = Vec::new();
+    let mut plans: Vec<&LogicalPlan> = Vec::new();
+    match plan {
+        LogicalPlan::Insert {
+            rows,
+            conflict: c,
+            returning: r,
+            ..
+        } => {
+            exprs.extend(rows.iter().flatten());
+            conflict_exprs(c, &mut exprs);
+            returning_exprs(r, &mut exprs);
+        }
+        LogicalPlan::InsertSelect {
+            query,
+            conflict: c,
+            returning: r,
+            ..
+        } => {
+            plans.push(query);
+            conflict_exprs(c, &mut exprs);
+            returning_exprs(r, &mut exprs);
+        }
+        LogicalPlan::Update {
+            sets,
+            predicate,
+            from,
+            returning: r,
+            ..
+        } => {
+            exprs.extend(sets.iter().map(|(_, e)| e));
+            exprs.extend(predicate.as_ref());
+            plans.extend(from.as_deref());
+            returning_exprs(r, &mut exprs);
+        }
+        LogicalPlan::Delete {
+            predicate,
+            using,
+            returning: r,
+            ..
+        } => {
+            exprs.extend(predicate.as_ref());
+            plans.extend(using.as_deref());
+            returning_exprs(r, &mut exprs);
+        }
+        LogicalPlan::Merge {
+            source,
+            on,
+            clauses,
+            returning: r,
+            ..
+        } => {
+            plans.push(source);
+            exprs.push(on);
+            for clause in clauses {
+                exprs.extend(clause.condition.as_ref());
+                match &clause.action {
+                    MergeActionPlan::Update { sets } => {
+                        exprs.extend(sets.iter().map(|(_, e)| e));
+                    }
+                    MergeActionPlan::Delete => {}
+                    MergeActionPlan::Insert { values, .. } => exprs.extend(values.iter()),
+                }
+            }
+            returning_exprs(r, &mut exprs);
+        }
+        _ => {}
+    }
+    (exprs, plans)
+}
+
 /// Does `plan` (including every nested expression/subquery) contain a
 /// [`LogicalPlan::TableFunction`] leaf? M-4: `check_statement` uses this to
 /// require ADMIN for any file/table-function scan in an authenticated
@@ -1102,7 +1276,6 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::TableFunction { .. } => true,
         LogicalPlan::CreateTableAs { query, .. }
-        | LogicalPlan::InsertSelect { query, .. }
         | LogicalPlan::CreateMaterializedView { query, .. }
         | LogicalPlan::Explain { plan: query } => contains_table_function(query),
         LogicalPlan::Cte { query, body, .. } => {
@@ -1168,15 +1341,14 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::IndexScan { value, .. } => expr_contains_table_function(value),
         LogicalPlan::Call { args, .. } => args.iter().any(expr_contains_table_function),
-        LogicalPlan::Insert { rows, .. } => rows.iter().flatten().any(expr_contains_table_function),
-        LogicalPlan::Update {
-            sets, predicate, ..
-        } => {
-            sets.iter().any(|(_, e)| expr_contains_table_function(e))
-                || predicate.as_ref().is_some_and(expr_contains_table_function)
-        }
-        LogicalPlan::Delete { predicate, .. } => {
-            predicate.as_ref().is_some_and(expr_contains_table_function)
+        LogicalPlan::Insert { .. }
+        | LogicalPlan::InsertSelect { .. }
+        | LogicalPlan::Update { .. }
+        | LogicalPlan::Delete { .. }
+        | LogicalPlan::Merge { .. } => {
+            let (exprs, plans) = dml_payload(plan);
+            exprs.iter().any(|e| expr_contains_table_function(e))
+                || plans.iter().any(|p| contains_table_function(p))
         }
         LogicalPlan::AlterTable { op, .. } => match op {
             AlterTablePlan::AddColumn { default, .. } => {
@@ -1449,29 +1621,18 @@ fn walk_scan_filters(
             }
         }
         LogicalPlan::Explain { plan } => walk_scan_filters(plan, &[], out),
-        LogicalPlan::CreateTableAs { query, .. } | LogicalPlan::InsertSelect { query, .. } => {
-            walk_scan_filters(query, &[], out)
-        }
-        LogicalPlan::Insert { rows, .. } => {
-            for row in rows {
-                for e in row {
-                    walk_expr_subquery_filters(e, out);
-                }
-            }
-        }
-        LogicalPlan::Update {
-            sets, predicate, ..
-        } => {
-            for (_, e) in sets {
+        LogicalPlan::CreateTableAs { query, .. } => walk_scan_filters(query, &[], out),
+        LogicalPlan::Insert { .. }
+        | LogicalPlan::InsertSelect { .. }
+        | LogicalPlan::Update { .. }
+        | LogicalPlan::Delete { .. }
+        | LogicalPlan::Merge { .. } => {
+            let (exprs, plans) = dml_payload(plan);
+            for e in exprs {
                 walk_expr_subquery_filters(e, out);
             }
-            if let Some(p) = predicate {
-                walk_expr_subquery_filters(p, out);
-            }
-        }
-        LogicalPlan::Delete { predicate, .. } => {
-            if let Some(p) = predicate {
-                walk_expr_subquery_filters(p, out);
+            for p in plans {
+                walk_scan_filters(p, &[], out);
             }
         }
         LogicalPlan::SetOp { left, right, .. } => {
@@ -1774,7 +1935,6 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
         LogicalPlan::IndexScan { value, .. } => exprs.push(value),
         LogicalPlan::Call { args, .. } => exprs.extend(args.iter()),
         LogicalPlan::CreateTableAs { query, .. }
-        | LogicalPlan::InsertSelect { query, .. }
         | LogicalPlan::CreateMaterializedView { query, .. } => children.push(query),
         LogicalPlan::Cte { query, body, .. } => {
             children.push(query);
@@ -1788,23 +1948,14 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
                 exprs.push(e);
             }
         }
-        LogicalPlan::Insert { rows, .. } => {
-            for row in rows {
-                exprs.extend(row.iter());
-            }
-        }
-        LogicalPlan::Update {
-            sets, predicate, ..
-        } => {
-            exprs.extend(sets.iter().map(|(_, e)| e));
-            if let Some(p) = predicate {
-                exprs.push(p);
-            }
-        }
-        LogicalPlan::Delete { predicate, .. } => {
-            if let Some(p) = predicate {
-                exprs.push(p);
-            }
+        LogicalPlan::Insert { .. }
+        | LogicalPlan::InsertSelect { .. }
+        | LogicalPlan::Update { .. }
+        | LogicalPlan::Delete { .. }
+        | LogicalPlan::Merge { .. } => {
+            let (e, p) = dml_payload(plan);
+            exprs.extend(e);
+            children.extend(p);
         }
         LogicalPlan::RefreshMaterializedView { .. } => {}
         LogicalPlan::Explain { plan } => children.push(plan),
@@ -2092,40 +2243,25 @@ fn walk_scan_projections(
         }
         // DML/DDL never runs through the projection-aware read path; their
         // expressions' subquery plans are still analyzed (in full).
-        LogicalPlan::Insert { rows, .. } => {
-            for row in rows {
-                for e in row {
-                    let mut need = Needed::All;
-                    collect_expr_projections(e, &mut need, out);
-                }
+        LogicalPlan::Insert { .. }
+        | LogicalPlan::InsertSelect { .. }
+        | LogicalPlan::Update { .. }
+        | LogicalPlan::Delete { .. }
+        | LogicalPlan::Merge { .. } => {
+            let (exprs, plans) = dml_payload(plan);
+            for e in exprs {
+                let mut need = Needed::All;
+                collect_expr_projections(e, &mut need, out);
             }
-        }
-        LogicalPlan::InsertSelect { query, .. } => {
-            walk_scan_projections(query, &Needed::All, out);
+            for p in plans {
+                walk_scan_projections(p, &Needed::All, out);
+            }
         }
         LogicalPlan::CreateTableAs { query, .. } => {
             walk_scan_projections(query, &Needed::All, out);
         }
         LogicalPlan::Explain { plan } => {
             walk_scan_projections(plan, &Needed::All, out);
-        }
-        LogicalPlan::Update {
-            sets, predicate, ..
-        } => {
-            for (_, e) in sets {
-                let mut need = Needed::All;
-                collect_expr_projections(e, &mut need, out);
-            }
-            if let Some(p) = predicate {
-                let mut need = Needed::All;
-                collect_expr_projections(p, &mut need, out);
-            }
-        }
-        LogicalPlan::Delete { predicate, .. } => {
-            if let Some(p) = predicate {
-                let mut need = Needed::All;
-                collect_expr_projections(p, &mut need, out);
-            }
         }
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::AlterTable { .. }

@@ -239,6 +239,9 @@ pub(crate) fn plan_dml(
         }
         LogicalPlan::Update { db, table, .. } => (db, table, TriggerEvent::Update),
         LogicalPlan::Delete { db, table, .. } => (db, table, TriggerEvent::Delete),
+        // MERGE fires INSERT/UPDATE/DELETE row triggers through the write
+        // funnels; its one statement-level event is UPDATE.
+        LogicalPlan::Merge { db, table, .. } => (db, table, TriggerEvent::Update),
         _ => return None,
     };
     let db = qdb.clone().unwrap_or_else(|| default_db.to_string());
@@ -399,8 +402,33 @@ pub(crate) fn fire_row_triggers(
     Ok(image)
 }
 
+/// Where the next appended row lands: the tail chunk when it has room, a new
+/// chunk otherwise (the rule [`DataTable::append_row`] follows).
+fn next_row_id(t: &DataTable) -> (usize, usize) {
+    let chunks = t.num_chunks();
+    if chunks == 0 {
+        return (0, 0);
+    }
+    // Appends only ever extend the tail chunk.
+    let tail = t.columns[0].chunks[chunks - 1].len();
+    if tail >= crate::vector::CHUNK_SIZE {
+        (chunks, 0)
+    } else {
+        (chunks - 1, tail)
+    }
+}
+
 /// Append staged rows, firing the table's `INSERT` row triggers per row.
 ///
+/// The id row `offset` rows past the tail will get once appended.
+fn predicted_id(t: &DataTable, offset: usize) -> crate::keys::RowId {
+    let global = t.num_rows() + offset;
+    crate::keys::RowId::new(
+        global / crate::vector::CHUNK_SIZE,
+        global % crate::vector::CHUNK_SIZE,
+    )
+}
+
 /// A table with no triggers and no waiting `AFTER STATEMENT` transition table
 /// runs the unchanged batch path — the trigger machinery costs it nothing.
 pub(crate) fn insert_rows(
@@ -411,11 +439,46 @@ pub(crate) fn insert_rows(
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<()> {
     let defs = row_defs(db, target_db, table, TriggerEvent::Insert, None);
-    if defs.is_empty() && db.trigger_capture.is_none() {
-        let t = db.table_mut_in(target_db, table)?;
-        for values in rows {
-            t.append_row(values)?;
+    // Primary/unique keys are enforced here, the funnel every SQL INSERT
+    // (VALUES, SELECT, CTAS row source, procedures, WAL replay) uses. The
+    // occupancy map is cached on the table, so a statement pays O(rows
+    // written) instead of an O(table) scan.
+    let mut keys = crate::keys::take_or_build(db, target_db, table)?;
+    if defs.is_empty() {
+        // No row triggers: validate every image before the first append, so a
+        // duplicate key leaves the table untouched (a statement is atomic).
+        if let Some(keys) = &mut keys {
+            let t = db.table_in(target_db, table)?;
+            // Every row is reserved before the first append, so the ids are
+            // predicted from the row count (`next_row_id` would return the
+            // same position for all of them).
+            for (i, values) in rows.iter().enumerate() {
+                keys.check(values, t, None)?;
+                keys.reserve(values, predicted_id(t, i));
+            }
         }
+        if db.trigger_capture.is_none() {
+            let t = db.table_mut_in(target_db, table)?;
+            for values in rows {
+                t.append_row(values)?;
+            }
+            crate::keys::store(db, target_db, table, keys);
+            return Ok(());
+        }
+        let mut appended = Vec::with_capacity(rows.len());
+        {
+            let t = db.table_mut_in(target_db, table)?;
+            for values in rows {
+                t.append_row(values.clone())?;
+                appended.push(values);
+            }
+        }
+        let capture = db
+            .trigger_capture
+            .as_mut()
+            .expect("checked above that a capture is installed");
+        capture.extend(appended.into_iter().map(|v| (Vec::new(), v)));
+        crate::keys::store(db, target_db, table, keys);
         return Ok(());
     }
     let mut capture = db.trigger_capture.take();
@@ -430,6 +493,12 @@ pub(crate) fn insert_rows(
                 fire_row_triggers(db, &defs, TriggerTiming::Before, None, Some(&values))?
                     .unwrap_or(values)
             };
+            if let Some(keys) = &mut keys {
+                let t = db.table_in(target_db, table)?;
+                keys.check(&new, t, None)?;
+                let (chunk, row) = next_row_id(t);
+                keys.reserve(&new, crate::keys::RowId::new(chunk, row));
+            }
             db.table_mut_in(target_db, table)?.append_row(new.clone())?;
             if let Some(c) = &mut capture {
                 c.push((Vec::new(), new.clone()));
@@ -441,6 +510,9 @@ pub(crate) fn insert_rows(
         Ok(())
     })();
     db.trigger_capture = capture;
+    if out.is_ok() {
+        crate::keys::store(db, target_db, table, keys);
+    }
     out
 }
 
@@ -454,7 +526,26 @@ pub(crate) fn update_rows(
     per_chunk: Vec<Vec<(usize, usize, Value)>>,
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<()> {
-    if db.trigger_capture.is_none() && !has_triggers(db, target_db, table) {
+    // Keys are enforced below, on the row image the write produces (a BEFORE
+    // trigger's NEW included), so the plain fast path is only safe for a
+    // keyless table.
+    // Only a SET that names a key column can break a key; a bulk UPDATE of
+    // other columns keeps the plain path. (A BEFORE trigger can still rewrite
+    // a key, which is why the fast path also requires that there is none.)
+    let keyed = {
+        let t = db.table_in(target_db, table)?;
+        let key_cols: Vec<usize> = t
+            .constraints
+            .keys
+            .iter()
+            .flat_map(|k| k.columns.iter().copied())
+            .collect();
+        per_chunk
+            .iter()
+            .flatten()
+            .any(|(col, _, _)| key_cols.contains(col))
+    };
+    if !keyed && db.trigger_capture.is_none() && !has_triggers(db, target_db, table) {
         let t = db.table_mut_in(target_db, table)?;
         for (ci, writes) in per_chunk.iter().enumerate() {
             t.update_rows(ci, writes)?;
@@ -479,6 +570,9 @@ pub(crate) fn update_rows(
         }
     }
     let defs = row_defs(db, target_db, table, TriggerEvent::Update, Some(&changed));
+    // A BEFORE trigger can rewrite a key column, so a keyed table always needs
+    // the occupancy map here (cheap: it is cached on the table).
+    let mut keys = crate::keys::take_or_build(db, target_db, table)?;
     let mut capture = db.trigger_capture.take();
     let out = (|| -> Result<()> {
         for (ci, writes) in per_chunk.iter().enumerate() {
@@ -528,6 +622,17 @@ pub(crate) fn update_rows(
                     .filter(|(_, (o, n))| o != n)
                     .map(|(col, (_, n))| (col, row, n.clone()))
                     .collect();
+                if let Some(keys) = &mut keys {
+                    let t = db.table_in(target_db, table)?;
+                    let id = crate::keys::RowId::new(ci, row);
+                    keys.release(&old);
+                    if let Err(e) = keys.check(&new, t, Some(id)) {
+                        // Restore the map so the error leaves no trace.
+                        keys.reserve(&old, id);
+                        return Err(e);
+                    }
+                    keys.reserve(&new, id);
+                }
                 if !writes.is_empty() {
                     db.table_mut_in(target_db, table)?
                         .update_rows(ci, &writes)?;
@@ -543,6 +648,9 @@ pub(crate) fn update_rows(
         Ok(())
     })();
     db.trigger_capture = capture;
+    if out.is_ok() {
+        crate::keys::store(db, target_db, table, keys);
+    }
     out
 }
 
@@ -563,6 +671,8 @@ pub(crate) fn delete_rows(
         for ci in (0..drops.len()).rev() {
             count += t.delete_from_chunk(ci, &drops[ci])?;
         }
+        // Deletes shift row indices, so the cached key map cannot be patched.
+        crate::keys::invalidate(db, target_db, table);
         return Ok(count);
     }
     let mut count = 0;
@@ -603,6 +713,9 @@ pub(crate) fn delete_rows(
         Ok(count)
     })();
     db.trigger_capture = capture;
+    if out.is_ok() {
+        crate::keys::invalidate(db, target_db, table);
+    }
     out
 }
 
@@ -901,6 +1014,8 @@ mod tests {
             db: Some("db".to_string()),
             table: "t".to_string(),
             predicate: None,
+            using: None,
+            returning: None,
         };
         assert_eq!(
             plan_dml(&plan, "cur"),
@@ -911,6 +1026,8 @@ mod tests {
             table: "T".to_string(),
             sets: Vec::new(),
             predicate: None,
+            from: None,
+            returning: None,
         };
         assert_eq!(
             plan_dml(&plan, "cur"),

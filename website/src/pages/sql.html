@@ -12,8 +12,18 @@ CREATE TABLE t2 AS SELECT ...;       -- CTAS
 CREATE TABLE IF NOT EXISTS t (...);  -- IF [NOT] EXISTS on CREATE/DROP TABLE
 INSERT INTO t VALUES (1, 'x', 9.5), (2, NULL, 3.0);
 INSERT INTO t SELECT ...;            -- INSERT ... SELECT
+INSERT INTO t VALUES (1, 'y', 2.0)
+  ON CONFLICT (id) DO UPDATE SET price = excluded.price  -- upsert (or DO NOTHING)
+  RETURNING id, price;                                   -- final rows, after triggers
+INSERT OR REPLACE INTO t VALUES (1, 'y', 2.0);  -- = DO UPDATE over the given columns
+INSERT OR IGNORE  INTO t VALUES (1, 'y', 2.0);  -- = DO NOTHING
 UPDATE t SET price = price * 1.1 WHERE id &gt; 1;   -- SET exprs see pre-update values
+UPDATE t SET price = s.price FROM s WHERE t.id = s.id;   -- UPDATE ... FROM
 DELETE FROM t WHERE price IS NULL;               -- NULL never matches
+DELETE FROM t USING s WHERE t.id = s.id;         -- DELETE ... USING
+MERGE INTO t USING s ON t.id = s.id              -- MERGE
+  WHEN MATCHED THEN UPDATE SET price = s.price
+  WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.name, s.price);
 BEGIN; UPDATE t SET price = 0; ROLLBACK;         -- flat snapshot transactions
 CREATE DATABASE db1;                 -- new, empty database
 DROP DATABASE db1;                   -- the last database cannot be dropped
@@ -37,10 +47,33 @@ optional <code>CONSTRAINT name</code> prefix):</p>
 
 <p>The declarations are validated at DDL time like DuckDB's (the referenced table
 must exist and the referenced columns must be exactly one of its PRIMARY KEY or
-UNIQUE constraints), but they are <strong>metadata only</strong>: writes never
-enforce them, and <code>DESCRIBE</code> reports them (<code>PRI</code>/<code>UNI</code>
-markers plus nullability). The optimizer uses a declared foreign key for
-conservative FK→PK join elimination — declarations are trusted, not verified.</p>
+UNIQUE constraints), and <code>DESCRIBE</code> reports them
+(<code>PRI</code>/<code>UNI</code> markers plus nullability).
+<strong><code>PRIMARY KEY</code> and <code>UNIQUE</code> are enforced</strong>:
+a duplicate, or a <code>NULL</code> in a primary key, is an error, checked per
+statement against the declared keys — so a statement that would introduce one
+aborts whole (including across the rows of a multi-row <code>INSERT</code>).
+<code>REFERENCES</code>/<code>FOREIGN KEY</code> stays a declaration: the
+optimizer trusts it for FK→PK join elimination, but writes do not check it.</p>
+
+<p>The DML forms match DuckDB 2.0. <code>ON CONFLICT [(cols)]</code> needs a
+matching declared <code>PRIMARY KEY</code>/<code>UNIQUE</code> constraint and
+<code>DO UPDATE</code> may read the proposed row as <code>excluded.col</code>;
+<code>INSERT OR REPLACE</code> is <code>DO UPDATE</code> over the columns the
+insert names, so unlisted columns keep their old values, and
+<code>INSERT OR IGNORE</code> is <code>DO NOTHING</code>. <code>RETURNING</code>
+works on <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>,
+<code>ON CONFLICT</code> and <code>MERGE</code>, and reports the final row — a
+<code>BEFORE</code> trigger's rewrite included. When several source rows match
+one target row, <code>UPDATE … FROM</code> keeps the last one in source order
+(DuckDB's behaviour), <code>DELETE … USING</code> deletes once, and
+<code>MERGE</code> refuses the statement with a "cannot affect the same target
+row more than once" error. <code>MERGE</code> clauses are tried in order and the
+first whose <code>AND</code> condition holds wins; <code>WHEN NOT MATCHED BY
+SOURCE</code> deletes target rows no source row matches. A
+<code>WITH</code> clause may hold data-modifying statements
+(<code>WITH x AS (INSERT … RETURNING …) SELECT … FROM x</code>); they run once,
+at the top level.</p>
 
 <p><code>UPDATE</code> and <code>DELETE</code> are statement-atomic: the statement
 sees the pre-update values and either applies completely or not at all.
@@ -509,9 +542,11 @@ SHOW TRIGGERS ON sales;</code></pre>
   <li>Definitions persist in <code>.pink</code> files and replay from the WAL
   by re-executing the firing statement, so its triggers fire again exactly
   once.</li>
-  <li>Refused: triggers on views and attached lake tables,
-  <code>RETURNING</code> on triggered tables, and trigger DDL inside a
-  transaction.</li>
+  <li><code>RETURNING</code> on a triggered table reports the image the
+  <code>BEFORE</code> row triggers left behind, not the one the statement
+  proposed.</li>
+  <li>Refused: triggers on views and attached lake tables, and trigger DDL
+  inside a transaction.</li>
 </ul>
 
 <h2>Materialized views</h2>
@@ -544,11 +579,10 @@ DROP MATERIALIZED VIEW totals;</code></pre>
 <ul>
   <li><strong>Correlated subqueries</strong> are rejected (uncorrelated subqueries
   and <code>EXISTS</code> work).</li>
-  <li><strong>DML forms</strong> — <code>INSERT … ON CONFLICT</code> (and
-  <code>INSERT OR REPLACE</code> / <code>REPLACE INTO</code>),
-  <code>UPDATE … FROM</code>, <code>DELETE … USING</code>,
-  <code>RETURNING</code>, <code>MERGE</code> and data-modifying CTEs — are
-  refused with a <code>wave 95b</code> error naming the form.</li>
+  <li><strong>MySQL DML spellings</strong> — <code>ON DUPLICATE KEY UPDATE</code>
+  and <code>REPLACE INTO</code> are refused by name; write
+  <code>ON CONFLICT … DO UPDATE SET</code> or <code>INSERT OR REPLACE</code>.
+  <code>COPY</code> is accepted as a statement, not as a CTE step.</li>
   <li><strong>Query forms</strong> — <code>LATERAL</code>, ordered-set aggregates
   (<code>WITHIN GROUP</code>), <code>TABLESAMPLE</code>,
   <code>FOR UPDATE</code>/<code>SHARE</code>, <code>AT TIME ZONE</code>, row
