@@ -1156,13 +1156,22 @@ pub enum PinkDbError {
     Parameter(String),
     Execution(String),
     Io(std::io::Error),
-    /// A CSV read/parse error: the message, plus the 1-based file line and the
-    /// header name of the offending field where the reader knows them.
-    Csv {
-        message: String,
-        line: Option<u64>,
-        column: Option<String>,
-    },
+    /// A CSV read/parse error (see [`CsvError`]). Boxed on purpose: every
+    /// `Result<_, PinkDbError>` carries the largest variant inline, and the
+    /// binder recurses deeply (macros, views, subqueries), so an inline
+    /// 64-byte payload doubled each frame's error slot and made deep macro
+    /// expansion overflow the stack before the depth limit could report it.
+    Csv(Box<CsvError>),
+}
+
+/// The details of a [`PinkDbError::Csv`]: the message, plus the 1-based file
+/// line and the header name of the offending field where the reader knows
+/// them.
+#[derive(Debug)]
+pub struct CsvError {
+    pub message: String,
+    pub line: Option<u64>,
+    pub column: Option<String>,
 }
 
 impl fmt::Display for PinkDbError {
@@ -1174,11 +1183,12 @@ impl fmt::Display for PinkDbError {
             | PinkDbError::Parameter(msg)
             | PinkDbError::Execution(msg) => write!(f, "{msg}"),
             PinkDbError::Io(e) => write!(f, "IO error: {e}"),
-            PinkDbError::Csv {
-                message,
-                line,
-                column,
-            } => {
+            PinkDbError::Csv(csv) => {
+                let CsvError {
+                    message,
+                    line,
+                    column,
+                } = csv.as_ref();
                 write!(f, "CSV error")?;
                 if let Some(line) = line {
                     write!(f, " on line {line}")?;
@@ -1596,5 +1606,23 @@ mod tests {
         ] {
             assert_eq!(parse_iso8601_utc(bad), None, "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod error_size_tests {
+    use super::PinkDbError;
+
+    /// `PinkDbError` rides inline in every `Result` of the deeply recursive
+    /// binder; a large variant inflates every frame (wave 76's inline CSV
+    /// payload made macro-in-view cycles overflow the stack before the depth
+    /// limit reported them). Box big payloads instead of growing this.
+    #[test]
+    fn pinkdb_error_stays_small() {
+        assert!(
+            std::mem::size_of::<PinkDbError>() <= 32,
+            "PinkDbError is {} bytes; box the large variant",
+            std::mem::size_of::<PinkDbError>()
+        );
     }
 }

@@ -1339,11 +1339,11 @@ fn read_rows<R: Read>(
                 rec.cells.len()
             );
             if opts.errors == ErrorPolicy::Error {
-                return Err(PinkDbError::Csv {
+                return Err(PinkDbError::Csv(Box::new(crate::types::CsvError {
                     message: reason,
                     line: Some(line),
                     column: None,
-                });
+                })));
             }
             rejects.push(line, None, reason);
             continue;
@@ -1667,13 +1667,17 @@ fn clean_batches(
 /// The error the sequential reader would have raised for a failed batch.
 fn batch_error(err: BatchError, newlines: &[u32], width: usize, line_base: u64) -> PinkDbError {
     match err {
-        BatchError::Fields { count, offset } => PinkDbError::Csv {
-            message: format!("row has {count} fields but the header has {width}"),
-            // The line is only needed on the error path: count the file's
-            // newlines before the row instead of tracking it in the loop.
-            line: Some(line_base + newlines.partition_point(|&n| (n as usize) < offset) as u64 + 1),
-            column: None,
-        },
+        BatchError::Fields { count, offset } => {
+            PinkDbError::Csv(Box::new(crate::types::CsvError {
+                message: format!("row has {count} fields but the header has {width}"),
+                // The line is only needed on the error path: count the file's
+                // newlines before the row instead of tracking it in the loop.
+                line: Some(
+                    line_base + newlines.partition_point(|&n| (n as usize) < offset) as u64 + 1,
+                ),
+                column: None,
+            }))
+        }
         BatchError::Db(e) => e,
     }
 }
@@ -2772,11 +2776,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err_kind(&err),
-            err_kind(&PinkDbError::Csv {
+            err_kind(&PinkDbError::Csv(Box::new(crate::types::CsvError {
                 message: String::new(),
                 line: None,
                 column: None,
-            })
+            })))
         );
         assert_eq!(
             err.to_string(),
