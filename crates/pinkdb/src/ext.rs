@@ -238,6 +238,10 @@ impl PinkDb {
                 f.source().to_string()
             } else if let Some(package) = self.loaded_packages.get(&key) {
                 package.clone()
+            } else if let Some(host) = self.host_scalar(&key) {
+                host.package().to_string()
+            } else if let Some(host) = self.host_statement(&key) {
+                host.package().to_string()
             } else {
                 continue;
             };

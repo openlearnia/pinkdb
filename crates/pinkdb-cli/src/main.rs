@@ -139,6 +139,10 @@ fn register_builtin_extensions() {
     if let Err(e) = pinkdb_math::ensure_registered() {
         eprintln!("warning: the math extension could not be registered: {e}");
     }
+    #[cfg(feature = "fts")]
+    if let Err(e) = pinkdb_fts::ensure_registered() {
+        eprintln!("warning: the fts extension could not be registered: {e}");
+    }
     // The arrow and parquet extensions are engine-adjacent, not scalar
     // extensions: they register their file surfaces process-wide, before any
     // store is created, so a durable `.open` can resolve file sources while
@@ -181,6 +185,14 @@ fn load_builtin_extensions(#[allow(unused_variables)] db: &mut PinkDb) {
     load_builtin_extension(db, pinkdb_datetime::EXTENSION_NAME);
     #[cfg(feature = "math")]
     load_builtin_extension(db, pinkdb_math::EXTENSION_NAME);
+    // fts is a package rather than a scalar extension: same rule, and a
+    // replayed log that recorded its `LOAD EXTENSION` already loaded it.
+    #[cfg(feature = "fts")]
+    if !db.is_extension_loaded(pinkdb_fts::EXTENSION_NAME)
+        && let Err(e) = db.load_extension_package(pinkdb_fts::EXTENSION_NAME)
+    {
+        eprintln!("warning: the fts extension could not be loaded: {e}");
+    }
 }
 
 /// Load one built-in extension by its registry name (shared by the feature

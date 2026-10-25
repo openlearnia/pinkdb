@@ -1732,6 +1732,107 @@ kill, fork, every write refusal in both directions, the key sentinel, and a
 TPC-H top-3 question answered end to end. The live test is opt-in:
 `PINKDB_AGENT_LIVE=1 cargo test -p pinkdb-cli --test agent_run -- --ignored`.
 
+## Full-text search (feature `fts`, wave 108a)
+
+A BM25 index with DuckDB's `fts` surface, built as a linked extension
+(`pinkdb-fts`). The index is ordinary tables in a database named
+`fts_main_<table>`, so it saves with the store and replays from the WAL; the
+query side is a scalar function, so `match_bm25` is plain SQL that any client
+— the CLI, the server, an MCP `query` tool in a read-only session — can rank
+with.
+
+```sh
+cargo build --release -p pinkdb-cli --features fts
+# a custom `ignore` pattern also needs the regex tokenizer:
+cargo build --release -p pinkdb-cli --features fts-regex
+```
+
+```sql
+CREATE TABLE docs (id INTEGER, title VARCHAR, body VARCHAR);
+INSERT INTO docs VALUES (1, 'Relational databases', 'Rows in tables'),
+                        (2, 'Search engines', 'BM25 ranks documents');
+
+CALL create_fts_index('docs', 'id', 'title', 'body');
+
+SELECT id, match_bm25('docs', id, 'relational database') AS score
+FROM docs
+ORDER BY score DESC;
+-- 1 | 3.826…, then NULL for the documents with no matching term
+
+CALL drop_fts_index('docs');
+```
+
+| statement / function | notes |
+|---|---|
+| `CALL create_fts_index(input_table, input_id, *input_values, stemmer := 'porter', stopwords := 'english', ignore := '(\\.&#124;[^a-z])+', strip_accents := 1, lower := 1, overwrite := 0)` | Builds `fts_main_<table>`. Refuses to replace an index without `overwrite := 1`. The default `ignore` is a built-in scanner; any other pattern needs the `fts-regex` feature. |
+| `CALL drop_fts_index(input_table)` | Drops the index database. |
+| `match_bm25(index, id, query, fields := NULL, k := 1.2, b := 0.75, conjunctive := 0)` | `id` is the indexed id column; `index` is the base table's name (a function cannot be schema-qualified). |
+| `stem(word)` | Porter (Snowball English), the same stemmer the index uses. |
+| `rrf(rank, k := 60)` | `1 / (k + rank)`, rank ≥ 1 — Reciprocal Rank Fusion for two ranked lists. |
+
+**Permissions.** `match_bm25` reads the index tables, which hold the base
+table's text, so the server checks it as a read of the **base table**: a
+session needs `SELECT` on `docs` to call `match_bm25('docs', …)`, exactly as if
+it had scanned `docs`. The check is static (the index name must be a
+constant). Building or dropping an index is a `CALL`, so it needs ADMIN and is
+refused in a read-only session — an MCP `query` tool can rank, not build.
+
+**Static, like DuckDB.** The index is a snapshot: after `INSERT`, `UPDATE` or
+`DELETE` on the base table, `match_bm25` keeps answering from the old index
+until it is re-created with `overwrite := 1`. An incremental index is a
+follow-up.
+
+**Scoring is DuckDB's BM25.** `idf(term) = ln(1 + (N − df + 0.5) / (df + 0.5))`,
+score = Σ over query terms of `idf · tf·(k1+1) / (tf + k1·(1 − b + b·len/avg_len))`,
+`N` documents, `df` over all indexed fields, lengths per field. Query terms are
+deduplicated; `fields := 'title,body'` restricts both the query and the
+statistics to those fields; `conjunctive := 1` keeps only documents that
+contain every term. A document with no matching term scores `NULL`.
+
+**Differences from DuckDB.** `PRAGMA create_fts_index(…)` is
+`CALL create_fts_index(…)` (pinkdb has no `PRAGMA`); `match_bm25` takes the
+base table name as its first argument instead of being a schema-qualified
+macro; `fields` is a comma-separated `VARCHAR` (v1 has no `LIST`); there are
+no `fts_main_<table>` SQL macros to call beyond that, and no
+`<table>.match_bm25` form. `stem` takes no `stemmer` argument — `porter` is the
+only one.
+
+**Fusing two rankings** (the retrieval half of wave 109): sum `rrf` over
+both ranked lists, one row per id.
+
+```sql
+SELECT id, sum(rrf(rank)) AS score
+FROM (
+  SELECT id, row_number() OVER (
+           ORDER BY match_bm25('docs', id, 'relational database') DESC) AS rank
+  FROM docs
+  WHERE match_bm25('docs', id, 'relational database') IS NOT NULL
+  UNION ALL
+  SELECT id, row_number() OVER (ORDER BY distance) AS rank FROM chunks
+) ranks
+GROUP BY id ORDER BY score DESC LIMIT 10;
+```
+
+**Cost.** The crate is off by default. The default tokenizer is hand-written,
+so `--features fts` adds only the BM25 code: `pinkdb` grows from 5,113,776 to
+5,271,568 bytes (+3.1%) and `pinkdb-server` from 4,727,056 to 4,885,552 bytes
+(+3.4%). A custom `ignore` pattern needs the `regex` crate: `--features
+fts-regex` builds 6,614,512 (+29.3%) and 6,229,568 (+31.8%) bytes. `regex` is
+already in the workspace graph through `extensions/string`, so it is not a new
+`Cargo.lock` entry.
+
+**Text processing.** Fields are lowercased, then accent-stripped, then split
+on runs of characters the `ignore` pattern matches (the default keeps `a-z`
+only), then stopwords are dropped, then tokens are stemmed with Porter
+(Snowball English). `stopwords := 'english'` is DuckDB's list: the SMART
+system's 571 English stop words. `stem(word)` exposes the same stemmer.
+
+**Limits.** English stopwords only (`stopwords := 'none'` disables them);
+`porter` is the only stemmer; no phrase queries, snippets, highlighting,
+fuzzy matching or per-field boosts; rebuilding reads the whole base table in
+one statement (100k documents × 2 fields: build 12.3 s, top-10 query
+103 ms mean, measured on an M-series laptop).
+
 ## C ABI (`pinkdb-ffi`)
 
 The `pinkdb-ffi` crate exposes the engine over a small C ABI as

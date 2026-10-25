@@ -390,6 +390,41 @@ fn read_only_refuses_writes_and_errors_are_json() {
     assert!(text.contains("not found"), "{text}");
 }
 
+/// Wave 108a: full-text search is plain SQL, so the read-only `query` tool
+/// may rank with `match_bm25`; building or dropping an index writes and is
+/// refused. Only built when the CLI ships the `fts` feature.
+#[cfg(feature = "fts")]
+#[test]
+fn full_text_search_reads_but_index_creation_is_refused() {
+    let fixture = Fixture::new(
+        "fts",
+        "CREATE TABLE docs (id INTEGER, body VARCHAR);\n\
+         INSERT INTO docs VALUES (1, 'relational databases rank rows'), \
+                                 (2, 'a bread recipe needs flour');\n\
+         CALL create_fts_index('docs', 'id', 'body');\n",
+    );
+    let mut client = fixture.client();
+    client.initialize();
+    let (is_error, text) = client.query(
+        "SELECT id, match_bm25('docs', id, 'relational database') AS score \
+         FROM docs ORDER BY score DESC",
+    );
+    assert!(!is_error, "{text}");
+    assert!(text.contains("| 1 |"), "{text}");
+    for sql in [
+        "CALL create_fts_index('docs', 'id', 'body', overwrite := 1)",
+        "CALL drop_fts_index('docs')",
+    ] {
+        let (is_error, text) = client.query(sql);
+        assert!(is_error, "{sql} must be refused: {text}");
+        assert!(text.contains("read-only"), "{sql}: {text}");
+    }
+    // The refused calls left the index in place.
+    let (is_error, text) = client.query("SELECT count(*) AS n FROM docs");
+    assert!(!is_error, "{text}");
+    assert!(text.contains("| 2 |"), "{text}");
+}
+
 /// Reading files and URLs is its own switch: `allow-writes` does not imply
 /// it, and the default session must not open anything a prompt injection
 /// names. The default build registers no file source, so with the switch the

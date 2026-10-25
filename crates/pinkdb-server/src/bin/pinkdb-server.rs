@@ -880,6 +880,22 @@ fn main() -> ExitCode {
         }
     };
 
+    // Built-in linked extensions, published before any store exists and
+    // loaded into the store this server serves. A durable store whose log
+    // already recorded the load keeps it (that is what the replay guard is
+    // for), so the load is skipped rather than reported as a duplicate.
+    #[cfg(feature = "fts")]
+    {
+        if let Err(e) = pinkdb_fts::ensure_registered() {
+            eprintln!("warning: the fts extension could not be registered: {e}");
+        }
+        if !db.is_extension_loaded(pinkdb_fts::EXTENSION_NAME)
+            && let Err(e) = db.load_extension(pinkdb_fts::EXTENSION_NAME)
+        {
+            eprintln!("warning: the fts extension could not be loaded: {e}");
+        }
+    }
+
     let mode = match (&args.file, &args.catalog) {
         (Some(path), _) => format!("durable: {path}"),
         #[cfg(feature = "catalog")]

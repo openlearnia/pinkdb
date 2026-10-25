@@ -131,6 +131,16 @@ jobs:
               cargo test -p pinkdb-server --features ui
               cargo test -p pinkdb-server --features ui,tls
               ! cargo tree -p pinkdb-server | grep -q tokio
+          - name: fts
+            run: |
+              cargo test -p pinkdb-fts
+              cargo test -p pinkdb-cli --features fts
+              cargo test -p pinkdb-cli --features fts-regex
+              cargo test -p pinkdb-server --features fts
+              # Full-text search is opt-in, and its default tokenizer must not
+              # pull in `regex`: the default binary links neither.
+              ! cargo tree -p pinkdb-cli -e normal | grep -q pinkdb-fts
+              ! cargo tree -p pinkdb-cli -e normal --features fts | grep -q regex
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 

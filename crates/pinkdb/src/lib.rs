@@ -108,6 +108,10 @@ pub use fsutil::{CopyToPolicy, write_atomic_private};
 pub use install::{InstalledExtension, NO_REPO_SUPPORT};
 pub use macros::{MacroDef, MacroParamDef};
 pub use package::{ExtensionPackage, extension_package_names, register_extension_package};
+/// The extension ABI's value types, re-exported so a package that declares
+/// host functions (`HostScalar`, `HostStatement`) can name its parameters
+/// without depending on the loader crate directly (wave 108a).
+pub use pinkdb_ext_loader::ExtType;
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use procedure::{ProcLanguage, ProcedureDef};
 pub use profile::QueryProfile;

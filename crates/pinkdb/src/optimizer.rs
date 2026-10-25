@@ -441,7 +441,12 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
         // expressions) but never the call itself. A callback may be impure,
         // non-deterministic, or fail at runtime; folding it would run it at
         // bind time — and once per execution instead of once per row.
-        BoundExpr::DynamicScalar { name, args, dtype } => {
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => {
             return BoundExpr::DynamicScalar {
                 name,
                 args: args
@@ -451,6 +456,7 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
                 dtype,
+                reads,
             };
         }
         leaf => return leaf,
@@ -882,7 +888,12 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
         // order), so it is allowed as long as every referenced column is a
         // passthrough (enforced per argument here). Pushing through a join,
         // union, or distinct is refused — those change the call count.
-        BoundExpr::DynamicScalar { name, args, dtype } => Some(BoundExpr::DynamicScalar {
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => Some(BoundExpr::DynamicScalar {
             name: name.clone(),
             args: args
                 .iter()
@@ -890,6 +901,7 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
                 .collect::<Option<Vec<_>>>()?
                 .into_boxed_slice(),
             dtype: *dtype,
+            reads: reads.clone(),
         }),
     }
 }
@@ -975,7 +987,12 @@ fn rewrite_through_keys(pred: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExp
             },
             dtype: *dtype,
         }),
-        BoundExpr::DynamicScalar { name, args, dtype } => Some(BoundExpr::DynamicScalar {
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => Some(BoundExpr::DynamicScalar {
             name: name.clone(),
             args: args
                 .iter()
@@ -983,6 +1000,7 @@ fn rewrite_through_keys(pred: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExp
                 .collect::<Option<Vec<_>>>()?
                 .into_boxed_slice(),
             dtype: *dtype,
+            reads: reads.clone(),
         }),
     }
 }
@@ -2421,6 +2439,7 @@ mod tests {
             name: "f".into(),
             args: vec![col(0)].into_boxed_slice(),
             dtype: T::Boolean,
+            reads: Box::default(),
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(aggregate(vec![col(0)])),

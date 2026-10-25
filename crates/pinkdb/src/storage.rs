@@ -1306,6 +1306,15 @@ pub struct PinkDb {
     /// this map keeps the WAL prefix pointing at the **package** — the name
     /// replay can resolve.
     pub(crate) package_dynamic_functions: HashMap<String, String>,
+    /// Active host scalars and host statements (wave 108a), keyed by
+    /// lowercased name. The package that installed each is inside the value.
+    pub(crate) host_scalars: HashMap<String, crate::package::HostScalar>,
+    pub(crate) host_statements: HashMap<String, crate::package::HostStatement>,
+    /// Process-unique identity of this store, shared by its clones (a clone
+    /// is a snapshot of the same store). An in-process cache — the fts
+    /// extension's loaded index — keys on it so two open stores never share
+    /// entries. Never persisted.
+    pub(crate) store_id: u64,
     /// Where SQL `COPY … TO` may write (M-3). Embedded stores default to
     /// [`crate::CopyToPolicy::Unrestricted`]; a network server installs
     /// `Disabled` at bind time and the `--allow-copy-to --copy-root` opt-in
@@ -1326,6 +1335,12 @@ impl Default for PinkDb {
     fn default() -> Self {
         Self::with_databases(["main"])
     }
+}
+
+/// A fresh store identity (see [`PinkDb::store_id`]).
+fn next_store_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Clone for PinkDb {
@@ -1386,6 +1401,9 @@ impl Clone for PinkDb {
             package_table_sources: self.package_table_sources.clone(),
             package_file_formats: self.package_file_formats.clone(),
             package_dynamic_functions: self.package_dynamic_functions.clone(),
+            host_scalars: self.host_scalars.clone(),
+            host_statements: self.host_statements.clone(),
+            store_id: self.store_id,
             copy_to_policy: self.copy_to_policy.clone(),
             stream_buffered_rows: std::sync::atomic::AtomicUsize::new(
                 self.stream_buffered_rows
@@ -1475,6 +1493,9 @@ impl PinkDb {
             package_table_sources: HashMap::new(),
             package_file_formats: HashMap::new(),
             package_dynamic_functions: HashMap::new(),
+            host_scalars: HashMap::new(),
+            host_statements: HashMap::new(),
+            store_id: next_store_id(),
             copy_to_policy: crate::CopyToPolicy::Unrestricted,
             stream_buffered_rows: std::sync::atomic::AtomicUsize::new(0),
             stream_peak_rows: std::sync::atomic::AtomicUsize::new(0),
@@ -1717,6 +1738,13 @@ impl PinkDb {
     pub fn table_version(&self, name: &str) -> Result<u64> {
         let db = self.current_db.clone();
         self.table_version_in(&db, name)
+    }
+
+    /// Process-unique identity of this store, shared by its snapshots. An
+    /// extension with an in-process cache keys on it (see the `store_id`
+    /// field).
+    pub fn store_id(&self) -> u64 {
+        self.store_id
     }
 
     pub fn table_version_in(&self, db: &str, name: &str) -> Result<u64> {

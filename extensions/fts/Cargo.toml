@@ -1,0 +1,32 @@
+[package]
+name = "pinkdb-fts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb full-text search extension: a DuckDB-fts-compatible BM25 index (create_fts_index, match_bm25, stem, rrf)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "pinkdb_fts"
+
+[dependencies]
+# The engine. Every function here is a package host function (wave 108a):
+# `match_bm25` reads the index tables and `create_fts_index` /
+# `drop_fts_index` write them, which a linked scalar's argument/return ABI
+# cannot express.
+pinkdb = { path = "../../crates/pinkdb" }
+# Custom `ignore` patterns only (`feature = "custom-ignore"`, CLI/server
+# feature `fts-regex`). The default pattern is a small scanner in text.rs, so
+# a plain `fts` build does not link this crate.
+regex = { version = "1.13", optional = true }
+
+[features]
+# Accept a non-default `ignore` regular expression. RE2-style / linear-time,
+# like DuckDB's RE2.
+custom-ignore = ["dep:regex"]
+
+[dev-dependencies]
+pinkdb = { path = "../../crates/pinkdb" }
+# The default scanner is tested against this same crate's regex engine.
+regex = "1.13"

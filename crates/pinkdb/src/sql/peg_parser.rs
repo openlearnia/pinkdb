@@ -1775,9 +1775,12 @@ peg::parser! {
         rule do_stmt() -> Statement
             = word("do") body:string_lit() { Statement::Do { body } }
 
+        /// Arguments are parsed as call arguments so a host statement can
+        /// take `name := value`, like a macro; a stored procedure still binds
+        /// them positionally and refuses a named one.
         rule call_args() -> Vec<Expr>
             = lparen() rparen() { Vec::new() }
-            / lparen() first:expr() rest:(comma() e:expr() { e })* rparen() {
+            / lparen() first:fn_arg() rest:(comma() e:fn_arg() { e })* rparen() {
                   let mut out = vec![first];
                   out.extend(rest);
                   out

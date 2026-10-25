@@ -1215,7 +1215,13 @@ fn expr_tables_read(
                 expr_tables_read(a, default_db, out);
             }
         }
-        BoundExpr::DynamicScalar { args, .. } => {
+        BoundExpr::DynamicScalar { args, reads, .. } => {
+            // A host scalar that declared its table reads (`match_bm25` reads
+            // the index, and its base table) records them here: RBAC's read
+            // pass and the WAL's frame sets then see them like a `Scan`.
+            for (db, table) in reads.iter() {
+                out.insert((db.clone(), table.clone()));
+            }
             for a in args.iter() {
                 expr_tables_read(a, default_db, out);
             }
@@ -2745,7 +2751,12 @@ pub(crate) fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
             args: args.into_iter().map(|a| shift_columns(a, by)).collect(),
             dtype,
         },
-        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => BoundExpr::DynamicScalar {
             name,
             args: args
                 .into_vec()
@@ -2754,6 +2765,7 @@ pub(crate) fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             dtype,
+            reads,
         },
         leaf => leaf,
     }

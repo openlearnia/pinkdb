@@ -1,0 +1,10 @@
+# doc_id	title	body
+0	Escapes	A literal escape such as \nline or C:\tables joins nothing
+1	Relational Databases	A relational database stores rows in tables
+2	Search Engines and BM25	Full text search ranks matching documents with BM25 over an inverted index
+3	Cooking	Bread needs flour, water and time
+4	Café Culture	Crème brûlée and café au lait in a Parisian café
+5	Text Search	The search index ranks the matching rows of the search table
+6	Databases	Relational rows, relational tables, relational keys
+7	Empty Fields	
+8	Numbers	1984 was a year; 1984 is a number and text search ignores it

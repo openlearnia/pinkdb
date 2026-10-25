@@ -634,6 +634,63 @@ DROP MATERIALIZED VIEW totals;</code></pre>
   data, records the error and retries with backoff.</li>
 </ul>
 
+<h2>Full-text search</h2>
+
+<p>A BM25 index (wave 108a, CLI/server feature <code>fts</code>) with DuckDB
+<code>fts</code>'s surface. The index is ordinary tables in a database named
+<code>fts_main_&lt;table&gt;</code>, so it saves with the store and replays
+from the WAL, and the query side is a plain function — an MCP <code>query</code>
+tool can rank in a read-only session.</p>
+
+<pre class="code" data-lang="sql"><code>CREATE TABLE docs (id INTEGER, title VARCHAR, body VARCHAR);
+INSERT INTO docs VALUES (1, 'Relational databases', 'Rows in tables'),
+                        (2, 'Search engines', 'BM25 ranks documents');
+CALL create_fts_index('docs', 'id', 'title', 'body');
+
+SELECT id, match_bm25('docs', id, 'relational database') AS score
+FROM docs ORDER BY score DESC;
+
+CALL drop_fts_index('docs');</code></pre>
+
+<ul>
+  <li><code>CALL create_fts_index(input_table, input_id, *input_values,
+  stemmer := 'porter', stopwords := 'english', ignore := '(\\.&#124;[^a-z])+',
+  strip_accents := 1, lower := 1, overwrite := 0)</code>; <code>CALL
+  drop_fts_index(input_table)</code>. Replacing an existing index needs
+  <code>overwrite := 1</code>. The default <code>ignore</code> is built in;
+  any other pattern needs the <code>fts-regex</code> feature.</li>
+  <li><code>match_bm25(index, id, query, fields := NULL, k := 1.2, b := 0.75,
+  conjunctive := 0)</code> — <code>id</code> is the indexed id column,
+  <code>index</code> the base table's name (a function cannot be
+  schema-qualified); <code>fields := 'title,body'</code> is a comma-separated
+  list; <code>conjunctive := 1</code> keeps only documents with every query
+  term; no matching term scores <code>NULL</code>.</li>
+  <li><code>stem(word)</code> is the index's Porter (Snowball English)
+  stemmer, and <code>rrf(rank, k := 60)</code> is
+  <code>1 / (k + rank)</code>, so two ranked lists fuse with
+  <code>sum(rrf(rank))</code> grouped by id.</li>
+  <li>Scoring is DuckDB's BM25 (the same idf, <code>k</code>/<code>b</code>,
+  per-field lengths), verified against an independent reference
+  implementation. Text is lowercased, accent-stripped, split on the
+  <code>ignore</code> pattern, filtered with DuckDB's <code>english</code>
+  stopwords (the SMART list, 571 words) and Porter-stemmed.</li>
+  <li>On the server, <code>match_bm25('docs', …)</code> is checked as a read
+  of <code>docs</code>: the session needs <code>SELECT</code> on the base
+  table, so the function cannot expose text a session may not scan. Building
+  or dropping an index is a <code>CALL</code> (ADMIN) and is refused in a
+  read-only session, including the read-only MCP <code>query</code>
+  tool.</li>
+  <li><strong>Static, like DuckDB</strong>: after an
+  <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code> on the base
+  table the index is stale until it is re-created with
+  <code>overwrite := 1</code>. Incremental indexing is a follow-up.</li>
+  <li>Differences: <code>CALL</code> instead of <code>PRAGMA</code>, the index
+  name as the first <code>match_bm25</code> argument instead of a
+  schema-qualified macro, <code>fields</code> as a <code>VARCHAR</code>
+  (no <code>LIST</code>), and no phrase queries, snippets or per-field
+  boosts.</li>
+</ul>
+
 <h2>Not supported yet</h2>
 
 <p>These are real gaps, listed so you can plan around them. Most are scheduled on the

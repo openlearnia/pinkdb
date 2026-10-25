@@ -1655,6 +1655,7 @@ dependencies = [
  "pinkdb-arrow",
  "pinkdb-datetime",
  "pinkdb-ext-loader",
+ "pinkdb-fts",
  "pinkdb-httpfs",
  "pinkdb-iceberg",
  "pinkdb-json",
@@ -1720,6 +1721,14 @@ name = "pinkdb-ffi"
 version = "0.1.0"
 dependencies = [
  "pinkdb",
+]
+
+[[package]]
+name = "pinkdb-fts"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "regex",
 ]
 
 [[package]]
@@ -1794,6 +1803,7 @@ dependencies = [
  "pink-lake",
  "pinkdb",
  "pinkdb-ext-loader",
+ "pinkdb-fts",
  "pinkdb-server-ui",
  "rcgen",
  "rustls",

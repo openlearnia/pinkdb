@@ -172,9 +172,9 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             }
             eval_scalar(*func, *dtype, &vecs)
         }
-        BoundExpr::DynamicScalar { name, args, dtype } => {
-            eval_dynamic_scalar(name, args, *dtype, chunk, cx)
-        }
+        BoundExpr::DynamicScalar {
+            name, args, dtype, ..
+        } => eval_dynamic_scalar(name, args, *dtype, chunk, cx),
     }
 }
 
@@ -196,6 +196,24 @@ fn eval_dynamic_scalar(
     chunk: &DataChunk,
     cx: &Cx,
 ) -> Result<Vector> {
+    // A package's host scalar (wave 108a) reads the store per row; its
+    // arguments are already resolved to the declared parameter order.
+    if let Some(host) = cx.db.host_scalar(name) {
+        let mut vecs = Vec::with_capacity(args.len());
+        for a in args {
+            vecs.push(eval_expr(a, chunk, cx)?);
+        }
+        let mut out = Vector::new_empty(dtype);
+        let mut row_values: Vec<crate::types::Value> = Vec::with_capacity(vecs.len());
+        for row in 0..chunk.num_rows() {
+            row_values.clear();
+            for v in &vecs {
+                row_values.push(v.get(row));
+            }
+            out.push_valid(host.call(cx.db, &row_values)?)?;
+        }
+        return Ok(out);
+    }
     let function = cx.db.dynamic_scalar(name).ok_or_else(|| {
         PinkDbError::Catalog(format!(
             "function \"{name}\" is not registered; load its extension again"

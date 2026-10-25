@@ -693,6 +693,14 @@ fn run_call_plan(
             values.push(v.get(0));
         }
     }
+    // A package's host statement (wave 108a): `db: None` marks it (see
+    // `bind_call`). It gets the store and the session database.
+    if qdb.is_none()
+        && let Some(host) = db.host_statement(name).cloned()
+    {
+        let mut ctx = crate::package::HostCtx::new(db, target.clone(), name.to_string());
+        return host.call(&mut ctx, &values);
+    }
     // `DO` (wave 83) runs its own definition.
     if let Some(def) = inline {
         return crate::procedure::execute_do(db, &target, def);
@@ -4170,7 +4178,12 @@ fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
                 .map(|e| Box::new(shift_join_columns(e, left_cols))),
             dtype: *dtype,
         },
-        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => BoundExpr::DynamicScalar {
             name: name.clone(),
             args: args
                 .iter()
@@ -4178,6 +4191,7 @@ fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             dtype: *dtype,
+            reads: reads.clone(),
         },
         BoundExpr::AggRef { .. }
         | BoundExpr::WindowRef { .. }

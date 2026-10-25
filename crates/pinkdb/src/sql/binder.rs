@@ -417,6 +417,10 @@ pub enum BoundExpr {
         name: Box<str>,
         args: Box<[BoundExpr]>,
         dtype: DataType,
+        /// Tables a host scalar declared it reads (see
+        /// [`crate::package::HostScalar::reads_tables`]); empty for a linked
+        /// extension scalar, which reads no store table.
+        reads: Box<[(String, String)]>,
     },
 }
 
@@ -2630,6 +2634,11 @@ impl<'a> Binder<'a> {
             return Ok(bound);
         }
         if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+            // A host function declares its parameter names, so it takes named
+            // arguments like a macro; everything else does not.
+            if let Some(host) = self.db.host_scalar(name).cloned() {
+                return self.bind_host_scalar(host, args, aggs, allow_agg);
+            }
             return Err(PinkDbError::Parse(format!(
                 "named arguments are only supported in macro calls (in \"{name}\")"
             )));
@@ -2965,6 +2974,12 @@ impl<'a> Binder<'a> {
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
+        // A package's host scalar (wave 108a) is store-aware but binds to the
+        // same plan node; only the argument assignment differs (named
+        // arguments, defaults).
+        if let Some(host) = self.db.host_scalar(name).cloned() {
+            return self.bind_host_scalar(host, args, aggs, allow_agg);
+        }
         let Some(func) = self.db.dynamic_scalar(name) else {
             return Err(PinkDbError::Catalog(format!("unknown function \"{name}\"")));
         };
@@ -3031,36 +3046,213 @@ impl<'a> Binder<'a> {
             // the CAST hint (`json_array(1)` and `ext_repeat('x', 1)` keep
             // their documented errors): a string is not a number, and parsing
             // one is not this ABI's job.
-            let mut b = b;
-            if !matches!(b, BoundExpr::Literal(Value::Null))
-                && crate::ext::ext_type_of(b.dtype()) != Some(want)
-            {
-                if want == crate::ext::ExtType::Double && b.dtype().is_numeric() {
-                    b = BoundExpr::Cast {
-                        expr: Box::new(b),
-                        dtype: DataType::Double,
-                    };
-                } else if want == crate::ext::ExtType::Varchar && b.dtype() == DataType::Variant {
-                    b = BoundExpr::Cast {
-                        expr: Box::new(b),
-                        dtype: DataType::Varchar,
-                    };
-                } else {
-                    return Err(PinkDbError::Type(format!(
-                        "{func_name} argument {} must be {want}, got {} (use CAST)",
-                        i + 1,
-                        b.dtype()
-                    )));
-                }
-            }
-            bound.push(b);
+            bound.push(coerce_host_arg(&func_name, i + 1, want, b)?);
         }
         Ok(BoundExpr::DynamicScalar {
             name: func_name.to_ascii_lowercase().into_boxed_str(),
             args: bound.into_boxed_slice(),
             dtype,
+            reads: Box::default(),
         })
     }
+
+    /// Bind a host scalar (wave 108a): arguments positionally or as
+    /// `name := value`, every omitted parameter from its declared default.
+    /// The result is a `DynamicScalar` node, so evaluation, optimization and
+    /// WAL bookkeeping are the linked scalar's.
+    fn bind_host_scalar(
+        &mut self,
+        host: crate::package::HostScalar,
+        args: &[Expr],
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        let key = host.name().to_ascii_lowercase();
+        // Record the registry key for the WAL layer: a logged statement that
+        // calls the function is prefixed with its package's `LOAD EXTENSION`.
+        {
+            let mut used = self.dynamic_functions_used.borrow_mut();
+            if !used.contains(&key) {
+                used.push(key.clone());
+            }
+        }
+        let bound = self.bind_host_params(host.name(), host.params(), args, aggs, allow_agg)?;
+        let reads = match host.reads() {
+            None => Box::default(),
+            Some(reads) => {
+                // The read set is checked once, at bind time, so an argument
+                // that selects it must be constant (a cast or a negation of
+                // one still is).
+                let values: Vec<Option<&Value>> = bound.iter().map(const_value).collect();
+                reads(&values, &self.default_db)?
+                    .into_iter()
+                    .map(|(db, table)| (db.to_ascii_lowercase(), table.to_ascii_lowercase()))
+                    .collect()
+            }
+        };
+        Ok(BoundExpr::DynamicScalar {
+            name: key.into_boxed_str(),
+            args: bound.into_boxed_slice(),
+            dtype: crate::ext::dtype_of_ext(host.ret()),
+            reads,
+        })
+    }
+
+    /// Resolve `args` against `params` and bind one expression per value the
+    /// callback receives, in declared order (a variadic parameter expands in
+    /// place).
+    fn bind_host_params(
+        &mut self,
+        what: &str,
+        params: &[crate::package::HostParam],
+        args: &[Expr],
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<Vec<BoundExpr>> {
+        let mut out = Vec::new();
+        let assigned = assign_host_args(what, params, args)?;
+        for (param, filled) in params.iter().zip(assigned) {
+            if filled.is_empty() {
+                match &param.default {
+                    Some(value) => out.push(BoundExpr::Literal(value.clone())),
+                    None => {
+                        return Err(PinkDbError::Catalog(format!(
+                            "{what} needs argument \"{}\"",
+                            param.name
+                        )));
+                    }
+                }
+                continue;
+            }
+            for index in filled {
+                // A named argument binds its value, not the `name := value`
+                // wrapper, which only macros accept outside a host function.
+                let expr = match &args[index] {
+                    Expr::NamedArg { expr, .. } => expr,
+                    other => other,
+                };
+                let bound = self.bind_expr(expr, aggs, allow_agg)?;
+                out.push(coerce_host_param_arg(what, index + 1, param.ty, bound)?);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Which arguments fill each parameter of a host function, positional first
+/// then named. A variadic parameter takes every extra positional argument; a
+/// positional argument after a named one is an error.
+fn assign_host_args(
+    what: &str,
+    params: &[crate::package::HostParam],
+    args: &[Expr],
+) -> Result<Vec<Vec<usize>>> {
+    let variadic_at = params.iter().position(|p| p.variadic);
+    let mut slots: Vec<Vec<usize>> = vec![Vec::new(); params.len()];
+    let mut next = 0usize;
+    let mut named = false;
+    for (index, arg) in args.iter().enumerate() {
+        if let Expr::NamedArg { name, .. } = arg {
+            named = true;
+            let at = params
+                .iter()
+                .position(|p| p.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    PinkDbError::Catalog(format!("{what} has no argument \"{name}\""))
+                })?;
+            if !slots[at].is_empty() {
+                return Err(PinkDbError::Catalog(format!(
+                    "{what} argument \"{name}\" was given twice"
+                )));
+            }
+            slots[at].push(index);
+            continue;
+        }
+        if named {
+            return Err(PinkDbError::Parse(format!(
+                "{what}: a positional argument cannot follow a named one"
+            )));
+        }
+        match variadic_at {
+            Some(at) if next >= at => slots[at].push(index),
+            _ if next < params.len() => {
+                slots[next].push(index);
+                next += 1;
+            }
+            _ => {
+                return Err(PinkDbError::Type(format!(
+                    "{what} takes {} argument(s)",
+                    params.len()
+                )));
+            }
+        }
+    }
+    Ok(slots)
+}
+
+/// Check one host-function argument against its declared type: ABI v1's rules
+/// (exact type, numeric→DOUBLE, VARIANT→VARCHAR), with the argument's SQL
+/// position in the message.
+fn coerce_host_arg(
+    what: &str,
+    position: usize,
+    want: crate::ext::ExtType,
+    bound: BoundExpr,
+) -> Result<BoundExpr> {
+    if matches!(bound, BoundExpr::Literal(Value::Null)) {
+        return Ok(bound);
+    }
+    if crate::ext::ext_type_of(bound.dtype()) == Some(want) {
+        return Ok(bound);
+    }
+    if want == crate::ext::ExtType::Double && bound.dtype().is_numeric() {
+        return Ok(BoundExpr::Cast {
+            expr: Box::new(bound),
+            dtype: DataType::Double,
+        });
+    }
+    if want == crate::ext::ExtType::Varchar && bound.dtype() == DataType::Variant {
+        return Ok(BoundExpr::Cast {
+            expr: Box::new(bound),
+            dtype: DataType::Varchar,
+        });
+    }
+    Err(PinkDbError::Type(format!(
+        "{what} argument {position} must be {want}, got {} (use CAST)",
+        bound.dtype()
+    )))
+}
+
+/// [`coerce_host_arg`], plus the integer widening a SQL-facing host function
+/// wants: a document-id column is usually `INTEGER` while the ABI type is
+/// `BIGINT`. The linked-function ABI keeps its exact rule.
+/// The value of a constant expression, seen through the casts and negations
+/// the binder wraps around a literal. `None` for anything that reads a
+/// column or a variable.
+fn const_value(expr: &BoundExpr) -> Option<&Value> {
+    match expr {
+        BoundExpr::Literal(value) => Some(value),
+        BoundExpr::Cast { expr, .. } | BoundExpr::Negate { expr, .. } => const_value(expr),
+        _ => None,
+    }
+}
+
+fn coerce_host_param_arg(
+    what: &str,
+    position: usize,
+    want: crate::ext::ExtType,
+    bound: BoundExpr,
+) -> Result<BoundExpr> {
+    if want == crate::ext::ExtType::Bigint
+        && bound.dtype() == DataType::Integer
+        && !matches!(bound, BoundExpr::Literal(Value::Null))
+    {
+        return Ok(BoundExpr::Cast {
+            expr: Box::new(bound),
+            dtype: DataType::Bigint,
+        });
+    }
+    coerce_host_arg(what, position, want, bound)
 }
 
 /// The arguments of a row constructor (`ROW(a, b)` or `(a, b)`), if `e` is
@@ -4185,7 +4377,12 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
         },
-        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => BoundExpr::DynamicScalar {
             name: name.clone(),
             args: args
                 .iter()
@@ -4193,6 +4390,7 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
                 .collect::<Option<Vec<_>>>()?
                 .into_boxed_slice(),
             dtype: *dtype,
+            reads: reads.clone(),
         },
         BoundExpr::InSubquery {
             expr,
@@ -4272,7 +4470,12 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
                 .collect(),
             dtype,
         },
-        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => BoundExpr::DynamicScalar {
             name,
             args: args
                 .into_vec()
@@ -4281,6 +4484,7 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             dtype,
+            reads,
         },
         BoundExpr::InSubquery {
             expr,
@@ -4358,7 +4562,12 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
                 .collect(),
             dtype,
         },
-        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => BoundExpr::DynamicScalar {
             name,
             args: args
                 .into_vec()
@@ -4367,6 +4576,7 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             dtype,
+            reads,
         },
         BoundExpr::InSubquery {
             expr,
@@ -5481,7 +5691,54 @@ fn bind_call(
     let target = Binder::new(db, default_db)
         .with_session(session.clone())
         .resolve_db(&qdb.map(str::to_string))?;
-    let def = db.procedure_in(&target, name)?;
+    let procedure = db.procedure_in(&target, name);
+    // A package's host statement (wave 108a) answers the name when no stored
+    // procedure does: user DDL always wins, and an unqualified call is the
+    // only form (`db.name(...)` stays a procedure lookup).
+    if procedure.is_err()
+        && qdb.is_none()
+        && let Some(host) = db.host_statement(name).cloned()
+    {
+        let mut bound = Vec::new();
+        let assigned = assign_host_args(host.name(), host.params(), args)?;
+        for (param, filled) in host.params().iter().zip(assigned) {
+            if filled.is_empty() {
+                match &param.default {
+                    Some(value) => bound.push(BoundExpr::Literal(value.clone())),
+                    None => {
+                        return Err(PinkDbError::Catalog(format!(
+                            "{} needs argument \"{}\"",
+                            host.name(),
+                            param.name
+                        )));
+                    }
+                }
+                continue;
+            }
+            for index in filled {
+                // `name := value` names the parameter; bind its value.
+                let expr = match &args[index] {
+                    Expr::NamedArg { expr, .. } => expr,
+                    other => other,
+                };
+                let value = bind_constant_expr(db, &target, expr, params.clone())?;
+                refuse_opaque_call_arg(index + 1, &value)?;
+                bound.push(coerce_host_arg(host.name(), index + 1, param.ty, value)?);
+            }
+        }
+        return Ok((
+            // `db: None` marks a host statement: the executor takes the
+            // package path instead of a procedure lookup.
+            LogicalPlan::Call {
+                db: None,
+                name: host.name().to_string(),
+                args: bound,
+                inline: None,
+            },
+            vec![host.name().to_ascii_lowercase()],
+        ));
+    }
+    let def = procedure?;
     if args.len() != def.params.len() {
         return Err(PinkDbError::Catalog(format!(
             "procedure \"{}\" takes {} argument(s), but {} were given",
@@ -5493,14 +5750,7 @@ fn bind_call(
     let mut bound = Vec::with_capacity(args.len());
     for (i, arg) in args.iter().enumerate() {
         let value = bind_constant_expr(db, &target, arg, params.clone())?;
-        if crate::plan::bound_expr_has_dynamic_scalar(&value) {
-            return Err(PinkDbError::Execution(format!(
-                "CALL argument {} calls a loadable-extension function; a durable store replays \
-                 a committed CALL statement, and an extension callback is opaque (impure or \
-                 nondeterministic) — evaluate the value into a table or a literal first",
-                i + 1
-            )));
-        }
+        refuse_opaque_call_arg(i + 1, &value)?;
         bound.push(value);
     }
     Ok((
@@ -5512,6 +5762,19 @@ fn bind_call(
         },
         Vec::new(),
     ))
+}
+
+/// A logged `CALL` replays, so its arguments must be deterministic: an
+/// extension callback is opaque (impure or nondeterministic).
+fn refuse_opaque_call_arg(position: usize, value: &BoundExpr) -> Result<()> {
+    if crate::plan::bound_expr_has_dynamic_scalar(value) {
+        return Err(PinkDbError::Execution(format!(
+            "CALL argument {position} calls a loadable-extension function; a durable store \
+             replays a committed CALL statement, and an extension callback is opaque (impure or \
+             nondeterministic) — evaluate the value into a table or a literal first"
+        )));
+    }
+    Ok(())
 }
 
 /// A plan that references no dynamic (extension) function: the shape every

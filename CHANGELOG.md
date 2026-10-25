@@ -8,6 +8,70 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-27
+### Wave 108a — full-text search: a BM25 index with DuckDB-fts parity ✅
+- **`extensions/fts` = `pinkdb-fts`.** DuckDB's `fts` surface over pinkdb
+  tables: `CALL create_fts_index(input_table, input_id, *input_values,
+  stemmer := 'porter', stopwords := 'english', ignore := '(\\.|[^a-z])+',
+  strip_accents := 1, lower := 1, overwrite := 0)`, `CALL
+  drop_fts_index(table)`, `match_bm25(index, id, query, fields := NULL,
+  k := 1.2, b := 0.75, conjunctive := 0)`, `stem(word)` and
+  `rrf(rank, k := 60)`. Argument names and defaults are DuckDB's; `PRAGMA`
+  becomes `CALL`, and the index name is `match_bm25`'s first argument (a
+  function cannot be schema-qualified).
+- **The index is a database, not a sidecar.** `fts_main_<table>` holds
+  `meta`, `docs`, `dict`, `terms`, `term_stats` and `field_stats`, written
+  deterministically (terms sorted before ids, postings in
+  `(term_id, doc_id, field_id)` order), so it saves with the store and a WAL
+  replay rebuilds the same bytes. It is **static like DuckDB**: after a base
+  table change `match_bm25` reads the old index until `overwrite := 1`
+  re-creates it; incremental indexing is a follow-up.
+- **Scoring is DuckDB's BM25, checked independently.** `idf = ln(1 + (N − df
+  + 0.5)/(df + 0.5))`, per-field lengths and average lengths, deduplicated
+  query terms, `fields` filtering both query and statistics, `conjunctive`
+  requiring every term; no match scores `NULL`. A stdlib-only Python
+  reference (`extensions/fts/tests/reference/bm25.py`) generates the fixture
+  the Rust tests compare against to 1e-9, including custom `k`/`b`, `fields`
+  and `conjunctive` top-k order.
+- **Text processing.** DuckDB's default `ignore` pattern (a built-in
+  scanner, no `regex` in a plain `fts` build; a custom pattern needs the
+  `fts-regex` feature), optional lowercasing/accent folding (Latin table),
+  DuckDB's `english` stopwords (the SMART system's 571 words), and Porter
+  stemming. `stemmer := 'porter'` is libstemmer's Porter, i.e.
+  Snowball's `porter.sbl`, not the 1980 paper — the hand-written stemmer
+  (no dependency) matches a 2,994-word fixture derived from
+  `/usr/share/dict/words` with an independent Snowball implementation, 0
+  mismatches (the paper-following first version disagreed on 65).
+- **One small engine hook, no new plan node.** `ExtensionPackage` gains an
+  optional `HostScalar` (reads the store, e.g. `match_bm25`) and
+  `HostStatement` (runs SQL and inserts rows, e.g. `create_fts_index`),
+  bound through the existing `DynamicScalar` node and `LogicalPlan::Call`;
+  `PinkDb::store_id()` keys the extension's in-process index cache,
+  `Database::is_extension_loaded` guards the CLI/server startup load, and
+  `CALL` now accepts `name := value` for host statements/scalars.
+- **Off by default.** `fts` is a CLI and server cargo feature (not in the
+  default set); the default binaries are unchanged. With it: `pinkdb`
+  5,113,776 → 5,271,568 bytes (+3.1%), `pinkdb-server` 4,727,056 →
+  4,885,552 (+3.4%). A custom `ignore` pattern (`fts-regex`, which enables
+  `pinkdb-fts/custom-ignore` and the `regex` crate — already in the
+  workspace graph) builds 6,614,512 and 6,229,568 bytes.
+- **Read-only MCP.** `match_bm25` ranks under the read-only `query` tool;
+  `create_fts_index`/`drop_fts_index` are `CALL` (global) statements and are
+  refused there, tested end to end.
+- **RBAC.** The server checks `match_bm25('docs', …)` as a read of `docs`
+  (`SELECT` on the base table), so a session without grants cannot probe the
+  indexed text through the function; the index name must be constant, so the
+  check is static.
+- **Tests.** 18 in `pinkdb-fts` (6 unit, 8 engine/flags, 2 reference, 2
+  stemmer) plus an ignored 100k-document benchmark; 2 CLI end-to-end runs
+  (fresh session, durable reopen) and 1 MCP read-only test with
+  `--features fts`; workspace 2,065 passed / 0 failed / 11 ignored. 100k
+  docs × 2 fields: load 0.80 s, index build 12.3 s, 2.82M postings,
+  top-10 query 103 ms mean (259 ms slowest) over a full scan.
+- **Pending.** A differential run against a real DuckDB `fts` install (not
+  available offline) is a reviewer task; ingestion, `rag_search` and the MCP
+  tools of row 108 remain queued.
+
 ## 2026-10-25
 ### Wave 106 — `pinkdb-agent`: a data agent harness as an extension ✅
 - **An agent that lives in the store.** `pinkdb-agent` is a native extension

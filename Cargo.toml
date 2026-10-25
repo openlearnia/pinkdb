@@ -32,6 +32,11 @@ members = [
     # Core math extension (wave 54): the DuckDB math surface the engine does
     # not already provide, authored with the SDK's linked registration.
     "extensions/math",
+    # Core full-text search extension (wave 108a): a DuckDB-fts-compatible BM25
+    # index. Engine-adjacent like arrow/parquet: the index tables are ordinary
+    # tables, so the extension needs the package host hooks. Wired behind the
+    # CLI's opt-in `fts` feature.
+    "extensions/fts",
     # Core arrow extension (wave 71): Arrow IPC file read/write. Engine-adjacent
     # (it depends on `pinkdb` and implements the host table-source and COPY-sink
     # hooks); the CLI wires it behind the opt-in `arrow` feature.

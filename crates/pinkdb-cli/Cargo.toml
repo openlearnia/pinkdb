@@ -25,6 +25,16 @@ json = ["dep:pinkdb-json"]
 datetime = ["dep:pinkdb-datetime"]
 # Core math extension: `pinkdb-math` (exp/ln/log, trigonometry, random()).
 math = ["dep:pinkdb-math"]
+# Opt-in full-text search (wave 108a): BM25 indexes with DuckDB's fts
+# surface (`CALL create_fts_index`, `match_bm25`, `stem`, `rrf`). Off by
+# default: it is the first extension that needs engine hooks beyond scalars
+# (named arguments, a host statement that runs SQL), and a store whose log
+# built an index needs the feature to replay. `match_bm25` is plain SQL, so
+# the MCP `query` tool can rank under the read-only policy while
+# `create_fts_index` (a write) is refused there.
+fts = ["dep:pinkdb-fts"]
+# `fts` plus a custom `ignore` regex (pinkdb-fts/custom-ignore).
+fts-regex = ["fts", "pinkdb-fts/custom-ignore"]
 # Opt-in core arrow extension (wave 71): Arrow IPC (Feather v2) file
 # read/write over arrow-rs — `FROM 'f.arrow'`, `read_arrow('f.arrow')` and
 # `COPY t TO 'f.arrow' (FORMAT arrow)`. Registers the table source and the
@@ -133,6 +143,10 @@ pinkdb-datetime = { path = "../../extensions/datetime", optional = true }
 # and the volatile random(), through the Rust extension SDK. Zero external
 # crates — `std`'s `f64` math and a hand-rolled PRNG.
 pinkdb-math = { path = "../../extensions/math", optional = true }
+# Opt-in full-text search (wave 108a): the `pinkdb-fts` package — BM25
+# scoring, the Porter stemmer, the tokenizer, and the index tables it writes
+# through the engine's host hooks.
+pinkdb-fts = { path = "../../extensions/fts", optional = true }
 # Core arrow extension (opt-in `arrow` feature): Arrow IPC file read/write —
 # the engine-adjacent crate that implements `pinkdb::FileFormat` over the
 # arrow-rs crates (`arrow-array`/`arrow-ipc`/`arrow-schema`, pinned to the

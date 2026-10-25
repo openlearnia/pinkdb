@@ -69,10 +69,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use pinkdb_ext_loader::{ExtHandle, LinkedExtension};
 
+use crate::exec::QueryResult;
 use crate::filefmt::FileFormat;
 use crate::storage::PinkDb;
 use crate::table_source::TableSource;
-use crate::types::{PinkDbError, Result};
+use crate::types::{PinkDbError, Result, Value};
 
 /// A host-published bundle of an extension's surfaces: optional scalar
 /// functions, any number of table sources, and any number of COPY sinks.
@@ -86,6 +87,8 @@ pub struct ExtensionPackage {
     scalars: Option<LinkedExtension>,
     table_sources: Vec<Arc<dyn TableSource>>,
     file_formats: Vec<Arc<dyn FileFormat>>,
+    host_scalars: Vec<HostScalar>,
+    host_statements: Vec<HostStatement>,
 }
 
 impl ExtensionPackage {
@@ -97,6 +100,8 @@ impl ExtensionPackage {
             scalars: None,
             table_sources: Vec::new(),
             file_formats: Vec::new(),
+            host_scalars: Vec::new(),
+            host_statements: Vec::new(),
         }
     }
 
@@ -122,6 +127,23 @@ impl ExtensionPackage {
         self
     }
 
+    /// Attach a host scalar: a per-row function that also receives the
+    /// store, for a function that reads the catalog or a table (wave 108a).
+    /// It binds like a linked scalar, with named arguments allowed.
+    pub fn with_host_scalar(mut self, scalar: HostScalar) -> Self {
+        self.host_scalars.push(scalar);
+        self
+    }
+
+    /// Attach a host statement: `CALL <name>(…)` runs it when no stored
+    /// procedure of that name exists. It may read and write the store
+    /// through [`HostCtx`]; the CALL stays one statement, so a durable store
+    /// logs and replays it once.
+    pub fn with_host_statement(mut self, statement: HostStatement) -> Self {
+        self.host_statements.push(statement);
+        self
+    }
+
     /// The package's registry key, as registered (original case).
     pub fn name(&self) -> &str {
         &self.name
@@ -137,6 +159,14 @@ impl ExtensionPackage {
 
     pub(crate) fn file_formats(&self) -> &[Arc<dyn FileFormat>] {
         &self.file_formats
+    }
+
+    pub(crate) fn host_scalars(&self) -> &[HostScalar] {
+        &self.host_scalars
+    }
+
+    pub(crate) fn host_statements(&self) -> &[HostStatement] {
+        &self.host_statements
     }
 }
 
@@ -192,6 +222,23 @@ pub fn register_extension_package(pkg: ExtensionPackage) -> Result<()> {
             )));
         }
         seen_formats.push(key);
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for name in pkg
+        .host_scalars()
+        .iter()
+        .map(HostScalar::name)
+        .chain(pkg.host_statements().iter().map(HostStatement::name))
+    {
+        let key = name.to_ascii_lowercase();
+        if seen.contains(&key) {
+            return Err(PinkDbError::Execution(format!(
+                "extension package \"{}\" declares host function \"{}\" twice",
+                pkg.name(),
+                name
+            )));
+        }
+        seen.push(key);
     }
     let mut packages = lock_registry();
     if packages
@@ -297,6 +344,23 @@ impl PinkDb {
                 )));
             }
         }
+        // A host scalar shares the scalar namespace with built-ins and every
+        // extension; a collision is refused before anything is installed.
+        for scalar in pkg.host_scalars() {
+            let key = scalar.name().to_ascii_lowercase();
+            if crate::sql::binder::ScalarFunc::from_name(&key).is_some()
+                || crate::sql::binder::AggFunc::from_name(&key).is_some()
+                || self.dynamic_scalar(&key).is_some()
+                || self.host_scalars.contains_key(&key)
+            {
+                return Err(PinkDbError::Execution(format!(
+                    "extension package \"{}\" cannot be loaded: function \"{}\" is already \
+                     registered",
+                    pkg.name(),
+                    scalar.name()
+                )));
+            }
+        }
         // Install. Nothing below can fail.
         let declared = pkg.name().to_string();
         if let Some(scalars) = pkg.scalars() {
@@ -318,7 +382,27 @@ impl PinkDb {
                 .insert(format.name().to_ascii_lowercase(), declared.clone());
             self.file_formats.push(Arc::clone(format));
         }
+        for mut scalar in pkg.host_scalars().iter().cloned() {
+            scalar.set_package(&declared);
+            self.host_scalars
+                .insert(scalar.name().to_ascii_lowercase(), scalar);
+        }
+        for mut statement in pkg.host_statements().iter().cloned() {
+            statement.set_package(&declared);
+            self.host_statements
+                .insert(statement.name().to_ascii_lowercase(), statement);
+        }
         Ok(declared)
+    }
+
+    /// The active host scalar `name` (case-insensitive), if any.
+    pub(crate) fn host_scalar(&self, name: &str) -> Option<&HostScalar> {
+        self.host_scalars.get(&name.to_ascii_lowercase())
+    }
+
+    /// The active host statement `name` (case-insensitive), if any.
+    pub(crate) fn host_statement(&self, name: &str) -> Option<&HostStatement> {
+        self.host_statements.get(&name.to_ascii_lowercase())
     }
 
     /// The package that installed the active table source `name`, if any
@@ -336,5 +420,277 @@ impl PinkDb {
         self.package_file_formats
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host functions and host statements (wave 108a)
+// ---------------------------------------------------------------------------
+//
+// A linked scalar function sees values only. An extension whose functions are
+// *about the store* — a search index that reads a table, a statement that
+// builds one — needs the store itself. These two surfaces are that door, and
+// they are deliberately narrow:
+//
+// - a **host scalar** receives `&PinkDb` and one row's arguments; it reads
+//   the catalog and tables and cannot write, so it stays a pure function of
+//   the store and a statement that calls it is still logged as read-only SQL;
+// - a **host statement** receives a [`HostCtx`], which executes internal SQL
+//   through the same statement path a procedure body uses (so the outer
+//   `CALL` remains one logged statement) and appends rows through the
+//   ordinary insert funnel (keys, triggers, constraints, versions).
+//
+// Both bind through the existing `DynamicScalar` / `Call` plan nodes, so no
+// new statement kind, plan node or parser rule exists for them.
+
+/// One named parameter of a [`HostScalar`] or [`HostStatement`].
+#[derive(Clone, Debug)]
+pub struct HostParam {
+    /// The name SQL writes (matched case-insensitively).
+    pub name: &'static str,
+    /// The declared type. Arguments are checked like ABI v1 arguments: exact
+    /// type, with the numeric→DOUBLE and VARIANT→VARCHAR widenings.
+    pub ty: crate::ext::ExtType,
+    /// The value an omitted parameter takes; `None` makes it required.
+    pub default: Option<Value>,
+    /// The last parameter repeats for every extra positional argument
+    /// (DuckDB's `*input_values`). Only meaningful on the last parameter.
+    pub variadic: bool,
+}
+
+impl HostParam {
+    /// A required positional-or-named parameter.
+    pub fn new(name: &'static str, ty: crate::ext::ExtType) -> Self {
+        Self {
+            name,
+            ty,
+            default: None,
+            variadic: false,
+        }
+    }
+
+    /// Give the parameter a value used when the call omits it.
+    pub fn default_value(mut self, value: Value) -> Self {
+        self.default = Some(value);
+        self
+    }
+
+    /// Let the parameter repeat for every extra argument.
+    pub fn variadic(mut self) -> Self {
+        self.variadic = true;
+        self
+    }
+}
+
+/// A host scalar's callback: reads the store, returns one value per row.
+type ScalarFn = Arc<dyn Fn(&PinkDb, &[Value]) -> Result<Value> + Send + Sync>;
+
+/// The tables a host scalar's call reads, given its arguments (`None` when an
+/// argument is not constant) and the statement's database. See
+/// [`HostScalar::reads_tables`].
+type ReadsFn = fn(&[Option<&Value>], &str) -> Result<Vec<(String, String)>>;
+
+/// A host statement's callback: runs SQL and inserts rows through the store.
+type StatementFn = Arc<dyn Fn(&mut HostCtx<'_>, &[Value]) -> Result<QueryResult> + Send + Sync>;
+
+/// A per-row function that also sees the store (see the module section on
+/// host functions). Bound and evaluated like a linked scalar.
+#[derive(Clone)]
+pub struct HostScalar {
+    name: String,
+    package: String,
+    params: Vec<HostParam>,
+    ret: crate::ext::ExtType,
+    eval: ScalarFn,
+    reads: Option<ReadsFn>,
+}
+
+impl std::fmt::Debug for HostScalar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostScalar")
+            .field("name", &self.name)
+            .field("params", &self.params)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostScalar {
+    /// `name`, its parameters (positional or `name := value`), the declared
+    /// return type, and the callback.
+    pub fn new(
+        name: impl Into<String>,
+        params: Vec<HostParam>,
+        ret: crate::ext::ExtType,
+        eval: impl Fn(&PinkDb, &[Value]) -> Result<Value> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            package: String::new(),
+            params,
+            ret,
+            eval: Arc::new(eval),
+            reads: None,
+        }
+    }
+
+    /// Declare the tables a call reads.
+    ///
+    /// The binder records them as the statement's reads, exactly as if the
+    /// plan held a `Scan`, so RBAC asks for `SELECT` on them and the WAL's
+    /// frame sets see them. The callback runs once, at bind time, so it must
+    /// reject an argument it cannot decide from (an index chosen per row
+    /// would make the check unenforceable). Return `(database, table)` pairs;
+    /// the default database is passed in for an unqualified name.
+    pub fn reads_tables(mut self, reads: ReadsFn) -> Self {
+        self.reads = Some(reads);
+        self
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn params(&self) -> &[HostParam] {
+        &self.params
+    }
+
+    pub fn ret(&self) -> crate::ext::ExtType {
+        self.ret
+    }
+
+    /// The package that installed the scalar (the WAL's `LOAD EXTENSION`
+    /// prefix names it).
+    pub fn package(&self) -> &str {
+        &self.package
+    }
+
+    pub(crate) fn set_package(&mut self, package: &str) {
+        self.package = package.to_string();
+    }
+
+    pub(crate) fn call(&self, db: &PinkDb, args: &[Value]) -> Result<Value> {
+        (self.eval)(db, args)
+    }
+
+    pub(crate) fn reads(&self) -> Option<ReadsFn> {
+        self.reads
+    }
+}
+
+/// The store handle a [`HostStatement`] runs with.
+///
+/// `execute` parses and runs **one** statement through the same path a
+/// procedure body uses: it is not logged separately, so the `CALL` that
+/// triggered it stays the store's one WAL record, and a replayed `CALL`
+/// re-runs the same work deterministically.
+pub struct HostCtx<'a> {
+    db: &'a mut PinkDb,
+    db_name: String,
+    statement: String,
+}
+
+impl<'a> HostCtx<'a> {
+    pub(crate) fn new(db: &'a mut PinkDb, db_name: String, statement: String) -> Self {
+        Self {
+            db,
+            db_name,
+            statement,
+        }
+    }
+
+    /// The store, read-only.
+    pub fn db(&self) -> &PinkDb {
+        self.db
+    }
+
+    /// The session database the `CALL` ran in.
+    pub fn db_name(&self) -> &str {
+        &self.db_name
+    }
+
+    /// Run one SQL statement against the store, without a WAL record of its
+    /// own. Errors name the host statement that issued it.
+    pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
+        let mut statements = crate::sql::parse_statements(sql)
+            .map_err(|e| PinkDbError::Parse(format!("{}: {e}", self.statement)))?;
+        if statements.len() != 1 {
+            return Err(PinkDbError::Execution(format!(
+                "{}: execute() takes exactly one statement, got {}",
+                self.statement,
+                statements.len()
+            )));
+        }
+        let stmt = statements.remove(0);
+        let name = self.statement.clone();
+        let (result, _wrote) = crate::procedure::run_call_statement(
+            self.db,
+            &self.db_name,
+            crate::sql::binder::ParamSlots::new(Vec::new()),
+            &stmt,
+            move |m| PinkDbError::Execution(format!("{name}: {m}")),
+        )?;
+        Ok(result)
+    }
+
+    /// Append `rows` to `db.table` through the ordinary insert funnel, so
+    /// keys, constraints, triggers and the table version behave exactly like
+    /// `INSERT`.
+    pub fn insert_rows(&mut self, db: &str, table: &str, rows: Vec<Vec<Value>>) -> Result<()> {
+        let budget = Arc::new(crate::exec::ExecBudget::unbounded());
+        crate::trigger::insert_rows(self.db, db, table, rows, &budget)
+    }
+}
+
+/// A `CALL <name>(…)` that a package provides (see the module section on host
+/// statements). A stored procedure of the same name shadows it.
+#[derive(Clone)]
+pub struct HostStatement {
+    name: String,
+    package: String,
+    params: Vec<HostParam>,
+    run: StatementFn,
+}
+
+impl std::fmt::Debug for HostStatement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostStatement")
+            .field("name", &self.name)
+            .field("params", &self.params)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostStatement {
+    pub fn new(
+        name: impl Into<String>,
+        params: Vec<HostParam>,
+        run: impl Fn(&mut HostCtx<'_>, &[Value]) -> Result<QueryResult> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            package: String::new(),
+            params,
+            run: Arc::new(run),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn params(&self) -> &[HostParam] {
+        &self.params
+    }
+
+    pub fn package(&self) -> &str {
+        &self.package
+    }
+
+    pub(crate) fn set_package(&mut self, package: &str) {
+        self.package = package.to_string();
+    }
+
+    pub(crate) fn call(&self, ctx: &mut HostCtx<'_>, args: &[Value]) -> Result<QueryResult> {
+        (self.run)(ctx, args)
     }
 }

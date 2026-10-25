@@ -172,6 +172,13 @@ impl Database {
         write_lock(&self.shared).load_extension(path)
     }
 
+    /// Whether `name` is loaded (a native library, a linked extension or an
+    /// extension package) — the guard a host uses before loading a built-in
+    /// one into a store whose replay may already have loaded it.
+    pub fn is_extension_loaded(&self, name: &str) -> bool {
+        read_lock(&self.shared).is_extension_loaded(name)
+    }
+
     /// A loaded native extension's handle, for a host that drives its
     /// `pinkdb_ext_serve` entry point (see [`crate::serve::serve_with`]).
     #[cfg(not(target_arch = "wasm32"))]

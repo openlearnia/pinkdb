@@ -32,6 +32,13 @@ lake-s3 = ["catalog", "pink-lake/s3"]
 # build does not even compile the console crate, so the lean server binary is
 # unchanged (see `docs/server-ui.md`).
 ui = ["dep:pinkdb-server-ui"]
+# Opt-in full-text search (wave 108a): publishes the `pinkdb-fts` package and
+# loads it into the store the server opens, so `match_bm25` works without a
+# client `LOAD EXTENSION` (which still needs --allow-load-extension). Off by
+# default: the default server binary does not change.
+fts = ["dep:pinkdb-fts"]
+# `fts` plus a custom `ignore` regex (pinkdb-fts/custom-ignore).
+fts-regex = ["fts", "pinkdb-fts/custom-ignore"]
 [lib]
 name = "pinkdb_server"
 path = "src/lib.rs"
@@ -42,6 +49,8 @@ path = "src/bin/pinkdb-server.rs"
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
+# Opt-in full-text search (wave 108a): the BM25 package.
+pinkdb-fts = { path = "../../extensions/fts", optional = true }
 # `--catalog` mode (wave 96b): the lake catalog and data store, only with the
 # `catalog` feature (see above).
 pink-lake = { path = "../pink-lake", optional = true }
