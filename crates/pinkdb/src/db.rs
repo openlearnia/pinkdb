@@ -1450,6 +1450,8 @@ fn refused_in_txn(stmt: &crate::sql::ast::Statement) -> Option<&'static str> {
         Statement::CreateDatabase { .. } => "CREATE DATABASE",
         Statement::DropDatabase { .. } => "DROP DATABASE",
         Statement::LoadExtension { .. } => "LOAD EXTENSION",
+        Statement::InstallExtension { .. } => "INSTALL",
+        Statement::LoadInstalledExtension { .. } => "LOAD",
         Statement::Checkpoint => "CHECKPOINT",
         // Wave 80: materialized-view definitions, schedules and counters are
         // store metadata the per-table transaction merge does not cover, and

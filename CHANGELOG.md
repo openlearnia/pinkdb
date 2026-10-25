@@ -91,6 +91,45 @@ one-liners below.
   `PINKDB_STMT_SET_VARIABLE` in the C ABI and `DoneKind::SetVariable` (tag 26)
   on the server wire, which bumps the protocol to v12.
 
+### Wave 93b — SQL `INSTALL`/`LOAD`, and a released `repo` variant ✅
+- **`INSTALL` is SQL now.** `INSTALL name [FROM '<repo-or-url>']`,
+  `FORCE INSTALL …` (re-download an identical cached copy) and `LOAD name`
+  (resolve an installed extension by name, no-op if it is already loaded) run
+  the same code as `.install` — one implementation in the engine
+  (`crates/pinkdb/src/install.rs` plus the repository client moved from the CLI
+  to `crates/pinkdb/src/repo/`), with `.install` reduced to a console alias.
+  Signature verification, SHA-256 checking, the catalog format and the cache
+  layout are unchanged.
+- **The trust boundary is explicit.** Both statements need the `repo` feature;
+  without it the error is `this build has no extension repository support
+  (rebuild with --features repo, or use the pinkdb-repo release variant)`.
+  Installing loads native code, so they take the `LOAD EXTENSION` opt-in
+  (`--allow-load-extension` / `PINKDB_ALLOW_LOAD_EXTENSION=1`), need `ADMIN`,
+  are refused inside a transaction, and a server refuses them for remote
+  clients unless started with `--allow-load-extension`; the MCP read-only
+  policy refuses them like every other write.
+- **WAL decision.** `INSTALL` is deliberately **not** logged: downloading is
+  not replay-deterministic and replay must never reach the network. `LOAD
+  <name>` is logged like `LOAD EXTENSION`, and replay re-resolves it from the
+  cache. Loading now happens from the verified cache path instead of a deleted
+  private staging copy — that is what keeps the recorded path replayable — with
+  a re-hash immediately before the load (a file that changed in between is
+  refused). `LOAD <name>` trusts the per-user cache.
+- **Release variant `repo`.** `install.sh --variant repo` (asset
+  `pinkdb-<ver>-<os>-<arch>-repo.tar.gz`, features `repo`) is now part of the
+  release matrix, smoke test and docs, so `.install`/`INSTALL` and the Ed25519
+  check are no longer source-build-only. Measured on darwin-aarch64: release
+  binary **7,040,240 B** with `repo` vs **4,920,832 B** default (+43.1%;
+  tarball 3,161,246 vs 2,151,249 B).
+- **Tests.** SQL-level end-to-end against the existing loopback fixture
+  repository: install, `FROM`-only (no configured repositories), `LOAD` by name
+  in a fresh process (no download), `FORCE` re-download, a tampered catalog
+  signature refused before any artifact request, the connection gate firing
+  before the network; non-admin RBAC refusals, MCP policy refusals and the
+  no-repo messages; `writes_tables` pins the WAL decision. Workspace **1,914**
+  tests, CLI with `repo` **123**, engine with `repo` **912**, release tooling
+  **12/12**, wasm32 build green.
+
 ### Wave 95b — SQL dialect completeness, batch 2 (DML) ✅
 - **Upserts.** `INSERT … ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]`
   with `excluded.col` (the proposed row) and the target table readable in the
@@ -207,8 +246,8 @@ one-liners below.
   confinement, bare names and `..` and symlinks refused, pins enforced. CI runs it after
   the four smokes and the C++ build, with the conformance matrix under
   `PINKDB_CONFORMANCE_STRICT=1` so a missing toolchain fails instead of skipping.
-- **93b is separate**: SQL `INSTALL` still does not exist (only the `.install`
-  dot-command), and no released CLI enables the `repo` feature.
+- **93b** shipped separately (see below): SQL `INSTALL`/`LOAD <name>` and a
+  released CLI variant with the `repo` feature.
 
 ## 2026-10-25
 ### Wave 95a — SQL dialect completeness, batch 1 ✅

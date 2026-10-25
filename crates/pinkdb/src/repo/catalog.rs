@@ -242,7 +242,7 @@ fn version_key(v: &str) -> (Vec<u64>, Option<String>) {
     (parts, pre)
 }
 
-fn compare_versions(a: &str, b: &str) -> Ordering {
+pub(crate) fn compare_versions(a: &str, b: &str) -> Ordering {
     let (a_parts, a_pre) = version_key(a);
     let (b_parts, b_pre) = version_key(b);
     let len = a_parts.len().max(b_parts.len());

@@ -1635,6 +1635,8 @@ pub(crate) fn refused_in_body(stmt: &Statement) -> Option<&'static str> {
         Statement::Use { .. } => "USE",
         Statement::Checkpoint => "CHECKPOINT",
         Statement::LoadExtension { .. } => "LOAD EXTENSION",
+        Statement::InstallExtension { .. } => "INSTALL",
+        Statement::LoadInstalledExtension { .. } => "LOAD",
         Statement::CreateDatabase { .. } => "CREATE DATABASE",
         Statement::DropDatabase { .. } => "DROP DATABASE",
         Statement::CreateProcedure { .. } => "CREATE PROCEDURE",

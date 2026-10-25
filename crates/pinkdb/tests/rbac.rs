@@ -511,6 +511,16 @@ fn authenticated_sessions_are_checked_per_statement() {
     assert!(e.contains("needs the ADMIN privilege"), "{e}");
     let e = execute(&mut alice, "LOAD EXTENSION 'nope.so';");
     assert!(e.contains("needs the ADMIN privilege"), "{e}");
+    // Wave 93: installing and loading an extension by name are store-level
+    // statements too, whether or not this build has the repository support.
+    for sql in [
+        "INSTALL math_ext;",
+        "LOAD math_ext;",
+        "FORCE INSTALL math_ext;",
+    ] {
+        let e = execute(&mut alice, sql);
+        assert!(e.contains("needs the ADMIN privilege"), "{sql}: {e}");
+    }
     // User/role management needs ADMIN.
     let e = execute(&mut alice, "CREATE USER bob PASSWORD 'x';");
     assert!(e.contains("needs the ADMIN privilege"), "{e}");

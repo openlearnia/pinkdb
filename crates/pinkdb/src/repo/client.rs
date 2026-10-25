@@ -1,11 +1,9 @@
 //! The HTTP side of the repository client: fetch `<base>/index.json` and
 //! `<base>/index.json.sig`, verify the detached signature **before any
 //! artifact request**, resolve `name[@version]` for the current platform,
-//! download the artifact to the local cache (atomic temp + rename), verify
-//! its SHA-256, and report where it landed. `.install` then stages the
-//! verified cache file in a private `0700` temporary directory, re-hashes the
-//! staged bytes, and only then `dlopen`s it (see
-//! `docs/extension-signing.md`).
+//! download the artifact to the local cache (atomic temp + rename), and verify
+//! its SHA-256. The caller re-hashes the cached file immediately before it
+//! `dlopen`s it (see [`crate::install`] and `docs/extension-signing.md`).
 //!
 //! Resolution order is the configured repository order; the first repository
 //! that has a matching artifact wins. A repository whose catalog cannot be
@@ -28,6 +26,7 @@ use ureq::Agent;
 use super::catalog::{ABI_VERSION, Catalog, Entry, Lookup, lookup};
 use super::config::extensions_dir;
 use super::signature::{SIGNATURE_FILE, Trust, Verifier};
+use crate::install::InstalledExtension;
 
 /// Catalog size cap (a catalog is a small JSON document).
 pub const CATALOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -138,31 +137,18 @@ fn fetch_signature(agent: &Agent, base: &str) -> Result<Option<Vec<u8>>, String>
     Ok(Some(bytes))
 }
 
-/// A successfully installed (downloaded or reused) artifact.
-#[derive(Debug, Clone)]
-pub struct Installed {
-    /// Base URL of the repository the artifact came from.
-    pub repository: String,
-    pub entry: Entry,
-    /// Local cache path: `$PINKDB_HOME/extensions/<name>/<version>/<platform>/<file>`.
-    pub path: PathBuf,
-    /// Hex SHA-256 of the bytes on disk (verified against the catalog).
-    pub sha256: String,
-    /// False when a previously cached copy was reused.
-    pub downloaded: bool,
-    /// How the catalog that described this artifact was authenticated.
-    pub trust: Trust,
-}
-
 /// Resolve, download, and verify `name[@version]` from the configured
-/// repositories (first match wins).
+/// repositories (first match wins). `force` revalidates the cached bytes even
+/// when a matching copy is already cached (`FORCE INSTALL`, `.install` never
+/// needs it).
 pub fn install(
     agent: &Agent,
     repositories: &[String],
     home: &Path,
     name: &str,
     version: Option<&str>,
-) -> Result<Installed, String> {
+    force: bool,
+) -> Result<InstalledExtension, String> {
     if repositories.is_empty() {
         return Err(
             "no repositories are configured; add one with `.repositories add <url>`".to_string(),
@@ -184,14 +170,16 @@ pub fn install(
             Lookup::Found(entry) => {
                 let entry = entry.clone();
                 let dest = artifact_path(home, &entry);
-                let (sha256, downloaded) = ensure_artifact(agent, base, &entry, &dest)?;
-                return Ok(Installed {
+                let (sha256, downloaded) = ensure_artifact(agent, base, &entry, &dest, force)?;
+                return Ok(InstalledExtension {
                     repository: base.clone(),
-                    entry,
+                    name: entry.name,
+                    version: entry.version,
+                    platform: entry.platform,
                     path: dest,
                     sha256,
                     downloaded,
-                    trust,
+                    signed_by: trust.signed_by(),
                 });
             }
             Lookup::NoMatch(reason) => reasons.push(format!("{base}: {reason}")),
@@ -205,98 +193,6 @@ pub fn install(
         "extension {wanted:?} was not found in any configured repository ({})",
         reasons.join("; ")
     ))
-}
-
-/// A verified artifact staged for `dlopen` in a private temporary directory.
-///
-/// The directory is created with mode `0700` (and the file with `0600` on
-/// Unix), the file is written with `create_new` (never following a planted
-/// symlink or reusing a name), and the bytes are re-hashed from disk after
-/// the write. Dropping the value removes the directory (best effort; on Unix
-/// the loaded library stays mapped).
-#[derive(Debug)]
-pub struct StagedArtifact {
-    dir: PathBuf,
-    path: PathBuf,
-}
-
-impl StagedArtifact {
-    /// Path of the re-hashed file to pass to `dlopen`.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for StagedArtifact {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Copy an already-catalog-verified artifact into a fresh `0700` directory
-/// with `create_new`, then re-hash the on-disk copy and compare it with the
-/// signed catalog entry. Nothing is returned unless both hashes match.
-pub fn stage_for_loading(entry: &Entry, source: &Path) -> Result<StagedArtifact, String> {
-    let file_name = entry
-        .file
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| format!("catalog entry for {} has no file name", entry.name))?;
-
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("pinkdb-ext-load-{}-{seq}", process::id()));
-    let mut builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(&dir).map_err(|e| {
-        format!(
-            "cannot create private staging directory {}: {e}",
-            dir.display()
-        )
-    })?;
-
-    let path = dir.join(file_name);
-    let staged = (|| {
-        let mut input =
-            fs::File::open(source).map_err(|e| format!("cannot read {}: {e}", source.display()))?;
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut output = options
-            .open(&path)
-            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-        std::io::copy(&mut input, &mut output)
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-        output
-            .sync_all()
-            .map_err(|e| format!("cannot sync {}: {e}", path.display()))?;
-        drop(output);
-
-        let actual = sha256_file(&path)?;
-        if actual != entry.sha256 {
-            return Err(format!(
-                "staged artifact {} failed re-hash: catalog says {}, file has {}; refusing to load it",
-                path.display(),
-                entry.sha256,
-                actual
-            ));
-        }
-        Ok(())
-    })();
-    if let Err(e) = staged {
-        let _ = fs::remove_dir_all(&dir);
-        return Err(e);
-    }
-    Ok(StagedArtifact { dir, path })
 }
 
 /// The cache path for one entry: the artifact's base name under
@@ -313,14 +209,17 @@ pub fn artifact_path(home: &Path, entry: &Entry) -> PathBuf {
 /// Return the artifact at `dest`, downloading it unless an already cached
 /// copy matches the catalog's SHA-256. Downloads are written to a temp file
 /// and renamed into place only after the hash is verified; a mismatch deletes
-/// the temp file and errors, leaving nothing behind.
+/// the temp file and errors, leaving nothing behind. `force` skips the cached
+/// copy, so the bytes on disk are always re-fetched and re-verified.
 fn ensure_artifact(
     agent: &Agent,
     base: &str,
     entry: &Entry,
     dest: &Path,
+    force: bool,
 ) -> Result<(String, bool), String> {
-    if dest.is_file()
+    if !force
+        && dest.is_file()
         && let Ok(sha) = sha256_file(dest)
         && sha == entry.sha256
     {
@@ -499,7 +398,15 @@ mod tests {
     #[test]
     fn install_without_repositories_is_a_clear_error() {
         let agent = agent();
-        let err = install(&agent, &[], Path::new("/nonexistent"), "math_ext", None).unwrap_err();
+        let err = install(
+            &agent,
+            &[],
+            Path::new("/nonexistent"),
+            "math_ext",
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("no repositories are configured"), "{err}");
     }
 
@@ -516,9 +423,26 @@ mod tests {
         // The base URL is unreachable; a cache hit must not touch the network.
         let agent = agent();
         let (sha, downloaded) =
-            ensure_artifact(&agent, "http://127.0.0.1:1", &entry, &dest).unwrap();
+            ensure_artifact(&agent, "http://127.0.0.1:1", &entry, &dest, false).unwrap();
         assert_eq!(sha, entry.sha256);
         assert!(!downloaded);
+    }
+
+    #[test]
+    fn force_skips_the_cached_copy() {
+        let dir = TempDir::new("force");
+        let entry = sample_entry(
+            "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib",
+            &sha256_hex(b"cached bytes"),
+        );
+        let dest = artifact_path(dir.path(), &entry);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"cached bytes").unwrap();
+        // A matching cache hit is ignored: the unreachable base proves the
+        // download was attempted anyway (FORCE means re-fetch and re-verify).
+        let agent = agent();
+        let err = ensure_artifact(&agent, "http://127.0.0.1:1", &entry, &dest, true).unwrap_err();
+        assert!(err.contains("GET http://127.0.0.1:1/"), "{err}");
     }
 
     #[test]
@@ -534,7 +458,7 @@ mod tests {
         // The cached copy does not match the catalog, so a download is
         // attempted (the unreachable base proves it was not reused).
         let agent = agent();
-        let err = ensure_artifact(&agent, "http://127.0.0.1:1", &entry, &dest).unwrap_err();
+        let err = ensure_artifact(&agent, "http://127.0.0.1:1", &entry, &dest, false).unwrap_err();
         assert!(err.contains("GET http://127.0.0.1:1/"), "{err}");
         // The old file stays untouched unless a verified download replaces it.
         assert_eq!(fs::read(&dest).unwrap(), b"corrupt");
@@ -547,56 +471,5 @@ mod tests {
         let big = vec![0xab; 200_000];
         fs::write(&path, &big).unwrap();
         assert_eq!(sha256_file(&path).unwrap(), sha256_hex(&big));
-    }
-
-    #[test]
-    fn stage_for_loading_writes_a_private_copy_and_rehashes_it() {
-        let dir = TempDir::new("stage");
-        let source = dir.path().join("artifact.dylib");
-        let bytes = b"verified extension bytes";
-        fs::write(&source, bytes).unwrap();
-        let entry = sample_entry(
-            "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib",
-            &sha256_hex(bytes),
-        );
-
-        let staged = stage_for_loading(&entry, &source).unwrap();
-        assert_eq!(fs::read(staged.path()).unwrap(), bytes);
-        assert_ne!(staged.path(), source);
-        let parent = staged.path().parent().unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(parent).unwrap().permissions().mode() & 0o777,
-                0o700,
-                "staging directory must be 0700"
-            );
-            assert_eq!(
-                fs::metadata(staged.path()).unwrap().permissions().mode() & 0o777,
-                0o600,
-                "staged file must be 0600"
-            );
-            // The directory is unique per call, even with the same entry.
-            let second = stage_for_loading(&entry, &source).unwrap();
-            assert_ne!(second.path().parent(), Some(parent));
-        }
-        let staged_path = staged.path().to_path_buf();
-        drop(staged);
-        assert!(!staged_path.exists(), "staging directory was not removed");
-    }
-
-    #[test]
-    fn stage_for_loading_refuses_a_tampered_source() {
-        let dir = TempDir::new("stage-tamper");
-        let source = dir.path().join("artifact.dylib");
-        fs::write(&source, b"tampered bytes").unwrap();
-        let entry = sample_entry(
-            "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib",
-            &sha256_hex(b"the bytes the catalog signed"),
-        );
-        let err = stage_for_loading(&entry, &source).unwrap_err();
-        assert!(err.contains("failed re-hash"), "{err}");
-        assert!(err.contains(&entry.sha256), "{err}");
     }
 }

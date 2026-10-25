@@ -1204,6 +1204,8 @@ fn read_checked(plan: &LogicalPlan) -> bool {
             | LogicalPlan::DropDatabase { .. }
             | LogicalPlan::Checkpoint
             | LogicalPlan::LoadExtension { .. }
+            | LogicalPlan::InstallExtension { .. }
+            | LogicalPlan::LoadInstalledExtension { .. }
             | LogicalPlan::Call { .. }
             // Schema DDL (checked for `CREATE` on the target database).
             | LogicalPlan::CreateTable { .. }
@@ -1316,6 +1318,8 @@ pub(crate) fn check_statement(
         }
         LogicalPlan::Checkpoint => return admin_only("CHECKPOINT"),
         LogicalPlan::LoadExtension { .. } => return admin_only("LOAD EXTENSION"),
+        LogicalPlan::InstallExtension { .. } => return admin_only("INSTALL"),
+        LogicalPlan::LoadInstalledExtension { .. } => return admin_only("LOAD"),
         // M-3: writing a file on the server host is never implied by SELECT.
         // A dedicated filesystem-write privilege would need a new grant
         // keyword and `.pink`/WAL persistence surface, so this pass reuses

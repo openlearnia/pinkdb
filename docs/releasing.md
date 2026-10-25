@@ -47,6 +47,7 @@ CLI assets:
 | `lean` | `--no-default-features` | no linked json/datetime/math extensions |
 | `pinklake` | `pinklake` | `.lake` over `.pink` data files |
 | `pinklake-s3` | `pinklake,s3` | pinklake + `s3://` storage |
+| `repo` | `repo` | SQL `INSTALL`/`LOAD <name>` and the `.install`/`.repositories`/`.installed` dot-commands (native only; adds the HTTPS client and the Ed25519 catalog verifier) |
 
 Server assets:
 

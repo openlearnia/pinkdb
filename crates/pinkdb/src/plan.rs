@@ -258,6 +258,22 @@ pub enum LogicalPlan {
     LoadExtension {
         path: String,
     },
+    /// `INSTALL <name> [FROM '<repository>']` / `FORCE INSTALL …` (wave 93):
+    /// download, verify and cache an extension from the repository, then load
+    /// it. **Not WAL-logged**: the download is not replay-deterministic and a
+    /// replay must never reach the network; the load is re-established by the
+    /// extension prefix of a later logged statement that calls it.
+    InstallExtension {
+        name: String,
+        from: Option<String>,
+        force: bool,
+    },
+    /// `LOAD <name>` (wave 93): load an extension already installed in the
+    /// local cache. WAL-logged like `LOAD EXTENSION`: the statement text is
+    /// recorded and re-resolved on replay by the extension replay rules.
+    LoadInstalledExtension {
+        name: String,
+    },
     /// `CHECKPOINT`: persist + roll the WAL of a durable store (no-op
     /// otherwise). Never WAL-logged and refused inside a transaction.
     Checkpoint,
@@ -770,6 +786,10 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             // logged statement may not even read one (see
             // `sql::bind_tracked_with`).
             | LogicalPlan::LoadExtension { .. }
+            // Wave 93: `LOAD <name>` is logged (replay re-resolves the cached
+            // artifact by name); `INSTALL` is not — downloading a file cannot
+            // be replayed deterministically.
+            | LogicalPlan::LoadInstalledExtension { .. }
             // Wave 80: materialized-view statements mutate the store (the
             // backing table and the catalog definition), so they are logged:
             // a durable store replays `CREATE/DROP/REFRESH MATERIALIZED VIEW`
@@ -820,6 +840,8 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
         LogicalPlan::CreateDatabase { .. } => "CREATE DATABASE",
         LogicalPlan::DropDatabase { .. } => "DROP DATABASE",
         LogicalPlan::LoadExtension { .. } => "LOAD EXTENSION",
+        LogicalPlan::InstallExtension { .. } => "INSTALL",
+        LogicalPlan::LoadInstalledExtension { .. } => "LOAD",
         LogicalPlan::Checkpoint => "CHECKPOINT",
         // Wave 80: materialized-view statements carry catalog metadata
         // (definition, schedule, refresh counters) that the per-table
@@ -968,6 +990,8 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::InstallExtension { .. }
+        | LogicalPlan::LoadInstalledExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }
@@ -1406,6 +1430,8 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::InstallExtension { .. }
+        | LogicalPlan::LoadInstalledExtension { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
@@ -1613,6 +1639,8 @@ fn walk_scan_filters(
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::InstallExtension { .. }
+        | LogicalPlan::LoadInstalledExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }
@@ -1935,6 +1963,8 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::InstallExtension { .. }
+        | LogicalPlan::LoadInstalledExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }
@@ -2312,6 +2342,8 @@ fn walk_scan_projections(
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::InstallExtension { .. }
+        | LogicalPlan::LoadInstalledExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }

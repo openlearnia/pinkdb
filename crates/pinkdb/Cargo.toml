@@ -20,6 +20,18 @@ encryption = ["dep:aes-gcm", "dep:subtle", "dep:sha2"]
 # $$…$$`): links the pinkdb-js sandbox crate. Off by default — the default
 # build stays engine-free and lean. `cargo build --features js`.
 js = ["dep:pinkdb-js", "pinkdb-js/engine"]
+# Opt-in extension-repository client: `INSTALL <name> [FROM <url>]`,
+# `LOAD <name>`, and the CLI's `.install`/`.repositories`/`.installed`.
+# Keep the default build lean: blocking HTTP over rustls, catalog JSON,
+# SHA-256 and Ed25519 catalog-signature verification compile only with this
+# feature (`sha2` is shared with `encryption`). Native only.
+repo = [
+    "dep:ureq",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:ed25519-dalek",
+    "dep:base64",
+]
 
 [dependencies]
 peg = "0.8"
@@ -48,6 +60,17 @@ argon2 = { version = "0.5", default-features = false, features = [
 ] }
 # The JavaScript procedure sandbox, only linked with the `js` feature.
 pinkdb-js = { path = "../pinkdb-js", optional = true }
+# Repository client (`repo` feature): blocking HTTP over rustls (no gzip: the
+# repository serves raw artifacts), catalog JSON, and Ed25519 verification of
+# the detached catalog signature.
+ureq = { version = "3.4", default-features = false, features = [
+    "rustls",
+], optional = true }
+serde_json = { version = "1", optional = true }
+ed25519-dalek = { version = "2.2", default-features = false, features = [
+    "std",
+], optional = true }
+base64 = { version = "0.23", optional = true }
 
 # Loadable extensions, on every target. Native builds use the `dlopen` half
 # (ABI v1) — the loader crate links `libloading` there; wasm builds use the

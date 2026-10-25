@@ -750,6 +750,8 @@ mod tests {
                    ALTER TABLE t ADD COLUMN b INT; CREATE VIEW v AS SELECT 1; DROP VIEW v; \
                    CREATE DATABASE d; DROP DATABASE d; COPY t TO 'x.parquet'; \
                    LOAD EXTENSION 'x'; CHECKPOINT; CREATE PROCEDURE p() AS 'x'; \
+                   INSTALL x; FORCE INSTALL x FROM 'https://example.test'; \
+                   LOAD x; \
                    DROP PROCEDURE p; CREATE MACRO m() AS 1; DROP MACRO m; \
                    CREATE USER u PASSWORD 'x'; ALTER USER u PASSWORD 'y'; DROP USER u; \
                    CREATE ROLE r; DROP ROLE r; BEGIN; COMMIT; ROLLBACK; \

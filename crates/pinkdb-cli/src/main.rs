@@ -102,8 +102,10 @@ use pinkdb_server::Client;
 #[cfg(feature = "tls")]
 use pinkdb_server::ClientTrust;
 
+/// The engine's extension-repository client: `.install` and the repository
+/// dot-commands are thin wrappers over the same code SQL `INSTALL` runs.
 #[cfg(feature = "repo")]
-mod repo;
+use pinkdb::repo;
 
 #[cfg(feature = "pinklake")]
 mod lake;
@@ -544,6 +546,13 @@ fn print_help() {
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
     println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases;");
     println!("     `LOAD EXTENSION '<path>'` loads a native extension (ABI v1).");
+    if cfg!(feature = "repo") {
+        println!("     `INSTALL <name> [FROM '<url>']`, `FORCE INSTALL …` and `LOAD <name>`");
+        println!("     install, verify (signed catalog + SHA-256) and load from the repository;");
+        println!("     like `LOAD EXTENSION`, SQL loading needs --allow-load-extension.");
+    } else {
+        println!("     `INSTALL`/`LOAD <name>` need the `repo` feature (not built).");
+    }
     if cfg!(feature = "json") {
         println!("JSON: json_extract, json_value, json_valid, json_array_length, json_object,");
         println!("      json_array are built in and loaded into every store (`json` feature); a");
@@ -587,8 +596,7 @@ fn print_help() {
 /// built without the opt-in `repo` feature.
 #[cfg(not(feature = "repo"))]
 fn repo_unavailable(cmd: &str) {
-    cli_error!("{cmd} is not available: this pinkdb binary was built without the repo feature;");
-    eprintln!("       rebuild with `cargo build -p pinkdb-cli --features repo`.");
+    cli_error!("{cmd} is not available: {}.", pinkdb::NO_REPO_SUPPORT);
 }
 
 /// The `.lake` message when the binary was built without the lake feature.
@@ -602,8 +610,15 @@ fn lake_unavailable(cmd: &str) {
     );
 }
 
-/// `.install <name[@version]>`: resolve, download, verify, cache, and load.
-#[cfg(feature = "repo")]
+/// `.install <name[@version]>`: the console alias for SQL `INSTALL` — one
+/// implementation (`PinkDb::install_extension` resolves, downloads, verifies
+/// the signed catalog and the artifact's SHA-256, caches it, and re-checks the
+/// bytes it is about to load).
+///
+/// Unlike the SQL statement it is not behind `--allow-load-extension`: typing
+/// it here is the operator asking for it, and every other script line can
+/// already load a library by path with the flag. Without the `repo` feature
+/// the engine reports why it cannot install.
 fn cmd_install(db: &mut PinkDb, arg: &str) {
     let arg = arg.trim();
     if arg.is_empty() || arg.split_whitespace().count() != 1 {
@@ -618,55 +633,25 @@ fn cmd_install(db: &mut PinkDb, arg: &str) {
         println!("Usage: .install <name[@version]>");
         return;
     }
-    let home = match repo::pinkdb_home() {
-        Ok(home) => home,
-        Err(e) => {
-            cli_error!("{e}");
-            return;
-        }
-    };
-    let repositories = match repo::load_repositories() {
-        Ok(repositories) => repositories,
-        Err(e) => {
-            cli_error!("{e}");
-            return;
-        }
-    };
-    let agent = repo::agent();
-    match repo::install(&agent, &repositories, &home, name, version) {
+    match db.install_extension(name, version, None, false) {
         Ok(installed) => {
             println!(
                 "Installed {} {} ({})",
-                installed.entry.name, installed.entry.version, installed.entry.platform
+                installed.name, installed.version, installed.platform
             );
             println!("  repository: {}", installed.repository);
             println!("  path:       {}", installed.path.display());
             println!("  sha256:     {}", installed.sha256);
-            match &installed.trust {
-                repo::Trust::Signed { key_id } => {
-                    println!("  signature:  verified (key {key_id})");
-                }
-                repo::Trust::UnsignedDev => {
-                    println!(
-                        "  signature:  NOT VERIFIED (PINKDB_EXT_ALLOW_UNSIGNED=1 is set — INSECURE)"
-                    );
-                }
+            match &installed.signed_by {
+                Some(key_id) => println!("  signature:  verified (key {key_id})"),
+                None => println!(
+                    "  signature:  NOT VERIFIED (PINKDB_EXT_ALLOW_UNSIGNED=1 is set — INSECURE)"
+                ),
             }
             if !installed.downloaded {
                 println!("  cached:     yes");
             }
-            // Copy the verified bytes into a fresh 0700 directory with
-            // `create_new`, re-hash the copy, and only then load it. The
-            // staging directory is removed when `staged` drops; the loaded
-            // library stays mapped.
-            let staged = match repo::stage_for_loading(&installed.entry, &installed.path) {
-                Ok(staged) => staged,
-                Err(e) => {
-                    cli_error!("{e}");
-                    return;
-                }
-            };
-            match db.load_extension(&staged.path().to_string_lossy()) {
+            match db.load_installed_extension(&installed.path) {
                 Ok(loaded) => println!("Extension {loaded} loaded."),
                 Err(e) => cli_error!("{e}"),
             }
@@ -1304,12 +1289,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
             #[cfg(not(feature = "parquet"))]
             parquet_unavailable(".parquet");
         }
-        ".install" => {
-            #[cfg(feature = "repo")]
-            cmd_install(db, rest);
-            #[cfg(not(feature = "repo"))]
-            repo_unavailable(".install");
-        }
+        ".install" => cmd_install(db, rest),
         ".repositories" => {
             #[cfg(feature = "repo")]
             cmd_repositories(rest);
@@ -1466,6 +1446,7 @@ fn print_help_remote() {
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
     println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases;");
     println!("     `LOAD EXTENSION '<path>'` loads a native extension (ABI v1).");
+    println!("     `INSTALL`/`LOAD <name>` also need the server's --allow-load-extension.");
 }
 
 fn display_value(v: &Value) -> String {

@@ -248,6 +248,10 @@ if [ "$kind" = cli ]; then
             expect_contains "pinklake-s3 format marker" "catalog format_version 7" -c ".help"
             expect_contains "pinklake-s3 URLs" "s3://bucket/prefix" -c ".help"
             ;;
+        repo)
+            expect_contains "repo .help" "INSTALL <name> [FROM" -c ".help"
+            expect_contains "repo .install usage" "Usage: .install <name[@version]>" -c ".install"
+            ;;
         *)
             die "unknown CLI variant '$variant'"
             ;;

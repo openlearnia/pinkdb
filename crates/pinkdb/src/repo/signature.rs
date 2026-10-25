@@ -161,6 +161,17 @@ pub enum Trust {
     UnsignedDev,
 }
 
+impl Trust {
+    /// The id of the key that signed the catalog, or `None` for the unsigned
+    /// development mode (the caller reports that as INSECURE).
+    pub fn signed_by(&self) -> Option<String> {
+        match self {
+            Trust::Signed { key_id } => Some(key_id.clone()),
+            Trust::UnsignedDev => None,
+        }
+    }
+}
+
 /// A set of trusted public keys plus the (insecure) unsigned escape hatch.
 #[derive(Debug, Clone)]
 pub struct Verifier {

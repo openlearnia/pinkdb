@@ -47,11 +47,12 @@ Pin a version or choose a feature variant:
 sh install.sh --version 0.1.0 --variant default
 sh install.sh --variant pinklake-s3     # .lake over .pink files + s3://
 sh install.sh --variant lean            # no linked json/datetime/math
+sh install.sh --variant repo            # SQL INSTALL/LOAD from the extension repository
 ```
 
 `--dry-run` prints the resolved version, asset, URL and destination without
 downloading; `--force` replaces an existing install. Supported variants are
-`default`, `lean`, `pinklake`, `pinklake-s3`.
+`default`, `lean`, `pinklake`, `pinklake-s3`, `repo`.
 Server binaries (`pinkdb-server-<version>-<os>-<arch>-{default,async-server,tls}.tar.gz`)
 and the `SHA256SUMS` manifest are attached to the same release. **Windows is
 not supported** — there is no Windows binary or `install.ps1`. See
@@ -2028,14 +2029,33 @@ exact `index.json` bytes (`index.json.sig`), verified by `.install` against a
 key pinned in the binary (see `docs/extension-signing.md`). The first published
 artifact is the C SDK example `math_ext` 0.1.0 (`darwin-arm64`).
 
-#### Installing extensions (`.install`)
+#### Installing extensions (`INSTALL`, `.install`)
 
-The CLI can install extensions from repositories. The HTTP/TLS/JSON/SHA-256
-client is an opt-in feature so the default binary stays lean:
+SQL `INSTALL` (and its console alias `.install`) resolves, downloads, verifies
+and loads an extension from a repository:
+
+```sql
+INSTALL math_ext;                                  -- configured repositories
+INSTALL math_ext FROM 'https://example.test/repo'; -- one repository, no config
+FORCE INSTALL math_ext;                            -- re-download, then load
+LOAD math_ext;                                     -- load an installed extension
+```
+
+The HTTP/TLS/JSON/SHA-256 client (plus the Ed25519 verifier) is an opt-in
+feature so the default binary stays lean. The `repo` release variant ships it,
+or build it yourself:
 
 ```sh
+sh install.sh --variant repo                  # released binary with the feature
 cargo build -p pinkdb-cli --features repo     # the `repo` feature
 ```
+
+A build without the feature answers `this build has no extension repository
+support (rebuild with --features repo, or use the pinkdb-repo release variant)`.
+Installing loads native code, so `INSTALL` and `LOAD <name>` take the same
+opt-in as `LOAD EXTENSION` (`--allow-load-extension` /
+`PINKDB_ALLOW_LOAD_EXTENSION=1`), need `ADMIN`, and a server refuses them for
+remote clients unless it was started with `--allow-load-extension`.
 
 Then, inside the REPL:
 
@@ -2079,18 +2099,24 @@ pinkdb> SELECT ext_clamp(CAST(42 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGIN
   overrides `PINKDB_EXT_REPO_PUBKEY` (replace the pin) and
   `PINKDB_EXT_ALLOW_UNSIGNED=1` (skip verification) print loud warnings and are
   **insecure**. See `docs/extension-signing.md`.
-- **Load:** `.install` finishes by staging the verified file in a private
-  `0700` temp directory with `create_new`, re-hashing the staged copy, then
-  `LOAD EXTENSION`-ing that path into the current session; the extension then
-  behaves exactly as described below (process-level, WAL replay re-loads it by
-  path).
+- **Load:** after the download, `INSTALL` re-hashes the cached file and then
+  loads it from its cache path (the same path printed as `path:` above) — a
+  file that changed between the rename and the load is refused. Loading from
+  the cache rather than a private staging copy keeps the recorded path
+  replayable: a durable database reloads the extension from there. `LOAD
+  <name>` resolves the highest installed version for this platform and loads
+  it (an already loaded name is a no-op). The extension then behaves exactly
+  as described below (process-level; WAL replay re-loads it by path).
 
 Semantics and persistence:
 
 - Extensions are **process-level**: they are not stored in `.pink` snapshots
-  and not part of a transaction. `LOAD EXTENSION` is refused inside
-  `BEGIN..COMMIT` (`LOAD EXTENSION is not allowed inside a transaction`), like
-  `CREATE DATABASE`. An accepted extension stays loaded (its library stays
+  and not part of a transaction. `LOAD EXTENSION`, `INSTALL` and `LOAD <name>`
+  are refused inside `BEGIN..COMMIT` (`… is not allowed inside a transaction`),
+  like `CREATE DATABASE`. `INSTALL` is deliberately **not** WAL-logged — a
+  download is not replay-deterministic and replay never reaches the network —
+  while `LOAD <name>` is logged like `LOAD EXTENSION` and re-resolved from the
+  cache on replay (so the installed artifact must still be there). An accepted extension stays loaded (its library stays
   mapped) for the lifetime of the store — even one that registers no functions
   — and its declared name is pinned: loading it again is a clear
   `extension "x" is already loaded` error (a failed load registers nothing).

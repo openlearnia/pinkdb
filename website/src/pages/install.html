@@ -36,11 +36,13 @@ export line to add. It never uses <code>sudo</code>.</p>
     <tr><td><code>lean</code></td><td><code>--no-default-features</code></td><td>the same core without the linked json/datetime/math extensions</td></tr>
     <tr><td><code>pinklake</code></td><td><code>pinklake</code></td><td><code>.lake</code> over <code>.pink</code> data files</td></tr>
     <tr><td><code>pinklake-s3</code></td><td><code>pinklake,s3</code></td><td>pinklake + <code>s3://</code> storage (AWS S3, R2)</td></tr>
+    <tr><td><code>repo</code></td><td><code>repo</code></td><td>SQL <code>INSTALL</code>/<code>LOAD &lt;name&gt;</code> and the <code>.install</code>/<code>.repositories</code>/<code>.installed</code> dot-commands (native only: adds the HTTPS client and the Ed25519 catalog verifier)</td></tr>
   </tbody>
 </table>
 </div>
 
 <pre class="code" data-lang="sh"><code>sh install.sh --variant pinklake-s3
+sh install.sh --variant repo          # INSTALL/LOAD from the extension repository
 sh install.sh --variant pinklake --prefix "$HOME/bin"</code></pre>
 
 <h2>Pin a version</h2>

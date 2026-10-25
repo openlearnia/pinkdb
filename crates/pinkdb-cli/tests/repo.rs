@@ -74,28 +74,42 @@ impl Drop for TempHome {
 /// `script` on stdin; returns stdout. The test public key replaces the
 /// production pin through the documented dev override.
 fn run_cli(home: &Path, script: &str) -> String {
-    run_cli_with(home, script, &[], Some(&test_public_key_pem()))
+    run_cli_with(home, script, &[], &[], Some(&test_public_key_pem()))
+}
+
+/// Like [`run_cli`], but with SQL loading turned on: `INSTALL` and `LOAD
+/// <name>` load native code, so they take the same opt-in as `LOAD EXTENSION`.
+fn run_cli_sql(home: &Path, script: &str) -> String {
+    run_cli_with(
+        home,
+        script,
+        &["--allow-load-extension"],
+        &[],
+        Some(&test_public_key_pem()),
+    )
 }
 
 /// Like [`run_cli`], with extra environment variables (e.g. the unsigned dev
 /// escape hatch).
 fn run_cli_env(home: &Path, script: &str, envs: &[(&str, &str)]) -> String {
-    run_cli_with(home, script, envs, Some(&test_public_key_pem()))
+    run_cli_with(home, script, &[], envs, Some(&test_public_key_pem()))
 }
 
 /// Run with the **embedded production pin** (no test override).
 fn run_cli_pinned(home: &Path, script: &str) -> String {
-    run_cli_with(home, script, &[], None)
+    run_cli_with(home, script, &[], &[], None)
 }
 
 fn run_cli_with(
     home: &Path,
     script: &str,
+    args: &[&str],
     envs: &[(&str, &str)],
     public_key_pem: Option<&str>,
 ) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
     command
+        .args(args)
         .env("PINKDB_HOME", home)
         .env_remove("PINKDB_EXT_REPO_PUBKEY")
         .env_remove("PINKDB_EXT_ALLOW_UNSIGNED");
@@ -902,6 +916,139 @@ fn second_install_reuses_the_cached_copy() {
         "the cached artifact must not be downloaded again"
     );
     assert_no_temp_files(home.path());
+}
+
+/// Wave 93: SQL `INSTALL` runs the same install path as `.install` (resolve,
+/// verify, cache, load), `LOAD <name>` resolves the cache, and `FORCE
+/// INSTALL` downloads again. Both statements take the `LOAD EXTENSION`
+/// opt-in, which is what a server's `--allow-load-extension` sets.
+#[test]
+fn sql_install_load_and_force_end_to_end() {
+    let home = TempHome::new("sql");
+    let bytes = fs::read(fixture_extension()).unwrap();
+    let platform = host_platform();
+    let file = artifact_file("0.1.0", &platform);
+    let sha = sha256_hex(&bytes);
+    let server = Fixture::start(
+        catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]),
+        vec![(file.clone(), bytes.clone())],
+    );
+    home.configure(&[&server.base_url()]);
+
+    // Without the opt-in the statement is refused before any request — the
+    // cache holds nothing, so the gate, not a missing file, is the reason.
+    let out = run_cli(home.path(), "INSTALL repo_ext;\n.quit\n");
+    assert!(
+        out.contains("INSTALL is disabled on this connection"),
+        "{out}"
+    );
+    assert!(out.contains("--allow-load-extension"), "{out}");
+    assert!(
+        server.requests().is_empty(),
+        "the gate must fire before the network: {:?}",
+        server.requests()
+    );
+
+    // With it, INSTALL installs and loads.
+    let out = run_cli_sql(
+        home.path(),
+        "INSTALL repo_ext;\nSELECT ext_repo_triple(CAST(14 AS BIGINT));\n.quit\n",
+    );
+    assert!(out.contains("Extension repo_ext loaded."), "{out}");
+    assert!(out.contains("│ 42"), "{out}");
+    assert_eq!(server.artifact_requests(), 1);
+
+    // A fresh process `LOAD`s the cached artifact: no download, and the
+    // extension works.
+    let out = run_cli_sql(
+        home.path(),
+        "LOAD repo_ext;\nSELECT ext_repo_triple(CAST(15 AS BIGINT));\n.quit\n",
+    );
+    assert!(out.contains("Extension repo_ext loaded."), "{out}");
+    assert!(out.contains("│ 45"), "{out}");
+    assert_eq!(server.artifact_requests(), 1, "LOAD must not download");
+
+    // FORCE re-downloads; repeating INSTALL afterwards reuses the loaded
+    // extension instead of failing on the duplicate name.
+    let out = run_cli_sql(
+        home.path(),
+        "FORCE INSTALL repo_ext;\nINSTALL repo_ext;\n.quit\n",
+    );
+    assert_eq!(
+        out.matches("Extension repo_ext loaded.").count(),
+        2,
+        "{out}"
+    );
+    assert_eq!(server.artifact_requests(), 2, "FORCE re-downloads");
+    assert_no_temp_files(home.path());
+}
+
+/// `INSTALL … FROM '<url>'` uses that repository instead of the configured
+/// ones, so it works with no `repositories.json` at all.
+#[test]
+fn sql_install_from_url_overrides_the_repositories() {
+    let home = TempHome::new("sql-from");
+    let bytes = fs::read(fixture_extension()).unwrap();
+    let platform = host_platform();
+    let file = artifact_file("0.1.0", &platform);
+    let sha = sha256_hex(&bytes);
+    let server = Fixture::start(
+        catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]),
+        vec![(file.clone(), bytes.clone())],
+    );
+
+    let out = run_cli_sql(
+        home.path(),
+        &format!(
+            "INSTALL repo_ext FROM '{}';\nSELECT ext_repo_triple(CAST(6 AS BIGINT));\n.quit\n",
+            server.base_url()
+        ),
+    );
+    assert!(out.contains("Extension repo_ext loaded."), "{out}");
+    assert!(out.contains("│ 18"), "{out}");
+    assert_eq!(server.artifact_requests(), 1);
+
+    // A `FROM` that is not an http(s) repository is refused while building
+    // the repository list, before any request.
+    let before = server.requests().len();
+    let out = run_cli_sql(
+        home.path(),
+        "INSTALL repo_ext FROM 'ftp://example.test';\n.quit\n",
+    );
+    assert!(out.contains("must start with http:// or https://"), "{out}");
+    assert_eq!(server.requests().len(), before);
+
+    // With an empty configured list and no `FROM`, the error says how to add
+    // a repository.
+    home.configure(&[]);
+    let out = run_cli_sql(home.path(), "INSTALL repo_ext;\n.quit\n");
+    assert!(out.contains("no repositories are configured"), "{out}");
+}
+
+/// A catalog whose signature does not verify is refused through SQL too, and
+/// the artifact is never fetched.
+#[test]
+fn sql_install_refuses_a_tampered_catalog_signature() {
+    let bytes = fs::read(fixture_extension()).unwrap();
+    let platform = host_platform();
+    let file = artifact_file("0.1.0", &platform);
+    let sha = sha256_hex(&bytes);
+    let catalog = catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]);
+    let server = Fixture::start_with_signature(
+        catalog,
+        Some(sign_envelope(b"a different catalog")),
+        vec![(file.clone(), bytes.clone())],
+    );
+    let home = TempHome::new("sql-bad-sig");
+    home.configure(&[&server.base_url()]);
+    let out = run_cli_sql(home.path(), "INSTALL repo_ext;\n.quit\n");
+    assert!(
+        out.contains("catalog signature verification failed"),
+        "{out}"
+    );
+    assert!(!out.contains("Extension repo_ext loaded."), "{out}");
+    assert_eq!(server.artifact_requests(), 0);
+    assert_eq!(server.requests(), vec!["/index.json", "/index.json.sig"]);
 }
 
 /// Opt-in live test against the official repository:

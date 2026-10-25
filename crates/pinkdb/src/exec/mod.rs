@@ -504,6 +504,21 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
     })
 }
 
+/// The shared gate for the statements that load native code (`LOAD EXTENSION`,
+/// `INSTALL`, `LOAD <name>`): off by default, because each one makes the
+/// process run native code. `source` says where the code comes from, so the
+/// message names what the operator is enabling.
+fn sql_load_gate(db: &PinkDb, statement: &str, source: &str) -> Result<()> {
+    if db.allow_sql_load_extension() {
+        return Ok(());
+    }
+    Err(PinkDbError::Execution(format!(
+        "{statement} is disabled on this connection (it is off by default: it makes the process \
+         load and run native code from {source}; enable it explicitly — the server's \
+         --allow-load-extension flag, or Database::set_allow_sql_load_extension(true))"
+    )))
+}
+
 /// `USE` validation + result. Bind already checks existence; re-checking here
 /// closes the window for the multi-writer `Connection` path (bind and run are
 /// separate lock acquisitions) and keeps `run` self-contained.
@@ -1429,21 +1444,38 @@ pub(crate) fn run_plain(
                 let name = db.resolve_replay_extension(path)?;
                 return Ok(QueryResult::LoadedExtension { name });
             }
-            if !db.allow_sql_load_extension() {
-                return Err(PinkDbError::Execution(
-                    "LOAD EXTENSION is disabled on this connection (it is off by default: \
-                     it makes the process load and run native code from a path the SQL names; \
-                     enable it explicitly — the server's --allow-load-extension flag, or \
-                     Database::set_allow_sql_load_extension(true))"
-                        .to_string(),
-                ));
-            }
+            sql_load_gate(db, "LOAD EXTENSION", "a path the SQL names")?;
             // Process-level side effect: load the library (native) or
             // resolve the name in the linked registry (wasm; natively too,
             // when nothing is loadable at `path`) and register its functions
             // (atomic; a failure registers nothing). The DB stays usable
             // afterwards either way.
             let name = db.load_extension(path)?;
+            Ok(QueryResult::LoadedExtension { name })
+        }
+        LogicalPlan::InstallExtension { name, from, force } => {
+            // Name a missing `repo` feature before gate or network: the
+            // build, not the connection, is what cannot install.
+            db.require_repository_support()?;
+            // Gate before the network: INSTALL downloads and then loads
+            // native code. It is never WAL-logged (see `writes_tables`), so
+            // replay never reaches this arm.
+            sql_load_gate(db, "INSTALL", "the artifact its repository catalog names")?;
+            let installed = db.install_extension(name, None, from.as_deref(), *force)?;
+            let name = db.load_installed_extension(&installed.path)?;
+            Ok(QueryResult::LoadedExtension { name })
+        }
+        LogicalPlan::LoadInstalledExtension { name } => {
+            let path = db.installed_extension_path(name)?;
+            if db.replaying {
+                // The cache path is the source a logged statement that calls
+                // the extension records; the replay rules decide whether it
+                // may be loaded (exactly like a recorded `LOAD EXTENSION`).
+                let name = db.resolve_replay_extension(&path.to_string_lossy())?;
+                return Ok(QueryResult::LoadedExtension { name });
+            }
+            sql_load_gate(db, "LOAD", "the extension it resolves in the local cache")?;
+            let name = db.load_installed_extension(&path)?;
             Ok(QueryResult::LoadedExtension { name })
         }
         LogicalPlan::CreateProcedure {
@@ -2311,6 +2343,8 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::InstallExtension { .. }
+        | LogicalPlan::LoadInstalledExtension { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
@@ -6021,6 +6055,16 @@ fn explain_into(
             format!("SetVariable {name} = {}", expr_text(value))
         }
         LogicalPlan::LoadExtension { path } => format!("LoadExtension {path}"),
+        LogicalPlan::InstallExtension { name, from, force } => {
+            let force = if *force { " (force)" } else { "" };
+            match from {
+                Some(url) => format!("InstallExtension{force} {name} FROM '{url}'"),
+                None => format!("InstallExtension{force} {name}"),
+            }
+        }
+        LogicalPlan::LoadInstalledExtension { name } => {
+            format!("LoadInstalledExtension {name}")
+        }
         LogicalPlan::Checkpoint => "Checkpoint".to_string(),
         LogicalPlan::ShowTables { db } => format!("ShowTables {db}"),
         LogicalPlan::ShowDatabases => "ShowDatabases".to_string(),
@@ -12969,6 +13013,65 @@ mod tests {
         db.execute("INSERT INTO c VALUES (100, 1, 'a'), (101, 2, 'b');")
             .unwrap();
         db
+    }
+
+    /// Wave 93 statement gates: `INSTALL` and `LOAD <name>` are store/process
+    /// level (a snapshot commit cannot undo them), so they are refused inside
+    /// a transaction, and `EXPLAIN` refuses them like every other statement
+    /// that shows no query plan.
+    #[test]
+    fn install_and_load_are_refused_in_transactions_and_by_explain() {
+        let mut db = PinkDb::new();
+        for sql in ["INSTALL httpfs;", "FORCE INSTALL httpfs;", "LOAD httpfs;"] {
+            let e = db.execute(&format!("EXPLAIN {sql}")).expect_err("refused");
+            assert!(
+                e.to_string()
+                    .contains("EXPLAIN supports a query or a DML statement"),
+                "{sql}: {e}"
+            );
+        }
+        db.execute("BEGIN;").unwrap();
+        for (sql, what) in [
+            ("INSTALL httpfs;", "INSTALL"),
+            (
+                "FORCE INSTALL httpfs FROM 'https://example.test';",
+                "INSTALL",
+            ),
+            ("LOAD httpfs;", "LOAD"),
+        ] {
+            let e = db.execute(sql).expect_err("refused inside a transaction");
+            assert_eq!(
+                e.to_string(),
+                format!("{what} is not allowed inside a transaction"),
+                "{sql}"
+            );
+        }
+        db.execute("ROLLBACK;").unwrap();
+        // Outside a transaction the statements reach execution (and, in a
+        // build without the repository, say precisely that).
+        let e = db.execute("LOAD httpfs;").expect_err("not installed");
+        assert!(
+            e.to_string().contains("no extension repository support")
+                || e.to_string().contains("is not installed"),
+            "{e}"
+        );
+    }
+
+    /// Wave 93 WAL decision: `INSTALL` downloads and verifies a file, which
+    /// a replay cannot reproduce (and must not try to), so it is not logged;
+    /// `LOAD <name>` is logged and re-resolved from the cache on replay.
+    #[test]
+    fn install_is_not_wal_logged_but_load_by_name_is() {
+        let db = PinkDb::new();
+        for (sql, logged) in [
+            ("INSTALL math_ext", false),
+            ("FORCE INSTALL math_ext FROM 'https://example.test'", false),
+            ("LOAD math_ext", true),
+        ] {
+            let stmt = crate::sql::parse_statements(sql).unwrap().remove(0);
+            let plan = crate::sql::binder::bind(&db, &stmt, "main").unwrap();
+            assert_eq!(crate::plan::writes_tables(&plan), logged, "{sql}");
+        }
     }
 
     fn explain_lines(db: &mut PinkDb, sql: &str) -> Vec<String> {

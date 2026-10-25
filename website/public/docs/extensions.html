@@ -216,10 +216,27 @@ separate from the <code>pinkdb-ffi</code> embedding ABI.</p>
 
 <h2 id="installing-from-the-extension-repository">Installing from the extension repository<a class="anchor" href="#installing-from-the-extension-repository" aria-label="Permalink: Installing from the extension repository">#</a></h2>
 
-<p>The CLI can install published artifacts with one command (needs the
-<code>repo</code> feature, which keeps the default binary lean):</p>
+<p>SQL <code>INSTALL</code> resolves, downloads, verifies and loads a published
+artifact; <code>.install</code> is the console alias. The client (HTTP/TLS, JSON,
+SHA-256 and the Ed25519 verifier) is an opt-in feature so the default binary
+stays lean — install the <code>repo</code> release variant, or build it:</p>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> repo</code></pre></div>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>sh install.sh <span class="tok-f">--variant</span> repo
+cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> repo</code></pre></div>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code>INSTALL math_ext;                                   <span class="tok-c">-- configured repositories</span>
+INSTALL math_ext <span class="tok-k">FROM</span> <span class="tok-s">'https://example.test/repo'</span>;  <span class="tok-c">-- one repository, no config</span>
+FORCE INSTALL math_ext;                             <span class="tok-c">-- re-download, then load</span>
+<span class="tok-k">LOAD</span> math_ext;                                      <span class="tok-c">-- load an installed extension</span></code></pre></div>
+
+<p>A build without the feature answers <code>this build has no extension
+repository support (rebuild with --features repo, or use the pinkdb-repo release
+variant)</code>. Both statements load native code, so they need the same opt-in
+as <code>LOAD EXTENSION</code> (<code>--allow-load-extension</code>), need
+<code>ADMIN</code>, and a server refuses them for remote clients unless it was
+started with <code>--allow-load-extension</code>. <code>INSTALL</code> is not
+WAL-logged (a download is not replay-deterministic); <code>LOAD &lt;name&gt;</code>
+is, and replay re-resolves it from the cache.</p>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>pinkdb&gt; .install math_ext
 Installed math_ext 0.1.0 (darwin-arm64)
@@ -411,9 +428,12 @@ cargo test <span class="tok-f">-p</span> pinkdb-ext-loader <span class="tok-f">-
   between hashing a file and mapping it cannot be closed with
   <code>dlopen</code> — treat the extension directory as root-owned.</li>
   <li><strong>Unsigned.</strong> A locally loaded library is not signature-checked: the
-  Ed25519 check covers <code>.install</code> packages from the repository, and only in
-  a build with the <code>repo</code> feature. A loaded library runs with the
-  privileges of the process that loaded it, which for the server means the server's.</li>
+  Ed25519 check covers <code>INSTALL</code>/<code>.install</code> packages from the
+  repository, and only in a build with the <code>repo</code> feature (the
+  <code>repo</code> release variant). <code>LOAD &lt;name&gt;</code> trusts the
+  per-user cache under <code>$PINKDB_HOME/extensions</code>. A loaded library runs
+  with the privileges of the process that loaded it, which for the server means the
+  server's.</li>
   <li><strong>Reproducible.</strong> A durable database replays
   <code>LOAD EXTENSION</code> by path, so use stable absolute paths.</li>
 </ul>

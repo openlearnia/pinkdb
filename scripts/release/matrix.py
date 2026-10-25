@@ -35,6 +35,7 @@ CLI_VARIANTS = (
     "lean",
     "pinklake",
     "pinklake-s3",
+    "repo",
 )
 SERVER_VARIANTS = ("default", "async-server", "tls")
 

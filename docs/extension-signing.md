@@ -71,7 +71,7 @@ openssl pkeyutl -verify -rawin -pubin \
   -in index.json -sigfile /tmp/sig.bin
 ```
 
-## Verification order in `.install`
+## Verification order in `INSTALL` / `.install`
 
 1. Fetch `index.json` **and** `index.json.sig` from the configured repository.
    A definite 404 on the signature means "unsigned"; any other signature
@@ -83,12 +83,15 @@ openssl pkeyutl -verify -rawin -pubin \
    after the signature verifies.
 3. Look up the requested artifact in the now-authenticated catalog (platform,
    ABI, sha256); download the bytes; verify the SHA-256.
-4. Write the artifact to a `0700` temp directory with `create_new` (file mode
-   `0600` on Unix), re-hash the on-disk file, and only then `dlopen` it. Never
-   `dlopen` on a failed verification. The staging directory is removed after
-   the load attempt (best effort; the mapped library remains). (Loading from an
-   already-open descriptor is a recorded follow-up to shrink the TOCTOU window
-   further.)
+4. Write the artifact into the cache atomically (temp file + rename under
+   `$PINKDB_HOME/extensions/<name>/<version>/<platform>/`), re-hash the
+   on-disk file immediately before `dlopen`, and load it from that cache path.
+   Never `dlopen` on a failed verification. Loading from the cache (rather than
+   a private staging copy that is deleted after the load) is what makes a
+   logged `LOAD <name>`/`LOAD EXTENSION` replayable; `LOAD <name>` trusts the
+   per-user cache. (Content-addressed cache entries and loading from an
+   already-open descriptor are recorded follow-ups that would shrink the
+   remaining TOCTOU window further.)
 5. No fallback to unsigned mode: an unsigned catalog is refused unless the user
    passes the explicit dev flag below.
 

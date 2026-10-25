@@ -26,6 +26,7 @@
 #   lean                --no-default-features
 #   pinklake            pinklake
 #   pinklake-s3         pinklake,s3
+#   repo                repo (SQL INSTALL/LOAD by name; native only)
 #
 # Server variants       cargo features
 #   default             (default features)
@@ -150,11 +151,12 @@ case "$kind/$variant" in
     cli/lean) no_default=1 ;;
     cli/pinklake) features="pinklake" ;;
     cli/pinklake-s3) features="pinklake,s3" ;;
+    cli/repo) features="repo" ;;
     server/default) ;;
     server/async-server) features="async-server" ;;
     server/tls) features="tls" ;;
     *)
-        die "unknown $kind variant '$variant' (CLI: default lean pinklake pinklake-s3; server: default async-server tls)"
+        die "unknown $kind variant '$variant' (CLI: default lean pinklake pinklake-s3 repo; server: default async-server tls)"
         ;;
 esac
 

@@ -337,7 +337,7 @@
       '<section class="panel" aria-labelledby="install-h">',
       '<h2 id="install-h">Install</h2>',
       '<p class="panel-note">From a pinkdb shell built with the opt-in <code>repo</code> feature:</p>',
-      cmdHtml(".install " + name, "latest"),
+      cmdHtml("INSTALL " + name + ";", "latest"),
       cmdHtml(".install " + name + "@" + entry.version, "pinned " + entry.version),
       "</section>",
     ].join("");

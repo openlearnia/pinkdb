@@ -76,10 +76,12 @@ encryption = ["pinkdb/encryption", "pink-lake?/encryption"]
 # Opt-in JavaScript procedures: forwards to `pinkdb/js` (the `pinkdb-js`
 # sandbox contract; the engine binding is the recorded follow-up).
 js = ["pinkdb/js"]
-# Opt-in extension-repository client: `.install`, `.repositories`, `.installed`.
-# Keeps the default binary lean: HTTP + TLS, JSON parsing, SHA-256 and Ed25519
-# catalog-signature verification live only behind this feature.
-repo = ["dep:ureq", "dep:serde_json", "dep:sha2", "dep:ed25519-dalek", "dep:base64"]
+# Opt-in extension repository: `.install`, `.repositories`, `.installed` and the
+# SQL `INSTALL`/`LOAD <name>` statements. The client lives in the engine
+# (`pinkdb/repo`: HTTP over rustls, catalog JSON, SHA-256 and Ed25519
+# signature verification), so the feature forwards to it and the default
+# binary stays byte-for-byte unaffected.
+repo = ["pinkdb/repo"]
 # Opt-in lake layer: `.lake save/open/versions/tables/info/attach` snapshot
 # the store into a lake catalog database (a `.pink`, SQLite or Postgres
 # database) plus immutable `.pink` data files. Keeps the default binary lean:
@@ -147,16 +149,6 @@ pinkdb-iceberg = { path = "../../extensions/iceberg", optional = true }
 # Remote-file transport and the `read_csv` table source (httpfs feature):
 # https GET/range + the SigV4 S3 client shared with pink-lake.
 pinkdb-httpfs = { path = "../pinkdb-httpfs", optional = true }
-# Repository client (repo feature): blocking HTTP over rustls (no gzip: the
-# repository serves raw artifacts), catalog JSON, SHA-256 verification, and
-# Ed25519 verification of the detached catalog signature. `ed25519-dalek`
-# compiles only when the feature is on; the default binary is byte-for-byte
-# unaffected.
-ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
-serde_json = { version = "1", optional = true }
-sha2 = { version = "0.10", optional = true }
-ed25519-dalek = { version = "2.2", default-features = false, features = ["std"], optional = true }
-base64 = { version = "0.23", optional = true }
 # Lake layer (`pinklake` feature): catalog + immutable data files.
 pink-lake = { path = "../pink-lake", optional = true }
 # Parquet lake format provider (`parquetlake` feature): the LakeFormat bridge
@@ -173,3 +165,8 @@ rcgen = "0.14"
 # replies on the client side (already in the workspace; the binary links it
 # only behind `repo`).
 serde_json = "1"
+# tests/repo.rs builds and signs catalogs itself: SHA-256 for the artifact
+# hashes, Ed25519 for the catalog envelope and its base64 encoding.
+sha2 = "0.10"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+base64 = "0.23"

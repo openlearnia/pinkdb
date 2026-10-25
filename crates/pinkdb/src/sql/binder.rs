@@ -4959,6 +4959,20 @@ fn bind_tracked_plan(
             // effects); bind only carries the literal path through.
             empty(LogicalPlan::LoadExtension { path: path.clone() })
         }
+        Statement::InstallExtension { name, from, force } => {
+            // Resolving, downloading and loading happen at execution; bind
+            // only carries the operands (the effect bypasses the plan).
+            empty(LogicalPlan::InstallExtension {
+                name: name.clone(),
+                from: from.clone(),
+                force: *force,
+            })
+        }
+        Statement::LoadInstalledExtension { name } => {
+            // Resolving the cache path is an execution check: an extension can
+            // be installed after this statement was bound.
+            empty(LogicalPlan::LoadInstalledExtension { name: name.clone() })
+        }
         Statement::Checkpoint => empty(LogicalPlan::Checkpoint),
         Statement::CreateProcedure {
             db: qdb,
@@ -7644,6 +7658,8 @@ pub(crate) fn plan_schema(
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::InstallExtension { .. }
+        | LogicalPlan::LoadInstalledExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }

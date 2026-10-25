@@ -132,6 +132,21 @@ pub enum Statement {
     LoadExtension {
         path: String,
     },
+    /// `INSTALL <name> [FROM '<repository>']` / `FORCE INSTALL …` (wave 93):
+    /// resolve, download, signature- and SHA-256-verify, cache, and load an
+    /// extension from the extension repository (needs the `repo` feature).
+    /// `from` overrides the configured repositories; `force` re-downloads an
+    /// identical cached copy.
+    InstallExtension {
+        name: String,
+        from: Option<String>,
+        force: bool,
+    },
+    /// `LOAD <name>` (wave 93): load an already installed extension from the
+    /// local cache (the name `INSTALL`/`.install` saved it under).
+    LoadInstalledExtension {
+        name: String,
+    },
     /// `CHECKPOINT`: persist a durable database and roll its WAL (a no-op
     /// for in-memory databases). Not a reserved word: only the bare
     /// statement form is recognized.

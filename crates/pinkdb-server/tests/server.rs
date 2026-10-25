@@ -1305,6 +1305,28 @@ fn load_extension_is_refused_for_remote_clients_by_default() {
     assert!(!msg.contains("LOAD EXTENSION is disabled"), "{msg}");
 }
 
+/// The repository statements load native code too, so a remote client cannot
+/// use them to bypass the opt-in. This server is built without the `repo`
+/// feature, so what a remote client gets is the capability refusal (the
+/// connection gate is covered by the CLI's `repo` tests, which build it in).
+#[test]
+fn remote_clients_cannot_install_or_load_by_name() {
+    let (_handle, addr) = start();
+    let mut c = Client::connect(&addr).unwrap();
+    for sql in [
+        "INSTALL math_ext;",
+        "FORCE INSTALL math_ext;",
+        "LOAD math_ext;",
+    ] {
+        let msg = c.execute(sql).expect_err("must be refused").to_string();
+        assert!(
+            msg.contains("no extension repository support") || msg.contains("is disabled"),
+            "{sql}: {msg}"
+        );
+        assert!(!msg.contains("loaded"), "{sql}: {msg}");
+    }
+}
+
 /// H-7: with an extension root configured, a remote client cannot name a
 /// path outside it — the load is refused before the file is touched.
 #[test]

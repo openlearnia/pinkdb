@@ -48,6 +48,10 @@ mod ext;
 /// `arrow` extension — see [`filefmt::FileFormat`].
 pub mod filefmt;
 pub mod fsutil;
+/// Extension installation (wave 93): the SQL `INSTALL`/`LOAD <name>` statements
+/// and the CLI's `.install` share one implementation; the repository client
+/// itself lives in [`repo`] behind the `repo` feature.
+mod install;
 /// The optional JavaScript procedure sandbox (cargo feature `js`): the bridge
 /// to `pinkdb-js`, which refuses cleanly when no engine is bound.
 #[cfg(feature = "js")]
@@ -71,6 +75,9 @@ pub mod profile;
 /// hashing, and the privilege check authenticated sessions run under.
 pub mod rbac;
 mod regex;
+/// The extension-repository client (cargo feature `repo`) — see [`install`].
+#[cfg(feature = "repo")]
+pub mod repo;
 /// Serving an extension's client (ABI minor 2; native targets only).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod serve;
@@ -95,6 +102,7 @@ pub use db::{AUTHENTICATION_REQUIRED, Connection, Database};
 pub use exec::{ExecLimits, QueryResult};
 pub use filefmt::FileFormat;
 pub use fsutil::{CopyToPolicy, write_atomic_private};
+pub use install::{InstalledExtension, NO_REPO_SUPPORT};
 pub use macros::{MacroDef, MacroParamDef};
 pub use package::{ExtensionPackage, extension_package_names, register_extension_package};
 pub use prepared::{BoundStatement, PreparedStatement};

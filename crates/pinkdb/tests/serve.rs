@@ -53,6 +53,9 @@ fn read_only_refuses_every_write_path() {
         "CREATE INDEX i ON t (x)",
         "COPY t TO '/tmp/pinkdb-wave105-copy.csv'",
         "LOAD EXTENSION '/nonexistent/pinkdb_nope.dylib'",
+        "INSTALL math_ext",
+        "FORCE INSTALL math_ext FROM 'https://example.test'",
+        "LOAD math_ext",
         "BEGIN",
         "CHECKPOINT",
         "CREATE USER alice PASSWORD 'hunter2'",
@@ -126,6 +129,15 @@ fn writes_run_when_the_host_allows_them() {
     let (code, text) = execute(&mut db, &writable(), "LOAD EXTENSION '/tmp/nope.dylib'");
     assert_eq!(code, 1, "{text}");
     assert!(!text.contains("read-only"), "{text}");
+
+    // The same holds for the repository statements: the policy lets them
+    // through, and the store then refuses them (`INSTALL` needs the `repo`
+    // feature here, `LOAD` finds nothing installed).
+    for sql in ["INSTALL math_ext", "LOAD math_ext"] {
+        let (code, text) = execute(&mut db, &writable(), sql);
+        assert_eq!(code, 1, "{sql}: {text}");
+        assert!(!text.contains("read-only"), "{sql}: {text}");
+    }
 }
 
 #[test]

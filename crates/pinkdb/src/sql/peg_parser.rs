@@ -1316,7 +1316,8 @@ peg::parser! {
             / delete()
             / txn()
             / use_stmt()
-            / load_extension()
+            / install()
+            / load_stmt()
             / alter_stmt()
             / drop()
             / refresh_stmt()
@@ -1435,11 +1436,34 @@ peg::parser! {
                  Statement::RefreshMaterializedView { db: t.0, name: t.1 }
               }
 
-        /// `LOAD EXTENSION '<path>'` — the path must be a string literal.
-        rule load_extension() -> Statement
+        /// `LOAD EXTENSION '<path>'` — the path must be a string literal —
+        /// and `LOAD <name>` (wave 93): an extension already installed in the
+        /// local cache under that name.
+        rule load_stmt() -> Statement
             = kw(Keyword::Load) kw(Keyword::Extension) path:string_lit() {
                   Statement::LoadExtension { path }
               }
+            / kw(Keyword::Load) name:ident() {
+                  Statement::LoadInstalledExtension { name }
+              }
+
+        /// `INSTALL <name> [FROM '<repository>']` and `FORCE INSTALL …`
+        /// (wave 93): download, verify and cache an extension from the
+        /// extension repository, then load it. `INSTALL` and `FORCE` are
+        /// matched as words, never as reserved words, so they stay usable as
+        /// names. SQL has no `@version` form: `.install <name@version>`
+        /// selects a version.
+        rule install() -> Statement
+            = word("install") name:ident() from:install_from() {
+                  Statement::InstallExtension { name, from, force: false }
+              }
+            / word("force") word("install") name:ident() from:install_from() {
+                  Statement::InstallExtension { name, from, force: true }
+              }
+
+        rule install_from() -> Option<String>
+            = word("from") url:string_lit() { Some(url) }
+            / { None }
 
         /// `GRANT …` (wave 48): the global `ADMIN` privilege, a table or
         /// database privilege, or a role membership (`GRANT role TO user`).
@@ -5167,6 +5191,63 @@ mod tests {
         ] {
             assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
         }
+    }
+
+    /// Wave 93: `INSTALL <name> [FROM '<url>']`, `FORCE INSTALL …` and
+    /// `LOAD <name>` (a name, not a path — `LOAD EXTENSION '<path>'` stays the
+    /// literal-path form). Neither INSTALL nor FORCE is reserved, so both stay
+    /// usable as identifiers.
+    #[test]
+    fn install_and_load_by_name_parse() {
+        for (sql, stmt) in [
+            (
+                "INSTALL httpfs;",
+                Statement::InstallExtension {
+                    name: "httpfs".to_string(),
+                    from: None,
+                    force: false,
+                },
+            ),
+            (
+                "install HttpFS from 'https://example.test/repo';",
+                Statement::InstallExtension {
+                    name: "HttpFS".to_string(),
+                    from: Some("https://example.test/repo".to_string()),
+                    force: false,
+                },
+            ),
+            (
+                "FORCE INSTALL httpfs FROM 'file:///tmp/repo';",
+                Statement::InstallExtension {
+                    name: "httpfs".to_string(),
+                    from: Some("file:///tmp/repo".to_string()),
+                    force: true,
+                },
+            ),
+            (
+                "LOAD httpfs;",
+                Statement::LoadInstalledExtension {
+                    name: "httpfs".to_string(),
+                },
+            ),
+        ] {
+            assert_eq!(parse(sql).unwrap(), vec![stmt], "{sql:?}");
+        }
+        for sql in [
+            "INSTALL;",
+            "INSTALL 'x';",
+            "INSTALL x FROM y;",
+            "INSTALL x FROM;",
+            "FORCE x;",
+            "FORCE INSTALL;",
+            "LOAD;",
+            "LOAD 1;",
+            "LOAD EXTENSION;",
+        ] {
+            assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
+        }
+        // Not reserved keywords: usable as table and column names.
+        assert!(parse("CREATE TABLE install (force INTEGER);").is_ok());
     }
 
     /// NUL bytes inside quoted identifiers are rejected at parse time (the C
