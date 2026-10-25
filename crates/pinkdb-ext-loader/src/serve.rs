@@ -7,10 +7,8 @@
 //! code) and refuses to load or serve the same file twice concurrently: a
 //! serve loop must never run against code another load could replace.
 
-use std::collections::HashSet;
 use std::ffi::{CString, c_char, c_void};
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
 
 use crate::{ExtError, LoadedExtension};
 
@@ -31,17 +29,9 @@ struct ServeState<'a> {
     host: &'a mut dyn StatementHost,
 }
 
-/// Canonical paths with a serve loop running right now.
-static SERVING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-
-fn serving() -> &'static Mutex<HashSet<PathBuf>> {
-    SERVING.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Whether a serve loop is running for the library at `path`.
+/// Whether a serve loop (or a command) is running for the library at `path`.
 pub fn is_serving(path: &Path) -> bool {
-    let guard = serving().lock().unwrap_or_else(|p| p.into_inner());
-    guard.contains(path)
+    crate::command::is_active(path)
 }
 
 /// The `execute_statement` implementation handed to a serving extension.
@@ -120,19 +110,13 @@ pub fn serve(
     let serve_fn = ext.serve_fn().ok_or_else(|| ExtError::NoServe {
         path: ext.path().to_string(),
     })?;
-    {
-        let mut guard = serving().lock().unwrap_or_else(|p| p.into_inner());
-        if !guard.insert(path.clone()) {
-            return Err(ExtError::Serving {
-                path: ext.path().to_string(),
-            });
-        }
+    if !crate::command::pin(&path) {
+        return Err(ExtError::Serving {
+            path: ext.path().to_string(),
+        });
     }
     let result = serve_locked(ext, serve_fn, transport, options, host);
-    serving()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&path);
+    crate::command::unpin(&path);
     result
 }
 

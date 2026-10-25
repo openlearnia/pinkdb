@@ -1620,6 +1620,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinkdb-agent"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "pinkdb-ext-loader",
+ "pinkdb-ext-sdk",
+ "pinkdb-warehouse-tools",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "pinkdb-arrow"
 version = "0.1.0"
 dependencies = [
@@ -1761,6 +1773,7 @@ version = "0.1.0"
 dependencies = [
  "pinkdb-ext-loader",
  "pinkdb-ext-sdk",
+ "pinkdb-warehouse-tools",
  "serde_json",
 ]
 
@@ -1803,6 +1816,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-service",
+]
+
+[[package]]
+name = "pinkdb-warehouse-tools"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

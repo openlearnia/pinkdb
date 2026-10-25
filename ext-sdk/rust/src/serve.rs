@@ -43,37 +43,62 @@ impl HostSession {
     /// applied there). Never panics: a host that cannot answer yields code 2
     /// with empty text.
     pub fn execute_statement(&mut self, sql: &str) -> StatementReply {
-        // The field is appended; an older host's struct ends before it.
-        let field_end = std::mem::offset_of!(PinkdbHostApi, execute_statement)
-            + std::mem::size_of::<PinkdbExtExecuteStatementFn>();
-        if (self.api.struct_size as usize) < field_end {
-            return StatementReply {
-                code: 2,
-                text: String::new(),
-            };
-        }
-        let mut out: *mut c_char = std::ptr::null_mut();
-        let mut len = 0usize;
-        let code = (self.api.execute_statement)(
-            self.ctx,
-            sql.as_ptr().cast::<c_char>(),
-            sql.len(),
-            &mut out,
-            &mut len,
-        );
-        let text = if out.is_null() {
-            String::new()
-        } else {
-            // SAFETY: the host returns `len` bytes it allocated; they are
-            // copied out before the host owns the block again.
-            let bytes = unsafe { std::slice::from_raw_parts(out.cast::<u8>(), len) };
-            let text = String::from_utf8_lossy(bytes).into_owned();
-            // SAFETY: alloc/free pairing per the ABI — the host allocated it.
-            (self.api.free)(out.cast::<std::ffi::c_void>());
-            text
-        };
-        StatementReply { code, text }
+        call_statement(&self.api, self.ctx, sql, false)
     }
+}
+
+/// Call one statement channel of `api`: the tool channel (`internal` false)
+/// or the extension's own bookkeeping channel (`internal` true).
+///
+/// Both fields are appended to the struct, so each is used only when the
+/// host's published `struct_size` covers it: an older host answers "no
+/// session" instead of reading a field it never wrote.
+pub(crate) fn call_statement(
+    api: &PinkdbHostApi,
+    ctx: *mut std::ffi::c_void,
+    sql: &str,
+    internal: bool,
+) -> StatementReply {
+    let (run, field_end) = if internal {
+        (
+            api.execute_internal as PinkdbExtExecuteStatementFn,
+            std::mem::offset_of!(PinkdbHostApi, execute_internal)
+                + std::mem::size_of::<PinkdbExtExecuteStatementFn>(),
+        )
+    } else {
+        (
+            api.execute_statement,
+            std::mem::offset_of!(PinkdbHostApi, execute_statement)
+                + std::mem::size_of::<PinkdbExtExecuteStatementFn>(),
+        )
+    };
+    if (api.struct_size as usize) < field_end {
+        return StatementReply {
+            code: 2,
+            text: String::new(),
+        };
+    }
+    let mut out: *mut c_char = std::ptr::null_mut();
+    let mut len = 0usize;
+    let code = run(
+        ctx,
+        sql.as_ptr().cast::<c_char>(),
+        sql.len(),
+        &mut out,
+        &mut len,
+    );
+    let text = if out.is_null() {
+        String::new()
+    } else {
+        // SAFETY: the host returns `len` bytes it allocated; they are copied
+        // out before the host owns the block again.
+        let bytes = unsafe { std::slice::from_raw_parts(out.cast::<u8>(), len) };
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        // SAFETY: alloc/free pairing per the ABI — the host allocated it.
+        (api.free)(out.cast::<std::ffi::c_void>());
+        text
+    };
+    StatementReply { code, text }
 }
 
 /// The body of a generated `pinkdb_ext_serve` export.
@@ -98,8 +123,7 @@ where
     // SAFETY: the host passes a live, initialized struct for the call.
     let api = unsafe { *api };
     // SAFETY: both are NUL-terminated strings per the ABI; NULL maps to "".
-    let transport = unsafe { cstr(transport) };
-    let options = unsafe { cstr(options) };
+    let (transport, options) = unsafe { (cstr(transport), cstr(options)) };
     let mut session = HostSession { api, ctx: host_ctx };
     match catch_unwind(AssertUnwindSafe(|| serve(&mut session, transport, options))) {
         Ok(Ok(())) => 0,
@@ -116,7 +140,7 @@ where
 
 /// Decode one optional C string. The ABI guarantees NUL termination; invalid
 /// UTF-8 is replaced rather than refused (the host chose the bytes).
-unsafe fn cstr<'a>(ptr: *const c_char) -> &'a str {
+pub(crate) unsafe fn cstr<'a>(ptr: *const c_char) -> &'a str {
     if ptr.is_null() {
         return "";
     }

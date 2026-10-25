@@ -1,4 +1,6 @@
-//! The tools a model sees, and the statement each call becomes.
+//! The tools a model sees, and the statement each call becomes. Shared by
+//! the MCP bridge (wave 105) and the agent extension (wave 106) so both expose
+//! the same warehouse surface.
 //!
 //! Every statement goes to the host unchanged (SQL, or a `.lake …` command on
 //! a host that routes those); the host decides whether it may run. The
@@ -6,6 +8,43 @@
 //! permission: a malformed name must not turn into a surprising statement.
 
 use serde_json::{Map, Value, json};
+
+/// What the host answered for one statement.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolReply {
+    /// `0` ok, `1` statement error, `2` the host has no live session.
+    pub code: i32,
+    pub text: String,
+}
+
+/// The host side of a tool call: run one statement, return its rendered text.
+///
+/// The host applies its own policy and budgets; this crate never decides what
+/// a tool may run.
+pub trait ToolHost {
+    fn execute(&mut self, statement: &str) -> ToolReply;
+}
+
+/// Run a tool call and keep the last reply: that is the answer.
+///
+/// A failing statement stops the call — the model reads the one-line JSON
+/// error and can correct itself — and an unknown tool or bad arguments come
+/// back as `Err` (also shown to the model).
+pub fn run(
+    host: &mut dyn ToolHost,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Result<ToolReply, String> {
+    let statements = statements(name, args)?;
+    let mut last = ToolReply::default();
+    for statement in statements {
+        last = host.execute(&statement);
+        if last.code != 0 {
+            break;
+        }
+    }
+    Ok(last)
+}
 
 /// Every tool, in `tools/list` order.
 pub fn tool_names() -> Vec<&'static str> {

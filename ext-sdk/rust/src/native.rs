@@ -25,8 +25,8 @@ use std::sync::OnceLock;
 
 use pinkdb_ext_loader::{
     ExtArg, ExtType, ExtValue, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_API_FLAGS_SIZE,
-    PINKDB_EXT_API_MINOR2_SIZE, PINKDB_EXT_API_V1_SIZE, PINKDB_EXT_FLAG_VOLATILE,
-    PinkdbExtScalarFn, PinkdbExtValue, PinkdbHostApi,
+    PINKDB_EXT_API_V1_SIZE, PINKDB_EXT_FLAG_VOLATILE, PinkdbExtScalarFn, PinkdbExtValue,
+    PinkdbHostApi,
 };
 
 use crate::ScalarSpec;
@@ -398,7 +398,7 @@ pub unsafe fn native_init(
 /// initialized, with `PINKDB_EXT_API_V1_SIZE <= struct_size`.
 unsafe fn host_api_copy(api: *const PinkdbHostApi) -> PinkdbHostApi {
     let published = (unsafe { *api }).struct_size;
-    if published >= PINKDB_EXT_API_MINOR2_SIZE {
+    if published >= std::mem::size_of::<PinkdbHostApi>() as u32 {
         return unsafe { *api };
     }
     // SAFETY: the host API's layout starts with the v1 fields, so writing the
@@ -415,6 +415,10 @@ unsafe fn host_api_copy(api: *const PinkdbHostApi) -> PinkdbHostApi {
         }
         if published < std::mem::offset_of!(PinkdbHostApi, execute_statement) {
             std::ptr::addr_of_mut!((*copy_ptr).execute_statement)
+                .write(unsupported_execute_statement);
+        }
+        if published < std::mem::offset_of!(PinkdbHostApi, execute_internal) {
+            std::ptr::addr_of_mut!((*copy_ptr).execute_internal)
                 .write(unsupported_execute_statement);
         }
         copy.assume_init()
@@ -631,6 +635,7 @@ mod tests {
             free: test_free,
             register_scalar_flags: dummy_register_flags,
             execute_statement: test_execute,
+            execute_internal: test_execute,
         });
     }
 

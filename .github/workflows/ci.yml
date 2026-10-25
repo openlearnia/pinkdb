@@ -50,10 +50,10 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo build
-        # The bridge cdylib is built here because the CLI's end-to-end MCP
-        # test (crates/pinkdb-cli/tests/mcp.rs) loads the real library; the
-        # extension's own protocol tests run in the same workspace test pass.
-        run: cargo build -p pinkdb-cli -p pinkdb-mcp
+        # The extension cdylibs are built here because the CLI's end-to-end
+        # tests load the real libraries (tests/mcp.rs, tests/agent_run.rs); the
+        # extensions' own tests run in the same workspace test pass.
+        run: cargo build -p pinkdb-cli -p pinkdb-mcp -p pinkdb-agent
 
       - name: cargo test
         run: cargo test -q
@@ -556,8 +556,8 @@ jobs:
         with:
           key: macos
 
-      - name: cargo build the MCP bridge
-        run: cargo build -p pinkdb-mcp
+      - name: cargo build the extensions
+        run: cargo build -p pinkdb-mcp -p pinkdb-agent
 
       - name: cargo test --workspace
         run: cargo test --workspace

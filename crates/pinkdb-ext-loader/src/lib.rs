@@ -81,6 +81,8 @@
 
 mod abi;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod command;
+#[cfg(not(target_arch = "wasm32"))]
 mod function;
 #[cfg(not(target_arch = "wasm32"))]
 mod host;
@@ -108,10 +110,13 @@ pub use abi::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use abi::{
     PINKDB_EXT_ABI_MINOR, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_API_FLAGS_SIZE,
-    PINKDB_EXT_API_MINOR2_SIZE, PINKDB_EXT_API_V1_SIZE, PINKDB_EXT_FLAG_KNOWN,
-    PINKDB_EXT_FLAG_VOLATILE, PinkdbExtAbiVersionFn, PinkdbExtExecuteStatementFn, PinkdbExtInitFn,
-    PinkdbExtNameFn, PinkdbExtScalarFn, PinkdbExtServeFn, PinkdbExtValue, PinkdbHostApi,
+    PINKDB_EXT_API_MINOR2_SIZE, PINKDB_EXT_API_MINOR4_SIZE, PINKDB_EXT_API_V1_SIZE,
+    PINKDB_EXT_FLAG_KNOWN, PINKDB_EXT_FLAG_VOLATILE, PinkdbExtAbiVersionFn, PinkdbExtCommandFn,
+    PinkdbExtExecuteStatementFn, PinkdbExtInitFn, PinkdbExtNameFn, PinkdbExtScalarFn,
+    PinkdbExtServeFn, PinkdbExtSinkFn, PinkdbExtValue, PinkdbHostApi,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use command::CommandHost;
 #[cfg(not(target_arch = "wasm32"))]
 pub use function::DynamicFunction;
 #[cfg(not(target_arch = "wasm32"))]
@@ -381,6 +386,11 @@ pub enum ExtError {
     Serving { path: String },
     /// `pinkdb_ext_serve` returned a non-zero code.
     ServeFailed { path: String, code: i32 },
+    /// The extension exports no `pinkdb_ext_command`.
+    NoCommand { path: String },
+    /// `pinkdb_ext_command` returned a non-zero code (it reported the reason
+    /// itself, through the output sink).
+    CommandFailed { path: String, code: i32 },
     /// A transport descriptor is not `stdio` or `http:HOST:PORT`, or the
     /// options/transport contains a NUL byte.
     BadTransport { message: String },
@@ -468,6 +478,13 @@ impl fmt::Display for ExtError {
             ExtError::ServeFailed { path, code } => {
                 write!(f, "extension \"{path}\" serve loop failed with code {code}")
             }
+            ExtError::NoCommand { path } => write!(
+                f,
+                "extension \"{path}\" exports no pinkdb_ext_command (it has no commands)"
+            ),
+            ExtError::CommandFailed { path, code } => {
+                write!(f, "extension \"{path}\" command failed with code {code}")
+            }
             ExtError::BadTransport { message } => {
                 write!(f, "invalid extension transport: {message}")
             }
@@ -523,6 +540,8 @@ pub struct LoadedExtension {
     /// The optional `pinkdb_ext_serve` export (ABI minor 2), detected by
     /// symbol presence so a v1 library loads unchanged.
     serve: Option<PinkdbExtServeFn>,
+    /// The optional `pinkdb_ext_command` export (ABI minor 4), same rule.
+    command: Option<PinkdbExtCommandFn>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -553,6 +572,12 @@ impl LoadedExtension {
     /// or `None` for a functions-only extension.
     pub fn serve_fn(&self) -> Option<PinkdbExtServeFn> {
         self.serve
+    }
+
+    /// The library's optional `pinkdb_ext_command` entry point (ABI minor 4),
+    /// or `None` for an extension that is not command-driven.
+    pub fn command_fn(&self) -> Option<PinkdbExtCommandFn> {
+        self.command
     }
 
     /// Consume the handle, yielding the functions (and with them the shared
@@ -966,6 +991,12 @@ fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, Ext
         Ok(symbol) => Some(*symbol),
         Err(_) => None,
     };
+    // ABI minor 4: the command entry point, same optional-by-symbol rule.
+    // SAFETY: looked up under the exact name and signature this ABI defines.
+    let command = match unsafe { library.get::<PinkdbExtCommandFn>(b"pinkdb_ext_command\0") } {
+        Ok(symbol) => Some(*symbol),
+        Err(_) => None,
+    };
 
     Ok(LoadedExtension {
         name,
@@ -976,6 +1007,7 @@ fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, Ext
         canonical_path: canonical.to_path_buf(),
         collector,
         serve,
+        command,
     })
     .inspect(|ext| {
         // The process-wide registry: the library stays mapped for the

@@ -65,11 +65,12 @@ pub(crate) fn host_api() -> PinkdbHostApi {
         alloc: host_alloc,
         free: host_free,
         register_scalar_flags,
-        // The init-scoped API has no statement session: the field exists so
-        // its offset is fixed for every extension, but calling it before a
-        // `pinkdb_ext_serve` returns "no session" instead of dereferencing a
-        // context that is a `Collector`, not a host.
+        // The init-scoped API has no statement session: the fields exist so
+        // their offsets are fixed for every extension, but calling either
+        // before a serve or command call returns "no session" instead of
+        // dereferencing a context that is a `Collector`, not a host.
         execute_statement: no_statement_session,
+        execute_internal: no_statement_session,
     }
 }
 

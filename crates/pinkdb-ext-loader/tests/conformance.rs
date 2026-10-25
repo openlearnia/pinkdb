@@ -28,8 +28,8 @@ use std::sync::Mutex;
 use common::conformance::{Fixture, build_dir, fixtures, path_string, repo_root};
 use pinkdb_ext_loader::{
     DynamicFunction, ExtArg, ExtError, ExtType, ExtValue, LoadedExtension,
-    PINKDB_EXT_API_MINOR2_SIZE, PINKDB_EXT_API_V1_SIZE, PinkdbExtInitFn, PinkdbExtScalarFn,
-    PinkdbHostApi, load,
+    PINKDB_EXT_API_MINOR2_SIZE, PINKDB_EXT_API_MINOR4_SIZE, PINKDB_EXT_API_V1_SIZE,
+    PinkdbExtInitFn, PinkdbExtScalarFn, PinkdbHostApi, load,
 };
 
 /// The functions the contract requires, in registration order.
@@ -670,12 +670,13 @@ fn legacy_host(abi_version: u32) -> LegacyHost {
 fn full_host(abi_version: u32) -> PinkdbHostApi {
     PinkdbHostApi {
         abi_version,
-        struct_size: PINKDB_EXT_API_MINOR2_SIZE,
+        struct_size: PINKDB_EXT_API_MINOR4_SIZE,
         register_scalar: stub_register,
         alloc: stub_alloc,
         free: stub_free,
         register_scalar_flags: stub_register_flags,
         execute_statement: stub_execute,
+        execute_internal: stub_execute,
     }
 }
 
@@ -729,6 +730,14 @@ fn child_host(mode: &str) -> Box<PinkdbHostApi> {
             boxed
         }
         "full" => Box::new(full_host(1)),
+        "minor2" => {
+            // A host that stops at the minor-2 surface: `execute_internal` is
+            // not part of what it publishes, so a v1 extension (which never
+            // looks past `execute_statement`) must still init.
+            let mut boxed = Box::new(full_host(1));
+            boxed.struct_size = PINKDB_EXT_API_MINOR2_SIZE;
+            boxed
+        }
         other => panic!("unknown negotiation mode {other}"),
     }
 }

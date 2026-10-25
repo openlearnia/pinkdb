@@ -33,12 +33,12 @@
 
 mod http;
 mod protocol;
-mod tools;
 mod transport;
 
 pub use http::{bind_address, is_loopback};
+pub use pinkdb_warehouse_tools as tools;
+pub use pinkdb_warehouse_tools::tool_names;
 pub use protocol::{Host, Server};
-pub use tools::tool_names;
 
 use pinkdb_ext_sdk::HostSession;
 

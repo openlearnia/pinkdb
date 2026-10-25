@@ -7,6 +7,10 @@ store with the same compact Markdown results and JSON errors as the
 <code>-agent</code> CLI mode. pinkdb contains no model code: the client brings
 the reasoning, pinkdb runs the SQL.</p>
 
+<p>To keep the reasoning inside pinkdb instead, use the <a
+href="docs/agent.html">pinkdb agent</a>: the same tools, run by pinkdb itself,
+with the session, its checkpoints and its token usage stored in the database.</p>
+
 <h2>Quick start</h2>
 
 <pre class="code" data-lang="sh"><code># build the bridge next to the CLI
@@ -137,8 +141,9 @@ unchanged:</p>
   and gets control back when the client disconnects.</li>
 </ul>
 
-<p>Both are detected by symbol presence. The ABI stays major version 1 with
-minor version 2 (<code>PINKDB_EXT_ABI_MINOR</code>), so a v1 extension keeps
+<p>Both are detected by symbol presence. The ABI stays major version 1
+(minor 4 now also carries the command entry point the <a
+href="docs/agent.html">pinkdb agent</a> uses), so a v1 extension keeps
 loading unchanged. A library that is serving cannot be loaded again, and the loader's
 path rules still apply. The Rust SDK exposes
 <code>HostSession</code> and <code>pinkdb_abi_exports_with_serve!</code>; the
@@ -167,3 +172,6 @@ claude mcp add pinkdb -- pinkdb --mcp store.pink   # Claude Code</code></pre>
 <p>The model gets the same answer a person would, in the form a context
 window can afford — no JSON envelope per row, and an explicit count when the
 result had to be cut.</p>
+
+<p>See also: <a href="docs/agent.html">the pinkdb agent</a> — the same tools
+with the loop inside pinkdb, sessions in the store, and resume and fork.</p>

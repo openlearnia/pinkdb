@@ -47,6 +47,13 @@ members = [
     # stdio or loopback HTTP; it is loaded, never linked, so no pinkdb binary
     # grows beyond the small host-side ABI addition.
     "extensions/mcp",
+    # The warehouse tool set (wave 106) the MCP bridge and the agent extension
+    # both expose: one set of JSON Schemas and one statement planner, so the
+    # two surfaces cannot drift.
+    "extensions/warehouse-tools",
+    # The data agent (wave 106): an LLM loop whose whole state lives in the
+    # store. Loaded like the MCP bridge, never linked.
+    "extensions/agent",
     # Shared remote-file transport + `read_csv` table source (wave 75):
     # https GET/range and the SigV4 S3 client pink-lake's `s3` feature uses.
     "crates/pinkdb-httpfs",

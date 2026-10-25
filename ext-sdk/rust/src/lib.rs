@@ -176,6 +176,8 @@
 //! must not call it. See `ext-sdk/rust/README.md` for the layout, the
 //! template, and the sharp edges.
 
+#[cfg(not(target_arch = "wasm32"))]
+mod command;
 mod macros;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
@@ -184,6 +186,8 @@ mod serve;
 mod spec;
 mod value;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use command::{AGENT_DATABASE, CommandSession, native_command};
 pub use pinkdb_ext_loader::{
     ExtArg, ExtError, ExtType, ExtValue, LinkedExtension, LinkedFunction, linked,
 };
@@ -206,12 +210,16 @@ pub fn register_linked_extension(ext: LinkedExtension) -> Result<(), ExtError> {
 #[doc(hidden)]
 pub mod __private {
     #[cfg(not(target_arch = "wasm32"))]
+    pub use crate::command::native_command;
+    #[cfg(not(target_arch = "wasm32"))]
     pub use crate::native::native_init;
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::serve::native_serve;
     /// The argument tag type, so a generated `min_args` can borrow a slice of
     /// declared types.
     pub use pinkdb_ext_loader::ExtType;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub use pinkdb_ext_loader::PinkdbExtSinkFn;
     #[cfg(not(target_arch = "wasm32"))]
     pub use pinkdb_ext_loader::PinkdbHostApi as HostApi;
 

@@ -1,7 +1,7 @@
 # pinkdb Go extension SDK
 
 Everything needed to build a loadable extension for pinkdb in Go against the
-extension ABI v1 (minor 2). An extension is a shared library built with cgo
+extension ABI v1 (minor 4). An extension is a shared library built with cgo
 (`go build -buildmode=c-shared`) that the host `dlopen`s and drives through the
 C ABI in [`include/pinkdb_extension.h`](include/pinkdb_extension.h). No pinkdb
 libraries are linked: the host provides its services through the
@@ -414,8 +414,10 @@ rules do:
 
 ### What this ABI cannot do
 
-Extension ABI v1 is a **scalar-function** ABI: scalar callbacks, and (minor 2)
-the statement bridge above. Table functions, scans, copy sinks and any other
+Extension ABI v1 is a **scalar-function** ABI: scalar callbacks, (minor 2)
+the statement bridge above, and (minor 4, not wrapped by this package yet) the
+`pinkdb_ext_command` entry point with its text sink and the `execute_internal`
+JSON-row host field. Table functions, scans, copy sinks and any other
 physical operator are the *linked* extension model — the `pinkdb-ext-loader`
 registry whose implementations are compiled into the host. A loadable extension
 cannot register them, and neither this package nor the template pretends

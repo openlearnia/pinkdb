@@ -1,0 +1,34 @@
+[package]
+name = "pinkdb-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "The pinkdb data agent: an OpenAI-compatible model that answers questions by running warehouse tools against the store (ABI minor 4 command extension)"
+license = "MIT"
+
+[lib]
+# A cdylib is what `LOAD EXTENSION '<path>/libpinkdb_agent.dylib'` loads (and
+# what `.agent` dispatches to); the rlib lets the tests drive the loop, the
+# provider and the store without a host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The ABI + safe Rust surface: the command entry point, the statement
+# callbacks and the output sink.
+pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
+# The warehouse tool set (wave 106), shared with the MCP bridge: same JSON
+# schemas, same statements, same dispatch to the host.
+pinkdb-warehouse-tools = { path = "../warehouse-tools" }
+# The provider speaks JSON; serde_json is already in the workspace, so this
+# adds no new external crate.
+serde_json = "1"
+# Blocking HTTP with rustls: the crate and features pinkdb-httpfs already
+# locks, without linking that crate (it links the whole engine). No async
+# runtime, no SSE or OpenAI client crate.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+# The tests drive the real engine's policy and a real durable store; the
+# engine never depends on this crate, so it is not a cycle.
+pinkdb = { path = "../../crates/pinkdb" }
+pinkdb-ext-loader = { path = "../../crates/pinkdb-ext-loader" }

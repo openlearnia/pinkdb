@@ -1,0 +1,11 @@
+[package]
+name = "pinkdb-warehouse-tools"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "The warehouse tool set pinkdb exposes to a model: JSON Schemas, descriptions and the statement each call becomes, shared by the MCP bridge and the agent extension"
+license = "MIT"
+
+[dependencies]
+# Tool schemas and arguments are JSON; serde_json is already in the workspace.
+serde_json = "1"

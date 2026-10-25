@@ -108,6 +108,7 @@ NAV = [
             {"key": "iceberg", "label": "Iceberg", "out": "docs/iceberg.html"},
             {"key": "server", "label": "Server", "out": "docs/server.html"},
             {"key": "agents", "label": "Agents and MCP", "out": "docs/agents.html"},
+            {"key": "agent", "label": "pinkdb agent", "out": "docs/agent.html"},
         ],
     },
     {
@@ -272,6 +273,16 @@ PAGES = {
             "Serve a store to an MCP client: the pinkdb-mcp extension, its "
             "tools and JSON Schemas, stdio and localhost HTTP transports, the "
             "read-only default, the extension ABI additions, and connecting an agent."
+        ),
+    },
+    "agent.html": {
+        "out": "docs/agent.html",
+        "nav": "agent",
+        "title": "The pinkdb agent — pinkdb",
+        "description": (
+            "pinkdb-agent runs the data-agent loop inside pinkdb: setup with an "
+            "environment key, the .agent commands, resume and fork, the two write "
+            "policies, the session tables and the budgets."
         ),
     },
     "bindings.html": {

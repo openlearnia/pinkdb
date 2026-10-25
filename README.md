@@ -1641,6 +1641,97 @@ bytes. Any MCP client connects with no adapter, e.g.
 `claude mcp add pinkdb -- pinkdb --mcp sales.pink` (Claude Code). The C/C++/Go
 SDKs get the serve surface with the next SDK refresh.
 
+## The pinkdb agent (wave 106)
+
+`pinkdb-agent` is the same idea with the loop inside pinkdb: it asks a model
+what to run, runs the warehouse tools itself, and keeps the whole
+conversation in the store, so a killed run resumes and a finished one can be
+forked. It is an extension — the engine, the CLI and the server still contain
+no model or HTTP client code.
+
+```sh
+cargo build --release -p pinkdb-cli -p pinkdb-agent
+
+export PINKDB_AGENT_API_KEY=…            # or Z_API_KEY, or:
+set -a; . ./.env; set +a                 # the key is exported, never read by pinkdb
+
+./target/release/pinkdb --agent sales.pink "Who are the top 3 customers by revenue?"
+```
+
+The extension reads its key from the environment when a run starts —
+`PINKDB_AGENT_API_KEY`, falling back to `Z_API_KEY` — and never loads a
+`.env` file itself: a program that silently picks up a file from the working
+directory is a footgun. It talks to one OpenAI-compatible
+`/chat/completions` endpoint: `PINKDB_AGENT_BASE_URL` and `PINKDB_AGENT_MODEL`
+override the defaults (`https://api.z.ai/api/paas/v4/chat/completions`,
+`glm-4.6`), the stream is parsed as SSE, and 429s and 5xx answers are retried
+three times with backoff. A 401 stops with a clear message and never echoes
+the key. The key is not stored: not in a table, not in the WAL, not in a log
+line, not in an error — `PINKDB_AGENT_API_KEY` is not reachable through `SET`
+either, because the extension only ever sees it in its own process memory.
+
+In a session, `.agent` dispatches to the loaded extension:
+
+```
+.agent ask "<question>" [allow-writes] [allow-files] [max-steps N] [tokens N]
+.agent resume <session>
+.agent sessions
+.agent show <session>
+.agent fork <session> <step> ["<new question>"]
+```
+
+(Without the extension, `.agent rows|cols|cell|budget|timeout|hint` keeps its
+wave-99 meaning and the run commands print the `LOAD EXTENSION` hint.)
+`--agent FILE "question"` loads `libpinkdb_agent` from the install directory
+like `--mcp`, with `--agent-allow-writes` / `--agent-allow-files`.
+
+**The tools are the warehouse tools** of the MCP bridge — `query`,
+`describe`, `tables`, `databases`, `explain`, `lake_tables`, `lake_versions`,
+`lake_changes`, shared code in `extensions/warehouse-tools` so the two
+cannot drift. There is no shell, no file editing, no web fetch and no
+`LOAD EXTENSION`: a data agent, not a coding agent.
+
+**Two policies, not one.** The model's tool calls run through the host
+statement callback under the read-only MCP policy — nothing but queries,
+`DESCRIBE`, `SHOW` and `EXPLAIN`, no external files or URLs — until the run
+is started with `allow-writes`, and `allow-files` stays a separate decision.
+On top of that the run may not write `pinkdb_agent` itself, even with
+`allow-writes`: those tables are the transcript the run resumes from, so a
+prompt injection that talks the model into a `INSERT INTO
+pinkdb_agent.messages` must fail. The extension writes that transcript
+through a second, internal channel that is confined to the `pinkdb_agent`
+database, so it cannot touch user data either.
+
+**Sessions are tables.** A session lives in the `pinkdb_agent` database of
+the store it ran against: `sessions`, `messages`, `tool_calls`,
+`checkpoints`, `usage`. Every step (transport, any calls, the tool results,
+the next checkpoint) commits, so `kill -9` costs at most one step:
+`.agent resume` re-requests an interrupted stream, reuses every recorded tool
+result, and re-runs only the read-only tools. `.agent fork <session> <step>`
+copies the transcript up to that step into a new session — the original is
+untouched — and continues it, optionally with a new question. Because it is
+plain SQL, `SELECT * FROM pinkdb_agent.tool_calls` is the audit trail and a
+WebUI can watch a run with `CDC`. Token usage is recorded per step and
+compared with the token budget; the step budget defaults to 20. Both are set
+per run, and the transcript records which limit stopped it.
+
+The command entry point is additive ABI (minor 4): an optional
+`pinkdb_ext_command` export detected by symbol presence, plus
+`execute_internal` for machine-readable rows. Every v1 and minor-2 extension
+loads unchanged, and the release binaries grew by 0.76% (`pinkdb`,
+5,035,312 → 5,073,504 bytes) and 0.03% (`pinkdb-server`, 4,668,016 →
+4,669,264 bytes); the agent itself is 2,471,632 bytes and adds no new
+third-party crate (blocking `ureq` with rustls, already in the workspace
+through `pinkdb-httpfs`).
+
+Tests run against a recorded mock provider — an HTTP server on
+`127.0.0.1:0` replaying checked-in SSE fixtures — so CI is deterministic and
+free: a single answer, a multi-step tool loop, tool arguments split across
+chunks, an interrupted stream, 429-then-success and 401, plus resume after a
+kill, fork, every write refusal in both directions, the key sentinel, and a
+TPC-H top-3 question answered end to end. The live test is opt-in:
+`PINKDB_AGENT_LIVE=1 cargo test -p pinkdb-cli --test agent_run -- --ignored`.
+
 ## C ABI (`pinkdb-ffi`)
 
 The `pinkdb-ffi` crate exposes the engine over a small C ABI as

@@ -1,7 +1,7 @@
 # pinkdb C++ extension SDK
 
 Everything needed to build a loadable extension for pinkdb in **C++17**, as a
-thin header-only wrapper over the extension ABI v1 (minor 2). No pinkdb
+thin header-only wrapper over the extension ABI v1 (minor 4). No pinkdb
 libraries are linked and no third-party library is used: an extension is a
 shared library that the host `dlopen`s and drives through the C ABI in
 [`include/pinkdb_extension.h`](include/pinkdb_extension.h). The wrapper in
@@ -153,6 +153,12 @@ Makefile are warning-clean under `-Wall -Wextra -Werror` (and under
   `pinkdb_ext_serve(api, host_ctx, transport, options)` entry point, where the
   host wires the api to a live session. It is not usable from a scalar
   callback, and a scalar callback must never call back into the engine.
+- **Commands (minor 4).** The header copy carries the optional
+  `pinkdb_ext_command(api, host_ctx, args, sink, sink_ctx)` entry point, the
+  `PinkdbExtSinkFn` stream sink and the `execute_internal` host field (JSON
+  rows, confined to the host's database for the extension). This wrapper does
+  not expose them yet: a C++ command extension needs a plain C shim over them
+  (see the Rust SDK's `CommandSession` for the shape).
 - **No unwinding.** `guard` catches everything at the `extern "C"` edge;
   anything it catches becomes a documented non-zero code plus a stderr
   diagnostic, because an exception crossing into C is undefined behavior.

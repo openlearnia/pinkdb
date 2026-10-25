@@ -22,18 +22,20 @@ use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
 pub const PINKDB_EXT_ABI_VERSION: u32 = 1;
 
-/// ABI **minor** version implemented by this loader (major 1, minor 3).
+/// ABI **minor** version implemented by this loader (major 1, minor 4).
 ///
 /// Minor 2 adds [`PinkdbHostApi::execute_statement`] and the optional
 /// `pinkdb_ext_serve` export; minor 3 adds [`ExtType::Variant`]
-/// ([`PINKDB_EXT_TYPE_VARIANT`]). Both are additive, so minor 1 and minor 0
-/// extensions are unchanged. The wire exposes the minor only indirectly
-/// (`struct_size`, symbol presence), which is why the major check stayed an
-/// equality check — and why a new *type tag* needs no `struct_size`
-/// landmark: a host only ever sends the types an extension declared, and an
-/// older host rejects an unknown tag at registration.
+/// ([`PINKDB_EXT_TYPE_VARIANT`]); minor 4 adds the optional
+/// `pinkdb_ext_command` export and [`PinkdbHostApi::execute_internal`]. All
+/// are additive, so minor 1 and minor 0 extensions are unchanged. The wire
+/// exposes the minor only indirectly (`struct_size`, symbol presence), which
+/// is why the major check stayed an equality check — and why a new *type tag*
+/// needs no `struct_size` landmark: a host only ever sends the types an
+/// extension declared, and an older host rejects an unknown tag at
+/// registration.
 #[cfg(not(target_arch = "wasm32"))]
-pub const PINKDB_EXT_ABI_MINOR: u32 = 3;
+pub const PINKDB_EXT_ABI_MINOR: u32 = 4;
 
 /// Maximum argument count accepted by [`crate::PinkdbHostApi::register_scalar`]
 /// and by [`crate::LinkedFunction::new`]. Kept identical for both loading
@@ -69,9 +71,17 @@ pub const PINKDB_EXT_API_V1_SIZE: u32 =
 pub const PINKDB_EXT_API_FLAGS_SIZE: u32 =
     std::mem::offset_of!(PinkdbHostApi, execute_statement) as u32;
 
-/// The `struct_size` of the current (minor 2) host API: the whole struct.
+/// The `struct_size` of the ABI minor-2 host API
+/// (`PINKDB_EXT_API_MINOR2_SIZE`): everything up to but not including
+/// `execute_internal`. That is exactly `size_of` on a minor-2 or minor-3 host,
+/// so the landmark keeps its meaning on both.
 #[cfg(not(target_arch = "wasm32"))]
-pub const PINKDB_EXT_API_MINOR2_SIZE: u32 = std::mem::size_of::<PinkdbHostApi>() as u32;
+pub const PINKDB_EXT_API_MINOR2_SIZE: u32 =
+    std::mem::offset_of!(PinkdbHostApi, execute_internal) as u32;
+
+/// The `struct_size` of the current (minor 4) host API: the whole struct.
+#[cfg(not(target_arch = "wasm32"))]
+pub const PINKDB_EXT_API_MINOR4_SIZE: u32 = std::mem::size_of::<PinkdbHostApi>() as u32;
 
 // Value / argument type tags (same numbering as the pinkdb C ABI).
 pub const PINKDB_EXT_TYPE_NULL: i32 = 0;
@@ -234,6 +244,32 @@ pub type PinkdbExtServeFn = unsafe extern "C" fn(
     options: *const c_char,
 ) -> i32;
 
+/// `pinkdb_ext_command(api, host_ctx, args, sink, sink_ctx) -> i32` — the
+/// optional command entry point (ABI minor 4).
+///
+/// The host calls it for one dot command (`.agent ask "…"`), with `args` the
+/// text after the command name. The extension writes streamed output through
+/// `sink` and returns 0 when it handled the command, non-zero on failure
+/// (having already said why through the sink). During the call
+/// [`PinkdbHostApi::execute_statement`] runs under the tool policy and
+/// [`PinkdbHostApi::execute_internal`] under the internal one, both bound to
+/// `host_ctx`; elsewhere both are stubs answering "no session" (code 2).
+#[cfg(not(target_arch = "wasm32"))]
+pub type PinkdbExtCommandFn = unsafe extern "C" fn(
+    api: *const PinkdbHostApi,
+    host_ctx: *mut c_void,
+    args: *const c_char,
+    sink: Option<PinkdbExtSinkFn>,
+    sink_ctx: *mut c_void,
+) -> i32;
+
+/// One streamed chunk of a command's output: channel 0 is answer/progress
+/// text (the host's stdout), 1 is a diagnostic (its stderr). `text` is exactly
+/// `len` bytes, not NUL-terminated.
+#[cfg(not(target_arch = "wasm32"))]
+pub type PinkdbExtSinkFn =
+    extern "C" fn(ctx: *mut c_void, channel: i32, text: *const c_char, len: usize);
+
 /// Host-provided services handed to `pinkdb_extension_init`. Mirrors
 /// `PinkdbHostApi` in the header field for field. A plain POD: extensions
 /// copy it out of init (the header documents it as init-scoped), and the
@@ -289,6 +325,15 @@ pub struct PinkdbHostApi {
     /// Appended after v1 shipped: an extension must compare `struct_size`
     /// before calling it.
     pub execute_statement: PinkdbExtExecuteStatementFn,
+    /// Run one statement under the *internal* policy (ABI minor 4): writes are
+    /// allowed only inside the database the host names for its extension, and
+    /// the text is JSON (`[{"columns":[…],"rows":[[…]]}, …]`) instead of
+    /// Markdown, because this channel carries an extension's own bookkeeping.
+    ///
+    /// Set only in the API handed to `pinkdb_ext_command`; init and serve
+    /// carry a stub answering "no live session". Appended after `execute
+    /// _statement`, so an extension must compare `struct_size` before using it.
+    pub execute_internal: PinkdbExtExecuteStatementFn,
 }
 
 /// The ABI's type tags as a Rust enum (the host never uses the NULL tag for
@@ -632,11 +677,14 @@ mod tests {
             // ABI minor 2: the statement callback is appended after the v1
             // fields, never inserted between them.
             assert_eq!(std::mem::offset_of!(PinkdbHostApi, execute_statement), 40);
-            assert_eq!(std::mem::size_of::<PinkdbHostApi>(), 48);
+            // ABI minor 4: the internal-channel callback follows it, so the
+            // minor-2 landmark below is exactly the old `size_of`.
+            assert_eq!(std::mem::offset_of!(PinkdbHostApi, execute_internal), 48);
+            assert_eq!(std::mem::size_of::<PinkdbHostApi>(), 56);
         }
         // The check an extension makes before calling the new field: the
         // host's struct_size covers it exactly when it is the last field.
-        const FIELD_END: usize = std::mem::offset_of!(PinkdbHostApi, execute_statement)
+        const FIELD_END: usize = std::mem::offset_of!(PinkdbHostApi, execute_internal)
             + std::mem::size_of::<PinkdbExtExecuteStatementFn>();
         assert_eq!(FIELD_END, std::mem::size_of::<PinkdbHostApi>());
         // The published size ladder the header's `PINKDB_EXT_API_*_SIZE` and
@@ -650,7 +698,26 @@ mod tests {
             PINKDB_EXT_API_FLAGS_SIZE as usize,
             std::mem::offset_of!(PinkdbHostApi, execute_statement)
         );
-        assert_eq!(PINKDB_EXT_API_MINOR2_SIZE as usize, FIELD_END);
+        // The minor-2 landmark is where `execute_statement` ends, which is
+        // also where `execute_internal` begins.
+        assert_eq!(
+            PINKDB_EXT_API_MINOR2_SIZE as usize,
+            std::mem::offset_of!(PinkdbHostApi, execute_statement)
+                + std::mem::size_of::<PinkdbExtExecuteStatementFn>()
+        );
+        assert_eq!(
+            PINKDB_EXT_API_MINOR2_SIZE as usize,
+            std::mem::offset_of!(PinkdbHostApi, execute_internal)
+        );
+        assert_eq!(
+            PINKDB_EXT_API_MINOR4_SIZE as usize,
+            std::mem::offset_of!(PinkdbHostApi, execute_internal)
+                + std::mem::size_of::<PinkdbExtExecuteStatementFn>()
+        );
+        assert_eq!(
+            PINKDB_EXT_API_MINOR4_SIZE as usize,
+            std::mem::size_of::<PinkdbHostApi>()
+        );
     }
 
     #[test]

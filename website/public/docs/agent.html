@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The pinkdb agent — pinkdb</title>
+<meta name="description" content="pinkdb-agent runs the data-agent loop inside pinkdb: setup with an environment key, the .agent commands, resume and fork, the two write policies, the session tables and the budgets.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/agent.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="The pinkdb agent — pinkdb">
+<meta property="og:description" content="pinkdb-agent runs the data-agent loop inside pinkdb: setup with an environment key, the .agent commands, resume and fork, the two write policies, the session tables and the budgets.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/agent.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+<script data-theme-script>
+/* Theme: follows the OS until the visitor picks one; the choice is kept in
+   localStorage and applied before first paint. Without JS the controls stay
+   hidden and the page simply follows prefers-color-scheme. */
+(function () {
+  var KEY = "pinkdb-theme";
+  var root = document.documentElement;
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var mode = "system";
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved === "light" || saved === "dark") mode = saved;
+  } catch (e) {}
+
+  function effective() { return mode === "system" ? (media.matches ? "dark" : "light") : mode; }
+
+  function apply() {
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    var dark = effective() === "dark";
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-pressed", String(dark));
+      toggles[i].setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      toggles[i].title = dark ? "Switch to light theme" : "Switch to dark theme";
+    }
+    var choices = document.querySelectorAll("[data-theme-choice]");
+    for (var j = 0; j < choices.length; j++) {
+      choices[j].setAttribute("aria-pressed", String(choices[j].getAttribute("data-theme-choice") === mode));
+    }
+  }
+
+  function choose(next) {
+    mode = next;
+    try {
+      if (mode === "system") localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, mode);
+    } catch (e) {}
+    // Switch in one frame: no per-element colour transitions.
+    root.classList.add("theme-switching");
+    apply();
+    void root.offsetWidth;
+    requestAnimationFrame(function () { root.classList.remove("theme-switching"); });
+  }
+
+  apply();
+  if (media.addEventListener) media.addEventListener("change", apply);
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var controls = document.querySelectorAll("[data-theme-toggle], .theme-switch");
+    for (var i = 0; i < controls.length; i++) controls[i].hidden = false;
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest("[data-theme-toggle], [data-theme-choice]");
+      if (!target) return;
+      if (target.hasAttribute("data-theme-toggle")) choose(effective() === "dark" ? "light" : "dark");
+      else choose(target.getAttribute("data-theme-choice"));
+    });
+    apply();
+  });
+})();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
+        <li><a href="../playground">Playground</a></li>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
+      </ul>
+    </nav>
+    <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle hidden aria-label="Switch theme">
+      <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+    </button>
+    <a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a>
+    </div>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">pinkdb agent</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+<li><a href="install">Install</a></li>
+<li><a href="docker">Docker</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="dialect">SQL dialect</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="iceberg">Iceberg</a></li>
+<li><a href="server">Server</a></li>
+<li><a href="agents">Agents and MCP</a></li>
+<li><a href="agent" class="active" aria-current="page">pinkdb agent</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
+<li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<p class="eyebrow">Reference</p>
+<h1>The pinkdb agent</h1>
+
+<p class="doc-meta">pinkdb contains no model code. The <a
+href="docs/agents">MCP bridge</a> lets an outside agent run the tools; the
+<strong>pinkdb agent</strong> goes one step further and runs the loop itself —
+asking a model what to run, executing the warehouse tools through the host,
+and keeping the whole conversation in the store, so a killed run resumes and
+a finished one can be forked. It is a <a
+href="docs/extensions">native extension</a> (<code>pinkdb-agent</code>),
+so the engine, the CLI and the server still contain no model or HTTP client
+code.</p>
+
+<h2 id="setup">Setup<a class="anchor" href="#setup" aria-label="Permalink: Setup">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-c"># build the agent next to the CLI</span>
+cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">-p</span> pinkdb-agent
+
+<span class="tok-c"># export the key; pinkdb never reads a .env file itself</span>
+set <span class="tok-f">-a</span>; . ./.env; set +a
+<span class="tok-c"># …or:</span>
+export <span class="tok-v">PINKDB_AGENT_API_KEY</span>=…
+
+<span class="tok-c"># ask one question against a store</span>
+./target/release/pinkdb <span class="tok-f">--agent</span> sales.pink <span class="tok-s">"Who are the top 3 customers by revenue?"</span></code></pre></div>
+
+<p>The extension reads the key from the environment when a run starts:
+<code>PINKDB_AGENT_API_KEY</code>, falling back to <code>Z_API_KEY</code>.
+<code>PINKDB_AGENT_BASE_URL</code> and <code>PINKDB_AGENT_MODEL</code>
+override the defaults
+(<code>https://api.z.ai/api/paas/v4/chat/completions</code>,
+<code>glm-4.6</code>) — any OpenAI-compatible chat-completions endpoint works.
+<code>--agent</code> loads <code>libpinkdb_agent</code> from the install
+directory, like <code>--mcp</code>; <code>--agent-allow-writes</code> and
+<code>--agent-allow-files</code> start the run under a looser policy.</p>
+
+<p><strong>The key never lands anywhere.</strong> It is not in a table, not in
+the WAL, not in a log line, not in an error and not in <code>Debug</code>
+output — the extension holds it in memory for the run — and there is no
+<code>SET</code> that reaches it. A 401 stops the run with “the provider
+rejected the API key (HTTP 401); check PINKDB_AGENT_API_KEY”, which names the
+variable and nothing else.</p>
+
+<h2 id="commands">Commands<a class="anchor" href="#commands" aria-label="Permalink: Commands">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>.agent ask "&lt;question&gt;" [allow-writes] [allow-files] [max-steps N] [tokens N]
+.agent resume &lt;session&gt;
+.agent sessions
+.agent show &lt;session&gt;
+.agent fork &lt;session&gt; &lt;step&gt; ["&lt;new question&gt;"]</code></pre></div>
+
+<p>Each one dispatches to the loaded extension; without it the run commands
+print the <code>LOAD EXTENSION</code> hint (and
+<code>.agent rows|cols|cell|budget|timeout|hint</code> keeps its wave-99
+meaning). A <code>resume</code> keeps the policy and budgets the session
+started with, because the transcript records them.</p>
+
+<h2 id="the-tools">The tools<a class="anchor" href="#the-tools" aria-label="Permalink: The tools">#</a></h2>
+
+<p>The agent has the same eight warehouse tools as the MCP bridge —
+<code>query</code>, <code>describe</code>, <code>tables</code>,
+<code>databases</code>, <code>explain</code>, <code>lake_tables</code>,
+<code>lake_versions</code>, <code>lake_changes</code> — from one shared crate
+(<code>extensions/warehouse-tools</code>), so the two cannot drift. There is
+no shell, no file editing, no web fetch and no <code>LOAD EXTENSION</code>: a
+data agent, not a coding agent. Results are the wave-99 compact Markdown with
+truncation notices; the host, not the model, enforces the row, byte and time
+budgets.</p>
+
+<h2 id="two-policies">Two policies<a class="anchor" href="#two-policies" aria-label="Permalink: Two policies">#</a></h2>
+
+<p>The model's tool calls run through the host statement callback under the
+same read-only policy as MCP: only queries, <code>DESCRIBE</code>,
+<code>SHOW</code> and <code>EXPLAIN</code>, with no external files or URLs,
+until the run is started with <code>allow-writes</code>. File access stays a
+separate decision (<code>allow-files</code>).</p>
+
+<p>On top of that, the agent's own database is off-limits to the model even
+with <code>allow-writes</code>: <code>pinkdb_agent</code> holds the transcript
+the run resumes from, so a prompt injection that talks the model into
+<code>INSERT INTO pinkdb_agent.messages …</code> must fail. The extension
+writes that transcript through a second, internal channel that may only write
+<code>pinkdb_agent</code> — so it cannot touch user data either. Both
+directions are tested.</p>
+
+<h2 id="sessions">Sessions<a class="anchor" href="#sessions" aria-label="Permalink: Sessions">#</a></h2>
+
+<p>A session lives in the <code>pinkdb_agent</code> database of the store it
+ran against: <code>sessions</code>, <code>messages</code>,
+<code>tool_calls</code>, <code>checkpoints</code> and <code>usage</code>. Every
+step — the model turn, its tool calls, their results and the next checkpoint —
+commits together, so a <code>kill -9</code> costs at most the step in flight.
+<code>.agent resume</code> re-requests an interrupted stream, reuses every
+recorded tool result, and re-runs only the read-only (replay-safe) tools.</p>
+
+<p><code>.agent fork &lt;session&gt; &lt;step&gt;</code> copies the transcript
+up to that step into a new session, records <code>origin</code> and
+<code>origin_step</code>, leaves the original untouched, and optionally
+continues the fork with a new question. Because the history is plain SQL,
+<code>SELECT * FROM pinkdb_agent.tool_calls</code> is the audit trail and a
+client can watch a run with CDC.</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>pinkdb&gt; .agent sessions
+pinkdb&gt; .agent show a1f2c3d4e5f6
+pinkdb&gt; .agent fork a1f2c3d4e5f6 2 <span class="tok-s">"Now break that down by region"</span></code></pre></div>
+
+<h2 id="budgets">Budgets<a class="anchor" href="#budgets" aria-label="Permalink: Budgets">#</a></h2>
+
+<p>A run stops at 20 steps by default, after an optional token budget, or when
+a statement hits the wave-99 <code>ExecLimits</code>; all three are set per run
+(<code>max-steps N</code>, <code>tokens N</code>, the
+<code>.agent timeout|budget</code> settings) and the transcript records which
+limit stopped it. Token usage is summed from the provider's usage chunks and
+committed per step.</p>
+
+<h2 id="under-the-hood">Under the hood<a class="anchor" href="#under-the-hood" aria-label="Permalink: Under the hood">#</a></h2>
+
+<p>The command entry point is an additive ABI capability (minor 4): an
+optional <code>pinkdb_ext_command(api, host_ctx, args, sink, sink_ctx)</code>
+export, detected by symbol presence, whose sink callback streams the answer or
+a diagnostic, plus a <code>PinkdbHostApi::execute_internal</code> field that
+answers machine-readable JSON rows for the extension's own reads. Every v1 and
+minor-2 extension — and all four SDK smokes — load unchanged. The provider
+client is blocking <code>ureq</code> with rustls (the same crate and features
+<code>pinkdb-httpfs</code> locks) with a hand-written SSE parser: no async
+runtime, no client crate, no new third-party crate in <code>Cargo.lock</code>.
+Measured on one machine, the release binaries grew by 0.76%
+(<code>pinkdb</code>, 5,035,312 → 5,073,504 bytes) and 0.03%
+(<code>pinkdb-server</code>, 4,668,016 → 4,669,264 bytes); the agent itself is
+2,471,632 bytes.</p>
+
+<p>Tests run against a recorded mock provider — a localhost server replaying
+checked-in SSE fixtures — so CI is deterministic and free: a single answer, a
+multi-step tool loop, arguments split across chunks, an interrupted stream,
+429-then-success, 401, kill-and-resume, fork, the refusals, the key sentinel
+and a TPC-H top-3 question end to end. The live run is opt-in:
+<code>PINKDB_AGENT_LIVE=1 cargo test -p pinkdb-cli --test agent_run --
+--ignored</code>.</p>
+
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="agents"><span class="pager-dir">Previous</span><span class="pager-title">Agents and MCP</span></a><a class="pager-link next" href="bindings"><span class="pager-dir">Next</span><span class="pager-title">Bindings overview</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/agent.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#setup">Setup</a></li>
+  <li><a href="#commands">Commands</a></li>
+  <li><a href="#the-tools">The tools</a></li>
+  <li><a href="#two-policies">Two policies</a></li>
+  <li><a href="#sessions">Sessions</a></li>
+  <li><a href="#budgets">Budgets</a></li>
+  <li><a href="#under-the-hood">Under the hood</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <div class="theme-switch" role="group" aria-label="Paper edition" hidden>
+      <span class="theme-switch-label" aria-hidden="true">edition</span>
+      <button type="button" data-theme-choice="system" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
+    </div>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

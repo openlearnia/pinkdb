@@ -407,6 +407,16 @@ fn print_help() {
     println!("Dot-commands:");
     println!("  .help                  show this help (.help agent: agent mode)");
     println!("  .agent [setting N]     show/change agent-mode caps and guard");
+    println!("  .agent ask|resume|sessions|show|fork");
+    println!("                         run the pinkdb agent (`.agent help`; needs LOAD");
+    println!(
+        "                         EXTENSION of {}): sessions live in the",
+        agent_library_name()
+    );
+    println!(
+        "                         {} database, tools read-only unless allow-writes",
+        pinkdb::serve::AGENT_DATABASE
+    );
     println!("  .quit | .exit          leave the shell");
     println!("  .read <file.sql>       run SQL and dot-commands from a file");
     println!("  .timer on|off          print each statement's run time with a phase breakdown");
@@ -1226,7 +1236,25 @@ fn run_dot(session: &mut Session, line: &str) -> bool {
             return true;
         }
         ".agent" => {
-            agent_settings_command(rest);
+            let verb = rest.split_whitespace().next().unwrap_or("");
+            if !AGENT_VERBS.contains(&verb) {
+                agent_settings_command(rest);
+                return true;
+            }
+            if verb == "help" {
+                agent_usage();
+                return true;
+            }
+            match session {
+                Session::Local(local) => {
+                    agent_command(&mut local.db, rest);
+                }
+                #[cfg(feature = "client")]
+                Session::Remote(_) => cli_error!(
+                    "the agent runs in this process, not on the server: `.agent {verb}` needs \
+                     a local store (`.open <file.pink>`), not --host"
+                ),
+            }
             return true;
         }
         ".timer" => {
@@ -1861,6 +1889,13 @@ struct Opts {
     /// `-agent` / `-no-agent`: force agent mode on or off (the flag wins over
     /// `PINKDB_AGENT_MODE` and auto-detection).
     agent: Option<bool>,
+    /// `--agent FILE "question"`: ask the agent once and exit (wave 106). A
+    /// bare `--agent` is wave 99's agent mode, above: only a following file
+    /// argument makes it a run.
+    agent_run: Option<(String, String)>,
+    /// `--agent-allow-writes`, `--agent-allow-files`: the policy for that run.
+    agent_allow_writes: bool,
+    agent_allow_files: bool,
     /// `--file-cache DIR`: keep remote byte ranges on disk between queries
     /// (wave 98c). Off unless given; `PINKDB_EXTERNAL_FILE_CACHE=1` and its
     /// `_DIR`/`_BYTES` variables do the same without the flag.
@@ -1899,6 +1934,19 @@ fn print_usage() {
     println!("  --mcp FILE         open FILE and serve an MCP client (an agent) on stdio:");
     println!("                     read-only, no LLM code in pinkdb; .mcp serve explains the");
     println!("                     rest (http, allow-writes)");
+    println!("  --agent FILE \"question\"");
+    println!("                     open FILE and ask the pinkdb agent one question, with");
+    println!(
+        "                     {} from the install directory (sessions live",
+        agent_library_name()
+    );
+    println!(
+        "                     in the {} database of FILE; read-only)",
+        pinkdb::serve::AGENT_DATABASE
+    );
+    println!("  --agent-allow-writes, --agent-allow-files");
+    println!("                     the policy for that question (the agent's own tables stay");
+    println!("                     read-only to the model either way)");
     println!("  --mcp-allow-files  let the MCP client read external files and URLs:");
     println!("                     table functions and bare paths, e.g. read_csv('/x.csv')");
     println!("  --mcp-extension PATH");
@@ -1939,11 +1987,14 @@ fn parse_args() -> Result<Opts, String> {
         extension_root: None,
         extension_pins: Vec::new(),
         agent: None,
+        agent_run: None,
+        agent_allow_writes: false,
+        agent_allow_files: false,
         file_cache: None,
         mcp: None,
         mcp_extension: None,
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -2025,7 +2076,30 @@ fn parse_args() -> Result<Opts, String> {
             other if other.starts_with("--mcp-extension=") => {
                 opts.mcp_extension = Some(other["--mcp-extension=".len()..].to_string());
             }
-            "-agent" | "--agent" => opts.agent = Some(true),
+            "-agent" | "--agent" => match args.peek() {
+                // `--agent FILE "question"` runs the agent (wave 106); alone or
+                // before another flag it keeps wave 99's forced agent mode.
+                Some(next) if !next.starts_with('-') => {
+                    let file = args.next().unwrap_or_default();
+                    let question = args.next().ok_or_else(|| {
+                        "--agent needs a question: pinkdb --agent FILE 'question'".to_string()
+                    })?;
+                    opts.agent_run = Some((file, question));
+                }
+                _ => opts.agent = Some(true),
+            },
+            "--agent-allow-writes" => opts.agent_allow_writes = true,
+            "--agent-allow-files" => opts.agent_allow_files = true,
+            other if other.starts_with("--agent=") => {
+                let file = other["--agent=".len()..].to_string();
+                let question = args.next().ok_or_else(|| {
+                    "--agent=FILE needs a question: pinkdb --agent=FILE 'question'".to_string()
+                })?;
+                if question.starts_with('-') {
+                    return Err("--agent=FILE needs a question, not a flag".to_string());
+                }
+                opts.agent_run = Some((file, question));
+            }
             "-no-agent" | "--no-agent" => opts.agent = Some(false),
             "-c" => {
                 let value = args.next().ok_or("-c requires a command")?;
@@ -2040,6 +2114,21 @@ fn parse_args() -> Result<Opts, String> {
         return Err(
             "--mcp-extension only says where the MCP bridge lives: it needs --mcp FILE".to_string(),
         );
+    }
+    if opts.agent_run.is_some() {
+        if opts.mcp.is_some() {
+            return Err("--agent and --mcp both own the process: pass one".to_string());
+        }
+        if opts.host.is_some() {
+            return Err(
+                "--agent runs against a local store: it does not take --host (sessions live in \
+                 the .pink file)"
+                    .to_string(),
+            );
+        }
+        if !opts.commands.is_empty() {
+            return Err("--agent asks one question: it does not take -c".to_string());
+        }
     }
     if let Some(dir) = &opts.file_cache {
         // The transport reads the cache configuration from the environment
@@ -2437,6 +2526,165 @@ fn run_mcp(opts: &Opts, path: &str, key: Option<EncryptionKey>) -> ! {
     std::process::exit(0);
 }
 
+/// The `.agent` verbs that go to the agent extension; every other word is
+/// wave 99's display setting (`.agent rows 40`, …).
+const AGENT_VERBS: [&str; 6] = ["ask", "resume", "sessions", "show", "fork", "help"];
+
+/// `.agent help`: what the extension's commands are and where sessions live.
+fn agent_usage() {
+    println!(
+        "The pinkdb agent (needs LOAD EXTENSION of {}):",
+        agent_library_name()
+    );
+    println!("  .agent ask \"<question>\" [allow-writes] [allow-files]");
+    println!("  .agent resume <session>    continue from the last checkpoint");
+    println!("  .agent sessions           list the sessions in this store");
+    println!("  .agent show <session>     the transcript so far");
+    println!("  .agent fork <session> <step> [\"<new question>\"]");
+    println!("  .agent [rows N | cols N | cell N | budget N | timeout MS | hint N]");
+    println!(
+        "Sessions live in the {} database of the open store; the key is",
+        pinkdb::serve::AGENT_DATABASE
+    );
+    println!("PINKDB_AGENT_API_KEY (or Z_API_KEY) and the tools run read-only unless");
+    println!("allow-writes; the agent's own tables stay read-only to the model.");
+}
+
+/// Run one `.agent` command in the loaded extension and report its exit code.
+fn agent_command(db: &mut PinkDb, args: &str) -> i32 {
+    if !db
+        .command_extensions()
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("agent"))
+    {
+        cli_error!(
+            "the agent extension is not loaded: \n\
+             LOAD EXTENSION '<dir>/{}' first",
+            agent_library_name()
+        );
+        return 1;
+    }
+    let (allow_writes, allow_files) = agent_flags(args);
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    let result = db.run_command(
+        "agent",
+        args,
+        agent_tool_policy(allow_writes, allow_files),
+        agent_internal_policy(),
+        &mut |channel, text| {
+            let sink: &mut dyn std::io::Write = if channel == 0 { &mut out } else { &mut err };
+            let _ = sink.write_all(text.as_bytes());
+            let _ = sink.flush();
+        },
+    );
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            cli_error!("{e}");
+            1
+        }
+    }
+}
+
+/// The flags the operator put on the command line. The extension parses them
+/// itself; the host needs them too, because the host enforces the policy.
+fn agent_flags(args: &str) -> (bool, bool) {
+    let mut allow_writes = false;
+    let mut allow_files = false;
+    for word in args.split_whitespace() {
+        match word {
+            "allow-writes" => allow_writes = true,
+            "allow-files" => allow_files = true,
+            _ => {}
+        }
+    }
+    (allow_writes, allow_files)
+}
+
+/// What the model's tools may do: the MCP policy plus the agent's own
+/// database, which stays off-limits even with allow-writes so a prompt
+/// injection cannot rewrite the transcript a run resumes from.
+fn agent_tool_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::ServePolicy {
+    pinkdb::serve::ServePolicy {
+        deny_write_databases: vec![pinkdb::serve::AGENT_DATABASE.to_string()],
+        limits: agent_limits(),
+        ..mcp_policy(allow_writes, allow_files)
+    }
+}
+
+/// What the extension's own bookkeeping may do: write, but only its database.
+fn agent_internal_policy() -> pinkdb::serve::ServePolicy {
+    pinkdb::serve::ServePolicy {
+        write_database: Some(pinkdb::serve::AGENT_DATABASE.to_string()),
+        limits: agent_limits(),
+        ..mcp_policy(true, true)
+    }
+}
+
+/// `--agent FILE "question"`: load the agent from the install directory, ask
+/// one question against FILE and exit. Never returns.
+fn run_agent(opts: &Opts, path: &str, question: &str, key: Option<EncryptionKey>) -> ! {
+    let opened = match key.clone() {
+        Some(key) => PinkDb::open_durable_with_key_and_options(path, &key, durable_options()),
+        None => PinkDb::open_durable_with_options(path, durable_options()),
+    };
+    let (mut db, report) = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            cli_error!("cannot open {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    load_builtin_extensions(&mut db);
+    load_installed_agent(&mut db);
+    if report.replayed_records > 0 {
+        eprintln!(
+            "replayed {} WAL record(s) ({} statement(s))",
+            report.replayed_records, report.replayed_statements
+        );
+    }
+    let mut args = format!(
+        "ask \"{}\"",
+        question.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    if opts.agent_allow_writes {
+        args.push_str(" allow-writes");
+    }
+    if opts.agent_allow_files {
+        args.push_str(" allow-files");
+    }
+    std::process::exit(agent_command(&mut db, &args));
+}
+
+/// Load the agent that sits next to this executable.
+fn load_installed_agent(db: &mut PinkDb) {
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(agent_library_name())))
+        .unwrap_or_else(|| std::path::PathBuf::from(agent_library_name()));
+    if let Err(e) = db.load_extension(&path.display().to_string()) {
+        cli_error!("{e}");
+        eprintln!(
+            "       --agent loads {} from the install directory; build it with \
+             `cargo build --release -p pinkdb-agent` and install it next to pinkdb",
+            path.display()
+        );
+        std::process::exit(1);
+    }
+}
+
+/// The agent library file name of this platform.
+fn agent_library_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "libpinkdb_agent.dylib"
+    } else if cfg!(target_os = "windows") {
+        "pinkdb_agent.dll"
+    } else {
+        "libpinkdb_agent.so"
+    }
+}
+
 /// Load the bridge that sits next to this executable.
 fn serve_installed_mcp(db: &mut PinkDb) {
     let path = std::env::current_exe()
@@ -2558,6 +2806,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // `--agent` owns the process too: one question, then the answer.
+    if let Some((file, question)) = opts.agent_run.clone() {
+        run_agent(&opts, &file, &question, key);
+    }
     // `--mcp` owns the process: an agent client drives the session, so there
     // is no prompt to fall back to.
     if let Some(path) = opts.mcp.clone() {

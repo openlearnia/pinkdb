@@ -1,5 +1,5 @@
 /*
- * pinkdb loadable-extension ABI v1 (minor 2) — https://github.com/openlearnia/pinkdb
+ * pinkdb loadable-extension ABI v1 (minor 4) — https://github.com/openlearnia/pinkdb
  *
  * An extension is a shared library (`.dylib` / `.so` / `.dll`) loaded at
  * runtime by the `pinkdb-ext-loader` crate (host side: the SQL statement
@@ -37,6 +37,18 @@
  *
  *       While a serve call runs the library is never unloaded and cannot be
  *       loaded a second time; the host enforces both.
+ *
+ *   int32_t     pinkdb_ext_command(const PinkdbHostApi *api, void *host_ctx,
+ *                                  const char *args, PinkdbExtSinkFn sink,
+ *                                  void *sink_ctx);
+ *       OPTIONAL (ABI minor 4). Present when the extension implements host
+ *       dot commands (the agent extension does). The host calls it once per
+ *       command and blocks until it returns 0; `args` is the text after the
+ *       command name, NUL-terminated UTF-8, valid for the call only. Text the
+ *       command streams goes through `sink(sink_ctx, channel, text, len)`:
+ *       channel 0 is the answer (the host's stdout), 1 a diagnostic (its
+ *       stderr). The same no-unwinding and one-call-at-a-time rules as
+ *       pinkdb_ext_serve apply, and the two share that one-call slot.
  *
  *   int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);
  *       Called exactly once, on the loading thread, right after the version
@@ -275,12 +287,13 @@ extern "C" {
 /* ABI version of this header / the host loader. */
 #define PINKDB_EXT_ABI_VERSION 1
 /* Additive level of that major version: 2 = pinkdb_ext_serve and the
- * execute_statement host field; 3 = the VARIANT value type (tag 10).
+ * execute_statement host field; 3 = the VARIANT value type (tag 10);
+ * 4 = pinkdb_ext_command and the execute_internal host field.
  * Extensions that do not use them need not care; hosts compare
  * PINKDB_EXT_ABI_VERSION and probe the additions. A new type tag is safe in
  * both directions: a host only ever sends tags the extension declared, and a
  * minor-2 host rejects a VARIANT registration with a clear error. */
-#define PINKDB_EXT_ABI_MINOR 3
+#define PINKDB_EXT_ABI_MINOR 4
 
 /* Maximum number of function arguments the host accepts. */
 #define PINKDB_EXT_MAX_ARGS 64
@@ -340,9 +353,17 @@ typedef int32_t (*PinkdbExtExecuteStatementFn)(void *ctx,
                                                char **out_text,
                                                size_t *out_len);
 
+/* One chunk of command output (see pinkdb_ext_command). `text` need not be
+ * NUL-terminated: exactly `len` bytes are read. The host copies them before
+ * the call returns to the extension, so the buffer may be reused. */
+typedef void (*PinkdbExtSinkFn)(void *ctx,
+                                int32_t channel,
+                                const char *text,
+                                size_t len);
+
 /* Host-provided services. Valid during pinkdb_extension_init, and for the
- * whole pinkdb_ext_serve call (the host builds a fresh struct for each and
- * wires `execute_statement` to the live session). */
+ * whole pinkdb_ext_serve or pinkdb_ext_command call (the host builds a fresh
+ * struct for each and wires the statement channels to the live session). */
 typedef struct PinkdbHostApi {
     /* PINKDB_EXT_ABI_VERSION and sizeof(PinkdbHostApi) as known to the host. */
     uint32_t abi_version;
@@ -379,7 +400,23 @@ typedef struct PinkdbHostApi {
      * and calling it there reads past the struct. In the struct handed to
      * pinkdb_extension_init this is a stub that always answers 2. */
     PinkdbExtExecuteStatementFn execute_statement;
+
+    /* Appended with ABI minor 4: run a statement for the extension's own
+     * bookkeeping (the agent's session tables). Same signature and codes as
+     * execute_statement, but the answer text is JSON — an array of
+     * `{"columns":[...],"rows":[[...]]}` objects — and writes are confined to
+     * the database the host keeps for this extension. Only wired during
+     * pinkdb_ext_command; elsewhere it is the same "no session" stub. */
+    PinkdbExtExecuteStatementFn execute_internal;
 } PinkdbHostApi;
+
+/* The command entry point (ABI minor 4). Returns 0 on success; a command that
+ * failed reports why through the sink and returns non-zero. */
+typedef int32_t (*PinkdbExtCommandFn)(const PinkdbHostApi *api,
+                                      void *host_ctx,
+                                      const char *args,
+                                      PinkdbExtSinkFn sink,
+                                      void *sink_ctx);
 
 /* `struct_size` negotiation landmarks, in the order the fields were appended.
  * An extension requires PINKDB_EXT_API_V1_SIZE bytes (refuse to init when the
@@ -389,12 +426,15 @@ typedef struct PinkdbHostApi {
  * compatible with. */
 #define PINKDB_EXT_API_V1_SIZE ((uint32_t)offsetof(PinkdbHostApi, register_scalar_flags))
 #define PINKDB_EXT_API_FLAGS_SIZE ((uint32_t)offsetof(PinkdbHostApi, execute_statement))
-#define PINKDB_EXT_API_MINOR2_SIZE ((uint32_t)sizeof(PinkdbHostApi))
+#define PINKDB_EXT_API_MINOR2_SIZE ((uint32_t)offsetof(PinkdbHostApi, execute_internal))
+#define PINKDB_EXT_API_MINOR4_SIZE ((uint32_t)sizeof(PinkdbHostApi))
 
 /* 1 when the host provides the register_scalar_flags field, else 0. */
 #define PINKDB_EXT_HOST_HAS_FLAGS(api) ((api)->struct_size >= PINKDB_EXT_API_FLAGS_SIZE)
 /* 1 when the host provides the execute_statement field, else 0. */
 #define PINKDB_EXT_HOST_HAS_EXECUTE(api) ((api)->struct_size >= PINKDB_EXT_API_MINOR2_SIZE)
+/* 1 when the host provides the execute_internal field, else 0. */
+#define PINKDB_EXT_HOST_HAS_INTERNAL(api) ((api)->struct_size >= PINKDB_EXT_API_MINOR4_SIZE)
 
 /* Copy the host API into an extension-owned struct.
  *

@@ -1,7 +1,7 @@
 # pinkdb C extension SDK
 
 Everything needed to build a loadable extension for pinkdb against extension
-ABI 1.2. No pinkdb libraries are linked: an extension is a shared library that
+ABI 1.4. No pinkdb libraries are linked: an extension is a shared library that
 the host `dlopen`s and drives through the C ABI in
 [`include/pinkdb_extension.h`](include/pinkdb_extension.h).
 
@@ -288,6 +288,28 @@ int32_t (*execute_statement)(void *ctx, const char *sql, size_t sql_len,
 The callback is only meaningful inside `pinkdb_ext_serve`, which receives the
 same `host_ctx`. In the init-scoped struct the pointer is a stub that always
 answers 2, so an extension can call it defensively from init without effect.
+
+## Commands (minor 4)
+
+ABI minor 4 adds a second optional entry point for extensions that *provide*
+commands rather than serve a protocol:
+
+```c
+int32_t pinkdb_ext_command(const PinkdbHostApi *api, void *host_ctx,
+                           const char *args, PinkdbExtSinkFn sink,
+                           void *sink_ctx);
+```
+
+The host calls it with the text after the command name and a sink it can write
+streamed output to (channel 0 = answer, channel 1 = diagnostic). The same call
+publishes `execute_internal`, which answers a statement as JSON rows
+(`[{"columns":[…],"rows":[[…]]}]`) instead of Markdown and is confined to the
+host's database for the extension, so an extension can keep its own tables
+without a second connection. Both are additive and detected by `struct_size` /
+symbol presence: a minor-2 host answers 2 for `execute_internal`, and an
+extension without `pinkdb_ext_command` loads as before. This header copy
+carries both; the C/C++/Go SDKs do not wrap them yet (the Rust SDK's
+`CommandSession` / `pinkdb_abi_exports_with_command!` is the reference).
 
 ## Security posture
 

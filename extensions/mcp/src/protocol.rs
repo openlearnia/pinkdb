@@ -28,6 +28,16 @@ pub struct Server<H: Host> {
     allow_files: bool,
 }
 
+impl<H: Host> tools::ToolHost for Server<H> {
+    fn execute(&mut self, statement: &str) -> tools::ToolReply {
+        let reply = self.host.execute(statement);
+        tools::ToolReply {
+            code: reply.code,
+            text: reply.text,
+        }
+    }
+}
+
 impl<H: Host> Server<H> {
     pub fn new(host: H, allow_writes: bool, allow_files: bool) -> Self {
         Server {
@@ -136,20 +146,10 @@ impl<H: Host> Server<H> {
                 return error_response(id, -32602, "tools/call arguments must be an object");
             }
         };
-        let statements = match tools::statements(name, &arguments) {
-            Ok(statements) => statements,
+        let last = match tools::run(self, name, &arguments) {
+            Ok(reply) => reply,
             Err(message) => return success(id, tool_result(&message, true)),
         };
-        let mut last = StatementReply {
-            code: 0,
-            text: String::new(),
-        };
-        for statement in statements {
-            last = self.host.execute(&statement);
-            if last.code != 0 {
-                break;
-            }
-        }
         let text = if last.text.is_empty() {
             match last.code {
                 0 => "(no output)".to_string(),

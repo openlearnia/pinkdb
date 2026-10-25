@@ -248,7 +248,7 @@ pub fn error_json(message: &str, kind: &str, position: Option<usize>) -> String 
 
 /// JSON string escaping without a dependency. Every control character is
 /// escaped, so the result is one physical line.
-fn json_escape_into(out: &mut String, text: &str) {
+pub(crate) fn json_escape_into(out: &mut String, text: &str) {
     for c in text.chars() {
         match c {
             '"' => out.push_str("\\\""),

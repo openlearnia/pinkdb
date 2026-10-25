@@ -444,3 +444,45 @@ macro_rules! pinkdb_abi_exports_with_serve {
         }
     };
 }
+
+/// Export `pinkdb_ext_command` (ABI minor 4) alongside the ABI v1 exports.
+///
+/// The host calls the given function for its dot commands with the command's
+/// argument text and an output sink; the function returns `0` on success. It
+/// may run tool statements ([`CommandSession::execute_statement`]) and its own
+/// bookkeeping statements ([`CommandSession::execute_internal`]).
+///
+/// ```no_run
+/// pinkdb_ext_sdk::pinkdb_extension! { name = "agent", functions = [] }
+/// fn command(session: &mut pinkdb_ext_sdk::CommandSession, args: &str) -> i32 {
+///     session.emit(0, args);
+///     0
+/// }
+/// pinkdb_ext_sdk::pinkdb_abi_exports_with_command!(command);
+/// ```
+#[macro_export]
+macro_rules! pinkdb_abi_exports_with_command {
+    ($command:path) => {
+        $crate::pinkdb_abi_exports!();
+
+        /// `pinkdb_ext_command` (ABI minor 4): the host hands control to this
+        /// extension for one dot command and blocks until it returns. Never
+        /// unwinds.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn pinkdb_ext_command(
+            api: *const $crate::__private::HostApi,
+            host_ctx: *mut ::core::ffi::c_void,
+            args: *const ::core::ffi::c_char,
+            sink: ::core::option::Option<$crate::__private::PinkdbExtSinkFn>,
+            sink_ctx: *mut ::core::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: the loader passes a live host API, its opaque context,
+            // a NUL-terminated argument string (or NULL) and an output sink
+            // pair; `native_command` documents the contract.
+            unsafe {
+                $crate::__private::native_command(api, host_ctx, args, sink, sink_ctx, $command)
+            }
+        }
+    };
+}

@@ -2,7 +2,8 @@
 
 Everything needed to build a pinkdb extension in **safe Rust** against the
 extension ABI v1 (**minor 2**: the additive `register_scalar_flags`,
-`execute_statement` and optional `pinkdb_ext_serve`). One `pinkdb_extension!`
+`execute_statement` and optional `pinkdb_ext_serve`; **minor 4**: the optional
+`pinkdb_ext_command` entry point and the `execute_internal` host field). One `pinkdb_extension!`
 declaration defines the extension —
 its name and its functions — and the SDK generates the ABI glue: value
 marshalling, VARCHAR ownership, NULL handling, the wave-49 **linked**
@@ -82,6 +83,7 @@ the author — no `unsafe`, no manual registration, no field to keep in sync.
 | 64 MiB VARCHAR limit, invalid UTF-8 | the host's rejections, surfacing as code 1; the SDK cannot produce a non-`String` payload, so invalid UTF-8 has no representation here |
 | callback concurrency and no unwinding | one `extern "C"` trampoline for every function: it `catch_unwind`s the body, answers code 2 and prints a one-line diagnostic instead of unwinding into the host |
 | `execute_statement` + optional `pinkdb_ext_serve` (minor 2) | `HostSession::execute_statement` and `pinkdb_abi_exports_with_serve!(serve)`; an extension without the export is functions-only, which is the default |
+| optional `pinkdb_ext_command` + `execute_internal` (minor 4) | `CommandSession` (the statement callback, a JSON-row internal read and a text sink for streamed output) and `pinkdb_abi_exports_with_command!(run)`; a library may export both entry points and the host calls the one it was asked for |
 | `PINKDB_EXT_MAX_ARGS`, name/arity/type validation | the host's job; the SDK registers only well-formed declarations, and a rejection fails the load even when init returns 0 |
 
 What the ABI does **not** register, and therefore what a path-loaded extension

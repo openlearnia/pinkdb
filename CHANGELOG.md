@@ -9,6 +9,72 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-25
+### Wave 106 — `pinkdb-agent`: a data agent harness as an extension ✅
+- **An agent that lives in the store.** `pinkdb-agent` is a native extension
+  (`LOAD EXTENSION 'libpinkdb_agent…'`) that runs the loop itself: it asks an
+  OpenAI-compatible endpoint what to do, executes the warehouse tools through
+  the host, and keeps sessions, messages, tool calls and their results,
+  checkpoints and token usage in the `pinkdb_agent` database. The engine, the
+  CLI and the server still contain no model or HTTP client code; the release
+  binaries grew only by the host-side ABI addition, 0.76% (`pinkdb`,
+  5,035,312 → 5,073,504 bytes) and 0.03% (`pinkdb-server`, 4,668,016 →
+  4,669,264 bytes), while the extension itself is 2,471,632 bytes.
+- **Commands.** `.agent ask "<question>" [allow-writes] [allow-files]
+  [max-steps N] [tokens N]`, `.agent resume`, `.agent sessions`,
+  `.agent show`, `.agent fork <session> <step> ["<question>"]`, and
+  `pinkdb --agent FILE "question"` (with `--agent-allow-writes` /
+  `--agent-allow-files`) which loads the extension from the install
+  directory like `--mcp`. The wave-99 `.agent rows|cols|cell|…` settings keep
+  working when no run verb is given.
+- **The key never lands anywhere.** `PINKDB_AGENT_API_KEY`, falling back to
+  `Z_API_KEY`, read from the environment when a run starts (never from a
+  `.env` file); `PINKDB_AGENT_BASE_URL` and `PINKDB_AGENT_MODEL` override the
+  z.ai defaults. It is not in a table, the WAL, a log line, an error or
+  `Debug` output, and a test greps the tables, the `.pink` bytes and stderr
+  for a sentinel.
+- **Two policies.** The model's calls run under the row-105 read-only policy
+  unless the run says `allow-writes` (`allow-files` stays separate), and the
+  agent's own tables are off-limits to it even then; the extension writes its
+  transcript over an internal channel that may only write `pinkdb_agent`.
+  Both directions are tested.
+- **Resume and fork.** Every step commits a checkpoint. A killed run resumes
+  from the last one, re-requests an interrupted stream, reuses recorded tool
+  results and re-runs only replay-safe (read-only) tools. A fork copies the
+  transcript up to a step into a new session and diverges; the original is
+  untouched. Budgets: 20 steps by default, an optional token budget, and the
+  wave-99 per-tool limits, all set per run and recorded when they stop it.
+- **Provider.** One hand-parsed SSE `/chat/completions` client: streaming,
+  tool calls with arguments split across chunks, usage, `finish_reason`,
+  timeouts, three attempts with backoff on 429/5xx, and a 401 that says the
+  key was rejected without echoing it. Blocking `ureq` with rustls, the same
+  crate and features `pinkdb-httpfs` locks; no async runtime, no client crate,
+  no new third-party crate in `Cargo.lock`.
+- **Shared tools, ABI minor 4.** The eight warehouse tools moved to
+  `extensions/warehouse-tools`, used by both `pinkdb-mcp` (behaviour
+  unchanged) and `pinkdb-agent`. The ABI gains an optional
+  `pinkdb_ext_command(api, host_ctx, args, sink, sink_ctx)` export and an
+  `execute_internal` host field returning JSON rows; both are detected by
+  symbol presence and `struct_size`, so v1, minor-2 and minor-3 extensions and
+  the four SDKs load unchanged.
+- **Tests.** 26 in `pinkdb-agent` (unit + a recorded mock provider over
+  checked-in SSE fixtures), 13 + 1 ignored end-to-end CLI runs
+  (`crates/pinkdb-cli/tests/agent_run.rs`) against a localhost mock: a single
+  answer, a multi-step tool loop, split arguments, an interrupted stream, 429,
+  401, kill-and-resume, fork, write refusals, the key sentinel, a budget stop
+  and a TPC-H top-3 question; workspace 2,040 tests in 179 suites, all gates
+  green.
+- **Live check (reviewer, z.ai `glm-4.6`, default endpoint).** The first live
+  run found that tools went out in their MCP shape; they are now wrapped as
+  chat-completions function tools (`{"type":"function","function":{…}}`), and
+  a unit test pins the shape. The opt-in live test then passed, and a manual
+  run answered a revenue question in 3 tool steps (4,202 tokens); the key's
+  bytes were absent from the store and its WAL.
+- **Policy hardening (reviewer).** The model's write ban on `pinkdb_agent`
+  also covers indirect writes under `allow-writes`: a data-modifying `WITH`
+  body, a trigger whose action writes there (or runs `CALL`), and `CALL`/`DO`,
+  which a confined channel now refuses outright. The extension's own channel
+  is confined the same way in the other direction. Tests for both.
+
 ### Wave 101b — `VARIANT` in Parquet, shredding and path statistics ✅
 - **Shredding.** A `VARIANT` column now splits into typed sub-columns: a
   `metadata` dictionary shared by the whole row group, a residual `value`

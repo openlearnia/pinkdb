@@ -47,7 +47,22 @@ pub struct ServePolicy {
     /// rows; `0` never prints it. The CLI fills this from
     /// `PINKDB_AGENT_HINT_ROWS` so both sides of one session agree.
     pub hint_rows: u64,
+    /// Databases a write may not touch, whatever [`Self::allow_writes`] says.
+    /// The agent harness lists [`AGENT_DATABASE`] here for the model's tool
+    /// channel, so a prompt injection cannot rewrite the transcript the run
+    /// resumes from.
+    pub deny_write_databases: Vec<String>,
+    /// When set, every write must stay inside this database: the agent
+    /// harness's own bookkeeping channel, which is nothing but its session
+    /// tables.
+    pub write_database: Option<String>,
 }
+
+/// The database a command extension keeps its state in. [`ServePolicy::
+/// deny_write_databases`] names it for the model's tool channel and
+/// [`ServePolicy::write_database`] confines the extension's own channel to it;
+/// `pinkdb_ext_sdk::AGENT_DATABASE` is the same name on the extension side.
+pub const AGENT_DATABASE: &str = "pinkdb_agent";
 
 /// A host command handler: text starting with `.`, the store, and whether the
 /// session is read-only.
@@ -68,6 +83,8 @@ impl Default for ServePolicy {
             },
             command: None,
             hint_rows: 100_000,
+            deny_write_databases: Vec::new(),
+            write_database: None,
         }
     }
 }
@@ -83,11 +100,164 @@ const NO_COMMANDS_HINT: &str = "this host cannot run \".lake\" commands: lake ca
                                  served by the pinkdb CLI (pinkdb --mcp <file>), not by an \
                                  embedded store";
 
+/// What a write to the agent's own tables gets, whatever else the policy
+/// allows: the transcript is the record a run resumes from.
+fn agent_table_hint(database: &str) -> String {
+    format!(
+        "this session may not write the agent's own tables in \"{database}\": they are the \
+         transcript an agent run resumes from, and a model must not rewrite it"
+    )
+}
+
+/// What a bookkeeping write outside the agent's database gets.
+const INTERNAL_WRITE_HINT: &str = "the agent keeps its state in one database: this statement \
+                                   writes outside it";
+
+/// What a write whose database cannot be resolved gets while a policy
+/// confines writes.
+const UNRESOLVED_WRITE_HINT: &str = "cannot tell which database this statement writes (it is \
+                                     unqualified and the session has no current database): the \
+                                     agent's write policy needs a qualified target";
+
+/// What a confined channel (the agent's tools, or its own bookkeeping) gets
+/// for a statement that may write outside any one database.
+const GLOBAL_WRITE_HINT: &str = "this statement may write outside one database (CALL, DO, a trigger \
+                                 that runs one, extension loading, RBAC, CHECKPOINT or COPY … TO), \
+                                 which the agent's write policy refuses";
+
 /// What a statement that opens a file or a URL gets while `allow_files` is
 /// off. Naming the switch matters: the operator, not the agent, decides.
 const FILES_HINT: &str = "external files and URLs are disabled: this session reads tables only \
                           (start the server with allow-files to permit read_csv, read_parquet \
                           and file paths)";
+
+/// What a statement writes, for the two database-confinement rules of
+/// [`ServePolicy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteTarget {
+    /// A query: it writes nothing.
+    Nothing,
+    /// Writes inside exactly these databases (already resolved against the
+    /// session's current database; lowercased for comparison).
+    Databases(Vec<String>),
+    /// Writes a table whose database is unknown: unqualified, in a session
+    /// with no current database (a [`crate::db::Connection`]).
+    Unknown,
+    /// A change outside any one database: `CHECKPOINT`, extension loading,
+    /// RBAC, `COPY … TO` a file, and `CALL`/`DO`, whose bodies may write
+    /// anywhere (as may a trigger whose action is one of them).
+    Global,
+}
+
+impl WriteTarget {
+    /// The combined target of two writes in one statement: `Global` beats
+    /// `Unknown`, which beats a database list (lists are unioned).
+    fn merge(self, other: WriteTarget) -> WriteTarget {
+        use WriteTarget::*;
+        match (self, other) {
+            (Global, _) | (_, Global) => Global,
+            (Unknown, _) | (_, Unknown) => Unknown,
+            (Nothing, t) | (t, Nothing) => t,
+            (Databases(mut a), Databases(b)) => {
+                for db in b {
+                    if !a.contains(&db) {
+                        a.push(db);
+                    }
+                }
+                Databases(a)
+            }
+        }
+    }
+}
+
+/// What `stmt` writes, given the session's `current_db`.
+///
+/// Conservative by construction: a statement kind this function does not
+/// classify is a [`WriteTarget::Global`], and one whose table database cannot
+/// be resolved is [`WriteTarget::Unknown`] — both are refused once a policy
+/// confines writes.
+pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
+    use Statement::*;
+    /// A catalog write that names its database, or inherits the session's.
+    fn table(db: &Option<String>, current_db: Option<&str>) -> WriteTarget {
+        match db.as_deref().or(current_db) {
+            Some(db) => WriteTarget::Databases(vec![db.to_ascii_lowercase()]),
+            None => WriteTarget::Unknown,
+        }
+    }
+    match stmt {
+        // Queries and metadata reads.
+        Describe { .. }
+        | DescribeMacro { .. }
+        | ShowTables
+        | ShowDatabases
+        | ShowMaterializedViews
+        | ShowMacros
+        | ShowTriggers { .. }
+        | Use { .. }
+        // Transaction control and session variables change no table by
+        // themselves; every statement inside the transaction is checked.
+        | Begin
+        | Commit
+        | Rollback
+        | SetVariable { .. } => WriteTarget::Nothing,
+        // A `WITH` may carry data-modifying bodies (`WITH x AS (INSERT …)`).
+        Select(sel) => sel
+            .with
+            .iter()
+            .filter_map(|cte| match &cte.query {
+                crate::sql::ast::CteBody::Dml(body) => Some(write_target(body, current_db)),
+                crate::sql::ast::CteBody::Query(_) => None,
+            })
+            .fold(WriteTarget::Nothing, WriteTarget::merge),
+        Explain(inner) => write_target(inner, current_db),
+        // A trigger writes wherever its action does each time it fires, not
+        // only the database of the table it is attached to.
+        CreateTrigger { db, action, .. } => {
+            table(db, current_db).merge(write_target(action, current_db))
+        }
+        CreateTable { db, .. }
+        | CreateTableAs { db, .. }
+        | Insert { db, .. }
+        | Update { db, .. }
+        | Delete { db, .. }
+        | Merge { db, .. }
+        | CreateView { db, .. }
+        | DropTable { db, .. }
+        | AlterTable { db, .. }
+        | DropView { db, .. }
+        | CreateMaterializedView { db, .. }
+        | RefreshMaterializedView { db, .. }
+        | DropMaterializedView { db, .. }
+        | CreateIndex { db, .. }
+        | DropIndex { db, .. }
+        | CreateProcedure { db, .. }
+        | DropProcedure { db, .. }
+        | DropTrigger { db, .. }
+        | CreateMacro { db, .. }
+        | DropMacro { db, .. } => table(db, current_db),
+        CreateDatabase { name, .. } | DropDatabase { name, .. } => {
+            WriteTarget::Databases(vec![name.to_ascii_lowercase()])
+        }
+        // Everything else a policy can see here changes the store outside one
+        // database, or runs SQL this function cannot inspect.
+        LoadExtension { .. }
+        | InstallExtension { .. }
+        | LoadInstalledExtension { .. }
+        | Checkpoint
+        | CopyTo { .. }
+        | RefreshMaterializedViews
+        | Call { .. }
+        | Do { .. }
+        | CreateUser { .. }
+        | AlterUser { .. }
+        | DropUser { .. }
+        | CreateRole { .. }
+        | DropRole { .. }
+        | Grant { .. }
+        | Revoke { .. } => WriteTarget::Global,
+    }
+}
 
 /// Whether `stmt` may run under `allow_writes`.
 ///
@@ -142,6 +312,104 @@ pub fn execute(db: &mut PinkDb, policy: &ServePolicy, sql: &str) -> (i32, String
         Ok(text) => (0, text),
         Err(text) => (1, text),
     }
+}
+
+/// Run one statement for a command extension's own bookkeeping: the same
+/// policy check as [`execute`], but the answer is JSON — an array of
+/// `{"columns":[…],"rows":[[…],…]}` objects, one per statement.
+///
+/// [`ServePolicy::write_database`] is what confines those writes; the model's
+/// tool channel goes through [`execute`] with [`ServePolicy::
+/// deny_write_databases`] instead.
+pub fn execute_internal(db: &mut PinkDb, policy: &ServePolicy, sql: &str) -> (i32, String) {
+    let text = sql.trim();
+    if text.starts_with('.') {
+        return (1, agent::error_json(NO_COMMANDS_HINT, "execution", None));
+    }
+    if let Err(error) = checked(policy, sql, Some(&*db)) {
+        return (1, error);
+    }
+    match db.execute_with_limits(sql, policy.limits) {
+        Ok(results) => (0, render_json(&results)),
+        Err(e) => (1, agent::error_json_for(&e, sql)),
+    }
+}
+
+/// Render statement results as JSON rows: cell values keep their JSON type
+/// where it is exact (null, boolean, integers, finite doubles), and every
+/// other type is its display text.
+pub fn render_json(results: &[QueryResult]) -> String {
+    fn quoted(out: &mut String, text: &str) {
+        out.push('"');
+        agent::json_escape_into(out, text);
+        out.push('"');
+    }
+    fn cell(out: &mut String, value: &crate::Value) {
+        use std::fmt::Write;
+        match value {
+            crate::Value::Null => out.push_str("null"),
+            crate::Value::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
+            crate::Value::Integer(n) => {
+                let _ = write!(out, "{n}");
+            }
+            crate::Value::Bigint(n) => {
+                let _ = write!(out, "{n}");
+            }
+            crate::Value::Double(x) if x.is_finite() => {
+                let _ = write!(out, "{x}");
+            }
+            // Non-finite doubles have no JSON number form; dates, timestamps,
+            // decimals, intervals and variants stay exact as their text.
+            other => quoted(out, &other.to_string()),
+        }
+    }
+    let mut out = String::from("[");
+    for (i, result) in results.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"columns\":[");
+        let (columns, rows): (Vec<&str>, Option<&Vec<Vec<crate::Value>>>) = match result {
+            QueryResult::Selected { names, rows, .. } => {
+                (names.iter().map(String::as_str).collect(), Some(rows))
+            }
+            // A statement without rows answers with its outcome line.
+            _ => (vec!["result"], None),
+        };
+        let names = columns;
+        for (j, name) in names.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            quoted(&mut out, name);
+        }
+        out.push_str("],\"rows\":[");
+        match rows {
+            Some(rows) => {
+                for (r, row) in rows.iter().enumerate() {
+                    if r > 0 {
+                        out.push(',');
+                    }
+                    out.push('[');
+                    for (c, value) in row.iter().enumerate() {
+                        if c > 0 {
+                            out.push(',');
+                        }
+                        cell(&mut out, value);
+                    }
+                    out.push(']');
+                }
+            }
+            None => {
+                out.push('[');
+                quoted(&mut out, &outcome_line(result));
+                out.push(']');
+            }
+        }
+        out.push_str("]}");
+    }
+    out.push(']');
+    out
 }
 
 /// What a serve call runs statements on: the embedded store (no privilege
@@ -261,6 +529,42 @@ fn checked(
         .any(|s| !statement_allowed(s, policy.allow_writes))
     {
         return Err(agent::error_json(READ_ONLY_HINT, "permission", None));
+    }
+    let current_db = store.map(|db| db.current_db().to_string());
+    let confining = !policy.deny_write_databases.is_empty() || policy.write_database.is_some();
+    for statement in &statements {
+        match write_target(statement, current_db.as_deref()) {
+            WriteTarget::Nothing => {}
+            // `CALL`/`DO` bodies, extension loading, RBAC and the like may
+            // write anywhere, so a confined channel refuses them.
+            WriteTarget::Global if confining => {
+                return Err(agent::error_json(GLOBAL_WRITE_HINT, "permission", None));
+            }
+            WriteTarget::Global => {}
+            WriteTarget::Databases(databases) => {
+                if let Some(denied) = databases.iter().find(|db| {
+                    policy
+                        .deny_write_databases
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(db))
+                }) {
+                    return Err(agent::error_json(
+                        &agent_table_hint(denied),
+                        "permission",
+                        None,
+                    ));
+                }
+                if let Some(allowed) = &policy.write_database
+                    && databases.iter().any(|db| !db.eq_ignore_ascii_case(allowed))
+                {
+                    return Err(agent::error_json(INTERNAL_WRITE_HINT, "permission", None));
+                }
+            }
+            WriteTarget::Unknown if confining => {
+                return Err(agent::error_json(UNRESOLVED_WRITE_HINT, "permission", None));
+            }
+            WriteTarget::Unknown => {}
+        }
     }
     if !policy.allow_files
         && let Some(db) = store
@@ -516,7 +820,7 @@ impl PinkDb {
         match handle {
             ExtHandle::Dynamic(ext) => Ok(ext),
             ExtHandle::Linked(_) => Err(PinkDbError::Execution(format!(
-                "extension \"{name}\" is linked: only a native extension can serve a client"
+                "extension \"{name}\" is linked: only a native extension has an entry point"
             ))),
         }
     }
@@ -567,6 +871,81 @@ pub fn serve_with(
 ) -> Result<()> {
     pinkdb_ext_loader::serve::serve(ext, transport, options, host)
         .map_err(|e| PinkDbError::Execution(e.to_string()))
+}
+
+/// The host half of a command call: the extension's own bookkeeping runs under
+/// `internal`, everything else under `policy`, and text goes to `sink`
+/// (channel `0` for the answer, `1` for a diagnostic).
+///
+/// The two policies are what separate an agent's transcript from the data: a
+/// command may write only its own database ([`ServePolicy::write_database`])
+/// while the statements it runs on the model's behalf cannot touch it
+/// ([`ServePolicy::deny_write_databases`]).
+pub struct CommandSession<'a> {
+    db: &'a mut PinkDb,
+    policy: ServePolicy,
+    internal: ServePolicy,
+    sink: &'a mut dyn FnMut(i32, &str),
+}
+
+impl pinkdb_ext_loader::CommandHost for CommandSession<'_> {
+    fn execute_statement(&mut self, sql: &str) -> (i32, String) {
+        execute(self.db, &self.policy, sql)
+    }
+
+    fn execute_internal(&mut self, sql: &str) -> (i32, String) {
+        execute_internal(self.db, &self.internal, sql)
+    }
+
+    fn emit(&mut self, channel: i32, text: &str) {
+        (self.sink)(channel, text);
+    }
+}
+
+impl PinkDb {
+    /// The declared names of the loaded extensions that export
+    /// `pinkdb_ext_command`, so a host can offer the commands only where they
+    /// work.
+    pub fn command_extensions(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .loaded_extensions
+            .values()
+            .filter(|h| match h {
+                ExtHandle::Dynamic(ext) => ext.command_fn().is_some(),
+                ExtHandle::Linked(_) => false,
+            })
+            .map(|h| h.name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Run one of `name`'s commands (`pinkdb_ext_command`), blocking until it
+    /// returns. `args` is the text after the command name, exactly as typed.
+    /// Load the extension first ([`PinkDb::load_extension`]).
+    pub fn run_command(
+        &mut self,
+        name: &str,
+        args: &str,
+        policy: ServePolicy,
+        internal: ServePolicy,
+        sink: &mut dyn FnMut(i32, &str),
+    ) -> Result<()> {
+        let ext = self.dynamic_extension(name)?;
+        if ext.command_fn().is_none() {
+            return Err(PinkDbError::Execution(format!(
+                "extension \"{name}\" exports no pinkdb_ext_command (it has no commands)"
+            )));
+        }
+        let mut session = CommandSession {
+            db: self,
+            policy,
+            internal,
+            sink,
+        };
+        pinkdb_ext_loader::command::run_command(&ext, args, &mut session)
+            .map_err(|e| PinkDbError::Execution(e.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -996,5 +1375,79 @@ mod tests {
         assert!(text.contains("lake catalogs"), "{text}");
         let (code, _) = host.execute_statement("SELECT 1");
         assert_eq!(code, 0);
+    }
+
+    /// The model's tool channel under `allow-writes` may change the store but
+    /// never the agent's own database — not directly, and not through a
+    /// data-modifying `WITH`, a trigger action, `CALL` or `DO`.
+    #[test]
+    fn the_tool_channel_cannot_reach_the_agent_database_indirectly() {
+        let mut db = store();
+        db.execute("CREATE DATABASE pinkdb_agent").unwrap();
+        db.execute("CREATE TABLE pinkdb_agent.messages (n INT)")
+            .unwrap();
+        db.execute(
+            "CREATE PROCEDURE scrub() AS $$ BEGIN DELETE FROM pinkdb_agent.messages; END $$",
+        )
+        .unwrap();
+        let policy = ServePolicy {
+            allow_writes: true,
+            deny_write_databases: vec![AGENT_DATABASE.to_string()],
+            ..ServePolicy::default()
+        };
+        for sql in [
+            "INSERT INTO pinkdb_agent.messages VALUES (1)",
+            "WITH x AS (INSERT INTO pinkdb_agent.messages VALUES (1) RETURNING n) SELECT * FROM x",
+            "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW \
+             EXECUTE INSERT INTO pinkdb_agent.messages VALUES (1)",
+            "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE PROCEDURE scrub()",
+            "CALL scrub()",
+            "DO $$ BEGIN DELETE FROM pinkdb_agent.messages; END $$",
+        ] {
+            let (code, text) = execute(&mut db, &policy, sql);
+            assert_eq!(code, 1, "{sql} was allowed: {text}");
+            assert_kind(&text, "permission");
+        }
+        // Ordinary writes elsewhere still go through.
+        let (code, text) = execute(&mut db, &policy, "INSERT INTO t VALUES (4, 'four')");
+        assert_eq!(code, 0, "{text}");
+        let (code, text) = execute(
+            &mut db,
+            &policy,
+            "CREATE TRIGGER audit AFTER INSERT ON t FOR EACH ROW EXECUTE INSERT INTO t VALUES (0, 'x')",
+        );
+        assert_eq!(code, 0, "{text}");
+    }
+
+    /// The extension's own channel is confined the other way: its database
+    /// only, and nothing that could write elsewhere.
+    #[test]
+    fn the_internal_channel_cannot_leave_the_agent_database() {
+        let mut db = store();
+        db.execute("CREATE DATABASE pinkdb_agent").unwrap();
+        db.execute("CREATE TABLE pinkdb_agent.messages (n INT)")
+            .unwrap();
+        let policy = ServePolicy {
+            allow_writes: true,
+            write_database: Some(AGENT_DATABASE.to_string()),
+            ..ServePolicy::default()
+        };
+        for sql in [
+            "INSERT INTO t VALUES (9, 'x')",
+            "WITH x AS (DELETE FROM t RETURNING a) SELECT * FROM x",
+            "CREATE TRIGGER tr AFTER INSERT ON pinkdb_agent.messages FOR EACH ROW \
+             EXECUTE DELETE FROM t",
+            "DO $$ BEGIN DELETE FROM t; END $$",
+        ] {
+            let (code, text) = execute_internal(&mut db, &policy, sql);
+            assert_eq!(code, 1, "{sql} was allowed: {text}");
+            assert_kind(&text, "permission");
+        }
+        let (code, text) = execute_internal(
+            &mut db,
+            &policy,
+            "INSERT INTO pinkdb_agent.messages VALUES (1)",
+        );
+        assert_eq!(code, 0, "{text}");
     }
 }

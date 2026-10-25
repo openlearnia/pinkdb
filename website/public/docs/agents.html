@@ -150,6 +150,7 @@
 <li><a href="iceberg">Iceberg</a></li>
 <li><a href="server">Server</a></li>
 <li><a href="agents" class="active" aria-current="page">Agents and MCP</a></li>
+<li><a href="agent">pinkdb agent</a></li>
 </ul>
 </div>
 <div class="side-group">
@@ -188,6 +189,10 @@ Protocol</a>, so an agent — pi, Claude Code, fx, any MCP client — can query 
 store with the same compact Markdown results and JSON errors as the
 <code>-agent</code> CLI mode. pinkdb contains no model code: the client brings
 the reasoning, pinkdb runs the SQL.</p>
+
+<p>To keep the reasoning inside pinkdb instead, use the <a
+href="docs/agent">pinkdb agent</a>: the same tools, run by pinkdb itself,
+with the session, its checkpoints and its token usage stored in the database.</p>
 
 <h2 id="quick-start">Quick start<a class="anchor" href="#quick-start" aria-label="Permalink: Quick start">#</a></h2>
 
@@ -319,8 +324,9 @@ unchanged:</p>
   and gets control back when the client disconnects.</li>
 </ul>
 
-<p>Both are detected by symbol presence. The ABI stays major version 1 with
-minor version 2 (<code>PINKDB_EXT_ABI_MINOR</code>), so a v1 extension keeps
+<p>Both are detected by symbol presence. The ABI stays major version 1
+(minor 4 now also carries the command entry point the <a
+href="docs/agent">pinkdb agent</a> uses), so a v1 extension keeps
 loading unchanged. A library that is serving cannot be loaded again, and the loader's
 path rules still apply. The Rust SDK exposes
 <code>HostSession</code> and <code>pinkdb_abi_exports_with_serve!</code>; the
@@ -350,8 +356,11 @@ claude mcp add pinkdb -- pinkdb <span class="tok-f">--mcp</span> store.pink   <s
 window can afford — no JSON envelope per row, and an explicit count when the
 result had to be cut.</p>
 
+<p>See also: <a href="docs/agent">the pinkdb agent</a> — the same tools
+with the loop inside pinkdb, sessions in the store, and resume and fork.</p>
+
 <footer class="doc-footer">
-<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="server"><span class="pager-dir">Previous</span><span class="pager-title">Server</span></a><a class="pager-link next" href="bindings"><span class="pager-dir">Next</span><span class="pager-title">Bindings overview</span></a></nav>
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="server"><span class="pager-dir">Previous</span><span class="pager-title">Server</span></a><a class="pager-link next" href="agent"><span class="pager-dir">Next</span><span class="pager-title">pinkdb agent</span></a></nav>
 <p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/agents.html" rel="noopener">Edit this page on GitHub</a></p>
 </footer>
 </article>
