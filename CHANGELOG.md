@@ -9,6 +9,51 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-25
+### Wave 96b — a stateless server: metadata in the lake catalog ✅ (phase 1)
+- **`pinkdb-server --catalog … --data …`.** A new durable mode beside `--file`:
+  the engine catalog (databases, table definitions with constraints, defaults and
+  indexes, views, macros, materialized views, procedures, triggers,
+  users/roles/grants, loaded-extension sources) lives in a lake catalog database,
+  and the rows live in lake data files. Restart the server — or start it on
+  another machine — on the same two URLs and you get the identical store; the
+  server process keeps nothing durable (no local WAL, no checkpoint, no replay).
+  `--catalog` takes `pink:<path>`, `sqlite:<path>` and a postgres:// catalog (the
+  `catalog-sqlite` / `catalog-postgres` features); `--data` takes a directory or
+  `s3://bucket/prefix` (feature `lake-s3`). `--file` behaviour is unchanged. The
+  mode is behind the server's `catalog` feature (the backend features imply
+  it), so the default binary links no lake code and stays the same size
+  (4.67 MB vs 4.65 MB on main, darwin-aarch64; linking `pink-lake`
+  unconditionally had cost +1.9 MB).
+- **Where the metadata goes.** The `ducklake_*` schema belongs to DuckDB, so the
+  engine catalog is one row of `pinkdb_engine_catalog` beside it — an image of
+  the engine's own catalog with the row pages omitted (`PINKCAT1`: the `.pink`
+  footer image, plus views as their `CREATE VIEW` source text and the loaded
+  extension sources), checksummed with crc32c. A password appears only as its
+  Argon2id hash. Rationale and phase split: `docs/wave-96b-plan.md`.
+- **One transaction per commit.** The image rides the same `CatalogChange` as
+  the lake's own delta, so data files + lake delta + metadata publish together;
+  a metadata-only statement (`CREATE VIEW`, `GRANT`, `CREATE ROLE`,
+  `LOAD EXTENSION`) replaces the image without minting a lake version. A crash
+  before the commit publishes nothing, one after it publishes everything.
+- **One server per catalog (phase 1).** A lease row with a 2 s heartbeat makes a
+  second server fail with `already served by …`; a crashed server's lease goes
+  stale after 6 s and the next server takes over. Several servers on one catalog
+  (fencing tokens, cache invalidation) are phase 2.
+- **Views round-trip in this mode.** `ViewDef` gained the view's SQL text (a
+  bound `Select` cannot be rendered back to SQL); `--file` still does not
+  persist views.
+- **Found, not fixed:** the documented wire bootstrap (`CREATE USER …` then
+  `GRANT ADMIN …`) cannot work in any mode — the engine's per-statement login
+  gate refuses the second statement once the first has armed it. Server tests
+  build users through the embedded handle; recorded in the ROADMAP.
+- Tests: the full round trip on `pink:` and `sqlite:` catalogs and on mock S3
+  data (rows above the inlining limit, so they really come from the bucket),
+  Postgres when `PINKDB_TEST_POSTGRES_URL` is set, RBAC after restart, the
+  second-server refusal, a killed server reopening complete, Argon2id-only
+  secrets. Gates: fmt, clippy, workspace tests (1,968 passed, 9 ignored),
+  `pinkdb-server` 121 (126 with all catalog/data features), `pink-lake`
+  `catalog-sqlite,s3,encryption` 317, wasm32 build.
+
 ### Wave 95c — SQL dialect completeness, batch 3 (query forms) ✅
 - **LATERAL and comma-separated `FROM`.** `FROM a, b` is a cross join in the
   same left-deep list as `JOIN`, so `FROM a, b JOIN c ON a.x = c.z` binds like

@@ -208,6 +208,17 @@ CREATE TABLE IF NOT EXISTS pinkdb_object (
     path  TEXT PRIMARY KEY,
     bytes BLOB NOT NULL
 );
+-- The engine catalog image (wave 96b): a stateless `pinkdb-server` keeps every
+-- engine-side catalog object in the catalog database instead of a local
+-- `.pink` + WAL. One row, one opaque blob, keyed by the revision it was
+-- published with: the `ducklake_*` schema is fixed by DuckDB interop, so this
+-- lives beside it under a pinkdb name. See `crates/pinkdb/src/catalog_image.rs`
+-- for the blob's layout.
+CREATE TABLE IF NOT EXISTS pinkdb_engine_catalog (
+    id       INTEGER PRIMARY KEY,
+    revision BIGINT NOT NULL,
+    encoded  BLOB NOT NULL
+);
 -- Replication state (wave 103 T2): every field the old `replication/state.json`
 -- carried has its own typed column. Tables are keyed by DuckLake's table id
 -- where one exists (`dest_table_id`); `source`/`dest` stay the flat catalog

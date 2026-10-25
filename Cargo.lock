@@ -1778,6 +1778,7 @@ dependencies = [
 name = "pinkdb-server"
 version = "0.1.0"
 dependencies = [
+ "pink-lake",
  "pinkdb",
  "pinkdb-ext-loader",
  "pinkdb-server-ui",

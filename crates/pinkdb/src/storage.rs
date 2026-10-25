@@ -939,13 +939,18 @@ impl DataTable {
 }
 
 /// A view: a stored query (rebound at each use, so drops/recreates of the
-/// underlying tables surface as errors, never stale plans). Views are
-/// session-local: `.save` does not persist them.
+/// underlying tables surface as errors, never stale plans). A `.pink` footer
+/// does not carry views (they are session-local to `--file`), but the engine
+/// catalog image does, from the statement text in `sql` (wave 96b).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewDef {
     pub name: String,
     pub query: Select,
     pub cols: Option<Vec<String>>,
+    /// The `CREATE VIEW` statement text, stamped by the executor. Empty for a
+    /// view created through `create_view_in` without a statement (a test or an
+    /// embedder); such a view cannot be written to a catalog image.
+    pub sql: String,
 }
 
 /// A materialized view: a cached query result stored as a regular table, plus
@@ -1088,6 +1093,20 @@ impl Session {
 /// the WAL handle (`Arc`), so transaction snapshots and multi-writer
 /// `txn.work` copies all log to the same file. In-memory databases have
 /// `wal == None` and are byte-for-byte unchanged.
+/// The host's commit hook (wave 96b): see [`PinkDb::set_commit_hook`].
+/// `Debug` prints nothing of the closure, so [`PinkDb`]'s derived `Debug`
+/// stays usable.
+pub(crate) struct CommitHook(CommitHookFn);
+
+/// The publish callback's type, named so the struct above reads plainly.
+type CommitHookFn = Box<dyn Fn(&PinkDb) -> Result<()> + Send + Sync>;
+
+impl std::fmt::Debug for CommitHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CommitHook")
+    }
+}
+
 #[derive(Debug)]
 pub struct PinkDb {
     /// Key = lowercased database name.
@@ -1244,6 +1263,17 @@ pub struct PinkDb {
     /// a trigger body is checked against *this* principal — invoker rights, not
     /// the definer's. `None` is a trusted embedded session.
     pub(crate) session_principal: Option<String>,
+    /// The host's commit hook (wave 96b): called after every committed unit —
+    /// one autocommit statement, or one `COMMIT` — so a host that keeps the
+    /// store's *durable* metadata elsewhere (pinkdb-server's lake catalog)
+    /// publishes it as part of the same commit. Shared by store clones and
+    /// never persisted; `None` means the store's own checkpoint/WAL is the
+    /// durable copy ([`PinkDb::set_commit_hook`]).
+    pub(crate) commit_hook: Option<std::sync::Arc<CommitHook>>,
+    /// Set when the commit hook failed (wave 96b): the durable copy is behind
+    /// the in-memory state, so no later statement may run. Shared by store
+    /// clones; `None` until a hook fails.
+    pub(crate) commit_hook_failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// While a trigger body (or anything it calls) runs: the principal every
     /// statement it binds is checked against — invoker rights, never a
     /// definer's. `None` outside a trigger body; an empty string is a trigger
@@ -1347,6 +1377,8 @@ impl Clone for PinkDb {
             dml_cte_rows: self.dml_cte_rows.clone(),
             trigger_depth: self.trigger_depth,
             session_principal: self.session_principal.clone(),
+            commit_hook: self.commit_hook.clone(),
+            commit_hook_failure: std::sync::Arc::clone(&self.commit_hook_failure),
             trigger_invoker: self.trigger_invoker.clone(),
             rbac: self.rbac.clone(),
             file_formats: self.file_formats.clone(),
@@ -1430,6 +1462,8 @@ impl PinkDb {
             dml_cte_rows: None,
             trigger_depth: 0,
             session_principal: None,
+            commit_hook: None,
+            commit_hook_failure: std::sync::Arc::default(),
             trigger_invoker: None,
             rbac: crate::rbac::RbacCatalog::default(),
             // Process-global sinks (`filefmt::register_global_file_format`)
@@ -1445,6 +1479,40 @@ impl PinkDb {
             stream_buffered_rows: std::sync::atomic::AtomicUsize::new(0),
             stream_peak_rows: std::sync::atomic::AtomicUsize::new(0),
             stream_folded_rows: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Install the host's commit hook (wave 96b). The hook runs after every
+    /// committed unit — one autocommit statement, or one `COMMIT` — while the
+    /// store lock is still held, and receives the store as it is *after* the
+    /// commit. It is the seam a host uses when the durable copy of the catalog
+    /// lives outside the store (pinkdb-server publishes its lake catalog
+    /// there). An error fails the committing statement; the host is
+    /// responsible for stopping the store, whose in-memory state is then ahead
+    /// of its durable one.
+    ///
+    /// The hook is shared by every clone of the store and never persisted.
+    pub fn set_commit_hook<F>(&mut self, hook: F)
+    where
+        F: Fn(&PinkDb) -> Result<()> + Send + Sync + 'static,
+    {
+        self.commit_hook = Some(std::sync::Arc::new(CommitHook(Box::new(hook))));
+    }
+
+    /// Run the host's commit hook, if any, after a commit was recorded.
+    fn run_commit_hook(&self) -> Result<()> {
+        match &self.commit_hook {
+            Some(hook) => {
+                let result = (hook.0)(self);
+                if let Err(err) = &result {
+                    *self
+                        .commit_hook_failure
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(err.to_string());
+                }
+                result
+            }
+            None => Ok(()),
         }
     }
 
@@ -2006,6 +2074,17 @@ impl PinkDb {
     /// from ever being observed or saved. The database must be reopened,
     /// which recovers exactly the durable prefix.
     pub(crate) fn ensure_wal_healthy(&self) -> Result<()> {
+        if let Some(msg) = self
+            .commit_hook_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return Err(PinkDbError::Execution(format!(
+                "the store stopped after a catalog publish failure ({msg}); \
+                 reopen it to recover the durable state"
+            )));
+        }
         if let Some(wal) = self.durable_handle() {
             let guard = wal.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(msg) = guard.failure() {
@@ -2219,7 +2298,7 @@ impl PinkDb {
                 sets,
             )?;
         }
-        Ok(())
+        self.run_commit_hook()
     }
 
     /// Open a transaction: refresh (a short lease only when something was
@@ -2613,9 +2692,23 @@ impl PinkDb {
                 name: name.to_string(),
                 query,
                 cols,
+                sql: String::new(),
             },
         );
         Ok(())
+    }
+
+    /// Stamp the statement text a view was created from, so the engine catalog
+    /// image can rebuild it (wave 96b).
+    pub fn set_view_source_in(&mut self, db: &str, name: &str, sql: &str) -> Result<()> {
+        let key = Self::key(name);
+        match self.catalog_mut(db)?.views.get_mut(&key) {
+            Some(view) => {
+                view.sql = sql.to_string();
+                Ok(())
+            }
+            None => Err(PinkDbError::Catalog(format!("view \"{name}\" not found"))),
+        }
     }
 
     pub fn drop_view(&mut self, name: &str) -> Result<()> {

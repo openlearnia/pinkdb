@@ -5822,6 +5822,7 @@ fn bind_create_view(
             name: name.to_string(),
             cols: cols.clone(),
             query: Box::new(query.clone()),
+            source: String::new(),
         },
         dynamic_functions,
     ))

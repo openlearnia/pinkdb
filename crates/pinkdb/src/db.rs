@@ -152,6 +152,18 @@ impl Database {
         }
     }
 
+    /// Install the host's commit hook (wave 96b): see
+    /// [`PinkDb::set_commit_hook`]. A stateless server publishes its lake
+    /// catalog image from here, so one statement's metadata and data become
+    /// one catalog transaction. Shared by every connection, since it lives on
+    /// the store.
+    pub fn set_commit_hook<F>(&self, hook: F)
+    where
+        F: Fn(&PinkDb) -> Result<()> + Send + Sync + 'static,
+    {
+        write_lock(&self.shared).set_commit_hook(hook);
+    }
+
     /// Load a native extension into the shared store (the host-bootstrap step
     /// a server that ships an extension does before serving). Returns the
     /// extension's declared name.

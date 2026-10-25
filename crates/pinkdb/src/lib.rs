@@ -39,6 +39,7 @@
 
 pub mod agent;
 pub mod attached;
+pub mod catalog_image;
 pub mod crypto;
 pub mod csv;
 pub mod db;

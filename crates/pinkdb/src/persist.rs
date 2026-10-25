@@ -3002,6 +3002,21 @@ fn index_defs(t: &DataTable) -> Vec<IndexDef> {
         .collect()
 }
 
+/// The metadata image's index entries: the same definitions with their row
+/// statistics cleared. The statistics describe rows the image does not carry
+/// (they live in the lake's data files, whose chunks the loader appends after
+/// decoding), and the `.pink` reader refuses statistics larger than the table.
+fn index_defs_without_rows(t: &DataTable) -> Vec<IndexDef> {
+    index_defs(t)
+        .into_iter()
+        .map(|def| IndexDef {
+            distinct_keys: 0,
+            indexed_rows: 0,
+            ..def
+        })
+        .collect()
+}
+
 /// Write one table's index definitions (the reader side of [`index_defs`]).
 fn write_index_defs(w: &mut Writer, defs: &[IndexDef]) {
     w.u32(defs.len() as u32);
@@ -3088,14 +3103,23 @@ impl PinkDb {
     /// sorted name order (deterministic bytes). Views are session-local and
     /// never persisted.
     fn to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(self.to_bytes_inner(true, false)?.0)
+        Ok(self.to_bytes_inner(true, false, false)?.0)
+    }
+
+    /// The engine catalog image (wave 96b): every database, macro, materialized
+    /// view, procedure, trigger and RBAC entry, with each table's schema,
+    /// constraints, defaults and index definitions but **no rows**. The lake
+    /// holds the rows; this is the metadata a stateless server restores from
+    /// the catalog.
+    pub(crate) fn to_metadata_bytes(&self) -> Result<Vec<u8>> {
+        Ok(self.to_bytes_inner(true, false, true)?.0)
     }
 
     /// [`PinkDb::to_bytes`] with the chunk-parallel encode disabled (test
     /// switch: both paths must produce identical bytes).
     #[cfg(test)]
     fn to_bytes_impl(&self, parallel: bool) -> Result<Vec<u8>> {
-        Ok(self.to_bytes_inner(parallel, false)?.0)
+        Ok(self.to_bytes_inner(parallel, false, false)?.0)
     }
 
     /// The one serialization path: `PINKDB06` bytes, optionally with the
@@ -3106,6 +3130,7 @@ impl PinkDb {
         &self,
         parallel: bool,
         collect_stats: bool,
+        omit_rows: bool,
     ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         // The optional catalog sections exist iff some object needs them (the
         // flags word is written in the footer, so decide it up front).
@@ -3155,15 +3180,29 @@ impl PinkDb {
             let mut tables: Vec<TableDir> = Vec::with_capacity(names.len());
             for name in &names {
                 let t = self.table_in(dbname, name)?;
-                let dir = write_table(
-                    &mut data,
-                    dbname,
-                    name,
-                    t,
-                    parallel,
-                    collect_stats,
-                    &mut saved,
-                )?;
+                // Wave 96b: the engine catalog image carries schemas and
+                // table metadata only; the rows live in the lake.
+                let dir = if omit_rows {
+                    TableDir {
+                        name: name.clone(),
+                        schema: t.schema(),
+                        constraints: t.constraints.clone(),
+                        defaults: t.columns.iter().map(|c| c.default.clone()).collect(),
+                        indexes: index_defs_without_rows(t),
+                        row_count: 0,
+                        row_groups: Vec::new(),
+                    }
+                } else {
+                    write_table(
+                        &mut data,
+                        dbname,
+                        name,
+                        t,
+                        parallel,
+                        collect_stats,
+                        &mut saved,
+                    )?
+                };
                 tables.push(dir);
             }
             db_dirs.push(DbDir {
@@ -3299,7 +3338,7 @@ impl PinkDb {
     /// `COUNT`/`MIN`/`MAX` from them without decoding a data file.
     pub fn to_pink_bytes_with_stats(&self) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         self.ensure_wal_healthy()?;
-        self.to_bytes_inner(true, true)
+        self.to_bytes_inner(true, true, false)
     }
 
     /// Write every database to `path` in the `.pink` columnar format.

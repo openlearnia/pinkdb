@@ -52,6 +52,8 @@ use std::process::ExitCode;
 use pinkdb::{Database, DurableOpenOptions};
 use std::time::Duration;
 
+#[cfg(feature = "catalog")]
+use pinkdb_server::CatalogStore;
 use pinkdb_server::{
     Client, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONCURRENT_LOGINS, DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS, DEFAULT_STATEMENT_TIMEOUT_MS, Server,
@@ -92,6 +94,13 @@ struct Args {
     host: String,
     port: u16,
     file: Option<String>,
+    /// `--catalog CATALOG`: keep the store in a pink-lake lake (wave 96b) —
+    /// the engine metadata in the catalog database, rows in `--data`.
+    /// Mutually exclusive with `--file`.
+    catalog: Option<String>,
+    /// `--data DIR|s3://BUCKET/PREFIX`: the lake's data location; required
+    /// with `--catalog`.
+    data: Option<String>,
     max_connections: usize,
     idle_timeout_secs: u64,
     /// Per-statement engine deadline (milliseconds); always positive.
@@ -154,6 +163,7 @@ struct Args {
 
 fn usage() -> &'static str {
     "Usage: pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]\n\
+     \x20       pinkdb-server [--host HOST] [--port PORT] --catalog CATALOG --data DIR\n\
      \x20                    [--max-connections N] [--idle-timeout SECS]\n\
      \x20                    [--statement-timeout-ms N] [--max-result-rows N]\n\
      \x20                    [--max-result-bytes N] [--max-concurrent-logins N]\n\
@@ -167,6 +177,11 @@ fn usage() -> &'static str {
      \x20 --host HOST            bind address (default 127.0.0.1)\n\
      \x20 --port PORT            TCP port; 0 picks an ephemeral port (default 5433)\n\
      \x20 --file PATH            durable database (checkpoint + WAL); in-memory when omitted\n\
+     \x20 --catalog CATALOG      keep the store in a pink-lake lake (wave 96b): engine\n\
+     \x20                        metadata in the catalog database, rows in --data\n\
+     \x20                        (pink:PATH, sqlite:PATH, or a postgres: URL; the\n\
+     \x20                        backends are build features)\n\
+     \x20 --data DIR|s3://…      the lake's data location; required with --catalog\n\
      \x20 --max-connections N    concurrent clients served (default 128)\n\
      \x20 --idle-timeout SECS    disconnect clients idle this long; 0 = never (default 300)\n\
      \x20 --statement-timeout-ms N  per-statement execution deadline in ms (default 30000);\n\
@@ -254,6 +269,8 @@ fn parse_args() -> Result<Args, String> {
         host: DEFAULT_HOST.to_string(),
         port: DEFAULT_PORT,
         file: None,
+        catalog: None,
+        data: None,
         max_connections: DEFAULT_MAX_CONNECTIONS,
         idle_timeout_secs: DEFAULT_IDLE_TIMEOUT.as_secs(),
         statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
@@ -313,6 +330,8 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid --port value {raw:?}"))?;
             }
             "--file" => args.file = Some(value("--file")?),
+            "--catalog" => args.catalog = Some(value("--catalog")?),
+            "--data" => args.data = Some(value("--data")?),
             "--max-connections" => {
                 let raw = value("--max-connections")?;
                 args.max_connections = raw
@@ -548,6 +567,30 @@ fn parse_args() -> Result<Args, String> {
                 .to_string(),
         );
     }
+    // Wave 96b: `--catalog` and `--file` are two durable stores, and `--data`
+    // is the catalog mode's data location. Refuse the ambiguous combinations
+    // before anything opens.
+    if args.catalog.is_some() && args.file.is_some() {
+        return Err(
+            "--catalog and --file are mutually exclusive: a --catalog store keeps \
+                    its metadata in the lake catalog, a --file store in the file"
+                .to_string(),
+        );
+    }
+    if args.catalog.is_some() && args.data.is_none() {
+        return Err(
+            "--catalog requires --data DIR|s3://BUCKET/PREFIX (the lake's data \
+                    location)"
+                .to_string(),
+        );
+    }
+    if args.catalog.is_none() && args.data.is_some() {
+        return Err(
+            "--data needs --catalog CATALOG (it names a --catalog store's data \
+                    location)"
+                .to_string(),
+        );
+    }
     Ok(args)
 }
 
@@ -780,8 +823,12 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    let db = match &args.file {
-        Some(path) => {
+    // Kept alive for the whole process: dropping it stops the lease heartbeat
+    // and releases the catalog lease.
+    #[cfg(feature = "catalog")]
+    let mut catalog_store: Option<CatalogStore> = None;
+    let db = match (&args.file, &args.catalog) {
+        (Some(path), _) => {
             // The durable open carries the extension policy: a WAL that
             // records an extension is only replayed into a load when the
             // operator opted in *and* the library is inside the extension
@@ -800,16 +847,50 @@ fn main() -> ExitCode {
                 }
             }
         }
-        None => {
+        #[cfg(not(feature = "catalog"))]
+        (None, Some(_)) => {
+            eprintln!(
+                "Error: --catalog needs a pinkdb-server built with the `catalog` feature \
+                 (cargo build -p pinkdb-server --features catalog, plus catalog-sqlite, \
+                 catalog-postgres or lake-s3 for those backends)"
+            );
+            return ExitCode::FAILURE;
+        }
+        #[cfg(feature = "catalog")]
+        (None, Some(catalog)) => {
+            let data = args.data.as_deref().unwrap_or_default();
+            let owner = format!("{}:{} pid {}", args.host, args.port, std::process::id());
+            match CatalogStore::open(catalog, data, &owner) {
+                Ok(store) => {
+                    let db = store.database();
+                    db.set_extension_root(extension_root.clone());
+                    catalog_store = Some(store);
+                    db
+                }
+                Err(e) => {
+                    eprintln!("Error: cannot open the lake catalog {catalog:?}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        (None, None) => {
             let db = Database::new();
             db.set_extension_root(extension_root.clone());
             db
         }
     };
 
-    let mode = match &args.file {
-        Some(path) => format!("durable: {path}"),
-        None => "in-memory".to_string(),
+    let mode = match (&args.file, &args.catalog) {
+        (Some(path), _) => format!("durable: {path}"),
+        #[cfg(feature = "catalog")]
+        (None, Some(catalog)) => format!(
+            "catalog: {catalog} (data {}, lake version {})",
+            args.data.as_deref().unwrap_or_default(),
+            catalog_store.as_ref().map_or(0, CatalogStore::version)
+        ),
+        #[cfg(not(feature = "catalog"))]
+        (None, Some(_)) => unreachable!("--catalog is refused above without the feature"),
+        (None, None) => "in-memory".to_string(),
     };
 
     // The warehouse browsing console (wave 78): opt-in, read-only, loopback

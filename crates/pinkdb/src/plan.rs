@@ -162,6 +162,10 @@ pub enum LogicalPlan {
         name: String,
         cols: Option<Vec<String>>,
         query: Box<Select>,
+        /// The defining statement's text, attached by
+        /// [`LogicalPlan::with_mv_source`] and carried into the engine catalog
+        /// image (wave 96b): a bound query cannot be rendered back to SQL.
+        source: String,
     },
     CreateMaterializedView {
         db: Option<String>,
@@ -717,6 +721,22 @@ pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> Logical
             def,
             or_replace,
             if_not_exists,
+            source: source.unwrap_or_default().to_string(),
+        },
+        // Wave 96b: a view is persisted the same way in the engine catalog
+        // image (the `.pink` footer still omits it, keeping `--file` views
+        // session-local).
+        LogicalPlan::CreateView {
+            db,
+            name,
+            cols,
+            query,
+            ..
+        } => LogicalPlan::CreateView {
+            db,
+            name,
+            cols,
+            query,
             source: source.unwrap_or_default().to_string(),
         },
         // Wave 100: a trigger definition is persisted as its `CREATE TRIGGER`

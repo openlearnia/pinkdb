@@ -615,6 +615,29 @@ impl SqlMetadataStore {
         })
     }
 
+    /// The engine catalog image and the revision it belongs to (wave 96b).
+    pub(crate) fn engine_catalog(&self) -> Result<Option<(u64, Vec<u8>)>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT revision, encoded FROM pinkdb_engine_catalog WHERE id = 1",
+                [],
+                |row| {
+                    let revision: i64 = row.get(0)?;
+                    Ok((pink_version(revision), row.get(1)?))
+                },
+            )
+            .map_err(|e| sql_error("reading the engine catalog image", e))
+        })
+    }
+
+    /// Publish the engine catalog image on its own (the first image of a
+    /// catalog, or a resync). A commit that changes both data and metadata
+    /// must instead pass the image through [`CatalogChange::engine_catalog`],
+    /// which publishes both in one transaction.
+    pub(crate) fn put_engine_catalog(&self, revision: u64, image: &[u8]) -> Result<()> {
+        self.with_conn(|conn| write_engine_catalog(conn, revision, image))
+    }
+
     pub(crate) fn delete_object(&self, rel: &str) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute("DELETE FROM pinkdb_object WHERE path = ?1", params![rel])
@@ -791,6 +814,14 @@ impl MetadataStore for SqlMetadataStore {
         SqlMetadataStore::head_version(self)
     }
 
+    fn engine_catalog(&self) -> Result<Option<(u64, Vec<u8>)>> {
+        SqlMetadataStore::engine_catalog(self)
+    }
+
+    fn put_engine_catalog(&self, revision: u64, image: &[u8]) -> Result<()> {
+        SqlMetadataStore::put_engine_catalog(self, revision, image)
+    }
+
     fn snapshot_versions(&self) -> Result<Vec<u64>> {
         SqlMetadataStore::snapshot_versions(self)
     }
@@ -888,6 +919,10 @@ impl MetadataStore for SqlMetadataStore {
 
     fn put_object(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
         SqlMetadataStore::put_object(self, rel, bytes, false)
+    }
+
+    fn replace_object(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
+        SqlMetadataStore::put_object(self, rel, bytes, true)
     }
 
     fn get_object(&self, rel: &str) -> Result<Option<Vec<u8>>> {
@@ -3284,6 +3319,12 @@ fn commit_in_conn(
     if let Some(lake_id) = target.lake_id.as_deref() {
         crate::maybe_fail_publish_after_snapshot(lake_id)?;
     }
+    // Wave 96b: the engine catalog image becomes visible with the version it
+    // describes — a crash here leaves the previous image and the previous
+    // version, never a half-published pair.
+    if let Some(image) = change.engine_catalog.as_deref() {
+        write_engine_catalog(conn, target.version, image)?;
+    }
     let _ = (inlined_inserts, inlined_deletes);
     Ok(target.version)
 }
@@ -3647,6 +3688,9 @@ fn commit_delta_in_conn(
     }
 
     insert_snapshot(conn, sid, change, next_catalog_id, next_file_id, &changes)?;
+    if let Some(image) = change.engine_catalog.as_deref() {
+        write_engine_catalog(conn, pink_version(sid), image)?;
+    }
     let touched = conn.total_changes().saturating_sub(rows_before);
     LAST_COMMIT_ROWS_TOUCHED.with(|rows| rows.set(touched));
     Ok(target_version)
@@ -5530,6 +5574,21 @@ fn i64_from_u64(value: u64) -> Result<i64> {
 
 fn i64_to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
+}
+
+/// Write the engine catalog image row (wave 96b), inserting it the first
+/// time. Runs on the commit's connection so the image lands in the commit's
+/// transaction.
+fn write_engine_catalog(conn: &dyn SqlConnection, revision: u64, image: &[u8]) -> Result<()> {
+    let revision = i64_from_u64(revision)?;
+    update_or_insert(
+        conn,
+        "writing the engine catalog image",
+        "UPDATE pinkdb_engine_catalog SET revision = ?1, encoded = ?2 WHERE id = 1",
+        params![revision, image],
+        "INSERT INTO pinkdb_engine_catalog (id, revision, encoded) VALUES (1, ?1, ?2)",
+        params![revision, image],
+    )
 }
 
 /// Update one row by key, inserting it when it is absent. Both backends

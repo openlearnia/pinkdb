@@ -18,21 +18,66 @@ cargo run --release -p pinkdb-server -- --host 127.0.0.1 --port 5433</code></pre
 <p>The full flag list:</p>
 
 <pre class="code" data-lang="text"><code>Usage: pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]
+        pinkdb-server [--host HOST] [--port PORT] --catalog CATALOG --data DIR
                      [--max-connections N] [--idle-timeout SECS]
                      [--allow-load-extension]
 
   --host HOST            bind address (default 127.0.0.1)
   --port PORT            TCP port; 0 picks an ephemeral port (default 5433)
   --file PATH            durable database (checkpoint + WAL); in-memory when omitted
+  --catalog CATALOG      keep the store in a pink-lake lake (wave 96b): engine
+                         metadata in the catalog database, rows in --data
+                         (pink:PATH, sqlite:PATH, or a postgres: URL; the
+                         backends are build features)
+  --data DIR|s3://…      the lake's data location; required with --catalog
   --max-connections N    concurrent clients served (default 128)
   --idle-timeout SECS    disconnect clients idle this long; 0 = never (default 300)
   --allow-load-extension let clients run LOAD EXTENSION (loads native code on
                          the server host; off by default)</code></pre>
 
 <p>On startup the server prints its listening address and runs until terminated.
-Both modes share the embedded durability path: with <code>--file</code>, committed
-transactions are replayed from the WAL on the next start, and rows acknowledged to a
-client survive a server crash.</p>
+Both durable modes share the embedded durability path: with <code>--file</code>,
+committed transactions are replayed from the WAL on the next start, and rows
+acknowledged to a client survive a server crash. <code>--file</code> and
+<code>--catalog</code> are mutually exclusive; <code>--data</code> requires
+<code>--catalog</code>; without either the server is in memory.</p>
+
+<h2>Stateless mode: metadata in the catalog, rows in a lake</h2>
+
+<p>With <code>--catalog</code> the server holds no durable state of its own: the
+engine catalog — databases, table definitions with constraints and defaults,
+views, macros, materialized views, procedures, triggers, users/roles/grants,
+loaded extension sources — goes into the lake catalog database, and the rows go
+into the lake data files. Restart the server (or start it on another machine)
+on the same catalog and data URL and you get the identical store.</p>
+
+<pre class="code" data-lang="sh"><code># metadata in the catalog database, rows in ./warehouse
+cargo run --release -p pinkdb-server -- \
+    --catalog sqlite:./warehouse.catalog --data ./warehouse
+
+# S3 data, and a Postgres or SQLite catalog with the matching features
+cargo run --release -p pinkdb-server --features lake-s3 -- \
+    --catalog sqlite:./warehouse.catalog --data s3://bucket/warehouse</code></pre>
+
+<p>The <code>ducklake_*</code> tables stay exactly what DuckDB expects; the
+engine catalog is one row of <code>pinkdb_engine_catalog</code> beside them, an
+image of the engine's own catalog with the row pages omitted. Every committed
+statement publishes at most one catalog transaction — data files, lake delta
+and metadata image together — and a metadata-only statement
+(<code>CREATE VIEW</code>, <code>GRANT</code>, <code>LOAD EXTENSION</code>)
+publishes the image without minting a lake version. Passwords are still stored
+only as Argon2id hashes.</p>
+
+<p>Phase 1 serves one server per catalog: a lease row with a 2 s heartbeat makes
+a second server fail with <code>already served by …</code> until the first stops
+or its heartbeat goes stale (6 s), which is how a crashed server is taken over.
+Shared catalogs need fencing tokens and cache invalidation, scoped as phase 2 in
+<a href="https://github.com/openlearnia/pinkdb/blob/main/docs/wave-96b-plan.md" rel="noopener"><code>docs/wave-96b-plan.md</code></a>.</p>
+
+<p>The mode needs the <code>catalog</code> feature; the default build links no
+lake, SQLite, Postgres or S3 code. A backend the build lacks is refused with
+the feature to rebuild with (<code>catalog</code>, <code>catalog-sqlite</code>,
+<code>catalog-postgres</code>, <code>lake-s3</code>).</p>
 
 <h2>Remote CLI mode</h2>
 

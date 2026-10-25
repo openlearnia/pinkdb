@@ -1232,6 +1232,72 @@ within `PINKDB_HEALTHCHECK_TIMEOUT_MS` (default 2000 ms); without an address it
 reads `PINKDB_HEALTHCHECK_ADDR`, then `PINKDB_HOST`/`PINKDB_PORT`, then
 `127.0.0.1:5433`. It is what the Docker image's `HEALTHCHECK` uses.
 
+### Stateless mode: metadata in the catalog, rows in a lake (wave 96b)
+
+A `--file` server keeps its whole store — catalog metadata *and* rows — in one
+local `.pink` file plus WAL. `--catalog` puts the metadata in a lake catalog
+database and the rows in lake data files, so the server holds no local state
+and can be restarted, or moved to another machine, from the catalog and data
+alone:
+
+```sh
+# metadata in the catalog database, rows in ./warehouse
+cargo run --release -p pinkdb-server -- \
+    --catalog sqlite:./warehouse.catalog --data ./warehouse
+
+# S3 data (build with `--features lake-s3`)
+cargo run --release -p pinkdb-server --features lake-s3 -- \
+    --catalog sqlite:./warehouse.catalog --data s3://bucket/warehouse
+```
+
+`--catalog` needs a server built with the `catalog` feature (the default
+binary links no lake code). It takes the same locations a lake catalog does:
+`pink:<path>`, `sqlite:<path>`, or a Postgres catalog URL (with the
+`catalog-sqlite` / `catalog-postgres` features, which imply `catalog`). `--data` takes a
+directory or `s3://bucket/prefix` (feature `lake-s3`). `--catalog` and
+`--file` are mutually exclusive, and `--data` requires `--catalog`; without
+either flag the server is in-memory, exactly as before.
+
+What lives where:
+
+- **The catalog** holds the lake's own `ducklake_*` tables (fixed by DuckDB
+  interop) plus one row of `pinkdb_engine_catalog`, the engine catalog image:
+  databases, table definitions with their constraints, defaults and indexes,
+  views (with their `CREATE VIEW` text), macros, materialized views,
+  procedures, triggers, users/roles/grants, and the loaded extension sources.
+  A password appears only as its Argon2id hash. The lake's own settings
+  (inlining limit, partition specs, write format) stay in its `ducklake_*`
+  rows, where they already live.
+- **The data location** holds the table rows, as ordinary `.pink` data files.
+- **The server process** holds nothing durable: there is no local WAL, no
+  checkpoint and no replay. The in-memory MVCC rules are unchanged.
+
+Every committed statement publishes at most one catalog transaction: the data
+files, the lake delta and the metadata image together. A statement that only
+changes metadata (`CREATE VIEW`, `GRANT`, `CREATE ROLE`, `LOAD EXTENSION`)
+publishes the image without minting a lake version; a statement inside
+`BEGIN … COMMIT` publishes once, at the commit; a rollback publishes nothing;
+a crash before the transaction commits publishes nothing, and one after it
+publishes everything.
+
+Views and other engine metadata survive a restart in this mode (they are part
+of the engine catalog), which `--file` still does not persist — `--file`
+behaviour is unchanged.
+
+**One server per catalog (phase 1).** The catalog carries a lease row
+(`pinkdb_object` / `engine/lease`) with a heartbeat every 2 s. A second server
+on the same catalog refuses to start with
+`the catalog is already served by <host:pid> (heartbeat <n>s ago)` until the
+first one stops or its heartbeat goes stale (6 s), so a crashed server is
+taken over on restart. Several servers on one catalog need fencing tokens and
+cache invalidation; that is phase 2 and is scoped in
+[`docs/wave-96b-plan.md`](docs/wave-96b-plan.md).
+
+The default `pinkdb-server` build has no SQLite, Postgres or S3 dependency: a
+catalog backend the build lacks is refused with the feature name to rebuild
+with, and `--data s3://…` without `lake-s3` says the build has no S3 data
+support.
+
 Server robustness, in one place:
 
 - **16 MiB stack per connection thread.** The default 2 MiB thread stack sits

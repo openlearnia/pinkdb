@@ -423,6 +423,7 @@ mod catalog_store;
 mod cdc;
 mod crypto;
 mod delete_file;
+pub mod engine;
 pub mod format;
 mod incremental;
 mod inlined;
@@ -447,6 +448,7 @@ pub use attach::AttachmentReport;
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
 pub use cdc::{ChangeKind, ChangeRow};
 pub use crypto::EncryptionKey;
+pub use engine::{EngineLease, LEASE_PATH, LEASE_TIMEOUT, LeaseError};
 pub use incremental::{
     AddFilesReport, Commit, CommitReport, CommitSettings, FlushReport, WritableAttachment,
 };
@@ -803,6 +805,10 @@ pub struct Lake {
     /// transaction metadata). Kept across a failed save, cleared by a
     /// successful one.
     pending_commit: Option<(Option<String>, Option<String>)>,
+    /// The engine catalog image [`Lake::set_engine_catalog`] staged for the
+    /// next published commit (wave 96b). Kept across a failed save, cleared by
+    /// a successful one — like `pending_commit`, so a retry publishes it once.
+    pending_engine_catalog: Option<Arc<Vec<u8>>>,
     /// The handle's `data_inlining_row_limit` default, applied to a table
     /// that does not record its own (DuckLake's session setting
     /// `ducklake_default_data_inlining_row_limit`; this handle is the
@@ -985,6 +991,7 @@ impl Lake {
             format_version: FORMAT_VERSION,
             version: 1,
             pending_commit: None,
+            pending_engine_catalog: None,
             inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
             write_format_choice: None,
             table_format_choices: BTreeMap::new(),
@@ -1126,6 +1133,7 @@ impl Lake {
             format_version: manifest.format_version,
             version: manifest.version,
             pending_commit: None,
+            pending_engine_catalog: None,
             inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
             write_format_choice: None,
             table_format_choices: BTreeMap::new(),
@@ -1297,6 +1305,35 @@ impl Lake {
     /// fails, so a retry still carries it.
     pub fn set_commit_message(&mut self, author: Option<String>, message: Option<String>) {
         self.pending_commit = Some((author, message));
+    }
+
+    /// Stage the engine catalog image (wave 96b) for the next published
+    /// commit: the engine's metadata and this commit's table data become one
+    /// version, so a reader never sees one without the other.
+    pub fn set_engine_catalog(&mut self, image: Vec<u8>) {
+        self.pending_engine_catalog = Some(Arc::new(image));
+    }
+
+    /// The engine catalog image at the head version, if the catalog carries
+    /// one (`None` for a lake written by a `--file` server or the CLI).
+    pub fn engine_catalog(&self) -> Result<Option<(u64, Vec<u8>)>> {
+        self.store.engine_catalog()
+    }
+
+    /// Publish the engine catalog image on its own, without a data commit —
+    /// the first image of a lake (whose tables are already published) or a
+    /// resync after the engine was rebuilt. Takes over a staged image, so a
+    /// later commit does not publish it a second time.
+    pub fn publish_engine_catalog(&mut self, image: &[u8]) -> Result<()> {
+        self.store.put_engine_catalog(self.version, image)?;
+        self.pending_engine_catalog = None;
+        Ok(())
+    }
+
+    /// The catalog's metadata store, for the engine lease
+    /// ([`crate::EngineLease`]) and the opaque side objects it keeps there.
+    pub(crate) fn store_handle(&self) -> Arc<dyn crate::metadata::MetadataStore> {
+        Arc::clone(&self.store)
     }
 
     /// This handle's default `data_inlining_row_limit` (DuckLake's session
@@ -1806,9 +1843,11 @@ impl Lake {
             lake_id: manifest.lake_id.clone(),
             author: manifest.author.clone(),
             commit_message: manifest.commit_message.clone(),
+            engine_catalog: self.pending_engine_catalog.clone(),
         };
         self.publish_sql_commit(change)?;
         self.pending_commit = None;
+        self.pending_engine_catalog = None;
         Ok(SaveReport {
             version,
             tables: table_count,

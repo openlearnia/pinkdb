@@ -1084,10 +1084,13 @@ pub(crate) fn run_plain(
             name,
             cols,
             query,
+            source,
         } => {
             let target = resolve_db(db, qdb);
             // Validated at bind time; store the AST for per-use rebinding.
             db.create_view_in(&target, name, (**query).clone(), cols.clone())?;
+            // Wave 96b: the catalog image rebuilds a view from its statement.
+            db.set_view_source_in(&target, name, source)?;
             Ok(QueryResult::CreatedView { name: name.clone() })
         }
         LogicalPlan::DropTable {

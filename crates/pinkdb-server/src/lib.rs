@@ -106,6 +106,8 @@
 //! `--ui-auth basic` or `--ui-token`). It owns its own tokio runtime on its
 //! own thread, so it works with either transport, and every synchronous
 //! engine call runs on a bounded blocking pool. See `docs/server-ui.md`.
+#[cfg(feature = "catalog")]
+pub mod catalog;
 pub mod client;
 pub mod protocol;
 pub mod server;
@@ -121,6 +123,8 @@ pub mod ui;
 #[cfg(feature = "async-server")]
 pub mod async_server;
 
+#[cfg(feature = "catalog")]
+pub use catalog::CatalogStore;
 pub use client::{Client, ClientError};
 pub use protocol::{
     DoneKind, MAX_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ROWS_PER_FRAME, Request, Response,

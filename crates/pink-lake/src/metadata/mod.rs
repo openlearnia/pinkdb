@@ -79,6 +79,10 @@ pub(crate) struct CatalogChange {
     pub(crate) lake_id: Option<String>,
     pub(crate) author: Option<String>,
     pub(crate) commit_message: Option<String>,
+    /// The engine catalog image to publish with this version (wave 96b). The
+    /// engine's metadata and its table data must become visible together, so
+    /// the image rides the commit's transaction instead of a second one.
+    pub(crate) engine_catalog: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// The typed metadata surface every catalog database implements.
@@ -106,6 +110,15 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
 
     /// The latest pinkdb version (`None` for a catalog with no snapshots).
     fn head_version(&self) -> Result<Option<u64>>;
+
+    /// The engine catalog image at the head revision (wave 96b):
+    /// `(revision, image)` — `None` for a catalog that never carried one.
+    fn engine_catalog(&self) -> Result<Option<(u64, Vec<u8>)>>;
+
+    /// Replace the engine catalog image at `revision` — the standalone
+    /// publish for a lake whose tables are already committed (a lake created
+    /// by the CLI or a `--file` server, adopted by a catalog server).
+    fn put_engine_catalog(&self, revision: u64, image: &[u8]) -> Result<()>;
 
     /// Every snapshot version, ascending.
     fn snapshot_versions(&self) -> Result<Vec<u64>>;
@@ -209,6 +222,9 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// old blob layout: the catalog's own tables are the source of truth;
     /// these rows only carry facts DuckLake has no column for.
     fn put_object(&self, rel: &str, bytes: &[u8]) -> Result<bool>;
+    /// [`Self::put_object`], replacing an existing row instead of refusing it:
+    /// the engine lease's heartbeat updates one row in place (wave 96b).
+    fn replace_object(&self, rel: &str, bytes: &[u8]) -> Result<bool>;
     fn get_object(&self, rel: &str) -> Result<Option<Vec<u8>>>;
     fn delete_object(&self, rel: &str) -> Result<()>;
     fn list_objects(&self, prefix: &str) -> Result<Vec<String>>;

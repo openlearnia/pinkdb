@@ -1173,6 +1173,19 @@ impl WritableAttachment {
         Ok(report)
     }
 
+    /// The base version's content and the lake handle, for a host that keeps
+    /// its own commit loop (the stateless server, wave 96b): the attachment
+    /// is a materialized view of the lake at [`Self::base_version`], not a
+    /// pinned writable one.
+    pub fn into_parts(self) -> (Lake, u64, Vec<(String, Arc<DataTable>)>) {
+        let base: Vec<(String, Arc<DataTable>)> = self
+            .base
+            .iter()
+            .map(|(key, table)| (key.clone(), Arc::clone(table)))
+            .collect();
+        (self.lake, self.base_version, base)
+    }
+
     /// Re-pin the base to the store's current content at `version`: used
     /// after a full `.lake save` of the same store published `version`, so
     /// the writable attachment continues from the new head with no pending
@@ -3010,12 +3023,14 @@ impl Lake {
             lake_id: new_catalog.lake_id.clone(),
             author: new_catalog.author.clone(),
             commit_message: new_catalog.commit_message.clone(),
+            engine_catalog: self.pending_engine_catalog.clone(),
         };
         self.publish_sql_commit(change)
             .map_err(PublishFailure::Retry)?;
         // The commit record is published; a later save without a new
         // `set_commit_message` must not repeat it.
         self.pending_commit = None;
+        self.pending_engine_catalog = None;
         Ok(report)
     }
 
@@ -3068,6 +3083,7 @@ impl Lake {
             lake_id: catalog.lake_id.clone(),
             author: catalog.author.clone(),
             commit_message: catalog.commit_message.clone(),
+            engine_catalog: None,
         };
         self.publish_sql_commit(change)
     }
