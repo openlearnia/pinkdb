@@ -15,6 +15,7 @@
 #include "pinkdb_extension.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,14 +26,16 @@
 static PinkdbHostApi g_api;
 
 /* Introspection counters (read by the loader tests, not part of the ABI). */
-static int64_t g_calls;
-static int64_t g_foreign_threads;
+/* Atomic: callbacks arrive concurrently on several threads, and a plain
+ * increment loses updates (the foreign-thread test counted 68 of 100). */
+static _Atomic int64_t g_calls;
+static _Atomic int64_t g_foreign_threads;
 static pthread_t g_init_thread;
 
 static void note_call(void) {
-    g_calls++;
+    atomic_fetch_add_explicit(&g_calls, 1, memory_order_relaxed);
     if (!pthread_equal(pthread_self(), g_init_thread)) {
-        g_foreign_threads++;
+        atomic_fetch_add_explicit(&g_foreign_threads, 1, memory_order_relaxed);
     }
 }
 
@@ -386,11 +389,11 @@ static int32_t cf_thread(void *user_data, const pinkdb_ext_value *args,
 /* ------------------------------------------------------------------------ */
 
 int64_t pinkdb_conformance_calls(void) {
-    return g_calls;
+    return atomic_load_explicit(&g_calls, memory_order_relaxed);
 }
 
 int64_t pinkdb_conformance_foreign_threads(void) {
-    return g_foreign_threads;
+    return atomic_load_explicit(&g_foreign_threads, memory_order_relaxed);
 }
 
 int64_t pinkdb_conformance_caps(void) {
