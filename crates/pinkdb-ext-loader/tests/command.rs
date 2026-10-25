@@ -10,6 +10,17 @@ mod common;
 
 use pinkdb_ext_loader::{CommandHost, ExtError, LoadedExtension, command, text_allocation_stats};
 
+/// The loader allows one running command per library *process-wide*, and every
+/// test here runs the same `command_ext`, so the tests take turns: run in
+/// parallel, one test's call made another's fail with `Serving`.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A host that records both channels and streams chunks into a vector.
 struct Recorder {
     internal: Vec<String>,
@@ -57,6 +68,7 @@ impl CommandHost for Recorder {
 
 #[test]
 fn command_entry_point_runs_and_returns() {
+    let _serial = serial();
     let ext = pinkdb_ext_loader::load(&common::extension_path("command_ext")).unwrap();
     assert!(
         ext.command_fn().is_some(),
@@ -104,6 +116,7 @@ fn command_entry_point_runs_and_returns() {
 
 #[test]
 fn an_extension_without_the_symbol_is_refused() {
+    let _serial = serial();
     // A v1 functions-only extension and a minor-2 serve extension both still
     // load; they simply have no commands.
     for name in ["test_ext", "serve_ext"] {
@@ -123,6 +136,7 @@ fn an_extension_without_the_symbol_is_refused() {
 
 #[test]
 fn running_the_same_library_twice_is_refused() {
+    let _serial = serial();
     let ext = pinkdb_ext_loader::load(&common::extension_path("command_ext")).unwrap();
     let mut host = Recorder::new();
     host.reenter = Some(ext.clone());
@@ -140,6 +154,7 @@ fn running_the_same_library_twice_is_refused() {
 
 #[test]
 fn a_statement_failure_is_reported_as_a_failed_command() {
+    let _serial = serial();
     // `command_ext` returns the first non-zero code it saw; the host answers
     // the statement channel with `1` when the policy refused it.
     struct Refusing(Recorder);
