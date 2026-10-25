@@ -233,8 +233,10 @@
  * - A host older than this addition has a smaller `struct_size` and no
  *   `register_scalar_flags` field. Compare before use:
  *
- *       if (api->struct_size >= offsetof(PinkdbHostApi, register_scalar_flags)
- *                                + sizeof(api->register_scalar_flags)) { ... }
+ *       if (PINKDB_EXT_HOST_HAS_FLAGS(api)) { ... }
+ *
+ *   (`PINKDB_EXT_HOST_HAS_FLAGS` / `PINKDB_EXT_HOST_HAS_EXECUTE` and the
+ *   `PINKDB_EXT_API_*_SIZE` landmarks are defined below the struct.)
  *
  *   An extension that needs a volatile registration MUST fail
  *   `pinkdb_extension_init` (return non-zero) on such a host — never fall
@@ -248,6 +250,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -303,7 +306,7 @@ typedef int32_t (*PinkdbExtScalarFn)(void *user_data,
 /* SQL text the extension asks the host to run (see pinkdb_ext_serve). The
  * callback runs a statement under the host's own limits, read-only policy
  * and role checks and returns
- *   0  success, *out_text/*out_len carry the formatted result (Markdown);
+ *   0  success, `*out_text` / `*out_len` carry the result (Markdown);
  *   1  the statement failed, the text is a JSON error object;
  *   2  no live session (the API this extension got did not come from serve).
  * `sql` need not be NUL-terminated: exactly `sql_len` bytes are read. The
@@ -357,6 +360,35 @@ typedef struct PinkdbHostApi {
      * pinkdb_extension_init this is a stub that always answers 2. */
     PinkdbExtExecuteStatementFn execute_statement;
 } PinkdbHostApi;
+
+/* `struct_size` negotiation landmarks, in the order the fields were appended.
+ * An extension requires PINKDB_EXT_API_V1_SIZE bytes (refuse to init when the
+ * host reports less) and may use an appended field only when the host's
+ * `struct_size` covers it. Comparing against a landmark — never against a
+ * hand-written byte count — keeps an extension working on every host it is
+ * compatible with. */
+#define PINKDB_EXT_API_V1_SIZE ((uint32_t)offsetof(PinkdbHostApi, register_scalar_flags))
+#define PINKDB_EXT_API_FLAGS_SIZE ((uint32_t)offsetof(PinkdbHostApi, execute_statement))
+#define PINKDB_EXT_API_MINOR2_SIZE ((uint32_t)sizeof(PinkdbHostApi))
+
+/* 1 when the host provides the register_scalar_flags field, else 0. */
+#define PINKDB_EXT_HOST_HAS_FLAGS(api) ((api)->struct_size >= PINKDB_EXT_API_FLAGS_SIZE)
+/* 1 when the host provides the execute_statement field, else 0. */
+#define PINKDB_EXT_HOST_HAS_EXECUTE(api) ((api)->struct_size >= PINKDB_EXT_API_MINOR2_SIZE)
+
+/* Copy the host API into an extension-owned struct.
+ *
+ * Keep the copy: the struct the host passes to pinkdb_extension_init is valid
+ * only for that call. Copy exactly the `struct_size` bytes the host published
+ * and zero the rest, so a header newer than the host never reads a field the
+ * host never wrote. The negotiation macros above still gate every call to an
+ * appended field. */
+static inline void pinkdb_ext_copy_api(PinkdbHostApi *dst, const PinkdbHostApi *src) {
+    size_t published = (size_t)src->struct_size;
+    if (published > sizeof(*dst)) published = sizeof(*dst);
+    memset(dst, 0, sizeof(*dst));
+    memcpy(dst, src, published);
+}
 
 #ifdef __cplusplus
 }

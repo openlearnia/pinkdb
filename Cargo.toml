@@ -20,6 +20,9 @@ members = [
     # the other way around.
     "ext-sdk/rust",
     "ext-sdk/rust/example/string_ext",
+    # The ABI conformance fixture (ext-sdk/conformance/README.md): the same
+    # contract as the C, C++, Go and Rust SDKs, measured through the Rust SDK.
+    "ext-sdk/rust/conformance",
     # In-repo first-party extensions (waves 52–56): built as cdylibs loaded
     # with `LOAD EXTENSION '<path>'` (and mirrored by the linked/wasm
     # registration).

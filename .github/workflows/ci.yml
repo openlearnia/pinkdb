@@ -461,7 +461,7 @@ jobs:
           go-version-file: ext-sdk/go/go.mod
           cache: false # stdlib-only module: there is no go.sum to cache
 
-      # Pre-build once so both smoke scripts hit a warm target/ (they build
+      # Pre-build once so the smoke scripts hit a warm target/ (they build
       # the release CLI themselves, so this is a no-op for them).
       - name: cargo build --release -p pinkdb-cli
         run: cargo build --release -p pinkdb-cli
@@ -469,8 +469,14 @@ jobs:
       - name: make -C ext-sdk/c
         run: make -C ext-sdk/c
 
+      - name: make -C ext-sdk/cpp
+        run: make -C ext-sdk/cpp
+
       - name: ./ext-sdk/c/smoke.sh
         run: ./ext-sdk/c/smoke.sh
+
+      - name: ./ext-sdk/cpp/smoke.sh
+        run: ./ext-sdk/cpp/smoke.sh
 
       - name: ./ext-sdk/go/smoke.sh
         run: ./ext-sdk/go/smoke.sh
@@ -491,6 +497,21 @@ jobs:
       # declared one into one binary (tests/coexist.rs).
       - name: ./ext-sdk/rust/smoke.sh
         run: ./ext-sdk/rust/smoke.sh
+
+      # The four SDKs are also one ABI contract: the same conformance fixture
+      # built by each SDK and driven through the loader, so the boundary
+      # behaviour (NULL/oversized values, invalid tags, unwind containment,
+      # foreign threads, error-path frees, struct_size negotiation) cannot
+      # drift apart SDK by SDK. STRICT makes a missing toolchain a failure.
+      - name: ABI conformance across the four SDKs
+        run: cargo test -p pinkdb-ext-loader --test conformance --test conformance_ownership
+        env:
+          PINKDB_CONFORMANCE_STRICT: "1"
+
+      # What the host *refuses*: opt-in loading, root confinement, path shape
+      # and SHA-256 pinning, all against the release CLI the smokes built.
+      - name: ./ext-sdk/posture.sh
+        run: ./ext-sdk/posture.sh
 
   # Real S3 semantics in a container (adobe/s3mock pulled from Docker Hub):
   # round-trip, concurrency races and refusals through the release CLI.

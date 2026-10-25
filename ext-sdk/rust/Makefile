@@ -1,10 +1,11 @@
 # pinkdb Rust extension SDK — build the worked example.
 #
-#   make            build the example (a workspace member) into target/release/
-#   make template   build the standalone skeleton in template/
-#   make clean      remove the skeleton's own target/ (the example's artifacts
-#                   live in the workspace target/ and are cleaned with `cargo
-#                   clean -p pinkdb-ext-sdk-example`)
+#   make                build the example (a workspace member) into target/release/
+#   make conformance    build the ABI conformance fixture (a workspace member)
+#   make template       build the standalone skeleton in template/
+#   make clean          remove the skeleton's own target/ (the example's artifacts
+#                       live in the workspace target/ and are cleaned with `cargo
+#                       clean -p pinkdb-ext-sdk-example`)
 #
 # The example is `example/string_ext` — one `pinkdb_extension!` declaration
 # that compiles to `librust_string_ext.<ext>`. smoke.sh builds it through this
@@ -36,7 +37,11 @@ template:
 	$(CARGO) build --release --manifest-path template/Cargo.toml
 	@printf 'template built: %s\n' "ext-sdk/rust/template/target/release/libmy_extension.$(SO_EXT)"
 
+conformance:
+	$(CARGO) build --release $(CARGO_TARGET_FLAG) -p pinkdb-ext-conformance
+	@printf 'conformance fixture built: %s\n' "$(TARGET_DIR)/release/libconformance_ext.$(SO_EXT)"
+
 clean:
 	rm -rf template/target
 
-.PHONY: all template clean
+.PHONY: all template conformance clean

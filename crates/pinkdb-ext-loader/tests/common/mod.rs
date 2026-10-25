@@ -12,6 +12,8 @@
 // is used by every file.
 #![allow(dead_code)]
 
+pub mod conformance;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;

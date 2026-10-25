@@ -246,17 +246,19 @@ A `v<version>` push to the extension workflow builds the catalog matrix:
 `linux-x64`, `linux-arm64`, `darwin-arm64`, and `darwin-x64` (cross-built on
 the arm runner). Each build job:
 
-1. runs `make -C ext-sdk/c all`, `make -C ext-sdk/go all`,
-   `make -C ext-sdk/rust all`, and every `extensions/*/Makefile`;
+1. runs `make -C ext-sdk/c all`, `make -C ext-sdk/cpp all`,
+   `make -C ext-sdk/go all`, `make -C ext-sdk/rust all`, and every
+   `extensions/*/Makefile`;
 2. checks every library's architecture with `file` (this is what makes the
    cross-built `darwin-x64` entries trustworthy);
-3. runs the C, Go, and Rust SDK smoke scripts on native platforms;
+3. runs the C, C++, Go, and Rust SDK smoke scripts on native platforms;
 4. stages catalog candidates and writes a manifest with
    `scripts/release/extensions.py discover`.
 
 The catalog candidates are unchanged from the previous single-job workflow:
 
-- the C/C++ SDK examples: `math_ext`, `string_ext`, `cpp_ext`;
+- the SDK examples: `math_ext` and `string_ext` (ext-sdk/c), `cpp_ext`
+  (ext-sdk/cpp);
 - `extensions/string` (`libstring_ext`), the only `extensions/*` directory with
   a Makefile and a built library.
 

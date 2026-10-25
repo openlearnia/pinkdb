@@ -1638,6 +1638,7 @@ dependencies = [
  "pinkdb",
  "pinkdb-arrow",
  "pinkdb-datetime",
+ "pinkdb-ext-loader",
  "pinkdb-httpfs",
  "pinkdb-iceberg",
  "pinkdb-json",
@@ -1660,11 +1661,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinkdb-ext-conformance"
+version = "0.1.0"
+dependencies = [
+ "pinkdb-ext-sdk",
+]
+
+[[package]]
 name = "pinkdb-ext-loader"
 version = "0.1.0"
 dependencies = [
  "libloading",
  "pinkdb",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -1767,6 +1776,7 @@ name = "pinkdb-server"
 version = "0.1.0"
 dependencies = [
  "pinkdb",
+ "pinkdb-ext-loader",
  "pinkdb-server-ui",
  "rcgen",
  "rustls",

@@ -8,13 +8,14 @@
 #   scripts/release/build-extensions.sh --platform darwin-x64 --version 0.1.0
 #
 # Builds (from the existing Makefiles, not a parallel recipe):
-#   ext-sdk/c       the C/C++ worked examples       -> catalog candidates
+#   ext-sdk/c       the C worked examples            -> catalog candidates
+#   ext-sdk/cpp     the C++ worked example           -> catalog candidate
 #   ext-sdk/go      the Go worked example            -> built + smoked
 #   ext-sdk/rust    the Rust SDK example             -> built + smoked
 #   extensions/*/   each directory with a Makefile   -> catalog candidates
 #
-# Catalog artifacts today are the three C/C++ examples (math_ext, string_ext,
-# cpp_ext) and extensions/string (libstring_ext). Cargo-built core extensions
+# Catalog artifacts today are the three SDK examples (math_ext, string_ext from
+# ext-sdk/c; cpp_ext from ext-sdk/cpp) and extensions/string (libstring_ext). Cargo-built core extensions
 # are linked into the CLI, and the Go/Rust SDK examples are not catalog
 # entries; docs/releasing.md records that gap precisely.
 #
@@ -139,6 +140,7 @@ fi
 # before every build (the Makefiles' timestamps cannot see GOARCH/TARGET_ARCH).
 echo "==> cleaning stale extension outputs"
 make -C "$repo_root/ext-sdk/c" clean >/dev/null 2>&1 || true
+make -C "$repo_root/ext-sdk/cpp" clean >/dev/null 2>&1 || true
 make -C "$repo_root/ext-sdk/go" clean >/dev/null 2>&1 || true
 for dir in "$repo_root"/extensions/*/; do
     [ -f "$dir/Makefile" ] || continue
@@ -149,6 +151,9 @@ done
 if [ "$cross" -eq 1 ]; then
     echo "==> make -C ext-sdk/c (TARGET_ARCH=x86_64)"
     make -C "$repo_root/ext-sdk/c" all TARGET_ARCH=x86_64
+
+    echo "==> make -C ext-sdk/cpp (TARGET_ARCH=x86_64)"
+    make -C "$repo_root/ext-sdk/cpp" all TARGET_ARCH=x86_64
 
     echo "==> make -C ext-sdk/go (GOOS=darwin GOARCH=amd64)"
     GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 CC="cc -arch x86_64" \
@@ -165,6 +170,9 @@ if [ "$cross" -eq 1 ]; then
 else
     echo "==> make -C ext-sdk/c"
     make -C "$repo_root/ext-sdk/c" all
+
+    echo "==> make -C ext-sdk/cpp"
+    make -C "$repo_root/ext-sdk/cpp" all
 
     echo "==> make -C ext-sdk/go"
     make -C "$repo_root/ext-sdk/go" all
@@ -186,6 +194,7 @@ fi
 shopt -s nullglob
 libs=(
     "$repo_root/ext-sdk/c/build/"*."$lib_ext"
+    "$repo_root/ext-sdk/cpp/build/"*."$lib_ext"
     "$repo_root/ext-sdk/go/build/"*."$lib_ext"
     "$repo_root/extensions/"*/build/*."$lib_ext"
     "$repo_root/extensions/"*/dist/*."$lib_ext"
@@ -206,6 +215,7 @@ elif [ "$skip_smoke" -eq 1 ]; then
     echo "warning: --skip-smoke: SDK smoke scripts were not run" >&2
 else
     "$repo_root/ext-sdk/c/smoke.sh"
+    "$repo_root/ext-sdk/cpp/smoke.sh"
     "$repo_root/ext-sdk/go/smoke.sh"
     "$repo_root/ext-sdk/rust/smoke.sh"
 fi

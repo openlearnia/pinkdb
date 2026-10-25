@@ -1,11 +1,11 @@
-//! The C/C++ , Go and Rust SDKs under `ext-sdk/` vendor `pinkdb_extension.h`.
+//! The C, C++, Go and Rust SDKs under `ext-sdk/` vendor `pinkdb_extension.h`.
 //! This test keeps every vendored copy byte-identical to the loader crate's
 //! copy, so editing one without re-vendoring the others fails `cargo test`.
 //!
 //! The loader header is the single source of truth; re-vendor with:
 //!
 //! ```sh
-//! for sdk in c go rust; do
+//! for sdk in c cpp go rust; do
 //!     cp crates/pinkdb-ext-loader/include/pinkdb_extension.h \
 //!        ext-sdk/$sdk/include/pinkdb_extension.h
 //! done
@@ -21,7 +21,7 @@ fn header_paths(manifest: &Path) -> (PathBuf, Vec<PathBuf>) {
         .parent()
         .and_then(Path::parent)
         .expect("the loader crate lives two levels below the repo root");
-    let vendored = ["c", "go", "rust"]
+    let vendored = ["c", "cpp", "go", "rust"]
         .iter()
         .map(|sdk| {
             repo.join("ext-sdk")

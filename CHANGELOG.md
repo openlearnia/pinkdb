@@ -83,6 +83,52 @@ one-liners below.
   `UPDATE t SET v = v + 1` 1 M rows 0.025 → 0.025 s, `DELETE FROM t WHERE id %
   2 = 0` 500 k rows 0.019 → 0.019 s (`bench/wave95b_perf/`).
 
+### Wave 93a — one ABI in four SDKs, one conformance fixture, pinned libraries ✅
+- **ABI 1.2, negotiated.** The extension header gained the size constants and macros a
+  library uses to ask what the host actually publishes — `PINKDB_EXT_API_V1_SIZE`,
+  `PINKDB_EXT_API_FLAGS_SIZE`, `PINKDB_EXT_API_MINOR2_SIZE`,
+  `PINKDB_EXT_HOST_HAS_FLAGS()` and `PINKDB_EXT_HOST_HAS_EXECUTE()` — plus
+  `pinkdb_ext_copy_api()`, which copies only the bytes `struct_size` promises (the old
+  `g_api = *api` read past a smaller host struct). The four vendored copies
+  (`ext-sdk/{c,cpp,go,rust}/include/pinkdb_extension.h`) are byte-identical to the loader's
+  and `tests/header_sync.rs` fails `cargo test` if they drift.
+- **C, C++, Go and Rust at the same ABI.** All four cover `register_scalar_flags` and
+  `PINKDB_EXT_FLAG_VOLATILE` (refusing to register a volatile function on a host too old
+  for the flag, instead of silently calling it deterministic), the full type-tag set
+  including INTERVAL's packed months/days with micros, the init-only host-API copy, the
+  name/arity/tag bounds, host `alloc`/`free` text ownership, and `execute_statement`. The
+  C++ SDK is new (`ext-sdk/cpp`, header-only `pinkdb::ext` with a move-only owned `Text`, a
+  `Writer` for results and an exception guard), and the copy-pasted Go shims became one
+  package (`ext-sdk/go/pinkdb`). Table functions, scans and copy sinks are still
+  linked-only, and every README says so.
+- **One fixture, four SDKs.** `ext-sdk/conformance/README.md` defines
+  `conformance_ext`: 15 functions, a canonical `cf_all` row that renders every tag
+  bit-exactly, `cf_fail` (publishes text, then fails), `cf_unwind` (panics/thows) and
+  introspection counters. Each SDK builds it, and the loader drives all four
+  (`crates/pinkdb-ext-loader/tests/conformance.rs`, 11 tests): tag round-trips with NULL,
+  embedded NUL, empty strings and 64 MiB + 1 results refused, error codes, panic
+  containment (a statement fails and the extension still answers afterwards), 100 callbacks
+  from four foreign threads, and `struct_size`/`abi_version` negotiation in a child process
+  (old host → refused non-zero with nothing registered as deterministic; full host → all 15
+  registered). `tests/conformance_ownership.rs` checks the host allocates and frees exactly
+  once per VARCHAR result and leaks nothing on empty, NULL or error paths.
+- **Local libraries can be pinned.** `--extension-pin PATH=SHA256` (CLI and server,
+  repeatable) installs a SHA-256 allowlist in the loader: once it is set, every load must
+  match a pin — an unpinned library, a hash mismatch, or a file that changed between the
+  hash and the `dlopen` is refused with the reason. The hash is read from an open file and
+  the file's `(dev, ino, len, mtime)` re-checked immediately before mapping; the residual
+  check-then-map window (there is no `fdlopen` on Linux or macOS) is documented. Local
+  libraries are still unsigned: Ed25519 signatures cover `.install` packages only.
+- **Posture, stated and tested.** `ext-sdk/posture.sh` drives the release CLI through the
+  refusals every README promises: `LOAD EXTENSION` off unless
+  `--allow-load-extension`/`PINKDB_ALLOW_LOAD_EXTENSION=1`, `--extension-root`
+  confinement, bare names and `..` and symlinks refused, pins enforced. CI runs it after
+  the four smokes and the C++ build, with the conformance matrix under
+  `PINKDB_CONFORMANCE_STRICT=1` so a missing toolchain fails instead of skipping.
+- **93b is separate**: SQL `INSTALL` still does not exist (only the `.install`
+  dot-command), and no released CLI enables the `repo` feature.
+
+## 2026-10-25
 ### Wave 95a — SQL dialect completeness, batch 1 ✅
 - **The matrix first.** `docs/sql-conformance.md`
   lists every query form row 95 scopes, each checked by running it against

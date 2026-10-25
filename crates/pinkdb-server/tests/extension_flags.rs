@@ -128,3 +128,85 @@ fn a_root_that_is_not_a_directory_is_refused_at_startup() {
     assert!(text.contains("is not a directory"), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// SHA-256 of the three bytes "abc". The "libraries" below are plain files:
+// the integrity check runs before `dlopen`, so it can be exercised without a
+// compiled extension.
+const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+fn stderr_text(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn a_bad_pin_is_refused_at_startup() {
+    for pin in ["nonsense", "/tmp/lib.dylib=xyz"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+            .args(["--host", "127.0.0.1", "--port", "0", "--extension-pin", pin])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run pinkdb-server");
+        assert_eq!(out.status.code(), Some(2), "pin {pin:?} must be refused");
+        assert!(stderr_text(&out).contains("invalid pin"), "pin {pin:?}");
+    }
+}
+
+#[test]
+fn an_allowlist_refuses_an_unpinned_library() {
+    let dir = scratch("unpinned");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let pinned = root.join("pinned.dylib");
+    let unpinned = root.join("unpinned.dylib");
+    std::fs::write(&pinned, b"abc").unwrap();
+    std::fs::write(&unpinned, b"abc").unwrap();
+    let pin = format!("{}={SHA256_ABC}", pinned.display());
+
+    let (mut child, addr) = start_server(&[
+        "--allow-load-extension",
+        "--extension-root",
+        root.to_str().unwrap(),
+        "--extension-pin",
+        &pin,
+    ]);
+    let mut client = Client::connect(&addr).expect("connect");
+    let msg = client
+        .execute(&format!("LOAD EXTENSION '{}';", unpinned.display()))
+        .expect_err("an unpinned library must be refused")
+        .to_string();
+    assert!(msg.contains("is not pinned"), "{msg}");
+
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_library_whose_hash_differs_from_its_pin_is_refused() {
+    let dir = scratch("tampered");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let library = root.join("tampered.dylib");
+    std::fs::write(&library, b"abcd").unwrap();
+    let pin = format!("{}={SHA256_ABC}", library.display());
+
+    let (mut child, addr) = start_server(&[
+        "--allow-load-extension",
+        "--extension-root",
+        root.to_str().unwrap(),
+        "--extension-pin",
+        &pin,
+    ]);
+    let mut client = Client::connect(&addr).expect("connect");
+    let msg = client
+        .execute(&format!("LOAD EXTENSION '{}';", library.display()))
+        .expect_err("a changed library must be refused")
+        .to_string();
+    assert!(msg.contains("does not match its pinned SHA-256"), "{msg}");
+
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}

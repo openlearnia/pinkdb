@@ -84,6 +84,8 @@ mod abi;
 mod function;
 #[cfg(not(target_arch = "wasm32"))]
 mod host;
+#[cfg(not(target_arch = "wasm32"))]
+mod integrity;
 pub mod linked;
 /// The optional serve entry point (ABI minor 2, native only).
 #[cfg(not(target_arch = "wasm32"))]
@@ -105,14 +107,19 @@ pub use abi::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use abi::{
-    PINKDB_EXT_ABI_MINOR, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_FLAG_KNOWN, PINKDB_EXT_FLAG_VOLATILE,
-    PinkdbExtAbiVersionFn, PinkdbExtExecuteStatementFn, PinkdbExtInitFn, PinkdbExtNameFn,
-    PinkdbExtScalarFn, PinkdbExtServeFn, PinkdbExtValue, PinkdbHostApi,
+    PINKDB_EXT_ABI_MINOR, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_API_FLAGS_SIZE,
+    PINKDB_EXT_API_MINOR2_SIZE, PINKDB_EXT_API_V1_SIZE, PINKDB_EXT_FLAG_KNOWN,
+    PINKDB_EXT_FLAG_VOLATILE, PinkdbExtAbiVersionFn, PinkdbExtExecuteStatementFn, PinkdbExtInitFn,
+    PinkdbExtNameFn, PinkdbExtScalarFn, PinkdbExtServeFn, PinkdbExtValue, PinkdbHostApi,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use function::DynamicFunction;
 #[cfg(not(target_arch = "wasm32"))]
 pub use host::{TextAllocStats, text_allocation_stats};
+#[cfg(not(target_arch = "wasm32"))]
+pub use integrity::{
+    allowlist_is_active, clear_allowlist, parse_sha256, pinned_paths, set_pins, sha256_file,
+};
 pub use linked::{LinkedExtension, LinkedFunction, LinkedScalar};
 
 /// One callable a host can register, whichever loading model produced it.
@@ -377,6 +384,19 @@ pub enum ExtError {
     /// A transport descriptor is not `stdio` or `http:HOST:PORT`, or the
     /// options/transport contains a NUL byte.
     BadTransport { message: String },
+    /// An `--extension-pin` entry is not `PATH=SHA256`, or the hash is not 64
+    /// hex digits.
+    BadPin { pin: String, message: String },
+    /// A SHA-256 allowlist is configured and this path is not in it.
+    Unpinned { path: String },
+    /// The file's contents do not match the pinned SHA-256.
+    Integrity {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    /// The pinned file was replaced between the hash check and the load.
+    Changed { path: String, message: String },
 }
 
 impl ExtError {
@@ -451,6 +471,26 @@ impl fmt::Display for ExtError {
             ExtError::BadTransport { message } => {
                 write!(f, "invalid extension transport: {message}")
             }
+            ExtError::BadPin { pin, message } => {
+                write!(f, "invalid pin \"{pin}\": {message}")
+            }
+            ExtError::Unpinned { path } => write!(
+                f,
+                "extension \"{path}\" is not pinned: this host requires a SHA-256 pin \
+                 (--extension-pin PATH=SHA256) for every loaded library"
+            ),
+            ExtError::Integrity {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "extension \"{path}\" does not match its pinned SHA-256 (expected {expected}, got {actual})"
+            ),
+            ExtError::Changed { path, message } => write!(
+                f,
+                "extension \"{path}\" changed on disk while it was being checked: {message}"
+            ),
         }
     }
 }
@@ -803,6 +843,14 @@ fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, Ext
     // underneath it.
     if serve::is_serving(canonical) {
         return Err(ExtError::Serving { path });
+    }
+    // Integrity before code: when the host pins hashes, refuse an unpinned or
+    // modified library without mapping it. The guard's identity is re-checked
+    // immediately before `dlopen`, because the platform loaders take a path
+    // and cannot be handed the file that was hashed.
+    let pin = integrity::verify(canonical, display)?;
+    if let Some(pin) = &pin {
+        pin.recheck()?;
     }
     // SAFETY: dlopen runs the library's initializers and maps its code; that
     // is exactly what loading an extension means, and the caller asked for

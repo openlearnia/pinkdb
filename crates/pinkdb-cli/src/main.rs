@@ -1872,6 +1872,9 @@ struct Opts {
     /// `--extension-root PATH`: confine every extension load to this
     /// directory.
     extension_root: Option<String>,
+    /// `--extension-pin PATH=SHA256` (repeatable): require every loaded
+    /// library to be one of these paths with exactly this content hash.
+    extension_pins: Vec<String>,
     /// `-agent` / `-no-agent`: force agent mode on or off (the flag wins over
     /// `PINKDB_AGENT_MODE` and auto-detection).
     agent: Option<bool>,
@@ -1925,6 +1928,10 @@ fn print_usage() {
     println!("                     confine every extension load to this directory (a path");
     println!("                     outside it, a bare library name, a `..` component and a");
     println!("                     symlinked library are always refused)");
+    println!("  --extension-pin PATH=SHA256");
+    println!("                     pin a library's contents: with any pin given, a load of an");
+    println!("                     unpinned path or of a file whose SHA-256 differs is refused");
+    println!("                     (repeatable; sha256sum output, `sha256:` prefix, is accepted)");
     if cfg!(feature = "tls") {
         println!("  --tls              encrypt the remote connection (TLS)");
         println!("  --tls-ca-cert PATH PEM certificate to trust for the server (a CA, or the");
@@ -1947,6 +1954,7 @@ fn parse_args() -> Result<Opts, String> {
         tls_insecure: false,
         allow_load_extension: false,
         extension_root: None,
+        extension_pins: Vec::new(),
         agent: None,
         file_cache: None,
         mcp: None,
@@ -2003,6 +2011,14 @@ fn parse_args() -> Result<Opts, String> {
             }
             other if other.starts_with("--extension-root=") => {
                 opts.extension_root = Some(other["--extension-root=".len()..].to_string());
+            }
+            "--extension-pin" => {
+                let value = args.next().ok_or("--extension-pin requires PATH=SHA256")?;
+                opts.extension_pins.push(value);
+            }
+            other if other.starts_with("--extension-pin=") => {
+                opts.extension_pins
+                    .push(other["--extension-pin=".len()..].to_string());
             }
             "--tls-ca-cert" => {
                 let value = args.next().ok_or("--tls-ca-cert requires a path")?;
@@ -2526,6 +2542,15 @@ fn main() {
             std::process::exit(2);
         }
         *EXTENSION_ROOT.lock().unwrap_or_else(|p| p.into_inner()) = Some(root);
+    }
+    // Content pins, installed before the store opens: the WAL replay path can
+    // load a library too, and it must see the same allowlist. A bad pin is a
+    // startup error, not a warning — the operator asked for a policy.
+    if !opts.extension_pins.is_empty()
+        && let Err(error) = pinkdb_ext_loader::set_pins(&opts.extension_pins)
+    {
+        eprintln!("Error: {error}");
+        std::process::exit(2);
     }
     // The linked registry must know the CLI's built-in extensions before any
     // store is created: a durable reopen whose WAL replays a json record

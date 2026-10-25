@@ -24,8 +24,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
 use pinkdb_ext_loader::{
-    ExtArg, ExtType, ExtValue, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_FLAG_VOLATILE, PinkdbExtScalarFn,
-    PinkdbExtValue, PinkdbHostApi,
+    ExtArg, ExtType, ExtValue, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_API_FLAGS_SIZE,
+    PINKDB_EXT_API_MINOR2_SIZE, PINKDB_EXT_API_V1_SIZE, PINKDB_EXT_FLAG_VOLATILE,
+    PinkdbExtScalarFn, PinkdbExtValue, PinkdbHostApi,
 };
 
 use crate::ScalarSpec;
@@ -42,6 +43,10 @@ pub const CODE_USER_ERROR: i32 = 1;
 /// stderr; `CODE_USER_ERROR` deliberately is not (a failing function is a
 /// normal SQL error, and the ABI has no message channel).
 pub const CODE_INTERNAL_ERROR: i32 = 2;
+/// `pinkdb_extension_init`'s code when the host's `struct_size` is smaller
+/// than the ABI v1 surface: the host is older than the ABI this SDK is built
+/// for, and its `alloc`/`free` are not where the header puts them.
+const INIT_STRUCT_SIZE: i32 = 2;
 /// `pinkdb_extension_init`'s code when the host's ABI version differs.
 const INIT_ABI_VERSION: i32 = 3;
 /// `pinkdb_extension_init`'s code when the extension declares a volatile
@@ -60,8 +65,7 @@ const INIT_RANGED_ARITY: i32 = 5;
 /// as known to this build. An extension calls the field only when the host's
 /// `struct_size` covers it (the field is appended last, so a bigger
 /// `struct_size` means a newer host that has it).
-const FLAGS_FIELD_END: u32 = (std::mem::offset_of!(PinkdbHostApi, register_scalar_flags)
-    + std::mem::size_of::<usize>()) as u32;
+const FLAGS_FIELD_END: u32 = PINKDB_EXT_API_FLAGS_SIZE;
 
 /// Whether a host whose `struct_size` is `struct_size` provides the additive
 /// `register_scalar_flags` entry point (see the header).
@@ -366,6 +370,71 @@ pub unsafe fn native_init(
     }
 }
 
+/// Copy the host's API, reading only the bytes it published.
+///
+/// A host that predates an appended entry point reports a smaller
+/// `struct_size`. Reading the whole struct would then be undefined behaviour,
+/// and leaving the trailing fields as garbage would put a wild pointer in the
+/// copy, so the unpublished ones are replaced by stubs that answer "not
+/// supported" — every call site already gates on `struct_size` before calling
+/// them.
+///
+/// # Safety
+///
+/// `api` must point at a `PinkdbHostApi` whose first `struct_size` bytes are
+/// initialized, with `PINKDB_EXT_API_V1_SIZE <= struct_size`.
+unsafe fn host_api_copy(api: *const PinkdbHostApi) -> PinkdbHostApi {
+    let published = (unsafe { *api }).struct_size;
+    if published >= PINKDB_EXT_API_MINOR2_SIZE {
+        return unsafe { *api };
+    }
+    // SAFETY: the host API's layout starts with the v1 fields, so writing the
+    // published prefix into a fresh struct and filling the rest field by field
+    // never leaves a byte the caller can observe uninitialized.
+    unsafe {
+        let mut copy = std::mem::MaybeUninit::<PinkdbHostApi>::uninit();
+        let published = published as usize;
+        std::ptr::copy_nonoverlapping(api.cast::<u8>(), copy.as_mut_ptr().cast::<u8>(), published);
+        let copy_ptr = copy.as_mut_ptr();
+        if published < std::mem::offset_of!(PinkdbHostApi, register_scalar_flags) {
+            std::ptr::addr_of_mut!((*copy_ptr).register_scalar_flags)
+                .write(unsupported_register_flags);
+        }
+        if published < std::mem::offset_of!(PinkdbHostApi, execute_statement) {
+            std::ptr::addr_of_mut!((*copy_ptr).execute_statement)
+                .write(unsupported_execute_statement);
+        }
+        copy.assume_init()
+    }
+}
+
+/// The `register_scalar_flags` stub of a copy that predates the field: a
+/// registration must fail rather than silently drop the flag.
+extern "C" fn unsupported_register_flags(
+    _ctx: *mut c_void,
+    _name: *const c_char,
+    _n_args: u32,
+    _arg_types: *const i32,
+    _ret_type: i32,
+    _flags: u32,
+    _callback: Option<PinkdbExtScalarFn>,
+    _user_data: *mut c_void,
+) -> i32 {
+    4
+}
+
+/// The `execute_statement` stub of a copy that predates the field: the ABI's
+/// "no live session" code.
+extern "C" fn unsupported_execute_statement(
+    _ctx: *mut c_void,
+    _sql: *const c_char,
+    _sql_len: usize,
+    _out_text: *mut *mut c_char,
+    _out_len: *mut usize,
+) -> i32 {
+    2
+}
+
 fn init_inner(
     api: *const PinkdbHostApi,
     host_ctx: *mut c_void,
@@ -386,9 +455,18 @@ fn init_inner(
         );
         return INIT_ABI_VERSION;
     }
+    if api.struct_size < PINKDB_EXT_API_V1_SIZE {
+        eprintln!(
+            "pinkdb extension {extension_name}: host api struct_size {}, at least {} is required",
+            api.struct_size, PINKDB_EXT_API_V1_SIZE
+        );
+        return INIT_STRUCT_SIZE;
+    }
     // Keep the first copy: a second load of the same image must not swap the
     // allocator out from under already-registered callbacks.
-    let _ = HOST_API.set(*api);
+    // SAFETY: the host published at least `PINKDB_EXT_API_V1_SIZE` bytes at
+    // `api` (checked above) and at most `sizeof(PinkdbHostApi)`.
+    let _ = HOST_API.set(unsafe { host_api_copy(api) });
     let flags_available = flags_registration_available(api.struct_size);
     if !flags_available && specs.iter().any(|spec| spec.volatile) {
         eprintln!(

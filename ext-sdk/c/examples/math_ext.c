@@ -1,14 +1,20 @@
 /*
  * pinkdb extension example — math_ext (ABI v1, plain C99).
  *
- * Registers two numeric scalar functions:
+ * Registers three numeric scalar functions:
  *
  *     ext_clamp(v BIGINT, lo BIGINT, hi BIGINT) -> BIGINT
  *         NULL in -> NULL out; errors (code 1) when lo > hi.
  *     ext_deg2rad(deg DOUBLE) -> DOUBLE
  *         Degrees to radians. NULL in -> NULL out.
+ *     ext_now_micros() -> TIMESTAMP
+ *         Wall-clock time in microseconds since the epoch, registered with
+ *         PINKDB_EXT_FLAG_VOLATILE: it is non-deterministic, so the engine
+ *         refuses it in any statement it WAL-logs (WAL replay would otherwise
+ *         produce a different value on recovery) and allows it in read-only
+ *         queries.
  *
- * Neither function needs the host allocator (no VARCHAR results), so the
+ * Nothing here needs the host allocator (no VARCHAR results), so the
  * `PinkdbHostApi` struct is used only during init. See ../README.md for the
  * full contract and `../include/pinkdb_extension.h` for the reference.
  */
@@ -17,6 +23,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------------ */
 /* Callbacks                                                                 */
@@ -75,6 +82,21 @@ static int32_t ext_deg2rad(void *user_data, const pinkdb_ext_value *args,
     return 0;
 }
 
+/* ext_now_micros(): the current wall clock in microseconds since the epoch.
+ * Volatile (see the file comment): the value must not be cached, folded, or
+ * compared across calls. */
+static int32_t ext_now_micros(void *user_data, const pinkdb_ext_value *args,
+                              size_t n_args, pinkdb_ext_value *out) {
+    (void)user_data;
+    (void)args; /* arity 0: the host passes args == NULL */
+    (void)n_args;
+
+    out->type_tag = PINKDB_EXT_TYPE_TIMESTAMP;
+    out->is_null = 0;
+    out->int64 = (int64_t)time(NULL) * 1000000;
+    return 0;
+}
+
 /* ------------------------------------------------------------------------ */
 /* ABI entry points                                                          */
 /* ------------------------------------------------------------------------ */
@@ -91,7 +113,10 @@ int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
     if (api == NULL || api->abi_version != PINKDB_EXT_ABI_VERSION) {
         return 1;
     }
-    if (api->struct_size < sizeof(PinkdbHostApi)) {
+    /* Refuse a host older than the ABI this file was written against. The
+     * negotiation macros in the header compare `struct_size` against the
+     * offset of the first field the SDK uses. */
+    if (api->struct_size < PINKDB_EXT_API_V1_SIZE) {
         return 2;
     }
 
@@ -107,6 +132,19 @@ int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
     if (api->register_scalar(host_ctx, "ext_deg2rad", 1, t_double,
                              PINKDB_EXT_TYPE_DOUBLE, ext_deg2rad, NULL) != 0) {
         return 11;
+    }
+    /* The flags entry point is appended after the v1 fields: a host that
+     * predates it has a shorter struct, so the pointer must not be read. A
+     * volatile function that cannot be declared must fail the load rather
+     * than be registered as deterministic. */
+    if (!PINKDB_EXT_HOST_HAS_FLAGS(api)) {
+        return 3;
+    }
+    if (api->register_scalar_flags(host_ctx, "ext_now_micros", 0, NULL,
+                                   PINKDB_EXT_TYPE_TIMESTAMP,
+                                   PINKDB_EXT_FLAG_VOLATILE, ext_now_micros,
+                                   NULL) != 0) {
+        return 12;
     }
     return 0;
 }

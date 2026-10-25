@@ -1,7 +1,9 @@
 # pinkdb Rust extension SDK
 
 Everything needed to build a pinkdb extension in **safe Rust** against the
-extension ABI v1. One `pinkdb_extension!` declaration defines the extension —
+extension ABI v1 (**minor 2**: the additive `register_scalar_flags`,
+`execute_statement` and optional `pinkdb_ext_serve`). One `pinkdb_extension!`
+declaration defines the extension —
 its name and its functions — and the SDK generates the ABI glue: value
 marshalling, VARCHAR ownership, NULL handling, the wave-49 **linked**
 registration that covers every target *including wasm*, and (for a cdylib,
@@ -19,9 +21,10 @@ ext-sdk/rust/
 │   ├── value.rs                 # the typed value model (ExtArgType / FromExtArg / IntoExtValue)
 │   └── native.rs                # the ABI v1 exports and the single extern "C" trampoline
 ├── example/string_ext/          # worked example (a workspace member): one declaration, four functions
+├── conformance/                 # the ABI conformance fixture (a workspace member), see below
 ├── template/                    # copy this directory to start an extension (standalone crate)
 ├── tests/                       # native (rustc-built cdylib) and linked round trips + a durable replay
-├── Makefile                     # builds the example / the template
+├── Makefile                     # builds the example / the conformance fixture / the template
 ├── smoke.sh                     # end-to-end test against the release CLI
 ├── check-native-exports.sh      # linked-only rlibs carry no ABI symbols; the cdylib does
 └── README.md
@@ -57,6 +60,35 @@ INSERT INTO t VALUES (ext_rs_tick());
 recommended). A successful load prints `Extension <name> loaded.`; the declared
 name is pinned, so loading the same extension twice is an error. Loaded
 functions resolve case-insensitively like built-ins and cannot shadow one.
+Loading is **refused unless the process opted in** (`--allow-load-extension` or
+`PINKDB_ALLOW_LOAD_EXTENSION=1`) — see [Security posture](#security-posture).
+
+## ABI 1.2 coverage
+
+The header is the contract; this is what the SDK does about each part of it,
+and where that code lives. "Covered" means the declaration path sets it up for
+the author — no `unsafe`, no manual registration, no field to keep in sync.
+
+| Contract | SDK |
+|---|---|
+| `pinkdb_extension_abi_version` / `_name` / `_init` | `pinkdb_abi_exports!()`, cdylib-only by design (see [Native cdylib](#native-cdylib-opting-in-to-the-abi-exports)) |
+| `struct_size` negotiation | `native.rs` compares the host's `struct_size` against the offset past `register_scalar_flags` (`flags_registration_available`) and calls the field only when the host has it — a pre-flags host still loads the deterministic functions |
+| init-only `PinkdbHostApi` and `host_ctx` | copied into `OnceLock`s in `native.rs` during init; callbacks never touch a caller's frame, and the trampoline refuses to run before init |
+| `register_scalar` | every `functions = [ ... ]` entry, registered with `flags == 0` (deterministic) at its declared arity |
+| `register_scalar_flags` + `PINKDB_EXT_FLAG_VOLATILE` | the `volatile = [ ... ]` list; on a host without the field the load **fails** rather than silently registering a volatile function as deterministic |
+| type tags 1–7 and 9: BOOLEAN, INTEGER, BIGINT, DOUBLE, VARCHAR, DATE, TIMESTAMP, INTERVAL | Rust `bool`, `i32`, `i64`, `f64`, `String`/`&'static str`/`&str`, `Date`, `Timestamp`, `Interval`; a NULL argument is `is_null` on its tag, which is `Option::None` (tag 0, `PINKDB_EXT_TYPE_NULL`, is never a registered parameter type). Tag 8 (the C ABI's DECIMAL) is unsupported by extension ABI v1 and has no spelling |
+| INTERVAL bit packing | `Interval { months, days, micros }`: `micros` in `int64`, `months << 32 \| days` over the `double`'s bits via `f64::to_bits`/`from_bits` — the author never sees the pattern |
+| host `alloc`/`free` text ownership | a `String`/`&'static str` result is allocated with `api->alloc` and handed over un-owned (the host copies and frees it immediately); the SDK never keeps or frees the pointer, and VARCHAR **inputs** are only ever borrowed |
+| 64 MiB VARCHAR limit, invalid UTF-8 | the host's rejections, surfacing as code 1; the SDK cannot produce a non-`String` payload, so invalid UTF-8 has no representation here |
+| callback concurrency and no unwinding | one `extern "C"` trampoline for every function: it `catch_unwind`s the body, answers code 2 and prints a one-line diagnostic instead of unwinding into the host |
+| `execute_statement` + optional `pinkdb_ext_serve` (minor 2) | `HostSession::execute_statement` and `pinkdb_abi_exports_with_serve!(serve)`; an extension without the export is functions-only, which is the default |
+| `PINKDB_EXT_MAX_ARGS`, name/arity/type validation | the host's job; the SDK registers only well-formed declarations, and a rejection fails the load even when init returns 0 |
+
+What the ABI does **not** register, and therefore what a path-loaded extension
+cannot be: **table functions, table scans and copy sinks**. The header has no
+`register_table*` / copy-sink entry point, so those interfaces exist only in the
+linked model — an extension that needs them is compiled into the host (see
+[One source, two loading models](#one-source-two-loading-models)).
 
 ## Writing an extension
 
@@ -340,6 +372,18 @@ my_extension::pinkdb_register_linked()?;
 // then, from SQL: LOAD EXTENSION 'my_extension'; SELECT my_ext_greet('world');
 ```
 
+### What is linked-only
+
+Table functions, table scans and copy sinks are **linked-only**: the ABI
+header registers scalar functions (`register_scalar` /
+`register_scalar_flags`) and nothing else, so there is no way to hand the host
+a table-producing or row-consuming callback through `LOAD EXTENSION`. An
+extension that needs them is compiled into the host and reaches SQL through
+the linked registration (`pinkdb_register_linked()`); everything a cdylib can
+do is a scalar function. Ranged arities (`optional`/`variadic`) are linked-only
+for a narrower reason — the native descriptor has a fixed arity — and the
+native init refuses them instead of mis-registering.
+
 Because this is a compile-time registration, an rlib of the extension can be
 linked into the host binary — that is exactly how a wasm build ships, and how
 every in-repo core extension (math, datetime, …) reaches the CLI. The SDK
@@ -348,6 +392,37 @@ an extension SDK. A linked-only crate must be export-free so several of them
 can coexist in one binary: `./ext-sdk/rust/check-native-exports.sh` asserts
 the rlibs carry no `pinkdb_extension_*` symbols (and that the example cdylib
 still exports all three).
+
+## Conformance fixture
+
+`ext-sdk/conformance/README.md` defines one extension — `conformance_ext` —
+that every SDK implements, so the loader measures the C, C++, Go and Rust SDKs
+against one contract instead of against their own examples: every value tag in
+both directions, NULL and zero-length results, host-allocated VARCHAR results,
+error code 1, a real panic, the volatile flag, foreign-thread counters, and the
+`struct_size` negotiation. The Rust implementation is `conformance/`, a
+workspace member:
+
+```sh
+cargo build -p pinkdb-ext-conformance      # target/debug/libconformance_ext.dylib
+make -C ext-sdk/rust conformance           # ... or target/release/libconformance_ext.dylib
+nm -g target/release/libconformance_ext.dylib | grep -E 'pinkdb_(extension|conformance)_'
+```
+
+It is ordinary SDK code — one `pinkdb_extension!` declaration plus the fixture's
+counters — with two departures that are the fixture's point:
+
+- `pinkdb_conformance_caps()` returns **2**: bit 1 set (`cf_unwind` really
+  panics, and the trampoline contains it as code 2), bit 0 **clear** — the
+  typed SDK cannot publish a VARCHAR result and then fail, so `cf_fail` is a
+  plain `Err` (code 1) and the host's error-path free is not exercised;
+- the three ABI exports are written out by hand instead of via
+  `pinkdb_abi_exports!()`, because the fixture must remember the thread
+  `pinkdb_extension_init` ran on to count foreign-thread callbacks. The bodies
+  are the macro's, unchanged.
+
+The C, C++ and Go fixtures are built by the loader tests themselves; the Rust
+one is a workspace member, so a plain `cargo test` builds it.
 
 ## Sharp edges
 
@@ -391,9 +466,12 @@ consequences, verified against the real host:
 The example is a workspace member, so `cargo build --release -p
 pinkdb-ext-sdk-example` (or `make -C ext-sdk/rust`) puts the library at
 `target/release/librust_string_ext.dylib` (`.so` on Linux; a `.dll` on
-Windows). A copied-out `template/` builds on its own: it is a standalone crate
-(`cargo build --release` inside it) with a path dependency on this SDK —
-`make -C ext-sdk/rust template` builds it in place to check the skeleton.
+Windows). The conformance fixture is one too: `make -C ext-sdk/rust
+conformance` (or `cargo build --release -p pinkdb-ext-conformance`) writes
+`target/release/libconformance_ext.$SO_EXT`. A copied-out `template/` builds
+on its own: it is a standalone crate (`cargo build --release` inside it) with a
+path dependency on this SDK — `make -C ext-sdk/rust template` builds it in
+place to check the skeleton.
 
 ## Testing your extension
 
@@ -428,12 +506,46 @@ Extensions are **process-level**: they are not stored in `.pink` snapshots and
 are not part of a transaction. `LOAD EXTENSION` is refused inside
 `BEGIN..COMMIT`. For a durable database the WAL replays the statements that
 need an extension, prefixed with `LOAD EXTENSION '<path>'` (a checkpoint
-resets that coverage), so keep extension files at stable absolute paths. A
-missing file at replay time is a hard recovery error naming the path. A
-*volatile* call is refused in any WAL-logged statement before it runs, so
-replay never has to reproduce a nondeterministic value. `pinkdb-server` loads
-extensions into the *server* process; anyone who can send SQL can load a
-shared library with the server's privileges.
+resets that coverage), so keep extension files at stable absolute paths — see
+[Security posture](#security-posture). A *volatile* call is refused in any
+WAL-logged statement before it runs, so replay never has to reproduce a
+nondeterministic value.
+
+## Security posture
+
+Loading an extension runs arbitrary native code in the host process. The
+guards are real but opt-in, so they are worth stating plainly:
+
+- **Loading is off by default.** `LOAD EXTENSION` is refused unless the
+  process was started with `--allow-load-extension`, or the environment is
+  `PINKDB_ALLOW_LOAD_EXTENSION=1`. Nothing loads an extension implicitly, not
+  even from a `.pink` snapshot.
+- **`--extension-root <dir>` confines it.** A load path must resolve under
+  that root; a bare name, a path with any `..` component, and a symlinked
+  path are refused (`crates/pinkdb-ext-loader`'s `path_confinement.rs` tests
+  each case). Without a root, `LOAD EXTENSION` takes an absolute path —
+  an RCE primitive for anyone who can already send SQL.
+- **Load through a stable absolute path.** WAL replay re-issues
+  `LOAD EXTENSION '<path>'` for the statements that need an extension, so a
+  moved, renamed or deleted library is a hard recovery error naming the path.
+  Symlinks are refused for the same reason: the path in the WAL must keep
+  meaning the same bytes.
+- **`--extension-pin PATH=SHA256` pins the bytes.** The flag (on the CLI and the
+  server, repeatable) installs a SHA-256 allowlist: once at least one pin is
+  given, a library that is not pinned is refused (`is not pinned`), a library
+  whose hash differs is refused (`does not match its pinned SHA-256`), and so is
+  one that changes between the hash and the load (`changed on disk while it was
+  being checked`). It is the only content check a local load has, and
+  `dlopen` takes a path rather than a descriptor, so the directory holding the
+  library must still be one only the operator can write.
+- **Locally loaded libraries are unsigned.** Ed25519 signing of extension
+  packages covers only `INSTALL` / `.install` — the package flow, with a
+  publisher key — not `LOAD EXTENSION '<path>'`, which trusts whatever file
+  is at the path.
+- **A server loads extensions with the server's privileges.**
+  `pinkdb-server` loads into the *server* process; anyone who can send SQL to
+  a server with loading enabled can therefore run code as the server user.
+  Treat SQL access to such a server as shell access.
 
 ## The vendored header
 

@@ -15,6 +15,9 @@ name = "pinkdb_ext_loader"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # The host calls it; it calls nothing else back into Rust.
 libloading = "0.8"
+# The optional SHA-256 allowlist (`src/integrity.rs`) hashes the library before
+# it is mapped. Only the hash is needed; no signing primitives here.
+sha2 = "0.10"
 
 [dev-dependencies]
 # The late-registration test opens the same test extension to call its

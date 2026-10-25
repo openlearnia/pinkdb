@@ -41,11 +41,11 @@ KNOWN_PLATFORMS = (
     "windows-x64",
 )
 
-# Descriptions for the in-repo C/C++ SDK examples.
+# Descriptions for the in-repo C and C++ SDK examples.
 EXAMPLE_DESCRIPTIONS = {
-    "math_ext": "Clamp and degree/radian helpers (ext_clamp, ext_deg2rad)",
-    "string_ext": "String helpers (ext_repeat, ext_title)",
-    "cpp_ext": "Checked integer addition (ext_add_checked)",
+    "math_ext": "Clamp and degree/radian helpers (ext_clamp, ext_deg2rad, ext_now_micros)",
+    "string_ext": "String helpers (ext_repeat, ext_title, ext_add_checked)",
+    "cpp_ext": "Checked integer addition (ext_add_checked) and ext_reverse (C++ SDK)",
 }
 
 
@@ -71,19 +71,19 @@ def candidates(root: Path, platform: str) -> list[tuple[str, Path, str]]:
     ext = lib_ext(platform)
     found: list[tuple[str, Path, str]] = []
 
-    # 1) The C/C++ SDK worked examples: examples/*.c(pp) -> build/<stem><ext>.
-    examples = sorted((root / "ext-sdk/c/examples").glob("*.c")) + sorted(
-        (root / "ext-sdk/c/examples").glob("*.cpp")
-    )
-    for src in examples:
-        stem = src.stem
-        found.append(
-            (
-                stem,
-                root / "ext-sdk/c/build" / f"{stem}{ext}",
-                EXAMPLE_DESCRIPTIONS.get(stem, f"pinkdb C SDK example {stem}"),
+    # 1) The SDK worked examples: examples/*.c(pp) -> build/<stem><ext>. The C
+    #    SDK owns the C examples, the header-only C++ SDK its C++ one; the
+    #    conformance fixtures are never catalog candidates.
+    for sdk, pattern in (("c", "*.c"), ("cpp", "*.cpp")):
+        for src in sorted((root / "ext-sdk" / sdk / "examples").glob(pattern)):
+            stem = src.stem
+            found.append(
+                (
+                    stem,
+                    root / "ext-sdk" / sdk / "build" / f"{stem}{ext}",
+                    EXAMPLE_DESCRIPTIONS.get(stem, f"pinkdb {sdk} SDK example {stem}"),
+                )
             )
-        )
 
     # 2) Repo extensions: extensions/<name>/ with exactly one built library
     #    under build/ or dist/. Ambiguity is an error, never a guess.

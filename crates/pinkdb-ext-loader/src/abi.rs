@@ -50,6 +50,26 @@ pub const PINKDB_EXT_FLAG_VOLATILE: u32 = 0x1;
 #[cfg(not(target_arch = "wasm32"))]
 pub const PINKDB_EXT_FLAG_KNOWN: u32 = PINKDB_EXT_FLAG_VOLATILE;
 
+/// The `struct_size` of the ABI v1 surface: the fields every host has, up to
+/// but not including the appended `register_scalar_flags`.
+///
+/// This mirrors the header's `PINKDB_EXT_API_V1_SIZE`; an extension that finds
+/// a smaller `struct_size` must refuse the load rather than read a field the
+/// host never published.
+#[cfg(not(target_arch = "wasm32"))]
+pub const PINKDB_EXT_API_V1_SIZE: u32 =
+    std::mem::offset_of!(PinkdbHostApi, register_scalar_flags) as u32;
+
+/// The `struct_size` of the ABI minor 1 surface (`PINKDB_EXT_API_FLAGS_SIZE`):
+/// everything up to but not including `execute_statement`.
+#[cfg(not(target_arch = "wasm32"))]
+pub const PINKDB_EXT_API_FLAGS_SIZE: u32 =
+    std::mem::offset_of!(PinkdbHostApi, execute_statement) as u32;
+
+/// The `struct_size` of the current (minor 2) host API: the whole struct.
+#[cfg(not(target_arch = "wasm32"))]
+pub const PINKDB_EXT_API_MINOR2_SIZE: u32 = std::mem::size_of::<PinkdbHostApi>() as u32;
+
 // Value / argument type tags (same numbering as the pinkdb C ABI).
 pub const PINKDB_EXT_TYPE_NULL: i32 = 0;
 pub const PINKDB_EXT_TYPE_BOOLEAN: i32 = 1;
@@ -581,6 +601,18 @@ mod tests {
         const FIELD_END: usize = std::mem::offset_of!(PinkdbHostApi, execute_statement)
             + std::mem::size_of::<PinkdbExtExecuteStatementFn>();
         assert_eq!(FIELD_END, std::mem::size_of::<PinkdbHostApi>());
+        // The published size ladder the header's `PINKDB_EXT_API_*_SIZE` and
+        // `PINKDB_EXT_HOST_HAS_*` macros spell out, pinned here so an SDK or
+        // fixture that hard-codes one fails a test instead of a load.
+        assert_eq!(
+            PINKDB_EXT_API_V1_SIZE as usize,
+            std::mem::offset_of!(PinkdbHostApi, register_scalar_flags)
+        );
+        assert_eq!(
+            PINKDB_EXT_API_FLAGS_SIZE as usize,
+            std::mem::offset_of!(PinkdbHostApi, execute_statement)
+        );
+        assert_eq!(PINKDB_EXT_API_MINOR2_SIZE as usize, FIELD_END);
     }
 
     #[test]

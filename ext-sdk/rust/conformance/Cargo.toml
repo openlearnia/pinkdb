@@ -1,0 +1,17 @@
+[package]
+name = "pinkdb-ext-conformance"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "The ABI v1 conformance fixture (ext-sdk/conformance/README.md), implemented with the Rust SDK"
+license = "MIT"
+publish = false
+
+[lib]
+# The fixture is loaded like any other extension: a shared library at
+# `target/<profile>/libconformance_ext.<dll suffix>`.
+name = "conformance_ext"
+crate-type = ["cdylib"]
+
+[dependencies]
+pinkdb-ext-sdk = { path = ".." }

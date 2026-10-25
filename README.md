@@ -212,7 +212,7 @@ CREATE DATABASE db1;                 -- new, empty database
 DROP DATABASE db1;                   -- last database cannot be dropped; dropping the
                                      -- current one switches the session to main
 USE db1;                             -- per-session current database (default: main)
-LOAD EXTENSION 'extensions/hello.dylib';   -- load a native extension (ABI v1)
+LOAD EXTENSION 'extensions/hello.dylib';   -- native extension (opt-in; see Security posture)
 LOAD EXTENSION 'windowed_math';            -- on wasm: load a linked registry extension
 CREATE PROCEDURE p(a INTEGER, b VARCHAR) AS $$
 BEGIN INSERT INTO t VALUES (a, b); END $$;     -- stored procedure (see below)
@@ -1195,8 +1195,9 @@ statement, join output included, default 10 000 000), `--max-result-bytes N`
 `--max-concurrent-logins N` (in-flight Argon2id verifications, default 4),
 `--transport sync|async`
 (default `sync`; `async` is the tokio I/O transport and needs a build with
-the `async-server` feature), `--allow-load-extension` (off by default; see
-Security posture), `--allow-copy-to` and `--copy-root PATH`. The last two are
+the `async-server` feature), `--allow-load-extension`, `--extension-root PATH` and
+`--extension-pin PATH=SHA256` (off by default; see Security posture),
+`--allow-copy-to` and `--copy-root PATH`. The last two are
 the `COPY … TO` opt-in: off by default (the server refuses it even for
 `ADMIN`), and when enabled every destination is confined to `--copy-root`,
 written atomically with mode 0600. `--allow-copy-to` without `--copy-root` is
@@ -1362,7 +1363,12 @@ server runs with `--allow-load-extension` (library:
 load and run a native library from its own filesystem, and even with RBAC
 that is a host-level capability (an authenticated session also needs
 `ADMIN`). WAL replay at startup still re-loads extensions a durable database
-already recorded.
+already recorded. Confine the paths with `--extension-root`, and pin the bytes
+with one or more `--extension-pin PATH=SHA256` flags: once any pin is given,
+the server refuses to load a library whose hash is not pinned, or whose file
+changed between the hash and the load. Locally loaded libraries are
+**unsigned** — the Ed25519 signature check covers `.install` packages, not
+libraries a path names — and they run with the server's privileges.
 
 `COPY … TO` is treated the same way and more strictly: an authenticated
 session needs `ADMIN` (a `SELECT` grant never implies a filesystem write),
@@ -1850,34 +1856,77 @@ with its value mapping and determinism rules — is shipped as a pinned
 contract; the binding itself is the recorded follow-up. Full design, limits
 and test matrix: `docs/wasm-extensions.md`.
 
-### Writing extensions (C/C++)
+### Writing extensions (C and C++)
 
-The in-repo C/C++ SDK (`ext-sdk/c/`) bundles the vendored ABI header, a
-commented skeleton (`ext-sdk/c/template/`), three worked examples (C numeric,
-C string, C++), a Makefile, and an end-to-end smoke test:
+Two SDKs share one ABI header. `ext-sdk/c/` is the C SDK: the vendored
+header, a commented skeleton (`ext-sdk/c/template/`) that also serves a
+session over `pinkdb_ext_serve`, worked numeric and string examples, a
+Makefile and an end-to-end smoke test. `ext-sdk/cpp/` is a header-only C++17
+wrapper (`pinkdb::ext`): `Host` negotiates `struct_size` for you and exposes
+`register_function`/`register_volatile`/`execute_statement`, `Value` reads
+the tags, a move-only `Text` owns a VARCHAR result in host memory, `Writer`
+fills the output value, and `guard()` contains exceptions before they reach
+the C boundary.
 
 ```sh
 make -C ext-sdk/c        # builds the examples into ext-sdk/c/build/
 ./ext-sdk/c/smoke.sh     # builds them, loads each via the release CLI, greps the results
+make -C ext-sdk/cpp      # builds the C++ example into ext-sdk/cpp/build/
+./ext-sdk/cpp/smoke.sh
 ```
 
-`ext-sdk/c/README.md` walks through the contract (exports, the host API
-struct, value tags, VARCHAR `alloc`/`free` ownership, NULL semantics,
-thread-safety, no unwinding) and the `LOAD EXTENSION '<path>'` workflow. The
-SDK's header is kept byte-identical to the loader crate's copy by a
-`cargo test` check.
+`ext-sdk/c/README.md` and `ext-sdk/cpp/README.md` walk through the contract
+(exports, the host API struct and the size constants an extension negotiates
+with — `PINKDB_EXT_API_V1_SIZE`, `PINKDB_EXT_HOST_HAS_FLAGS()`,
+`PINKDB_EXT_HOST_HAS_EXECUTE()`, `pinkdb_ext_copy_api()` — value tags
+including INTERVAL's packed months/days, VARCHAR `alloc`/`free` ownership and
+the 64 MiB result limit, NULL semantics, thread-safety, no unwinding) and the
+`LOAD EXTENSION '<path>'` workflow. Every SDK's header copy is kept
+byte-identical to the loader crate's by a `cargo test` check.
 
-A Go SDK (`ext-sdk/go/`) builds the same ABI v1 with cgo
-(`go build -buildmode=c-shared`): the three exports come from `//export`
-directives, and small static C shims stand in for the host's function
-pointers (`register_scalar`/`alloc`/`free`), which Go cannot call directly.
-`ext-sdk/go/README.md` documents the cgo patterns and the sharp edges — the
-Go runtime is linked into the host process, callbacks are invoked from
-foreign rayon worker threads, VARCHAR results must be copied into
-host-`alloc` memory, panics must be recovered before they cross the ABI
-boundary, and `-buildmode=c-shared` symbol-export rules — and
-`./ext-sdk/go/smoke.sh` builds and exercises the example end to end. Its
-header copy is pinned by the same `cargo test` check.
+A Go SDK (`ext-sdk/go/`) builds the same ABI with cgo
+(`go build -buildmode=c-shared`). Its `pinkdb` package
+(`ext-sdk/go/pinkdb`) carries the whole surface — `Init`, `Register`,
+`RegisterVolatile` (which refuses on a host too old for the flag instead of
+registering a volatile function as deterministic), `Guard` for panics,
+`SetText`/`FreeText` for host-owned VARCHAR results, and `ExecuteStatement` —
+so an extension is one `//export` block per entry point and no hand-copied
+shims. Each extension keeps a three-line `static inline` accessor for its own
+`//export`ed callbacks, because cgo cannot take a C symbol's address.
+`ext-sdk/go/README.md` documents the sharp edges — the Go runtime is linked
+into the host process, callbacks arrive on foreign rayon threads, VARCHAR
+results must be copied into host-`alloc` memory, panics must be recovered
+before they cross the boundary — and `./ext-sdk/go/smoke.sh` exercises the
+example end to end.
+
+### The ABI conformance fixture
+
+All four SDKs build the same library, `conformance_ext`, from one contract
+(`ext-sdk/conformance/README.md`): 15 functions covering every tag, a
+canonical summary row, zero-length and oversized VARCHAR results, a function
+that publishes text and then fails, one that panics/throws, a `VOLATILE` one,
+and call counters. `crates/pinkdb-ext-loader/tests/conformance.rs` builds each
+SDK's copy and drives all four through the loader — NULL and oversized
+values, error codes, unwind containment, foreign-thread callbacks and
+old-host/new-host `struct_size` behaviour — so the SDKs cannot drift apart
+one at a time. `PINKDB_CONFORMANCE_STRICT=1` makes a missing toolchain a
+failure (CI sets it); without it a missing `go`/`c++`/`cargo` skips that SDK
+with a note.
+
+### Extension security posture
+
+Loading native code is off by default: the CLI needs `--allow-load-extension`
+(or `PINKDB_ALLOW_LOAD_EXTENSION=1`), the server needs the same flag, and a
+remote `LOAD EXTENSION` additionally needs `ADMIN`. `--extension-root PATH`
+confines every load to one directory, and a bare library name, a `..`
+component and a symlinked library are always refused — replay resolves through
+the same rules, so keep the paths absolute and stable. `--extension-pin
+PATH=SHA256` (repeatable) installs an allowlist: once set, a library that is
+not pinned, or whose hash differs, is refused, and the file is re-checked
+right before it is mapped. Locally loaded libraries are **unsigned** (Ed25519
+signatures cover `.install` packages only) and run with the privileges of the
+process that loads them. `ext-sdk/posture.sh` exercises every one of these
+refusals against the release CLI.
 
 ### Writing extensions (Rust)
 
@@ -1946,7 +1995,8 @@ make -C ext-sdk/rust        # builds the example into target/release/
 rules, the volatility contract, the error-code mapping (the C ABI carries no
 error text) and the crate's own round-trip tests (native `LOAD EXTENSION`,
 linked registration, durable replay); its header copy is pinned by the same
-`cargo test` check.
+`cargo test` check, and its build of the shared `conformance_ext` fixture
+(`ext-sdk/rust/conformance/`) is in the loader's conformance matrix.
 
 ### Extension repository
 

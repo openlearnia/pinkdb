@@ -146,10 +146,10 @@ int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
     if (api == NULL || api->abi_version != PINKDB_EXT_ABI_VERSION) {
         return 1;
     }
-    if (api->struct_size < sizeof(PinkdbHostApi)) {
+    if (api->struct_size < PINKDB_EXT_API_V1_SIZE) {
         return 2;
     }
-    g_api = *api;
+    pinkdb_ext_copy_api(&g_api, api);
 
     static const int32_t t_repeat[2] = {PINKDB_EXT_TYPE_VARCHAR, PINKDB_EXT_TYPE_INTEGER};
     static const int32_t t_title[1] = {PINKDB_EXT_TYPE_VARCHAR};

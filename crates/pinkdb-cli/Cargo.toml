@@ -114,6 +114,10 @@ catalog-postgres = ["pink-lake?/catalog-postgres"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
+# The optional SHA-256 pin allowlist (`--extension-pin`): a workspace crate the
+# engine already links, so this adds no dependency to the binary beyond the API
+# the flag needs.
+pinkdb-ext-loader = { path = "../pinkdb-ext-loader" }
 rustyline = "14"
 # Core json extension (default feature): six DuckDB JSON functions over
 # VARCHAR (v1 has no JSON type). Links no external crates — parsing and

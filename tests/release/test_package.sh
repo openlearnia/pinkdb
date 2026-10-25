@@ -157,9 +157,14 @@ fi
 # ---- extensions.py discovery ------------------------------------------------
 extroot="$tmp/extroot"
 mkdir -p "$extroot/ext-sdk/c/examples" "$extroot/ext-sdk/c/build" \
+    "$extroot/ext-sdk/cpp/examples" "$extroot/ext-sdk/cpp/build" \
     "$extroot/extensions/foo/build"
 : >"$extroot/ext-sdk/c/examples/math_ext.c"
 : >"$extroot/ext-sdk/c/build/math_ext.dylib"
+: >"$extroot/ext-sdk/cpp/examples/cpp_ext.cpp"
+: >"$extroot/ext-sdk/cpp/build/cpp_ext.dylib"
+mkdir -p "$extroot/ext-sdk/cpp/conformance"
+: >"$extroot/ext-sdk/cpp/conformance/conformance_ext.cpp"
 : >"$extroot/extensions/foo/build/libfoo.dylib"
 printf 'Foo helpers\n' >"$extroot/extensions/foo/description.txt"
 if python3 "$repo_root/scripts/release/extensions.py" discover \
@@ -169,15 +174,19 @@ if python3 "$repo_root/scripts/release/extensions.py" discover \
 import sys
 
 rows = [line.rstrip("\n").split("\t") for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-assert len(rows) == 2, rows
+assert len(rows) == 3, rows
 by_name = {r[0]: r for r in rows}
 assert by_name["math_ext"][3] == "math_ext.dylib"
+# The C++ example is staged from ext-sdk/cpp, and the conformance fixture
+# (which has no build output here) is never a catalog candidate.
+assert by_name["cpp_ext"][3] == "cpp_ext.dylib"
+assert "conformance_ext" not in by_name
 assert by_name["foo"][3] == "libfoo.dylib"
 assert by_name["foo"][4] == "Foo helpers"
 assert all(len(r) == 6 and len(r[5]) == 64 for r in rows)
 PY
     then
-        ok "extensions.py stages C example + extensions/foo"
+        ok "extensions.py stages the C and C++ examples + extensions/foo"
     else
         fail "extensions.py manifest contents"
     fi

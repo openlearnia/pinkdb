@@ -107,6 +107,9 @@ struct Args {
     /// `--extension-root PATH`: the directory every extension load is
     /// confined to.
     extension_root: Option<String>,
+    /// `--extension-pin PATH=SHA256` (repeatable): require every library a
+    /// client loads to be one of these paths with exactly this hash.
+    extension_pins: Vec<String>,
     /// `--allow-copy-to`: let clients run COPY … TO (off by default; ADMIN is
     /// still required in an authenticated session).
     /// Wave 105: the MCP bridge extension (`libpinkdb_mcp.*`). Its presence
@@ -155,7 +158,7 @@ fn usage() -> &'static str {
      \x20                    [--statement-timeout-ms N] [--max-result-rows N]\n\
      \x20                    [--max-result-bytes N] [--max-concurrent-logins N]\n\
      \x20                    [--transport sync|async] [--allow-load-extension]\n\
-     \x20                    [--extension-root PATH]\n\
+     \x20                    [--extension-root PATH [--extension-pin PATH=SHA256]]\n\
      \x20                    [--allow-copy-to --copy-root PATH]\n\
      \x20                    [--tls-cert PATH.pem --tls-key PATH.pem]\n\
      \x20                    [--mcp-extension PATH [--mcp-port PORT] [--mcp-user NAME]]\n\
@@ -185,6 +188,9 @@ fn usage() -> &'static str {
      \x20 --extension-root PATH  confine every extension load to this directory (a path\n\
      \x20                        outside it is refused; a bare library name, a `..`\n\
      \x20                        component and a symlinked library are always refused)\n\
+     \x20 --extension-pin PATH=SHA256  pin a library's contents: with any pin given,\n\
+     \x20                        a load of an unpinned path or of a file whose SHA-256\n\
+     \x20                        differs from its pin is refused (repeatable)\n\
      \x20 --allow-copy-to        let clients run COPY TO (writes files on the server\n\
      \x20                        host; off by default; ADMIN is also required)\n\
      \x20 --copy-root PATH       confine every COPY TO destination to this directory\n\
@@ -257,6 +263,7 @@ fn parse_args() -> Result<Args, String> {
         transport: Transport::Sync,
         allow_load_extension: false,
         extension_root: None,
+        extension_pins: Vec::new(),
         mcp_extension: None,
         mcp_port: DEFAULT_MCP_PORT,
         mcp_user: None,
@@ -371,6 +378,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--allow-load-extension" if inline.is_none() => args.allow_load_extension = true,
             "--extension-root" => args.extension_root = Some(value("--extension-root")?),
+            "--extension-pin" => args.extension_pins.push(value("--extension-pin")?),
             "--allow-copy-to" if inline.is_none() => args.allow_copy_to = true,
             "--copy-root" => args.copy_root = Some(value("--copy-root")?),
             "--mcp-extension" => args.mcp_extension = Some(value("--mcp-extension")?),
@@ -747,6 +755,17 @@ fn main() -> ExitCode {
         }
         None => None,
     };
+
+    // Content pins: installed before the first store opens, because a WAL
+    // replay can load a library through the same loader. A bad pin stops the
+    // server; the operator asked for a policy and should not get a silent
+    // half of it.
+    if !args.extension_pins.is_empty()
+        && let Err(error) = pinkdb_ext_loader::set_pins(&args.extension_pins)
+    {
+        eprintln!("Error: {error}");
+        return ExitCode::from(2);
+    }
 
     // COPY TO destination root (M-3): validated before anything binds.
     let copy_root: Option<std::path::PathBuf> = match &args.copy_root {

@@ -12,11 +12,12 @@
 __pycache__/
 *.swp
 
-# C/C++ extension SDK build outputs
+# C extension SDK build outputs (the C++ SDK has its own build/ directory)
 /ext-sdk/c/build/
 /ext-sdk/c/template/build/
 /ext-sdk/c/template/my_extension.dylib
 /ext-sdk/c/template/my_extension.so
+/ext-sdk/cpp/build/
 
 # Go extension SDK build outputs
 /ext-sdk/go/build/

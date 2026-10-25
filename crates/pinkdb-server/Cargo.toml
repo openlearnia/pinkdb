@@ -34,6 +34,10 @@ path = "src/bin/pinkdb-server.rs"
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
+# The optional SHA-256 pin allowlist (`--extension-pin`): a workspace crate the
+# engine already links, so this adds no dependency to the binary beyond the API
+# the flag needs.
+pinkdb-ext-loader = { path = "../pinkdb-ext-loader" }
 # Async transport (`async-server` feature only): the listener, per-connection
 # frame I/O, timers, and the blocking pool that runs engine calls. `net` +
 # `rt-multi-thread` + `time` + `sync` + `io-util`; no other runtime feature is

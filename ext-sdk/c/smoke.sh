@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# pinkdb C/C++ extension SDK smoke test.
+# pinkdb C extension SDK smoke test.
 #
 # End-to-end proof that the SDK works against a real host:
 #   1. builds the release CLI (`cargo build --release -p pinkdb-cli`);
-#   2. builds the three examples with the SDK Makefile (build/*.dylib);
+#   2. builds the examples and the ABI conformance fixture with the SDK
+#      Makefile (build/*.dylib);
 #   3. runs a deterministic SQL session in a scratch directory that loads
 #      each example via `LOAD EXTENSION '<path>'` and exercises the
 #      registered functions: numeric results, NULL inputs, a VARCHAR result
@@ -35,8 +36,8 @@ make -C "$here" -s all
 
 math="$here/build/math_ext.$so_ext"
 string="$here/build/string_ext.$so_ext"
-cpp="$here/build/cpp_ext.$so_ext"
-for lib in "$math" "$string" "$cpp"; do
+conformance="$here/build/conformance_ext.$so_ext"
+for lib in "$math" "$string" "$conformance"; do
     if [ ! -f "$lib" ]; then
         echo "FAIL: expected example library is missing: $lib" >&2
         exit 1
@@ -58,22 +59,26 @@ trap cleanup EXIT
 statements=(
     "LOAD EXTENSION '$math';"
     "LOAD EXTENSION '$string';"
-    "LOAD EXTENSION '$cpp';"
+    "LOAD EXTENSION '$conformance';"
 
     # Display queries: what the report shows. Values are grepped below.
     "SELECT ext_clamp(CAST(5 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGINT)) AS clamped, ext_deg2rad(CAST(180 AS DOUBLE)) AS radians;"
     "SELECT ext_repeat('ab', 3) AS repeated, ext_title('hello wORLD') AS titled;"
-    "SELECT ext_add_checked(CAST(2 AS BIGINT), CAST(3 AS BIGINT)) AS sum;"
+    "SELECT ext_now_micros() IS NOT NULL AS now_present;"
 
     # Numeric behavior, NULL handling, VARCHAR ownership and error paths.
     "SELECT CASE WHEN ext_clamp(CAST(5 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGINT)) = 5 AND ext_clamp(CAST(-5 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGINT)) = 0 AND ext_clamp(CAST(50 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGINT)) = 10 THEN 'clamp ok' ELSE 'clamp FAIL' END;"
     "SELECT CASE WHEN ext_deg2rad(CAST(180 AS DOUBLE)) > 3.14159 AND ext_deg2rad(CAST(180 AS DOUBLE)) < 3.1416 AND ext_deg2rad(CAST(0 AS DOUBLE)) = 0.0 THEN 'degrees ok' ELSE 'degrees FAIL' END;"
-    "SELECT CASE WHEN ext_clamp(NULL, CAST(0 AS BIGINT), CAST(10 AS BIGINT)) IS NULL AND ext_deg2rad(NULL) IS NULL AND ext_repeat(NULL, 3) IS NULL AND ext_repeat('x', NULL) IS NULL AND ext_title(NULL) IS NULL AND ext_add_checked(NULL, CAST(5 AS BIGINT)) IS NULL THEN 'null ok' ELSE 'null FAIL' END;"
+    "SELECT CASE WHEN ext_clamp(NULL, CAST(0 AS BIGINT), CAST(10 AS BIGINT)) IS NULL AND ext_deg2rad(NULL) IS NULL AND ext_repeat(NULL, 3) IS NULL AND ext_repeat('x', NULL) IS NULL AND ext_title(NULL) IS NULL AND ext_now_micros() IS NOT NULL THEN 'null ok' ELSE 'null FAIL' END;"
     "SELECT CASE WHEN ext_repeat('ab', 3) = 'ababab' AND ext_repeat('héllo', 2) = 'héllohéllo' AND ext_repeat('ab', 0) IS NOT NULL AND length(ext_repeat('ab', 0)) = 0 AND upper(ext_repeat('ab', 2)) = 'ABAB' THEN 'repeat ok' ELSE 'repeat FAIL' END;"
     "SELECT CASE WHEN ext_title('hello wORLD') = 'Hello World' AND ext_title('pinkdb') = 'Pinkdb' THEN 'title ok' ELSE 'title FAIL' END;"
-    "SELECT CASE WHEN ext_add_checked(CAST(2 AS BIGINT), CAST(3 AS BIGINT)) = 5 AND ext_add_checked(9223372036854775807, CAST(0 AS BIGINT)) = 9223372036854775807 AND ext_add_checked(CAST(-2 AS BIGINT), CAST(-3 AS BIGINT)) = -5 THEN 'add ok' ELSE 'add FAIL' END;"
-    "SELECT ext_add_checked(9223372036854775807, CAST(1 AS BIGINT));"
+    "SELECT CASE WHEN ext_now_micros() IS NOT NULL AND ext_now_micros() IS NOT NULL THEN 'volatile ok' ELSE 'volatile FAIL' END;"
     "SELECT ext_clamp(CAST(1 AS BIGINT), CAST(10 AS BIGINT), CAST(0 AS BIGINT));"
+
+    # Volatile: allowed in a read-only query, refused in a statement the
+    # engine WAL-logs (replay would compute a different value).
+    "CREATE TABLE volatile_t (x BIGINT);"
+    "INSERT INTO volatile_t VALUES (ext_now_micros());"
 )
 
 echo "==> running the session in $tmp"
@@ -117,18 +122,17 @@ check_marker() { # check_marker <description> <marker>: one result ROW is exactl
 
 check "math_ext loaded"            "Extension math_ext loaded."
 check "string_ext loaded"          "Extension string_ext loaded."
-check "cpp_ext loaded"             "Extension cpp_ext loaded."
+check "conformance_ext loaded"     "Extension conformance_ext loaded."
 check_marker "ext_clamp applied"       "clamp ok"
 check_marker "ext_deg2rad applied"     "degrees ok"
 check_marker "NULL inputs -> NULL"     "null ok"
 check_marker "ext_repeat + ownership"  "repeat ok"
 check_marker "ext_title applied"       "title ok"
-check_marker "ext_add_checked applied" "add ok"
+check_marker "volatile allowed in SELECT" "volatile ok"
 check "ext_clamp/deg2rad display row"  "│ 5       │ 3.141592653589793 │"
 check "VARCHAR display row"            "│ ababab   │ Hello World │"
-check "ext_add_checked display row"    "│ 5      │"
-check "ext_add_checked overflow error" "ext_add_checked() failed with code 1"
 check "ext_clamp lo > hi error"        "ext_clamp() failed with code 1"
+check "volatile refused in WAL statement" "ext_now_micros() is volatile (nondeterministic)"
 
 if [ "$failures" -ne 0 ]; then
     printf 'FAILED: %d of %d checks failed\n' "$failures" "$((checks + failures))" >&2

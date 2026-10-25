@@ -248,38 +248,76 @@ Extension math_ext loaded.</code></pre></div>
 
 <h2 id="writing-an-extension">Writing an extension<a class="anchor" href="#writing-an-extension" aria-label="Permalink: Writing an extension">#</a></h2>
 
-<p>The in-repo SDKs provide a vendored ABI header, a commented template and worked
-examples:</p>
+<p>The in-repo SDKs all speak the same ABI (<code>PINKDB_EXT_ABI_VERSION</code> 1,
+minor 2), keep a vendored header that is byte-identical to the loader's, and build
+the same conformance fixture so they cannot drift apart:</p>
 
 <div class="table-wrap">
 <table>
-  <thead><tr><th>SDK</th><th>Directory</th><th>Status</th></tr></thead>
+  <thead><tr><th>SDK</th><th>Directory</th><th>What it adds</th></tr></thead>
   <tbody>
     <tr>
-      <td>C / C++</td>
-      <td><code>ext-sdk/c/</code> (examples: numeric, string, C++)</td>
-      <td>shipped</td>
+      <td>C</td>
+      <td><code>ext-sdk/c/</code></td>
+      <td>vendored header, template (incl. <code>pinkdb_ext_serve</code>), numeric and
+      string examples, Makefile, smoke test</td>
+    </tr>
+    <tr>
+      <td>C++ (header-only)</td>
+      <td><code>ext-sdk/cpp/</code></td>
+      <td><code>pinkdb::ext</code> RAII wrapper: <code>Host</code>,
+      <code>Value</code>, move-only <code>Text</code>, <code>Writer</code>,
+      exception <code>guard()</code></td>
     </tr>
     <tr>
       <td>Go (cgo, <code>-buildmode=c-shared</code>)</td>
       <td><code>ext-sdk/go/</code></td>
-      <td>shipped</td>
+      <td><code>pinkdb</code> package: <code>Init</code>, <code>Register</code>,
+      <code>RegisterVolatile</code>, <code>Guard</code>, <code>SetText</code>,
+      <code>ExecuteStatement</code></td>
     </tr>
     <tr>
       <td>Rust</td>
-      <td><code>ext-sdk/rust/</code> (safe wrapper + macros)</td>
-      <td>shipped (safe wrapper + <code>pinkdb_extension!</code> macros)</td>
+      <td><code>ext-sdk/rust/</code></td>
+      <td><code>pinkdb_extension!</code> macros + <code>pinkdb_abi_exports!()</code>;
+      no <code>unsafe</code> in an extension</td>
     </tr>
   </tbody>
 </table>
 </div>
 
-<p>An extension exports three symbols; <code>init</code> registers scalar functions
-through the host API:</p>
+<p>An extension exports two required symbols, an optional third, and <code>init</code>
+registers scalar functions through the host API:</p>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">C</span></div><pre class="code" data-lang="c"><code>uint32_t    pinkdb_extension_abi_version(void);   /* PINKDB_EXT_ABI_VERSION */
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">C</span></div><pre class="code" data-lang="c"><code>uint32_t    pinkdb_extension_abi_version(void);   /* must return PINKDB_EXT_ABI_VERSION */
 const char *pinkdb_extension_name(void);          /* UTF-8, non-empty, <=256 bytes */
-int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);</code></pre></div>
+int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);
+
+/* Optional (ABI minor 2): serve a client on stdio or localhost HTTP. */
+int32_t     pinkdb_ext_serve(const PinkdbHostApi *api, void *host_ctx,
+                             const char *transport, const char *options);</code></pre></div>
+
+<p>Negotiate before touching an optional field: <code>api-&gt;struct_size</code> says
+how much of the host API this host publishes, and the header's
+<code>PINKDB_EXT_HOST_HAS_FLAGS(api)</code> / <code>PINKDB_EXT_HOST_HAS_EXECUTE(api)</code>
+answer that for you. Copy the struct with <code>pinkdb_ext_copy_api()</code> — it is
+valid only during <code>init</code>:</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">C</span></div><pre class="code" data-lang="c"><code><span class="tok-k">int32_t</span> pinkdb_extension_init(<span class="tok-k">const</span> PinkdbHostApi *api, <span class="tok-k">void</span> *host_ctx) {
+    <span class="tok-k">if</span> (api-&gt;struct_size &lt; PINKDB_EXT_API_V1_SIZE) <span class="tok-k">return</span> <span class="tok-n">2</span>;   <span class="tok-c">/* too old */</span>
+    pinkdb_ext_copy_api(&amp;g_api, api);
+    <span class="tok-k">if</span> (!PINKDB_EXT_HOST_HAS_FLAGS(api)) <span class="tok-k">return</span> <span class="tok-n">3</span>;   <span class="tok-c">/* cannot declare volatile */</span>
+
+    <span class="tok-k">static</span> <span class="tok-k">const</span> <span class="tok-k">int32_t</span> bigint = PINKDB_EXT_TYPE_BIGINT;
+    <span class="tok-k">int</span> code = g_api.register_scalar_flags(host_ctx, <span class="tok-s">"hello_now"</span>, <span class="tok-n">0</span>, <span class="tok-k">NULL</span>,
+                                           PINKDB_EXT_TYPE_BIGINT,
+                                           PINKDB_EXT_FLAG_VOLATILE,
+                                           hello_now, <span class="tok-k">NULL</span>);
+    <span class="tok-k">if</span> (code != <span class="tok-n">0</span>) <span class="tok-k">return</span> <span class="tok-n">10</span>;
+    code = g_api.register_scalar(host_ctx, <span class="tok-s">"hello_add"</span>, <span class="tok-n">2</span>, &amp;bigint,
+                                 PINKDB_EXT_TYPE_BIGINT, hello_add, <span class="tok-k">NULL</span>);
+    <span class="tok-k">return</span> code != <span class="tok-n">0</span> ? <span class="tok-n">11</span> : <span class="tok-n">0</span>;
+}</code></pre></div>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">C</span></div><pre class="code" data-lang="c"><code><span class="tok-k">static</span> <span class="tok-k">int32_t</span> hello_add(<span class="tok-k">void</span> *user_data, <span class="tok-k">const</span> pinkdb_ext_value *args,
                          <span class="tok-k">size_t</span> n_args, pinkdb_ext_value *out) {
@@ -299,28 +337,47 @@ int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);</co
                                 PINKDB_EXT_TYPE_BIGINT, hello_add, <span class="tok-k">NULL</span>);
 }</code></pre></div>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>make <span class="tok-f">-C</span> ext-sdk/c                 <span class="tok-c"># build the examples</span>
-./ext-sdk/c/smoke.sh              <span class="tok-c"># build + load + query, end to end</span>
-make <span class="tok-f">-C</span> ext-sdk/go &amp;&amp; ./ext-sdk/go/smoke.sh
-make <span class="tok-f">-C</span> ext-sdk/rust &amp;&amp; ./ext-sdk/rust/smoke.sh</code></pre></div>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>make <span class="tok-f">-C</span> ext-sdk/c  &amp;&amp; ./ext-sdk/c/smoke.sh      <span class="tok-c"># C</span>
+make <span class="tok-f">-C</span> ext-sdk/cpp &amp;&amp; ./ext-sdk/cpp/smoke.sh   <span class="tok-c"># C++ (header-only wrapper)</span>
+make <span class="tok-f">-C</span> ext-sdk/go &amp;&amp; ./ext-sdk/go/smoke.sh     <span class="tok-c"># Go</span>
+make <span class="tok-f">-C</span> ext-sdk/rust &amp;&amp; ./ext-sdk/rust/smoke.sh <span class="tok-c"># Rust</span>
+./ext-sdk/posture.sh                             <span class="tok-c"># the host-side refusals</span>
+cargo test <span class="tok-f">-p</span> pinkdb-ext-loader <span class="tok-f">--test</span> conformance  <span class="tok-c"># all four SDKs, one contract</span></code></pre></div>
 
 <p>Contract highlights (the header is complete):</p>
 
 <ul>
-  <li><strong>Deterministic vs volatile:</strong> a function may declare itself volatile (clock/random-like); the engine then refuses to call it in any statement it WAL-logs (replay could diverge) with an explicit error. Deterministic is the default.</li>
+  <li><strong>Size negotiation:</strong> <code>struct_size</code> grows additively —
+  <code>PINKDB_EXT_API_V1_SIZE</code>, <code>PINKDB_EXT_API_FLAGS_SIZE</code> (adds
+  <code>register_scalar_flags</code>) and <code>PINKDB_EXT_API_MINOR2_SIZE</code> (adds
+  <code>execute_statement</code>). Check before you call; an extension that needs a
+  newer field must refuse to load, never fall back to weaker semantics.</li>
+  <li><strong>Deterministic vs volatile:</strong> a function may declare itself volatile (clock/random-like); the engine then refuses to call it in any statement it WAL-logs (replay could diverge) with an explicit error. Deterministic is the default, and a host too old for the flag makes a volatile declaration a load failure.</li>
   <li><strong>Thread safety:</strong> callbacks run concurrently on the executor's
   rayon workers — a function may be invoked on several threads at once, so its state
   must be guarded (atomics, locks, TLS). <code>register_scalar</code> is only valid
   inside <code>pinkdb_extension_init</code>.</li>
-  <li><strong>Typing:</strong> ABI v1 is strictly typed; the result must carry the
+  <li><strong>Typing:</strong> the ABI is strictly typed — <code>BOOLEAN</code>,
+  <code>INTEGER</code>, <code>BIGINT</code>, <code>DOUBLE</code>, <code>VARCHAR</code>,
+  <code>DATE</code>, <code>TIMESTAMP</code> and <code>INTERVAL</code> (months/days packed
+  into the <code>double</code> bits, micros in the <code>int64</code>;
+  <code>DECIMAL</code> is deliberately unsupported). The result must carry the
   registered type tag.</li>
+  <li><strong>Limits:</strong> <code>64</code> arguments, a <code>256</code>-byte
+  function name, and a <code>64 MiB</code> VARCHAR result — over the limit is an error,
+  not a truncation. Unknown type tags and unknown flag bits are rejected at
+  registration.</li>
   <li><strong>VARCHAR results</strong> must be allocated with
   <code>api-&gt;alloc(size)</code>; the host copies <code>text_len</code> bytes and
   frees them with <code>api-&gt;free</code> immediately after the call — on every
   path. A rejected registration fails the whole load atomically.</li>
   <li><strong>Errors:</strong> a non-zero return aborts the enclosing statement with
   a message naming the function and code; callbacks must not panic across the ABI
-  boundary (in C++: catch everything).</li>
+  boundary (in C++: catch everything). A VARCHAR result published on an error path is
+  still freed by the host — never leak it.</li>
+  <li><strong>Scalar only:</strong> this ABI registers scalar functions. Table
+  functions, replacement scans and COPY sinks are an extension <em>package</em> (below),
+  linked into the host — there is no registration call for them.</li>
 </ul>
 
 <h2 id="extensions-and-durable-databases">Extensions and durable databases<a class="anchor" href="#extensions-and-durable-databases" aria-label="Permalink: Extensions and durable databases">#</a></h2>
@@ -337,6 +394,28 @@ make <span class="tok-f">-C</span> ext-sdk/rust &amp;&amp; ./ext-sdk/rust/smoke.
   <li>On <code>pinkdb-server</code>, <code>LOAD EXTENSION</code> loads native code
   into the <em>server</em> process and is refused for remote clients unless the
   server runs with <code>--allow-load-extension</code>.</li>
+</ul>
+
+<h2 id="security-posture-local-libraries-are-trusted-or-pinned">Security posture: local libraries are trusted, or pinned<a class="anchor" href="#security-posture-local-libraries-are-trusted-or-pinned" aria-label="Permalink: Security posture: local libraries are trusted, or pinned">#</a></h2>
+
+<ul>
+  <li><strong>Opt-in.</strong> Nothing loads unless the CLI or server was started with
+  <code>--allow-load-extension</code> (or <code>PINKDB_ALLOW_LOAD_EXTENSION=1</code>),
+  and a remote <code>LOAD EXTENSION</code> also needs <code>ADMIN</code>.</li>
+  <li><strong>Confined.</strong> <code>--extension-root PATH</code> confines every load
+  to one directory; a bare library name (the dynamic loader's search path), a
+  <code>..</code> component and a symlinked library are always refused.</li>
+  <li><strong>Pinned.</strong> <code>--extension-pin PATH=SHA256</code> (repeatable)
+  turns on an allowlist: an unpinned library, a hash mismatch, or a file that changes
+  between the hash and the load is refused with the reason. The remaining window
+  between hashing a file and mapping it cannot be closed with
+  <code>dlopen</code> — treat the extension directory as root-owned.</li>
+  <li><strong>Unsigned.</strong> A locally loaded library is not signature-checked: the
+  Ed25519 check covers <code>.install</code> packages from the repository, and only in
+  a build with the <code>repo</code> feature. A loaded library runs with the
+  privileges of the process that loaded it, which for the server means the server's.</li>
+  <li><strong>Reproducible.</strong> A durable database replays
+  <code>LOAD EXTENSION</code> by path, so use stable absolute paths.</li>
 </ul>
 
 <h2 id="extension-packages-table-functions-and-copy-sinks-wave-86">Extension packages: table functions and COPY sinks (wave 86)<a class="anchor" href="#extension-packages-table-functions-and-copy-sinks-wave-86" aria-label="Permalink: Extension packages: table functions and COPY sinks (wave 86)">#</a></h2>
@@ -415,6 +494,7 @@ db.execute(<span class="tok-s">"LOAD EXTENSION 'lake';"</span>)?;       <span cl
   <li><a href="#installing-from-the-extension-repository">Installing from the extension repository</a></li>
   <li><a href="#writing-an-extension">Writing an extension</a></li>
   <li><a href="#extensions-and-durable-databases">Extensions and durable databases</a></li>
+  <li><a href="#security-posture-local-libraries-are-trusted-or-pinned">Security posture: local libraries are trusted, or pinned</a></li>
   <li><a href="#extension-packages-table-functions-and-copy-sinks-wave-86">Extension packages: table functions and COPY sinks (wave 86)</a></li>
 </ul>
 <p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
