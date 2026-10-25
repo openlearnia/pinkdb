@@ -11,14 +11,12 @@
 //!   the parquet source when it is registered. `read_csv('…')` is explicit
 //!   and accepts any local path or supported URL.
 //!
-//! # Semantics (wave 75 base surface)
+//! # Semantics
 //!
-//! The dialect is the engine's existing importer exactly: comma-separated,
-//! `"` quoting with `""` escapes, one header row, UTF-8, empty/unquoted cells
-//! as NULL, and the same whole-file type inference (INTEGER → BIGINT →
-//! DOUBLE, BOOLEAN, DATE, TIMESTAMP, else VARCHAR). `read_csv` therefore
-//! returns the same schema and values as `.import` for the same bytes; a
-//! `read_csv` and an `.import` of one file agree by construction.
+//! `read_csv` and `.import` share one parser and one option set
+//! ([`CsvOptions`] in the engine): dialect, encoding, header handling, NULL
+//! rules, inference and the error policy are the same code, so a `read_csv`
+//! and an `.import` of one file agree by construction, locally and remotely.
 //!
 //! Projection pushdown is applied *after* parsing (the CSV parser decodes
 //! every column; there is no column pruning in the format), and unprojected
@@ -36,16 +34,19 @@
 //!
 //! # Options
 //!
-//! [`CsvOptions`] is the extension point wave 76 fills in. Today every
-//! option is at its default (DuckDB's default dialect); a named argument is
-//! recognised and refused with a precise "not supported yet" message rather
-//! than silently ignored.
+//! A named argument is applied through the engine's
+//! [`CsvOptions::apply`], the same table `.import key=value` uses; the names
+//! are DuckDB's (`delimiter`, `quote`, `escape`, `encoding`, `header`,
+//! `nullstr`, `names`, `errors`, `allow_quoted_nulls`, `force_not_null`).
+//! `errors=warn` skips a bad row instead of failing the scan (a table
+//! function has no place to print the report `.import` prints).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pinkdb::attached::PrunePredicate;
-use pinkdb::csv::{infer_csv_schema, parse_csv_chunks, stream_csv_chunks};
+pub use pinkdb::csv::{CsvOptions, CsvSchema, Encoding};
+use pinkdb::csv::{parse_csv_chunks, sniff_csv, stream_csv_chunks};
 use pinkdb::{
     DataChunk, DataType, PinkDb, PinkDbError, Result, TableFunctionArg, TableFunctionCall,
     TableScanOutput, TableSource, TableSourceStats, Vector,
@@ -55,49 +56,6 @@ use crate::{Fetcher, HttpfsConfig, open_with};
 
 /// The registry name (`EXPLAIN` shows it; counters are attributed to it).
 pub const SOURCE_NAME: &str = "httpfs";
-
-/// Text encodings wave 76 will add. UTF-8 is the only implemented one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Encoding {
-    #[default]
-    Utf8,
-}
-
-impl Encoding {
-    pub fn name(self) -> &'static str {
-        match self {
-            Encoding::Utf8 => "utf-8",
-        }
-    }
-}
-
-/// CSV dialect and import options. Wave 75 pins the defaults; wave 76 adds
-/// the delimiter/quote/encoding/header/nullstr surface additively.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CsvOptions {
-    /// Field separator (default `,`).
-    pub delimiter: u8,
-    /// Quote byte (default `"`).
-    pub quote: u8,
-    /// Escape byte inside a quoted field (`None` = doubled quote).
-    pub escape: Option<u8>,
-    /// Whether the first row is the header (default `true`).
-    pub header: bool,
-    /// Text encoding (default UTF-8).
-    pub encoding: Encoding,
-}
-
-impl Default for CsvOptions {
-    fn default() -> Self {
-        Self {
-            delimiter: b',',
-            quote: b'"',
-            escape: None,
-            header: true,
-            encoding: Encoding::Utf8,
-        }
-    }
-}
 
 /// One parsed `read_csv` / replacement-scan call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,15 +67,7 @@ pub struct Call {
 
 impl Call {
     fn cache_key(&self) -> String {
-        format!(
-            "{}|{}|{}|{:?}|{}|{}",
-            self.path,
-            self.options.delimiter,
-            self.options.quote,
-            self.options.escape,
-            self.options.header,
-            self.options.encoding.name()
-        )
+        format!("{}|{:?}", self.path, self.options)
     }
 }
 
@@ -185,41 +135,41 @@ fn positional_path(args: &[TableFunctionArg]) -> Result<String> {
     path.ok_or_else(|| PinkDbError::Catalog("read_csv takes exactly one path argument".to_string()))
 }
 
-/// The option-parsing shape wave 76 extends. All wave-76 names are
-/// recognised and refused precisely (never ignored).
+/// Apply a call's named arguments through the engine's option table — one
+/// parser for `.import` and `read_csv`.
 fn parse_options(args: &[TableFunctionArg]) -> Result<CsvOptions> {
-    let options = CsvOptions::default();
+    let mut options = CsvOptions::default();
     for arg in args {
         let Some(name) = arg.name_lower() else {
             continue;
         };
-        match name.as_str() {
-            "delimiter" | "sep" | "quote" | "escape" | "encoding" | "header" | "auto_detect"
-            | "all_varchar" | "nullstr" | "names" | "columns" | "types" | "sample_size"
-            | "skip" | "ignore_errors" => {
-                return Err(PinkDbError::Catalog(format!(
-                    "read_csv option `{name}` is not supported yet: wave 75 reads DuckDB's \
-                     default CSV dialect (comma-delimited, double-quote quoting, one header \
-                     row, UTF-8); the option surface is the next file-import wave"
-                )));
-            }
-            other => {
-                return Err(PinkDbError::Catalog(format!(
-                    "unknown read_csv option `{other}`"
-                )));
-            }
-        }
+        options.apply(&name, &option_text(arg, &name)?)?;
     }
     Ok(options)
+}
+
+/// One option value as text. DuckDB accepts numbers/booleans where the value
+/// is a scalar (`header := 1`, `sample_size := 100`), so only the string-ish
+/// kinds are converted and everything else is refused precisely.
+fn option_text(arg: &TableFunctionArg, name: &str) -> Result<String> {
+    Ok(match &arg.value {
+        pinkdb::Value::Varchar(s) => s.clone(),
+        pinkdb::Value::Integer(i) => i.to_string(),
+        pinkdb::Value::Bigint(i) => i.to_string(),
+        pinkdb::Value::Double(f) => f.to_string(),
+        pinkdb::Value::Boolean(b) => b.to_string(),
+        other => {
+            return Err(PinkDbError::Type(format!(
+                "read_csv option `{name}` expects a string, got {other:?}"
+            )));
+        }
+    })
 }
 
 fn is_remote(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("s3://")
 }
-
-/// One CSV file's inferred output schema.
-pub type CsvSchema = Vec<(String, DataType)>;
 
 #[derive(Debug)]
 struct Cached {
@@ -289,14 +239,14 @@ impl CsvSource {
             let bytes = std::fs::read(&call.path).map_err(|e| {
                 PinkDbError::Execution(format!("cannot read CSV \"{}\": {e}", call.path))
             })?;
-            let schema = infer_csv_schema(&bytes)?;
+            let schema = sniff_csv(&bytes, &call.options)?;
             return Ok((Body::Whole(bytes), schema));
         }
         let head = self
             .open(&call.path)?
             .fetch_range(0, SNIFF_BYTES)
             .map_err(|e| PinkDbError::Execution(format!("cannot read \"{}\": {e}", call.path)))?;
-        let schema = infer_csv_schema(&head)?;
+        let schema = sniff_csv(&head, &call.options)?;
         if (head.len() as u64) < SNIFF_BYTES {
             // The probe returned less than it asked for: that was the whole
             // file, so the scan re-parses it without another request.
@@ -350,7 +300,7 @@ impl CsvSource {
             Some(entry) => (entry.body, entry.schema),
             None => self.load(call)?,
         };
-        let types: Vec<DataType> = schema.iter().map(|(_, t)| *t).collect();
+        let types = &schema.types;
         let selected: Vec<bool> = match projection {
             Some(projection) => (0..types.len()).map(|i| projection.contains(&i)).collect(),
             None => vec![true; types.len()],
@@ -359,18 +309,18 @@ impl CsvSource {
         let mut rows = 0u64;
         let mut emit = |chunk: DataChunk| {
             rows += chunk.num_rows as u64;
-            sink(Self::project(chunk, &selected, &types))
+            sink(Self::project(chunk, &selected, types))
         };
         match body {
             Body::Whole(bytes) => {
-                for chunk in parse_csv_chunks(&bytes, &types)? {
+                for chunk in parse_csv_chunks(&bytes, &schema)? {
                     emit(chunk)?;
                 }
             }
             Body::Stream(head) => {
                 let reader =
                     crate::prefetch::Prefetch::open_after_head(self.open(&call.path)?, head);
-                stream_csv_chunks(reader, &types, &mut emit)?;
+                stream_csv_chunks(reader, &schema, &mut emit)?;
             }
         }
         Ok((rows, decoded))
@@ -409,7 +359,14 @@ impl TableSource for CsvSource {
             body,
             schema: schema.clone(),
         });
-        Ok(Some(schema))
+        Ok(Some(
+            schema
+                .names
+                .iter()
+                .cloned()
+                .zip(schema.types.iter().copied())
+                .collect(),
+        ))
     }
 
     fn scan(
@@ -559,6 +516,7 @@ pub fn ensure_registered_with(config: HttpfsConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pinkdb::csv::{ErrorPolicy, Header};
     use pinkdb::{QueryResult, Value};
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
@@ -651,43 +609,78 @@ mod tests {
         let call = parse_call(&csv_call("x.csv")).unwrap().unwrap();
         assert_eq!(call.options, CsvOptions::default());
         assert_eq!(call.options.delimiter, b',');
-        assert!(call.options.header);
+        assert_eq!(call.options.header, Header::Auto);
 
-        let bad = TableFunctionCall::Function {
+        // Wave-76 options parse through the engine's shared option table.
+        let named = |values: Vec<(&str, Value)>| TableFunctionCall::Function {
             name: "read_csv".to_string(),
-            args: args(vec![
-                ("", Value::Varchar("x.csv".into())),
-                ("delimiter", Value::Varchar(";".into())),
-            ]),
+            args: args(values),
         };
-        let err = parse_call(&bad).unwrap_err().to_string();
-        assert!(err.contains("delimiter"), "{err}");
+        let call = parse_call(&named(vec![
+            ("", Value::Varchar("x.csv".into())),
+            ("sep", Value::Varchar("\t".into())),
+            ("quote", Value::Varchar("'".into())),
+            ("escape", Value::Varchar("\\".into())),
+            ("encoding", Value::Varchar("latin-1".into())),
+            ("header", Value::Boolean(false)),
+            ("errors", Value::Varchar("warn".into())),
+            ("nullstr", Value::Varchar("NA, N/A".into())),
+            ("names", Value::Varchar("a,b".into())),
+            ("allow_quoted_nulls", Value::Boolean(false)),
+            ("force_not_null", Value::Varchar("b".into())),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(call.options.delimiter, b'\t');
+        assert_eq!(call.options.quote, b'\'');
+        assert_eq!(call.options.escape, Some(b'\\'));
+        assert_eq!(call.options.encoding, pinkdb::csv::Encoding::Latin1);
+        assert_eq!(call.options.header, Header::Absent);
+        assert_eq!(call.options.errors, ErrorPolicy::Warn);
+        assert_eq!(call.options.nullstr, vec!["NA", "N/A"]);
+        assert_eq!(
+            call.options.names,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        assert!(!call.options.allow_quoted_nulls);
+        assert_eq!(call.options.force_not_null, vec!["b"]);
+
+        // The option set is part of the cache key, so two shapes of one path
+        // never share a sniff.
+        let plain = parse_call(&csv_call("x.csv")).unwrap().unwrap();
+        assert_ne!(plain.cache_key(), call_of("x.csv", ";").cache_key());
+
+        // Recognised but unimplemented stays precise, never silently ignored.
+        let unsupported = named(vec![
+            ("", Value::Varchar("x.csv".into())),
+            ("all_varchar", Value::Boolean(true)),
+        ]);
+        let err = parse_call(&unsupported).unwrap_err().to_string();
+        assert!(err.contains("all_varchar"), "{err}");
         assert!(err.contains("not supported yet"), "{err}");
 
-        let unknown = TableFunctionCall::Function {
-            name: "read_csv".to_string(),
-            args: args(vec![
-                ("", Value::Varchar("x.csv".into())),
-                ("bogus", Value::Integer(1)),
-            ]),
-        };
+        let unknown = named(vec![
+            ("", Value::Varchar("x.csv".into())),
+            ("bogus", Value::Integer(1)),
+        ]);
         let err = parse_call(&unknown).unwrap_err().to_string();
-        assert!(err.contains("unknown read_csv option `bogus`"), "{err}");
+        assert!(err.contains("unknown CSV option `bogus`"), "{err}");
 
-        let two = TableFunctionCall::Function {
-            name: "read_csv".to_string(),
-            args: args(vec![
-                ("", Value::Varchar("a.csv".into())),
-                ("", Value::Varchar("b.csv".into())),
-            ]),
-        };
+        let bad_delimiter = named(vec![
+            ("", Value::Varchar("x.csv".into())),
+            ("delimiter", Value::Varchar(";;".into())),
+        ]);
+        let err = parse_call(&bad_delimiter).unwrap_err().to_string();
+        assert!(err.contains("exactly one byte"), "{err}");
+
+        let two = named(vec![
+            ("", Value::Varchar("a.csv".into())),
+            ("", Value::Varchar("b.csv".into())),
+        ]);
         let err = parse_call(&two).unwrap_err().to_string();
         assert!(err.contains("exactly one path"), "{err}");
 
-        let not_string = TableFunctionCall::Function {
-            name: "read_csv".to_string(),
-            args: args(vec![("", Value::Integer(1))]),
-        };
+        let not_string = named(vec![("", Value::Integer(1))]);
         let err = parse_call(&not_string).unwrap_err().to_string();
         assert!(err.contains("string path"), "{err}");
 
@@ -697,6 +690,124 @@ mod tests {
             args: args(vec![("", Value::Varchar("x.parquet".into()))]),
         };
         assert!(parse_call(&other).unwrap().is_none());
+    }
+
+    fn call_of(path: &str, delimiter: &str) -> Call {
+        parse_call(&TableFunctionCall::Function {
+            name: "read_csv".to_string(),
+            args: args(vec![
+                ("", Value::Varchar(path.to_string())),
+                ("delimiter", Value::Varchar(delimiter.to_string())),
+            ]),
+        })
+        .unwrap()
+        .unwrap()
+    }
+
+    /// The same bytes with the same options give the same rows locally and
+    /// remotely: options only change how the parser reads, never the
+    /// transport split.
+    #[test]
+    fn options_read_the_same_local_and_remote() {
+        let server = crate::test_http::TestHttpServer::start();
+        // Latin-1 `é`, semicolon delimiter, CRLF, a quoted field holding `;`.
+        let body: &[u8] = b"id;name\r\n1;Andr\xe9\r\n2;\"b;b\"\r\n";
+        server.put("/o/opts.csv", body);
+        let dir = scratch_dir("opts");
+        let local = dir.join("opts.csv");
+        std::fs::write(&local, body).unwrap();
+        let mut db = PinkDb::new();
+        db.register_table_source(source_with(HttpfsConfig {
+            allow_http: true,
+            ..Default::default()
+        }));
+        let sql = |path: &str| {
+            format!(
+                "SELECT id, name FROM read_csv('{path}', delimiter := ';', \
+                 encoding := 'latin-1', header := true) ORDER BY id;"
+            )
+        };
+        let local_rows = rows(&mut db, &sql(local.to_str().unwrap()));
+        assert_eq!(
+            local_rows,
+            vec![
+                vec![Value::Integer(1), Value::Varchar("André".into())],
+                vec![Value::Integer(2), Value::Varchar("b;b".into())],
+            ]
+        );
+        assert_eq!(rows(&mut db, &sql(&server.url("/o/opts.csv"))), local_rows);
+    }
+
+    /// `errors=warn` skips a malformed row in a scan; the default fails.
+    #[test]
+    fn warn_policy_skips_bad_rows_in_a_scan() {
+        let dir = scratch_dir("warn");
+        let path = dir.join("w.csv");
+        std::fs::write(&path, "a,b\n1,2\n3,4,5\n6,7\n").unwrap();
+        let path = path.to_str().unwrap();
+        let mut db = PinkDb::new();
+        db.register_table_source(source());
+        let err = db
+            .execute(&format!("SELECT COUNT(*) FROM read_csv('{path}');"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("3 fields"), "{err}");
+        let got = rows(
+            &mut db,
+            &format!("SELECT SUM(a) FROM read_csv('{path}', errors := 'warn');"),
+        );
+        assert_eq!(got, vec![vec![Value::Bigint(7)]]);
+        // DuckDB's name for the same thing, and the switch back to strict.
+        let got = rows(
+            &mut db,
+            &format!("SELECT SUM(a) FROM read_csv('{path}', ignore_errors := true);"),
+        );
+        assert_eq!(got, vec![vec![Value::Bigint(7)]]);
+        let err = db
+            .execute(&format!(
+                "SELECT COUNT(*) FROM read_csv('{path}', ignore_errors := false);"
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("3 fields"), "{err}");
+    }
+
+    /// Timing aid, not a gate: a scan of a file larger than the sniff window
+    /// over the test HTTP server (the streaming path), and the same file
+    /// locally. Run with `cargo test -p pinkdb-httpfs --all-features
+    /// --release -- --ignored --nocapture csv_scan_speed`.
+    #[test]
+    #[ignore]
+    fn csv_scan_speed() {
+        let mut body = String::with_capacity(4 << 20);
+        body.push_str("id,name,note\n");
+        for i in 0..1_200_000u32 {
+            body.push_str(&format!("{i},n{i},\"a,b {i}\"\n"));
+        }
+        let body = body.into_bytes();
+        let dir = scratch_dir("speed");
+        let file = dir.join("big.csv");
+        std::fs::write(&file, &body).unwrap();
+        let server = crate::test_http::TestHttpServer::start();
+        server.put("/r/big.csv", &body);
+        let mut db = PinkDb::new();
+        db.register_table_source(source_with(HttpfsConfig {
+            allow_http: true,
+            ..Default::default()
+        }));
+        let url = server.url("/r/big.csv");
+        for (what, path) in [("local", file.display().to_string()), ("remote", url)] {
+            let start = std::time::Instant::now();
+            let got = rows(
+                &mut db,
+                &format!("SELECT COUNT(*), SUM(id) FROM read_csv('{path}');"),
+            );
+            eprintln!(
+                "{what}: {} bytes, {:?} -> {got:?}",
+                body.len(),
+                start.elapsed()
+            );
+        }
     }
 
     #[test]

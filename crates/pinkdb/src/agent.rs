@@ -220,7 +220,7 @@ pub fn error_kind(err: &PinkDbError) -> &'static str {
         PinkDbError::Parameter(_) => "parameter",
         PinkDbError::Execution(_) => "execution",
         PinkDbError::Io(_) => "io",
-        PinkDbError::Csv(_) => "csv",
+        PinkDbError::Csv { .. } => "csv",
     }
 }
 

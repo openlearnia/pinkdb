@@ -90,6 +90,7 @@ macro_rules! cli_error {
     }};
 }
 
+use pinkdb::csv::CsvOptions;
 use pinkdb::{
     DataType, DurableOpenOptions, EncryptionKey, PinkDb, QueryProfile, QueryResult, Value,
 };
@@ -411,11 +412,16 @@ fn print_help() {
     println!("  .tables                list tables and views of the current database");
     println!("  .schema <table|view>   show a schema (accepts db.table; quoting honored)");
     if cfg!(feature = "httpfs") {
-        println!("  .import <file.csv|https://…|s3://…> [table]");
-        println!("                         import CSV from a local file or a remote object");
+        println!("  .import <file.csv|https://…|s3://…> [table] [key=value …]");
+        println!("                         import CSV from a local file or a remote object;");
+        println!("                         options: delimiter, quote, escape, encoding, header,");
+        println!("                         errors=warn, nullstr, names, force_not_null");
     } else {
-        println!("  .import <file.csv> [table]  import CSV (table defaults to file stem;");
-        println!("                         db.table targets another database)");
+        println!("  .import <file.csv> [table] [key=value …]  import CSV (table defaults to the");
+        println!("                         file stem; db.table targets another database; options");
+        println!(
+            "                         are the read_csv ones: delimiter, encoding, errors=warn, …)"
+        );
     }
     if cfg!(feature = "parquet") {
         println!("  .parquet [stats|reset] parquet reader counters (pushdown evidence)");
@@ -908,22 +914,29 @@ fn cmd_schema(db: &mut PinkDb, arg: &str) {
 }
 
 /// Split one whitespace-delimited token off the front of `input`, keeping
-/// double-quoted spans together (the quotes stay in the token so the
-/// identifier parser can honor them).
+/// quoted spans together (the quotes stay in the token so the identifier and
+/// option-value parsers can honor them). Single quotes quote only an option
+/// value (`key='a b'`), so a path may contain an apostrophe.
 fn take_token(input: &str) -> Option<(String, &str)> {
     let s = input.trim_start();
     if s.is_empty() {
         return None;
     }
-    let mut in_quotes = false;
+    let mut quote: Option<char> = None;
+    let mut after_eq = false;
     let mut end = s.len();
     for (i, c) in s.char_indices() {
-        if c == '"' {
-            in_quotes = !in_quotes;
-        } else if c.is_whitespace() && !in_quotes {
-            end = i;
-            break;
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || (c == '\'' && after_eq) => quote = Some(c),
+            None if c.is_whitespace() => {
+                end = i;
+                break;
+            }
+            None => {}
         }
+        after_eq = c == '=';
     }
     Some((s[..end].to_string(), &s[end..]))
 }
@@ -943,23 +956,64 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Strip the outer quotes of an option value (`';'`, `"var"`); `""` unescapes.
+fn unquote_value(s: &str) -> String {
+    let t = s.trim();
+    let inner = t
+        .strip_prefix('\'')
+        .and_then(|x| x.strip_suffix('\''))
+        .or_else(|| t.strip_prefix('"').and_then(|x| x.strip_suffix('"')));
+    match inner {
+        Some(x) if t.len() >= 2 => x.replace("\"\"", "\""),
+        _ => t.to_string(),
+    }
+}
+
+fn import_usage() {
+    println!("Usage: .import <file.csv|https://…|s3://…> [table] [key=value …]");
+    println!("       options: delimiter quote escape encoding header errors nullstr names");
+    println!("                allow_quoted_nulls force_not_null (as in read_csv)");
+}
+
 fn cmd_import(db: &mut PinkDb, arg: &str) {
-    let Some((file, rest)) = take_token(arg) else {
-        println!("Usage: .import <file.csv|https://…|s3://…> [table]");
+    let Some((file, mut rest)) = take_token(arg) else {
+        import_usage();
         return;
     };
     let file = unquote(&file);
-    let table = match take_token(rest) {
-        Some((t, tail)) if tail.trim().is_empty() => Some(t),
-        Some(_) => {
-            println!("Usage: .import <file.csv|https://…|s3://…> [table]");
-            return;
+    let mut table = None;
+    let mut opts = CsvOptions::default();
+    let mut seen_option = false;
+    while let Some((token, tail)) = take_token(rest) {
+        rest = tail;
+        match token.split_once('=') {
+            Some((key, value)) => {
+                seen_option = true;
+                if let Err(e) = opts.apply(key.trim(), &unquote_value(value)) {
+                    cli_error!("{e}");
+                    return;
+                }
+            }
+            // Only the table may come before the first option.
+            None if table.is_none() && !seen_option => table = Some(token),
+            None => {
+                import_usage();
+                return;
+            }
         }
-        None => None,
-    };
+    }
     let t0 = Instant::now();
-    match pinkdb::csv::import_csv(db, &file, table.as_deref()) {
-        Ok(n) => println!("Imported {n} rows in {:.3}s", t0.elapsed().as_secs_f64()),
+    match pinkdb::csv::import_csv_opts(db, &file, table.as_deref(), &opts) {
+        Ok(report) => {
+            println!(
+                "Imported {} rows in {:.3}s",
+                report.rows,
+                t0.elapsed().as_secs_f64()
+            );
+            if report.rejects.total > 0 {
+                print!("{}", report.rejects);
+            }
+        }
         Err(e) => cli_error!("{e}"),
     }
 }

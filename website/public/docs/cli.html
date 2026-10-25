@@ -248,10 +248,11 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
       (<code>"My Db".t</code>)</td>
     </tr>
     <tr>
-      <td><code>.import &lt;file.csv&gt; [table]</code></td>
+      <td><code>.import &lt;file.csv&gt; [table] [key=value …]</code></td>
       <td>import a CSV; the table defaults to the file stem, and a
       <code>db.table</code> target names another database when <code>db</code>
-      exists</td>
+      exists. Options are the <code>read_csv</code> ones below
+      (<code>sep=';' encoding=latin-1 header=true errors=warn …</code>)</td>
     </tr>
     <tr>
       <td><code>.save &lt;file.pink&gt;</code></td>
@@ -373,6 +374,51 @@ the <code>repo</code> feature.</p>
 left side names an existing database — otherwise the whole string is the table name,
 so a file stem like <code>data.2024.csv</code> imports as
 <code>data.2024</code>.</p>
+
+<h2 id="csv-options">CSV options<a class="anchor" href="#csv-options" aria-label="Permalink: CSV options">#</a></h2>
+
+<p><code>.import</code> and <code>read_csv</code> share one option set (DuckDB's
+parameter names), so <code>.import f.csv t sep=';' header=true</code> and
+<code>SELECT * FROM read_csv('f.csv', sep := ';', header := true)</code> read a
+file identically — locally, over <code>https://</code> and from
+<code>s3://</code>:</p>
+
+<ul>
+  <li><code>delimiter</code> / <code>sep</code> / <code>delim</code> /
+  <code>separator</code> — any single byte (a tab, or the
+  <code>\t</code> spelling); <code>quote</code> — any byte;
+  <code>escape</code> — a byte or off (the default).</li>
+  <li><code>encoding</code> — <code>utf-8</code> (default), <code>latin-1</code>,
+  <code>windows-1252</code>, <code>utf-16le</code>, <code>utf-16be</code>; the
+  default (<code>auto</code>) strips a UTF-8 BOM and switches to UTF-16 on a
+  LE/BE BOM. Decoders stream, so remote read-ahead is unaffected.</li>
+  <li><code>header</code> — <code>auto</code> (default) applies DuckDB's rule:
+  infer over every row and again over the rows below the first, and treat row 1
+  as a header when the two disagree or the data is all text.
+  <code>true</code>/<code>false</code> force it, <code>names='x,y'</code>
+  overrides the names.</li>
+  <li><code>nullstr='NA,N/A'</code> adds NULL tokens;
+  <code>allow_quoted_nulls=false</code> keeps a quoted empty field as
+  <code>''</code>; <code>force_not_null='a'</code> keeps a column's empties as
+  <code>''</code>. By default an empty field is NULL whether quoted or not.</li>
+  <li><code>errors=warn</code> (DuckDB's name for the same thing,
+  <code>ignore_errors := true</code>) skips bad rows. <code>.import</code>
+  prints a rejects report — line, column and reason, the first ten plus a
+  total; a <code>read_csv</code> scan has nowhere to print that, so there a
+  bad row is silently dropped. <code>error</code> is the default: the import
+  fails, names the line, and leaves no table behind.</li>
+  <li>An import parses in parallel whenever a scan can prove the file's dialect
+  (no <code>\r</code>, quotes only as RFC 4180 quoting — a quote opens a
+  field, <code>""</code> is a literal quote, a close is followed by a delimiter
+  or a line end). Any other file goes through the streaming record reader, with
+  the same schema and rows. <code>read_csv</code> scans use the same parser,
+  window by window for a remote or large file, so a scan of a 773 MB
+  <code>lineitem.csv</code> takes 1.4 s instead of 5.3 s.</li>
+</ul>
+
+<p>Importing into a table that already exists matches columns <strong>by header
+name</strong>, case-insensitively: missing columns import as NULL, and file
+columns the table has no home for follow the error policy.</p>
 
 <h2 id="output-and-timing">Output and timing<a class="anchor" href="#output-and-timing" aria-label="Permalink: Output and timing">#</a></h2>
 
@@ -560,6 +606,7 @@ credentials — <code>--user</code>/<code>--password</code> (or
 <ul>
   <li><a href="#build-and-run">Build and run</a></li>
   <li><a href="#dot-commands">Dot-commands</a></li>
+  <li><a href="#csv-options">CSV options</a></li>
   <li><a href="#output-and-timing">Output and timing</a></li>
   <li><a href="#agent-mode">Agent mode</a></li>
   <li><a href="#scripting">Scripting</a></li>

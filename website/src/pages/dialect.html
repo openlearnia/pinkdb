@@ -36,7 +36,7 @@ is <a href="https://github.com/openlearnia/pinkdb/blob/main/docs/sql-conformance
     <tr><td><code>COPY</code> (files)</td><td>✗</td><td>CSV in via <code>.import</code> (local and, from wave 75, <code>https://</code> / <code>s3://</code>); remote exports are a follow-up</td></tr>
     <tr><td><code>ATTACH</code> (SQL)</td><td>✗</td><td>lakes attach with the <code>.lake attach</code> dot-command; Iceberg <code>ATTACH</code> is planned (wave 72)</td></tr>
     <tr><td><code>TRUNCATE</code>, <code>VACUUM</code>, <code>ANALYZE</code></td><td>✗</td><td>use <code>DELETE</code>; maintenance waves cover lake compaction (wave 67)</td></tr>
-    <tr><td>Table functions, <code>FROM 'file.csv'</code></td><td>✗</td><td><code>read_csv('url')</code> arrives with wave 75; <code>read_parquet</code>/<code>read_arrow</code> with waves 70–71</td></tr>
+    <tr><td>Table functions, <code>FROM 'file.csv'</code></td><td>✅</td><td><code>read_csv</code> (with the wave-76 options), <code>read_parquet</code>, <code>read_arrow</code> and replacement scans for local paths, <code>https://</code> and <code>s3://</code> in builds with the matching feature</td></tr>
   </tbody>
 </table>
 </div>

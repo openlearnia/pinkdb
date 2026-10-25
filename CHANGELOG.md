@@ -53,6 +53,93 @@ one-liners below.
   `bench/wave95_perf/`).
 
 ## 2026-10-24
+### Wave 76 — CSV import options ✅
+- **One option set, two front ends.** `.import` and `read_csv` now share
+  `pinkdb::csv::CsvOptions`, so `.import f.csv t sep=';' header=true` and
+  `read_csv('f.csv', sep := ';', header := true)` read a file identically —
+  locally, over `https://` and from `s3://`. Named parameters use DuckDB's
+  names (`delimiter`/`sep`/`delim`/`separator`, `quote`, `escape`, `encoding`,
+  `header`, `nullstr`/`null`, `names`/`column_names`,
+  `ignore_errors`/`errors`, `allow_quoted_nulls`, `force_not_null`); an unknown
+  or unsupported name is an error naming it, never silently ignored.
+- **Dialect.** `delimiter` takes any single byte (a literal tab or the `\t`
+  spelling), `quote` any byte, `escape` a byte or off (the default). A
+  multi-byte delimiter is refused instead of truncated.
+- **Encodings.** `latin-1`, `windows-1252`, `utf-16le`, `utf-16be`, and the
+  default `utf-8`; the default (`auto`) also strips a UTF-8 BOM and switches to
+  UTF-16 on a LE/BE BOM. The decoders are hand-written and stream — no new
+  dependency — so the wave-98c read-ahead and ranged remote reads keep working
+  and the sniff window never needs the whole file.
+- **Header and column matching.** `header=auto` applies DuckDB's rule: infer
+  the types over every row and again over the rows below the first; row 1 is a
+  header when the two disagree or when the data is all text. Importing into an
+  existing table matches columns **by header name**, case-insensitively:
+  missing columns become `NULL`, and file columns the table has no home for
+  follow the error policy. `names=` overrides the header, `header=false` reads
+  the first line as data (`column0`, `column1`, …).
+- **NULLs.** `nullstr='NA,N/A'` adds tokens, `allow_quoted_nulls=false` keeps a
+  quoted empty field as `''`, `force_not_null='a'` keeps a column's empties as
+  `''` (which widens the column to `VARCHAR`). The default is DuckDB's measured
+  behaviour, not the folklore: an empty field is `NULL` whether quoted or not.
+  A quoted cell keeps its own whitespace (only unquoted cells are trimmed), so
+  `"  x  "` stays `"  x  "` while `" 1 "` still imports as a number.
+- **`errors=warn`** (DuckDB's `ignore_errors := true`, accepted by that name
+  too) skips bad rows — a value that does not parse, or a row with more fields
+  than the header — and `.import` prints a rejects report (line, column,
+  reason; the first ten plus a total). A `read_csv` scan has nowhere to print
+  that report, so a scan skips silently: `warn` means skip, never "count the
+  bad rows". `error` stays the default: the first bad row fails the import and
+  leaves no table behind, and the error names the line. Storing rejects in a
+  table remains the recorded follow-up.
+- **The `csv` crate is gone.** Wave 75 pulled it in for the record reader; the
+  engine's own streaming reader replaced it and the dependency was left behind,
+  unused, with only `PinkDbError::Csv(csv::Error)` still naming it. That variant
+  is now pinkdb's own `PinkDbError::Csv { message, line, column }` (the FFI,
+  agent-JSON and Python bindings keep their stable `"csv"` error kind, and a
+  structural error now names its line), and `csv` left `Cargo.toml` and the
+  lockfile (22 lines). Size of the default release `pinkdb` binary:
+  **4,524,032 → 4,536,208 bytes** (+12,176, +0.27 %), which is the new error
+  payload and formatting, not the dependency — re-adding the unused `csv` crate
+  to the same tree builds a binary 16 bytes *smaller* (build metadata), so it
+  contributed no code.
+- **No import-speed regression.** The options layer initially cost 7× on
+  `.import` (18.2 s for TPC-H `lineitem`, 773 MB / 6 001 215 rows, against
+  2.54 s before the wave). Two causes: the type sniff walked the *whole* file
+  through the byte-at-a-time record reader, and the parallel batch parser
+  refused any file containing a `"`, so any quoted column fell back to it. The
+  sniff is now sample-limited (20 480 rows, DuckDB's `sample_size`; a column
+  with no value in the sample still triggers the exact pass), and the batch
+  parser understands RFC 4180 quoting — fields are split with the quoting
+  rules, `""` unescapes, a quoted cell keeps its whitespace — so a file is
+  parsed in parallel exactly as the record reader would read it — a file the
+  scan cannot prove falls back to the reader rather than being read wrong.
+  Measured with the reviewer's harness, interleaved, median of 3: `lineitem`
+  **2.54 s → 0.87 s**, `orders` (174 MB) **0.42 s → 0.21 s** — twice as fast
+  as before the wave, not just within budget. Slower by design, and measured
+  on the same 773 MB file: `errors=warn` 12.2 s (the rejects report needs the
+  sequential reader), `encoding=latin-1` 14.2 s, `encoding=utf-16` 13.3 s
+  (1.5 GB, BOM autodetected) — transcoding and warn still run through the
+  record reader, which is the recorded next target.
+- **`read_csv` scans share it.** A table-function scan parsed with the record
+  reader too (7.4 s for `SELECT count(*) FROM read_csv('lineitem.csv')`
+  against 5.03 s before the wave). It now runs the same batch parser: a file
+  under the 8 MiB sniff window at once, anything larger — a remote object, or
+  a local file past that window — in 8 MiB windows of the wave-98c prefetch,
+  each window cut at its last provable record end so a record can straddle two
+  windows, and a window the scan cannot prove is finished by the reader. 5.03 s → **1.36 s**, and
+  the same 33.9 MB file through the test HTTP server 486 ms → **120 ms**
+  (local 522 → 77 ms). Values, not just counts, match `.import` on lineitem
+  (`sum(length(l_comment))`, `sum(l_orderkey)`, date bounds, `sum(l_quantity)`).
+- **Unchanged:** a sampled column that a later row contradicts still falls
+  back to whole-file inference, and a durable import still checkpoints before
+  it returns. An import that appends to an existing table is atomic too: a
+  strict failure restores the table instead of leaving half the file in it.
+- Tests: `pinkdb` CSV module 34 (from 19), including a DuckDB-oracle test for
+  the empty-field rule and header auto-detection that skips when the α binary
+  is absent; `pinkdb-httpfs` 62 (local-vs-remote option parity, `errors=warn`
+  in a scan); 4 new `.import` CLI tests; workspace **1865** tests / 161 suites,
+  9 ignored (one of them the scan speed aid).
+
 ### Wave 101a — the `VARIANT` type core ✅
 - **The type.** `VARIANT` is now a column type: one column, any shape per row —
   a JSON null, boolean, integer, double, decimal, string, date/timestamp, array

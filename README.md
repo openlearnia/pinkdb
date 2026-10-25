@@ -645,8 +645,9 @@ variables set the defaults.
 
 REPL dot-commands: `.help`, `.quit` / `.exit`, `.read`, `.timer`, `.databases`, `.tables`,
 `.schema <t|v>` (accepts `db.table`; views show their output columns),
-`.import <file.csv> [table]` (table defaults to the file stem; `db.table`
-targets another database; with `--features httpfs`, an `https://`/`s3://` URL),
+`.import <file.csv> [table] [key=value …]` (table defaults to the file stem;
+`db.table` targets another database; with `--features httpfs`, an
+`https://`/`s3://` URL; options are `read_csv`'s below),
 `.save <file.pink>`, `.open <file.pink>`.
 `.databases` marks the current one and counts tables and views separately
 (`main (current) (2 tables, 1 view)`). `.tables` and `.schema` scope to the
@@ -660,11 +661,53 @@ CSV inference (per column, over all non-empty cells): all i32 → INTEGER, all
 i64 → BIGINT, all f64 → DOUBLE, all true/false (case-insensitive) → BOOLEAN,
 else VARCHAR. Empty cell → NULL.
 
-Types are inferred from the first 20 480 rows (DuckDB's sample size); if a
-later row disagrees with the sampled schema, the import transparently reruns
-with whole-file inference, so the final schema always matches the rule above.
-Files containing no `"` and no `\r` bytes are parsed in parallel across the
-rayon pool; anything else goes through the `csv` crate sequentially.
+Options are shared with the `read_csv` table function (same `CsvOptions`, DuckDB
+parameter names), as `.import f.csv t sep=';'` or
+`read_csv('f.csv', sep := ';')`: `delimiter`/`sep`/`delim`/`separator` (any one
+byte, `\t` spelling), `quote`, `escape` (default off), `encoding` (`utf-8`
+default; `latin-1`, `windows-1252`, `utf-16le`, `utf-16be`, and BOM autodetect —
+the decoders are hand-rolled and stream, so remote read-ahead is unaffected),
+`header` (`auto` default), `names`, `nullstr`, `allow_quoted_nulls`,
+`force_not_null`, and `errors` / `ignore_errors`. An unknown option name is an
+error, never ignored.
+
+`header=auto` uses DuckDB's rule: types are inferred over every row and again
+over the rows below the first, and row 1 is a header when the two disagree or
+the data is all text (`a,b` + `1,2` → header; `1,2` + `3,4` → no header).
+Importing into a table that already exists matches columns **by header name**,
+case-insensitively: missing columns import as NULL, file columns the table has
+no column for follow the error policy. `names='x,y'` overrides the header and
+`header=false` reads the first line as data (`column0`, `column1`, …).
+
+The empty-field rule is DuckDB's measured one: an empty field is NULL whether
+quoted or not; `allow_quoted_nulls=false` keeps a quoted empty field as `''`,
+`force_not_null='a'` keeps a column's empties as `''` (which widens it to
+VARCHAR), and `nullstr='NA,N/A'` adds NULL tokens.
+`errors=warn` (DuckDB's `ignore_errors := true`, accepted by that name too)
+skips bad rows (a value that does not parse, a row with more fields than the
+header) instead of failing the import, and `.import` prints a rejects report
+with the line, column and reason — the first ten plus a total. A `read_csv`
+scan has nowhere to print that report, so there a bad row is just dropped
+(`warn` means skip, and the scan returns the rows that parsed).
+`error` stays the default: the first bad row fails the import and leaves no
+table behind, and the error names the line (`CSV error on line 4: row has 3
+fields but the header has 2`).
+
+Types are inferred from the first 20 480 rows — DuckDB's sample size, and one
+pass over the file's head rather than the whole file. If a later row disagrees
+with the sampled schema, the import transparently reruns with whole-file
+inference, so the final schema always matches the rule above. Imports are
+parsed in parallel across the rayon pool whenever the file's dialect is
+provable from a scan: no `\r`, and quotes only as RFC 4180 quoting (a quote
+opens a field, `""` is a literal quote, a close is followed by a delimiter or
+a line end). Anything else goes through the streaming record reader, which
+reads the same bytes row by row — same schema, same rows, slower.
+
+`read_csv` scans take the same parser: a local file is parsed whole, a remote
+one (or a local file past the 8 MiB sniff window) is parsed in 8 MiB windows,
+each window cut at its last provable record end so a record may straddle two
+windows, and the record reader finishes any window the scan cannot prove. A
+scan of TPC-H `lineitem` (773 MB) went from 5.03 s to 1.36 s.
 
 ## Persistence
 
@@ -1595,11 +1638,16 @@ SELECT * FROM read_arrow('https://example.com/data.arrow');
 SELECT * FROM 's3://bucket/data.arrow';          -- whole object (IPC has no ranges)
 
 SELECT * FROM 'data/sales.csv';                  -- local .csv, same source
+
+-- the wave-76 options work the same on every scheme
+SELECT * FROM read_csv('https://example.com/e.csv', sep := ';', encoding := 'latin-1');
+SELECT * FROM read_csv('s3://bucket/e.csv', header := false, nullstr := 'NA');
 ```
 
 ```text
 .import https://example.com/sales.csv
 .import s3://bucket/data/sales.csv import_name
+.import e.csv import_name sep=';' encoding=latin-1 header=true
 ```
 
 - **Claim rules**: claims are by **extension regardless of scheme** — `.csv`
@@ -1609,13 +1657,12 @@ SELECT * FROM 'data/sales.csv';                  -- local .csv, same source
   `http://` too (the transport refuses plain http unless
   `PINKDB_HTTPFS_ALLOW_HTTP=1`). A remote path's query/fragment is ignored
   for the extension decision and kept for the transport.
-- **Parser**: exactly the engine's `.import` parser — comma-separated,
-  `"`-quoting with `""` escapes, one header row, UTF-8, empty fields as
-  NULL, and the same whole-file type inference (INTEGER → BIGINT → DOUBLE →
-  BOOLEAN → DATE → TIMESTAMP → VARCHAR). `read_csv` and `.import` of the same
-  bytes produce the same schema and rows. The wave-76 option surface
-  (`delimiter`, `quote`, `encoding`, `header`, …) is parsed-but-refused today
-  with a precise message, never ignored.
+- **Parser**: exactly the engine's `.import` parser and option set — the
+  wave-76 delimiter/quote/escape/encoding/header/NULL options, the same header
+  detection, type inference and empty-field rule. `read_csv` and `.import` of
+  the same bytes produce the same schema and rows, locally and remotely. The
+  sniff window is the first 8 MiB; a longer file streams through the same
+  reader, so options and semantics do not change with file size.
 - **Transport**: one shared crate, `pinkdb-httpfs`, serves both this feature
   and the lake's `s3` feature. It supports whole-object GET and **byte-range
   GET** (`Range: bytes=…`) on `https://` and `s3://`, plus HEAD size, through
@@ -1671,7 +1718,7 @@ SELECT * FROM 'data/sales.csv';                  -- local .csv, same source
 
 | Format | Schemes | Read strategy | Limits |
 |---|---|---|---|
-| CSV (`httpfs`) | `https://`, `s3://` (claim); `http://` explicit-only | whole-object `fetch()`; parser reuses `.import` | single object; default dialect only |
+| CSV (`httpfs`) | `https://`, `s3://` (claim); `http://` explicit-only | whole-object `fetch()`; parser reuses `.import` | single object; no globs/dirs/compression |
 | Parquet (`parquet/remote`) | `https://`, `s3://`, `http://` (claim; transport gate) | **ranged** footer + projected column-chunk ranges (one request per coalesced run, bounded read-ahead; serial 128 KiB blocks when `PINKDB_HTTPFS_PARALLELISM=0/1`); whole-object only when HEAD reports no size; `COUNT(*)` from footer row counts | single object; no remote globs/dirs |
 | Arrow IPC (`arrow/remote`) | `https://`, `s3://`, `http://` (claim; transport gate) | **whole-object** `fetch()` (IPC has no ranged footer protocol); one fetch per bind→scan | single object; no remote globs/dirs |
 | Iceberg (`iceberg/remote`) | `https://`, `s3://` (claim; transport gate) | **ranged**: the metadata JSON, the manifest list and each Avro manifest are windowed reads (256 KiB read-ahead), the data files then go through Parquet's ranged reader | single table; no remote directory listing, so the table needs `metadata/version-hint.text` |

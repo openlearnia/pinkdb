@@ -1145,7 +1145,7 @@ pub fn extract_field(part: &str) -> std::result::Result<ExtractField, String> {
 }
 
 /// All engine errors. Lean: a few string-carrying variants + transparent
-/// IO/CSV wrappers. No extra deps (no thiserror).
+/// IO wrappers. No extra deps (no thiserror).
 #[derive(Debug)]
 pub enum PinkDbError {
     Catalog(String),
@@ -1156,7 +1156,13 @@ pub enum PinkDbError {
     Parameter(String),
     Execution(String),
     Io(std::io::Error),
-    Csv(csv::Error),
+    /// A CSV read/parse error: the message, plus the 1-based file line and the
+    /// header name of the offending field where the reader knows them.
+    Csv {
+        message: String,
+        line: Option<u64>,
+        column: Option<String>,
+    },
 }
 
 impl fmt::Display for PinkDbError {
@@ -1168,7 +1174,20 @@ impl fmt::Display for PinkDbError {
             | PinkDbError::Parameter(msg)
             | PinkDbError::Execution(msg) => write!(f, "{msg}"),
             PinkDbError::Io(e) => write!(f, "IO error: {e}"),
-            PinkDbError::Csv(e) => write!(f, "CSV error: {e}"),
+            PinkDbError::Csv {
+                message,
+                line,
+                column,
+            } => {
+                write!(f, "CSV error")?;
+                if let Some(line) = line {
+                    write!(f, " on line {line}")?;
+                }
+                if let Some(column) = column {
+                    write!(f, ", column \"{column}\"")?;
+                }
+                write!(f, ": {message}")
+            }
         }
     }
 }
@@ -1177,7 +1196,6 @@ impl std::error::Error for PinkDbError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PinkDbError::Io(e) => Some(e),
-            PinkDbError::Csv(e) => Some(e),
             _ => None,
         }
     }
@@ -1186,12 +1204,6 @@ impl std::error::Error for PinkDbError {
 impl From<std::io::Error> for PinkDbError {
     fn from(e: std::io::Error) -> Self {
         PinkDbError::Io(e)
-    }
-}
-
-impl From<csv::Error> for PinkDbError {
-    fn from(e: csv::Error) -> Self {
-        PinkDbError::Csv(e)
     }
 }
 

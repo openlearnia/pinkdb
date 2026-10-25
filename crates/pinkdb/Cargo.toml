@@ -22,7 +22,6 @@ encryption = ["dep:aes-gcm", "dep:subtle", "dep:sha2"]
 js = ["dep:pinkdb-js", "pinkdb-js/engine"]
 
 [dependencies]
-csv = "1"
 peg = "0.8"
 rayon = "1.12.0"
 # The second compression stage of a `.pink` chunk frame (wave 102): the
