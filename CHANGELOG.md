@@ -9,6 +9,58 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-25
+### Wave 101b — `VARIANT` in Parquet, shredding and path statistics ✅
+- **Shredding.** A `VARIANT` column now splits into typed sub-columns: a
+  `metadata` dictionary shared by the whole row group, a residual `value`
+  buffer, and a `typed_value` group with one column per shredded object path.
+  The policy is inferred per column over all of its rows — a key is shredded
+  when it appears in at least 32 rows and in at least half of them, every
+  occurrence carries the same primitive kind (BOOLEAN, BIGINT, DOUBLE,
+  VARCHAR, DATE, TIMESTAMP), and at most eight keys qualify, most frequent
+  first. Present-but-null keys and every other shape stay in the residual, so
+  `{}` and `{"a": null}` remain distinct, and the reader reconciles both
+  buffers exactly.
+- **Parquet `VARIANT`.** `COPY … TO '….parquet'` and `read_parquet` no longer
+  refuse `VARIANT`: the writer emits the specification's `Variant` logical
+  type (specification version 1) and the reader accepts it, including a
+  per-row metadata dictionary and partially shredded files. DuckDB 2.0 reads a
+  pinkdb file and pinkdb reads a DuckDB file; the interop test runs both
+  directions and is skipped when the DuckDB binary is absent.
+- **Path statistics and pruning.** Every shredded path gets exact min/max and
+  null-count statistics, keyed the way DuckDB spells a path (`"a"`,
+  `"user"."id"`). So `WHERE payload['a'] = 5` or
+  `variant_extract(payload, '$.a') = 5` skips files whose bounds exclude the
+  value in `.pink` and Parquet lakes alike. A SQL catalog stores those facts in
+  DuckLake's own `ducklake_file_variant_stats` table — one row per summed path
+  per data file, written in the same catalog transaction as
+  `ducklake_file_column_stats` and deleted with the file by `expire` and
+  `cleanup`, on `pink:`, `sqlite:` and Postgres catalogs. DuckDB 2.0 attaches a
+  pinkdb-written lake and reads the rows, and pinkdb prunes on rows DuckDB
+  wrote; both directions are tested. Parquet row groups prune too, from the
+  shredded leaves' own statistics, which are trusted only for files whose
+  footer declares the shredding complete (`pinkdb.variant.complete`).
+- **Comparisons coerce the scalar side.** `payload['a'] = 5` and
+  `variant_extract(payload, '$.kind') = 'buy'` bind, with the scalar put on
+  `VARIANT`'s side; booleans, numbers, decimals, dates and timestamps compare
+  by value, a literal string becomes a variant string (not JSON), and a
+  non-literal `VARCHAR` is still a bind error.
+- **Extension ABI.** New `ExtType::Variant` (tag 10) carrying pinkdb's binary
+  encoding on the text channel; the ABI minor version goes 2 → 3, v1 and v1.2
+  extensions keep loading, and the header, Rust SDK and conformance fixture
+  (`cf_variant`, all four SDKs) were updated.
+- **Faster reassembly.** A leaf's records are stored flat with one offset per
+  row, and its byte values in one pool per leaf, instead of a vector and a
+  buffer per row; a full-value scan of a shredded Parquet column went from
+  0.695 s to 0.525 s over 1M rows and its ratio against the unshredded layout
+  from 1.40x to 1.18x.
+- **Measured.** 1M rows of mixed shapes in ten files: Parquet 12.3 MB shredded
+  against 14.4 MB unshredded (same data as JSON text: 12.0 MB), a selective
+  path filter 0.027 s against 0.260 s unshredded, 0.020 s against 0.209 s in a
+  `.pink` lake; a full scan of the column costs 1.18x the unshredded layout
+  when read straight from the file and is at parity at lake level. TPC-H
+  Q1/Q6 over 10M rows unchanged within noise (0.168/0.065 s against
+  0.166/0.066 s).
+
 ### Wave 96b — a stateless server: metadata in the lake catalog ✅ (phase 1)
 - **`pinkdb-server --catalog … --data …`.** A new durable mode beside `--file`:
   the engine catalog (databases, table definitions with constraints, defaults and

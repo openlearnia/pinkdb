@@ -6,8 +6,8 @@ import (
 )
 
 // Value / argument type tags, in the header's numbering (the pinkdb C ABI's
-// numbering, plus 9 for INTERVAL). Tag 8 is that ABI's DECIMAL, which
-// extension ABI v1 deliberately does not support.
+// numbering, plus 9 for INTERVAL and 10 for VARIANT). Tag 8 is that ABI's
+// DECIMAL, which extension ABI v1 deliberately does not support.
 const (
 	TypeNull      int32 = 0
 	TypeBoolean   int32 = 1
@@ -18,6 +18,7 @@ const (
 	TypeDate      int32 = 6
 	TypeTimestamp int32 = 7
 	TypeInterval  int32 = 9
+	TypeVariant   int32 = 10
 )
 
 // Value mirrors the C `pinkdb_ext_value` struct field for field, so a
@@ -98,6 +99,17 @@ func Bytes(b []byte) Value {
 	return v
 }
 
+// Variant builds a VARIANT value that borrows b: opaque pinkdb-encoded bytes
+// on the same text channel as VARCHAR. A *result* goes through
+// [API.SetVariant] so the host owns and frees the bytes.
+func Variant(b []byte) Value {
+	v := Value{TypeTag: TypeVariant, TextLen: uintptr(len(b))}
+	if len(b) > 0 {
+		v.TextPtr = &b[0]
+	}
+	return v
+}
+
 // Date builds a DATE value from days since 1970-01-01.
 func Date(days int32) Value { return Value{TypeTag: TypeDate, Int64: int64(days)} }
 
@@ -117,6 +129,10 @@ func Interval(months, days int32, micros int64) Value {
 		Double:  math.Float64frombits(bits),
 	}
 }
+
+// VariantBytes borrows a VARIANT value's payload (opaque pinkdb-encoded
+// bytes). Valid only for the duration of the callback, like [Value.Bytes].
+func (v Value) VariantBytes() []byte { return v.Bytes() }
 
 // Bool reads a BOOLEAN value.
 func (v Value) Bool() bool { return v.Int64 != 0 }

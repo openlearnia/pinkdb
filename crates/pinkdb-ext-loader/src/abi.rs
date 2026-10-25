@@ -22,15 +22,18 @@ use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
 pub const PINKDB_EXT_ABI_VERSION: u32 = 1;
 
-/// ABI **minor** version implemented by this loader (major 1, minor 2).
+/// ABI **minor** version implemented by this loader (major 1, minor 3).
 ///
 /// Minor 2 adds [`PinkdbHostApi::execute_statement`] and the optional
-/// `pinkdb_ext_serve` export; both are additive, so minor 1 and minor 0
+/// `pinkdb_ext_serve` export; minor 3 adds [`ExtType::Variant`]
+/// ([`PINKDB_EXT_TYPE_VARIANT`]). Both are additive, so minor 1 and minor 0
 /// extensions are unchanged. The wire exposes the minor only indirectly
 /// (`struct_size`, symbol presence), which is why the major check stayed an
-/// equality check.
+/// equality check — and why a new *type tag* needs no `struct_size`
+/// landmark: a host only ever sends the types an extension declared, and an
+/// older host rejects an unknown tag at registration.
 #[cfg(not(target_arch = "wasm32"))]
-pub const PINKDB_EXT_ABI_MINOR: u32 = 2;
+pub const PINKDB_EXT_ABI_MINOR: u32 = 3;
 
 /// Maximum argument count accepted by [`crate::PinkdbHostApi::register_scalar`]
 /// and by [`crate::LinkedFunction::new`]. Kept identical for both loading
@@ -84,6 +87,12 @@ pub const PINKDB_EXT_TYPE_TIMESTAMP: i32 = 7;
 /// DECIMAL, which extension ABI v1 deliberately does not support. The
 /// by-value payload packing is [`pack_interval`] / [`unpack_interval`].
 pub const PINKDB_EXT_TYPE_INTERVAL: i32 = 9;
+/// Semi-structured value. The payload rides the VARCHAR channel
+/// (`text_ptr` / `text_len`, exact byte count, no NUL): bytes in pinkdb's
+/// VARIANT encoding, the same bytes `pinkdb::variant::encode` writes and
+/// `pinkdb::variant::decode` reads. The tag number matches `pinkdb.h`'s
+/// `PINKDB_TYPE_VARIANT` (that header renders the value as JSON text).
+pub const PINKDB_EXT_TYPE_VARIANT: i32 = 10;
 
 /// Pack an interval's three fields into the by-value ABI payload: `micros`
 /// goes in the `int64` field, `months`/`days` ride in the bits of the
@@ -296,6 +305,9 @@ pub enum ExtType {
     /// Calendar interval (`months`, `days`, `micros`), carried by value as
     /// [`pack_interval`] describes.
     Interval,
+    /// Semi-structured value, carried as pinkdb-encoded VARIANT bytes over
+    /// the VARCHAR channel ([`PINKDB_EXT_TYPE_VARIANT`]).
+    Variant,
 }
 
 impl ExtType {
@@ -310,6 +322,7 @@ impl ExtType {
             ExtType::Date => PINKDB_EXT_TYPE_DATE,
             ExtType::Timestamp => PINKDB_EXT_TYPE_TIMESTAMP,
             ExtType::Interval => PINKDB_EXT_TYPE_INTERVAL,
+            ExtType::Variant => PINKDB_EXT_TYPE_VARIANT,
         }
     }
 
@@ -324,6 +337,7 @@ impl ExtType {
             PINKDB_EXT_TYPE_DATE => Some(ExtType::Date),
             PINKDB_EXT_TYPE_TIMESTAMP => Some(ExtType::Timestamp),
             PINKDB_EXT_TYPE_INTERVAL => Some(ExtType::Interval),
+            PINKDB_EXT_TYPE_VARIANT => Some(ExtType::Variant),
             _ => None,
         }
     }
@@ -339,6 +353,7 @@ impl ExtType {
             ExtType::Date => "DATE",
             ExtType::Timestamp => "TIMESTAMP",
             ExtType::Interval => "INTERVAL",
+            ExtType::Variant => "VARIANT",
         }
     }
 }
@@ -367,6 +382,8 @@ pub enum ExtArg<'a> {
         days: i32,
         micros: i64,
     },
+    /// pinkdb-encoded VARIANT bytes, borrowed for the duration of the call.
+    Variant(&'a [u8]),
 }
 
 impl ExtArg<'_> {
@@ -382,6 +399,7 @@ impl ExtArg<'_> {
             ExtArg::Date(_) => ExtType::Date,
             ExtArg::Timestamp(_) => ExtType::Timestamp,
             ExtArg::Interval { .. } => ExtType::Interval,
+            ExtArg::Variant(_) => ExtType::Variant,
         }
     }
 
@@ -414,6 +432,14 @@ impl ExtArg<'_> {
             ExtArg::Double(x) => (PINKDB_EXT_TYPE_DOUBLE, 0, 0, x, std::ptr::null(), 0),
             ExtArg::Varchar(bytes) => (
                 PINKDB_EXT_TYPE_VARCHAR,
+                0,
+                0,
+                0.0,
+                bytes.as_ptr() as *const c_char,
+                bytes.len(),
+            ),
+            ExtArg::Variant(bytes) => (
+                PINKDB_EXT_TYPE_VARIANT,
                 0,
                 0,
                 0.0,
@@ -467,6 +493,8 @@ pub enum ExtValue {
         days: i32,
         micros: i64,
     },
+    /// pinkdb-encoded VARIANT bytes, copied out of extension memory.
+    Variant(Vec<u8>),
 }
 
 impl ExtValue {
@@ -482,6 +510,7 @@ impl ExtValue {
             ExtValue::Date(_) => ExtType::Date,
             ExtValue::Timestamp(_) => ExtType::Timestamp,
             ExtValue::Interval { .. } => ExtType::Interval,
+            ExtValue::Variant(_) => ExtType::Variant,
         })
     }
 }
@@ -501,6 +530,7 @@ mod tests {
             ExtType::Date,
             ExtType::Timestamp,
             ExtType::Interval,
+            ExtType::Variant,
         ];
         let mut tags: Vec<i32> = all.iter().map(|t| t.tag()).collect();
         tags.sort_unstable();
@@ -531,6 +561,14 @@ mod tests {
         assert_eq!(d.type_tag, PINKDB_EXT_TYPE_DOUBLE);
         assert_eq!(d.double, 2.5);
         assert_eq!(d.int64, 0);
+
+        // A VARIANT borrows its bytes on the text channel, length included.
+        let v = ExtArg::Variant(&[0x01, 0x02, 0x00]);
+        let abi = v.to_abi();
+        assert_eq!(abi.type_tag, PINKDB_EXT_TYPE_VARIANT);
+        assert_eq!(abi.is_null, 0);
+        assert_eq!(abi.text_len, 3);
+        assert!(!abi.text_ptr.is_null());
     }
 
     /// The interval payload survives the by-value round trip in every field,

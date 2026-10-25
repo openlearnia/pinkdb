@@ -103,7 +103,7 @@ pub use abi::{
     ExtArg, ExtType, ExtValue, PINKDB_EXT_MAX_ARGS, PINKDB_EXT_TYPE_BIGINT,
     PINKDB_EXT_TYPE_BOOLEAN, PINKDB_EXT_TYPE_DATE, PINKDB_EXT_TYPE_DOUBLE, PINKDB_EXT_TYPE_INTEGER,
     PINKDB_EXT_TYPE_INTERVAL, PINKDB_EXT_TYPE_NULL, PINKDB_EXT_TYPE_TIMESTAMP,
-    PINKDB_EXT_TYPE_VARCHAR, pack_interval, unpack_interval,
+    PINKDB_EXT_TYPE_VARCHAR, PINKDB_EXT_TYPE_VARIANT, pack_interval, unpack_interval,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use abi::{

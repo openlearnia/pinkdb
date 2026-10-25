@@ -38,8 +38,14 @@ pub struct FileColumn {
     pub name: String,
     /// The engine type the column reads as.
     pub ty: DataType,
-    /// Leaf ordinal within the file (the column index for `get_column_reader`).
+    /// The ordinal of the column's first leaf within the file (`metadata`
+    /// for a VARIANT group, the only leaf otherwise).
     pub leaf: usize,
+    /// Leaves the column occupies in a row group: more than one only for a
+    /// shredded VARIANT column.
+    pub leaves: usize,
+    /// A shredded VARIANT column's schema, when the column is one.
+    pub shred: Option<std::sync::Arc<crate::variant_read::VariantColumn>>,
     /// Whether the column may hold NULLs (a `REQUIRED` column never does).
     pub optional: bool,
     /// The physical type, kept for the decode dispatch.
@@ -155,19 +161,38 @@ fn decimal_type(precision: i32, scale: i32) -> std::result::Result<DataType, Str
     })
 }
 
-/// Validate a file schema for flatness and map every leaf column; `Err`
-/// carries the first unsupported column's message.
+/// Validate a file schema for flatness and map every column; `Err` carries
+/// the first unsupported column's message.
 ///
-/// The schema root's children are the columns. A child that is a group is
-/// nested (refused, including LIST/MAP), and a repeated leaf is refused too
-/// (one column chunk would hold many values per row).
+/// The schema root's children are the columns. A `Variant`-annotated group is
+/// the one accepted group (it is read through [`crate::variant_read`]); any
+/// other group is nested and refused (including LIST/MAP), and a repeated
+/// leaf is refused too (one column chunk would hold many values per row).
 pub fn map_columns(
     schema: &Type,
     descr: &parquet::schema::types::SchemaDescriptor,
 ) -> Result<Vec<FileColumn>> {
     let mut out = Vec::new();
+    let mut leaf = 0usize;
     for field in schema.get_fields() {
         let info = field.get_basic_info();
+        if field.is_group() && is_variant(field) {
+            let shred = crate::variant_read::parse_column(field)?;
+            out.push(FileColumn {
+                name: field.name().to_string(),
+                ty: DataType::Variant,
+                leaf,
+                leaves: shred.leaves,
+                shred: Some(std::sync::Arc::new(shred)),
+                optional: info.has_repetition()
+                    && info.repetition() == parquet::basic::Repetition::OPTIONAL,
+                physical: PhysicalType::BYTE_ARRAY,
+                unsigned: false,
+                type_length: 0,
+            });
+            leaf += out.last().expect("a column was pushed").leaves;
+            continue;
+        }
         if field.is_group() {
             return Err(PinkDbError::Type(format!(
                 "column \"{}\" is a nested group; pinkdb's parquet reader supports flat \
@@ -196,19 +221,29 @@ pub fn map_columns(
                 field.name()
             ))
         })?;
-        let leaf = out.len();
         out.push(FileColumn {
             name: field.name().to_string(),
             ty,
             leaf,
+            leaves: 1,
+            shred: None,
             optional: info.has_repetition()
                 && info.repetition() == parquet::basic::Repetition::OPTIONAL,
             physical,
             unsigned: is_unsigned(field),
             type_length: descr.column(leaf).type_length(),
         });
+        leaf += 1;
     }
     Ok(out)
+}
+
+/// Whether a group is annotated as the Parquet `Variant` logical type.
+pub fn is_variant(field: &Type) -> bool {
+    matches!(
+        field.get_basic_info().logical_type_ref(),
+        Some(LogicalType::Variant(_))
+    )
 }
 
 /// Whether the schema element's annotation is an unsigned integer.

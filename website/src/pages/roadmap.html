@@ -20,7 +20,9 @@ on GitHub, and the wave-by-wave summary in the
     <p>DDL/DML, inner/outer/full/cross and multi-way joins, CTEs, derived tables and
     uncorrelated subqueries, window functions (<code>lag</code>/<code>lead</code>/
     <code>ntile</code>/frames), aggregates, CASE/CAST/COALESCE/LIKE, dates and
-    timestamps, DECIMAL and INTERVAL, set operations, views, snapshot transactions,
+    timestamps, DECIMAL, INTERVAL and <code>VARIANT</code> (semi-structured,
+    shredded into typed columns in Parquet, pruned by path statistics), set
+    operations, views, snapshot transactions,
     transactions, multiple databases, <code>EXPLAIN</code>/<code>SHOW</code>/
     <code>DESCRIBE</code>, and prepared statements (<code>?</code> placeholders with
     a bind API). Differentially tested against DuckDB.</p>

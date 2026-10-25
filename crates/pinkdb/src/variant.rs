@@ -1035,6 +1035,41 @@ pub enum Step {
     Index(usize),
 }
 
+/// The statistics key of a path, in the spelling DuckLake's
+/// `ducklake_file_variant_stats.variant_path` uses: every key double-quoted,
+/// joined by `.` (`"a"`, `"nested"."k"`), with an embedded `"` doubled. The
+/// writer and the pruning reader spell a path the same way, so a predicate
+/// and a statistic agree by construction.
+///
+/// Only object keys are spelled: the shredding policy is shallow, so no
+/// published path crosses an array. `None` for a path no engine can name — an
+/// empty key, or one holding a backslash (DuckDB's own struct-type spelling of
+/// a shredded key cannot parse either, so such a key is never shredded) — and
+/// those paths get no statistics.
+pub fn stats_path_text(steps: &[Step]) -> Option<String> {
+    let mut out = String::new();
+    for step in steps {
+        let Step::Key(key) = step else {
+            return None;
+        };
+        if key.is_empty() || key.contains('\\') {
+            return None;
+        }
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push('"');
+        for ch in key.chars() {
+            if ch == '"' {
+                out.push('"');
+            }
+            out.push(ch);
+        }
+        out.push('"');
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// Parse a path: `a`, `a.b[1]`, `$.a[0]`, `$['a b'][2]`.
 ///
 /// DuckDB 2.0 spells extraction three ways (`v['a']`, `v.a`,
@@ -1386,6 +1421,24 @@ pub fn from_value(v: &Value) -> Result<Variant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_paths_use_the_ducklake_spelling() {
+        let key = |k: &str| Step::Key(Arc::from(k));
+        assert_eq!(stats_path_text(&[key("a")]).as_deref(), Some("\"a\""));
+        assert_eq!(
+            stats_path_text(&[key("a b"), key("k")]).as_deref(),
+            Some("\"a b\".\"k\"")
+        );
+        assert_eq!(
+            stats_path_text(&[key("a\"b")]).as_deref(),
+            Some("\"a\"\"b\"")
+        );
+        assert_eq!(stats_path_text(&[]), None);
+        assert_eq!(stats_path_text(&[key("")]), None);
+        assert_eq!(stats_path_text(&[key("a\\b")]), None);
+        assert_eq!(stats_path_text(&[Step::Index(0)]), None);
+    }
 
     fn round_trip(v: &Variant) {
         let mut bytes = Vec::new();

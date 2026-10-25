@@ -17,6 +17,7 @@
 //! | DATE | INT32 + DATE |
 //! | TIMESTAMP | INT64 + TIMESTAMP(MICROS), `is_adjusted_to_utc = false` |
 //! | DECIMAL(p,s) | INT32 (p ≤ 9) / INT64 (p ≤ 18) / FIXED_LEN_BYTE_ARRAY(16) + DECIMAL(p,s) |
+//! | VARIANT | GROUP + `Variant` logical type: `metadata`, `value`, and a `typed_value` group with one typed column per shredded key ([`variant_shred`]) |
 //!
 //! Every column is `OPTIONAL`; NULLs travel as definition levels. INTERVAL is
 //! refused — parquet's INTERVAL is millisecond precision and pinkdb's is
@@ -48,8 +49,14 @@ use parquet::data_type::{
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter};
+use parquet::file::writer::{
+    SerializedColumnWriter, SerializedFileWriter, SerializedRowGroupWriter,
+};
 use parquet::schema::types::Type;
+use pinkdb::variant::Variant;
+use pinkdb::variant_shred::{
+    ShredKind, ShredPolicy, decode_metadata, encode_metadata, encode_value, infer_policy, shred_row,
+};
 use pinkdb::{DataTable, DataType, Value, Vector};
 
 /// The footer key naming the database a lake data file belongs to.
@@ -188,7 +195,24 @@ fn write_table_with_key_values(
     key_values: Vec<KeyValue>,
 ) -> Result<Vec<u8>, WriteError> {
     let schema = table.schema();
-    let root = build_schema(&schema)?;
+    let policies = column_policies(table);
+    // Tell readers that every VARIANT column was shredded with a policy
+    // inferred over the whole column, so each typed leaf bounds every value of
+    // its path (`crate::variant_stats` trusts this key, and nothing else).
+    let mut key_values = key_values;
+    if schema
+        .iter()
+        .any(|(_, dtype)| matches!(dtype, DataType::Variant))
+        && !key_values
+            .iter()
+            .any(|kv| kv.key == crate::variant_stats::COMPLETE_KEY)
+    {
+        key_values.push(KeyValue::new(
+            crate::variant_stats::COMPLETE_KEY.to_string(),
+            crate::variant_stats::COMPLETE_VALUE.to_string(),
+        ));
+    }
+    let root = build_schema(&schema, &policies)?;
     let mut builder = WriterProperties::builder()
         // Chunk statistics travel in the footer (min/max/NULL count), so the
         // file is self-describing for other readers and for pruning.
@@ -223,12 +247,17 @@ fn write_table_with_key_values(
             let rows = end - start;
             let mut group = writer.next_row_group()?;
             for (index, (name, dtype)) in schema.iter().enumerate() {
-                let column = group
-                    .next_column()?
-                    .ok_or_else(|| WriteError::InvalidValue {
-                        column: name.clone(),
-                        message: "the parquet writer skipped a schema column".to_string(),
-                    })?;
+                if matches!(dtype, DataType::Variant) {
+                    write_variant_column(
+                        &mut group,
+                        &policies[index],
+                        rows,
+                        &mut cursors[index],
+                        name,
+                    )?;
+                    continue;
+                }
+                let column = group.next_column()?.ok_or_else(|| skipped(name))?;
                 write_column(column, dtype, rows, &mut cursors[index], name)?;
             }
             group.close()?;
@@ -289,22 +318,68 @@ fn physical_type(dtype: DataType, column: &str) -> Result<PhysicalType, WriteErr
                     .to_string(),
             });
         }
-        DataType::Variant => {
-            return Err(WriteError::UnsupportedType {
-                column: column.to_string(),
-                message: "VARIANT needs parquet's shredded representation (wave 101b); \
-                          refusing to write it as JSON text"
-                    .to_string(),
-            });
-        }
+        // Written as the `Variant` logical type; see `write_variant_column`.
+        DataType::Variant => return Err(skipped(column)),
     })
+}
+
+/// The parquet writer's own column order moved on (`next_column()` returned
+/// `None`): a schema/row-group mismatch, never reachable from a well-formed
+/// table.
+fn skipped(column: &str) -> WriteError {
+    WriteError::InvalidValue {
+        column: column.to_string(),
+        message: "the parquet writer skipped a schema column".to_string(),
+    }
+}
+
+/// Shredding policies for the table's VARIANT columns (empty for the rest),
+/// inferred once from every row of the column.
+///
+/// A Parquet schema cannot change between row groups, so the policy is fixed
+/// at the file level: this is why the plan asks for a *sampled* policy rather
+/// than an exact one.
+fn column_policies(table: &DataTable) -> Vec<ShredPolicy> {
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            if column.dtype != DataType::Variant {
+                return ShredPolicy::default();
+            }
+            // The policy is inferred over the **whole** column, not a sample:
+            // a typed leaf is a complete bound for its path only if no later
+            // row holds another kind there, and the per-path statistics of
+            // both lake formats rely on that (see `crate::variant_stats`).
+            let mut values: Vec<Arc<Variant>> = Vec::new();
+            for chunk in &column.chunks {
+                let pinkdb::VectorData::Variant(items) = chunk.data() else {
+                    continue;
+                };
+                for (index, item) in items.iter().enumerate() {
+                    if chunk.is_valid(index) {
+                        values.push(Arc::clone(item));
+                    }
+                }
+            }
+            let refs: Vec<&Variant> = values.iter().map(|value| value.as_ref()).collect();
+            infer_policy(&refs)
+        })
+        .collect()
 }
 
 /// The flat parquet schema: every column OPTIONAL (definition levels carry
 /// the NULLs), with the logical annotation the existing reader maps back.
-fn build_schema(schema: &[(String, DataType)]) -> Result<Type, WriteError> {
+fn build_schema(
+    schema: &[(String, DataType)],
+    policies: &[ShredPolicy],
+) -> Result<Type, WriteError> {
     let mut fields = Vec::with_capacity(schema.len());
-    for (name, dtype) in schema {
+    for (index, (name, dtype)) in schema.iter().enumerate() {
+        if matches!(dtype, DataType::Variant) {
+            fields.push(Arc::new(variant_group(name, &policies[index])?));
+            continue;
+        }
         let physical = physical_type(*dtype, name)?;
         let mut builder =
             Type::primitive_type_builder(name, physical).with_repetition(Repetition::OPTIONAL);
@@ -341,9 +416,9 @@ fn build_schema(schema: &[(String, DataType)]) -> Result<Type, WriteError> {
                     builder = builder.with_length(DECIMAL_FIXED_LEN);
                 }
             }
-            DataType::Interval | DataType::Variant => {
-                unreachable!("refused by physical_type")
-            }
+            // Refused by `physical_type`, and VARIANT never reaches the flat
+            // primitive path above.
+            DataType::Interval | DataType::Variant => unreachable!("refused by physical_type"),
         }
         fields.push(Arc::new(builder.build()?));
     }
@@ -500,7 +575,7 @@ fn write_column(
         }
         // Refused in `physical_type`/`build_schema` before any row is read.
         DataType::Interval => unreachable!("interval columns are refused before writing"),
-        DataType::Variant => unreachable!("variant columns are refused before writing"),
+        DataType::Variant => unreachable!("variant columns use write_variant_column"),
     }
     column.close()?;
     Ok(())
@@ -559,4 +634,398 @@ fn wrong_type(value: &Value, expected: DataType) -> String {
             .map(|t| t.name())
             .unwrap_or_else(|| "NULL".to_string())
     )
+}
+
+// ---------------------------------------------------------------------------
+// VARIANT: the Parquet `Variant` logical type
+// ---------------------------------------------------------------------------
+
+/// The specification version the `Variant` logical type advertises, and the
+/// one DuckDB 2.0 writes.
+const VARIANT_SPEC_VERSION: i8 = 1;
+
+/// One VARIANT column's Parquet group, per the spec:
+///
+/// ```text
+/// <name> GROUP OPTIONAL (Variant)
+///   metadata    BYTE_ARRAY REQUIRED
+///   value       BYTE_ARRAY OPTIONAL
+///   typed_value GROUP OPTIONAL          -- only when the policy shreds
+///     <key> GROUP REQUIRED
+///       value       BYTE_ARRAY OPTIONAL
+///       typed_value <type>     OPTIONAL
+/// ```
+fn variant_group(name: &str, policy: &ShredPolicy) -> Result<Type, WriteError> {
+    let mut fields = vec![
+        Arc::new(variant_leaf("metadata", PhysicalType::BYTE_ARRAY, None)?),
+        Arc::new(variant_leaf("value", PhysicalType::BYTE_ARRAY, None)?),
+    ];
+    if !policy.is_empty() {
+        let mut typed = Vec::with_capacity(policy.fields.len());
+        for field in &policy.fields {
+            // The spec's group shape: a `value` buffer beside `typed_value`.
+            // This writer puts every value that is not of the policy's kind
+            // (and every explicit null) in the top-level residual object, so
+            // the per-key `value` leaf stays empty — but both DuckDB's reader
+            // and ours require the leaf to exist.
+            let children = vec![
+                Arc::new(variant_leaf("value", PhysicalType::BYTE_ARRAY, None)?),
+                Arc::new(variant_leaf(
+                    "typed_value",
+                    typed_physical(field.kind),
+                    Some(field.kind),
+                )?),
+            ];
+            typed.push(Arc::new(
+                Type::group_type_builder(field.name.as_ref())
+                    .with_repetition(Repetition::REQUIRED)
+                    .with_fields(children)
+                    .build()?,
+            ));
+        }
+        fields.push(Arc::new(
+            Type::group_type_builder("typed_value")
+                .with_repetition(Repetition::OPTIONAL)
+                .with_fields(typed)
+                .build()?,
+        ));
+    }
+    Ok(Type::group_type_builder(name)
+        .with_repetition(Repetition::OPTIONAL)
+        .with_logical_type(Some(LogicalType::variant(Some(VARIANT_SPEC_VERSION))))
+        .with_fields(fields)
+        .build()?)
+}
+
+/// The physical type of one shredded kind.
+fn typed_physical(kind: ShredKind) -> PhysicalType {
+    match kind {
+        ShredKind::Bool => PhysicalType::BOOLEAN,
+        ShredKind::Int64 => PhysicalType::INT64,
+        ShredKind::Double => PhysicalType::DOUBLE,
+        ShredKind::Str => PhysicalType::BYTE_ARRAY,
+        ShredKind::Date => PhysicalType::INT32,
+        ShredKind::Timestamp => PhysicalType::INT64,
+    }
+}
+
+/// One leaf of a variant group. `kind` adds the logical annotation a typed
+/// leaf needs (STRING, DATE, TIMESTAMP); the byte buffers carry none.
+fn variant_leaf(
+    name: &str,
+    physical: PhysicalType,
+    kind: Option<ShredKind>,
+) -> Result<Type, WriteError> {
+    let mut builder = Type::primitive_type_builder(name, physical)
+        // `metadata` is the only REQUIRED leaf; the buffers are optional so a
+        // NULL row needs no bytes.
+        .with_repetition(if name == "metadata" {
+            Repetition::REQUIRED
+        } else {
+            Repetition::OPTIONAL
+        });
+    match kind {
+        Some(ShredKind::Str) => {
+            builder = builder
+                .with_converted_type(ConvertedType::UTF8)
+                .with_logical_type(Some(LogicalType::String));
+        }
+        Some(ShredKind::Date) => {
+            builder = builder
+                .with_converted_type(ConvertedType::DATE)
+                .with_logical_type(Some(LogicalType::Date));
+        }
+        Some(ShredKind::Timestamp) => {
+            builder = builder
+                .with_converted_type(ConvertedType::TIMESTAMP_MICROS)
+                .with_logical_type(Some(LogicalType::timestamp(false, TimeUnit::MICROS)));
+        }
+        Some(ShredKind::Bool | ShredKind::Int64 | ShredKind::Double) | None => {}
+    }
+    Ok(builder.build()?)
+}
+
+/// Shred the row group's VARIANT values, then write the group's leaves in
+/// schema order: `metadata`, `value`, then each shredded key's `value` (always
+/// NULL here) and `typed_value`.
+fn write_variant_column<W: std::io::Write + Send>(
+    group: &mut SerializedRowGroupWriter<'_, W>,
+    policy: &ShredPolicy,
+    rows: usize,
+    cursor: &mut ColumnCursor<'_>,
+    name: &str,
+) -> Result<(), WriteError> {
+    let mut values: Vec<Option<Variant>> = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        match cursor.next() {
+            Value::Null => values.push(None),
+            Value::Variant(value) => values.push(Some((*value).clone())),
+            other => {
+                return Err(WriteError::InvalidValue {
+                    column: name.to_string(),
+                    message: wrong_type(&other, DataType::Variant),
+                });
+            }
+        }
+    }
+
+    let mut residuals: Vec<Option<Variant>> = Vec::with_capacity(rows);
+    let mut typed: Vec<Vec<Option<Variant>>> = Vec::with_capacity(rows);
+    let mut dict: Vec<Arc<str>> = Vec::new();
+    for value in &values {
+        let Some(value) = value else {
+            residuals.push(None);
+            typed.push(vec![None; policy.fields.len()]);
+            continue;
+        };
+        let (residual, fields) = shred_row(value, policy);
+        if let Some(residual) = &residual {
+            collect_keys(residual, &mut dict);
+        }
+        residuals.push(residual);
+        typed.push(fields);
+    }
+    // One dictionary for the whole column, shared by every row of the group
+    // (the plan's "shared per-column key dictionary"). It is complete before
+    // any value is encoded, because field ids index into it.
+    dict.extend(policy.fields.iter().map(|field| field.name.clone()));
+    dict.sort_unstable();
+    dict.dedup();
+    let metadata = encode_metadata(&dict);
+    let keys = decode_metadata(&metadata).map_err(|e| WriteError::InvalidValue {
+        column: name.to_string(),
+        message: format!("{e}"),
+    })?;
+
+    write_variant_metadata(group, &values, &metadata, name)?;
+    write_variant_value(group, &values, &residuals, &keys, name)?;
+    for (index, field) in policy.fields.iter().enumerate() {
+        write_variant_key_value(group, &values, name)?;
+        let field_values: Vec<Option<Variant>> =
+            typed.iter().map(|row| row[index].clone()).collect();
+        write_variant_typed(
+            group,
+            field.kind,
+            &values,
+            &field_values,
+            name,
+            field.name.as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Every object key a value holds, at any depth: nested objects index the same
+/// per-column dictionary, so a key missing from it would be unencodable.
+fn collect_keys(value: &Variant, out: &mut Vec<Arc<str>>) {
+    match value {
+        Variant::Object(entries) => {
+            for (key, item) in entries.iter() {
+                out.push(key.clone());
+                collect_keys(item, out);
+            }
+        }
+        Variant::Array(items) => {
+            for item in items.iter() {
+                collect_keys(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `metadata` leaf: one dictionary copy per defined row (REQUIRED inside
+/// the optional group, so a NULL row is definition level 0).
+fn write_variant_metadata<W: std::io::Write + Send>(
+    group: &mut SerializedRowGroupWriter<'_, W>,
+    values: &[Option<Variant>],
+    metadata: &[u8],
+    column: &str,
+) -> Result<(), WriteError> {
+    let mut levels = Vec::with_capacity(values.len());
+    let mut batch = Vec::with_capacity(values.len());
+    for value in values {
+        levels.push(i16::from(u8::from(value.is_some())));
+        if value.is_some() {
+            batch.push(ByteArray::from(metadata.to_vec()));
+        }
+    }
+    write_leaf::<W, ByteArrayType>(group, &batch, &levels, column)
+}
+
+/// The residual `value` leaf: level 0 is a NULL row, 1 a row with nothing
+/// left over, 2 the residual object.
+fn write_variant_value<W: std::io::Write + Send>(
+    group: &mut SerializedRowGroupWriter<'_, W>,
+    values: &[Option<Variant>],
+    residuals: &[Option<Variant>],
+    keys: &[Arc<str>],
+    column: &str,
+) -> Result<(), WriteError> {
+    let mut levels = Vec::with_capacity(values.len());
+    let mut batch = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        match (value, &residuals[index]) {
+            (None, _) => levels.push(0),
+            (Some(_), None) => levels.push(1),
+            (Some(_), Some(residual)) => {
+                levels.push(2);
+                let mut bytes = Vec::new();
+                encode_value(residual, keys, &mut bytes).map_err(|e| WriteError::InvalidValue {
+                    column: column.to_string(),
+                    message: format!("{e}"),
+                })?;
+                batch.push(ByteArray::from(bytes));
+            }
+        }
+    }
+    write_leaf::<W, ByteArrayType>(group, &batch, &levels, column)
+}
+
+/// One shredded key's `typed_value` leaf: level 0 NULL row, 2 absent key,
+/// 3 a typed value.
+/// A shredded key's `value` leaf: the spec requires the buffer, but this
+/// writer never fills it (unshredded values stay in the top-level residual).
+fn write_variant_key_value<W: std::io::Write + Send>(
+    group: &mut SerializedRowGroupWriter<'_, W>,
+    rows: &[Option<Variant>],
+    column: &str,
+) -> Result<(), WriteError> {
+    // Definition levels: 0 is a SQL NULL row, 1 a row whose value is not an
+    // object (nothing is shredded, so `typed_value` is absent and the whole
+    // value sits in `value`), 2 a shredded object row with this leaf unset.
+    let levels: Vec<i16> = rows
+        .iter()
+        .map(|row| match row {
+            None => 0,
+            Some(Variant::Object(_)) => 2,
+            Some(_) => 1,
+        })
+        .collect();
+    write_leaf::<W, ByteArrayType>(group, &[], &levels, column)
+}
+
+fn write_variant_typed<W: std::io::Write + Send>(
+    group: &mut SerializedRowGroupWriter<'_, W>,
+    kind: ShredKind,
+    rows: &[Option<Variant>],
+    values: &[Option<Variant>],
+    column: &str,
+    field: &str,
+) -> Result<(), WriteError> {
+    // Both buffers are `(definition levels, values)`; the levels are the same
+    // for every kind, only the value representation differs.
+    let levels = |values: &[Option<Variant>]| -> Vec<i16> {
+        rows.iter()
+            .zip(values)
+            .map(|(row, value)| match row {
+                // Only an object is shredded: a scalar or array row keeps its
+                // whole value in `value` with `typed_value` absent, which is
+                // what the spec (and DuckDB's reader) requires of a
+                // partially-shredded column.
+                None => 0,
+                Some(Variant::Object(_)) if value.is_some() => 3,
+                Some(Variant::Object(_)) => 2,
+                Some(_) => 1,
+            })
+            .collect()
+    };
+    let levels = levels(values);
+    let wrong = |value: &Variant| WriteError::InvalidValue {
+        column: column.to_string(),
+        message: format!(
+            "shredded field \"{field}\" holds {} but its column is {}",
+            value.type_name(),
+            kind.name()
+        ),
+    };
+    match kind {
+        ShredKind::Bool => {
+            let mut batch = Vec::new();
+            for row in rows.iter().zip(values) {
+                if let (Some(_), Some(value)) = row {
+                    match value {
+                        Variant::Bool(b) => batch.push(*b),
+                        other => return Err(wrong(other)),
+                    }
+                }
+            }
+            write_leaf::<W, BoolType>(group, &batch, &levels, column)
+        }
+        ShredKind::Int64 => {
+            let mut batch = Vec::new();
+            for (row, value) in rows.iter().zip(values) {
+                if let (Some(_), Some(value)) = (row, value) {
+                    match value {
+                        Variant::Int(i) => batch.push(*i),
+                        other => return Err(wrong(other)),
+                    }
+                }
+            }
+            write_leaf::<W, Int64Type>(group, &batch, &levels, column)
+        }
+        ShredKind::Double => {
+            let mut batch = Vec::new();
+            for (row, value) in rows.iter().zip(values) {
+                if let (Some(_), Some(value)) = (row, value) {
+                    match value {
+                        Variant::Double(x) => batch.push(*x),
+                        other => return Err(wrong(other)),
+                    }
+                }
+            }
+            write_leaf::<W, DoubleType>(group, &batch, &levels, column)
+        }
+        ShredKind::Str => {
+            let mut batch = Vec::new();
+            for (row, value) in rows.iter().zip(values) {
+                if let (Some(_), Some(value)) = (row, value) {
+                    match value {
+                        Variant::Str(s) => batch.push(ByteArray::from(s.as_bytes().to_vec())),
+                        other => return Err(wrong(other)),
+                    }
+                }
+            }
+            write_leaf::<W, ByteArrayType>(group, &batch, &levels, column)
+        }
+        ShredKind::Date => {
+            let mut batch = Vec::new();
+            for (row, value) in rows.iter().zip(values) {
+                if let (Some(_), Some(value)) = (row, value) {
+                    match value {
+                        Variant::Date(d) => batch.push(*d),
+                        other => return Err(wrong(other)),
+                    }
+                }
+            }
+            write_leaf::<W, Int32Type>(group, &batch, &levels, column)
+        }
+        ShredKind::Timestamp => {
+            let mut batch = Vec::new();
+            for (row, value) in rows.iter().zip(values) {
+                if let (Some(_), Some(value)) = (row, value) {
+                    match value {
+                        Variant::Timestamp(us) => batch.push(*us),
+                        other => return Err(wrong(other)),
+                    }
+                }
+            }
+            write_leaf::<W, Int64Type>(group, &batch, &levels, column)
+        }
+    }
+}
+
+/// Write one leaf chunk of a variant group and close it.
+fn write_leaf<W: std::io::Write + Send, T: ParquetDataType>(
+    group: &mut SerializedRowGroupWriter<'_, W>,
+    values: &[T::T],
+    levels: &[i16],
+    column: &str,
+) -> Result<(), WriteError> {
+    let mut writer = group.next_column()?.ok_or_else(|| skipped(column))?;
+    writer
+        .typed::<T>()
+        .write_batch(values, Some(levels), None)?;
+    writer.close()?;
+    Ok(())
 }

@@ -107,6 +107,36 @@ fn demo(name: &str) -> LinkedExtension {
                 },
             )
             .unwrap(),
+            // VARIANT: the payload is opaque bytes on the text channel — the
+            // engine encodes an argument before the call and decodes a result
+            // after it, so an extension never sees the value model.
+            LinkedFunction::new(
+                "lnk_variant_echo",
+                vec![ExtType::Variant],
+                ExtType::Variant,
+                |args: &[ExtArg<'_>]| match args[0] {
+                    ExtArg::Variant(bytes) => Ok(ExtValue::Variant(bytes.to_vec())),
+                    ExtArg::Null(_) => Ok(ExtValue::Null),
+                    ref other => Err(format!("unexpected argument {other:?}")),
+                },
+            )
+            .unwrap(),
+            // The engine's VARIANT encoding of the integer 1 (`T_INT` then the
+            // i64 payload): an extension can build a value the engine reads.
+            LinkedFunction::new(
+                "lnk_variant_one",
+                vec![],
+                ExtType::Variant,
+                |_args: &[ExtArg<'_>]| Ok(ExtValue::Variant(vec![0x02, 1, 0, 0, 0, 0, 0, 0, 0])),
+            )
+            .unwrap(),
+            LinkedFunction::new(
+                "lnk_variant_bad",
+                vec![],
+                ExtType::Variant,
+                |_args: &[ExtArg<'_>]| Ok(ExtValue::Variant(vec![0xff])),
+            )
+            .unwrap(),
             // Failure paths: an error, a panic, and a contract violation.
             LinkedFunction::new(
                 "lnk_fail",
@@ -171,6 +201,55 @@ fn scratch(tag: &str) -> std::path::PathBuf {
 }
 
 // ---------- loading and calling ----------
+
+#[test]
+fn variant_payloads_cross_the_boundary_as_bytes() {
+    let mut db = store("variant");
+
+    // A VARIANT argument reaches the callback as encoded bytes and the result
+    // is decoded back into the same value.
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT CAST(lnk_variant_echo(CAST('{\"a\":1,\"b\":[1,\"two\"],\"c\":null}' AS VARIANT)) \
+                    AS VARCHAR);"
+        ),
+        vec![vec![Value::Varchar(
+            "{\"a\":1,\"b\":[1,\"two\"],\"c\":null}".to_string()
+        )]]
+    );
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT variant_extract(lnk_variant_echo(CAST('{\"a\":[1,2]}' AS VARIANT)), 'a') \
+                    = CAST('[1,2]' AS VARIANT);"
+        ),
+        vec![vec![Value::Boolean(true)]]
+    );
+    // NULL in, NULL out; the tag alone does not make a value.
+    assert_eq!(
+        rows(&mut db, "SELECT lnk_variant_echo(NULL) IS NULL;"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    // A payload the extension built itself decodes like any other.
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT CAST(lnk_variant_one() AS VARCHAR), \
+                             variant_type(lnk_variant_one());"
+        ),
+        vec![vec![
+            Value::Varchar("1".to_string()),
+            Value::Varchar("BIGINT".to_string())
+        ]]
+    );
+    // Bytes that do not decode fail the statement with the function named.
+    let message = error(&mut db, "SELECT lnk_variant_bad();");
+    assert!(
+        message.contains("lnk_variant_bad") && message.contains("invalid VARIANT payload"),
+        "unexpected error: {message}"
+    );
+}
 
 #[test]
 fn registered_extension_runs_through_sql() {

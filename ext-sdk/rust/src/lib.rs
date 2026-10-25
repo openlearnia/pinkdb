@@ -52,6 +52,7 @@
 //! | `DATE` | [`Date`] | [`Date`] |
 //! | `TIMESTAMP` | [`Timestamp`] | [`Timestamp`] |
 //! | `INTERVAL` | [`Interval`] | [`Interval`] |
+//! | `VARIANT` | [`Variant`] | [`Variant`] |
 //!
 //! `Option<T>` around any of them means "NULL is a normal value": a NULL
 //! argument decodes to `None`, and `None` encodes to SQL NULL. A NULL that
@@ -191,7 +192,7 @@ pub use serve::{HostSession, StatementReply};
 pub use spec::ScalarSpec;
 pub use value::{
     Date, ExtArgType, FromExtArg, FromExtArgAt, Interval, IntoExtValue, Optional, Timestamp,
-    decode_arguments,
+    Variant, decode_arguments,
 };
 
 /// Publish a linked extension in the process-global registry (wave 49);

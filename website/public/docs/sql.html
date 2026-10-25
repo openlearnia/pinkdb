@@ -608,8 +608,14 @@ text — is what persistence and the wire use.</p>
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">SELECT</span> variant_extract(payload, <span class="tok-s">'b[1]'</span>) <span class="tok-k">FROM</span> events;   <span class="tok-c">-- 2.5, as a VARIANT</span>
 <span class="tok-k">SELECT</span> variant_keys(payload) <span class="tok-k">FROM</span> events;              <span class="tok-c">-- ["a","b"] / [] / NULL / NULL</span></code></pre></div>
 
-<p>There is no subscript operator, so <code>payload['a']</code> does not parse;
-<code>variant_extract(payload, 'a')</code> is the spelling. The JSON
+<p>Subscripts reach inside a value without JSONPath and are 1-based like
+DuckDB: <code>payload['a']</code>, <code>payload.a</code>,
+<code>payload['b'][2]</code> (0 is an error). A comparison whose sides are a
+<code>VARIANT</code> and a scalar puts the scalar on <code>VARIANT</code>'s
+side, so <code>payload['a'] = 5</code> and
+<code>variant_extract(payload, '$.kind') = 'buy'</code> work; a literal string
+becomes a variant string (it is not JSON-parsed) and a non-literal
+<code>VARCHAR</code> is still a bind error. The JSON
 extension's functions also accept a <code>VARIANT</code> and see its JSON text
 (<code>json_extract</code>, <code>json_array_length</code>,
 <code>json_valid</code>, …).</p>
@@ -638,12 +644,43 @@ extension's functions also accept a <code>VARIANT</code> and see its JSON text
 <p><strong>Persistence and encodings.</strong> A <code>VARIANT</code> column
 survives save/open, WAL replay, checkpoint and
 <code>ALTER TABLE … ADD COLUMN … DEFAULT</code> (new <code>.pink</code> dtype
-tag; no statistics). It crosses the wire protocol as a length-prefixed blob
+tag). It crosses the wire protocol as a length-prefixed blob
 (protocol v11), the C ABI as its JSON text (<code>PINKDB_TYPE_VARIANT</code>),
-and the JS/WASM binding as a native JSON value. The extension ABI, Arrow and
-Parquet refuse it with a clear error; a <code>.pink</code> lake data file
-round-trips it. Parquet <code>VARIANT</code>, shredding into typed
-sub-columns and statistics on shredded paths are wave 101b.</p>
+the extension ABI as the opaque binary encoding (<code>ExtType::Variant</code>,
+ABI minor 3), and the JS/WASM binding as a native JSON value. A
+<code>.pink</code> lake data file round-trips it.</p>
+
+<h3>Parquet, shredding and pruning</h3>
+
+<p>Parquet gets the specification's <code>Variant</code> logical type — a
+<code>metadata</code> dictionary shared by the row group, a residual
+<code>value</code> buffer and an optional <code>typed_value</code> group — so
+<code>COPY … TO '….parquet'</code> and <code>read_parquet</code> carry a
+<code>VARIANT</code> column both ways, and DuckDB 2.0 reads a pinkdb file while
+pinkdb reads a DuckDB file. Which object keys become typed columns is decided
+per column over its rows: a key is shredded when it appears in at least 32
+rows and in half of them, every occurrence has the same primitive kind
+(BOOLEAN, BIGINT, DOUBLE, VARCHAR, DATE, TIMESTAMP), and at most eight keys
+qualify, most frequent first. Present-but-null keys and other shapes (nested
+objects, arrays, DECIMALs, a JSON null) stay in the residual buffer, so
+<code>{}</code> and <code>{"a": null}</code> remain distinct values.</p>
+
+<p>Each shredded path gets exact min/max and null-count statistics, keyed the
+way DuckDB spells a path (<code>"a"</code>, <code>"user"."id"</code>), so a
+filter on <code>payload['a']</code> or
+<code>variant_extract(payload, '$.a')</code> skips files whose bounds exclude
+the value — in <code>.pink</code> and Parquet lakes alike. A catalog keeps
+those path facts in DuckLake's own
+<code>ducklake_file_variant_stats</code> table, written and deleted with the
+file's other statistics on <code>pink:</code>, <code>sqlite:</code> and
+Postgres catalogs. DuckDB 2.0 attaches a pinkdb lake and reads them, and
+pinkdb prunes on rows DuckDB wrote. On 1M rows of mixed shapes in ten Parquet
+files: 12.3 MB shredded against 14.4 MB unshredded (same data as JSON text:
+12.0 MB), a selective path filter 0.027 s against 0.260 s (all files scanned)
+and 0.020 s against 0.209 s in a <code>.pink</code> lake. A full scan of the
+column is at parity with the unshredded layout in a lake and 1.18x it when
+read straight from the file. TPC-H Q1/Q6 over 10M rows are unchanged within
+noise.</p>
 
 <h2 id="three-valued-logic">Three-valued logic<a class="anchor" href="#three-valued-logic" aria-label="Permalink: Three-valued logic">#</a></h2>
 

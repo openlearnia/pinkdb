@@ -40,7 +40,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread::ThreadId;
 
-use pinkdb_ext_sdk::{Date, Interval, Timestamp, pinkdb_extension};
+use pinkdb_ext_sdk::{Date, Interval, Timestamp, Variant, pinkdb_extension};
 
 /// The fixture's capability word (see the module docs): bit 0 clear, bit 1
 /// set.
@@ -128,6 +128,13 @@ pinkdb_extension! {
         /// is the (months, days, micros) triple, so the ABI's bit packing
         /// never appears here.
         fn cf_interval(value: Option<Interval>) -> Option<Interval> {
+            tally();
+            value
+        },
+
+        /// Opaque VARIANT bytes on the text channel: the SDK copies them out
+        /// of host memory and the host decodes what comes back.
+        fn cf_variant(value: Option<Variant>) -> Option<Variant> {
             tally();
             value
         },

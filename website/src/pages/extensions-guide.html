@@ -84,7 +84,7 @@ Extension math_ext loaded.</code></pre>
 <h2>Writing an extension</h2>
 
 <p>The in-repo SDKs all speak the same ABI (<code>PINKDB_EXT_ABI_VERSION</code> 1,
-minor 2), keep a vendored header that is byte-identical to the loader's, and build
+minor 3), keep a vendored header that is byte-identical to the loader's, and build
 the same conformance fixture so they cannot drift apart:</p>
 
 <div class="table-wrap">
@@ -194,18 +194,20 @@ cargo test -p pinkdb-ext-loader --test conformance  # all four SDKs, one contrac
   inside <code>pinkdb_extension_init</code>.</li>
   <li><strong>Typing:</strong> the ABI is strictly typed — <code>BOOLEAN</code>,
   <code>INTEGER</code>, <code>BIGINT</code>, <code>DOUBLE</code>, <code>VARCHAR</code>,
-  <code>DATE</code>, <code>TIMESTAMP</code> and <code>INTERVAL</code> (months/days packed
-  into the <code>double</code> bits, micros in the <code>int64</code>;
+  <code>DATE</code>, <code>TIMESTAMP</code>, <code>INTERVAL</code> (months/days packed
+  into the <code>double</code> bits, micros in the <code>int64</code>) and
+  <code>VARIANT</code> (ABI minor 3: pinkdb's opaque binary encoding on the text
+  channel, not JSON; older hosts simply refuse a registration that asks for it);
   <code>DECIMAL</code> is deliberately unsupported). The result must carry the
   registered type tag.</li>
   <li><strong>Limits:</strong> <code>64</code> arguments, a <code>256</code>-byte
   function name, and a <code>64 MiB</code> VARCHAR result — over the limit is an error,
   not a truncation. Unknown type tags and unknown flag bits are rejected at
   registration.</li>
-  <li><strong>VARCHAR results</strong> must be allocated with
+  <li><strong>VARCHAR and VARIANT results</strong> must be allocated with
   <code>api-&gt;alloc(size)</code>; the host copies <code>text_len</code> bytes and
   frees them with <code>api-&gt;free</code> immediately after the call — on every
-  path. A rejected registration fails the whole load atomically.</li>
+  path, and the same 64 MiB cap applies to both. A rejected registration fails the whole load atomically.</li>
   <li><strong>Errors:</strong> a non-zero return aborts the enclosing statement with
   a message naming the function and code; callbacks must not panic across the ABI
   boundary (in C++: catch everything). A VARCHAR result published on an error path is

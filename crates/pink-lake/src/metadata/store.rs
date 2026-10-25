@@ -2587,6 +2587,7 @@ type StatRow = (
     Option<String>,
     Option<String>,
     Option<i64>,
+    Vec<stats::StatsPath>,
 );
 
 /// Every visible file's column statistics for one table, grouped by data-file
@@ -2674,8 +2675,72 @@ fn load_stats_blocks(
         };
         staged.entry(file_id).or_default().push((
             *order,
-            (name.clone(), ty.clone(), nulls, min, max, contains_nan),
+            (
+                name.clone(),
+                ty.clone(),
+                nulls,
+                min,
+                max,
+                contains_nan,
+                Vec::new(),
+            ),
         ));
+    }
+    // Path statistics live in their own table (DuckLake v1.1); each row
+    // belongs to the column it names, under the name that column had when the
+    // file was written (a rename reuses the id).
+    let stmt = conn
+        .prepare(
+            "SELECT data_file_id, column_id, variant_path, shredded_type, null_count,
+                    min_value, max_value
+             FROM ducklake_file_variant_stats WHERE table_id = ?1
+             ORDER BY data_file_id, variant_path",
+        )
+        .map_err(|e| sql_error("reading file variant statistics", e))?;
+    let rows = stmt
+        .query_map(params![table_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|e| sql_error("reading file variant statistics", e))?;
+    for row in rows {
+        let (file_id, column_id, path, dtype, nulls, min, max) =
+            row.map_err(|e| sql_error("reading file variant statistics", e))?;
+        let Some(file_begin) = visible.get(&file_id) else {
+            continue;
+        };
+        let Some(history) = column_history.get(&column_id) else {
+            continue;
+        };
+        let Some(order) = history
+            .iter()
+            .find(|(begin, end, _, _, _)| {
+                begin <= file_begin && end.is_none_or(|end| end > *file_begin)
+            })
+            .map(|(_, _, order, _, _)| order)
+        else {
+            continue;
+        };
+        let Some(entries) = staged.get_mut(&file_id) else {
+            continue;
+        };
+        let Some((_, stat)) = entries.iter_mut().find(|(at, _)| at == order) else {
+            continue;
+        };
+        stat.6.push(stats::StatsPath {
+            path,
+            dtype,
+            nulls: nulls.map(i64_to_u64).unwrap_or(0),
+            min,
+            max,
+        });
     }
     Ok(staged
         .into_iter()
@@ -2696,7 +2761,7 @@ fn build_stats_block(
         return Ok(None);
     }
     let mut columns = Vec::with_capacity(rows.len());
-    for (name, column_type, nulls, min, max, contains_nan) in rows {
+    for (name, column_type, nulls, min, max, contains_nan, paths) in rows {
         let dtype = pink_dtype(&column_type);
         let column_name = name.clone();
         let decode_stat = |value: Option<String>| -> Result<Option<String>> {
@@ -2721,6 +2786,7 @@ fn build_stats_block(
             max: decode_stat(max)?,
             nan: (dtype == pinkdb::DataType::Double)
                 .then_some(contains_nan.unwrap_or(0).max(0) as u64),
+            paths,
         });
     }
     let mut block = StatsBlock {
@@ -2778,6 +2844,53 @@ fn load_file_stats(
     let mut rows = Vec::new();
     for row in mapped {
         rows.push(row.map_err(|e| sql_error("reading file statistics", e))?);
+    }
+    let mut rows: Vec<StatRow> = rows
+        .into_iter()
+        .map(|(name, ty, nulls, min, max, nan)| (name, ty, nulls, min, max, nan, Vec::new()))
+        .collect();
+    // Path statistics live in DuckLake's own table, joined to the column name
+    // the file was written under.
+    let stmt = conn
+        .prepare(
+            "SELECT v.variant_path, v.shredded_type, v.null_count, v.min_value, v.max_value,
+                    c.column_name
+             FROM ducklake_file_variant_stats v
+             JOIN ducklake_data_file f
+               ON f.data_file_id = v.data_file_id
+             JOIN ducklake_column c
+               ON c.table_id = v.table_id AND c.column_id = v.column_id
+              AND c.begin_snapshot <= f.begin_snapshot
+              AND (c.end_snapshot IS NULL OR c.end_snapshot > f.begin_snapshot)
+             WHERE v.data_file_id = ?1 AND v.table_id = ?2
+             ORDER BY c.column_order, v.variant_path",
+        )
+        .map_err(|e| sql_error("reading file variant statistics", e))?;
+    let mapped = stmt
+        .query_map(params![file_id, table_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(|e| sql_error("reading file variant statistics", e))?;
+    for row in mapped {
+        let (path, dtype, nulls, min, max, column) =
+            row.map_err(|e| sql_error("reading file variant statistics", e))?;
+        let Some(stat) = rows.iter_mut().find(|stat| stat.0 == column) else {
+            continue;
+        };
+        stat.6.push(stats::StatsPath {
+            path,
+            dtype,
+            nulls: nulls.map(i64_to_u64).unwrap_or(0),
+            min,
+            max,
+        });
     }
     // Re-seal the reconstructed block exactly as the writer did, so `.pink`
     // attach can still verify it. The CRC covers the table key and path.
@@ -4612,6 +4725,27 @@ fn write_file_stats(
             ],
         )
         .map_err(|e| sql_error("inserting file column statistics", e))?;
+        for path in &column.paths {
+            conn.execute(
+                "INSERT INTO ducklake_file_variant_stats
+                 (data_file_id, table_id, column_id, variant_path, shredded_type,
+                  column_size_bytes, value_count, null_count, min_value, max_value,
+                  contains_nan, extra_stats)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, NULL, NULL)",
+                params![
+                    file_id,
+                    row.table_id,
+                    column_id,
+                    path.path.clone(),
+                    path.dtype.clone(),
+                    i64_from_u64(rows.saturating_sub(path.nulls))?,
+                    i64_from_u64(path.nulls)?,
+                    path.min.clone(),
+                    path.max.clone()
+                ],
+            )
+            .map_err(|e| sql_error("inserting file variant statistics", e))?;
+        }
     }
     Ok(())
 }

@@ -113,20 +113,10 @@ unsafe fn collect_args<'a>(
             Some(ExtType::Integer) => ExtArg::Integer(value.int64 as i32),
             Some(ExtType::Bigint) => ExtArg::Bigint(value.int64),
             Some(ExtType::Double) => ExtArg::Double(value.double),
-            Some(ExtType::Varchar) => {
-                if value.text_len == 0 {
-                    ExtArg::Varchar(&[])
-                } else {
-                    // SAFETY: the ABI requires a non-NULL pointer to at least
-                    // `text_len` readable bytes for the duration of the call.
-                    unsafe {
-                        ExtArg::Varchar(std::slice::from_raw_parts(
-                            value.text_ptr as *const u8,
-                            value.text_len,
-                        ))
-                    }
-                }
-            }
+            // SAFETY: the ABI requires a non-NULL pointer to at least
+            // `text_len` readable bytes for the duration of the call.
+            Some(ExtType::Varchar) => ExtArg::Varchar(unsafe { text_bytes(value) }),
+            Some(ExtType::Variant) => ExtArg::Variant(unsafe { text_bytes(value) }),
             Some(ExtType::Date) => ExtArg::Date(value.int64 as i32),
             Some(ExtType::Timestamp) => ExtArg::Timestamp(value.int64),
             Some(ExtType::Interval) => {
@@ -152,6 +142,22 @@ unsafe fn collect_args<'a>(
         });
     }
     Ok(out)
+}
+
+/// The bytes of a text-channel argument (VARCHAR or VARIANT).
+///
+/// # Safety
+///
+/// `value.text_ptr` must point at `value.text_len` readable bytes that stay
+/// readable for the returned lifetime — the ABI promises exactly that for an
+/// argument, for the duration of the call.
+unsafe fn text_bytes<'a>(value: &PinkdbExtValue) -> &'a [u8] {
+    if value.text_len == 0 {
+        return &[];
+    }
+    // SAFETY: promised by the caller; `text_len == 0` with a NULL or stale
+    // pointer is the one case that never reads memory.
+    unsafe { std::slice::from_raw_parts(value.text_ptr as *const u8, value.text_len) }
 }
 
 /// Write one result value into the host-owned struct, allocating VARCHAR
@@ -203,34 +209,41 @@ fn write_result(value: ExtValue, out: &mut PinkdbExtValue) -> Result<(), String>
             out.double = double;
             Ok(())
         }
-        ExtValue::Varchar(bytes) => {
-            out.is_null = 0;
-            if bytes.is_empty() {
-                // A zero-length VARCHAR: NULL text_ptr, text_len 0 (never
-                // freed by the host, and read as an empty string).
-                return Ok(());
-            }
-            let Some(api) = HOST_API.get() else {
-                return Err("the host API was never initialized".to_string());
-            };
-            let ptr = (api.alloc)(bytes.len());
-            if ptr.is_null() {
-                return Err(format!(
-                    "the host could not allocate {} bytes for a VARCHAR result",
-                    bytes.len()
-                ));
-            }
-            // SAFETY: `alloc` returned a fresh block of `bytes.len()` bytes
-            // owned by the host (`free` is its pair, and the host frees a
-            // non-NULL `text_ptr` right after this call returns).
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
-            }
-            out.text_ptr = ptr as *const c_char;
-            out.text_len = bytes.len();
-            Ok(())
-        }
+        // VARCHAR and VARIANT share the text channel and its ownership rule.
+        ExtValue::Varchar(bytes) => write_text(&bytes, out, "VARCHAR"),
+        ExtValue::Variant(bytes) => write_text(&bytes, out, "VARIANT"),
     }
+}
+
+/// Copy result bytes into host memory through `api->alloc`.
+///
+/// A zero-length payload leaves a NULL `text_ptr` with `text_len` 0 (the host
+/// never frees it and reads it as empty); anything else must come from
+/// `api->alloc` because the host frees it right after the call returns.
+fn write_text(bytes: &[u8], out: &mut PinkdbExtValue, tag_name: &str) -> Result<(), String> {
+    out.is_null = 0;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let Some(api) = HOST_API.get() else {
+        return Err("the host API was never initialized".to_string());
+    };
+    let ptr = (api.alloc)(bytes.len());
+    if ptr.is_null() {
+        return Err(format!(
+            "the host could not allocate {} bytes for a {tag_name} result",
+            bytes.len()
+        ));
+    }
+    // SAFETY: `alloc` returned a fresh block of `bytes.len()` bytes owned by
+    // the host (`free` is its pair, and the host frees a non-NULL `text_ptr`
+    // right after this call returns).
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+    }
+    out.text_ptr = ptr as *const c_char;
+    out.text_len = bytes.len();
+    Ok(())
 }
 
 /// The panic payload as a string, for the stderr diagnostic.

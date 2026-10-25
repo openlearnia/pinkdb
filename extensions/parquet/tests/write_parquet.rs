@@ -485,35 +485,77 @@ fn interval_is_refused_naming_the_column() {
     cleanup(&dir);
 }
 
-/// Wave 101a: parquet VARIANT needs the shredded (metadata + value buffer)
-/// representation, which is wave 101b; writing it as JSON text would produce a
-/// file that no reader could check against the DuckDB spec.
+/// Wave 101b: a VARIANT column is written as the parquet `Variant` logical
+/// type — a metadata dictionary, the residual `value` buffer and the shredded
+/// `typed_value` group — and reads back through the existing reader.
 #[test]
-fn variant_is_refused_naming_the_column_and_wave_101b() {
+fn variant_is_written_as_the_parquet_variant_type() {
     let dir = scratch("variant");
+    let rows: Vec<Vec<Value>> = (0..40)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                Value::Variant(std::sync::Arc::new(
+                    pinkdb::variant::from_json_str(&format!(r#"{{"a":{i},"tag":"t{i}"}}"#))
+                        .unwrap(),
+                )),
+            ]
+        })
+        .collect();
     let src = table(
         "vr",
         vec![
             ("ok".to_string(), DataType::Integer),
             ("doc".to_string(), DataType::Variant),
         ],
-        vec![vec![
-            Value::Integer(1),
-            Value::Variant(std::sync::Arc::new(
-                pinkdb::variant::from_json_str(r#"{"a":[1,2]}"#).unwrap(),
-            )),
-        ]],
+        rows,
     );
-    let err = write_table(&src).unwrap_err();
-    assert!(matches!(err, WriteError::UnsupportedType { .. }), "{err:?}");
-    let text = err.to_string();
-    assert!(text.contains("doc"), "must name the column: {text}");
+    let (schema, read) = round_trip(&src, &dir);
+    assert_eq!(schema, src.schema());
+    let want: Vec<Vec<Value>> = (0..40)
+        .map(|i| {
+            vec![
+                Value::Integer(i),
+                Value::Variant(std::sync::Arc::new(
+                    pinkdb::variant::from_json_str(&format!(r#"{{"a":{i},"tag":"t{i}"}}"#))
+                        .unwrap(),
+                )),
+            ]
+        })
+        .collect();
+    assert_eq!(read, want);
+
+    // The footer names the logical type and carries the shredded group.
+    let file = std::fs::File::open(dir.join("data.parquet")).unwrap();
+    let reader = SerializedFileReader::new(file).unwrap();
+    let metadata = reader.metadata();
+    let descr = metadata.file_metadata().schema_descr();
+    let doc = descr
+        .root_schema()
+        .get_fields()
+        .iter()
+        .find(|field| field.name() == "doc")
+        .expect("the VARIANT column is in the schema");
+    assert_eq!(
+        doc.get_basic_info().logical_type_ref(),
+        Some(&parquet::basic::LogicalType::variant(Some(1)))
+    );
+    let names: Vec<&str> = doc.get_fields().iter().map(|field| field.name()).collect();
+    assert_eq!(names, ["metadata", "value", "typed_value"]);
+    let shredded: Vec<&str> = doc.get_fields()[2]
+        .get_fields()
+        .iter()
+        .map(|field| field.name())
+        .collect();
+    assert_eq!(shredded, ["a", "tag"]);
+    // Readers other than this one may trust the shredding only because the
+    // writer says every policy field is complete for the file.
+    let key_values = metadata.file_metadata().key_value_metadata().unwrap();
     assert!(
-        text.to_lowercase().contains("variant"),
-        "must say what was refused: {text}"
+        key_values
+            .iter()
+            .any(|kv| kv.key == "pinkdb.variant.complete")
     );
-    assert!(text.contains("101b"), "must point at the plan: {text}");
-    assert!(!dir.join("data.parquet").exists());
     cleanup(&dir);
 }
 

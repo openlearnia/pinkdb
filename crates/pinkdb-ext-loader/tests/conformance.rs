@@ -33,7 +33,7 @@ use pinkdb_ext_loader::{
 };
 
 /// The functions the contract requires, in registration order.
-const REQUIRED: [&str; 15] = [
+const REQUIRED: [&str; 16] = [
     "cf_echo",
     "cf_bool",
     "cf_int",
@@ -42,6 +42,7 @@ const REQUIRED: [&str; 15] = [
     "cf_date",
     "cf_timestamp",
     "cf_interval",
+    "cf_variant",
     "cf_all",
     "cf_empty",
     "cf_fill",
@@ -305,6 +306,27 @@ fn values_round_trip_in_every_tag() {
         }
         assert_eq!(
             call(&ext, "cf_interval", &[ExtArg::Null(ExtType::Interval)]),
+            ExtValue::Null,
+            "{sdk}"
+        );
+
+        // VARIANT: the payload is opaque bytes on the text channel, so a
+        // fixture that is not the engine cannot interpret it — it must come
+        // back byte for byte, empty and embedded-NUL payloads included.
+        for bytes in [
+            [].as_slice(),
+            [0x00].as_slice(),
+            [0x18, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00].as_slice(),
+            [0x11, 0x02, 0x00, 0x01, 0x02, 0x61, 0x62].as_slice(),
+        ] {
+            assert_eq!(
+                call(&ext, "cf_variant", &[ExtArg::Variant(bytes)]),
+                ExtValue::Variant(bytes.to_vec()),
+                "{sdk} cf_variant({bytes:?})"
+            );
+        }
+        assert_eq!(
+            call(&ext, "cf_variant", &[ExtArg::Null(ExtType::Variant)]),
             ExtValue::Null,
             "{sdk}"
         );

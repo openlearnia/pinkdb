@@ -2,6 +2,7 @@
 //! Distinct → Sort → Limit (plus DDL/DML and set unions).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::attached::AtSpec;
 use crate::sql::ast::{JoinKind, MergeMatch, Select, SetOp, SortSpec};
@@ -1852,17 +1853,15 @@ fn collect_prune_predicates(
         BoundExpr::Binary {
             op, left, right, ..
         } => {
-            // `column op literal`, or `literal op column` (flipped).
-            let direct = match (&**left, &**right) {
-                (BoundExpr::Column { index, dtype }, BoundExpr::Literal(v)) => {
-                    Some((*index, *dtype, v, false))
-                }
-                (BoundExpr::Literal(v), BoundExpr::Column { index, dtype }) => {
-                    Some((*index, *dtype, v, true))
-                }
+            // `column op literal`, or `literal op column` (flipped). The
+            // column side may be a VARIANT path (`v['a']`, `variant_extract`),
+            // whose statistics live under the path.
+            let direct = match (literal_of(left), literal_of(right)) {
+                (None, Some(v)) => Some((&**left, v, false)),
+                (Some(v), None) => Some((&**right, v, true)),
                 _ => None,
             };
-            let Some((column, column_dtype, literal, flipped)) = direct else {
+            let Some((column_expr, literal, flipped)) = direct else {
                 return;
             };
             if literal.is_null() {
@@ -1871,21 +1870,42 @@ fn collect_prune_predicates(
                 // (pruning everything is equivalent but noisy).
                 return;
             }
+            let Some((column, path)) = prune_target(column_expr) else {
+                return;
+            };
             let Some(literal_dtype) = literal.data_type() else {
                 return;
             };
-            if !prunable_types(column_dtype, literal_dtype) {
-                return;
+            match &path {
+                None => {
+                    let column_dtype = column_expr.dtype();
+                    if !prunable_types(column_dtype, literal_dtype) {
+                        return;
+                    }
+                }
+                // A path's bounds are VARIANT values; the literal is whatever
+                // the comparison's implicit cast to VARIANT makes it.
+                Some(_) if !variant_literal(literal_dtype) => return,
+                Some(_) => {}
             }
             let op = if flipped { flip(*op) } else { *op };
             let Some(prune_op) = prune_op(op) else {
                 return;
             };
-            out.push(PrunePredicate::compare(column, prune_op, literal.clone()));
+            out.push(match path {
+                None => PrunePredicate::compare(column, prune_op, literal.clone()),
+                Some(path) => PrunePredicate::path_compare(column, path, prune_op, literal.clone()),
+            });
         }
         BoundExpr::IsNull { expr, negated } => {
-            if let BoundExpr::Column { index, .. } = &**expr {
-                out.push(PrunePredicate::null_test(*index, *negated));
+            match prune_target(expr) {
+                Some((column, None)) => out.push(PrunePredicate::null_test(column, *negated)),
+                // An absent key and an explicit `null` both read as SQL NULL,
+                // which is exactly what a path's NULL count counts.
+                Some((column, Some(path))) => {
+                    out.push(PrunePredicate::path_null_test(column, path, *negated))
+                }
+                None => {}
             }
         }
         _ => {}
@@ -1906,6 +1926,98 @@ fn prune_op(op: crate::sql::ast::BinaryOp) -> Option<crate::attached::PruneOp> {
         BinaryOp::GtEq => PruneOp::GtEq,
         _ => return None,
     })
+}
+
+/// The literal a comparison operand is, looking through the implicit cast to
+/// VARIANT `comparison_ok` inserts.
+fn literal_of(expr: &crate::sql::binder::BoundExpr) -> Option<&crate::types::Value> {
+    use crate::sql::binder::BoundExpr;
+    match expr {
+        BoundExpr::Literal(v) => Some(v),
+        BoundExpr::Cast { expr, .. } => match &**expr {
+            BoundExpr::Literal(v) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The pruned column and, for a VARIANT path expression, the canonical path
+/// text its statistics are keyed by. The path is the same text
+/// [`crate::variant::stats_path_text`] derives from the shredder's steps, so
+/// predicate and statistic cannot disagree.
+fn prune_target(expr: &crate::sql::binder::BoundExpr) -> Option<(usize, Option<Arc<str>>)> {
+    use crate::sql::binder::{BoundExpr, ScalarFunc};
+    use crate::variant::Step;
+    let mut steps: Vec<Step> = Vec::new();
+    let mut at = expr;
+    loop {
+        match at {
+            BoundExpr::Column { index, .. } => {
+                let path = if steps.is_empty() {
+                    None
+                } else {
+                    steps.reverse();
+                    Some(Arc::<str>::from(crate::variant::stats_path_text(&steps)?))
+                };
+                return Some((*index, path));
+            }
+            BoundExpr::Scalar {
+                func: ScalarFunc::VariantField,
+                args,
+                ..
+            } => match (args.first()?, args.get(1)?) {
+                (base, BoundExpr::Literal(crate::types::Value::Varchar(key))) => {
+                    steps.push(Step::Key(key.as_str().into()));
+                    at = base;
+                }
+                _ => return None,
+            },
+            // `v[1]` is the first element, so the index is 1-based.
+            BoundExpr::Scalar {
+                func: ScalarFunc::VariantIndex,
+                args,
+                ..
+            } => match (args.first()?, args.get(1)?) {
+                (base, BoundExpr::Literal(crate::types::Value::Integer(index))) => {
+                    steps.push(Step::Index(usize::try_from(index.checked_sub(1)?).ok()?));
+                    at = base;
+                }
+                _ => return None,
+            },
+            BoundExpr::Scalar {
+                func: ScalarFunc::VariantExtract,
+                args,
+                ..
+            } => match (args.first()?, args.get(1)?) {
+                (base, BoundExpr::Literal(crate::types::Value::Varchar(path))) => {
+                    let parsed = crate::variant::parse_path(path).ok()?;
+                    steps.extend(parsed.into_iter().rev());
+                    at = base;
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+}
+
+/// Whether a literal of `dtype` is comparable to a VARIANT value: the kinds
+/// VARIANT holds as scalars (`comparison_ok`'s implicit cast set).
+fn variant_literal(dtype: crate::types::DataType) -> bool {
+    use crate::types::DataType;
+    matches!(
+        dtype,
+        DataType::Variant
+            | DataType::Boolean
+            | DataType::Integer
+            | DataType::Bigint
+            | DataType::Double
+            | DataType::Decimal { .. }
+            | DataType::Varchar
+            | DataType::Date
+            | DataType::Timestamp
+    )
 }
 
 /// The operator when the operands are swapped (`literal < column` becomes

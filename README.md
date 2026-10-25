@@ -277,7 +277,7 @@ SELECT DISTINCT ON (expr, ...) ...                -- first row per key, in ORDER
 -- exact error is [docs/sql-conformance.md](docs/sql-conformance.md).
 ```
 
-### VARIANT (wave 101a)
+### VARIANT (wave 101)
 
 A `VARIANT` column holds a value whose shape can differ from row to row — a
 JSON null, boolean, integer, double, decimal, string, date/timestamp, array or
@@ -297,6 +297,9 @@ SELECT typeof(payload), variant_type(payload), variant_keys(payload) FROM events
 SELECT variant_extract(payload, 'b[1]') FROM events;   -- 2.5
 SELECT payload['a'], payload.b[2] FROM events;         -- 1, "x" (1-based)
 SELECT CAST(payload AS VARCHAR) FROM events;           -- JSON text
+-- A comparison puts the scalar on VARIANT's side, so a path filter reads
+-- naturally; a literal string stays a string, it is not JSON-parsed.
+SELECT id FROM events WHERE payload['a'] = 1 OR variant_extract(payload, '$.b[1]') = 2.5;
 ```
 
 Casts go both ways. `VARIANT → VARCHAR` yields JSON text, and that round trip
@@ -317,6 +320,16 @@ Unlike DuckDB, `VARCHAR → VARIANT` **parses JSON** rather than copying the
 string, so `'{"a":1}'::VARIANT` is the object; this is what gives the type a
 literal form that the parser, the WAL and prepared statements already carry
 (DuckDB needs the JSON extension's `json()` first).
+
+A comparison whose sides are a `VARIANT` and a scalar puts the scalar on
+`VARIANT`'s side instead of refusing to bind, so `payload['a'] = 5` and
+`variant_extract(payload, '$.kind') = 'buy'` work: booleans, numbers, decimals,
+dates and timestamps compare by value, a *literal* string becomes a variant
+string (not JSON — `'[1]'` is the four characters `[1]`), and a non-literal
+`VARCHAR` is still a bind error, because only a visible cast can say whether
+the text is meant as JSON. `variant_extract(payload, 'a')` and `payload['a']`
+are therefore the fast spelling for a filter: their path is the one the
+statistics are keyed by.
 
 Functions: `typeof(v)` (`'VARIANT'`), `variant_type(v)` (`NULL`, `BOOL`,
 `BIGINT`, `DOUBLE`, `DECIMAL`, `VARCHAR`, `DATE`, `TIMESTAMP`, `ARRAY`,
@@ -339,15 +352,64 @@ its own group and is never equal to SQL `NULL`.
 
 Persistence: `.pink` gained dtype tag 9 (a column) and default-value tag 9, so
 a `VARIANT` column survives save/open, WAL replay, checkpoint and
-`ALTER TABLE … ADD COLUMN … DEFAULT`; VARIANT chunks carry no min/max
-statistics. An older build that meets the new tag reports a clear
-`corrupt file: bad dtype tag 9` — no legacy reader. The C ABI exposes
-`PINKDB_TYPE_VARIANT` with the JSON text, the JS/WASM binding hands it over as
-a native JSON value, and the extension ABI, the Arrow extension and Parquet
-write refuse it with a clear error (Parquet `VARIANT` is wave 101b, together
-with shredding and statistics on shredded paths — plan in
-[`docs/wave-101-plan.md`](docs/wave-101-plan.md)). A `.pink` lake data file
-round-trips a `VARIANT` column.
+`ALTER TABLE … ADD COLUMN … DEFAULT`. An older build that meets the new tag
+reports a clear `corrupt file: bad dtype tag 9` — no legacy reader. The C ABI
+exposes `PINKDB_TYPE_VARIANT` with the JSON text, the JS/WASM binding hands it
+over as a native JSON value, and the extension ABI carries it as the opaque
+binary encoding (`ExtType::Variant`, ABI minor 3; v1 and v1.2 extensions keep
+loading).
+
+#### Shredding, Parquet and pruning (wave 101b)
+
+Parquet files get the spec's `Variant` logical type: a `metadata` dictionary
+column shared by the row group, a residual `value` buffer and an optional
+`typed_value` group. Which object keys become typed columns is decided per
+column, over the column's rows: a key is shredded when it appears in at least
+32 rows and in at least half of them, every occurrence carries
+the same primitive kind (BOOLEAN, BIGINT, DOUBLE, VARCHAR, DATE or TIMESTAMP)
+and at most 8 keys qualify, most frequent first. Present-but-null keys and
+keys of any other kind (nested objects, arrays, DECIMALs, a JSON null) stay in
+the residual `value` buffer, so `{}` and `{"a": null}` stay distinct and a
+reader reconciles the two buffers exactly. Files written this way are readable
+by DuckDB 2.0 and vice versa (`cargo test -p pinkdb-parquet --test
+variant_parquet`, skipped when the binary is absent), and `COPY … TO
+'….parquet'` / `read_parquet` no longer refuse `VARIANT`.
+
+Statistics follow the shredding: each typed path gets exact min/max and null
+count, keyed by the path DuckDB spells (`"a"`, `"user"."id"` — every key
+double-quoted, joined by `.`). Both lake formats prune with them, so a filter
+on `payload['a']` or `variant_extract(payload, '$.a')` skips whole files. The
+DuckLake catalog keeps one `ducklake_file_variant_stats` row per path per data
+file — the table DuckLake v1.1 already defines — written and deleted in the
+same transaction as the file's other statistics, so an attached lake keeps
+them across sessions and DuckDB 2.0 reads them (and pinkdb prunes on rows
+DuckDB wrote). `shredded_type` and the bounds are plain text (`int64`,
+`varchar`, `date`, … / `39`, `v0`).
+
+Measured on 1M rows of mixed shapes (common `id`/`kind`/`amount`/`tags`/
+`user` paths, every 23rd row a scalar string, every 29th an array), 10 data
+files per lake, best of three runs:
+
+| lake | data size | `count(*)` | full `kind` filter | `a` path filter (pruned) |
+| --- | --- | --- | --- | --- |
+| Parquet, shredded | 12.3 MB | 0.000 s | 0.287 s | **0.027 s** |
+| Parquet, unshredded | 14.4 MB | 0.000 s | 0.269 s | 0.260 s |
+| `.pink`, shredded | 13.1 MB | 0.000 s | 0.212 s | **0.020 s** |
+| `.pink`, unshredded | 13.1 MB | 0.000 s | 0.219 s | 0.209 s |
+| Parquet, JSON text | 12.0 MB | 0.000 s | 0.108 s | 0.104 s (no pruning) |
+
+Shredding makes Parquet 15% smaller and turns a selective path filter into a
+metadata-only answer (about 10x faster), while a *full* scan of the column
+costs the same as the unshredded layout in a lake and 1.18x it when read
+straight from the file: the reader still rebuilds every value from all its
+leaves and the scan layer pushes no per-leaf projection, but each leaf's
+records are stored flat and its byte values in one pool, so reassembly is
+close to free. A `VARCHAR` column holding the same JSON text scans faster
+still but cannot prune on a path, which is the trade the type makes. TPC-H
+Q1/Q6 over a 10M-row `lineitem` are unchanged within noise (0.168/0.065 s
+against 0.166/0.066 s for the build before this wave).
+
+A `.pink` lake data file round-trips a `VARIANT` column.
 
 ### Browser playground
 

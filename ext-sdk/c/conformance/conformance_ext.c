@@ -170,6 +170,32 @@ static int32_t cf_interval(void *user_data, const pinkdb_ext_value *args,
     return 0;
 }
 
+/* VARIANT rides the same text channel as VARCHAR: an opaque pinkdb-encoded
+ * payload, copied into host memory because the input is valid only during
+ * this call. */
+static int32_t cf_variant(void *user_data, const pinkdb_ext_value *args,
+                          size_t n_args, pinkdb_ext_value *out) {
+    (void)user_data;
+    (void)n_args;
+    note_call();
+    if (args[0].is_null) {
+        return 0;
+    }
+    size_t len = args[0].text_len;
+    char *buf = (char *)g_api.alloc(len == 0 ? 1 : len);
+    if (buf == NULL) {
+        return 1;
+    }
+    if (len != 0) {
+        memcpy(buf, args[0].text_ptr, len);
+    }
+    out->type_tag = PINKDB_EXT_TYPE_VARIANT;
+    out->is_null = 0;
+    out->text_ptr = buf;
+    out->text_len = len;
+    return 0;
+}
+
 /* VARCHAR is the one tag whose payload is a pointer: copy the bytes into
  * host memory, because the input is valid only during this call. */
 static int32_t cf_echo(void *user_data, const pinkdb_ext_value *args,
@@ -440,6 +466,7 @@ int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
     static const int32_t t_date[1] = {PINKDB_EXT_TYPE_DATE};
     static const int32_t t_timestamp[1] = {PINKDB_EXT_TYPE_TIMESTAMP};
     static const int32_t t_interval[1] = {PINKDB_EXT_TYPE_INTERVAL};
+    static const int32_t t_variant[1] = {PINKDB_EXT_TYPE_VARIANT};
     static const int32_t t_all[8] = {
         PINKDB_EXT_TYPE_BOOLEAN, PINKDB_EXT_TYPE_INTEGER,
         PINKDB_EXT_TYPE_BIGINT,  PINKDB_EXT_TYPE_DOUBLE,
@@ -478,6 +505,10 @@ int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
     if (api->register_scalar(host_ctx, "cf_interval", 1, t_interval,
                              PINKDB_EXT_TYPE_INTERVAL, cf_interval, NULL) != 0) {
         return 17;
+    }
+    if (api->register_scalar(host_ctx, "cf_variant", 1, t_variant,
+                             PINKDB_EXT_TYPE_VARIANT, cf_variant, NULL) != 0) {
+        return 23;
     }
     if (api->register_scalar(host_ctx, "cf_all", 8, t_all,
                              PINKDB_EXT_TYPE_VARCHAR, cf_all, NULL) != 0) {

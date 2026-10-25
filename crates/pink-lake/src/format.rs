@@ -837,6 +837,7 @@ fn surviving_row_groups(
                 rows: group.rows,
                 zone: Some(&zone),
                 partition: None,
+                paths: None,
             };
             if crate::zone::file_prunes(facts, &[], &table.schema, filters) {
                 None

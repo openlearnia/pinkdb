@@ -44,6 +44,7 @@ lowercase):
 | `cf_date` | DATE | the argument (days since 1970-01-01); NULL in → NULL out |
 | `cf_timestamp` | TIMESTAMP | the argument (microseconds since the epoch); NULL in → NULL out |
 | `cf_interval` | INTERVAL | the argument (months, days, micros); NULL in → NULL out |
+| `cf_variant` | VARIANT | the argument's payload bytes verbatim (opaque pinkdb encoding — the fixture cannot interpret them); NULL in → NULL out |
 | `cf_all` | BOOLEAN, INTEGER, BIGINT, DOUBLE, VARCHAR, DATE, TIMESTAMP, INTERVAL | the canonical summary below |
 | `cf_empty` | — | a zero-length VARCHAR (`is_null = 0`, `text_len = 0`) |
 | `cf_fill` | BIGINT `n` | `n` bytes of `'x'` (host-allocated); `n < 0` → NULL |
@@ -54,6 +55,13 @@ lowercase):
 
 Every trailing `NULL in → NULL out` means: write nothing (the host pre-fills
 `out` with NULL) and return 0.
+
+`cf_variant` is a pass-through like `cf_interval`, not a field in `cf_all`:
+the VARIANT payload is an opaque byte string on the text channel, so a fixture
+written in a language other than the engine can only prove that the bytes
+survive unchanged (empty and embedded-NUL payloads included) and that the tag,
+NULL handling and result-buffer ownership are wired. Decoding the payload is
+the engine's job and is covered by the engine's own tests.
 
 ### `cf_all`'s canonical summary
 

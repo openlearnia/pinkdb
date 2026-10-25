@@ -668,6 +668,7 @@ mod tests {
             column: 0,
             op: PruneOp::Eq,
             value: Some(Value::Bigint(5)),
+            path: None,
         };
         assert!(!bounds_may_match(
             Some(&lower),
@@ -679,6 +680,7 @@ mod tests {
             column: 0,
             op: PruneOp::Eq,
             value: Some(Value::Bigint(2)),
+            path: None,
         };
         assert!(bounds_may_match(
             Some(&lower),

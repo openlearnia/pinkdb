@@ -52,7 +52,10 @@ use pinkdb::{ColumnStats, DataType, Value};
 use crate::{LakeError, Result};
 
 /// The statistics block version this build writes and reads.
-pub(crate) const STATS_VERSION: u32 = 1;
+///
+/// Version 2 added the per-path facts as their own field (version 1 smuggled
+/// them through a VARIANT column's `min`, a layout nothing else understood).
+pub(crate) const STATS_VERSION: u32 = 2;
 
 /// The statistics one v1 `.pink` table entry publishes: its schema and
 /// per-column exact facts, bound to the catalog key, the data file, and the
@@ -94,11 +97,42 @@ pub(crate) struct StatsColumn {
     /// every other type).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) nan: Option<u64>,
+    /// Per-**path** statistics of a VARIANT column (empty for every other
+    /// type). They live in DuckLake's own
+    /// `ducklake_file_variant_stats` table in the catalog; a `.pink` data
+    /// file also carries them in its block, so both lake formats publish the
+    /// same facts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) paths: Vec<StatsPath>,
 }
 
-/// The block's schema and gated statistics: `(schema, stats)` in column
-/// order, exactly the shape [`pinkdb::AttachedTable`] wants.
-type SchemaAndStats = (Vec<(String, DataType)>, Vec<ColumnStats>);
+/// One shredded path's exact statistics: the facts a `v['a'] = 5` filter
+/// prunes on.
+///
+/// `path` is the key [`pinkdb::variant::stats_path_text`] derives from a
+/// query's path steps and DuckLake calls `variant_path`, so a predicate and a
+/// statistic agree by construction. `dtype` is the `shredded_type` the bounds
+/// are written under, `nulls` counts the rows where the path has no value
+/// (absent key or explicit `null` — the same to a filter), and `min`/`max`
+/// bound the rest under the engine's VARIANT order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StatsPath {
+    pub(crate) path: String,
+    pub(crate) dtype: String,
+    pub(crate) nulls: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) min: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max: Option<String>,
+}
+
+/// The block's schema, gated statistics and per-path statistics, all in
+/// column order: `(schema, stats, paths)`.
+type SchemaAndStats = (
+    Vec<(String, DataType)>,
+    Vec<ColumnStats>,
+    Vec<Vec<StatsPath>>,
+);
 
 impl StatsBlock {
     /// Build the block for one saved table from the facts the engine
@@ -124,13 +158,33 @@ impl StatsBlock {
                         }
                     }),
                 };
+            // A VARIANT column has no value bounds of its own: its facts are
+            // the per-path entries, published in DuckLake's
+            // `ducklake_file_variant_stats`.
+            let (min, max) = if col.dtype == DataType::Variant {
+                (None, None)
+            } else {
+                (encode(&col.min)?, encode(&col.max)?)
+            };
+            let facts = col
+                .paths
+                .iter()
+                .map(|path| StatsPath {
+                    path: path.path.clone(),
+                    dtype: path.kind.clone(),
+                    nulls: path.null_count,
+                    min: path.min.clone(),
+                    max: path.max.clone(),
+                })
+                .collect();
             columns.push(StatsColumn {
                 name: col.name.clone(),
                 dtype: dtype_name(col.dtype),
                 nulls: col.null_count,
-                min: encode(&col.min)?,
-                max: encode(&col.max)?,
+                min,
+                max,
                 nan: (col.dtype == DataType::Double).then_some(col.nan_count),
+                paths: facts,
             });
         }
         let mut block = Self {
@@ -215,8 +269,9 @@ impl StatsBlock {
                 self.table, self.version
             )));
         }
-        let mut schema = Vec::with_capacity(self.columns.len());
+        let mut schema: Vec<(String, DataType)> = Vec::with_capacity(self.columns.len());
         let mut stats = Vec::with_capacity(self.columns.len());
+        let mut paths: Vec<Vec<StatsPath>> = Vec::with_capacity(self.columns.len());
         for col in &self.columns {
             let dtype = dtype_from_name(&col.dtype).ok_or_else(|| {
                 corrupt(format!(
@@ -229,6 +284,15 @@ impl StatsBlock {
                     "table \"{}\": column \"{}\" has {} NULLs in {} rows",
                     self.table, col.name, col.nulls, self.rows
                 )));
+            }
+            if !col.paths.is_empty() {
+                if dtype != DataType::Variant {
+                    return Err(corrupt(format!(
+                        "table \"{}\": column \"{}\" of type {dtype:?} carries path statistics",
+                        self.table, col.name
+                    )));
+                }
+                check_path_facts(&col.name, &col.paths, self.rows, &corrupt)?;
             }
             if col.min.is_some() != col.max.is_some() {
                 return Err(corrupt(format!(
@@ -246,9 +310,50 @@ impl StatsBlock {
                 max,
                 col.nan,
             ));
+            paths.push(col.paths.clone());
         }
-        Ok((schema, stats))
+        Ok((schema, stats, paths))
     }
+}
+
+/// Verify a column's path facts: no duplicate path, at most `rows` NULLs, a
+/// kind this engine knows, both bounds or neither, and each bound decoding as
+/// that kind.
+fn check_path_facts(
+    column: &str,
+    paths: &[StatsPath],
+    rows: u64,
+    corrupt: &impl Fn(String) -> LakeError,
+) -> Result<()> {
+    for (at, path) in paths.iter().enumerate() {
+        if paths[..at].iter().any(|seen| seen.path == path.path) {
+            return Err(corrupt(format!(
+                "column \"{column}\" lists path {:?} twice",
+                path.path
+            )));
+        }
+        if path.nulls > rows {
+            return Err(corrupt(format!(
+                "column \"{column}\" path {:?} has {} NULLs in {rows} rows",
+                path.path, path.nulls
+            )));
+        }
+        if path.min.is_some() != path.max.is_some() {
+            return Err(corrupt(format!(
+                "column \"{column}\" path {:?} carries only one of min/max",
+                path.path
+            )));
+        }
+        for bound in [&path.min, &path.max].into_iter().flatten() {
+            if pinkdb::variant_shred::stats_bound(&path.dtype, bound).is_none() {
+                return Err(corrupt(format!(
+                    "column \"{column}\" path {:?} has bound {bound:?} that is not a {} value",
+                    path.path, path.dtype
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn decode_option(
@@ -424,9 +529,9 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
                 micros: iv.micros,
             }
         }
-        // No writer emits VARIANT statistics (its kinds have no single order
-        // text), so nothing to decode.
-        DataType::Variant => return None,
+        DataType::Variant => {
+            return None;
+        }
     })
 }
 
@@ -539,6 +644,7 @@ mod tests {
                 min,
                 max,
                 nan_count: 0,
+                paths: Vec::new(),
             }],
         }
     }
@@ -654,7 +760,7 @@ mod tests {
         assert_eq!(parsed, block);
         assert!(parsed.verify_crc());
 
-        let (schema, stats) = block
+        let (schema, stats, _) = block
             .schema_and_stats(std::path::Path::new("catalog.json"))
             .unwrap();
         assert_eq!(schema, vec![("c".to_string(), DataType::Integer)]);

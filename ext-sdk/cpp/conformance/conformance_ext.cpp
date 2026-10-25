@@ -148,6 +148,17 @@ void append_int(std::string &text, const char *prefix, const ext::Value &value, 
     }
 }
 
+int32_t cf_variant(void *, const ext::Args &args, ext::Writer &out) {
+    enter();
+    if (args[0].is_null()) {
+        return 0;
+    }
+    // Opaque pinkdb-encoded bytes on the text channel; the writer allocates
+    // them through the host, exactly like a VARCHAR result.
+    out.set_variant(args[0].variant());
+    return 0;
+}
+
 int32_t cf_all(void *, const ext::Args &args, ext::Writer &out) {
     enter();
 
@@ -303,6 +314,9 @@ extern "C" int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ct
         }
         if (reg("cf_interval", {ext::kInterval}, ext::kInterval, &cf_interval, false) != 0) {
             return 17;
+        }
+        if (reg("cf_variant", {ext::kVariant}, ext::kVariant, &cf_variant, false) != 0) {
+            return 23;
         }
         if (reg("cf_all",
                 {ext::kBoolean, ext::kInteger, ext::kBigint, ext::kDouble, ext::kVarchar,

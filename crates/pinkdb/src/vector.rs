@@ -533,6 +533,10 @@ impl Vector {
             (VectorData::Interval(d), VectorData::Interval(s)) => {
                 d.extend_from_slice(&s[start..start + len]);
             }
+            (VectorData::Variant(d), VectorData::Variant(s)) => {
+                // Variants share their Arc value instead of copying.
+                d.extend(s[start..start + len].iter().cloned());
+            }
             _ => unreachable!("extend_from: vector dtype mismatch"),
         }
         let base = self.len;

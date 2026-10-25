@@ -98,11 +98,11 @@ pub(crate) fn ext_type_of(dtype: DataType) -> Option<ExtType> {
         // rejects such arguments with its usual message.
         DataType::Interval => Some(ExtType::Interval),
         DataType::Decimal { .. } => None,
-        // VARIANT has no ABI type (nor does DECIMAL): the binder's exact-type
-        // check rejects it as an argument or return type with a clear error.
-        // Pushing it through the C ABI needs a byte-string payload and a
-        // follow-up, so extensions cannot read or build one for now.
-        DataType::Variant => None,
+        // VARIANT is an additive ABI v1 type (tag 10, the pinkdb C ABI's
+        // number). Its payload rides the VARCHAR text channel as bytes in the
+        // engine's VARIANT encoding — the extension sees no field names, only
+        // opaque bytes, which keeps the ABI free of a second value model.
+        DataType::Variant => Some(ExtType::Variant),
     }
 }
 
@@ -117,6 +117,7 @@ pub(crate) fn dtype_of_ext(dtype: ExtType) -> DataType {
         ExtType::Date => DataType::Date,
         ExtType::Timestamp => DataType::Timestamp,
         ExtType::Interval => DataType::Interval,
+        ExtType::Variant => DataType::Variant,
     }
 }
 
@@ -556,6 +557,7 @@ pub(crate) fn push_ext_arg<'a>(
     vector: &'a Vector,
     row: usize,
     declared: ExtType,
+    variant: Option<&'a [u8]>,
 ) {
     if !vector.is_valid(row) {
         out.push(ExtArg::Null(declared));
@@ -579,9 +581,26 @@ pub(crate) fn push_ext_arg<'a>(
         VectorData::Decimal { .. } => {
             unreachable!("extensions v1 do not accept DECIMAL arguments")
         }
-        // Same for VARIANT.
-        VectorData::Variant(_) => unreachable!("extensions v1 do not accept VARIANT arguments"),
+        VectorData::Variant(_) => {
+            ExtArg::Variant(variant.expect("a VARIANT argument is encoded before it is pushed"))
+        }
     });
+}
+
+/// Encode one VARIANT cell for the ABI — bytes in the engine's VARIANT
+/// encoding, the format [`crate::variant::decode`] reads back. `None` when the
+/// vector is not a VARIANT or the cell is NULL (a NULL crosses as
+/// [`ExtArg::Null`], carrying no payload).
+pub(crate) fn variant_arg_bytes(vector: &Vector, row: usize) -> Option<Vec<u8>> {
+    let VectorData::Variant(items) = vector.data() else {
+        return None;
+    };
+    if !vector.is_valid(row) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    crate::variant::encode(&items[row], &mut bytes);
+    Some(bytes)
 }
 
 /// Convert one ABI result into an engine value, checking it against the
@@ -661,6 +680,17 @@ pub(crate) fn ext_value_to_value(
                 micros,
             }
         }
+        ExtValue::Variant(bytes) => {
+            if dtype != DataType::Variant {
+                return Err(mismatch(ExtType::Variant));
+            }
+            let value = crate::variant::decode(&bytes).map_err(|e| {
+                PinkDbError::Execution(format!(
+                    "extension function {function}() returned an invalid VARIANT payload: {e}"
+                ))
+            })?;
+            Value::Variant(std::sync::Arc::new(value))
+        }
     })
 }
 
@@ -679,6 +709,7 @@ mod tests {
             DataType::Date,
             DataType::Timestamp,
             DataType::Interval,
+            DataType::Variant,
         ] {
             assert_eq!(dtype_of_ext(ext_type_of(dtype).unwrap()), dtype);
         }

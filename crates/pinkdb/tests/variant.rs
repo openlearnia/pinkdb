@@ -768,3 +768,57 @@ fn duckdb_parity_on_shared_behaviour() {
     // (`ordering_is_total_across_kinds` pins the same sequence).
     let _ = DataType::Variant;
 }
+
+// ------------------------------------------------- implicit coercion (101b)
+
+/// A comparison between a VARIANT path and a scalar coerces the scalar instead
+/// of refusing it (`comparison_ok` has no VARIANT/scalar rule), so DuckDB's
+/// `variant_extract(v, 'a') = 5` spelling works. A VARCHAR literal becomes a
+/// VARIANT *string*, not JSON: `CAST(VARCHAR AS VARIANT)` parses JSON, so
+/// coercing through it would reject `'buy'`.
+#[test]
+fn comparisons_coerce_the_scalar_side_to_the_variant_kind() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t(v VARIANT);").unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (CAST('{\"a\": 5, \"kind\": \"buy\", \"ok\": true}' AS VARIANT));",
+    )
+    .unwrap();
+    let got = rows(
+        &mut db,
+        "SELECT variant_extract(v, '$.a') = 5,
+                v['a'] = 5,
+                variant_extract(v, '$.kind') = 'buy',
+                v['kind'] = 'buy',
+                variant_extract(v, '$.kind') <> 'view',
+                variant_extract(v, '$.ok') = true,
+                5 = variant_extract(v, '$.a'),
+                'buy' = variant_extract(v, '$.kind'),
+                v['missing'] = 5
+         FROM t;",
+    );
+    assert_eq!(
+        got,
+        vec![vec![
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Null,
+        ]]
+    );
+    // A non-literal VARCHAR still needs an explicit cast: there is no way to
+    // build a VARIANT string from a runtime string without one.
+    let message = err(
+        &mut db,
+        "SELECT count(*) FROM t WHERE v['kind'] = upper('buy');",
+    );
+    assert!(
+        message.contains("VARIANT") && message.contains("VARCHAR"),
+        "unexpected error: {message}"
+    );
+}

@@ -148,7 +148,11 @@ pub struct AttachmentReport {
 }
 
 /// A `.pink` file's schema and gated statistics, as attach wants them.
-type SchemaAndStats = (Vec<(String, pinkdb::DataType)>, Vec<ColumnStats>);
+type SchemaAndStats = (
+    Vec<(String, pinkdb::DataType)>,
+    Vec<ColumnStats>,
+    Vec<Vec<crate::stats::StatsPath>>,
+);
 
 /// One data file of an attached table: its exact row count, the physical
 /// positions its delete files drop (merge-on-read), its per-column zone map
@@ -170,6 +174,9 @@ struct AttachedFile {
     /// value set, so a file that provably could not match a predicate before
     /// deletes still cannot after them (see `crate::zone`).
     zone: Option<Vec<ColumnStats>>,
+    /// The file's per-path VARIANT statistics (`v['a']` pruning); empty when
+    /// no metadata carries them.
+    paths: Vec<pinkdb::PathStats>,
     /// The file's partition value map, keyed by
     /// [`crate::catalog::PartitionKey::key_text`]; not necessarily aligned
     /// with the table's current spec (a file written before the spec was set
@@ -945,10 +952,31 @@ fn file_survivors(
                 rows: file.rows,
                 zone: file.zone.as_deref(),
                 partition: file.partition.as_ref(),
+                paths: (!file.paths.is_empty()).then_some(file.paths.as_slice()),
             };
             !zone::file_prunes(facts, &entry.keys, &entry.schema, predicates)
         })
         .cloned()
+        .collect()
+}
+
+/// One file's published path statistics as the engine-side values pruning
+/// compares. A bound that does not decode is dropped rather than guessed:
+/// the path then prunes less, never wrongly.
+fn path_stats(paths: &[crate::stats::StatsPath]) -> Vec<pinkdb::PathStats> {
+    let bound = |path: &crate::stats::StatsPath, text: &Option<String>| {
+        text.as_deref()
+            .and_then(|text| pinkdb::variant_shred::stats_bound(&path.dtype, text))
+            .map(|value| pinkdb::Value::Variant(std::sync::Arc::new(value)))
+    };
+    paths
+        .iter()
+        .map(|path| pinkdb::PathStats {
+            path: path.path.clone(),
+            null_count: Some(path.nulls),
+            min: bound(path, &path.min),
+            max: bound(path, &path.max),
+        })
         .collect()
 }
 
@@ -1132,6 +1160,7 @@ fn load_file(
                     column: physical,
                     op: filter.op,
                     value: filter.value.clone(),
+                    path: filter.path.clone(),
                 })
             })
             .collect();
@@ -1374,7 +1403,7 @@ fn block_schema_and_stats(
         path: manifest_path.to_path_buf(),
         message,
     };
-    let (schema, stats) = if check_crc {
+    let (schema, stats, paths) = if check_crc {
         block.schema_and_stats(manifest_path)?
     } else {
         block.schema_and_stats_with_crc_check(manifest_path, false)?
@@ -1399,7 +1428,7 @@ fn block_schema_and_stats(
             block.rows,
         )));
     }
-    Ok((schema, stats))
+    Ok((schema, stats, paths))
 }
 
 /// Fold per-file statistics into one table's: NULL counts add up,
@@ -1562,7 +1591,7 @@ pub(crate) fn build_from(
                         .and_then(|file| {
                             block_file_stats(key, entry, file, &manifest_path, format.id())
                                 .ok()
-                                .map(|(schema, _)| schema)
+                                .map(|(schema, _, _)| schema)
                         })
                         .unwrap_or_default(),
                 };
@@ -1648,6 +1677,10 @@ pub(crate) fn build_from(
         // value, so physical facts fall back; default-materialized constants
         // stay exact).
         let mut zones: Vec<Vec<ColumnStats>> = Vec::with_capacity(entry.files.len());
+        // Each file's per-path VARIANT statistics, projected onto the logical
+        // schema like `zones` (a default-filled column has none, and a
+        // reordered one moves its paths with its column).
+        let mut file_paths: Vec<Vec<pinkdb::PathStats>> = Vec::with_capacity(entry.files.len());
         let mut schema: Option<Vec<(String, pinkdb::DataType)>> = None;
         for (fi, file) in entry.files.iter().enumerate() {
             // A v1–v3 entry's single file carries no per-file count; the
@@ -1655,9 +1688,9 @@ pub(crate) fn build_from(
             let rows = file.rows().unwrap_or(entry.rows);
             let deleted = layout.get(fi).map(|(_, _, d)| d.len() as u64).unwrap_or(0);
             let surviving = rows.saturating_sub(deleted);
-            let (file_schema, file_stats) =
+            let (file_schema, file_stats, block_paths) =
                 block_file_stats(key, entry, file, &manifest_path, provider.id())?;
-            let (zone_stats, stats) = match &record {
+            let (zone_stats, stats, paths) = match &record {
                 // Project the file's physical statistics onto the logical
                 // schema: renamed columns map, old-file columns materialize
                 // their default's constant facts, dropped ones vanish.
@@ -1667,6 +1700,7 @@ pub(crate) fn build_from(
                         record.map_file(file_version, &file_schema, &storage.abs(file.path()))?;
                     let mut zone_stats = Vec::with_capacity(record.columns.len());
                     let mut stats = Vec::with_capacity(record.columns.len());
+                    let mut paths = Vec::new();
                     // Only the merged table-level facts lose a deleted file's
                     // per-column values (a deleted position may have held any
                     // value); the file's zone map keeps them.
@@ -1680,6 +1714,7 @@ pub(crate) fn build_from(
                                 } else {
                                     stats.push(file_stats[*pi].clone());
                                 }
+                                paths.extend(path_stats(&block_paths[*pi]));
                             }
                             None => {
                                 let constant = record.default_stats(li, surviving);
@@ -1702,7 +1737,7 @@ pub(crate) fn build_from(
                         }
                         Some(_) => {}
                     }
-                    (zone_stats, stats)
+                    (zone_stats, stats, paths)
                 }
                 None => {
                     match &schema {
@@ -1726,11 +1761,16 @@ pub(crate) fn build_from(
                     } else {
                         file_stats.clone()
                     };
-                    (file_stats, merged)
+                    let paths = block_paths
+                        .iter()
+                        .flat_map(|block| path_stats(block))
+                        .collect();
+                    (file_stats, merged, paths)
                 }
             };
             per_file.push((surviving, stats));
             zones.push(zone_stats);
+            file_paths.push(paths);
         }
         let schema = match schema {
             Some(schema) => schema,
@@ -1851,18 +1891,22 @@ pub(crate) fn build_from(
         let file_list: Vec<AttachedFile> = layout
             .iter()
             .zip(entry.files.iter().zip(zones.iter()))
-            .map(|((rel, rows, deletes), (file, zone))| AttachedFile {
-                rel: rel.clone(),
-                rows: *rows,
-                schema_version: file
-                    .schema_version()
-                    .or_else(|| record.as_ref().map(|r| r.version))
-                    .unwrap_or(0),
-                deletes: deletes.clone(),
-                zone: Some(zone.clone()),
-                partition: file.partition().cloned(),
-                footer: file.footer_location(),
-            })
+            .zip(file_paths.iter())
+            .map(
+                |(((rel, rows, deletes), (file, zone)), paths)| AttachedFile {
+                    rel: rel.clone(),
+                    rows: *rows,
+                    schema_version: file
+                        .schema_version()
+                        .or_else(|| record.as_ref().map(|r| r.version))
+                        .unwrap_or(0),
+                    deletes: deletes.clone(),
+                    zone: Some(zone.clone()),
+                    paths: paths.clone(),
+                    partition: file.partition().cloned(),
+                    footer: file.footer_location(),
+                },
+            )
             .collect();
         let lkey = (dbname.to_ascii_lowercase(), table.to_ascii_lowercase());
         if files.contains_key(&lkey) || unavailable.contains_key(&lkey) {
@@ -2154,6 +2198,7 @@ mod tests {
                 min: Some(Value::Integer(-5)),
                 max: Some(Value::Integer(9)),
                 nan_count: 0,
+                paths: Vec::new(),
             }],
         };
         // A v4 entry whose single file carries `block` and declares 3 rows.
@@ -2189,7 +2234,7 @@ mod tests {
         // A consistent block attaches.
         let block = StatsBlock::from_saved(key, "data/main.t/x.pink", &saved).unwrap();
         let e = entry(Some(block));
-        let (schema, stats) = pink_file_stats(key, &e, &e.files[0], path).unwrap();
+        let (schema, stats, _) = pink_file_stats(key, &e, &e.files[0], path).unwrap();
         assert_eq!(schema[0].0, "i");
         assert_eq!(stats[0].min, Some(Value::Integer(-5)));
 
@@ -2252,7 +2297,7 @@ mod tests {
             inlined_limit: None,
             next_row_id: 0,
         };
-        let (schema, stats) = pink_file_stats(key, &v1, &v1.files[0], path).unwrap();
+        let (schema, stats, _) = pink_file_stats(key, &v1, &v1.files[0], path).unwrap();
         assert_eq!(schema[0].0, "i");
         assert_eq!(stats[0].max, Some(Value::Integer(9)));
     }

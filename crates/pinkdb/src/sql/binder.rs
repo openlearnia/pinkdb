@@ -1697,8 +1697,20 @@ impl<'a> Binder<'a> {
                     | BinaryOp::GtEq
                     | BinaryOp::Like
                     | BinaryOp::NotLike => {
-                        comparison_ok(*op, l.dtype(), r.dtype())?;
-                        DataType::Boolean
+                        let (l, r) = match comparison_ok(*op, l.dtype(), r.dtype()) {
+                            Ok(()) => (l, r),
+                            Err(error) => {
+                                let (l, r) = variant_coerce(l, r);
+                                comparison_ok(*op, l.dtype(), r.dtype()).map_err(|_| error)?;
+                                (l, r)
+                            }
+                        };
+                        return Ok(BoundExpr::Binary {
+                            op: *op,
+                            left: Box::new(l),
+                            right: Box::new(r),
+                            dtype: DataType::Boolean,
+                        });
                     }
                     // `a || b`: both sides format to VARCHAR (DuckDB casts
                     // implicitly); NULL on either side → NULL.
@@ -3170,8 +3182,62 @@ fn const_i64(e: &Expr) -> Option<i64> {
     }
 }
 
-/// Implicitly cast one `||` operand to VARCHAR (everything formats to
-/// VARCHAR; a bare NULL stays typeless so its NULL propagates).
+/// DuckDB's implicit coercion in a comparison with a VARIANT operand: the
+/// other side is converted instead of being refused, so `v['a'] = 5` and
+/// `v['a'] = 'x'` work. Scalars become `CAST(literal AS VARIANT)`; a VARCHAR
+/// literal becomes a VARIANT string at bind time, because this engine's
+/// `CAST(VARCHAR AS VARIANT)` *parses JSON* (wave 101a, so `'{"a":1}'::VARIANT`
+/// is an object) — casting `'x'` through it would either fail or reinterpret
+/// the text. A non-literal VARCHAR is left alone (its comparison stays the
+/// bind error `comparison_ok` gives): there is no way to build a VARIANT
+/// string from a runtime string without a cast the user can see. Kinds
+/// VARIANT cannot hold (INTERVAL) stay a type error too.
+fn variant_coerce(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
+    /// The VARIANT-string form of a VARCHAR literal.
+    fn text(e: &BoundExpr) -> Option<crate::variant::Variant> {
+        match e {
+            BoundExpr::Literal(crate::types::Value::Varchar(s)) => Some(
+                crate::variant::Variant::Str(std::sync::Arc::from(s.as_str())),
+            ),
+            _ => None,
+        }
+    }
+    fn literal(v: crate::variant::Variant) -> BoundExpr {
+        BoundExpr::Literal(crate::types::Value::Variant(std::sync::Arc::new(v)))
+    }
+    fn castable(dtype: Option<DataType>) -> bool {
+        matches!(
+            dtype,
+            Some(
+                DataType::Boolean
+                    | DataType::Integer
+                    | DataType::Bigint
+                    | DataType::Double
+                    | DataType::Decimal { .. }
+                    | DataType::Date
+                    | DataType::Timestamp
+            )
+        )
+    }
+    let cast = |e: BoundExpr, dtype| BoundExpr::Cast {
+        expr: Box::new(e),
+        dtype,
+    };
+    match (l.dtype(), r.dtype()) {
+        (DataType::Variant, DataType::Varchar) => match text(&r) {
+            Some(v) => (l, literal(v)),
+            None => (l, r),
+        },
+        (DataType::Varchar, DataType::Variant) => match text(&l) {
+            Some(v) => (literal(v), r),
+            None => (l, r),
+        },
+        (DataType::Variant, dtype) if castable(Some(dtype)) => (l, cast(r, DataType::Variant)),
+        (dtype, DataType::Variant) if castable(Some(dtype)) => (cast(l, DataType::Variant), r),
+        _ => (l, r),
+    }
+}
+
 fn cast_to_varchar(e: BoundExpr) -> BoundExpr {
     if e.dtype() == DataType::Varchar || matches!(e, BoundExpr::Literal(Value::Null)) {
         e

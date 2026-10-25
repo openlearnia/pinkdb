@@ -12,7 +12,7 @@ use pinkdb_ext_loader::{ExtArg, ExtType, ExtValue};
 
 /// The ABI type a Rust argument type maps to.
 ///
-/// Implemented for the seven ABI v1 value types and for `Option<T>`, which
+/// Implemented for the eight ABI v1 value types and for `Option<T>`, which
 /// wraps the same tag and additionally tells the generated glue that NULL is
 /// a legal input (see [`FromExtArg`]).
 pub trait ExtArgType {
@@ -46,6 +46,9 @@ impl ExtArgType for Timestamp {
 }
 impl ExtArgType for Interval {
     const EXT_TYPE: ExtType = ExtType::Interval;
+}
+impl ExtArgType for Variant {
+    const EXT_TYPE: ExtType = ExtType::Variant;
 }
 /// An optional argument keeps its inner type's tag and accepts NULL.
 impl<T: ExtArgType> ExtArgType for Option<T> {
@@ -233,6 +236,15 @@ impl FromExtArg<'_> for Interval {
     }
 }
 
+impl FromExtArg<'_> for Variant {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<Variant, String> {
+        match arg {
+            ExtArg::Variant(bytes) => Ok(Variant(bytes.to_vec())),
+            other => Err(type_message("VARIANT", "Variant", other)),
+        }
+    }
+}
+
 impl<'a, T: FromExtArg<'a>> FromExtArg<'a> for Option<T> {
     fn from_ext_arg(arg: &'a ExtArg<'a>) -> Result<Option<T>, String> {
         match arg {
@@ -399,6 +411,13 @@ impl IntoExtValue for Interval {
     }
 }
 
+impl IntoExtValue for Variant {
+    const RET_TYPE: ExtType = ExtType::Variant;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Variant(self.0))
+    }
+}
+
 impl<T: IntoExtValue> IntoExtValue for Option<T> {
     const RET_TYPE: ExtType = T::RET_TYPE;
     fn into_ext_value(self) -> Result<ExtValue, String> {
@@ -446,6 +465,30 @@ pub struct Interval {
     pub days: i32,
     /// Time part in microseconds.
     pub micros: i64,
+}
+
+/// A SQL `VARIANT`: pinkdb's own encoded bytes, carried opaquely.
+///
+/// The encoding is self-describing (PinkDB's variant format, not JSON text):
+/// the host decodes and validates what a function returns, so a payload that
+/// does not decode fails the statement. The SDK does not depend on the engine
+/// crate, so it cannot build or inspect values — an extension that needs the
+/// contents must parse the bytes itself, or take the argument as `String`
+/// (the binder casts VARIANT to VARCHAR as JSON text for a VARCHAR parameter).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Variant(pub Vec<u8>);
+
+impl Variant {
+    /// The encoded bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Wrap already-encoded bytes (the caller promises they decode; the host
+    /// rejects them at call time otherwise).
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Variant {
+        Variant(bytes.into())
+    }
 }
 
 #[cfg(test)]

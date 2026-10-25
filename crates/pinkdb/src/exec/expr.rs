@@ -206,10 +206,22 @@ fn eval_dynamic_scalar(
         vecs.push(eval_expr(a, chunk, cx)?);
     }
     let mut out = Vector::new_empty(dtype);
-    // Reused per row: no allocation once warm.
-    let mut ext_args: Vec<ExtArg<'_>> = Vec::with_capacity(vecs.len());
+    // VARIANT arguments cross as encoded bytes, borrowed for the call, so the
+    // row's payloads are encoded into an arena first: an `ExtArg` cannot own
+    // them (it is `Copy` and points into the caller's borrow). The arena and
+    // the argument list live for one row, because the list borrows the arena.
+    let has_variant = vecs
+        .iter()
+        .any(|v| matches!(v.data(), crate::vector::VectorData::Variant(_)));
     for row in 0..chunk.num_rows() {
-        ext_args.clear();
+        let variant_args: Vec<Option<Vec<u8>>> = if has_variant {
+            vecs.iter()
+                .map(|v| crate::ext::variant_arg_bytes(v, row))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut ext_args: Vec<ExtArg<'_>> = Vec::with_capacity(vecs.len());
         for (i, v) in vecs.iter().enumerate() {
             // Positional declared type; a variadic function repeats the last
             // one for arguments past its declared list. The binder checked the
@@ -220,7 +232,8 @@ fn eval_dynamic_scalar(
                     "function \"{name}\" declares no argument {i}, but the call supplied one"
                 )));
             };
-            crate::ext::push_ext_arg(&mut ext_args, v, row, arg_type);
+            let encoded = variant_args.get(i).and_then(|bytes| bytes.as_deref());
+            crate::ext::push_ext_arg(&mut ext_args, v, row, arg_type, encoded);
         }
         let value = function
             .call(&ext_args)

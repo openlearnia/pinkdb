@@ -115,6 +115,28 @@ pub enum PruneOp {
     IsNotNull,
 }
 
+/// The exact statistics of one **path** of a VARIANT column
+/// (`v['a']`, `variant_extract(v, '$.a')`).
+///
+/// Same contract as [`ColumnStats`]: every field is `None` when the lake
+/// cannot prove it exactly, and a pruning decision never relies on an
+/// approximation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathStats {
+    /// The canonical path key ([`crate::variant::stats_path_text`]).
+    pub path: String,
+    /// Exact number of rows where the path is SQL NULL (the key is absent, or
+    /// its value is `Variant::Null`) — what `v['a'] IS NULL` tests.
+    pub null_count: Option<u64>,
+    /// Exact min/max of the path's non-NULL values. The VARIANT total order
+    /// makes these comparable with a scalar literal: a path typed
+    /// `Int64`/`Double`/`Decimal` compares by numeric value, and a path that
+    /// is never a number sorts after every number, which is exactly what
+    /// pruning a numeric filter needs.
+    pub min: Option<Value>,
+    pub max: Option<Value>,
+}
+
 /// One simple conjunctive predicate the executor pushes into an attached-lake
 /// scan so the lake layer can skip whole data files whose zone maps prove no
 /// row can match (wave 66; lake-scan stage 3).
@@ -136,6 +158,9 @@ pub struct PrunePredicate {
     /// The literal; `None` exactly for [`PruneOp::IsNull`] /
     /// [`PruneOp::IsNotNull`].
     pub value: Option<Value>,
+    /// The VARIANT path the predicate tests (`v['a'] = 5`), or `None` for a
+    /// predicate on the column's own value.
+    pub path: Option<Arc<str>>,
 }
 
 impl PrunePredicate {
@@ -145,6 +170,17 @@ impl PrunePredicate {
             column,
             op,
             value: Some(value),
+            path: None,
+        }
+    }
+
+    /// A `v['path'] op value` predicate on one path of a VARIANT column.
+    pub fn path_compare(column: usize, path: Arc<str>, op: PruneOp, value: Value) -> Self {
+        Self {
+            column,
+            op,
+            value: Some(value),
+            path: Some(path),
         }
     }
 
@@ -158,6 +194,21 @@ impl PrunePredicate {
                 PruneOp::IsNull
             },
             value: None,
+            path: None,
+        }
+    }
+
+    /// A `v['path'] IS [NOT] NULL` predicate on one path of a VARIANT column.
+    pub fn path_null_test(column: usize, path: Arc<str>, negated: bool) -> Self {
+        Self {
+            column,
+            op: if negated {
+                PruneOp::IsNotNull
+            } else {
+                PruneOp::IsNull
+            },
+            value: None,
+            path: Some(path),
         }
     }
 }

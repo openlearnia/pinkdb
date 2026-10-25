@@ -337,6 +337,31 @@ pub struct SavedColumnStats {
     pub max: Option<Value>,
     /// Exact number of NaN values (doubles; always 0 for other types).
     pub nan_count: u64,
+    /// Per-path statistics of a VARIANT column (empty for every other type).
+    pub paths: Vec<SavedPathStats>,
+}
+
+/// Exact statistics of one **path** of a VARIANT column: the facts a filter
+/// on `v['a']` is pruned with.
+///
+/// Only paths a shredding policy would type are recorded
+/// ([`crate::variant_shred::infer_policy`]), and only when every non-NULL
+/// value of the path had the policy's kind — otherwise `min`/`max` would not
+/// bound the path's values and the entry is dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedPathStats {
+    /// The statistics key ([`crate::variant::stats_path_text`]) — the same
+    /// spelling DuckLake's `ducklake_file_variant_stats.variant_path` uses.
+    pub path: String,
+    /// The `shredded_type` name the bounds are published under
+    /// ([`crate::variant_shred::ShredKind::stats_type`]).
+    pub kind: String,
+    /// Rows where the path is SQL NULL (key absent, or `Variant::Null`).
+    pub null_count: u64,
+    /// Exact min/max of the path's non-NULL values, as catalog text
+    /// ([`crate::variant_shred::stats_bound_text`]).
+    pub min: Option<String>,
+    pub max: Option<String>,
 }
 
 /// Exact statistics of one saved table, in data-file order.
@@ -2124,7 +2149,30 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
         // row contributes no bytes at all (its offset is unchanged), so the
         // validity bitmap alone decides NULL-ness and `Variant::Null` stays a
         // real value.
-        DataType::Variant => best = Some((ENC_PLAIN, variant_payload(v))),
+        // VARIANT: the payload repeats its tag bytes and key dictionaries from
+        // value to value, so the second stage usually shrinks it (a
+        // JSON-shaped 1M-row column goes from 107 MB to ~40 MB). The probe
+        // keeps chunks it cannot help byte-identical to the unframed writer.
+        DataType::Variant => {
+            let plain = variant_payload(v);
+            // Probe the value region, not the offset table in front of it: an
+            // ascending offset table has no 4-byte repeat to find, so a probe
+            // over the whole payload would never fire on a large chunk.
+            let rows = variant_rows(v);
+            let data_start = 4 + (rows + 1) * 4;
+            let frame = if plain.len() >= LZ_MIN_ATTEMPT
+                && data_start < plain.len()
+                && lz_probe(&plain[data_start..])
+            {
+                enc_compressed_frame(ENC_PLAIN, &plain)
+            } else {
+                None
+            };
+            best = Some((ENC_PLAIN, plain));
+            if let Some(frame) = frame {
+                consider_best(&mut best, ENC_LZ_FRAME, frame);
+            }
+        }
         DataType::Double => {
             let values = float64_payload(v);
             let bits: Vec<u64> = values.iter().map(|x| x.to_bits()).collect();
@@ -2356,6 +2404,14 @@ fn tag_error(dtype: DataType, tag: u8) -> PinkDbError {
 /// The PLAIN payload of a VARIANT chunk: `u32 row count | u32 offsets
 /// (count + 1) | encoded values`. A NULL row contributes no bytes (its offset
 /// equals the next one).
+/// The row count of a VARIANT chunk.
+fn variant_rows(v: &Vector) -> usize {
+    match v.data() {
+        VectorData::Variant(values) => values.len(),
+        _ => unreachable!("variant chunk has a non-variant payload"),
+    }
+}
+
 fn variant_payload(v: &Vector) -> Vec<u8> {
     let VectorData::Variant(values) = v.data() else {
         unreachable!("variant chunk has a non-variant payload")
@@ -3631,7 +3687,7 @@ fn write_table(
         }
     }
     if collect_stats {
-        saved.push(SavedTableStats {
+        let mut entry = SavedTableStats {
             db: dbname.to_string(),
             table: name.to_string(),
             rows: t.num_rows() as u64,
@@ -3645,9 +3701,12 @@ fn write_table(
                     min: acc.min,
                     max: acc.max,
                     nan_count: acc.nan_count,
+                    paths: Vec::new(),
                 })
                 .collect(),
-        });
+        };
+        variant_path_stats(t, &mut entry);
+        saved.push(entry);
     }
     // The pages, column by column: `by_column[ci]` holds the column's pages
     // in chunk order.
@@ -5289,7 +5348,7 @@ pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
             }
         }
     }
-    SavedTableStats {
+    let mut saved = SavedTableStats {
         db: db.to_string(),
         table: table.to_string(),
         rows: src.num_rows() as u64,
@@ -5303,8 +5362,77 @@ pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
                 min: acc.min,
                 max: acc.max,
                 nan_count: acc.nan_count,
+                paths: Vec::new(),
             })
             .collect(),
+    };
+    variant_path_stats(src, &mut saved);
+    saved
+}
+
+/// Fill in every VARIANT column's per-path statistics: one policy pass over
+/// the whole column (so a typed path is a *complete* bound), then one
+/// accumulate pass. Two passes keep the policy exact; the alternative
+/// (sampling) would let a later row's other-kind value silently invalidate
+/// min/max.
+fn variant_path_stats(src: &DataTable, saved: &mut SavedTableStats) {
+    use crate::variant::Variant;
+
+    let mut policy_rows: Vec<Option<Vec<std::sync::Arc<Variant>>>> = Vec::new();
+    for column in &src.columns {
+        if column.dtype != DataType::Variant {
+            policy_rows.push(None);
+            continue;
+        }
+        let mut values: Vec<std::sync::Arc<Variant>> = Vec::new();
+        for chunk in &column.chunks {
+            let VectorData::Variant(items) = chunk.data() else {
+                continue;
+            };
+            for (index, item) in items.iter().enumerate() {
+                if chunk.is_valid(index) {
+                    values.push(std::sync::Arc::clone(item));
+                }
+            }
+        }
+        policy_rows.push(Some(values));
+    }
+
+    for (index, values) in policy_rows.iter().enumerate() {
+        let Some(values) = values else { continue };
+        let refs: Vec<&Variant> = values.iter().map(|v| v.as_ref()).collect();
+        let policy = crate::variant_shred::infer_policy(&refs);
+        if policy.is_empty() {
+            continue;
+        }
+        let mut acc = crate::variant_shred::PathStatsAcc::new(&policy);
+        for chunk in &src.columns[index].chunks {
+            let VectorData::Variant(items) = chunk.data() else {
+                continue;
+            };
+            for (row, item) in items.iter().enumerate() {
+                if chunk.is_valid(row) {
+                    acc.see(item);
+                } else {
+                    acc.see_null();
+                }
+            }
+        }
+        saved.columns[index].paths = acc
+            .finish()
+            .into_iter()
+            .map(|p| SavedPathStats {
+                kind: p.kind.stats_type().to_string(),
+                path: p.path,
+                null_count: p.null_count,
+                min: p
+                    .min
+                    .and_then(|v| crate::variant_shred::stats_bound_text(p.kind, &v)),
+                max: p
+                    .max
+                    .and_then(|v| crate::variant_shred::stats_bound_text(p.kind, &v)),
+            })
+            .collect();
     }
 }
 

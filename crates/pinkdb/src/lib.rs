@@ -92,11 +92,13 @@ pub mod text;
 pub mod trigger;
 pub mod types;
 pub mod variant;
+pub mod variant_shred;
 pub mod vector;
 pub mod wal;
 
 pub use attached::{
-    AtSpec, AttachedLake, AttachedScan, AttachedTable, ColumnStats, PruneOp, PrunePredicate,
+    AtSpec, AttachedLake, AttachedScan, AttachedTable, ColumnStats, PathStats, PruneOp,
+    PrunePredicate,
 };
 pub use crypto::EncryptionKey;
 pub use db::{AUTHENTICATION_REQUIRED, Connection, Database};

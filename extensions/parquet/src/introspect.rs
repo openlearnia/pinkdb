@@ -328,9 +328,10 @@ fn metadata_rows(metas: &[FileMeta]) -> Result<Vec<DataChunk>> {
     let mut rows = Rows::new(bind("parquet_metadata"));
     for meta in metas {
         for (rg_index, rg) in meta.row_groups.iter().enumerate() {
-            for (leaf, column) in meta.columns.iter().enumerate() {
+            for (index, column) in meta.columns.iter().enumerate() {
+                let leaf = column.leaf;
                 let chunk = &rg.chunks[leaf];
-                let stats = rg.stats.get(leaf).and_then(|s| s.as_ref());
+                let stats = rg.stats.get(index).and_then(|s| s.as_ref());
                 let (min, max) = match stats {
                     Some(stats) => (
                         stats.min.as_ref().map(render_stat),

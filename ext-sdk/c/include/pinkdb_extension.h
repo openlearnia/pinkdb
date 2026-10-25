@@ -71,10 +71,12 @@
  *             the C spelling — offsets and layout are identical); for
  *             INTERVAL it carries no numeric meaning and is read as a bit
  *             pattern (see below);
- *   text_ptr  VARCHAR bytes; NULL when absent;
+ *   text_ptr  VARCHAR bytes, or a VARIANT payload (see below); NULL when
+ *             absent;
  *   text_len  byte length of text_ptr (embedded NUL bytes are allowed; a
- *             trailing NUL is neither required nor read). A VARCHAR result
- *             over 64 MiB is rejected without reading or freeing the buffer.
+ *             trailing NUL is neither required nor read). A VARCHAR or
+ *             VARIANT result over 64 MiB is rejected without reading or
+ *             freeing the buffer.
  *
  * INTERVAL (type tag 9, same number as the pinkdb C ABI's
  * PINKDB_TYPE_INTERVAL) is a calendar interval with DuckDB's three fields:
@@ -90,6 +92,19 @@
  * The three fields round-trip exactly; a NULL interval ignores the payload.
  * Argument and result marshalling is identical. (Type tags 8 — the pinkdb C
  * ABI's DECIMAL — is deliberately not supported by extension ABI v1.)
+ *
+ * VARIANT (type tag 10, the pinkdb C ABI's PINKDB_TYPE_VARIANT number) is a
+ * semi-structured value. The payload rides the text channel: `text_ptr` /
+ * `text_len` hold exactly the bytes of pinkdb's VARIANT encoding — the same
+ * opaque format the engine stores and re-reads (`pinkdb::variant::encode` /
+ * `decode`). It is not JSON text: an extension that wants JSON must parse
+ * the bytes itself (the C ABI's JSON rendering is a display surface, not this
+ * one). The encoding is self-describing (nested objects and arrays included),
+ * so an extension can hand any bytes back and the host decodes and validates
+ * them; a payload that does not decode fails the statement with an error
+ * naming the function. Reuse `api->alloc` for returned bytes exactly as for
+ * VARCHAR results — the host copies `text_len` bytes and frees the buffer
+ * immediately. Argument bytes are host-owned and valid only during the call.
  *
  * ---------------------------------------------------------------------------
  * Scalar callbacks
@@ -135,8 +150,9 @@
  *   host, even when `is_null` is set or the callback returns a non-zero
  *   code — never return a stack, static, or interior pointer there, and
  *   never keep it;
- * - a `text_ptr` carried under any non-VARCHAR tag is ignored and **never
- *   freed** (it is not a VARCHAR result buffer), and a VARCHAR result whose
+ * - a `text_ptr` carried under any tag other than VARCHAR or VARIANT is
+ *   ignored and **never** freed (it is not a result buffer), and a VARCHAR
+ *   or VARIANT result whose
  *   `text_len` exceeds 64 MiB is rejected without reading or freeing the
  *   pointer;
  * - the host never frees a NULL `text_ptr`;
@@ -259,9 +275,12 @@ extern "C" {
 /* ABI version of this header / the host loader. */
 #define PINKDB_EXT_ABI_VERSION 1
 /* Additive level of that major version: 2 = pinkdb_ext_serve and the
- * execute_statement host field. Extensions that do not use them need not
- * care; hosts compare PINKDB_EXT_ABI_VERSION and probe the additions. */
-#define PINKDB_EXT_ABI_MINOR 2
+ * execute_statement host field; 3 = the VARIANT value type (tag 10).
+ * Extensions that do not use them need not care; hosts compare
+ * PINKDB_EXT_ABI_VERSION and probe the additions. A new type tag is safe in
+ * both directions: a host only ever sends tags the extension declared, and a
+ * minor-2 host rejects a VARIANT registration with a clear error. */
+#define PINKDB_EXT_ABI_MINOR 3
 
 /* Maximum number of function arguments the host accepts. */
 #define PINKDB_EXT_MAX_ARGS 64
@@ -271,8 +290,8 @@ extern "C" {
 #define PINKDB_EXT_FLAG_VOLATILE 0x1u
 
 /* Value / argument type tags (same numbering as the pinkdb C ABI). 8 is that
- * ABI's DECIMAL, which extension ABI v1 does not support; 9 is INTERVAL (see
- * the payload note at the top of this header). */
+ * ABI's DECIMAL, which extension ABI v1 does not support; 9 is INTERVAL and
+ * 10 is VARIANT (see the payload notes at the top of this header). */
 enum {
     PINKDB_EXT_TYPE_NULL = 0,
     PINKDB_EXT_TYPE_BOOLEAN = 1,
@@ -282,7 +301,8 @@ enum {
     PINKDB_EXT_TYPE_VARCHAR = 5,
     PINKDB_EXT_TYPE_DATE = 6,
     PINKDB_EXT_TYPE_TIMESTAMP = 7,
-    PINKDB_EXT_TYPE_INTERVAL = 9
+    PINKDB_EXT_TYPE_INTERVAL = 9,
+    PINKDB_EXT_TYPE_VARIANT = 10
 };
 
 /* One tagged scalar value; see the layout notes at the top of this header. */

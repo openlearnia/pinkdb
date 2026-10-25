@@ -29,8 +29,9 @@ pub struct ColStats {
     pub max_exact: bool,
 }
 
-/// One row group: its row count, per-leaf-column statistics (by leaf index
-/// into [`FileMeta::columns`]) and the column chunks' metadata.
+/// One row group: its row count, per-column statistics (by index into
+/// [`FileMeta::columns`]) and the column chunks' metadata (one per leaf, in
+/// file order).
 #[derive(Debug, Clone)]
 pub struct RowGroupMeta {
     pub rows: u64,
@@ -38,7 +39,13 @@ pub struct RowGroupMeta {
     pub bytes: i64,
     /// The row group's compressed byte size (the sum of its chunks').
     pub compressed_bytes: i64,
+    /// Statistics per engine column; a shredded VARIANT column has none (its
+    /// per-path statistics live in [`RowGroupMeta::paths`]).
     pub stats: Vec<Option<ColStats>>,
+    /// Path-qualified statistics of the shredded VARIANT columns:
+    /// `(column index, canonical path, bounds)`, in file order.
+    pub paths: Vec<(usize, String, ColStats)>,
+    /// One entry per leaf column chunk, in file order.
     pub chunks: Vec<ChunkInfo>,
 }
 
@@ -144,6 +151,14 @@ fn build_meta(
     let file_metadata = metadata.file_metadata();
     let schema_root: Arc<Type> = file_metadata.schema_descr().root_schema_ptr();
     let columns = map_columns(schema_root.as_ref(), file_metadata.schema_descr())?;
+    // Only a file whose writer shredded each VARIANT column over the whole
+    // column gives sound per-path bounds (see `variant_stats`).
+    let variant_complete = file_metadata.key_value_metadata().is_some_and(|kvs| {
+        kvs.iter().any(|kv| {
+            kv.key == crate::variant_stats::COMPLETE_KEY
+                && kv.value.as_deref() == Some(crate::variant_stats::COMPLETE_VALUE)
+        })
+    });
     let rows = FileMeta::rows_of(file_metadata.num_rows(), path)?;
 
     let mut row_groups = Vec::with_capacity(metadata.num_row_groups());
@@ -151,32 +166,48 @@ fn build_meta(
         let rg = metadata.row_group(i);
         let rg_rows = FileMeta::rows_of(rg.num_rows(), path)?;
         let mut stats = Vec::with_capacity(columns.len());
+        let mut paths: Vec<(usize, String, ColStats)> = Vec::new();
         let mut chunks = Vec::with_capacity(columns.len());
         let mut compressed_bytes = 0i64;
-        for (leaf, column) in columns.iter().enumerate() {
-            let chunk = rg.column(leaf);
-            stats.push(column_stats(chunk.statistics(), column, path)?);
-            compressed_bytes += chunk.compressed_size();
-            chunks.push(ChunkInfo {
-                file_offset: chunk.file_offset(),
-                num_values: chunk.num_values(),
-                compression: format!("{:?}", chunk.compression()),
-                encodings: chunk.encodings().map(|e| format!("{e:?}")).collect(),
-                index_page_offset: chunk.index_page_offset(),
-                dictionary_page_offset: chunk.dictionary_page_offset(),
-                data_page_offset: chunk.data_page_offset(),
-                compressed_size: chunk.compressed_size(),
-                uncompressed_size: chunk.uncompressed_size(),
-                distinct_count: chunk.statistics().and_then(|s| s.distinct_count_opt()),
-                bloom_filter_offset: chunk.bloom_filter_offset(),
-                bloom_filter_length: chunk.bloom_filter_length(),
-            });
+        for (at, column) in columns.iter().enumerate() {
+            if let Some(shred) = &column.shred {
+                // A shredded column's own min/max would have to compare whole
+                // objects; the useful bounds are per path.
+                stats.push(None);
+                paths.extend(
+                    crate::variant_stats::column_paths(shred, rg, column.leaf, variant_complete)
+                        .into_iter()
+                        .map(|(path, stats)| (at, path, stats)),
+                );
+            } else {
+                let chunk = rg.column(column.leaf);
+                stats.push(column_stats(chunk.statistics(), column, path)?);
+            }
+            for offset in 0..column.leaves {
+                let chunk = rg.column(column.leaf + offset);
+                compressed_bytes += chunk.compressed_size();
+                chunks.push(ChunkInfo {
+                    file_offset: chunk.file_offset(),
+                    num_values: chunk.num_values(),
+                    compression: format!("{:?}", chunk.compression()),
+                    encodings: chunk.encodings().map(|e| format!("{e:?}")).collect(),
+                    index_page_offset: chunk.index_page_offset(),
+                    dictionary_page_offset: chunk.dictionary_page_offset(),
+                    data_page_offset: chunk.data_page_offset(),
+                    compressed_size: chunk.compressed_size(),
+                    uncompressed_size: chunk.uncompressed_size(),
+                    distinct_count: chunk.statistics().and_then(|s| s.distinct_count_opt()),
+                    bloom_filter_offset: chunk.bloom_filter_offset(),
+                    bloom_filter_length: chunk.bloom_filter_length(),
+                });
+            }
         }
         row_groups.push(RowGroupMeta {
             rows: rg_rows,
             bytes: rg.total_byte_size(),
             compressed_bytes,
             stats,
+            paths,
             chunks,
         });
     }

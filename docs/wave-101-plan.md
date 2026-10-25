@@ -9,8 +9,9 @@ first*, so it is split:
 - **101a (done, this document):** the type itself — value model, columnar
   storage, casts, functions, semantics, persistence, and the wire/FFI
   encodings.
-- **101b (queued):** shredding, Parquet `VARIANT` read/write, lake data files
-  and statistics on shredded paths. Scope at the end of this document.
+- **101b (landed 2026-10-25):** shredding, Parquet `VARIANT` read/write, lake
+  data files and statistics on shredded paths, `ExtType::Variant`. The scope
+  sketch is at the end of this document, with what actually shipped below it.
 
 Everything marked *measured* comes from `/tmp/duckdb-2.0.0/duckdb`
 (2.0.0 "Cyanoptera", commit `d54cbbe3df`) run while writing this wave.
@@ -289,9 +290,10 @@ re-plumbed through the extension ABI; see below.
   `format_contract` test, which now carries a `VARIANT` column with nested,
   unicode and NULL rows). The catalog type spelling gains `variant`; the stats
   block emits no min/max for it.
-- Parquet lake: a VARIANT column is **refused** with a message naming 101b
-  (`VARIANT needs parquet's shredded representation (wave 101b)`), the same way
-  INTERVAL is refused today, rather than written as text or a blob.
+- Parquet lake (101a state, replaced by 101b): a VARIANT column was
+  **refused** with a message naming 101b (`VARIANT needs parquet's shredded
+  representation (wave 101b)`), the same way INTERVAL is refused today, rather
+  than written as text or a blob.
 
 ## Not done in 101a
 
@@ -307,7 +309,7 @@ re-plumbed through the extension ABI; see below.
 - **Subscripts** `v['a']` / `v.a` and the path argument of `variant_type` /
   `variant_keys` (`variant_type(v, 'a')`).
 
-## 101b (queued) — from this plan's scope
+## 101b (landed 2026-10-25) — from this plan's scope
 
 1. **Shredding.** Split a VARIANT column into typed sub-columns (a
    `typed_value` column per kind present, plus a leftover `unshredded` blob
@@ -325,6 +327,42 @@ re-plumbed through the extension ABI; see below.
    dictionary (this wave writes one per value), a LIST type so
    `variant_keys` can return `VARCHAR[]` like DuckDB, and an
    `ExtType::Variant` payload for extensions.
+
+## What 101b shipped
+
+1. **Shredding** lives in `crates/pinkdb/src/variant_shred.rs` (spec codec,
+   policy, residual/typed split, `PathStatsAcc`). The spec's shape is a
+   `typed_value` group with one `(value, typed_value)` pair per shredded key —
+   not one column per kind plus a leftover blob as sketched above — and the
+   residual is the group's `value` buffer, so both readers reconcile exactly
+   the same way. The policy is inferred per column over all of the column's rows at write
+   time (the thresholds are frequency ones: at least 32 present rows, at least
+   half of them, one non-NULL kind, at most 8 keys). A present-but-null or other-kind key stays in the
+   residual, keeping `{}` and `{"a": null}` distinct (the reference shredder
+   collapses them).
+2. **Parquet** writes `LogicalType::variant(Some(1))` with `metadata`,
+   `value` and the optional `typed_value` group and reads it back, including
+   per-row metadata dictionaries and partially shredded files; DuckDB 2.0
+   interop is tested in both directions.
+3. **Lake statistics** are path-qualified everywhere. The `.pink` stats block
+   and the Parquet row-group statistics carry path keys; the DuckLake catalog
+   keeps one `ducklake_file_variant_stats` row per shredded path per data file
+   (DuckLake v1.1 already defines that table), written in the same catalog
+   transaction as `ducklake_file_column_stats` and deleted with the file by
+   expire and cleanup. `variant_path` uses DuckDB's spelling — every key
+   double-quoted and joined by `.` — and `shredded_type`/`min_value`/`max_value`
+   their plain text form; DuckDB 2.0 reads a pinkdb lake and pinkdb prunes on
+   rows DuckDB wrote.
+4. **The shared per-column dictionary** from the plan's "pressure" list is
+   in: one metadata blob per row group, object field ids indexing it.
+5. **`ExtType::Variant`** exists (ABI minor 3, tag 10, pinkdb's binary
+   encoding on the text channel).
+6. **Reassembly** stores a leaf's records flat (one offset per row) and its
+   byte values in one pool per leaf, so a shredded full scan costs ~1.2x the
+   unshredded layout instead of ~1.5x while a path filter stays 8–10x faster;
+   the remaining gap is the extra leaves a shredded row must read.
+7. **Still out of scope:** a LIST type, so `variant_keys` keeps returning JSON
+   array text; and no projection pushdown into the shredded tree.
 
 ## Differences from DuckDB, recorded
 

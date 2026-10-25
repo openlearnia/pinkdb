@@ -286,12 +286,22 @@ func (a *API) register(name string, args []int32, ret int32, flags uint32, fn, u
 // Returns 0 on success, non-zero when the host allocator failed (the result
 // then stays NULL, so the statement fails with a code rather than a crash).
 func (a *API) SetText(out unsafe.Pointer, b []byte) int32 {
+	return a.setBytes(out, TypeVarchar, b)
+}
+
+// SetVariant publishes b as the callback's VARIANT result: the bytes are
+// opaque pinkdb-encoded data, allocated and freed exactly like VARCHAR text.
+func (a *API) SetVariant(out unsafe.Pointer, b []byte) int32 {
+	return a.setBytes(out, TypeVariant, b)
+}
+
+func (a *API) setBytes(out unsafe.Pointer, tag int32, b []byte) int32 {
 	if a == nil || out == nil {
 		return ErrUsage
 	}
 	v := (*Value)(out)
 	if len(b) == 0 {
-		v.TypeTag = TypeVarchar
+		v.TypeTag = tag
 		v.IsNull = 0
 		v.TextPtr = nil
 		v.TextLen = 0
@@ -302,7 +312,7 @@ func (a *API) SetText(out unsafe.Pointer, b []byte) int32 {
 		return 1
 	}
 	copy(unsafe.Slice((*byte)(p), len(b)), b)
-	v.TypeTag = TypeVarchar
+	v.TypeTag = tag
 	v.IsNull = 0
 	v.TextPtr = (*byte)(p)
 	v.TextLen = uintptr(len(b))

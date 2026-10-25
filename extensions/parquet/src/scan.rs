@@ -195,7 +195,7 @@ struct DecodePlan<'a> {
     placeholders: Vec<Option<Arc<Vector>>>,
 }
 
-/// The output columns this file decodes, as (output, leaf, column).
+/// The output columns this file decodes, as (output, column index, column).
 fn decoded_columns<'a>(
     file: &'a FileResolved,
     plan: &DecodePlan<'_>,
@@ -204,8 +204,8 @@ fn decoded_columns<'a>(
     (0..resolved.schema.len())
         .filter(|out| plan.needed[*out] && resolved.kind[*out] == OutKind::FileColumn)
         .filter_map(|out| {
-            let leaf = file.out_to_file.get(out).copied().flatten()?;
-            Some((out, leaf, &file.meta.columns[leaf]))
+            let at = file.out_to_file.get(out).copied().flatten()?;
+            Some((out, at, &file.meta.columns[at]))
         })
         .collect()
 }
@@ -275,8 +275,8 @@ fn decode_row_group<R: ChunkReader + 'static>(
     // One column at a time: each needed file column decodes into
     // chunk-sized pieces (a vector cannot exceed CHUNK_SIZE rows).
     let mut pieces: Vec<Vec<Vector>> = Vec::with_capacity(decoded.len());
-    for (_, leaf, column) in decoded {
-        pieces.push(decode_column(&*row_group_reader, *leaf, column, rows)?);
+    for (_, _, column) in decoded {
+        pieces.push(decode_column(&*row_group_reader, column, rows)?);
     }
     Ok(pieces)
 }
@@ -310,7 +310,7 @@ fn assemble_row_group(
                     match decoded.iter().position(|(out, _, _)| *out == out_index) {
                         Some(slot) => {
                             let from = file.out_to_file[out_index]
-                                .map(|leaf| file.meta.columns[leaf].ty)
+                                .map(|at| file.meta.columns[at].ty)
                                 .expect("a decoded file column has a leaf");
                             let piece = std::mem::replace(
                                 &mut pieces[slot][chunk_index],
@@ -407,7 +407,13 @@ fn scan_remote_parallel(
         out.row_groups += 1;
         let spans: Vec<ByteSpan> = decoded
             .iter()
-            .filter_map(|(_, leaf, _)| rg.chunks.get(*leaf).and_then(crate::ranged::chunk_span))
+            .flat_map(|(_, _, column)| {
+                (0..column.leaves).filter_map(move |offset| {
+                    rg.chunks
+                        .get(column.leaf + offset)
+                        .and_then(crate::ranged::chunk_span)
+                })
+            })
             // The single-request cap: a chunk larger than it stays on the
             // lazy path (it cannot be split without chaining reads).
             .filter(|span| span.len <= crate::ranged::MAX_REQUEST_BYTES)
@@ -587,11 +593,26 @@ fn row_group_survives(
         if resolved.kind.get(filter.column) != Some(&OutKind::FileColumn) {
             continue;
         }
-        let Some(leaf) = file.out_to_file.get(filter.column).copied().flatten() else {
+        let Some(at) = file.out_to_file.get(filter.column).copied().flatten() else {
             continue;
         };
-        let column = &file.meta.columns[leaf];
-        let Some(stats) = rg.stats.get(leaf).and_then(|s| s.as_ref()) else {
+        if let Some(path) = &filter.path {
+            // A path-qualified predicate prunes on the shredded leaf's
+            // statistics; a row group without them cannot be excluded.
+            let stats = rg
+                .paths
+                .iter()
+                .find(|(column, at_path, _)| *column == at && at_path == path.as_ref())
+                .map(|(_, _, stats)| stats);
+            if let Some(stats) = stats
+                && !path_keeps(stats, filter, rg.rows)
+            {
+                return false;
+            }
+            continue;
+        }
+        let column = &file.meta.columns[at];
+        let Some(stats) = rg.stats.get(at).and_then(|s| s.as_ref()) else {
             continue;
         };
         if !stats_keeps(
@@ -605,6 +626,96 @@ fn row_group_survives(
         }
     }
     true
+}
+
+/// Whether one path's statistics prove the row group may hold a matching
+/// row: the same rules as [`stats_keeps`], over VARIANT bounds.
+///
+/// The bounds are VARIANT values, so the literal is compared in the engine's
+/// VARIANT order (`1` = `1.0` = `DECIMAL 1.0`, and a path typed as another
+/// kind sorts as that kind) — the same order the filter's own comparison
+/// uses, which is what makes pruning by path sound.
+fn path_keeps(stats: &crate::file_meta::ColStats, filter: &PrunePredicate, rows: u64) -> bool {
+    use pinkdb::variant::{Variant, cmp, from_value};
+
+    let to_variant = |value: &Value| -> Option<Variant> {
+        match value {
+            Value::Variant(v) => Some((**v).clone()),
+            other => from_value(other).ok(),
+        }
+    };
+    // NaN is unordered against every bound, so no bound proves anything
+    // about a NaN literal or a NaN bound.
+    let compare = |bound: &Value, literal: &Value| -> Option<std::cmp::Ordering> {
+        let bound = to_variant(bound)?;
+        let literal = to_variant(literal)?;
+        if let (Variant::Double(a), Variant::Double(b)) = (&bound, &literal)
+            && (a.is_nan() || b.is_nan())
+        {
+            return None;
+        }
+        Some(cmp(&bound, &literal))
+    };
+    match filter.op {
+        PruneOp::IsNull => stats.null_count != Some(0),
+        PruneOp::IsNotNull => stats.null_count != Some(rows),
+        PruneOp::NotEq => {
+            // `<>` is safe only when every value of the path equals the
+            // literal; without both bounds, keep the row group.
+            let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
+                return true;
+            };
+            let Some(literal) = filter.value.as_ref() else {
+                return true;
+            };
+            if min != max {
+                return true;
+            }
+            compare(min, literal).is_none_or(|order| !order.is_eq())
+        }
+        _ => {
+            let Some(literal) = filter.value.as_ref() else {
+                return true;
+            };
+            match filter.op {
+                PruneOp::Eq => {
+                    if compare_literal(&stats.min, literal, &compare).is_some_and(|o| o.is_gt()) {
+                        return false;
+                    }
+                    if compare_literal(&stats.max, literal, &compare).is_some_and(|o| o.is_lt()) {
+                        return false;
+                    }
+                    true
+                }
+                PruneOp::Lt => stats
+                    .min
+                    .as_ref()
+                    .is_none_or(|min| compare(min, literal).is_none_or(|o| o.is_lt())),
+                PruneOp::LtEq => stats
+                    .min
+                    .as_ref()
+                    .is_none_or(|min| compare(min, literal).is_none_or(|o| !o.is_gt())),
+                PruneOp::Gt => stats
+                    .max
+                    .as_ref()
+                    .is_none_or(|max| compare(max, literal).is_none_or(|o| o.is_gt())),
+                PruneOp::GtEq => stats
+                    .max
+                    .as_ref()
+                    .is_none_or(|max| compare(max, literal).is_none_or(|o| !o.is_lt())),
+                PruneOp::IsNull | PruneOp::IsNotNull | PruneOp::NotEq => unreachable!(),
+            }
+        }
+    }
+}
+
+/// `compare` applied to an optional bound (an absent bound excludes nothing).
+fn compare_literal(
+    bound: &Option<Value>,
+    literal: &Value,
+    compare: &impl Fn(&Value, &Value) -> Option<std::cmp::Ordering>,
+) -> Option<std::cmp::Ordering> {
+    compare(bound.as_ref()?, literal)
 }
 
 /// Whether the statistics prove the row group may hold a matching row.
@@ -696,10 +807,13 @@ fn stats_keeps(
 /// rows each, in row order).
 fn decode_column(
     row_group: &dyn RowGroupReader,
-    leaf: usize,
     column: &FileColumn,
     rows: usize,
 ) -> Result<Vec<Vector>> {
+    if let Some(shred) = &column.shred {
+        return crate::variant_read::read_column(row_group, column.leaf, shred, rows, &column.name);
+    }
+    let leaf = column.leaf;
     let scale = match column.ty {
         DataType::Decimal { scale, .. } => scale,
         _ => 0,

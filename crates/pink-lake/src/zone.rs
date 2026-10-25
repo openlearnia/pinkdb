@@ -51,6 +51,9 @@ pub(crate) struct FileFacts<'a> {
     /// The file's recorded partition values, keyed by
     /// [`PartitionKey::key_text`]; `None` (the map value) is SQL NULL.
     pub(crate) partition: Option<&'a BTreeMap<String, Option<String>>>,
+    /// The file's per-path VARIANT statistics (see
+    /// [`pinkdb::attached::PathStats`]), when the format publishes them.
+    pub(crate) paths: Option<&'a [pinkdb::PathStats]>,
 }
 
 /// The partition label of one row value under one key: the identity value
@@ -174,6 +177,9 @@ pub(crate) fn predicate_prunes(
     schema: &[(String, DataType)],
     predicate: &PrunePredicate,
 ) -> bool {
+    if predicate.path.is_some() {
+        return path_prunes(facts, schema, predicate);
+    }
     let Some((_, column_dtype)) = schema.get(predicate.column) else {
         return false;
     };
@@ -220,6 +226,76 @@ pub(crate) fn zone_prunes(
     op: PruneOp,
     literal: Option<&Value>,
 ) -> bool {
+    prunes_with(zone, rows, op, literal, |a, b| {
+        Some(pinkdb::plan::compare_values(a, b))
+    })
+}
+
+/// True when one path's statistics prove the file holds no matching row — the
+/// same rules as [`zone_prunes`], over VARIANT bounds.
+///
+/// The bounds and the literal are compared in the engine's VARIANT total
+/// order (`1` = `1.0` = `DECIMAL 1.0`; a path never typed as a number sorts
+/// after every number), which is the order the filter itself uses. A literal
+/// that cannot become a VARIANT (or a NaN) has no order against the bounds, so
+/// it prunes nothing.
+fn path_prunes(
+    facts: FileFacts<'_>,
+    schema: &[(String, DataType)],
+    predicate: &PrunePredicate,
+) -> bool {
+    let Some(path) = &predicate.path else {
+        return false;
+    };
+    let Some((_, DataType::Variant)) = schema.get(predicate.column) else {
+        return false;
+    };
+    if facts.rows == 0 {
+        return true;
+    }
+    let Some(stats) = facts
+        .paths
+        .and_then(|paths| paths.iter().find(|s| s.path == path.as_ref()))
+    else {
+        return false;
+    };
+    let zone = ColumnStats {
+        null_count: stats.null_count,
+        min: stats.min.clone(),
+        max: stats.max.clone(),
+    };
+    prunes_with(
+        &zone,
+        facts.rows,
+        predicate.op,
+        predicate.value.as_ref(),
+        |a, b| {
+            let to_variant = |value: &Value| match value {
+                Value::Variant(v) => Some((**v).clone()),
+                other => pinkdb::variant::from_value(other).ok(),
+            };
+            let a = to_variant(a)?;
+            let b = to_variant(b)?;
+            if let (pinkdb::variant::Variant::Double(x), pinkdb::variant::Variant::Double(y)) =
+                (&a, &b)
+                && (x.is_nan() || y.is_nan())
+            {
+                return None;
+            }
+            Some(pinkdb::variant::cmp(&a, &b))
+        },
+    )
+}
+
+/// [`zone_prunes`]'s rules, over any comparator (`None` = the two values have
+/// no order, so nothing is proven).
+fn prunes_with(
+    zone: &ColumnStats,
+    rows: u64,
+    op: PruneOp,
+    literal: Option<&Value>,
+    compare: impl Fn(&Value, &Value) -> Option<std::cmp::Ordering>,
+) -> bool {
     let all_null = zone.null_count == Some(rows);
     match op {
         PruneOp::IsNull => zone.null_count == Some(0),
@@ -232,12 +308,12 @@ pub(crate) fn zone_prunes(
                 return true;
             }
             if let Some(min) = &zone.min
-                && pinkdb::plan::compare_values(literal, min).is_lt()
+                && compare(literal, min) == Some(std::cmp::Ordering::Less)
             {
                 return true;
             }
             if let Some(max) = &zone.max
-                && pinkdb::plan::compare_values(literal, max).is_gt()
+                && compare(literal, max) == Some(std::cmp::Ordering::Greater)
             {
                 return true;
             }
@@ -251,8 +327,8 @@ pub(crate) fn zone_prunes(
             // no row differs; rows with NULL satisfy nothing either.
             match (&zone.min, &zone.max) {
                 (Some(min), Some(max)) => {
-                    pinkdb::plan::compare_values(min, literal).is_eq()
-                        && pinkdb::plan::compare_values(max, literal).is_eq()
+                    compare(min, literal) == Some(std::cmp::Ordering::Equal)
+                        && compare(max, literal) == Some(std::cmp::Ordering::Equal)
                 }
                 _ => false,
             }
@@ -266,7 +342,7 @@ pub(crate) fn zone_prunes(
             }
             zone.min
                 .as_ref()
-                .is_some_and(|min| !pinkdb::plan::compare_values(min, literal).is_lt())
+                .is_some_and(|min| matches!(compare(min, literal), Some(o) if !o.is_lt()))
         }
         PruneOp::LtEq => {
             let Some(literal) = literal else {
@@ -277,7 +353,7 @@ pub(crate) fn zone_prunes(
             }
             zone.min
                 .as_ref()
-                .is_some_and(|min| pinkdb::plan::compare_values(min, literal).is_gt())
+                .is_some_and(|min| matches!(compare(min, literal), Some(o) if o.is_gt()))
         }
         PruneOp::Gt => {
             let Some(literal) = literal else {
@@ -288,7 +364,7 @@ pub(crate) fn zone_prunes(
             }
             zone.max
                 .as_ref()
-                .is_some_and(|max| !pinkdb::plan::compare_values(max, literal).is_gt())
+                .is_some_and(|max| matches!(compare(max, literal), Some(o) if !o.is_gt()))
         }
         PruneOp::GtEq => {
             let Some(literal) = literal else {
@@ -299,7 +375,7 @@ pub(crate) fn zone_prunes(
             }
             zone.max
                 .as_ref()
-                .is_some_and(|max| pinkdb::plan::compare_values(max, literal).is_lt())
+                .is_some_and(|max| matches!(compare(max, literal), Some(o) if o.is_lt()))
         }
     }
 }
@@ -452,6 +528,7 @@ mod tests {
             rows: 0,
             zone: None,
             partition: None,
+            paths: None,
         };
         assert!(predicate_prunes(
             empty,
@@ -485,6 +562,7 @@ mod tests {
             rows: 4,
             zone: None, // no zone map at all: the partition value still prunes
             partition: Some(&partition),
+            paths: None,
         };
         let eq = PrunePredicate::compare(1, PruneOp::Eq, Value::Varchar("x".to_string()));
         assert!(!predicate_prunes(facts, &k, &s, &eq));
@@ -506,6 +584,7 @@ mod tests {
             rows: 4,
             zone: None,
             partition: Some(&null_partition),
+            paths: None,
         };
         assert!(predicate_prunes(facts, &k, &s, &not_null));
         assert!(!predicate_prunes(facts, &k, &s, &is_null));

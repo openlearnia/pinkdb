@@ -92,6 +92,7 @@ constexpr int32_t kVarchar = PINKDB_EXT_TYPE_VARCHAR;
 constexpr int32_t kDate = PINKDB_EXT_TYPE_DATE;
 constexpr int32_t kTimestamp = PINKDB_EXT_TYPE_TIMESTAMP;
 constexpr int32_t kInterval = PINKDB_EXT_TYPE_INTERVAL;
+constexpr int32_t kVariant = PINKDB_EXT_TYPE_VARIANT;
 
 // Codes `guard` returns when it contains an exception. They are ordinary
 // statement-error codes: the host reports them as
@@ -179,6 +180,10 @@ public:
         }
         return std::string_view(value_->text_ptr, value_->text_len);
     }
+
+    /// VARIANT payload: opaque pinkdb-encoded bytes on the same text channel
+    /// as `varchar()`, borrowed for the duration of the call.
+    std::string_view variant() const noexcept { return varchar(); }
 
     int32_t date() const noexcept { return static_cast<int32_t>(value_->int64); } ///< days since 1970-01-01
     int64_t timestamp() const noexcept { return value_->int64; }                  ///< µs since 1970-01-01 UTC
@@ -357,15 +362,11 @@ public:
     /// Allocate the bytes with the host's `alloc` (the ABI's only legal source
     /// for result text) and publish them. An empty string is a zero-length
     /// VARCHAR with a NULL `text_ptr`: nothing to free, read as "".
-    void set_text(std::string_view bytes) {
-        if (bytes.empty()) {
-            tag(kVarchar);
-            out_->text_ptr = nullptr;
-            out_->text_len = 0;
-            return;
-        }
-        set_text(Text::copy(allocator_, bytes));
-    }
+    void set_text(std::string_view bytes) { set_bytes(kVarchar, bytes); }
+
+    /// Publish a VARIANT payload (opaque pinkdb-encoded bytes): the same
+    /// allocation and ownership rule as `set_text`, under the VARIANT tag.
+    void set_variant(std::string_view bytes) { set_bytes(kVariant, bytes); }
 
     /// Transfer an owned host buffer into the result. From here the host frees
     /// it — also when the callback then returns a non-zero code.
@@ -381,6 +382,20 @@ public:
     Text make_text(std::string_view bytes) const { return Text::copy(allocator_, bytes); }
 
 private:
+    void set_bytes(int32_t type_tag, std::string_view bytes) {
+        if (bytes.empty()) {
+            tag(type_tag);
+            out_->text_ptr = nullptr;
+            out_->text_len = 0;
+            return;
+        }
+        Text text = Text::copy(allocator_, bytes);
+        tag(type_tag);
+        out_->text_ptr = text.data();
+        out_->text_len = text.size();
+        text.release();
+    }
+
     void tag(int32_t type_tag) noexcept {
         out_->type_tag = type_tag;
         out_->is_null = 0;

@@ -32,8 +32,8 @@ package main
 // registration — Go cannot take the address of a C symbol.
 #define PINKDB_CF_FUNCTIONS(X)                                                 \
     X(cf_echo) X(cf_bool) X(cf_int) X(cf_bigint) X(cf_double) X(cf_date)       \
-    X(cf_timestamp) X(cf_interval) X(cf_all) X(cf_empty) X(cf_fill) X(cf_fail) \
-    X(cf_unwind) X(cf_volatile) X(cf_thread)
+    X(cf_timestamp) X(cf_interval) X(cf_variant) X(cf_all) X(cf_empty)       \
+    X(cf_fill) X(cf_fail) X(cf_unwind) X(cf_volatile) X(cf_thread)
 
 #define PINKDB_CF_EXTERN(name) \
     extern int32_t name(void *user_data, void *args, size_t n_args, void *out);
@@ -198,6 +198,18 @@ func cfInterval(args []pinkdb.Value, out *pinkdb.Value) int32 {
 	return 0
 }
 
+// cfVariant passes VARIANT bytes through unchanged: an opaque payload on the
+// text channel, published with the host's allocator.
+func cfVariant(args []pinkdb.Value, out *pinkdb.Value) int32 {
+	if len(args) < 1 {
+		return 1
+	}
+	if args[0].IsNull != 0 {
+		return 0
+	}
+	return api.SetVariant(unsafe.Pointer(out), args[0].VariantBytes())
+}
+
 // cfAll renders the canonical one-line summary the fixture defines:
 //
 //	b=<bool>,i=<int>,big=<bigint>,d=<double bits>,v=<varchar>,date=<days>,ts=<micros>,iv=<months>/<days>/<micros>
@@ -353,6 +365,11 @@ func cf_interval(userData, args unsafe.Pointer, nArgs C.size_t, out unsafe.Point
 	return invoke(cfInterval, args, out, nArgs)
 }
 
+//export cf_variant
+func cf_variant(userData, args unsafe.Pointer, nArgs C.size_t, out unsafe.Pointer) C.int32_t {
+	return invoke(cfVariant, args, out, nArgs)
+}
+
 //export cf_all
 func cf_all(userData, args unsafe.Pointer, nArgs C.size_t, out unsafe.Pointer) C.int32_t {
 	return invoke(cfAll, args, out, nArgs)
@@ -446,6 +463,7 @@ var registrations = []registration{
 	{"cf_date", []int32{pinkdb.TypeDate}, pinkdb.TypeDate, C.cf_date_ptr(), false},
 	{"cf_timestamp", []int32{pinkdb.TypeTimestamp}, pinkdb.TypeTimestamp, C.cf_timestamp_ptr(), false},
 	{"cf_interval", []int32{pinkdb.TypeInterval}, pinkdb.TypeInterval, C.cf_interval_ptr(), false},
+	{"cf_variant", []int32{pinkdb.TypeVariant}, pinkdb.TypeVariant, C.cf_variant_ptr(), false},
 	{"cf_all", []int32{
 		pinkdb.TypeBoolean, pinkdb.TypeInteger, pinkdb.TypeBigint, pinkdb.TypeDouble,
 		pinkdb.TypeVarchar, pinkdb.TypeDate, pinkdb.TypeTimestamp, pinkdb.TypeInterval,

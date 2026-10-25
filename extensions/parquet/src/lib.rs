@@ -142,6 +142,8 @@ mod remote;
 mod resolve;
 mod scan;
 mod schema_map;
+mod variant_read;
+mod variant_stats;
 pub mod write;
 
 use std::sync::Arc;

@@ -246,6 +246,26 @@ typed snapshots, not a rendered manifest.</p>
   <li>Parquet with the <code>parquetlake</code> feature (and DuckDB interop).</li>
 </ul>
 
+<p>Either format prunes whole files with the statistics block: exact min/max,
+null count and NaN count per column, and for a <code>VARIANT</code> column one
+entry per shredded path, keyed the way DuckDB spells a path
+(<code>"a"</code>, <code>"user"."id"</code> — every key double-quoted, joined by
+<code>.</code>), so <code>WHERE payload['a'] = 5</code> or
+<code>variant_extract(payload, '$.a') = 5</code> skips files whose bounds
+exclude the value.</p>
+
+<p>A catalog stores those path facts in DuckLake's own
+<code>ducklake_file_variant_stats</code> table: one row per shredded path per
+data file, with <code>variant_path</code>, <code>shredded_type</code>, value and
+null counts and plain-text <code>min_value</code>/<code>max_value</code>. The
+rows are written in the same catalog transaction as
+<code>ducklake_file_column_stats</code> and deleted with their data file by
+<code>expire</code> and <code>cleanup</code>, on every catalog backend
+(<code>pink:</code>, <code>sqlite:</code>, and a Postgres catalog). Both
+directions of the DuckDB interop are tested: DuckDB 2.0 attaches a
+pinkdb-written lake and reads the rows, and pinkdb prunes files using rows
+DuckDB wrote.</p>
+
 <p>Each table pins its provider; appends keep it. A build without a table's
 provider lists the table as unavailable and refuses only that table — other
 tables still load.</p>
