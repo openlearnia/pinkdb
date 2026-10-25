@@ -13,6 +13,9 @@
 # The SDK smokes cover what a *loaded* extension does; this script covers what
 # the host refuses, which is where the trust boundary actually lives.
 set -eu
+# Assertions read the CLI's human output; run from a coding agent's shell
+# (AI_AGENT, CLAUDECODE, ...) the CLI would switch to agent mode (wave 99).
+export PINKDB_AGENT_MODE=0
 
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)

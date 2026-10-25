@@ -16,6 +16,9 @@
 set -euo pipefail
 # `LOAD EXTENSION` is off by default (security review C-2): this smoke script
 # deliberately loads native code, so it opts in explicitly.
+# Assertions read the CLI's human output; run from a coding agent's shell
+# (AI_AGENT, CLAUDECODE, ...) the CLI would switch to agent mode (wave 99).
+export PINKDB_AGENT_MODE=0
 export PINKDB_ALLOW_LOAD_EXTENSION=1
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
