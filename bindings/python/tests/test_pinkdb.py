@@ -256,6 +256,22 @@ class StatementKindTests(unittest.TestCase):
         self.assertIsNone(results[-1].name)
 
 
+class MemoryPathTests(unittest.TestCase):
+    def test_memory_path_opens_in_memory_and_creates_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with pinkdb.connect(":memory:") as conn:
+                    conn.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1)")
+                with pinkdb.connect(":memory:") as conn:
+                    with self.assertRaises(pinkdb.Error):
+                        conn.execute("SELECT * FROM t")
+                self.assertEqual(os.listdir(tmp), [])
+            finally:
+                os.chdir(cwd)
+
+
 class DecimalIntervalTests(unittest.TestCase):
     def test_array_values_are_lists_of_floats(self):
         with pinkdb.connect(":memory:") as conn:

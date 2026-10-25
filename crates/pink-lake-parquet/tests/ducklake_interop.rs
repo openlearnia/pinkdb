@@ -882,7 +882,7 @@ fn a_pinkdb_lake_round_trips_array_columns() {
     lake.write_from_store(&store).unwrap();
     drop(lake);
 
-    let mut lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
+    let lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
     let mut db = lake.load(None).unwrap();
     assert_eq!(
         query(&mut db, "SELECT typeof(v) FROM t LIMIT 1")[0][0].to_string(),
@@ -1043,11 +1043,10 @@ fn a_duckdb_list_column_is_refused_with_the_followup_wave() {
     }
 
     let catalog = format!("sqlite:{}", catalog_path.display());
-    let mut lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
-    let error = lake
-        .load(None)
-        .err()
-        .expect("a variable-length LIST column must not load as an ARRAY");
+    let lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
+    let Err(error) = lake.load(None) else {
+        panic!("a variable-length LIST column must not load as an ARRAY");
+    };
     let text = error.to_string();
     assert!(
         text.contains("107a2"),

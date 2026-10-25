@@ -985,11 +985,15 @@ def _encode_path(path) -> bytes:
 def connect(path) -> "Connection":
     """Open a durable pinkdb database (checkpoint + WAL) at ``path``.
 
-    ``path`` is a ``str``, ``bytes`` or ``os.PathLike``. Raises
-    :class:`ValueError` for an empty path or one containing a NUL byte, and
-    :class:`Error` when the native open fails (or the path is not valid
-    UTF-8).
+    ``path`` is a ``str``, ``bytes`` or ``os.PathLike``. The string
+    ``":memory:"`` opens a fresh in-memory database instead, as it does in
+    ``sqlite3`` and DuckDB (the same as :func:`connect_memory`), so it never
+    creates a file of that name. Raises :class:`ValueError` for an empty path
+    or one containing a NUL byte, and :class:`Error` when the native open
+    fails (or the path is not valid UTF-8).
     """
+    if path == ":memory:" or path == b":memory:":
+        return connect_memory()
     raw = _encode_path(path)
     handle = _LIB.pinkdb_open(raw)
     if not handle:

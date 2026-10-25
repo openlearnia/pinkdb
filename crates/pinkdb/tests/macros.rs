@@ -397,6 +397,28 @@ fn macro_in_view_cycles_fail_cleanly() {
     );
 }
 
+/// A view met again inside its own expansion is refused at the first
+/// re-entry (not at the macro depth limit), while using one view twice side
+/// by side, or a view inside another view, is not a cycle.
+#[test]
+fn a_view_cycle_is_refused_at_the_first_reentry() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+    db.execute("CREATE MACRO f(x) AS x + 1;").unwrap();
+    db.execute("CREATE VIEW v AS SELECT f(a) AS y FROM t;")
+        .unwrap();
+    db.execute("CREATE VIEW w AS SELECT y FROM v;").unwrap();
+    let rows = db.execute("SELECT count(*) FROM v AS l, v AS r;").unwrap();
+    assert!(format!("{rows:?}").contains('4'), "{rows:?}");
+    db.execute("SELECT * FROM w JOIN v ON w.y = v.y;").unwrap();
+    db.execute("SELECT f(f(a)) FROM t;").unwrap();
+    db.execute("CREATE OR REPLACE MACRO f(x) AS (SELECT COUNT(*) FROM v) + x;")
+        .unwrap();
+    let e = err(&mut db, "SELECT * FROM w;");
+    assert!(e.contains("view \"v\" is recursive"), "{e}");
+}
+
 #[test]
 fn materialized_views_refresh_through_macros() {
     let s = Scratch::new("mv");

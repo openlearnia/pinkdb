@@ -50,7 +50,7 @@ Python version you target; there is no cross-compilation.
 ```python
 import pinkdb
 
-connection = pinkdb.connect("data.pink")     # or pinkdb.connect_memory()
+connection = pinkdb.connect("data.pink")     # or pinkdb.connect(":memory:")
 try:
     cursor = connection.cursor()
     cursor.execute("CREATE TABLE t (x INTEGER, s VARCHAR)")

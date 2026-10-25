@@ -1292,6 +1292,13 @@ struct Binder<'a> {
     /// Substitution work used by this statement's macro expansions, shared
     /// like the depth. Bounds a body that duplicates its arguments.
     macro_nodes: Rc<Cell<usize>>,
+    /// The views (`db.view`, lowercased) whose bodies are being bound right
+    /// now, shared like the macro depth. A view has no arguments, so meeting
+    /// one again inside its own expansion is always a cycle (through a macro
+    /// or another view); it is refused at once instead of nesting until the
+    /// macro depth limit — which, crossing views and subqueries, could exhaust
+    /// a small thread stack first.
+    views_expanding: Rc<RefCell<Vec<String>>>,
 }
 
 impl<'a> Binder<'a> {
@@ -1329,6 +1336,7 @@ impl<'a> Binder<'a> {
             params: None,
             macro_depth: Rc::new(Cell::new(0)),
             macro_nodes: Rc::new(Cell::new(0)),
+            views_expanding: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -1372,6 +1380,7 @@ impl<'a> Binder<'a> {
             params: self.params.clone(),
             macro_depth: Rc::clone(&self.macro_depth),
             macro_nodes: Rc::clone(&self.macro_nodes),
+            views_expanding: Rc::clone(&self.views_expanding),
         }
     }
 
@@ -8574,7 +8583,17 @@ fn bind_source_raw(
                 // silently shadow it; DuckDB resolves the table). The body's
                 // own CTEs are bound below and scoped to it.
                 child.ctes.clear();
-                let sub = bind_select_in(child.db, &mut child, &view.query)?;
+                let key = format!("{lookup_db}.{name}").to_ascii_lowercase();
+                if binder.views_expanding.borrow().contains(&key) {
+                    return Err(PinkDbError::Catalog(format!(
+                        "view \"{name}\" is recursive: its definition reads itself through \
+                         a macro or another view"
+                    )));
+                }
+                binder.views_expanding.borrow_mut().push(key);
+                let sub = bind_select_in(child.db, &mut child, &view.query);
+                binder.views_expanding.borrow_mut().pop();
+                let sub = sub?;
                 let mut schema = plan_schema(child.db, &child.default_db, &child.ctes, &sub)?;
                 if let Some(cols) = &view.cols {
                     for (s, c) in schema.iter_mut().zip(cols.iter()) {

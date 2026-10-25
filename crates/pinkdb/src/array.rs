@@ -763,23 +763,31 @@ pub(crate) fn read_elems(bytes: &[u8], elem: ArrayElem, n: usize) -> Result<Elem
     let body = bytes.get(pos..need).ok_or_else(short_payload)?;
     let values = match elem {
         ArrayElem::Integer => ArrayElems::Ints(
-            body.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+            body.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c) as i64)
                 .collect(),
         ),
         ArrayElem::Bigint => ArrayElems::Ints(
-            body.chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().expect("8 bytes")))
+            body.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
                 .collect(),
         ),
         ArrayElem::Double => ArrayElems::Floats(
-            body.chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().expect("8 bytes")))
+            body.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect(),
         ),
         ArrayElem::Float => ArrayElems::Floats32(
-            body.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            body.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect(),
         ),
     };

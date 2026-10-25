@@ -1137,8 +1137,10 @@ fn value_from_pink(v: &PinkValue) -> Result<pinkdb::Value, String> {
             // contract.
             let bytes = unsafe { std::slice::from_raw_parts(v.text_ptr as *const u8, want) };
             let values = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect::<Vec<f32>>();
             let array = pinkdb::array::ArrayValue::new(
                 pinkdb::ArrayElem::Float,
@@ -1165,8 +1167,10 @@ fn value_from_pink(v: &PinkValue) -> Result<pinkdb::Value, String> {
             // contract.
             let bytes = unsafe { std::slice::from_raw_parts(v.text_ptr as *const u8, want) };
             let values = bytes
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect::<Vec<f64>>();
             // The payload always holds exactly `len` elements, so the
             // constructor cannot fail.
