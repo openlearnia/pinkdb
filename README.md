@@ -231,6 +231,13 @@ FROM t [<join> u ON <cond>] ...    -- multi-way; INNER / LEFT [OUTER] / RIGHT [O
                                    -- FULL [OUTER] / CROSS JOIN; composite ON
                                    -- (several equality pairs), non-equi predicates
                                    -- (>, <, >=, <=, !=) run over a nested loop
+  | FROM t, u [JOIN v ON t.x = v.z]  -- a comma is a CROSS JOIN in the same
+                                   -- left-deep chain (ON sees the items left of it)
+  | FROM LATERAL (SELECT ...) AS s -- LATERAL subqueries (uncorrelated only: a
+                                   -- derived plan has no outer scope)
+  | FROM t USING SAMPLE 10 ROWS    -- TABLESAMPLE/USING SAMPLE: n ROWS | n PERCENT,
+  | FROM t TABLESAMPLE BERNOULLI(10 PERCENT)  -- bernoulli | system | reservoir,
+                                   -- REPEATABLE (seed) for a deterministic draw
   | FROM db1.t                    -- qualified tables resolve in that database
   | FROM (SELECT ...) AS s         -- derived tables (alias required)
   | FROM (VALUES (1,'a'),(2,'b')) t(x, y)  -- VALUES: in FROM, standalone, or
@@ -238,7 +245,8 @@ FROM t [<join> u ON <cond>] ...    -- multi-way; INNER / LEFT [OUTER] / RIGHT [O
   | WITH [RECURSIVE] w AS (SELECT ...) ...   -- CTEs, incl. WITH w(a, b) column
                                    -- aliases; RECURSIVE iterates the
                                    -- UNION [ALL] step (bounded, see below)
-[WINDOW w AS (PARTITION BY … ORDER BY …), ...]
+[WINDOW w AS (PARTITION BY … ORDER BY …), ...]   -- a window may build on another:
+                                   -- OVER (w ORDER BY x), WINDOW v AS (w ROWS …)
 WHERE expr                        -- incl. IS [NOT] NULL, IS [NOT] DISTINCT FROM,
                                   -- BETWEEN, IN (subquery|list), EXISTS (subquery)
 GROUP BY [DISTINCT] expr, ... | GROUPING SETS (…), ROLLUP (…), CUBE (…)
@@ -253,7 +261,16 @@ SELECT DISTINCT ON (expr, ...) ...                -- first row per key, in ORDER
 -- (uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL).
 -- Expressions: CAST / TRY_CAST (NULL on failure), `x IS [NOT] DISTINCT FROM y`,
 -- `s LIKE p [ESCAPE e]`, `s SIMILAR TO regex`, subscripts `v['a']`, `v[0]`,
--- `v.a`, `s[2]`, `s[2:4]`; aggregates may take `FILTER (WHERE …)`.
+-- `v.a`, `s[2]`, `s[2:4]`; aggregates and window aggregates may take
+-- `FILTER (WHERE …)`; row constructors `(a, b) = (c, d)`, `(a, b) < (c, d)`,
+-- `(a, b) IN (…)`; `ts AT TIME ZONE 'UTC'` (a UTC-family zone is the identity:
+-- there is no TIMESTAMPTZ); `json_set` / `json_insert` / `json_replace` /
+-- `json_remove` on JSON text and on VARIANT; ordered-set aggregates
+-- `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`, `percentile_disc`,
+-- `mode()`; `SET VARIABLE x = 1` then `getvariable('x')` or `$x` (per-connection
+-- session state: never persisted or logged).
+-- `FOR UPDATE` / `FOR SHARE` are refused by name (MVCC already serializes
+-- writers); so are list literals — the engine has no LIST type.
 -- Over a few hundred forms either answer or refuse by name: the full matrix of
 -- what is supported, what differs from DuckDB 2.0 and what is refused with an
 -- exact error is [docs/sql-conformance.md](docs/sql-conformance.md).

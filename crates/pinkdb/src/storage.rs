@@ -4,7 +4,7 @@
 //! rows). [`PinkDb`] = map of table name → table. Single connection, single
 //! thread. No persistence in v1.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use pinkdb_ext_loader::{ExtFunction, ExtHandle};
@@ -1017,6 +1017,67 @@ impl DbCatalog {
 /// transactions give multi-statement atomicity, not isolation.
 ///
 /// Databases are named, case-insensitive namespaces (default `main`).
+/// The `SET VARIABLE` state of one client.
+///
+/// A session is one client, not one store: the embedded [`PinkDb`] handle is a
+/// single session, and every network [`crate::Connection`] owns its own map, so
+/// one client's variables are invisible to — and cannot be overwritten by —
+/// another's queries. Clones share the map (a transaction's private snapshot
+/// runs in the session that opened it).
+///
+/// Variables are session state, not table data: they are not transactional
+/// (a `ROLLBACK` keeps them, like DuckDB), never persisted, and never written
+/// to the WAL. A statement the engine logs may not *read* one (see
+/// `sql::bind_tracked_with`): replay re-binds the logged text against a fresh
+/// session, so a reference there could not reproduce its value.
+#[derive(Clone, Default)]
+pub struct Session {
+    /// Lowercased name -> value.
+    vars: Arc<Mutex<BTreeMap<String, Value>>>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Values can hold anything a query can (a secret, a tenant filter);
+        // never render them into a log line or an error.
+        f.debug_struct("Session")
+            .field("variables", &self.len())
+            .finish()
+    }
+}
+
+impl Session {
+    /// A session with no variables set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The value bound to `name` (case-insensitive), if the session set it.
+    pub fn get(&self, name: &str) -> Option<Value> {
+        self.lock().get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    /// Bind `name` for the rest of the session; a later `SET` replaces it.
+    pub fn set(&self, name: &str, value: Value) {
+        self.lock().insert(name.to_ascii_lowercase(), value);
+    }
+
+    /// How many variables the session holds.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// `true` when the session set no variables.
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Value>> {
+        // A panic elsewhere must not turn every later statement into a panic.
+        self.vars.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// `current_db` is the *embedded session's* default database: unqualified
 /// names resolve against it. [`crate::Connection`]s carry their own session
 /// database and never mutate this one.
@@ -1046,6 +1107,10 @@ pub struct PinkDb {
     pub(crate) loaded_extensions: HashMap<String, ExtHandle>,
     /// Lowercased name of the embedded session's current database.
     pub(crate) current_db: String,
+    /// The embedded handle's session (see [`Session`]): `SET VARIABLE` state
+    /// for this client only. A network [`crate::Connection`] overrides it with
+    /// its own session for every statement it runs.
+    pub(crate) session: Session,
     pub(crate) txn_snapshot: Option<Box<PinkDb>>,
     /// Durable WAL handle, shared by every clone of this store.
     pub(crate) wal: Option<Arc<Mutex<Wal>>>,
@@ -1245,6 +1310,9 @@ impl Clone for PinkDb {
             dynamic_functions: self.dynamic_functions.clone(),
             loaded_extensions: self.loaded_extensions.clone(),
             current_db: self.current_db.clone(),
+            // Clones share the session: a transaction's private snapshot runs
+            // in the session that opened it.
+            session: self.session.clone(),
             txn_snapshot: self.txn_snapshot.clone(),
             wal: self.wal.clone(),
             lease: self.lease.clone(),
@@ -1330,6 +1398,7 @@ impl PinkDb {
             dynamic_functions: HashMap::new(),
             loaded_extensions: HashMap::new(),
             current_db: "main".to_string(),
+            session: Session::default(),
             txn_snapshot: None,
             wal: None,
             lease: None,

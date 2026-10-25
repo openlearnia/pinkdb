@@ -117,6 +117,15 @@ pub enum Statement {
     Use {
         name: String,
     },
+    /// `SET VARIABLE <name> = <expr>`: bind a session variable that
+    /// `getvariable('name')` and `$name` read back.
+    ///
+    /// Variables are bind-time values (they are spliced as literals, never as
+    /// SQL text) and live for the session, not the transaction.
+    SetVariable {
+        name: String,
+        value: Expr,
+    },
     /// `LOAD EXTENSION '<path>'`: load a native loadable extension (ABI v1)
     /// and register its scalar functions. The path is a string literal kept
     /// exactly as written (never canonicalized by the parser).
@@ -657,9 +666,42 @@ pub struct FromClause {
     /// (`FROM t AS x AT (VERSION => 1)`), DuckLake's shape. Only table
     /// references may carry one.
     pub at: Option<crate::attached::AtSpec>,
+    /// `TABLESAMPLE …` / `USING SAMPLE …` on the head source.
+    pub sample: Option<SampleSpec>,
+    /// `FROM LATERAL (…)`: the source is bound after the items to its left, so
+    /// it may name them — pinkdb's derived plans are uncorrelated, so that is
+    /// refused with a named error (see `bind_source_raw`).
+    pub lateral: bool,
     /// Chained joins, left-deep, in written order: each `ON` condition sees
     /// every table to its left plus its own right-hand source.
     pub joins: Vec<JoinClause>,
+}
+
+/// One `TABLESAMPLE` / `USING SAMPLE` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampleSpec {
+    pub method: SampleMethod,
+    pub size: SampleSize,
+    /// `REPEATABLE (seed)`: the same seed samples the same rows.
+    pub repeatable: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleMethod {
+    /// Whole blocks (here: whole chunks) are kept or dropped together.
+    System,
+    /// Each row is kept independently.
+    Bernoulli,
+    /// Exactly `size` rows, drawn without replacement.
+    Reservoir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SampleSize {
+    /// `n ROWS`.
+    Rows(i64),
+    /// `p PERCENT` (or `p%`).
+    Percent(f64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,6 +726,10 @@ pub struct JoinClause {
     pub col_aliases: Option<Vec<String>>,
     /// `AT (...)` after this join's table reference (see [`FromClause::at`]).
     pub at: Option<crate::attached::AtSpec>,
+    /// `TABLESAMPLE …` / `USING SAMPLE …` on this join's right source.
+    pub sample: Option<SampleSpec>,
+    /// `JOIN LATERAL (…)` / `, LATERAL (…)`.
+    pub lateral: bool,
     /// `ON` condition; `None` for CROSS JOIN, which has no condition.
     pub on: Option<Expr>,
 }
@@ -718,6 +764,10 @@ impl SortSpec {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OverClause {
+    /// The window this specification builds on (`OVER (w ORDER BY ...)` and
+    /// `WINDOW v AS (w ...)`); the base's clauses are inherited where this one
+    /// leaves them empty.
+    pub base: Option<String>,
     pub partition: Vec<Expr>,
     pub order: Vec<OrderItem>,
     /// `None` = default frame (whole partition, or cumulative with ORDER BY).

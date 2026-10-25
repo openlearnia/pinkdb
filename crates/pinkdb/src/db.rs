@@ -180,6 +180,7 @@ impl Database {
             principal: None,
             require_login: false,
             exec_limits: None,
+            session: crate::storage::Session::new(),
         }
     }
 
@@ -420,6 +421,10 @@ pub struct Connection {
     /// (no timeout, no result cap); a network front-end always sets its
     /// policy with [`Connection::set_exec_limits`].
     exec_limits: Option<crate::exec::ExecLimits>,
+    /// This connection's `SET VARIABLE` state. One map per client, never
+    /// shared: another connection (or the embedded handle) cannot read or
+    /// overwrite it. Not transactional, not persisted, not logged.
+    session: crate::storage::Session,
 }
 
 impl Connection {
@@ -642,7 +647,8 @@ impl Connection {
         params: &[crate::types::Value],
     ) -> Result<crate::prepared::BoundStatement> {
         let default_db = self.current_db.clone();
-        self.with_bind_store(|db| stmt.bind(db, &default_db, params))
+        let session = &self.session;
+        self.with_bind_store(|db| stmt.bind_in(db, &default_db, params, session))
     }
 
     /// Execute a prepared statement like any other statement of this
@@ -753,7 +759,7 @@ impl Connection {
                 let pre = self.current_db.clone();
                 let bind_start = profile.as_ref().map(|_| Instant::now());
                 let (plan, dynamic_functions_used) =
-                    crate::sql::bind_tracked(&txn.work, stmt, &pre)?;
+                    crate::sql::bind_tracked_in(&txn.work, stmt, &pre, &self.session)?;
                 budget.check_deadline()?;
                 let plan = crate::plan::with_mv_source(plan, sql_text);
                 if let Some(p) = profile.as_deref_mut() {
@@ -763,6 +769,9 @@ impl Connection {
                 // transaction state too (the snapshot carries the RBAC
                 // catalog as of BEGIN).
                 txn.work.session_principal = self.principal.clone();
+                // `SET VARIABLE` state is the connection's, not the store's:
+                // the snapshot binds and runs in this session.
+                txn.work.session = self.session.clone();
                 enforce(self.principal.as_deref(), &txn.work, &plan, &pre)?;
                 // A durable transaction logs its mutating statements: one
                 // that reads an attached lake table could never replay (the
@@ -857,7 +866,7 @@ impl Connection {
                 // under the exclusive lock.
                 let shared = read_lock(&self.db.shared);
                 let bind_start = profile.as_ref().map(|_| Instant::now());
-                let (plan, _) = crate::sql::bind_tracked(&shared, stmt, &pre)?;
+                let (plan, _) = crate::sql::bind_tracked_in(&shared, stmt, &pre, &self.session)?;
                 budget.check_deadline()?;
                 if let Some(p) = profile.as_deref_mut() {
                     p.bind += bind_start.map(|s| s.elapsed()).unwrap_or_default();
@@ -868,7 +877,12 @@ impl Connection {
                 enforce(self.principal.as_deref(), &shared, &plan, &pre)?;
                 let result = if is_read_only(&plan) {
                     let exec_start = profile.as_ref().map(|_| Instant::now());
-                    let result = crate::exec::run_read_with_budget(&shared, &plan, budget.clone());
+                    let result = crate::exec::run_read_with_budget(
+                        &shared,
+                        &plan,
+                        budget.clone(),
+                        self.session.clone(),
+                    );
                     // Release before the `USE` logging below re-locks.
                     drop(shared);
                     if let Some(p) = profile.as_deref_mut() {
@@ -975,13 +989,15 @@ impl Connection {
         // have changed the catalog between the caller's read-guard bind and
         // this lock.
         let bind_start = profile.as_ref().map(|_| Instant::now());
-        let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+        let (plan, dynamic_functions_used) =
+            crate::sql::bind_tracked_in(&shared, stmt, pre, &self.session)?;
         budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
         if let Some(p) = profile.as_deref_mut() {
             p.bind += bind_start.map(|s| s.elapsed()).unwrap_or_default();
         }
         shared.session_principal = self.principal.clone();
+        shared.session = self.session.clone();
         enforce(self.principal.as_deref(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
@@ -997,10 +1013,12 @@ impl Connection {
             }
             // The refresh/rebind under the lease is execution time: it is the
             // span the caller waits on, not a second bind phase.
-            let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+            let (plan, dynamic_functions_used) =
+                crate::sql::bind_tracked_in(&shared, stmt, pre, &self.session)?;
             budget.check_deadline()?;
             let plan = crate::plan::with_mv_source(plan, sql_text);
             shared.session_principal = self.principal.clone();
+            shared.session = self.session.clone();
             enforce(self.principal.as_deref(), &shared, &plan, pre)?;
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
@@ -1849,6 +1867,62 @@ mod tests {
         assert!(!rows.is_empty());
         assert!(
             matches!(rows.last().unwrap().last().unwrap(), Value::Varchar(s) if s.contains("Scan"))
+        );
+    }
+
+    /// `SET VARIABLE` is session state: one map per connection, never the
+    /// store's. A second client can neither read the first's value nor
+    /// overwrite it (the map used to live on the store, which leaked one
+    /// user's variable into every other user's queries).
+    #[test]
+    fn session_variables_are_per_connection() {
+        let db = Database::new();
+        let mut a = db.connect();
+        let mut b = db.connect();
+        assert_eq!(
+            a.execute("SET VARIABLE x = 41;").unwrap(),
+            vec![QueryResult::SetVariable {
+                name: "x".to_string()
+            }]
+        );
+        assert_eq!(
+            rows_of(a.execute("SELECT $x, getvariable('x');").unwrap()),
+            vec![vec![Value::Integer(41), Value::Integer(41)]]
+        );
+        // B does not see A's variable: `getvariable` is NULL, `$x` errors.
+        assert_eq!(
+            rows_of(b.execute("SELECT getvariable('x') IS NULL;").unwrap()),
+            vec![vec![Value::Boolean(true)]]
+        );
+        let err = b.execute("SELECT $x;").unwrap_err().to_string();
+        assert!(err.contains("Variable x does not exist"), "{err}");
+        // B's own value shadows nothing: A keeps 41.
+        b.execute("SET VARIABLE x = 7;").unwrap();
+        assert_eq!(
+            rows_of(b.execute("SELECT $x;").unwrap()),
+            vec![vec![Value::Integer(7)]]
+        );
+        assert_eq!(
+            rows_of(a.execute("SELECT $x;").unwrap()),
+            vec![vec![Value::Integer(41)]]
+        );
+        // A prepared statement binds against its own connection's session.
+        let stmt = crate::prepared::PreparedStatement::parse("SELECT $x;").unwrap();
+        for (conn, want) in [(&mut a, 41), (&mut b, 7)] {
+            let bound = conn.bind(&stmt, &[]).unwrap();
+            assert_eq!(
+                rows_of(vec![conn.execute_bound(&bound).unwrap()]),
+                vec![vec![Value::Integer(want)]]
+            );
+        }
+        // Variables are not transactional (DuckDB's rule): a rollback keeps
+        // them, so a session's value never depends on an aborted statement.
+        a.execute("BEGIN;").unwrap();
+        a.execute("SET VARIABLE y = 1;").unwrap();
+        a.execute("ROLLBACK;").unwrap();
+        assert_eq!(
+            rows_of(a.execute("SELECT $y;").unwrap()),
+            vec![vec![Value::Integer(1)]]
         );
     }
 

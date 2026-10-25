@@ -19,7 +19,7 @@ use super::ast::*;
 use crate::attached::AtSpec;
 use crate::plan::{AlterTablePlan, LogicalPlan, RecursiveStep};
 use crate::storage::{
-    DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
+    DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, Session, TableConstraints,
 };
 use crate::table_source::{TableFunctionArg, TableFunctionCall};
 use crate::types::{
@@ -35,6 +35,14 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// `percentile_cont(p) WITHIN GROUP (ORDER BY x)` — interpolated
+    /// percentile; the fraction rides on [`BoundAgg::direct`].
+    PercentileCont,
+    /// `percentile_disc(p) WITHIN GROUP (ORDER BY x)` — the first input value
+    /// whose cumulative share reaches the fraction.
+    PercentileDisc,
+    /// `mode() WITHIN GROUP (ORDER BY x)` — the most frequent input value.
+    Mode,
 }
 
 impl AggFunc {
@@ -113,6 +121,14 @@ pub enum ScalarFunc {
     /// treats the pattern as a fully anchored regex (`%`/`_` are literal),
     /// and so does this.
     SimilarTo,
+    /// `json_set(json, path, value)` — assign, creating missing parents.
+    JsonSet,
+    /// `json_insert(json, path, value)` — assign only when the path is missing.
+    JsonInsert,
+    /// `json_replace(json, path, value)` — assign only when the path exists.
+    JsonReplace,
+    /// `json_remove(json, path)` — remove the value at the path.
+    JsonRemove,
 }
 
 impl ScalarFunc {
@@ -177,6 +193,10 @@ pub struct BoundAgg {
     /// `FILTER (WHERE pred)`: rows where the predicate is not TRUE are
     /// skipped by this aggregate (the other aggregates still see them).
     pub filter: Option<BoundExpr>,
+    /// The constant fraction of an ordered-set percentile aggregate
+    /// (`percentile_cont(0.5) WITHIN GROUP (…)`); `None` for every other
+    /// aggregate.
+    pub direct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +319,9 @@ pub struct BoundWindow {
     pub partition: Vec<BoundExpr>,
     pub order: Vec<(BoundExpr, SortSpec)>,
     pub frame: BoundFrame,
+    /// `FILTER (WHERE …)`: rows the predicate rejects do not feed the
+    /// aggregate (DuckDB: they contribute nothing, not a NULL).
+    pub filter: Option<BoundExpr>,
     pub dtype: DataType,
 }
 
@@ -798,6 +821,101 @@ fn check_cast(from: DataType, to: DataType) -> Result<()> {
     )))
 }
 
+/// The ordered-set aggregate behind `name`, if any.
+fn ordered_set_from_name(name: &str) -> Option<AggFunc> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "percentile_cont" | "quantile_cont" => AggFunc::PercentileCont,
+        "percentile_disc" | "quantile_disc" => AggFunc::PercentileDisc,
+        "mode" => AggFunc::Mode,
+        _ => return None,
+    })
+}
+
+/// The constant fraction of a percentile aggregate. DuckDB requires a
+/// constant here too (a column fraction is rejected).
+fn percentile_fraction(name: &str, e: &Expr) -> Result<f64> {
+    let p = match e {
+        Expr::Literal(Value::Double(p)) => *p,
+        Expr::Literal(Value::Integer(i)) => f64::from(*i),
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr,
+        } => match &**expr {
+            Expr::Literal(Value::Double(p)) => -*p,
+            Expr::Literal(Value::Integer(i)) => -f64::from(*i),
+            _ => f64::NAN,
+        },
+        _ => f64::NAN,
+    };
+    if !(0.0..=1.0).contains(&p) {
+        return Err(PinkDbError::Type(format!(
+            "the fraction of {name} must be a constant between 0 and 1"
+        )));
+    }
+    Ok(p)
+}
+
+/// The result type of an ordered-set aggregate: `percentile_cont` interpolates
+/// into DOUBLE (DECIMAL keeps its scale, like DuckDB), `percentile_disc` and
+/// `mode` return an input value unchanged.
+fn ordered_set_dtype(func: AggFunc, name: &str, input: DataType) -> Result<DataType> {
+    let numeric = matches!(
+        input,
+        DataType::Integer | DataType::Bigint | DataType::Double | DataType::Decimal { .. }
+    );
+    match func {
+        AggFunc::PercentileCont if matches!(input, DataType::Decimal { .. }) => Ok(input),
+        AggFunc::PercentileCont if numeric => Ok(DataType::Double),
+        AggFunc::PercentileCont => Err(PinkDbError::Type(format!(
+            "{name} needs a numeric ORDER BY expression, not {input}"
+        ))),
+        AggFunc::PercentileDisc
+            if !numeric && !matches!(input, DataType::Date | DataType::Timestamp) =>
+        {
+            Err(PinkDbError::Type(format!(
+                "{name} needs a numeric or temporal ORDER BY expression, not {input}"
+            )))
+        }
+        _ => Ok(input),
+    }
+}
+
+/// `l IS [NOT] DISTINCT FROM r` from already-bound operands: equality that
+/// treats NULL as a value. `COALESCE(l = r, FALSE) OR (l IS NULL AND r IS
+/// NULL)` is total (never NULL) and needs no executor support.
+fn distinct_from_bound(op: BinaryOp, l: BoundExpr, r: BoundExpr) -> BoundExpr {
+    let is_null = |e: &BoundExpr| BoundExpr::IsNull {
+        expr: Box::new(e.clone()),
+        negated: false,
+    };
+    let both_null = BoundExpr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(is_null(&l)),
+        right: Box::new(is_null(&r)),
+        dtype: DataType::Boolean,
+    };
+    let equal = BoundExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(l),
+        right: Box::new(r),
+        dtype: DataType::Boolean,
+    };
+    let same = BoundExpr::Binary {
+        op: BinaryOp::Or,
+        left: Box::new(BoundExpr::Coalesce {
+            args: vec![equal, BoundExpr::Literal(Value::Boolean(false))],
+            dtype: DataType::Boolean,
+        }),
+        right: Box::new(both_null),
+        dtype: DataType::Boolean,
+    };
+    if op == BinaryOp::IsNotDistinctFrom {
+        same
+    } else {
+        BoundExpr::Not(Box::new(same))
+    }
+}
+
 fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
     if (is_numeric(l) && is_numeric(r))
         || (l == DataType::Varchar && r == DataType::Varchar)
@@ -1078,7 +1196,11 @@ struct Binder<'a> {
     /// derived tables/views/CTE bodies) are covered. The WAL layer maps them
     /// back to their extension sources so a logged record can be prefixed
     /// with the `LOAD EXTENSION` statements its replay needs.
+    /// Extension functions and session variables the statement depends on
+    /// (see [`Binder::deps`]).
     dynamic_functions_used: Rc<RefCell<Vec<String>>>,
+    /// The session whose `SET VARIABLE` values this statement reads.
+    session: Session,
     /// `?` slots when binding a parameterized statement (shared with child
     /// scopes); `None` binds a plain statement, where a `?` is an error.
     params: Option<ParamSlots>,
@@ -1121,6 +1243,7 @@ impl<'a> Binder<'a> {
             views_used: Rc::new(RefCell::new(Vec::new())),
             dml_cte_ok: true,
             dynamic_functions_used: Rc::new(RefCell::new(Vec::new())),
+            session: db.session.clone(),
             params: None,
             macro_depth: Rc::new(Cell::new(0)),
             macro_nodes: Rc::new(Cell::new(0)),
@@ -1131,6 +1254,13 @@ impl<'a> Binder<'a> {
     /// against `params` (see [`ParamSlots`]).
     fn with_params(mut self, params: Option<ParamSlots>) -> Self {
         self.params = params;
+        self
+    }
+
+    /// Bind in `session` instead of the database handle's own session: a
+    /// network connection's variables are its own, not the store's.
+    fn with_session(mut self, session: Session) -> Self {
+        self.session = session;
         self
     }
 
@@ -1156,6 +1286,7 @@ impl<'a> Binder<'a> {
             views_used: Rc::clone(&self.views_used),
             dml_cte_ok: false,
             dynamic_functions_used: Rc::clone(&self.dynamic_functions_used),
+            session: self.session.clone(),
             params: self.params.clone(),
             macro_depth: Rc::clone(&self.macro_depth),
             macro_nodes: Rc::clone(&self.macro_nodes),
@@ -1253,36 +1384,7 @@ impl<'a> Binder<'a> {
         let l = self.bind_expr(left, aggs, allow_agg)?;
         let r = self.bind_expr(right, aggs, allow_agg)?;
         comparison_ok(BinaryOp::Eq, l.dtype(), r.dtype())?;
-        let is_null = |e: &BoundExpr| BoundExpr::IsNull {
-            expr: Box::new(e.clone()),
-            negated: false,
-        };
-        let both_null = BoundExpr::Binary {
-            op: BinaryOp::And,
-            left: Box::new(is_null(&l)),
-            right: Box::new(is_null(&r)),
-            dtype: DataType::Boolean,
-        };
-        let equal = BoundExpr::Binary {
-            op: BinaryOp::Eq,
-            left: Box::new(l),
-            right: Box::new(r),
-            dtype: DataType::Boolean,
-        };
-        let same = BoundExpr::Binary {
-            op: BinaryOp::Or,
-            left: Box::new(BoundExpr::Coalesce {
-                args: vec![equal, BoundExpr::Literal(Value::Boolean(false))],
-                dtype: DataType::Boolean,
-            }),
-            right: Box::new(both_null),
-            dtype: DataType::Boolean,
-        };
-        Ok(if op == BinaryOp::IsNotDistinctFrom {
-            same
-        } else {
-            BoundExpr::Not(Box::new(same))
-        })
+        Ok(distinct_from_bound(op, l, r))
     }
 
     /// The type a bare `?` operand takes from the other side's type `ctx`:
@@ -1569,6 +1671,11 @@ impl<'a> Binder<'a> {
                 Ok(BoundExpr::Column { index, dtype })
             }
             Expr::Binary { op, left, right } => {
+                // A row constructor compared with another row: per-field
+                // rewrite (no STRUCT type needed).
+                if let Some(rewritten) = self.bind_row_compare(*op, left, right, aggs, allow_agg)? {
+                    return Ok(rewritten);
+                }
                 if matches!(op, BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom) {
                     return self.bind_is_distinct(*op, left, right, aggs, allow_agg);
                 }
@@ -1776,16 +1883,23 @@ impl<'a> Binder<'a> {
                         dtype: DataType::Varchar,
                     }),
                     t => Err(PinkDbError::Type(format!(
-                        "subscripting a {t} is not supported (wave 95c): only VARCHAR and VARIANT \
-                         have subscripts"
+                        "subscripting a {t} is not supported: only VARCHAR and VARIANT have \
+                         subscripts"
                     ))),
                 }
             }
             Expr::Slice { base, from, to } => {
                 let base = self.bind_expr(base, aggs, allow_agg)?;
+                if base.dtype() == DataType::Variant {
+                    return Err(PinkDbError::Type(
+                        "slicing a VARIANT is not supported: ARRAY_SLICE needs a LIST and pinkdb \
+                         has no LIST type (use variant_extract with a path)"
+                            .to_string(),
+                    ));
+                }
                 if base.dtype() != DataType::Varchar {
                     return Err(PinkDbError::Type(format!(
-                        "slicing a {} is not supported (wave 95c): only VARCHAR slices",
+                        "slicing a {} is not supported: only VARCHAR slices",
                         base.dtype()
                     )));
                 }
@@ -1892,6 +2006,14 @@ impl<'a> Binder<'a> {
                 query,
                 negated,
             } => {
+                if row_args(expr).is_some() {
+                    // The single-column set probe in the executor cannot carry
+                    // a row: name the limitation instead of a type mismatch.
+                    return Err(PinkDbError::Execution(
+                        "a row constructor in IN (SELECT ...) is not supported: compare the columns one by one"
+                            .to_string(),
+                    ));
+                }
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
                 let mut child = self.child();
                 let sub = bind_select_in(child.db, &mut child, query)?;
@@ -1926,6 +2048,58 @@ impl<'a> Binder<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// A window specification may build on another one (`WINDOW v AS (w ORDER
+    /// BY x)`, `OVER (w ROWS 1 PRECEDING)`). DuckDB's rules: the base's clauses
+    /// are inherited where the derived one leaves them empty, a derived clause
+    /// may not override a non-empty base clause, and a base frame cannot be
+    /// copied because the copy would silently keep two frames.
+    fn resolve_window(&self, over: &OverClause, depth: usize) -> Result<OverClause> {
+        let Some(name) = &over.base else {
+            return Ok(over.clone());
+        };
+        if depth > 16 {
+            return Err(PinkDbError::Catalog(format!(
+                "window \"{name}\" builds on itself"
+            )));
+        }
+        let Some(base) = self.named_windows.get(&name.to_ascii_lowercase()) else {
+            return Err(PinkDbError::Catalog(format!("window \"{name}\" not found")));
+        };
+        let base = self.resolve_window(base, depth + 1)?;
+        if !over.partition.is_empty() && !base.partition.is_empty() {
+            return Err(PinkDbError::Parse(format!(
+                "Cannot override PARTITION BY clause of window \"{name}\""
+            )));
+        }
+        if !over.order.is_empty() && !base.order.is_empty() {
+            return Err(PinkDbError::Parse(format!(
+                "Cannot override ORDER BY clause of window \"{name}\""
+            )));
+        }
+        // Naming a window inside a specification copies it, and DuckDB refuses
+        // to copy one that has a frame (`OVER w` is the way to reuse a frame).
+        if base.frame.is_some() {
+            return Err(PinkDbError::Parse(format!(
+                "cannot copy window \"{name}\" because it has a frame clause"
+            )));
+        }
+        Ok(OverClause {
+            base: None,
+            partition: if over.partition.is_empty() {
+                base.partition
+            } else {
+                over.partition.clone()
+            },
+            order: if over.order.is_empty() {
+                base.order
+            } else {
+                over.order.clone()
+            },
+            frame: over.frame.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn bind_window(
         &mut self,
         name: &str,
@@ -1952,26 +2126,30 @@ impl<'a> Binder<'a> {
                 "nested window functions are not supported in v1".to_string(),
             ));
         }
-        if filter.is_some() {
-            return Err(PinkDbError::Execution(
-                "FILTER on a window function is not supported (wave 95c)".to_string(),
-            ));
-        }
         // A named window resolves to its definition; `WINDOW w AS (...)` sits
         // before the select list, so `binder.named_windows` is already filled.
         let named;
         let over = match over {
-            OverSpec::Inline(over) => over,
+            OverSpec::Inline(over) => {
+                named = self.resolve_window(over, 0)?;
+                &named
+            }
             OverSpec::Named(n) => {
                 let Some(spec) = self.named_windows.get(&n.to_ascii_lowercase()) else {
                     return Err(PinkDbError::Catalog(format!("window \"{n}\" not found")));
                 };
-                named = spec.clone();
+                named = self.resolve_window(spec, 0)?;
                 &named
             }
         };
         // Resolve the function first (arity checks mirror the agg path).
-        let kind: WindowKind = if let Some(wf) = WindowFunc::from_name(name) {
+        let kind: WindowKind = if ordered_set_from_name(name).is_some() {
+            // DuckDB has no windowed percentile either (the name only exists
+            // as an ordered-set aggregate).
+            return Err(PinkDbError::Execution(format!(
+                "{name}() WITHIN GROUP cannot be used as a window function"
+            )));
+        } else if let Some(wf) = WindowFunc::from_name(name) {
             if args.iter().any(|a| a == &Expr::Star) {
                 return Err(PinkDbError::Parse(
                     "`*` is only valid in COUNT(*)".to_string(),
@@ -2030,8 +2208,14 @@ impl<'a> Binder<'a> {
         };
         // Bind arg/partition/order in window scope (aggregates flow to the
         // shared agg list so `SUM(SUM(x)) OVER ()` works).
+        // DuckDB implements FILTER only for aggregate window functions.
+        if filter.is_some() && !matches!(kind, WindowKind::Agg(_)) {
+            return Err(PinkDbError::Execution(format!(
+                "FILTER is not implemented for the window function \"{name}\""
+            )));
+        }
         self.in_window = true;
-        let result = self.bind_window_inner(kind, args, over, aggs, allow_agg);
+        let result = self.bind_window_inner(kind, args, over, filter, aggs, allow_agg);
         self.in_window = false;
         result
     }
@@ -2042,6 +2226,7 @@ impl<'a> Binder<'a> {
         kind: WindowKind,
         args: &[Expr],
         over: &OverClause,
+        filter: Option<&Expr>,
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
@@ -2102,6 +2287,20 @@ impl<'a> Binder<'a> {
             },
             None => BoundFrame::default_for(!order.is_empty()),
         };
+        // The predicate sees the window's own input scope: columns and group
+        // keys, never an aggregate or another window.
+        let filter = match filter {
+            None => None,
+            Some(pred) => {
+                let bound = self.bind_expr(pred, aggs, false)?;
+                if bound.dtype() != DataType::Boolean {
+                    return Err(PinkDbError::Type(
+                        "FILTER needs a BOOLEAN expression".to_string(),
+                    ));
+                }
+                Some(bound)
+            }
+        };
         let win = BoundWindow {
             func,
             arg,
@@ -2110,6 +2309,7 @@ impl<'a> Binder<'a> {
             partition,
             order,
             frame,
+            filter,
             dtype,
         };
         let index = match self.windows.iter().position(|w| w == &win) {
@@ -2285,6 +2485,83 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// `percentile_cont(p) WITHIN GROUP (ORDER BY x)`, `percentile_disc(…)`
+    /// and `mode() WITHIN GROUP (ORDER BY x)`: the ordered expression is the
+    /// last argument (the parser folded the clause in), a percentile's
+    /// constant fraction the first.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_ordered_set(
+        &mut self,
+        func: AggFunc,
+        name: &str,
+        args: &[Expr],
+        distinct: bool,
+        filter: Option<&Expr>,
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        if !allow_agg {
+            return Err(PinkDbError::Execution(
+                "aggregate functions are not allowed in WHERE or GROUP BY".to_string(),
+            ));
+        }
+        if distinct {
+            return Err(PinkDbError::Execution(format!(
+                "DISTINCT is not supported in {name}()"
+            )));
+        }
+        let (direct, ordered) = match (func, args) {
+            (AggFunc::Mode, [ordered]) => (None, ordered),
+            (AggFunc::Mode, _) => {
+                return Err(PinkDbError::Type(
+                    "mode() takes exactly one ORDER BY expression".to_string(),
+                ));
+            }
+            (_, [fraction, ordered]) => (Some(percentile_fraction(name, fraction)?), ordered),
+            _ => {
+                return Err(PinkDbError::Type(format!(
+                    "{name}(...) needs a constant fraction and one ORDER BY expression: \
+                     write {name}(0.5) WITHIN GROUP (ORDER BY x)"
+                )));
+            }
+        };
+        let arg = self.bind_expr(ordered, aggs, allow_agg)?;
+        if !arg.is_aggregate_free() {
+            return Err(PinkDbError::Execution(
+                "nested aggregates are not supported in v1".to_string(),
+            ));
+        }
+        let dtype = ordered_set_dtype(func, name, arg.dtype())?;
+        let filter = match filter {
+            None => None,
+            Some(pred) => {
+                let bound = self.bind_expr(pred, aggs, false)?;
+                if bound.dtype() != DataType::Boolean {
+                    return Err(PinkDbError::Type(
+                        "FILTER needs a BOOLEAN expression".to_string(),
+                    ));
+                }
+                Some(bound)
+            }
+        };
+        let agg = BoundAgg {
+            func,
+            arg: Some(arg),
+            dtype,
+            distinct,
+            filter,
+            direct,
+        };
+        let index = match aggs.iter().position(|a| a == &agg) {
+            Some(i) => i,
+            None => {
+                aggs.push(agg);
+                aggs.len() - 1
+            }
+        };
+        Ok(BoundExpr::AggRef { index, dtype })
+    }
+
     fn bind_function(
         &mut self,
         name: &str,
@@ -2299,6 +2576,13 @@ impl<'a> Binder<'a> {
         if name.eq_ignore_ascii_case("grouping") {
             return self.bind_grouping(args);
         }
+        // Ordered-set aggregates: `percentile_cont`, `percentile_disc`, `mode`.
+        // The parser folds `WITHIN GROUP (ORDER BY e)` into the argument list
+        // (see `ordered_set_args`), so this runs before the FILTER check — an
+        // ordered-set aggregate takes a FILTER like any other aggregate.
+        if let Some(func) = ordered_set_from_name(name) {
+            return self.bind_ordered_set(func, name, args, distinct, filter, aggs, allow_agg);
+        }
         // Wave 77: a stored macro shadows every built-in of the same name
         // (DuckDB's rule: `CREATE MACRO abs(x) AS 42` wins). Expansion is a
         // pure AST splice into the caller's bind — invoker rights, call-site
@@ -2307,6 +2591,28 @@ impl<'a> Binder<'a> {
             return Err(PinkDbError::Execution(format!(
                 "FILTER is only supported on aggregate functions, not \"{name}\""
             )));
+        }
+        // `ROW(a, b)` / `(a, b)`: there is no STRUCT type, so a row is only
+        // meaningful inside a comparison or an `IN` list, where
+        // [`Binder::bind_row_compare`] rewrites it field by field. Reaching
+        // here means it stands alone as a value.
+        if name.eq_ignore_ascii_case("row") {
+            return Err(PinkDbError::Type(
+                "a row constructor is only supported in a comparison or an IN list: the engine has no STRUCT type"
+                    .to_string(),
+            ));
+        }
+        if let Some(variable) = name.strip_prefix('$') {
+            return self.bind_variable(variable, true);
+        }
+        if name.eq_ignore_ascii_case("getvariable") {
+            return self.bind_getvariable(args);
+        }
+        if name.eq_ignore_ascii_case("timezone") {
+            return self.bind_timezone(args, aggs, allow_agg);
+        }
+        if let Some(func) = json_mutator_from_name(name) {
+            return self.bind_json_mutator(func, name, args, aggs, allow_agg);
         }
         if let Some(bound) = self.bind_scalar_macro(name, args, distinct, aggs, allow_agg)? {
             return Ok(bound);
@@ -2375,6 +2681,7 @@ impl<'a> Binder<'a> {
                 dtype,
                 distinct,
                 filter,
+                direct: None,
             };
             // Dedupe identical aggregates so `SUM(x), SUM(x)` computes once.
             let index = match aggs.iter().position(|a| a == &agg) {
@@ -2412,6 +2719,220 @@ impl<'a> Binder<'a> {
         // Not a built-in: a loaded extension may provide it (case-insensitive)
         // — a `dlopen` callback or a linked registry function.
         self.bind_dynamic_function(name, args, aggs, allow_agg)
+    }
+
+    /// `getvariable('name')` / `$name`: a session variable's value.
+    ///
+    /// A variable is a bind-time constant spliced as a literal — never as SQL
+    /// text — so it cannot change a statement's shape or inject syntax.
+    fn bind_getvariable(&mut self, args: &[Expr]) -> Result<BoundExpr> {
+        let name = match args {
+            [Expr::Literal(Value::Varchar(name))] => name,
+            _ => {
+                return Err(PinkDbError::Type(
+                    "getvariable takes exactly 1 argument: a variable name string literal"
+                        .to_string(),
+                ));
+            }
+        };
+        self.bind_variable(name, false)
+    }
+
+    /// A `SET VARIABLE` value spliced in at bind time.
+    ///
+    /// DuckDB returns NULL for an unset name through `getvariable` but errors
+    /// for the `$name` shorthand, so the two spellings pass `strict`
+    /// differently.
+    fn bind_variable(&mut self, name: &str, strict: bool) -> Result<BoundExpr> {
+        // Replay re-binds the logged statement text against a fresh session,
+        // so a logged statement may not depend on a variable; recording the
+        // read lets `bind_tracked_with` refuse it. The `$` prefix cannot be an
+        // extension function name (those are identifiers).
+        let dep = format!("${name}");
+        let mut deps = self.dynamic_functions_used.borrow_mut();
+        if !deps.contains(&dep) {
+            deps.push(dep);
+        }
+        drop(deps);
+        match self.session.get(name) {
+            Some(v) => Ok(BoundExpr::Literal(v)),
+            None if !strict => Ok(BoundExpr::Literal(Value::Null)),
+            None => Err(PinkDbError::Catalog(format!(
+                "Variable {name} does not exist"
+            ))),
+        }
+    }
+
+    /// `timezone(zone, ts)` and `ts AT TIME ZONE zone`.
+    ///
+    /// pinkdb has no TIMESTAMPTZ and no time zone database, so a UTC-family
+    /// zone is the identity on the naive TIMESTAMP (DuckDB's round trip
+    /// `(ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'` returns `ts` as well) and
+    /// any other zone is refused by name.
+    fn bind_timezone(
+        &mut self,
+        args: &[Expr],
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        if args.len() != 2 {
+            return Err(PinkDbError::Type(
+                "timezone takes exactly 2 arguments (zone, timestamp)".to_string(),
+            ));
+        }
+        let zone = match &args[0] {
+            Expr::Literal(Value::Varchar(z)) => z.to_ascii_uppercase(),
+            _ => {
+                return Err(PinkDbError::Type(
+                    "AT TIME ZONE needs a zone name string literal".to_string(),
+                ));
+            }
+        };
+        if !is_utc_zone(&zone) {
+            return Err(PinkDbError::Execution(format!(
+                "AT TIME ZONE '{zone}' needs a time zone database: pinkdb has no TIMESTAMPTZ \
+                 (only UTC-family zones are an identity on the naive TIMESTAMP)"
+            )));
+        }
+        let arg = self.bind_expr(&args[1], aggs, allow_agg)?;
+        match arg.dtype() {
+            DataType::Timestamp => Ok(arg),
+            DataType::Date | DataType::Varchar => Ok(BoundExpr::Cast {
+                expr: Box::new(arg),
+                dtype: DataType::Timestamp,
+            }),
+            other => Err(PinkDbError::Type(format!(
+                "AT TIME ZONE needs a TIMESTAMP or DATE, got {other}"
+            ))),
+        }
+    }
+
+    /// `json_set(json, path, value)`, `json_insert(…)`, `json_replace(…)`,
+    /// `json_remove(json, path)`.
+    ///
+    /// The document is JSON *text* (`VARCHAR`) or a `VARIANT`; the result has
+    /// the document's type. Any value may be written — DuckDB needs a
+    /// `::JSON` cast on the value, pinkdb converts it like `CAST(x AS VARIANT)`.
+    fn bind_json_mutator(
+        &mut self,
+        func: ScalarFunc,
+        name: &str,
+        args: &[Expr],
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        let want = if func == ScalarFunc::JsonRemove { 2 } else { 3 };
+        if args.len() != want {
+            return Err(PinkDbError::Type(format!(
+                "{name} takes exactly {want} arguments ({})",
+                if want == 2 {
+                    "json, path"
+                } else {
+                    "json, path, value"
+                }
+            )));
+        }
+        let doc = self.bind_expr(&args[0], aggs, allow_agg)?;
+        let dtype = match doc.dtype() {
+            DataType::Variant => DataType::Variant,
+            DataType::Varchar => DataType::Varchar,
+            // A bare NULL is typed INTEGER; it is a NULL document, not a type
+            // error (the function is strict, so it evaluates to NULL).
+            _ if doc == BoundExpr::Literal(Value::Null) => DataType::Varchar,
+            other => {
+                return Err(PinkDbError::Type(format!(
+                    "{name} needs a VARCHAR or VARIANT document, got {other}"
+                )));
+            }
+        };
+        let mut path = self.bind_expr(&args[1], aggs, allow_agg)?;
+        if path.dtype() != DataType::Varchar {
+            path = BoundExpr::Cast {
+                expr: Box::new(path),
+                dtype: DataType::Varchar,
+            };
+        }
+        let mut bound = vec![doc, path];
+        if want == 3 {
+            bound.push(self.bind_expr(&args[2], aggs, allow_agg)?);
+        }
+        Ok(BoundExpr::Scalar {
+            func,
+            args: bound,
+            dtype,
+        })
+    }
+
+    /// `ROW(a, b) <op> ROW(c, d)` — `None` when neither side is a row.
+    ///
+    /// DuckDB's struct comparison: `=`/`<>` compare field by field with
+    /// `IS NOT DISTINCT FROM` (NULL equals NULL), and the ordering operators
+    /// are lexicographic with NULL sorting greater than any value. Every
+    /// sub-expression is two-valued, so a row comparison is never NULL.
+    fn bind_row_compare(
+        &mut self,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<Option<BoundExpr>> {
+        let (Some(l), Some(r)) = (row_args(left), row_args(right)) else {
+            return Ok(None);
+        };
+        if !matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+        ) {
+            return Ok(None);
+        }
+        if l.len() != r.len() {
+            return Err(PinkDbError::Type(format!(
+                "cannot compare a row of {} fields with a row of {} fields",
+                l.len(),
+                r.len()
+            )));
+        }
+        if l.is_empty() {
+            return Err(PinkDbError::Type(
+                "a row constructor needs at least one field".to_string(),
+            ));
+        }
+        let mut eqs = Vec::with_capacity(l.len());
+        let mut lts = Vec::with_capacity(l.len());
+        let mut gts = Vec::with_capacity(l.len());
+        for (a, b) in l.iter().zip(r) {
+            // Binding the pair as a comparison applies the usual numeric
+            // coercion once; the three field predicates reuse the result.
+            let (x, y) = self.bind_binary_operands(BinaryOp::Lt, a, b, aggs, allow_agg)?;
+            eqs.push(distinct_from_bound(
+                BinaryOp::IsNotDistinctFrom,
+                x.clone(),
+                y.clone(),
+            ));
+            lts.push(null_greater_lt(&x, &y));
+            gts.push(null_greater_gt(&x, &y));
+        }
+        let mut eq = eqs[0].clone();
+        for e in &eqs[1..] {
+            eq = b_and(eq, e.clone());
+        }
+        let lt = lexicographic(&lts, &eqs);
+        let gt = lexicographic(&gts, &eqs);
+        Ok(Some(match op {
+            BinaryOp::Eq => eq,
+            BinaryOp::NotEq => BoundExpr::Not(Box::new(eq)),
+            BinaryOp::Lt => lt,
+            BinaryOp::LtEq => b_or(lt, eq),
+            BinaryOp::Gt => gt,
+            BinaryOp::GtEq => b_or(gt, eq),
+            _ => unreachable!("only comparisons reach here"),
+        }))
     }
 
     /// Bind a call to a function registered by a loaded extension.
@@ -2530,6 +3051,100 @@ impl<'a> Binder<'a> {
     }
 }
 
+/// The arguments of a row constructor (`ROW(a, b)` or `(a, b)`), if `e` is
+/// one (see `row_ctor` in the parser).
+fn row_args(e: &Expr) -> Option<&[Expr]> {
+    match e {
+        Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("row") => Some(args),
+        _ => None,
+    }
+}
+
+/// The JSON mutators (see [`Binder::bind_json_mutator`]).
+fn json_mutator_from_name(name: &str) -> Option<ScalarFunc> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "json_set" => ScalarFunc::JsonSet,
+        "json_insert" => ScalarFunc::JsonInsert,
+        "json_replace" => ScalarFunc::JsonReplace,
+        "json_remove" => ScalarFunc::JsonRemove,
+        _ => return None,
+    })
+}
+
+/// The zone names `AT TIME ZONE` accepts as an identity on a naive TIMESTAMP.
+fn is_utc_zone(zone: &str) -> bool {
+    matches!(
+        zone,
+        "UTC" | "GMT" | "Z" | "ZULU" | "UCT" | "UNIVERSAL" | "ETC/UTC" | "ETC/GMT" | "+00:00"
+    )
+}
+
+fn b_and(a: BoundExpr, b: BoundExpr) -> BoundExpr {
+    BoundExpr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(a),
+        right: Box::new(b),
+        dtype: DataType::Boolean,
+    }
+}
+
+fn b_or(a: BoundExpr, b: BoundExpr) -> BoundExpr {
+    BoundExpr::Binary {
+        op: BinaryOp::Or,
+        left: Box::new(a),
+        right: Box::new(b),
+        dtype: DataType::Boolean,
+    }
+}
+
+/// `a < b` with NULL sorting greater than any value (two-valued, so it can be
+/// combined with plain `AND`/`OR` in a row comparison).
+fn null_greater_lt(a: &BoundExpr, b: &BoundExpr) -> BoundExpr {
+    let a_non_null = BoundExpr::IsNull {
+        expr: Box::new(a.clone()),
+        negated: true,
+    };
+    let b_null = BoundExpr::IsNull {
+        expr: Box::new(b.clone()),
+        negated: false,
+    };
+    let lt = BoundExpr::Binary {
+        op: BinaryOp::Lt,
+        left: Box::new(a.clone()),
+        right: Box::new(b.clone()),
+        dtype: DataType::Boolean,
+    };
+    b_and(a_non_null, b_or(b_null, lt))
+}
+
+/// `a > b` with NULL sorting greater than any value.
+fn null_greater_gt(a: &BoundExpr, b: &BoundExpr) -> BoundExpr {
+    let b_non_null = BoundExpr::IsNull {
+        expr: Box::new(b.clone()),
+        negated: true,
+    };
+    let a_null = BoundExpr::IsNull {
+        expr: Box::new(a.clone()),
+        negated: false,
+    };
+    let gt = BoundExpr::Binary {
+        op: BinaryOp::Gt,
+        left: Box::new(a.clone()),
+        right: Box::new(b.clone()),
+        dtype: DataType::Boolean,
+    };
+    b_and(b_non_null, b_or(a_null, gt))
+}
+
+/// Lexicographic order over per-field predicates: `lt0 OR (eq0 AND lt1) OR …`.
+fn lexicographic(lt: &[BoundExpr], eq: &[BoundExpr]) -> BoundExpr {
+    let mut acc = lt[lt.len() - 1].clone();
+    for i in (0..lt.len() - 1).rev() {
+        acc = b_or(lt[i].clone(), b_and(eq[i].clone(), acc));
+    }
+    acc
+}
+
 /// A VARCHAR slot for the string functions: a VARCHAR argument or a bare
 /// NULL literal (which the executor turns into NULL).
 fn varchar_arg(e: &BoundExpr) -> bool {
@@ -2634,6 +3249,11 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                 "SUM needs a numeric argument".to_string(),
             )),
         },
+        // Ordered-set aggregates type themselves (`ordered_set_dtype`); this
+        // arm only keeps the match exhaustive.
+        AggFunc::PercentileCont | AggFunc::PercentileDisc | AggFunc::Mode => {
+            Ok(arg.unwrap_or(DataType::Double))
+        }
         AggFunc::Min | AggFunc::Max => {
             let t = arg.expect("min/max has an arg");
             if !is_numeric(t)
@@ -2853,6 +3473,10 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
             }
             Ok(DataType::Boolean)
         }
+        ScalarFunc::JsonSet | ScalarFunc::JsonInsert | ScalarFunc::JsonReplace => {
+            unreachable!("bound by bind_json_mutator")
+        }
+        ScalarFunc::JsonRemove => unreachable!("bound by bind_json_mutator"),
         ScalarFunc::Substr => {
             arity(&[2, 3])?;
             if args[0].dtype() != DataType::Varchar {
@@ -3127,12 +3751,28 @@ fn default_name(expr: &Expr) -> String {
                     }
                 })
                 .collect();
+            // The `$name` shorthand keeps its spelling: its bound value is a
+            // literal, but the projection name comes from the AST.
+            if name.starts_with('$') {
+                return name.clone();
+            }
             let distinct = if *distinct { "DISTINCT " } else { "" };
-            format!(
-                "{}({distinct}{})",
-                name.to_ascii_lowercase(),
-                inner.join(", ")
-            )
+            let lower = name.to_ascii_lowercase();
+            // An ordered-set aggregate was folded into a plain call by the
+            // parser; name it the way it was written.
+            match (lower.as_str(), args.as_slice()) {
+                ("mode", [_]) => {
+                    return format!("mode() WITHIN GROUP (ORDER BY {})", inner[0]);
+                }
+                (
+                    "percentile_cont" | "quantile_cont" | "percentile_disc" | "quantile_disc",
+                    [_, _],
+                ) => {
+                    return format!("{lower}({} ORDER BY {})", inner[0], inner[1]);
+                }
+                _ => {}
+            }
+            format!("{lower}({distinct}{})", inner.join(", "))
         }
         Expr::ScalarSubquery(_) => "(subquery)".to_string(),
         Expr::InSubquery { negated, .. } => {
@@ -3904,7 +4544,18 @@ pub(crate) fn bind_tracked(
     stmt: &Statement,
     default_db: &str,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    bind_tracked_with(db, stmt, default_db, None)
+    bind_tracked_with(db, stmt, default_db, None, &db.session)
+}
+
+/// [`bind_tracked`] in an explicit session: a network connection binds against
+/// its own `SET VARIABLE` map, never the store's.
+pub(crate) fn bind_tracked_in(
+    db: &PinkDb,
+    stmt: &Statement,
+    default_db: &str,
+    session: &Session,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    bind_tracked_with(db, stmt, default_db, None, session)
 }
 
 /// [`bind_tracked`] for a `?`-parameterized statement: `params` carries one
@@ -3921,13 +4572,34 @@ pub(crate) fn bind_tracked(
 /// never reach the WAL and are unaffected, and the guard is applied uniformly
 /// whether or not this store currently has a WAL attached, so the same SQL
 /// behaves identically in tests and on a durable store.
+///
+/// A session-variable read (`$name`, `getvariable`) is refused in a logged
+/// statement for the same reason: its value is session state, and replay
+/// re-binds the logged text against a fresh session, so it could not
+/// reproduce the value. Read-only statements may read one freely.
 pub(crate) fn bind_tracked_with(
     db: &PinkDb,
     stmt: &Statement,
     default_db: &str,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let (plan, dynamic) = bind_tracked_plan(db, stmt, default_db, params)?;
+    let (plan, deps) = bind_tracked_plan(db, stmt, default_db, params, session)?;
+    // The binder records a variable read as a `$`-prefixed dependency (no
+    // extension function name can start with `$`); split them off before the
+    // volatility guard sees the function names.
+    let (variables, dynamic): (Vec<String>, Vec<String>) =
+        deps.into_iter().partition(|dep| dep.starts_with('$'));
+    if crate::plan::writes_tables(&plan)
+        && let Some(name) = variables.first()
+    {
+        return Err(PinkDbError::Execution(format!(
+            "session variable {} is session state and cannot be read by a statement the engine \
+             WAL-logs: replay would bind the logged text against an empty session. Inline the \
+             value, or read it in a query",
+            name.trim_start_matches('$')
+        )));
+    }
     if crate::plan::writes_tables(&plan)
         && let Some(function) = db.first_volatile_dynamic_function(&dynamic)
     {
@@ -3946,6 +4618,7 @@ fn bind_tracked_plan(
     stmt: &Statement,
     default_db: &str,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let empty = |plan| Ok((plan, Vec::new()));
     match stmt {
@@ -3954,7 +4627,15 @@ fn bind_tracked_plan(
             name,
             items,
             if_not_exists,
-        } => bind_create_table(db, default_db, qdb.as_deref(), name, items, *if_not_exists),
+        } => bind_create_table(
+            db,
+            default_db,
+            qdb.as_deref(),
+            name,
+            items,
+            *if_not_exists,
+            session,
+        ),
         Statement::CreateTableAs {
             db: qdb,
             name,
@@ -3968,6 +4649,7 @@ fn bind_tracked_plan(
             query,
             *if_not_exists,
             params.clone(),
+            session,
         ),
         Statement::Insert {
             db: qdb,
@@ -3987,6 +4669,7 @@ fn bind_tracked_plan(
                 on_conflict.as_ref(),
                 returning.as_deref(),
                 params.clone(),
+                session,
             ),
             InsertSource::Select(query) => bind_insert_select(
                 db,
@@ -3998,6 +4681,7 @@ fn bind_tracked_plan(
                 on_conflict.as_ref(),
                 returning.as_deref(),
                 params.clone(),
+                session,
             ),
         },
         Statement::Update {
@@ -4017,6 +4701,7 @@ fn bind_tracked_plan(
             where_clause,
             returning.as_deref(),
             params.clone(),
+            session,
         ),
         Statement::Delete {
             db: qdb,
@@ -4033,6 +4718,7 @@ fn bind_tracked_plan(
             where_clause,
             returning.as_deref(),
             params.clone(),
+            session,
         ),
         Statement::Merge {
             db: qdb,
@@ -4053,13 +4739,14 @@ fn bind_tracked_plan(
             clauses,
             returning.as_deref(),
             params.clone(),
+            session,
         ),
         Statement::CopyTo {
             db: qdb,
             table,
             path,
             format,
-        } => bind_copy_to(db, default_db, qdb, table, path, format.as_deref()),
+        } => bind_copy_to(db, default_db, qdb, table, path, format.as_deref(), session),
         Statement::Begin => empty(LogicalPlan::Begin),
         Statement::Commit => empty(LogicalPlan::Commit),
         Statement::Rollback => empty(LogicalPlan::Rollback),
@@ -4068,7 +4755,7 @@ fn bind_tracked_plan(
             name,
             cols,
             query,
-        } => bind_create_view(db, default_db, qdb, name, cols, query),
+        } => bind_create_view(db, default_db, qdb, name, cols, query, session),
         Statement::CreateMaterializedView {
             db: qdb,
             name,
@@ -4078,7 +4765,9 @@ fn bind_tracked_plan(
         } => {
             let target = Binder::new(db, default_db).resolve_db(qdb)?;
             // Bind the inner query.
-            let mut binder = Binder::new(db, default_db).with_params(params.clone());
+            let mut binder = Binder::new(db, default_db)
+                .with_session(session.clone())
+                .with_params(params.clone());
             let plan = bind_select_in(db, &mut binder, query)?;
             let dynamic = binder.dynamic_functions_used();
             Ok((
@@ -4179,9 +4868,15 @@ fn bind_tracked_plan(
                 if_exists: *if_exists,
             })
         }
-        Statement::AlterTable { db: qdb, name, op } => {
-            bind_alter_table(db, default_db, qdb.as_deref(), name, op, params.clone())
-        }
+        Statement::AlterTable { db: qdb, name, op } => bind_alter_table(
+            db,
+            default_db,
+            qdb.as_deref(),
+            name,
+            op,
+            params.clone(),
+            session,
+        ),
         Statement::DropView { db: qdb, name } => empty(LogicalPlan::DropView {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
@@ -4206,8 +4901,9 @@ fn bind_tracked_plan(
         }
         Statement::Explain(inner) => {
             // EXPLAIN never executes its inner statement, so a DML plan is
-            // safe to render; DDL and session statements have no plan shape
-            // worth showing (and would bypass their own statement gates).
+            // safe to render; DDL and the other session statements have no
+            // plan shape worth showing (and would bypass their own gates).
+            // `SET VARIABLE` has one (DuckDB shows it too) and runs nothing.
             if !matches!(
                 **inner,
                 Statement::Select(_)
@@ -4215,6 +4911,7 @@ fn bind_tracked_plan(
                     | Statement::Update { .. }
                     | Statement::Delete { .. }
                     | Statement::Merge { .. }
+                    | Statement::SetVariable { .. }
             ) {
                 return Err(PinkDbError::Parse(
                     "EXPLAIN supports a query or a DML statement".to_string(),
@@ -4222,7 +4919,8 @@ fn bind_tracked_plan(
             }
             // Bind the inner statement fully (errors surface here) and wrap
             // it — EXPLAIN never executes it.
-            let (plan, dynamic) = bind_tracked_plan(db, inner, default_db, params.clone())?;
+            let (plan, dynamic) =
+                bind_tracked_plan(db, inner, default_db, params.clone(), session)?;
             Ok((
                 LogicalPlan::Explain {
                     plan: Box::new(plan),
@@ -4239,6 +4937,22 @@ fn bind_tracked_plan(
                 )));
             }
             empty(LogicalPlan::Use { name: name.clone() })
+        }
+        Statement::SetVariable { name, value } => {
+            // A statement binds with no FROM scope, so the value can only be a
+            // constant expression (a scalar subquery included).
+            let mut binder = Binder::new(db, default_db).with_session(session.clone());
+            let mut aggs = Vec::new();
+            let bound = binder.bind_expr(value, &mut aggs, false)?;
+            if !aggs.is_empty() {
+                return Err(PinkDbError::Execution(
+                    "SET VARIABLE takes no aggregate".to_string(),
+                ));
+            }
+            empty(LogicalPlan::SetVariable {
+                name: name.to_ascii_lowercase().into_boxed_str(),
+                value: bound,
+            })
         }
         Statement::LoadExtension { path } => {
             // Existence/success is checked at execution (loading has side
@@ -4311,7 +5025,15 @@ fn bind_tracked_plan(
             db: qdb,
             name,
             args,
-        } => bind_call(db, default_db, qdb.as_deref(), name, args, params.clone()),
+        } => bind_call(
+            db,
+            default_db,
+            qdb.as_deref(),
+            name,
+            args,
+            params.clone(),
+            session,
+        ),
         // Wave 83: an anonymous block binds to a `Call` carrying its parsed
         // definition — the same execution, atomicity, logging and RBAC path
         // (running one requires ADMIN in an authenticated session, like CALL).
@@ -4349,6 +5071,7 @@ fn bind_tracked_plan(
                 or_replace: *or_replace,
                 if_not_exists: *if_not_exists,
             },
+            session,
         ),
         Statement::DropMacro {
             db: qdb,
@@ -4384,7 +5107,7 @@ fn bind_tracked_plan(
         Statement::DropRole { name, if_exists } => bind_drop_role(db, name, *if_exists),
         Statement::Grant { target } => bind_grant(db, default_db, target, false),
         Statement::Revoke { target } => bind_grant(db, default_db, target, true),
-        Statement::Select(sel) => bind_select(db, default_db, sel, params.clone()),
+        Statement::Select(sel) => bind_select(db, default_db, sel, params.clone(), session),
     }
 }
 
@@ -4487,6 +5210,7 @@ fn bind_create_macro(
     default_db: &str,
     qdb: Option<&str>,
     args: CreateMacroArgs<'_>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let CreateMacroArgs {
         name,
@@ -4512,7 +5236,7 @@ fn bind_create_macro(
         match &p.default {
             Some(default) => {
                 seen_default = true;
-                validate_macro_default(db, &target, name, &p.name, default)?;
+                validate_macro_default(db, session, &target, name, &p.name, default)?;
                 defs.push(crate::macros::MacroParamDef {
                     name: p.name.clone(),
                     default: Some(default.clone()),
@@ -4583,6 +5307,7 @@ fn recursive_macro(name: &str) -> PinkDbError {
 /// error names the parameter, and re-spliced at every call.
 fn validate_macro_default(
     db: &PinkDb,
+    session: &Session,
     target_db: &str,
     macro_name: &str,
     param: &str,
@@ -4594,7 +5319,7 @@ fn validate_macro_default(
              subqueries"
         )));
     }
-    let mut binder = Binder::new(db, target_db);
+    let mut binder = Binder::new(db, target_db).with_session(session.clone());
     let mut aggs = Vec::new();
     let bound = binder.bind_expr(default, &mut aggs, true).map_err(|e| {
         PinkDbError::Type(format!(
@@ -4671,8 +5396,11 @@ fn bind_call(
     name: &str,
     args: &[Expr],
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    let target = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(&qdb.map(str::to_string))?;
     let def = db.procedure_in(&target, name)?;
     if args.len() != def.params.len() {
         return Err(PinkDbError::Catalog(format!(
@@ -5056,9 +5784,12 @@ fn bind_create_view(
     name: &str,
     cols: &Option<Vec<String>>,
     query: &Select,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let view_db = Binder::new(db, default_db).resolve_db(qdb)?;
-    let mut binder = Binder::new(db, &view_db);
+    let view_db = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(qdb)?;
+    let mut binder = Binder::new(db, &view_db).with_session(session.clone());
     let bound = bind_select_in(db, &mut binder, query)?;
     let schema = plan_schema(db, &view_db, &binder.ctes, &bound)?;
     if let Some(cols) = cols
@@ -5096,8 +5827,11 @@ fn bind_update(
     where_clause: &Option<Expr>,
     returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let table_db = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(qdb)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
@@ -5143,7 +5877,9 @@ fn bind_update(
             )));
         }
     }
-    let mut binder = Binder::new(db, &table_db).with_params(params.clone());
+    let mut binder = Binder::new(db, &table_db)
+        .with_session(session.clone())
+        .with_params(params.clone());
     binder.allow_win = false;
     // `UPDATE … FROM` (wave 95b) binds its sources first, so their column
     // indices start at 0 and every expression's input row is the source row
@@ -5203,7 +5939,8 @@ fn bind_update(
     reject_view_dependency(db, &binder.views_used())?;
     let mut dynamic_functions = binder.dynamic_functions_used();
     // A RETURNING expression may itself call an extension function.
-    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    let (returning, returning_dynamic) =
+        bind_returning(db, session, &table_db, t, returning, params)?;
     for name in returning_dynamic {
         if !dynamic_functions.iter().any(|n| n == &name) {
             dynamic_functions.push(name);
@@ -5233,13 +5970,18 @@ fn bind_delete(
     where_clause: &Option<Expr>,
     returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let table_db = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(qdb)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
     let t = db.table_in(&table_db, table)?;
-    let mut binder = Binder::new(db, &table_db).with_params(params.clone());
+    let mut binder = Binder::new(db, &table_db)
+        .with_session(session.clone())
+        .with_params(params.clone());
     binder.allow_win = false;
     binder.allow_alias = false;
     // `DELETE … USING` binds its sources first (row = source ++ target).
@@ -5269,7 +6011,8 @@ fn bind_delete(
     }
     reject_view_dependency(db, &binder.views_used())?;
     let mut dynamic_functions = binder.dynamic_functions_used();
-    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    let (returning, returning_dynamic) =
+        bind_returning(db, session, &table_db, t, returning, params)?;
     for name in returning_dynamic {
         if !dynamic_functions.iter().any(|n| n == &name) {
             dynamic_functions.push(name);
@@ -5302,8 +6045,11 @@ fn bind_copy_to(
     table: &str,
     path: &str,
     format: Option<&str>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let table_db = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(qdb)?;
     let t = db.table_in(&table_db, table).map_err(|_| {
         PinkDbError::Catalog(format!(
             "COPY source table \"{table}\" does not exist in database \"{table_db}\" \
@@ -5346,6 +6092,7 @@ fn bind_copy_to(
 /// target's columns, like DuckDB.
 fn bind_returning(
     db: &PinkDb,
+    session: &Session,
     table_db: &str,
     t: &DataTable,
     projections: Option<&[Projection]>,
@@ -5354,7 +6101,9 @@ fn bind_returning(
     let Some(projections) = projections else {
         return Ok((None, Vec::new()));
     };
-    let mut binder = Binder::new(db, table_db).with_params(params);
+    let mut binder = Binder::new(db, table_db)
+        .with_session(session.clone())
+        .with_params(params);
     binder.allow_win = false;
     binder.allow_alias = false;
     binder.tables.push(ScopeTable {
@@ -5517,6 +6266,7 @@ fn bind_sets(
 /// rejected row, keeping the rest of the existing row).
 fn bind_conflict(
     db: &PinkDb,
+    session: &Session,
     table_db: &str,
     t: &DataTable,
     on_conflict: Option<&OnConflict>,
@@ -5530,7 +6280,9 @@ fn bind_conflict(
         Some(cols) => Some(conflict_target(t, cols)?),
         None => t.constraints.primary_key().map(|k| k.columns.clone()),
     };
-    let mut binder = Binder::new(db, table_db).with_params(params);
+    let mut binder = Binder::new(db, table_db)
+        .with_session(session.clone())
+        .with_params(params);
     binder.allow_win = false;
     binder.allow_alias = false;
     binder.tables.push(ScopeTable {
@@ -5605,8 +6357,11 @@ fn bind_merge(
     clauses: &[MergeClause],
     returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let table_db = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(qdb)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
@@ -5616,7 +6371,9 @@ fn bind_merge(
             "MERGE needs at least one WHEN clause".to_string(),
         ));
     }
-    let mut binder = Binder::new(db, &table_db).with_params(params.clone());
+    let mut binder = Binder::new(db, &table_db)
+        .with_session(session.clone())
+        .with_params(params.clone());
     binder.allow_win = false;
     binder.allow_alias = false;
     // The source binds first (column 0..), then the target row follows it in
@@ -5719,7 +6476,8 @@ fn bind_merge(
     }
     reject_view_dependency(db, &binder.views_used())?;
     let mut dynamic_functions = binder.dynamic_functions_used();
-    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    let (returning, returning_dynamic) =
+        bind_returning(db, session, &table_db, t, returning, params)?;
     for name in returning_dynamic {
         if !dynamic_functions.iter().any(|n| n == &name) {
             dynamic_functions.push(name);
@@ -5749,8 +6507,11 @@ fn bind_insert(
     on_conflict: Option<&OnConflict>,
     returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let table_db = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(qdb)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
@@ -5801,7 +6562,9 @@ fn bind_insert(
             }
         }
         for (pos, cell) in row.iter().enumerate() {
-            let mut binder = Binder::new(db, &table_db).with_params(params.clone());
+            let mut binder = Binder::new(db, &table_db)
+                .with_session(session.clone())
+                .with_params(params.clone());
             binder.allow_win = false;
             // `INSERT INTO t [(cols)] VALUES (?...)`: a bare `?` cell takes the
             // target column's type; the value converts to it below.
@@ -5823,9 +6586,17 @@ fn bind_insert(
         bound_rows.push(bound);
     }
     reject_view_dependency(db, &views_used)?;
-    let (conflict, conflict_dynamic) =
-        bind_conflict(db, &table_db, t, on_conflict, &order, params.clone())?;
-    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    let (conflict, conflict_dynamic) = bind_conflict(
+        db,
+        session,
+        &table_db,
+        t,
+        on_conflict,
+        &order,
+        params.clone(),
+    )?;
+    let (returning, returning_dynamic) =
+        bind_returning(db, session, &table_db, t, returning, params)?;
     for name in conflict_dynamic.into_iter().chain(returning_dynamic) {
         if !dynamic_functions.iter().any(|n| n == &name) {
             dynamic_functions.push(name);
@@ -5857,8 +6628,11 @@ fn bind_insert_select(
     on_conflict: Option<&OnConflict>,
     returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let table_db = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(qdb)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
@@ -5884,7 +6658,9 @@ fn bind_insert_select(
             }
         }
     }
-    let mut binder = Binder::new(db, default_db).with_params(params.clone());
+    let mut binder = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .with_params(params.clone());
     let query_plan = bind_select_in(db, &mut binder, query)?;
     let source = plan_schema(db, &binder.default_db, &binder.ctes, &query_plan)?;
     if source.len() != order.len() {
@@ -5904,9 +6680,17 @@ fn bind_insert_select(
     }
     reject_view_dependency(db, &binder.views_used())?;
     let mut dynamic = binder.dynamic_functions_used();
-    let (conflict, conflict_dynamic) =
-        bind_conflict(db, &table_db, t, on_conflict, &order, params.clone())?;
-    let (returning, returning_dynamic) = bind_returning(db, &table_db, t, returning, params)?;
+    let (conflict, conflict_dynamic) = bind_conflict(
+        db,
+        session,
+        &table_db,
+        t,
+        on_conflict,
+        &order,
+        params.clone(),
+    )?;
+    let (returning, returning_dynamic) =
+        bind_returning(db, session, &table_db, t, returning, params)?;
     for name in conflict_dynamic.into_iter().chain(returning_dynamic) {
         if !dynamic.iter().any(|n| n == &name) {
             dynamic.push(name);
@@ -5942,8 +6726,11 @@ fn bind_create_table(
     name: &str,
     items: &[TableItem],
     if_not_exists: bool,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    let target = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(&qdb.map(str::to_string))?;
     let mut schema: Vec<(String, DataType)> = Vec::new();
     let mut constraints = TableConstraints::default();
     // Named constraints are echoes of the DDL; only the declaration matters.
@@ -6002,8 +6789,11 @@ fn bind_alter_table(
     name: &str,
     op: &AlterTableOp,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    let target = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(&qdb.map(str::to_string))?;
     if let Some(err) = db.attached_read_only(&target, name) {
         return Err(err);
     }
@@ -6052,7 +6842,9 @@ fn bind_alter_table(
             let bound_default = match default {
                 None => None,
                 Some(expr) => {
-                    let mut binder = Binder::new(db, &target).with_params(params.clone());
+                    let mut binder = Binder::new(db, &target)
+                        .with_session(session.clone())
+                        .with_params(params.clone());
                     binder.allow_win = false;
                     binder.pin_parameter(expr, column.dtype)?;
                     let mut aggs = Vec::new();
@@ -6406,6 +7198,7 @@ fn bind_foreign_key(
 
 /// Bind `CREATE TABLE t AS SELECT ...`: infer the new table's schema from the
 /// query's output (names + types).
+#[allow(clippy::too_many_arguments)]
 fn bind_create_table_as(
     db: &PinkDb,
     default_db: &str,
@@ -6414,9 +7207,14 @@ fn bind_create_table_as(
     query: &Select,
     if_not_exists: bool,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
-    let mut binder = Binder::new(db, default_db).with_params(params);
+    let table_db = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .resolve_db(qdb)?;
+    let mut binder = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .with_params(params);
     let query_plan = bind_select_in(db, &mut binder, query)?;
     // The schema is taken from the query's evaluated output at execution
     // (names from the final Project, types from its expressions) — binding
@@ -6529,8 +7327,11 @@ fn bind_select(
     default_db: &str,
     sel: &Select,
     params: Option<ParamSlots>,
+    session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
-    let mut binder = Binder::new(db, default_db).with_params(params);
+    let mut binder = Binder::new(db, default_db)
+        .with_session(session.clone())
+        .with_params(params);
     let plan = bind_select_in(db, &mut binder, sel)?;
     Ok((plan, binder.dynamic_functions_used()))
 }
@@ -6602,6 +7403,8 @@ fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Logi
                 alias: Some("__setop".to_string()),
                 col_aliases: None,
                 at: None,
+                sample: None,
+                lateral: false,
                 joins: Vec::new(),
             }),
             where_clause: None,
@@ -6760,8 +7563,9 @@ pub(crate) fn bind_mv_query(
     db: &PinkDb,
     default_db: &str,
     query: &crate::sql::ast::Select,
+    session: &Session,
 ) -> Result<LogicalPlan> {
-    let mut binder = Binder::new(db, default_db);
+    let mut binder = Binder::new(db, default_db).with_session(session.clone());
     bind_select_in(db, &mut binder, query)
 }
 
@@ -6808,7 +7612,8 @@ pub(crate) fn plan_schema(
         | LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
-        | LogicalPlan::Offset { input, .. } => plan_schema(db, default_db, ctes, input),
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Sample { input, .. } => plan_schema(db, default_db, ctes, input),
         // A DML statement is a query scope only through `RETURNING` (a
         // data-modifying CTE); without one it produces no rows.
         LogicalPlan::Insert { returning, .. }
@@ -6845,6 +7650,7 @@ pub(crate) fn plan_schema(
         | LogicalPlan::ShowMacros { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::Use { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateMaterializedView { .. }
@@ -7049,8 +7855,9 @@ fn bind_source(
     alias: &Option<String>,
     col_aliases: &Option<Vec<String>>,
     at: Option<AtSpec>,
+    lateral: bool,
 ) -> Result<(ScopeTable, LogicalPlan)> {
-    let (mut scope, plan) = bind_source_raw(db, binder, source, alias, at)?;
+    let (mut scope, plan) = bind_source_raw(db, binder, source, alias, at, lateral)?;
     // `t(x, y)`: rename the source's columns positionally. `VALUES` supplies
     // its own `col0…` names, so this is also how `(VALUES …) t(x, y)` names
     // them.
@@ -7069,6 +7876,34 @@ fn bind_source(
     Ok((scope, plan))
 }
 
+/// A `LATERAL` subquery binds exactly like a plain derived table: pinkdb's
+/// derived plans are uncorrelated, so an earlier FROM item has no address
+/// inside one. When a lateral subquery *does* name such a column, re-binding
+/// with the outer scope visible tells that apart from a plain typo and names
+/// the real limit.
+fn lateral_column_error(
+    db: &PinkDb,
+    binder: &Binder,
+    q: &Select,
+    err: PinkDbError,
+    lateral: bool,
+) -> PinkDbError {
+    if !lateral || !matches!(err, PinkDbError::Catalog(_)) {
+        return err;
+    }
+    let mut probe = binder.child();
+    probe.tables = binder.tables.clone();
+    if bind_select_in(db, &mut probe, q).is_ok() {
+        PinkDbError::Execution(
+            "a LATERAL subquery cannot reference columns of an earlier FROM item: \
+             pinkdb binds derived plans without an outer scope (uncorrelated LATERAL only)"
+                .to_string(),
+        )
+    } else {
+        err
+    }
+}
+
 /// Bind one `FROM` source with an empty alias/scope handling.
 fn bind_source_raw(
     db: &PinkDb,
@@ -7076,6 +7911,7 @@ fn bind_source_raw(
     source: &FromSource,
     alias: &Option<String>,
     at: Option<AtSpec>,
+    lateral: bool,
 ) -> Result<(ScopeTable, LogicalPlan)> {
     match source {
         // `(VALUES (1,'a'), (2,'b'))`: constant rows, `col0…` names (renamed
@@ -7374,7 +8210,10 @@ fn bind_source_raw(
                 .clone()
                 .ok_or_else(|| PinkDbError::Parse("derived table needs an alias".to_string()))?;
             let mut child = binder.child();
-            let sub = bind_select_in(db, &mut child, q)?;
+            let sub = match bind_select_in(db, &mut child, q) {
+                Ok(sub) => sub,
+                Err(err) => return Err(lateral_column_error(db, binder, q, err, lateral)),
+            };
             let schema = plan_schema(db, &child.default_db, &binder.ctes, &sub)?;
             Ok((
                 ScopeTable {
@@ -7443,8 +8282,13 @@ fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<CtePl
                     "WITH RECURSIVE cannot contain a data-modifying statement".to_string(),
                 ));
             }
-            let (plan, dynamic) =
-                bind_tracked_plan(db, inner, &binder.default_db, binder.params.clone())?;
+            let (plan, dynamic) = bind_tracked_plan(
+                db,
+                inner,
+                &binder.default_db,
+                binder.params.clone(),
+                &binder.session,
+            )?;
             {
                 let mut used = binder.dynamic_functions_used.borrow_mut();
                 for name in dynamic {
@@ -7600,6 +8444,19 @@ fn wrap_ctes(
 /// `UPDATE … FROM` / `DELETE … USING` / `MERGE … USING` source starts at
 /// column 0 and the statement's target row follows it in every expression's
 /// input row. For a SELECT the scope starts empty.
+/// Wrap a source plan in its `TABLESAMPLE` / `USING SAMPLE` node, if it has
+/// one. Sampling happens before the join, so a sampled source feeds only the
+/// rows it kept into the join.
+fn with_sample(plan: LogicalPlan, sample: Option<&crate::sql::ast::SampleSpec>) -> LogicalPlan {
+    match sample {
+        None => plan,
+        Some(sample) => LogicalPlan::Sample {
+            input: Box::new(plan),
+            sample: sample.clone(),
+        },
+    }
+}
+
 fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Result<LogicalPlan> {
     let (left, left_plan) = bind_source(
         db,
@@ -7608,9 +8465,10 @@ fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Resul
         &from.alias,
         &from.col_aliases,
         from.at,
+        from.lateral,
     )?;
     let mut left_cols = left.columns.len();
-    let mut base = left_plan;
+    let mut base = with_sample(left_plan, from.sample.as_ref());
     binder.tables.push(left);
     for join in &from.joins {
         let (right, right_plan) = bind_source(
@@ -7620,6 +8478,7 @@ fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Resul
             &join.alias,
             &join.col_aliases,
             join.at,
+            join.lateral,
         )?;
         // The same effective name twice is refused, except for two
         // unaliased base tables from *different* databases
@@ -7643,6 +8502,7 @@ fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Resul
         // condition binds, so `ON` sees the left tables ++ right table
         // (joined-space column indices).
         binder.tables.push(right);
+        let right_plan = with_sample(right_plan, join.sample.as_ref());
         let shape = bind_join_shape(binder, join.kind, left_cols, join.on.as_ref())?;
         base = match shape {
             BoundJoin::Hash {

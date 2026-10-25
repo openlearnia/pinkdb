@@ -162,6 +162,7 @@ fn result_kind(r: &QueryResult) -> &'static str {
         QueryResult::CreatedDatabase { .. } => "CreatedDatabase",
         QueryResult::DroppedDatabase { .. } => "DroppedDatabase",
         QueryResult::Used { .. } => "Used",
+        QueryResult::SetVariable { .. } => "SetVariable",
         QueryResult::LoadedExtension { .. } => "LoadedExtension",
         QueryResult::AlteredTable { .. } => "AlteredTable",
         QueryResult::Checkpointed => "Checkpointed",
@@ -211,6 +212,8 @@ fn result_message(r: &QueryResult) -> String {
         QueryResult::CreatedDatabase { name } => format!("Database {name} created."),
         QueryResult::DroppedDatabase { name } => format!("Database {name} dropped."),
         QueryResult::Used { db } => format!("Using database {db}."),
+        // DuckDB prints nothing for `SET VARIABLE`.
+        QueryResult::SetVariable { .. } => String::new(),
         QueryResult::LoadedExtension { name } => format!("Extension {name} loaded."),
         QueryResult::Checkpointed => "Checkpoint complete.".to_string(),
         QueryResult::AlteredTable { name } => format!("Table {name} altered."),

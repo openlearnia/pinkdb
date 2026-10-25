@@ -80,7 +80,9 @@ enum {
     PINKDB_STMT_CREATED_ROLE = 20,
     PINKDB_STMT_DROPPED_ROLE = 21,
     PINKDB_STMT_GRANTED = 22,
-    PINKDB_STMT_REVOKED = 23
+    PINKDB_STMT_REVOKED = 23,
+    /* SET VARIABLE (wave 95c): pinkdb_result_name returns the variable. */
+    PINKDB_STMT_SET_VARIABLE = 24
 };
 
 /* Value / column type tags. */

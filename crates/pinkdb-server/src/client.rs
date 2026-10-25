@@ -728,6 +728,7 @@ fn build_result(
         DoneKind::CreatedDatabase => QueryResult::CreatedDatabase { name },
         DoneKind::DroppedDatabase => QueryResult::DroppedDatabase { name },
         DoneKind::Used => QueryResult::Used { db: name },
+        DoneKind::SetVariable => QueryResult::SetVariable { name },
         DoneKind::LoadedExtension => QueryResult::LoadedExtension { name },
         DoneKind::Checkpointed => QueryResult::Checkpointed,
         DoneKind::AlteredTable => QueryResult::AlteredTable { name },

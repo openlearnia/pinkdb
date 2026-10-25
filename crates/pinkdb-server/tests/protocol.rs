@@ -75,11 +75,12 @@ fn requests_round_trip() {
 
 /// Wave 48 pins the wire surface of protocol v9: the version number, the
 /// `Login`/`LoggedIn` tags, and the seven RBAC `Done` kinds. Wave 84 adds the
-/// v10 profiling messages; wave 101a adds the VARIANT value and dtype tags.
+/// v10 profiling messages; wave 101a adds the VARIANT value and dtype tags;
+/// wave 95c adds the `SetVariable` `Done` kind (v12).
 /// A change here is a protocol change and must bump [`PROTOCOL_VERSION`].
 #[test]
-fn protocol_v11_pins_the_variant_tags_and_keeps_the_v10_surface() {
-    assert_eq!(PROTOCOL_VERSION, 11);
+fn protocol_v12_pins_the_variant_tags_and_keeps_the_v10_surface() {
+    assert_eq!(PROTOCOL_VERSION, 12);
     assert_eq!(msg_type::LOGIN, 6);
     assert_eq!(msg_type::LOGGED_IN, 18);
     assert_eq!(msg_type::SET_PROFILING, 7);
@@ -100,6 +101,7 @@ fn protocol_v11_pins_the_variant_tags_and_keeps_the_v10_surface() {
         (DoneKind::DroppedRole, 23),
         (DoneKind::Granted, 24),
         (DoneKind::Revoked, 25),
+        (DoneKind::SetVariable, 26),
     ] {
         let frame = encode_response(&Response::Done {
             kind,
@@ -119,10 +121,10 @@ fn protocol_v11_pins_the_variant_tags_and_keeps_the_v10_surface() {
         );
     }
     // A tag past the current surface is still rejected.
-    let bytes = frame(msg_type::DONE, &[26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let bytes = frame(msg_type::DONE, &[27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert!(matches!(
         decode_response(&bytes),
-        Err(ProtocolError::Malformed(msg)) if msg.contains("unknown Done kind 26")
+        Err(ProtocolError::Malformed(msg)) if msg.contains("unknown Done kind 27")
     ));
 }
 

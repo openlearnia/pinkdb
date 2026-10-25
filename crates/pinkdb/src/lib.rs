@@ -104,7 +104,7 @@ pub use rbac::{
     GrantObject, GrantPrivs, GrantSpec, GrantTarget, PasswordSource, Privilege, UserDef,
     hash_password, validate_password_hash, verify_password,
 };
-pub use storage::{DataTable, PinkDb, ViewDef};
+pub use storage::{DataTable, PinkDb, Session, ViewDef};
 pub use table_source::{
     TableFunctionArg, TableFunctionCall, TableScanOutput, TableSource, TableSourceStats,
 };
@@ -515,6 +515,7 @@ fn result_facts(result: &QueryResult) -> (u64, u32, &'static str) {
         QueryResult::CreatedDatabase { .. } => (0, 0, "CreatedDatabase"),
         QueryResult::DroppedDatabase { .. } => (0, 0, "DroppedDatabase"),
         QueryResult::Used { .. } => (0, 0, "Used"),
+        QueryResult::SetVariable { .. } => (0, 0, "SetVariable"),
         QueryResult::LoadedExtension { .. } => (0, 0, "LoadedExtension"),
         QueryResult::AlteredTable { .. } => (0, 0, "AlteredTable"),
         QueryResult::Checkpointed => (0, 0, "Checkpointed"),

@@ -9,6 +9,88 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-25
+### Wave 95c — SQL dialect completeness, batch 3 (query forms) ✅
+- **LATERAL and comma-separated `FROM`.** `FROM a, b` is a cross join in the
+  same left-deep list as `JOIN`, so `FROM a, b JOIN c ON a.x = c.z` binds like
+  DuckDB. `LATERAL (SELECT …)` may sit in the head position, after a comma, or
+  after any `JOIN` (including `CROSS JOIN LATERAL` and `LEFT JOIN LATERAL … ON
+  true`). pinkdb binds derived plans without an outer scope, so a lateral
+  subquery that references a column of an earlier `FROM` item is refused by
+  name instead of silently returning the uncorrelated answer.
+- **Ordered-set aggregates.** `percentile_cont`/`quantile_cont`,
+  `percentile_disc`/`quantile_disc` and `mode` with `WITHIN GROUP (ORDER BY …)`,
+  `FILTER` before or after the `WITHIN GROUP` clause, and the DuckDB result
+  types (a `DECIMAL` percentile stays `DECIMAL`, an integer one becomes
+  `DOUBLE`, `percentile_disc`/`mode` keep the input type, empty input is
+  `NULL`, ties in `mode` pick the smallest value). A non-constant fraction, a
+  missing `WITHIN GROUP`, or `OVER ()` on an ordered-set aggregate are named
+  errors.
+- **`TABLESAMPLE` / `USING SAMPLE`** with DuckDB's methods — `bernoulli`,
+  `system`, `reservoir` — for `n ROWS` and `n PERCENT`, plus `REPEATABLE
+  (seed)`. Sampling is deterministic under a seed (pinkdb's own SplitMix64
+  stream, so the same seed picks different rows than DuckDB but the same rows
+  every run); a discrete count with `bernoulli`/`system` is refused with
+  DuckDB's message. `USING SAMPLE 2 ROWS REPEATABLE(7)` (no method) is accepted
+  as a superset of DuckDB, which needs the parenthesised method form.
+- **Window `FILTER` and windows built on windows.** `agg(x) FILTER (WHERE …)
+  OVER (…)` skips non-matching rows frame-relatively (DuckDB's answer, `NULL`
+  where nothing matches); a non-aggregate window function with `FILTER` is
+  refused by name. `WINDOW w AS (…)` definitions can now build on an earlier
+  window (`OVER (w ORDER BY …)`, `WINDOW v AS (w ROWS 1 PRECEDING)`), with
+  DuckDB's merge rules: the base's `PARTITION BY`/`ORDER BY` are inherited, a
+  derived clause may fill a gap but not override one, and copying a base that
+  has a frame clause is an error.
+- **Row constructors.** `ROW(a, b)` and `(a, b)` compare field-wise in `=`,
+  `<>`, `<`, `<=`, `>`, `>=` and work as the left side of `IN (…)` with a
+  value list. DuckDB's semantics are reproduced exactly: row comparison treats
+  `NULL` as an ordinary value (`(1,NULL) = (1,NULL)` is true, `NULL` sorts
+  greater), while `IN (SELECT …)` keeps three-valued logic. A standalone row
+  and `(a, b) IN (SELECT …)` are refused by name (pinkdb has no `STRUCT`
+  type and its `IN` probe is single-column).
+- **`AT TIME ZONE` and `timezone(zone, ts)`.** Folded into one function. pinkdb
+  timestamps are naive and it has no time-zone database, so a UTC-family zone
+  (`UTC`, `GMT`, `Z`, `Etc/UTC`, `+00:00`) is the identity on a `TIMESTAMP`
+  (a `DATE`/`VARCHAR` is cast first) and any other zone is refused with a
+  message naming the missing time-zone database.
+- **JSON mutation functions.** `json_set`, `json_insert`, `json_replace` and
+  `json_remove` are engine functions with DuckDB's path semantics (missing
+  parents are created, `json_insert` never overwrites, `json_replace` never
+  creates, an array index past the end is ignored, `$` is the whole document,
+  `$."quoted key"` works, any `NULL` argument gives `NULL`). They accept JSON
+  text or a `VARIANT` and return the same kind, and a `VARIANT` value argument
+  needs no `::JSON` cast — a documented superset of DuckDB, whose signatures
+  require `JSON`.
+- **Session variables.** `SET VARIABLE name = <expr>`, `getvariable('name')` and
+  the `$name` shorthand. The value is spliced at bind time, so a later statement
+  sees it (a variable set inside a multi-statement string is visible to the
+  statements after it). `getvariable` of an unset name is `NULL` like DuckDB;
+  `$name` errors, also like DuckDB. The state is **per connection**, like
+  DuckDB's session: the embedded handle is one session, every network
+  `Connection` and every served/MCP session its own, so one client's variable is
+  invisible to — and cannot be overwritten by — another's. Variables are never
+  persisted or WAL-logged, and a logged statement may not read one (replay
+  would bind its text against a fresh session), which the binder refuses by
+  name.
+- **`FOR UPDATE` / `FOR SHARE`** stay refused, with a message naming the reason:
+  pinkdb has no row locks and its MVCC already serializes writers. DuckDB 2.0
+  rejects the clause too.
+- **`MERGE` and `UPDATE … FROM` now hash-join their equality keys.** The ON /
+  WHERE equality conjuncts build a hash table over the source once and probe it
+  per target row (residual predicates still filter), keeping the old nested loop
+  for anything without an equality key. Measured on 10 000 × 1 000 rows,
+  interleaved: `MERGE` 3.18 s → 0.05 s (~65×), `UPDATE … FROM` 3.09 s → 0.006 s
+  (~500×); 100 000 × 10 000: 340 s → 0.47 s and 318 s → 0.03 s; 1 000 000 ×
+  100 000: `MERGE` 4.9 s, `UPDATE … FROM` 0.28 s (the nested-loop baseline at
+  that size is an extrapolation of ~9 h, not a measurement). TPC-H Q1/Q6 and a
+  group-by/sort query show no change (interleaved A/B, medians equal).
+- **Docs, tests, wire protocol.** `docs/sql-conformance.md` gains the full
+  batch-3 matrix (no form left unassigned) and `bench/duckdiff.py` 40 new cases
+  (376 pass). The conformance suite adds 26 DuckDB-checked cases plus
+  pinkdb-only cases for the forms whose spelling differs, seeded-sampling
+  determinism and session variables. `SET VARIABLE` reports
+  `PINKDB_STMT_SET_VARIABLE` in the C ABI and `DoneKind::SetVariable` (tag 26)
+  on the server wire, which bumps the protocol to v12.
+
 ### Wave 95b — SQL dialect completeness, batch 2 (DML) ✅
 - **Upserts.** `INSERT … ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]`
   with `excluded.col` (the proposed row) and the target table readable in the

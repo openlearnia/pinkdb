@@ -244,6 +244,14 @@ pub enum LogicalPlan {
     Use {
         name: String,
     },
+    /// `SET VARIABLE <name> = <expr>`: bind a session variable. The value is
+    /// evaluated once, at execution, and spliced into later statements as a
+    /// literal (see [`crate::storage::Session`]). Session state, not store
+    /// state: never logged, never persisted.
+    SetVariable {
+        name: Box<str>,
+        value: BoundExpr,
+    },
     /// `LOAD EXTENSION '<path>'`: load a native extension (ABI v1) and
     /// register its scalar functions. Process-level and not part of any
     /// snapshot — but WAL-logged, because a durable reopen must re-load it.
@@ -518,6 +526,13 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         limit: usize,
     },
+    /// `TABLESAMPLE` / `USING SAMPLE`: keep a subset of the input rows. The
+    /// executor draws it; with `REPEATABLE (seed)` the same seed keeps the
+    /// same rows.
+    Sample {
+        input: Box<LogicalPlan>,
+        sample: crate::sql::ast::SampleSpec,
+    },
     /// `OFFSET <n>`: drop the first `n` rows (may sit under `Limit`).
     Offset {
         input: Box<LogicalPlan>,
@@ -631,9 +646,11 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
                 | LogicalPlan::Sort { .. }
                 | LogicalPlan::Limit { .. }
                 | LogicalPlan::Offset { .. }
+                | LogicalPlan::Sample { .. }
                 | LogicalPlan::Window { .. }
                 | LogicalPlan::SetOp { .. }
                 | LogicalPlan::Use { .. }
+                | LogicalPlan::SetVariable { .. }
                 | LogicalPlan::ShowTables { .. }
                 | LogicalPlan::ShowDatabases
                 | LogicalPlan::ShowMaterializedViews { .. }
@@ -747,6 +764,11 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::CreateDatabase { .. }
             | LogicalPlan::DropDatabase { .. }
             | LogicalPlan::Use { .. }
+            // `SET VARIABLE` is session state, not store state: it is
+            // read-only for the store (no lock upgrade) and never logged —
+            // replay binds a logged statement against a fresh session, so a
+            // logged statement may not even read one (see
+            // `sql::bind_tracked_with`).
             | LogicalPlan::LoadExtension { .. }
             // Wave 80: materialized-view statements mutate the store (the
             // backing table and the catalog definition), so they are logged:
@@ -944,6 +966,7 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Use { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
@@ -1059,6 +1082,7 @@ pub(crate) fn collect_tables_read(
                 let exprs = w
                     .arg
                     .iter()
+                    .chain(w.filter.iter())
                     .chain(w.partition.iter())
                     .chain(w.order.iter().map(|(e, _)| e));
                 for e in exprs {
@@ -1112,7 +1136,9 @@ pub(crate) fn collect_tables_read(
                 expr_tables_read(e, default_db, out);
             }
         }
-        LogicalPlan::Distinct { input, .. } | LogicalPlan::Limit { input, .. } => {
+        LogicalPlan::Distinct { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sample { input, .. } => {
             collect_tables_read(input, default_db, out);
         }
         LogicalPlan::Offset { input, .. } => {
@@ -1289,6 +1315,7 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
                 || windows.iter().any(|w| {
                     w.arg
                         .iter()
+                        .chain(w.filter.iter())
                         .chain(w.partition.iter())
                         .chain(w.order.iter().map(|(e, _)| e))
                         .any(expr_contains_table_function)
@@ -1335,7 +1362,8 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Limit { input, .. }
-        | LogicalPlan::Offset { input, .. } => contains_table_function(input),
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Sample { input, .. } => contains_table_function(input),
         LogicalPlan::SetOp { left, right, .. } => {
             contains_table_function(left) || contains_table_function(right)
         }
@@ -1376,6 +1404,7 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Use { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::ShowTables { .. }
@@ -1551,7 +1580,9 @@ fn walk_scan_filters(
             collect_prune_predicates(predicate, &mut here);
             walk_scan_filters(input, &here, out);
         }
-        LogicalPlan::Limit { input, .. } | LogicalPlan::Offset { input, .. } => {
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Sample { input, .. } => {
             walk_scan_filters(input, inherited, out);
         }
         LogicalPlan::Scan { db: Some(_), .. } | LogicalPlan::TableFunction { .. } => {
@@ -1580,6 +1611,7 @@ fn walk_scan_filters(
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Use { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
@@ -1649,6 +1681,7 @@ fn walk_scan_filters(
                 for e in w
                     .arg
                     .iter()
+                    .chain(w.filter.iter())
                     .chain(w.partition.iter())
                     .chain(w.order.iter().map(|(e, _)| e))
                 {
@@ -1900,6 +1933,7 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Use { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
@@ -1971,6 +2005,7 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
             children.push(input);
             for w in windows {
                 exprs.extend(w.arg.iter());
+                exprs.extend(w.filter.iter());
                 exprs.extend(w.partition.iter());
                 exprs.extend(w.order.iter().map(|(e, _)| e));
             }
@@ -2016,9 +2051,9 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
             children.push(input);
             exprs.extend(keys.iter().map(|(e, _)| e));
         }
-        LogicalPlan::Limit { input, .. } | LogicalPlan::Offset { input, .. } => {
-            children.push(input)
-        }
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Sample { input, .. } => children.push(input),
     }
     for e in exprs {
         expr_dynamic(e, found);
@@ -2172,6 +2207,7 @@ fn walk_scan_projections(
                 for e in w
                     .arg
                     .iter()
+                    .chain(w.filter.iter())
                     .chain(w.partition.iter())
                     .chain(w.order.iter().map(|(e, _)| e))
                 {
@@ -2198,9 +2234,9 @@ fn walk_scan_projections(
             }
             walk_scan_projections(input, &need, out);
         }
-        LogicalPlan::Limit { input, .. } | LogicalPlan::Offset { input, .. } => {
-            walk_scan_projections(input, needed, out)
-        }
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Sample { input, .. } => walk_scan_projections(input, needed, out),
         // Unbounded shapes: `Distinct` hashes whole rows; `Union` coerces
         // every column of both sides; `Join` assembles all columns of both
         // sides; a `Cte` query's output is materialized once and reused by
@@ -2274,6 +2310,7 @@ fn walk_scan_projections(
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Use { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases

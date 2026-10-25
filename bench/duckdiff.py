@@ -469,6 +469,63 @@ QUERIES = [
     ("json-extract-bad-path", "SELECT json_extract('{\"a\":1}', '$.a.');", False, True),
     ("json-object-odd-args", "SELECT json_object('a');", False, True),
     ("json-object-null-key", "SELECT json_object(CAST(NULL AS VARCHAR), 'v');", False, True),
+    # ---- wave 95c: lateral sources, ordered sets, sampling, rows, windows ----
+    # LATERAL is uncorrelated in pinkdb (a derived plan has no outer scope), so
+    # every probe keeps the subquery independent of the items to its left.
+    ("lateral-head-source", "SELECT s.a FROM LATERAL (SELECT 1 AS a) s;", False, False),
+    ("lateral-derived", "SELECT e.id, s.d FROM emp e, LATERAL (SELECT 5 AS d) s ORDER BY e.id;", False, False),
+    ("lateral-left-join", "SELECT e.id, s.d FROM emp e LEFT JOIN LATERAL (SELECT id2 AS d FROM (SELECT 7 AS id2) z) s ON true ORDER BY e.id;", False, False),
+    ("comma-from-cross", "SELECT COUNT(*) FROM emp e, dept d;", False, False),
+    ("comma-from-on-sees-left", "SELECT COUNT(*) FROM emp e, jx JOIN jy ON jx.x = jy.x;", False, False),
+    ("ordered-set-cont", "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM jx;", False, False),
+    ("ordered-set-disc", "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x), percentile_disc(0) WITHIN GROUP (ORDER BY x), percentile_disc(1) WITHIN GROUP (ORDER BY x) FROM jx;", False, False),
+    ("ordered-set-mode", "SELECT mode() WITHIN GROUP (ORDER BY did) FROM emp;", False, False),
+    ("ordered-set-filter", "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FILTER (WHERE x > 1) FROM jx;", False, False),
+    ("ordered-set-group", "SELECT did, percentile_disc(0.5) WITHIN GROUP (ORDER BY id) FROM emp WHERE did IS NOT NULL GROUP BY did ORDER BY did;", False, False),
+    # Sampling: only counts that every method pins (a seeded draw picks
+    # different rows in each engine, so the row *identity* is pinkdb-only).
+    ("sample-rows", "SELECT COUNT(*) FROM (SELECT * FROM jx USING SAMPLE 2 ROWS) s;", False, False),
+    ("sample-rows-tablesample", "SELECT COUNT(*) FROM jx TABLESAMPLE reservoir(2 ROWS);", False, False),
+    ("sample-rows-more-than-input", "SELECT COUNT(*) FROM jx USING SAMPLE 10 ROWS;", False, False),
+    ("sample-bernoulli-all", "SELECT COUNT(*) FROM jx TABLESAMPLE BERNOULLI(100 PERCENT);", False, False),
+    ("sample-bernoulli-none", "SELECT COUNT(*) FROM jx TABLESAMPLE BERNOULLI(0 PERCENT);", False, False),
+    ("sample-system-all", "SELECT COUNT(*) FROM jx TABLESAMPLE SYSTEM(100 PERCENT);", False, False),
+    ("sample-reservoir-percent-all", "SELECT COUNT(*) FROM jx USING SAMPLE reservoir(100 PERCENT);", False, False),
+    ("sample-of-derived", "SELECT COUNT(*) FROM (SELECT * FROM emp WHERE did = 10) e USING SAMPLE 1 ROWS;", False, False),
+    ("sample-bernoulli-discrete", "SELECT * FROM jx TABLESAMPLE BERNOULLI(2);", False, True),
+    # Row constructors compare field by field; NULLs compare as values (no
+    # three-valued logic), which is what DuckDB does too.
+    ("row-comparison", "SELECT (1,2) = (1,2), (1,NULL) = (1,NULL), (1,NULL) < (1,3), (2,NULL) > (1,3), (1,2) < (1,3);", False, False),
+    ("row-in-list", "SELECT (1,2) IN ((1,2),(3,4)), (1,NULL) IN ((1,2),(3,4)), (1,2) IN ((3,4),(5,6));", False, False),
+    ("window-filter", "SELECT x, SUM(x) FILTER (WHERE x > 1) OVER (ORDER BY x) FROM jx ORDER BY x;", False, False),
+    ("window-filter-count", "SELECT x, COUNT(*) FILTER (WHERE x > 1) OVER () FROM jx ORDER BY x;", False, False),
+    ("window-on-window", "SELECT id, SUM(id) OVER (w ORDER BY id) FROM emp WINDOW w AS (PARTITION BY did) ORDER BY id;", False, False),
+    ("window-on-window-chain", "SELECT id, SUM(id) OVER v FROM emp WINDOW w AS (ORDER BY id), v AS (w ROWS 1 PRECEDING) ORDER BY id;", False, False),
+    ("window-copy-frame", "SELECT id, SUM(id) OVER (w) FROM emp WINDOW w AS (ORDER BY id ROWS 1 PRECEDING);", False, True),
+    # Session variables: one text for both engines (DuckDB has the same three
+    # spellings).
+    ("set-variable", "SET VARIABLE x = 41; SELECT getvariable('x') + 1, $x + 1;", False, False),
+    ("set-variable-where", "SET VARIABLE lim = 2; SELECT COUNT(*) FROM jx WHERE x > $lim;", False, False),
+    ("getvariable-missing", "SELECT getvariable('nope');", False, False),
+    # ---- wave 95c: json mutation functions ----
+    # DuckDB needs JSON-typed arguments; a VARCHAR *literal* casts to JSON
+    # implicitly, so one SQL text runs on both engines (pinkdb reads a
+    # VARCHAR value as JSON text). Documents keep their keys sorted on the
+    # pinkdb side, so every probe writes keys in sorted order.
+    ("json-set", "SELECT json_set('{\"a\":1}', '$.b', '2')::VARCHAR, json_set('{\"a\":1}', '$.a', '\"x\"')::VARCHAR, json_set('{}', '$.a.b.c', '1')::VARCHAR, json_set('{\"a\":1}', '$.b', 'true')::VARCHAR;", False, False),
+    ("json-insert", "SELECT json_insert('{\"a\":1}', '$.a', '9')::VARCHAR, json_insert('{\"a\":1}', '$.b', '9')::VARCHAR, json_insert('{}', '$.a.b', '9')::VARCHAR, json_insert('{\"a\":1}', '$.a.b', '9')::VARCHAR;", False, False),
+    ("json-replace", "SELECT json_replace('{\"a\":1}', '$.a', '9')::VARCHAR, json_replace('{\"a\":1}', '$.b', '9')::VARCHAR, json_replace('{}', '$.a.b', '9')::VARCHAR, json_replace('[1,2]', '$[0]', '9')::VARCHAR;", False, False),
+    ("json-remove", "SELECT json_remove('{\"a\":1,\"b\":2}', '$.a')::VARCHAR, json_remove('[1,2,3]', '$[1]')::VARCHAR, json_remove('{\"a\":1}', '$.zz')::VARCHAR, json_remove('{\"a\":1}', '$')::VARCHAR;", False, False),
+    ("json-set-arrays", "SELECT json_set('[1]', '$[1]', '9')::VARCHAR, json_set('[1]', '$[5]', '9')::VARCHAR, json_set('{\"a\":[1,2]}', '$.a[0]', '9')::VARCHAR, json_insert('[1,2]', '$[2]', '3')::VARCHAR, json_set('{\"a\":\"s\"}', '$.a[0]', '9')::VARCHAR;", False, False),
+    ("json-set-root", "SELECT json_set('{\"a\":1}', '$', '9')::VARCHAR, json_set('{\"a\":1}', '$.a.b', '9')::VARCHAR, json_set('{\"a\":{\"b\":1}}', '$.a.b', '2')::VARCHAR, json_remove('{\"a\":{\"b\":1}}', '$.a.b')::VARCHAR;", False, False),
+    ("json-set-quoted-keys", "SELECT json_set('{\"a\":1}', '$.\"x y\"', '2')::VARCHAR;", False, False),
+    ("json-mutate-null-args", "SELECT json_set(NULL, '$.a', '1')::VARCHAR, json_set('{\"a\":1}', NULL, '1')::VARCHAR, json_set('{\"a\":1}', '$.b', NULL)::VARCHAR, json_remove(NULL, '$.a')::VARCHAR;", False, False),
+    # Removing the only other key leaves one key, so pinkdb's sorted keys and
+    # DuckDB's insertion order cannot disagree.
+    ("json-mutate-column", "SELECT json_remove(doc, '$.t')::VARCHAR FROM jdocs WHERE id = 1;", False, False),
+    # error cases: both engines must refuse.
+    ("json-mutate-arity", "SELECT json_remove('{\"a\":1}', '$.a', '$.b');", False, True),
+    ("json-mutate-bad-path", "SELECT json_set('{\"a\":1}', '$.', '1');", False, True),
     # ---- wave 56: the core datetime extension ----
     # DATE arguments take `::TIMESTAMP` in pinkdb (the strict extension ABI
     # inserts no implicit casts); DuckDB accepts the same cast, so every

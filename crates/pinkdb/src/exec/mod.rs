@@ -26,6 +26,7 @@ use rayon::prelude::*;
 use window::eval_window;
 
 use crate::attached::{AttachedTable, PruneOp};
+use crate::optimizer::columns_in;
 use crate::plan::{
     AlterTablePlan, LogicalPlan, MAX_RECURSIVE_ITERATIONS, MAX_RECURSIVE_ROWS, agg_output_schema,
     compare_values, win_output_schema,
@@ -248,6 +249,12 @@ pub enum QueryResult {
     Used {
         db: String,
     },
+    /// `SET VARIABLE <name> = <value>`: the session variable now holds the
+    /// value. Variables are session-scoped, so a durable store logs the
+    /// statement (a later logged statement may read it) but no table changed.
+    SetVariable {
+        name: String,
+    },
     /// `LOAD EXTENSION '<path>'`: `name` is the extension's declared name.
     LoadedExtension {
         name: String,
@@ -396,6 +403,11 @@ pub(crate) struct Cx<'a> {
     /// The result sets of the statement's data-modifying CTEs (wave 95b),
     /// filled by the statement entry point before the body evaluates.
     pub(crate) dml_ctes: std::sync::Arc<HashMap<String, Output>>,
+    /// The session this statement reads and writes `SET VARIABLE` state in.
+    /// The statement entry point installs the client's session here (a
+    /// network connection's own, never the store's); a read path that only
+    /// holds a read lock passes it explicitly.
+    pub(crate) session: crate::storage::Session,
 }
 
 #[derive(Clone)]
@@ -432,7 +444,14 @@ impl<'a> Cx<'a> {
             prunes: std::sync::Arc::new(crate::plan::ScanFilters::default()),
             budget,
             dml_ctes,
+            session: db.session.clone(),
         }
+    }
+
+    /// Run in `session` instead of the database handle's own session.
+    pub(crate) fn with_session(mut self, session: crate::storage::Session) -> Self {
+        self.session = session;
+        self
     }
 
     /// The statement deadline check, called at chunk/row boundaries.
@@ -463,6 +482,26 @@ impl<'a> Cx<'a> {
 /// the store's current database (the embedded session's).
 fn resolve_db(db: &PinkDb, qdb: &Option<String>) -> String {
     qdb.clone().unwrap_or_else(|| db.current_db().to_string())
+}
+
+/// `SET VARIABLE`: evaluate the value (a constant expression, like a `CALL`
+/// argument) and bind it in the running session. Never touches the store, so
+/// nothing is logged or persisted.
+fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
+    let single = DataChunk {
+        columns: Vec::new(),
+        num_rows: 1,
+    };
+    let v = eval_expr(value, &single, cx)?;
+    if v.len() != 1 {
+        return Err(PinkDbError::Execution(
+            "a SET VARIABLE value did not evaluate to one value".to_string(),
+        ));
+    }
+    cx.session.set(name, v.get(0));
+    Ok(QueryResult::SetVariable {
+        name: name.to_string(),
+    })
 }
 
 /// `USE` validation + result. Bind already checks existence; re-checking here
@@ -1368,6 +1407,10 @@ pub(crate) fn run_plain(
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
         }
         LogicalPlan::Use { name } => use_result(db, name),
+        LogicalPlan::SetVariable { name, value } => {
+            let cx = Cx::with_budget(db, budget.clone());
+            set_variable(&cx, name, value)
+        }
         LogicalPlan::Checkpoint => {
             if db.is_durable() {
                 db.checkpoint()?;
@@ -1689,20 +1732,29 @@ pub(crate) fn run_plain(
 /// Execute a read-only plan against a shared store (used under a read lock
 /// by concurrent readers; also backs [`run`]'s query arm).
 pub fn run_read(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
-    run_read_with_budget(db, plan, std::sync::Arc::new(ExecBudget::unbounded()))
+    run_read_with_budget(
+        db,
+        plan,
+        std::sync::Arc::new(ExecBudget::unbounded()),
+        db.session.clone(),
+    )
 }
 
-/// [`run_read`] under one statement's resource budget (M-6).
+/// [`run_read`] under one statement's resource budget (M-6), in `session`
+/// (a network connection's own; `run_read` uses the handle's session).
 pub(crate) fn run_read_with_budget(
     db: &PinkDb,
     plan: &LogicalPlan,
     budget: std::sync::Arc<ExecBudget>,
+    session: crate::storage::Session,
 ) -> Result<QueryResult> {
     debug_assert!(
         crate::plan::is_read_only(plan),
         "run_read needs a query plan"
     );
-    let cx = Cx::with_budget(db, budget).with_projections(plan);
+    let cx = Cx::with_budget(db, budget)
+        .with_session(session)
+        .with_projections(plan);
     run_read_with(&cx, plan)
 }
 
@@ -1711,6 +1763,11 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
     // returns the target database for the session layer to apply.
     if let LogicalPlan::Use { name } = plan {
         return use_result(cx.db, name);
+    }
+    // `SET VARIABLE` writes session state only: it is read-only for the store
+    // (no lock upgrade, nothing logged) but must still run on the read path.
+    if let LogicalPlan::SetVariable { name, value } = plan {
+        return set_variable(cx, name, value);
     }
     // `COPY … TO …` (wave 71) is read-only for the store (only an external
     // file is written) but produces DuckDB's `Count` result, not a row set —
@@ -2256,6 +2313,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::Use { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateMaterializedView { .. }
@@ -2848,6 +2906,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     prunes: cx.prunes.clone(),
                     budget: cx.budget.clone(),
                     dml_ctes: cx.dml_ctes.clone(),
+                    session: cx.session.clone(),
                 };
                 return eval(&child, body);
             }
@@ -2883,6 +2942,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         prunes: cx.prunes.clone(),
                         budget: cx.budget.clone(),
                         dml_ctes: cx.dml_ctes.clone(),
+                        session: cx.session.clone(),
                     };
                     let produced = eval(&child, &step.step)?;
                     let fresh = if step.all {
@@ -2922,6 +2982,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 prunes: cx.prunes.clone(),
                 budget: cx.budget.clone(),
                 dml_ctes: cx.dml_ctes.clone(),
+                session: cx.session.clone(),
             };
             eval(&child, body)
         }
@@ -3044,6 +3105,94 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let inner = eval(cx, input)?;
             Ok(skip_output(inner, *offset))
         }
+        LogicalPlan::Sample { input, sample } => {
+            let inner = eval(cx, input)?;
+            Ok(sample_output(inner, sample))
+        }
+    }
+}
+
+/// SplitMix64: one seed, one reproducible stream. Sampling needs no
+/// cryptographic quality, only a fast, well-mixed sequence that a seed
+/// reproduces exactly.
+fn sample_rand(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Reservoir sample: `n` distinct global row indices out of `total`, drawn
+/// without replacement. Every input position is considered once, so a seed
+/// reproduces the same set.
+fn reservoir(seed: &mut u64, total: usize, n: usize, keep: &mut [bool]) {
+    let n = n.min(total);
+    let mut chosen: Vec<usize> = (0..n).collect();
+    for i in n..total {
+        let j = (sample_rand(seed) % (i as u64 + 1)) as usize;
+        if j < n {
+            chosen[j] = i;
+        }
+    }
+    for i in chosen {
+        keep[i] = true;
+    }
+}
+
+/// The `TABLESAMPLE` / `USING SAMPLE` operator: pick the rows to keep, then
+/// gather them in input order. Without `REPEATABLE` a fresh seed makes the
+/// sample random; with it, the same seed keeps the same rows.
+fn sample_output(input: Output, sample: &crate::sql::ast::SampleSpec) -> Output {
+    use crate::sql::ast::{SampleMethod, SampleSize};
+    let total: usize = input.chunks.iter().map(|c| c.num_rows()).sum();
+    let mut seed = match sample.repeatable {
+        Some(seed) => seed as u64,
+        None => crate::mv::now_ms() as u64 ^ (total as u64).wrapping_mul(0x9E37_79B9),
+    };
+    let threshold = |p: f64| (p.clamp(0.0, 100.0) / 100.0 * u64::MAX as f64) as u64;
+    let mut keep = vec![false; total];
+    match sample.size {
+        SampleSize::Rows(n) => reservoir(&mut seed, total, n.max(0) as usize, &mut keep),
+        SampleSize::Percent(p) => match sample.method {
+            SampleMethod::Bernoulli => {
+                let t = threshold(p);
+                for slot in keep.iter_mut() {
+                    *slot = sample_rand(&mut seed) < t;
+                }
+            }
+            SampleMethod::System => {
+                // SYSTEM samples blocks: one draw per chunk, and the whole
+                // chunk is kept or dropped with it.
+                let t = threshold(p);
+                let mut base = 0;
+                for chunk in &input.chunks {
+                    let block_kept = sample_rand(&mut seed) < t;
+                    for slot in &mut keep[base..base + chunk.num_rows()] {
+                        *slot = block_kept;
+                    }
+                    base += chunk.num_rows();
+                }
+            }
+            SampleMethod::Reservoir => {
+                let n = ((p.clamp(0.0, 100.0) / 100.0) * total as f64).round() as usize;
+                reservoir(&mut seed, total, n, &mut keep);
+            }
+        },
+    }
+    let mut chunks = Vec::with_capacity(input.chunks.len());
+    let mut base = 0;
+    for chunk in &input.chunks {
+        let selection: Vec<usize> = (0..chunk.num_rows()).filter(|i| keep[base + i]).collect();
+        base += chunk.num_rows();
+        if !selection.is_empty() {
+            chunks.push(chunk.gather(&selection));
+        }
+    }
+    Output {
+        chunks,
+        names: input.names,
+        types: input.types,
     }
 }
 
@@ -3231,6 +3380,148 @@ impl MatchTable {
             }
         }
     }
+}
+
+/// Hash index over a DML statement's source rows. `UPDATE … FROM`,
+/// `DELETE … USING` and `MERGE` match every target row against the source;
+/// the predicate's equality conjuncts (the same split the binder applies to a
+/// JOIN's `ON`) become hash keys, so the per-row work is a probe instead of a
+/// full scan. The full predicate is still evaluated on every candidate, so
+/// results are exactly the nested loop's.
+///
+/// Key expressions live in the joined `[source…, target…]` column space the
+/// DML executor builds its one-row chunks in: source keys evaluate against a
+/// source chunk as-is, target keys are shifted into target space.
+pub(crate) struct DmlIndex {
+    table: MatchTable,
+    keys: Vec<BoundExpr>,
+    commons: Vec<Option<DataType>>,
+    ints: bool,
+}
+
+impl DmlIndex {
+    /// `None` when the predicate has no equality between a source column and a
+    /// target column: the caller keeps the nested loop.
+    pub(crate) fn build(
+        cx: &Cx,
+        source: &[DataChunk],
+        src_cols: usize,
+        predicate: &BoundExpr,
+    ) -> Result<Option<DmlIndex>> {
+        let mut parts = Vec::new();
+        conjuncts(predicate, &mut parts);
+        let mut src_keys: Vec<BoundExpr> = Vec::new();
+        let mut keys: Vec<BoundExpr> = Vec::new();
+        for part in parts {
+            let BoundExpr::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } = part
+            else {
+                continue;
+            };
+            let pair =
+                split_sides(left, right, src_cols).or_else(|| split_sides(right, left, src_cols));
+            let Some((src, tgt)) = pair else { continue };
+            src_keys.push(src.clone());
+            keys.push(shift_join_columns(tgt, src_cols));
+        }
+        if src_keys.is_empty() {
+            return Ok(None);
+        }
+        let ints =
+            src_keys.len() == 1 && is_int_key(src_keys[0].dtype()) && is_int_key(keys[0].dtype());
+        let commons: Vec<Option<DataType>> = src_keys
+            .iter()
+            .zip(keys.iter())
+            .map(|(s, t)| common_numeric(s.dtype(), t.dtype()).ok())
+            .collect();
+        let rows: usize = source.iter().map(|c| c.num_rows()).sum();
+        if rows > u32::MAX as usize {
+            return Err(PinkDbError::Execution(
+                "DML source exceeds u32 rows".to_string(),
+            ));
+        }
+        let reserve = rows.min(1 << 20);
+        let table = MatchTable::build(cx, source, &src_keys, &commons, ints, reserve)?;
+        Ok(Some(DmlIndex {
+            table,
+            keys,
+            commons,
+            ints,
+        }))
+    }
+
+    /// The source `(chunk, row)` candidates for one target row, in source input
+    /// order. A NULL key matches nothing (`=` is never true for NULL).
+    pub(crate) fn probe(
+        &self,
+        cx: &Cx,
+        chunk: &DataChunk,
+        row: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<Vec<(u32, u32)>> {
+        let kvs: Vec<Vector> = self
+            .keys
+            .iter()
+            .zip(self.commons.iter())
+            .map(|(k, c)| eval_join_key(cx, k, chunk, *c, self.ints))
+            .collect::<Result<_>>()?;
+        if kvs.iter().any(|kv| kv.is_null(row)) {
+            return Ok(Vec::new());
+        }
+        let mut head = if self.ints {
+            self.table.head_int(int_key_at(&kvs[0], row))
+        } else {
+            buf.clear();
+            for kv in &kvs {
+                kv.encode_into(buf, row);
+            }
+            self.table.head_bytes(buf)
+        };
+        let mut out = Vec::new();
+        while let Some(node) = head {
+            let (sc, sr, next) = self.table.node(node);
+            out.push((sc, sr));
+            head = (next != NIL).then_some(next);
+        }
+        Ok(out)
+    }
+}
+
+/// Flatten `a AND b AND …` into its conjuncts.
+fn conjuncts<'e>(expr: &'e BoundExpr, out: &mut Vec<&'e BoundExpr>) {
+    match expr {
+        BoundExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            conjuncts(left, out);
+            conjuncts(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// `Some((source side, target side))` when `a` reads only source columns and
+/// `b` only target columns. Both sides must read a column, so a constant
+/// comparison (`s.x = 1`) stays a filter rather than becoming a key.
+fn split_sides<'e>(
+    a: &'e BoundExpr,
+    b: &'e BoundExpr,
+    src_cols: usize,
+) -> Option<(&'e BoundExpr, &'e BoundExpr)> {
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    columns_in(a, &mut left);
+    columns_in(b, &mut right);
+    let source_only = !left.is_empty() && left.iter().all(|c| *c < src_cols);
+    let target_only = !right.is_empty() && right.iter().all(|c| *c >= src_cols);
+    (source_only && target_only).then_some((a, b))
 }
 
 /// One hash-join input: its chunks plus its output dtypes.
@@ -4348,7 +4639,7 @@ fn fused_join_aggregate(
                                         .collect(),
                                     accs: aggs
                                         .iter()
-                                        .map(|a| Acc::new(a.func, a.distinct))
+                                        .map(|a| Acc::new(a.func, a.distinct, a.direct))
                                         .collect(),
                                 },
                             ));
@@ -5709,6 +6000,26 @@ fn explain_into(
         LogicalPlan::CreateDatabase { name, .. } => format!("CreateDatabase {name}"),
         LogicalPlan::DropDatabase { name, .. } => format!("DropDatabase {name}"),
         LogicalPlan::Use { name } => format!("Use {name}"),
+        LogicalPlan::Sample { input, sample } => {
+            children.push(input);
+            let size = match sample.size {
+                crate::sql::ast::SampleSize::Rows(n) => format!("{n} ROWS"),
+                crate::sql::ast::SampleSize::Percent(p) => format!("{p} PERCENT"),
+            };
+            let method = match sample.method {
+                crate::sql::ast::SampleMethod::System => "system",
+                crate::sql::ast::SampleMethod::Bernoulli => "bernoulli",
+                crate::sql::ast::SampleMethod::Reservoir => "reservoir",
+            };
+            let repeat = match sample.repeatable {
+                Some(seed) => format!(" REPEATABLE({seed})"),
+                None => String::new(),
+            };
+            format!("Sample {method}({size}){repeat}")
+        }
+        LogicalPlan::SetVariable { name, value } => {
+            format!("SetVariable {name} = {}", expr_text(value))
+        }
         LogicalPlan::LoadExtension { path } => format!("LoadExtension {path}"),
         LogicalPlan::Checkpoint => "Checkpoint".to_string(),
         LogicalPlan::ShowTables { db } => format!("ShowTables {db}"),
@@ -5809,10 +6120,24 @@ fn explain_into(
                 .iter()
                 .map(|a| {
                     let d = if a.distinct { "DISTINCT " } else { "" };
-                    let name = format!("{:?}", a.func).to_ascii_lowercase();
-                    match &a.arg {
-                        Some(e) => format!("{name}({d}{})", expr_text(e)),
-                        None => format!("{name}(*)"),
+                    let name = match a.func {
+                        AggFunc::PercentileCont => "percentile_cont".to_string(),
+                        AggFunc::PercentileDisc => "percentile_disc".to_string(),
+                        AggFunc::Mode => "mode".to_string(),
+                        func => format!("{func:?}").to_ascii_lowercase(),
+                    };
+                    match (&a.arg, a.direct) {
+                        (Some(e), Some(fraction)) => {
+                            format!(
+                                "{name}({fraction}) WITHIN GROUP (ORDER BY {})",
+                                expr_text(e)
+                            )
+                        }
+                        (Some(e), None) if a.func == AggFunc::Mode => {
+                            format!("{name}() WITHIN GROUP (ORDER BY {})", expr_text(e))
+                        }
+                        (Some(e), None) => format!("{name}({d}{})", expr_text(e)),
+                        (None, _) => format!("{name}(*)"),
                     }
                 })
                 .collect();

@@ -82,6 +82,8 @@ struct ChunkVecs<'a> {
     arg: Option<FusedVec<'a>>,
     /// lag/lead DEFAULT expression, when present.
     deflt: Option<FusedVec<'a>>,
+    /// `FILTER (WHERE …)`, evaluated in the same pass as the arg.
+    keep: Option<FusedVec<'a>>,
 }
 
 /// Evaluate all windows, appending one column each (sequentially, so later
@@ -97,6 +99,15 @@ pub(crate) fn eval_window(
         out = eval_one_window(cx, &out, w)?;
     }
     Ok(out)
+}
+
+/// True when the window's `FILTER` predicate rejects row `i` (a NULL or
+/// FALSE predicate both reject, like an aggregate's FILTER).
+fn filtered_out(keep: &Option<FusedVec<'_>>, i: usize) -> bool {
+    match keep {
+        None => false,
+        Some(v) => !matches!(v.v().get(i), Value::Boolean(true)),
+    }
 }
 
 fn eval_one_window(cx: &Cx, chunks: &[DataChunk], w: &BoundWindow) -> Result<Vec<DataChunk>> {
@@ -123,11 +134,16 @@ fn eval_one_window(cx: &Cx, chunks: &[DataChunk], w: &BoundWindow) -> Result<Vec
                 Some(e) => Some(eval_agg_vec(e, chunk, cx)?),
                 None => None,
             };
+            let keep = match &w.filter {
+                Some(e) => Some(eval_agg_vec(e, chunk, cx)?),
+                None => None,
+            };
             Ok(ChunkVecs {
                 part,
                 ord,
                 arg,
                 deflt,
+                keep,
             })
         })
         .collect::<Result<_>>()?;
@@ -141,7 +157,10 @@ fn eval_one_window(cx: &Cx, chunks: &[DataChunk], w: &BoundWindow) -> Result<Vec
             (0..chunk.num_rows())
                 .map(|i| Row {
                     ord: key_vals(&cv.ord, i),
+                    // A row the FILTER rejects feeds the aggregate nothing: a
+                    // NULL arg is exactly "skipped" for every aggregate.
                     arg: match &cv.arg {
+                        _ if filtered_out(&cv.keep, i) => None,
                         None => Some(Value::Integer(1)), // COUNT(*): every row counts
                         Some(v) if v.v().is_null(i) => None,
                         Some(v) => Some(v.v().get(i)),
@@ -353,7 +372,7 @@ fn eval_partition(
                     FrameBound::Preceding(_) | FrameBound::Following(_)
                 ));
             if w.frame.start == FrameBound::UnboundedPreceding && !range_offset {
-                let mut acc = Acc::new(f, false);
+                let mut acc = Acc::new(f, false, None);
                 let mut next_to_add = 0usize;
                 for (pos, g) in seq.iter().enumerate() {
                     if let Some((_, hi)) = frame_range(&w.frame, pos, &seq, rows, w) {
@@ -371,7 +390,7 @@ fn eval_partition(
                 // Bounded start: frames are bounded by the spec, so a per-row
                 // recompute is fine (and keeps the code simple).
                 for (pos, g) in seq.iter().enumerate() {
-                    let mut acc = Acc::new(f, false);
+                    let mut acc = Acc::new(f, false, None);
                     if let Some((lo, hi)) = frame_range(&w.frame, pos, &seq, rows, w) {
                         for k in lo..=hi {
                             acc.update(rows[seq[k]].arg.as_ref());

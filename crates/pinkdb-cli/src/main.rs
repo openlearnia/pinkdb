@@ -1627,6 +1627,8 @@ fn render_results_into(out: &mut String, results: &[QueryResult]) {
             QueryResult::Used { db } => {
                 let _ = writeln!(out, "Using database {}.", clean(db));
             }
+            // DuckDB prints nothing for `SET VARIABLE`.
+            QueryResult::SetVariable { .. } => {}
             QueryResult::LoadedExtension { name } => {
                 let _ = writeln!(out, "Extension {} loaded.", clean(name));
             }

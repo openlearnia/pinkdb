@@ -1050,6 +1050,13 @@ pub fn parse_path(path: &str) -> Result<Vec<Step>> {
     let bad = || PinkDbError::Execution(format!("invalid VARIANT path {path:?}"));
     while !rest.is_empty() {
         if let Some(r) = rest.strip_prefix('.') {
+            // `$."x y"` quotes a key, as DuckDB's path grammar does.
+            if let Some(r) = r.strip_prefix('"') {
+                let (key, r) = r.split_once('"').ok_or_else(bad)?;
+                steps.push(Step::Key(Arc::from(key)));
+                rest = r;
+                continue;
+            }
             let end = r.find(['.', '[']).unwrap_or(r.len());
             if end == 0 {
                 return Err(bad());
@@ -1077,7 +1084,12 @@ pub fn parse_path(path: &str) -> Result<Vec<Step>> {
         }
     }
     if steps.is_empty() {
-        return Err(bad());
+        // `$` alone is the whole document; an empty path is a mistake.
+        return if path.trim() == "$" {
+            Ok(steps)
+        } else {
+            Err(bad())
+        };
     }
     Ok(steps)
 }
@@ -1094,6 +1106,117 @@ pub fn walk<'a>(v: &'a Variant, steps: &[Step]) -> Option<&'a Variant> {
         };
     }
     Some(cur)
+}
+
+/// How [`set_path`] treats a path that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetMode {
+    /// `json_set`: assign, creating missing parents.
+    Set,
+    /// `json_insert`: assign only when the path is missing.
+    Insert,
+    /// `json_replace`: assign only when the path exists.
+    Replace,
+}
+
+/// `json_set` / `json_insert` / `json_replace`: `root` with `value` at `steps`.
+///
+/// An empty `steps` is the document itself (`$`). A step into a scalar, or an
+/// array index past the end, leaves the document unchanged — the silent no-op
+/// DuckDB makes; only an existing (`Insert`) or missing (`Replace`) path
+/// behaves differently.
+pub fn set_path(root: &Variant, steps: &[Step], value: &Variant, mode: SetMode) -> Result<Variant> {
+    assign(root, steps, value, mode)
+}
+
+fn assign(cur: &Variant, steps: &[Step], value: &Variant, mode: SetMode) -> Result<Variant> {
+    let Some((step, rest)) = steps.split_first() else {
+        return Ok(match mode {
+            SetMode::Insert => cur.clone(),
+            SetMode::Set | SetMode::Replace => value.clone(),
+        });
+    };
+    match (step, cur) {
+        (Step::Key(k), Variant::Object(fields)) => {
+            let mut out: Vec<(Arc<str>, Variant)> =
+                fields.iter().map(|(f, v)| (f.clone(), v.clone())).collect();
+            match out.iter().position(|(f, _)| f == k) {
+                Some(pos) => {
+                    let child = out[pos].1.clone();
+                    out[pos].1 = assign(&child, rest, value, mode)?;
+                }
+                None if mode == SetMode::Replace => return Ok(cur.clone()),
+                None => out.push((k.clone(), build(rest, value)?)),
+            }
+            Variant::object(out)
+        }
+        (Step::Index(i), Variant::Array(items)) => {
+            let mut out: Vec<Variant> = items.to_vec();
+            match out.get(*i) {
+                Some(_) => {
+                    let child = out[*i].clone();
+                    out[*i] = assign(&child, rest, value, mode)?;
+                }
+                None if *i == out.len() && mode != SetMode::Replace => {
+                    out.push(build(rest, value)?)
+                }
+                None => return Ok(cur.clone()),
+            }
+            Variant::array(out)
+        }
+        _ => Ok(cur.clone()),
+    }
+}
+
+/// The container chain for a path that does not exist yet: a key creates an
+/// object, an index an array holding the value at slot 0.
+fn build(steps: &[Step], value: &Variant) -> Result<Variant> {
+    let Some((step, rest)) = steps.split_first() else {
+        return Ok(value.clone());
+    };
+    match step {
+        Step::Key(k) => Variant::object(vec![(k.clone(), build(rest, value)?)]),
+        Step::Index(_) => Variant::array(vec![build(rest, value)?]),
+    }
+}
+
+/// `json_remove`: `root` without the value at `steps`. A missing path leaves
+/// it unchanged; an empty `steps` removes the document itself (`$`).
+pub fn remove_path(root: &Variant, steps: &[Step]) -> Result<Variant> {
+    let Some((step, rest)) = steps.split_first() else {
+        return Ok(Variant::Null);
+    };
+    match (step, root) {
+        (Step::Key(k), Variant::Object(fields)) => {
+            let mut out: Vec<(Arc<str>, Variant)> = Vec::with_capacity(fields.len());
+            for (f, v) in fields.iter() {
+                if f == k {
+                    if rest.is_empty() {
+                        continue;
+                    }
+                    out.push((f.clone(), remove_path(v, rest)?));
+                } else {
+                    out.push((f.clone(), v.clone()));
+                }
+            }
+            Variant::object(out)
+        }
+        (Step::Index(i), Variant::Array(items)) => {
+            let mut out: Vec<Variant> = Vec::with_capacity(items.len());
+            for (j, v) in items.iter().enumerate() {
+                if j == *i {
+                    if rest.is_empty() {
+                        continue;
+                    }
+                    out.push(remove_path(v, rest)?);
+                } else {
+                    out.push(v.clone());
+                }
+            }
+            Variant::array(out)
+        }
+        _ => Ok(root.clone()),
+    }
 }
 
 /// `variant_keys`: the object's keys as a JSON array (pinkdb has no LIST
@@ -1407,7 +1530,10 @@ mod tests {
         assert_eq!(walk(&v, &steps).unwrap(), &Variant::Int(20));
         assert!(walk(&v, &parse_path("a.b[2]").unwrap()).is_none());
         assert!(walk(&v, &parse_path("a.c").unwrap()).is_none());
-        for bad in ["", "$", "a..b", "a[", "a[x]", "[1]x"] {
+        // A bare `$` is the whole document: no steps, which the JSON mutators
+        // read as "replace/remove the document itself".
+        assert!(parse_path("$").unwrap().is_empty());
+        for bad in ["", "a..b", "a[", "a[x]", "[1]x"] {
             assert!(parse_path(bad).is_err(), "{bad}");
         }
     }

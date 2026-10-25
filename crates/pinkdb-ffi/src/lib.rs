@@ -81,6 +81,8 @@ pub const PINKDB_STMT_DROPPED_ROLE: i32 = 21;
 pub const PINKDB_STMT_GRANTED: i32 = 22;
 /// `REVOKE …`; `pinkdb_result_name` carries the revoked grant's description.
 pub const PINKDB_STMT_REVOKED: i32 = 23;
+/// `SET VARIABLE` (wave 95c); `pinkdb_result_name` is the variable.
+pub const PINKDB_STMT_SET_VARIABLE: i32 = 24;
 
 // ----- value / column type tags -----
 pub const PINKDB_TYPE_NULL: i32 = 0;
@@ -463,6 +465,7 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::CreatedDatabase { .. } => PINKDB_STMT_CREATED_DATABASE,
         QueryResult::DroppedDatabase { .. } => PINKDB_STMT_DROPPED_DATABASE,
         QueryResult::Used { .. } => PINKDB_STMT_USED,
+        QueryResult::SetVariable { .. } => PINKDB_STMT_SET_VARIABLE,
         QueryResult::LoadedExtension { .. } => PINKDB_STMT_LOADED_EXTENSION,
         QueryResult::Checkpointed => PINKDB_STMT_CHECKPOINTED,
         QueryResult::AlteredTable { .. } => PINKDB_STMT_ALTERED_TABLE,
@@ -557,6 +560,7 @@ fn build_result(results: Vec<QueryResult>) -> PinkResult {
                         (0, Some(nul_terminated(description)))
                     }
                     QueryResult::Used { db } => (0, Some(nul_terminated(db))),
+                    QueryResult::SetVariable { name } => (0, Some(nul_terminated(name))),
                     QueryResult::LoadedExtension { name } => (0, Some(nul_terminated(name))),
                     _ => (0, None),
                 };

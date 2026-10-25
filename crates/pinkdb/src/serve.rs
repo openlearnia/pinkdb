@@ -414,6 +414,9 @@ fn outcome_line(result: &QueryResult) -> String {
         QueryResult::CreatedDatabase { name: db } => format!("Created database {}", name(db)),
         QueryResult::DroppedDatabase { name: db } => format!("Dropped database {}", name(db)),
         QueryResult::Used { db } => format!("Using database {}", name(db)),
+        QueryResult::SetVariable { name: variable } => {
+            format!("Set variable {}", name(variable))
+        }
         QueryResult::LoadedExtension { name: ext } => format!("Loaded extension {}", name(ext)),
         QueryResult::AlteredTable { name: table } => format!("Altered table {}", name(table)),
         QueryResult::Checkpointed => "Checkpointed".to_string(),
@@ -946,6 +949,39 @@ mod tests {
             execute(&mut db, &writes, ".lake commit c"),
             (0, ".lake commit c (read-only: false)".to_string())
         );
+    }
+
+    /// A served session is one client: the MCP bridge (and the server) hand
+    /// each client its own connection, so `SET VARIABLE` in one session is
+    /// invisible to the next — it used to live on the store and leaked.
+    #[test]
+    fn served_sessions_keep_their_variables_apart() {
+        let db = crate::db::Database::new();
+        let mut first = db.connect();
+        let mut second = db.connect();
+        let policy = ServePolicy {
+            allow_writes: true,
+            ..ServePolicy::default()
+        };
+        {
+            let mut host = SessionHost::new(&mut first, &policy);
+            assert_eq!(
+                host.execute_statement("SET VARIABLE x = 41"),
+                (0, "Set variable x".to_string())
+            );
+            assert_eq!(host.execute_statement("SELECT $x").0, 0);
+        }
+        {
+            let mut host = SessionHost::new(&mut second, &policy);
+            let (code, text) = host.execute_statement("SELECT $x");
+            assert_eq!(code, 1);
+            assert!(text.contains("Variable x does not exist"), "{text}");
+            // Its own value shadows nothing in the other session.
+            assert_eq!(host.execute_statement("SET VARIABLE x = 7").0, 0);
+            assert!(host.execute_statement("SELECT $x").1.contains('7'));
+        }
+        let mut host = SessionHost::new(&mut first, &policy);
+        assert!(host.execute_statement("SELECT $x").1.contains("41"));
     }
 
     #[test]

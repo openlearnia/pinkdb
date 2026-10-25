@@ -2327,6 +2327,7 @@ mod tests {
             dtype: T::Bigint,
             distinct: false,
             filter: None,
+            direct: None,
         }
     }
 

@@ -277,6 +277,12 @@ second committer with a write-conflict error instead of a silent lost update.</p
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">SELECT</span> [<span class="tok-k">DISTINCT</span>] expr [<span class="tok-k">AS</span> alias], ...
 <span class="tok-k">FROM</span> t [<span class="tok-k">JOIN</span> u <span class="tok-k">ON</span> t.x = u.y]      <span class="tok-c">-- INNER / LEFT / RIGHT / FULL [OUTER], CROSS</span>
   | <span class="tok-k">FROM</span> a <span class="tok-k">JOIN</span> b <span class="tok-k">ON</span> ... <span class="tok-k">JOIN</span> c <span class="tok-k">ON</span> ...   <span class="tok-c">-- multi-way (n-ary) joins</span>
+  | <span class="tok-k">FROM</span> t, u [<span class="tok-k">JOIN</span> v <span class="tok-k">ON</span> t.x = v.z]  <span class="tok-c">-- a comma is a CROSS JOIN in the same</span>
+                                  <span class="tok-c">-- left-deep chain (ON sees the items left of it)</span>
+  | <span class="tok-k">FROM</span> LATERAL (<span class="tok-k">SELECT</span> ...) <span class="tok-k">AS</span> s <span class="tok-c">-- LATERAL subqueries (uncorrelated only)</span>
+  | <span class="tok-k">FROM</span> t USING SAMPLE <span class="tok-n">10</span> <span class="tok-k">ROWS</span>   <span class="tok-c">-- TABLESAMPLE / USING SAMPLE: n ROWS | n PERCENT,</span>
+  | <span class="tok-k">FROM</span> t TABLESAMPLE BERNOULLI(<span class="tok-n">10</span> PERCENT)  <span class="tok-c">-- bernoulli | system | reservoir,</span>
+                                  <span class="tok-c">-- REPEATABLE (seed) for a deterministic draw</span>
   | <span class="tok-k">FROM</span> db1.t                    <span class="tok-c">-- qualified tables resolve in that database</span>
   | <span class="tok-k">FROM</span> (<span class="tok-k">SELECT</span> ...) <span class="tok-k">AS</span> s         <span class="tok-c">-- derived tables (alias required)</span>
   | <span class="tok-k">FROM</span> (<span class="tok-k">VALUES</span> (<span class="tok-n">1</span>,<span class="tok-s">'a'</span>), (<span class="tok-n">2</span>,<span class="tok-s">'b'</span>)) t(x, y)  <span class="tok-c">-- VALUES, column aliases optional</span>
@@ -284,7 +290,8 @@ second committer with a write-conflict error instead of a silent lost update.</p
   | <span class="tok-k">WITH</span> [RECURSIVE] w <span class="tok-k">AS</span> (<span class="tok-k">SELECT</span> ...) ...  <span class="tok-c">-- CTEs, incl. WITH w(a, b) AS column</span>
                                   <span class="tok-c">-- aliases; RECURSIVE needs an anchor plus a</span>
                                   <span class="tok-c">-- UNION [ALL] step (bounded, see below)</span>
-[WINDOW w <span class="tok-k">AS</span> (<span class="tok-k">PARTITION</span> <span class="tok-k">BY</span> ... <span class="tok-k">ORDER</span> <span class="tok-k">BY</span> ...), ...]
+[WINDOW w <span class="tok-k">AS</span> (<span class="tok-k">PARTITION</span> <span class="tok-k">BY</span> ... <span class="tok-k">ORDER</span> <span class="tok-k">BY</span> ...), ...]   <span class="tok-c">-- a window may build on</span>
+                                  <span class="tok-c">-- another: OVER (w ORDER BY x), WINDOW v AS (w ROWS ...)</span>
 <span class="tok-k">WHERE</span> expr                        <span class="tok-c">-- IS [NOT] NULL, IS [NOT] DISTINCT FROM,</span>
                                   <span class="tok-c">-- BETWEEN, IN (subquery|list), EXISTS</span>
 <span class="tok-k">GROUP</span> <span class="tok-k">BY</span> ... | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)   <span class="tok-k">HAVING</span> ...
@@ -297,7 +304,12 @@ QUALIFY expr                      <span class="tok-c">-- after WINDOW, before OR
 <span class="tok-k">VALUES</span> (<span class="tok-n">1</span>, <span class="tok-s">'a'</span>), (<span class="tok-n">2</span>, <span class="tok-s">'b'</span>);          <span class="tok-c">-- column names col0, col1, ...</span>
 
 COUNT(<span class="tok-k">DISTINCT</span> x)                 <span class="tok-c">-- inside aggregates</span>
-SUM(x) FILTER (<span class="tok-k">WHERE</span> ...)         <span class="tok-c">-- filtered aggregates</span>
+SUM(x) FILTER (<span class="tok-k">WHERE</span> ...)         <span class="tok-c">-- filtered aggregates, window aggregates too</span>
+PERCENTILE_CONT(<span class="tok-n">0.5</span>) WITHIN <span class="tok-k">GROUP</span> (<span class="tok-k">ORDER</span> <span class="tok-k">BY</span> x)   <span class="tok-c">-- ordered-set aggregates:</span>
+PERCENTILE_DISC(<span class="tok-n">0.9</span>) WITHIN <span class="tok-k">GROUP</span> (<span class="tok-k">ORDER</span> <span class="tok-k">BY</span> x)   <span class="tok-c">-- percentile_cont/disc, and</span>
+MODE() WITHIN <span class="tok-k">GROUP</span> (<span class="tok-k">ORDER</span> <span class="tok-k">BY</span> x)                 <span class="tok-c">-- mode(); FILTER allowed too</span>
+<span class="tok-k">SET</span> VARIABLE x = <span class="tok-n">41</span>;              <span class="tok-c">-- session variable (per connection),</span>
+<span class="tok-k">SELECT</span> getvariable(<span class="tok-s">'x'</span>), $x;      <span class="tok-c">-- read back by getvariable or $x</span>
 <span class="tok-k">SELECT</span> ... <span class="tok-k">UNION</span> [<span class="tok-k">ALL</span>|<span class="tok-k">DISTINCT</span>] <span class="tok-k">SELECT</span> ...
 <span class="tok-k">SELECT</span> ... INTERSECT [<span class="tok-k">ALL</span>] <span class="tok-k">SELECT</span> ...
 <span class="tok-k">SELECT</span> ... EXCEPT [<span class="tok-k">ALL</span>] <span class="tok-k">SELECT</span> ...
@@ -314,6 +326,20 @@ SHOW TABLES;  DESCRIBE t;         <span class="tok-c">-- introspection</span></c
   fast path.</li>
   <li>Outer joins NULL-extend the unmatched side's columns.</li>
   <li>Cross-database joins work: <code>db1.t JOIN db2.u</code>.</li>
+  <li>A comma-separated <code>FROM</code> list is a chain of <code>CROSS JOIN</code>s,
+  so <code>FROM a, b JOIN c ON a.x = c.z</code> binds like DuckDB (the later
+  <code>ON</code> sees the items left of the comma).</li>
+  <li><code>LATERAL</code> subqueries are accepted in the <code>FROM</code> head
+  position, after <code>CROSS JOIN</code>/<code>JOIN</code> and in the comma form.
+  A derived plan has no outer scope, so a <code>LATERAL</code> subquery that
+  <em>references</em> an earlier <code>FROM</code> item is refused by name
+  (uncorrelated <code>LATERAL</code> only); a lateral table function is refused
+  too.</li>
+  <li><code>TABLESAMPLE</code> / <code>USING SAMPLE</code> takes <code>n ROWS</code>
+  (exactly <code>n</code>, reservoir sampling) or <code>n PERCENT</code>, with the
+  <code>bernoulli</code>, <code>system</code> or <code>reservoir</code> method, and
+  <code>REPEATABLE (seed)</code> makes the draw reproducible (within pinkdb — the
+  generator is its own, so a seed picks different rows than DuckDB's).</li>
 </ul>
 
 <h3>Subqueries and CTEs</h3>
@@ -765,16 +791,13 @@ SHOW MATERIALIZED VIEWS;               <span class="tok-c">-- schedule, last ref
   and <code>REPLACE INTO</code> are refused by name; write
   <code>ON CONFLICT … DO UPDATE SET</code> or <code>INSERT OR REPLACE</code>.
   <code>COPY</code> is accepted as a statement, not as a CTE step.</li>
-  <li><strong>Query forms</strong> — <code>LATERAL</code>, ordered-set aggregates
-  (<code>WITHIN GROUP</code>), <code>TABLESAMPLE</code>,
-  <code>FOR UPDATE</code>/<code>SHARE</code>, <code>AT TIME ZONE</code>, row
-  constructors, list literals and the <code>LIST</code> type, <code>FILTER</code> on
-  a window aggregate, a window built on another window, slicing a
-  <code>VARIANT</code>, the JSON mutators (<code>json_set</code>,
-  <code>json_insert</code>, <code>json_replace</code>, <code>json_remove</code>)
-  and <code>SET VARIABLE</code>/<code>$name</code> — are refused with a
-  <code>wave 95c</code> error. None of them degrades into a generic syntax
-  error.</li>
+  <li><strong>Query forms</strong> — <code>FOR UPDATE</code>/<code>FOR SHARE</code>
+  (pinkdb has no row locks; its MVCC already serializes writers), list literals and
+  the <code>LIST</code> type, and slicing a <code>VARIANT</code> (that needs a
+  <code>LIST</code>) — are refused by name. So is a <code>LATERAL</code> subquery
+  that references an earlier <code>FROM</code> item, and
+  <code>(a, b) IN (SELECT ...)</code> (compare the columns one by one). None of
+  them degrades into a generic syntax error.</li>
   <li><strong>Indexes</strong> (<code>CREATE INDEX</code>), <strong>materialized
   views</strong> and <strong>stored procedures</strong> are planned
   (waves 42–44).</li>

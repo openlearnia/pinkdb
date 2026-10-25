@@ -293,6 +293,7 @@ pub(crate) fn substitute_expr(
                 crate::sql::ast::OverSpec::Named(n) => crate::sql::ast::OverSpec::Named(n.clone()),
                 crate::sql::ast::OverSpec::Inline(over) => {
                     crate::sql::ast::OverSpec::Inline(crate::sql::ast::OverClause {
+                        base: over.base.clone(),
                         partition: over
                             .partition
                             .iter()
@@ -478,6 +479,7 @@ pub(crate) fn substitute_select(
                 Ok((
                     name.clone(),
                     crate::sql::ast::OverClause {
+                        base: spec.base.clone(),
                         partition: spec
                             .partition
                             .iter()
@@ -531,6 +533,8 @@ fn substitute_from(
         alias: from.alias.clone(),
         col_aliases: from.col_aliases.clone(),
         at: from.at,
+        sample: from.sample.clone(),
+        lateral: from.lateral,
         joins: from
             .joins
             .iter()
@@ -541,6 +545,8 @@ fn substitute_from(
                     alias: join.alias.clone(),
                     col_aliases: join.col_aliases.clone(),
                     at: join.at,
+                    sample: join.sample.clone(),
+                    lateral: join.lateral,
                     on: match &join.on {
                         Some(e) => Some(substitute_expr(e, args, used)?),
                         None => None,

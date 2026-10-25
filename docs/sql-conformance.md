@@ -13,7 +13,7 @@ Row 95 is big, so it is split:
 |---|---|---|
 | **95a** | the query forms: `QUALIFY`, `TRY_CAST`, subscripts, `IS [NOT] DISTINCT FROM`, `VALUES`/`TABLE`, `FETCH FIRST`, `LIKE … ESCAPE`, `SIMILAR TO`, `DISTINCT ON`, aggregate `FILTER`, named `WINDOW`, `GROUPING SETS`/`ROLLUP`/`CUBE` + `GROUPING()`, `WITH RECURSIVE`, set operations with `ALL` | **done** (this page) |
 | **95b** | the DML forms: `INSERT … ON CONFLICT` (and `INSERT OR REPLACE` / `INSERT OR IGNORE`), `UPDATE … FROM`, `DELETE … USING`, `RETURNING`, `MERGE`, data-modifying CTEs, primary/unique key enforcement | **done** (this page) |
-| **95c** | the rest: `LATERAL`, ordered-set aggregates (`WITHIN GROUP`), `TABLESAMPLE`, `FOR UPDATE`/`SHARE`, `AT TIME ZONE`, row constructors, list literals/`LIST`, `FILTER` on a window aggregate, windows built on another window, VARIANT slicing, the JSON mutation functions, `SET VARIABLE`/`$name` | queued — every form is refused with a `wave 95c` error |
+| **95c** | the rest: `LATERAL`, ordered-set aggregates (`WITHIN GROUP`), `TABLESAMPLE`, `FOR UPDATE`/`SHARE`, `AT TIME ZONE`, row constructors, list literals/`LIST`, `FILTER` on a window aggregate, windows built on another window, VARIANT slicing, the JSON mutation functions, `SET VARIABLE`/`$name` | **done** (this page) |
 
 Legend: **✅ supported** (same answer as DuckDB 2.0.0 on the shared corpus) ·
 **≈ divergent** (accepted, different from DuckDB, in the stated way) ·
@@ -36,7 +36,7 @@ Legend: **✅ supported** (same answer as DuckDB 2.0.0 on the shared corpus) ·
 | `SIMILAR TO pattern` | ≈ | Implemented as a **fully anchored regular expression**, which is what DuckDB 2.0 actually does (`%` and `_` are literals, `.*` is the wildcard). Supports literals, `.`, `[...]`/`[^...]` ranges, `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}`, `(…)`, `\|`, `\x` escapes and `^`/`$`; patterns over 1024 characters or repetitions over 1000 fail with `SIMILAR TO pattern too complex`. Divergence: `SIMILAR TO … ESCAPE` is refused (DuckDB refuses it too) and a malformed repetition such as `a{1,2,3}` is read literally instead of raising DuckDB's regex error. |
 | `DISTINCT ON (…)` | ✅ | Keeps the first row per key in `ORDER BY` order, like DuckDB; the key need not be selected and `ORDER BY` need not contain it. Combined with plain `DISTINCT` is refused (`DISTINCT and DISTINCT ON cannot be combined`); with plain `DISTINCT` semantics also reachable via `GROUP BY`. |
 | aggregate `FILTER (WHERE …)` | ✅ | `sum(a) FILTER (WHERE a > 1)`, `count(*) FILTER (…)`, `count(DISTINCT a) FILTER (…)`; the filtered rows contribute nothing (not a zero). Never takes a fused aggregate fast path, so it cannot silently read unfiltered columns. |
-| named `WINDOW w AS (…)` | ✅ | Definitions may reference select aliases and each other only left-to-right; `OVER w` resolves through them. A window that builds on another window (`WINDOW v AS (w ORDER BY a)`, `OVER (w ROWS …)`) is **✗** `a window that builds on another window is not supported (wave 95c)`. |
+| named `WINDOW w AS (…)` | ✅ | Definitions may reference select aliases and each other only left-to-right; `OVER w` resolves through them. A window may build on another window (95c): see the batch-3 table. |
 | `GROUP BY GROUPING SETS (…)` | ✅ | Sets, `ROLLUP(…)` (longest prefix first) and `CUBE(…)` (DuckDB's order); multiple group-set items cross-product with the plain keys. Implemented as a union of aggregates, so `HAVING`/`ORDER BY`/`LIMIT` apply once. `CUBE` over more than 12 expressions is refused. |
 | `GROUPING(a, b)`, `GROUPING()` | ✅ | Big-endian mask like DuckDB: `GROUPING(a, b) = 2·g(a) + g(b)`; the zero-argument form is `0` for detail sets and `1` for the grand total. Naming a non-grouped expression is an error. |
 | `WITH RECURSIVE r(…) AS (anchor UNION [ALL] step)` | ✅ | Semi-naive iteration: the step sees only the rows the previous round added, `UNION` (not `ALL`) also drops rows already produced, and iteration stops when the step adds nothing. Bounds: **100 000 iterations** (`recursive CTE "r" still produced rows after 100000 iterations`) and **10 000 000 rows** (`recursive CTE "r" passed 10000000 rows`) — a runaway recursion is an error, never a hang. The step's columns are cast to the anchor's types. |
@@ -64,24 +64,24 @@ Legend: **✅ supported** (same answer as DuckDB 2.0.0 on the shared corpus) ·
 A conflict target that is not backed by a key is refused like DuckDB:
 `the specified columns as conflict target are not referenced by a UNIQUE/PRIMARY KEY CONSTRAINT`.
 
-## The rest — batch 3 (95c, queued)
+## The rest — batch 3 (95c)
 
-| form | status | error |
+| form | status | notes (DuckDB 2.0.0 reference) |
 |---|---|---|
-| `LATERAL` (in `FROM` and after `JOIN`) | ✗ | `LATERAL is not supported (wave 95c)` |
-| ordered-set aggregates `WITHIN GROUP (ORDER BY …)` | ✗ | `ordered-set aggregates (WITHIN GROUP) are not supported (wave 95c)` |
-| `TABLESAMPLE` | ✗ | `TABLESAMPLE is not supported (wave 95c)` |
-| `FOR UPDATE` / `FOR SHARE` | ✗ | `SELECT ... FOR UPDATE/SHARE is not supported (wave 95c): the engine has no row locks` |
-| `AT TIME ZONE` | ✗ | `AT TIME ZONE is not supported (wave 95c): cast to TIMESTAMP and use date_trunc instead` |
-| row constructors: `ROW(1, 2)`, `(1, 2)` | ✗ | `row constructors are not supported (wave 95c): use VALUES or separate columns` |
-| list literals and the `LIST` type: `[1, 2]`, `t[1]` on a list | ✗ | `list literals are not supported (wave 95c): the engine has no LIST type` |
-| `FILTER` on a window aggregate | ✗ | `FILTER on a window function is not supported (wave 95c)` |
-| a window built on another window | ✗ | `a window that builds on another window is not supported (wave 95c)` |
-| slicing a VARIANT (`v[1:2]`) | ✗ | `slicing a VARIANT is not supported (wave 95c): only VARCHAR slices` |
-| subscripting another type (`a[1]` on `INT`) | ✗ | `subscripting a INTEGER is not supported (wave 95c): only VARCHAR and VARIANT have subscripts` |
-| `json_set` / `json_insert` / `json_replace` / `json_remove` | ✗ | `unknown function "json_set"` (the JSON extension has the read-only functions; the mutators are wave 95c) |
-| `SET VARIABLE x = 1` | ✗ | `SET VARIABLE is not supported (wave 95c): use a parameter or a table` |
-| `$x` shorthand | ✗ | `the \`$name\` variable shorthand is not supported (wave 95c): use SET VARIABLE/getvariable` |
+| `LATERAL` derived subquery, `CROSS JOIN LATERAL`, comma-lateral | ≈ | A lateral source is bound after the items to its left, so it sees their columns — but pinkdb binds a derived plan without an outer scope, so a subquery that **references** an earlier `FROM` item is refused by name: `a LATERAL subquery cannot reference columns of an earlier FROM item: pinkdb binds derived plans without an outer scope (uncorrelated LATERAL only)`. Everything uncorrelated matches DuckDB, including `FROM LATERAL (…) s` in the head position (a no-op there, as in DuckDB). A lateral **table function** is refused: `a LATERAL table function is not supported: only LATERAL subqueries are`. |
+| comma-separated `FROM a, b` | ✅ | A comma is a `CROSS JOIN` in the same left-deep chain, so a later `JOIN … ON` may reference an item left of the comma — DuckDB's rule (`FROM a, b JOIN c ON a.x = c.z` binds). |
+| `FILTER` on a window aggregate | ✅ | `sum(a) FILTER (WHERE a > 1) OVER (ORDER BY a)` skips the non-matching rows of the frame (they contribute nothing, so the result is `NULL` until the frame has a match), like DuckDB. On a non-aggregate window function it is refused with `FILTER is not implemented for the window function "row_number"` (DuckDB: Binder Error, same shape). |
+| a window built on another window (`OVER (w ORDER BY a)`, `OVER (w ROWS …)`, `WINDOW v AS (w …)`) | ✅ | The base's `PARTITION BY`/`ORDER BY` are inherited and the derived specification may add a clause the base leaves empty; a clause the base already has cannot be overridden (`Cannot override ORDER BY clause of window "w"`) and copying a base that has a frame is refused (`cannot copy window "w" because it has a frame clause`) — DuckDB's wording, reported at bind time. |
+| ordered-set aggregates `percentile_cont`/`percentile_disc` (`quantile_*`), `mode()` `WITHIN GROUP (ORDER BY e)` | ✅ | `percentile_cont` interpolates and returns `DOUBLE` (a `DECIMAL` input keeps its type), `percentile_disc` returns the input type, `mode()` the most frequent value with the **smallest** winning ties. `NULL`s are skipped, an empty input is `NULL`, `FILTER` may be written before or after `WITHIN GROUP`, and `ORDER BY … DESC` is accepted and ignored (DuckDB ignores it too). The fraction must be a constant in `[0, 1]`. Not windowable: `percentile_cont() WITHIN GROUP cannot be used as a window function`. |
+| `TABLESAMPLE` / `USING SAMPLE` (`bernoulli`, `system`, `reservoir`; `n ROWS`, `n PERCENT`, `n%`) with `REPEATABLE (seed)` | ≈ | Counts and method rules match DuckDB: `USING SAMPLE n ROWS` is reservoir and yields exactly `n` rows (fewer when the input is smaller), `PERCENT` is per row with `bernoulli`, per chunk with `system` and a `round(p/100·n)`-row reservoir with `reservoir`; a discrete `ROWS` count with `bernoulli`/`system` is refused with DuckDB's message. The **rows** a seeded draw picks differ, because each engine has its own generator — `REPEATABLE (seed)` is reproducible within pinkdb, not across engines. Superset: the bare `USING SAMPLE 2 ROWS REPEATABLE(7)` parses (DuckDB needs the parenthesised method form). `EXPLAIN` prints `Sample reservoir(1 ROWS) REPEATABLE(7)`. |
+| row constructors `ROW(a, b)`, `(a, b)` in a comparison or `IN` | ✅ | Field by field with NULL-as-a-value semantics, exactly DuckDB's: `=`/`<>` compare each field with `IS [NOT] DISTINCT FROM`, the ordered operators are lexicographic with `NULL` sorting greater, and a row `IN` list is the OR of those field-wise equalities. A standalone row is refused (`a row constructor is only supported in a comparison or an IN list: the engine has no STRUCT type`) and so is `(a, b) IN (SELECT …)` (`a row constructor in IN (SELECT ...) is not supported: compare the columns one by one`). |
+| `AT TIME ZONE`, `timezone(zone, ts)` | ≈ | pinkdb has no `TIMESTAMPTZ` and no time zone database, so a UTC-family zone (`UTC`, `GMT`, `Z`, `Zulu`, `UCT`, `Universal`, `Etc/UTC`, `Etc/GMT`, `+00:00`) is the identity on the naive `TIMESTAMP` — what DuckDB's UTC round trip returns — and any other zone is refused: `AT TIME ZONE 'EUROPE/PARIS' needs a time zone database: pinkdb has no TIMESTAMPTZ (only UTC-family zones are an identity on the naive TIMESTAMP)`. The parser folds the operator to `timezone(zone, ts)`, so `EXPLAIN` shows one form. |
+| `json_set` / `json_insert` / `json_replace` / `json_remove` | ≈ | Implemented in the engine on JSON **text** (`VARCHAR`) or `VARIANT`, and the result keeps the document's kind (`VARCHAR` text or `VARIANT`). DuckDB needs `::JSON` arguments and refuses `VARIANT` ones, so pinkdb is a superset: the value argument may be any SQL value (a `VARCHAR` value is read as JSON text, so `'hi'` needs `'"hi"'`). `NULL` document, path or value give `NULL`; paths are `$.a[0]`, `$['a b']`, `$."a b"`, and `$` alone means the whole document. `json_insert` never overwrites an existing path, `json_replace` never creates a missing one, and `json_remove` takes exactly two arguments (`json_remove takes exactly 2 arguments (json, path)`, DuckDB's arity). |
+| `SET VARIABLE x = …`, `getvariable('x')`, `$x` | ✅ | The value is bound once per statement and spliced in as a literal, so later statements of the session see it. **Session state is per connection** (the embedded handle is one session; each network `Connection` and each served/MCP session its own), so one client's variable is invisible to another's. Variables are never persisted or logged, and a logged statement that reads one is refused by name (`replay would bind the logged text against an empty session`). `EXPLAIN SET VARIABLE x = 41` renders `SetVariable x = 41` (DuckDB shows a plan for it too). `getvariable` of an unset name is `NULL` while `$x` is an error (`Variable nope does not exist`) — DuckDB's exact split. |
+| `FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` | ✗ | `SELECT ... FOR UPDATE/SHARE is not supported: pinkdb has no row locks (its MVCC already serializes writers)` — DuckDB 2.0 is a syntax error at `FOR`; pinkdb names the reason instead. |
+| list literals `[1, 2]`, the `LIST` type, `t[1]` on a list | ✗ | `list literals are not supported: the engine has no LIST type (needs a LIST type)` — a `LIST` type is the missing piece. |
+| slicing a `VARIANT` (`v[1:2]`) | ✗ | `slicing a VARIANT is not supported: ARRAY_SLICE needs a LIST and pinkdb has no LIST type (use variant_extract with a path)` — DuckDB refuses a VARIANT slice too (`ARRAY_SLICE can only operate on LISTs and VARCHARs`). |
+| subscripting another type (`a[1]` on `INT`) | ✗ | `subscripting a INTEGER is not supported: only VARCHAR and VARIANT have subscripts` |
 
 ## Divergences worth knowing
 
@@ -103,6 +103,12 @@ not planned to change.
 | `MERGE … RETURNING` over several affected rows | every affected row, in clause order (matched updates/deletes, then inserts) | every affected row; the relative order is not defined by DuckDB |
 | duplicate keys in one `INSERT` | the first row wins, the rest are dropped for `ON CONFLICT`/`OR REPLACE` (DuckDB's behaviour) | first row wins |
 | a table written by a pre-95b build that already holds duplicate keys | refuses to open on WAL replay with the duplicate-key error (no silent fix-up; pre-1.0, no migration) | n/a |
+| `LATERAL (SELECT … WHERE t.a …)` | the named "cannot reference columns of an earlier FROM item" error (derived plans have no outer scope) | correlates the subquery with the item to its left |
+| `REPEATABLE (seed)` | reproducible **within pinkdb** (one generator per sample) | reproducible within DuckDB; the two engines pick different rows |
+| `AT TIME ZONE 'Europe/Paris'` | refused: no time zone database | converts to `TIMESTAMPTZ` |
+| `json_set(doc, path, value)` with a `VARCHAR` document | in the engine, on JSON text or `VARIANT`; any SQL value may be the value argument | needs `::JSON` arguments and refuses `VARIANT` ones |
+| `(a, b) IN (SELECT …)` | refused by name (compare the columns one by one) | three-valued row `= ANY` |
+| `USING SAMPLE 2 ROWS REPEATABLE(7)` | accepted | parser error (needs `reservoir(2 ROWS)`) |
 
 ## What is covered by tests
 
@@ -112,7 +118,9 @@ not planned to change.
   (`t(a, b, g)` with five rows), each pinned to DuckDB's answer and
   re-measured on DuckDB when `/tmp/duckdb-2.0.0/duckdb` exists;
 * `explain_shows_the_new_operators` — `EXPLAIN` shows `Window`, `Distinct`,
-  `Values` and `Cte` + `Recursive step (UNION ALL)` for the new forms;
+  `Values`, `Cte` + `Recursive step (UNION ALL)` for the batch-1 forms and
+  `Sample reservoir(2 ROWS) REPEATABLE(7)`, the ordered-set aggregate text and
+  `SetVariable x = 41` for batch 3;
 * `batch_two_dml_forms_match_duckdb` — 25 DML cases (upserts, `RETURNING`,
   `UPDATE … FROM`, `DELETE … USING`, `MERGE`, data-modifying CTEs), each pinned
   to DuckDB's answer and re-measured on DuckDB when it is present (the same
@@ -127,7 +135,14 @@ not planned to change.
 * `explain_names_the_dml_cte_forms` — `EXPLAIN` renders each DML form (the
   conflict action, the `MERGE` clauses, the source/using join) and refuses a
   DDL statement with a sentence;
-* `later_waves_are_named_in_the_error` — every 95c refusal above;
+* `batch_three_query_forms_match_duckdb` — 26 batch-3 cases (`LATERAL`, comma `FROM`, ordered sets, sampling counts, row comparisons, window `FILTER`, windows on windows), each pinned to DuckDB's answer and re-measured on DuckDB when it is present (the same cases run in `bench/duckdiff.py` as the wave-95c batteries);
+* `batch_three_pinkdb_only_forms` — the forms whose spelling differs in DuckDB (JSON mutators on text and on `VARIANT`, `AT TIME ZONE 'UTC'`);
+* `seeded_samples_are_reproducible` — the same `REPEATABLE` seed gives the same rows, a different seed gives different ones;
+* `session_variables_are_visible_to_later_statements` — `SET VARIABLE` + `getvariable` + `$name`, a variable inside `WHERE`, and the `getvariable`/`$name` split for an unset name;
+* `session_variables_are_per_connection` (db) and `set_variable_is_per_connection` (server) — two clients binding the same name see their own values and cannot read each other's;
+* `served_sessions_keep_their_variables_apart` — the same isolation for served/MCP sessions;
+* `crates/pinkdb/tests/session_variables.rs` — variables are never logged or persisted (a crash replays the writes and finds an empty session), and a logged statement that reads one is refused by name;
+* `refusals_name_the_missing_feature` — every remaining refusal above (`FOR UPDATE`, a non-UTC `AT TIME ZONE`, a standalone row, a list literal, a correlated `LATERAL`, a lateral table function, `(a,b) IN (SELECT …)`, `json_remove` arity, a non-constant percentile, a windowed percentile, `FILTER` on `row_number`, `TABLESAMPLE BERNOULLI(10)`, a window copied from a framed base), plus the two window-merge errors;
 * `crates/pinkdb/tests/dml_replay.rs` — a store written with `ON CONFLICT`,
   `MERGE`, `UPDATE … FROM`, `DELETE … USING` and a data-modifying CTE is
   dropped without a checkpoint and reopened; the WAL replays the statements
@@ -164,5 +179,41 @@ writes in the same process are constant time — a one-row `INSERT` or
 `INSERT … ON CONFLICT` into a 1 M-row keyed table executes in under 0.1 ms
 once warm, against 0.9 s when the map was rebuilt per statement. An `UPDATE`
 that does not write a key column skips the check entirely, which is why the
-bulk update is unchanged. The 95a query A/B (Q1/Q6/group-sort) also still holds: its
-operators are untouched by wave 95b.
+bulk update is unchanged. The 95a query A/B (Q1/Q6/group-sort) also still holds: its operators are
+untouched by wave 95b.
+
+Wave 95c added no cost to existing queries either. The A/B ran the 1 M-row
+`lineitem` store from `bench/wave95_perf/` against a pre-change binary (a
+`git worktree` at HEAD `a7044e6` with its own `CARGO_TARGET_DIR`), five
+interleaved rounds each:
+
+| workload | HEAD (median) | this change (median) |
+|---|---|---|
+| TPC-H Q1 | 0.012 s | 0.012 s |
+| TPC-H Q6 | 0.007 s | 0.007 s |
+| group by + sort + limit (`bench/wave95_perf/sort_group.sql`) | 0.1285 s | 0.1295 s |
+
+The group-sort row is the median of 12 interleaved rounds whose two
+distributions overlap (HEAD 0.124–0.139 s, this change 0.125–0.137 s), so it is
+noise rather than a step. It was a real 5 % step at first: `Acc` had gained an
+eighth variant, which pulled drop glue into the serial partial-merge loop. The
+ordered-set state now shares the `CountDistinct` variant's slot (`Acc::Collect`),
+so `Acc` is back to seven variants and the step is gone.
+
+`MERGE` and `UPDATE … FROM` no longer nest-loop over the source: the equality
+keys of the `ON`/`WHERE` predicate drive a hash table (`DmlIndex`), with the
+non-equality conjuncts still evaluated per candidate. `bench/wave95c_perf/`
+holds the generator, the two statements and `run.sh`; each run copies the store
+so the statement sees the same input.
+
+| workload | HEAD | this change |
+|---|---|---|
+| `MERGE` 1 M target × 100 k source | not runnable (10¹¹ pairs; ≈9.4 h extrapolated) | 4.9 s |
+| `UPDATE … FROM` 1 M × 100 k | not runnable (≈8.8 h extrapolated) | 0.28 s |
+| `MERGE` 100 k × 10 k | 340.2 s | 0.47 s |
+| `UPDATE … FROM` 100 k × 10 k | 318.2 s | 0.027 s |
+| `MERGE` 10 k × 1 k (median of 5) | 3.18 s | 0.048 s |
+| `UPDATE … FROM` 10 k × 1 k (median of 5) | 3.09 s | 0.006 s |
+
+The two large-target rows are extrapolations of the measured nested-loop cost
+per candidate pair, not measurements — the old code cannot finish them here.

@@ -999,8 +999,14 @@ pub(crate) fn validate(db: &PinkDb, def: &TriggerDef) -> Result<()> {
         crate::sql::binder::bind_constant_expr_tracked(&probe, &def.db, when, Some(slots.clone()))
             .map_err(|e| err(def, format!("WHEN: {e}")))?;
     }
-    crate::sql::binder::bind_tracked_with(&probe, &def.action, &def.db, Some(slots))
-        .map_err(|e| err(def, format!("EXECUTE: {e}")))?;
+    crate::sql::binder::bind_tracked_with(
+        &probe,
+        &def.action,
+        &def.db,
+        Some(slots),
+        &probe.session,
+    )
+    .map_err(|e| err(def, format!("EXECUTE: {e}")))?;
     Ok(())
 }
 

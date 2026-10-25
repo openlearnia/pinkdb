@@ -95,6 +95,12 @@ second committer with a write-conflict error instead of a silent lost update.</p
 <pre class="code" data-lang="sql"><code>SELECT [DISTINCT] expr [AS alias], ...
 FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT / RIGHT / FULL [OUTER], CROSS
   | FROM a JOIN b ON ... JOIN c ON ...   -- multi-way (n-ary) joins
+  | FROM t, u [JOIN v ON t.x = v.z]  -- a comma is a CROSS JOIN in the same
+                                  -- left-deep chain (ON sees the items left of it)
+  | FROM LATERAL (SELECT ...) AS s -- LATERAL subqueries (uncorrelated only)
+  | FROM t USING SAMPLE 10 ROWS   -- TABLESAMPLE / USING SAMPLE: n ROWS | n PERCENT,
+  | FROM t TABLESAMPLE BERNOULLI(10 PERCENT)  -- bernoulli | system | reservoir,
+                                  -- REPEATABLE (seed) for a deterministic draw
   | FROM db1.t                    -- qualified tables resolve in that database
   | FROM (SELECT ...) AS s         -- derived tables (alias required)
   | FROM (VALUES (1,'a'), (2,'b')) t(x, y)  -- VALUES, column aliases optional
@@ -102,7 +108,8 @@ FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT / RIGHT / FULL [OUTER], CROSS
   | WITH [RECURSIVE] w AS (SELECT ...) ...  -- CTEs, incl. WITH w(a, b) AS column
                                   -- aliases; RECURSIVE needs an anchor plus a
                                   -- UNION [ALL] step (bounded, see below)
-[WINDOW w AS (PARTITION BY ... ORDER BY ...), ...]
+[WINDOW w AS (PARTITION BY ... ORDER BY ...), ...]   -- a window may build on
+                                  -- another: OVER (w ORDER BY x), WINDOW v AS (w ROWS ...)
 WHERE expr                        -- IS [NOT] NULL, IS [NOT] DISTINCT FROM,
                                   -- BETWEEN, IN (subquery|list), EXISTS
 GROUP BY ... | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)   HAVING ...
@@ -115,7 +122,12 @@ SELECT ... TABLE t;                 -- the whole table (plus any trailing clause
 VALUES (1, 'a'), (2, 'b');          -- column names col0, col1, ...
 
 COUNT(DISTINCT x)                 -- inside aggregates
-SUM(x) FILTER (WHERE ...)         -- filtered aggregates
+SUM(x) FILTER (WHERE ...)         -- filtered aggregates, window aggregates too
+PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)   -- ordered-set aggregates:
+PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY x)   -- percentile_cont/disc, and
+MODE() WITHIN GROUP (ORDER BY x)                 -- mode(); FILTER allowed too
+SET VARIABLE x = 41;              -- session variable (per connection),
+SELECT getvariable('x'), $x;      -- read back by getvariable or $x
 SELECT ... UNION [ALL|DISTINCT] SELECT ...
 SELECT ... INTERSECT [ALL] SELECT ...
 SELECT ... EXCEPT [ALL] SELECT ...
@@ -132,6 +144,20 @@ SHOW TABLES;  DESCRIBE t;         -- introspection</code></pre>
   fast path.</li>
   <li>Outer joins NULL-extend the unmatched side's columns.</li>
   <li>Cross-database joins work: <code>db1.t JOIN db2.u</code>.</li>
+  <li>A comma-separated <code>FROM</code> list is a chain of <code>CROSS JOIN</code>s,
+  so <code>FROM a, b JOIN c ON a.x = c.z</code> binds like DuckDB (the later
+  <code>ON</code> sees the items left of the comma).</li>
+  <li><code>LATERAL</code> subqueries are accepted in the <code>FROM</code> head
+  position, after <code>CROSS JOIN</code>/<code>JOIN</code> and in the comma form.
+  A derived plan has no outer scope, so a <code>LATERAL</code> subquery that
+  <em>references</em> an earlier <code>FROM</code> item is refused by name
+  (uncorrelated <code>LATERAL</code> only); a lateral table function is refused
+  too.</li>
+  <li><code>TABLESAMPLE</code> / <code>USING SAMPLE</code> takes <code>n ROWS</code>
+  (exactly <code>n</code>, reservoir sampling) or <code>n PERCENT</code>, with the
+  <code>bernoulli</code>, <code>system</code> or <code>reservoir</code> method, and
+  <code>REPEATABLE (seed)</code> makes the draw reproducible (within pinkdb — the
+  generator is its own, so a seed picks different rows than DuckDB's).</li>
 </ul>
 
 <h3>Subqueries and CTEs</h3>
@@ -583,16 +609,13 @@ DROP MATERIALIZED VIEW totals;</code></pre>
   and <code>REPLACE INTO</code> are refused by name; write
   <code>ON CONFLICT … DO UPDATE SET</code> or <code>INSERT OR REPLACE</code>.
   <code>COPY</code> is accepted as a statement, not as a CTE step.</li>
-  <li><strong>Query forms</strong> — <code>LATERAL</code>, ordered-set aggregates
-  (<code>WITHIN GROUP</code>), <code>TABLESAMPLE</code>,
-  <code>FOR UPDATE</code>/<code>SHARE</code>, <code>AT TIME ZONE</code>, row
-  constructors, list literals and the <code>LIST</code> type, <code>FILTER</code> on
-  a window aggregate, a window built on another window, slicing a
-  <code>VARIANT</code>, the JSON mutators (<code>json_set</code>,
-  <code>json_insert</code>, <code>json_replace</code>, <code>json_remove</code>)
-  and <code>SET VARIABLE</code>/<code>$name</code> — are refused with a
-  <code>wave 95c</code> error. None of them degrades into a generic syntax
-  error.</li>
+  <li><strong>Query forms</strong> — <code>FOR UPDATE</code>/<code>FOR SHARE</code>
+  (pinkdb has no row locks; its MVCC already serializes writers), list literals and
+  the <code>LIST</code> type, and slicing a <code>VARIANT</code> (that needs a
+  <code>LIST</code>) — are refused by name. So is a <code>LATERAL</code> subquery
+  that references an earlier <code>FROM</code> item, and
+  <code>(a, b) IN (SELECT ...)</code> (compare the columns one by one). None of
+  them degrades into a generic syntax error.</li>
   <li><strong>Indexes</strong> (<code>CREATE INDEX</code>), <strong>materialized
   views</strong> and <strong>stored procedures</strong> are planned
   (waves 42–44).</li>

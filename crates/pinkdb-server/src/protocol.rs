@@ -78,7 +78,9 @@ use pinkdb::{DataType, Value};
 /// statement's `Done` with that statement's timings and facts (wave 84).
 /// v11: `VARIANT` value (tag 10) and dtype (tag 9) tags (wave 101a). A
 /// VARIANT rides as `u32 byte length | encoded value`.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// v12: [`DoneKind::SetVariable`] (tag 26) reports `SET VARIABLE`; `name` is
+/// the variable.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -508,6 +510,8 @@ pub enum DoneKind {
     Granted = 24,
     /// `REVOKE …` (v9); `name` names the grant that was removed.
     Revoked = 25,
+    /// `SET VARIABLE x = …` (v12, wave 95c); `name` is the variable.
+    SetVariable = 26,
 }
 
 impl DoneKind {
@@ -539,6 +543,7 @@ impl DoneKind {
             23 => DoneKind::DroppedRole,
             24 => DoneKind::Granted,
             25 => DoneKind::Revoked,
+            26 => DoneKind::SetVariable,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown Done kind {other}"

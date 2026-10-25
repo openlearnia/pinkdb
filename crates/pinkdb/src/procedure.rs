@@ -2433,7 +2433,10 @@ pub(crate) fn run_call_statement(
     err: impl Fn(&str) -> PinkDbError,
 ) -> Result<(QueryResult, bool)> {
     let slots = slots.with_logged_procedure(db.is_durable());
-    let (plan, _dynamic) = crate::sql::binder::bind_tracked_with(db, sql, db_name, Some(slots))?;
+    // `db` is the handle this call runs on, so its session is the caller's
+    // (a network connection installs its own before running the statement).
+    let (plan, _dynamic) =
+        crate::sql::binder::bind_tracked_with(db, sql, db_name, Some(slots), &db.session)?;
     // Lazy index lifecycle: mutation times only set a flag (see
     // `PinkDb::rebuild_stale_indexes`).
     db.rebuild_stale_indexes();

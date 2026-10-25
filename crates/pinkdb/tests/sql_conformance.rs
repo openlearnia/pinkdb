@@ -322,40 +322,363 @@ fn explain_shows_the_new_operators() {
     );
     assert!(rec.contains("Cte"), "{rec}");
     assert!(rec.contains("Recursive step (UNION ALL)"), "{rec}");
+    let sample = plan(
+        &mut db,
+        "SELECT a FROM t USING SAMPLE reservoir(2 ROWS) REPEATABLE(7)",
+    );
+    assert!(
+        sample.contains("Sample reservoir(2 ROWS) REPEATABLE(7)"),
+        "{sample}"
+    );
+    let ordered = plan(
+        &mut db,
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM t",
+    );
+    assert!(
+        ordered.contains("percentile_cont(0.5) WITHIN GROUP (ORDER BY #0)"),
+        "{ordered}"
+    );
+    let set = plan(&mut db, "SET VARIABLE x = 41");
+    assert!(set.contains("SetVariable x = 41"), "{set}");
 }
 
-/// Forms still queued for a later wave fail with the wave, not a parse error
-/// that reads like a typo.
+/// Forms this engine refuses keep a refusal that names what is missing,
+/// rather than a parse error that reads like a typo.
 #[test]
-fn later_waves_are_named_in_the_error() {
+fn refusals_name_the_missing_feature() {
     let mut db = db();
     let cases = [
-        ("SELECT * FROM LATERAL (SELECT 1) s", "95c"),
-        ("SELECT * FROM t TABLESAMPLE 10 PERCENT", "95c"),
-        ("SELECT a FROM t FOR UPDATE", "95c"),
+        ("SELECT a FROM t FOR UPDATE", "no row locks"),
         (
-            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM t",
-            "95c",
+            "SELECT ts AT TIME ZONE 'Europe/Paris' FROM t",
+            "time zone database",
+        ),
+        ("SELECT (a, b) FROM t", "no STRUCT type"),
+        ("SELECT [1,2,3]", "needs a LIST type"),
+        ("SELECT $nope", "Variable nope does not exist"),
+        (
+            "SELECT * FROM t, LATERAL (SELECT t.a) s",
+            "LATERAL subquery cannot reference",
         ),
         (
-            "SELECT a FROM t WINDOW w AS (PARTITION BY g), w2 AS (w ORDER BY a)",
-            "95c",
+            "SELECT * FROM t, LATERAL foo(1) r",
+            "LATERAL table function",
         ),
-        ("SELECT ts AT TIME ZONE 'UTC' FROM t", "95c"),
-        ("SELECT (a, b) FROM t", "95c"),
-        ("SELECT [1,2,3]", "95c"),
-        ("SELECT sum(a) FILTER (WHERE a > 1) OVER () FROM t", "95c"),
-        ("SET VARIABLE x = 1", "95c"),
-        ("SELECT $x", "95c"),
-        ("SELECT json_set('{}', '$.a', 1)", "unknown function"),
+        (
+            "SELECT (1,2) IN (SELECT * FROM (VALUES (1,2)) v(x,y))",
+            "row constructor in IN (SELECT",
+        ),
+        (
+            "SELECT json_remove('{\"a\":1}', '$.a', '$.b')",
+            "takes exactly 2 arguments",
+        ),
+        (
+            "SELECT percentile_cont(a) WITHIN GROUP (ORDER BY a) FROM t",
+            "constant between 0 and 1",
+        ),
+        (
+            "SELECT percentile_cont(0.5) OVER () FROM t",
+            "cannot be used as a window function",
+        ),
+        (
+            "SELECT first_value(a) FILTER (WHERE a > 1) OVER () FROM t",
+            "FILTER is not implemented",
+        ),
+        (
+            "SELECT a FROM t TABLESAMPLE BERNOULLI(10)",
+            "discrete sample count",
+        ),
+        (
+            "SELECT sum(a) OVER (w) FROM t WINDOW w AS (ORDER BY a ROWS 1 PRECEDING)",
+            "cannot copy window",
+        ),
+        (
+            "SELECT sum(a) OVER (w ORDER BY a) FROM t WINDOW w AS (ORDER BY a)",
+            "Cannot override ORDER BY",
+        ),
     ];
-    for (sql, wave) in cases {
+    for (sql, want) in cases {
         let err = db.execute(sql).unwrap_err().to_string();
         assert!(
-            err.contains(wave),
-            "{sql}: expected {wave} in the error, got {err}"
+            err.contains(want),
+            "{sql}: expected {want:?} in the error, got {err}"
         );
     }
+}
+
+// ------------------------------------- batch 3: query forms (wave 95c)
+
+/// Forms whose *spelling* is the same in DuckDB, so a pin can be re-measured
+/// there. `SET VARIABLE`, `AT TIME ZONE` and the JSON mutators spell
+/// differently (DuckDB has a TIMESTAMPTZ and a JSON type) and are pinned in
+/// the pinkdb-only tests below.
+const CASES_95C: &[(&str, &str, &[&str])] = &[
+    (
+        "window_filter",
+        "SELECT a, CAST(sum(a) FILTER (WHERE a > 1) OVER (ORDER BY a) AS VARCHAR) FROM t ORDER BY a",
+        &["1\tNULL", "2\t2", "3\t5", "4\t9", "5\t14"],
+    ),
+    (
+        "window_filter_count_star",
+        "SELECT a, CAST(count(*) FILTER (WHERE b IS NULL) OVER () AS VARCHAR) FROM t ORDER BY a",
+        &["1\t1", "2\t1", "3\t1", "4\t1", "5\t1"],
+    ),
+    (
+        "row_comparison",
+        "SELECT CAST((1,2) = (1,2) AS VARCHAR), CAST((1,NULL) = (1,NULL) AS VARCHAR), \
+         CAST((1,2) < (1,3) AS VARCHAR), CAST((1,NULL) > (1,3) AS VARCHAR), \
+         CAST(ROW(1,2) = ROW(1,2) AS VARCHAR), CAST((1,NULL) <> (1,2) AS VARCHAR), \
+         CAST((NULL,1) < (2,0) AS VARCHAR)",
+        &["true\ttrue\ttrue\ttrue\ttrue\ttrue\tfalse"],
+    ),
+    (
+        "row_in_list",
+        "SELECT CAST((1,2) IN ((1,2),(3,4)) AS VARCHAR), \
+         CAST((1,NULL) IN ((1,2),(3,4)) AS VARCHAR), \
+         CAST((1,2) IN ((3,4),(5,6)) AS VARCHAR)",
+        &["true\tfalse\tfalse"],
+    ),
+    (
+        "sample_rows",
+        "SELECT count(*) FROM t USING SAMPLE 3 ROWS",
+        &["3"],
+    ),
+    (
+        "sample_rows_more_than_input",
+        "SELECT count(*) FROM t USING SAMPLE 10 ROWS",
+        &["5"],
+    ),
+    (
+        "sample_reservoir_rows",
+        "SELECT count(*) FROM t TABLESAMPLE reservoir(2 ROWS)",
+        &["2"],
+    ),
+    (
+        "sample_bernoulli_all",
+        "SELECT count(*) FROM t TABLESAMPLE BERNOULLI(100 PERCENT)",
+        &["5"],
+    ),
+    (
+        "sample_bernoulli_none",
+        "SELECT count(*) FROM t TABLESAMPLE BERNOULLI(0 PERCENT)",
+        &["0"],
+    ),
+    (
+        "sample_system_all",
+        "SELECT count(*) FROM t USING SAMPLE system(100 PERCENT)",
+        &["5"],
+    ),
+    (
+        "sample_reservoir_percent_all",
+        "SELECT count(*) FROM t USING SAMPLE reservoir(100 PERCENT)",
+        &["5"],
+    ),
+    (
+        "sample_of_derived_table",
+        "SELECT count(*) FROM (SELECT * FROM t) s USING SAMPLE 2 ROWS",
+        &["2"],
+    ),
+    (
+        "ordered_set_percentile_cont",
+        "SELECT CAST(percentile_cont(0.3) WITHIN GROUP (ORDER BY a) AS VARCHAR), \
+         CAST(percentile_cont(0.6) WITHIN GROUP (ORDER BY a) AS VARCHAR), \
+         CAST(percentile_cont(0) WITHIN GROUP (ORDER BY a) AS INTEGER), \
+         CAST(percentile_cont(1) WITHIN GROUP (ORDER BY a) AS INTEGER) FROM t",
+        &["2.2\t3.4\t1\t5"],
+    ),
+    (
+        "ordered_set_percentile_disc",
+        "SELECT CAST(percentile_disc(0.5) WITHIN GROUP (ORDER BY a) AS VARCHAR), \
+         CAST(percentile_disc(0) WITHIN GROUP (ORDER BY a) AS VARCHAR), \
+         CAST(percentile_disc(1) WITHIN GROUP (ORDER BY a) AS VARCHAR) FROM t",
+        &["3\t1\t5"],
+    ),
+    (
+        "ordered_set_mode",
+        "SELECT CAST(mode() WITHIN GROUP (ORDER BY g) AS VARCHAR), \
+         CAST(mode() WITHIN GROUP (ORDER BY a) AS VARCHAR) FROM t",
+        &["q\t1"],
+    ),
+    (
+        "ordered_set_filter",
+        "SELECT CAST(percentile_cont(0.25) WITHIN GROUP (ORDER BY a) \
+         FILTER (WHERE a > 2) AS VARCHAR) FROM t",
+        &["3.5"],
+    ),
+    (
+        "lateral_derived",
+        "SELECT CAST(sum(d) AS VARCHAR) FROM t, LATERAL (SELECT 5 AS d) s",
+        &["25"],
+    ),
+    (
+        "lateral_cross_join",
+        "SELECT CAST(count(*) AS VARCHAR) FROM t CROSS JOIN LATERAL (SELECT 5 AS d) s",
+        &["5"],
+    ),
+    (
+        "lateral_left_join",
+        "SELECT CAST(sum(d) AS VARCHAR) FROM t LEFT JOIN LATERAL (SELECT 7 AS d) s ON true",
+        &["35"],
+    ),
+    (
+        "lateral_head_source",
+        "SELECT * FROM LATERAL (SELECT 1 AS a) s",
+        &["1"],
+    ),
+    (
+        "comma_from_is_cross_join",
+        "SELECT CAST(count(*) AS VARCHAR) FROM t, t AS t2",
+        &["25"],
+    ),
+    (
+        "comma_from_on_sees_left",
+        "SELECT CAST(count(*) AS VARCHAR) FROM (SELECT 1 AS x) a, \
+         (SELECT 2 AS y) b JOIN (SELECT 1 AS z) c ON a.x = c.z",
+        &["1"],
+    ),
+    (
+        "ordered_set_empty_input",
+        "SELECT CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY a) AS VARCHAR) \
+         FROM t WHERE a > 100",
+        &["NULL"],
+    ),
+    (
+        "window_on_window_partition",
+        "SELECT a, CAST(sum(a) OVER (w ORDER BY a) AS VARCHAR) FROM t \
+         WINDOW w AS (PARTITION BY g) ORDER BY a",
+        &["1\t1", "2\t3", "3\t3", "4\t7", "5\t12"],
+    ),
+    (
+        "window_on_window_frame",
+        "SELECT a, CAST(sum(a) OVER (w ROWS UNBOUNDED PRECEDING) AS VARCHAR) FROM t \
+         WINDOW w AS (ORDER BY a) ORDER BY a",
+        &["1\t1", "2\t3", "3\t6", "4\t10", "5\t15"],
+    ),
+    (
+        "window_on_window_chain",
+        "SELECT a, CAST(sum(a) OVER v AS VARCHAR) FROM t \
+         WINDOW w AS (ORDER BY a), v AS (w ROWS 1 PRECEDING) ORDER BY a",
+        &["1\t1", "2\t3", "3\t5", "4\t7", "5\t9"],
+    ),
+];
+
+#[test]
+fn batch_three_query_forms_match_duckdb() {
+    let mut db = db();
+    for (label, sql, want) in CASES_95C {
+        let got = tabs(&mut db, sql);
+        let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+        assert_eq!(got, want, "{label}: {sql}");
+        if let Some(measured) = duck(sql) {
+            assert_eq!(measured, want, "{label}: duckdb drifted from the pin");
+        }
+    }
+}
+
+/// `REPEATABLE (seed)` makes a sample reproducible; two runs of the same
+/// statement return the same rows, and a different seed a different sample
+/// (the corpus is wide enough that the chance of a collision is 1 in 100).
+#[test]
+fn seeded_samples_are_reproducible() {
+    let mut db = db();
+    let setup = "CREATE TABLE s AS WITH RECURSIVE r(i) AS \
+         (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i < 100) SELECT i FROM r;";
+    for stmt in setup.split(';') {
+        if !stmt.trim().is_empty() {
+            db.execute(stmt).unwrap();
+        }
+    }
+    let sql = |seed: i64| {
+        format!("SELECT i FROM s USING SAMPLE reservoir(5 ROWS) REPEATABLE({seed}) ORDER BY i")
+    };
+    let first = tabs(&mut db, &sql(42));
+    assert_eq!(first.len(), 5, "{first:?}");
+    assert_eq!(tabs(&mut db, &sql(42)), first, "same seed, same rows");
+    assert_ne!(tabs(&mut db, &sql(43)), first, "different seed, other rows");
+    // A percent sample is seeded the same way.
+    let pct = "SELECT count(*) FROM s USING SAMPLE bernoulli(50 PERCENT) REPEATABLE(1)";
+    assert_eq!(tabs(&mut db, pct), tabs(&mut db, pct));
+}
+
+/// Forms whose *spelling* differs in DuckDB (no TIMESTAMPTZ, no `SET
+/// VARIABLE`, a JSON type instead of JSON text), pinned without the DuckDB
+/// re-check; `bench/duckdiff.py` measures the JSON mutators on both engines
+/// with the cast spellings both accept.
+const CASES_95C_PINKDB_ONLY: &[(&str, &str, &[&str])] = &[
+    (
+        "json_mutators_on_text",
+        "SELECT json_set('{\"a\":1}', '$.b', 2), json_insert('{\"a\":1}', '$.a', 9), \
+         json_replace('{\"a\":1}', '$.a', 9), json_remove('{\"a\":1,\"b\":2}', '$.a')",
+        &["{\"a\":1,\"b\":2}\t{\"a\":1}\t{\"a\":9}\t{\"b\":2}"],
+    ),
+    (
+        "json_mutator_paths",
+        "SELECT json_set('{}', '$.a.b.c', 1), json_set('[1]', '$[5]', 9), \
+         json_set('[1]', '$[1]', 9), json_insert('[1,2]', '$[2]', 3), \
+         json_set('{\"a\":1}', '$', 9), CAST(json_remove('{\"a\":1}', '$') AS VARCHAR)",
+        &["{\"a\":{\"b\":{\"c\":1}}}\t[1]\t[1,9]\t[1,2,3]\t9\tNULL"],
+    ),
+    (
+        "json_mutators_are_strict",
+        "SELECT CAST(json_set(NULL, '$.b', 1) AS VARCHAR), \
+         CAST(json_set('{\"a\":1}', NULL, 1) AS VARCHAR), \
+         CAST(json_set('{\"a\":1}', '$.b', NULL) AS VARCHAR)",
+        &["NULL\tNULL\tNULL"],
+    ),
+    (
+        "json_mutators_on_variant",
+        "SELECT CAST(json_set('{\"a\":1}'::VARIANT, '$.b', 2) \
+                   = '{\"a\":1,\"b\":2}'::VARIANT AS VARCHAR), \
+         typeof(json_set('{\"a\":1}'::VARIANT, '$.b', 2)), \
+         CAST(json_remove('{\"a\":1,\"b\":2}'::VARIANT, '$.a') AS VARCHAR)",
+        &["true\tVARIANT\t{\"b\":2}"],
+    ),
+    (
+        "at_time_zone_utc_is_the_identity",
+        "SELECT CAST(TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE 'UTC' AS VARCHAR), \
+         CAST(timezone('GMT', DATE '2024-01-01') AS VARCHAR), \
+         CAST(TIMESTAMP '2024-01-01 12:00:00' AT TIME ZONE '+00:00' AS VARCHAR)",
+        &["2024-01-01 12:00:00\t2024-01-01 00:00:00\t2024-01-01 12:00:00"],
+    ),
+];
+
+#[test]
+fn batch_three_pinkdb_only_forms() {
+    let mut db = db();
+    for (label, sql, want) in CASES_95C_PINKDB_ONLY {
+        let got = tabs(&mut db, sql);
+        let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+        assert_eq!(got, want, "{label}: {sql}");
+    }
+}
+
+/// `SET VARIABLE` stores a session value that `getvariable('name')` and the
+/// `$name` shorthand read; the value is spliced at bind time as a literal.
+#[test]
+fn session_variables_are_visible_to_later_statements() {
+    let mut db = db();
+    assert_eq!(
+        script_rows(
+            &mut db,
+            "SET VARIABLE x = 41; SELECT getvariable('x') + 1, $x + 1"
+        ),
+        vec!["42\t42"]
+    );
+    assert_eq!(
+        script_rows(
+            &mut db,
+            "SET VARIABLE g = 'q'; SELECT count(*) FROM t WHERE g = $g"
+        ),
+        vec!["3"]
+    );
+    let err = db.execute("SELECT $nope").unwrap_err().to_string();
+    assert!(err.contains("Variable nope does not exist"), "{err}");
+    // DuckDB returns NULL for an unset name through `getvariable`; only the
+    // `$name` shorthand errors.
+    assert_eq!(
+        script_rows(&mut db, "SELECT getvariable('nope') IS NULL"),
+        vec!["true"]
+    );
 }
 
 // ---------------------------------------------------- batch 2: DML (wave 95b)

@@ -99,6 +99,42 @@ fn rows(results: Vec<QueryResult>) -> Vec<Vec<Value>> {
     }
 }
 
+/// `SET VARIABLE` is per connection: one client's value is invisible to — and
+/// cannot be overwritten by — another's. It used to live on the shared store,
+/// so every user of one server saw the same variables.
+#[test]
+fn set_variable_is_per_connection() {
+    let (_handle, addr) = start();
+    let mut a = Client::connect(&addr).unwrap();
+    let mut b = Client::connect(&addr).unwrap();
+    assert_eq!(
+        a.execute("SET VARIABLE x = 41;").unwrap(),
+        vec![QueryResult::SetVariable {
+            name: "x".to_string()
+        }]
+    );
+    assert_eq!(
+        rows(a.execute("SELECT $x;").unwrap()),
+        vec![vec![Value::Integer(41)]]
+    );
+    assert_eq!(
+        rows(b.execute("SELECT getvariable('x') IS NULL;").unwrap()),
+        vec![vec![Value::Boolean(true)]]
+    );
+    let err = b.execute("SELECT $x;").unwrap_err().to_string();
+    assert!(err.contains("Variable x does not exist"), "{err}");
+    // B's own binding does not touch A's.
+    b.execute("SET VARIABLE x = 7;").unwrap();
+    assert_eq!(
+        rows(b.execute("SELECT $x;").unwrap()),
+        vec![vec![Value::Integer(7)]]
+    );
+    assert_eq!(
+        rows(a.execute("SELECT $x;").unwrap()),
+        vec![vec![Value::Integer(41)]]
+    );
+}
+
 fn varchar(s: &str) -> Value {
     Value::Varchar(s.to_string())
 }
@@ -613,7 +649,7 @@ fn a_version_9_hello_is_refused() {
     match protocol::read_response(&mut reader).unwrap() {
         Response::Error { message } => {
             assert!(message.contains("protocol version mismatch"), "{message}");
-            assert!(message.contains("server speaks v11"), "{message}");
+            assert!(message.contains("server speaks v12"), "{message}");
             assert!(message.contains("asked for v9"), "{message}");
         }
         other => panic!("expected Error, got {other:?}"),

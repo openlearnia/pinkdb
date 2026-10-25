@@ -171,10 +171,112 @@ pub(crate) enum Acc {
         cur: Option<Value>,
         is_min: bool,
     },
-    /// `COUNT(DISTINCT x)`: one encoded non-NULL value per distinct cell
-    /// (the byte encoding is the same one GROUP BY/DISTINCT use, so equality
-    /// semantics — NULL skipped, −0.0/NaN canonical — are shared).
-    CountDistinct(FastSet<Vec<u8>>),
+    /// A collecting aggregate: `COUNT(DISTINCT x)` or one of the ordered-set
+    /// aggregates. The two share one `Acc` variant on purpose — an eighth
+    /// variant measurably slows the per-group merge of every other aggregate.
+    Collect(Collect),
+}
+
+/// The collecting accumulators. `COUNT(DISTINCT x)` keeps one encoded value
+/// per distinct cell (the encoding GROUP BY/DISTINCT use, so equality
+/// semantics — NULL skipped, −0.0/NaN canonical — are shared); the ordered-set
+/// aggregates keep every non-NULL value and sort once in `finalize`.
+pub(crate) enum Collect {
+    Distinct(FastSet<Vec<u8>>),
+    /// `percentile_cont(fraction)`.
+    Cont {
+        vals: Vec<Value>,
+        fraction: f64,
+    },
+    /// `percentile_disc(fraction)`.
+    Disc {
+        vals: Vec<Value>,
+        fraction: f64,
+    },
+    /// `mode()`.
+    Mode {
+        vals: Vec<Value>,
+    },
+}
+
+impl Collect {
+    #[inline]
+    fn push_vec(&mut self, v: &Vector, i: usize) {
+        match self {
+            Collect::Distinct(seen) => {
+                let mut buf = Vec::new();
+                v.encode_into(&mut buf, i);
+                seen.insert(buf);
+            }
+            Collect::Cont { vals, .. } | Collect::Disc { vals, .. } | Collect::Mode { vals } => {
+                vals.push(v.get(i))
+            }
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, arg: Option<&Value>) {
+        match self {
+            Collect::Distinct(seen) => {
+                if let Some(v) = arg {
+                    let mut buf = Vec::new();
+                    encode_value(&mut buf, v);
+                    seen.insert(buf);
+                }
+            }
+            Collect::Cont { vals, .. } | Collect::Disc { vals, .. } | Collect::Mode { vals } => {
+                if let Some(v) = arg {
+                    vals.push(v.clone());
+                }
+            }
+        }
+    }
+
+    /// Combine two partial accumulators of the same aggregate.
+    fn merge(self, other: Collect) -> Collect {
+        match (self, other) {
+            (Collect::Distinct(mut seen), Collect::Distinct(more)) => {
+                seen.extend(more);
+                Collect::Distinct(seen)
+            }
+            (Collect::Cont { mut vals, fraction }, Collect::Cont { vals: more, .. }) => {
+                vals.extend(more);
+                Collect::Cont { vals, fraction }
+            }
+            (Collect::Disc { mut vals, fraction }, Collect::Disc { vals: more, .. }) => {
+                vals.extend(more);
+                Collect::Disc { vals, fraction }
+            }
+            (Collect::Mode { mut vals }, Collect::Mode { vals: more }) => {
+                vals.extend(more);
+                Collect::Mode { vals }
+            }
+            // DISTINCT and ordered-set accumulators never meet: one `Collect`
+            // per aggregate slot.
+            (mine, _) => mine,
+        }
+    }
+
+    fn result(&self, dtype: DataType) -> Result<Value> {
+        match self {
+            Collect::Distinct(seen) => Ok(Value::Bigint(seen.len() as i64)),
+            Collect::Cont { vals, fraction } => {
+                ordered_set_result(vals, OrderedSet::PercentileCont(*fraction), dtype)
+            }
+            Collect::Disc { vals, fraction } => {
+                ordered_set_result(vals, OrderedSet::PercentileDisc(*fraction), dtype)
+            }
+            Collect::Mode { vals } => ordered_set_result(vals, OrderedSet::Mode, dtype),
+        }
+    }
+}
+
+/// Which ordered-set aggregate an ordered [`Collect`] computes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OrderedSet {
+    PercentileCont(f64),
+    PercentileDisc(f64),
+    Mode,
 }
 
 /// Add `x` to a wrapping i64 sum, counting signed wraparounds so the exact
@@ -195,10 +297,13 @@ fn exact_sum(sum: i64, wraps: i64) -> i128 {
 }
 
 impl Acc {
-    pub(crate) fn new(func: AggFunc, distinct: bool) -> Acc {
+    /// `direct` is the ordered-set aggregate's constant fraction
+    /// (`percentile_cont(0.5)`); every other function ignores it.
+    #[inline]
+    pub(crate) fn new(func: AggFunc, distinct: bool, direct: Option<f64>) -> Acc {
         if distinct {
             debug_assert_eq!(func, AggFunc::Count);
-            return Acc::CountDistinct(FastSet::default());
+            return Acc::Collect(Collect::Distinct(FastSet::default()));
         }
         match func {
             AggFunc::Count => Acc::Count(0),
@@ -216,6 +321,15 @@ impl Acc {
                 cur: None,
                 is_min: false,
             },
+            AggFunc::PercentileCont => Acc::Collect(Collect::Cont {
+                vals: Vec::new(),
+                fraction: direct.unwrap_or(0.0),
+            }),
+            AggFunc::PercentileDisc => Acc::Collect(Collect::Disc {
+                vals: Vec::new(),
+                fraction: direct.unwrap_or(0.0),
+            }),
+            AggFunc::Mode => Acc::Collect(Collect::Mode { vals: Vec::new() }),
         }
     }
 
@@ -260,7 +374,9 @@ impl Acc {
             }
             Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
             // DISTINCT accumulators take the generic per-row path.
-            Acc::CountDistinct(_) => unreachable!("COUNT(DISTINCT) uses update_vec"),
+            Acc::Collect(_) => {
+                unreachable!("COUNT(DISTINCT) and ordered-set aggregates use update_vec")
+            }
         }
     }
 
@@ -287,7 +403,9 @@ impl Acc {
                 *count += 1;
             }
             Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
-            Acc::CountDistinct(_) => unreachable!("COUNT(DISTINCT) uses update_vec"),
+            Acc::Collect(_) => {
+                unreachable!("COUNT(DISTINCT) and ordered-set aggregates use update_vec")
+            }
         }
     }
 
@@ -391,11 +509,7 @@ impl Acc {
                     *cur = Some(v.get(i));
                 }
             }
-            Acc::CountDistinct(seen) => {
-                let mut buf = Vec::new();
-                v.encode_into(&mut buf, i);
-                seen.insert(buf);
-            }
+            Acc::Collect(c) => c.push_vec(v, i),
         }
     }
 
@@ -482,13 +596,7 @@ impl Acc {
                     }
                 }
             }
-            Acc::CountDistinct(seen) => {
-                if let Some(v) = arg {
-                    let mut buf = Vec::new();
-                    encode_value(&mut buf, v);
-                    seen.insert(buf);
-                }
-            }
+            Acc::Collect(c) => c.push(arg),
         }
     }
 
@@ -545,11 +653,14 @@ impl Acc {
                 *count += 1;
             }
             Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
-            Acc::CountDistinct(_) => unreachable!("COUNT(DISTINCT) uses update_vec"),
+            Acc::Collect(_) => {
+                unreachable!("COUNT(DISTINCT) and ordered-set aggregates use update_vec")
+            }
             other => other.update(Some(&Value::Decimal(x, scale))),
         }
     }
 
+    #[inline(never)]
     pub(crate) fn merge(&mut self, other: Acc) {
         // Owned matching keeps every combination explicit and total.
         let mine = std::mem::replace(self, Acc::Count(0));
@@ -710,17 +821,14 @@ impl Acc {
                     is_min,
                 }
             }
-            (Acc::CountDistinct(a), Acc::CountDistinct(b)) => {
-                let mut seen = a;
-                seen.extend(b);
-                Acc::CountDistinct(seen)
-            }
+            (Acc::Collect(a), Acc::Collect(b)) => Acc::Collect(a.merge(b)),
             // Different aggregates never meet (one Acc per agg slot).
             (mine, _) => mine,
         };
     }
     /// Finalize by reference: identical results to [`Acc::finalize`], for
     /// callers (window frames) that must keep the accumulator live.
+    #[inline]
     pub(crate) fn finalize_ref(&self, dtype: DataType) -> Result<Value> {
         Ok(match self {
             Acc::Count(n) => Value::Bigint(*n),
@@ -776,12 +884,84 @@ impl Acc {
                 }
             }
             Acc::MinMax { cur, .. } => cur.clone().unwrap_or(Value::Null),
-            Acc::CountDistinct(seen) => Value::Bigint(seen.len() as i64),
+            Acc::Collect(c) => c.result(dtype)?,
         })
     }
 
     pub(crate) fn finalize(self, dtype: DataType) -> Result<Value> {
         self.finalize_ref(dtype)
+    }
+}
+
+/// Final value of an ordered-set aggregate. The collected non-NULL values are
+/// sorted once here: `WITHIN GROUP (ORDER BY e)` only says *which* expression
+/// orders them (the clause's direction and NULL placement cannot matter, and
+/// DuckDB ignores them too), so a single ascending sort serves all three.
+fn ordered_set_result(vals: &[Value], kind: OrderedSet, dtype: DataType) -> Result<Value> {
+    if vals.is_empty() {
+        return Ok(Value::Null);
+    }
+    // `finalize_ref` keeps the accumulator alive (window frames), so the sort
+    // works on a copy.
+    let mut vals = vals.to_vec();
+    vals.sort_by(compare_values);
+    let n = vals.len();
+    Ok(match kind {
+        OrderedSet::Mode => {
+            // The longest run in sorted order; ties keep the smallest value
+            // (DuckDB's `mode`).
+            let (mut best, mut best_len) = (0usize, 0usize);
+            let mut i = 0;
+            while i < n {
+                let mut j = i + 1;
+                while j < n && compare_values(&vals[i], &vals[j]) == std::cmp::Ordering::Equal {
+                    j += 1;
+                }
+                if j - i > best_len {
+                    best = i;
+                    best_len = j - i;
+                }
+                i = j;
+            }
+            vals[best].clone()
+        }
+        OrderedSet::PercentileDisc(p) => {
+            let idx = ((p * n as f64).ceil() as usize)
+                .saturating_sub(1)
+                .min(n - 1);
+            vals[idx].clone()
+        }
+        OrderedSet::PercentileCont(p) => {
+            let pos = p * (n - 1) as f64;
+            let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+            let (a, b) = (as_f64(&vals[lo]), as_f64(&vals[hi]));
+            let x = a + (b - a) * (pos - lo as f64);
+            match dtype {
+                DataType::Decimal { precision, scale } => {
+                    let mantissa =
+                        crate::types::f64_to_decimal(x, precision, scale).ok_or_else(|| {
+                            PinkDbError::Execution(format!(
+                                "Overflow in percentile_cont: {x} does not fit in {dtype}"
+                            ))
+                        })?;
+                    Value::Decimal(mantissa, scale)
+                }
+                _ => Value::Double(x),
+            }
+        }
+    })
+}
+
+/// A numeric cell as `f64` for percentile interpolation.
+fn as_f64(v: &Value) -> f64 {
+    match v {
+        Value::Integer(i) => f64::from(*i),
+        Value::Bigint(i) => *i as f64,
+        Value::Double(x) => *x,
+        Value::Decimal(m, s) => crate::types::decimal_to_f64(*m, *s),
+        Value::Date(d) => f64::from(*d),
+        Value::Timestamp(t) => *t as f64,
+        _ => f64::NAN,
     }
 }
 
@@ -1251,7 +1431,10 @@ fn new_group(
         enc,
         Group {
             keys: key_vecs.iter().map(|kv| kv.v().get(i)).collect(),
-            accs: aggs.iter().map(|a| Acc::new(a.func, a.distinct)).collect(),
+            accs: aggs
+                .iter()
+                .map(|a| Acc::new(a.func, a.distinct, a.direct))
+                .collect(),
         },
     ));
     idx
@@ -1431,12 +1614,9 @@ fn accumulate(
         }
         return;
     };
-    let generic = gids.first().is_some_and(|&g| {
-        matches!(
-            groups[g].1.accs[j],
-            Acc::MinMax { .. } | Acc::CountDistinct(_)
-        )
-    });
+    let generic = gids
+        .first()
+        .is_some_and(|&g| matches!(groups[g].1.accs[j], Acc::MinMax { .. } | Acc::Collect(_)));
     match v.data() {
         VectorData::Int32(d) if !generic => {
             for (i, &g) in gids.iter().enumerate() {
@@ -1486,7 +1666,10 @@ pub(crate) fn merge_partials(
     // Fast path: no keys means a single global group — merge accumulators
     // directly instead of probing the table per row.
     if !has_keys {
-        let mut accs: Vec<Acc> = aggs.iter().map(|a| Acc::new(a.func, a.distinct)).collect();
+        let mut accs: Vec<Acc> = aggs
+            .iter()
+            .map(|a| Acc::new(a.func, a.distinct, a.direct))
+            .collect();
         // Reuse the per-chunk partials computed above (each non-empty chunk
         // holds exactly one group; a fresh table scans as one 0-row chunk,
         // so an empty partial has no group to merge).
@@ -1527,7 +1710,10 @@ pub(crate) fn merge_partials(
     if groups.is_empty() && !has_keys {
         groups.push(Group {
             keys: Vec::new(),
-            accs: aggs.iter().map(|a| Acc::new(a.func, a.distinct)).collect(),
+            accs: aggs
+                .iter()
+                .map(|a| Acc::new(a.func, a.distinct, a.direct))
+                .collect(),
         });
     }
     groups
@@ -1594,11 +1780,11 @@ mod tests {
 
     #[test]
     fn integer_sum_is_exact_across_many_wraps_and_merges() {
-        let mut acc = Acc::new(AggFunc::Sum, false);
+        let mut acc = Acc::new(AggFunc::Sum, false, None);
         for _ in 0..5 {
             acc.update(Some(&Value::Bigint(i64::MAX)));
         }
-        let mut other = Acc::new(AggFunc::Sum, false);
+        let mut other = Acc::new(AggFunc::Sum, false, None);
         for _ in 0..5 {
             other.update(Some(&Value::Bigint(i64::MIN)));
         }
@@ -1610,7 +1796,7 @@ mod tests {
             Value::Bigint(2)
         );
         // Out of range at the end is an error, never a wrapped value.
-        let mut big = Acc::new(AggFunc::Sum, false);
+        let mut big = Acc::new(AggFunc::Sum, false, None);
         big.update(Some(&Value::Bigint(i64::MAX)));
         big.update(Some(&Value::Bigint(1)));
         assert!(big.finalize_ref(DataType::Bigint).is_err());

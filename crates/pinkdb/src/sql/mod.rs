@@ -13,7 +13,7 @@ pub(crate) mod split;
 
 use crate::types::{PinkDbError, Result, Value};
 pub use binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, bind};
-pub(crate) use binder::{bind_mv_query, bind_tracked};
+pub(crate) use binder::{bind_mv_query, bind_tracked, bind_tracked_in};
 /// Maximum AST depth the parser accepts (see [`check_ast_depth`]).
 ///
 /// Measured in nodes along the deepest root-to-leaf path: every statement,
@@ -790,6 +790,8 @@ fn empty_from() -> ast::FromClause {
         alias: None,
         col_aliases: None,
         at: None,
+        sample: None,
+        lateral: false,
         joins: Vec::new(),
     }
 }

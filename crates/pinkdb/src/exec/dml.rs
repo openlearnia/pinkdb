@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{Cx, ExecBudget, Output, QueryResult, eval, eval_expr};
+use super::{Cx, DmlIndex, ExecBudget, Output, QueryResult, eval, eval_expr};
 use crate::keys::{KeySpace, RowId};
 use crate::plan::{
     ConflictActionPlan, ConflictPlan, LogicalPlan, MergeActionPlan, MergeClausePlan, Returning,
@@ -223,6 +223,11 @@ pub(crate) fn update_from(
     let mut count = 0usize;
     {
         let cx = Cx::with_budget(db, budget.clone());
+        let index = match predicate {
+            Some(p) => DmlIndex::build(&cx, &src_chunks, src_types.len(), p)?,
+            None => None,
+        };
+        let mut buf = Vec::new();
         for (ci, writes) in per_chunk.iter_mut().enumerate() {
             cx.check_deadline()?;
             let chunk = t.scan_chunk(ci).ok_or_else(|| {
@@ -230,16 +235,32 @@ pub(crate) fn update_from(
             })?;
             for row in 0..chunk.num_rows() {
                 let mut chosen: Option<DataChunk> = None;
-                for sc in &src_chunks {
-                    for srow in 0..sc.num_rows() {
+                // One candidate pair: the predicate decides whether it wins.
+                let visit =
+                    |sc: usize, srow: usize, chosen: &mut Option<DataChunk>| -> Result<()> {
                         budget.check_deadline()?;
-                        let joined = join_chunk(sc, srow, &chunk, row, &src_types, &schema)?;
+                        let joined =
+                            join_chunk(&src_chunks[sc], srow, &chunk, row, &src_types, &schema)?;
                         let keep = match predicate {
                             Some(p) => is_true(&eval_expr(p, &joined, &cx)?, 0)?,
                             None => true,
                         };
                         if keep {
-                            chosen = Some(joined);
+                            *chosen = Some(joined);
+                        }
+                        Ok(())
+                    };
+                match &index {
+                    Some(index) => {
+                        for (sc, srow) in index.probe(&cx, &chunk, row, &mut buf)? {
+                            visit(sc as usize, srow as usize, &mut chosen)?;
+                        }
+                    }
+                    None => {
+                        for (sc, source_chunk) in src_chunks.iter().enumerate() {
+                            for srow in 0..source_chunk.num_rows() {
+                                visit(sc, srow, &mut chosen)?;
+                            }
                         }
                     }
                 }
@@ -279,26 +300,53 @@ pub(crate) fn delete_using(
     let mut drops: Vec<Vec<usize>> = Vec::with_capacity(t.num_chunks());
     {
         let cx = Cx::with_budget(db, budget.clone());
+        let index = match predicate {
+            Some(p) => DmlIndex::build(&cx, &src_chunks, src_types.len(), p)?,
+            None => None,
+        };
+        let mut buf = Vec::new();
         for ci in 0..t.num_chunks() {
             cx.check_deadline()?;
             let chunk = t.scan_chunk(ci).ok_or_else(|| {
                 PinkDbError::Execution("storage changed during DELETE".to_string())
             })?;
             let mut dropped = Vec::new();
-            'rows: for row in 0..chunk.num_rows() {
-                for sc in &src_chunks {
-                    for srow in 0..sc.num_rows() {
-                        budget.check_deadline()?;
-                        let joined = join_chunk(sc, srow, &chunk, row, &src_types, &schema)?;
-                        let hit = match predicate {
-                            Some(p) => is_true(&eval_expr(p, &joined, &cx)?, 0)?,
-                            None => true,
-                        };
-                        if hit {
-                            dropped.push(row);
-                            continue 'rows;
+            for row in 0..chunk.num_rows() {
+                let hit = |sc: usize, srow: usize| -> Result<bool> {
+                    budget.check_deadline()?;
+                    let joined =
+                        join_chunk(&src_chunks[sc], srow, &chunk, row, &src_types, &schema)?;
+                    Ok(match predicate {
+                        Some(p) => is_true(&eval_expr(p, &joined, &cx)?, 0)?,
+                        None => true,
+                    })
+                };
+                let matched = match &index {
+                    Some(index) => {
+                        let mut found = false;
+                        for (sc, srow) in index.probe(&cx, &chunk, row, &mut buf)? {
+                            if hit(sc as usize, srow as usize)? {
+                                found = true;
+                                break;
+                            }
                         }
+                        found
                     }
+                    None => {
+                        let mut found = false;
+                        'candidates: for (sc, source_chunk) in src_chunks.iter().enumerate() {
+                            for srow in 0..source_chunk.num_rows() {
+                                if hit(sc, srow)? {
+                                    found = true;
+                                    break 'candidates;
+                                }
+                            }
+                        }
+                        found
+                    }
+                };
+                if matched {
+                    dropped.push(row);
                 }
             }
             drops.push(dropped);
@@ -347,6 +395,16 @@ pub(crate) fn merge(
     let mut source_matched = vec![false; src_rows.len()];
     {
         let cx = Cx::with_budget(db, budget.clone());
+        let index = DmlIndex::build(&cx, &src_chunks, src_types.len(), on)?;
+        // Global source-row index per chunk: `hits` and `source_matched` are
+        // indexed by it, and a probe yields chunk-local coordinates.
+        let mut src_starts = Vec::with_capacity(src_chunks.len());
+        let mut acc = 0usize;
+        for source_chunk in &src_chunks {
+            src_starts.push(acc);
+            acc += source_chunk.num_rows();
+        }
+        let mut buf = Vec::new();
         for ci in 0..t.num_chunks() {
             cx.check_deadline()?;
             let chunk = t.scan_chunk(ci).ok_or_else(|| {
@@ -356,11 +414,33 @@ pub(crate) fn merge(
                 budget.check_deadline()?;
                 // Every source row whose ON holds for this target row.
                 let mut hits: Vec<usize> = Vec::new();
-                for (si, &(sc, sr)) in src_rows.iter().enumerate() {
-                    let joined = join_chunk(&src_chunks[sc], sr, &chunk, row, &src_types, &schema)?;
-                    if is_true(&eval_expr(on, &joined, &cx)?, 0)? {
-                        hits.push(si);
-                        source_matched[si] = true;
+                match &index {
+                    Some(index) => {
+                        for (sc, sr) in index.probe(&cx, &chunk, row, &mut buf)? {
+                            let si = src_starts[sc as usize] + sr as usize;
+                            let joined = join_chunk(
+                                &src_chunks[sc as usize],
+                                sr as usize,
+                                &chunk,
+                                row,
+                                &src_types,
+                                &schema,
+                            )?;
+                            if is_true(&eval_expr(on, &joined, &cx)?, 0)? {
+                                hits.push(si);
+                                source_matched[si] = true;
+                            }
+                        }
+                    }
+                    None => {
+                        for (si, &(sc, sr)) in src_rows.iter().enumerate() {
+                            let joined =
+                                join_chunk(&src_chunks[sc], sr, &chunk, row, &src_types, &schema)?;
+                            if is_true(&eval_expr(on, &joined, &cx)?, 0)? {
+                                hits.push(si);
+                                source_matched[si] = true;
+                            }
+                        }
                     }
                 }
                 if hits.is_empty() {

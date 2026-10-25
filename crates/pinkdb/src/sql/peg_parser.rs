@@ -888,6 +888,9 @@ enum PostfixOp {
     Slice(Option<Expr>, Option<Expr>),
     /// `.field` after a non-identifier primary (`(expr).a`).
     Field(String),
+    /// `x AT TIME ZONE z` — folds to the two-argument `timezone(z, x)`
+    /// scalar (DuckDB desugars the clause the same way).
+    AtTimeZone(Expr),
 }
 
 /// The trailing clauses every query form accepts (`ORDER BY`, `LIMIT`,
@@ -926,6 +929,8 @@ fn values_select(rows: Vec<Vec<Expr>>, tail: QueryTail) -> Select {
             alias: None,
             col_aliases: None,
             at: None,
+            sample: None,
+            lateral: false,
             joins: Vec::new(),
         }),
         where_clause: None,
@@ -949,6 +954,8 @@ fn table_select(db: Option<String>, name: String, tail: QueryTail) -> Select {
             alias: None,
             col_aliases: None,
             at: None,
+            sample: None,
+            lateral: false,
             joins: Vec::new(),
         }),
         ..values_select(Vec::new(), tail)
@@ -1037,6 +1044,60 @@ fn negate_if(negated: bool, e: Expr) -> Expr {
 }
 
 /// `x IN (a, b)` → `(x = a) OR (x = b)`; `IN ()` → FALSE.
+/// A row constructor `(a, b)` / `ROW(a, b)`.
+///
+/// The engine has no STRUCT type, so a row is not a value: the binder only
+/// accepts one inside a comparison or an `IN` list and rewrites it per field
+/// (see [`crate::sql::binder`]). Keeping the shape as the plain `row(...)`
+/// call means the AST needs no row variant and a stored view or macro body
+/// re-binds through the same rewrite.
+fn row_ctor(args: Vec<Expr>) -> Expr {
+    Expr::Function {
+        name: "row".to_string(),
+        args,
+        distinct: false,
+        filter: None,
+    }
+}
+
+/// Fold `WITHIN GROUP (ORDER BY e)` into the aggregate call's argument list:
+/// `percentile_cont(p) WITHIN GROUP (ORDER BY e)` becomes
+/// `percentile_cont(p, e)` and `mode() WITHIN GROUP (ORDER BY e)` becomes
+/// `mode(e)`. The clause only contributes its single expression — the binder
+/// sorts the values itself, so direction and NULL placement cannot matter
+/// (NULLs are skipped), and DuckDB ignores `DESC` here too.
+fn ordered_set_args(
+    name: String,
+    mut args: Vec<Expr>,
+    items: Vec<OrderItem>,
+) -> std::result::Result<(String, Vec<Expr>), &'static str> {
+    let [item] = <[OrderItem; 1]>::try_from(items)
+        .map_err(|_| "ordered-set aggregates take exactly one ORDER BY expression")?;
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "mode" => {
+            if !args.is_empty() {
+                return Err("mode() takes no argument before WITHIN GROUP");
+            }
+            args.push(item.expr);
+        }
+        "percentile_cont" | "quantile_cont" | "percentile_disc" | "quantile_disc" => {
+            if args.len() != 1 {
+                return Err(
+                    "a percentile aggregate takes one fraction and one ORDER BY expression",
+                );
+            }
+            args.push(item.expr);
+        }
+        _ => {
+            return Err(
+                "WITHIN GROUP is only supported for percentile_cont, percentile_disc and mode",
+            );
+        }
+    }
+    Ok((name, args))
+}
+
 fn desugar_in_list(left: Expr, items: Vec<Expr>, negated: bool) -> Expr {
     let mut acc = Expr::Literal(Value::Boolean(false));
     for item in items {
@@ -1968,11 +2029,11 @@ peg::parser! {
                   MergeAction::Insert { columns, values }
               }
 
-        /// `SET VARIABLE name = expr` and the `$name` shorthand that reads it
-        /// back are both refused by name (see also `primary`).
+        /// `SET VARIABLE name = expr`. `SET`, `VARIABLE` and the name are
+        /// words, so both stay usable as identifiers elsewhere.
         rule set_variable_stmt() -> Statement
-            = kw(Keyword::Set) word("variable") {?
-                  Err("SET VARIABLE is not supported (wave 95c): use a parameter or a table")
+            = kw(Keyword::Set) word("variable") name:ident() eq() value:expr() {
+                  Statement::SetVariable { name, value }
               }
 
         /// `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71).
@@ -2144,7 +2205,9 @@ peg::parser! {
         /// engine has no row locks and DuckDB 2.0 rejects the clause too.
         rule for_clause()
             = word("for") (word("update") / word("share") / word("no") word("key") word("update")) {?
-                  Err("SELECT ... FOR UPDATE/SHARE is not supported (wave 95c): the engine has no row locks")
+                  // Row locks would be a no-op: pinkdb's MVCC already serializes
+                  // writers, and DuckDB 2.0 rejects the clause outright.
+                  Err("SELECT ... FOR UPDATE/SHARE is not supported: pinkdb has no row locks (its MVCC already serializes writers)")
               }
 
         /// `DISTINCT`, `DISTINCT ON (a, b)` or neither.
@@ -2221,7 +2284,8 @@ peg::parser! {
             / name:ident() {?
                   if matches!(
                       name.to_ascii_lowercase().as_str(),
-                      "qualify" | "window" | "fetch" | "for" | "tablesample" | "lateral" | "returning"
+                      "qualify" | "window" | "fetch" | "for" | "tablesample" | "using" | "lateral"
+                          | "returning"
                   ) {
                       Err("identifier")
                   } else {
@@ -2236,34 +2300,102 @@ peg::parser! {
         /// USING` and `MERGE … USING` share it, so all four spell a source the
         /// same way.
         rule from_list() -> FromClause
-            = source:from_source() suffix:source_suffix() _ts:tablesample_check() joins:(j:join_clause() { j })* {?
-                  let (alias, col_aliases, at) = suffix;
+            = source:from_source() suffix:source_suffix() sample:sample_clause() joins:(j:from_entry() { j })* {?
+                  let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
                   } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
-                      Ok(FromClause { source, alias, col_aliases, at, joins })
+                      Ok(FromClause { source, alias, col_aliases, at, sample, lateral, joins })
                   }
               }
 
-        rule from_source() -> FromSource
-            = word("lateral") lparen() query() rparen() {?
-                  Err("LATERAL is not supported (wave 95c)")
+        /// One step of the FROM chain: a comma source (`FROM a, b` is a cross
+        /// join, and `FROM a, LATERAL (…) b` may see `a`) or a spelled-out
+        /// join. Both land in the same left-deep list in written order, so an
+        /// `ON` condition sees every source to its left.
+        rule from_entry() -> JoinClause
+            = comma() source:from_source() suffix:source_suffix() sample:sample_clause() {?
+                  let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
+                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
+                      Err("derived table needs an alias")
+                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
+                      Err("AT is only valid after a table name")
+                  } else {
+                      Ok(JoinClause { kind: JoinKind::Cross, source, alias, col_aliases, at, sample, lateral, on: None })
+                  }
               }
-            / lparen() q:query() rparen() { FromSource::Derived(Box::new(q)) }
-            / name:ident() lparen() args:table_function_args() rparen() {
-                  FromSource::Function { name, args }
-              }
-            / s:string_lit() { FromSource::Path(s) }
-            / t:table_ref() { FromSource::Table { db: t.0, name: t.1 } }
+            / j:join_clause() { j }
 
-        /// `TABLESAMPLE` after a FROM/join source: parsed only to refuse it
-        /// with a diagnostic instead of a confusing "expected end of
-        /// statement" error (the bare-alias rule keeps the word unclaimed).
-        rule tablesample_check() -> bool
-            = word("tablesample") {? Err("TABLESAMPLE is not supported (wave 95c)") }
-            / { true }
+        /// A FROM source and whether it was spelled `LATERAL`.
+        rule from_source() -> (FromSource, bool)
+            = word("lateral") lparen() q:query() rparen() {
+                  (FromSource::Derived(Box::new(q)), true)
+              }
+            / word("lateral") name:ident() lparen() table_function_args() rparen() {?
+                  let _ = name;
+                  Err("a LATERAL table function is not supported: only LATERAL subqueries are")
+              }
+            / lparen() q:query() rparen() { (FromSource::Derived(Box::new(q)), false) }
+            / name:ident() lparen() args:table_function_args() rparen() {
+                  (FromSource::Function { name, args }, false)
+              }
+            / s:string_lit() { (FromSource::Path(s), false) }
+            / t:table_ref() { (FromSource::Table { db: t.0, name: t.1 }, false) }
+
+        /// `TABLESAMPLE …` / `USING SAMPLE …` after a FROM/join source. Both
+        /// spellings take the same body; `REPEATABLE (seed)` makes the sample
+        /// reproducible.
+        rule sample_clause() -> Option<SampleSpec>
+            = word("tablesample") s:sample_body() { Some(s) }
+            / word("using") word("sample") s:sample_body() { Some(s) }
+            / { None }
+
+        /// `method(size)` or `size[(method)]`, both optionally followed by
+        /// `REPEATABLE (seed)`.
+        rule sample_body() -> SampleSpec
+            = m:sample_method() lparen() size:sample_size() rparen() r:repeatable_clause()? {?
+                  // DuckDB: a discrete count needs the reservoir method.
+                  if m != SampleMethod::Reservoir && matches!(size.0, SampleSize::Rows(_)) {
+                      Err("Sample method Bernoulli cannot be used with a discrete sample count, \
+                           either switch to reservoir sampling or use a sample_size")
+                  } else {
+                      Ok(SampleSpec { method: m, size: size.0, repeatable: r })
+                  }
+              }
+            / size:sample_size() lparen() m:sample_method() rparen() r:repeatable_clause()? {?
+                  if m != SampleMethod::Reservoir && matches!(size.0, SampleSize::Rows(_)) {
+                      Err("Sample method Bernoulli cannot be used with a discrete sample count, \
+                           either switch to reservoir sampling or use a sample_size")
+                  } else {
+                      Ok(SampleSpec { method: m, size: size.0, repeatable: r })
+                  }
+              }
+            / size:sample_size() r:repeatable_clause()? {
+                  SampleSpec { method: size.1, size: size.0, repeatable: r }
+              }
+
+        /// A sample size and the method its unit implies: `n ROWS` samples
+        /// whole rows (reservoir), `p PERCENT` (or `p%`) samples a fraction.
+        rule sample_size() -> (SampleSize, SampleMethod)
+            = n:sample_number() word("rows") { (SampleSize::Rows(n as i64), SampleMethod::Reservoir) }
+            / n:sample_number() word("percent") { (SampleSize::Percent(n), SampleMethod::System) }
+            / n:sample_number() "%" { (SampleSize::Percent(n), SampleMethod::System) }
+            / n:sample_number() { (SampleSize::Rows(n as i64), SampleMethod::Reservoir) }
+
+        /// A sample size: an integer count or a fractional percentage.
+        rule sample_number() -> f64
+            = n:float_text() ws() {? n.parse::<f64>().or(Err("sample size")) }
+            / n:int_text() ws() {? n.parse::<f64>().or(Err("sample size")) }
+
+        rule sample_method() -> SampleMethod
+            = word("bernoulli") { SampleMethod::Bernoulli }
+            / word("system") { SampleMethod::System }
+            / word("reservoir") { SampleMethod::Reservoir }
+
+        rule repeatable_clause() -> i64
+            = word("repeatable") lparen() n:nonneg_integer() rparen() { n as i64 }
 
         /// The argument list of a table-function FROM source: literals only
         /// (the binder evaluates them), optionally named with `:=` or `=>`.
@@ -2337,24 +2469,24 @@ peg::parser! {
         /// condition binds against every table to its left plus its own
         /// right-hand source (multi-way joins are left-deep).
         rule join_clause() -> JoinClause
-            = kw(Keyword::Cross) kw(Keyword::Join) source:from_source() suffix:source_suffix() _ts:tablesample_check() {?
-                  let (alias, col_aliases, at) = suffix;
+            = kw(Keyword::Cross) kw(Keyword::Join) source:from_source() suffix:source_suffix() sample:sample_clause() {?
+                  let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
                   } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
-                      Ok(JoinClause { kind: JoinKind::Cross, source, alias, col_aliases, at, on: None })
+                      Ok(JoinClause { kind: JoinKind::Cross, source, alias, col_aliases, at, sample, lateral, on: None })
                   }
               }
-            / kind:join_kind() source:from_source() suffix:source_suffix() _ts:tablesample_check() kw(Keyword::On) on:expr() {?
-                  let (alias, col_aliases, at) = suffix;
+            / kind:join_kind() source:from_source() suffix:source_suffix() sample:sample_clause() kw(Keyword::On) on:expr() {?
+                  let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
                   } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
-                      Ok(JoinClause { kind, source, alias, col_aliases, at, on: Some(on) })
+                      Ok(JoinClause { kind, source, alias, col_aliases, at, sample, lateral, on: Some(on) })
                   }
               }
 
@@ -2420,9 +2552,6 @@ peg::parser! {
 
         rule window_def() -> (String, OverClause)
             = name:ident() kw(Keyword::As) lparen() spec:window_spec() rparen() { (name, spec) }
-            / name:ident() kw(Keyword::As) lparen() base:ident() ws() {?
-                  Err("a window that builds on another window is not supported (wave 95c)")
-              }
 
         rule having_clause() -> Expr = kw(Keyword::Having) e:expr() { e }
         rule order_by_clause() -> Vec<OrderItem> = kw(Keyword::Order) kw(Keyword::By) l:order_list() { l }
@@ -2586,6 +2715,15 @@ peg::parser! {
                           base: Box::new(expr),
                           index: Box::new(Expr::Literal(Value::Varchar(field))),
                       },
+                      // `AT TIME ZONE` is the two-argument `timezone(zone, ts)`
+                      // scalar, DuckDB's desugaring (its column titles show
+                      // `timezone('UTC', …)` too).
+                      PostfixOp::AtTimeZone(zone) => Expr::Function {
+                          name: "timezone".to_string(),
+                          args: vec![zone, expr],
+                          distinct: false,
+                          filter: None,
+                      },
                   })
               }
 
@@ -2602,9 +2740,7 @@ peg::parser! {
             }
             / lbracket() i:expr() rbracket() { PostfixOp::Index(i) }
             / lbracket() from:slice_bound()? slice_sep() to:slice_bound()? rbracket() { PostfixOp::Slice(from, to) }
-            / word("at") word("time") word("zone") {?
-                  Err("AT TIME ZONE is not supported (wave 95c): cast to TIMESTAMP and use date_trunc instead")
-              }
+            / word("at") word("time") word("zone") z:primary() { PostfixOp::AtTimeZone(z) }
 
         rule slice_bound() -> Expr = e:expr() { e }
 
@@ -2631,19 +2767,32 @@ peg::parser! {
             / exists_expr()
             / extract_call()
             / lparen() q:query() rparen() { Expr::ScalarSubquery(Box::new(q)) }
-            / lparen() _a:expr() comma() _b:expr() (comma() _c:expr())* rparen() {?
-                  Err("row constructors are not supported (wave 95c): use VALUES or separate columns")
+            / lparen() first:expr() comma() second:expr() rest:(comma() e:expr() { e })* rparen() {
+                  let mut args = vec![first, second];
+                  args.extend(rest);
+                  row_ctor(args)
               }
             / lparen() e:expr() rparen() { e }
+            // `ROW(a, b)`: `ROW` is a keyword, so `fn_call` cannot take it.
+            / kw(Keyword::Row) lparen() args:expr_list() rparen() { row_ctor(args) }
             / ident_expr()
 
         /// `$name` — the variable shorthand that reads a `SET VARIABLE` back.
         /// `$$...$$` is a string literal and is matched earlier, so `$` here
         /// can only start a variable name.
+        ///
+        /// The `$` stays in the name so the binder can keep DuckDB's split:
+        /// `$name` errors when the variable is unset, `getvariable('name')`
+        /// returns NULL. No identifier can start with `$`, so the name is
+        /// unambiguous.
         rule dollar_name() -> Expr
-            = "$" ws() name:ident_raw() ws() {?
-                  let _ = name;
-                  Err("the `$name` variable shorthand is not supported (wave 95c): use SET VARIABLE/getvariable")
+            = "$" ws() name:ident_raw() ws() {
+                  Expr::Function {
+                      name: format!("${name}"),
+                      args: Vec::new(),
+                      distinct: false,
+                      filter: None,
+                  }
               }
 
         /// `TRY_CAST(x AS type)` — NULL instead of an error when the value
@@ -2658,7 +2807,7 @@ peg::parser! {
         rule list_literal() -> Expr
             = lbracket() items:expr_list()? rbracket() {?
                   let _ = items;
-                  Err("list literals are not supported (wave 95c): the engine has no LIST type")
+                  Err("list literals are not supported: the engine has no LIST type (needs a LIST type)")
               }
 
         /// `?` — a positional prepared-statement parameter. The payload is the
@@ -2840,23 +2989,27 @@ peg::parser! {
 
         rule fn_call() -> Expr
             = name:non_coalesce_name() lparen() distinct:distinct_flag() args:fn_args() rparen()
-              filter:filter_clause()? within_group_check()? over:over_clause()? {
-                  match over {
+              filter:filter_clause()? within:within_group_clause()? after:filter_clause()? over:over_clause()? {?
+                  let filter = match (filter, after) {
+                      (Some(_), Some(_)) => return Err("write FILTER once"),
+                      (before, later) => before.or(later),
+                  };
+                  let (name, args) = match within {
+                      Some(items) => ordered_set_args(name, args, items)?,
+                      None => (name, args),
+                  };
+                  Ok(match over {
                       Some(over) => Expr::Window { name, args, over, distinct, filter: filter.map(Box::new) },
                       None => Expr::Function { name, args, distinct, filter: filter.map(Box::new) },
-                  }
+                  })
               }
 
         /// `FILTER (WHERE cond)` after an aggregate call.
         rule filter_clause() -> Expr = word("filter") lparen() kw(Keyword::Where) e:expr() rparen() { e }
 
-        /// `WITHIN GROUP (ORDER BY ...)` (ordered-set aggregates): parsed only
-        /// to refuse it with a diagnostic.
-        rule within_group_check() -> bool
-            = word("within") word("group") lparen() order_by_clause() rparen() {?
-                  Err("ordered-set aggregates (WITHIN GROUP) are not supported (wave 95c)")
-              }
-            / { true }
+        /// `WITHIN GROUP (ORDER BY ...)` (ordered-set aggregates).
+        rule within_group_clause() -> Vec<OrderItem>
+            = word("within") word("group") lparen() items:order_by_clause() rparen() { items }
 
         /// `DISTINCT` before a function call's first argument.
         rule distinct_flag() -> bool
@@ -2896,15 +3049,12 @@ peg::parser! {
         rule over_clause() -> OverSpec
             = kw(Keyword::Over) name:ident() { OverSpec::Named(name) }
             / kw(Keyword::Over) lparen() spec:window_spec() rparen() { OverSpec::Inline(spec) }
-            / kw(Keyword::Over) lparen() name:ident() partition_clause()? order_by_clause()? frame_clause()? rparen() {?
-                  let _ = name;
-                  Err("a window that builds on another window is not supported (wave 95c)")
-              }
 
         /// The inside of `OVER (...)` and of a `WINDOW w AS (...)` definition.
         rule window_spec() -> OverClause
-            = partition:partition_clause()? order:order_by_clause()? frame:frame_clause()? {
+            = base:ident()? partition:partition_clause()? order:order_by_clause()? frame:frame_clause()? {
                   OverClause {
+                      base,
                       partition: partition.unwrap_or_default(),
                       order: order.unwrap_or_default(),
                       frame,

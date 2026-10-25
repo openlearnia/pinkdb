@@ -1521,6 +1521,7 @@ pub(crate) fn send_result<S: FrameSink + ?Sized>(
         QueryResult::CreatedDatabase { name } => done(w, DoneKind::CreatedDatabase, 0, name),
         QueryResult::DroppedDatabase { name } => done(w, DoneKind::DroppedDatabase, 0, name),
         QueryResult::Used { db } => done(w, DoneKind::Used, 0, db),
+        QueryResult::SetVariable { name } => done(w, DoneKind::SetVariable, 0, name),
         QueryResult::LoadedExtension { name } => done(w, DoneKind::LoadedExtension, 0, name),
         QueryResult::Checkpointed => done(w, DoneKind::Checkpointed, 0, ""),
         QueryResult::AlteredTable { name } => done(w, DoneKind::AlteredTable, 0, name),

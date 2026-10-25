@@ -2195,6 +2195,48 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
             }
             (a, b) => Err(PinkDbError::Execution(format!("mod of {a} and {b}"))),
         },
+        ScalarFunc::JsonSet
+        | ScalarFunc::JsonInsert
+        | ScalarFunc::JsonReplace
+        | ScalarFunc::JsonRemove => {
+            let mode = match func {
+                ScalarFunc::JsonInsert => crate::variant::SetMode::Insert,
+                ScalarFunc::JsonReplace => crate::variant::SetMode::Replace,
+                _ => crate::variant::SetMode::Set,
+            };
+            let as_variant = matches!(&row[0], Value::Variant(_));
+            let doc = match &row[0] {
+                Value::Variant(v) => (**v).clone(),
+                Value::Varchar(text) => crate::variant::from_json_str(text)?,
+                v => {
+                    return Err(PinkDbError::Execution(format!(
+                        "a JSON document must be VARCHAR or VARIANT, not {v}"
+                    )));
+                }
+            };
+            let Value::Varchar(path) = &row[1] else {
+                return Err(PinkDbError::Execution(
+                    "a JSON path must be VARCHAR".to_string(),
+                ));
+            };
+            let steps = crate::variant::parse_path(path)?;
+            let out = if func == ScalarFunc::JsonRemove {
+                if steps.is_empty() {
+                    // `$` removes the whole document, which DuckDB answers
+                    // with SQL NULL rather than a variant null.
+                    return Ok(Value::Null);
+                }
+                crate::variant::remove_path(&doc, &steps)?
+            } else {
+                let value = crate::variant::from_value(&row[2])?;
+                crate::variant::set_path(&doc, &steps, &value, mode)?
+            };
+            Ok(if as_variant {
+                Value::Variant(std::sync::Arc::new(out))
+            } else {
+                Value::Varchar(out.to_json())
+            })
+        }
         ScalarFunc::Concat | ScalarFunc::NullIf | ScalarFunc::Greatest | ScalarFunc::Least => {
             unreachable!("non-strict scalar reached the strict path")
         }

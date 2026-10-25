@@ -486,9 +486,9 @@ pub(crate) fn rebind_query(
 ) -> Result<Box<LogicalPlan>> {
     let stmts = crate::sql::parse_statements(query_sql)?;
     match stmts.into_iter().next() {
-        Some(crate::sql::ast::Statement::CreateMaterializedView { query, .. }) => {
-            Ok(Box::new(crate::sql::bind_mv_query(db, db_name, &query)?))
-        }
+        Some(crate::sql::ast::Statement::CreateMaterializedView { query, .. }) => Ok(Box::new(
+            crate::sql::bind_mv_query(db, db_name, &query, &db.session)?,
+        )),
         _ => Err(PinkDbError::Catalog(format!(
             "the persisted definition of a materialized view is not a CREATE \
              MATERIALIZED VIEW statement: {query_sql}"
