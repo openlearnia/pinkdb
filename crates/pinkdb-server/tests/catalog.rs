@@ -547,9 +547,9 @@ fn round_trip_on_mock_s3_data() {
         "no data file reached the bucket: {keys:?}"
     );
     assert!(
-        keys.iter().all(|key| (key.starts_with("data/")
+        keys.iter().all(|key| key.starts_with("data/")
             || key.contains("/data/")
-            || key.ends_with("lake-data.json"))),
+            || key.ends_with("lake-data.json")),
         "the bucket holds data objects only: {keys:?}"
     );
 
