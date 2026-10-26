@@ -1847,6 +1847,7 @@ name = "pinkdb-vss"
 version = "0.1.0"
 dependencies = [
  "pinkdb",
+ "rayon",
 ]
 
 [[package]]

@@ -16,7 +16,14 @@ name = "pinkdb_vss"
 # engine serializes the graph into `.pink`.
 pinkdb = { path = "../../crates/pinkdb" }
 
-[dev-dependencies]
+# Parallel HNSW build (wave 107d). Already in the workspace lockfile
+# through the engine, so no new crate; native only — on wasm32 the build
+# runs the same search sequentially and produces the same graph.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.12.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rayon = "1.12.0"
 pinkdb = { path = "../../crates/pinkdb" }
 
 [[example]]

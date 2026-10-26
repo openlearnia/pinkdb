@@ -3222,7 +3222,7 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   `libpinkdb_mcp.dylib` 588,640 B, zero new third-party crates; plan in
   `docs/wave-106-plan.md`.
 
-- 2026-10-26 — Wave 103c (uncommitted, `stream-a`): the last JSON-catalog traces are gone
+- 2026-10-26 — Wave 103c (acf7b84): the last JSON-catalog traces are gone
   from pink-lake. Errors carry the catalog location as given — `pink:`, `sqlite:` or a
   redacted Postgres URL — from one `Lake::catalog_label()`/metadata-store label computed at
   open, replacing `CATALOG_FILE` and the root-joined catalog paths; `NotALake`/
@@ -3236,3 +3236,25 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   `-p pink-lake` with `s3` / `s3,encryption` / `catalog-sqlite,s3,encryption` /
   `catalog-postgres`); pink-lake 323, pink-lake-parquet 29, pinkdb-cli 189 (1 ignored),
   workspace 2,118 passed / 12 ignored / 195 binaries.
+- 2026-10-26 — Wave 107d (row 107 follow-up): **parallel HNSW build**,
+  deterministic at any thread count. Batched insertion in
+  `extensions/vss`: the first 1,024 vectors build sequentially as in
+  107b, then batches of 256 run a parallel read-only search against the
+  frozen graph plus an exact intra-batch pass, with neighbour selection
+  in the same parallel phase (peers and frozen candidates selected
+  separately, then merged — a joint selection let exact duplicates
+  island the batch), a sequential in-order commit of own links and the
+  entry point, and reverse-link pruning applied in parallel one
+  neighbour list at a time in insert order. Constants are fixed, never
+  derived from the pool size, so 1/2/4/8 threads produce byte-identical
+  graph bytes (unit test) and a WAL replay rebuilds the same graph
+  (engine test). `VectorIndex::insert_batch` is a new defaulted trait
+  method; the engine calls it for `CREATE INDEX` and for appends of
+  at least 32 rows, single-row inserts keep the old path. Measured on
+  an Apple M4 (4P+6E): 100k×768 build 111.5 s sequential → 32.1 s at 4
+  threads (3.5×) and 30.4 s on all 10 (3.7×), recall@10 0.878/0.961 at
+  ef 64/128 (sequential 0.874/0.963); 1M×128 867 s → 139.1 s (6.2×),
+  recall 0.751/0.883 (sequential 0.740/0.862 — never worse). Zero new
+  crates: `pinkdb-vss` depends on the already-locked rayon only on
+  non-wasm targets, and wasm32 runs the same phases sequentially.
+  Plan: [docs/wave-107d-plan.md](docs/wave-107d-plan.md).

@@ -15,6 +15,23 @@ one-liners below.
   are reasoning models: their hidden reasoning tokens count against the token
   budget and are recorded in `usage` like any other completion tokens.
 
+### Wave 107d — parallel HNSW build ✅
+- **Parallel, still deterministic.** `CREATE INDEX … USING HNSW` and
+  multi-row inserts into an indexed table now build in parallel
+  (batched insertion in `pinkdb-vss`: parallel search against the graph
+  frozen at each batch start, sequential in-order commit). The graph
+  depends only on the data and the insert order — 1, 4 or 16 threads
+  produce byte-identical graphs, so a replica or a WAL crash replay
+  rebuilds exactly the original index. Small appends (under 32 rows)
+  and single-row inserts keep the sequential path; graphs of at most
+  1,024 vectors are unchanged from 107b. Threads come from rayon's
+  global pool (`RAYON_NUM_THREADS` applies); no new crates.
+- **Measured (Apple M4, release).** 100k × 768 build 111.5 s sequential
+  → 32.1 s at 4 threads (3.5×), 30.4 s on all cores (3.7×), recall@10
+  0.878 at ef_search 64 (sequential 0.874). 1M × 128 build 867 s →
+  139.1 s (6.2×), recall 0.751 (sequential 0.740). Search latency is
+  unchanged.
+
 ### Wave 107b — vector similarity search ✅
 - **Distance functions (core SQL).** `array_distance` / `array_l2_distance`
   (Euclidean, not squared), `array_cosine_distance`,

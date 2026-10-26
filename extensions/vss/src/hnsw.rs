@@ -18,6 +18,16 @@ const MAGIC: &[u8; 8] = b"PHNSW01\0";
 /// a corrupt file must not allocate an enormous link table.
 const MAX_LEVEL: usize = 32;
 
+/// Parallel build (wave 107d): the first `SEED` vectors of a graph go in
+/// sequentially, exactly as before, so small graphs are unchanged. The rest
+/// go in batches of `BATCH`: levels drawn in insert order, a parallel
+/// read-only search against the graph frozen at the batch start (plus an
+/// exact pass over the batch itself), then links applied sequentially in
+/// insert order. Both constants are fixed — never derived from the thread
+/// count — so the graph depends only on the data and the insert order.
+const SEED: usize = 1024;
+const BATCH: usize = 256;
+
 /// HNSW parameters, named as DuckDB's vss extension names them.
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
@@ -256,14 +266,21 @@ impl Hnsw {
     }
 
     fn link(&mut self, node: u32, level: usize, neighbours: Vec<u32>) {
+        let keep = self.pruned(node, level, neighbours);
+        self.nodes[node as usize].links[level] = keep;
+    }
+
+    /// The neighbour list `node` should keep on `level` out of
+    /// `neighbours`: pure (reads vectors only), so the batch commit can run
+    /// it in parallel and assign the results afterwards.
+    fn pruned(&self, node: u32, level: usize, neighbours: Vec<u32>) -> Vec<u32> {
         let cap = self.params.level_cap(level);
         let base = self.nodes[node as usize].vector.clone();
         let cands: Vec<(f32, u32)> = neighbours
             .into_iter()
             .map(|n| (self.dist(&base, &self.nodes[n as usize].vector), n))
             .collect();
-        let keep = self.select(cands, cap);
-        self.nodes[node as usize].links[level] = keep;
+        self.select(cands, cap)
     }
 
     fn insert_vector(&mut self, row: u64, vector: &[f32]) {
@@ -299,17 +316,7 @@ impl Hnsw {
         for lc in (0..=level.min(self.max_level)).rev() {
             let found = self.search_layer(&query, &entries, self.params.ef_construction, lc);
             let selected = self.select(found.clone(), self.params.level_cap(lc));
-            self.nodes[id as usize].links[lc] = selected.clone();
-            for &neighbour in &selected {
-                let links = &mut self.nodes[neighbour as usize].links[lc];
-                if links.len() < self.params.level_cap(lc) {
-                    links.push(id);
-                } else {
-                    let mut cands = links.clone();
-                    cands.push(id);
-                    self.link(neighbour, lc, cands);
-                }
-            }
+            self.connect(id, lc, selected);
             entries = found.into_iter().map(|(_, n)| n).collect();
             if entries.is_empty() {
                 entries.push(nearest);
@@ -318,6 +325,200 @@ impl Hnsw {
         if level > self.max_level {
             self.entry = Some(id);
             self.max_level = level;
+        }
+    }
+
+    /// Set `id`'s links on `level` to `selected`, then add the reverse link
+    /// to each neighbour, pruning an over-full neighbour list with the same
+    /// heuristic. Shared by the sequential insert and the batch commit.
+    fn connect(&mut self, id: u32, level: usize, selected: Vec<u32>) {
+        self.nodes[id as usize].links[level] = selected.clone();
+        for &neighbour in &selected {
+            let links = &mut self.nodes[neighbour as usize].links[level];
+            if links.len() < self.params.level_cap(level) {
+                links.push(id);
+            } else {
+                let mut cands = links.clone();
+                cands.push(id);
+                self.link(neighbour, level, cands);
+            }
+        }
+    }
+
+    /// Batched build: seed sequentially, then parallel-search /
+    /// sequential-commit batches (see `SEED`). Deterministic for a given
+    /// row order at any thread count, including the sequential fallback.
+    fn insert_bulk(&mut self, rows: &[(u64, &[f32])]) {
+        let mut pos = 0;
+        while pos < rows.len() && self.nodes.len() < SEED {
+            self.insert_vector(rows[pos].0, rows[pos].1);
+            pos += 1;
+        }
+        while pos < rows.len() {
+            let end = (pos + BATCH).min(rows.len());
+            self.insert_one_batch(&rows[pos..end]);
+            pos = end;
+        }
+    }
+
+    fn insert_one_batch(&mut self, batch: &[(u64, &[f32])]) {
+        // Levels first, in insert order, from the one RNG stream: batching
+        // must not change the level (or the serialized RNG state) of any row.
+        let levels: Vec<usize> = batch.iter().map(|_| self.random_level()).collect();
+        // Replacements tombstone the frozen node before the search, as a
+        // sequential insert would; a row repeated in the batch supersedes
+        // its earlier copy, which is pushed below as a linkless tombstone.
+        let mut superseded = vec![false; batch.len()];
+        let mut seen: HashMap<u64, usize> = HashMap::new();
+        for (i, &(row, _)) in batch.iter().enumerate() {
+            if let Some(&prev) = seen.get(&row) {
+                superseded[prev] = true;
+            }
+            seen.insert(row, i);
+            if let Some(old) = self.row_to_node.remove(&row) {
+                let node = &mut self.nodes[old as usize];
+                if !node.deleted {
+                    node.deleted = true;
+                    self.live -= 1;
+                }
+            }
+        }
+        let base = self.nodes.len();
+        let frozen_entry = self.entry;
+        let frozen_max = self.max_level;
+        // Push every node first (selection reads peer vectors). The batch
+        // nodes have no links yet and no frozen link points at them, so the
+        // searches below still see exactly the frozen graph.
+        for (i, &(row, vector)) in batch.iter().enumerate() {
+            self.nodes.push(Node {
+                row,
+                level: levels[i] as u8,
+                deleted: superseded[i],
+                vector: vector.to_vec(),
+                links: vec![Vec::new(); levels[i] + 1],
+            });
+            if !superseded[i] {
+                self.live += 1;
+                self.row_to_node.insert(row, (base + i) as u32);
+            }
+        }
+        // Parallel phase: read-only against the frozen graph, ending in
+        // each node's selected neighbours per level (selection is pure:
+        // it reads vectors only). Every task writes only its own slot and
+        // `collect` keeps insert order, so the selections cannot depend
+        // on scheduling or thread count.
+        let search = |i: usize| -> Vec<Vec<u32>> {
+            let query = batch[i].1;
+            let level = levels[i];
+            let mut frozen: Vec<Vec<(f32, u32)>> = vec![Vec::new(); level + 1];
+            let mut peers: Vec<Vec<(f32, u32)>> = vec![Vec::new(); level + 1];
+            if let Some(entry) = frozen_entry {
+                let mut nearest = entry;
+                for lc in ((level + 1)..=frozen_max).rev() {
+                    nearest = self.greedy(query, nearest, lc);
+                }
+                let mut entries = vec![nearest];
+                for lc in (0..=level.min(frozen_max)).rev() {
+                    let found = self.search_layer(query, &entries, self.params.ef_construction, lc);
+                    entries = found.iter().map(|&(_, n)| n).collect();
+                    if entries.is_empty() {
+                        entries.push(nearest);
+                    }
+                    frozen[lc] = found;
+                }
+            }
+            // Batch peers are not in the frozen graph yet: an exact pass so
+            // near-duplicates in one batch still find each other. A peer is
+            // only a candidate on levels it actually has.
+            for (j, &(_, peer)) in batch.iter().enumerate() {
+                if j == i || superseded[j] {
+                    continue;
+                }
+                let d = self.dist(query, peer);
+                for cand in peers.iter_mut().take(level.min(levels[j]) + 1) {
+                    cand.push((d, (base + j) as u32));
+                }
+            }
+            // Select from peers and from the frozen graph separately, then
+            // merge (peers first) and cap. One joint selection would let
+            // near peers diversity-reject every frozen candidate — exact
+            // duplicates do exactly that — leaving the batch as an island
+            // with no edges to the old graph.
+            (0..=level)
+                .map(|lc| {
+                    let cap = self.params.level_cap(lc);
+                    let mut selected = self.select(peers[lc].clone(), cap);
+                    for node in self.select(frozen[lc].clone(), cap) {
+                        if !selected.contains(&node) {
+                            selected.push(node);
+                        }
+                    }
+                    selected.truncate(cap);
+                    selected
+                })
+                .collect()
+        };
+        let empty = |i: usize| vec![Vec::new(); levels[i] + 1];
+        #[cfg(not(target_arch = "wasm32"))]
+        let selections: Vec<Vec<Vec<u32>>> = {
+            use rayon::prelude::*;
+            (0..batch.len())
+                .into_par_iter()
+                .map(|i| if superseded[i] { empty(i) } else { search(i) })
+                .collect()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let selections: Vec<Vec<Vec<u32>>> = (0..batch.len())
+            .map(|i| if superseded[i] { empty(i) } else { search(i) })
+            .collect();
+        // Commit, in insert order: set each node's own links, remember the
+        // reverse additions per (neighbour, level) in insert order, and
+        // update the entry point. No graph search happens here.
+        let mut reverse: HashMap<(u32, usize), Vec<u32>> = HashMap::new();
+        for (i, _) in batch.iter().enumerate() {
+            if superseded[i] {
+                continue;
+            }
+            let id = (base + i) as u32;
+            for (lc, selected) in selections[i].iter().enumerate() {
+                for &neighbour in selected {
+                    reverse.entry((neighbour, lc)).or_default().push(id);
+                }
+                self.nodes[id as usize].links[lc] = selected.clone();
+            }
+            if self.entry.is_none() || levels[i] > self.max_level {
+                self.entry = Some(id);
+                self.max_level = levels[i];
+            }
+        }
+        // Apply the reverse additions. Each (neighbour, level) list is
+        // independent and its additions are already in insert order, so
+        // this phase is parallel too; the sequential replay of one list is
+        // exactly the push-or-prune a sequential commit would have done.
+        let additions: Vec<((u32, usize), Vec<u32>)> = reverse.into_iter().collect();
+        let apply = |((node, lc), adds): &((u32, usize), Vec<u32>)| {
+            let cap = self.params.level_cap(*lc);
+            let mut list = self.nodes[*node as usize].links[*lc].clone();
+            for &id in adds {
+                if list.len() < cap {
+                    list.push(id);
+                } else {
+                    let mut cands = list.clone();
+                    cands.push(id);
+                    list = self.pruned(*node, *lc, cands);
+                }
+            }
+            ((*node, *lc), list)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let applied: Vec<((u32, usize), Vec<u32>)> = {
+            use rayon::prelude::*;
+            additions.par_iter().map(apply).collect()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let applied: Vec<((u32, usize), Vec<u32>)> = additions.iter().map(apply).collect();
+        for ((node, lc), list) in applied {
+            self.nodes[node as usize].links[lc] = list;
         }
     }
 
@@ -572,6 +773,22 @@ impl VectorIndex for Hnsw {
         Ok(())
     }
 
+    fn insert_batch(&mut self, rows: &[(u64, &[f32])]) -> Result<()> {
+        // Validate everything before mutating, so a bad row cannot leave a
+        // half-applied batch behind.
+        for (_, vector) in rows {
+            if vector.len() != self.dim {
+                return Err(PinkDbError::Execution(format!(
+                    "vector index expects {} dimensions, got {}",
+                    self.dim,
+                    vector.len()
+                )));
+            }
+        }
+        self.insert_bulk(rows);
+        Ok(())
+    }
+
     fn delete(&mut self, row: u64) {
         if let Some(node) = self.row_to_node.remove(&row) {
             let n = &mut self.nodes[node as usize];
@@ -734,6 +951,133 @@ mod tests {
         assert_eq!(
             a.search(q, 10, None).unwrap(),
             c.search(q, 10, None).unwrap()
+        );
+    }
+
+    fn bulk_build(data: &[Vec<f32>]) -> Hnsw {
+        let mut index = Hnsw::new(32, Metric::L2Sq, Params::default());
+        let rows: Vec<(u64, &[f32])> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v.as_slice()))
+            .collect();
+        index.insert_batch(&rows).unwrap();
+        index
+    }
+
+    #[test]
+    fn batch_below_seed_matches_sequential_build() {
+        let data = clustered(500, 6);
+        let mut sequential = Hnsw::new(6, Metric::Cosine, Params::default());
+        for (row, v) in data.iter().enumerate() {
+            sequential.insert(row as u64, v).unwrap();
+        }
+        let mut bulk = Hnsw::new(6, Metric::Cosine, Params::default());
+        let rows: Vec<(u64, &[f32])> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v.as_slice()))
+            .collect();
+        bulk.insert_batch(&rows).unwrap();
+        assert_eq!(sequential.serialize().unwrap(), bulk.serialize().unwrap());
+    }
+
+    #[test]
+    fn batch_build_is_thread_count_independent() {
+        // 20k x 32 clustered set, built under pools of 1, 2, 4 and 8.
+        let data: Vec<Vec<f32>> = (0..20_000)
+            .map(|i| {
+                let cluster = (i % 16) as f32;
+                (0..32)
+                    .map(|d| cluster * 4.0 + (((i * 31 + d * 17) % 89) as f32 / 89.0))
+                    .collect()
+            })
+            .collect();
+        let mut reference: Option<Vec<u8>> = None;
+        for threads in [1usize, 2, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let bytes = pool.install(|| bulk_build(&data).serialize().unwrap());
+            match &reference {
+                None => reference = Some(bytes),
+                Some(expected) => assert_eq!(*expected, bytes, "{threads} threads"),
+            }
+        }
+    }
+
+    #[test]
+    fn batch_boundary_cases_round_trip() {
+        // n < SEED, n = SEED, n = SEED + 1, several batches.
+        for n in [17usize, SEED, SEED + 1, SEED + 3 * BATCH + 5] {
+            let data = clustered(n, 4);
+            let mut index = Hnsw::new(4, Metric::L2Sq, Params::default());
+            // Rebuild at this dim: `bulk_build` is fixed at 32.
+            let rows: Vec<(u64, &[f32])> = data
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as u64, v.as_slice()))
+                .collect();
+            index.insert_batch(&rows).unwrap();
+            assert_eq!(index.stats().live, n, "n={n}");
+            let bytes = index.serialize().unwrap();
+            let back = Hnsw::from_serialized(&bytes).unwrap();
+            assert_eq!(bytes, back.serialize().unwrap(), "n={n}");
+            // `clustered` repeats vectors with period 776, so the top hit
+            // need not be the last row itself — only an identical vector.
+            let (dist, row) = back.search(&data[n - 1], 1, None).unwrap()[0];
+            assert_eq!(dist, 0.0, "n={n}");
+            assert_eq!(data[row as usize], data[n - 1], "n={n}");
+        }
+    }
+
+    #[test]
+    fn batch_of_exact_duplicates_all_stay_live_and_searchable() {
+        let mut data = clustered(SEED, 4);
+        let dup = vec![42.0, 42.0, 42.0, 42.0];
+        data.extend((0..BATCH).map(|_| dup.clone()));
+        let mut index = Hnsw::new(4, Metric::L2Sq, Params::default());
+        let rows: Vec<(u64, &[f32])> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v.as_slice()))
+            .collect();
+        index.insert_batch(&rows).unwrap();
+        assert_eq!(index.stats().live, SEED + BATCH);
+        let hits = index.search(&dup, 10, None).unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|(_, row)| *row >= SEED as u64), "{hits:?}");
+    }
+
+    #[test]
+    fn a_batch_can_raise_max_level() {
+        // White-box: one batch on an empty graph (the seed phase bypassed),
+        // so the entry point and max level come from the batch commit.
+        // M = 2 draws high levels often; the fixed seed makes this stable.
+        let data = clustered(BATCH, 4);
+        let params = Params {
+            m: 2,
+            m0: 4,
+            ..Params::default()
+        };
+        let mut index = Hnsw::new(4, Metric::L2Sq, params);
+        let rows: Vec<(u64, &[f32])> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v.as_slice()))
+            .collect();
+        index.insert_one_batch(&rows);
+        let entry = index.entry.expect("batch sets an entry point");
+        assert!(index.max_level >= 2, "max_level={}", index.max_level);
+        assert_eq!(
+            index.nodes[entry as usize].level as usize, index.max_level,
+            "the entry point sits at the max level"
+        );
+        let bytes = index.serialize().unwrap();
+        assert_eq!(
+            bytes,
+            Hnsw::from_serialized(&bytes).unwrap().serialize().unwrap()
         );
     }
 

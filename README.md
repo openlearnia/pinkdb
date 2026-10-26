@@ -2144,6 +2144,20 @@ including after a crash replay. `FLOAT[N]` and `DOUBLE[N]` columns are
 indexed; a `DOUBLE` vector is narrowed to `f32` in the graph, while the exact
 path keeps `f64`.
 
+**Parallel build (wave 107d).** Creating an index (and appending at
+least 32 rows to an indexed table) builds in parallel: batches of
+vectors are searched against the graph frozen at the batch start on
+rayon's pool — `RAYON_NUM_THREADS` sizes it, as for the rest of the
+engine — then linked in insert order. The batch size is a fixed
+constant, never derived from the thread count, so 1, 4 or 16 threads
+produce **byte-identical graphs**: a replica or a crash replay rebuilds
+exactly the original index. The first 1,024 vectors and single-row
+inserts keep the sequential path, so small graphs are exactly the 107b
+graphs. Measured on an Apple M4: 100k × 768 builds in 30.4 s on all
+cores versus 111.5 s sequential (3.7×), and 1M × 128 in 139.1 s versus
+867 s (6.2×), with recall@10 at `ef_search` 64 of 0.878 and 0.751
+respectively (sequential: 0.874 and 0.740 — never worse).
+
 **The rewrite.** The optimizer replaces exactly
 `ORDER BY <distance>(col, constant) ASC LIMIT k` over a native table's indexed
 `ARRAY` column with a `VectorTopK` index scan, when the function matches the
@@ -2186,14 +2200,14 @@ queries, release build, `recall@10` against exact:
 
 | set | build | graph | ef | recall@10 | p50 / p95 |
 |---|---|---|---|---|---|
-| 100k × 768 | 94.5 s | 318 MB | 16 | 0.522 | 0.53 / 0.58 ms |
-| | | | 64 | 0.874 | 0.86 / 0.92 ms |
-| | | | 128 | 0.963 | 1.13 / 1.22 ms |
-| | | | 256 | 0.992 | 1.43 / 1.55 ms |
-| 1M × 128 | 867 s | 617 MB | 16 | 0.414 | 0.26 / 0.43 ms |
-| | | | 64 | 0.740 | 0.49 / 0.56 ms |
-| | | | 128 | 0.862 | 0.76 / 0.87 ms |
-| | | | 256 | 0.926 | 1.22 / 1.36 ms |
+| 100k × 768 | 30.4 s | 319 MB | 16 | 0.535 | 0.55 / 0.61 ms |
+| | | | 64 | 0.878 | 0.92 / 0.99 ms |
+| | | | 128 | 0.961 | 1.19 / 1.28 ms |
+| | | | 256 | 0.991 | 1.51 / 1.61 ms |
+| 1M × 128 | 139 s | 632 MB | 16 | 0.423 | 0.37 / 0.95 ms |
+| | | | 64 | 0.751 | 0.48 / 0.54 ms |
+| | | | 128 | 0.883 | 0.76 / 0.79 ms |
+| | | | 256 | 0.956 | 1.23 / 1.31 ms |
 
 Exact brute force over the same stores takes 18.0/18.4 ms and 69.6/94.3 ms
 (p50/p95) with the plain `ORDER BY … LIMIT` top-k heap; the index is 20–140×

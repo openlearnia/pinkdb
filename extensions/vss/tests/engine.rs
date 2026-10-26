@@ -350,6 +350,31 @@ fn recall_on_clustered_100k_is_at_least_95_percent() {
 }
 
 #[test]
+fn parallel_build_matches_crash_replay() {
+    register();
+    let dir = scratch("bulkcrash");
+    let path = dir.join("store.pink");
+    let mut db = PinkDb::open_durable(path.to_str().unwrap()).unwrap();
+    db.load_extension_package("vss").unwrap();
+    // Past the 1,024-vector seed and several 256-vector batches, then a
+    // multi-row INSERT into the indexed table (also the bulk path).
+    create_table(&mut db, "items", 3000, 8, 8);
+    db.execute("CREATE INDEX items_vec ON items USING HNSW (v) WITH (metric = 'l2sq');")
+        .unwrap();
+    insert_rows(&mut db, "items", 3000, 4500, 8, 8);
+    let q = vector_sql(&vector(4000, 8, 8));
+    let sql = format!("SELECT id FROM items ORDER BY array_distance(v, {q}) LIMIT 10");
+    let expected = ids(&mut db, &sql);
+    let graph = db.to_pink_bytes().unwrap();
+    drop(db);
+
+    let mut replayed = PinkDb::open_durable(path.to_str().unwrap()).unwrap();
+    assert_eq!(ids(&mut replayed, &sql), expected);
+    assert_eq!(replayed.to_pink_bytes().unwrap(), graph);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn wal_replay_after_a_checkpoint_applies_to_the_pending_graph() {
     register();
     let dir = scratch("walpending");

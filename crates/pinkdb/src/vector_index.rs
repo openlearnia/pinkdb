@@ -48,6 +48,16 @@ pub trait VectorIndex: Send + Sync + Debug {
     fn dim(&self) -> usize;
     /// Add one row. An existing row is replaced (delete + insert).
     fn insert(&mut self, row: u64, vector: &[f32]) -> Result<()>;
+    /// Add many rows, in the given order. The default is a loop over
+    /// [`Self::insert`]; a provider may override it with a bulk build so
+    /// long as the result depends only on the rows and their order (wave
+    /// 107d: the HNSW build is parallel yet thread-count independent).
+    fn insert_batch(&mut self, rows: &[(u64, &[f32])]) -> Result<()> {
+        for (row, vector) in rows {
+            self.insert(*row, vector)?;
+        }
+        Ok(())
+    }
     /// Tombstone one row; it stays in the graph for connectivity.
     fn delete(&mut self, row: u64);
     /// Apply a physical row-number shift after a DELETE.

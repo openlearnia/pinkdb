@@ -196,6 +196,11 @@ progress log</a>.</p>
 <ul>
 <li>The agent's default model is now z.ai's <code>glm-5.3</code> (was <code>glm-4.6</code>); <code>PINKDB_AGENT_MODEL=glm-5.3-flash</code> picks the faster, cheaper variant. Both are reasoning models: their hidden reasoning tokens count against the token budget and are recorded in <code>usage</code> like any other completion tokens.</li>
 </ul>
+<h3>Wave 107d — parallel HNSW build ✅</h3>
+<ul>
+<li><strong>Parallel, still deterministic.</strong> <code>CREATE INDEX … USING HNSW</code> and multi-row inserts into an indexed table now build in parallel (batched insertion in <code>pinkdb-vss</code>: parallel search against the graph frozen at each batch start, sequential in-order commit). The graph depends only on the data and the insert order — 1, 4 or 16 threads produce byte-identical graphs, so a replica or a WAL crash replay rebuilds exactly the original index. Small appends (under 32 rows) and single-row inserts keep the sequential path; graphs of at most 1,024 vectors are unchanged from 107b. Threads come from rayon's global pool (<code>RAYON_NUM_THREADS</code> applies); no new crates.</li>
+<li><strong>Measured (Apple M4, release).</strong> 100k × 768 build 111.5 s sequential → 32.1 s at 4 threads (3.5×), 30.4 s on all cores (3.7×), recall@10 0.878 at ef_search 64 (sequential 0.874). 1M × 128 build 867 s → 139.1 s (6.2×), recall 0.751 (sequential 0.740). Search latency is unchanged.</li>
+</ul>
 <h3>Wave 107b — vector similarity search ✅</h3>
 <ul>
 <li><strong>Distance functions (core SQL).</strong> <code>array_distance</code> / <code>array_l2_distance</code> (Euclidean, not squared), <code>array_cosine_distance</code>, <code>array_cosine_similarity</code>, <code>array_inner_product</code> and <code>array_negative_inner_product</code> over fixed-length <code>FLOAT[N]</code>/<code>DOUBLE[N]</code> arrays. <code>DOUBLE</code>/mixed inputs compute in <code>f64</code>, <code>FLOAT</code>/<code>FLOAT</code> in <code>f32</code> and return <code>DOUBLE</code> (pinkdb has no scalar <code>FLOAT</code>; DuckDB returns <code>FLOAT</code>, and the widened values agree). A <code>NULL</code> array gives <code>NULL</code>; a <code>NULL</code> element or mismatched lengths is a clear error, as in DuckDB. The constant query vector is folded once at bind time and broadcast per chunk.</li>

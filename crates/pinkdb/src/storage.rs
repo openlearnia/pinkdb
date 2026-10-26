@@ -170,6 +170,37 @@ impl VectorIndexDef {
     }
 }
 
+/// Append-buffer size for vector-index maintenance, and the count at which
+/// an append switches from per-row `insert` to the provider's bulk build
+/// (wave 107d). Small appends keep the exact sequential path; the buffer is
+/// a multiple of the HNSW batch size, so flushing never re-segments a build.
+const VECTOR_APPEND_BUFFER: usize = 1024;
+const VECTOR_BATCH_MIN: usize = 32;
+
+fn flush_vector_rows(
+    def: &mut VectorIndexDef,
+    table: &str,
+    pending: &mut Vec<(u64, Vec<f32>)>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let index = def.writable(table)?;
+    if pending.len() >= VECTOR_BATCH_MIN {
+        let refs: Vec<(u64, &[f32])> = pending
+            .iter()
+            .map(|(row, vector)| (*row, vector.as_slice()))
+            .collect();
+        index.insert_batch(&refs)?;
+    } else {
+        for (row, vector) in pending.iter() {
+            index.insert(*row, vector)?;
+        }
+    }
+    pending.clear();
+    Ok(())
+}
+
 /// A single-column hash index: maps a key value to the global row indices
 /// (flattened across chunks) where it occurs. NULL keys are not stored
 /// (NULL never matches `=`).
@@ -605,6 +636,8 @@ impl DataTable {
                     continue;
                 };
                 let n = n as usize;
+                let table = self.name.clone();
+                let mut pending: Vec<(u64, Vec<f32>)> = Vec::new();
                 let mut offset = 0usize;
                 for chunk in &column.chunks {
                     let len = chunk.len();
@@ -615,11 +648,15 @@ impl DataTable {
                             else {
                                 continue;
                             };
-                            def.writable(&self.name)?.insert(global, &vector)?;
+                            pending.push((global, vector));
+                            if pending.len() == VECTOR_APPEND_BUFFER {
+                                flush_vector_rows(def, &table, &mut pending)?;
+                            }
                         }
                     }
                     offset += len;
                 }
+                flush_vector_rows(def, &table, &mut pending)?;
             }
             Ok(())
         })();
@@ -2920,16 +2957,24 @@ impl PinkDb {
         };
         let mut index = provider.create(dim, options)?;
         // Build before touching the catalog: a failed build leaves no index.
+        // One bulk call per chunk (wave 107d): the provider parallelises
+        // the build, and chunk-sized calls bound the copied vectors.
         {
             let t = self.table_in(db, table)?;
             let col = &t.columns[column];
             let mut offset = 0usize;
             for chunk in &col.chunks {
-                for row in 0..chunk.len() {
-                    if let Some(vector) = crate::vector_index::row_vector(chunk, row, dim) {
-                        index.insert((offset + row) as u64, &vector)?;
-                    }
-                }
+                let rows: Vec<(u64, Vec<f32>)> = (0..chunk.len())
+                    .filter_map(|row| {
+                        crate::vector_index::row_vector(chunk, row, dim)
+                            .map(|vector| ((offset + row) as u64, vector))
+                    })
+                    .collect();
+                let refs: Vec<(u64, &[f32])> = rows
+                    .iter()
+                    .map(|(row, vector)| (*row, vector.as_slice()))
+                    .collect();
+                index.insert_batch(&refs)?;
                 offset += chunk.len();
             }
         }
