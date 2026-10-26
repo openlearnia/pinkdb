@@ -219,6 +219,7 @@ pub fn error_kind(err: &PinkDbError) -> &'static str {
         PinkDbError::Parse(_) => "parse",
         PinkDbError::Parameter(_) => "parameter",
         PinkDbError::Execution(_) => "execution",
+        PinkDbError::Permission(_) => "permission",
         PinkDbError::Io(_) => "io",
         PinkDbError::Csv(_) => "csv",
     }

@@ -39,6 +39,11 @@ ui = ["dep:pinkdb-server-ui"]
 fts = ["dep:pinkdb-fts"]
 # `fts` plus a custom `ignore` regex (pinkdb-fts/custom-ignore).
 fts-regex = ["fts", "pinkdb-fts/custom-ignore"]
+# Opt-in embeddings (wave 107c): publishes the `pinkdb-embeddings` package and
+# loads it into the store the server opens, so `embed(text)` works without a
+# client `LOAD EXTENSION`. Off by default: the default server binary is
+# unchanged.
+embeddings = ["dep:pinkdb-embeddings"]
 [lib]
 name = "pinkdb_server"
 path = "src/lib.rs"
@@ -51,6 +56,8 @@ path = "src/bin/pinkdb-server.rs"
 pinkdb = { path = "../pinkdb" }
 # Opt-in full-text search (wave 108a): the BM25 package.
 pinkdb-fts = { path = "../../extensions/fts", optional = true }
+# Opt-in embeddings (wave 107c): the `embed(text)` package.
+pinkdb-embeddings = { path = "../../extensions/embeddings", optional = true }
 # `--catalog` mode (wave 96b): the lake catalog and data store, only with the
 # `catalog` feature (see above).
 pink-lake = { path = "../pink-lake", optional = true }

@@ -1654,6 +1654,7 @@ dependencies = [
  "pinkdb",
  "pinkdb-arrow",
  "pinkdb-datetime",
+ "pinkdb-embeddings",
  "pinkdb-ext-loader",
  "pinkdb-fts",
  "pinkdb-httpfs",
@@ -1674,6 +1675,16 @@ version = "0.1.0"
 dependencies = [
  "pinkdb",
  "pinkdb-ext-sdk",
+]
+
+[[package]]
+name = "pinkdb-embeddings"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "serde_json",
+ "sha2 0.10.9",
+ "ureq",
 ]
 
 [[package]]
@@ -1802,6 +1813,7 @@ version = "0.1.0"
 dependencies = [
  "pink-lake",
  "pinkdb",
+ "pinkdb-embeddings",
  "pinkdb-ext-loader",
  "pinkdb-fts",
  "pinkdb-server-ui",

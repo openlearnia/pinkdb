@@ -131,6 +131,8 @@ const FILES_HINT: &str = "external files and URLs are disabled: this session rea
                           (start the server with allow-files to permit read_csv, read_parquet \
                           and file paths)";
 
+pub use crate::package::SERVICES_HINT;
+
 /// What a statement writes, for the two database-confinement rules of
 /// [`ServePolicy`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +331,9 @@ pub fn execute_internal(db: &mut PinkDb, policy: &ServePolicy, sql: &str) -> (i3
     if let Err(error) = checked(policy, sql, Some(&*db)) {
         return (1, error);
     }
+    // The statement's own executor enforces this for calls that only bind
+    // after an earlier statement of the batch ran (wave 107c).
+    db.set_external_services(policy.allow_files);
     match db.execute_with_limits(sql, policy.limits) {
         Ok(results) => (0, render_json(&results)),
         Err(e) => (1, agent::error_json_for(&e, sql)),
@@ -422,6 +427,10 @@ pub trait Session {
     /// The store, for wave 99's cost hint; `None` where the hint is not
     /// reachable (a connection's store is behind the shared lock).
     fn hint_store(&self) -> Option<&PinkDb>;
+
+    /// Install the policy's external-services switch for the next statement
+    /// (wave 107c): refused calls fail at the call site, before any request.
+    fn set_external_services(&mut self, allowed: bool);
 }
 
 impl Session for PinkDb {
@@ -431,6 +440,10 @@ impl Session for PinkDb {
 
     fn hint_store(&self) -> Option<&PinkDb> {
         Some(self)
+    }
+
+    fn set_external_services(&mut self, allowed: bool) {
+        PinkDb::set_external_services(self, allowed);
     }
 }
 
@@ -442,6 +455,10 @@ impl Session for crate::db::Connection {
 
     fn hint_store(&self) -> Option<&PinkDb> {
         None
+    }
+
+    fn set_external_services(&mut self, allowed: bool) {
+        crate::db::Connection::set_external_services(self, allowed);
     }
 }
 
@@ -495,6 +512,7 @@ fn run(db: &mut PinkDb, policy: &ServePolicy, sql: &str) -> std::result::Result<
         return command(db, text, !policy.allow_writes);
     }
     let statements = checked(policy, sql, Some(&*db))?;
+    db.set_external_services(policy.allow_files);
     render(db, policy, sql, &statements)
 }
 
@@ -504,6 +522,7 @@ fn run_on<R: Session + ?Sized>(
     sql: &str,
 ) -> std::result::Result<String, String> {
     let statements = checked(policy, sql, session.hint_store())?;
+    session.set_external_services(policy.allow_files);
     render(session, policy, sql, &statements)
 }
 
@@ -568,33 +587,45 @@ fn checked(
     }
     if !policy.allow_files
         && let Some(db) = store
-        && statements.iter().any(|s| scans_files(db, s))
     {
-        return Err(agent::error_json(FILES_HINT, "permission", None));
+        for statement in &statements {
+            if let Some(hint) = external_reason(db, statement) {
+                return Err(agent::error_json(hint, "permission", None));
+            }
+        }
     }
     Ok(statements)
 }
 
-/// Whether one statement would read external data.
+/// Why one statement would reach outside the store, or `None`.
 ///
 /// Two checks, because either alone has a blind spot. The syntax check sees
 /// a file source before binding, so it also holds on a host with no file
 /// source registered (where binding fails and nothing could be read anyway).
 /// The plan check sees what the binder rewrites a plain `FROM` into — a view
 /// over `read_csv`, say — and reaches table functions inside expressions.
-fn scans_files(db: &PinkDb, statement: &Statement) -> bool {
+/// The dynamic functions the binder recorded are checked in between: a host
+/// scalar that declared itself external I/O is gated by the same switch.
+fn external_reason(db: &PinkDb, statement: &Statement) -> Option<&'static str> {
     if ast_scans_files(statement) {
-        return true;
+        return Some(FILES_HINT);
     }
     let session_db = db.current_db().to_string();
-    let Ok((plan, _)) = crate::sql::bind_tracked(db, statement, &session_db) else {
-        return false;
+    let Ok((plan, dynamic)) = crate::sql::bind_tracked(db, statement, &session_db) else {
+        return None;
     };
+    if dynamic
+        .iter()
+        .any(|name| db.host_scalar(name).is_some_and(|h| h.is_external_io()))
+    {
+        return Some(crate::package::SERVICES_HINT);
+    }
     crate::plan::contains_table_function(&crate::optimizer::optimize(db, plan))
+        .then_some(FILES_HINT)
 }
 
-/// The syntactic half of [`scans_files`]: any `FROM` source that is a call or
-/// a bare path, in every `SELECT` of the statement (CTEs, derived tables,
+/// The syntactic half of [`external_reason`]: any `FROM` source that is a call
+/// or a bare path, in every `SELECT` of the statement (CTEs, derived tables,
 /// joins, set-operation arms).
 fn ast_scans_files(statement: &Statement) -> bool {
     match statement {

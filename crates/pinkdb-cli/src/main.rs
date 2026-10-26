@@ -143,6 +143,12 @@ fn register_builtin_extensions() {
     if let Err(e) = pinkdb_fts::ensure_registered() {
         eprintln!("warning: the fts extension could not be registered: {e}");
     }
+    // The embeddings package fixes its `FLOAT[N]` width when it is published,
+    // so the variable must be read before the first store exists.
+    #[cfg(feature = "embeddings")]
+    if let Err(e) = pinkdb_embeddings::ensure_registered() {
+        eprintln!("warning: the embeddings extension could not be registered: {e}");
+    }
     // The arrow and parquet extensions are engine-adjacent, not scalar
     // extensions: they register their file surfaces process-wide, before any
     // store is created, so a durable `.open` can resolve file sources while
@@ -192,6 +198,12 @@ fn load_builtin_extensions(#[allow(unused_variables)] db: &mut PinkDb) {
         && let Err(e) = db.load_extension_package(pinkdb_fts::EXTENSION_NAME)
     {
         eprintln!("warning: the fts extension could not be loaded: {e}");
+    }
+    #[cfg(feature = "embeddings")]
+    if !db.is_extension_loaded(pinkdb_embeddings::EXTENSION_NAME)
+        && let Err(e) = db.load_extension_package(pinkdb_embeddings::EXTENSION_NAME)
+    {
+        eprintln!("warning: the embeddings extension could not be loaded: {e}");
     }
 }
 

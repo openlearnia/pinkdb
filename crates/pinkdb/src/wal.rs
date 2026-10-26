@@ -3,7 +3,7 @@
 //! For `<path>.pink` the log is a sidecar `<path>.pink.wal`:
 //!
 //! ```text
-//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=4)
+//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=5)
 //!          + generation u64 + wal_id [16] + crc32(0..36) u32
 //!          + commit slot A (24 bytes) + commit slot B (24 bytes)
 //!          + reserved zero u32×2
@@ -19,10 +19,14 @@
 //! the frame's **touched set** ([`FrameSets`]): every catalog table the
 //! frame's statements read or wrote (plus databases its `CREATE/DROP
 //! DATABASE` names), cleared to `sets_len = u32::MAX` for legacy records an
-//! upgrade adopted. Version 2/3 WALs are accepted and upgraded in place under
-//! the write lease (records are re-encoded with unknown sets); older builds
-//! refuse version 4 cleanly through the `BadVersion` path before reading any
-//! record. Encrypted **WAL** containers are version 3; encrypted checkpoints
+//! upgrade adopted. Version 5 (wave 107c) appends the frame's **replay
+//! memo** ([`ExtCall`]): the `(function, arguments) → result` pairs of every
+//! `external_io` host scalar the frame called, so replay answers those calls
+//! from the record instead of calling out; a frame that called none carries
+//! an empty memo. Version 2/3 WALs are accepted and upgraded in place under
+//! the write lease (records are re-encoded with unknown sets and an empty
+//! memo); older builds refuse version 5 cleanly through the `BadVersion`
+//! path before reading any record. Encrypted **WAL** containers are version 3; encrypted checkpoints
 //! stay at container version 2, so `.pink` bytes are unchanged by this wave.
 //!
 //! # Multi-process access (wave 45m) and optimistic commits (wave 45o)
@@ -194,6 +198,7 @@ use std::time::{Duration, Instant};
 
 use crate::crypto::{self, EncryptionKey, RecordCipher, TAG_LEN};
 use crate::storage::PinkDb;
+use crate::types::Value;
 use crate::types::{PinkDbError, Result};
 
 pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
@@ -201,18 +206,19 @@ pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
 /// version 3 (wave 45m) adds `wal_id` and the dual commit slots; version 4
 /// (wave 45o) extends the record payload with the frame's touched-object set
 /// (see [`FrameSets`]), which is what optimistic multi-writer commits
-/// validate against. Every durable open rewrites legacy files in place under
-/// the write lease; an older build refuses a v4 file with a clean
-/// version error before it reads any record.
-pub const WAL_VERSION: u32 = 4;
+/// validate against; version 5 (wave 107c) appends the replay memo of the
+/// record's `external_io` host-scalar calls (see [`ExtCall`]). Every durable
+/// open rewrites legacy files in place under the write lease; an older build
+/// refuses a v5 file with a clean version error before it reads any record.
+pub const WAL_VERSION: u32 = 5;
 /// The wave-45m plaintext version (no per-frame sets): upgraded at open.
 const WAL_VERSION_V3: u32 = 3;
 /// The pre-multi-process plaintext version, accepted and upgraded at open.
 const WAL_VERSION_V2: u32 = 2;
-/// v3/v4 plaintext header: magic(8) + version(4) + generation(8) + wal_id(16) +
+/// v3+ plaintext header: magic(8) + version(4) + generation(8) + wal_id(16) +
 /// crc32(0..36)(4) + slot A(24) + slot B(24) + reserved(8).
 pub(crate) const HEADER_LEN: usize = 96;
-/// Where records begin in a v3/v4 plaintext WAL (== `HEADER_LEN`).
+/// Where records begin in a v3+ plaintext WAL (== `HEADER_LEN`).
 pub(crate) const RECORDS_START: usize = HEADER_LEN;
 /// Where records begin in a v2 plaintext WAL (records are re-encoded by the
 /// upgrade).
@@ -296,6 +302,7 @@ fn force_unsupported() -> bool {
 fn fresh_wal_id() -> WalId {
     use std::hash::{BuildHasher, Hasher};
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let state = std::collections::hash_map::RandomState::new();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1032,6 +1039,59 @@ pub struct RecoveryInfo {
     pub stale_rolls_removed: u64,
 }
 
+/// One recorded result of an `external_io` host scalar, carried in the WAL
+/// record of the statement that called it (payload v5).
+///
+/// The WAL is logical: replay re-executes the logged SQL. A function that
+/// reaches an outside service (a paid embeddings endpoint) cannot be
+/// re-executed by a replay — the service may be unreachable, the key unset,
+/// or the answer different. The executor records `(name, args) -> result` for
+/// every such call while the statement runs, and replay serves the recorded
+/// result instead of calling the function. Deduplicated by `(name, args)`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExtCall {
+    /// Lowercased host-scalar name (as bound).
+    pub(crate) name: String,
+    pub(crate) args: Vec<crate::types::Value>,
+    pub(crate) result: crate::types::Value,
+}
+
+/// The hash key of one `(name, args)` call: the lowercased name and the
+/// arguments in the record's own value encoding. Bits, not `==`: a `DOUBLE`
+/// argument matches exactly (NaN payloads and -0.0 included), and `Value` is
+/// not `Hash`. `None` only for a value too large to encode, which can never
+/// match a recorded call either.
+pub(crate) fn ext_call_key(name: &str, args: &[Value]) -> Option<Vec<u8>> {
+    let mut key = name.to_ascii_lowercase().into_bytes();
+    key.push(0);
+    for arg in args {
+        encode_value(&mut key, arg).ok()?;
+    }
+    Some(key)
+}
+
+/// A record's memo, indexed for replay: one hash lookup per row, so replaying
+/// a million-row backfill is linear, not quadratic.
+#[derive(Debug, Default)]
+pub(crate) struct ReplayMemo {
+    results: std::collections::HashMap<Vec<u8>, Value>,
+}
+
+impl ReplayMemo {
+    pub(crate) fn new(calls: &[ExtCall]) -> Self {
+        let results = calls
+            .iter()
+            .filter_map(|call| Some((ext_call_key(&call.name, &call.args)?, call.result.clone())))
+            .collect();
+        Self { results }
+    }
+
+    /// The recorded result of `name(args)`, if this record made that call.
+    pub(crate) fn get(&self, name: &str, args: &[Value]) -> Option<&Value> {
+        self.results.get(&ext_call_key(name, args)?)
+    }
+}
+
 /// One parsed WAL record.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Record {
@@ -1040,6 +1100,8 @@ pub(crate) struct Record {
     /// The frame's touched-object set (payload v4); `None` = unknown (a
     /// record adopted from a legacy v2/v3 upgrade).
     sets: Option<FrameSets>,
+    /// The external-call memo (payload v5); empty for a legacy record.
+    memo: Vec<ExtCall>,
 }
 
 /// Default WAL size that triggers an automatic checkpoint after a commit
@@ -1475,7 +1537,7 @@ struct OpenedWal {
 }
 
 impl Wal {
-    /// A current-format (v4) plaintext header with the given incarnation id.
+    /// A current-format (v5) plaintext header with the given incarnation id.
     fn header_for(generation: u64, wal_id: &WalId) -> [u8; HEADER_LEN] {
         let mut h = [0u8; HEADER_LEN];
         h[..8].copy_from_slice(WAL_MAGIC);
@@ -1494,8 +1556,8 @@ impl Wal {
     }
 
     /// Create (or recreate) the WAL file at `path` with just a header and
-    /// position it for appends: the plaintext v4 header (fresh `wal_id`), or
-    /// — when `cipher` is given — an encrypted container v4 header plus the
+    /// position it for appends: the plaintext current header (fresh `wal_id`),
+    /// or — when `cipher` is given — an encrypted container header plus the
     /// authenticated 144-byte publish block. The returned fd is opened `append`: a
     /// second process may append between this process's writes, and a
     /// non-append fd would overwrite from its cached offset.
@@ -1814,7 +1876,12 @@ impl Wal {
     /// the frame's touched-object set (payload v4): `None` is reserved for
     /// legacy re-encodes during an upgrade; every live append knows its set,
     /// so optimistic commits can validate against this record later.
-    pub(crate) fn append(&mut self, stmts: &[String], sets: Option<&FrameSets>) -> Result<()> {
+    pub(crate) fn append(
+        &mut self,
+        stmts: &[String],
+        sets: Option<&FrameSets>,
+        memo: &[ExtCall],
+    ) -> Result<()> {
         if let Some(msg) = &self.poisoned {
             return Err(PinkDbError::Execution(format!(
                 "WAL is unusable after an earlier write failure ({msg})"
@@ -1833,7 +1900,7 @@ impl Wal {
         if let Some(s) = &mut sets {
             s.canonicalize();
         }
-        let payload = encode_payload(stmts, sets.as_ref())?;
+        let payload = encode_payload(stmts, sets.as_ref(), memo)?;
         let len = record_len_guard(payload.len())?;
         let lsn = self.last_lsn.checked_add(1).ok_or_else(|| {
             PinkDbError::Execution("WAL LSN space exhausted (u64::MAX)".to_string())
@@ -1940,6 +2007,8 @@ impl Wal {
     /// statement against a vanished database would have failed at execution).
     /// The tracked replay session then becomes unknown, so the next append
     /// prefixes unconditionally.
+    // The arguments are the record's fields, one per column of the payload.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_in_session(
         &mut self,
         db_before: Option<&str>,
@@ -1948,6 +2017,7 @@ impl Wal {
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&FrameSets>,
+        memo: &[ExtCall],
     ) -> Result<()> {
         let mut rec: Vec<String> = Vec::with_capacity(stmts.len() + touched_extensions.len() + 1);
         if let Some(before) = db_before
@@ -1973,7 +2043,7 @@ impl Wal {
             rec.push(format!("LOAD EXTENSION '{}'", path.replace('\'', "''")));
         }
         rec.extend_from_slice(stmts);
-        self.append(&rec, sets)?;
+        self.append(&rec, sets, memo)?;
         // Covered only after a successful append.
         self.tracked_extensions
             .extend(touched_extensions.iter().cloned());
@@ -2300,12 +2370,13 @@ fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
     Ok(sets)
 }
 
-/// Encode a record payload (v4 layout):
-/// `u32 stmt_count | u32 sets_len | sets | stmt_count*(u32 len | UTF-8 SQL)`.
+/// Encode a record payload (v5 layout):
+/// `u32 stmt_count | u32 sets_len | sets | stmt_count*(u32 len | UTF-8 SQL) |
+/// u32 memo_count | memo entries`.
 /// `sets_len` is [`SETS_UNKNOWN`] when the frame's touched set is unknown (a
 /// legacy record adopted by an upgrade), else the [`encode_sets`] block's
 /// byte length.
-fn encode_payload(stmts: &[String], sets: Option<&FrameSets>) -> Result<Vec<u8>> {
+fn encode_payload(stmts: &[String], sets: Option<&FrameSets>, memo: &[ExtCall]) -> Result<Vec<u8>> {
     let count = u32::try_from(stmts.len()).map_err(|_| {
         PinkDbError::Execution("transaction has too many statements for one WAL record".to_string())
     })?;
@@ -2318,6 +2389,7 @@ fn encode_payload(stmts: &[String], sets: Option<&FrameSets>) -> Result<Vec<u8>>
             .map_err(|_| PinkDbError::Execution("frame sets too large".to_string()))?,
         None => SETS_UNKNOWN,
     };
+    let memo_bytes = encode_ext_calls(memo)?;
     let mut total = 8usize + sets_bytes.len();
     for s in stmts {
         let n = u32::try_from(s.len()).map_err(|_| {
@@ -2327,6 +2399,9 @@ fn encode_payload(stmts: &[String], sets: Option<&FrameSets>) -> Result<Vec<u8>>
             PinkDbError::Execution("transaction is too large for one WAL record".to_string())
         })?;
     }
+    total = total.checked_add(memo_bytes.len()).ok_or_else(|| {
+        PinkDbError::Execution("transaction is too large for one WAL record".to_string())
+    })?;
     // Reject oversized payloads before allocating them.
     let _ = record_len_guard(total)?;
     let mut out = Vec::with_capacity(total);
@@ -2337,17 +2412,254 @@ fn encode_payload(stmts: &[String], sets: Option<&FrameSets>) -> Result<Vec<u8>>
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
     }
+    out.extend_from_slice(&memo_bytes);
     debug_assert_eq!(out.len(), total);
     Ok(out)
 }
 
+/// A recorded value's type tag in the WAL memo. The tags are file format, not
+/// an API: change one and the payload version must change with it.
+const VALUE_NULL: u8 = 0;
+const VALUE_BOOLEAN: u8 = 1;
+const VALUE_INTEGER: u8 = 2;
+const VALUE_BIGINT: u8 = 3;
+const VALUE_DOUBLE: u8 = 4;
+const VALUE_VARCHAR: u8 = 5;
+const VALUE_DATE: u8 = 6;
+const VALUE_TIMESTAMP: u8 = 7;
+const VALUE_DECIMAL: u8 = 8;
+const VALUE_INTERVAL: u8 = 9;
+const VALUE_VARIANT: u8 = 10;
+const VALUE_ARRAY: u8 = 11;
+
+fn encode_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let n = u32::try_from(bytes.len()).map_err(|_| {
+        PinkDbError::Execution("a WAL memo value is too large for one record".to_string())
+    })?;
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_value(out: &mut Vec<u8>, value: &crate::types::Value) -> Result<()> {
+    match value {
+        Value::Null => out.push(VALUE_NULL),
+        Value::Boolean(b) => {
+            out.push(VALUE_BOOLEAN);
+            out.push(u8::from(*b));
+        }
+        Value::Integer(i) => {
+            out.push(VALUE_INTEGER);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        Value::Bigint(i) => {
+            out.push(VALUE_BIGINT);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        Value::Double(d) => {
+            out.push(VALUE_DOUBLE);
+            // Bits, not decimal text: the replay must reproduce the value
+            // exactly, including NaN payloads and -0.0.
+            out.extend_from_slice(&d.to_bits().to_le_bytes());
+        }
+        Value::Varchar(s) => {
+            out.push(VALUE_VARCHAR);
+            encode_bytes(out, s.as_bytes())?;
+        }
+        Value::Date(d) => {
+            out.push(VALUE_DATE);
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Timestamp(t) => {
+            out.push(VALUE_TIMESTAMP);
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Decimal(v, scale) => {
+            out.push(VALUE_DECIMAL);
+            out.extend_from_slice(&v.to_le_bytes());
+            out.push(*scale);
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            out.push(VALUE_INTERVAL);
+            out.extend_from_slice(&months.to_le_bytes());
+            out.extend_from_slice(&days.to_le_bytes());
+            out.extend_from_slice(&micros.to_le_bytes());
+        }
+        Value::Variant(v) => {
+            out.push(VALUE_VARIANT);
+            let mut buf = Vec::new();
+            crate::variant::encode(v, &mut buf);
+            encode_bytes(out, &buf)?;
+        }
+        Value::Array(a) => {
+            out.push(VALUE_ARRAY);
+            encode_bytes(out, &crate::array::encode_cell(a))?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_ext_calls(calls: &[ExtCall]) -> Result<Vec<u8>> {
+    let count = u32::try_from(calls.len()).map_err(|_| {
+        PinkDbError::Execution("too many external calls for one WAL record".to_string())
+    })?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&count.to_le_bytes());
+    for call in calls {
+        encode_bytes(&mut out, call.name.as_bytes())?;
+        let argc = u32::try_from(call.args.len()).map_err(|_| {
+            PinkDbError::Execution("too many arguments for an external call".to_string())
+        })?;
+        out.extend_from_slice(&argc.to_le_bytes());
+        for arg in &call.args {
+            encode_value(&mut out, arg)?;
+        }
+        encode_value(&mut out, &call.result)?;
+    }
+    Ok(out)
+}
+
+/// A bounds-checked reader over a decoded payload.
+struct Payload<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Payload<'a> {
+    fn new(bytes: &'a [u8], pos: usize) -> Self {
+        Self { bytes, pos }
+    }
+
+    fn take(&mut self, n: usize) -> std::result::Result<&'a [u8], String> {
+        let end = self.pos.checked_add(n).ok_or("truncated payload")?;
+        if end > self.bytes.len() {
+            return Err("truncated payload".to_string());
+        }
+        let slice = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> std::result::Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> std::result::Result<u32, String> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+    }
+
+    fn i32(&mut self) -> std::result::Result<i32, String> {
+        let bytes = self.take(4)?;
+        Ok(i32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+    }
+
+    fn i64(&mut self) -> std::result::Result<i64, String> {
+        let bytes = self.take(8)?;
+        Ok(i64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+    }
+
+    fn i128(&mut self) -> std::result::Result<i128, String> {
+        let bytes = self.take(16)?;
+        Ok(i128::from_le_bytes(bytes.try_into().expect("16 bytes")))
+    }
+
+    fn bytes(&mut self) -> std::result::Result<&'a [u8], String> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+}
+
+fn decode_value(r: &mut Payload<'_>) -> std::result::Result<Value, String> {
+    let tag = r.u8()?;
+    Ok(match tag {
+        VALUE_NULL => Value::Null,
+        VALUE_BOOLEAN => Value::Boolean(r.u8()? != 0),
+        VALUE_INTEGER => Value::Integer(r.i32()?),
+        VALUE_BIGINT => Value::Bigint(r.i64()?),
+        VALUE_DOUBLE => Value::Double(f64::from_bits(u64::from_le_bytes(
+            r.take(8)?.try_into().expect("8 bytes"),
+        ))),
+        VALUE_VARCHAR => Value::Varchar(
+            std::str::from_utf8(r.bytes()?)
+                .map_err(|_| "WAL memo text is not UTF-8".to_string())?
+                .to_string(),
+        ),
+        VALUE_DATE => Value::Date(r.i32()?),
+        VALUE_TIMESTAMP => Value::Timestamp(r.i64()?),
+        VALUE_DECIMAL => {
+            let value = r.i128()?;
+            let scale = r.u8()?;
+            Value::Decimal(value, scale)
+        }
+        VALUE_INTERVAL => Value::Interval {
+            months: r.i32()?,
+            days: r.i32()?,
+            micros: r.i64()?,
+        },
+        VALUE_VARIANT => {
+            let value = crate::variant::decode(r.bytes()?).map_err(|e| e.to_string())?;
+            Value::Variant(std::sync::Arc::new(value))
+        }
+        VALUE_ARRAY => {
+            let value = crate::array::decode_cell(r.bytes()?).map_err(|e| e.to_string())?;
+            Value::Array(std::sync::Arc::new(value))
+        }
+        other => return Err(format!("unknown WAL memo value tag {other}")),
+    })
+}
+
+/// Decode the memo that ends a v5 payload. A payload that ends with the last
+/// statement (every v4 record, and every v5 record whose statement called no
+/// `external_io` function) has an empty memo.
+fn decode_ext_calls(payload: &[u8], pos: usize) -> std::result::Result<Vec<ExtCall>, String> {
+    if pos == payload.len() {
+        return Ok(Vec::new());
+    }
+    let mut r = Payload::new(payload, pos);
+    let count = r.u32()? as usize;
+    if count > payload.len() / 4 {
+        return Err(format!("implausible external-call count {count}"));
+    }
+    let mut calls = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = std::str::from_utf8(r.bytes()?)
+            .map_err(|_| "WAL memo function name is not UTF-8".to_string())?
+            .to_string();
+        let argc = r.u32()? as usize;
+        // Every encoded value is at least one tag byte, so a count larger
+        // than the remaining payload is corrupt.
+        if argc > r.remaining() {
+            return Err("truncated external-call arguments".to_string());
+        }
+        let mut args = Vec::with_capacity(argc);
+        for _ in 0..argc {
+            args.push(decode_value(&mut r)?);
+        }
+        let result = decode_value(&mut r)?;
+        calls.push(ExtCall { name, args, result });
+    }
+    if r.pos != payload.len() {
+        return Err("trailing bytes after the external-call memo".to_string());
+    }
+    Ok(calls)
+}
+
 /// Decode `count` statements starting at `pos` (each `u32 len | UTF-8 SQL`);
-/// the payload must end exactly there.
+/// returns them and the position just past the last one.
 fn decode_statements(
     payload: &[u8],
     mut pos: usize,
     count: usize,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<(Vec<String>, usize), String> {
     if count > payload.len() / 4 {
         return Err(format!("implausible statement count {count}"));
     }
@@ -2366,25 +2678,29 @@ fn decode_statements(
         stmts.push(s.to_string());
         pos += n;
     }
+    Ok((stmts, pos))
+}
+
+/// Decode a legacy (v2/v3) payload: `u32 count | count*(u32 len | SQL)`. The
+/// frame's touched set is unknown and there is no memo.
+fn decode_payload_legacy(payload: &[u8]) -> std::result::Result<Vec<String>, String> {
+    if payload.len() < 4 {
+        return Err("truncated payload".to_string());
+    }
+    let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
+    let (stmts, pos) = decode_statements(payload, 4, count)?;
     if pos != payload.len() {
         return Err("trailing bytes in payload".to_string());
     }
     Ok(stmts)
 }
 
-/// Decode a legacy (v2/v3) payload: `u32 count | count*(u32 len | SQL)`. The
-/// frame's touched set is unknown.
-fn decode_payload_legacy(payload: &[u8]) -> std::result::Result<Vec<String>, String> {
-    if payload.len() < 4 {
-        return Err("truncated payload".to_string());
-    }
-    let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
-    decode_statements(payload, 4, count)
-}
+/// A decoded payload: its statements, the touched sets and the replay memo.
+type PayloadParts = (Vec<String>, Option<FrameSets>, Vec<ExtCall>);
 
-/// Bounds-checked v4 payload decode. `Err` means a CRC-valid record is
+/// Bounds-checked v4/v5 payload decode. `Err` means a CRC-valid record is
 /// malformed (hard error on replay, never a silent drop).
-fn decode_payload(payload: &[u8]) -> std::result::Result<(Vec<String>, Option<FrameSets>), String> {
+fn decode_payload(payload: &[u8]) -> std::result::Result<PayloadParts, String> {
     if payload.len() < 8 {
         return Err("truncated payload".to_string());
     }
@@ -2402,8 +2718,9 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<(Vec<String>, Option<Fr
         }
         (Some(decode_sets(&payload[8..8 + n])?), 8 + n)
     };
-    let stmts = decode_statements(payload, stmts_start, count)?;
-    Ok((stmts, sets))
+    let (stmts, pos) = decode_statements(payload, stmts_start, count)?;
+    let memo = decode_ext_calls(payload, pos)?;
+    Ok((stmts, sets, memo))
 }
 
 /// Parse records from `start` onward. A short read, or an LSN that does not
@@ -2455,7 +2772,7 @@ fn parse_records(
         if end > data.len() {
             break;
         }
-        let (stmts, sets) = match cipher {
+        let (stmts, sets, memo) = match cipher {
             Some(c) => {
                 let next = ordinal_base
                     .checked_add(ordinal)
@@ -2486,6 +2803,7 @@ fn parse_records(
                                     format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                                 })?,
                                 None,
+                                Vec::new(),
                             )
                         }
                     }
@@ -2525,11 +2843,17 @@ fn parse_records(
                             format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                         })?,
                         None,
+                        Vec::new(),
                     )
                 }
             }
         };
-        out.push(Record { lsn, stmts, sets });
+        out.push(Record {
+            lsn,
+            stmts,
+            sets,
+            memo,
+        });
         prev = lsn;
         ordinal += 1;
         pos = end;
@@ -2566,7 +2890,7 @@ fn rewrite_encrypted(
             Some((1, last_lsn)),
         )?)?;
         for rec in records {
-            let payload = encode_payload(&rec.stmts, rec.sets.as_ref())?;
+            let payload = encode_payload(&rec.stmts, rec.sets.as_ref(), &rec.memo)?;
             let len = record_len_guard(payload.len())?;
             let ct = fresh.seal(rec.lsn, &payload)?;
             f.write_all(&len.to_le_bytes())?;
@@ -2581,7 +2905,7 @@ fn rewrite_encrypted(
     Ok(fresh)
 }
 
-/// `<wal>.<gen>.upgrade`: temp name for the in-place legacy→v4 plaintext
+/// `<wal>.<gen>.upgrade`: temp name for the in-place legacy→current plaintext
 /// rewrite. Deliberately not matched by `scan_rolls` (only `.roll` names
 /// are), so a crash mid-upgrade leaves an ignorable temp (design row R1).
 fn upgrade_path(wal: &Path, generation: u64) -> PathBuf {
@@ -2590,10 +2914,10 @@ fn upgrade_path(wal: &Path, generation: u64) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Rewrite a legacy plaintext WAL (v2 or v3) in place as v4 under the lease:
-/// fresh `wal_id`, publish slot A seeded with the last intact LSN, the intact
-/// records re-encoded in the v4 payload layout (their touched sets are
-/// unknown). A torn tail is simply not copied. Temp + rename; a crash re-runs
+/// Rewrite a legacy plaintext WAL (v2 or v3) in place as the current version
+/// under the lease: fresh `wal_id`, publish slot A seeded with the last intact
+/// LSN, the intact records re-encoded in the current payload layout (their
+/// touched sets are unknown, their memo empty). A torn tail is simply not copied. Temp + rename; a crash re-runs
 /// the upgrade (R1).
 fn upgrade_plain(path: &Path, data: &[u8], generation: u64, records_start: usize) -> Result<()> {
     let (records, good_end) =
@@ -2605,7 +2929,7 @@ fn upgrade_plain(path: &Path, data: &[u8], generation: u64, records_start: usize
     let slot = slot_bytes(1, last_lsn, WAL_SLOT_DOMAIN);
     out[WAL_SLOT_A as usize..WAL_SLOT_A as usize + SLOT_LEN].copy_from_slice(&slot);
     for rec in &records {
-        let payload = encode_payload(&rec.stmts, None)?;
+        let payload = encode_payload(&rec.stmts, None, &rec.memo)?;
         let len = record_len_guard(payload.len())?;
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&rec.lsn.to_le_bytes());
@@ -2647,7 +2971,7 @@ fn wal_legacy_format(path: &Path) -> Result<bool> {
         ))
 }
 
-/// Upgrade a legacy WAL in place (plaintext v2/v3 → v4; an older container →
+/// Upgrade a legacy WAL in place (plaintext v2/v3 → current; an older container →
 /// the current WAL container version with a fresh nonce prefix and publish
 /// block), under the lease.
 fn upgrade_legacy_wal(
@@ -2705,7 +3029,7 @@ fn read_wal_identity(path: &Path) -> Result<WalIdentity> {
     let mut f = File::open(path)?;
     let meta = f.metadata()?;
     // Enough for any container header (max salt + key-check) plus the
-    // authenticated 144-byte publish block, or a plaintext v4 header.
+    // authenticated 144-byte publish block, or a plaintext current header.
     let mut buf = [0u8; 512];
     let n = f.read(&mut buf)?;
     let h =
@@ -4620,12 +4944,22 @@ fn normalized_path(p: &Path) -> Option<PathBuf> {
 /// Apply one recovered record: every statement must replay cleanly. A
 /// CRC-valid record that fails to parse/bind/execute is a hard error.
 fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
+    // Every `external_io` host scalar of this record is served from the
+    // record's memo, never called: a replay must not reach a provider (it may
+    // have no key and no network) and must reproduce the original vectors.
+    let previous = db.set_ext_replay(Some(std::sync::Arc::new(ReplayMemo::new(&rec.memo))));
+    let mut outcome = Ok(());
     for sql in &rec.stmts {
-        db.execute(sql).map_err(|e| {
-            PinkDbError::Execution(format!("WAL replay failed at lsn {}: {e}", rec.lsn))
-        })?;
+        if let Err(e) = db.execute(sql) {
+            outcome = Err(PinkDbError::Execution(format!(
+                "WAL replay failed at lsn {}: {e}",
+                rec.lsn
+            )));
+            break;
+        }
     }
-    Ok(())
+    db.set_ext_replay(previous);
+    outcome
 }
 
 #[cfg(test)]
@@ -4636,6 +4970,39 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn the_replay_memo_matches_calls_exactly_by_hash() {
+        let call = |name: &str, args: Vec<Value>, result: i64| ExtCall {
+            name: name.to_string(),
+            args,
+            result: Value::Bigint(result),
+        };
+        let memo = ReplayMemo::new(&[
+            call("embed", vec![Value::Varchar("a".into())], 1),
+            call("embed", vec![Value::Double(f64::NAN)], 2),
+            call("embed", vec![Value::Double(-0.0)], 3),
+            call("embed", vec![Value::Null], 4),
+        ]);
+        let get = |name: &str, args: Vec<Value>| memo.get(name, &args).cloned();
+        assert_eq!(
+            get("EMBED", vec![Value::Varchar("a".into())]),
+            Some(Value::Bigint(1))
+        );
+        // Bits, not `==`: NaN finds itself and -0.0 is not 0.0.
+        assert_eq!(
+            get("embed", vec![Value::Double(f64::NAN)]),
+            Some(Value::Bigint(2))
+        );
+        assert_eq!(
+            get("embed", vec![Value::Double(-0.0)]),
+            Some(Value::Bigint(3))
+        );
+        assert_eq!(get("embed", vec![Value::Double(0.0)]), None);
+        assert_eq!(get("embed", vec![Value::Null]), Some(Value::Bigint(4)));
+        assert_eq!(get("embed", vec![Value::Varchar("b".into())]), None);
+        assert_eq!(get("other", vec![Value::Varchar("a".into())]), None);
+    }
 
     /// Per-test scratch directory: every file the test creates under it is
     /// removed when the guard drops — including on a panic — so WAL tests
@@ -5037,7 +5404,7 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(&Wal::header_fresh(generation)).unwrap();
         for (lsn, stmts) in records {
-            let payload = encode_payload(stmts, None).unwrap();
+            let payload = encode_payload(stmts, None, &[]).unwrap();
             f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
             f.write_all(&lsn.to_le_bytes()).unwrap();
             f.write_all(&crc32(&payload).to_le_bytes()).unwrap();
@@ -5528,16 +5895,16 @@ mod tests {
         );
 
         // A future version is refused cleanly through the same BadVersion
-        // path an older build would use to refuse our version 4 (that
+        // path an older build would use to refuse our version 5 (that
         // direction cannot be executed from this tree).
         let mut future = Vec::new();
         future.extend_from_slice(WAL_MAGIC);
-        future.extend_from_slice(&5u32.to_le_bytes());
+        future.extend_from_slice(&6u32.to_le_bytes());
         future.extend_from_slice(b"payload-bytes");
         std::fs::write(wal_path(&p), &future).unwrap();
         let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("version 5 is not supported"),
+            err.to_string().contains("version 6 is not supported"),
             "{err}"
         );
 
@@ -5617,10 +5984,10 @@ mod tests {
         assert_eq!(info.replayed_records, 2);
         assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
 
-        // The file is now v4: 96-byte header, the records re-encoded in the
-        // v4 payload layout (same statements, same LSNs, same order).
+        // The file is now v5: 96-byte header, the records re-encoded in the
+        // v5 payload layout (same statements, same LSNs, same order).
         let data = std::fs::read(&wal).unwrap();
-        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 5);
         assert_eq!(
             u32::from_le_bytes(data[36..40].try_into().unwrap()),
             crc32(&data[..36])
@@ -5819,7 +6186,7 @@ mod tests {
             assert!(err.to_string().contains("exceeds the u32"), "{err}");
         }
         // Real encodings stay far under the limit.
-        let payload = encode_payload(&["SELECT 1".to_string()], None).unwrap();
+        let payload = encode_payload(&["SELECT 1".to_string()], None, &[]).unwrap();
         assert!(payload.len() < 100);
     }
 
@@ -5941,7 +6308,7 @@ mod tests {
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
         let sql = "LOAD EXTENSION '/nonexistent/pinkdb-h5-test.dylib';";
-        let payload = encode_payload(&[sql.to_string()], None).unwrap();
+        let payload = encode_payload(&[sql.to_string()], None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -6036,7 +6403,8 @@ mod tests {
         // A crashed publisher: append and fsync a record, never publish.
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
-        let payload = encode_payload(&["INSERT INTO t VALUES (7);".to_string()], None).unwrap();
+        let payload =
+            encode_payload(&["INSERT INTO t VALUES (7);".to_string()], None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -8260,8 +8628,8 @@ mod tests {
             let upgraded = std::fs::read(&wal).unwrap();
             assert_eq!(
                 u32::from_le_bytes(upgraded[8..12].try_into().unwrap()),
-                4,
-                "the upgrade published a v4 header"
+                5,
+                "the upgrade published a v5 header"
             );
             assert!(!upgrade.exists(), "the temp was renamed over the WAL");
 
@@ -8635,6 +9003,7 @@ mod tests {
                 .append(
                     &["INSERT INTO t VALUES (9);".to_string()],
                     Some(&sets_of(&[("main", "t")], &[])),
+                    &[],
                 )
                 .unwrap();
         }

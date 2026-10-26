@@ -1210,6 +1210,19 @@ pub struct PinkDb {
     /// exact path match is a no-op instead of the user-facing "already
     /// loaded" error. Normal SQL keeps the strict duplicate-load refusal.
     pub(crate) replaying: bool,
+    /// Recorded results of the `external_io` host scalars of the WAL record
+    /// being replayed (wave 107c), keyed by (function, arguments) inside the
+    /// record. `None` outside a replay: a live statement records instead.
+    ext_replay: Option<std::sync::Arc<crate::wal::ReplayMemo>>,
+    /// External-call memo the open transaction's buffered statements produced
+    /// (wave 107c); flushed as part of the transaction's one WAL record.
+    wal_txn_memo: Vec<crate::wal::ExtCall>,
+    /// Whether this session may call `external_io` host scalars: the serve
+    /// policy's `allow-files` switch (wave 107c). `true` for the embedded
+    /// API and the CLI; the server and MCP set it per session so a read-only
+    /// session cannot reach a paid service through a macro, view or trigger
+    /// body that binds only after the statement starts.
+    external_services: bool,
     /// Attached read-only lakes (`.lake attach`): session-local, additive to
     /// the visible catalog for reads only — never part of the store's own
     /// tables and never touched by `.save`, `.lake save`, or the WAL.
@@ -1385,6 +1398,15 @@ impl Clone for PinkDb {
             allow_extension_replay: self.allow_extension_replay,
             extension_root: self.extension_root.clone(),
             replaying: false,
+            // A clone is a snapshot, never the record being replayed, and
+            // the memo of an open transaction belongs to the store that
+            // opened it (the committing clone flushes it).
+            // A snapshot keeps the replay memo: a body's `ROLLBACK` restores
+            // a snapshot taken *during* the replay, and the rest of the
+            // record still needs the memo.
+            ext_replay: self.ext_replay.clone(),
+            wal_txn_memo: self.wal_txn_memo.clone(),
+            external_services: self.external_services,
             attached_lakes: self.attached_lakes.clone(),
             table_sources: self.table_sources.clone(),
             mv_pending: self.mv_pending.clone(),
@@ -1476,6 +1498,9 @@ impl PinkDb {
             allow_extension_replay: false,
             extension_root: None,
             replaying: false,
+            ext_replay: None,
+            wal_txn_memo: Vec::new(),
+            external_services: true,
             attached_lakes: Vec::new(),
             // Process-global table sources (`table_source::
             // register_global_table_source`) seed every store constructed
@@ -2108,6 +2133,35 @@ impl PinkDb {
         self.wal.is_some()
     }
 
+    /// Install (or clear) the replay memo of the WAL record being replayed,
+    /// returning the previous one so the caller can restore it. While set,
+    /// every `external_io` host scalar must be served from it.
+    pub(crate) fn set_ext_replay(
+        &mut self,
+        memo: Option<std::sync::Arc<crate::wal::ReplayMemo>>,
+    ) -> Option<std::sync::Arc<crate::wal::ReplayMemo>> {
+        std::mem::replace(&mut self.ext_replay, memo)
+    }
+
+    /// The record being replayed, if any: `(function, args) -> result`.
+    pub(crate) fn ext_replay(&self) -> Option<&crate::wal::ReplayMemo> {
+        self.ext_replay.as_deref()
+    }
+
+    /// Permission for this session to call `external_io` host scalars (the
+    /// serve policy's `allow-files` switch). The default is allowed: the
+    /// embedded API and the CLI are not a shared service. The server and MCP
+    /// turn it off for a read-only session, and every statement that session
+    /// runs carries the flag to the executor.
+    pub fn set_external_services(&mut self, allowed: bool) {
+        self.external_services = allowed;
+    }
+
+    /// Whether this session may call `external_io` host scalars.
+    pub fn external_services(&self) -> bool {
+        self.external_services
+    }
+
     /// Fail-stop after a WAL write failure. The statement whose append failed
     /// was already applied in memory but is not durable; refusing every later
     /// statement (reads included) and every serialization keeps that state
@@ -2230,6 +2284,7 @@ impl PinkDb {
         sql: &str,
         dynamic_functions_used: &[String],
         sets: Option<&crate::wal::FrameSets>,
+        memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
         // Replayed statements are already in the WAL and must never be logged
         // again — not even buffered into an open transaction's record: frame
@@ -2252,7 +2307,7 @@ impl PinkDb {
                 return Ok(());
             }
             let sets = self.proc_frame.touched();
-            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets));
+            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), memo);
         }
         // Wave 48: a `CREATE/ALTER USER` is logged in its `PASSWORD_HASH`
         // form — the plaintext of the statement text must never reach the
@@ -2275,6 +2330,15 @@ impl PinkDb {
             self.wal_txn_sets.extend(&sets);
             push_unique(&mut self.wal_txn_ext_paths, touched);
             push_unique(&mut self.wal_txn_ext_loaded, loaded);
+            for call in memo {
+                if !self
+                    .wal_txn_memo
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&call.name) && c.args == call.args)
+                {
+                    self.wal_txn_memo.push(call.clone());
+                }
+            }
             return Ok(());
         }
         // `USE` is self-contained: replaying it lands in the target session
@@ -2284,13 +2348,21 @@ impl PinkDb {
                 let mut guard = wal.lock().map_err(|_| {
                     PinkDbError::Execution("internal lock error (poisoned)".to_string())
                 })?;
-                guard.append(&[sql.to_string()], Some(&sets))?;
+                guard.append(&[sql.to_string()], Some(&sets), memo)?;
                 guard.set_session_db(&name.to_ascii_lowercase());
             }
             return Ok(());
         }
         let db = self.current_db.clone();
-        self.wal_append_session(&db, &db, &[sql.to_string()], &touched, &loaded, Some(&sets))
+        self.wal_append_session(
+            &db,
+            &db,
+            &[sql.to_string()],
+            &touched,
+            &loaded,
+            Some(&sets),
+            memo,
+        )
     }
 
     /// Append one committed unit executed in session database `db_before`,
@@ -2315,6 +2387,8 @@ impl PinkDb {
     /// execution and append, which guarantees the statements are then
     /// session-independent: a session-dependent statement against a vanished
     /// database would have failed before reaching the WAL.
+    // The arguments are the record's fields, one per column of the payload.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn wal_append_session(
         &self,
         db_before: &str,
@@ -2323,6 +2397,7 @@ impl PinkDb {
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&crate::wal::FrameSets>,
+        memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
             let mut guard = wal.lock().map_err(|_| {
@@ -2336,6 +2411,7 @@ impl PinkDb {
                 touched_extensions,
                 loaded_extensions,
                 sets,
+                memo,
             )?;
         }
         self.run_commit_hook()
@@ -2362,6 +2438,7 @@ impl PinkDb {
         self.wal_txn_ext_paths.clear();
         self.wal_txn_ext_loaded.clear();
         self.wal_txn_sets = crate::wal::FrameSets::default();
+        self.wal_txn_memo.clear();
         self.txn_touched = crate::wal::FrameSets::default();
         // A new transaction starts with no writes; ROLLBACK must not leave
         // this transaction's writes in the ON COMMIT dirty set.
@@ -2415,14 +2492,21 @@ impl PinkDb {
             let touched = std::mem::take(&mut self.wal_txn_ext_paths);
             let loaded = std::mem::take(&mut self.wal_txn_ext_loaded);
             let sets = std::mem::take(&mut self.wal_txn_sets);
+            let memo = std::mem::take(&mut self.wal_txn_memo);
             let before = self
                 .wal_txn_db
                 .take()
                 .unwrap_or_else(|| self.current_db.clone());
             let after = self.current_db.clone();
-            if let Err(e) =
-                self.wal_append_session(&before, &after, &stmts, &touched, &loaded, Some(&sets))
-            {
+            if let Err(e) = self.wal_append_session(
+                &before,
+                &after,
+                &stmts,
+                &touched,
+                &loaded,
+                Some(&sets),
+                &memo,
+            ) {
                 // Keep the statements: a retried COMMIT must never publish
                 // changes that made it to memory but not to the WAL.
                 self.wal_txn = stmts;
@@ -2430,6 +2514,7 @@ impl PinkDb {
                 self.wal_txn_ext_paths = touched;
                 self.wal_txn_ext_loaded = loaded;
                 self.wal_txn_sets = sets;
+                self.wal_txn_memo = memo;
                 return Err(e);
             }
         }
@@ -2438,6 +2523,7 @@ impl PinkDb {
         self.wal_txn_ext_paths.clear();
         self.wal_txn_ext_loaded.clear();
         self.wal_txn_sets = crate::wal::FrameSets::default();
+        self.wal_txn_memo.clear();
         self.txn_touched = crate::wal::FrameSets::default();
         // The transaction's writes are now committed: they become the ON
         // COMMIT trigger's dirty set for the next statement boundary.

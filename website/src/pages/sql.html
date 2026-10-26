@@ -814,6 +814,68 @@ CALL drop_fts_index('docs');</code></pre>
   boosts.</li>
 </ul>
 
+<h2>Embeddings</h2>
+
+<p><code>embed(text)</code> returns a fixed-size <code>FLOAT[N]</code> vector
+from an OpenAI-compatible <code>POST</code> endpoint — wave 107c, CLI/server
+feature <code>embeddings</code>, off by default. It is a linked extension, so
+the model, the endpoint and the width are settings, not SQL: the width is
+<code>PINKDB_EMBEDDINGS_DIMENSIONS</code> and becomes the <code>N</code> of the
+type at bind time, so <code>embed()</code> is a scalar like any other and the
+result is an ordinary array column.</p>
+
+<pre class="code" data-lang="sql"><code>CREATE TABLE docs (id INTEGER, body VARCHAR, v FLOAT[1024]);
+INSERT INTO docs VALUES (1, 'pinkdb is a mini DuckDB in Rust', NULL),
+                        (2, 'BM25 ranks documents', NULL);
+
+UPDATE docs SET v = embed(body);
+
+WITH q AS (SELECT embed('an embedded database') AS v)
+SELECT d.id, array_cosine_distance(d.v, q.v) AS distance
+FROM docs d, q ORDER BY distance LIMIT 5;</code></pre>
+
+<ul>
+  <li>Variables are read from the environment at call time:
+  <code>PINKDB_EMBEDDINGS_BASE_URL</code> (required: any OpenAI-compatible
+  <code>/embeddings</code> URL; there is no default provider),
+  <code>PINKDB_EMBEDDINGS_MODEL</code> (required),
+  <code>PINKDB_EMBEDDINGS_DIMENSIONS</code> (default <code>1024</code>),
+  <code>PINKDB_EMBEDDINGS_API_KEY</code> (required; no other provider's key is
+  ever used),
+  <code>PINKDB_EMBEDDINGS_BATCH_SIZE</code> (default <code>128</code>),
+  <code>PINKDB_EMBEDDINGS_TIMEOUT_MS</code> (default <code>30000</code>) and
+  <code>PINKDB_EMBEDDINGS_CACHE_DIR</code>. No <code>.env</code> is loaded and
+  no <code>SET</code> reaches them; the key is never stored, logged or
+  echoed.</li>
+  <li>A provider that answers another width is an error naming
+  <code>PINKDB_EMBEDDINGS_DIMENSIONS</code>; restart pinkdb to change it.</li>
+  <li>Arguments are evaluated a chunk at a time, so a table costs requests per
+  distinct text: <code>NULL</code>s make no request, duplicates inside a chunk
+  are collapsed, and the rest go out 128 at a time (1000 rows with 300
+  distinct texts = 3 requests).</li>
+  <li>An in-process 64 MiB cache keyed by (base URL, model, dimensions,
+  SHA-256 of the text) answers a repeated text without a request;
+  <code>PINKDB_EMBEDDINGS_CACHE_DIR</code> keeps content-addressed files so
+  the cache survives a restart. Nothing is written into the store.</li>
+  <li><code>embed()</code> is never constant-folded or evaluated while
+  binding, and <code>WHERE false</code> makes no call. It is not declared
+  volatile in the WAL sense — <code>UPDATE … SET v = embed(body)</code> must
+  work in a durable store — instead a logged statement's WAL record carries
+  its <code>embed()</code> results (the <em>replay memo</em>): a crash replay
+  is bit-identical, needs no key, and never contacts the provider. The price
+  is WAL size: 1,000 rows at 1024 dimensions add about 4 KiB per distinct
+  text.</li>
+  <li>A call is external I/O to a paid service: the read-only MCP
+  <code>query</code> tool refuses it, and <code>allow-files</code> permits
+  it. The refusal is enforced at the call site, so a batch, a macro, a view,
+  a trigger action or a <code>CALL</code>/<code>DO</code> body cannot reach
+  the provider under the read-only default.</li>
+  <li><code>NULL</code> input gives <code>NULL</code>; an empty string is
+  sent. <code>401</code> is not retried; <code>429</code> and
+  <code>5xx</code> are retried (three attempts, 250/500 ms). The model is a
+  setting, not a second argument.</li>
+</ul>
+
 <h2>Not supported yet</h2>
 
 <p>These are real gaps, listed so you can plan around them. Most are scheduled on the

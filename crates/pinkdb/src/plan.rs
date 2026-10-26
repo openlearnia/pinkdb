@@ -2057,31 +2057,29 @@ fn prunable_types(column_dtype: DataType, literal_dtype: DataType) -> bool {
     numeric(column_dtype) && numeric(literal_dtype)
 }
 
-/// True when `plan` (or any subquery inside one of its expressions) calls a
-/// loadable-extension function. The procedure executor refuses such a
-/// statement: a callback is opaque (it may be impure, nondeterministic or
-/// fail), so a durable store could not replay a logged `CALL` that ran it.
+/// The distinct loadable-extension functions `plan` calls (host scalars
+/// included), subqueries and DML expressions covered. The procedure executor
+/// uses the names to refuse only the calls a replay cannot record: an
+/// `external_io` host scalar's results travel in the WAL memo, an ABI
+/// callback's cannot.
 ///
 /// Deeper than [`BoundExpr::contains_dynamic_scalar`], which stops at a
 /// subquery boundary because its callers ask a folding question; here the
 /// answer must cover the whole statement.
-pub(crate) fn contains_dynamic_scalar(plan: &LogicalPlan) -> bool {
-    let mut found = false;
+pub(crate) fn dynamic_scalar_names(plan: &LogicalPlan) -> Vec<String> {
+    let mut found = Vec::new();
     walk_dynamic_scalars(plan, &mut found);
     found
 }
 
-/// [`contains_dynamic_scalar`] for one bound expression (subqueries included).
+/// [`dynamic_scalar_names`] for one bound expression (subqueries included).
 pub(crate) fn bound_expr_has_dynamic_scalar(expr: &BoundExpr) -> bool {
-    let mut found = false;
+    let mut found = Vec::new();
     expr_dynamic(expr, &mut found);
-    found
+    !found.is_empty()
 }
 
-fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
-    if *found {
-        return;
-    }
+fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
     let mut exprs: Vec<&BoundExpr> = Vec::new();
     let mut children: Vec<&LogicalPlan> = Vec::new();
     match plan {
@@ -2225,28 +2223,23 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
     }
     for e in exprs {
         expr_dynamic(e, found);
-        if *found {
-            return;
-        }
     }
     for c in children {
         walk_dynamic_scalars(c, found);
-        if *found {
-            return;
-        }
     }
 }
 
 /// One expression's dynamic-scalar check, descending into subquery plans (a
 /// subquery's own WHERE/HAVING/key expressions bind in their own scope, so
 /// they are checked through their plan).
-fn expr_dynamic(expr: &BoundExpr, found: &mut bool) {
+fn expr_dynamic(expr: &BoundExpr, found: &mut Vec<String>) {
     use crate::sql::binder::BoundExpr as E;
-    if *found {
-        return;
-    }
     match expr {
-        E::DynamicScalar { .. } => *found = true,
+        E::DynamicScalar { name, .. } => {
+            if !found.iter().any(|n| n.as_str() == name.as_ref()) {
+                found.push(name.to_string());
+            }
+        }
         E::Literal(_) | E::Column { .. } | E::AggRef { .. } | E::WindowRef { .. } => {}
         E::Not(e)
         | E::Negate { expr: e, .. }

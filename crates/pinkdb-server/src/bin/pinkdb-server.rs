@@ -895,6 +895,17 @@ fn main() -> ExitCode {
             eprintln!("warning: the fts extension could not be loaded: {e}");
         }
     }
+    #[cfg(feature = "embeddings")]
+    {
+        if let Err(e) = pinkdb_embeddings::ensure_registered() {
+            eprintln!("warning: the embeddings extension could not be registered: {e}");
+        }
+        if !db.is_extension_loaded(pinkdb_embeddings::EXTENSION_NAME)
+            && let Err(e) = db.load_extension(pinkdb_embeddings::EXTENSION_NAME)
+        {
+            eprintln!("warning: the embeddings extension could not be loaded: {e}");
+        }
+    }
 
     let mode = match (&args.file, &args.catalog) {
         (Some(path), _) => format!("durable: {path}"),

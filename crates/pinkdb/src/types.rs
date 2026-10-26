@@ -1287,6 +1287,9 @@ pub enum PinkDbError {
     /// an untypable `?`, or a value that cannot convert to the inferred type.
     Parameter(String),
     Execution(String),
+    /// The session's policy forbids this statement or function (serve.rs' read-only
+    /// and external-services switches); the message is the user-facing hint.
+    Permission(String),
     Io(std::io::Error),
     /// A CSV read/parse error (see [`CsvError`]). Boxed on purpose: every
     /// `Result<_, PinkDbError>` carries the largest variant inline, and the
@@ -1313,7 +1316,8 @@ impl fmt::Display for PinkDbError {
             | PinkDbError::Type(msg)
             | PinkDbError::Parse(msg)
             | PinkDbError::Parameter(msg)
-            | PinkDbError::Execution(msg) => write!(f, "{msg}"),
+            | PinkDbError::Execution(msg)
+            | PinkDbError::Permission(msg) => write!(f, "{msg}"),
             PinkDbError::Io(e) => write!(f, "IO error: {e}"),
             PinkDbError::Csv(csv) => {
                 let CsvError {

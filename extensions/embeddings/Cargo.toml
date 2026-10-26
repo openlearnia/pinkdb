@@ -1,0 +1,24 @@
+[package]
+name = "pinkdb-embeddings"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb embeddings extension: embed(text) returns a text's embedding as FLOAT[N] from an OpenAI-compatible endpoint"
+license = "MIT"
+publish = false
+
+[lib]
+name = "pinkdb_embeddings"
+
+[dependencies]
+# The engine: `embed` is a package host scalar (wave 108a), evaluated a
+# chunk at a time, and returns an ARRAY value (wave 107a).
+pinkdb = { path = "../../crates/pinkdb" }
+# The request and response are JSON; already in the workspace.
+serde_json = "1"
+# Blocking HTTP with rustls, the crate and features the agent (wave 106) and
+# pinkdb-httpfs already lock. No async runtime, no provider SDK.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# Cache keys hash the endpoint identity and the text, so the on-disk cache
+# names files by digest and the key never appears in a path.
+sha2 = "0.10"

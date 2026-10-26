@@ -1820,6 +1820,11 @@ struct Frame<'a> {
     segment: Option<Vec<String>>,
     /// The body ran `COMMIT` or `ROLLBACK`.
     txn_controlled: bool,
+    /// The enclosing statement's budget: the policy gate for `external_io`
+    /// host scalars, and the collector of their results for the WAL record
+    /// (wave 107c). A body's statements run with it, so a call the store
+    /// logs carries every external result it produced.
+    budget: std::sync::Arc<crate::exec::ExecBudget>,
 }
 
 /// What kind of procedural call a frame runs (wave 83).
@@ -1889,8 +1894,9 @@ pub(crate) fn execute_call(
     db_name: &str,
     def: &ProcedureDef,
     args: Vec<Value>,
+    budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<QueryResult> {
-    execute_call_kind(db, db_name, def, args, CallKind::Procedure)
+    execute_call_kind(db, db_name, def, args, CallKind::Procedure, budget)
 }
 
 /// Run one `DO` block (wave 83): an anonymous, parameterless SQL body with
@@ -1900,8 +1906,9 @@ pub(crate) fn execute_do(
     db: &mut PinkDb,
     db_name: &str,
     def: &ProcedureDef,
+    budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<QueryResult> {
-    execute_call_kind(db, db_name, def, Vec::new(), CallKind::Do)
+    execute_call_kind(db, db_name, def, Vec::new(), CallKind::Do, budget)
 }
 
 fn execute_call_kind(
@@ -1910,6 +1917,7 @@ fn execute_call_kind(
     def: &ProcedureDef,
     args: Vec<Value>,
     kind: CallKind,
+    budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<QueryResult> {
     if db.proc_depth >= MAX_CALL_DEPTH {
         return Err(PinkDbError::Execution(format!(
@@ -1919,7 +1927,7 @@ fn execute_call_kind(
         )));
     }
     db.proc_depth += 1;
-    let out = execute_call_inner(db, db_name, def, args, kind);
+    let out = execute_call_inner(db, db_name, def, args, kind, budget);
     db.proc_depth = db.proc_depth.saturating_sub(1);
     out
 }
@@ -1930,6 +1938,7 @@ fn execute_call_inner(
     def: &ProcedureDef,
     args: Vec<Value>,
     kind: CallKind,
+    budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<QueryResult> {
     if let Some(e) = unsupported_language(def) {
         return Err(e);
@@ -1977,7 +1986,7 @@ fn execute_call_inner(
         None
     };
     let (out, restore) = match def.language {
-        ProcLanguage::Sql => run_sql_body(db, db_name, def, scope, kind, snapshot),
+        ProcLanguage::Sql => run_sql_body(db, db_name, def, scope, kind, snapshot, budget),
         ProcLanguage::JavaScript => (run_js_body(db, db_name, def, scope), snapshot),
     };
     if out.is_err()
@@ -1998,6 +2007,7 @@ fn run_sql_body(
     scope: Vec<Var>,
     kind: CallKind,
     restore: Option<Box<PinkDb>>,
+    budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> (Result<QueryResult>, Option<Box<PinkDb>>) {
     let Some(body) = &def.body else {
         return (
@@ -2026,6 +2036,7 @@ fn run_sql_body(
         restore,
         segment,
         txn_controlled: false,
+        budget: budget.clone(),
     };
     let flow = match exec_block(db, &mut frame, &body.stmts) {
         Ok(flow) => flow,
@@ -2247,10 +2258,16 @@ fn exec_stmts(db: &mut PinkDb, frame: &mut Frame, stmts: &[ProcStmt]) -> Result<
             } => {
                 frame.statements += 1;
                 let (result, writes) = exec_sql(db, frame, stmt.off, sql).map_err(|e| {
-                    PinkDbError::Execution(format!(
+                    let message = format!(
                         "procedure \"{}\": statement {} (`{text}`): {e}",
                         frame.name, frame.statements
-                    ))
+                    );
+                    match e {
+                        // A policy refusal keeps its kind, so a client can
+                        // tell it from a runtime failure inside a body.
+                        PinkDbError::Permission(_) => PinkDbError::Permission(message),
+                        _ => PinkDbError::Execution(message),
+                    }
                 })?;
                 if writes && frame.segment.is_some() {
                     let rendered = render_segment_statement(frame, source)?;
@@ -2385,7 +2402,7 @@ fn eval_bound(
         columns: Vec::new(),
         num_rows: 1,
     };
-    let cx = crate::exec::Cx::new(db);
+    let cx = crate::exec::Cx::with_budget(db, frame.budget.clone());
     let v = crate::exec::expr::eval_expr(bound, &single, &cx)?;
     if v.len() != 1 {
         return Err(frame.err(off, "the expression did not evaluate to exactly one value"));
@@ -2420,7 +2437,9 @@ fn exec_sql(
     variables.extend(frame.variables());
     let slots = crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(variables);
     let db_name = frame.db_name.clone();
-    run_call_statement(db, &db_name, slots, sql, |msg| frame.err(off, msg))
+    run_call_statement(db, &db_name, slots, sql, Some(&frame.budget), |msg| {
+        frame.err(off, msg)
+    })
 }
 
 /// Bind, check and run one statement of a procedure call — the shared path
@@ -2432,6 +2451,7 @@ pub(crate) fn run_call_statement(
     db_name: &str,
     slots: crate::sql::binder::ParamSlots,
     sql: &Statement,
+    budget: Option<&std::sync::Arc<crate::exec::ExecBudget>>,
     err: impl Fn(&str) -> PinkDbError,
 ) -> Result<(QueryResult, bool)> {
     let slots = slots.with_logged_procedure(db.is_durable());
@@ -2443,11 +2463,29 @@ pub(crate) fn run_call_statement(
     // `PinkDb::rebuild_stale_indexes`).
     db.rebuild_stale_indexes();
     let plan = crate::optimizer::optimize(db, plan);
-    if crate::plan::contains_dynamic_scalar(&plan) {
+    // An ABI callback is opaque: its result cannot be carried in the WAL, so
+    // a logged call still refuses it. A package's host scalar is different:
+    // an `external_io` one records its results in the enclosing statement's
+    // memo (wave 107c), so it is allowed exactly when a budget can hold them.
+    let dynamic = crate::plan::dynamic_scalar_names(&plan);
+    if let Some(name) = dynamic.iter().find(|name| db.host_scalar(name).is_none()) {
+        return Err(err(&format!(
+            "a statement of this procedure calls the loadable-extension function \"{name}\"; \
+             extension callbacks are opaque (impure or nondeterministic), so a durable store \
+             cannot replay this call — run the statement outside the procedure instead"
+        )));
+    }
+    if budget.is_none()
+        && db.is_durable()
+        && dynamic.iter().any(|name| {
+            db.host_scalar(name)
+                .is_some_and(|host| host.is_external_io())
+        })
+    {
         return Err(err(
-            "a statement of this procedure calls a loadable-extension function; extension \
-             callbacks are opaque (impure or nondeterministic), so a durable store cannot \
-             replay this call — run the statement outside the procedure instead",
+            "a statement of this procedure calls an external service, and this call runs \
+             without a statement whose WAL record could carry the result — run the statement \
+             outside the procedure instead",
         ));
     }
     // Invoker rights (wave 100): a trigger body runs with the privileges of
@@ -2473,7 +2511,11 @@ pub(crate) fn run_call_statement(
     db.proc_frame.add_sets(&sets);
     db.proc_frame.add_writes(&writes);
     let wrote = crate::plan::writes_tables(&plan);
-    Ok((crate::exec::run(db, &plan)?, wrote))
+    let result = match budget {
+        Some(budget) => crate::exec::run_with_budget(db, &plan, budget.clone())?,
+        None => crate::exec::run(db, &plan)?,
+    };
+    Ok((result, wrote))
 }
 
 /// `COMMIT` / `ROLLBACK` in a body (wave 83). Allowed only in the outermost
@@ -2517,6 +2559,7 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
             && !segment.is_empty()
         {
             let sets = db.proc_frame.touched();
+            let memo = frame.budget.take_external_calls();
             db.wal_append_session(
                 &frame.db_name,
                 &frame.db_name,
@@ -2524,6 +2567,7 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
                 &[],
                 &[],
                 Some(&sets),
+                &memo,
             )?;
             segment.clear();
         }
@@ -2534,6 +2578,8 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
         if let Some(segment) = frame.segment.as_mut() {
             segment.clear();
         }
+        // The rolled-back segment is gone: so is what it recorded.
+        frame.budget.take_external_calls();
     }
     frame.restore = Some(boxed_snapshot(db));
     frame.txn_controlled = true;

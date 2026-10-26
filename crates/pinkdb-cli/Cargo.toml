@@ -35,6 +35,13 @@ math = ["dep:pinkdb-math"]
 fts = ["dep:pinkdb-fts"]
 # `fts` plus a custom `ignore` regex (pinkdb-fts/custom-ignore).
 fts-regex = ["fts", "pinkdb-fts/custom-ignore"]
+# Opt-in embeddings (wave 107c): the `pinkdb-embeddings` package — `embed(text)`
+# returns a `FLOAT[N]` vector from an OpenAI-compatible embeddings endpoint,
+# with the width fixed at bind time from `PINKDB_EMBEDDINGS_DIMENSIONS`. Off by
+# default: it links the blocking HTTPS client (ureq + rustls), and a call needs
+# a key in the environment. `embed()` is external I/O, so the agent read-only
+# policy refuses it unless the session started with `allow-files`.
+embeddings = ["dep:pinkdb-embeddings"]
 # Opt-in core arrow extension (wave 71): Arrow IPC (Feather v2) file
 # read/write over arrow-rs — `FROM 'f.arrow'`, `read_arrow('f.arrow')` and
 # `COPY t TO 'f.arrow' (FORMAT arrow)`. Registers the table source and the
@@ -147,6 +154,9 @@ pinkdb-math = { path = "../../extensions/math", optional = true }
 # scoring, the Porter stemmer, the tokenizer, and the index tables it writes
 # through the engine's host hooks.
 pinkdb-fts = { path = "../../extensions/fts", optional = true }
+# Opt-in embeddings (wave 107c): `embed(text)` through an OpenAI-compatible
+# provider, behind the `embeddings` feature.
+pinkdb-embeddings = { path = "../../extensions/embeddings", optional = true }
 # Core arrow extension (opt-in `arrow` feature): Arrow IPC file read/write —
 # the engine-adjacent crate that implements `pinkdb::FileFormat` over the
 # arrow-rs crates (`arrow-array`/`arrow-ipc`/`arrow-schema`, pinned to the

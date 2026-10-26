@@ -328,7 +328,7 @@ pub(crate) fn run_with_triggers(
             .iter()
             .filter(|d| d.timing == TriggerTiming::Before && d.level == TriggerLevel::Statement)
         {
-            run_trigger(db, def, TriggerScope::default())?;
+            run_trigger(db, def, TriggerScope::default(), budget)?;
         }
         let after: Vec<&TriggerDef> = defs
             .iter()
@@ -374,7 +374,7 @@ pub(crate) fn run_with_triggers(
                         crate::exec::output_from_rows(&schema, &rows)?,
                     ));
                 }
-                run_trigger(db, def, scope)?;
+                run_trigger(db, def, scope, budget)?;
             }
         }
         Ok(result)
@@ -390,11 +390,12 @@ pub(crate) fn fire_row_triggers(
     timing: TriggerTiming,
     old: Option<&[Value]>,
     new: Option<&[Value]>,
+    budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<Option<Vec<Value>>> {
     let mut image = new.map(|n| n.to_vec());
     for def in defs.iter().filter(|d| d.timing == timing) {
         let scope = row_scope(db, def, old, image.as_deref())?;
-        let scope = run_trigger(db, def, scope)?;
+        let scope = run_trigger(db, def, scope, budget)?;
         if let Some(rows) = scope.rows.iter().find(|(a, _)| a == "new").map(|(_, c)| c) {
             image = Some(rows.iter().map(|(_, _, v)| v.clone()).collect());
         }
@@ -490,8 +491,15 @@ pub(crate) fn insert_rows(
             let new = if defs.is_empty() {
                 values
             } else {
-                fire_row_triggers(db, &defs, TriggerTiming::Before, None, Some(&values))?
-                    .unwrap_or(values)
+                fire_row_triggers(
+                    db,
+                    &defs,
+                    TriggerTiming::Before,
+                    None,
+                    Some(&values),
+                    budget,
+                )?
+                .unwrap_or(values)
             };
             if let Some(keys) = &mut keys {
                 let t = db.table_in(target_db, table)?;
@@ -504,7 +512,7 @@ pub(crate) fn insert_rows(
                 c.push((Vec::new(), new.clone()));
             }
             if !defs.is_empty() {
-                fire_row_triggers(db, &defs, TriggerTiming::After, None, Some(&new))?;
+                fire_row_triggers(db, &defs, TriggerTiming::After, None, Some(&new), budget)?;
             }
         }
         Ok(())
@@ -608,8 +616,14 @@ pub(crate) fn update_rows(
                     new[col] = value;
                 }
                 if !defs.is_empty()
-                    && let Some(modified) =
-                        fire_row_triggers(db, &defs, TriggerTiming::Before, Some(&old), Some(&new))?
+                    && let Some(modified) = fire_row_triggers(
+                        db,
+                        &defs,
+                        TriggerTiming::Before,
+                        Some(&old),
+                        Some(&new),
+                        budget,
+                    )?
                 {
                     new = modified;
                 }
@@ -641,7 +655,14 @@ pub(crate) fn update_rows(
                     c.push((old.clone(), new.clone()));
                 }
                 if !defs.is_empty() {
-                    fire_row_triggers(db, &defs, TriggerTiming::After, Some(&old), Some(&new))?;
+                    fire_row_triggers(
+                        db,
+                        &defs,
+                        TriggerTiming::After,
+                        Some(&old),
+                        Some(&new),
+                        budget,
+                    )?;
                 }
             }
         }
@@ -697,7 +718,7 @@ pub(crate) fn delete_rows(
                         .collect()
                 };
                 if !defs.is_empty() {
-                    fire_row_triggers(db, &defs, TriggerTiming::Before, Some(&old), None)?;
+                    fire_row_triggers(db, &defs, TriggerTiming::Before, Some(&old), None, budget)?;
                 }
                 count += db
                     .table_mut_in(target_db, table)?
@@ -706,7 +727,7 @@ pub(crate) fn delete_rows(
                     c.push((old.clone(), Vec::new()));
                 }
                 if !defs.is_empty() {
-                    fire_row_triggers(db, &defs, TriggerTiming::After, Some(&old), None)?;
+                    fire_row_triggers(db, &defs, TriggerTiming::After, Some(&old), None, budget)?;
                 }
             }
         }
@@ -743,7 +764,12 @@ fn row_scope(
 /// Run one trigger body: bind and execute its action (and its `WHEN` clause)
 /// with the row/transition scope installed, and hand the scope back so a
 /// `BEFORE ROW` trigger's `NEW` assignments can be read off it.
-fn run_trigger(db: &mut PinkDb, def: &TriggerDef, scope: TriggerScope) -> Result<TriggerScope> {
+fn run_trigger(
+    db: &mut PinkDb,
+    def: &TriggerDef,
+    scope: TriggerScope,
+    budget: &std::sync::Arc<crate::exec::ExecBudget>,
+) -> Result<TriggerScope> {
     let previous_scope = db.trigger_scope.replace(scope);
     // A body's own DML must not append to the firing statement's transition
     // tables (its rows are the outer statement's, not this body's).
@@ -775,7 +801,7 @@ fn run_trigger(db: &mut PinkDb, def: &TriggerDef, scope: TriggerScope) -> Result
                 columns: Vec::new(),
                 num_rows: 1,
             };
-            let cx = crate::exec::Cx::new(db);
+            let cx = crate::exec::Cx::with_budget(db, budget.clone());
             let v = crate::exec::expr::eval_expr(&bound, &single, &cx)?;
             if v.len() != 1 {
                 return Err(err(def, "the WHEN clause did not evaluate to one value"));
@@ -798,9 +824,14 @@ fn run_trigger(db: &mut PinkDb, def: &TriggerDef, scope: TriggerScope) -> Result
                 }
             }
         }
-        crate::procedure::run_call_statement(db, &def.db, slots(), &def.action, |msg| {
-            err(def, msg.to_string())
-        })?;
+        crate::procedure::run_call_statement(
+            db,
+            &def.db,
+            slots(),
+            &def.action,
+            Some(budget),
+            |msg| err(def, msg.to_string()),
+        )?;
         Ok(())
     })();
     let scope = db.trigger_scope.take().unwrap_or_default();

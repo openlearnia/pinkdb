@@ -1088,13 +1088,16 @@ fails `COMMIT` with a write conflict instead of logging an unreplayable
 record. `SyncPolicy::Sync` fsyncs every record; `Batch` fsyncs on
 `flush_wal`/checkpoint.
 
-The WAL format is `PINKWAL1` + version `4`: a generation number, a 16-byte
+The WAL format is `PINKWAL1` + version `5`: a generation number, a 16-byte
 `wal_id` (a fresh incarnation id per file creation, so a replaced file is
 never mistaken for the old one), a header CRC, two 24-byte commit slots and,
 per record, the payload's **touched set** — the tables its statements read or
 wrote, plus `CREATE`/`DROP DATABASE` names — the substrate cross-process
 commit validation compares (`sets_len = u32::MAX` marks a record whose set is
-unknown, adopted from an older WAL). Rolled generations are named
+unknown, adopted from an older WAL) — plus the **external-call replay memo**:
+the `(function, arguments) → result` pairs of every `external_io` host scalar
+the unit called, so replay answers those calls from the record instead of
+calling out (see Embeddings). Rolled generations are named
 `<wal>.<gen>.roll`. Every append publishes
 `(seq + 1, last LSN)` into the alternate commit slot — the dual slots plus a
 CRC make a torn or lost update harmless — and bumps the epoch in
@@ -1191,7 +1194,7 @@ design): `BEGIN` captures the current position (WAL `wal_id`, generation,
 applied LSN, checkpoint identity) and takes no lease; statements run on that
 private snapshot, and `COMMIT` takes the lease only for `[refresh → validate
 → append → publish]`. Validation is table-granularity against the touched
-sets every WAL v4 record carries: a frame committed after the base that
+sets every WAL v5 record carries: a frame committed after the base that
 touched a table the unit **read or wrote** is a typed `write conflict on
 table "db.name" (… lsn N …)` naming the object and the frame's LSN —
 read-set validation is also what prevents write skew across processes. The
@@ -1994,6 +1997,102 @@ system's 571 English stop words. `stem(word)` exposes the same stemmer.
 fuzzy matching or per-field boosts; rebuilding reads the whole base table in
 one statement (100k documents × 2 fields: build 12.3 s, top-10 query
 103 ms mean, measured on an M-series laptop).
+
+## Embeddings (feature `embeddings`, wave 107c)
+
+`embed(text)` returns a fixed-size `FLOAT[N]` vector from an
+OpenAI-compatible `POST {base_url}` endpoint, so a document table grows its
+vector column with one `UPDATE` and no client-side glue. It is a linked
+extension (`pinkdb-embeddings`), off by default: the default binaries link
+neither the package nor the blocking HTTPS client (ureq + rustls, the same
+stack as the agent).
+
+```sh
+cargo build --release -p pinkdb-cli --features embeddings
+cargo build --release -p pinkdb-server --features embeddings   # loads it into the store it serves
+```
+
+```sql
+CREATE TABLE docs (id INTEGER, body VARCHAR, v FLOAT[1024]);
+INSERT INTO docs VALUES (1, 'pinkdb is a mini DuckDB in Rust', NULL),
+                        (2, 'BM25 ranks documents', NULL);
+
+UPDATE docs SET v = embed(body);
+
+-- Brute force and exact: the stored vectors are plain FLOAT[1024] values.
+WITH q AS (SELECT embed('an embedded database') AS v)
+SELECT d.id, array_cosine_distance(d.v, q.v) AS distance
+FROM docs d, q ORDER BY distance LIMIT 5;
+```
+
+`array_cosine_distance` is wave 107b's `vss` extension (its HNSW index also
+turns that query into an index scan); without it the vectors are still plain
+data, and the ranking is plain arithmetic over `v[i]` — sum the squared
+differences of the elements and `ORDER BY` that.
+
+**Configuration.** Read from the environment when a call runs — nothing is
+read from the store or a `.env` file, and no `SET` reaches it.
+
+| variable | default | notes |
+|---|---|---|
+| `PINKDB_EMBEDDINGS_BASE_URL` | required | Any OpenAI-compatible `/embeddings` URL, including a local server. There is no default provider (z.ai's global API serves no embedding model). |
+| `PINKDB_EMBEDDINGS_MODEL` | required | Sent as `model`. |
+| `PINKDB_EMBEDDINGS_DIMENSIONS` | `1024` | The `N` of `FLOAT[N]`: fixed when the package is published (CLI/server startup) and sent as `dimensions`. A provider that answers another width is an error naming this variable; restart pinkdb to change it. |
+| `PINKDB_EMBEDDINGS_API_KEY` | required | Only this variable: a key exported for another provider is never sent here. |
+| `PINKDB_EMBEDDINGS_BATCH_SIZE` | `128` | Inputs per HTTP request. |
+| `PINKDB_EMBEDDINGS_TIMEOUT_MS` | `30000` | Per request. |
+| `PINKDB_EMBEDDINGS_CACHE_DIR` | — | Optional persistent cache directory. |
+
+The key lives in the environment only: it is never written to the store, the
+WAL or a log, `Debug` prints `<redacted>`, an error never quotes it, and a
+provider's 401 is reported without its body.
+
+**Batching.** Arguments are evaluated a chunk at a time (up to 2048 rows), so
+`embed(body)` over a table costs requests per distinct text, not per row:
+`NULL`s are skipped without a request, duplicates inside the chunk are
+collapsed, and the rest go out `PINKDB_EMBEDDINGS_BATCH_SIZE` at a time.
+Measured: 1000 rows holding 300 distinct texts make 3 requests.
+
+**Caching.** An in-process LRU (64 MiB, keyed by base URL, model, dimensions
+and the SHA-256 of the text) answers a repeated text — a second identical
+query makes no request. With `PINKDB_EMBEDDINGS_CACHE_DIR` each vector is also
+a content-addressed file written atomically (temp name, then rename), so the
+cache survives a restart; it is never a table in your store, and a `SELECT`
+never writes rows.
+
+**Volatility and replay.** `embed()` is opaque to the planner: never
+constant-folded, never evaluated while binding or optimizing, and `WHERE
+false` makes no call. It is deliberately *not* declared volatile in the
+engine's WAL sense — that guard refuses every logged statement, and `UPDATE …
+SET v = embed(body)` is the whole point of the function. Instead a statement
+the engine WAL-logs carries the results of its `embed()` calls in the
+record's **replay memo** (`(function, arguments) → value`, deduplicated). A
+crash then re-executes the SQL with the memo answering every call: the
+vectors are bit-identical, the provider is not contacted, and no key is
+needed. A memo miss is a hard error naming the function, never a live call.
+The price is WAL size — 1,000 rows at 1024 dimensions add 4 133 005 bytes
+(4.0 KiB per distinct text) to the record, so checkpoint after a backfill.
+Opening the store with a build that has no `embeddings` feature fails at the
+recorded `LOAD EXTENSION` with the engine's usual "a database file never
+loads native code on its own" error; rebuild with the feature, or keep the
+unsigned vectors out of the WAL by computing them in a read-only statement.
+
+**Policy.** A call is external I/O to a paid service, so the server's
+read-only MCP `query` tool refuses it even though `embed()` reads no table;
+start the server with `allow-files` (the switch that already permits
+`read_csv` and URLs) to allow it. The switch is checked twice: when the
+statement binds (an early, friendly error) and at every call site in the
+executor — so a call reached through a multi-statement batch, a macro, a
+view, a trigger action, a `CALL`/`DO` body or a prepared statement is
+refused before any request. A local model server on loopback is still
+external I/O by this rule.
+
+**Errors and limits.** A `NULL` argument gives `NULL` with no request; an
+empty string is sent (the provider decides what it means). `401` is not
+retried; `429` and `5xx` are retried up to three attempts with 250 ms/500 ms
+backoff; a timeout is `PINKDB_EMBEDDINGS_TIMEOUT_MS`. The model is a setting,
+not a second argument (`embed(text, model)` was optional in the plan). No
+embeddings are computed by the default build.
 
 ## C ABI (`pinkdb-ffi`)
 

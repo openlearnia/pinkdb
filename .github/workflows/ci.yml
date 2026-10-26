@@ -141,6 +141,15 @@ jobs:
               # pull in `regex`: the default binary links neither.
               ! cargo tree -p pinkdb-cli -e normal | grep -q pinkdb-fts
               ! cargo tree -p pinkdb-cli -e normal --features fts | grep -q regex
+          - name: embeddings
+            run: |
+              cargo test -p pinkdb-embeddings
+              cargo test -p pinkdb-cli --features embeddings
+              cargo test -p pinkdb-server --features embeddings
+              # Embeddings are opt-in (wave 107c), and the default binary must
+              # link neither the package nor the blocking HTTPS client it uses.
+              ! cargo tree -p pinkdb-cli -e normal | grep -q pinkdb-embeddings
+              ! cargo tree -p pinkdb-cli -e normal | grep -q ureq
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 

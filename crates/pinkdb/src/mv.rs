@@ -411,7 +411,7 @@ impl PinkDb {
     /// must be held by the caller for durable stores).
     pub(crate) fn log_auto_refresh(&self, report: &AutoRefresh) -> Result<()> {
         let db = self.current_db.clone();
-        self.wal_append_session(&db, &db, &report.stmts, &[], &[], Some(&report.sets))
+        self.wal_append_session(&db, &db, &report.stmts, &[], &[], Some(&report.sets), &[])
     }
 
     /// Mark a successful refresh: the wall-clock stamp, the attempt stamp and

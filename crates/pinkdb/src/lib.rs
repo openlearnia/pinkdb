@@ -268,13 +268,15 @@ impl PinkDb {
             // is added below (only the first statement carries it).
             let stmt_start = profiling.then(std::time::Instant::now);
             // One budget per statement (wave 99): the deadline starts before
-            // binding, matching the `Connection` path. `None` is the
-            // historical zero-cost path.
-            let budget =
-                limits.map(|limits| std::sync::Arc::new(exec::ExecBudget::new(Some(&limits))));
-            let run_plan = |db: &mut PinkDb, plan: &plan::LogicalPlan| match &budget {
-                Some(budget) => exec::run_with_budget(db, plan, budget.clone()),
-                None => exec::run(db, plan),
+            // binding, matching the `Connection` path. It always exists: the
+            // executor records the results of `external_io` host scalars in it
+            // (wave 107c) when the statement is WAL-logged.
+            let budget = std::sync::Arc::new(
+                exec::ExecBudget::new(limits.as_ref())
+                    .with_external_services(self.external_services()),
+            );
+            let run_plan = |db: &mut PinkDb, plan: &plan::LogicalPlan| {
+                exec::run_with_budget(db, plan, budget.clone())
             };
             let bind_start = profiling.then(std::time::Instant::now);
             let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &session_db)?;
@@ -287,6 +289,11 @@ impl PinkDb {
             let optimize = optimize_start
                 .map(|start| start.elapsed())
                 .unwrap_or_default();
+            // A record replay serves these results instead of calling the
+            // function; only a statement that is actually WAL-logged records.
+            budget.set_collect_external_calls(
+                self.is_durable() && !self.replaying && plan::writes_tables(&plan),
+            );
             // Store/process-level statements cannot be undone by a snapshot
             // commit of the multi-writer path: refuse inside a txn.
             // (LOAD EXTENSION is process-level too: the private snapshot's
@@ -403,11 +410,13 @@ impl PinkDb {
                     execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
                     let log_start = profiling.then(std::time::Instant::now);
                     if let Some(texts) = &texts {
+                        let memo = budget.take_external_calls();
                         self.wal_log_statement(
                             &plan,
                             &texts[i],
                             &dynamic_functions_used,
                             Some(&sets),
+                            &memo,
                         )?;
                         self.maybe_auto_checkpoint(lease.as_ref());
                     }
@@ -471,7 +480,8 @@ impl PinkDb {
                 execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
                 let log_start = profiling.then(std::time::Instant::now);
                 if let Some(texts) = &texts {
-                    self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used, None)?;
+                    let memo = budget.take_external_calls();
+                    self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used, None, &memo)?;
                     self.maybe_auto_checkpoint(lease.as_ref());
                 }
                 log = log_start.map(|start| start.elapsed()).unwrap_or_default();

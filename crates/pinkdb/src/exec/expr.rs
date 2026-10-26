@@ -203,6 +203,65 @@ fn eval_dynamic_scalar(
         for a in args {
             vecs.push(eval_expr(a, chunk, cx)?);
         }
+        let external = host.is_external_io();
+        // A replay serves every `external_io` result from the WAL record's
+        // memo: the provider is not reachable (and may have no key), and the
+        // replayed vectors must equal the ones the original statement wrote.
+        // A miss is a hard error, never a fresh call.
+        if external && let Some(memo) = cx.db.ext_replay() {
+            let mut out = Vector::new_empty(dtype);
+            for row in 0..chunk.num_rows() {
+                let row_values: Vec<crate::types::Value> =
+                    vecs.iter().map(|v| v.get(row)).collect();
+                match memo.get(name, &row_values) {
+                    Some(result) => out.push_valid(result.clone())?,
+                    None => {
+                        return Err(PinkDbError::Execution(format!(
+                            "WAL replay has no recorded result for {name}() (row {row}): the \
+                             record's external-call memo does not cover this call"
+                        )));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        // The authority for the session's external-services policy is the
+        // call site, not the binder: a statement in a batch can bind only
+        // after an earlier one created what it reads.
+        if external && !cx.budget.external_services() {
+            return Err(PinkDbError::Permission(
+                crate::package::SERVICES_HINT.to_string(),
+            ));
+        }
+        let collect = external && cx.budget.collects_external_calls();
+        // A batched scalar gets the whole chunk, so one call can deduplicate
+        // and batch its work (and an external round trip is not paid per
+        // row). The contract is the declared type and one result per row.
+        if let Some(batch) = host.batch() {
+            let out = batch(cx.db, &vecs)?;
+            if out.len() != chunk.num_rows() {
+                return Err(PinkDbError::Execution(format!(
+                    "host function {name}() returned {} rows for a chunk of {}",
+                    out.len(),
+                    chunk.num_rows()
+                )));
+            }
+            if out.dtype() != dtype {
+                return Err(PinkDbError::Execution(format!(
+                    "host function {name}() returned {} but declares {dtype}",
+                    out.dtype()
+                )));
+            }
+            if collect {
+                for row in 0..chunk.num_rows() {
+                    let row_values: Vec<crate::types::Value> =
+                        vecs.iter().map(|v| v.get(row)).collect();
+                    cx.budget
+                        .record_external_call(name, row_values, out.get(row));
+                }
+            }
+            return Ok(out);
+        }
         let mut out = Vector::new_empty(dtype);
         let mut row_values: Vec<crate::types::Value> = Vec::with_capacity(vecs.len());
         for row in 0..chunk.num_rows() {
@@ -210,7 +269,12 @@ fn eval_dynamic_scalar(
             for v in &vecs {
                 row_values.push(v.get(row));
             }
-            out.push_valid(host.call(cx.db, &row_values)?)?;
+            let value = host.call(cx.db, &row_values)?;
+            if collect {
+                cx.budget
+                    .record_external_call(name, row_values.clone(), value.clone());
+            }
+            out.push_valid(value)?;
         }
         return Ok(out);
     }

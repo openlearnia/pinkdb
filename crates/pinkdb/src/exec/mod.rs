@@ -13,7 +13,7 @@ pub(crate) mod window;
 
 use crate::types::{FastMap, FastSet};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use aggregate::{
     Acc, Group, HIGH_CARDINALITY_KEYS, Partial, aggregate, emit_groups, fold_stream,
@@ -89,6 +89,25 @@ pub(crate) struct ExecBudget {
     /// twice: each cap bounds its own materialization stage.
     result_rows: std::sync::atomic::AtomicUsize,
     result_bytes: std::sync::atomic::AtomicUsize,
+    /// Whether this statement's statement is WAL-logged, so the results of
+    /// the `external_io` host scalars it calls must travel in its record
+    /// (wave 107c): replay serves them and never calls the function again.
+    collect_external_calls: std::sync::atomic::AtomicBool,
+    /// The results recorded so far, deduplicated by `(function, arguments)`.
+    external_calls: std::sync::Mutex<ExternalCalls>,
+    /// Whether this session may call `external_io` host scalars: the serve
+    /// policy's `allow-files` switch. `false` refuses the call before it
+    /// leaves the process, whatever statement shape reaches it (a macro,
+    /// view, trigger or procedure body included).
+    external_services: std::sync::atomic::AtomicBool,
+}
+
+/// [`ExecBudget`]'s recorded `external_io` results, in call order, and the
+/// keys already recorded.
+#[derive(Debug, Default)]
+struct ExternalCalls {
+    calls: std::vec::Vec<crate::wal::ExtCall>,
+    seen: HashSet<std::vec::Vec<u8>>,
 }
 
 impl ExecBudget {
@@ -103,7 +122,82 @@ impl ExecBudget {
             bytes: std::sync::atomic::AtomicUsize::new(0),
             result_rows: std::sync::atomic::AtomicUsize::new(0),
             result_bytes: std::sync::atomic::AtomicUsize::new(0),
+            collect_external_calls: std::sync::atomic::AtomicBool::new(false),
+            external_calls: std::sync::Mutex::new(ExternalCalls::default()),
+            external_services: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// A statement that a durable store WAL-logs must carry the results of
+    /// every `external_io` host scalar it calls.
+    pub(crate) fn set_collect_external_calls(&self, collect: bool) {
+        self.collect_external_calls
+            .store(collect, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The serve policy's `allow-files` switch for the session this statement
+    /// runs in.
+    pub(crate) fn with_external_services(self, allowed: bool) -> Self {
+        self.external_services
+            .store(allowed, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    pub(crate) fn external_services(&self) -> bool {
+        self.external_services
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record one `external_io` result (no-op unless the statement is being
+    /// collected). Deduplicated: a retried statement records the same calls
+    /// again, and a chunk repeats inputs.
+    pub(crate) fn record_external_call(
+        &self,
+        name: &str,
+        args: std::vec::Vec<crate::types::Value>,
+        result: crate::types::Value,
+    ) {
+        if !self
+            .collect_external_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut calls = self
+            .external_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A hash set of encoded keys, not a scan: a million-row backfill
+        // records a million calls.
+        let Some(key) = crate::wal::ext_call_key(name, &args) else {
+            return;
+        };
+        if !calls.seen.insert(key) {
+            return;
+        }
+        calls.calls.push(crate::wal::ExtCall {
+            name: name.to_string(),
+            args,
+            result,
+        });
+    }
+
+    /// Whether recording is on, so the caller can skip building the
+    /// arguments for a scalar that does not record.
+    pub(crate) fn collects_external_calls(&self) -> bool {
+        self.collect_external_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The statement's recorded `external_io` results, in call order.
+    pub(crate) fn take_external_calls(&self) -> std::vec::Vec<crate::wal::ExtCall> {
+        std::mem::take(
+            &mut *self
+                .external_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+        .calls
     }
 
     /// Unbounded, for internal evaluation paths that have no `Connection`
@@ -703,12 +797,12 @@ fn run_call_plan(
     }
     // `DO` (wave 83) runs its own definition.
     if let Some(def) = inline {
-        return crate::procedure::execute_do(db, &target, def);
+        return crate::procedure::execute_do(db, &target, def, budget);
     }
     // Resolve the definition now (the binder did too, but the catalog may have
     // been refreshed between bind and execution).
     let def = db.procedure_in(&target, name)?.clone();
-    crate::procedure::execute_call(db, &target, &def, values)
+    crate::procedure::execute_call(db, &target, &def, values, budget)
 }
 
 /// Run a DML body, materializing `RETURNING` from the rows it wrote.

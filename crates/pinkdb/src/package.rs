@@ -485,6 +485,11 @@ impl HostParam {
 /// A host scalar's callback: reads the store, returns one value per row.
 type ScalarFn = Arc<dyn Fn(&PinkDb, &[Value]) -> Result<Value> + Send + Sync>;
 
+/// A host scalar's chunk callback: gets every argument vector for the chunk
+/// and returns the whole result column. See [`HostScalar::batched`].
+type BatchFn =
+    Arc<dyn Fn(&PinkDb, &[crate::vector::Vector]) -> Result<crate::vector::Vector> + Send + Sync>;
+
 /// The tables a host scalar's call reads, given its arguments (`None` when an
 /// argument is not constant) and the statement's database. See
 /// [`HostScalar::reads_tables`].
@@ -493,16 +498,28 @@ type ReadsFn = fn(&[Option<&Value>], &str) -> Result<Vec<(String, String)>>;
 /// A host statement's callback: runs SQL and inserts rows through the store.
 type StatementFn = Arc<dyn Fn(&mut HostCtx<'_>, &[Value]) -> Result<QueryResult> + Send + Sync>;
 
-/// A per-row function that also sees the store (see the module section on
-/// host functions). Bound and evaluated like a linked scalar.
+/// What a call to an external service (a host scalar declared
+/// [`HostScalar::external_io`]) gets while `allow_files` is off. One switch
+/// for everything that leaves the store: a remote call can cost money, so the
+/// read-only default refuses it. It lives here, next to the marker, because
+/// the executor refuses the call on `wasm32` too (where `serve` is absent).
+pub const SERVICES_HINT: &str = "external services are disabled: this session reads tables only \
+                             (start the server with allow-files to permit a call to an \
+                             external service, such as embed())";
+
+/// A function that also sees the store (see the module section on host
+/// functions). Bound and evaluated like a linked scalar: per row
+/// ([`HostScalar::new`]) or over a whole chunk ([`HostScalar::batched`]).
 #[derive(Clone)]
 pub struct HostScalar {
     name: String,
     package: String,
     params: Vec<HostParam>,
     ret: crate::ext::ExtType,
-    eval: ScalarFn,
+    eval: Option<ScalarFn>,
+    batch: Option<BatchFn>,
     reads: Option<ReadsFn>,
+    external_io: bool,
 }
 
 impl std::fmt::Debug for HostScalar {
@@ -528,9 +545,51 @@ impl HostScalar {
             package: String::new(),
             params,
             ret,
-            eval: Arc::new(eval),
+            eval: Some(Arc::new(eval)),
+            batch: None,
             reads: None,
+            external_io: false,
         }
+    }
+
+    /// `name`, its parameters, the declared return type, and a callback that
+    /// sees **every row of the chunk at once**: each argument arrives as its
+    /// evaluated [`Vector`](crate::vector::Vector) (an invalid cell is a
+    /// NULL, and the callback decides what that means), and the return value
+    /// is the result column for the same rows, with the declared type and
+    /// length. This is the shape for work whose cost is one round trip per
+    /// call — an HTTP request for an embedding, say — so it can batch,
+    /// deduplicate and cache across the chunk instead of paying per row.
+    /// There is no per-row fallback: a batched scalar is only ever called
+    /// this way.
+    pub fn batched(
+        name: impl Into<String>,
+        params: Vec<HostParam>,
+        ret: crate::ext::ExtType,
+        eval: impl Fn(&PinkDb, &[crate::vector::Vector]) -> Result<crate::vector::Vector>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            package: String::new(),
+            params,
+            ret,
+            eval: None,
+            batch: Some(Arc::new(eval)),
+            reads: None,
+            external_io: false,
+        }
+    }
+
+    /// Declare that a call leaves the process — a network service, possibly a
+    /// paid one. `serve`'s read-only policy refuses such a call unless the
+    /// session was started with `allow-files`, the same switch that permits
+    /// external files and URLs.
+    pub fn external_io(mut self) -> Self {
+        self.external_io = true;
+        self
     }
 
     /// Declare the tables a call reads.
@@ -569,7 +628,23 @@ impl HostScalar {
     }
 
     pub(crate) fn call(&self, db: &PinkDb, args: &[Value]) -> Result<Value> {
-        (self.eval)(db, args)
+        let eval = self.eval.as_ref().ok_or_else(|| {
+            PinkDbError::Execution(format!(
+                "host function {}() is evaluated a chunk at a time",
+                self.name
+            ))
+        })?;
+        eval(db, args)
+    }
+
+    pub(crate) fn batch(&self) -> Option<&BatchFn> {
+        self.batch.as_ref()
+    }
+
+    /// Whether a call leaves the process (a paid service), which the agent
+    /// policy gates. Only the native `serve` module reads it.
+    pub(crate) fn is_external_io(&self) -> bool {
+        self.external_io
     }
 
     pub(crate) fn reads(&self) -> Option<ReadsFn> {
@@ -627,6 +702,7 @@ impl<'a> HostCtx<'a> {
             &self.db_name,
             crate::sql::binder::ParamSlots::new(Vec::new()),
             &stmt,
+            None,
             move |m| PinkDbError::Execution(format!("{name}: {m}")),
         )?;
         Ok(result)

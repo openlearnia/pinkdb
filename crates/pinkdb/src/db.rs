@@ -200,6 +200,7 @@ impl Database {
             require_login: false,
             exec_limits: None,
             session: crate::storage::Session::new(),
+            external_services: true,
         }
     }
 
@@ -390,6 +391,10 @@ struct Txn {
     /// SQL text of this transaction's mutating statements: one WAL record at
     /// COMMIT (empty for read-only transactions, which log nothing).
     wal_stmts: Vec<String>,
+    /// Results of the `external_io` host scalars those statements called
+    /// (wave 107c), deduplicated; travels in the same WAL record so a replay
+    /// never calls the provider again.
+    wal_memo: Vec<crate::wal::ExtCall>,
     /// Extension paths touched by those statements (dynamic functions they
     /// call), deduped, in first-use order; the record is
     /// `LOAD EXTENSION`-prefixed for every path the WAL generation has not
@@ -444,9 +449,20 @@ pub struct Connection {
     /// shared: another connection (or the embedded handle) cannot read or
     /// overwrite it. Not transactional, not persisted, not logged.
     session: crate::storage::Session,
+    /// Whether this session may call `external_io` host scalars (wave 107c):
+    /// the serve policy's `allow-files` switch, set per statement batch by
+    /// the front-end. `true` by default: an embedded connection is trusted.
+    external_services: bool,
 }
 
 impl Connection {
+    /// Allow or refuse `external_io` host scalars in this session (the serve
+    /// policy's `allow-files` switch). Refused calls return a permission
+    /// error before any request leaves the process.
+    pub fn set_external_services(&mut self, allowed: bool) {
+        self.external_services = allowed;
+    }
+
     /// Parse and run every statement, returning one result each.
     /// Multi-statement strings mix freely (each statement locks as needed).
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
@@ -721,7 +737,10 @@ impl Connection {
         // One budget per statement: the deadline starts here (before bind)
         // and is shared by every evaluation context of this statement. No
         // limits (the embedded default) is a zero-cost `None` budget.
-        let budget = Arc::new(crate::exec::ExecBudget::new(self.exec_limits.as_ref()));
+        let budget = Arc::new(
+            crate::exec::ExecBudget::new(self.exec_limits.as_ref())
+                .with_external_services(self.external_services),
+        );
         // Transaction control never touches table data: handle first. The
         // whole transition (including COMMIT's WAL append) is execution time.
         match stmt {
@@ -814,8 +833,12 @@ impl Connection {
                     let stmt_sets = txn.work.plan_sets_store(&plan, &pre);
                     txn.wal_sets.extend(&stmt_sets);
                 }
+                budget.set_collect_external_calls(
+                    txn.work.is_durable() && crate::plan::writes_tables(&plan),
+                );
                 let exec_start = profile.as_ref().map(|_| Instant::now());
                 let result = crate::exec::run_with_budget(&mut txn.work, &plan, budget.clone())?;
+                let memo = budget.take_external_calls();
                 if let Some(p) = profile.as_deref_mut() {
                     p.execute += exec_start.map(|s| s.elapsed()).unwrap_or_default();
                 }
@@ -866,6 +889,15 @@ impl Connection {
                     for p in crate::storage::loaded_extension_path(&plan) {
                         if !txn.wal_ext_loaded.contains(&p) {
                             txn.wal_ext_loaded.push(p);
+                        }
+                    }
+                    for call in memo {
+                        if !txn
+                            .wal_memo
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&call.name) && c.args == call.args)
+                        {
+                            txn.wal_memo.push(call);
                         }
                     }
                 }
@@ -952,6 +984,7 @@ impl Connection {
                             &[],
                             &[],
                             Some(&sets),
+                            &[],
                         )?;
                     }
                     if let Some(p) = profile {
@@ -1021,6 +1054,7 @@ impl Connection {
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
+        budget.set_collect_external_calls(shared.is_durable() && crate::plan::writes_tables(&plan));
         if !self.db.lease.is_some() || !crate::plan::optimistic_eligible(&plan) {
             // Serialized path: lease first, then refresh, run, log.
             drop(shared);
@@ -1042,6 +1076,9 @@ impl Connection {
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
             }
+            budget.set_collect_external_calls(
+                shared.is_durable() && crate::plan::writes_tables(&plan),
+            );
             // Wave 83: an autocommit CALL may COMMIT/ROLLBACK in its body.
             shared.standalone_call = true;
             let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone());
@@ -1058,6 +1095,7 @@ impl Connection {
                 &result,
                 lease.as_ref(),
                 None,
+                &budget,
             )?;
             let log = log_start.map(|start| start.elapsed()).unwrap_or_default();
             if let Some(p) = profile.as_deref_mut() {
@@ -1106,6 +1144,7 @@ impl Connection {
                 &result,
                 lease.as_ref(),
                 Some(&sets),
+                &budget,
             )?;
             let log = log_start.map(|start| start.elapsed()).unwrap_or_default();
             if let Some(p) = profile.as_deref_mut() {
@@ -1143,6 +1182,7 @@ impl Connection {
             &result,
             lease.as_ref(),
             None,
+            &budget,
         )?;
         let log = log_start.map(|start| start.elapsed()).unwrap_or_default();
         if let Some(p) = profile {
@@ -1169,7 +1209,11 @@ impl Connection {
         result: &QueryResult,
         lease: Option<&LeaseGuard>,
         sets: Option<&crate::wal::FrameSets>,
+        budget: &Arc<crate::exec::ExecBudget>,
     ) -> Result<()> {
+        // The statement's recorded external-call results travel in its record:
+        // a replay serves them and never calls the provider (wave 107c).
+        let memo = budget.take_external_calls();
         if crate::plan::writes_tables(plan) {
             // Wave 80: the committed unit's writes feed the ON COMMIT trigger
             // for the next statement boundary (a no-op for MV-free stores).
@@ -1183,7 +1227,7 @@ impl Connection {
         {
             if !stmts.is_empty() {
                 let sets = shared.proc_frame.touched();
-                shared.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets))?;
+                shared.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), &memo)?;
                 shared.maybe_auto_checkpoint(lease);
             }
             return Ok(());
@@ -1208,6 +1252,7 @@ impl Connection {
                 &touched,
                 &loaded,
                 Some(&sets),
+                &memo,
             )?;
             shared.maybe_auto_checkpoint(lease);
         }
@@ -1256,6 +1301,7 @@ impl Connection {
             view_writes: HashSet::new(),
             wal_sets: crate::wal::FrameSets::default(),
             wal_stmts: Vec::new(),
+            wal_memo: Vec::new(),
             wal_ext_paths: Vec::new(),
             wal_ext_loaded: Vec::new(),
             wal_db_before: None,
@@ -1383,6 +1429,7 @@ impl Connection {
                 &txn.wal_ext_paths,
                 &txn.wal_ext_loaded,
                 Some(&sets),
+                &txn.wal_memo,
             )?;
         }
         // Merge: swap written tables (carrying bumped versions) and views.
