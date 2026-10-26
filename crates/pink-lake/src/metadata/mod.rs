@@ -55,9 +55,8 @@ pub(crate) mod postgres;
 /// One commit's typed change.
 ///
 /// A publication either carries the complete target catalog ([`CatalogChange::catalog`],
-/// used by the compatibility `catalog.json` CAS and by maintenance rewrites
-/// that still build a whole target) or the typed delta the lake already
-/// computed ([`CatalogChange::manifest`], the O(delta) path used by commits
+/// used by saves and maintenance rewrites that build a whole target) or the
+/// typed delta the lake already computed ([`CatalogChange::manifest`], the O(delta) path used by commits
 /// and saves). `schema_version`, `format_version` and `updated` are the
 /// catalog-handle facts that are not part of the per-table delta.
 #[derive(Debug, Clone)]
@@ -229,13 +228,12 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// version.
     fn commit(&self, base_version: u64, change: CatalogChange) -> Result<u64>;
 
-    /// The stored commit-delta manifest (`commits/<version>.json`'s logical
-    /// content), if the store keeps one. Used by change-data reads.
+    /// The stored commit-delta manifest's logical content, if the store keeps
+    /// one. Used by change-data reads.
     fn commit_manifest(&self, version: u64) -> Result<Option<Vec<u8>>>;
 
     /// Store/read an opaque catalog-side object (replication state, the
-    /// `lake.json`/`highest.json` compatibility rows, …). This is not the
-    /// old blob layout: the catalog's own tables are the source of truth;
+    /// engine lease, …). The catalog's own tables are the source of truth;
     /// these rows only carry facts DuckLake has no column for.
     fn put_object(&self, rel: &str, bytes: &[u8]) -> Result<bool>;
     /// [`Self::put_object`], replacing an existing row instead of refusing it:

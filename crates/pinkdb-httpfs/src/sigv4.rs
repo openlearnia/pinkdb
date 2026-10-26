@@ -391,7 +391,7 @@ mod tests {
             &creds(),
             &SigningInput {
                 method: "PUT",
-                canonical_uri: "/lakes/mine/catalog.json",
+                canonical_uri: "/lakes/mine/object.bin",
                 canonical_query: "",
                 headers: vec![
                     ("host", "mybucket.s3.us-east-1.amazonaws.com"),
@@ -408,7 +408,7 @@ mod tests {
         );
         assert_eq!(
             signed.canonical_request,
-            "PUT\n/lakes/mine/catalog.json\n\n\
+            "PUT\n/lakes/mine/object.bin\n\n\
              host:mybucket.s3.us-east-1.amazonaws.com\n\
              if-match:\"9f86d081884c7d659a2feaa0c55ad015\"\n\
              x-amz-content-sha256:4cdbdc97901ade291d828daee607eb93b01b68f8a10c478b9f73dd9e6d5967a5\n\
@@ -419,11 +419,11 @@ mod tests {
         assert_eq!(
             signed.string_to_sign,
             "AWS4-HMAC-SHA256\n20261014T101112Z\n20261014/us-east-1/s3/aws4_request\n\
-             75892741b70bd0c37ebd2aefd5580742722bd1d8f65c9f90dfd5e87572aa8aa9"
+             8f55c78a000ce21c790ec7208dc6815e027fbf1e819eb3115acda76d74aa85dd"
         );
         assert_eq!(
             signed.signature,
-            "fde843e5cc49606d8df99c7dd7bee0787dc948a3a899a5c073da775ed8f253cf"
+            "8418173a8beaebe7604140dbdf8f55836be2bc759d31bd02c7a8e1a8b5336e33"
         );
     }
 

@@ -1,6 +1,7 @@
-//! The lake catalog: the JSON metadata of one version.
+//! The lake catalog: the metadata of one version.
 //!
-//! `catalog.json` and `snapshots/<version>.json` have the same shape:
+//! A manifest is stored as typed DuckLake rows (see `metadata`); this is its
+//! logical shape:
 //!
 //! ```json
 //! {
@@ -995,15 +996,13 @@ pub(crate) fn assign_missing_table_ids(tables: &mut BTreeMap<String, TableEntry>
     Ok(())
 }
 
-/// One commit's delta manifest (`commits/<version>.json`): the data and
-/// delete files this commit added, per table, plus the logical row movement.
+/// One commit's delta manifest: the data and delete files this commit added,
+/// per table, plus the logical row movement.
 ///
-/// Written append-only (create-only, like a snapshot) *before* the snapshot
-/// manifest and the catalog that reference the same files, so the audit trail
-/// is never ahead of the authoritative state. A full snapshot (`.lake save`)
-/// also writes one: `replaced` marks a table whose whole file list this commit
-/// replaced (a full rewrite), as opposed to an append/delete delta on top of
-/// the base version's files.
+/// Published in the same catalog transaction as the snapshot record it
+/// belongs to. A full snapshot (`.lake save`) also writes one: `replaced`
+/// marks a table whose whole file list this commit replaced (a full rewrite),
+/// as opposed to an append/delete delta on top of the base version's files.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct CommitManifest {
     pub(crate) format_version: u32,
@@ -1020,9 +1019,8 @@ pub(crate) struct CommitManifest {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TableDelta {
     /// The runtime-only part of a delta: the target table facts and the
-    /// inlined row versions that no `commits/<v>.json` needs to carry (the
-    /// SQL catalog derives the audit manifest back from its rows). Skipped
-    /// by serde so the object-store delta JSON stays exactly as it was.
+    /// inlined row versions, which the SQL catalog derives back from its rows.
+    /// Skipped by serde (it is not part of the stored delta).
     #[serde(skip)]
     pub(crate) runtime: TableRuntime,
     /// Data files this commit added.

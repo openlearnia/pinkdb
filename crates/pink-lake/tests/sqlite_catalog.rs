@@ -50,6 +50,34 @@ fn sqlite_location_validation() {
     assert!(err.to_string().contains("data location"), "{err}");
 }
 
+/// A catalog row that no longer exists fails the open, and the error names the
+/// catalog location as given (`sqlite:<path>`), never a JSON file.
+#[test]
+fn a_catalog_without_its_metadata_names_its_location() {
+    use rusqlite::Connection;
+
+    let dir = catalog_suite::scratch("catalog-label");
+    let path = dir.join("lake.db");
+    let catalog = format!("sqlite:{}", path.display());
+    let lake = Lake::create_url(&catalog).unwrap();
+    drop(lake);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE ducklake_metadata;").unwrap();
+    }
+
+    let err = Lake::open_url(&catalog).unwrap_err();
+    assert!(matches!(err, LakeError::NotALake { .. }), "{err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&catalog),
+        "the error must name {catalog}: {message}"
+    );
+    // The deleted JSON layout's file name must not appear in a catalog error.
+    assert!(!message.contains(concat!("catalog", ".json")), "{message}");
+    catalog_suite::cleanup(&dir);
+}
+
 #[test]
 fn create_save_open_round_trip() {
     catalog_suite::create_save_open_round_trip(&mut SqliteSuite::new());

@@ -238,6 +238,8 @@ fn live_rows(entry: &AttachedEntry) -> u64 {
 #[derive(Debug)]
 pub(crate) struct LakeAttachment {
     location: String,
+    /// The catalog location this attachment's errors name (redacted URL).
+    catalog: String,
     store: Arc<dyn crate::metadata::MetadataStore>,
     storage: Arc<dyn Storage>,
     root: std::path::PathBuf,
@@ -310,6 +312,11 @@ struct CachedTable {
 }
 
 impl LakeAttachment {
+    /// The catalog location, for error attribution.
+    fn catalog_path(&self) -> &std::path::Path {
+        std::path::Path::new(&self.catalog)
+    }
+
     #[cfg(test)]
     pub(crate) fn loads(&self) -> u64 {
         self.loads.load(Ordering::Relaxed)
@@ -655,7 +662,7 @@ impl AttachedLake for LakeAttachment {
                 &entry.key(),
                 &entry.table,
                 Some(&wanted),
-                &self.root.join("catalog.json"),
+                self.catalog_path(),
             )
             .map_err(|e| PinkDbError::Execution(e.to_string()))?;
             if let Some(first) = &present
@@ -746,7 +753,7 @@ impl LakeAttachment {
         let versions = published_versions(&*self.store, self.pinned).map_err(catalog_error)?;
         let mut index = Vec::with_capacity(versions.len());
         for version in versions {
-            match manifest_for(&*self.store, &self.root, Some(version)) {
+            match manifest_for(&*self.store, self.catalog_path(), Some(version)) {
                 Ok((manifest, _))
                     if self.lake_id.is_none()
                         || manifest.format_version < 6
@@ -819,6 +826,7 @@ impl LakeAttachment {
             &self.store,
             &self.storage,
             &self.root,
+            &self.catalog,
             Some(version),
             self.lake_id.as_deref(),
         )
@@ -884,7 +892,7 @@ impl LakeAttachment {
         }
         if !entry.inlined.is_empty() {
             let record = entry.record.as_ref().ok_or_else(|| LakeError::Corrupt {
-                path: self.root.join("catalog.json"),
+                path: self.catalog_path().to_path_buf(),
                 message: format!(
                     "table \"{}\" carries inlined rows but no schema record",
                     entry.key()
@@ -900,7 +908,7 @@ impl LakeAttachment {
                 &entry.key(),
                 &entry.table,
                 Some(&wanted),
-                &self.root.join("catalog.json"),
+                self.catalog_path(),
             )?;
             match &mut union {
                 None => union = Some((table, present)),
@@ -1535,23 +1543,26 @@ pub(crate) fn build(
         &lake.store,
         &lake.storage,
         lake.path(),
+        lake.catalog_label(),
         version,
         Some(&lake.lake_id),
     )
 }
 
-/// [`build`] without a [`Lake`] handle: the storage root and the version to
-/// pin. Time-travel views are built through this same function, so a version
-/// query validates exactly like `.lake attach <dir> <version>`.
+/// [`build`] without a [`Lake`] handle: the storage root, the catalog
+/// location errors name and the version to pin. Time-travel views are built
+/// through this same function, so a version query validates exactly like
+/// `.lake attach <dir> <version>`.
 pub(crate) fn build_from(
     store: &Arc<dyn crate::metadata::MetadataStore>,
     storage: &Arc<dyn Storage>,
     root: &std::path::Path,
+    catalog: &str,
     version: Option<u64>,
     lake_id: Option<&str>,
 ) -> Result<(Arc<LakeAttachment>, AttachmentReport)> {
     let stats_before = storage.stats();
-    let (manifest, manifest_path) = manifest_for(&**store, root, version)?;
+    let (manifest, manifest_path) = manifest_for(&**store, std::path::Path::new(catalog), version)?;
     if let Some(expected) = lake_id
         && manifest.format_version >= 6
         && manifest.lake_id.as_deref() != Some(expected)
@@ -1937,6 +1948,7 @@ pub(crate) fn build_from(
     let attachment = Arc::new(LakeAttachment {
         store: Arc::clone(store),
         location: root.display().to_string(),
+        catalog: catalog.to_string(),
         storage: Arc::clone(storage),
         root,
         lake_id: lake_id.map(str::to_string),
@@ -2228,7 +2240,7 @@ mod tests {
             inlined_limit: None,
             next_row_id: 0,
         };
-        let path = std::path::Path::new("snapshots/2.json");
+        let path = std::path::Path::new("data/main.t/x.pink");
         let key = "main.t";
 
         // A consistent block attaches.

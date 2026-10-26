@@ -21,9 +21,6 @@ use std::time::UNIX_EPOCH;
 use super::storage::{Head, LocalCopy, ObjectInfo, Storage};
 use crate::{LakeError, Result, fresh_id};
 
-/// The catalog file name inside the lake root.
-pub(crate) const CATALOG_FILE: &str = "catalog.json";
-
 /// Directory-and-file I/O rooted at one lake directory.
 #[derive(Debug)]
 pub(crate) struct LocalStorage {

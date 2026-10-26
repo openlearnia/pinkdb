@@ -1453,12 +1453,12 @@ mod tests {
         assert_eq!(target.host, "acc.r2.cloudflarestorage.com");
 
         let virtual_hosted = Endpoint::parse("https://s3.us-east-1.amazonaws.com", false).unwrap();
-        let target = virtual_hosted.target("mybucket", "lakes/mine/catalog.json", "");
+        let target = virtual_hosted.target("mybucket", "lakes/mine/object.bin", "");
         assert_eq!(
             target.url,
-            "https://mybucket.s3.us-east-1.amazonaws.com/lakes/mine/catalog.json"
+            "https://mybucket.s3.us-east-1.amazonaws.com/lakes/mine/object.bin"
         );
-        assert_eq!(target.canonical_uri, "/lakes/mine/catalog.json");
+        assert_eq!(target.canonical_uri, "/lakes/mine/object.bin");
         assert_eq!(target.host, "mybucket.s3.us-east-1.amazonaws.com");
 
         // A port and a base path survive both styles.
@@ -1663,14 +1663,14 @@ mod tests {
     fn xml_helpers_parse_listings_and_errors() {
         let listing = "<?xml version=\"1.0\"?><ListBucketResult>\
             <IsTruncated>false</IsTruncated>\
-            <Contents><Key>snapshots/1.json</Key><ETag>&quot;1&quot;</ETag><Size>5</Size></Contents>\
-            <Contents><Key>snapshots/2&amp;3.json</Key></Contents>\
+            <Contents><Key>objects/1.bin</Key><ETag>&quot;1&quot;</ETag><Size>5</Size></Contents>\
+            <Contents><Key>objects/2&amp;3.bin</Key></Contents>\
             </ListBucketResult>";
         let keys: Vec<String> = xml_blocks(listing, "Contents")
             .iter()
             .filter_map(|block| xml_field(block, "Key"))
             .collect();
-        assert_eq!(keys, vec!["snapshots/1.json", "snapshots/2&3.json"]);
+        assert_eq!(keys, vec!["objects/1.bin", "objects/2&3.bin"]);
         assert_eq!(xml_field(listing, "IsTruncated").as_deref(), Some("false"));
 
         let error = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>";
@@ -1755,7 +1755,7 @@ mod tests {
                 .with_credentials(mock.access_key_id(), "not-the-secret"),
         )
         .unwrap();
-        let err = client.get_object("catalog.json").unwrap_err();
+        let err = client.get_object("object.bin").unwrap_err();
         assert!(matches!(err, Error::Auth { .. }), "{err:?}");
         assert!(err.to_string().contains("SignatureDoesNotMatch"), "{err}");
         assert_eq!(mock.verified_requests(), 0, "no request verified");

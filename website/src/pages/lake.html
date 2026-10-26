@@ -111,10 +111,9 @@ let mut lake = Lake::create_with_catalog_with_key("pink:lake.pink", "data", key)
 
 <h2>No legacy layout</h2>
 
-<p>JSON-layout lakes (<code>catalog.json</code>, <code>snapshots/</code>,
-<code>commits/</code>, <code>highest.json</code>, <code>lake.json</code>) do not
-open in this build and there is no converter. Re-save such a lake with an older
-pinkdb build, then open the new catalog here.</p>
+<p>Pre-103 JSON-layout lakes (a JSON catalog plus snapshot and commit files) do
+not open in this build and there is no converter. Re-save such a lake with an
+older pinkdb build, then open the new catalog here.</p>
 
 <ul class="next-links">
   <li><a href="{{root}}docs/guide-csv-to-lake.html">Guide: CSV to a lake →</a></li>

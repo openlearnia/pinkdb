@@ -739,10 +739,7 @@ fn include_exclude_and_stale_table_drops_body() {
         "b is excluded; nothing else remains"
     );
     let err = replication::catch_up(&mut dest, job, None, None).unwrap_err();
-    assert!(
-        err.to_string().contains("not a pink-lake directory"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("not a pink lake"), "{err}");
     assert_eq!(
         replication::jobs(&dest).unwrap()[0].status.as_str(),
         "error"
@@ -1078,10 +1075,10 @@ fn mock_s3_destination_replicates_and_persists_state_body() {
     let report = replication::catch_up(&mut dest, job, None, None).unwrap();
     assert_eq!(report.tables_synced, 1, "{}", report.message);
     assert!(
-        !mock.keys().iter().any(|k| k.ends_with("state.json")
-            || k.ends_with("catalog.json")
-            || k.contains("/snapshots/")),
-        "state stays in the catalog, not object storage: {:?}",
+        mock.keys().iter().all(|k| k.starts_with("data/")
+            || k.contains("/data/")
+            || k.ends_with("lake-data.json")),
+        "the destination prefix holds data objects only: {:?}",
         mock.keys()
     );
 

@@ -1009,7 +1009,7 @@ mod tests {
 
     #[test]
     fn an_unknown_id_is_named() {
-        let err = format_for("no-such-format", Path::new("catalog.json")).unwrap_err();
+        let err = format_for("no-such-format", Path::new("lake.pink")).unwrap_err();
         assert!(matches!(err, LakeError::UnknownFormat { .. }), "{err:?}");
         let text = err.to_string();
         assert!(text.contains("no-such-format"), "{text}");

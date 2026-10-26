@@ -46,7 +46,7 @@
 //! are ignored; a mapped one whose type disagrees with the record is a
 //! [`LakeError::Corrupt`] — type changes are not part of this wave.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pinkdb::{DataType, Value};
 
@@ -432,12 +432,13 @@ pub(crate) struct SchemaDelta {
 /// v4 table) is materialized as epoch 1 with `added: 1` for every column, so
 /// its files migrate cleanly.
 pub(crate) fn plan_schema_delta(
+    catalog: &Path,
     key: &str,
     base_entry: &crate::catalog::TableEntry,
     base_table: &pinkdb::DataTable,
     current: &pinkdb::DataTable,
 ) -> Result<SchemaDelta> {
-    let base = match TableSchema::from_entry(key, base_entry, &manifest_path())? {
+    let base = match TableSchema::from_entry(key, base_entry, catalog)? {
         Some(record) => record,
         None => TableSchema {
             version: 1,
@@ -601,10 +602,4 @@ pub(crate) fn plan_schema_delta(
         }),
         view,
     })
-}
-
-/// A manifest path for internal decode errors (schema deltas are planned
-/// from in-memory manifests; real read paths carry their own path).
-pub(crate) fn manifest_path() -> PathBuf {
-    PathBuf::from("catalog.json")
 }

@@ -735,7 +735,7 @@ mod tests {
         let mock = crate::mock_s3::MockS3::start();
         let storage = storage_with_secret(&mock, "ops-bucket", "ops", "not-the-secret");
         let err = storage
-            .read("catalog.json", "reading catalog.json")
+            .read("object.bin", "reading object.bin")
             .unwrap_err();
         assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
         assert!(err.to_string().contains("SignatureDoesNotMatch"), "{err}");
@@ -751,21 +751,21 @@ mod tests {
 
         mock.tamper_next_body_hash();
         let err = storage
-            .read("catalog.json", "reading catalog.json")
+            .read("object.bin", "reading object.bin")
             .unwrap_err();
         assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
         assert!(err.to_string().contains("x-amz-content-sha256"), "{err}");
 
         mock.set_clock_offset_secs(3600);
         let err = storage
-            .read("catalog.json", "reading catalog.json")
+            .read("object.bin", "reading object.bin")
             .unwrap_err();
         assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
         assert!(err.to_string().contains("RequestTimeTooSkewed"), "{err}");
         mock.set_clock_offset_secs(0);
         // Back in time: the same request verifies (and the mock records it).
-        mock.put_object("ops/catalog.json", b"{}");
-        assert_eq!(storage.read("catalog.json", "reading").unwrap(), b"{}");
+        mock.put_object("ops/object.bin", b"{}");
+        assert_eq!(storage.read("object.bin", "reading").unwrap(), b"{}");
         assert!(mock.verified_requests() >= 1);
     }
 
@@ -842,18 +842,16 @@ mod tests {
         mock.restrict_buckets(&["real-bucket"]);
         let ghost = storage(&mock, "ghost-bucket", "lake");
 
-        let err = ghost
-            .read("catalog.json", "reading catalog.json")
-            .unwrap_err();
+        let err = ghost.read("object.bin", "reading object.bin").unwrap_err();
         assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
         assert!(err.to_string().contains("bucket does not exist"), "{err}");
 
-        let err = ghost.head("catalog.json").unwrap_err();
+        let err = ghost.head("object.bin").unwrap_err();
         assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
         assert!(err.to_string().contains("bucket does not exist"), "{err}");
 
         // The existing bucket still reads as a lake-less prefix.
         let real = storage(&mock, "real-bucket", "lake");
-        assert_eq!(real.head("catalog.json").unwrap(), Head::Missing);
+        assert_eq!(real.head("object.bin").unwrap(), Head::Missing);
     }
 }

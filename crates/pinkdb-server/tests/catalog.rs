@@ -547,8 +547,10 @@ fn round_trip_on_mock_s3_data() {
         "no data file reached the bucket: {keys:?}"
     );
     assert!(
-        !keys.iter().any(|key| key.ends_with("catalog.json")),
-        "the metadata must stay in the catalog, not in the bucket: {keys:?}"
+        keys.iter().all(|key| (key.starts_with("data/")
+            || key.contains("/data/")
+            || key.ends_with("lake-data.json"))),
+        "the bucket holds data objects only: {keys:?}"
     );
 
     std::thread::sleep(pink_lake::LEASE_TIMEOUT + Duration::from_millis(300));

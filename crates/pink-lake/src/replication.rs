@@ -14,15 +14,15 @@
 //! - [`Source::Store`] — one database of the caller's live [`PinkDb`] store
 //!   (the CLI's session store), passed to [`catch_up`] as `Some(store)`.
 //!
-//! Jobs and their per-table state live **in the destination lake**
-//! (`replication/state.json`), so any process that opens the destination sees
-//! them. Every destination write is an ordinary incremental lake commit
+//! Jobs and their per-table state live **in the destination lake's catalog**
+//! (the `replication_state` row), so any process that opens the destination
+//! sees them. Every destination write is an ordinary incremental lake commit
 //! ([`Lake::commit_from_tables`] with only that table in `base`/`current`):
 //! a replicated version is a normal version (time travel, attach, CDC and
 //! maintenance all apply), and the existing concurrent-writer rebase/retry/
 //! conflict rules govern races with other writers.
 //!
-//! # State (`replication/state.json`)
+//! # State (the catalog's `replication_state` row)
 //!
 //! ```json
 //! {
@@ -148,9 +148,6 @@ use serde::{Deserialize, Serialize};
 use crate::incremental::{Commit, CommitReport, CommitSettings};
 use crate::storage::Location;
 use crate::{EncryptionKey, Lake, LakeError, Result};
-
-/// The lake-relative path of the replication state file (in the destination).
-pub const STATE_PATH: &str = "replication/state.json";
 
 /// The replication state format this build writes and reads.
 pub const REPLICATION_FORMAT: u32 = 1;
@@ -284,7 +281,7 @@ impl JobSpec {
     }
 }
 
-/// One job, exactly as `replication/state.json` records it.
+/// One job, exactly as the catalog's replication state records it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     /// The job id (unique in the destination; never reused).

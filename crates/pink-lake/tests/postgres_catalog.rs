@@ -75,3 +75,50 @@ fn open_of_a_fresh_schema_creates_nothing() {
     catalog_suite::cleanup(&dir);
     suite.finish("open_of_a_fresh_schema_creates_nothing");
 }
+
+/// A catalog row that no longer exists fails the open, and the error names the
+/// catalog location (the URL as given) with any password redacted.
+#[test]
+fn a_catalog_without_its_metadata_names_its_redacted_location() {
+    let Some(mut suite) =
+        PostgresSuite::from_env("a_catalog_without_its_metadata_names_its_redacted_location")
+    else {
+        return;
+    };
+    let dir = catalog_suite::scratch("catalog-label");
+    let catalog = suite.catalog(&dir, "label");
+    let data = dir.join("data");
+    let lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    drop(lake);
+    suite.sql(&catalog, "DROP TABLE ducklake_metadata");
+
+    let err = Lake::open_url(&catalog).unwrap_err();
+    assert!(matches!(err, LakeError::NotALake { .. }), "{err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&pink_lake::redact_location(&catalog)),
+        "the error must name the catalog: {message}"
+    );
+    // The deleted JSON layout's file name must not appear in a catalog error.
+    assert!(!message.contains(concat!("catalog", ".json")), "{message}");
+
+    // A password in the URL never reaches the message (a server that rejects
+    // the injected password stops the open before the catalog check; then the
+    // only assertion is that the secret is scrubbed).
+    let with_password = catalog.replacen('@', ":sekret@", 1);
+    let err = Lake::open_url(&with_password).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        !message.contains("sekret"),
+        "the password leaked: {message}"
+    );
+    if matches!(err, LakeError::NotALake { .. }) {
+        assert!(
+            message.contains(&pink_lake::redact_location(&with_password)),
+            "the error must name the redacted catalog: {message}"
+        );
+    }
+
+    catalog_suite::cleanup(&dir);
+    suite.finish("a_catalog_without_its_metadata_names_its_redacted_location");
+}

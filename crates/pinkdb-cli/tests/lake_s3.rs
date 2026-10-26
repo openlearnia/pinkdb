@@ -107,8 +107,10 @@ fn lake_s3_save_open_versions_tables_info() {
     );
     let keys = mock.keys();
     assert!(
-        !keys.iter().any(|k| k.ends_with("catalog.json")),
-        "metadata is in the catalog database, not object storage: {keys:?}"
+        keys.iter().all(|k| k.starts_with("data/")
+            || k.contains("/data/")
+            || k.ends_with("lake-data.json")),
+        "the bucket holds data objects only: {keys:?}"
     );
     assert_eq!(
         keys.iter().filter(|k| k.contains("/data/")).count(),

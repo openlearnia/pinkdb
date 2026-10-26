@@ -69,8 +69,8 @@
 //!
 //! # Snapshots: `expire_snapshots`
 //!
-//! Removes `snapshots/<v>.json` **and its `commits/<v>.json`** for versions
-//! selected by a rule — an explicit `versions` list, an `older_than` cutoff,
+//! Removes a snapshot row **and its commit delta** for versions selected by
+//! a rule — an explicit `versions` list, an `older_than` cutoff,
 //! and/or pinkdb's `retain_last` (keep the newest N) — never the current
 //! version (DuckLake filters `snapshot_id != MAX(snapshot_id)`, and an
 //! explicit `versions` entry naming the current snapshot was probed to be a
@@ -125,18 +125,18 @@
 //!
 //! # Concurrency
 //!
-//! A compaction publishes exactly like a commit: candidate files first,
-//! `commits/<v>.json`, `snapshots/<v>.json`, then the conditional catalog
-//! replace — so a crash leaves only unreferenced leftovers. A conflicting
-//! publish retries under [`CommitSettings`] (DuckLake's retry knobs),
-//! **re-planning and re-writing** the merged files against the new head; the
-//! superseded attempt's files are deleted best-effort before the retry (they
-//! were never published, so nothing references them — a crash in that window
-//! leaves them for `cleanup_old_files`). Snapshot expiration and object
-//! cleanup first verify the catalog still declares this handle's version
+//! A compaction publishes exactly like a commit: candidate files first, then
+//! one transaction that adds the snapshot row and the typed delta — so a
+//! crash leaves only unreferenced leftovers. A conflicting publish retries
+//! under [`CommitSettings`] (DuckLake's retry knobs), **re-planning and
+//! re-writing** the merged files against the new head; the superseded
+//! attempt's files are deleted best-effort before the retry (they were never
+//! published, so nothing references them — a crash in that window leaves
+//! them for `cleanup_old_files`). Snapshot expiration and object cleanup
+//! first verify the catalog still declares this handle's version
 //! (single-writer contract) and then delete; a concurrent publisher racing
 //! one of them is refused up front, and neither operation changes the
-//! current version or `catalog.json`.
+//! current version.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -147,7 +147,6 @@ use crate::catalog::{
     Catalog, CommitManifest, DeleteRef, FileFormat, FileRef, TableDelta, TableEntry,
 };
 use crate::incremental::CommitSettings;
-use crate::local::CATALOG_FILE;
 use crate::snapshot::SnapshotInfo;
 use crate::{
     FORMAT_VERSION, LAKE_DATA_FILE, Lake, LakeError, Result, apply_file_deletes, copy_chunks,
@@ -285,8 +284,8 @@ pub struct ExpireSettings {
 pub struct ExpireReport {
     pub versions: Vec<SnapshotInfo>,
     pub dry_run: bool,
-    /// Bytes of the removed `snapshots/<v>.json` + `commits/<v>.json`
-    /// objects (stored sizes, so ciphertext for an encrypted lake).
+    /// Bytes freed: always 0 — expiration deletes catalog rows; data objects
+    /// belong to `cleanup_old_files`.
     pub bytes: u64,
 }
 
@@ -415,8 +414,8 @@ pub struct LakeOption {
 /// (`catalog_type`, `extension_version`, `data_path`) docked to pinkdb.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LakeSettings {
-    /// Where the catalog metadata lives: `"json"` (pinkdb's `catalog.json` +
-    /// snapshot files; DuckLake reports its metadata backend, `duckdb`).
+    /// Where the catalog metadata lives: `"database"` (pinkdb's DuckLake
+    /// catalog tables; DuckLake reports its metadata backend, `duckdb`).
     pub catalog_type: String,
     /// The pink-lake crate version.
     pub extension_version: String,
@@ -575,8 +574,8 @@ impl Lake {
         id: &str,
     ) -> Result<CompactionReport> {
         let key = format!("{db}.{table}");
-        split_key(&key, &self.root)?;
-        crate::format::format_for(id, &self.root.join(CATALOG_FILE))?;
+        split_key(&key, self.catalog_path())?;
+        crate::format::format_for(id, self.catalog_path())?;
         let plan = PlanOptions {
             min_file_size: None,
             max_file_size: None,
@@ -618,7 +617,7 @@ impl Lake {
         options: PlanOptions,
     ) -> Result<CompactionReport> {
         if let Some(table) = table {
-            split_key(table, &self.root)?;
+            split_key(table, self.catalog_path())?;
         }
         let retry = CommitSettings::default();
         let mut attempt: u32 = 0;
@@ -633,7 +632,7 @@ impl Lake {
                 .checked_add(1)
                 .filter(|v| *v <= crate::MAX_VERSION)
                 .ok_or_else(|| LakeError::Overflow {
-                    path: self.root.clone(),
+                    path: self.catalog_path().to_path_buf(),
                     version: head.version,
                 })?;
             // Unpublished files this attempt wrote: deleted best-effort
@@ -692,7 +691,7 @@ impl Lake {
                 Some((author, message)) => (author.clone(), message.clone()),
                 None => (None, None),
             };
-            let changes = manifest_for(&*self.store, &self.root, Some(head.version))
+            let changes = manifest_for(&*self.store, self.catalog_path(), Some(head.version))
                 .ok()
                 .map(|(previous, _)| {
                     crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
@@ -725,7 +724,7 @@ impl Lake {
                 skipped,
                 bytes_written: files_bytes,
             };
-            match self.publish_catalog_version(&new_catalog, commit_manifest, &[], &[]) {
+            match self.publish_catalog_version(&new_catalog, commit_manifest) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -754,7 +753,7 @@ impl Lake {
         options: &PlanOptions,
         written: &mut Vec<String>,
     ) -> Result<(Vec<PlannedTable>, u64, Vec<String>)> {
-        let manifest_path = self.storage.abs(CATALOG_FILE);
+        let manifest_path = self.catalog_path().to_path_buf();
         if let Some(selected) = table {
             // DuckLake resolves the named table up front and raises when it
             // does not exist; do the same (never a silent empty plan).
@@ -1075,7 +1074,7 @@ impl Lake {
         rows: u64,
         deleted: &[u64],
     ) -> Result<DataTable> {
-        let (dbname, table) = split_key(key, &self.root.join(CATALOG_FILE))?;
+        let (dbname, table) = split_key(key, self.catalog_path())?;
         let mini = self.open_data_file(rel, format)?;
         let (file_db, file_table) = only_table(&mini, rel, &self.root)?;
         if !file_db.eq_ignore_ascii_case(dbname) || !file_table.name.eq_ignore_ascii_case(table) {
@@ -1099,11 +1098,10 @@ impl Lake {
         apply_file_deletes(file_table, deleted, key, rel)
     }
 
-    /// Expire old snapshot manifests (and their commit deltas), DuckLake's
-    /// `ducklake_expire_snapshots`. Deletes `snapshots/<v>.json` and
-    /// `commits/<v>.json`; the current version is never touched, and time
-    /// travel to an expired version becomes the ordinary clean
-    /// `VersionNotFound`. See [`ExpireSettings`] for the selection rules.
+    /// Expire old snapshot records (and their commit deltas), DuckLake's
+    /// `ducklake_expire_snapshots`. Deletes the version's rows; the current
+    /// version is never touched, and time travel to an expired version
+    /// becomes the ordinary clean `VersionNotFound`. See [`ExpireSettings`] for the selection rules.
     pub fn expire_snapshots(&mut self, settings: &ExpireSettings) -> Result<ExpireReport> {
         if settings.versions.is_some() && settings.older_than_micros.is_some() {
             return Err(LakeError::InvalidOption {
@@ -1388,7 +1386,9 @@ impl Lake {
         let (catalog, _) = self.manifest(None)?;
         collect(&catalog);
         for version in self.versions()? {
-            if let Ok((manifest, _)) = manifest_for(&*self.store, &self.root, Some(version)) {
+            if let Ok((manifest, _)) =
+                manifest_for(&*self.store, self.catalog_path(), Some(version))
+            {
                 collect(&manifest);
             }
         }
@@ -1583,7 +1583,7 @@ impl Lake {
             ),
             option(
                 "current_version",
-                "Current lake version (catalog.json)",
+                "Current lake version",
                 manifest.version.to_string(),
             ),
             option(

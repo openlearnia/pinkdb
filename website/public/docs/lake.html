@@ -294,10 +294,9 @@ lake.write_from_store(&amp;db)?;
 
 <h2 id="no-legacy-layout">No legacy layout<a class="anchor" href="#no-legacy-layout" aria-label="Permalink: No legacy layout">#</a></h2>
 
-<p>JSON-layout lakes (<code>catalog.json</code>, <code>snapshots/</code>,
-<code>commits/</code>, <code>highest.json</code>, <code>lake.json</code>) do not
-open in this build and there is no converter. Re-save such a lake with an older
-pinkdb build, then open the new catalog here.</p>
+<p>Pre-103 JSON-layout lakes (a JSON catalog plus snapshot and commit files) do
+not open in this build and there is no converter. Re-save such a lake with an
+older pinkdb build, then open the new catalog here.</p>
 
 <ul class="next-links">
   <li><a href="../docs/guide-csv-to-lake">Guide: CSV to a lake →</a></li>

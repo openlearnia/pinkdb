@@ -22,10 +22,9 @@
 //! catalog opens here without them and a pink-written catalog attaches in
 //! DuckDB.
 //!
-//! The store is also the write side of the compatibility layer: `catalog.json`
-//! and `snapshots/<v>.json` are *rendered* from the rows on read, never stored
-//! as full manifests. A commit diffs the base catalog it reads inside the
-//! transaction against its target and writes only the changed rows.
+//! A manifest is *rendered* from the rows on read, never stored as a whole.
+//! A commit diffs the base catalog it reads inside the transaction against
+//! its target and writes only the changed rows.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -80,8 +79,8 @@ pub(crate) fn last_commit_rows_touched() -> u64 {
 #[derive(Debug)]
 struct Inner {
     id: u64,
-    url: String,
-    path: PathBuf,
+    /// The catalog location errors name: the URL as given, password redacted.
+    label: PathBuf,
     conn: Box<dyn SqlConnection>,
 }
 
@@ -93,8 +92,7 @@ pub(crate) struct SqlMetadataStore {
     inner: Arc<Inner>,
 }
 
-/// The transaction a SQL catalog's compatibility layer uses for one
-/// publication.
+/// The transaction one SQL catalog publication runs in.
 pub(crate) struct StoreTransaction {
     store_id: u64,
 }
@@ -167,18 +165,17 @@ impl SqlMetadataStore {
         create: bool,
         open: impl FnOnce(&str, &Path, bool) -> Result<Box<dyn SqlConnection>>,
     ) -> Result<Self> {
+        let label = PathBuf::from(crate::redact_location(url));
         let conn = open(url, path, create)?;
         let dialect = conn.dialect();
-        let initialized = has_ducklake_tables(&*conn, dialect)?;
+        let initialized = has_ducklake_tables(&*conn, dialect, &label)?;
         if create {
             conn.execute_batch(&dialect.ducklake_ddl())
                 .map_err(|e| sql_error("creating the DuckLake catalog schema", e))?;
             conn.execute_batch(&dialect.side_ddl())
                 .map_err(|e| sql_error("creating the pinkdb side tables", e))?;
         } else if !initialized {
-            return Err(LakeError::NotALake {
-                path: PathBuf::from(url),
-            });
+            return Err(LakeError::NotALake { path: label });
         } else if !table_exists(&*conn, "pinkdb_meta")?
             || !table_exists(&*conn, "pinkdb_replication_state")?
         {
@@ -197,8 +194,7 @@ impl SqlMetadataStore {
         let store = Self {
             inner: Arc::new(Inner {
                 id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
-                url: url.to_string(),
-                path: path.to_path_buf(),
+                label,
                 conn,
             }),
         };
@@ -220,7 +216,7 @@ impl SqlMetadataStore {
                 Some(value) => {
                     if value != SIDE_VERSION.to_string() {
                         return Err(LakeError::Unsupported {
-                            path: self.inner.path.clone(),
+                            path: self.label().to_path_buf(),
                             found: value.parse().unwrap_or(0),
                         });
                     }
@@ -237,9 +233,9 @@ impl SqlMetadataStore {
         })
     }
 
-    /// The catalog URL, for `Storage::abs` messages.
-    pub(crate) fn url(&self) -> &str {
-        &self.inner.url
+    /// The catalog location errors name (redacted URL).
+    fn label(&self) -> &Path {
+        &self.inner.label
     }
 
     /// Run `f` on the active publish transaction when this store owns one on
@@ -331,7 +327,7 @@ impl SqlMetadataStore {
     /// One table's full entry at `version` (`None` = head).
     pub(crate) fn table(&self, key: &str, version: Option<u64>) -> Result<Option<TableEntry>> {
         self.with_conn(|conn| {
-            let sid = resolve_sid(conn, version)?;
+            let sid = resolve_sid(conn, version, self.label())?;
             let Some(table) = find_table(conn, key, sid)? else {
                 return Ok(None);
             };
@@ -350,7 +346,7 @@ impl SqlMetadataStore {
         version: Option<u64>,
     ) -> Result<Option<TableEntry>> {
         self.with_conn(|conn| {
-            let sid = resolve_sid(conn, version)?;
+            let sid = resolve_sid(conn, version, self.label())?;
             let Some(table) = find_table(conn, key, sid)? else {
                 return Ok(None);
             };
@@ -364,7 +360,7 @@ impl SqlMetadataStore {
     /// One table's non-file facts at `version` (`None` = head).
     pub(crate) fn table_stub(&self, key: &str, version: Option<u64>) -> Result<Option<TableEntry>> {
         self.with_conn(|conn| {
-            let sid = resolve_sid(conn, version)?;
+            let sid = resolve_sid(conn, version, self.label())?;
             let Some(table) = find_table(conn, key, sid)? else {
                 return Ok(None);
             };
@@ -454,7 +450,7 @@ impl SqlMetadataStore {
         key: &str,
         columns: &[(String, pinkdb::DataType)],
     ) -> Result<Vec<crate::format::FieldIds>> {
-        self.with_conn(|conn| planned_field_ids(conn, key, columns))
+        self.with_conn(|conn| planned_field_ids(conn, key, columns, self.label()))
     }
 
     pub(crate) fn forget_scheduled(&self, ids: &[i64]) -> Result<()> {
@@ -526,10 +522,10 @@ impl SqlMetadataStore {
     pub(crate) fn set_table_format(&self, key: &str, format: &str) -> Result<()> {
         self.with_conn(|conn| {
             let sid = head_snapshot_id(conn)?.ok_or_else(|| LakeError::NotALake {
-                path: PathBuf::from("catalog"),
+                path: self.label().to_path_buf(),
             })?;
             let table = find_table(conn, key, sid)?.ok_or_else(|| LakeError::Corrupt {
-                path: PathBuf::from("catalog"),
+                path: self.label().to_path_buf(),
                 message: format!("table \"{key}\" is not in the catalog"),
             })?;
             update_or_insert(
@@ -691,7 +687,7 @@ impl SqlMetadataStore {
         let result = self.with_conn(|conn| {
             if head_version_conn(conn)?.is_some() {
                 return Err(LakeError::AlreadyALake {
-                    path: PathBuf::from(self.url()),
+                    path: self.label().to_path_buf(),
                 });
             }
             create_in_conn(conn, data_location, created_by, catalog)
@@ -707,15 +703,14 @@ impl SqlMetadataStore {
         }
     }
 
-    /// Commit one publication inside the active transaction. The adapter's
-    /// `put_if_match("catalog.json")` calls this; the typed trait method wraps
-    /// it in its own transaction.
+    /// Commit one publication inside the active transaction.
+    /// [`MetadataStore::commit`] wraps it in the store's own transaction.
     pub(crate) fn commit_in_transaction(
         &self,
         base_version: u64,
         change: CatalogChange,
     ) -> Result<u64> {
-        self.with_conn(|conn| commit_in_conn(conn, base_version, &change))
+        self.with_conn(|conn| commit_in_conn(conn, base_version, &change, self.label()))
     }
 
     // ---------- metadata facts ----------
@@ -965,7 +960,7 @@ impl MetadataStore for SqlMetadataStore {
 
 // ============================ connection helpers ============================
 
-fn has_ducklake_tables(conn: &dyn SqlConnection, _dialect: Dialect) -> Result<bool> {
+fn has_ducklake_tables(conn: &dyn SqlConnection, _dialect: Dialect, label: &Path) -> Result<bool> {
     if !table_exists(conn, "ducklake_metadata")? {
         return Ok(false);
     }
@@ -980,7 +975,7 @@ fn has_ducklake_tables(conn: &dyn SqlConnection, _dialect: Dialect) -> Result<bo
     match version.as_deref() {
         None | Some(DUCKLAKE_VERSION) => Ok(true),
         Some(other) => Err(LakeError::Unsupported {
-            path: PathBuf::from("catalog"),
+            path: label.to_path_buf(),
             found: other
                 .split('.')
                 .next()
@@ -1642,10 +1637,10 @@ fn load_conn_inner(
     }))
 }
 
-fn resolve_sid(conn: &dyn SqlConnection, version: Option<u64>) -> Result<i64> {
+fn resolve_sid(conn: &dyn SqlConnection, version: Option<u64>, label: &Path) -> Result<i64> {
     let Some(head) = head_snapshot_id(conn)? else {
         return Err(LakeError::NotALake {
-            path: PathBuf::from("catalog"),
+            path: label.to_path_buf(),
         });
     };
     let sid = match version {
@@ -1654,7 +1649,7 @@ fn resolve_sid(conn: &dyn SqlConnection, version: Option<u64>) -> Result<i64> {
             let sid = snapshot_id(version)?;
             if sid > head {
                 return Err(LakeError::Conflict {
-                    path: PathBuf::from("catalog"),
+                    path: label.to_path_buf(),
                     message: format!("version {version} is newer than the catalog head"),
                 });
             }
@@ -3279,14 +3274,15 @@ fn commit_in_conn(
     conn: &dyn SqlConnection,
     base_version: u64,
     change: &CatalogChange,
+    label: &Path,
 ) -> Result<u64> {
     let Some(target) = change.catalog.as_ref() else {
-        return commit_delta_in_conn(conn, base_version, change);
+        return commit_delta_in_conn(conn, base_version, change, label);
     };
     let head = head_version_conn(conn)?;
     if head != Some(base_version) {
         return Err(LakeError::Conflict {
-            path: PathBuf::from("catalog"),
+            path: label.to_path_buf(),
             message: format!(
                 "the catalog head moved to {} while this commit was based on {base_version}; \
                  rebase and retry",
@@ -3297,7 +3293,7 @@ fn commit_in_conn(
     }
     let Some(base) = load_conn(conn, Some(base_version))? else {
         return Err(LakeError::Conflict {
-            path: PathBuf::from("catalog"),
+            path: label.to_path_buf(),
             message: format!("the base version {base_version} does not exist"),
         });
     };
@@ -3348,7 +3344,7 @@ fn commit_in_conn(
     let target_keys: Vec<String> = target.tables.keys().cloned().collect();
     for key in target_keys {
         let entry = &target.tables[&key];
-        let (schema_name, table_name) = split_key(&key)?;
+        let (schema_name, table_name) = split_key(&key, label)?;
         let base_entry = base.tables.get(&key);
         let identity_changed = match (base_entry, entry.table_id.as_deref()) {
             (Some(old), Some(new)) => old.table_id.as_deref().is_some_and(|old| old != new),
@@ -3501,12 +3497,13 @@ fn commit_delta_in_conn(
     conn: &dyn SqlConnection,
     base_version: u64,
     change: &CatalogChange,
+    label: &Path,
 ) -> Result<u64> {
     let target_version = base_version + 1;
     let head = head_version_conn(conn)?;
     if head != Some(base_version) {
         return Err(LakeError::Conflict {
-            path: PathBuf::from("catalog"),
+            path: label.to_path_buf(),
             message: format!(
                 "the catalog head moved to {} while this commit was based on {base_version}; \
                  rebase and retry",
@@ -3541,7 +3538,7 @@ fn commit_delta_in_conn(
     let mut altered_tables: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
     for (key, delta) in &change.manifest.tables {
         let runtime = &delta.runtime;
-        let (schema_name, table_name) = split_key(key)?;
+        let (schema_name, table_name) = split_key(key, label)?;
         let mut row = find_table(conn, key, base_sid)?;
         if runtime.dropped {
             let Some(old) = row.take() else {
@@ -5353,9 +5350,10 @@ fn planned_field_ids(
     conn: &dyn SqlConnection,
     key: &str,
     columns: &[(String, pinkdb::DataType)],
+    label: &Path,
 ) -> Result<Vec<crate::format::FieldIds>> {
     use crate::format::FieldIds;
-    let (schema_name, table_name) = split_key(key)?;
+    let (schema_name, table_name) = split_key(key, label)?;
     let table_id: Option<i64> = conn
         .query_row(
             "SELECT t.table_id FROM ducklake_table t
@@ -5483,11 +5481,11 @@ fn fresh_field_ids(
     out
 }
 
-fn split_key(key: &str) -> Result<(String, String)> {
+fn split_key(key: &str, label: &Path) -> Result<(String, String)> {
     key.split_once('.')
         .map(|(db, table)| (db.to_string(), table.to_string()))
         .ok_or_else(|| LakeError::Corrupt {
-            path: PathBuf::from("catalog"),
+            path: label.to_path_buf(),
             message: format!("catalog key \"{key}\" has no database part"),
         })
 }

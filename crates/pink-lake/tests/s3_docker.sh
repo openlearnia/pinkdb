@@ -795,8 +795,8 @@ PY
 KEYS="$(list_keys "itest/")" || fail "listing itest/ failed"
 printf '%s\n' "$KEYS" | grep -qE '^itest/data/main\.t/[0-9a-f-]+\.(pink|parquet)$' \
     || fail "the roundtrip's data object is missing"
-if printf '%s\n' "$KEYS" | grep -qE 'itest/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
-    fail "metadata objects must not be written to S3 anymore: $KEYS"
+if printf '%s\n' "$KEYS" | grep -vqE '^itest/(data/|lake-data\.json$)'; then
+    fail "S3 holds data objects and the ownership marker only: $KEYS"
 fi
 printf '%s\n' "$KEYS" | grep -qxF "itest/lake-data.json" \
     || fail "the lake-data.json ownership marker is missing"
@@ -848,8 +848,8 @@ for k in $(printf '%s\n' "$ENC_KEYS" | grep -E '^enc/data/'); do
     [ "$(head -c 8 "$TMP/enc_data.bin")" = "PNKLAKE1" ] \
         || fail "$k is not a PNKLAKE1 container"
 done
-if printf '%s\n' "$ENC_KEYS" | grep -qE 'enc/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
-    fail "encrypted metadata must not be written to S3: $ENC_KEYS"
+if printf '%s\n' "$ENC_KEYS" | grep -vqE '^enc/(data/|lake-data\.json$)'; then
+    fail "S3 holds encrypted data objects and the ownership marker only: $ENC_KEYS"
 fi
 ok "every enc/ data object is a PNKLAKE1 container"
 
@@ -1136,8 +1136,8 @@ assert_re "$TMP/conc_metadata.log" '^main\.settle \(1 row\)$'
 # The split lake keeps its data under conc/ and nothing else but the
 # `lake-data.json` ownership marker: no catalog, no snapshots, no commits.
 CONC_KEYS="$(list_keys "conc/")" || fail "listing conc/ failed"
-if printf '%s\n' "$CONC_KEYS" | grep -qE 'conc/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
-    fail "catalog metadata must not be written to S3: $CONC_KEYS"
+if printf '%s\n' "$CONC_KEYS" | grep -vqE '^conc/(data/|lake-data\.json$)'; then
+    fail "S3 holds data objects and the ownership marker only: $CONC_KEYS"
 fi
 printf '%s\n' "$CONC_KEYS" | grep -qxF "conc/lake-data.json" \
     || fail "the split lake's lake-data.json ownership marker is missing"
@@ -1378,8 +1378,8 @@ PY
 WINNER="$(sed -n 's/^winner=//p' "$TMP/conflict.state")"
 
 CONFLICT_KEYS="$(list_keys "conflict/")" || fail "listing conflict/ failed"
-if printf '%s\n' "$CONFLICT_KEYS" | grep -qE 'conflict/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
-    fail "catalog metadata must not be written to S3: $CONFLICT_KEYS"
+if printf '%s\n' "$CONFLICT_KEYS" | grep -vqE '^conflict/(data/|lake-data\.json$)'; then
+    fail "S3 holds data objects only: $CONFLICT_KEYS"
 fi
 printf '%s\n' "$CONFLICT_KEYS" | grep -qE '^conflict/data/main\.(tslow|tquick)/[0-9a-f-]+\.(pink|pinkdel)$' \
     || fail "the conflict run's data objects are missing"
@@ -1433,8 +1433,8 @@ assert_re "$TMP/refuse_retry.log" '^Saved lake version 4 in '
 ok "the split form still publishes: version 4"
 
 REFUSE_KEYS="$(list_keys "refuse/")" || fail "listing refuse/ failed"
-if printf '%s\n' "$REFUSE_KEYS" | grep -qE 'refuse/(catalog\.json|snapshots/|commits/|highest\.json|lake\.json)'; then
-    fail "catalog metadata must not be written to S3: $REFUSE_KEYS"
+if printf '%s\n' "$REFUSE_KEYS" | grep -vqE '^refuse/(data/|lake-data\.json$)'; then
+    fail "S3 holds data objects and the ownership marker only: $REFUSE_KEYS"
 fi
 printf '%s\n' "$REFUSE_KEYS" | grep -qxF "refuse/lake-data.json" \
     || fail "the refuse/ ownership marker is missing"

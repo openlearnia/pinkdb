@@ -86,8 +86,8 @@ fn save_open_attach_and_commit_through_a_pink_catalog() {
         "the ownership marker is at the data root"
     );
     assert!(
-        !dir.join("data-root").join("catalog.json").exists(),
-        "no object-store metadata at the data location"
+        !dir.join("data-root").join("catalog.pink").exists(),
+        "the catalog stays at its own location, not in the data root"
     );
 
     // Read-only attach by the catalog URL, an explicit `data` open (the moved

@@ -91,7 +91,7 @@ fn full_cycle_create_save_open_versions_tables() {
     let scratch = scratch("cycle");
     let db = small_store();
 
-    // create → v1, snapshots/1.json + catalog.json at the lake prefix.
+    // create → v1; the catalog is local, the prefix holds data objects only.
     let mut lake = create_s3_lake(mock_config(&mock, "test-bucket", "lakes/mine")).unwrap();
     assert_eq!(lake.current_version(), 1);
     assert_eq!(lake.format_version(), 7);
@@ -99,10 +99,10 @@ fn full_cycle_create_save_open_versions_tables() {
     assert_eq!(lake.path().to_str().unwrap(), "s3://test-bucket/lakes/mine");
     let keys = mock.keys();
     assert!(
-        !keys
-            .iter()
-            .any(|k| k.ends_with("catalog.json") || k.contains("/snapshots/")),
-        "metadata stays in the local catalog: {keys:?}"
+        keys.iter().all(|k| k.starts_with("data/")
+            || k.contains("/data/")
+            || k.ends_with("lake-data.json")),
+        "the prefix holds data objects only: {keys:?}"
     );
     assert!(
         keys.iter().any(|k| k.ends_with("lake-data.json")),
@@ -187,7 +187,7 @@ fn full_cycle_create_save_open_versions_tables() {
     // Not a lake: a different prefix under the same bucket.
     let err = open_s3_lake(mock_config(&mock, "test-bucket", "lakes/other")).unwrap_err();
     assert!(matches!(err, LakeError::NotALake { .. }), "{err:?}");
-    assert!(err.to_string().contains("not a pink-lake"), "{err}");
+    assert!(err.to_string().contains("not a pink lake"), "{err}");
     std::fs::remove_dir_all(&scratch).ok();
 }
 
@@ -205,9 +205,9 @@ fn prefixes_and_percent_encoded_table_names_round_trip() {
     lake.write_from_store(&db).unwrap();
     let root_keys = mock.keys();
     assert!(
-        !root_keys
-            .iter()
-            .any(|k| k.ends_with("catalog.json") || k.contains("snapshots/")),
+        root_keys.iter().all(|k| k.starts_with("data/")
+            || k.contains("/data/")
+            || k.ends_with("lake-data.json")),
         "{root_keys:?}"
     );
     assert!(
@@ -222,10 +222,9 @@ fn prefixes_and_percent_encoded_table_names_round_trip() {
     let mut lake = create_s3_lake(mock_config(&mock, "deep-bucket", "a/b/c")).unwrap();
     lake.write_from_store(&db).unwrap();
     assert!(
-        !mock
-            .keys()
-            .iter()
-            .any(|k| k.ends_with("catalog.json") || k.contains("snapshots/"))
+        mock.keys().iter().all(|k| k.starts_with("data/")
+            || k.contains("/data/")
+            || k.ends_with("lake-data.json"))
     );
     assert_eq!(
         open_s3_lake(mock_config(&mock, "deep-bucket", "a/b/c"))
@@ -556,7 +555,7 @@ fn s3_error_taxonomy_slowdown_redirect_and_missing_bucket() {
     assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
     let message = err.to_string();
     assert!(message.contains("bucket does not exist"), "{message}");
-    assert!(!message.contains("not a pink-lake directory"), "{message}");
+    assert!(!message.contains("not a pink lake"), "{message}");
 }
 
 /// Virtual-hosted addressing (`bucket.<endpoint>/key`) round-trips against
@@ -806,8 +805,8 @@ fn maintenance_over_s3_merges_expires_and_cleans_only_unreferenced_objects() {
         })
         .unwrap();
     assert_eq!(report.version_numbers(), vec![2, 3]);
-    assert_eq!(mock.object(&format!("{prefix}/snapshots/2.json")), None);
-    assert_eq!(mock.object(&format!("{prefix}/commits/2.json")), None);
+    assert_eq!(lake.versions().unwrap(), vec![1, 4, 5]);
+    assert_eq!(lake.commits().unwrap(), vec![4, 5]);
     assert!(lake.load(None).is_ok());
 
     // Cleanup: nothing yet (the remaining snapshot 4 still references the

@@ -124,6 +124,25 @@ one-liners below.
   Release binaries: `pinkdb` 5 208 656 → 7 252 992 B (+2 044 336 B, +39.2%),
   `pinkdb-server` 4 821 232 → 6 845 456 B (+2 024 224 B, +42.0%).
 
+### Wave 103c — errors name the real lake catalog ✅
+- Every lake error that reports a catalog problem now names the catalog's
+  actual location as it was given — `pink:/path/lake.pink`,
+  `sqlite:/path/cat.db`, or the Postgres URL with its password redacted —
+  instead of pointing at a JSON catalog file that has not existed since wave
+  103. A lake opened from a bare path reports the resolved `pink:` URL, a
+  SQLite catalog reports its URL form, and a Postgres catalog never echoes its
+  password.
+- `Lake::catalog_label()` exposes that location (computed once at open); the
+  metadata store labels its catalog-row errors with the same redacted URL, and
+  a SQLite catalog's I/O errors name the `.db` file.
+- The deleted JSON layout's file name no longer appears in `crates/`, the
+  README or the website: source, comments, tests and fixtures that still used
+  it were rewritten or dropped, and the S3 tests now use a neutral object key.
+- Tests: one per backend (pink, SQLite, PostgreSQL) removes the catalog's
+  DuckLake metadata and asserts the failure names the catalog location and
+  carries no stale file name; the PostgreSQL one also asserts the password is
+  not echoed. No behaviour change beyond messages, no new dependencies.
+
 ## 2026-10-25
 ### Wave 107a — the fixed-size `ARRAY` type ✅
 - **The type.** A column can now be `FLOAT[N]`/`REAL[N]`, `DOUBLE[N]`,
@@ -1096,8 +1115,8 @@ one-liners below.
   pinkdb catalog (default), `sqlite:<path>` (`catalog-sqlite`) or
   `postgres://…` (`catalog-postgres`), all using DuckLake v1.1's
   `ducklake_*` tables with `begin_snapshot`/`end_snapshot`. Commits insert a
-  typed delta and one snapshot row instead of rewriting
-  `catalog.json`/`snapshots/`; `count(*)` is `SUM(record_count)`, and
+  typed delta and one snapshot row instead of rewriting a JSON catalog and
+  its snapshot files; `count(*)` is `SUM(record_count)`, and
   time travel, expire, cleanup, CDC, replication state and statistics read
   the same rows. DuckDB's `ducklake` extension can attach the SQLite/Postgres
   catalogs, and pinkdb opens DuckDB-written DuckLakes.
@@ -1110,8 +1129,8 @@ one-liners below.
 - **Per-file encryption** stays: each data/delete file is a PNKLAKE1
   raw-key container with its own random 256-bit key recorded in the
   catalog; a `pink:` catalog may itself be engine-encrypted. Manifest
-  sealing, the passphrase-derived lake key, `highest.json`, `lake.json`,
-  `moved.json` and the degraded/conditional metadata-write paths are gone.
+  sealing, the passphrase-derived lake key, the JSON rollback marker and the
+  marker files, and the degraded/conditional metadata-write paths are gone.
 - **Breaking:** lakes saved by an older build in the JSON layout do not open.
   There is no converter; re-save them with an older build (for example
   `.lake open <old>` then `.lake save pink:new.pink`) before opening with this
@@ -1409,7 +1428,7 @@ one-liners below.
 - WALs, checkpoints, lock files and lake artifacts are created `0600` (lake
   directories `0700`), and existing engine/lake files are tightened on open.
 - Lake catalogs are now **v6**: manifests are bound to `(lake_id, version)`,
-  a `highest.json` marker detects rollbacks, and cross-lake/foreign-manifest
+  a separate rollback marker detects rollbacks, and cross-lake/foreign-manifest
   substitution is refused. Local tags now include `(dev, ino)` so a
   same-size/same-second replacement can no longer slip past the CAS.
 
@@ -1795,8 +1814,8 @@ one-liners below.
   data files, delete files — as `PNKLAKE1` **AES-256-GCM** containers under one
   Argon2id derivation per session. A `Storage`-level decorator means commits,
   deletes, time travel and retry paths are covered with no per-call-site code.
-- The `catalog.json == snapshots/<v>.json` byte invariant survives (seal once,
-  publish the same ciphertext); **S3 conditional-write CAS is unchanged**;
+- The manifest byte-identity invariant survives (seal once, publish the same
+  ciphertext); **S3 conditional-write CAS is unchanged**;
   statistics-fast attach on encrypted lean lakes still decodes zero data files.
 - Wrong/missing keys and tampered containers fail closed with authenticated
   errors (never “corrupt file”); plaintext lakes stay byte-identical and are
@@ -1860,8 +1879,8 @@ one-liners below.
   published file — a 1M-row lake committed 4 rows in **7.6 KB / 0.54 s with 0
   bytes rewritten** (vs a 2.6 MB full save).
 - **DELETE / UPDATE** write positional delete files applied at read time
-  (merge-on-read); every published version also writes a small
-  `commits/<v>.json` delta manifest.
+  (merge-on-read); every published version also writes a small commit delta
+  manifest.
 - **Writable attached lakes**: `.lake attach <dir> write`, mutate with normal
   SQL, `.lake commit` publishes the diff; guarded `.lake detach`; durable
   sessions replay commits idempotently after a crash.

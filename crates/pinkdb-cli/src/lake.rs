@@ -2234,8 +2234,8 @@ fn warn_missing_data_files(lake: &Lake) {
 // ---------------------------------------------------------------------------
 // Replication (wave 89): `.lake replicate …` — table-level jobs between a
 // source (another lake, or one database of the session store) and a writable
-// destination lake. Jobs and their cursors live in the destination
-// (`replication/state.json`); `start` keeps a supervisor for this session.
+// destination lake. Jobs and their cursors live in the destination's
+// catalog; `start` keeps a supervisor for this session.
 
 /// The `.lake replicate` command list.
 fn replicate_usage() {
@@ -3026,8 +3026,8 @@ fn cmd_rewrite(arg: &str) {
 }
 
 /// `.lake expire <dir> [versions=a,b,c] [older_than=<iso8601>] [keep=N]
-/// [dry-run]` — DuckLake's `ducklake_expire_snapshots`: remove old
-/// `snapshots/<v>.json` + `commits/<v>.json`, never the current version.
+/// [dry-run]` — DuckLake's `ducklake_expire_snapshots`: remove the old
+/// versions' catalog rows, never the current version.
 /// `keep=N` always retains the newest N versions (a pinkdb addition);
 /// `versions` and `older_than` are mutually exclusive (DuckLake's rule).
 fn cmd_expire(arg: &str) {

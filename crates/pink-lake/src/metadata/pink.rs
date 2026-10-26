@@ -63,7 +63,7 @@ pub(crate) fn open_keyed(
         let wal = PathBuf::from(format!("{}.wal", path.display()));
         if !create && !path.exists() && !wal.exists() {
             return Err(LakeError::NotALake {
-                path: PathBuf::from(url),
+                path: PathBuf::from(crate::redact_location(url)),
             });
         }
         let options = DurableOpenOptions {
@@ -385,10 +385,11 @@ fn changed_rows(results: &[QueryResult]) -> usize {
 /// lease or its optimistic commit validator rejects this writer. The lake's
 /// conflict loop treats both exactly like SQLite's `SQLITE_BUSY`.
 fn map_error(url: &str, error: pinkdb::PinkDbError) -> LakeError {
+    let location = crate::redact_location(url);
     let text = error.to_string();
     if text.contains("write conflict on") || text.contains(" is busy:") {
         return LakeError::Conflict {
-            path: PathBuf::from(url),
+            path: PathBuf::from(&location),
             message: text,
         };
     }
@@ -396,24 +397,24 @@ fn map_error(url: &str, error: pinkdb::PinkDbError) -> LakeError {
     // boundary: a keyed `pink:` catalog database is opened with the user's key.
     if text.contains("wrong key") {
         return LakeError::WrongKey {
-            path: PathBuf::from(url),
+            path: PathBuf::from(&location),
             message: text,
         };
     }
     if text.contains("file is encrypted") || text.contains("encryption support is not compiled") {
         return LakeError::Encrypted {
-            path: PathBuf::from(url),
+            path: PathBuf::from(&location),
             message: text,
         };
     }
     if text.contains("not encrypted") {
         return LakeError::NotEncrypted {
-            path: PathBuf::from(url),
+            path: PathBuf::from(&location),
             message: text,
         };
     }
     LakeError::Io {
-        context: format!("the pinkdb catalog {url}"),
+        context: format!("the pinkdb catalog {location}"),
         source: std::io::Error::other(text),
     }
 }

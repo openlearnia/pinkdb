@@ -31,7 +31,7 @@
 //!   reported (the row's insertion stays reported at its begin version; the
 //!   flushed file's rows are skipped as insertions so nothing is counted
 //!   twice).
-//! - **File rows**: a version's plain appended files (`commits/<v>.json`
+//! - **File rows**: a version's plain appended files (the commit delta's
 //!   `data_files` without compaction/flush markers) are insertions; positional
 //!   delete files added by a version are deletions of the target file's rows
 //!   at the recorded positions. Values are read from the (immutable) file and
@@ -57,14 +57,14 @@
 //!
 //! # Expired history
 //!
-//! The reads depend on the retained objects: a missing `commits/<v>.json`
-//! (expired by `expire_snapshots`) or a cleaned delete/data file makes the
-//! read a clean error naming the object, never a silently partial answer.
+//! The reads depend on the retained catalog history: a commit delta missing
+//! because `expire_snapshots` removed its version, or a cleaned delete/data
+//! file, makes the read a clean error naming the object, never a silently
+//! partial answer.
 
 use pinkdb::{DataTable, Value};
 
 use crate::catalog::{CommitManifest, DeleteRef, TableEntry};
-use crate::local::CATALOG_FILE;
 use crate::schema::TableSchema;
 use crate::{Lake, LakeError, Result, only_table, split_key, validate_rel_path};
 
@@ -160,7 +160,7 @@ impl Lake {
         insertions: bool,
         deletions: bool,
     ) -> Result<Vec<ChangeRow>> {
-        let (_, _) = split_key(table, &self.root)?;
+        let (_, _) = split_key(table, self.catalog_path())?;
         let end = end.unwrap_or(self.version);
         if start < 1 || end > self.version || start > end {
             return Err(LakeError::InvalidOption {
@@ -232,7 +232,7 @@ impl Lake {
                 }
             }
         }
-        // The per-version audit trail: `commits/<v>.json`.
+        // The per-version audit trail: the commit delta the catalog holds.
         for version in start..=end {
             let Some(delta) = read_commit_manifest(&*self.store, version)? else {
                 // Version 1 is the empty create manifest and never carries a
@@ -241,7 +241,7 @@ impl Lake {
                     continue;
                 }
                 return Err(LakeError::Corrupt {
-                    path: self.storage.abs(&format!("commits/{version}.json")),
+                    path: self.catalog_path().to_path_buf(),
                     message: format!(
                         "commit manifest for version {version} is missing (expired or cleaned); \
                          row-level changes over a range that includes it are not available"
@@ -388,7 +388,7 @@ impl Lake {
         expect_rows: Option<u64>,
         positions: Option<&[u64]>,
     ) -> Result<Vec<Vec<Value>>> {
-        let (dbname, table_name) = split_key(table, &self.storage.abs(CATALOG_FILE))?;
+        let (dbname, table_name) = split_key(table, self.catalog_path())?;
         // The file's own metadata is the authority: a delete-file target or a
         // compaction source is named by path, and every value read is checked
         // against the decoded file.
@@ -410,7 +410,7 @@ impl Lake {
             && expect_rows != rows
         {
             return Err(LakeError::Corrupt {
-                path: self.storage.abs(CATALOG_FILE),
+                path: self.catalog_path().to_path_buf(),
                 message: format!(
                     "table \"{table}\": commit delta says \"{rel}\" holds {expect_rows} \
                          rows, but the file holds {rows}"
@@ -473,11 +473,15 @@ impl Lake {
         if version <= 1 {
             return Ok(false);
         }
-        match crate::manifest_for(&*self.store, &self.root, Some(version - 1)) {
+        match crate::manifest_for(&*self.store, self.catalog_path(), Some(version - 1)) {
             Ok((manifest, _)) => Ok(manifest.tables.contains_key(table)),
             Err(LakeError::VersionNotFound { .. }) | Err(LakeError::Io { .. }) => {
                 Err(LakeError::Corrupt {
-                    path: self.storage.abs(&format!("snapshots/{}.json", version - 1)),
+                    path: std::path::PathBuf::from(format!(
+                        "{} (snapshot {})",
+                        self.catalog_label(),
+                        version - 1
+                    )),
                     message: format!(
                         "version {}'s predecessor is missing (expired or cleaned); change \
                          data over a range that includes a full save needs it",
@@ -501,9 +505,9 @@ fn kind_rank(kind: ChangeKind) -> u8 {
 }
 
 /// Every path a commit delta names must be a plain lake-relative `data/…`
-/// path, exactly like the main manifest's `files` list. A tampered
-/// `commits/<v>.json` must fail here, before any `abs`/read, so an absolute
-/// path or `..` can never reach another location on disk.
+/// path, exactly like the main manifest's `files` list. A tampered commit
+/// delta must fail here, before any `abs`/read, so an absolute path or `..`
+/// can never reach another location on disk.
 fn validate_commit_paths(manifest: &CommitManifest) -> Result<()> {
     for delta in manifest.tables.values() {
         for file in &delta.data_files {

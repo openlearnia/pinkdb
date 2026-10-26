@@ -22,10 +22,10 @@
 //!   spec on the table's entry; existing files keep their recorded values,
 //!   new appends split by the new spec.
 //!
-//! Every published version (including a full `.lake save`) also writes
-//! `commits/<version>.json`, an append-only delta manifest listing the data
-//! and delete files that commit added and the row movement per table — the
-//! audit trail behind the authoritative snapshot, never a load-time input.
+//! Every published version (including a full `.lake save`) also records a
+//! commit delta listing the data and delete files that commit added and the
+//! row movement per table — the audit trail behind the authoritative snapshot,
+//! never a load-time input.
 //!
 //! [`Lake::commit_from_tables`] is the high-level form: it diffs the caller's
 //! current tables against the logical content of a pinned version (the
@@ -73,7 +73,6 @@ use pinkdb::{AttachedLake, DataTable, PinkDb, Value};
 use crate::catalog::{
     Catalog, CommitManifest, DeleteRef, FileRef, PartitionKey, TableDelta, TableEntry,
 };
-use crate::local::CATALOG_FILE;
 use crate::storage::Head;
 use crate::{
     FORMAT_VERSION, Lake, LakeError, Result, delete_file, manifest_for, only_table, split_key,
@@ -1075,12 +1074,18 @@ impl WritableAttachment {
     pub fn changed_tables(&self, db: &PinkDb) -> Result<Vec<String>> {
         let mut out = Vec::new();
         for (key, base_table) in &self.base {
-            let (dbname, table) = split_key(key, self.location())?;
+            let (dbname, table) = split_key(key, self.lake.catalog_path())?;
             let changed = match db.table_in(dbname, table) {
                 Ok(current) => {
                     let layout = self.base_layout(key)?;
                     let entry = self.base_entry(key)?;
-                    let delta = crate::schema::plan_schema_delta(key, &entry, base_table, current)?;
+                    let delta = crate::schema::plan_schema_delta(
+                        self.lake.catalog_path(),
+                        key,
+                        &entry,
+                        base_table,
+                        current,
+                    )?;
                     !diff_table(&layout, base_table, current, &delta.view)?.is_empty()
                         || delta.record.is_some()
                 }
@@ -1118,7 +1123,7 @@ impl WritableAttachment {
         // renames — publishing it as a drop would silently lose the new
         // name's rows). Refuse with the way out instead.
         for (key, base_table) in &self.base {
-            let (dbname, table) = split_key(key, self.location())?;
+            let (dbname, table) = split_key(key, self.lake.catalog_path())?;
             if db.table_in(dbname, table).is_ok() {
                 continue;
             }
@@ -1151,7 +1156,7 @@ impl WritableAttachment {
             .collect();
         let mut current: Vec<(String, Arc<DataTable>)> = Vec::new();
         for (key, _) in &base {
-            let (dbname, table) = split_key(key, self.location())?;
+            let (dbname, table) = split_key(key, self.lake.catalog_path())?;
             if let Ok(t) = db.table_in(dbname, table) {
                 current.push((key.clone(), Arc::new(t.clone())));
             }
@@ -1201,7 +1206,7 @@ impl WritableAttachment {
     pub fn repin_at(&mut self, version: u64, db: &PinkDb) -> Result<()> {
         let mut base = BTreeMap::new();
         for key in self.base.keys() {
-            let (dbname, table) = split_key(key, self.location())?;
+            let (dbname, table) = split_key(key, self.lake.catalog_path())?;
             if let Ok(t) = db.table_in(dbname, table) {
                 base.insert(key.clone(), Arc::new(t.clone()));
             }
@@ -1331,9 +1336,9 @@ impl Lake {
     /// Publish an incremental commit: appended rows become new immutable data
     /// files, positional deletes become delete files, and the new version's
     /// manifest lists the previous files plus these — **no existing file is
-    /// rewritten or replaced**. Publication order is data and delete files →
-    /// `commits/<v>.json` → `snapshots/<v>.json` → `catalog.json`, the same
-    /// crash-safe order a full save uses.
+    /// rewritten or replaced**. Data and delete files are written first; the
+    /// catalog transaction that adds the snapshot and delta rows comes last,
+    /// the same crash-safe order a full save uses.
     ///
     /// A stale base (another writer moved the catalog) and a conflicting
     /// publisher are both retryable under `settings` — DuckLake's optimistic
@@ -1365,7 +1370,7 @@ impl Lake {
             .chain(commit.deletes.keys())
             .chain(commit.drops.iter())
         {
-            split_key(key, &self.root)?;
+            split_key(key, self.catalog_path())?;
         }
         let origin = self.version;
         let mut attempt: u32 = 0;
@@ -1389,7 +1394,7 @@ impl Lake {
                             return Err(if attempt == 0 {
                                 e
                             } else {
-                                retry_exhausted(e, attempt)
+                                retry_exhausted(e, attempt, self.catalog_path())
                             });
                         }
                         attempt += 1;
@@ -1411,7 +1416,7 @@ impl Lake {
                 Err(PublishFailure::Fatal(e)) => return Err(e),
                 Err(PublishFailure::Retry(e)) => {
                     if attempt >= settings.max_retry_count {
-                        return Err(retry_exhausted(e, attempt));
+                        return Err(retry_exhausted(e, attempt, self.catalog_path()));
                     }
                     attempt += 1;
                 }
@@ -1459,7 +1464,7 @@ impl Lake {
         keys: &[String],
         settings: &CommitSettings,
     ) -> Result<CommitReport> {
-        split_key(table, &self.root)?;
+        split_key(table, self.catalog_path())?;
         let (manifest, manifest_path) = self.manifest(None)?;
         let entry = manifest
             .tables
@@ -1484,11 +1489,12 @@ impl Lake {
         }
         // The table's schema lives in its data files; attach reads it without
         // materializing anything.
-        let (tdb, ttable) = split_key(table, &self.root)?;
+        let (tdb, ttable) = split_key(table, self.catalog_path())?;
         let (attachment, _) = crate::attach::build_from(
             &self.store,
             &self.storage,
             &self.root,
+            self.catalog_label(),
             None,
             Some(&self.lake_id),
         )?;
@@ -1529,7 +1535,7 @@ impl Lake {
         table: &str,
         settings: &CommitSettings,
     ) -> Result<CommitReport> {
-        split_key(table, &self.root)?;
+        split_key(table, self.catalog_path())?;
         let (manifest, manifest_path) = self.manifest(None)?;
         let entry = manifest
             .tables
@@ -1559,12 +1565,12 @@ impl Lake {
         base: &[(String, Arc<DataTable>)],
         current: &[(String, Arc<DataTable>)],
     ) -> Result<(Commit, BTreeMap<String, Arc<DataTable>>)> {
-        let manifest_path = self.root.join("catalog");
+        let manifest_path = self.catalog_path().to_path_buf();
         let mut manifest = self
             .store
             .head_shell()?
             .ok_or_else(|| LakeError::NotALake {
-                path: self.root.clone(),
+                path: self.catalog_path().to_path_buf(),
             })?;
         let mut keys: BTreeSet<&str> = BTreeSet::new();
         keys.extend(base.iter().map(|(key, _)| key.as_str()));
@@ -1610,7 +1616,13 @@ impl Lake {
                     // the new name, an added column materializes its default
                     // on read, a dropped one hides. Published with the commit
                     // when it changed anything.
-                    let delta = crate::schema::plan_schema_delta(key, &entry, base_table, table)?;
+                    let delta = crate::schema::plan_schema_delta(
+                        self.catalog_path(),
+                        key,
+                        &entry,
+                        base_table,
+                        table,
+                    )?;
                     if let Some(record) = &delta.record {
                         commit.set_schema(key, record.clone());
                     }
@@ -1709,7 +1721,7 @@ impl Lake {
         limit: Option<u64>,
         settings: &CommitSettings,
     ) -> Result<CommitReport> {
-        split_key(table, &self.root)?;
+        split_key(table, self.catalog_path())?;
         let (manifest, manifest_path) = self.manifest(None)?;
         let entry = manifest
             .tables
@@ -1761,7 +1773,7 @@ impl Lake {
             return Err(pre_incremental_head(self.format_version));
         }
         if let Some(table) = table {
-            split_key(table, &self.root)?;
+            split_key(table, self.catalog_path())?;
         }
         let mut attempt: u32 = 0;
         loop {
@@ -1772,13 +1784,13 @@ impl Lake {
                 self.ensure_catalog_unchanged()?;
             }
             let head = self.read_catalog_for_commit()?;
-            let manifest_path = self.storage.abs(CATALOG_FILE);
+            let manifest_path = self.catalog_path().to_path_buf();
             let version = head
                 .version
                 .checked_add(1)
                 .filter(|v| *v <= crate::MAX_VERSION)
                 .ok_or_else(|| LakeError::Overflow {
-                    path: self.root.clone(),
+                    path: self.catalog_path().to_path_buf(),
                     version: head.version,
                 })?;
             let keys: Vec<String> = match table {
@@ -1904,7 +1916,7 @@ impl Lake {
                 Some((author, message)) => (author.clone(), message.clone()),
                 None => (None, None),
             };
-            let changes = manifest_for(&*self.store, &self.root, Some(head.version))
+            let changes = manifest_for(&*self.store, self.catalog_path(), Some(head.version))
                 .ok()
                 .map(|(previous, _)| {
                     crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
@@ -1937,7 +1949,7 @@ impl Lake {
                 data_files,
                 bytes_written: file_bytes,
             };
-            match self.publish_catalog_version(&new_catalog, commit_manifest, &[], &[]) {
+            match self.publish_catalog_version(&new_catalog, commit_manifest) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -1986,7 +1998,7 @@ impl Lake {
         if self.format_version < 4 {
             return Err(pre_incremental_head(self.format_version));
         }
-        split_key(table, &self.root)?;
+        split_key(table, self.catalog_path())?;
         if paths.is_empty() {
             return Err(LakeError::InvalidOption {
                 message: "ducklake_add_data_files needs at least one path".to_string(),
@@ -2010,13 +2022,13 @@ impl Lake {
                 self.ensure_catalog_unchanged()?;
             }
             let head = self.read_catalog_for_commit()?;
-            let manifest_path = self.storage.abs(CATALOG_FILE);
+            let manifest_path = self.catalog_path().to_path_buf();
             let version = head
                 .version
                 .checked_add(1)
                 .filter(|v| *v <= crate::MAX_VERSION)
                 .ok_or_else(|| LakeError::Overflow {
-                    path: self.root.clone(),
+                    path: self.catalog_path().to_path_buf(),
                     version: head.version,
                 })?;
             let entry = head
@@ -2203,7 +2215,7 @@ impl Lake {
                 Some((author, message)) => (author.clone(), message.clone()),
                 None => (None, None),
             };
-            let changes = manifest_for(&*self.store, &self.root, Some(head.version))
+            let changes = manifest_for(&*self.store, self.catalog_path(), Some(head.version))
                 .ok()
                 .map(|(previous, _)| {
                     crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
@@ -2235,7 +2247,7 @@ impl Lake {
                 files: registered,
                 bytes_written: 0,
             };
-            match self.publish_catalog_version(&new_catalog, commit_manifest, &[], &[]) {
+            match self.publish_catalog_version(&new_catalog, commit_manifest) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -2268,7 +2280,7 @@ impl Lake {
     /// are checked — a lake may hold unavailable tables the commit does not
     /// touch, and they simply ride along in the published manifest.
     fn ensure_commit_tables_available(&self, head: &Catalog, commit: &Commit) -> Result<()> {
-        let manifest_path = self.storage.abs(CATALOG_FILE);
+        let manifest_path = self.catalog_path().to_path_buf();
         for key in commit
             .appends
             .keys()
@@ -2423,7 +2435,7 @@ impl Lake {
         // rows. Only a hand-built commit (no expectations) may rebase.
         if retries > 0 && !commit.expect.is_empty() {
             return Err(PublishFailure::Fatal(LakeError::Conflict {
-                path: self.root.join("catalog"),
+                path: self.catalog_path().to_path_buf(),
                 message: "table changed in the lake since this change was computed (another \
                           writer published to it); the stored difference cannot be applied \
                           on top — re-attach or recompute the change against the current \
@@ -2442,7 +2454,7 @@ impl Lake {
             .filter(|v| *v <= crate::MAX_VERSION)
             .ok_or_else(|| {
                 PublishFailure::Fatal(LakeError::Overflow {
-                    path: self.root.clone(),
+                    path: self.catalog_path().to_path_buf(),
                     version: self.version,
                 })
             })?;
@@ -2469,7 +2481,7 @@ impl Lake {
             });
             if actual != expected {
                 return Err(PublishFailure::Fatal(LakeError::Conflict {
-                    path: self.storage.abs(CATALOG_FILE),
+                    path: self.catalog_path().to_path_buf(),
                     message: format!(
                         "table \"{key}\" changed in the lake since this change was computed \
                          (another writer published to it); the stored difference cannot be \
@@ -2536,7 +2548,7 @@ impl Lake {
                     || commit.inlining_changes.contains_key(key)
                 {
                     return Err(PublishFailure::Fatal(LakeError::Corrupt {
-                        path: self.storage.abs(CATALOG_FILE),
+                        path: self.catalog_path().to_path_buf(),
                         message: format!(
                             "table \"{key}\" does not exist; a commit cannot delete from or \
                              drop it"
@@ -2639,7 +2651,7 @@ impl Lake {
                 && written.id() != entry.format().id()
             {
                 return Err(PublishFailure::Fatal(LakeError::Conflict {
-                    path: self.storage.abs(CATALOG_FILE),
+                    path: self.catalog_path().to_path_buf(),
                     message: format!(
                         "table \"{key}\" changed its data-file format from \"{}\" to \"{}\" \
                          while this commit was in flight; the appended files cannot join the \
@@ -2663,7 +2675,7 @@ impl Lake {
                 let count = new.len() as u64;
                 let Some(next) = base.checked_add(count) else {
                     return Err(PublishFailure::Fatal(LakeError::Corrupt {
-                        path: self.storage.abs(CATALOG_FILE),
+                        path: self.catalog_path().to_path_buf(),
                         message: format!("table \"{key}\": row ids overflow u64"),
                     }));
                 };
@@ -2671,7 +2683,7 @@ impl Lake {
                 entry.next_row_id = next;
                 entry.rows = entry.rows.checked_add(added).ok_or_else(|| {
                     PublishFailure::Fatal(LakeError::Corrupt {
-                        path: self.storage.abs(CATALOG_FILE),
+                        path: self.catalog_path().to_path_buf(),
                         message: format!("table \"{key}\" overflows u64 rows"),
                     })
                 })?;
@@ -2696,7 +2708,7 @@ impl Lake {
             entry.next_row_id = next_row_id;
             entry.rows = entry.rows.checked_add(added).ok_or_else(|| {
                 PublishFailure::Fatal(LakeError::Corrupt {
-                    path: self.storage.abs(CATALOG_FILE),
+                    path: self.catalog_path().to_path_buf(),
                     message: format!("table \"{key}\" overflows u64 rows"),
                 })
             })?;
@@ -2710,7 +2722,7 @@ impl Lake {
         for (key, ids) in &commit.inlined_deletes {
             let entry = tables.get_mut(key).ok_or_else(|| {
                 PublishFailure::Fatal(LakeError::Corrupt {
-                    path: self.storage.abs(CATALOG_FILE),
+                    path: self.catalog_path().to_path_buf(),
                     message: format!("table \"{key}\" does not exist in the head version"),
                 })
             })?;
@@ -2721,7 +2733,7 @@ impl Lake {
                     .find(|r| r.row_id == *id && r.end.is_none())
                 else {
                     return Err(PublishFailure::Fatal(LakeError::Conflict {
-                        path: self.storage.abs(CATALOG_FILE),
+                        path: self.catalog_path().to_path_buf(),
                         message: format!(
                             "table \"{key}\": inlined row {id} is not live at version {} \
                              (already deleted, superseded, or never inlined); recompute the \
@@ -2734,7 +2746,7 @@ impl Lake {
                 row.flushed = false;
                 entry.rows = entry.rows.checked_sub(1).ok_or_else(|| {
                     PublishFailure::Fatal(LakeError::Corrupt {
-                        path: self.storage.abs(CATALOG_FILE),
+                        path: self.catalog_path().to_path_buf(),
                         message: format!(
                             "table \"{key}\": ending inlined row {id} underflows its row count"
                         ),
@@ -2751,7 +2763,7 @@ impl Lake {
         for (key, limit) in &commit.inlining_changes {
             let entry = tables.get_mut(key).ok_or_else(|| {
                 PublishFailure::Fatal(LakeError::Corrupt {
-                    path: self.storage.abs(CATALOG_FILE),
+                    path: self.catalog_path().to_path_buf(),
                     message: format!(
                         "table \"{key}\" does not exist; a commit cannot set or clear its \
                          data_inlining_row_limit"
@@ -2772,7 +2784,7 @@ impl Lake {
         for (key, record) in &commit.schemas {
             let Some(entry) = tables.get_mut(key) else {
                 return Err(PublishFailure::Fatal(LakeError::Corrupt {
-                    path: self.storage.abs(CATALOG_FILE),
+                    path: self.catalog_path().to_path_buf(),
                     message: format!(
                         "the commit publishes a schema for table \"{key}\", but the head \
                          version does not have it"
@@ -2794,7 +2806,7 @@ impl Lake {
         for (key, files) in &uploaded.deletes {
             let entry = tables.get_mut(key).ok_or_else(|| {
                 PublishFailure::Fatal(LakeError::Corrupt {
-                    path: self.storage.abs(CATALOG_FILE),
+                    path: self.catalog_path().to_path_buf(),
                     message: format!("table \"{key}\" does not exist in the head version"),
                 })
             })?;
@@ -2806,7 +2818,7 @@ impl Lake {
                 let pos: &[u64] = positions.get(file).expect("validated delete positions");
                 let Some(idx) = entry.files.iter().position(|f| f.path() == dref.file) else {
                     return Err(PublishFailure::Fatal(LakeError::Conflict {
-                        path: self.storage.abs(CATALOG_FILE),
+                        path: self.catalog_path().to_path_buf(),
                         message: format!(
                             "table \"{key}\": the commit deletes from \"{}\", which is no \
                              longer part of the table at version {} (another writer replaced \
@@ -2817,7 +2829,7 @@ impl Lake {
                 };
                 let file_rows = entry.files[idx].rows().ok_or_else(|| {
                     PublishFailure::Fatal(LakeError::Corrupt {
-                        path: self.storage.abs(CATALOG_FILE),
+                        path: self.catalog_path().to_path_buf(),
                         message: format!(
                             "table \"{key}\": \"{}\" has no row count; a positional delete \
                              cannot be applied",
@@ -2850,7 +2862,7 @@ impl Lake {
                         .collect();
                     if !overlap.is_empty() {
                         return Err(PublishFailure::Fatal(LakeError::Conflict {
-                            path: self.storage.abs(CATALOG_FILE),
+                            path: self.catalog_path().to_path_buf(),
                             message: format!(
                                 "table \"{key}\": {} positions of \"{}\" (first {}) were \
                                  already deleted by another commit; recompute the change \
@@ -2865,7 +2877,7 @@ impl Lake {
                 entry.deletes.push(dref.clone());
                 entry.rows = entry.rows.checked_sub(pos.len() as u64).ok_or_else(|| {
                     PublishFailure::Fatal(LakeError::Corrupt {
-                        path: self.storage.abs(CATALOG_FILE),
+                        path: self.catalog_path().to_path_buf(),
                         message: format!(
                             "table \"{key}\": deleting {} rows underflows its {} rows",
                             pos.len(),
@@ -2885,7 +2897,7 @@ impl Lake {
         for (key, spec) in &commit.partition_changes {
             let entry = tables.get_mut(key).ok_or_else(|| {
                 PublishFailure::Fatal(LakeError::Corrupt {
-                    path: self.storage.abs(CATALOG_FILE),
+                    path: self.catalog_path().to_path_buf(),
                     message: format!(
                         "table \"{key}\" does not exist; a commit cannot set or clear its \
                          partition specification"
@@ -2953,16 +2965,9 @@ impl Lake {
             None => (None, None),
         };
         let updated = crate::time::iso8601_utc(std::time::SystemTime::now());
-        let sql_store = Some(Arc::clone(&self.store));
-        let changes = if sql_store.is_some() {
-            None
-        } else {
-            crate::manifest_for(&*self.store, &self.root, Some(version - 1))
-                .ok()
-                .map(|(previous, _)| {
-                    crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
-                })
-        };
+        // SQL catalogs persist the typed tables, not the audit summary; the
+        // per-version `changes` diff has no column to live in.
+        let changes = None;
         let schema_version = crate::next_schema_version(Some(&head), &tables);
         let new_catalog = crate::catalog::Catalog {
             format_version: crate::FORMAT_VERSION,
@@ -3041,18 +3046,10 @@ impl Lake {
         Ok(report)
     }
 
-    /// The publish step of one commit attempt: `commits/<v>.json` (self-healing
-    /// a stray from a crashed attempt), then the snapshot link (create-only),
-    /// then the conditional catalog replace.
-    ///
-    /// `snapshot_plain` is the new manifest; it is sealed **once** here and
-    /// the exact same bytes go to `snapshots/<v>.json` and to `catalog.json`,
-    /// so the byte-identity invariant survives encryption (see
-    /// `Storage::seal_manifest`).
-    /// Apply one typed delta through the SQL metadata store. The store owns
-    /// the transaction (head check + snapshot row + delta rows + incremental
-    /// statistics); a moved head is the same retryable conflict the object
-    /// layout reports.
+    /// The publish step of one commit attempt: apply one typed delta through
+    /// the SQL metadata store. The store owns the transaction (head check +
+    /// snapshot row + delta rows + incremental statistics); a moved head is a
+    /// retryable conflict.
     pub(crate) fn publish_sql_commit(
         &mut self,
         change: crate::metadata::CatalogChange,
@@ -3072,14 +3069,12 @@ impl Lake {
     }
 
     /// Publish one maintenance/settings version through the backend's native
-    /// path: a typed delta on a SQL catalog (so `pinkdb_table_change` and the
-    /// inlined end markers are written), the object sequence otherwise.
+    /// path: a typed delta through the SQL metadata store (so
+    /// `pinkdb_table_change` and the inlined end markers are written).
     pub(crate) fn publish_catalog_version(
         &mut self,
         catalog: &crate::catalog::Catalog,
         manifest: crate::catalog::CommitManifest,
-        _commit_bytes: &[u8],
-        _snapshot_plain: &[u8],
     ) -> Result<()> {
         let change = crate::metadata::CatalogChange {
             catalog: None,
@@ -3100,7 +3095,7 @@ impl Lake {
     /// never enough here: walking `head.tables` must see the lake.
     pub(crate) fn read_catalog_for_commit(&mut self) -> Result<crate::catalog::Catalog> {
         let manifest = self.store.head()?.ok_or_else(|| LakeError::NotALake {
-            path: self.root.clone(),
+            path: self.catalog_path().to_path_buf(),
         })?;
         self.version = manifest.version;
         self.format_version = manifest.format_version;
@@ -3115,7 +3110,7 @@ impl Lake {
             .store
             .head_shell()?
             .ok_or_else(|| LakeError::NotALake {
-                path: self.root.clone(),
+                path: self.catalog_path().to_path_buf(),
             })?;
         self.version = manifest.version;
         self.format_version = manifest.format_version;
@@ -3129,7 +3124,7 @@ impl Lake {
     fn commit_head(&self, commit: &Commit, use_expect: bool) -> Result<crate::catalog::Catalog> {
         let store = &*self.store;
         let head = store.head_shell()?.ok_or_else(|| LakeError::NotALake {
-            path: self.root.clone(),
+            path: self.catalog_path().to_path_buf(),
         })?;
         let mut keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         keys.extend(commit.appends.keys().cloned());
@@ -3193,7 +3188,7 @@ impl Lake {
             .store
             .head_shell()?
             .ok_or_else(|| LakeError::NotALake {
-                path: self.root.clone(),
+                path: self.catalog_path().to_path_buf(),
             })?;
         self.version = manifest.version;
         self.format_version = manifest.format_version;
@@ -3273,11 +3268,11 @@ enum PublishFailure {
 }
 
 /// Wrap an exhausted retry budget's last conflict with the attempt count.
-fn retry_exhausted(e: LakeError, retries: u32) -> LakeError {
+fn retry_exhausted(e: LakeError, retries: u32, catalog: &std::path::Path) -> LakeError {
     LakeError::Conflict {
         path: match &e {
             LakeError::Conflict { path, .. } => path.clone(),
-            _ => std::path::PathBuf::from("catalog.json"),
+            _ => catalog.to_path_buf(),
         },
         message: format!(
             "{} (after {retries} retr{}; another writer keeps publishing — raise \

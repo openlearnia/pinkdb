@@ -1394,9 +1394,9 @@ plaintext, like DuckLake's.
 (`.lake changes`, `.lake replicate`); replication state and per-table cursors
 are typed side tables, not JSON objects.
 
-**No legacy layout.** JSON-layout lakes (`catalog.json`, `snapshots/`,
-`commits/`, `highest.json`, `lake.json`) do not open in this build. There is no
-converter: re-save such a lake with an older pinkdb build (for example
+**No legacy layout.** Pre-103 JSON-layout lakes (a JSON catalog plus snapshot
+and commit files) do not open in this build. There is no converter: re-save
+such a lake with an older pinkdb build (for example
 `.lake open <old>; .lake save pink:new.pink`), then open it with this one.
 
 ## Network server

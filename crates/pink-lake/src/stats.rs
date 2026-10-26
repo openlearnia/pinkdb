@@ -779,7 +779,7 @@ mod tests {
         assert!(parsed.verify_crc());
 
         let (schema, stats, _) = block
-            .schema_and_stats(std::path::Path::new("catalog.json"))
+            .schema_and_stats(std::path::Path::new("data/main.t/x.pink"))
             .unwrap();
         assert_eq!(schema, vec![("c".to_string(), DataType::Integer)]);
         assert_eq!(stats[0].min, Some(Value::Integer(-5)));
@@ -809,7 +809,7 @@ mod tests {
         // A corrupted block is refused with a clear message.
         block.crc32 ^= 1;
         let err = block
-            .schema_and_stats(std::path::Path::new("catalog.json"))
+            .schema_and_stats(std::path::Path::new("data/main.t/x.pink"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("failed its checksum"), "{err}");
@@ -832,7 +832,7 @@ mod tests {
             )
             .unwrap()
         };
-        let path = std::path::Path::new("snapshots/2.json");
+        let path = std::path::Path::new("data/main.t/x.pink");
 
         let mut b = make();
         b.nulls_break();

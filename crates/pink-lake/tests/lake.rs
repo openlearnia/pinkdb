@@ -316,8 +316,8 @@ fn save_rejects_unrepresentable_stores_before_creating_a_lake() {
     let err = save_store_lake(&dotted, &lake_dir).unwrap_err().to_string();
     assert!(err.contains("contains \".\""), "{err}");
     assert!(
-        !lake_dir.join("catalog.json").exists(),
-        "a rejected save leaves no partial lake"
+        !lake_dir.join("data").exists(),
+        "a rejected save writes no data"
     );
 
     // A table name whose encoded `data/` directory blows the filesystem
@@ -331,7 +331,7 @@ fn save_rejects_unrepresentable_stores_before_creating_a_lake() {
     assert!(err.contains("over the 200-byte limit"), "{err}");
     let err = save_store_lake(&long, &lake_dir).unwrap_err().to_string();
     assert!(err.contains("over the 200-byte limit"), "{err}");
-    assert!(!lake_dir.join("catalog.json").exists());
+    assert!(!lake_dir.join("data").exists());
     assert!(validate_store(&PinkDb::new()).is_ok());
 
     // A long-but-encodable name still saves: the check is not over-strict.
@@ -1142,9 +1142,9 @@ fn save_store_creates_open_or_create_and_errors_are_clear() {
 
     // create refuses an existing lake; open refuses a non-lake.
     let err = create_lake(&missing).unwrap_err().to_string();
-    assert!(err.contains("already a pink-lake"), "{err}");
+    assert!(err.contains("already a pink lake"), "{err}");
     let err = open_lake(&dir).unwrap_err().to_string();
-    assert!(err.contains("not a pink-lake"), "{err}");
+    assert!(err.contains("not a pink lake"), "{err}");
     cleanup(&dir);
 }
 
@@ -1364,7 +1364,7 @@ fn attach_refusals_are_clean_errors() {
     let dir = scratch("attach_refuse");
     let missing = dir.join("nope");
     let err = open_lake(&missing).unwrap_err().to_string();
-    assert!(err.contains("not a pink-lake"), "{err}");
+    assert!(err.contains("not a pink lake"), "{err}");
 
     // A missing data file.
     let lake_dir = dir.join("lake");

@@ -42,16 +42,8 @@
 //! The binding is the whole integrity story for *identity*: a data or delete
 //! file's container authenticates the lake-relative path it was written for,
 //! so swapping two files (even of the same shape) fails authentication
-//! instead of silently loading different values. A **manifest** is bound to
-//! `(lake_id, version)` (M-7), not to its path: `catalog.json` and
-//! `snapshots/<v>.json` are byte-identical by construction (the same sealed
-//! bytes are published to both — see [`Crypto::seal`]), so a path binding
-//! would break that invariant. The lake identity makes a same-version
-//! manifest from another lake under the same key fail authentication, and the
-//! version makes an older snapshot under a newer name fail too. Commit delta
-//! manifests (`commits/<v>.json`) are bound to their own path (their audit
-//! value depends on not being interchangeable), and `highest.json` is bound
-//! to `(lake_id, highest_version)`.
+//! instead of silently loading different values. Both live under the same
+//! path binding the store records for them.
 //!
 //! # Key material
 //!
@@ -116,41 +108,29 @@ const HEADER_FIXED_LEN: usize = 39;
 pub(crate) const SEGMENT_PLAIN_MAX: usize = 1 << 20;
 
 /// Which kind of lake artifact a container holds; the AAD binds it, so a
-/// manifest can never authenticate as a data file (or the reverse).
+/// data file can never authenticate as a delete file (or the reverse).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 pub(crate) enum Domain {
-    /// `catalog.json` and `snapshots/<v>.json` (bound to nothing path-like:
-    /// the pair is the same bytes, see the module docs).
-    Manifest,
     /// One `data/<table>/<uuid>.pink` file, bound to its path.
     DataFile,
-    /// One `commits/<v>.json` delta manifest, bound to its path.
-    Commit,
     /// One `data/<table>/<uuid>.pinkdel` delete file, bound to its path.
     DeleteFile,
-    /// `highest.json`, bound to `(lake_id, highest_version)` (M-7).
-    Highest,
 }
 
 impl Domain {
+    /// The AAD tag; the two live values are never renumbered.
     fn id(self) -> u8 {
         match self {
-            Domain::Manifest => 1,
             Domain::DataFile => 2,
-            Domain::Commit => 3,
             Domain::DeleteFile => 4,
-            Domain::Highest => 5,
         }
     }
 
     fn name(id: u8) -> &'static str {
         match id {
-            1 => "a manifest (catalog/snapshot)",
             2 => "a data file",
-            3 => "a commit delta manifest",
             4 => "a delete file",
-            5 => "the highest-version marker",
             _ => "an unknown artifact",
         }
     }
@@ -565,11 +545,8 @@ mod imp {
         /// (key, nonce) pair).
         ///
         /// Because the base is per container, sealing the same plaintext
-        /// twice produces two different containers; the
-        /// `catalog.json == snapshots/<v>.json` invariant is preserved by
-        /// sealing **once per version** and publishing those exact bytes to
-        /// both objects (the storage decorator's seal-manifest path), never
-        /// by sealing twice and hoping for determinism.
+        /// twice produces two different containers; nothing may rely on
+        /// sealing to be deterministic.
         pub(crate) fn seal(
             &self,
             path: &Path,
@@ -788,7 +765,7 @@ mod tests {
     use super::*;
 
     fn path() -> std::path::PathBuf {
-        std::path::PathBuf::from("catalog.json")
+        std::path::PathBuf::from("data/main.t/x.pink")
     }
 
     #[cfg(feature = "encryption")]
@@ -803,12 +780,10 @@ mod tests {
 
     #[cfg(feature = "encryption")]
     #[test]
-    fn round_trips_manifests_and_data_files() {
+    fn round_trips_data_and_delete_files() {
         let crypto = crypto();
         for (domain, binding) in [
-            (Domain::Manifest, ""),
             (Domain::DataFile, "data/main.t/x.pink"),
-            (Domain::Commit, "commits/2.json"),
             (Domain::DeleteFile, "data/main.t/x.pinkdel"),
         ] {
             for plain in [
@@ -828,18 +803,18 @@ mod tests {
     #[test]
     fn every_container_has_a_fresh_nonce_base_and_cannot_be_replayed() {
         let crypto = crypto();
-        let a = seal(&crypto, Domain::Manifest, "", b"same bytes");
-        let b = seal(&crypto, Domain::Manifest, "", b"same bytes");
+        let a = seal(&crypto, Domain::DataFile, "", b"same bytes");
+        let b = seal(&crypto, Domain::DataFile, "", b"same bytes");
         assert_ne!(
             a, b,
             "two containers must never share a nonce base (keystream reuse)"
         );
         assert_eq!(
-            crypto.open(&path(), Domain::Manifest, "", &a).unwrap(),
+            crypto.open(&path(), Domain::DataFile, "", &a).unwrap(),
             b"same bytes"
         );
         assert_eq!(
-            crypto.open(&path(), Domain::Manifest, "", &b).unwrap(),
+            crypto.open(&path(), Domain::DataFile, "", &b).unwrap(),
             b"same bytes"
         );
     }
@@ -850,20 +825,20 @@ mod tests {
     #[test]
     fn nonce_base_is_128_bits_and_domain_separated() {
         let crypto = crypto();
-        let a = seal(&crypto, Domain::Manifest, "", b"same");
-        let b = seal(&crypto, Domain::Manifest, "", b"same");
+        let a = seal(&crypto, Domain::DataFile, "", b"same");
+        let b = seal(&crypto, Domain::DataFile, "", b"same");
         assert_eq!(u32::from_le_bytes(a[8..12].try_into().unwrap()), 2);
         let base_a: [u8; 16] = a[19..35].try_into().unwrap();
         let base_b: [u8; 16] = b[19..35].try_into().unwrap();
         assert!(base_a.iter().any(|x| *x != 0));
         assert_ne!(base_a, base_b);
         assert_ne!(
-            imp::nonce_for(&base_a, Domain::Manifest, 0),
-            imp::nonce_for(&base_a, Domain::DataFile, 0)
+            imp::nonce_for(&base_a, Domain::DataFile, 0),
+            imp::nonce_for(&base_a, Domain::DeleteFile, 0)
         );
         assert_ne!(
-            imp::nonce_for(&base_a, Domain::Manifest, 0),
-            imp::nonce_for(&base_a, Domain::Manifest, 1)
+            imp::nonce_for(&base_a, Domain::DataFile, 0),
+            imp::nonce_for(&base_a, Domain::DataFile, 1)
         );
     }
 
@@ -890,9 +865,9 @@ mod tests {
     fn wrong_key_is_distinguished_from_tampering() {
         let good = crypto();
         let bad = Crypto::new(EncryptionKey::from_raw([8u8; 32])).unwrap();
-        let sealed = seal(&good, Domain::Manifest, "", b"payload");
+        let sealed = seal(&good, Domain::DataFile, "", b"payload");
         let err = bad
-            .open(&path(), Domain::Manifest, "", &sealed)
+            .open(&path(), Domain::DataFile, "", &sealed)
             .unwrap_err();
         assert!(matches!(err, LakeError::WrongKey { .. }), "{err:?}");
 
@@ -901,7 +876,7 @@ mod tests {
         let last = flipped.len() - 1;
         flipped[last] ^= 0x01;
         let err = good
-            .open(&path(), Domain::Manifest, "", &flipped)
+            .open(&path(), Domain::DataFile, "", &flipped)
             .unwrap_err();
         assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
 
@@ -910,27 +885,27 @@ mod tests {
         let mut flipped = sealed.clone();
         flipped[19] ^= 0x01;
         let err = good
-            .open(&path(), Domain::Manifest, "", &flipped)
+            .open(&path(), Domain::DataFile, "", &flipped)
             .unwrap_err();
         assert!(matches!(err, LakeError::WrongKey { .. }), "{err:?}");
 
         // A truncated payload (terminal frame lost) is tampering.
         let cut = &sealed[..sealed.len() - (4 + TAG_LEN)];
-        let err = good.open(&path(), Domain::Manifest, "", cut).unwrap_err();
+        let err = good.open(&path(), Domain::DataFile, "", cut).unwrap_err();
         assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
 
         // A container sealed for another domain/binding is refused.
         let data = seal(&good, Domain::DataFile, "data/a/x.pink", b"p");
-        let err = good.open(&path(), Domain::Manifest, "", &data).unwrap_err();
+        let err = good.open(&path(), Domain::DataFile, "", &data).unwrap_err();
         assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
         let err = good
             .open(&path(), Domain::DataFile, "data/b/y.pink", &data)
             .unwrap_err();
         assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
-        // ... including a commit delta used as a data file.
-        let commit = seal(&good, Domain::Commit, "commits/2.json", b"c");
+        // ... including a delete file used as a data file.
+        let delete = seal(&good, Domain::DeleteFile, "data/main.t/x.pinkdel", b"c");
         let err = good
-            .open(&path(), Domain::DataFile, "commits/2.json", &commit)
+            .open(&path(), Domain::DataFile, "data/main.t/x.pinkdel", &delete)
             .unwrap_err();
         assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
     }
@@ -940,14 +915,14 @@ mod tests {
     fn keyed_reads_of_plaintext_and_engine_containers_are_refused() {
         let crypto = crypto();
         let err = crypto
-            .open(&path(), Domain::Manifest, "", b"{\"format_version\":7}")
+            .open(&path(), Domain::DataFile, "", b"{\"format_version\":7}")
             .unwrap_err();
         assert!(matches!(err, LakeError::NotEncrypted { .. }), "{err:?}");
         // An engine container mistaken for a lake one names the mixup.
         let mut engine = ENGINE_ENC_MAGIC.to_vec();
         engine.extend_from_slice(&[0u8; 64]);
         let err = crypto
-            .open(&path(), Domain::Manifest, "", &engine)
+            .open(&path(), Domain::DataFile, "", &engine)
             .unwrap_err();
         assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
         assert!(err.to_string().contains("PINKENC1"), "{err}");
@@ -963,7 +938,7 @@ mod tests {
         data.extend_from_slice(&99u32.to_le_bytes());
         data.resize(128, 0);
         let err = crypto
-            .open(&path(), Domain::Manifest, "", &data)
+            .open(&path(), Domain::DataFile, "", &data)
             .unwrap_err();
         assert!(
             matches!(err, LakeError::UnsupportedContainer { found: 99, .. }),

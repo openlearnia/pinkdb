@@ -5,22 +5,20 @@
 //!
 //! # What a lake is
 //!
-//! A lake is a directory (or, with the `s3` feature, an `s3://bucket/prefix`
-//! key prefix with exactly the same layout):
+//! A lake is a data directory (or, with the `s3` feature, an
+//! `s3://bucket/prefix` key prefix) plus a catalog on DuckLake v1.1 tables: a
+//! `pink:<path>` or `sqlite:<path>` file (a bare path means `pink:`), or a
+//! PostgreSQL URL, used as given:
 //!
 //! ```text
 //! <lake>/
-//!   lake.json                   random 128-bit lake identity (never replaced)
-//!   highest.json                authenticated highest published version
-//!   catalog.json                current catalog (authoritative for "latest")
-//!   snapshots/<version>.json    immutable manifests, one per published version
-//!   commits/<version>.json      immutable per-commit delta manifests (audit)
+//!   lake-data.json              this catalog's data-ownership marker
 //!   data/<table>/<uuid>.pink    immutable per-table data files (`PINKDB06`)
 //!   data/<table>/<uuid>.pinkdel positional delete files (see delete_file)
-//!   replication/state.json      replication jobs + per-table cursor state (wave 89)
 //! ```
 //!
-//! `catalog.json` and every snapshot manifest are JSON of the same shape:
+//! Every published version is a snapshot row in the catalog; its manifest (the
+//! [`catalog::Catalog`] type) has this shape:
 //!
 //! ```json
 //! {
@@ -193,26 +191,22 @@
 //! [`Lake::write_from_store`] writes a full snapshot: every table of every
 //! database of the store is written to a fresh data file (one file per table
 //! per version — a full save never appends and never reuses), then the
-//! manifest is published as `snapshots/<version>.json`, then `catalog.json`
-//! is replaced with the same bytes. [`Lake::commit`] (and the higher-level
-//! [`Lake::commit_from_tables`]) publishes an **incremental** version on top
-//! of one: appended files are added to the table's file list, positional
-//! deletes become delete files, and **no file a previous version references
-//! is rewritten, replaced, or reused for new data** — the `incremental`
-//! module documents the delta format. Each commit also writes
-//! `commits/<version>.json`, an append-only delta manifest (audit, never a
-//! load-time input). A version number is `previous + 1`, computed with
-//! `checked_add` and capped at [`MAX_VERSION`]; a lake whose next version
-//! would exceed the cap is a clear [`LakeError::Overflow`], never a wrap.
-//! Every manifest's `version` must be in `1..=MAX_VERSION` (a tampered
-//! `version: 0` or `version: u64::MAX` is [`LakeError::Corrupt`]). Snapshot
-//! manifests are *hard-linked* into place, never renamed over: a snapshot
-//! file that already exists is never replaced ([`LakeError::Conflict`]), so
-//! restoring an older `catalog.json` and re-saving cannot clobber an
-//! already-published `snapshots/<v>.json`. Old snapshots and old data files
-//! are never touched, so any published version stays loadable.
-//! [`Lake::load`] takes the latest version (the catalog) or one specific
-//! snapshot.
+//! catalog rows describing it are written in the same store transaction. [`Lake::commit`] (and
+//! the higher-level [`Lake::commit_from_tables`]) publishes an
+//! **incremental** version on top of one: appended files are added to the
+//! table's file list, positional deletes become delete files, and **no file a
+//! previous version references is rewritten, replaced, or reused for new
+//! data** — the `incremental` module documents the delta format. Each commit
+//! also records its author and message on the snapshot row. A version number
+//! is `previous + 1`, computed with `checked_add` and capped at
+//! [`MAX_VERSION`]; a lake whose next version would exceed the cap is a clear
+//! [`LakeError::Overflow`], never a wrap. Every manifest's `version` must be
+//! in `1..=MAX_VERSION` (a tampered `version: 0` or `version: u64::MAX` is
+//! [`LakeError::Corrupt`]). An already-published version is never replaced
+//! ([`LakeError::Conflict`]), so saving it again cannot clobber its snapshot.
+//! Old snapshots and old data files are never touched, so any published
+//! version stays loadable. [`Lake::load`] takes the latest version (the
+//! catalog) or one specific snapshot.
 //!
 //! Every version also carries a **snapshot record** (wave 64; see the
 //! `snapshot` module): `updated` is its publish time (millisecond ISO-8601
@@ -272,9 +266,9 @@
 //! files — candidates must share partition values and schema epoch, merge
 //! skips delete-bearing files (rewrite is the tool for those), and every
 //! source file stays on disk byte-identical for the versions that reference
-//! it. [`Lake::expire_snapshots`] removes old `snapshots/<v>.json` +
-//! `commits/<v>.json` (never the current version; time travel to an expired
-//! version is a clean error). [`Lake::cleanup_old_files`] /
+//! it. [`Lake::expire_snapshots`] removes old snapshot rows and their commit
+//! deltas (never the current version; time travel to an expired version is a
+//! clean error). [`Lake::cleanup_old_files`] /
 //! [`Lake::delete_orphaned_files`] delete `data/` objects no retained
 //! version references, behind a two-day age gate and an explicit
 //! `dry-run`/`confirm`. [`Lake::list_files`], [`Lake::table_info`],
@@ -287,7 +281,7 @@
 //! # Replication (wave 89)
 //!
 //! [`replication`] is the **table-level** replication API: a writable
-//! destination lake carries jobs (`replication/state.json`) that copy the
+//! destination lake carries jobs (in its catalog) that copy the
 //! tables of one source — another lake, or one database of the caller's live
 //! [`PinkDb`] store — under the same `db.table` names. A job's tables are
 //! ordinary lake tables: every destination write is an incremental
@@ -314,24 +308,16 @@
 //!
 //! # Crash safety and durability
 //!
-//! Publication order is data and delete files → commit manifest
-//! (`commits/<version>.json`) → snapshot manifest (`snapshots/<version>.json`)
-//! → `catalog.json`. Each write goes to a **unique** temp sibling
-//! (`<name>.<uuid>.tmp`, created with `create_new(true)` so a planted symlink
-//! or an older writer's temp file is never followed or truncated), is
-//! fsynced, and is then renamed (catalog, data files) or hard-linked
-//! (snapshot manifests) into place; the parent directory is fsynced
+//! A commit writes its immutable data and delete files first, then publishes
+//! everything else in one catalog transaction (head check, snapshot record,
+//! typed delta; see `metadata`). Each file write goes to a **unique** temp
+//! sibling (`<name>.<uuid>.tmp`, created with `create_new(true)` so a planted
+//! symlink or an older writer's temp file is never followed or truncated), is
+//! fsynced, and is then renamed into place; the parent directory is fsynced
 //! afterwards, best-effort. A crash anywhere can only leave *unreferenced*
-//! leftovers: the previous catalog still loads, and stray data files, stray
-//! `.tmp` files, and snapshots above the catalog's version are ignored —
-//! [`Lake::versions`] lists only manifests that parse and declare their own
-//! canonical version. A stray manifest at exactly the *next* version cannot
-//! be told apart from a published one, so a save or commit that lands on it
-//! refuses with [`LakeError::Conflict`] instead of replacing it; delete the
-//! unpublished stray (the catalog still points at the previous version) to
-//! continue. A stray **commit delta** at the next version (never with its
-//! snapshot) is self-healing: the retry that reaches that version overwrites
-//! it, because the snapshot is the authoritative manifest.
+//! leftovers: the catalog still names the last committed version, and stray
+//! data files and `.tmp` files are ignored — [`Lake::versions`] lists only
+//! the snapshots the catalog holds.
 //!
 //! This is **process-crash safety**: after a `kill -9`, the previous version
 //! always loads. It is deliberately *not* a power-loss guarantee on APFS:
@@ -342,22 +328,20 @@
 //!
 //! # Concurrent writers
 //!
-//! A lake is **one live writer handle per directory** (no file locking).
+//! A lake is **one live writer handle per catalog** (no file locking).
 //! Concurrent readers of one published version are fine. A handle that tries
 //! to publish after another handle or process moved the catalog forward
 //! fails with [`LakeError::Conflict`] ("another writer published version N;
-//! reopen the lake") before its catalog replacement — and two writers racing
-//! for the same version cannot both win: the snapshot link is atomic, so
-//! exactly one publishes `snapshots/<v>.json`, and `catalog.json` is
-//! byte-identical to the snapshot of its version. A **commit** whose publish
-//! conflicts is retried under [`CommitSettings`] (DuckLake's
+//! reopen the lake") — and two writers racing for the same version cannot
+//! both win: the store's head check admits exactly one. A **commit** whose
+//! publish conflicts is retried under [`CommitSettings`] (DuckLake's
 //! `ducklake_max_retry_count`/`ducklake_retry_backoff`/`ducklake_retry_wait_ms`,
 //! defaults 10 / 1.5 / 100 ms), rebasing the already-written immutable files
 //! onto the new head; a delta whose base files the head no longer contains
-//! is refused, never silently re-applied. Over S3 both publications are
-//! conditional writes (`If-None-Match: *`, `If-Match: <etag>`), which AWS
-//! S3 / Cloudflare R2 evaluate atomically with the write commit. An endpoint
-//! that rejects conditionals refuses the write
+//! is refused, never silently re-applied. Over S3 data files are published
+//! with conditional writes (`If-None-Match: *`), which AWS S3 / Cloudflare
+//! R2 evaluate atomically with the write commit. An endpoint that rejects
+//! conditionals refuses the write unless the
 //! fallback is explicitly opted into — see the `s3` feature docs and the
 //! README.
 //!
@@ -379,10 +363,9 @@
 //! - Data files are **plaintext by default**. With the non-default
 //!   `encryption` feature, a lake opened or created with a key
 //!   ([`EncryptionKey`], or the CLI's `PINKDB_KEY`) seals every artifact —
-//!   catalog, snapshots, commit deltas, data files, and positional delete
-//!   files — into `PNKLAKE1` containers (AES-256-GCM, one Argon2id derivation
-//!   per session; see the `crypto` module for the format and the
-//!   `catalog.json == snapshots/<v>.json` byte-identity story). A keyed open
+//!   the `pink:` catalog file, data files, and positional delete files — into
+//!   `PNKLAKE1` containers (AES-256-GCM, one Argon2id derivation per session;
+//!   see the `crypto` module for the format). A keyed open
 //!   of a plaintext lake is refused and a keyless open of an encrypted lake
 //!   is refused, so a key is never silently ignored. The engine's own
 //!   `.pink` containers (`PINKENC1`) are never stored in a lake. Plaintext
@@ -452,7 +435,7 @@ pub use engine::{EngineLease, LEASE_PATH, LEASE_TIMEOUT, LeaseError};
 pub use incremental::{
     AddFilesReport, Commit, CommitReport, CommitSettings, FlushReport, WritableAttachment,
 };
-use local::{CATALOG_FILE, LocalStorage};
+use local::LocalStorage;
 pub use maintenance::{
     CleanupReport, CleanupSettings, CompactionReport, DEFAULT_RETENTION_SECS, ExpireReport,
     ExpireSettings, LakeFileInfo, LakeOption, LakeSettings, MergeSettings, RewriteSettings,
@@ -489,8 +472,9 @@ pub const MIN_FORMAT_VERSION: u32 = 7;
 /// this (a future format) is [`LakeError::Unsupported`] in every build.
 pub const MAX_FORMAT_VERSION: u32 = 7;
 
-/// The lake-relative name of the identity object (M-7). Created once, never
-/// replaced.
+/// The tree-walk marker of a pre-103 lake directory: only the data-location
+/// guard looks for it, so a new catalog never takes over an older build's
+/// files. Nothing reads or writes it as a lake.
 pub(crate) const LAKE_FILE: &str = "lake.json";
 
 /// The data-root ownership marker of a split lake (wave 96a): `{"lake_id": …}`.
@@ -519,7 +503,7 @@ pub type Result<T> = std::result::Result<T, LakeError>;
 /// Everything that can go wrong while operating on a lake.
 #[derive(Debug)]
 pub enum LakeError {
-    /// The directory is not a lake: `catalog.json` is missing.
+    /// The location holds no lake catalog.
     NotALake { path: PathBuf },
     /// The lake's catalog was migrated away (wave 96a): the source carries a
     /// `moved.json` (object store) or a `pink_lake_meta.moved_to` row (SQL),
@@ -527,9 +511,11 @@ pub enum LakeError {
     /// instead of `NotALake`, so a moved lake is never mistaken for a deleted
     /// one.
     CatalogMoved { path: PathBuf, moved_to: String },
-    /// `catalog.json` already exists; `create` refuses to overwrite a lake.
+    /// The location already holds a lake catalog; `create` refuses to
+    /// overwrite a lake.
     AlreadyALake { path: PathBuf },
-    /// Malformed lake metadata (bad JSON, bad shape, bad file references).
+    /// Malformed lake metadata (a bad catalog row, a bad data-file
+    /// reference).
     Corrupt { path: PathBuf, message: String },
     /// The metadata is well-formed but a newer/incompatible format.
     Unsupported { path: PathBuf, found: u32 },
@@ -569,9 +555,9 @@ pub enum LakeError {
     /// A catalog row names the data format removed in wave 104. There is no
     /// reader and no converter: the lake must be re-saved by an older build.
     RemovedFormat { message: String },
-    /// An encrypted lake artifact was read without a key: `catalog.json`, a
-    /// snapshot, a commit delta, or a data file is a `PNKLAKE1` container (or
-    /// this build cannot read it at all). A keyless open never guesses.
+    /// An encrypted lake artifact was read without a key: the catalog
+    /// database or a data file is a `PNKLAKE1` container (or this build
+    /// cannot read it at all). A keyless open never guesses.
     Encrypted { path: PathBuf, message: String },
     /// A key was supplied but the artifact is plaintext. Refused so a key can
     /// never be silently ignored (`pinkdb::crypto` has the same rule for
@@ -612,7 +598,7 @@ impl fmt::Display for LakeError {
         match self {
             LakeError::NotALake { path } => write!(
                 f,
-                "{} is not a pink-lake directory (no catalog.json; use create)",
+                "{} is not a pink lake (no catalog at that location; use create)",
                 path.display()
             ),
             LakeError::CatalogMoved { path, moved_to } => write!(
@@ -621,11 +607,9 @@ impl fmt::Display for LakeError {
                  location instead)",
                 path.display()
             ),
-            LakeError::AlreadyALake { path } => write!(
-                f,
-                "{} is already a pink-lake directory (use open)",
-                path.display()
-            ),
+            LakeError::AlreadyALake { path } => {
+                write!(f, "{} is already a pink lake (use open)", path.display())
+            }
             LakeError::Corrupt { path, message } => {
                 write!(f, "corrupt lake metadata at {}: {message}", path.display())
             }
@@ -792,6 +776,9 @@ pub struct SaveReport {
 #[derive(Debug)]
 pub struct Lake {
     root: PathBuf,
+    /// The catalog location errors name: the URL as given, password redacted
+    /// (`pink:<path>`, `sqlite:<path>` or a Postgres URL).
+    catalog: String,
     /// The data location (objects only; the catalog is `store`).
     storage: Arc<dyn Storage>,
     /// The catalog database (DuckLake tables).
@@ -985,6 +972,7 @@ impl Lake {
         let root = data.abs("");
         let lake = Self {
             root,
+            catalog: redact_location(catalog_url).to_string(),
             storage: data,
             store,
             lake_id,
@@ -998,7 +986,6 @@ impl Lake {
         };
         lake.storage
             .put(LAKE_DATA_FILE, &data_ownership_json(&lake.lake_id)?)?;
-        let _ = catalog_url;
         Ok(lake)
     }
 
@@ -1127,6 +1114,7 @@ impl Lake {
         let root = data.abs("");
         Ok(Self {
             root,
+            catalog: redact_location(catalog_url).to_string(),
             storage: data,
             store,
             lake_id,
@@ -1274,19 +1262,31 @@ impl Lake {
         &self.root
     }
 
+    /// The catalog location this handle's errors name: the URL it was opened
+    /// with, password redacted (`pink:<path>`, `sqlite:<path>` or a Postgres
+    /// URL).
+    pub fn catalog_label(&self) -> &str {
+        &self.catalog
+    }
+
+    /// [`Lake::catalog_label`] as a path, for the error-attribution helpers.
+    fn catalog_path(&self) -> &Path {
+        Path::new(&self.catalog)
+    }
+
     /// The catalog `format_version` this handle last saw: the version the lake
     /// was opened with, or [`FORMAT_VERSION`] after a successful save.
     pub fn format_version(&self) -> u32 {
         self.format_version
     }
 
-    /// The current version (from `catalog.json`, cached after open/save).
+    /// The current version (the catalog's head, cached after open/save).
     pub fn current_version(&self) -> u64 {
         self.version
     }
 
     /// The lake's random 128-bit identity (32 lowercase hex characters), as
-    /// recorded in v6 manifests, `lake.json` and `highest.json` (M-7).
+    /// recorded in the catalog (M-7).
     pub fn lake_id(&self) -> &str {
         &self.lake_id
     }
@@ -1366,7 +1366,7 @@ impl Lake {
         let mut out = Vec::new();
         let mut previous: Option<Catalog> = None;
         for version in self.versions()? {
-            match manifest_for(&*self.store, &self.root, Some(version)) {
+            match manifest_for(&*self.store, self.catalog_path(), Some(version)) {
                 Ok((mut manifest, path)) => {
                     if self.check_lake_id(&manifest, &path).is_err() {
                         continue;
@@ -1398,15 +1398,8 @@ impl Lake {
         Ok(out)
     }
 
-    /// Published snapshot versions, ascending: every `snapshots/<v>.json`
-    /// that is named canonically (`<decimal>`, no leading zeros), declares
-    /// its own version `v`, and parses. A leftover manifest from an
-    /// interrupted publish (`v > current`) is ignored, as are corrupt
-    /// manifests, `01.json`-style names, and non-numeric names — they are
-    /// never loadable through this handle. A snapshot that cannot be *read*
-    /// (permissions, a transient object-store error) is an error, never a
-    /// silently missing version; one deleted between listing and reading is
-    /// skipped.
+    /// Published snapshot versions, ascending: every version the catalog
+    /// holds at or below this handle's head.
     pub fn versions(&self) -> Result<Vec<u64>> {
         published_versions(&*self.store, self.version)
     }
@@ -1524,12 +1517,11 @@ impl Lake {
         Ok(out)
     }
 
-    /// The published commit-delta manifest versions, ascending: every
-    /// `commits/<v>.json` naming a version at or below the current one (and
-    /// below this build's newest format). The delta manifests are the
-    /// append-only audit trail of how each version was built (which data and
-    /// delete files it added); the snapshot manifests stay authoritative for
-    /// loading.
+    /// The published commit-delta versions, ascending: every version at or
+    /// below the current one whose delta the catalog kept (from version 2
+    /// on). The deltas are the append-only audit trail of how each version was
+    /// built (which data and delete files it added); the snapshot record
+    /// stays authoritative for loading.
     pub fn commits(&self) -> Result<Vec<u64>> {
         Ok(self
             .store
@@ -1573,10 +1565,9 @@ impl Lake {
     ///
     /// Fails before writing anything when the store cannot be represented
     /// ([`validate_store`]) or when the handle is stale ([`LakeError::Conflict`]);
-    /// fails without replacing an existing `snapshots/<version>.json`, and
-    /// re-checks the catalog right before replacing it, so a concurrent
-    /// publication can never produce a catalog that disagrees with the
-    /// snapshot of its version.
+    /// the catalog transaction re-checks the head, so a concurrent publication
+    /// can never produce a catalog that disagrees with the snapshot of its
+    /// version.
     pub fn write_from_store_report(&mut self, db: &PinkDb) -> Result<SaveReport> {
         validate_store(db)?;
         // Fail fast on a handle another writer has already outdated (before
@@ -1587,28 +1578,27 @@ impl Lake {
             .checked_add(1)
             .filter(|v| *v <= MAX_VERSION)
             .ok_or_else(|| LakeError::Overflow {
-                path: self.root.clone(),
+                path: self.catalog_path().to_path_buf(),
                 version: self.version,
             })?;
         // The previous version's manifest, read before the data loop: a full
         // save **preserves the partitioning** of a table that is saved again
         // under the same key (the store itself has no partition concept), so
         // re-saving a partitioned table re-splits its rows the same way. The
-        // handle is at the head (`ensure_catalog_unchanged` above), and
-        // `catalog.json` is byte-identical to a healthy snapshot, so fall back
-        // to the catalog when the snapshot read fails: an unreadable
-        // predecessor must not silently reset the lake-wide monotonic
-        // `schema_version` (or drop a partition spec). If even the catalog
-        // cannot be read, the save fails loudly.
-        let previous = manifest_for(&*self.store, &self.root, Some(self.version))
+        // handle is at the head (`ensure_catalog_unchanged` above), so fall
+        // back to the head manifest when the previous snapshot read fails: an
+        // unreadable predecessor must not silently reset the lake-wide
+        // monotonic `schema_version` (or drop a partition spec). If even the
+        // head cannot be read, the save fails loudly.
+        let previous = manifest_for(&*self.store, self.catalog_path(), Some(self.version))
             .ok()
             .map(|(manifest, _)| manifest);
         // The head catalog is the authoritative entry set. A table this build
         // cannot read is carried forward verbatim when the store has no table
         // under its key; a store table under that key would replace data this
         // build cannot read, so the save is refused (wave 88, rule 5).
-        let head = manifest_for(&*self.store, &self.root, None)?.0;
-        let head_path = self.storage.abs(CATALOG_FILE);
+        let head = manifest_for(&*self.store, self.catalog_path(), None)?.0;
+        let head_path = self.catalog_path().to_path_buf();
         let mut store_keys: BTreeSet<String> = BTreeSet::new();
         for dbname in db.list_databases() {
             for name in db.list_tables_in(&dbname) {
@@ -1871,7 +1861,7 @@ impl Lake {
     /// always re-encode under the entry's own pinned format (or the target of
     /// [`Lake::rewrite_table_format`]).
     pub fn set_write_format(&mut self, id: &str) -> Result<()> {
-        crate::format::format_for(id, &self.root.join(CATALOG_FILE))?;
+        crate::format::format_for(id, self.catalog_path())?;
         self.write_format_choice = Some(FileFormat::new(id));
         Ok(())
     }
@@ -1900,7 +1890,7 @@ impl Lake {
                 ),
             });
         }
-        crate::format::format_for(id, &self.root.join(CATALOG_FILE))?;
+        crate::format::format_for(id, self.catalog_path())?;
         self.table_format_choices
             .insert(format!("{db}.{table}"), FileFormat::new(id));
         Ok(())
@@ -1974,8 +1964,8 @@ impl Lake {
         format: FileFormat,
         src: &DataTable,
     ) -> Result<(FileRef, u64)> {
-        let (dbname, table) = split_key(key, &self.root.join(CATALOG_FILE))?;
-        let provider = crate::format::format_for(format.id(), &self.root.join(CATALOG_FILE))?;
+        let (dbname, table) = split_key(key, self.catalog_path())?;
+        let provider = crate::format::format_for(format.id(), self.catalog_path())?;
         let dir = format!("data/{}", encode_key(key));
         let id = fresh_id();
         let rows = src.num_rows() as u64;
@@ -2112,9 +2102,9 @@ impl Lake {
         positions: &[u64],
         format: &FileFormat,
     ) -> Result<(DeleteRef, u64)> {
-        let (dbname, table) = split_key(key, &self.root.join(CATALOG_FILE))?;
+        let (dbname, table) = split_key(key, self.catalog_path())?;
         validate_rel_path(file)?;
-        let provider = crate::format::format_for(format.id(), &self.root.join(CATALOG_FILE))?;
+        let provider = crate::format::format_for(format.id(), self.catalog_path())?;
         let positions = delete_file::normalize(positions.to_vec());
         let dir = format!("data/{}", encode_key(key));
         let rel = format!("{dir}/{}.{}", fresh_id(), provider.delete_extension());
@@ -2137,7 +2127,7 @@ impl Lake {
     /// cross-checked here, so a snapshot substituted from another lake (same
     /// key) is refused even when it parses.
     fn manifest(&self, version: Option<u64>) -> Result<(Catalog, PathBuf)> {
-        let (manifest, path) = manifest_for(&*self.store, &self.root, version)?;
+        let (manifest, path) = manifest_for(&*self.store, self.catalog_path(), version)?;
         self.check_lake_id(&manifest, &path)?;
         Ok((manifest, path))
     }
@@ -2166,7 +2156,7 @@ impl Lake {
         let head = self.store.head_version()?;
         if head != Some(self.version) {
             return Err(LakeError::Conflict {
-                path: self.root.join("catalog"),
+                path: self.catalog_path().to_path_buf(),
                 message: format!(
                     "another writer published version {} (this handle is based on version \
                      {}); reopen the lake",
@@ -2364,7 +2354,7 @@ impl Lake {
     /// entry's format id is resolved through the provider registry — an id
     /// with no provider is a clean [`LakeError::UnknownFormat`].
     fn open_data_file(&self, rel: &str, format: FileFormat) -> Result<PinkDb> {
-        let provider = crate::format::format_for(format.id(), &self.root.join(CATALOG_FILE))?;
+        let provider = crate::format::format_for(format.id(), self.catalog_path())?;
         let path = self.storage.abs(rel);
         let file = crate::format::DataFile::new(&path, rel, Arc::clone(&self.storage));
         provider.read(&file)
@@ -2647,11 +2637,10 @@ fn catalog_needs_data(location: &str, verb: &str) -> LakeError {
 }
 
 /// Refuse a data location that already belongs to a lake: an existing
-/// `catalog.json`/`lake.json` (the default layout), another catalog's
-/// `lake-data.json` owner marker (a split lake that has no data files yet),
-/// or any `data/` object (wave 96a ownership).
+/// `lake.json`, another catalog's `lake-data.json` owner marker (a split lake
+/// that has no data files yet), or any `data/` object (wave 96a ownership).
 fn ensure_data_location_free(data: &dyn Storage, data_location: &str) -> Result<()> {
-    if data.exists(CATALOG_FILE)? || data.exists(LAKE_FILE)? {
+    if data.exists(LAKE_FILE)? {
         return Err(LakeError::AlreadyALake { path: data.abs("") });
     }
     if !data.list_recursive("data")?.is_empty() {
@@ -2870,41 +2859,42 @@ pub fn catalog_set_table_format(catalog_url: &str, key: &str, format: &str) -> R
     store.set_table_format(key, format)
 }
 
-/// The manifest for the latest version (`None`) or one snapshot, with the path
-/// it was read from (for error attribution). Free function so an attachment —
-/// which holds only the storage and the root, not the [`Lake`] handle — can
-/// read arbitrary versions for time travel.
+/// The manifest for the latest version (`None`) or one snapshot, with the
+/// catalog location it was read from (for error attribution; `catalog` is the
+/// lake's [`Lake::catalog_label`]). Free function so an attachment — which
+/// holds only the storage, the data root and the label, not the [`Lake`]
+/// handle — can read arbitrary versions for time travel.
 pub(crate) fn manifest_for(
     store: &dyn crate::metadata::MetadataStore,
-    root: &Path,
+    catalog: &Path,
     version: Option<u64>,
 ) -> Result<(Catalog, PathBuf)> {
-    let Some(catalog) = store.load(version)? else {
+    let Some(manifest) = store.load(version)? else {
         return Err(match version {
             Some(version) => LakeError::VersionNotFound {
-                path: root.to_path_buf(),
+                path: catalog.to_path_buf(),
                 version,
             },
             None => LakeError::NotALake {
-                path: root.to_path_buf(),
+                path: catalog.to_path_buf(),
             },
         });
     };
     // A catalog row naming the data format removed in wave 104 is refused
     // for every operation, not treated as a missing provider: no build will
     // ever read it again, and the lake must be re-saved by an older build.
-    if catalog
+    if manifest
         .tables
         .values()
         .any(|entry| crate::format::is_removed(entry.format().id()))
     {
         return Err(crate::format::removed_format_error());
     }
-    let rel = match version {
-        None => "catalog".to_string(),
-        Some(v) => format!("snapshot {v}"),
+    let label = match version {
+        None => catalog.to_path_buf(),
+        Some(v) => PathBuf::from(format!("{} (snapshot {v})", catalog.display())),
     };
-    Ok((catalog, root.join(rel)))
+    Ok((manifest, label))
 }
 
 /// The published snapshot versions at or below `up_to`, ascending (see
@@ -3329,7 +3319,7 @@ mod tests {
 
     #[test]
     fn split_key_splits_on_the_first_dot() {
-        let catalog = PathBuf::from("catalog.json");
+        let catalog = PathBuf::from("pink:/tmp/lake.pink");
         assert_eq!(split_key("main.t", &catalog).unwrap(), ("main", "t"));
         assert_eq!(
             split_key("analytics.a.b", &catalog).unwrap(),
@@ -3337,10 +3327,10 @@ mod tests {
         );
         assert_eq!(split_key("main.", &catalog).unwrap(), ("main", ""));
         let err = split_key("nodot", &catalog).unwrap_err().to_string();
-        assert!(err.contains("catalog.json"), "{err}");
-        let snapshot = PathBuf::from("snapshots/2.json");
+        assert!(err.contains("pink:/tmp/lake.pink"), "{err}");
+        let snapshot = PathBuf::from("sqlite:/tmp/cat.db (snapshot 2)");
         let err = split_key("nodot", &snapshot).unwrap_err().to_string();
-        assert!(err.contains("snapshots/2.json"), "{err}");
+        assert!(err.contains("sqlite:/tmp/cat.db (snapshot 2)"), "{err}");
     }
 
     #[test]

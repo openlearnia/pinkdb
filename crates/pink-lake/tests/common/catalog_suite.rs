@@ -148,6 +148,21 @@ impl PostgresSuite {
             .flatten()
             .is_some()
     }
+
+    /// Run one statement in `catalog`'s schema (corruption tests).
+    pub fn sql(&self, catalog: &str, sql: &str) {
+        let (_, schema) = catalog
+            .rsplit_once("schema=")
+            .expect("the suite's catalog URL carries a schema");
+        let mut config = self.base.parse::<postgres::Config>().expect("test URL");
+        config
+            .ssl_mode(postgres::config::SslMode::Disable)
+            .application_name("pinkdb-lake-test-corrupt");
+        let mut client = config.connect(postgres::NoTls).expect("test server");
+        client
+            .batch_execute(&format!("SET search_path TO \"{schema}\"; {sql}"))
+            .expect("the corruption statement");
+    }
 }
 
 #[cfg(feature = "catalog-postgres")]
@@ -323,8 +338,15 @@ pub fn create_save_open_round_trip(suite: &mut dyn Suite) {
             .any(|path| path.extension().is_some_and(|ext| ext != "json")),
         "the data files live at the data location: {data_files:?}"
     );
-    assert!(!data.join("catalog.json").exists());
-    assert!(!data.join("snapshots").exists());
+    let mut names: Vec<String> = std::fs::read_dir(&data)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["data".to_string(), "lake-data.json".to_string()]
+    );
 
     // Open with only the catalog URL: the recorded data location is used.
     let lake = Lake::open_with_catalog(&catalog, None).unwrap();

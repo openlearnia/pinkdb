@@ -21,17 +21,9 @@
 //! local HEAD-then-read behavior (including the "not a regular file"
 //! refusal).
 //!
-//! Two operations carry the single-writer contract:
-//!
-//! - [`Storage::put_new`] publishes a snapshot manifest **only if it does not
-//!   exist yet** (`If-None-Match: *` over S3; a hard link locally), so two
-//!   writers racing for one version cannot both win.
-//! - [`Storage::put_if_match`] replaces `catalog.json` **only if it still
-//!   carries the version tag read moments earlier** (`If-Match: <etag>` over
-//!   S3, HTTP 412 → conflict; a file-identity re-check locally). The lake
-//!   additionally re-parses the catalog right before this call, so a stale
-//!   handle fails with the familiar "another writer published version N"
-//!   error even on backends that cannot enforce conditional writes.
+//! Single-writer safety lives in the metadata store's head check inside its
+//! transaction (see `metadata`); the storage layer only has to make each
+//! object write atomic ([`Storage::put`]).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -302,10 +294,9 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
 
     /// Delete one object. Published versions are never mutated (every
     /// retained version stays loadable), so only maintenance touches this:
-    /// `expire_snapshots` removes *expired* `snapshots/<v>.json` and their
-    /// `commits/<v>.json`, and `cleanup_old_files` /
-    /// `delete_orphaned_files` remove `data/` objects no retained version
-    /// references. A missing object is a backend-specific answer (S3 DELETE
+    /// `cleanup_old_files` / `delete_orphaned_files` remove `data/` objects no
+    /// retained version references (snapshot expiration only deletes catalog
+    /// rows). A missing object is a backend-specific answer (S3 DELETE
     /// is idempotent; locally it is a `NotFound` I/O error the maintenance
     /// code treats as already-deleted).
     fn delete(&self, rel: &str) -> Result<()>;

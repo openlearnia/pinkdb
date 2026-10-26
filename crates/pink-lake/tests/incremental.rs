@@ -139,7 +139,7 @@ fn file_list(lake_dir: &Path, _table: &str) -> Vec<String> {
         .collect()
 }
 
-/// One table's entry in `catalog.json`, raw (the crate's `TableEntry` is
+/// One table's entry in the catalog, raw (the crate's `TableEntry` is
 /// private; the published JSON is the contract).
 fn lake_entry(lake_dir: &Path, key: &str) -> serde_json::Value {
     catalog_json(lake_dir)["tables"][key].clone()

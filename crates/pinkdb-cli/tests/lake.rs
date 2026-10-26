@@ -260,7 +260,7 @@ fn lake_errors_are_clear() {
         ".lake open {missing}\n.lake tables {missing}\n.quit\n",
         missing = missing.display()
     ));
-    assert!(out.contains("is not a pink-lake directory"), "{out}");
+    assert!(out.contains("is not a pink lake"), "{out}");
 
     // Usage errors.
     let out = run(
@@ -316,8 +316,8 @@ fn failed_saves_do_not_leave_a_partial_lake() {
     ));
     assert!(out.contains("contains \".\""), "{out}");
     assert!(
-        !dotted.join("catalog.json").exists(),
-        "a rejected save must not leave a lake: {out}"
+        !dotted.join("data").exists(),
+        "a rejected save must write no data: {out}"
     );
 
     // A table whose encoded `data/` directory blows the filesystem name
@@ -331,8 +331,8 @@ fn failed_saves_do_not_leave_a_partial_lake() {
     ));
     assert!(out.contains("over the 200-byte limit"), "{out}");
     assert!(
-        !long.join("catalog.json").exists(),
-        "a rejected save must not leave a lake: {out}"
+        !long.join("data").exists(),
+        "a rejected save must write no data: {out}"
     );
     cleanup(&dir);
 }
@@ -2236,7 +2236,7 @@ fn attach_errors_are_clear_and_never_panic() {
         ".lake attach {missing}\n.quit\n",
         missing = dir.join("no-such-lake").display()
     ));
-    assert!(out.contains("not a pink-lake"), "{out}");
+    assert!(out.contains("not a pink lake"), "{out}");
 
     // A missing data file.
     let missing_lake = dir.join("missing_lake");

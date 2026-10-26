@@ -48,10 +48,9 @@ with `is a data location, not a lake catalog` and point at the split form, e.g.
 `.lake save pink:lake.pink data s3://bucket/prefix` (or a `postgres://`
 catalog for multi-machine lakes).
 
-Nothing named `catalog.json`, `snapshots/`, `commits/`, `highest.json`,
-`lake.json` or `moved.json` is written to S3 any more; the only non-data
-object under a split lake's prefix is the `lake-data.json` ownership marker
-(lake id) that cleanup verifies before deleting anything.
+The catalog never lives in S3: the only objects under a split lake's prefix
+are data files and the `lake-data.json` ownership marker (lake id) that
+cleanup verifies before deleting anything.
 
 The harness reads that state with `pinkdb-cli`'s own commands (all of which
 accept the catalog and print catalog state, never S3 metadata):
@@ -250,8 +249,8 @@ metadata object from S3:
    alone (the documented "reopen the lake to continue"), which also pins the
    full-snapshot semantics: the settle save drops the race's table and
    publishes `main.settle`.
-5. **The S3 side is data only.** Under `conc/` the harness asserts there is
-   no `catalog.json`, `snapshots/`, `commits/`, `highest.json` or `lake.json`,
+5. **The S3 side is data only.** Under `conc/` the harness asserts every key
+   is a data object or the `lake-data.json` marker,
    that `lake-data.json` is present, that the data objects match
    `data/main.<table>/<uuid>.pink`, and that `.lake files` names exactly the
    head's one data file, which is in the listing.

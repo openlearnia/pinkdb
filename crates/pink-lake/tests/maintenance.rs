@@ -818,10 +818,6 @@ fn expire_snapshots_dry_run_then_versions_with_clean_time_travel_errors() {
         })
         .unwrap();
     assert_eq!(report.version_numbers(), vec![2, 3]);
-    assert!(!lake_dir.join("snapshots/2.json").exists());
-    assert!(!lake_dir.join("commits/2.json").exists());
-    assert!(!lake_dir.join("snapshots/3.json").exists());
-    assert!(!lake_dir.join("commits/3.json").exists());
     assert_eq!(lake.versions().unwrap(), vec![1, 4, 5]);
     // The create snapshot has no commit delta; the retained ones do.
     assert_eq!(lake.commits().unwrap(), vec![4, 5]);
