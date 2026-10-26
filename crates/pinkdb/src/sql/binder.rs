@@ -2791,6 +2791,11 @@ impl<'a> Binder<'a> {
         if name.eq_ignore_ascii_case("getvariable") {
             return self.bind_getvariable(args);
         }
+        // Wave 109: who is asking. Bound here, before `bind_scalar_macro`, so
+        // a stored macro cannot shadow the session's identity.
+        if name.eq_ignore_ascii_case("current_user") || name.eq_ignore_ascii_case("current_roles") {
+            return self.bind_identity(name, args);
+        }
         if name.eq_ignore_ascii_case("timezone") {
             return self.bind_timezone(args, aggs, allow_agg);
         }
@@ -2949,6 +2954,47 @@ impl<'a> Binder<'a> {
                 "Variable {name} does not exist"
             ))),
         }
+    }
+
+    /// `current_user()` / `current_roles()`: the caller's identity, spliced in
+    /// at bind time.
+    ///
+    /// A literal, not a `ScalarFunc`, for two reasons: `eval_scalar` sizes its
+    /// output chunk from the first argument, so a zero-argument scalar would
+    /// emit no rows; and a literal records the `$current_user` dependency, so
+    /// the existing rule that a WAL-logged statement may not read session state
+    /// covers a logged `INSERT … VALUES (current_user())` as well.
+    ///
+    /// An embedded store has no login, so it answers [`crate::rbac::
+    /// IMPLICIT_PRINCIPAL`]: the operator at the CLI is one principal.
+    fn bind_identity(&mut self, name: &str, args: &[Expr]) -> Result<BoundExpr> {
+        if !args.is_empty() {
+            return Err(PinkDbError::Type(format!(
+                "{}() takes no arguments",
+                name.to_ascii_lowercase()
+            )));
+        }
+        let dep = format!("${}", name.to_ascii_lowercase());
+        let mut deps = self.dynamic_functions_used.borrow_mut();
+        if !deps.contains(&dep) {
+            deps.push(dep);
+        }
+        drop(deps);
+        let principal = self.session.principal();
+        let value = if name.eq_ignore_ascii_case("current_user") {
+            Value::Varchar(principal.unwrap_or_else(|| crate::rbac::IMPLICIT_PRINCIPAL.to_string()))
+        } else {
+            // Display names, the spelling `CREATE ROLE` took: a statement's
+            // text must keep working after a role is renamed in another case.
+            let rbac = self.db.rbac();
+            let roles: Vec<String> = principal
+                .iter()
+                .flat_map(|principal| rbac.roles_of(principal))
+                .map(|role| rbac.display_of(&role))
+                .collect();
+            Value::Varchar(roles.join(","))
+        };
+        Ok(BoundExpr::Literal(value))
     }
 
     /// `timezone(zone, ts)` and `ts AT TIME ZONE zone`.

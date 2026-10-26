@@ -293,3 +293,46 @@ fn quoted_text(kind: &str, text: &str) -> Result<String, String> {
     }
     Ok(format!("\"{}\"", text.replace('"', "\"\"")))
 }
+
+/// The warehouse tool table as an MCP [`ToolSet`]: the eight tools above,
+/// planned into statements by [`run`]. The MCP bridge (wave 105) and agent
+/// memory (wave 109) both serve it, so a client sees one warehouse surface
+/// whichever extension it connects to.
+///
+/// [`ToolSet`]: pinkdb_mcp_protocol::ToolSet
+#[derive(Default)]
+pub struct Warehouse;
+
+impl pinkdb_mcp_protocol::ToolSet for Warehouse {
+    fn schemas(&self) -> Vec<Value> {
+        schemas()
+    }
+
+    fn call(
+        &mut self,
+        host: &mut dyn pinkdb_mcp_protocol::Host,
+        name: &str,
+        arguments: &Map<String, Value>,
+    ) -> Result<pinkdb_mcp_protocol::ToolReply, String> {
+        let reply = run(&mut Bridge(host), name, arguments)?;
+        Ok(pinkdb_mcp_protocol::ToolReply {
+            code: reply.code,
+            text: reply.text,
+        })
+    }
+}
+
+/// The MCP host as this crate's [`ToolHost`]. The public channel only: a tool
+/// call is a statement the host's policy decides on, never the extension's
+/// own bookkeeping.
+struct Bridge<'a>(&'a mut dyn pinkdb_mcp_protocol::Host);
+
+impl ToolHost for Bridge<'_> {
+    fn execute(&mut self, statement: &str) -> ToolReply {
+        let reply = self.0.execute(statement);
+        ToolReply {
+            code: reply.code,
+            text: reply.text,
+        }
+    }
+}

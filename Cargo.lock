@@ -1801,6 +1801,29 @@ version = "0.1.0"
 dependencies = [
  "pinkdb-ext-loader",
  "pinkdb-ext-sdk",
+ "pinkdb-mcp-protocol",
+ "pinkdb-warehouse-tools",
+ "serde_json",
+]
+
+[[package]]
+name = "pinkdb-mcp-protocol"
+version = "0.1.0"
+dependencies = [
+ "pinkdb-ext-sdk",
+ "serde_json",
+]
+
+[[package]]
+name = "pinkdb-memory"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "pinkdb-embeddings",
+ "pinkdb-ext-loader",
+ "pinkdb-ext-sdk",
+ "pinkdb-llm",
+ "pinkdb-mcp-protocol",
  "pinkdb-warehouse-tools",
  "serde_json",
 ]
@@ -1861,6 +1884,7 @@ dependencies = [
 name = "pinkdb-warehouse-tools"
 version = "0.1.0"
 dependencies = [
+ "pinkdb-mcp-protocol",
  "serde_json",
 ]
 

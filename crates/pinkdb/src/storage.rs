@@ -1268,14 +1268,21 @@ impl DbCatalog {
 pub struct Session {
     /// Lowercased name -> value.
     vars: Arc<Mutex<BTreeMap<String, Value>>>,
+    /// The authenticated user of this session (wave 48's login), lowercased:
+    /// what `current_user()` answers and what `current_roles()` resolves.
+    /// `None` is the trusted embedded session, whose implicit principal is
+    /// [`IMPLICIT_PRINCIPAL`].
+    principal: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Values can hold anything a query can (a secret, a tenant filter);
-        // never render them into a log line or an error.
+        // never render them into a log line or an error. The principal is not
+        // a secret and is what a `current_user()` bug report needs.
         f.debug_struct("Session")
             .field("variables", &self.len())
+            .field("principal", &self.principal())
             .finish()
     }
 }
@@ -1284,6 +1291,19 @@ impl Session {
     /// A session with no variables set.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Adopt `principal` as this session's user (`None` = trusted embedded).
+    pub(crate) fn set_principal(&self, principal: Option<String>) {
+        *self.principal.lock().unwrap_or_else(|e| e.into_inner()) = principal;
+    }
+
+    /// The session's user, `None` on a trusted embedded session.
+    pub(crate) fn principal(&self) -> Option<String> {
+        self.principal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The value bound to `name` (case-insensitive), if the session set it.

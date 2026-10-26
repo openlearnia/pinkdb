@@ -109,6 +109,7 @@ NAV = [
             {"key": "server", "label": "Server", "out": "docs/server.html"},
             {"key": "agents", "label": "Agents and MCP", "out": "docs/agents.html"},
             {"key": "agent", "label": "pinkdb agent", "out": "docs/agent.html"},
+            {"key": "memory", "label": "Agent memory", "out": "docs/memory.html"},
         ],
     },
     {
@@ -283,6 +284,17 @@ PAGES = {
             "pinkdb-agent runs the data-agent loop inside pinkdb: setup with an "
             "environment key, the .agent commands, resume and fork, the two write "
             "policies, the session tables and the budgets."
+        ),
+    },
+    "memory.html": {
+        "out": "docs/memory.html",
+        "nav": "memory",
+        "title": "Agent memory — pinkdb",
+        "description": (
+            "pinkdb-memory stores an agent's long-term memory in pinkdb tables: "
+            "L0 turns, L1 atoms, L2 scenarios and an L3 persona, distilled by a "
+            "model through pinkdb-llm, read back layered and budgeted, and "
+            "filtered per principal by the extension."
         ),
     },
     "bindings.html": {

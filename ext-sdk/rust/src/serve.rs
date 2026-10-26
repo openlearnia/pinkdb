@@ -45,6 +45,14 @@ impl HostSession {
     pub fn execute_statement(&mut self, sql: &str) -> StatementReply {
         call_statement(&self.api, self.ctx, sql, false)
     }
+
+    /// Run one statement for the extension's own bookkeeping: no privilege
+    /// check, writes confined to the extension's database by the host, JSON
+    /// results. Code 2 with empty text means the host has no internal channel
+    /// (an older host, or one that does not keep state for this extension).
+    pub fn execute_internal(&mut self, sql: &str) -> StatementReply {
+        call_statement(&self.api, self.ctx, sql, true)
+    }
 }
 
 /// Call one statement channel of `api`: the tool channel (`internal` false)

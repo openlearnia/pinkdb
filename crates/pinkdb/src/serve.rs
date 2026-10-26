@@ -34,6 +34,16 @@ pub struct ServePolicy {
     /// into `read_csv('/home/u/.ssh/id_rsa')` or a URL carrying the data out.
     /// The check happens here, before the statement runs.
     pub allow_files: bool,
+    /// Let a statement reach an external service: a host scalar that declared
+    /// itself external I/O, such as wave 107c's `embed()`, which calls an
+    /// embeddings provider. Off by default. Independent of
+    /// [`Self::allow_files`], and split from it because the two are not the
+    /// same risk: a model call leaks the text it is given, a file read leaks
+    /// whatever the path names, and an extension's own bookkeeping channel may
+    /// need the first while it must never have the second. The operator's
+    /// `allow-files` switch sets both, so the documented MCP behaviour is
+    /// unchanged.
+    pub allow_external_services: bool,
     /// Caps for the Markdown formatter (rows, columns, cell width).
     pub display: AgentDisplay,
     /// Budget for every statement the extension runs.
@@ -56,6 +66,26 @@ pub struct ServePolicy {
     /// harness's own bookkeeping channel, which is nothing but its session
     /// tables.
     pub write_database: Option<String>,
+    /// Databases a statement may not *read*, whatever its privileges. A host
+    /// names a database whose rows are filtered per caller by an extension
+    /// (wave 109's memory tables): the extension's tools serve them, a direct
+    /// `SELECT` from the served session does not.
+    pub deny_read_databases: Vec<String>,
+    /// When set, a statement may read *only* the tables of these databases.
+    /// An extension's bookkeeping channel runs without the RBAC gate (it keeps
+    /// its own state, and the caller it serves is not the user whose memory it
+    /// filters), so the policy — not the extension's quoting — is what keeps a
+    /// mistyped identifier or a slip in a generated predicate inside the
+    /// extension's own tables. Reads are collected from the bound plan, so a
+    /// view, a CTE or a macro body cannot reach around the list, and a table
+    /// function or a bare path names no table the list could vouch for.
+    pub read_databases: Option<Vec<String>>,
+    /// The policy an extension's own bookkeeping channel
+    /// ([`StatementHost::execute_internal`]) runs under. `None` — the default —
+    /// means this host has no such channel and refuses it; a host that loads an
+    /// extension keeping its own state names the extension's database in
+    /// [`Self::write_database`] here.
+    pub internal: Option<Box<ServePolicy>>,
 }
 
 /// The database a command extension keeps its state in. [`ServePolicy::
@@ -75,6 +105,7 @@ impl Default for ServePolicy {
         ServePolicy {
             allow_writes: false,
             allow_files: false,
+            allow_external_services: false,
             display: AgentDisplay::DEFAULT,
             limits: ExecLimits {
                 statement_timeout: Some(std::time::Duration::from_secs(30)),
@@ -85,6 +116,9 @@ impl Default for ServePolicy {
             hint_rows: 100_000,
             deny_write_databases: Vec::new(),
             write_database: None,
+            deny_read_databases: Vec::new(),
+            read_databases: None,
+            internal: None,
         }
     }
 }
@@ -112,6 +146,28 @@ fn agent_table_hint(database: &str) -> String {
 /// What a bookkeeping write outside the agent's database gets.
 const INTERNAL_WRITE_HINT: &str = "the agent keeps its state in one database: this statement \
                                    writes outside it";
+
+/// What a direct read of a per-caller database gets. The rows are filtered by
+/// the extension that owns them, so the served session reaches them through
+/// its tools instead.
+fn masked_read_hint(database: &str) -> String {
+    format!(
+        "this session may not read \"{database}\" directly: its rows are filtered per caller by \
+         the extension that owns them, which serves them through its own tools"
+    )
+}
+
+/// What a read outside a confined channel's own databases gets. The channel
+/// runs without the RBAC gate, so the policy, not the extension's quoting, is
+/// what keeps it at home; a table function or a path names nothing the list
+/// could vouch for.
+fn confined_read_hint(databases: &[String]) -> String {
+    format!(
+        "this session may read only the tables of {}: it is a confined channel for one \
+         extension's own state, and that extension serves everything else through its tools",
+        databases.join(", ")
+    )
+}
 
 /// What a write whose database cannot be resolved gets while a policy
 /// confines writes.
@@ -328,12 +384,12 @@ pub fn execute_internal(db: &mut PinkDb, policy: &ServePolicy, sql: &str) -> (i3
     if text.starts_with('.') {
         return (1, agent::error_json(NO_COMMANDS_HINT, "execution", None));
     }
-    if let Err(error) = checked(policy, sql, Some(&*db)) {
+    if let Err(error) = checked(policy, sql, Some(&mut *db)) {
         return (1, error);
     }
     // The statement's own executor enforces this for calls that only bind
     // after an earlier statement of the batch ran (wave 107c).
-    db.set_external_services(policy.allow_files);
+    db.set_external_services(policy.allow_external_services);
     match db.execute_with_limits(sql, policy.limits) {
         Ok(results) => (0, render_json(&results)),
         Err(e) => (1, agent::error_json_for(&e, sql)),
@@ -428,9 +484,24 @@ pub trait Session {
     /// reachable (a connection's store is behind the shared lock).
     fn hint_store(&self) -> Option<&PinkDb>;
 
+    /// Show the store to a policy check, this one time. A policy that names
+    /// databases to refuse (or the only ones it allows) is unenforceable
+    /// without the catalog, so this is the hook it runs through: the
+    /// connection borrows the store under its shared lock for the call, and a
+    /// host with no store answers `None` — which refuses nothing, the same
+    /// answer as a policy that names no database.
+    fn check_store(&mut self, check: &mut dyn FnMut(&PinkDb) -> Option<String>) -> Option<String>;
+
     /// Install the policy's external-services switch for the next statement
     /// (wave 107c): refused calls fail at the call site, before any request.
     fn set_external_services(&mut self, allowed: bool);
+
+    /// Run `sql` for the extension's own bookkeeping
+    /// ([`StatementHost::execute_internal`]): the host's internal policy is the
+    /// only limit on what it may touch, so no privilege check runs here.
+    fn run_internal(&mut self, sql: &str, limits: ExecLimits) -> Result<Vec<QueryResult>> {
+        self.run_statement(sql, limits)
+    }
 }
 
 impl Session for PinkDb {
@@ -440,6 +511,10 @@ impl Session for PinkDb {
 
     fn hint_store(&self) -> Option<&PinkDb> {
         Some(self)
+    }
+
+    fn check_store(&mut self, check: &mut dyn FnMut(&PinkDb) -> Option<String>) -> Option<String> {
+        check(self)
     }
 
     fn set_external_services(&mut self, allowed: bool) {
@@ -457,8 +532,17 @@ impl Session for crate::db::Connection {
         None
     }
 
+    fn check_store(&mut self, check: &mut dyn FnMut(&PinkDb) -> Option<String>) -> Option<String> {
+        self.with_store(|db| check(db))
+    }
+
     fn set_external_services(&mut self, allowed: bool) {
         crate::db::Connection::set_external_services(self, allowed);
+    }
+
+    fn run_internal(&mut self, sql: &str, limits: ExecLimits) -> Result<Vec<QueryResult>> {
+        self.set_exec_limits(limits);
+        self.execute_as_extension(sql)
     }
 }
 
@@ -487,6 +571,33 @@ impl<R: Session + ?Sized> StatementHost for SessionHost<'_, R> {
         }
         execute_on(self.session, self.policy, sql)
     }
+
+    fn execute_internal(&mut self, sql: &str) -> (i32, String) {
+        match &self.policy.internal {
+            Some(internal) => internal_on(self.session, internal, sql),
+            None => (2, String::new()),
+        }
+    }
+}
+
+/// [`execute_internal`] on any [`Session`]: the same checks and budget, without
+/// the privilege gate.
+fn internal_on<R: Session + ?Sized>(
+    session: &mut R,
+    policy: &ServePolicy,
+    sql: &str,
+) -> (i32, String) {
+    if sql.trim().starts_with('.') {
+        return (1, agent::error_json(NO_COMMANDS_HINT, "execution", None));
+    }
+    if let Err(error) = checked(policy, sql, Some(&mut *session)) {
+        return (1, error);
+    }
+    session.set_external_services(policy.allow_external_services);
+    match session.run_internal(sql, policy.limits) {
+        Ok(results) => (0, render_json(&results)),
+        Err(e) => (1, agent::error_json_for(&e, sql)),
+    }
 }
 
 /// [`execute`] on any [`Session`]: the same policy check, budgets and
@@ -511,8 +622,8 @@ fn run(db: &mut PinkDb, policy: &ServePolicy, sql: &str) -> std::result::Result<
         };
         return command(db, text, !policy.allow_writes);
     }
-    let statements = checked(policy, sql, Some(&*db))?;
-    db.set_external_services(policy.allow_files);
+    let statements = checked(policy, sql, Some(&mut *db))?;
+    db.set_external_services(policy.allow_external_services);
     render(db, policy, sql, &statements)
 }
 
@@ -521,8 +632,8 @@ fn run_on<R: Session + ?Sized>(
     policy: &ServePolicy,
     sql: &str,
 ) -> std::result::Result<String, String> {
-    let statements = checked(policy, sql, session.hint_store())?;
-    session.set_external_services(policy.allow_files);
+    let statements = checked(policy, sql, Some(&mut *session))?;
+    session.set_external_services(policy.allow_external_services);
     render(session, policy, sql, &statements)
 }
 
@@ -533,10 +644,10 @@ fn run_on<R: Session + ?Sized>(
 /// network server's bridge) does not expose it, because its store is behind
 /// the shared lock: there the login's RBAC gate already restricts file scans
 /// to administrators (`rbac` M-4), so the policy does not need to see the plan.
-fn checked(
+fn checked<R: Session + ?Sized>(
     policy: &ServePolicy,
     sql: &str,
-    store: Option<&PinkDb>,
+    session: Option<&mut R>,
 ) -> std::result::Result<Vec<Statement>, String> {
     let statements =
         crate::sql::parse_statements(sql).map_err(|e| agent::error_json_for(&e, sql))?;
@@ -549,7 +660,10 @@ fn checked(
     {
         return Err(agent::error_json(READ_ONLY_HINT, "permission", None));
     }
-    let current_db = store.map(|db| db.current_db().to_string());
+    let mut session = session;
+    let current_db = session
+        .as_deref_mut()
+        .and_then(|s| s.check_store(&mut |db| Some(db.current_db().to_string())));
     let confining = !policy.deny_write_databases.is_empty() || policy.write_database.is_some();
     for statement in &statements {
         match write_target(statement, current_db.as_deref()) {
@@ -585,16 +699,83 @@ fn checked(
             WriteTarget::Unknown => {}
         }
     }
-    if !policy.allow_files
-        && let Some(db) = store
+    // The two catalog checks need the store, which a connection lends only for
+    // the call (`Session::check_store`). A read is named before an external
+    // switch: a statement that reads a table it may not read is refused for
+    // that, whichever way it would also have left the store.
+    if !policy.deny_read_databases.is_empty()
+        || policy.read_databases.is_some()
+        || !policy.allow_files
+        || !policy.allow_external_services
     {
         for statement in &statements {
-            if let Some(hint) = external_reason(db, statement) {
-                return Err(agent::error_json(hint, "permission", None));
+            let reason = session
+                .as_deref_mut()
+                .and_then(|s| s.check_store(&mut |db| statement_reason(db, policy, statement)));
+            if let Some(hint) = reason {
+                return Err(agent::error_json(&hint, "permission", None));
             }
         }
     }
     Ok(statements)
+}
+
+/// The first policy reason one statement is refused, or `None`: what it reads,
+/// then whether it leaves the store.
+fn statement_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Option<String> {
+    if let Some(hint) = read_reason(db, policy, statement) {
+        return Some(hint);
+    }
+    external_reason(db, statement, policy).map(str::to_string)
+}
+
+/// Why one statement would read a database the policy refuses, or `None`.
+///
+/// The read set comes from the bound plan (views inlined, CTEs walked), so a
+/// view over a refused table is refused like the table itself. A statement
+/// that does not bind has no read set to hide: it fails at bind time with its
+/// own error.
+fn read_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Option<String> {
+    let allowed = policy.read_databases.as_deref();
+    // A table function or a bare path names no table to check, and it is how a
+    // file would be read, which an allow-list never permits. Asked before
+    // binding so a source whose function is not installed is still refused for
+    // the right reason.
+    if let Some(allowed) = allowed
+        && ast_scans_files(statement)
+    {
+        return Some(confined_read_hint(allowed));
+    }
+    let session_db = db.current_db().to_string();
+    let (plan, _) = crate::sql::bind_tracked(db, statement, &session_db).ok()?;
+    let mut reads = std::collections::HashSet::new();
+    crate::plan::collect_tables_read(&plan, &session_db, &mut reads);
+    if let Some(allowed) = allowed {
+        // A view over a table function binds to a scan the syntax check cannot
+        // see, so the plan is asked too.
+        if crate::plan::contains_table_function(&crate::optimizer::optimize(db, plan.clone())) {
+            return Some(confined_read_hint(allowed));
+        }
+        if reads
+            .iter()
+            .any(|(database, _)| !allowed.iter().any(|a| a.eq_ignore_ascii_case(database)))
+        {
+            return Some(confined_read_hint(allowed));
+        }
+    }
+    let mut denied: Vec<&String> = reads
+        .iter()
+        .map(|(db, _)| db)
+        .filter(|db| {
+            policy
+                .deny_read_databases
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(db))
+        })
+        .collect();
+    denied.sort();
+    denied.dedup();
+    denied.first().map(|db| masked_read_hint(db))
 }
 
 /// Why one statement would reach outside the store, or `None`.
@@ -605,23 +786,37 @@ fn checked(
 /// The plan check sees what the binder rewrites a plain `FROM` into — a view
 /// over `read_csv`, say — and reaches table functions inside expressions.
 /// The dynamic functions the binder recorded are checked in between: a host
-/// scalar that declared itself external I/O is gated by the same switch.
-fn external_reason(db: &PinkDb, statement: &Statement) -> Option<&'static str> {
-    if ast_scans_files(statement) {
+/// scalar that declared itself external I/O is gated by its own switch, so an
+/// extension's bookkeeping channel can call a model while it still cannot
+/// open a file.
+fn external_reason(
+    db: &PinkDb,
+    statement: &Statement,
+    policy: &ServePolicy,
+) -> Option<&'static str> {
+    if policy.allow_files && policy.allow_external_services {
+        return None;
+    }
+    if !policy.allow_files && ast_scans_files(statement) {
         return Some(FILES_HINT);
     }
     let session_db = db.current_db().to_string();
     let Ok((plan, dynamic)) = crate::sql::bind_tracked(db, statement, &session_db) else {
         return None;
     };
-    if dynamic
-        .iter()
-        .any(|name| db.host_scalar(name).is_some_and(|h| h.is_external_io()))
+    if !policy.allow_external_services
+        && dynamic
+            .iter()
+            .any(|name| db.host_scalar(name).is_some_and(|h| h.is_external_io()))
     {
         return Some(crate::package::SERVICES_HINT);
     }
-    crate::plan::contains_table_function(&crate::optimizer::optimize(db, plan))
-        .then_some(FILES_HINT)
+    if !policy.allow_files
+        && crate::plan::contains_table_function(&crate::optimizer::optimize(db, plan))
+    {
+        return Some(FILES_HINT);
+    }
+    None
 }
 
 /// The syntactic half of [`external_reason`]: any `FROM` source that is a call
@@ -828,6 +1023,13 @@ pub struct ServeHost<'a> {
 impl StatementHost for ServeHost<'_> {
     fn execute_statement(&mut self, sql: &str) -> (i32, String) {
         execute(self.db, self.policy, sql)
+    }
+
+    fn execute_internal(&mut self, sql: &str) -> (i32, String) {
+        match &self.policy.internal {
+            Some(internal) => execute_internal(self.db, internal, sql),
+            None => (2, String::new()),
+        }
     }
 }
 

@@ -451,6 +451,12 @@ fn print_help() {
         "                         {} database, tools read-only unless allow-writes",
         pinkdb::serve::AGENT_DATABASE
     );
+    println!("  .memory add|search|update|forget|distill|persona|show|serve");
+    println!("                         the agent memory (`.memory help`; needs LOAD EXTENSION");
+    println!(
+        "                         of {}): turns, atoms, scenarios and a persona",
+        memory_library_name()
+    );
     println!("  .quit | .exit          leave the shell");
     println!("  .read <file.sql>       run SQL and dot-commands from a file");
     println!("  .timer on|off          print each statement's run time with a phase breakdown");
@@ -1267,6 +1273,28 @@ fn run_dot(session: &mut Session, line: &str) -> bool {
     match cmd {
         ".help" if rest == "agent" => {
             print_help_agent();
+            return true;
+        }
+        ".help" if rest == "memory" => {
+            memory_usage();
+            return true;
+        }
+        ".memory" => {
+            let verb = rest.split_whitespace().next().unwrap_or("");
+            if verb == "help" {
+                memory_usage();
+                return true;
+            }
+            match session {
+                Session::Local(local) => {
+                    memory_command(&mut local.db, rest);
+                }
+                #[cfg(feature = "client")]
+                Session::Remote(_) => cli_error!(
+                    "memory runs in this process, not on the server: `.memory {verb}` needs \
+                     a local store (`.open <file.pink>`), not --host"
+                ),
+            }
             return true;
         }
         ".agent" => {
@@ -2519,6 +2547,10 @@ fn mcp_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::ServePoli
     pinkdb::serve::ServePolicy {
         allow_writes,
         allow_files,
+        // One operator switch for everything outside the store: `allow-files`
+        // also permits a call to an external service (wave 107c's `embed()`),
+        // which is what the MCP and agent documentation promise.
+        allow_external_services: allow_files,
         command,
         // One session, one hint threshold: `PINKDB_AGENT_HINT_ROWS` tunes the
         // CLI and the MCP tools the same way.
@@ -2644,17 +2676,30 @@ fn agent_command(db: &mut PinkDb, args: &str) -> i32 {
     let (allow_writes, allow_files) = agent_flags(args);
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
+    let mut answer = String::new();
     let result = db.run_command(
         "agent",
         args,
         agent_tool_policy(allow_writes, allow_files),
         agent_internal_policy(),
         &mut |channel, text| {
+            if channel == 0 {
+                answer.push_str(text);
+            }
             let sink: &mut dyn std::io::Write = if channel == 0 { &mut out } else { &mut err };
             let _ = sink.write_all(text.as_bytes());
             let _ = sink.flush();
         },
     );
+    // The run's turns become L0 under the caller's identity, so the next run
+    // (and the memory tools) start from what this one said. The two extensions
+    // cannot call each other — the ABI carries statements, not commands — so
+    // the host, which owns both, is the seam.
+    if result.is_ok()
+        && let Some(question) = agent_question(args)
+    {
+        agent_memory_record(db, &question, &answer);
+    }
     match result {
         Ok(()) => 0,
         Err(e) => {
@@ -2690,13 +2735,215 @@ fn agent_tool_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::Se
     }
 }
 
-/// What the extension's own bookkeeping may do: write, but only its database.
+/// What the extension's own bookkeeping may do: write its database, read its
+/// database, and reach no file. The channel runs without the RBAC gate, so the
+/// read list — not the extension's quoting — is what keeps a mistyped
+/// identifier inside the transcript.
 fn agent_internal_policy() -> pinkdb::serve::ServePolicy {
     pinkdb::serve::ServePolicy {
         write_database: Some(pinkdb::serve::AGENT_DATABASE.to_string()),
+        read_databases: Some(vec![pinkdb::serve::AGENT_DATABASE.to_string()]),
         limits: agent_limits(),
-        ..mcp_policy(true, true)
+        ..mcp_policy(true, false)
     }
+}
+
+/// The agent memory's database. The engine does not name it: the extension
+/// owns the shape, and these policies are what keep every other statement out
+/// of it. A cell can only be trusted to the extension because the extension is
+/// what filters rows by their visibility.
+const MEMORY_DATABASE: &str = "pinkdb_memory";
+
+/// The memory library file name of this platform: what `.memory` tells the
+/// user to load.
+fn memory_library_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "libpinkdb_memory.dylib"
+    } else if cfg!(target_os = "windows") {
+        "pinkdb_memory.dll"
+    } else {
+        "libpinkdb_memory.so"
+    }
+}
+
+/// `.memory help`: the four layers, the verbs and where memory lives.
+fn memory_usage() {
+    println!(
+        "The pinkdb agent memory (needs LOAD EXTENSION of {}):",
+        memory_library_name()
+    );
+    println!(
+        "  .memory add [--visibility private|team|restricted|agent] [--tag T] [--acl u:a,r:t]"
+    );
+    println!("              [--speaker user|agent] [--conversation C] [--agent NAME] <text>");
+    println!("  .memory search [--items N] [--chars N] [--timeout-ms N] <query>");
+    println!("  .memory update <atom> <text>   supersede a fact, keeping the old row");
+    println!("  .memory forget <atom>          hide a fact from search, keeping the row");
+    println!("  .memory distill [--provider N] [--model M]   drain the queue through a model");
+    println!("  .memory persona                the long-term profile");
+    println!("  .memory show                   counts, atoms and scenarios");
+    println!("  .memory serve [stdio | http <port>] [allow-memory] [allow-writes] [allow-files]");
+    println!("  .memory help                   this help");
+    println!(
+        "Memory lives in the {} database of the open store: raw turns (L0), atoms",
+        MEMORY_DATABASE
+    );
+    println!("distilled from them (L1), scenarios grouping atoms (L2) and one persona (L3).");
+    println!("Every row carries its owner, team and visibility, and only this extension reads");
+    println!("past them, so the tables are granted to nobody — an administrator can still read");
+    println!("them directly. Distillation needs a provider: name one with `provider <name>` or");
+    println!("PINKDB_AGENT_PROVIDER and export that provider's key; add and search work without");
+    println!("one. A served session's write tools need `allow-memory`.");
+}
+
+/// Run one `.memory` command in the loaded extension and report its exit code.
+fn memory_command(db: &mut PinkDb, args: &str) -> i32 {
+    if args.split_whitespace().next() == Some("serve") {
+        return memory_serve(db, args);
+    }
+    if !db
+        .command_extensions()
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("memory"))
+    {
+        cli_error!(
+            "the memory extension is not loaded: \n\
+             LOAD EXTENSION '<dir>/{}' first",
+            memory_library_name()
+        );
+        return 1;
+    }
+    let (allow_writes, allow_files) = agent_flags(args);
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    let result = db.run_command(
+        "memory",
+        args,
+        memory_tool_policy(allow_writes, allow_files),
+        memory_internal_policy(),
+        &mut |channel, text| {
+            let sink: &mut dyn std::io::Write = if channel == 0 { &mut out } else { &mut err };
+            let _ = sink.write_all(text.as_bytes());
+            let _ = sink.flush();
+        },
+    );
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            cli_error!("{e}");
+            1
+        }
+    }
+}
+
+/// What the memory tools' statements may do. The tools reach memory through the
+/// internal channel; a tool that plans a statement against the memory tables is
+/// a bug, not a grant, so the public channel cannot read or write them.
+fn memory_tool_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::ServePolicy {
+    pinkdb::serve::ServePolicy {
+        deny_read_databases: vec![MEMORY_DATABASE.to_string()],
+        deny_write_databases: vec![MEMORY_DATABASE.to_string()],
+        limits: agent_limits(),
+        ..mcp_policy(allow_writes, allow_files)
+    }
+}
+
+/// What the extension's own bookkeeping may do: read and write memory, reach
+/// the embeddings provider, and nothing else. The channel runs without the
+/// RBAC gate, so the read list is the defense: a slip in a generated predicate
+/// reads `pinkdb_memory` or fails, never a user's table or a file.
+fn memory_internal_policy() -> pinkdb::serve::ServePolicy {
+    pinkdb::serve::ServePolicy {
+        write_database: Some(MEMORY_DATABASE.to_string()),
+        read_databases: Some(vec![MEMORY_DATABASE.to_string()]),
+        allow_external_services: true,
+        limits: agent_limits(),
+        ..mcp_policy(true, false)
+    }
+}
+
+/// What a served memory session may do: the MCP policy, memory masked off the
+/// public channel, and the trusted channel the extension reads rows through.
+fn memory_serve_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::ServePolicy {
+    pinkdb::serve::ServePolicy {
+        deny_read_databases: vec![MEMORY_DATABASE.to_string()],
+        deny_write_databases: vec![MEMORY_DATABASE.to_string()],
+        internal: Some(Box::new(memory_internal_policy())),
+        limits: agent_limits(),
+        ..mcp_policy(allow_writes, allow_files)
+    }
+}
+
+/// `.memory serve`: hand the memory extension the transport. The extension owns
+/// the protocol; the host enforces the policy, and `allow-memory` is the only
+/// switch that lets its write tools run.
+fn memory_serve(db: &mut PinkDb, rest: &str) -> i32 {
+    let mut args = rest.split_whitespace();
+    let _ = args.next();
+    let mut allow_memory = false;
+    let mut allow_writes = false;
+    let mut allow_files = false;
+    let mut transport = "stdio".to_string();
+    while let Some(token) = args.next() {
+        match token {
+            "allow-memory" => allow_memory = true,
+            "allow-writes" => allow_writes = true,
+            "allow-files" => allow_files = true,
+            "stdio" => transport = "stdio".to_string(),
+            "http" => match args.next() {
+                Some(addr) if addr.contains(':') => transport = format!("http:{addr}"),
+                Some(port) => transport = format!("http:127.0.0.1:{port}"),
+                None => {
+                    memory_usage();
+                    return 1;
+                }
+            },
+            other if other.starts_with("http:") => transport = other.to_string(),
+            other => {
+                cli_error!("unknown .memory serve argument {other:?}");
+                memory_usage();
+                return 1;
+            }
+        }
+    }
+    if !db
+        .serveable_extensions()
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("memory"))
+    {
+        cli_error!(
+            "the memory extension is not loaded: \n\
+             LOAD EXTENSION '<dir>/{}' first",
+            memory_library_name()
+        );
+        return 1;
+    }
+    let mut options = Vec::new();
+    if allow_memory {
+        options.push("allow-memory");
+    }
+    if allow_writes {
+        options.push("allow-writes");
+    }
+    if allow_files {
+        options.push("allow-files");
+    }
+    eprintln!(
+        "serving agent memory on {transport} ({}; memory writes {}) — the client's \
+         disconnect ends it",
+        mcp_mode(allow_writes, allow_files),
+        if allow_memory { "allowed" } else { "refused" }
+    );
+    if let Err(e) = db.serve_extension(
+        "memory",
+        &transport,
+        &options.join(" "),
+        memory_serve_policy(allow_writes, allow_files),
+    ) {
+        cli_error!("{e}");
+        return 1;
+    }
+    0
 }
 
 /// `--agent FILE "question"`: load the agent from the install directory, ask
@@ -2737,6 +2984,82 @@ fn run_agent(opts: &Opts, path: &str, question: &str, key: Option<EncryptionKey>
         args.push_str(" allow-files");
     }
     std::process::exit(agent_command(&mut db, &args));
+}
+
+/// Is the agent memory loaded in this store?
+fn memory_loaded(db: &PinkDb) -> bool {
+    db.command_extensions()
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("memory"))
+}
+
+/// The question a `.agent ask` run was given, for the memory transcript. A
+/// quoted question is exact; an unquoted one runs until its first flag.
+fn agent_question(args: &str) -> Option<String> {
+    let trimmed = args.trim_start();
+    let rest = trimmed.strip_prefix("ask")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let mut question = String::new();
+        let mut escaped = false;
+        for c in quoted.chars() {
+            if escaped {
+                question.push(c);
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                return Some(question);
+            } else {
+                question.push(c);
+            }
+        }
+        return None;
+    }
+    let words: Vec<&str> = rest
+        .split_whitespace()
+        .take_while(|word| !matches!(*word, "provider" | "model" | "allow-writes" | "allow-files"))
+        .collect();
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// Record the two turns of one agent run in the memory extension, under the
+/// caller's identity and as L0. Skipped when memory is not loaded, and never
+/// fatal: memory that cannot be written must not turn a finished answer into a
+/// failed one.
+fn agent_memory_record(db: &mut PinkDb, question: &str, answer: &str) {
+    if !memory_loaded(db) {
+        return;
+    }
+    for (speaker, text) in [("user", question), ("agent", answer)] {
+        let text = sanitize(text);
+        if text.is_empty() {
+            continue;
+        }
+        let args = format!("add --speaker {speaker} --conversation agent {text}");
+        let _ = db.run_command(
+            "memory",
+            &args,
+            memory_tool_policy(false, false),
+            memory_internal_policy(),
+            &mut |_, _| {},
+        );
+    }
+}
+
+/// One line the memory command grammar can take whole: no quotes, no
+/// backslashes, and a cap that keeps a long answer from becoming a huge cell.
+fn sanitize(text: &str) -> String {
+    text.split_whitespace()
+        .map(|word| word.replace(['"', '\\'], ""))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(4000)
+        .collect()
 }
 
 /// Escape one word for the `.agent` command line's quoting rules.

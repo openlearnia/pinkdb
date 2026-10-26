@@ -19,6 +19,9 @@ pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
 # The warehouse tool set (wave 106), shared with the agent extension so the
 # two surfaces cannot drift.
 pinkdb-warehouse-tools = { path = "../warehouse-tools" }
+# The MCP wire itself (JSON-RPC 2.0, stdio and loopback HTTP), shared with
+# agent memory so the two bridges cannot drift.
+pinkdb-mcp-protocol = { path = "../mcp-protocol" }
 # JSON-RPC 2.0 and MCP both speak JSON; serde_json is already in the
 # workspace, so this adds no new external crate.
 serde_json = "1"

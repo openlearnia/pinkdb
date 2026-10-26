@@ -486,3 +486,51 @@ macro_rules! pinkdb_abi_exports_with_command {
         }
     };
 }
+
+/// Both entry points, for an extension that serves a protocol **and** a dot
+/// command (wave 109's agent memory).
+///
+/// This exists because the two single-entry macros above each expand
+/// [`pinkdb_abi_exports!`](crate::pinkdb_abi_exports), so calling both at once
+/// defines the ABI v1 exports twice. The two functions have the shapes
+/// documented on [`pinkdb_abi_exports_with_serve!`](crate::pinkdb_abi_exports_with_serve)
+/// and [`pinkdb_abi_exports_with_command!`](crate::pinkdb_abi_exports_with_command):
+///
+/// ```no_run
+/// pinkdb_ext_sdk::pinkdb_extension! { name = "memory", functions = [] }
+/// fn serve(session: &mut pinkdb_ext_sdk::HostSession, transport: &str, options: &str) -> Result<(), String> {
+///     let _ = (transport, options, session);
+///     Ok(())
+/// }
+/// fn command(session: &mut pinkdb_ext_sdk::CommandSession, args: &str) -> i32 {
+///     let _ = (args, session);
+///     0
+/// }
+/// pinkdb_ext_sdk::pinkdb_abi_exports_with_serve_and_command!(serve, command);
+/// ```
+#[macro_export]
+macro_rules! pinkdb_abi_exports_with_serve_and_command {
+    ($serve:path, $command:path) => {
+        $crate::pinkdb_abi_exports_with_serve!($serve);
+
+        /// `pinkdb_ext_command` (ABI minor 4): the host hands control to this
+        /// extension for one dot command and blocks until it returns. Never
+        /// unwinds.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn pinkdb_ext_command(
+            api: *const $crate::__private::HostApi,
+            host_ctx: *mut ::core::ffi::c_void,
+            args: *const ::core::ffi::c_char,
+            sink: ::core::option::Option<$crate::__private::PinkdbExtSinkFn>,
+            sink_ctx: *mut ::core::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: the loader passes a live host API, its opaque context,
+            // a NUL-terminated argument string (or NULL) and an output sink
+            // pair; `native_command` documents the contract.
+            unsafe {
+                $crate::__private::native_command(api, host_ctx, args, sink, sink_ctx, $command)
+            }
+        }
+    };
+}

@@ -5,43 +5,83 @@
 //! `notifications/initialized` notification. No resources, prompts or
 //! sampling: pinkdb offers tools, and the client's model does the rest.
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
-use crate::tools;
 use pinkdb_ext_sdk::StatementReply;
 
 /// What a tool call asks the host to run. The implementation is the ABI's
 /// statement callback in production and a fake in tests.
 pub trait Host {
     /// Run one statement (SQL, or a `.lake …` command on a host that routes
-    /// those). The reply's code is `0` success, `1` statement error with a
-    /// JSON error line, anything else "no session".
+    /// those) under the host's public policy. The reply's code is `0`
+    /// success, `1` statement error with a JSON error line, anything else
+    /// "no session".
     fn execute(&mut self, statement: &str) -> StatementReply;
+
+    /// Run one statement on the extension's own bookkeeping channel: the
+    /// host's confined internal policy, which a bridge uses for the state it
+    /// owns and for the caller identity. The default is "this host has no
+    /// such channel" — code `2`, which is what an extension checks for.
+    fn execute_internal(&mut self, statement: &str) -> StatementReply {
+        let _ = statement;
+        StatementReply {
+            code: 2,
+            text: String::new(),
+        }
+    }
 }
 
-/// One JSON-RPC dispatcher over a [`Host`].
+/// One tool result, in the terms the dispatcher renders.
+#[derive(Clone, Debug)]
+pub struct ToolReply {
+    /// The last statement's code: `0` success, `1` statement error, `2` no
+    /// session, `3` refused by the policy (the statement carries the reason).
+    pub code: i32,
+    /// Markdown for a query, or one JSON error line.
+    pub text: String,
+}
+
+/// The tools one bridge serves: the schemas `tools/list` answers with, and
+/// the call behind `tools/call`.
+///
+/// A bridge owns its tool table because only it knows which statements are
+/// legal for the caller; this crate only carries the messages.
+pub trait ToolSet {
+    /// The JSON schemas, in the order `tools/list` reports them.
+    fn schemas(&self) -> Vec<Value>;
+
+    /// Run one tool. `Err` is an error *result* the client's model reads (an
+    /// unknown tool, a bad argument); a statement that fails is `Ok` with a
+    /// non-zero code.
+    fn call(
+        &mut self,
+        host: &mut dyn Host,
+        name: &str,
+        arguments: &Map<String, Value>,
+    ) -> Result<ToolReply, String>;
+
+    /// A sentence for `initialize`'s `instructions` when this table needs
+    /// one, e.g. how to enable its write tools.
+    fn instructions(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// One JSON-RPC dispatcher over a [`Host`] and a [`ToolSet`].
 pub struct Server<H: Host> {
     host: H,
+    tools: Box<dyn ToolSet>,
     /// Reported in `initialize`; the host enforces it.
     allow_writes: bool,
     /// The same for external files and URLs (`allow_files` in the host policy).
     allow_files: bool,
 }
 
-impl<H: Host> tools::ToolHost for Server<H> {
-    fn execute(&mut self, statement: &str) -> tools::ToolReply {
-        let reply = self.host.execute(statement);
-        tools::ToolReply {
-            code: reply.code,
-            text: reply.text,
-        }
-    }
-}
-
 impl<H: Host> Server<H> {
-    pub fn new(host: H, allow_writes: bool, allow_files: bool) -> Self {
+    pub fn new(host: H, tools: Box<dyn ToolSet>, allow_writes: bool, allow_files: bool) -> Self {
         Server {
             host,
+            tools,
             allow_writes,
             allow_files,
         }
@@ -84,7 +124,7 @@ impl<H: Host> Server<H> {
         let response = match method {
             "initialize" => success(id, self.initialize()),
             "ping" => success(id, json!({})),
-            "tools/list" => success(id, json!({ "tools": tools::schemas() })),
+            "tools/list" => success(id, json!({ "tools": self.tools.schemas() })),
             "tools/call" => self.call_tool(id, params),
             other => error_response(
                 id,
@@ -112,6 +152,10 @@ impl<H: Host> Server<H> {
             "External files and URLs are refused: only tables in this store are readable."
         };
         let policy = format!("{writes} {files}");
+        let extra = match self.tools.instructions() {
+            Some(sentence) => format!(" {sentence}"),
+            None => String::new(),
+        };
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": { "listChanged": false } },
@@ -123,15 +167,15 @@ impl<H: Host> Server<H> {
                 "pinkdb is an embedded SQL database. Call tools/list for the tools; `query` runs \
                  SQL and returns compact Markdown (at most 100 rows, then a notice with the true \
                  row count), `describe`/`tables`/`databases` explore the schema, and `explain` \
-                 shows a plan before an expensive query. {policy}"
+                 shows a plan before an expensive query. {policy}{extra}"
             ),
         })
     }
 
-    /// `tools/call`: plan the statements for the named tool, run them in
-    /// order, and answer with the last one's text. A statement error is a
-    /// tool result with `isError: true` — the client's model reads the JSON
-    /// error line and can correct itself — not a JSON-RPC error.
+    /// `tools/call`: hand the call to the tool table and answer with what it
+    /// returns. A tool error is a tool result with `isError: true` — the
+    /// client's model reads the message and can correct itself — not a
+    /// JSON-RPC error.
     fn call_tool(&mut self, id: Value, params: Option<&Value>) -> String {
         let Some(params) = params else {
             return error_response(id, -32602, "tools/call needs params");
@@ -146,7 +190,7 @@ impl<H: Host> Server<H> {
                 return error_response(id, -32602, "tools/call arguments must be an object");
             }
         };
-        let last = match tools::run(self, name, &arguments) {
+        let last = match self.tools.call(&mut self.host, name, &arguments) {
             Ok(reply) => reply,
             Err(message) => return success(id, tool_result(&message, true)),
         };

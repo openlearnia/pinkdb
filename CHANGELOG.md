@@ -9,6 +9,80 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-26
+### Wave 109 — agent memory ✅
+
+Long-term memory for agents, stored in pinkdb tables and served by a new native
+extension (`pinkdb-memory`). A conversation becomes facts, facts become projects,
+projects become a profile — and a later run starts from all three instead of
+from nothing.
+
+- **Four layers.** `memory_add` (or `.memory add …`) appends an **L0** turn;
+  `.memory distill` turns undistilled turns into **L1** atoms ("the user's
+  warehouse is TPC-H SF1", with a confidence, a tag and its sources),
+  atoms into **L2** scenarios (a titled summary naming its atoms) and
+  scenarios into an **L3** persona — one long-term profile per principal.
+  Everything lives in one database, `pinkdb_memory`.
+- **Distillation never blocks an add.** A model call happens only in
+  `.memory distill` (or the `memory_distill` tool), through the shared
+  `pinkdb-llm` client. Each answer is validated against a strict JSON contract
+  before a single row is written; a malformed answer is recorded and retried
+  later, never half-applied. No provider configured is one clear error — add and
+  search keep working. `PINKDB_MEMORY_DISTILL_EVERY=N` queues a distillation
+  every N turns.
+- **Visibility is enforced on every read**, not by grants:
+  `--visibility private` (the owner), `team` (the owner's role), `restricted`
+  (the users, roles and agents in `--acl u:bob,r:ops`) or `agent` (the named
+  agent identity). The memory tables are granted to nobody, so a client cannot
+  `SELECT` around the filter; an ordinary user's `SELECT` fails with the
+  engine's `permission denied` and the memory tools come back with only the
+  rows that principal may see.
+- **The internal channel is confined on both sides.** The channel the extension
+  uses for its own state skips the RBAC gate, so the policy is what limits it:
+  `ServePolicy::read_databases` is a read allow-list checked against the bound
+  plan (a view, CTE or macro cannot reach around it; a table function or bare
+  path is refused before it binds), and external services got their own
+  `allow_external_services` switch instead of riding on `allow-files` (the
+  operator's `allow-files` sets both, so nothing user-facing changed). Writing
+  that test found a latent hole: `Connection::hint_store()` answers `None`, so
+  *no* catalog-based policy check ran for a served session over a connection —
+  `SELECT * FROM main.secret` went through a channel that named only
+  `pinkdb_memory`. `Session::check_store` lends the store for the check and
+  `deny_read_databases` is enforced on that path from now on.
+- **Identity comes from the engine now.** `SELECT current_user()` and
+  `SELECT current_roles()` answer the logged-in user and its (transitive) role
+  names, comma-joined; an embedded store answers `pinkdb`. The extension asks
+  the host on its own confined channel, so an MCP client cannot spoof who it is.
+- **Layered, budgeted retrieval.** `memory_search` returns the persona, the
+  best-matching scenarios, then atoms and turns ranked by **BM25 + RRF**, and
+  in hybrid mode also by `embed()` + `array_distance` when the embeddings and
+  vss packages are loaded — the result says which mode it used and why. Three
+  budgets (items, characters, timeout) each stop it, and every hit carries its
+  layer, id, score, source and visibility.
+- **History, not deletion.** A contradicting fact supersedes the old atom
+  (`superseded_by`) and `forget` marks a row `forgotten` with an audit entry;
+  nothing is hard-deleted, so `show` still answers what you believed last week.
+- **Surfaces.** `.memory add|search|update|forget|distill|persona|show|serve`
+  next to `.agent`; six MCP tools (`memory_add`, `memory_search`,
+  `memory_update`, `memory_forget`, `memory_distill`, `memory_persona`) on the
+  memory extension's own bridge, which shares the new `pinkdb-mcp-protocol`
+  crate with `pinkdb-mcp`. The write tools need `allow-memory`; read-only
+  clients get the two read tools only. With the memory extension loaded, an
+  `.agent` run records its question and answer as L0 turns.
+
+```sh
+cargo build --release -p pinkdb-cli -p pinkdb-memory
+
+./target/release/pinkdb sales.pink
+pinkdb> LOAD EXTENSION 'target/release/libpinkdb_memory.dylib';
+pinkdb> .memory add my warehouse is TPC-H SF1 --tag tpch
+pinkdb> .memory distill --provider zai      # needs that provider's key variable
+pinkdb> .memory search how big is the warehouse
+```
+
+Follow-ups recorded on the roadmap: Skill assets (109b), an LLM-Wiki with a
+link graph (109c) and a Code-Graph (109d), plus the agent's own `memory_search`
+tool and the server's background distillation worker.
+
 ### Wave 110 — S3 catalog store (`catalog-s3`) ✅
 - **`pink+s3://bucket/prefix` lake catalogs.** With the new off-by-default
   `catalog-s3` feature (forwarded by the CLI and server), the lake catalog

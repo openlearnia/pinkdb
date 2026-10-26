@@ -51,15 +51,23 @@ jobs:
 
       - name: cargo build
         # The extension cdylibs are built here because the CLI's end-to-end
-        # tests load the real libraries (tests/mcp.rs, tests/agent_run.rs); the
-        # extensions' own tests run in the same workspace test pass.
-        run: cargo build -p pinkdb-cli -p pinkdb-mcp -p pinkdb-agent
+        # tests load the real libraries (tests/mcp.rs, tests/agent_run.rs,
+        # tests/memory_run.rs); the extensions' own tests run in the same
+        # workspace test pass.
+        run: cargo build -p pinkdb-cli -p pinkdb-mcp -p pinkdb-agent -p pinkdb-memory
 
       - name: cargo test -p pinkdb-llm
         # The shared model client (wave 106b): both wire protocols against
         # recorded fixtures on 127.0.0.1, the registry and key isolation. Its
         # own step so a provider regression is named in the CI summary.
         run: cargo test -q -p pinkdb-llm
+
+      - name: cargo test -p pinkdb-memory
+        # Agent memory (wave 109): distillation against a scripted provider, the
+        # four visibility classes over real users and roles, the retrieval
+        # budgets, supersession and the key sentinel. Its own step so a memory
+        # regression is named in the CI summary.
+        run: cargo test -q -p pinkdb-memory
 
       - name: cargo test
         run: cargo test -q
@@ -593,7 +601,7 @@ jobs:
           key: macos
 
       - name: cargo build the extensions
-        run: cargo build -p pinkdb-mcp -p pinkdb-agent -p pinkdb-llm
+        run: cargo build -p pinkdb-mcp -p pinkdb-agent -p pinkdb-memory -p pinkdb-llm
 
       - name: cargo test --workspace
         run: cargo test --workspace

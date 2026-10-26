@@ -1,0 +1,192 @@
+<h1>Agent memory</h1>
+
+<p class="doc-meta">An agent that remembers: <code>pinkdb-memory</code> keeps a
+conversation's turns, the facts distilled from them, the projects those facts
+belong to and one long-term profile per principal — in pinkdb tables, under
+pinkdb's users and roles, read back layered and budgeted. It is a native
+extension (<a href="docs/extensions.html">like the agent</a>): the engine, the
+CLI and the server contain no model code, and the memory extension contains no
+model either — model calls go through the shared <code>pinkdb-llm</code>
+client.</p>
+
+<h2>The four layers</h2>
+
+<table>
+<thead><tr><th>layer</th><th>stored in</th><th>what it is</th></tr></thead>
+<tbody>
+<tr><td><strong>L0</strong> conversation</td><td><code>l0_turns</code></td><td>the turn as it happened — speaker, text, tag, conversation</td></tr>
+<tr><td><strong>L1</strong> atoms</td><td><code>atoms</code></td><td>one standalone fact, with confidence, tag, its source turns and <code>superseded_by</code></td></tr>
+<tr><td><strong>L2</strong> scenarios</td><td><code>scenarios</code></td><td>a titled summary that names the atoms it groups</td></tr>
+<tr><td><strong>L3</strong> persona</td><td><code>personas</code></td><td>the long-term profile; the latest row wins, older ones stay</td></tr>
+</tbody>
+</table>
+
+<p>Everything lives in one database, <code>pinkdb_memory</code>, and every row
+carries the same identity columns: <code>owner</code>, <code>team</code>,
+<code>visibility</code>, an ACL of users, roles and agents, and
+<code>agent</code>. Nothing is hard-deleted. <code>forget</code> sets
+<code>status = 'forgotten'</code> and appends an audit row;
+<code>update</code> writes a <em>new</em> atom that supersedes the old one, so
+<code>show</code> still answers what you believed last week.</p>
+
+<h2>Setup</h2>
+
+<pre class="code" data-lang="sh"><code># the extension, next to the CLI
+cargo build --release -p pinkdb-cli -p pinkdb-memory
+
+./target/release/pinkdb sales.pink
+pinkdb&gt; LOAD EXTENSION 'target/release/libpinkdb_memory.dylib';
+pinkdb&gt; .memory add my warehouse is TPC-H SF1 --tag tpch
+pinkdb&gt; .memory add I always read EXPLAIN before a big join --tag style
+
+# distillation is a model call, and only here; name the provider
+set -a; . ./.env; set +a                     # exported, never read by pinkdb
+pinkdb&gt; .memory distill --provider zai
+
+pinkdb&gt; .memory search how big is my warehouse
+pinkdb&gt; .memory show                        # counts per layer, persona, recent rows</code></pre>
+
+<p><strong>There is no default provider</strong>, exactly as with
+<code>.agent</code>: a distill without one fails with
+<code>no provider: …</code> while <code>add</code> and
+<code>search</code> keep working.</p>
+
+<h2>Distillation</h2>
+
+<p><code>add</code> never calls a model. It appends an L0 turn (plus a queue row
+when <code>PINKDB_MEMORY_DISTILL_EVERY=N</code> says so) and returns.
+<code>distill</code> drains the queue, one model call per step:</p>
+
+<ol>
+<li><strong>turns → atoms.</strong> The prompt carries the undistilled turns and
+the owner's active atoms, and asks for
+<code>{"atoms":[{"text":…,"confidence":…,"tag":…,"supersedes":…}]}</code>.</li>
+<li><strong>atoms → a scenario.</strong> Atoms no scenario names yet become
+<code>{"scenarios":[{"title":…,"summary":…,"atoms":[ids],"tag":…}]}</code>; a
+scenario that names no known atom is dropped rather than stored empty.</li>
+<li><strong>scenarios → the persona.</strong> One call over the scenario
+summaries answers <code>{"persona":…}</code>, appended as a new row.</li>
+</ol>
+
+<p>Every answer is validated against that contract <em>before</em> a single row
+is written: required fields, types, length caps, confidence in range, and every
+referenced atom id must exist and be visible to the owner. A malformed answer
+writes nothing, records the error on the queue row and is retried later; the
+attempt count stops at three, and an operator's next
+<code>.memory distill</code> resets failures to pending. A contradicting fact
+supersedes the atom it contradicts in the same batch as the insert, so the two
+never both look current.</p>
+
+<h2>Who can read what</h2>
+
+<p>Visibility is a row filter the extension applies on <em>every</em> read —
+search, persona, show and the distillation input — not a grant the client could
+skip:</p>
+
+<table>
+<thead><tr><th>visibility</th><th>readable by</th></tr></thead>
+<tbody>
+<tr><td><code>private</code></td><td>the owner</td></tr>
+<tr><td><code>team</code></td><td>the owner and the members of the owner's role</td></tr>
+<tr><td><code>restricted</code></td><td>the owner and the users, roles and agents named in <code>--acl u:bob,r:ops</code></td></tr>
+<tr><td><code>agent</code></td><td>the named agent identity only</td></tr>
+</tbody>
+</table>
+
+<p>The memory tables are granted to nobody. A non-admin's
+<code>SELECT * FROM pinkdb_memory.atoms</code> fails with the engine's
+<code>permission denied: … needs the SELECT privilege …</code>, and the memory
+tools come back with only the rows that principal may see. An administrator can
+always read the tables directly — that is the audit escape hatch, documented
+rather than hidden. A served session is refused a statement that reads
+<code>pinkdb_memory</code> at all, so even an admin's MCP client goes through
+the tools. On an embedded store without users there is no identity to protect:
+the trusted session is the operator, and it answers as the implicit principal
+<code>pinkdb</code>.</p>
+
+<p><strong>The extension's own channel is confined too.</strong> It skips the
+privilege check (that is what lets it write its own state), so the serve policy
+is what limits it: a read allow-list over <code>pinkdb_memory</code>, checked
+against the bound plan — a view, a CTE or a macro cannot reach around it, and a
+table function or bare path is refused before it binds — with external services
+(<code>embed()</code>) allowed on their own switch and files off. Writing that
+test found a latent engine hole: a served session over a connection skipped
+every catalog-based policy check, so a channel that named only
+<code>pinkdb_memory</code> could read <code>main.secret</code>. It is closed
+(<code>Session::check_store</code>), and the read mask now applies on that path
+as well.</p>
+
+<p><strong>Identity comes from the engine.</strong> This wave added
+<code>SELECT current_user()</code> and <code>SELECT current_roles()</code> —
+the logged-in principal and its transitive roles, comma-joined. They are bound
+to constants at bind time, they are refused in a statement the engine WAL-logs
+(as any session state is), and the extension asks the host on its own confined
+channel, so a tool argument cannot spoof who is asking. No extension ABI version
+changed, so every loaded extension and all four SDKs are untouched.</p>
+
+<h2>Retrieval</h2>
+
+<p><code>memory_search</code> answers in layers, because a bootstrap should be
+cheap: the caller's persona, then the best-matching scenarios (a term-overlap
+score over title and summary), then atoms and turns ranked by <strong>BM25</strong>
+and fused with <strong>RRF</strong> — DuckDB's constants, computed inside the
+extension so a fresh write is ranked without rebuilding an index. When the
+<code>embeddings</code> package and a provider are available, the same query is
+embedded, atoms are ranked by <code>array_distance</code> over a lazily created
+<code>atom_vectors</code> table, and the two lists are fused the same way; the
+answer names its mode (<code>bm25</code>, <code>hybrid</code>) and, when it
+falls back, why.</p>
+
+<p>Three budgets stop retrieval and each one is reported: <code>--items N</code>,
+<code>--chars N</code> and <code>--timeout-ms MS</code>. Persona and scenarios
+count against the same budget — a bootstrap that ignores the budget is not
+budgeted. Every hit carries its layer, id, fused score, source
+(<code>bm25</code>, <code>vector</code>, <code>bm25+vector</code>) and
+visibility.</p>
+
+<h2>Commands and tools</h2>
+
+<pre class="code" data-lang="text"><code>.memory add &lt;text&gt; [--visibility private|team|restricted|agent] [--tag &lt;name&gt;]
+                   [--acl u:bob,r:ops] [--speaker user|agent] [--conversation &lt;name&gt;]
+                   [--agent &lt;identity&gt;]
+.memory search &lt;query&gt; [--items N] [--chars N] [--timeout-ms MS]
+.memory update &lt;atom&gt; &lt;text&gt;      -- a new atom that supersedes the old one
+.memory forget &lt;id&gt;               -- soft delete plus an audit row
+.memory distill [--provider &lt;name&gt;] [--model &lt;name&gt;]
+.memory persona
+.memory show
+.memory serve [stdio | http &lt;port&gt;] [allow-memory] [allow-writes] [allow-files]</code></pre>
+
+<p>The MCP side is the same operations plus the warehouse tools the
+<a href="docs/agents.html">MCP bridge</a> has, served by the memory extension
+itself (an extension cannot call another extension, and memory reads must use
+the host's confined channel): <code>memory_add</code>,
+<code>memory_search</code>, <code>memory_update</code>,
+<code>memory_forget</code>, <code>memory_distill</code>,
+<code>memory_persona</code>. A read-only bridge lists and runs the two read
+tools only; the four write tools need <code>allow-memory</code>, and even then
+the host's policy lets them write only <code>pinkdb_memory</code>.</p>
+
+<p>With the memory extension loaded, <a href="docs/agent.html">an
+<code>.agent</code> run</a> records its question and its answer as two L0 turns
+under the caller's identity. The two extensions cannot call each other, so the
+CLI host — which owns both — is the seam; a memory failure cannot fail a
+finished run.</p>
+
+<h2>Tests</h2>
+
+<p>Everything runs against a scripted provider and a loopback embeddings
+server: a short conversation distilled end to end into atoms, a scenario and a
+persona, then searched; every visibility class against real users and roles; a
+refused direct <code>SELECT</code>; supersession and forget with their audit
+rows; each of the three budgets; hybrid RRF against hand-computed scores; a
+malformed answer, a 429 then success, and a failure that stops at the attempt
+cap; the write switch; and a sentinel that greps a durable store's bytes for
+the embeddings key. The one live test is opt-in and names its provider:
+<code>PINKDB_MEMORY_LIVE=1 cargo test -p pinkdb-memory --test live --
+--ignored</code>. The plan, including what this wave deliberately did not
+build, is <a href="https://github.com/openlearnia/pinkdb/blob/main/docs/wave-109-plan.md" rel="noopener">docs/wave-109-plan.md</a>.</p>
+
+<p>See also: <a href="docs/agent.html">the pinkdb agent</a> — the loop inside
+pinkdb, whose turns this extension remembers — and <a href="docs/agents.html">agents and
+MCP</a> for the bridge itself.</p>

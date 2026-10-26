@@ -1,0 +1,20 @@
+[package]
+name = "pinkdb-mcp-protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "The Model Context Protocol wire pinkdb extensions serve: JSON-RPC 2.0, the tool table, stdio and loopback HTTP"
+license = "MIT"
+
+[lib]
+# An rlib only: this is not an extension, it is the protocol the MCP bridge
+# (wave 105) and agent memory (wave 109) both speak. Loading it would register
+# nothing.
+crate-type = ["rlib"]
+
+[dependencies]
+# `StatementReply` is the shape a host answers a statement with; the protocol
+# never calls an extension itself.
+pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
+# JSON-RPC 2.0 and MCP both speak JSON.
+serde_json = "1"

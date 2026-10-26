@@ -201,6 +201,7 @@ impl Database {
             exec_limits: None,
             session: crate::storage::Session::new(),
             external_services: true,
+            trusted: false,
         }
     }
 
@@ -453,14 +454,30 @@ pub struct Connection {
     /// the serve policy's `allow-files` switch, set per statement batch by
     /// the front-end. `true` by default: an embedded connection is trusted.
     external_services: bool,
+    /// `true` while an extension's own bookkeeping statement runs
+    /// ([`crate::serve::Session::run_internal`], wave 109): the RBAC gate is
+    /// skipped for it — the host's internal policy is what confines it — while
+    /// `principal` stays set, so `current_user()` and a trigger's invoker
+    /// rights still see the logged-in user.
+    trusted: bool,
 }
 
 impl Connection {
     /// Allow or refuse `external_io` host scalars in this session (the serve
-    /// policy's `allow-files` switch). Refused calls return a permission
-    /// error before any request leaves the process.
+    /// policy's `allow-external-services` switch). Refused calls return a
+    /// permission error before any request leaves the process.
     pub fn set_external_services(&mut self, allowed: bool) {
         self.external_services = allowed;
+    }
+
+    /// Borrow the store for a policy check. A served session's store sits
+    /// behind the shared lock — its statements take that lock one at a time —
+    /// so a policy that has to read the catalog (which tables a statement
+    /// reads, whether it calls a service) gets it for the call and no longer.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn with_store<R>(&mut self, check: impl FnOnce(&PinkDb) -> R) -> R {
+        let shared = read_lock(&self.db.shared);
+        check(&shared)
     }
 
     /// Parse and run every statement, returning one result each.
@@ -597,12 +614,36 @@ impl Connection {
             return Err(crate::rbac::auth_failed());
         }
         self.principal = Some(user.to_ascii_lowercase());
+        self.session.set_principal(self.principal.clone());
         Ok(name)
     }
 
     /// The authenticated principal of this session, if any (lowercased).
     pub fn principal(&self) -> Option<&str> {
         self.principal.as_deref()
+    }
+
+    /// The principal a statement's RBAC check runs under: `None` trusts the
+    /// statement (an embedded session, or an extension's own bookkeeping
+    /// channel — see [`Connection::execute_as_extension`]).
+    fn gate(&self) -> Option<&str> {
+        if self.trusted {
+            None
+        } else {
+            self.principal.as_deref()
+        }
+    }
+
+    /// Run a statement for a loaded extension's own bookkeeping: the RBAC gate
+    /// is skipped, because the host's internal [`crate::serve::ServePolicy`]
+    /// is what confines the statement. The session keeps its principal, so
+    /// `current_user()` inside the statement still answers the caller.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn execute_as_extension(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
+        self.trusted = true;
+        let result = self.execute(sql);
+        self.trusted = false;
+        result
     }
 
     /// Forget this session's principal. An embedded connection becomes
@@ -613,6 +654,7 @@ impl Connection {
     /// connection in for one statement.
     pub fn logout(&mut self) {
         self.principal = None;
+        self.session.set_principal(None);
     }
 
     /// Arm (or disarm) the network authentication gate.
@@ -783,6 +825,13 @@ impl Connection {
         if let Some(txn) = &mut self.txn {
             txn.work.proc_frame_reset();
         }
+        // Read once: the transaction arm below borrows `self.txn` mutably, so
+        // it cannot call `self.gate()` there.
+        let gate = if self.trusted {
+            None
+        } else {
+            self.principal.clone()
+        };
         match &mut self.txn {
             Some(txn) => {
                 // Store/process-level DDL is refused inside a transaction: the
@@ -810,7 +859,7 @@ impl Connection {
                 // `SET VARIABLE` state is the connection's, not the store's:
                 // the snapshot binds and runs in this session.
                 txn.work.session = self.session.clone();
-                enforce(self.principal.as_deref(), &txn.work, &plan, &pre)?;
+                enforce(gate.as_deref(), &txn.work, &plan, &pre)?;
                 // A durable transaction logs its mutating statements: one
                 // that reads an attached lake table could never replay (the
                 // guard is a no-op for in-memory stores).
@@ -925,7 +974,7 @@ impl Connection {
                 // Wave 48: the privilege check runs on the bound plan under
                 // the same lock the bind took, so no statement can slip
                 // between the check and its execution.
-                enforce(self.principal.as_deref(), &shared, &plan, &pre)?;
+                enforce(self.gate(), &shared, &plan, &pre)?;
                 let result = if is_read_only(&plan) {
                     let exec_start = profile.as_ref().map(|_| Instant::now());
                     let result = crate::exec::run_read_with_budget(
@@ -1050,7 +1099,7 @@ impl Connection {
         }
         shared.session_principal = self.principal.clone();
         shared.session = self.session.clone();
-        enforce(self.principal.as_deref(), &shared, &plan, pre)?;
+        enforce(self.gate(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
@@ -1072,7 +1121,7 @@ impl Connection {
             let plan = crate::plan::with_mv_source(plan, sql_text);
             shared.session_principal = self.principal.clone();
             shared.session = self.session.clone();
-            enforce(self.principal.as_deref(), &shared, &plan, pre)?;
+            enforce(self.gate(), &shared, &plan, pre)?;
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
             }
@@ -1166,7 +1215,7 @@ impl Connection {
         budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
         shared.session_principal = self.principal.clone();
-        enforce(self.principal.as_deref(), &shared, &plan, pre)?;
+        enforce(self.gate(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }

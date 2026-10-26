@@ -134,7 +134,7 @@ fn command_locked(
 ///
 /// The ABI requires `sql` to point at `sql_len` readable bytes and the two
 /// out pointers to be writable (or NULL-checked here).
-unsafe fn read_statement<'a>(
+pub(crate) unsafe fn read_statement<'a>(
     sql: *const c_char,
     sql_len: usize,
     out_text: *mut *mut c_char,
@@ -162,7 +162,7 @@ unsafe fn read_statement<'a>(
 /// # Safety
 ///
 /// `out_text`/`out_len` must be the pointers [`read_statement`] just cleared.
-unsafe fn write_reply(
+pub(crate) unsafe fn write_reply(
     (code, text): (i32, String),
     out_text: *mut *mut c_char,
     out_len: *mut usize,

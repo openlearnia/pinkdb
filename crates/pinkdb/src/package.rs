@@ -564,10 +564,12 @@ type ReadsFn = fn(&[Option<&Value>], &str) -> Result<Vec<(String, String)>>;
 type StatementFn = Arc<dyn Fn(&mut HostCtx<'_>, &[Value]) -> Result<QueryResult> + Send + Sync>;
 
 /// What a call to an external service (a host scalar declared
-/// [`HostScalar::external_io`]) gets while `allow_files` is off. One switch
-/// for everything that leaves the store: a remote call can cost money, so the
-/// read-only default refuses it. It lives here, next to the marker, because
-/// the executor refuses the call on `wasm32` too (where `serve` is absent).
+/// [`HostScalar::external_io`]) gets while [`ServePolicy::
+/// allow_external_services`] is off. Its own switch, not the files one: a
+/// remote call can cost money and leaks the text it is given, while a file
+/// read leaks whatever the path names. The operator's `allow-files` sets both.
+/// It lives here, next to the marker, because the executor refuses the call on
+/// `wasm32` too (where `serve` is absent).
 pub const SERVICES_HINT: &str = "external services are disabled: this session reads tables only \
                              (start the server with allow-files to permit a call to an \
                              external service, such as embed())";
@@ -649,9 +651,11 @@ impl HostScalar {
     }
 
     /// Declare that a call leaves the process — a network service, possibly a
-    /// paid one. `serve`'s read-only policy refuses such a call unless the
-    /// session was started with `allow-files`, the same switch that permits
-    /// external files and URLs.
+    /// paid one. `serve`'s read-only policy refuses such a call unless
+    /// [`ServePolicy::allow_external_services`] is on; it is its own switch,
+    /// not the files one, because a remote call leaks the text it is given
+    /// while a file read leaks whatever the path names (the operator's
+    /// `allow-files` sets both).
     pub fn external_io(mut self) -> Self {
         self.external_io = true;
         self

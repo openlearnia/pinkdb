@@ -388,7 +388,7 @@ fn sentinel(tag: &str) -> String {
 }
 
 /// Every variable the provider registry reads.
-const SCRUBBED: [&str; 21] = [
+const SCRUBBED: [&str; 22] = [
     "PINKDB_AGENT_PROVIDER",
     "PINKDB_AGENT_MODEL",
     "PINKDB_AGENT_BASE_URL",
@@ -410,6 +410,7 @@ const SCRUBBED: [&str; 21] = [
     "OPENROUTER_API_KEY",
     "GEMINI_API_KEY",
     "PINKDB_AGENT_LIVE",
+    "PINKDB_MEMORY_DISTILL_EVERY",
 ];
 
 /// Point every provider at `mock`, each through its own root variable (a
@@ -494,6 +495,25 @@ impl Store {
         script
     }
 
+    /// The script for a session that runs the agent *and* the memory
+    /// extension: memory is loaded first, the order this seam was built in.
+    /// The other order is pinned by
+    /// `loading_the_agent_before_memory_still_runs_every_statement`.
+    fn memory_script(&self, lines: &[String]) -> String {
+        let path = self.path.display();
+        let mut script = format!(
+            ".open {path}\nLOAD EXTENSION '{}';\nLOAD EXTENSION '{}';\n",
+            agent_library().display(),
+            memory_library().display()
+        );
+        for line in lines {
+            script.push_str(line);
+            script.push('\n');
+        }
+        script.push_str(&format!(".save {path}\n"));
+        script
+    }
+
     /// Replay the WAL and checkpoint it into the snapshot.
     fn fold(&self) {
         let path = self.path.display();
@@ -544,6 +564,38 @@ impl Drop for Store {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The memory extension next to the CLI, built on demand: only the test that
+/// loads both extensions needs it, and `cargo test -p pinkdb-cli` does not
+/// build the extension's cdylib.
+fn memory_library() -> PathBuf {
+    static MEMORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    MEMORY
+        .get_or_init(|| {
+            let name = if cfg!(target_os = "macos") {
+                "libpinkdb_memory.dylib"
+            } else if cfg!(target_os = "windows") {
+                "pinkdb_memory.dll"
+            } else {
+                "libpinkdb_memory.so"
+            };
+            let _ = Command::new(env!("CARGO"))
+                .args(["build", "-q", "-p", "pinkdb-memory"])
+                .status();
+            let mut candidates = Vec::new();
+            if let Some(dir) = Path::new(cli()).parent() {
+                candidates.push(dir.join(name));
+                if let Some(target) = dir.parent() {
+                    candidates.push(target.join("debug").join(name));
+                }
+            }
+            candidates
+                .into_iter()
+                .find(|path| path.is_file())
+                .unwrap_or_else(|| PathBuf::from(name))
+        })
+        .clone()
 }
 
 /// The first data cell of a table the CLI printed.
@@ -1790,4 +1842,60 @@ fn a_live_zai_provider_answers() {
 #[ignore = "needs PINKDB_AGENT_LIVE=1, a real key in ANTHROPIC_API_KEY, and network"]
 fn a_live_anthropic_provider_answers() {
     live("anthropic", &["ANTHROPIC_API_KEY"]);
+}
+
+#[test]
+fn an_agent_run_records_its_turns_in_memory() {
+    let store = Store::new("memory");
+    let mock = Mock::start(vec![answer("There are 5 customers.")]);
+    let lines = [
+        ".agent ask \"how many customers are there?\"".to_string(),
+        ".memory show".to_string(),
+    ];
+    let (out, status) = run_merged(store.command(&mock), &store.memory_script(&lines));
+    assert_eq!(status.code(), Some(0), "the run failed:\n{out}");
+    // The question and the answer are both L0 turns under the caller's
+    // identity, so a later run starts from what this one said.
+    assert!(out.contains("turns: 2"), "output: {out}");
+
+    let quiet = Mock::start(Vec::new());
+    let (found, status) = run_merged(
+        store.command(&quiet),
+        &store.memory_script(&[".memory search customers".to_string()]),
+    );
+    assert_eq!(status.code(), Some(0), "{found}");
+    assert!(found.contains("how many customers are there"), "{found}");
+    assert!(found.contains("There are 5 customers"), "{found}");
+}
+
+/// Two `LOAD EXTENSION` statements followed by two more, in one
+/// non-interactive script, with the agent's library first: every line runs.
+///
+/// Wave 109 recorded the opposite for this shape — the second load and the
+/// statement after it apparently dropped — and could not reproduce it later
+/// with the same order. A statement is silently swallowed only when an earlier
+/// one was left unterminated (`Input` keeps buffering until a line's last code
+/// token is `;`, so the next line joins it), and `LOAD` lines from an earlier
+/// draft of this harness lacked that `;`. This test pins the shape so a
+/// dropped load or statement fails loudly instead of reading as "no output".
+#[test]
+fn loading_the_agent_before_memory_still_runs_every_statement() {
+    let store = Store::new("load-order");
+    let path = store.path.display();
+    let script = format!(
+        ".open {path}\nLOAD EXTENSION '{}';\nLOAD EXTENSION '{}';\n\
+         SELECT 'first' AS marker;\nSELECT 'second' AS marker;\n.save {path}\n",
+        agent_library().display(),
+        memory_library().display()
+    );
+    let (out, status) = run_merged(store.plain_command(), &script);
+    assert!(status.success(), "the script must succeed:\n{out}");
+    for expected in [
+        "Extension agent loaded.",
+        "Extension memory loaded.",
+        "first",
+        "second",
+    ] {
+        assert!(out.contains(expected), "missing {expected:?} in:\n{out}");
+    }
 }

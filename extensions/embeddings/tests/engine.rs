@@ -344,7 +344,7 @@ fn the_api_key_never_reaches_the_store_or_its_wal() {
 }
 
 #[test]
-fn the_agent_policy_refuses_embed_and_allow_files_permits_it() {
+fn the_agent_policy_refuses_embed_and_the_services_switch_permits_it() {
     let mock = Mock::embeddings();
     let _env = engine_env(&mock.base_url(), None);
     let mut db = support::store();
@@ -362,7 +362,7 @@ fn the_agent_policy_refuses_embed_and_allow_files_permits_it() {
     assert_eq!(mock.count(), 0, "a refused statement must not call");
 
     let allowed = ServePolicy {
-        allow_files: true,
+        allow_external_services: true,
         ..ServePolicy::default()
     };
     let (code, text) = execute(&mut db, &allowed, "SELECT embed(body) FROM docs");
@@ -539,10 +539,10 @@ fn write_only() -> ServePolicy {
     }
 }
 
-fn write_and_files() -> ServePolicy {
+fn write_and_services() -> ServePolicy {
     ServePolicy {
         allow_writes: true,
-        allow_files: true,
+        allow_external_services: true,
         ..ServePolicy::default()
     }
 }
@@ -571,7 +571,7 @@ fn a_batch_whose_call_cannot_bind_at_check_time_is_refused_at_execution() {
     assert_eq!(mock.count(), 0, "a refused statement must not call");
 
     let mut db = support::store();
-    let (code, text) = execute(&mut db, &write_and_files(), script);
+    let (code, text) = execute(&mut db, &write_and_services(), script);
     assert_eq!(code, 0, "{text}");
     assert_eq!(mock.count(), 1);
 }
@@ -581,10 +581,14 @@ fn a_macro_and_a_view_cannot_smuggle_embed_past_the_policy() {
     let mock = Mock::embeddings();
     let _env = engine_env(&mock.base_url(), None);
     let mut db = support::store();
-    run(&mut db, &write_and_files(), "CREATE MACRO m(x) AS embed(x)");
     run(
         &mut db,
-        &write_and_files(),
+        &write_and_services(),
+        "CREATE MACRO m(x) AS embed(x)",
+    );
+    run(
+        &mut db,
+        &write_and_services(),
         "CREATE VIEW v AS SELECT embed('a') AS e",
     );
     assert_eq!(mock.count(), 0, "defining a macro or view must not call");
@@ -596,7 +600,7 @@ fn a_macro_and_a_view_cannot_smuggle_embed_past_the_policy() {
     }
     assert_eq!(mock.count(), 0);
 
-    let (code, text) = execute(&mut db, &write_and_files(), "SELECT e FROM v");
+    let (code, text) = execute(&mut db, &write_and_services(), "SELECT e FROM v");
     assert_eq!(code, 0, "{text}");
     assert_eq!(mock.count(), 1);
 }
@@ -635,12 +639,12 @@ fn a_trigger_body_and_a_do_block_are_refused_at_execution() {
     assert_eq!(mock.count(), 0);
 
     // The same trigger and body run once the switch permits external I/O.
-    let (code, text) = execute(&mut db, &write_and_files(), "INSERT INTO t VALUES ('y')");
+    let (code, text) = execute(&mut db, &write_and_services(), "INSERT INTO t VALUES ('y')");
     assert_eq!(code, 0, "{text}");
     assert_eq!(mock.count(), 1);
     let (code, text) = execute(
         &mut db,
-        &write_and_files(),
+        &write_and_services(),
         "DO $$ BEGIN INSERT INTO log VALUES (embed('b')); END $$",
     );
     assert_eq!(code, 0, "{text}");

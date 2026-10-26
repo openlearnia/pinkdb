@@ -269,7 +269,10 @@ SELECT DISTINCT ON (expr, ...) ...                -- first row per key, in ORDER
 -- `json_remove` on JSON text and on VARIANT; ordered-set aggregates
 -- `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)`, `percentile_disc`,
 -- `mode()`; `SET VARIABLE x = 1` then `getvariable('x')` or `$x` (per-connection
--- session state: never persisted or logged).
+-- session state: never persisted or logged); `current_user()` and
+-- `current_roles()`: who is asking, as the logged-in principal and its
+-- transitive roles, comma-joined (bound per statement; `pinkdb` on an embedded
+-- store that has no users).
 -- `FOR UPDATE` / `FOR SHARE` are refused by name (MVCC already serializes
 -- writers); so are list literals — the engine has no LIST type.
 -- Over a few hundred forms either answer or refuse by name: the full matrix of
@@ -1968,6 +1971,91 @@ end. The live tests are opt-in and name their provider:
 `PINKDB_AGENT_LIVE=1 cargo test -p pinkdb-cli --test agent_run -- --ignored`
 runs the z.ai one with `ZAI_API_KEY` and the Anthropic one with
 `ANTHROPIC_API_KEY`.
+
+## Agent memory (wave 109)
+
+`pinkdb-memory` gives an agent long-term memory in four layers, stored in one
+database (`pinkdb_memory`), distilled by a model and read back layered and
+budgeted. The design is a Rust reimplementation of
+[TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory)
+(no code copied); what pinkdb adds is the enforcement — every row is filed under
+a principal and read back through a row filter, not through a grant.
+
+| layer | table | what it holds |
+|---|---|---|
+| **L0** conversation | `l0_turns` | the turn as it happened (speaker, text, tag, conversation) |
+| **L1** atoms | `atoms` | one standalone fact, with confidence, tag, sources and `superseded_by` |
+| **L2** scenarios | `scenarios` | a titled summary naming the atoms it groups |
+| **L3** persona | `personas` | the long-term profile; latest row wins |
+
+```sh
+cargo build --release -p pinkdb-cli -p pinkdb-memory
+
+./target/release/pinkdb sales.pink
+pinkdb> LOAD EXTENSION 'target/release/libpinkdb_memory.dylib';
+pinkdb> .memory add my warehouse is TPC-H SF1 --tag tpch
+pinkdb> .memory add I always read EXPLAIN before a big join --tag style
+pinkdb> .memory distill --provider zai        # that provider's key variable, no .env
+pinkdb> .memory search how big is my warehouse
+pinkdb> .memory show                          # counts per layer, persona, recent rows
+```
+
+**Distillation is queued, never on the add path.** `add` appends an L0 turn and
+returns; `.memory distill` drains the queue with one model call per step —
+turns → atoms, atoms → a scenario, scenarios → the persona — through the shared
+`pinkdb-llm` client (no default provider, exactly as with `.agent`). Each answer
+is validated against a strict JSON contract *before* anything is written, so a
+malformed answer changes nothing and is retried later (`attempts` stops at 3;
+an operator's drain resets failures). A contradicting fact supersedes the old
+atom and keeps it; `forget` hides a row and appends an audit entry — nothing is
+hard-deleted. `PINKDB_MEMORY_DISTILL_EVERY=N` queues a distillation every N
+turns.
+
+**Visibility is a row filter the extension applies on every read**: `private`
+(the owner), `team` (the owner's role), `restricted` (the users, roles and
+agents in the ACL — `--acl u:bob,r:ops`) and `agent` (the named agent identity).
+The memory tables are granted to no one, so a client cannot `SELECT` around the
+filter (the engine answers `permission denied`); administrators can still read
+the tables directly, which is the escape hatch when an operator must audit them.
+An embedded store without users runs as the implicit principal `pinkdb`.
+
+The extension reaches those tables through a confined internal channel: it runs
+without the privilege check (that is what lets it write its own state), so the
+serve policy — not the extension's quoting — limits it to `read_databases:
+[pinkdb_memory]`, external services on (`embed()`) and files off. A statement on
+that channel that reads a user table, directly or through a view, a CTE or a
+macro, is refused before it runs.
+
+**Identity comes from the engine.** `SELECT current_user()` and
+`SELECT current_roles()` (new in this wave, comma-joined display names) answer
+the logged-in principal; the extension asks on its own confined channel, so a
+tool argument cannot spoof who is asking. No extension ABI change was needed.
+
+**Retrieval** returns the persona and the best-matching scenarios first, then
+atoms and turns ranked by BM25 and fused with RRF (108a's constants); when the
+`embeddings` package is loaded and an embeddings provider is configured, it also
+ranks by `embed()` + `array_distance` and fuses the two lists — the answer says
+which mode it used and why it fell back. Three budgets stop it: `--items`,
+`--chars`, `--timeout-ms`. Every hit carries its layer, id, score, source
+(`bm25`, `vector`, `bm25+vector`) and visibility.
+
+**Surfaces.** `.memory add|search|update|forget|distill|persona|show|serve`; six
+MCP tools (`memory_add`, `memory_search`, `memory_update`, `memory_forget`,
+`memory_distill`, `memory_persona`) alongside the warehouse tools on the memory
+extension's own bridge (`serve stdio allow-memory` — the write tools need the
+switch, reads never do); and, with the memory extension loaded, an `.agent` run
+records its question and answer as L0 turns under the caller's identity.
+
+Tests run against a scripted provider and a loopback embeddings server: an
+end-to-end distillation, all four visibility classes against real users and
+roles, a refused direct `SELECT`, supersession and forget with audit rows, the
+three budgets, hybrid RRF against hand-computed scores, malformed JSON and a
+429-then-success, and a sentinel that greps a durable store's bytes for the
+embeddings key. The one live test is opt-in:
+`PINKDB_MEMORY_LIVE=1 cargo test -p pinkdb-memory --test live -- --ignored`.
+Release sizes in this wave: `pinkdb` 5,382,768 B, `pinkdb-server` 4,977,888 B,
+`libpinkdb_memory.dylib` 2,746,160 B — the extension is a cdylib, so neither
+binary links it, and it needs no third-party crate.
 
 ## Full-text search (feature `fts`, wave 108a)
 

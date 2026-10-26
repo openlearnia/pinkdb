@@ -23,6 +23,49 @@ pub trait StatementHost {
     /// complete answer the client can read and act on. Any other code means
     /// the host could not run a statement at all.
     fn execute_statement(&mut self, sql: &str) -> (i32, String);
+
+    /// Run one statement for the extension's *own bookkeeping*: the same policy
+    /// checker, but no privilege check and writes confined to the database the
+    /// host keeps for this extension. Answers `(0, json)` on success, where
+    /// `json` is an array of `{"columns":[…],"rows":[[…],…]}` results.
+    ///
+    /// The default is "this host has no such channel" (`2`, no text), which is
+    /// what a serve host without `ServePolicy::internal` answers — an extension
+    /// detects it by the code.
+    fn execute_internal(&mut self, sql: &str) -> (i32, String) {
+        let _ = sql;
+        (2, String::new())
+    }
+}
+
+/// The extension's own channel: its internal policy, JSON results. Mirrors
+/// [`crate::command`]'s internal channel; the host decides what it may touch
+/// and an older host leaves the ABI field NULL, so the call never arrives.
+extern "C" fn execute_internal(
+    ctx: *mut c_void,
+    sql: *const c_char,
+    sql_len: usize,
+    out_text: *mut *mut c_char,
+    out_len: *mut usize,
+) -> i32 {
+    // SAFETY: see `crate::command::read_statement`.
+    let Some(sql) = (unsafe { crate::command::read_statement(sql, sql_len, out_text, out_len) })
+    else {
+        return 2;
+    };
+    let Some(sql) = sql else {
+        return 1;
+    };
+    // SAFETY: `ctx` is the `ServeState` this module passed to `pinkdb_ext_serve`.
+    let Some(state) = (unsafe { ctx.cast::<ServeState<'_>>().as_mut() }) else {
+        return 2;
+    };
+    let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        state.host.execute_internal(sql)
+    }))
+    .unwrap_or((2, String::new()));
+    // SAFETY: the out pointers are the ones `read_statement` cleared.
+    unsafe { crate::command::write_reply(reply, out_text, out_len) }
 }
 
 struct ServeState<'a> {
@@ -135,6 +178,7 @@ fn serve_locked(
     })?;
     let mut api = crate::host::host_api();
     api.execute_statement = execute_statement;
+    api.execute_internal = execute_internal;
     let mut state = ServeState { host };
     // SAFETY (all of it): `api` is a fully initialized host struct (the same
     // one init gets, with the statement field wired), `state` lives for the

@@ -62,6 +62,14 @@ use crate::types::{PinkDbError, Result};
 /// encryption's `DEFAULT_SALT_LEN`).
 const SALT_LEN: usize = 16;
 
+/// The name a *trusted embedded* session answers to: an empty store has no
+/// users to tell apart, and `current_user()` still has to answer one name (the
+/// CLI, the FFI, a test). Not reserved: a store that defines a user called
+/// `pinkdb` simply cannot tell that user's statements from an embedded
+/// session's, which is why a store with users should be accessed through a
+/// login.
+pub const IMPLICIT_PRINCIPAL: &str = "pinkdb";
+
 /// One privilege. Table privileges apply to a `(database, table)` pair,
 /// [`Privilege::Create`] to a database, and `ADMIN` is global (it is not a
 /// [`Privilege`] variant: `GRANT ADMIN` has its own statement form with no

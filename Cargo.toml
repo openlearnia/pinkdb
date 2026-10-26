@@ -56,6 +56,9 @@ members = [
     # stdio or loopback HTTP; it is loaded, never linked, so no pinkdb binary
     # grows beyond the small host-side ABI addition.
     "extensions/mcp",
+    # The MCP wire the bridge and agent memory share (wave 109): JSON-RPC 2.0,
+    # the tool table trait, stdio and loopback HTTP. An rlib, never loaded.
+    "extensions/mcp-protocol",
     # The warehouse tool set (wave 106) the MCP bridge and the agent extension
     # both expose: one set of JSON Schemas and one statement planner, so the
     # two surfaces cannot drift.
@@ -63,6 +66,10 @@ members = [
     # The data agent (wave 106): an LLM loop whose whole state lives in the
     # store. Loaded like the MCP bridge, never linked.
     "extensions/agent",
+    # Agent memory (wave 109): L0 turns, L1 atoms, L2 scenarios and L3
+    # personas, distilled through the shared model client and read back
+    # layered and budgeted. Loaded like the agent, never linked.
+    "extensions/memory",
     # The shared model client (wave 106b): the provider-neutral transcript, the
     # provider registry and the OpenAI and Anthropic wire protocols. An rlib
     # linked into an extension (the agent now, agent memory next), never loaded

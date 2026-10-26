@@ -2,12 +2,17 @@
 //! Protocol client — pi, Claude Code, fx, any MCP client.
 //!
 //! The client brings the reasoning; there is no model code here and none in
-//! pinkdb. This crate speaks JSON-RPC 2.0, turns a tool call into one
-//! statement, and hands the statement to the host, which runs it under its
-//! own budgets and answers with `pinkdb::agent` Markdown (or a one-line JSON
-//! error). Nothing in this crate decides what a client may run: the host's
-//! statement callback applies the read-only policy, the role grants and the
-//! time/row limits.
+//! pinkdb. This crate wires the shared protocol ([`pinkdb_mcp_protocol`]) to
+//! one host session, so a tool call becomes one statement for the host, which
+//! runs it under its own budgets and answers with `pinkdb::agent` Markdown (or
+//! a one-line JSON error). Nothing in this crate decides what a client may
+//! run: the host's statement callback applies the read-only policy, the role
+//! grants and the time/row limits.
+//!
+//! The wire (JSON-RPC 2.0, `tools/list`, `tools/call`, stdio and loopback
+//! HTTP) and the tool table live in `pinkdb-mcp-protocol` and
+//! `pinkdb-warehouse-tools`, because agent memory serves the same surface
+//! from its own extension.
 //!
 //! # Loading
 //!
@@ -21,41 +26,39 @@
 //! `pinkdb --mcp store.pink` is the one-flag form the pi package
 //! (`integrations/pi-pinkdb`) uses: it loads this extension from the install
 //! directory and serves stdio.
-//!
-//! # Shape
-//!
-//! - [`protocol`]: the JSON-RPC/MCP dispatcher and the [`Host`] it calls.
-//! - [`tools`]: the tool schemas a model reads and the statement each one
-//!   sends.
-//! - [`http`]: the localhost-only streamable-HTTP transport.
-//! - [`transport`]: stdio or HTTP, chosen by the descriptor the host passed to
-//!   `pinkdb_ext_serve` (`stdio` or `http:HOST:PORT`).
 
-mod http;
-mod protocol;
-mod transport;
-
-pub use http::{bind_address, is_loopback};
+pub use pinkdb_mcp_protocol::{Host, Server, ToolReply, ToolSet, bind_address, is_loopback};
 pub use pinkdb_warehouse_tools as tools;
 pub use pinkdb_warehouse_tools::tool_names;
-pub use protocol::{Host, Server};
 
-use pinkdb_ext_sdk::HostSession;
+use pinkdb_ext_sdk::{HostSession, StatementReply};
 
 pinkdb_ext_sdk::pinkdb_extension! {
     name = "mcp",
     functions = [],
 }
 
-/// The host's callback as this crate's [`Host`].
+/// The host's callback as this crate's [`Host`]. Only the public channel: the
+/// MCP bridge has no bookkeeping of its own, so it also has no internal one.
 struct SessionHost<'a> {
     session: &'a mut HostSession,
 }
 
 impl Host for SessionHost<'_> {
-    fn execute(&mut self, statement: &str) -> pinkdb_ext_sdk::StatementReply {
+    fn execute(&mut self, statement: &str) -> StatementReply {
         self.session.execute_statement(statement)
     }
+}
+
+/// The dispatcher over `host` and the warehouse tool table, with the write
+/// policy `initialize` reports (the host enforces it, not this crate).
+pub fn server<H: Host>(host: H, allow_writes: bool, allow_files: bool) -> Server<H> {
+    Server::new(
+        host,
+        Box::new(pinkdb_warehouse_tools::Warehouse),
+        allow_writes,
+        allow_files,
+    )
 }
 
 /// `pinkdb_ext_serve`: run the protocol loop until the client disconnects.
@@ -63,12 +66,12 @@ impl Host for SessionHost<'_> {
 /// client in `initialize`, never trusted for enforcement.
 fn serve(session: &mut HostSession, transport: &str, options: &str) -> Result<(), String> {
     let enabled = |flag: &str| options.split_whitespace().any(|option| option == flag);
-    let mut server = Server::new(
+    let mut server = server(
         SessionHost { session },
         enabled("allow-writes"),
         enabled("allow-files"),
     );
-    transport::serve(&mut server, transport)
+    pinkdb_mcp_protocol::transport::serve(&mut server, transport)
 }
 
 pinkdb_ext_sdk::pinkdb_abi_exports_with_serve!(serve);
