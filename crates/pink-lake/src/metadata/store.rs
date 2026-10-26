@@ -433,7 +433,10 @@ impl SqlMetadataStore {
     /// Expire snapshots and everything only they could see (DuckLake's
     /// `DeleteSnapshots`). See [`MetadataStore::expire_snapshots`].
     pub(crate) fn expire_snapshots(&self, versions: &[u64]) -> Result<()> {
-        self.with_conn(|conn| expire_conn(conn, versions))
+        self.with_conn(|conn| {
+            expire_conn(conn, versions)?;
+            conn.maintenance()
+        })
     }
 
     pub(crate) fn scheduled_files(&self) -> Result<Vec<(i64, String)>> {

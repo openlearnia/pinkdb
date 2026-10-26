@@ -27,6 +27,7 @@ catalog = ["dep:pink-lake"]
 catalog-sqlite = ["catalog", "pink-lake/catalog-sqlite"]
 catalog-postgres = ["catalog", "pink-lake/catalog-postgres"]
 lake-s3 = ["catalog", "pink-lake/s3"]
+catalog-s3 = ["catalog", "lake-s3", "pink-lake/catalog-s3"]
 # Opt-in warehouse browsing UI (wave 78): the read-only web console the
 # server serves next to its binary protocol. Off by default: the default
 # build does not even compile the console crate, so the lean server binary is

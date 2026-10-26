@@ -349,6 +349,12 @@ pub(crate) trait SqlConnection: Send + Sync + std::fmt::Debug {
     /// Rows changed since this connection was opened (the scaling
     /// diagnostic; only SQLite can answer it exactly).
     fn total_changes(&self) -> u64;
+
+    /// Backend maintenance after snapshot expiration. Local databases have
+    /// nothing extra to do; object-backed catalogs may prune folded logs.
+    fn maintenance(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Statement helpers written against `&dyn SqlConnection`, so a store method

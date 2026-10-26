@@ -5,10 +5,18 @@
 #[path = "common/local_lake.rs"]
 mod local_lake;
 
-#[cfg(any(not(feature = "catalog-sqlite"), not(feature = "catalog-postgres")))]
+#[cfg(any(
+    not(feature = "catalog-sqlite"),
+    not(feature = "catalog-postgres"),
+    not(feature = "catalog-s3")
+))]
 use pink_lake::{Lake, LakeError};
 
-#[cfg(any(not(feature = "catalog-sqlite"), not(feature = "catalog-postgres")))]
+#[cfg(any(
+    not(feature = "catalog-sqlite"),
+    not(feature = "catalog-postgres"),
+    not(feature = "catalog-s3")
+))]
 fn catalog_gate(catalog: &str, feature: &str, data: &str) {
     for result in [
         Lake::open_url(catalog),
@@ -27,6 +35,16 @@ fn catalog_gate(catalog: &str, feature: &str, data: &str) {
         );
         assert!(err.to_string().contains(feature), "{err}");
     }
+}
+
+#[cfg(not(feature = "catalog-s3"))]
+#[test]
+fn an_s3_catalog_needs_the_feature() {
+    catalog_gate(
+        "pink+s3://catalog-bucket/lake",
+        "catalog-s3",
+        "/tmp/pink_lake_catalog_gate_data",
+    );
 }
 
 #[cfg(not(feature = "catalog-sqlite"))]

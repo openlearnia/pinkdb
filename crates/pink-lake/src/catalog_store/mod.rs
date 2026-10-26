@@ -33,6 +33,16 @@ pub(crate) fn open_metadata_store_keyed(
             create,
             key.and_then(|key| key.engine_key()),
         )?)),
+        #[cfg(feature = "catalog-s3")]
+        Location::CatalogS3 { bucket, prefix } => Ok(Some(crate::metadata::s3::open(
+            catalog_url,
+            bucket,
+            prefix,
+            create,
+            key.and_then(|key| key.engine_key()),
+        )?)),
+        #[cfg(not(feature = "catalog-s3"))]
+        Location::CatalogS3 { .. } => Ok(None),
         #[cfg(feature = "catalog-sqlite")]
         Location::Sqlite(path) => Ok(Some(crate::metadata::sqlite::open(
             catalog_url,

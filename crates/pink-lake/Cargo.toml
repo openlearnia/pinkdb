@@ -14,6 +14,9 @@ default = []
 # in the shared `pinkdb-httpfs` crate (also the engine's remote-file
 # transport); this feature forwards to its `s3` half.
 s3 = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3"]
+# Opt-in object-backed catalog database (wave 110). Implies the existing S3
+# transport; off by default, so ordinary builds do not grow.
+catalog-s3 = ["s3"]
 # Opt-in at-rest encryption (`PNKLAKE1` containers over data and delete
 # files). Audited RustCrypto crates only (the same AES-256-GCM the engine's
 # `pinkdb/encryption` uses; per-file keys are raw, so no KDF is linked here).

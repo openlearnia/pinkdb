@@ -9,6 +9,32 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-26
+### Wave 110 — S3 catalog store (`catalog-s3`) ✅
+- **`pink+s3://bucket/prefix` lake catalogs.** With the new off-by-default
+  `catalog-s3` feature (forwarded by the CLI and server), the lake catalog
+  database itself lives on object storage: no database server, nothing
+  durable on local disk. Data defaults to `s3://bucket/prefix/data/`.
+- **Delta-only commits.** Each commit uploads only its own records as
+  immutable `prefix/catalog/log/<seq>` objects (one per record; still one
+  request for a typical single-row commit); a full
+  `prefix/catalog/checkpoint/<seq>.pink` image is uploaded every 100 records
+  (`PINKDB_CATALOG_S3_CHECKPOINT_INTERVAL`),
+  `prefix/catalog/head` records the newest one for operators, and readers
+  find checkpoints by listing. Commit cost is O(delta), never O(catalog). Measured
+  against the mock endpoint: a one-row commit is 3 S3 requests (2 LIST, 1
+  conditional PUT) and 2.9 KB uploaded, and a cold reopen downloads one
+  checkpoint image plus the logs written since. Writers race on conditional creates of
+  the next log object; the loser reloads and retries through the existing
+  conflict path, and an endpoint without conditional writes is read-only.
+- **Encryption and maintenance.** A keyed lake seals checkpoint and log
+  objects in `PINKENC1`; snapshot expiration (never a commit) prunes folded
+  log objects and superseded checkpoints. Checkpoint images are cached
+  locally by bucket/prefix/sequence.
+- **Interop note.** DuckDB's DuckLake extension cannot attach a `pink+s3://`
+  catalog; migrate by saving the loaded lake to a `pink:`/`sqlite:`/
+  `postgres://` catalog (and back). Without the feature the location fails
+  with a clear `FeatureMissing` naming `catalog-s3`.
+
 ### Wave 106b — several model providers for pinkdb-agent ✅
 - **No default provider.** Every run names one: `.agent ask "…" provider
   <name> [model <name>]`, `pinkdb --agent FILE "q" --agent-provider <name>

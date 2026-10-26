@@ -194,9 +194,36 @@ Incremental commits, time travel and statistics-only attach included.</p>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>pink:lake.pink                       durable pinkdb catalog (default)
 sqlite:/srv/lakes/sales.db           SQLite catalog (catalog-sqlite)
-postgres://user@host/db?schema=lake  Postgres catalog (catalog-postgres)</code></pre></div>
+postgres://user@host/db?schema=lake  Postgres catalog (catalog-postgres)
+pink+s3://bucket/prefix              catalog on object storage (catalog-s3)</code></pre></div>
 
-<p>All three hold the same <code>ducklake_*</code> rows. A commit inserts its
+<h2 id="catalog-on-object-storage-pink-s3">Catalog on object storage (<code>pink+s3://</code>)<a class="anchor" href="#catalog-on-object-storage-pink-s3" aria-label="Permalink: Catalog on object storage (pink+s3://)">#</a></h2>
+
+<p>With the opt-in <code>catalog-s3</code> feature the catalog database itself
+lives in the bucket — no database server, nothing durable on local disk. The
+durable state is a <code>.pink</code> database split across immutable objects:
+<code>prefix/catalog/log/&lt;seq&gt;</code> holds a transaction's committed WAL
+records, one object each (a delta; its size does not grow with the number of
+data files), and <code>prefix/catalog/checkpoint/&lt;seq&gt;.pink</code> is a
+full image every 100 records
+(<code>PINKDB_CATALOG_S3_CHECKPOINT_INTERVAL</code>).
+<code>prefix/catalog/head</code> names the newest checkpoint for operators;
+readers find checkpoints by listing. Data defaults to
+<code>s3://bucket/prefix/data/</code>.</p>
+
+<p>Writers race on conditional creates of the next log object; the loser
+reloads the records it missed and retries through the usual conflict path. An
+endpoint without conditional writes is read-only — never check-then-put. A
+keyed lake seals both object kinds in <code>PINKENC1</code>. Expired snapshots
+prune folded log objects; commits never delete. Checkpoint images are cached
+locally by bucket/prefix/sequence, so a reopen downloads only newer logs.</p>
+
+<p>DuckDB's DuckLake extension cannot attach this catalog (it speaks only
+DuckDB, SQLite and Postgres catalogs). Migrate by saving the loaded lake to a
+new catalog (<code>.lake save pink:…</code> or <code>sqlite:…</code>) and
+back.</p>
+
+<p>All of them hold the same <code>ducklake_*</code> rows. A commit inserts its
 typed delta and one snapshot row — the commit point — instead of rewriting a JSON
 catalog. A bare path means <code>pink:&lt;path&gt;</code>, and its data defaults to
 <code>&lt;path&gt;.files/</code>. The catalog records the data location, so later
@@ -313,6 +340,7 @@ older pinkdb build, then open the new catalog here.</p>
 <p class="toc-title">On this page</p>
 <ul>
   <li><a href="#what-a-lake-is">What a lake is</a></li>
+  <li><a href="#catalog-on-object-storage-pink-s3">Catalog on object storage (pink+s3://)</a></li>
   <li><a href="#save-open-attach">Save, open, attach</a></li>
   <li><a href="#incremental-commits">Incremental commits</a></li>
   <li><a href="#data-formats">Data formats</a></li>

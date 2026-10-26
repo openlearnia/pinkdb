@@ -9,6 +9,13 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-26</h2>
+<h3>Wave 110 — S3 catalog store (<code>catalog-s3</code>) ✅</h3>
+<ul>
+<li><strong><code>pink+s3://bucket/prefix</code> lake catalogs.</strong> With the new off-by-default <code>catalog-s3</code> feature (forwarded by the CLI and server), the lake catalog database itself lives on object storage: no database server, nothing durable on local disk. Data defaults to <code>s3://bucket/prefix/data/</code>.</li>
+<li><strong>Delta-only commits.</strong> Each commit uploads only its own records as immutable <code>prefix/catalog/log/&lt;seq&gt;</code> objects (one per record; still one request for a typical single-row commit); a full <code>prefix/catalog/checkpoint/&lt;seq&gt;.pink</code> image is uploaded every 100 records (<code>PINKDB_CATALOG_S3_CHECKPOINT_INTERVAL</code>), <code>prefix/catalog/head</code> records the newest one for operators, and readers find checkpoints by listing. Commit cost is O(delta), never O(catalog). Measured against the mock endpoint: a one-row commit is 3 S3 requests (2 LIST, 1 conditional PUT) and 2.9 KB uploaded, and a cold reopen downloads one checkpoint image plus the logs written since. Writers race on conditional creates of the next log object; the loser reloads and retries through the existing conflict path, and an endpoint without conditional writes is read-only.</li>
+<li><strong>Encryption and maintenance.</strong> A keyed lake seals checkpoint and log objects in <code>PINKENC1</code>; snapshot expiration (never a commit) prunes folded log objects and superseded checkpoints. Checkpoint images are cached locally by bucket/prefix/sequence.</li>
+<li><strong>Interop note.</strong> DuckDB's DuckLake extension cannot attach a <code>pink+s3://</code> catalog; migrate by saving the loaded lake to a <code>pink:</code>/<code>sqlite:</code>/ <code>postgres://</code> catalog (and back). Without the feature the location fails with a clear <code>FeatureMissing</code> naming <code>catalog-s3</code>.</li>
+</ul>
 <h3>Wave 106b — several model providers for pinkdb-agent ✅</h3>
 <ul>
 <li><strong>No default provider.</strong> Every run names one: <code>.agent ask "…" provider &lt;name&gt; [model &lt;name&gt;]</code>, <code>pinkdb --agent FILE "q" --agent-provider &lt;name&gt; --agent-model &lt;name&gt;</code>, or <code>PINKDB_AGENT_PROVIDER</code>/<code>PINKDB_AGENT_MODEL</code> (a run argument beats the environment). With none, the run fails with <code>no provider: pass provider &lt;name&gt; or set PINKDB_AGENT_PROVIDER (one of: …)</code> and the agent never infers a provider from an exported key.</li>

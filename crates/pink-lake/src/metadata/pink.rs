@@ -78,24 +78,48 @@ pub(crate) fn open_keyed(
             None => PinkDb::open_durable_with_options(&path.to_string_lossy(), options),
         };
         let (db, _) = opened.map_err(|e| map_error(url, e))?;
-        // Every process that opens the catalog replays its WAL, so the WAL
-        // must stay small: a catalog commit logs ~14 KB, and at the engine's
-        // default 64 MiB threshold 1,000 commits left 14 MB of WAL that cost
-        // 0.7 s of replay on every attach (0.02 s after a checkpoint). A
-        // 1 MiB threshold bounds replay to roughly 70 commits; the checkpoint
-        // rewrites only the catalog file (0.4 MB at 1,000 data files).
-        db.set_auto_checkpoint_bytes(Some(CATALOG_AUTO_CHECKPOINT_BYTES));
-        let connection = PinkConnection {
-            db: Arc::new(Mutex::new(db)),
-            url: url.to_string(),
-            gate: Arc::new(Mutex::new(false)),
-            prepared: Arc::new(Mutex::new(HashMap::new())),
-            in_transaction: false,
-            finished: AtomicBool::new(false),
-            total: AtomicU64::new(0),
-        };
-        Ok(Box::new(connection))
+        Ok(Box::new(connection(url, db, None)))
     })
+}
+
+#[cfg(feature = "catalog-s3")]
+pub(crate) fn open_db(
+    url: &str,
+    db: PinkDb,
+    remote: Option<Arc<super::s3::RemoteCatalog>>,
+    create: bool,
+) -> Result<SqlMetadataStore> {
+    let path = db.durable_path().ok_or_else(|| LakeError::Internal {
+        message: "the S3 catalog cache is not durable".to_string(),
+    })?;
+    SqlMetadataStore::open(url, &path, create, move |url, _path, _create| {
+        Ok(Box::new(connection(url, db, remote)))
+    })
+}
+
+fn connection(
+    url: &str,
+    db: PinkDb,
+    #[cfg(feature = "catalog-s3")] remote: Option<Arc<super::s3::RemoteCatalog>>,
+    #[cfg(not(feature = "catalog-s3"))] _remote: Option<()>,
+) -> PinkConnection {
+    // Every process that opens a local catalog replays its WAL, so keep it
+    // small. The S3 adapter owns checkpoint cadence and disables local rolls.
+    #[cfg(feature = "catalog-s3")]
+    db.set_auto_checkpoint_bytes(remote.is_none().then_some(CATALOG_AUTO_CHECKPOINT_BYTES));
+    #[cfg(not(feature = "catalog-s3"))]
+    db.set_auto_checkpoint_bytes(Some(CATALOG_AUTO_CHECKPOINT_BYTES));
+    PinkConnection {
+        db: Arc::new(Mutex::new(db)),
+        url: url.to_string(),
+        gate: Arc::new(Mutex::new(false)),
+        prepared: Arc::new(Mutex::new(HashMap::new())),
+        in_transaction: false,
+        finished: AtomicBool::new(false),
+        total: AtomicU64::new(0),
+        #[cfg(feature = "catalog-s3")]
+        remote,
+    }
 }
 
 /// The WAL size that triggers an automatic checkpoint of a `.pink` catalog
@@ -128,6 +152,8 @@ struct PinkConnection {
     in_transaction: bool,
     finished: AtomicBool,
     total: AtomicU64,
+    #[cfg(feature = "catalog-s3")]
+    remote: Option<Arc<super::s3::RemoteCatalog>>,
 }
 
 impl PinkConnection {
@@ -159,6 +185,12 @@ impl PinkConnection {
             .db
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(feature = "catalog-s3")]
+        if !self.in_transaction
+            && let Some(remote) = &self.remote
+        {
+            remote.refresh(&mut db)?;
+        }
         let prepared = {
             let mut cache = self
                 .prepared
@@ -175,13 +207,20 @@ impl PinkConnection {
                 },
             }
         };
-        match prepared {
-            Some(prepared) => db
-                .execute_prepared(&prepared, &values)
-                .map(|result| vec![result])
-                .map_err(|e| map_error(&self.url, e)),
-            None => db.execute(&sql).map_err(|e| map_error(&self.url, e)),
+        let results = match prepared {
+            Some(prepared) => vec![
+                db.execute_prepared(&prepared, &values)
+                    .map_err(|e| map_error(&self.url, e))?,
+            ],
+            None => db.execute(&sql).map_err(|e| map_error(&self.url, e))?,
+        };
+        #[cfg(feature = "catalog-s3")]
+        if !self.in_transaction
+            && let Some(remote) = &self.remote
+        {
+            remote.publish(&mut db)?;
         }
+        Ok(results)
     }
 
     /// Run a semicolon-separated batch (schema creation) without the gate
@@ -192,7 +231,20 @@ impl PinkConnection {
             .db
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        db.execute(sql).map_err(|e| map_error(&self.url, e))
+        #[cfg(feature = "catalog-s3")]
+        if !self.in_transaction
+            && let Some(remote) = &self.remote
+        {
+            remote.refresh(&mut db)?;
+        }
+        let results = db.execute(sql).map_err(|e| map_error(&self.url, e))?;
+        #[cfg(feature = "catalog-s3")]
+        if !self.in_transaction
+            && let Some(remote) = &self.remote
+        {
+            remote.publish(&mut db)?;
+        }
+        Ok(results)
     }
 }
 
@@ -260,6 +312,17 @@ impl SqlConnection for PinkConnection {
             drop(held);
             std::thread::sleep(Duration::from_millis(1));
         }
+        #[cfg(feature = "catalog-s3")]
+        if let Some(remote) = &self.remote {
+            let mut db = self
+                .db
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(error) = remote.refresh(&mut db) {
+                self.release_gate();
+                return Err(error);
+            }
+        }
         let handle = PinkConnection {
             db: Arc::clone(&self.db),
             url: self.url.clone(),
@@ -268,6 +331,8 @@ impl SqlConnection for PinkConnection {
             in_transaction: true,
             finished: AtomicBool::new(false),
             total: AtomicU64::new(0),
+            #[cfg(feature = "catalog-s3")]
+            remote: self.remote.clone(),
         };
         if let Err(error) = handle.run_batch_unguarded(Dialect::Pink.begin_write()) {
             handle.release_gate();
@@ -282,10 +347,21 @@ impl SqlConnection for PinkConnection {
                 message: "commit on a non-transaction pinkdb handle".to_string(),
             });
         }
-        let result = self.run_batch_unguarded("COMMIT");
+        let result = self.run_batch_unguarded("COMMIT").map(|_| ());
+        #[cfg(feature = "catalog-s3")]
+        let result = result.and_then(|()| match &self.remote {
+            Some(remote) => {
+                let mut db = self
+                    .db
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                remote.publish(&mut db)
+            }
+            None => Ok(()),
+        });
         self.finished.store(true, Ordering::Relaxed);
         self.release_gate();
-        result.map(|_| ())
+        result
     }
 
     fn rollback(&self) -> Result<()> {
@@ -300,6 +376,19 @@ impl SqlConnection for PinkConnection {
 
     fn total_changes(&self) -> u64 {
         self.total.load(Ordering::Relaxed)
+    }
+
+    fn maintenance(&self) -> Result<()> {
+        #[cfg(feature = "catalog-s3")]
+        if let Some(remote) = &self.remote {
+            let db = self
+                .db
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            remote.checkpoint_now(&db)?;
+            remote.prune()?;
+        }
+        Ok(())
     }
 }
 
@@ -384,7 +473,7 @@ fn changed_rows(results: &[QueryResult]) -> usize {
 /// A pinkdb error is a retryable catalog conflict when the engine's write
 /// lease or its optimistic commit validator rejects this writer. The lake's
 /// conflict loop treats both exactly like SQLite's `SQLITE_BUSY`.
-fn map_error(url: &str, error: pinkdb::PinkDbError) -> LakeError {
+pub(crate) fn map_error(url: &str, error: pinkdb::PinkDbError) -> LakeError {
     let location = crate::redact_location(url);
     let text = error.to_string();
     if text.contains("write conflict on") || text.contains(" is busy:") {

@@ -46,6 +46,9 @@ pub(crate) mod dialect;
 pub(crate) mod pink;
 pub(crate) mod store;
 
+#[cfg(feature = "catalog-s3")]
+pub(crate) mod s3;
+
 #[cfg(feature = "catalog-sqlite")]
 pub(crate) mod sqlite;
 

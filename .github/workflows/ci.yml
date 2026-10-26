@@ -95,6 +95,7 @@ jobs:
               cargo test -p pink-lake --features s3,encryption
               cargo test -p pink-lake --features catalog-sqlite
               cargo test -p pink-lake --features catalog-sqlite,s3,encryption
+              cargo test -p pink-lake --features catalog-s3,encryption
               cargo test -p pink-lake --test replication_catalogs
               cargo test -p pink-lake --features catalog-sqlite --test replication_catalogs
           - name: cli-lake
@@ -104,6 +105,7 @@ jobs:
               cargo test -p pinkdb-cli --features pinklake,s3,encryption
               cargo test -p pinkdb-cli --features s3
               cargo test -p pinkdb-cli --features pinklake,s3,catalog-sqlite
+              cargo test -p pinkdb-cli --features pinklake,s3,catalog-s3
               # Parquet-format lakes through the CLI: three of these tests went
               # stale after wave 103 because no job built `parquetlake` (wave 98c).
               cargo test -p pinkdb-cli --features pinklake,s3,parquetlake
@@ -256,6 +258,8 @@ jobs:
           cargo clippy --all-targets -p pink-lake --features s3 -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3,encryption -- -D warnings
           cargo clippy --all-targets -p pink-lake --features catalog-sqlite,s3,encryption -- -D warnings
+          cargo clippy --all-targets -p pink-lake --features catalog-s3,encryption -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,catalog-s3 -- -D warnings
           cargo clippy --all-targets -p pink-lake --features catalog-postgres -- -D warnings
           cargo clippy --all-targets -p pink-lake --features catalog-sqlite,catalog-postgres,s3,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake,s3,catalog-sqlite -- -D warnings

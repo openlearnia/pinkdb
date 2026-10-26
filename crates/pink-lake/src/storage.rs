@@ -611,6 +611,11 @@ pub(crate) enum Location {
         bucket: String,
         prefix: String,
     },
+    /// A pinkdb catalog database whose checkpoint and WAL records live in S3.
+    CatalogS3 {
+        bucket: String,
+        prefix: String,
+    },
     /// A durable pinkdb `.pink` catalog (`pink:<path>`).
     Pink(PathBuf),
     Sqlite(PathBuf),
@@ -625,6 +630,9 @@ impl Location {
     /// `s3://…` is not a thing). A bare path keeps its current meaning: the
     /// object-store JSON directory layout.
     pub(crate) fn parse(location: &str) -> Result<Self> {
+        if let Some(rest) = location.strip_prefix("pink+s3://") {
+            return Self::parse_catalog_s3(location, rest);
+        }
         if let Some(rest) = location.strip_prefix("pink:") {
             return Self::parse_pink(location, rest);
         }
@@ -675,6 +683,16 @@ impl Location {
     }
 
     fn parse_s3(original: &str, rest: &str) -> Result<Self> {
+        let (bucket, prefix) = Self::parse_s3_parts(original, rest)?;
+        Ok(Location::S3 { bucket, prefix })
+    }
+
+    fn parse_catalog_s3(original: &str, rest: &str) -> Result<Self> {
+        let (bucket, prefix) = Self::parse_s3_parts(original, rest)?;
+        Ok(Location::CatalogS3 { bucket, prefix })
+    }
+
+    fn parse_s3_parts(original: &str, rest: &str) -> Result<(String, String)> {
         let (bucket, prefix) = match rest.split_once('/') {
             Some((bucket, prefix)) => (bucket, prefix.trim_end_matches('/')),
             None => (rest, ""),
@@ -684,10 +702,7 @@ impl Location {
             message,
         })?;
         validate_prefix(prefix, original)?;
-        Ok(Location::S3 {
-            bucket: bucket.to_string(),
-            prefix: prefix.to_string(),
-        })
+        Ok((bucket.to_string(), prefix.to_string()))
     }
 }
 
@@ -763,6 +778,21 @@ mod tests {
                 "{url}"
             );
         }
+    }
+
+    #[test]
+    fn catalog_s3_urls_are_distinct_from_data_locations() {
+        assert_eq!(
+            Location::parse("pink+s3://bucket/lake").unwrap(),
+            Location::CatalogS3 {
+                bucket: "bucket".to_string(),
+                prefix: "lake".to_string(),
+            }
+        );
+        assert_ne!(
+            Location::parse("pink+s3://bucket/lake").unwrap(),
+            Location::parse("s3://bucket/lake").unwrap()
+        );
     }
 
     #[test]

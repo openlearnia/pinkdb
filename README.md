@@ -168,7 +168,7 @@ SQL text
 | `pinkdb-parquet` | opt-in (`parquet` feature) read-side Parquet extension, engine-adjacent: `read_parquet`/`parquet_scan`, the four `parquet_*` metadata functions and DuckDB's replacement scan (`FROM 'file.parquet'`), with projection + row-group-statistics pushdown; flat schemas, TIMESTAMP(nanos)/TIME/UUID/FLOAT16/nested types refused by name; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects through a ranged `ChunkReader` |
 | `pinkdb-iceberg` | opt-in (`iceberg` feature) read-side Iceberg v2 extension, engine-adjacent: `iceberg_scan`, `iceberg_snapshots` and `iceberg_metadata` over a table location (the table directory, `metadata/` or a `…/metadata/vN.metadata.json` file), the current snapshot or a named one (`snapshot_from_id`, `snapshot_from_timestamp`), positional deletes, schema evolution by field id, partition-summary + column-stat pruning and `count(*)` from the manifest record counts; equality deletes are refused by name and a newer-than-v2 format is refused at open; turns `parquet` on for the data files, and its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` tables through the same ranged transport `read_parquet` uses |
 | `pinkdb-httpfs` | opt-in (`httpfs` feature) remote-file transport + `read_csv` table source: `https://` GET/HEAD/byte-range and the SigV4 `s3://` object client **shared with pink-lake and the parquet/arrow `remote` features**; `read_csv('url')`, `.import <url>`, `FROM 'https://…/x.csv'`; single objects only (no globs/compression/COPY TO yet) |
-| `pink-lake` | lake layer: a catalog database (`pink:` `.pink` file, `sqlite:`, or `postgres://`) on DuckLake v1.1's tables plus immutable data files — `.pink` (`PINKDB06`) always, Parquet with `parquetlake`; data on local disk or S3/R2 (opt-in `s3`); opt-in `encryption` seals each data/delete file with its own key in a `PNKLAKE1` container; `catalog-sqlite` / `catalog-postgres` add the SQL backends |
+| `pink-lake` | lake layer: a catalog database (`pink:` `.pink` file, `sqlite:`, or `postgres://`) on DuckLake v1.1's tables plus immutable data files — `.pink` (`PINKDB06`) always, Parquet with `parquetlake`; data on local disk or S3/R2 (opt-in `s3`); opt-in `encryption` seals each data/delete file with its own key in a `PNKLAKE1` container; `catalog-sqlite` / `catalog-postgres` add the SQL backends, `catalog-s3` puts the catalog on object storage |
 
 Design rules: Rust edition 2024 (MSRV 1.97), zero async (the server's opt-in
 `async-server` transport, wave 47, is the documented I/O-boundary carve-out);
@@ -1354,9 +1354,29 @@ three databases:
   of DuckDB's `.duckdb` catalog;
 - `sqlite:<path>` — a SQLite file (feature `catalog-sqlite`);
 - `postgres://…` — a Postgres schema (feature `catalog-postgres`), for lakes
-  shared by several machines.
+  shared by several machines;
+- `pink+s3://bucket/prefix` — the catalog database itself on object storage
+  (feature `catalog-s3`, off by default), for lakes with no database server
+  and nothing durable on local disk. Its data defaults to
+  `s3://bucket/prefix/data/`.
 
-All three store the same DuckLake v1.1-style `ducklake_*` tables. A commit
+With `pink+s3://` the durable catalog is a `.pink` database split across
+immutable objects: `prefix/catalog/log/<seq>` holds the committed WAL records
+of one transaction, one object per record (a delta whose size does not grow
+with the lake), and `prefix/catalog/checkpoint/<seq>.pink` is a full image
+every 100 records (`PINKDB_CATALOG_S3_CHECKPOINT_INTERVAL`).
+`prefix/catalog/head` names the newest checkpoint for operators; readers
+find checkpoints by listing, so a stale or missing hint costs nothing. Writers race on conditional
+creates of the next log object; the loser reloads and retries through the
+usual conflict path, and an endpoint without conditional writes is
+read-only. A keyed lake seals both object kinds in `PINKENC1`. DuckDB's
+DuckLake extension cannot attach this catalog (it speaks only DuckDB,
+SQLite and Postgres); migrate by saving the loaded lake to a new catalog
+(`.lake save pink:…` / `sqlite:…` and back). Checkpoint images are cached
+locally by bucket/prefix/sequence, so a reopen downloads only the log
+objects written since.
+
+All of them store the same DuckLake v1.1-style `ducklake_*` tables. A commit
 inserts its delta and one snapshot row (the commit point); readers materialize
 the head by joining the snapshot rows. `count(*)` is `SUM(record_count)`, and
 `begin_snapshot`/`end_snapshot` give time travel and maintenance without
@@ -1480,7 +1500,8 @@ cargo run --release -p pinkdb-server --features lake-s3 -- \
 `--catalog` needs a server built with the `catalog` feature (the default
 binary links no lake code). It takes the same locations a lake catalog does:
 `pink:<path>`, `sqlite:<path>`, or a Postgres catalog URL (with the
-`catalog-sqlite` / `catalog-postgres` features, which imply `catalog`). `--data` takes a
+`catalog-sqlite`, `catalog-postgres` or `catalog-s3` features, which imply
+`catalog`). `--data` takes a
 directory or `s3://bucket/prefix` (feature `lake-s3`). `--catalog` and
 `--file` are mutually exclusive, and `--data` requires `--catalog`; without
 either flag the server is in-memory, exactly as before.

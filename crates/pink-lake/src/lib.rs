@@ -902,7 +902,10 @@ impl Lake {
         let catalog_location = Location::parse(catalog_url)?;
         if !matches!(
             catalog_location,
-            Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
+            Location::Pink(_)
+                | Location::Sqlite(_)
+                | Location::Postgres(_)
+                | Location::CatalogS3 { .. }
         ) {
             return Err(LakeError::BadLocation {
                 location: redact_location(catalog_url),
@@ -1224,7 +1227,10 @@ impl Lake {
         let location = Location::parse(catalog_url)?;
         if !matches!(
             location,
-            Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
+            Location::Pink(_)
+                | Location::Sqlite(_)
+                | Location::Postgres(_)
+                | Location::CatalogS3 { .. }
         ) {
             return Err(LakeError::BadLocation {
                 location: redact_location(catalog_url),
@@ -2438,6 +2444,16 @@ fn storage_for(location: Location) -> Result<Arc<dyn Storage>> {
                       / Lake::open_with_catalog"
                 .to_string(),
         }),
+        Location::CatalogS3 { bucket, prefix } => Err(LakeError::BadLocation {
+            location: if prefix.is_empty() {
+                format!("pink+s3://{bucket}")
+            } else {
+                format!("pink+s3://{bucket}/{prefix}")
+            },
+            message: "a catalog location is not a data location; use Lake::create_with_catalog \
+                      / Lake::open_with_catalog"
+                .to_string(),
+        }),
     }
 }
 
@@ -2445,7 +2461,10 @@ fn storage_for(location: Location) -> Result<Arc<dyn Storage>> {
 fn is_catalog_location(location: &Location) -> bool {
     matches!(
         location,
-        Location::Pink(_) | Location::Sqlite(_) | Location::Postgres(_)
+        Location::Pink(_)
+            | Location::Sqlite(_)
+            | Location::Postgres(_)
+            | Location::CatalogS3 { .. }
     )
 }
 
@@ -2482,7 +2501,9 @@ fn default_catalog_data_location(path: &Path) -> String {
 /// location comes from the catalog (its recorded path, else the default).
 fn open_catalog_location(location: &str, verb: &str) -> Result<String> {
     match Location::parse(location)? {
-        Location::Pink(_) | Location::Sqlite(_) => Ok(location.to_string()),
+        Location::Pink(_) | Location::Sqlite(_) | Location::CatalogS3 { .. } => {
+            Ok(location.to_string())
+        }
         Location::Postgres(_) => {
             #[cfg(not(feature = "catalog-postgres"))]
             {
@@ -2530,6 +2551,14 @@ fn default_catalog_split(location: &str, verb: &str) -> Result<(String, String)>
                 Err(catalog_needs_data(location, verb))
             }
         }
+        Location::CatalogS3 { bucket, prefix } => {
+            let data = if prefix.is_empty() {
+                format!("s3://{bucket}/data")
+            } else {
+                format!("s3://{bucket}/{prefix}/data")
+            };
+            Ok((location.to_string(), data))
+        }
         Location::S3 { .. } => Err(LakeError::BadLocation {
             location: redact_location(location),
             message: format!(
@@ -2551,6 +2580,11 @@ fn default_catalog_split(location: &str, verb: &str) -> Result<(String, String)>
 fn default_data_for_catalog(catalog_url: &str) -> Option<String> {
     match Location::parse(catalog_url).ok()? {
         Location::Pink(path) | Location::Sqlite(path) => Some(default_catalog_data_location(&path)),
+        Location::CatalogS3 { bucket, prefix } => Some(if prefix.is_empty() {
+            format!("s3://{bucket}/data")
+        } else {
+            format!("s3://{bucket}/{prefix}/data")
+        }),
         _ => None,
     }
 }
@@ -2559,6 +2593,7 @@ fn catalog_feature_missing(catalog_url: &str, location: &Location) -> LakeError 
     let feature = match location {
         Location::Sqlite(_) => "catalog-sqlite",
         Location::Postgres(_) => "catalog-postgres",
+        Location::CatalogS3 { .. } => "catalog-s3",
         _ => "catalog",
     };
     LakeError::FeatureMissing {

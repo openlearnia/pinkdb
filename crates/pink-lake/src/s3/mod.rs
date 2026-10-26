@@ -49,6 +49,13 @@ const MAX_LIST_PAGES: usize = 10_000;
 /// `PINKDB_HTTPFS_PARALLELISM` (0/1 = one part at a time).
 const DOWNLOAD_PART_BYTES: u64 = 8 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PutNew {
+    Written,
+    Exists,
+    ConditionalUnsupported,
+}
+
 /// One S3 backend rooted at `s3://bucket/prefix`.
 #[derive(Debug)]
 pub(crate) struct S3Storage {
@@ -310,6 +317,25 @@ impl S3Storage {
                 Err(self.not_found(rel, context))
             }
             Err(e) => Err(self.map(context, e)),
+        }
+    }
+
+    /// Atomically create one object. Catalog logs must never emulate this
+    /// with HEAD+PUT: an endpoint without conditional writes is read-only.
+    #[cfg_attr(not(feature = "catalog-s3"), allow(dead_code))]
+    pub(crate) fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<PutNew> {
+        let context = format!("PUT {}", self.abs(rel).display());
+        match self
+            .client
+            .put_object(&self.key(rel), bytes, Condition::IfNoneMatch)
+        {
+            Ok(Put::Written) => {
+                self.bucket_confirmed.store(true, Ordering::Relaxed);
+                Ok(PutNew::Written)
+            }
+            Ok(Put::PreconditionFailed) => Ok(PutNew::Exists),
+            Ok(Put::ConditionalUnsupported) => Ok(PutNew::ConditionalUnsupported),
+            Err(error) => Err(self.map(&context, error)),
         }
     }
 }

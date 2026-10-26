@@ -136,6 +136,9 @@ catalog-sqlite = ["pink-lake?/catalog-sqlite"]
 # `data` at create. Forwards to pink-lake's `catalog-postgres`; like
 # `catalog-sqlite` the `?` keeps it from enabling pink-lake on its own.
 catalog-postgres = ["pink-lake?/catalog-postgres"]
+# Opt-in `pink+s3://` catalog databases (wave 110). `pinklake` remains
+# explicit, matching the other forwarded catalog features.
+catalog-s3 = ["s3", "pink-lake?/catalog-s3"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }

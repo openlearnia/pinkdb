@@ -322,6 +322,41 @@ fn lake_s3_attach_reports_and_queries() {
     assert!(!out.contains("Error:"), "{out}");
 }
 
+/// Wave 110: the catalog itself lives in the bucket (`pink+s3://`).
+#[cfg(feature = "catalog-s3")]
+#[test]
+fn lake_catalog_s3_save_open_and_versions() {
+    let mock = mock_s3::MockS3::start();
+    let catalog = "pink+s3://cli-bucket/catalogs/cli";
+    let out = run_mock(
+        &mock,
+        &format!(
+            "CREATE TABLE t (a INTEGER, b VARCHAR);\n\
+             INSERT INTO t VALUES (1, 'x'), (2, 'y');\n\
+             .lake save {catalog}\n\
+             .quit\n"
+        ),
+    );
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    let keys = mock.keys();
+    assert!(
+        keys.iter().any(|k| k.contains("/catalog/log/")),
+        "catalog log objects in the bucket: {keys:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k.contains("/data/")),
+        "data objects default under the catalog prefix: {keys:?}"
+    );
+    let out = run_mock(
+        &mock,
+        &format!(
+            ".lake versions {catalog}\n.lake open {catalog}\nSELECT a FROM t ORDER BY a;\n.quit\n"
+        ),
+    );
+    assert!(out.contains("Opened lake version 2"), "{out}");
+    assert!(out.contains('1') && out.contains('2'), "{out}");
+}
+
 /// A plain-http endpoint still needs the explicit test opt-in.
 #[test]
 fn plain_http_and_degraded_endpoints_need_explicit_cli_opt_ins() {

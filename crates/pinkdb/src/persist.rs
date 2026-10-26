@@ -3707,6 +3707,21 @@ impl PinkDb {
         self.to_bytes()
     }
 
+    /// The bytes [`PinkDb::save_with_key`] would write, without staging a
+    /// file. Used by object-backed checkpoint stores.
+    pub fn to_pink_bytes_with_key(&self, key: &EncryptionKey) -> Result<Vec<u8>> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = key;
+            Err(crate::crypto::unavailable())
+        }
+        #[cfg(feature = "encryption")]
+        {
+            self.ensure_wal_healthy()?;
+            crate::crypto::seal_container(&self.to_bytes()?, key, 0)
+        }
+    }
+
     /// [`PinkDb::to_pink_bytes`] plus the exact per-column statistics of
     /// every table, collected in the same chunk pass as the encode — the
     /// bytes are bit-identical to [`PinkDb::to_pink_bytes`] and the added
@@ -3868,6 +3883,27 @@ impl PinkDb {
     /// image and is refused as a bad magic.
     pub fn from_pink_bytes(data: &[u8]) -> Result<PinkDb> {
         Self::load_bytes(data)
+    }
+
+    /// Load a `PINKENC1` checkpoint image from memory.
+    pub fn from_pink_bytes_with_key(data: &[u8], key: &EncryptionKey) -> Result<PinkDb> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (data, key);
+            Err(crate::crypto::unavailable())
+        }
+        #[cfg(feature = "encryption")]
+        {
+            if !crate::crypto::is_container(data) {
+                return Err(PinkDbError::Execution(
+                    "catalog checkpoint is not encrypted (a key was supplied)".to_string(),
+                ));
+            }
+            let plain = crate::crypto::open_container(data, key, 0)?;
+            let mut db = Self::load_bytes(&plain)?;
+            db.encryption_key = Some(key.clone());
+            Ok(db)
+        }
     }
 
     /// Decode a serialized `.pink` image (`PINKDB06`).

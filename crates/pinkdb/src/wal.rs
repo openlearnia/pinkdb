@@ -211,6 +211,10 @@ pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
 /// open rewrites legacy files in place under the write lease; an older build
 /// refuses a v5 file with a clean version error before it reads any record.
 pub const WAL_VERSION: u32 = 5;
+/// An engine WAL payload detached from a local WAL file. Object-backed
+/// catalog stores use this framing so each immutable object is one logical
+/// WAL record without inheriting a local file's generation, LSN, or nonce.
+const PORTABLE_RECORD_MAGIC: &[u8; 8] = b"PINKREC1";
 /// The wave-45m plaintext version (no per-frame sets): upgraded at open.
 const WAL_VERSION_V3: u32 = 3;
 /// The pre-multi-process plaintext version, accepted and upgraded at open.
@@ -1159,6 +1163,9 @@ pub struct Wal {
     /// unchanged after the first generation; a process that reopens an
     /// existing WAL starts this at 0.
     bytes_appended_since_gen_start: u64,
+    /// Logical records appended by this process and not yet claimed by an
+    /// external durability adapter. Replays never enter this queue.
+    portable_records: Vec<Vec<u8>>,
     /// The write lease of the owning durable store (shared with the store).
     lease: Arc<Lease>,
     /// What the owning store's memory already includes of this file.
@@ -1646,6 +1653,7 @@ impl Wal {
             cipher: opened.cipher,
             auto_checkpoint_bytes: Some(DEFAULT_AUTO_CHECKPOINT_BYTES),
             bytes_appended_since_gen_start: 0,
+            portable_records: Vec::new(),
             lease,
             applied: Applied::default(),
             journal: Vec::new(),
@@ -1902,6 +1910,7 @@ impl Wal {
         }
         let payload = encode_payload(stmts, sets.as_ref(), memo)?;
         let len = record_len_guard(payload.len())?;
+        let portable = encode_portable_record(&payload)?;
         let lsn = self.last_lsn.checked_add(1).ok_or_else(|| {
             PinkDbError::Execution("WAL LSN space exhausted (u64::MAX)".to_string())
         })?;
@@ -1942,6 +1951,7 @@ impl Wal {
                 // Journal the frame so open optimistic bases validate against
                 // it even though it never goes through a replay pass.
                 self.journal_push(lsn, sets);
+                self.portable_records.push(portable);
                 self.publish();
                 Ok(())
             }
@@ -2182,6 +2192,53 @@ impl Wal {
 }
 
 // ---------- payload + record encoding ----------
+
+fn encode_portable_record(payload: &[u8]) -> Result<Vec<u8>> {
+    let len = record_len_guard(payload.len())?;
+    let mut out = Vec::with_capacity(20 + payload.len());
+    out.extend_from_slice(PORTABLE_RECORD_MAGIC);
+    out.extend_from_slice(&WAL_VERSION.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&crc32(payload).to_le_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+fn decode_portable_record(bytes: &[u8], lsn: u64) -> Result<Record> {
+    if bytes.len() < 20 || &bytes[..8] != PORTABLE_RECORD_MAGIC {
+        return Err(PinkDbError::Execution(
+            "catalog WAL record has invalid PINKREC1 framing".to_string(),
+        ));
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
+    if version != WAL_VERSION {
+        return Err(PinkDbError::Execution(format!(
+            "catalog WAL record version {version} is unsupported (expected {WAL_VERSION})"
+        )));
+    }
+    let len = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes")) as usize;
+    if bytes.len() != 20usize.saturating_add(len) {
+        return Err(PinkDbError::Execution(
+            "catalog WAL record is truncated or has trailing bytes".to_string(),
+        ));
+    }
+    let payload = &bytes[20..];
+    let expected = u32::from_le_bytes(bytes[16..20].try_into().expect("4 bytes"));
+    if crc32(payload) != expected {
+        return Err(PinkDbError::Execution(
+            "catalog WAL record checksum mismatch".to_string(),
+        ));
+    }
+    let (stmts, sets, memo) = decode_payload(payload).map_err(|message| {
+        PinkDbError::Execution(format!("invalid catalog WAL record: {message}"))
+    })?;
+    Ok(Record {
+        lsn,
+        stmts,
+        sets,
+        memo,
+    })
+}
 
 /// u32 framing guard: a payload this long cannot be written as one record.
 fn record_len_guard(len: usize) -> Result<u32> {
@@ -4772,6 +4829,76 @@ impl PinkDb {
         Some(guard.checkpoint_path().to_path_buf())
     }
 
+    /// Drain the portable logical records appended by this handle since the
+    /// previous call. Each item is the same versioned payload as one local
+    /// WAL frame, detached from that file's generation and LSN.
+    pub fn drain_wal_records(&mut self) -> Result<Vec<Vec<u8>>> {
+        let Some(wal) = self.durable_handle() else {
+            return Ok(Vec::new());
+        };
+        let mut wal = wal
+            .lock()
+            .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?;
+        Ok(std::mem::take(&mut wal.portable_records))
+    }
+
+    /// Replay ordered portable WAL records onto this database without
+    /// appending them to its local WAL. Object-backed stores use the object
+    /// sequence as the record LSN.
+    pub fn replay_wal_records(&mut self, records: &[(u64, Vec<u8>)]) -> Result<()> {
+        if self.in_transaction() {
+            return Err(PinkDbError::Execution(
+                "cannot replay catalog WAL records inside a transaction".to_string(),
+            ));
+        }
+        let decoded = records
+            .iter()
+            .map(|(lsn, bytes)| decode_portable_record(bytes, *lsn))
+            .collect::<Result<Vec<_>>>()?;
+        let local_session = self.current_db.clone();
+        let stashed_wal = self.wal.take();
+        self.replaying = true;
+        let result = decoded
+            .iter()
+            .try_for_each(|record| replay_record(self, record));
+        self.replaying = false;
+        self.wal = stashed_wal;
+        if self.database_exists(&local_session) {
+            self.set_current_db(&local_session);
+        } else {
+            let fallback = self.fallback_db();
+            self.set_current_db(&fallback);
+        }
+        result
+    }
+
+    /// Seal one portable WAL record as a `PINKENC1` object. The object
+    /// sequence is authenticated as the container context.
+    pub fn seal_wal_record(record: &[u8], key: &EncryptionKey, sequence: u64) -> Result<Vec<u8>> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (record, key, sequence);
+            Err(crate::crypto::unavailable())
+        }
+        #[cfg(feature = "encryption")]
+        {
+            crate::crypto::seal_container(record, key, sequence)
+        }
+    }
+
+    /// Open a portable WAL record sealed by [`PinkDb::seal_wal_record`].
+    pub fn open_wal_record(record: &[u8], key: &EncryptionKey, sequence: u64) -> Result<Vec<u8>> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (record, key, sequence);
+            Err(crate::crypto::unavailable())
+        }
+        #[cfg(feature = "encryption")]
+        {
+            crate::crypto::open_container(record, key, sequence)
+        }
+    }
+
     /// fsync the WAL (relevant with [`SyncPolicy::Batch`]); no-op in memory.
     /// Takes the lease: with `Batch` a flush is the durability point other
     /// processes wait for.
@@ -5513,6 +5640,36 @@ mod tests {
         // The recovered WAL continues the LSN sequence.
         back.execute("INSERT INTO t VALUES (3, 'z');").unwrap();
         assert_eq!(records_of(&wal_path(&p)).last().unwrap().lsn, 4);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn portable_records_replay_without_relogging() {
+        let p = tmp_ckpt("portable");
+        let mut source = durable(&p);
+        source.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        source.execute("INSERT INTO t VALUES (1);").unwrap();
+        source.execute("INSERT INTO t VALUES (2);").unwrap();
+        let records = source.drain_wal_records().unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(source.drain_wal_records().unwrap().is_empty());
+
+        let mut target = PinkDb::new();
+        let numbered: Vec<_> = records
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| (index as u64 + 1, record))
+            .collect();
+        target.replay_wal_records(&numbered).unwrap();
+        assert_eq!(ints(&mut target, "SELECT a FROM t ORDER BY a"), vec![1, 2]);
+
+        let mut corrupt = numbered[0].1.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let error = PinkDb::new()
+            .replay_wal_records(&[(1, corrupt)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("checksum mismatch"), "{error}");
         cleanup(&p);
     }
 

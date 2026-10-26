@@ -3038,7 +3038,10 @@ impl Lake {
             engine_catalog: self.pending_engine_catalog.clone(),
         };
         self.publish_sql_commit(change)
-            .map_err(PublishFailure::Retry)?;
+            .map_err(|error| match error {
+                conflict @ LakeError::Conflict { .. } => PublishFailure::Retry(conflict),
+                fatal => PublishFailure::Fatal(fatal),
+            })?;
         // The commit record is published; a later save without a new
         // `set_commit_message` must not repeat it.
         self.pending_commit = None;
