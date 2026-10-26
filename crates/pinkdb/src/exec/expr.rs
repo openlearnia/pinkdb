@@ -339,8 +339,7 @@ fn eval_scalar_subquery(
 ) -> Result<Vector> {
     let key = memo_key(query);
     if let Some(Memo::Scalar(v)) = cx.memo.lock().expect("memo").get(&key) {
-        let v = v.clone();
-        return const_vector(v, chunk.num_rows());
+        return const_vector(v.clone(), chunk.num_rows());
     }
     let out = eval(cx, query)?;
     let mut rows = 0usize;
@@ -384,7 +383,10 @@ fn eval_in_subquery(
     let out = eval(cx, query)?;
     let rhs_t = out.types.first().copied().unwrap_or(DataType::Integer);
     let common = common_numeric(l.dtype(), rhs_t).ok();
-    let mut set = FastSet::default();
+    // Reserve the whole result up front: a large IN set (one entry per row)
+    // otherwise rehashes ~log2(n) times while the filter scans the outer side.
+    let rows: usize = out.chunks.iter().map(|c| c.num_rows()).sum();
+    let mut set = FastSet::with_capacity_and_hasher(rows, Default::default());
     let mut has_null = false;
     let mut buf = Vec::new();
     for c in &out.chunks {
@@ -459,8 +461,7 @@ fn eval_exists(
 ) -> Result<Vector> {
     let key = memo_key(query);
     if let Some(Memo::Flag(b)) = cx.memo.lock().expect("memo").get(&key) {
-        let b = *b;
-        return const_vector(Value::Boolean(b != negated), chunk.num_rows());
+        return const_vector(Value::Boolean(*b != negated), chunk.num_rows());
     }
     let out = eval(cx, query)?;
     let any = out.chunks.iter().any(|c| c.num_rows() > 0);

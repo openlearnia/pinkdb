@@ -2793,6 +2793,88 @@ pub(crate) fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
     }
 }
 
+/// Rewrite every column index in `expr` through `f` (used when a join's
+/// inputs are reordered, so a predicate still reads the same values).
+pub(crate) fn map_columns(expr: BoundExpr, f: &dyn Fn(usize) -> usize) -> BoundExpr {
+    match expr {
+        BoundExpr::Column { index, dtype } => BoundExpr::Column {
+            index: f(index),
+            dtype,
+        },
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => BoundExpr::InSubquery {
+            expr: Box::new(map_columns(*expr, f)),
+            query,
+            negated,
+        },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(map_columns(*expr, f)),
+            dtype,
+        },
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => BoundExpr::Case {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| (map_columns(c, f), map_columns(v, f)))
+                .collect(),
+            else_: else_.map(|e| Box::new(map_columns(*e, f))),
+            dtype,
+        },
+        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+            args: args.into_iter().map(|a| map_columns(a, f)).collect(),
+            dtype,
+        },
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => BoundExpr::Binary {
+            op,
+            left: Box::new(map_columns(*left, f)),
+            right: Box::new(map_columns(*right, f)),
+            dtype,
+        },
+        BoundExpr::Not(e) => BoundExpr::Not(Box::new(map_columns(*e, f))),
+        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
+            expr: Box::new(map_columns(*expr, f)),
+            dtype,
+        },
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(map_columns(*expr, f)),
+            negated,
+        },
+        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+            func,
+            args: args.into_iter().map(|a| map_columns(a, f)).collect(),
+            dtype,
+        },
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => BoundExpr::DynamicScalar {
+            name,
+            args: args
+                .into_vec()
+                .into_iter()
+                .map(|a| map_columns(a, f))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            dtype,
+            reads,
+        },
+        leaf => leaf,
+    }
+}
+
 /// Output names/types of an Aggregate node (keys then aggs). Shared by the
 /// executor and the binder's schema inference.
 pub(crate) fn agg_output_schema(

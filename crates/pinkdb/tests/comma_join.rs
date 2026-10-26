@@ -1,0 +1,137 @@
+//! Wave 111: a comma join (`FROM a, b WHERE a.k = b.k`) must hash, not
+//! materialize the cross product. The optimizer extracts crossing equalities
+//! into hash keys and keeps every other predicate; these tests pin that the
+//! answer is unchanged.
+
+use pinkdb::{PinkDb, QueryResult, Value};
+
+fn db() -> PinkDb {
+    let mut db = PinkDb::new();
+    for stmt in [
+        "CREATE TABLE l (k INTEGER, q INTEGER);",
+        "INSERT INTO l VALUES (1,10),(2,20),(3,NULL),(4,40);",
+        "CREATE TABLE r (k INTEGER, v VARCHAR);",
+        "INSERT INTO r VALUES (1,'a'),(2,'b'),(3,'c'),(5,'e'),(NULL,'n');",
+    ] {
+        db.execute(stmt).unwrap();
+    }
+    db
+}
+
+fn rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
+    match db.execute(sql).unwrap().pop().unwrap() {
+        QueryResult::Selected { rows, .. } => rows,
+        other => panic!("expected rows from {sql}, got {other:?}"),
+    }
+}
+
+fn explain(db: &mut PinkDb, sql: &str) -> String {
+    rows(db, &format!("EXPLAIN {sql};"))
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Varchar(s) => s.clone(),
+            other => panic!("expected EXPLAIN text, got {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn comma_join_returns_the_same_rows_as_explicit_join() {
+    let mut db = db();
+    for (comma, explicit) in [
+        (
+            "SELECT l.k, r.v FROM l, r WHERE l.k = r.k ORDER BY l.k",
+            "SELECT l.k, r.v FROM l JOIN r ON l.k = r.k ORDER BY l.k",
+        ),
+        (
+            "SELECT count(*), sum(l.q) FROM l, r WHERE l.k = r.k AND r.v <> 'b'",
+            "SELECT count(*), sum(l.q) FROM l JOIN r ON l.k = r.k WHERE r.v <> 'b'",
+        ),
+        (
+            "SELECT l.k, r.v FROM l, r, l l2 WHERE l.k = r.k AND l2.k = r.k ORDER BY l.k",
+            "SELECT l.k, r.v FROM l JOIN r ON l.k = r.k JOIN l l2 ON l2.k = r.k ORDER BY l.k",
+        ),
+    ] {
+        assert_eq!(rows(&mut db, comma), rows(&mut db, explicit), "{comma}");
+    }
+    // Pinned rows, so a shared drift cannot hide behind the comparison.
+    let got = rows(
+        &mut db,
+        "SELECT l.k, r.v FROM l, r WHERE l.k = r.k ORDER BY l.k",
+    );
+    let want = vec![
+        vec![Value::Integer(1), Value::Varchar("a".into())],
+        vec![Value::Integer(2), Value::Varchar("b".into())],
+        vec![Value::Integer(3), Value::Varchar("c".into())],
+    ];
+    assert_eq!(got, want);
+}
+
+#[test]
+fn comma_join_plans_a_hash_join_and_keeps_residuals_above_it() {
+    let mut db = db();
+    let plan = explain(&mut db, "SELECT l.k FROM l, r WHERE l.k = r.k");
+    assert!(plan.contains("Join inner on [#0=#0]"), "{plan}");
+    assert!(!plan.contains("NestedLoopJoin"), "{plan}");
+
+    // A predicate that spans both sides is not a key and must stay a filter.
+    let plan = explain(
+        &mut db,
+        "SELECT l.k FROM l, r WHERE l.k = r.k AND l.q > length(r.v)",
+    );
+    assert!(plan.contains("Join inner on [#0=#0]"), "{plan}");
+    assert!(plan.contains("Filter"), "{plan}");
+}
+
+/// An outer join's condition on its *preserved* side must not become a filter
+/// on that side: it decides which rows match, not which rows survive. Pinned
+/// against DuckDB 2.0 (`a LEFT JOIN b ON a.k = b.k AND a.x > 5` keeps every
+/// row of `a`, NULL-extending the ones that fail the condition).
+#[test]
+fn an_outer_joins_preserved_side_condition_keeps_every_preserved_row() {
+    let mut db = PinkDb::new();
+    for stmt in [
+        "CREATE TABLE a (k INTEGER, x INTEGER);",
+        "CREATE TABLE b (k INTEGER, y INTEGER);",
+        "INSERT INTO a VALUES (1,1),(2,10);",
+        "INSERT INTO b VALUES (1,100),(2,200);",
+    ] {
+        db.execute(stmt).unwrap();
+    }
+    let left = rows(
+        &mut db,
+        "SELECT a.k, a.x, b.y FROM a LEFT JOIN b ON a.k = b.k AND a.x > 5 ORDER BY a.k;",
+    );
+    assert_eq!(
+        left,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Integer(10), Value::Integer(200)],
+        ]
+    );
+    let right = rows(
+        &mut db,
+        "SELECT a.k, b.y FROM b RIGHT JOIN a ON a.k = b.k AND a.x > 5 ORDER BY a.k;",
+    );
+    assert_eq!(
+        right,
+        vec![
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Integer(200)],
+        ]
+    );
+    // The null-supplying side's condition may still move into that side: the
+    // join hashes and the answer is the same as DuckDB's.
+    let pushed = rows(
+        &mut db,
+        "SELECT a.k, b.y FROM a LEFT JOIN b ON a.k = b.k AND b.y > 150 ORDER BY a.k;",
+    );
+    assert_eq!(
+        pushed,
+        vec![
+            vec![Value::Integer(1), Value::Null],
+            vec![Value::Integer(2), Value::Integer(200)],
+        ]
+    );
+}

@@ -138,6 +138,7 @@ NAV = [
         "title": "Project",
         "section": "roadmap",
         "items": [
+            {"key": "benchmarks", "label": "Benchmarks", "out": "docs/benchmarks.html"},
             {"key": "roadmap", "label": "Roadmap", "out": "docs/roadmap.html"},
             {"key": "changelog", "label": "Changelog", "out": "docs/changelog.html"},
         ],
@@ -414,6 +415,17 @@ PAGES = {
             "planned: TLS, RBAC, async object storage, wasm extensions, the "
             "Rust extension SDK, and core json/string/math/datetime "
             "extensions."
+        ),
+    },
+    "benchmarks.html": {
+        "out": "docs/benchmarks.html",
+        "nav": "benchmarks",
+        "title": "Benchmarks — pinkdb",
+        "description": (
+            "pinkdb against DuckDB on TPC-H SF 0.1 and SF 1, CSV and Parquet "
+            "ingest, durable writes, lake attach, FTS and HNSW: the method, "
+            "the machine, the tables, and an honest account of where pinkdb "
+            "is slower and why."
         ),
     },
     "changelog.html": {

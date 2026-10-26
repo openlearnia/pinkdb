@@ -1,0 +1,121 @@
+<h1>Benchmarks</h1>
+
+<p class="doc-meta">Every number here comes from <code>bench/suite</code>, the
+suite in this repository, run on one quiet machine. pinkdb is compared with
+DuckDB v2.0.0 on the same data, the same thread count and the same warm cache.
+The suite records the machine, the git commit, the load average and every raw
+timing, so any table below can be reproduced or disputed.</p>
+
+<h2>The short version</h2>
+
+<table>
+  <thead>
+    <tr><th>Workload</th><th>pinkdb</th><th>DuckDB</th><th>Ratio</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>TPC-H SF 1, 16 supported queries (geomean)</td>
+        <td>—</td><td>—</td><td>32× slower (15 queries)</td></tr>
+    <tr><td>TPC-H SF 0.1, 16 supported queries (geomean)</td>
+        <td>—</td><td>—</td><td>8.6× slower</td></tr>
+    <tr><td>TPC-H Q1, SF 1</td><td>156 ms</td><td>13 ms</td><td>12×</td></tr>
+    <tr><td>TPC-H Q6, SF 1</td><td>79 ms</td><td>3 ms</td><td>26×</td></tr>
+    <tr><td>TPC-H Q13, SF 1</td><td>439 ms</td><td>38 ms</td><td>12×</td></tr>
+    <tr><td>TPC-H Q9, SF 1</td><td>659 ms</td><td>26 ms</td><td>25×</td></tr>
+    <tr><td>TPC-H Q7, SF 1</td><td>1.20 s</td><td>9 ms</td><td>133×</td></tr>
+    <tr><td>CSV ingest, lineitem SF 0.1</td><td>2.07 M rows/s</td>
+        <td>1.66 M rows/s</td><td>1.2× faster</td></tr>
+    <tr><td>Parquet ingest, lineitem SF 0.1</td><td>1.20 M rows/s</td>
+        <td>5.41 M rows/s</td><td>4.5× slower</td></tr>
+    <tr><td>Single-row autocommit inserts</td><td>113k rows/s</td>
+        <td>—</td><td>—</td></tr>
+    <tr><td>Batched inserts</td><td>363k rows/s</td>
+        <td>—</td><td>—</td></tr>
+    <tr><td>Lake open, <code>pink:</code> catalog (SF 0.1)</td>
+        <td>20 ms</td><td>—</td><td>—</td></tr>
+    <tr><td>Lake open, <code>pink+s3://</code> (mock S3)</td>
+        <td>85 ms</td><td>—</td><td>—</td></tr>
+    <tr><td>FTS index build, 100k documents</td><td>824 ms</td>
+        <td>—</td><td>—</td></tr>
+    <tr><td>FTS top-10 query, 100k documents</td><td>&lt;1 ms</td>
+        <td>—</td><td>—</td></tr>
+    <tr><td>HNSW build, 100k × 768, 1 thread</td><td>117.3 s</td>
+        <td>—</td><td>—</td></tr>
+    <tr><td>HNSW build, 100k × 768, 8 threads</td><td>24.0 s</td>
+        <td>—</td><td>—</td></tr>
+    <tr><td>HNSW recall@10, <code>ef_search=128</code></td><td>0.961</td>
+        <td>—</td><td>—</td></tr>
+    <tr><td>Default binary</td><td>5.4 MB</td><td>—</td><td>—</td></tr>
+    <tr><td>CLI start-up</td><td>5.2 ms</td><td>—</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<p>The six TPC-H queries not listed (2, 4, 17, 20, 21, 22) use correlated
+subqueries. pinkdb's binder refuses those on purpose, with a clear error; they
+are missing features, not slow ones.</p>
+
+<h2>Method</h2>
+
+<p>The suite generates TPC-H with DuckDB's built-in <code>dbgen</code>, writes
+the eight tables to Parquet, and loads that <em>same</em> Parquet into a
+<code>.pink</code> store and into a DuckDB database. Each query runs in a fresh
+process against the warm store; the suite discards one warm-up run and reports
+the median of five. Both engines get eight worker threads
+(<code>RAYON_NUM_THREADS</code> and <code>SET threads</code>). Row counts and a
+checksum of every answer are compared across the two engines, so a fast wrong
+answer cannot enter the table.</p>
+
+<p>The machine was an Apple M4 (10 cores, 17 GB RAM, macOS 27.0.1, rustc
+1.97.1, DuckDB v2.0.0 <code>d54cbbe3df</code>). Load average stayed between 1.8
+and 4.3 and is recorded in the JSON. DuckDB's timer has 1 ms resolution, so its
+smallest figures are upper bounds; pinkdb's column is reported the same way,
+rounded to the millisecond.</p>
+
+<h2>Where pinkdb is slower, and why</h2>
+
+<p>The join operator is the honest answer for TPC-H. pinkdb copies rows into
+new vectors at every hash-join probe; DuckDB's probe writes only the surviving
+selection vector. pinkdb's hash join also builds on the input the plan happens
+to put on the right, which for several TPC-H queries is the large side. The
+optimizer now rewrites comma joins into hash joins and derives per-table
+filters from an <code>OR</code> of conjunctions (that is what halved Q7 at SF
+0.1), but it still has no statistics or cost model, so it cannot reorder a
+six-table join the way DuckDB's query graph does.</p>
+
+<p>Q7 remains the worst gap because both nation filters start above a join
+rather than on a scan, and the join that needs them most is built on the wrong
+side. Q18 is dominated by materialising 1.5 million group keys for an
+<code>IN</code> subquery. Q1 and Q6 are scan-bound: pinkdb's filter and
+aggregate paths are vectorised but do not use DuckDB's perfect-hash or
+selection-vector tricks, which is most of the 8–26× gap on those queries.</p>
+
+<p>Ingest is mixed: pinkdb's CSV reader is faster than DuckDB's on a wide
+lineitem file, while its Parquet reader is about 4.6× slower because DuckDB
+reads and decodes in larger parallel batches. The durable-write numbers have no
+DuckDB comparison: DuckDB has no per-statement WAL with fsync policies, so
+there is nothing to compare against.</p>
+
+<h2>Reproduce it</h2>
+
+<pre class="code" data-lang="sh"><code># the default: TPC-H SF 0.1, every family, about ten minutes
+bench/suite/run.sh
+
+# one family at SF 1 (needs ~1 GB per engine and a quiet machine)
+bench/suite/run.sh --only tpch --scale 1
+
+# the CI guard: 60k rows, no DuckDB, compares against the committed baseline
+python3 bench/suite/run.py --only ci</code></pre>
+
+<p>Results land in <code>bench/suite/results/&lt;date&gt;-&lt;commit&gt;.json</code>
+with a Markdown summary beside it. <code>--only</code> takes any comma-separated
+subset of <code>tpch,ingest,durable,lake,search,footprint,ci</code>;
+<code>--work-dir</code> keeps the generated stores for a rerun. Nothing in the
+suite downloads data or installs a DuckDB extension.</p>
+
+<h2>What is not measured</h2>
+
+<p>DuckDB's <code>fts</code> and <code>vss</code> extensions need
+<code>INSTALL</code>, which this project does not run without an explicit
+go-ahead, so the search family has no cross-engine comparison yet. Join-order
+enumeration, a build-side choice driven by cardinalities, and a cheaper
+<code>IN</code>-subquery path are the known next steps; each is a ROADMAP row,
+not a hidden caveat in these tables.</p>

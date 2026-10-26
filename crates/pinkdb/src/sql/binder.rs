@@ -1022,7 +1022,7 @@ fn distinct_from_bound(op: BinaryOp, l: BoundExpr, r: BoundExpr) -> BoundExpr {
     }
 }
 
-fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
+pub(crate) fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
     if (is_numeric(l) && is_numeric(r))
         || (l == DataType::Varchar && r == DataType::Varchar)
         || (l == DataType::Date && r == DataType::Date)
@@ -2179,10 +2179,11 @@ impl<'a> Binder<'a> {
                     ));
                 }
                 let dtype = schema[0].1;
-                Ok(BoundExpr::ScalarSubquery {
-                    query: Box::new(query),
-                    dtype,
-                })
+                // The optimizer does not descend into a subquery body later,
+                // so optimize it here or it keeps the binder's nested-loop
+                // joins.
+                let query = optimize_subquery(child.db, query);
+                Ok(BoundExpr::ScalarSubquery { query, dtype })
             }
             Expr::InSubquery {
                 expr,
@@ -2215,7 +2216,7 @@ impl<'a> Binder<'a> {
                 })?;
                 Ok(BoundExpr::InSubquery {
                     expr: Box::new(bound),
-                    query: Box::new(sub),
+                    query: optimize_subquery(child.db, sub),
                     negated: *negated,
                 })
             }
@@ -2223,7 +2224,7 @@ impl<'a> Binder<'a> {
                 let mut child = self.child();
                 let sub = bind_select_in(child.db, &mut child, query)?;
                 Ok(BoundExpr::Exists {
-                    query: Box::new(sub),
+                    query: optimize_subquery(child.db, sub),
                     negated: *negated,
                 })
             }
@@ -4959,7 +4960,7 @@ fn and_all(mut exprs: Vec<BoundExpr>) -> Option<BoundExpr> {
 /// Try to read a conjunct as a crossing equality: one side references only
 /// the accumulated left (indices < `left_cols`), the other only the just-added
 /// right (indices >= `left_cols`). Returns the pair as side-relative keys.
-fn equi_pair(conjunct: &BoundExpr, left_cols: usize) -> Option<(BoundExpr, BoundExpr)> {
+pub(crate) fn equi_pair(conjunct: &BoundExpr, left_cols: usize) -> Option<(BoundExpr, BoundExpr)> {
     let BoundExpr::Binary {
         op: BinaryOp::Eq,
         left,
@@ -8038,6 +8039,15 @@ fn branch_has_trailing_clause(sel: &Select) -> bool {
 /// ORDER BY/LIMIT/OFFSET (written after the last branch) apply to the whole
 /// set operation.
 ///
+/// Optimize a subquery body at bind time. The top-level optimizer does not
+/// descend into `BoundExpr` subqueries, so without this a subquery keeps the
+/// binder's nested-loop joins. Return a box so the large plan temporary never
+/// sits in the recursive `bind_expr` frame.
+#[inline(never)]
+fn optimize_subquery(db: &PinkDb, plan: LogicalPlan) -> Box<LogicalPlan> {
+    Box::new(crate::optimizer::optimize(db, plan))
+}
+
 /// Every query context (statement, derived table, CTE body, view, subquery)
 /// must enter here: `bind_select_with` binds a single branch and ignores
 /// `unions`.

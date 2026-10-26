@@ -668,3 +668,35 @@ jobs:
         run: |
           scripts/check-website.sh \
             || { echo "::error::website output is stale — run python3 website/build.py (it also regenerates the changelog page) and commit the result"; exit 1; }
+
+  # Benchmark guard: TPC-H SF 0.01 plus a few micro-benchmarks, compared with
+  # `bench/suite/baseline-ci.json`. Deliberately non-blocking — a shared
+  # GitHub runner is noisy, so a 2x slowdown is a signal to investigate, not a
+  # merge gate. The family is DuckDB-free: it generates its own 60k-row data,
+  # so no extension install or download is involved.
+  bench-regression:
+    name: benchmark regression
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: bench
+
+      # The baseline records the size of this exact feature set, so the guard
+      # must measure the same binary.
+      - name: build the measured CLI
+        run: |
+          cargo build --release -p pinkdb-cli \
+            --features pinklake,s3,catalog-sqlite,catalog-s3,parquetlake,parquet,fts,vss
+
+      - name: run the guard
+        run: python3 bench/suite/run.py --only ci --skip-build

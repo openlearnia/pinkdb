@@ -16,8 +16,30 @@ use pinkdb::{CHUNK_SIZE, DataTable, DataType, PinkDb, Value, Vector};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Unique scratch directory for one test.
-fn scratch(tag: &str) -> PathBuf {
+/// Unique scratch directory for one test, removed when the guard drops —
+/// including when the test panics, so a failure leaves no litter behind.
+struct ScratchDir(PathBuf);
+
+impl std::ops::Deref for ScratchDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for ScratchDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(tag: &str) -> ScratchDir {
     let dir = std::env::temp_dir().join(format!(
         "pink_lake_{tag}_{}_{}",
         std::process::id(),
@@ -25,11 +47,7 @@ fn scratch(tag: &str) -> PathBuf {
     ));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn cleanup(dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir);
+    ScratchDir(dir)
 }
 
 /// The helper catalog's `pink:` database path.
@@ -228,7 +246,6 @@ fn versions_accumulate_and_old_versions_stay_loadable() {
             ("main.t".to_string(), 4),
         ]
     );
-    cleanup(&dir);
 }
 
 #[test]
@@ -246,7 +263,6 @@ fn database_names_with_a_dot_are_refused_cleanly() {
     // The failed save published nothing.
     assert_eq!(lake.current_version(), 1);
     assert_eq!(lake.versions().unwrap(), vec![1]);
-    cleanup(&dir);
 }
 
 #[test]
@@ -272,7 +288,6 @@ fn table_names_stay_inside_the_data_directory() {
     segments.sort();
     assert_eq!(segments, vec!["main...", "main.a%2Fb", "main.odd%20name"]);
     assert_eq!(data_files(&dir.join("data")).len(), 3);
-    cleanup(&dir);
 }
 
 #[test]
@@ -297,7 +312,6 @@ fn empty_databases_and_dropped_main_are_documented_v1_limits() {
         loaded.table_in("only", "t").unwrap().get(0, 0),
         Some(Value::Integer(5))
     );
-    cleanup(&dir);
 }
 
 #[test]
@@ -343,7 +357,6 @@ fn save_rejects_unrepresentable_stores_before_creating_a_lake() {
     assert_eq!(save_store_lake(&ok, &lake_dir).unwrap(), 2);
     let lake = open_lake(&lake_dir).unwrap();
     assert_eq!(lake.load(None).unwrap().list_tables().len(), 1);
-    cleanup(&dir);
 }
 
 #[cfg(unix)]
@@ -370,7 +383,6 @@ fn missing_data_files_are_reported_but_metadata_still_reads() {
     assert!(lake.tables().unwrap().iter().any(|(k, _)| k == "main.t"));
     let err = lake.load(None).unwrap_err().to_string();
     assert!(err.contains("loading data file"), "{err}");
-    cleanup(&dir);
 }
 
 #[test]
@@ -434,7 +446,6 @@ fn pink_roundtrip_preserves_every_bit_pattern() {
         Some(Value::Varchar("héllo wörld 🌍\0embedded".into()))
     );
     assert_eq!(fid.get(5, 4), Some(Value::Varchar(String::new())));
-    cleanup(&dir);
 }
 
 #[test]
@@ -457,7 +468,6 @@ fn a_corrupt_pink_data_file_is_a_clear_error() {
 
     // Metadata still reads; only a load fails.
     assert!(lake.tables().unwrap().iter().any(|(k, _)| k == "main.fid"));
-    cleanup(&dir);
 }
 
 #[test]
@@ -583,7 +593,6 @@ fn extreme_values_and_chunk_shapes_roundtrip() {
         store_bytes(&loaded, &dir, "loaded"),
         store_bytes(&db, &dir, "orig")
     );
-    cleanup(&dir);
 }
 
 #[test]
@@ -611,7 +620,6 @@ fn csv_import_chunk_boundaries_roundtrip() {
     // The CSV loader's chunk boundary (full chunk + remainder) is the same
     // after a `.pink` round-trip.
     assert_eq!(sizes(loaded.table("t").unwrap()), vec![CHUNK_SIZE, 123]);
-    cleanup(&dir);
 }
 
 /// Query `db` and return the rows bit-exactly (NaN payloads and `-0.0`
@@ -739,7 +747,6 @@ fn attach_of_the_fidelity_store_matches_the_loaded_store() {
         let b = select_rows(&mut mut_loaded, &sql);
         assert_rows_bit_same(&a, &b, &sql);
     }
-    cleanup(&dir);
 }
 
 /// Attach reads the requested version only, and stays pinned to it however
@@ -775,7 +782,6 @@ fn attach_is_pinned_to_the_requested_version() {
         select_rows(&mut attached, "SELECT COUNT(*) FROM t;"),
         vec![vec![Value::Bigint(3)]]
     );
-    cleanup(&dir);
 }
 
 // ---------- time travel and snapshot records (wave 64) ----------
@@ -783,7 +789,7 @@ fn attach_is_pinned_to_the_requested_version() {
 /// A three-version lake: v2 holds `t` with two rows, v3 adds a row, v4 adds
 /// another. Returns `(scratch, lake_dir, versions)` where `versions` is the
 /// per-version record list read through [`Lake::snapshots`].
-fn time_travel_lake(tag: &str) -> (PathBuf, PathBuf, Vec<pink_lake::SnapshotInfo>) {
+fn time_travel_lake(tag: &str) -> (ScratchDir, PathBuf, Vec<pink_lake::SnapshotInfo>) {
     let dir = scratch(tag);
     let lake_dir = dir.join("lake");
     let mut db = PinkDb::new();
@@ -818,7 +824,7 @@ fn try_rows(db: &mut PinkDb, sql: &str) -> Result<Vec<Vec<Value>>, String> {
 /// current version is unchanged by any number of time-travel reads.
 #[test]
 fn time_travel_reads_exact_old_versions() {
-    let (dir, lake_dir, records) = time_travel_lake("tt_versions");
+    let (_dir, lake_dir, records) = time_travel_lake("tt_versions");
     assert_eq!(
         records.iter().map(|r| r.version).collect::<Vec<_>>(),
         vec![1, 2, 3, 4]
@@ -889,14 +895,13 @@ fn time_travel_reads_exact_old_versions() {
         try_rows(&mut db, "SELECT COUNT(*) FROM t;").unwrap(),
         vec![vec![Value::Bigint(4)]]
     );
-    cleanup(&dir);
 }
 
 /// `AT (TIMESTAMP => …)` resolves to the newest snapshot at or before the
 /// timestamp, inclusively; before the first snapshot it is a clean error.
 #[test]
 fn time_travel_timestamp_resolves_inclusively() {
-    let (dir, lake_dir, records) = time_travel_lake("tt_timestamp");
+    let (_dir, lake_dir, records) = time_travel_lake("tt_timestamp");
     // The writer's millisecond times must be strictly increasing across the
     // three saves for this test to have a single right answer; the 5 ms
     // sleeps make that true, and a failure here is a real (not flaky-time)
@@ -989,14 +994,13 @@ fn time_travel_timestamp_resolves_inclusively() {
         try_rows(&mut db, "SELECT COUNT(*) FROM t;").unwrap(),
         vec![vec![Value::Bigint(4)]]
     );
-    cleanup(&dir);
 }
 
 /// Unknown, unpublished and out-of-range versions are clean errors, and the
 /// session keeps answering afterwards.
 #[test]
 fn time_travel_unknown_versions_are_clean_errors() {
-    let (dir, lake_dir, _) = time_travel_lake("tt_unknown");
+    let (_dir, lake_dir, _) = time_travel_lake("tt_unknown");
     let report = open_lake(&lake_dir).unwrap().attach(None).unwrap();
     let mut db = PinkDb::new();
     db.attach_lake(report.lake.clone()).unwrap();
@@ -1041,7 +1045,6 @@ fn time_travel_unknown_versions_are_clean_errors() {
         err.contains("later") && err.contains("does not exist at version 2"),
         "{err}"
     );
-    cleanup(&dir);
 }
 
 /// Statistics fast paths work per version: `COUNT(*)`/`MIN`/`MAX` over
@@ -1049,7 +1052,7 @@ fn time_travel_unknown_versions_are_clean_errors() {
 /// while a filtered read decodes that version's file and caches it.
 #[test]
 fn time_travel_stats_fast_paths_do_not_decode() {
-    let (dir, lake_dir, _) = time_travel_lake("tt_stats");
+    let (_dir, lake_dir, _) = time_travel_lake("tt_stats");
     let report = open_lake(&lake_dir).unwrap().attach(None).unwrap();
     let lake = Arc::clone(&report.lake);
     let mut db = PinkDb::new();
@@ -1093,14 +1096,13 @@ fn time_travel_stats_fast_paths_do_not_decode() {
         vec![vec![Value::Bigint(4)]]
     );
     assert_eq!(lake.decode_stats().0, 2);
-    cleanup(&dir);
 }
 
 /// Time travel never reaches past the version an attachment is pinned to,
 /// and the pinned version is served by the attachment itself.
 #[test]
 fn time_travel_is_capped_at_the_attached_version() {
-    let (dir, lake_dir, _) = time_travel_lake("tt_capped");
+    let (_dir, lake_dir, _) = time_travel_lake("tt_capped");
     let report = open_lake(&lake_dir).unwrap().attach(Some(2)).unwrap();
     assert_eq!(report.version, 2);
     let mut db = PinkDb::new();
@@ -1124,7 +1126,6 @@ fn time_travel_is_capped_at_the_attached_version() {
         try_rows(&mut db, "SELECT COUNT(*) FROM t AT (VERSION => 2);").unwrap(),
         vec![vec![Value::Bigint(2)]]
     );
-    cleanup(&dir);
 }
 
 #[test]
@@ -1145,7 +1146,6 @@ fn save_store_creates_open_or_create_and_errors_are_clear() {
     assert!(err.contains("already a pink lake"), "{err}");
     let err = open_lake(&dir).unwrap_err().to_string();
     assert!(err.contains("not a pink lake"), "{err}");
-    cleanup(&dir);
 }
 
 #[test]
@@ -1193,9 +1193,6 @@ fn a_table_entry_can_list_several_data_files() {
         loaded.table("t").unwrap().get(4, 1),
         Some(Value::Varchar("v4".into()))
     );
-
-    cleanup(&dir);
-    cleanup(&other);
 }
 
 #[test]
@@ -1226,7 +1223,6 @@ fn stale_handles_conflict_instead_of_forking_the_version_chain() {
     assert_eq!(b.current_version(), 3);
     assert_eq!(b.write_from_store(&db).unwrap(), 4);
     assert_eq!(a.load(Some(3)).unwrap().table("t").unwrap().num_rows(), 3);
-    cleanup(&dir);
 }
 
 #[cfg(unix)]
@@ -1248,7 +1244,6 @@ fn a_failed_data_write_keeps_the_published_version() {
         // failure cannot be injected, so there is nothing to assert.
         std::fs::remove_file(t_dir.join("probe")).ok();
         std::fs::set_permissions(&t_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        cleanup(&dir);
         return;
     }
     let err = lake.write_from_store(&db).unwrap_err().to_string();
@@ -1260,7 +1255,6 @@ fn a_failed_data_write_keeps_the_published_version() {
     std::fs::set_permissions(&t_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(lake.write_from_store(&db).unwrap(), 3);
     assert_same_store(&db, &lake.load(None).unwrap());
-    cleanup(&dir);
 }
 
 /// Commit messages and change summaries are recorded per version, cleared
@@ -1353,7 +1347,6 @@ fn snapshot_records_carry_messages_and_change_summaries() {
             .all(|r| r.message.as_deref() != Some("retry me")),
         "the failed save's pending record must not publish"
     );
-    cleanup(&dir);
 }
 
 /// Attach refusals: not a lake, a v1 lake, a missing data file, a row-count
@@ -1441,7 +1434,6 @@ fn attach_refusals_are_clean_errors() {
     let union_rows = attached.load(&table.db, &table.table).unwrap();
     assert_eq!(union_rows.num_rows() as u64, original * 2);
     let _ = first_rows;
-    cleanup(&dir);
 }
 
 #[test]
@@ -1452,13 +1444,12 @@ fn an_interrupted_create_is_healed_not_bricked() {
     // its first transaction leaves an empty `pink:` DB. Opening it as a lake
     // says "not a lake"; open-or-create initializes it instead of bricking.
     let catalog = catalog_path(&dir);
-    std::fs::create_dir_all(dir.clone()).unwrap();
+    std::fs::create_dir_all(&*dir).unwrap();
     drop(PinkDb::open_durable(&catalog.display().to_string()).unwrap());
     let mut lake = open_or_create_lake(&dir).unwrap();
     assert_eq!(lake.current_version(), 1);
     assert_eq!(lake.write_from_store(&db).unwrap(), 2);
     assert_eq!(lake.load(None).unwrap().table("t").unwrap().num_rows(), 3);
-    cleanup(&dir);
 }
 
 /// M-5: every lake artifact a save publishes is owner-only (0600), and an
@@ -1514,7 +1505,6 @@ fn lake_artifacts_are_owner_only_and_existing_ones_are_tightened() {
     let _lake = open_lake(&dir).unwrap();
     assert_eq!(mode(&catalog), 0o600, "catalog was not tightened on open");
     assert_eq!(mode(&data), 0o600, "data file was not tightened on open");
-    cleanup(&dir);
 }
 
 #[test]

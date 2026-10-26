@@ -16,10 +16,10 @@
 //!   rule and its caveat.
 
 use crate::exec::expr::eval_expr;
-use crate::plan::{LogicalPlan, shift_columns};
+use crate::plan::{LogicalPlan, map_columns, shift_columns};
 use crate::sql::ast::{BinaryOp, JoinKind};
 use crate::sql::binder::BoundExpr;
-use crate::types::DataType;
+use crate::types::{DataType, Value};
 use crate::vector::DataChunk;
 
 /// Optimize a bound plan: constant folding + predicate pushdown + FK→PK join
@@ -28,7 +28,7 @@ use crate::vector::DataChunk;
 /// stored data — only column-free expressions are evaluated) and for the
 /// declarative constraints the elimination rule reads.
 pub fn optimize(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
-    let plan = pushdown(fold_plan(db, plan));
+    let plan = pushdown_inner(fold_plan(db, plan), Some(db));
     let plan = apply_vector_topk(db, plan);
     let plan = eliminate_fk_joins(db, plan);
     let plan = drop_count_star_projections(plan);
@@ -802,6 +802,542 @@ fn and_all(mut exprs: Vec<BoundExpr>) -> Option<BoundExpr> {
     Some(acc)
 }
 
+/// The value a conjunct pins column `c` to with `=`, if it does.
+fn eq_const(atom: &BoundExpr, c: usize) -> Option<&Value> {
+    let BoundExpr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = atom
+    else {
+        return None;
+    };
+    match (&**left, &**right) {
+        (BoundExpr::Column { index, .. }, BoundExpr::Literal(v)) if *index == c => Some(v),
+        (BoundExpr::Literal(v), BoundExpr::Column { index, .. }) if *index == c => Some(v),
+        _ => None,
+    }
+}
+
+/// The literal bound on column `c` for `>=` / `<=`, if the column is on the
+/// left (the binder puts it there).
+fn range_const(atom: &BoundExpr, c: usize, op: BinaryOp) -> Option<&Value> {
+    let BoundExpr::Binary {
+        op: got,
+        left,
+        right,
+        ..
+    } = atom
+    else {
+        return None;
+    };
+    if *got != op {
+        return None;
+    }
+    match (&**left, &**right) {
+        (BoundExpr::Column { index, .. }, BoundExpr::Literal(v)) if *index == c => Some(v),
+        _ => None,
+    }
+}
+
+fn value_num(v: &Value) -> Option<f64> {
+    match v {
+        Value::Integer(i) => Some(*i as f64),
+        Value::Bigint(i) => Some(*i as f64),
+        Value::Double(f) => Some(*f),
+        Value::Decimal(i, s) => Some(*i as f64 / 10f64.powi(*s as i32)),
+        Value::Date(d) => Some(*d as f64),
+        Value::Timestamp(t) => Some(*t as f64),
+        _ => None,
+    }
+}
+
+/// Disjunctive normal form: each term is a conjunction of the atoms it kept.
+/// Returns false once the term count would exceed `cap`, so a pathological
+/// `OR` chain cannot blow up the plan.
+fn dnf_terms<'a>(e: &'a BoundExpr, terms: &mut Vec<Vec<&'a BoundExpr>>, cap: usize) -> bool {
+    match e {
+        BoundExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            // Disjunction concatenates: each branch contributes its own terms.
+            let mut l = Vec::new();
+            let mut r = Vec::new();
+            if !dnf_terms(left, &mut l, cap) || !dnf_terms(right, &mut r, cap) {
+                return false;
+            }
+            if l.len() + r.len() > cap {
+                return false;
+            }
+            l.extend(r);
+            *terms = l;
+            true
+        }
+        BoundExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            let mut l = Vec::new();
+            let mut r = Vec::new();
+            if !dnf_terms(left, &mut l, cap) || !dnf_terms(right, &mut r, cap) {
+                return false;
+            }
+            if l.len().saturating_mul(r.len()) > cap {
+                return false;
+            }
+            let mut out = Vec::with_capacity(l.len() * r.len());
+            for a in l {
+                for b in &r {
+                    let mut t = a.clone();
+                    t.extend(b.iter().copied());
+                    out.push(t);
+                }
+            }
+            *terms = out;
+            true
+        }
+        other => {
+            terms.push(vec![other]);
+            true
+        }
+    }
+}
+
+/// Facts every branch of an `OR` agrees on, as one conjunct per column:
+/// `(a = 1 AND …) OR (a = 2 AND …)` implies `a IN (1, 2)`, and bounds imply
+/// the union's bound. The disjunction itself is kept — derived facts are
+/// weaker — so this only narrows the rows the branches must inspect.
+fn derive_common_filters(pred: &BoundExpr) -> Option<BoundExpr> {
+    let mut terms = Vec::new();
+    if !dnf_terms(pred, &mut terms, 256) || terms.len() < 2 {
+        return None;
+    }
+    let mut cols = Vec::new();
+    columns_in(pred, &mut cols);
+    cols.sort_unstable();
+    cols.dedup();
+    let mut facts = Vec::new();
+    for &c in &cols {
+        if c == usize::MAX {
+            continue;
+        }
+        let mut dtype = None;
+        let mut values = Vec::new();
+        let mut every_eq = true;
+        for term in &terms {
+            let mut hit = None;
+            for atom in term {
+                if let Some(v) = eq_const(atom, c) {
+                    hit = Some(v);
+                    break;
+                }
+            }
+            match hit {
+                Some(v) => values.push(v.clone()),
+                None => {
+                    every_eq = false;
+                    break;
+                }
+            }
+        }
+        if every_eq && !values.is_empty() && values.len() <= 64 {
+            dtype = values.first().and_then(|v| v.data_type());
+            // Deduplicate while keeping a deterministic plan shape.
+            let mut uniq: Vec<Value> = Vec::new();
+            for v in values {
+                if !uniq.contains(&v) {
+                    uniq.push(v);
+                }
+            }
+            // Stable order keeps the derived conjunct identical when pushdown
+            // revisits the node, so the "already present" check matches.
+            uniq.sort_by_key(|v| format!("{v:?}"));
+            if uniq.len() == 1 {
+                let v = uniq.pop().unwrap();
+                facts.push(BoundExpr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(BoundExpr::Column {
+                        index: c,
+                        dtype: dtype.unwrap_or(DataType::Varchar),
+                    }),
+                    right: Box::new(BoundExpr::Literal(v)),
+                    dtype: DataType::Boolean,
+                });
+            } else if let Some(dt) = dtype {
+                let col = BoundExpr::Column {
+                    index: c,
+                    dtype: dt,
+                };
+                let mut acc: Option<BoundExpr> = None;
+                for v in uniq {
+                    let eq = BoundExpr::Binary {
+                        op: BinaryOp::Eq,
+                        left: Box::new(col.clone()),
+                        right: Box::new(BoundExpr::Literal(v)),
+                        dtype: DataType::Boolean,
+                    };
+                    acc = Some(match acc {
+                        None => eq,
+                        Some(prev) => BoundExpr::Binary {
+                            op: BinaryOp::Or,
+                            left: Box::new(prev),
+                            right: Box::new(eq),
+                            dtype: DataType::Boolean,
+                        },
+                    });
+                }
+                facts.push(acc.unwrap());
+            }
+            continue;
+        }
+
+        // Ranges: a bound every branch states narrows to the tightest one.
+        for (op, pick_max) in [(BinaryOp::GtEq, true), (BinaryOp::LtEq, false)] {
+            let mut best: Option<&Value> = None;
+            let mut every = true;
+            for term in &terms {
+                let mut hit = None;
+                for atom in term {
+                    if let Some(v) = range_const(atom, c, op) {
+                        hit = Some(v);
+                        break;
+                    }
+                }
+                let Some(v) = hit else {
+                    every = false;
+                    break;
+                };
+                let better = match (best, value_num(v)) {
+                    (None, _) => true,
+                    (Some(b), Some(n)) => match (value_num(b), n) {
+                        (Some(bn), n) => {
+                            if pick_max {
+                                n > bn
+                            } else {
+                                n < bn
+                            }
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if better {
+                    best = Some(v);
+                }
+            }
+            if !every {
+                continue;
+            }
+            if let Some(v) = best {
+                dtype = dtype.or_else(|| v.data_type());
+                if let Some(dt) = dtype {
+                    facts.push(BoundExpr::Binary {
+                        op,
+                        left: Box::new(BoundExpr::Column {
+                            index: c,
+                            dtype: dt,
+                        }),
+                        right: Box::new(BoundExpr::Literal(v.clone())),
+                        dtype: DataType::Boolean,
+                    });
+                }
+            }
+        }
+    }
+    and_all(facts)
+}
+
+/// A crossing equality usable as a hash key: one side addresses only the
+/// accumulated left input, the other only the just-added right input.
+fn equi_key(expr: &BoundExpr, left_cols: usize) -> Option<(BoundExpr, BoundExpr)> {
+    let (l, r) = crate::sql::binder::equi_pair(expr, left_cols)?;
+    // An impure expression must keep its per-row call count; a pair the
+    // comparison rules reject cannot hash.
+    (!expr.contains_dynamic_scalar()
+        && crate::sql::binder::comparison_ok(BinaryOp::Eq, l.dtype(), r.dtype()).is_ok())
+    .then_some((l, r))
+}
+
+/// Crossing equalities `expr` implies, and whether `expr` must still run above
+/// the join. An `AND` implies every child's keys; an `OR` implies only the
+/// keys every branch shares (the predicate guarantees them).
+fn implied_equi(expr: &BoundExpr, left_cols: usize) -> (Vec<(BoundExpr, BoundExpr)>, bool) {
+    match expr {
+        BoundExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            let (mut keys, left_keep) = implied_equi(left, left_cols);
+            let (right_keys, right_keep) = implied_equi(right, left_cols);
+            keys.extend(right_keys);
+            (keys, left_keep && right_keep)
+        }
+        BoundExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            let (left_keys, _) = implied_equi(left, left_cols);
+            let (right_keys, _) = implied_equi(right, left_cols);
+            // The disjunction itself is never fully enforced by a key.
+            (
+                left_keys
+                    .into_iter()
+                    .filter(|pair| right_keys.contains(pair))
+                    .collect(),
+                true,
+            )
+        }
+        _ => match equi_key(expr, left_cols) {
+            Some(pair) => (vec![pair], false),
+            None => (Vec::new(), true),
+        },
+    }
+}
+
+/// Split conjuncts into hash keys and the residual that must still run, in
+/// the order the predicate listed them.
+fn equi_keys(
+    conjuncts: Vec<BoundExpr>,
+    left_cols: usize,
+) -> (Vec<BoundExpr>, Vec<BoundExpr>, Vec<BoundExpr>) {
+    let mut left_keys = Vec::new();
+    let mut right_keys = Vec::new();
+    let mut residual = Vec::new();
+    for c in conjuncts {
+        let (keys, keep) = implied_equi(&c, left_cols);
+        for (l, r) in keys {
+            left_keys.push(l);
+            right_keys.push(r);
+        }
+        if keep {
+            residual.push(c);
+        }
+    }
+    (left_keys, right_keys, residual)
+}
+
+/// Flatten a condition-less comma-join chain into leaves in FROM order.
+/// Returns `None` for anything else (an `on` condition or an outer join has
+/// semantics a plain reorder must not disturb).
+fn comma_join_leaves(plan: &LogicalPlan) -> Option<(Vec<LogicalPlan>, Vec<usize>)> {
+    let mut chain = Vec::new();
+    let mut cur = plan;
+    while let LogicalPlan::NestedLoopJoin {
+        kind: JoinKind::Inner | JoinKind::Cross,
+        left,
+        right,
+        on: None,
+        left_cols,
+    } = cur
+    {
+        chain.push((right.as_ref().clone(), *left_cols));
+        cur = left;
+    }
+    if chain.is_empty() {
+        return None;
+    }
+    chain.reverse();
+    let mut leaves = vec![cur.clone()];
+    let mut widths = Vec::with_capacity(chain.len() + 1);
+    let mut before = 0;
+    for (right, left_cols) in chain {
+        widths.push(left_cols - before);
+        before = left_cols;
+        leaves.push(right);
+    }
+    // The last leaf's width is not stored anywhere, but reordering keeps it
+    // last, so no expression over its columns ever needs a new offset.
+    widths.push(usize::MAX);
+    Some((leaves, widths))
+}
+
+/// The leaf holding global column `g`, given each leaf's start and width.
+fn leaf_of(g: usize, offsets: &[usize], widths: &[usize]) -> Option<usize> {
+    offsets
+        .iter()
+        .zip(widths)
+        .position(|(&off, &w)| g >= off && (w == usize::MAX || g < off + w))
+}
+
+/// Greedy join order for a comma chain: start from the first table and always
+/// add a table that an equality connects to the joined set. A cross product
+/// is unavoidable only when no remaining table is connected. The last leaf
+/// stays last: its width is unknown, so moving it would need one.
+///
+/// The order is recomputed from the same predicate on every pushdown pass;
+/// since it always starts at leaf 0 and breaks ties by position, an already
+/// reordered chain maps to itself and the pass terminates.
+fn comma_join_order(
+    leaves: usize,
+    widths: &[usize],
+    conjuncts: &[BoundExpr],
+) -> Option<Vec<usize>> {
+    if leaves < 3 {
+        return None;
+    }
+    let mut offsets = Vec::with_capacity(leaves);
+    let mut acc = 0;
+    for (i, w) in widths.iter().enumerate() {
+        offsets.push(acc);
+        if i + 1 < leaves {
+            acc += w;
+        }
+    }
+    // Equality edges between leaves.
+    let mut edges = vec![Vec::new(); leaves];
+    for c in conjuncts {
+        let BoundExpr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } = c
+        else {
+            continue;
+        };
+        let mut lc = Vec::new();
+        let mut rc = Vec::new();
+        columns_in(left, &mut lc);
+        columns_in(right, &mut rc);
+        if lc.is_empty() || rc.is_empty() || lc.contains(&usize::MAX) || rc.contains(&usize::MAX) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (
+            lc.iter()
+                .filter_map(|g| leaf_of(*g, &offsets, widths))
+                .next(),
+            rc.iter()
+                .filter_map(|g| leaf_of(*g, &offsets, widths))
+                .next(),
+        ) else {
+            continue;
+        };
+        if a != b {
+            edges[a].push(b);
+            edges[b].push(a);
+        }
+    }
+    // Only reorder when the FROM order actually crosses: a leaf that no
+    // equality connects to an earlier one. The extra projection that keeps
+    // the output order is then paid only where it buys a hash join.
+    if (0..leaves).all(|i| i == 0 || edges[i].iter().any(|e| *e < i)) {
+        return None;
+    }
+    let mut used = vec![false; leaves];
+    used[0] = true;
+    let mut order = vec![0];
+    while order.len() < leaves - 1 {
+        let mut best: Option<(usize, usize)> = None;
+        for j in 1..leaves - 1 {
+            if used[j] {
+                continue;
+            }
+            let score = edges[j].iter().filter(|e| used[**e]).count();
+            if score > 0 && best.is_none_or(|(_, s)| score > s) {
+                best = Some((j, score));
+            }
+        }
+        let next = best
+            .map(|(j, _)| j)
+            .or_else(|| (1..leaves - 1).find(|j| !used[*j]))?;
+        used[next] = true;
+        order.push(next);
+    }
+    order.push(leaves - 1);
+    // A disconnected graph has a cross product in every order, so reordering
+    // cannot help; and reordering a connected chain once leaves no cross, so
+    // this guard also stops a revisit from reordering it again.
+    let mut placed = vec![false; leaves];
+    for &i in &order {
+        if !placed[i] && i != 0 && !edges[i].iter().any(|e| placed[*e]) {
+            return None;
+        }
+        placed[i] = true;
+    }
+    (order.iter().enumerate().any(|(pos, i)| pos != *i)).then_some(order)
+}
+
+/// Reorder a comma-join chain so equality-connected tables join first, and
+/// rewrite the predicate's column indices to match. Only the shape changes:
+/// every leaf and every conjunct is kept, so results are identical.
+fn reorder_comma_join(
+    pred: &BoundExpr,
+    plan: &LogicalPlan,
+    db: Option<&crate::storage::PinkDb>,
+) -> Option<LogicalPlan> {
+    let db = db?;
+    let (leaves, widths) = comma_join_leaves(plan)?;
+    let mut conjuncts = Vec::new();
+    split_conjuncts(pred.clone(), &mut conjuncts);
+    let order = comma_join_order(leaves.len(), &widths, &conjuncts)?;
+    let mut offsets = Vec::with_capacity(leaves.len());
+    let mut acc = 0;
+    for (i, w) in widths.iter().enumerate() {
+        offsets.push(acc);
+        if i + 1 < leaves.len() {
+            acc += w;
+        }
+    }
+    let mut new_offsets = vec![0; leaves.len()];
+    let mut acc = 0;
+    for (pos, &leaf) in order.iter().enumerate() {
+        new_offsets[leaf] = acc;
+        if pos + 1 < order.len() {
+            acc += widths[leaf];
+        }
+    }
+    let remap = |g: usize| match leaf_of(g, &offsets, &widths) {
+        Some(i) => new_offsets[i] + (g - offsets[i]),
+        None => g,
+    };
+    let predicate = map_columns(pred.clone(), &remap);
+    // The parent still addresses the chain's original column order, so put a
+    // transparent projection on top. Its width is the chain's width.
+    let schema = crate::sql::binder::plan_schema(db, db.current_db(), &[], plan).ok()?;
+    let mut exprs = Vec::with_capacity(schema.len());
+    let mut names = Vec::with_capacity(schema.len());
+    for (g, (name, dtype)) in schema.iter().enumerate() {
+        exprs.push(BoundExpr::Column {
+            index: remap(g),
+            dtype: *dtype,
+        });
+        names.push(name.clone());
+    }
+    let mut plan = leaves[order[0]].clone();
+    let mut left_width = widths[order[0]];
+    for &leaf in &order[1..] {
+        plan = LogicalPlan::NestedLoopJoin {
+            kind: JoinKind::Cross,
+            left: Box::new(plan),
+            right: Box::new(leaves[leaf].clone()),
+            on: None,
+            left_cols: left_width,
+        };
+        if widths[leaf] != usize::MAX {
+            left_width += widths[leaf];
+        }
+    }
+    let filter = LogicalPlan::Filter {
+        input: Box::new(plan),
+        predicate,
+    };
+    Some(LogicalPlan::Project {
+        input: Box::new(filter),
+        exprs,
+        names,
+    })
+}
+
 /// Remap a predicate through a transparent projection: every `Column{i}`
 /// must address a bare `Column`/`AggRef` passthrough (same scope below).
 fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<BoundExpr> {
@@ -1008,7 +1544,11 @@ fn rewrite_through_keys(pred: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExp
 
 /// Push a filter one level down. Returns `(plan, moved)`. When no push
 /// applies, the filter stays above the input — never dropped.
-fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
+fn push_one_level(
+    input: LogicalPlan,
+    pred: BoundExpr,
+    pdb: Option<&crate::storage::PinkDb>,
+) -> (LogicalPlan, bool) {
     match input {
         LogicalPlan::Project {
             input: inner,
@@ -1028,7 +1568,7 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             ),
             None => {
                 let input = LogicalPlan::Project {
-                    input: Box::new(pushdown(*inner)),
+                    input: Box::new(pushdown_inner(*inner, pdb)),
                     exprs,
                     names,
                 };
@@ -1272,6 +1812,85 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                 true,
             )
         }
+        // A comma join (`FROM a, b`) binds as a condition-less cross nested
+        // loop, so its equality predicates arrive as a Filter above. Turn
+        // crossing equalities into hash keys — the nested loop would build
+        // the full |a| × |b| product, which is quadratic even for tiny
+        // tables. Only a condition-less inner/cross join qualifies: with an
+        // `on` or an outer kind, moving a conjunct changes semantics.
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            left_cols,
+        } if on.is_none() && matches!(kind, JoinKind::Inner | JoinKind::Cross) => {
+            let mut conjuncts = Vec::new();
+            split_conjuncts(pred.clone(), &mut conjuncts);
+            let (left_keys, right_keys, keep) = equi_keys(conjuncts, left_cols);
+            // A conjunct that only reads one side still filters that side
+            // first, so the cross product is over surviving rows only.
+            let (mut left_only, mut right_only, mut above) = (Vec::new(), Vec::new(), Vec::new());
+            for c in keep {
+                let mut cols = Vec::new();
+                columns_in(&c, &mut cols);
+                if !cols.is_empty() && cols.iter().all(|i| *i < left_cols) {
+                    left_only.push(c);
+                } else if !cols.is_empty() && cols.iter().all(|i| *i >= left_cols) {
+                    right_only.push(shift_columns(c, left_cols));
+                } else {
+                    above.push(c);
+                }
+            }
+            let pushed = !left_keys.is_empty() || !left_only.is_empty() || !right_only.is_empty();
+            let report = |plan: LogicalPlan, preds: Vec<BoundExpr>| match and_all(preds) {
+                Some(predicate) => LogicalPlan::Filter {
+                    input: Box::new(plan),
+                    predicate,
+                },
+                None => plan,
+            };
+            let left = report(pushdown_inner(*left, pdb), left_only);
+            let right = report(pushdown_inner(*right, pdb), right_only);
+            if left_keys.is_empty() {
+                let plan = LogicalPlan::NestedLoopJoin {
+                    kind,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    on,
+                    left_cols,
+                };
+                (
+                    match and_all(above) {
+                        Some(predicate) => LogicalPlan::Filter {
+                            input: Box::new(plan),
+                            predicate,
+                        },
+                        None => plan,
+                    },
+                    pushed,
+                )
+            } else {
+                let join = LogicalPlan::Join {
+                    kind: JoinKind::Inner,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    left_keys,
+                    right_keys,
+                    left_cols,
+                };
+                (
+                    match and_all(above) {
+                        Some(predicate) => LogicalPlan::Filter {
+                            input: Box::new(join),
+                            predicate,
+                        },
+                        None => join,
+                    },
+                    true,
+                )
+            }
+        }
         // A nested-loop join's condition is not a hash key: pushing a WHERE
         // conjunct into one side would change outer-join and non-equi
         // semantics, so the filter always stays above (children still get
@@ -1286,8 +1905,8 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             LogicalPlan::Filter {
                 input: Box::new(LogicalPlan::NestedLoopJoin {
                     kind,
-                    left: Box::new(pushdown(*left)),
-                    right: Box::new(pushdown(*right)),
+                    left: Box::new(pushdown_inner(*left, pdb)),
+                    right: Box::new(pushdown_inner(*right, pdb)),
                     on,
                     left_cols,
                 }),
@@ -1370,21 +1989,64 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
     }
 }
 
-fn pushdown(plan: LogicalPlan) -> LogicalPlan {
+fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> LogicalPlan {
     match plan {
         LogicalPlan::Filter { input, predicate } => {
-            let input = pushdown(*input);
+            // A left-deep comma chain joins in FROM order: tables that no
+            // equality connects end up as a cross product before a later hash
+            // key can use either side. Reorder the chain here, before the
+            // filter enters it, so the predicate and the chain layout agree.
+            if let Some(reordered) = reorder_comma_join(&predicate, &input, pdb) {
+                return pushdown_inner(reordered, pdb);
+            }
+            let input = pushdown_inner(*input, pdb);
+            // Derived facts are plain conjuncts, so the usual pushdown moves
+            // them to the scan that owns the column. Pushdown can revisit a
+            // node it just moved, so skip facts that are already conjuncts.
+            // Only a conjunction can imply a weaker per-column fact: a lone
+            // OR already is the disjunction, and re-deriving it would feed
+            // the pushed-down copy back into itself.
+            // Only a conjunction can imply a weaker per-column fact. A lone
+            // OR is already the disjunction, and deriving facts from the
+            // pushed-down copy feeds itself: the extra conjuncts would be
+            // pushed as new filters over the same children every time this
+            // node is revisited.
+            let mut conj = Vec::new();
+            split_conjuncts(predicate.clone(), &mut conj);
+            let derived = if conj.len() > 1 {
+                derive_common_filters(&predicate)
+            } else {
+                None
+            };
+            let predicate = match derived {
+                Some(extra) => {
+                    let mut have = Vec::new();
+                    split_conjuncts(predicate.clone(), &mut have);
+                    let mut add = Vec::new();
+                    split_conjuncts(extra, &mut add);
+                    add.retain(|e| !have.contains(e));
+                    match and_all(add) {
+                        Some(extra) => and_all(vec![extra, predicate]).unwrap(),
+                        None => predicate,
+                    }
+                }
+                None => predicate,
+            };
             // Literals: `WHERE false` still needs the row stream shaped
             // correctly — keep the Filter node (it yields zero rows).
-            let (plan, moved) = push_one_level(input, predicate);
-            if moved { pushdown(plan) } else { plan }
+            let (plan, moved) = push_one_level(input, predicate, pdb);
+            if moved {
+                pushdown_inner(plan, pdb)
+            } else {
+                plan
+            }
         }
         LogicalPlan::Project {
             input,
             exprs,
             names,
         } => LogicalPlan::Project {
-            input: Box::new(pushdown(*input)),
+            input: Box::new(pushdown_inner(*input, pdb)),
             exprs,
             names,
         },
@@ -1397,8 +2059,8 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             left_cols,
         } => LogicalPlan::Join {
             kind,
-            left: Box::new(pushdown(*left)),
-            right: Box::new(pushdown(*right)),
+            left: Box::new(pushdown_inner(*left, pdb)),
+            right: Box::new(pushdown_inner(*right, pdb)),
             left_keys,
             right_keys,
             left_cols,
@@ -1409,15 +2071,87 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             right,
             on,
             left_cols,
-        } => LogicalPlan::NestedLoopJoin {
-            kind,
-            left: Box::new(pushdown(*left)),
-            right: Box::new(pushdown(*right)),
-            on,
-            left_cols,
-        },
+        } => {
+            let left = pushdown_inner(*left, pdb);
+            let right = pushdown_inner(*right, pdb);
+            // Same rewrite as above for a condition on the join itself: an
+            // equality part hashes, and an outer join's residual may move into
+            // the side it references (a filter above the join would drop the
+            // NULL-extended rows the outer join must preserve).
+            if let Some(on) = &on {
+                let mut conjuncts = Vec::new();
+                split_conjuncts(on.clone(), &mut conjuncts);
+                let (left_keys, right_keys, residual) = equi_keys(conjuncts, left_cols);
+                if !left_keys.is_empty() {
+                    let residual_side = residual.iter().try_fold(
+                        (Vec::new(), Vec::new()),
+                        |(mut left_only, mut right_only), c| {
+                            let mut cols = Vec::new();
+                            columns_in(c, &mut cols);
+                            // A constant predicate is not tied to either side;
+                            // below an outer join it would change which rows
+                            // are preserved, so it keeps the nested loop.
+                            if cols.is_empty() || cols.contains(&usize::MAX) {
+                                return None;
+                            }
+                            let all_left = cols.iter().all(|i| *i < left_cols);
+                            let all_right = cols.iter().all(|i| *i >= left_cols);
+                            // Only the *null-supplying* side's conditions may
+                            // move into that side: a LEFT JOIN's right input, a
+                            // RIGHT JOIN's left input. A condition on the
+                            // preserved side decides which preserved rows find a
+                            // match, not which rows survive, so filtering that
+                            // input would drop rows the join must NULL-extend
+                            // (`a LEFT JOIN b ON a.k = b.k AND a.x > 5` keeps
+                            // every row of `a`). Those, mixed and FULL residuals
+                            // keep the nested loop.
+                            match kind {
+                                JoinKind::Inner => {}
+                                JoinKind::Left if all_right => {
+                                    right_only.push(shift_columns(c.clone(), left_cols))
+                                }
+                                JoinKind::Right if all_left => left_only.push(c.clone()),
+                                _ => return None,
+                            }
+                            Some((left_only, right_only))
+                        },
+                    );
+                    if let Some((left_only, right_only)) = residual_side {
+                        let with_filter =
+                            |plan: LogicalPlan, preds: Vec<BoundExpr>| match and_all(preds) {
+                                Some(predicate) => LogicalPlan::Filter {
+                                    input: Box::new(plan),
+                                    predicate,
+                                },
+                                None => plan,
+                            };
+                        let left = with_filter(left, left_only);
+                        let right = with_filter(right, right_only);
+                        let join = LogicalPlan::Join {
+                            kind,
+                            left: Box::new(left),
+                            right: Box::new(right),
+                            left_keys,
+                            right_keys,
+                            left_cols,
+                        };
+                        return match kind {
+                            JoinKind::Inner => with_filter(join, residual),
+                            _ => join,
+                        };
+                    }
+                }
+            }
+            LogicalPlan::NestedLoopJoin {
+                kind,
+                left: Box::new(left),
+                right: Box::new(right),
+                on,
+                left_cols,
+            }
+        }
         LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
-            input: Box::new(pushdown(*input)),
+            input: Box::new(pushdown_inner(*input, pdb)),
             keys,
             aggs,
         },
@@ -1426,7 +2160,7 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             windows,
             input_cols,
         } => LogicalPlan::Window {
-            input: Box::new(pushdown(*input)),
+            input: Box::new(pushdown_inner(*input, pdb)),
             windows,
             input_cols,
         },
@@ -1437,8 +2171,8 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             types,
         } => LogicalPlan::SetOp {
             op,
-            left: Box::new(pushdown(*left)),
-            right: Box::new(pushdown(*right)),
+            left: Box::new(pushdown_inner(*left, pdb)),
+            right: Box::new(pushdown_inner(*right, pdb)),
             types,
         },
         LogicalPlan::InsertSelect {
@@ -1452,7 +2186,7 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             db,
             table,
             columns,
-            query: Box::new(pushdown(*query)),
+            query: Box::new(pushdown_inner(*query, pdb)),
             conflict,
             returning,
         },
@@ -1464,11 +2198,11 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
         } => LogicalPlan::CreateTableAs {
             db,
             name,
-            query: Box::new(pushdown(*query)),
+            query: Box::new(pushdown_inner(*query, pdb)),
             if_not_exists,
         },
         LogicalPlan::Explain { plan } => LogicalPlan::Explain {
-            plan: Box::new(pushdown(*plan)),
+            plan: Box::new(pushdown_inner(*plan, pdb)),
         },
         // Filters push within the body and within the query independently —
         // never across the CTE boundary (different scopes).
@@ -1479,24 +2213,24 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             recursive,
         } => LogicalPlan::Cte {
             name,
-            query: Box::new(pushdown(*query)),
-            body: Box::new(pushdown(*body)),
-            recursive: recursive.map(|r| Box::new(r.map(&|p| pushdown(p)))),
+            query: Box::new(pushdown_inner(*query, pdb)),
+            body: Box::new(pushdown_inner(*body, pdb)),
+            recursive: recursive.map(|r| Box::new(r.map(&|p| pushdown_inner(p, pdb)))),
         },
         LogicalPlan::Distinct { input, on } => LogicalPlan::Distinct {
-            input: Box::new(pushdown(*input)),
+            input: Box::new(pushdown_inner(*input, pdb)),
             on,
         },
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
-            input: Box::new(pushdown(*input)),
+            input: Box::new(pushdown_inner(*input, pdb)),
             keys,
         },
         LogicalPlan::Limit { input, limit } => LogicalPlan::Limit {
-            input: Box::new(pushdown(*input)),
+            input: Box::new(pushdown_inner(*input, pdb)),
             limit,
         },
         LogicalPlan::Offset { input, offset } => LogicalPlan::Offset {
-            input: Box::new(pushdown(*input)),
+            input: Box::new(pushdown_inner(*input, pdb)),
             offset,
         },
         leaf => leaf,
@@ -2243,6 +2977,10 @@ fn rewrite_sort(
 }
 #[cfg(test)]
 mod tests {
+    fn pushdown(plan: LogicalPlan) -> LogicalPlan {
+        pushdown_inner(plan, None)
+    }
+
     use super::*;
     use crate::sql::binder::BoundExpr as B;
     use crate::types::{DataType as T, Value};
@@ -2312,6 +3050,130 @@ mod tests {
         if let LogicalPlan::Join { left, right, .. } = out {
             assert!(matches!(*left, LogicalPlan::Filter { .. }));
             assert!(matches!(*right, LogicalPlan::Filter { .. }));
+        }
+    }
+
+    #[test]
+    fn comma_join_equalities_become_hash_keys() {
+        // Cross nested loop with an equality predicate above it: the pair
+        // becomes hash keys instead of every left row meeting every right
+        // row. `col(2)` is the right side's first column and must shift to 0.
+        let eq = B::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(col(0)),
+            right: Box::new(col(2)),
+            dtype: T::Boolean,
+        };
+        let cross = LogicalPlan::NestedLoopJoin {
+            kind: JoinKind::Cross,
+            left: Box::new(LogicalPlan::SingleRow),
+            right: Box::new(LogicalPlan::SingleRow),
+            on: None,
+            left_cols: 2,
+        };
+        let out = pushdown(LogicalPlan::Filter {
+            input: Box::new(cross.clone()),
+            predicate: eq.clone(),
+        });
+        match out {
+            LogicalPlan::Join {
+                kind,
+                left_keys,
+                right_keys,
+                ..
+            } => {
+                assert_eq!(kind, JoinKind::Inner);
+                assert_eq!(left_keys, vec![col(0)]);
+                assert_eq!(right_keys, vec![col(0)]);
+            }
+            other => panic!("comma join stayed nested: {other:?}"),
+        }
+
+        // A mixed-side residual cannot hash: it stays a filter above the join.
+        let residual = B::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(col(1)),
+            right: Box::new(col(3)),
+            dtype: T::Boolean,
+        };
+        let pred = B::Binary {
+            op: BinaryOp::And,
+            left: Box::new(eq),
+            right: Box::new(residual),
+            dtype: T::Boolean,
+        };
+        let out = pushdown(LogicalPlan::Filter {
+            input: Box::new(cross),
+            predicate: pred,
+        });
+        assert!(matches!(out, LogicalPlan::Filter { .. }), "{out:?}");
+        if let LogicalPlan::Filter { input, .. } = out {
+            assert!(matches!(*input, LogicalPlan::Join { .. }));
+        }
+    }
+
+    #[test]
+    fn or_of_conjunctions_derives_per_column_filters() {
+        // (c0 = 1 AND c2 = 7) OR (c0 = 2 AND c2 = 8) implies c0 IN (1, 2)
+        // and c2 IN (7, 8). The disjunction is kept (facts are weaker).
+        let eq = |c: usize, v: i32| B::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(col(c)),
+            right: Box::new(B::Literal(Value::Integer(v))),
+            dtype: T::Boolean,
+        };
+        let and = |a: B, b: B| B::Binary {
+            op: BinaryOp::And,
+            left: Box::new(a),
+            right: Box::new(b),
+            dtype: T::Boolean,
+        };
+        let or = |a: B, b: B| B::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(a),
+            right: Box::new(b),
+            dtype: T::Boolean,
+        };
+        let pred = or(and(eq(0, 1), eq(2, 7)), and(eq(0, 2), eq(2, 8)));
+        let facts = derive_common_filters(&pred).expect("facts every branch agrees on");
+        let mut conjuncts = Vec::new();
+        split_conjuncts(facts, &mut conjuncts);
+        assert_eq!(conjuncts.len(), 2, "{conjuncts:?}");
+        let mut lits = Vec::new();
+        for fact in &conjuncts {
+            let mut pairs = Vec::new();
+            collect_eq_literals(fact, &mut pairs);
+            pairs.sort_unstable();
+            lits.push(pairs);
+        }
+        assert_eq!(lits, vec![vec![(0, 1), (0, 2)], vec![(2, 7), (2, 8)]]);
+    }
+
+    /// Equality column/literal pairs under an OR chain, for the derivation test.
+    fn collect_eq_literals(e: &B, out: &mut Vec<(usize, i32)>) {
+        match e {
+            B::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => {
+                collect_eq_literals(left, out);
+                collect_eq_literals(right, out);
+            }
+            B::Binary {
+                op: BinaryOp::Eq,
+                left,
+                right,
+                ..
+            } => {
+                if let (B::Column { index, .. }, B::Literal(Value::Integer(v))) =
+                    (&**left, &**right)
+                {
+                    out.push((*index, *v));
+                }
+            }
+            other => panic!("unexpected fact shape: {other:?}"),
         }
     }
 
