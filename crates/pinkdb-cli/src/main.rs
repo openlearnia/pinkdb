@@ -441,7 +441,7 @@ fn print_help() {
     println!("Dot-commands:");
     println!("  .help                  show this help (.help agent: agent mode)");
     println!("  .agent [setting N]     show/change agent-mode caps and guard");
-    println!("  .agent ask|resume|sessions|show|fork");
+    println!("  .agent ask|resume|sessions|show|fork|providers");
     println!("                         run the pinkdb agent (`.agent help`; needs LOAD");
     println!(
         "                         EXTENSION of {}): sessions live in the",
@@ -1930,6 +1930,12 @@ struct Opts {
     /// `--agent-allow-writes`, `--agent-allow-files`: the policy for that run.
     agent_allow_writes: bool,
     agent_allow_files: bool,
+    /// `--agent-provider`, `--agent-model` (wave 106b): which provider out of
+    /// the built-in table answers that run, and on which model. There is no
+    /// default provider, so one of these or `PINKDB_AGENT_PROVIDER` is
+    /// required.
+    agent_provider: Option<String>,
+    agent_model: Option<String>,
     /// `--file-cache DIR`: keep remote byte ranges on disk between queries
     /// (wave 98c). Off unless given; `PINKDB_EXTERNAL_FILE_CACHE=1` and its
     /// `_DIR`/`_BYTES` variables do the same without the flag.
@@ -1981,6 +1987,10 @@ fn print_usage() {
     println!("  --agent-allow-writes, --agent-allow-files");
     println!("                     the policy for that question (the agent's own tables stay");
     println!("                     read-only to the model either way)");
+    println!("  --agent-provider NAME, --agent-model NAME");
+    println!("                     which provider answers that question and on which model;");
+    println!("                     there is no default provider (`.agent providers` lists");
+    println!("                     them, PINKDB_AGENT_PROVIDER names one for every run)");
     println!("  --mcp-allow-files  let the MCP client read external files and URLs:");
     println!("                     table functions and bare paths, e.g. read_csv('/x.csv')");
     println!("  --mcp-extension PATH");
@@ -2024,6 +2034,8 @@ fn parse_args() -> Result<Opts, String> {
         agent_run: None,
         agent_allow_writes: false,
         agent_allow_files: false,
+        agent_provider: None,
+        agent_model: None,
         file_cache: None,
         mcp: None,
         mcp_extension: None,
@@ -2124,6 +2136,18 @@ fn parse_args() -> Result<Opts, String> {
             },
             "--agent-allow-writes" => opts.agent_allow_writes = true,
             "--agent-allow-files" => opts.agent_allow_files = true,
+            "--agent-provider" => {
+                opts.agent_provider = Some(args.next().ok_or("--agent-provider requires a name")?);
+            }
+            other if other.starts_with("--agent-provider=") => {
+                opts.agent_provider = Some(other["--agent-provider=".len()..].to_string());
+            }
+            "--agent-model" => {
+                opts.agent_model = Some(args.next().ok_or("--agent-model requires a name")?);
+            }
+            other if other.starts_with("--agent-model=") => {
+                opts.agent_model = Some(other["--agent-model=".len()..].to_string());
+            }
             other if other.starts_with("--agent=") => {
                 let file = other["--agent=".len()..].to_string();
                 let question = args.next().ok_or_else(|| {
@@ -2163,6 +2187,12 @@ fn parse_args() -> Result<Opts, String> {
         if !opts.commands.is_empty() {
             return Err("--agent asks one question: it does not take -c".to_string());
         }
+    } else if opts.agent_provider.is_some() || opts.agent_model.is_some() {
+        return Err(
+            "--agent-provider and --agent-model configure one --agent FILE \"question\" run: in \
+             a session say `.agent ask \"…\" provider <name> model <name>`"
+                .to_string(),
+        );
     }
     if let Some(dir) = &opts.file_cache {
         // The transport reads the cache configuration from the environment
@@ -2562,7 +2592,15 @@ fn run_mcp(opts: &Opts, path: &str, key: Option<EncryptionKey>) -> ! {
 
 /// The `.agent` verbs that go to the agent extension; every other word is
 /// wave 99's display setting (`.agent rows 40`, …).
-const AGENT_VERBS: [&str; 6] = ["ask", "resume", "sessions", "show", "fork", "help"];
+const AGENT_VERBS: [&str; 7] = [
+    "ask",
+    "resume",
+    "sessions",
+    "show",
+    "fork",
+    "providers",
+    "help",
+];
 
 /// `.agent help`: what the extension's commands are and where sessions live.
 fn agent_usage() {
@@ -2570,18 +2608,23 @@ fn agent_usage() {
         "The pinkdb agent (needs LOAD EXTENSION of {}):",
         agent_library_name()
     );
-    println!("  .agent ask \"<question>\" [allow-writes] [allow-files]");
-    println!("  .agent resume <session>    continue from the last checkpoint");
+    println!(
+        "  .agent ask \"<question>\" [provider <name>] [model <name>] [allow-writes] [allow-files]"
+    );
+    println!("  .agent resume <session> [provider <name>] [model <name>]");
     println!("  .agent sessions           list the sessions in this store");
     println!("  .agent show <session>     the transcript so far");
-    println!("  .agent fork <session> <step> [\"<new question>\"]");
+    println!("  .agent fork <session> <step> [provider <name>] [model <name>] [\"<question>\"]");
+    println!("  .agent providers          the built-in providers and whose key is set");
     println!("  .agent [rows N | cols N | cell N | budget N | timeout MS | hint N]");
     println!(
-        "Sessions live in the {} database of the open store; the key is",
+        "Sessions live in the {} database of the open store. There is no default",
         pinkdb::serve::AGENT_DATABASE
     );
-    println!("PINKDB_AGENT_API_KEY (or Z_API_KEY) and the tools run read-only unless");
-    println!("allow-writes; the agent's own tables stay read-only to the model.");
+    println!("provider: name one with `provider <name>` or PINKDB_AGENT_PROVIDER, and export");
+    println!("that provider's own key variable (`.agent providers` lists them). The tools");
+    println!("run read-only unless allow-writes; the agent's own tables stay read-only");
+    println!("to the model.");
 }
 
 /// Run one `.agent` command in the loaded extension and report its exit code.
@@ -2678,10 +2721,15 @@ fn run_agent(opts: &Opts, path: &str, question: &str, key: Option<EncryptionKey>
             report.replayed_records, report.replayed_statements
         );
     }
-    let mut args = format!(
-        "ask \"{}\"",
-        question.replace('\\', "\\\\").replace('"', "\\\"")
-    );
+    let mut args = format!("ask \"{}\"", agent_quote(question));
+    // The extension owns the grammar: the flags become the same words
+    // `.agent ask` takes, so there is one parser and one precedence rule.
+    if let Some(provider) = &opts.agent_provider {
+        args.push_str(&format!(" provider \"{}\"", agent_quote(provider)));
+    }
+    if let Some(model) = &opts.agent_model {
+        args.push_str(&format!(" model \"{}\"", agent_quote(model)));
+    }
     if opts.agent_allow_writes {
         args.push_str(" allow-writes");
     }
@@ -2689,6 +2737,11 @@ fn run_agent(opts: &Opts, path: &str, question: &str, key: Option<EncryptionKey>
         args.push_str(" allow-files");
     }
     std::process::exit(agent_command(&mut db, &args));
+}
+
+/// Escape one word for the `.agent` command line's quoting rules.
+fn agent_quote(word: &str) -> String {
+    word.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Load the agent that sits next to this executable.

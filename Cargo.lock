@@ -1623,12 +1623,10 @@ dependencies = [
 name = "pinkdb-agent"
 version = "0.1.0"
 dependencies = [
- "pinkdb",
- "pinkdb-ext-loader",
  "pinkdb-ext-sdk",
+ "pinkdb-llm",
  "pinkdb-warehouse-tools",
  "serde_json",
- "ureq",
 ]
 
 [[package]]
@@ -1777,6 +1775,15 @@ version = "0.1.0"
 dependencies = [
  "pinkdb",
  "pinkdb-ext-loader",
+]
+
+[[package]]
+name = "pinkdb-llm"
+version = "0.1.0"
+dependencies = [
+ "pinkdb-warehouse-tools",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

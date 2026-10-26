@@ -1,0 +1,27 @@
+[package]
+name = "pinkdb-llm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "The model client pinkdb's extensions share: a provider-neutral transcript, a provider registry, and the OpenAI chat-completions and Anthropic Messages wire protocols over blocking HTTP"
+license = "MIT"
+
+[lib]
+# An rlib only: nothing here registers a SQL surface, so it is linked into an
+# extension (`pinkdb-agent`, and wave 109's memory extension) rather than
+# loaded itself.
+crate-type = ["rlib"]
+
+[dependencies]
+# Both protocols are JSON on the wire; serde_json is already in the workspace.
+serde_json = "1"
+# Blocking HTTP with rustls: the crate and features pinkdb-httpfs already
+# locks, without depending on that crate (it links the whole engine). No async
+# runtime, no SSE or provider SDK.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+# The encoder tests send the real warehouse tool schemas, which is how the
+# "every tool goes out as a function tool" and "every tool goes out with an
+# input_schema" invariants are pinned to the actual tool set.
+pinkdb-warehouse-tools = { path = "../warehouse-tools" }

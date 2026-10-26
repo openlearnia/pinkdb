@@ -1817,38 +1817,80 @@ no model or HTTP client code.
 ```sh
 cargo build --release -p pinkdb-cli -p pinkdb-agent
 
-export PINKDB_AGENT_API_KEY=…            # or Z_API_KEY, or:
+export ZAI_API_KEY=…                     # the provider's own key variable, or:
 set -a; . ./.env; set +a                 # the key is exported, never read by pinkdb
 
-./target/release/pinkdb --agent sales.pink "Who are the top 3 customers by revenue?"
+./target/release/pinkdb --agent sales.pink "Who are the top 3 customers by revenue?" \
+    --agent-provider zai
 ```
 
-The extension reads its key from the environment when a run starts —
-`PINKDB_AGENT_API_KEY`, falling back to `Z_API_KEY` — and never loads a
-`.env` file itself: a program that silently picks up a file from the working
-directory is a footgun. It talks to one OpenAI-compatible
-`/chat/completions` endpoint: `PINKDB_AGENT_BASE_URL` and `PINKDB_AGENT_MODEL`
-override the defaults (`https://api.z.ai/api/paas/v4/chat/completions`,
-`glm-5.3`), the stream is parsed as SSE, and 429s and 5xx answers are retried
-three times with backoff. A 401 stops with a clear message and never echoes
-the key. The key is not stored: not in a table, not in the WAL, not in a log
-line, not in an error — `PINKDB_AGENT_API_KEY` is not reachable through `SET`
-either, because the extension only ever sees it in its own process memory.
+**Providers (wave 106b).** There is **no default provider**: every run names
+one, with `provider <name>` on the run, `--agent-provider` on the command
+line, or `PINKDB_AGENT_PROVIDER`. A run that names none fails with
+`no provider: pass provider <name> or set PINKDB_AGENT_PROVIDER (one of: …)`;
+the agent never guesses one from whichever key happens to be exported. The
+built-in table (`pinkdb-llm`, shared with the coming agent-memory extension):
+
+| provider | protocol | API root | root override | key variable | default model |
+|---|---|---|---|---|---|
+| `zai` | openai | `https://api.z.ai/api/paas/v4` | `PINKDB_AGENT_ZAI_BASE_URL` | `ZAI_API_KEY`, then `Z_API_KEY` | `glm-5.3` |
+| `anthropic` | anthropic | `https://api.anthropic.com/v1` | `PINKDB_AGENT_ANTHROPIC_BASE_URL` | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` |
+| `openai` | openai | `https://api.openai.com/v1` | `PINKDB_AGENT_OPENAI_BASE_URL` | `OPENAI_API_KEY` | — |
+| `deepseek` | openai | `https://api.deepseek.com/v1` | `PINKDB_AGENT_DEEPSEEK_BASE_URL` | `DEEPSEEK_API_KEY` | — |
+| `openrouter` | openai | `https://openrouter.ai/api/v1` | `PINKDB_AGENT_OPENROUTER_BASE_URL` | `OPENROUTER_API_KEY` | — |
+| `gemini` | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | `PINKDB_AGENT_GEMINI_BASE_URL` | `GEMINI_API_KEY` | — |
+| `ollama` | openai | `http://127.0.0.1:11434/v1` | `PINKDB_AGENT_OLLAMA_BASE_URL` | none (no auth header) | — |
+| `custom` | `PINKDB_AGENT_PROTOCOL` (default openai) | none | `PINKDB_AGENT_BASE_URL` (required) | `PINKDB_AGENT_API_KEY` (optional) | — |
+
+"—" means the run must name a model (`model <name>`, `--agent-model` or
+`PINKDB_AGENT_MODEL`); a run argument beats the environment. The root gets
+`/chat/completions` (OpenAI-compatible) or `/messages` (the Anthropic
+Messages API) appended. Each provider's root is overridden only by its own
+variable (`PINKDB_AGENT_ANTHROPIC_BASE_URL` points anthropic at a proxy or
+gateway and moves nobody else); `PINKDB_AGENT_BASE_URL` is `custom`'s alone
+and every built-in provider ignores it, so a root exported for a custom
+endpoint can never receive `ANTHROPIC_API_KEY`. `.agent providers` prints the
+table with each row's override variable, the root in effect, and
+`key: set` / `key: missing` / `no key needed` — never a key or any part of
+one.
+
+**Key isolation.** A key variable is only ever read for, and sent to, its own
+provider: `ANTHROPIC_API_KEY` never reaches z.ai, a z.ai key never reaches
+OpenRouter, and `PINKDB_AGENT_API_KEY` belongs to `custom` alone. The key goes
+in the header its protocol names (`Authorization: Bearer` or `x-api-key`)
+and nowhere else, and the extension never loads a `.env` file itself: a
+program that silently picks up a file from the working directory is a
+footgun. Both protocols stream SSE parsed by hand; 429, 5xx and Anthropic's
+529 are retried three times with backoff, a 401/403 stops with a message that
+names the provider and its key variable and never echoes the key, and
+reasoning traces (`reasoning_content`, `thinking_delta`) are dropped rather
+than recorded or sent back. Anthropic requests send `max_tokens` (8192,
+`PINKDB_AGENT_MAX_TOKENS` overrides it) and no extended thinking. The key is
+not stored: not in a table, not in the WAL, not in a log line, not in an
+error, and not reachable through `SET`.
 
 In a session, `.agent` dispatches to the loaded extension:
 
 ```
-.agent ask "<question>" [allow-writes] [allow-files] [max-steps N] [tokens N]
-.agent resume <session>
+.agent ask "<question>" [provider <name>] [model <name>] [allow-writes] [allow-files] [max-steps N] [tokens N]
+.agent resume <session> [provider <name>] [model <name>]
 .agent sessions
 .agent show <session>
-.agent fork <session> <step> ["<new question>"]
+.agent fork <session> <step> [provider <name>] [model <name>] ["<new question>"]
+.agent providers
 ```
 
 (Without the extension, `.agent rows|cols|cell|budget|timeout|hint` keeps its
 wave-99 meaning and the run commands print the `LOAD EXTENSION` hint.)
 `--agent FILE "question"` loads `libpinkdb_agent` from the install directory
-like `--mcp`, with `--agent-allow-writes` / `--agent-allow-files`.
+like `--mcp`, with `--agent-allow-writes` / `--agent-allow-files` and
+`--agent-provider` / `--agent-model`.
+
+`.agent resume` continues on the session's recorded provider and model unless
+it names others. `.agent fork` may switch provider: the transcript is stored
+provider-neutral, so forking a z.ai session onto Anthropic re-encodes the same
+messages for the other wire protocol (a switched provider without a `model`
+gets its own default, never the old provider's model).
 
 **The tools are the warehouse tools** of the MCP bridge — `query`,
 `describe`, `tables`, `databases`, `explain`, `lake_tables`, `lake_versions`,
@@ -1876,7 +1918,9 @@ result, and re-runs only the read-only tools. `.agent fork <session> <step>`
 copies the transcript up to that step into a new session — the original is
 untouched — and continues it, optionally with a new question. Because it is
 plain SQL, `SELECT * FROM pinkdb_agent.tool_calls` is the audit trail and a
-WebUI can watch a run with `CDC`. Token usage is recorded per step and
+WebUI can watch a run with `CDC`. `sessions` records the provider and
+`usage` records the provider and model of every step, so comparing two
+providers' cost is a `GROUP BY`. Token usage is recorded per step and
 compared with the token budget; the step budget defaults to 20. Both are set
 per run, and the transcript records which limit stopped it.
 
@@ -1887,15 +1931,22 @@ loads unchanged, and the release binaries grew by 0.76% (`pinkdb`,
 5,035,312 → 5,073,504 bytes) and 0.03% (`pinkdb-server`, 4,668,016 →
 4,669,264 bytes); the agent itself is 2,471,632 bytes and adds no new
 third-party crate (blocking `ureq` with rustls, already in the workspace
-through `pinkdb-httpfs`).
+through `pinkdb-httpfs`). The second protocol and the provider table (wave
+106b) cost 76,272 bytes: the release `libpinkdb_agent.dylib` went from
+2,471,968 to 2,548,240 bytes, still with no new crate.
 
 Tests run against a recorded mock provider — an HTTP server on
-`127.0.0.1:0` replaying checked-in SSE fixtures — so CI is deterministic and
-free: a single answer, a multi-step tool loop, tool arguments split across
-chunks, an interrupted stream, 429-then-success and 401, plus resume after a
-kill, fork, every write refusal in both directions, the key sentinel, and a
-TPC-H top-3 question answered end to end. The live test is opt-in:
-`PINKDB_AGENT_LIVE=1 cargo test -p pinkdb-cli --test agent_run -- --ignored`.
+`127.0.0.1:0` replaying checked-in SSE fixtures in both protocols — so CI is
+deterministic and free: a single answer, a multi-step tool loop, tool
+arguments split across chunks, an interrupted stream, 429/529-then-success and
+401, plus resume after a kill, fork (also from z.ai onto Anthropic), every
+write refusal in both directions, key isolation across four exported
+sentinels, a leftover `PINKDB_AGENT_BASE_URL` mock that a `provider anthropic`
+run never contacts, provider precedence, and a TPC-H top-3 question answered end to
+end. The live tests are opt-in and name their provider:
+`PINKDB_AGENT_LIVE=1 cargo test -p pinkdb-cli --test agent_run -- --ignored`
+runs the z.ai one with `ZAI_API_KEY` and the Anthropic one with
+`ANTHROPIC_API_KEY`.
 
 ## Full-text search (feature `fts`, wave 108a)
 

@@ -198,44 +198,94 @@ code.</p>
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-c"># build the agent next to the CLI</span>
 cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">-p</span> pinkdb-agent
 
-<span class="tok-c"># export the key; pinkdb never reads a .env file itself</span>
+<span class="tok-c"># export the provider's own key; pinkdb never reads a .env file itself</span>
 set <span class="tok-f">-a</span>; . ./.env; set +a
 <span class="tok-c"># …or:</span>
-export <span class="tok-v">PINKDB_AGENT_API_KEY</span>=…
+export <span class="tok-v">ZAI_API_KEY</span>=…
 
-<span class="tok-c"># ask one question against a store</span>
-./target/release/pinkdb <span class="tok-f">--agent</span> sales.pink <span class="tok-s">"Who are the top 3 customers by revenue?"</span></code></pre></div>
+<span class="tok-c"># ask one question against a store, naming the provider</span>
+./target/release/pinkdb <span class="tok-f">--agent</span> sales.pink <span class="tok-s">"Who are the top 3 customers by revenue?"</span> \
+    <span class="tok-f">--agent-provider</span> zai</code></pre></div>
 
-<p>The extension reads the key from the environment when a run starts:
-<code>PINKDB_AGENT_API_KEY</code>, falling back to <code>Z_API_KEY</code>.
-<code>PINKDB_AGENT_BASE_URL</code> and <code>PINKDB_AGENT_MODEL</code>
-override the defaults
-(<code>https://api.z.ai/api/paas/v4/chat/completions</code>,
-<code>glm-5.3</code>; <code>glm-5.3-flash</code> is the faster, cheaper choice) — any OpenAI-compatible chat-completions endpoint works.
-<code>--agent</code> loads <code>libpinkdb_agent</code> from the install
-directory, like <code>--mcp</code>; <code>--agent-allow-writes</code> and
+<h2 id="providers">Providers<a class="anchor" href="#providers" aria-label="Permalink: Providers">#</a></h2>
+
+<p><strong>There is no default provider.</strong> Every run names one —
+<code>provider &lt;name&gt;</code> on the run, <code>--agent-provider</code>
+on the command line, or <code>PINKDB_AGENT_PROVIDER</code> — and a run that
+names none fails with <code>no provider: pass provider &lt;name&gt; or set
+PINKDB_AGENT_PROVIDER (one of: …)</code>. The agent never guesses a provider
+from whichever key happens to be exported. The built-in table lives in
+<code>pinkdb-llm</code>, a crate the agent-memory extension will share:</p>
+
+<table>
+<thead><tr><th>provider</th><th>protocol</th><th>API root</th><th>root override</th><th>key variable</th><th>default model</th></tr></thead>
+<tbody>
+<tr><td><code>zai</code></td><td>openai</td><td><code>https://api.z.ai/api/paas/v4</code></td><td><code>PINKDB_AGENT_ZAI_BASE_URL</code></td><td><code>ZAI_API_KEY</code>, then <code>Z_API_KEY</code></td><td><code>glm-5.3</code></td></tr>
+<tr><td><code>anthropic</code></td><td>anthropic</td><td><code>https://api.anthropic.com/v1</code></td><td><code>PINKDB_AGENT_ANTHROPIC_BASE_URL</code></td><td><code>ANTHROPIC_API_KEY</code></td><td><code>claude-sonnet-5-5</code></td></tr>
+<tr><td><code>openai</code></td><td>openai</td><td><code>https://api.openai.com/v1</code></td><td><code>PINKDB_AGENT_OPENAI_BASE_URL</code></td><td><code>OPENAI_API_KEY</code></td><td>—</td></tr>
+<tr><td><code>deepseek</code></td><td>openai</td><td><code>https://api.deepseek.com/v1</code></td><td><code>PINKDB_AGENT_DEEPSEEK_BASE_URL</code></td><td><code>DEEPSEEK_API_KEY</code></td><td>—</td></tr>
+<tr><td><code>openrouter</code></td><td>openai</td><td><code>https://openrouter.ai/api/v1</code></td><td><code>PINKDB_AGENT_OPENROUTER_BASE_URL</code></td><td><code>OPENROUTER_API_KEY</code></td><td>—</td></tr>
+<tr><td><code>gemini</code></td><td>openai</td><td><code>https://generativelanguage.googleapis.com/v1beta/openai</code></td><td><code>PINKDB_AGENT_GEMINI_BASE_URL</code></td><td><code>GEMINI_API_KEY</code></td><td>—</td></tr>
+<tr><td><code>ollama</code></td><td>openai</td><td><code>http://127.0.0.1:11434/v1</code></td><td><code>PINKDB_AGENT_OLLAMA_BASE_URL</code></td><td>none (no auth header)</td><td>—</td></tr>
+<tr><td><code>custom</code></td><td><code>PINKDB_AGENT_PROTOCOL</code> (default openai)</td><td>none</td><td><code>PINKDB_AGENT_BASE_URL</code> (required)</td><td><code>PINKDB_AGENT_API_KEY</code> (optional)</td><td>—</td></tr>
+</tbody>
+</table>
+
+<p>“—” means the run must name a model (<code>model &lt;name&gt;</code>,
+<code>--agent-model</code> or <code>PINKDB_AGENT_MODEL</code>); a run argument
+beats the environment. The protocol appends <code>/chat/completions</code>
+(OpenAI-compatible) or <code>/messages</code> (the Anthropic Messages API) to
+the root. Each provider's root is overridden only by its own variable
+(<code>PINKDB_AGENT_ANTHROPIC_BASE_URL</code> points anthropic at a proxy or
+gateway and moves nobody else); <code>PINKDB_AGENT_BASE_URL</code> is
+<code>custom</code>'s alone and every built-in provider ignores it, so a root
+exported for a custom endpoint can never receive
+<code>ANTHROPIC_API_KEY</code>. <code>.agent providers</code> prints the table
+with each row's override variable, the root in effect, and <code>key:
+set</code>, <code>key: missing</code> or <code>no key needed</code> — never a
+key or any part of one.</p>
+
+<p>Both protocols stream SSE parsed by hand. 429, 5xx and Anthropic's 529
+(overloaded) are retried three times with backoff; reasoning traces
+(<code>reasoning_content</code>, <code>thinking_delta</code>) are dropped,
+never recorded or sent back. Anthropic requests hoist the system prompt into
+<code>system</code>, send tool calls and results as <code>tool_use</code> /
+<code>tool_result</code> blocks with alternating roles, and carry
+<code>max_tokens</code> (8192; <code>PINKDB_AGENT_MAX_TOKENS</code> overrides
+it) with no extended thinking. <code>--agent</code> loads
+<code>libpinkdb_agent</code> from the install directory, like
+<code>--mcp</code>; <code>--agent-allow-writes</code> and
 <code>--agent-allow-files</code> start the run under a looser policy.</p>
+
+<p><strong>Key isolation.</strong> A key variable is only ever read for, and
+sent to, its own provider: <code>ANTHROPIC_API_KEY</code> never reaches z.ai,
+a z.ai key never reaches OpenRouter, and <code>PINKDB_AGENT_API_KEY</code>
+belongs to <code>custom</code> alone. The key goes in the header its protocol
+names (<code>Authorization: Bearer</code> or <code>x-api-key</code>) and
+nowhere else.</p>
 
 <p><strong>The key never lands anywhere.</strong> It is not in a table, not in
 the WAL, not in a log line, not in an error and not in <code>Debug</code>
 output — the extension holds it in memory for the run — and there is no
-<code>SET</code> that reaches it. A 401 stops the run with “the provider
-rejected the API key (HTTP 401); check PINKDB_AGENT_API_KEY”, which names the
-variable and nothing else.</p>
+<code>SET</code> that reaches it. A 401 or 403 stops the run with “the zai
+provider rejected the API key (HTTP 401); check ZAI_API_KEY or Z_API_KEY”,
+which names the provider and its variable and nothing else.</p>
 
 <h2 id="commands">Commands<a class="anchor" href="#commands" aria-label="Permalink: Commands">#</a></h2>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>.agent ask "&lt;question&gt;" [allow-writes] [allow-files] [max-steps N] [tokens N]
-.agent resume &lt;session&gt;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>.agent ask "&lt;question&gt;" [provider &lt;name&gt;] [model &lt;name&gt;] [allow-writes] [allow-files] [max-steps N] [tokens N]
+.agent resume &lt;session&gt; [provider &lt;name&gt;] [model &lt;name&gt;]
 .agent sessions
 .agent show &lt;session&gt;
-.agent fork &lt;session&gt; &lt;step&gt; ["&lt;new question&gt;"]</code></pre></div>
+.agent fork &lt;session&gt; &lt;step&gt; [provider &lt;name&gt;] [model &lt;name&gt;] ["&lt;new question&gt;"]
+.agent providers</code></pre></div>
 
 <p>Each one dispatches to the loaded extension; without it the run commands
 print the <code>LOAD EXTENSION</code> hint (and
 <code>.agent rows|cols|cell|budget|timeout|hint</code> keeps its wave-99
 meaning). A <code>resume</code> keeps the policy and budgets the session
-started with, because the transcript records them.</p>
+started with, because the transcript records them, and continues on the
+session's recorded provider and model unless it names others.</p>
 
 <h2 id="the-tools">The tools<a class="anchor" href="#the-tools" aria-label="Permalink: The tools">#</a></h2>
 
@@ -278,13 +328,19 @@ recorded tool result, and re-runs only the read-only (replay-safe) tools.</p>
 <p><code>.agent fork &lt;session&gt; &lt;step&gt;</code> copies the transcript
 up to that step into a new session, records <code>origin</code> and
 <code>origin_step</code>, leaves the original untouched, and optionally
-continues the fork with a new question. Because the history is plain SQL,
+continues the fork with a new question. A fork may switch provider: the
+transcript is stored provider-neutral, so a z.ai session forked onto Anthropic
+is the same messages re-encoded for the other protocol (a switched provider
+without a <code>model</code> gets its own default, never the old provider's
+model). <code>sessions</code> records the provider and <code>usage</code> the
+provider and model of every step, so comparing two providers' cost is a
+<code>GROUP BY</code>. Because the history is plain SQL,
 <code>SELECT * FROM pinkdb_agent.tool_calls</code> is the audit trail and a
 client can watch a run with CDC.</p>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>pinkdb&gt; .agent sessions
 pinkdb&gt; .agent show a1f2c3d4e5f6
-pinkdb&gt; .agent fork a1f2c3d4e5f6 2 <span class="tok-s">"Now break that down by region"</span></code></pre></div>
+pinkdb&gt; .agent fork a1f2c3d4e5f6 2 provider anthropic <span class="tok-s">"Now break that down by region"</span></code></pre></div>
 
 <h2 id="budgets">Budgets<a class="anchor" href="#budgets" aria-label="Permalink: Budgets">#</a></h2>
 
@@ -309,15 +365,21 @@ runtime, no client crate, no new third-party crate in <code>Cargo.lock</code>.
 Measured on one machine, the release binaries grew by 0.76%
 (<code>pinkdb</code>, 5,035,312 → 5,073,504 bytes) and 0.03%
 (<code>pinkdb-server</code>, 4,668,016 → 4,669,264 bytes); the agent itself is
-2,471,632 bytes.</p>
+2,471,632 bytes. The second protocol and the provider table (wave 106b) added
+76,272 bytes: the release <code>libpinkdb_agent.dylib</code> is 2,548,240
+bytes, still with no new crate.</p>
 
 <p>Tests run against a recorded mock provider — a localhost server replaying
-checked-in SSE fixtures — so CI is deterministic and free: a single answer, a
-multi-step tool loop, arguments split across chunks, an interrupted stream,
-429-then-success, 401, kill-and-resume, fork, the refusals, the key sentinel
-and a TPC-H top-3 question end to end. The live run is opt-in:
+checked-in SSE fixtures in both protocols — so CI is deterministic and free: a
+single answer, a multi-step tool loop, arguments split across chunks, an
+interrupted stream, 429/529-then-success, 401, kill-and-resume, fork (also from
+z.ai onto Anthropic), the refusals, key isolation with four sentinels exported
+at once, a leftover <code>PINKDB_AGENT_BASE_URL</code> mock that a
+<code>provider anthropic</code> run never contacts, provider precedence and a TPC-H top-3 question end to end. The live
+runs are opt-in and name their provider:
 <code>PINKDB_AGENT_LIVE=1 cargo test -p pinkdb-cli --test agent_run --
---ignored</code>.</p>
+--ignored</code> runs the z.ai one with <code>ZAI_API_KEY</code> and the
+Anthropic one with <code>ANTHROPIC_API_KEY</code>.</p>
 
 <footer class="doc-footer">
 <nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="agents"><span class="pager-dir">Previous</span><span class="pager-title">Agents and MCP</span></a><a class="pager-link next" href="bindings"><span class="pager-dir">Next</span><span class="pager-title">Bindings overview</span></a></nav>
@@ -328,6 +390,7 @@ and a TPC-H top-3 question end to end. The live run is opt-in:
 <p class="toc-title">On this page</p>
 <ul>
   <li><a href="#setup">Setup</a></li>
+  <li><a href="#providers">Providers</a></li>
   <li><a href="#commands">Commands</a></li>
   <li><a href="#the-tools">The tools</a></li>
   <li><a href="#two-policies">Two policies</a></li>

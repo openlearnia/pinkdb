@@ -12,18 +12,18 @@
 
 use serde_json::Value;
 
-use crate::chat::{Message, Turn, Usage};
 use crate::host::Host;
+use pinkdb_llm::{Message, Turn, Usage};
 
 /// The database, shared with the host's internal write policy.
 pub const DATABASE: &str = pinkdb_ext_sdk::AGENT_DATABASE;
 
 const SCHEMA: [&str; 5] = [
     "CREATE TABLE IF NOT EXISTS pinkdb_agent.sessions (id VARCHAR, created_at BIGINT, \
-     updated_at BIGINT, question VARCHAR, model VARCHAR, base_url VARCHAR, status VARCHAR, \
-     stop_reason VARCHAR, max_steps INTEGER, token_budget BIGINT, allow_writes BOOLEAN, \
-     allow_files BOOLEAN, origin VARCHAR, origin_step INTEGER, steps INTEGER, \
-     prompt_tokens BIGINT, completion_tokens BIGINT, cost DOUBLE)",
+     updated_at BIGINT, question VARCHAR, provider VARCHAR, model VARCHAR, base_url VARCHAR, \
+     status VARCHAR, stop_reason VARCHAR, max_steps INTEGER, token_budget BIGINT, \
+     allow_writes BOOLEAN, allow_files BOOLEAN, origin VARCHAR, origin_step INTEGER, \
+     steps INTEGER, prompt_tokens BIGINT, completion_tokens BIGINT, cost DOUBLE)",
     "CREATE TABLE IF NOT EXISTS pinkdb_agent.messages (session VARCHAR, step INTEGER, \
      seq INTEGER, role VARCHAR, content VARCHAR, call_id VARCHAR, tool_name VARCHAR, \
      created_at BIGINT)",
@@ -32,8 +32,12 @@ const SCHEMA: [&str; 5] = [
      replay_safe BOOLEAN, code INTEGER, reply VARCHAR, created_at BIGINT)",
     "CREATE TABLE IF NOT EXISTS pinkdb_agent.checkpoints (session VARCHAR, step INTEGER, \
      note VARCHAR, created_at BIGINT)",
+    // `provider` and `model` are per step, not only per session: a resume or a
+    // fork may switch provider, and a per-step cost comparison between two
+    // providers is then a GROUP BY instead of an archaeology project.
     "CREATE TABLE IF NOT EXISTS pinkdb_agent.usage (session VARCHAR, step INTEGER, \
-     prompt_tokens BIGINT, completion_tokens BIGINT, cost DOUBLE, created_at BIGINT)",
+     provider VARCHAR, model VARCHAR, prompt_tokens BIGINT, completion_tokens BIGINT, \
+     cost DOUBLE, created_at BIGINT)",
 ];
 
 /// A step whose rows are all committed. Written last, so `step` in this table
@@ -45,6 +49,8 @@ pub const CHECKPOINT: &str = "tools";
 pub struct Session {
     pub id: String,
     pub question: String,
+    /// The registry name of the provider this session last ran on.
+    pub provider: String,
     pub model: String,
     pub base_url: String,
     pub status: String,
@@ -65,6 +71,7 @@ pub struct Session {
 #[derive(Debug, Clone)]
 pub struct NewSession<'a> {
     pub question: &'a str,
+    pub provider: &'a str,
     pub model: &'a str,
     pub base_url: &'a str,
     pub max_steps: u32,
@@ -192,31 +199,32 @@ fn cell_bool(row: &[Value], index: usize) -> bool {
     }
 }
 
-const SESSION_COLUMNS: &str = "id, question, model, base_url, status, stop_reason, max_steps, \
-     token_budget, allow_writes, allow_files, origin, origin_step, steps, prompt_tokens, \
-     completion_tokens, created_at, updated_at";
+const SESSION_COLUMNS: &str = "id, question, provider, model, base_url, status, stop_reason, \
+     max_steps, token_budget, allow_writes, allow_files, origin, origin_step, steps, \
+     prompt_tokens, completion_tokens, created_at, updated_at";
 
 fn session_row(row: &[Value]) -> Session {
     Session {
         id: cell_str(row, 0),
         question: cell_str(row, 1),
-        model: cell_str(row, 2),
-        base_url: cell_str(row, 3),
-        status: cell_str(row, 4),
-        stop_reason: cell_str(row, 5),
-        max_steps: cell_u64(row, 6) as u32,
-        token_budget: cell_u64(row, 7),
-        allow_writes: cell_bool(row, 8),
-        allow_files: cell_bool(row, 9),
-        origin: cell_str(row, 10),
-        origin_step: cell_u64(row, 11) as u32,
-        steps: cell_u64(row, 12) as u32,
+        provider: cell_str(row, 2),
+        model: cell_str(row, 3),
+        base_url: cell_str(row, 4),
+        status: cell_str(row, 5),
+        stop_reason: cell_str(row, 6),
+        max_steps: cell_u64(row, 7) as u32,
+        token_budget: cell_u64(row, 8),
+        allow_writes: cell_bool(row, 9),
+        allow_files: cell_bool(row, 10),
+        origin: cell_str(row, 11),
+        origin_step: cell_u64(row, 12) as u32,
+        steps: cell_u64(row, 13) as u32,
         usage: Usage {
-            prompt_tokens: cell_u64(row, 13),
-            completion_tokens: cell_u64(row, 14),
+            prompt_tokens: cell_u64(row, 14),
+            completion_tokens: cell_u64(row, 15),
         },
-        created_at: cell_u64(row, 15),
-        updated_at: cell_u64(row, 16),
+        created_at: cell_u64(row, 16),
+        updated_at: cell_u64(row, 17),
     }
 }
 
@@ -224,10 +232,11 @@ fn session_row(row: &[Value]) -> Session {
 pub fn create_session(host: &mut dyn Host, id: &str, new: &NewSession<'_>) -> Result<(), String> {
     let now = now();
     let sql = format!(
-        "INSERT INTO {DATABASE}.sessions ({SESSION_COLUMNS}) VALUES ({}, {}, {}, {}, {}, NULL, \
-         {}, {}, {}, {}, {}, {}, 0, 0, 0, {}, {})",
+        "INSERT INTO {DATABASE}.sessions ({SESSION_COLUMNS}) VALUES ({}, {}, {}, {}, {}, {}, \
+         NULL, {}, {}, {}, {}, {}, {}, 0, 0, 0, {}, {})",
         text(id),
         text(new.question),
+        text(new.provider),
         text(new.model),
         text(new.base_url),
         text("running"),
@@ -363,15 +372,43 @@ pub fn is_replay_safe(name: &str, allow_writes: bool) -> bool {
     name != "query" || !allow_writes
 }
 
-/// Record an assistant turn and its usage, and open a `running` row for every
-/// tool call it asked for (before the calls run, so a kill is visible).
-pub fn record_assistant(
+/// Point a session at the provider and model it is actually running on.
+///
+/// A resume or a fork may name a different provider than the one recorded, and
+/// `.agent show` must not then describe a run that is not happening.
+pub fn set_provider(
     host: &mut dyn Host,
     id: &str,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> Result<(), String> {
+    write(
+        host,
+        &format!(
+            "UPDATE {DATABASE}.sessions SET updated_at = {}, provider = {}, model = {}, \
+             base_url = {} WHERE id = {}",
+            now(),
+            text(provider),
+            text(model),
+            text(base_url),
+            text(id),
+        ),
+    )
+}
+
+/// Record an assistant turn and its usage, and open a `running` row for every
+/// tool call it asked for (before the calls run, so a kill is visible).
+///
+/// The usage row carries the session's provider and model, so the per-step
+/// cost of a run that switched providers stays attributable.
+pub fn record_assistant(
+    host: &mut dyn Host,
+    session: &Session,
     step: u32,
     turn: &Turn,
-    allow_writes: bool,
 ) -> Result<(), String> {
+    let (id, allow_writes) = (session.id.as_str(), session.allow_writes);
     record_message(host, id, step, 1, "assistant", &turn.content, "", "")?;
     for (seq, call) in turn.tool_calls.iter().enumerate() {
         write(
@@ -399,10 +436,12 @@ pub fn record_assistant(
     write(
         host,
         &format!(
-            "INSERT INTO {DATABASE}.usage (session, step, prompt_tokens, completion_tokens, cost, \
-             created_at) VALUES ({}, {}, {}, {}, 0, {})",
+            "INSERT INTO {DATABASE}.usage (session, step, provider, model, prompt_tokens, \
+             completion_tokens, cost, created_at) VALUES ({}, {}, {}, {}, {}, {}, 0, {})",
             text(id),
             step,
+            text(&session.provider),
+            text(&session.model),
             turn.usage.prompt_tokens,
             turn.usage.completion_tokens,
             now(),
@@ -427,7 +466,7 @@ pub fn assistant(host: &mut dyn Host, id: &str, step: u32) -> Result<Option<Turn
         content,
         tool_calls: calls
             .iter()
-            .map(|row| crate::chat::ToolCall {
+            .map(|row| pinkdb_llm::ToolCall {
                 id: row.call_id.clone(),
                 name: row.name.clone(),
                 arguments: row.arguments.clone(),
@@ -530,7 +569,7 @@ pub fn history(host: &mut dyn Host, id: &str) -> Result<Vec<Message>, String> {
     let rows = rows(host, &sql)?;
     // Steps with tool calls need the assistant message to carry them, so the
     // calls are read once per step rather than per message.
-    let mut calls: Vec<(u32, Vec<crate::chat::ToolCall>)> = Vec::new();
+    let mut calls: Vec<(u32, Vec<pinkdb_llm::ToolCall>)> = Vec::new();
     let mut history = Vec::new();
     for row in rows {
         let step = cell_u64(&row, 0) as u32;
@@ -541,9 +580,9 @@ pub fn history(host: &mut dyn Host, id: &str) -> Result<Vec<Message>, String> {
                 let recorded = match calls.iter().find(|(s, _)| *s == step) {
                     Some((_, recorded)) => recorded.clone(),
                     None => {
-                        let loaded: Vec<crate::chat::ToolCall> = tool_calls(host, id, step)?
+                        let loaded: Vec<pinkdb_llm::ToolCall> = tool_calls(host, id, step)?
                             .into_iter()
-                            .map(|call| crate::chat::ToolCall {
+                            .map(|call| pinkdb_llm::ToolCall {
                                 id: call.call_id,
                                 name: call.name,
                                 arguments: call.arguments,
@@ -572,18 +611,25 @@ pub fn history(host: &mut dyn Host, id: &str) -> Result<Vec<Message>, String> {
 
 /// Copy the rows of `source` with `step <= upto` into `target`, plus the
 /// session row itself (as a new session that records where it came from).
+///
+/// `provider` and `model` are what the fork will run on, which need not be
+/// what the source ran on: the copied transcript is provider-neutral, so the
+/// next request simply re-encodes it for the new wire protocol.
 pub fn copy_into(
     host: &mut dyn Host,
     source: &Session,
     target: &str,
     upto: u32,
+    provider: &str,
+    model: &str,
 ) -> Result<(), String> {
     create_session(
         host,
         target,
         &NewSession {
             question: &source.question,
-            model: &source.model,
+            provider,
+            model,
             base_url: &source.base_url,
             max_steps: source.max_steps,
             token_budget: source.token_budget,
@@ -647,23 +693,27 @@ pub fn copy_into(
     )? {
         checkpoint(host, target, cell_u64(&row, 0) as u32, &cell_str(&row, 1))?;
     }
+    // The copied usage rows keep the provider that actually earned them: the
+    // fork's own steps are recorded under its own provider from step N+1.
     for row in rows(
         host,
         &format!(
-            "SELECT step, prompt_tokens, completion_tokens, cost FROM {DATABASE}.usage WHERE \
-             {filter} ORDER BY step"
+            "SELECT step, provider, model, prompt_tokens, completion_tokens, cost FROM \
+             {DATABASE}.usage WHERE {filter} ORDER BY step"
         ),
     )? {
         write(
             host,
             &format!(
-                "INSERT INTO {DATABASE}.usage (session, step, prompt_tokens, completion_tokens, \
-                 cost, created_at) VALUES ({}, {}, {}, {}, {}, {})",
+                "INSERT INTO {DATABASE}.usage (session, step, provider, model, prompt_tokens, \
+                 completion_tokens, cost, created_at) VALUES ({}, {}, {}, {}, {}, {}, {}, {})",
                 text(target),
                 cell_u64(&row, 0),
-                cell_u64(&row, 1),
-                cell_u64(&row, 2),
-                if let Some(Value::Number(number)) = row.get(3) {
+                text(&cell_str(&row, 1)),
+                text(&cell_str(&row, 2)),
+                cell_u64(&row, 3),
+                cell_u64(&row, 4),
+                if let Some(Value::Number(number)) = row.get(5) {
                     number.to_string()
                 } else {
                     "0".to_string()

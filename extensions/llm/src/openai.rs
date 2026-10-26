@@ -1,124 +1,15 @@
-//! The chat shape the harness speaks: one OpenAI-compatible
-//! `/chat/completions` request and the streamed turn it answers with.
+//! The OpenAI-compatible wire protocol: `POST <root>/chat/completions`.
 //!
-//! Only what a data agent needs: system/user/assistant/tool messages, tool
-//! calls, the finish reason and token usage. Everything is plain data, so the
-//! store can persist it and the tests can compare it.
+//! What z.ai, DeepSeek, OpenAI, OpenRouter, Gemini's compatibility endpoint
+//! and Ollama all speak. The request is the transcript as `messages`, the
+//! reply is an SSE stream of `choices[0].delta` chunks ended by `[DONE]`.
 
 use serde_json::{Value, json};
 
-/// One message in the transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Message {
-    System(String),
-    User(String),
-    /// Assistant text, plus the tool calls it asked for (usually empty).
-    Assistant {
-        content: String,
-        tool_calls: Vec<ToolCall>,
-    },
-    /// The result of one tool call, addressed by the call's id.
-    Tool {
-        call_id: String,
-        content: String,
-    },
-}
+use crate::chat::{Message, PartialCall, ToolCall, Turn, Usage, finish_calls, slot};
 
-impl Message {
-    pub fn system(text: impl Into<String>) -> Message {
-        Message::System(text.into())
-    }
-
-    pub fn user(text: impl Into<String>) -> Message {
-        Message::User(text.into())
-    }
-
-    pub fn assistant(text: impl Into<String>) -> Message {
-        Message::Assistant {
-            content: text.into(),
-            tool_calls: Vec::new(),
-        }
-    }
-
-    pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Message {
-        Message::Tool {
-            call_id: call_id.into(),
-            content: content.into(),
-        }
-    }
-
-    pub fn to_json(&self) -> Value {
-        match self {
-            Message::System(content) => json!({"role": "system", "content": content}),
-            Message::User(content) => json!({"role": "user", "content": content}),
-            Message::Assistant {
-                content,
-                tool_calls,
-            } if tool_calls.is_empty() => json!({"role": "assistant", "content": content}),
-            Message::Assistant {
-                content,
-                tool_calls,
-            } => json!({
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls.iter().map(ToolCall::to_json).collect::<Vec<_>>(),
-            }),
-            Message::Tool { call_id, content } => {
-                json!({"role": "tool", "tool_call_id": call_id, "content": content})
-            }
-        }
-    }
-}
-
-/// One tool call the model asked for: `name` and its JSON `arguments` as the
-/// model wrote them (a string, possibly split across stream chunks).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
-}
-
-impl ToolCall {
-    pub fn to_json(&self) -> Value {
-        json!({
-            "id": self.id,
-            "type": "function",
-            "function": {"name": self.name, "arguments": self.arguments},
-        })
-    }
-}
-
-/// Prompt and completion tokens reported by the provider.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Usage {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-}
-
-impl Usage {
-    pub fn total(&self) -> u64 {
-        self.prompt_tokens + self.completion_tokens
-    }
-}
-
-/// One assistant turn: its text, the tool calls it asked for, why it stopped
-/// and what it cost.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Turn {
-    pub content: String,
-    pub tool_calls: Vec<ToolCall>,
-    pub finish_reason: String,
-    pub usage: Usage,
-}
-
-/// A tool call being assembled from stream deltas.
-#[derive(Debug, Clone, Default)]
-struct PartialCall {
-    id: String,
-    name: String,
-    arguments: String,
-}
+/// The path this protocol appends to a provider's base URL.
+pub const PATH: &str = "/chat/completions";
 
 /// The request body for one turn. `tools` are the shared MCP-shaped
 /// definitions (`name`, `description`, `inputSchema`); chat completions wants
@@ -126,11 +17,42 @@ struct PartialCall {
 pub fn request_body(model: &str, messages: &[Message], tools: &[Value]) -> Value {
     json!({
         "model": model,
-        "messages": messages.iter().map(Message::to_json).collect::<Vec<_>>(),
+        "messages": messages.iter().map(message).collect::<Vec<_>>(),
         "tools": tools.iter().map(function_tool).collect::<Vec<_>>(),
         "tool_choice": "auto",
         "stream": true,
         "stream_options": {"include_usage": true},
+    })
+}
+
+/// One transcript message as a chat-completions message.
+fn message(message: &Message) -> Value {
+    match message {
+        Message::System(content) => json!({"role": "system", "content": content}),
+        Message::User(content) => json!({"role": "user", "content": content}),
+        Message::Assistant {
+            content,
+            tool_calls,
+        } if tool_calls.is_empty() => json!({"role": "assistant", "content": content}),
+        Message::Assistant {
+            content,
+            tool_calls,
+        } => json!({
+            "role": "assistant",
+            "content": content,
+            "tool_calls": tool_calls.iter().map(tool_call).collect::<Vec<_>>(),
+        }),
+        Message::Tool { call_id, content } => {
+            json!({"role": "tool", "tool_call_id": call_id, "content": content})
+        }
+    }
+}
+
+fn tool_call(call: &ToolCall) -> Value {
+    json!({
+        "id": call.id,
+        "type": "function",
+        "function": {"name": call.name, "arguments": call.arguments},
     })
 }
 
@@ -180,6 +102,10 @@ impl Accumulator {
         let Some(delta) = choice.get("delta") else {
             return Ok(());
         };
+        // `delta.reasoning_content` (z.ai GLM-5.x, DeepSeek's reasoners) is
+        // deliberately not read. A reasoning trace is not an answer: folding it
+        // into `content` would record it in the transcript and send it back on
+        // the next turn, which the providers themselves tell you not to do.
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             self.content.push_str(text);
         }
@@ -188,10 +114,7 @@ impl Accumulator {
         };
         for call in calls {
             let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-            if self.calls.len() <= index {
-                self.calls.resize(index + 1, PartialCall::default());
-            }
-            let slot = &mut self.calls[index];
+            let slot = slot(&mut self.calls, index);
             if let Some(id) = call.get("id").and_then(Value::as_str)
                 && !id.is_empty()
             {
@@ -212,25 +135,15 @@ impl Accumulator {
         Ok(())
     }
 
+    /// True when the payload is this protocol's end-of-stream marker.
+    pub fn is_done(data: &str) -> bool {
+        data.trim() == "[DONE]"
+    }
+
     pub fn finish(self) -> Turn {
         Turn {
             content: self.content,
-            tool_calls: self
-                .calls
-                .into_iter()
-                .filter(|call| !call.name.is_empty())
-                .enumerate()
-                .map(|(i, call)| ToolCall {
-                    // A provider that omits ids still needs a stable address.
-                    id: if call.id.is_empty() {
-                        format!("call_{i}")
-                    } else {
-                        call.id
-                    },
-                    name: call.name,
-                    arguments: call.arguments,
-                })
-                .collect(),
+            tool_calls: finish_calls(self.calls),
             finish_reason: self.finish_reason,
             usage: self.usage,
         }
@@ -279,6 +192,24 @@ mod tests {
         assert!(turn.tool_calls.is_empty());
     }
 
+    /// A reasoner streams its scratchpad as `reasoning_content`. It is not part
+    /// of the answer, so it must not reach the turn (and through it the store,
+    /// and through that the next request).
+    #[test]
+    fn reasoning_content_is_dropped() {
+        let mut acc = Accumulator::default();
+        for chunk in [
+            r#"{"choices":[{"delta":{"reasoning_content":"let me think about SELECT"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"4"}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"more thinking"},"finish_reason":"stop"}]}"#,
+        ] {
+            acc.feed(chunk).expect("a valid chunk");
+        }
+        let turn = acc.finish();
+        assert_eq!(turn.content, "4");
+        assert!(!turn.content.contains("think"), "{:?}", turn.content);
+    }
+
     #[test]
     fn a_missing_tool_call_id_gets_a_stable_address() {
         let mut acc = Accumulator::default();
@@ -313,5 +244,28 @@ mod tests {
             assert_eq!(wire["function"]["parameters"], tool["inputSchema"]);
             assert_eq!(wire["function"]["parameters"]["type"], "object");
         }
+    }
+
+    /// A tool result is addressed by the id of the call it answers.
+    #[test]
+    fn a_tool_result_carries_its_call_id() {
+        let body = request_body(
+            "m",
+            &[
+                Message::Assistant {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".to_string(),
+                        name: "tables".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                },
+                Message::tool("c1", "| name |"),
+            ],
+            &[],
+        );
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(body["messages"][1]["role"], "tool");
+        assert_eq!(body["messages"][1]["tool_call_id"], "c1");
     }
 }

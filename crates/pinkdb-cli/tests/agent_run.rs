@@ -1,10 +1,13 @@
-//! Wave 106, end to end: the `agent` extension, driven from the CLI.
+//! Waves 106 and 106b, end to end: the `agent` extension, driven from the CLI.
 //!
 //! Every model call here goes to a mock provider on 127.0.0.1: an SSE stream
 //! written by a `TcpListener` thread, one scripted reply per connection, so
-//! the tests are offline and deterministic. The extension's own unit tests
-//! cover the SSE parser and the accumulator; these cover the host contract —
-//! the CLI, the policy, the store and the transcript.
+//! the tests are offline and deterministic. The mock speaks both wire
+//! protocols (chat completions and the Anthropic Messages API) and records
+//! every request's headers, which is what the key-isolation test reads.
+//! `pinkdb-llm`'s own tests cover the SSE parsers and the encoders; these
+//! cover the host contract — the CLI, the policy, the store and the
+//! transcript — and the provider selection across process boundaries.
 //!
 //! Build the extension first (`cargo build -p pinkdb-agent`); the tests ask
 //! `PINKDB_AGENT_LIB` or the workspace target directory for it.
@@ -97,9 +100,13 @@ fn resolve_agent_library() -> PathBuf {
 
 /// One scripted reply, written when a connection's request has been read.
 enum Reply {
-    /// A complete SSE stream: each chunk is a `data:` payload, then `[DONE]`.
+    /// A complete chat-completions stream: each chunk is a `data:` payload,
+    /// then `[DONE]`.
     Sse(Vec<String>),
-    /// A status code and a body (401, 429, …).
+    /// A complete Messages API stream: each event is a `data:` payload, ended
+    /// by `message_stop` instead of `[DONE]`.
+    Anthropic(Vec<String>),
+    /// A status code and a body (401, 429, 529, …).
     Status(u16, String),
     /// A stream cut off in the middle of an event: the socket closes.
     Cut,
@@ -137,6 +144,56 @@ fn answer(text: &str) -> Reply {
     ])
 }
 
+/// The Messages API's version of [`answer`]: usage, one text block, a stop.
+fn anthropic_answer(text: &str) -> Reply {
+    Reply::Anthropic(vec![
+        json!({"type": "message_start",
+               "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}})
+        .to_string(),
+        json!({"type": "content_block_start", "index": 0,
+               "content_block": {"type": "text", "text": ""}})
+        .to_string(),
+        json!({"type": "content_block_delta", "index": 0,
+               "delta": {"type": "text_delta", "text": text}})
+        .to_string(),
+        json!({"type": "content_block_stop", "index": 0}).to_string(),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+               "usage": {"output_tokens": 5}})
+        .to_string(),
+        json!({"type": "message_stop"}).to_string(),
+    ])
+}
+
+/// The Messages API's version of [`tool_calls`]: one `tool_use` block per
+/// call, its arguments as one `input_json_delta`.
+fn anthropic_tool_calls(calls: &[(&str, &str, &str)]) -> Reply {
+    let mut events = vec![
+        json!({"type": "message_start",
+               "message": {"usage": {"input_tokens": 10, "output_tokens": 1}}})
+        .to_string(),
+    ];
+    for (index, (id, name, arguments)) in calls.iter().enumerate() {
+        events.push(
+            json!({"type": "content_block_start", "index": index,
+                   "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}})
+            .to_string(),
+        );
+        events.push(
+            json!({"type": "content_block_delta", "index": index,
+                   "delta": {"type": "input_json_delta", "partial_json": arguments}})
+            .to_string(),
+        );
+        events.push(json!({"type": "content_block_stop", "index": index}).to_string());
+    }
+    events.push(
+        json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+               "usage": {"output_tokens": 5}})
+        .to_string(),
+    );
+    events.push(json!({"type": "message_stop"}).to_string());
+    Reply::Anthropic(events)
+}
+
 /// One assistant turn asking for `calls` = `(id, tool, arguments)`.
 fn tool_calls(calls: &[(&str, &str, &str)]) -> Reply {
     let calls: Vec<Value> = calls
@@ -158,9 +215,17 @@ fn tool_calls(calls: &[(&str, &str, &str)]) -> Reply {
     ])
 }
 
+/// One request as the mock saw it. The head is kept because the key-isolation
+/// test has to read the credential headers, not only the body.
+#[derive(Clone, Default)]
+struct Request {
+    head: String,
+    body: String,
+}
+
 struct Mock {
     port: u16,
-    requests: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<Request>>>,
     accepted: Arc<AtomicUsize>,
 }
 
@@ -189,27 +254,34 @@ impl Mock {
         }
     }
 
-    fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/v1/chat/completions", self.port)
+    /// The API **root**: the protocol appends `/chat/completions` or
+    /// `/messages` itself, so one mock serves either.
+    fn base(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.port)
     }
 
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
     }
 
-    /// The request bodies that arrived, parsed.
-    fn bodies(&self) -> Vec<Value> {
+    fn requests(&self) -> Vec<Request> {
         self.requests
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The request bodies that arrived, parsed.
+    fn bodies(&self) -> Vec<Value> {
+        self.requests()
             .iter()
-            .map(|body| serde_json::from_str(body).unwrap_or(Value::Null))
+            .map(|request| serde_json::from_str(&request.body).unwrap_or(Value::Null))
             .collect()
     }
 }
 
 /// Read one HTTP/1.1 request: the head, then `content-length` bytes of body.
-fn read_request(stream: &mut std::net::TcpStream) -> String {
+fn read_request(stream: &mut std::net::TcpStream) -> Request {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("read timeout");
@@ -217,7 +289,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> String {
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
         match stream.read(&mut byte) {
-            Ok(0) | Err(_) => return String::new(),
+            Ok(0) | Err(_) => return Request::default(),
             Ok(_) => head.push(byte[0]),
         }
     }
@@ -240,7 +312,10 @@ fn read_request(stream: &mut std::net::TcpStream) -> String {
         }
     }
     body.truncate(filled);
-    String::from_utf8_lossy(&body).to_string()
+    Request {
+        head,
+        body: String::from_utf8_lossy(&body).to_string(),
+    }
 }
 
 fn write_reply(stream: &mut std::net::TcpStream, reply: Reply) {
@@ -254,6 +329,23 @@ fn write_reply(stream: &mut std::net::TcpStream, reply: Reply) {
                 body.push_str("\n\n");
             }
             body.push_str("data: [DONE]\n\n");
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{}",
+                body
+            );
+            let _ = stream.write_all(head.as_bytes());
+        }
+        Reply::Anthropic(events) => {
+            // The real API names each event on its own line too; the client
+            // reads the `type` inside the payload, so the name is decoration.
+            let mut body = String::new();
+            for event in events {
+                let name = serde_json::from_str::<Value>(&event)
+                    .ok()
+                    .and_then(|v| v["type"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                body.push_str(&format!("event: {name}\ndata: {event}\n\n"));
+            }
             let head = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{}",
                 body
@@ -295,6 +387,40 @@ fn sentinel(tag: &str) -> String {
     format!("sk-sentinel-{}-{tag}", std::process::id())
 }
 
+/// Every variable the provider registry reads.
+const SCRUBBED: [&str; 21] = [
+    "PINKDB_AGENT_PROVIDER",
+    "PINKDB_AGENT_MODEL",
+    "PINKDB_AGENT_BASE_URL",
+    "PINKDB_AGENT_ZAI_BASE_URL",
+    "PINKDB_AGENT_ANTHROPIC_BASE_URL",
+    "PINKDB_AGENT_OPENAI_BASE_URL",
+    "PINKDB_AGENT_DEEPSEEK_BASE_URL",
+    "PINKDB_AGENT_OPENROUTER_BASE_URL",
+    "PINKDB_AGENT_GEMINI_BASE_URL",
+    "PINKDB_AGENT_OLLAMA_BASE_URL",
+    "PINKDB_AGENT_PROTOCOL",
+    "PINKDB_AGENT_API_KEY",
+    "PINKDB_AGENT_MAX_TOKENS",
+    "ZAI_API_KEY",
+    "Z_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GEMINI_API_KEY",
+    "PINKDB_AGENT_LIVE",
+];
+
+/// Point every provider at `mock`, each through its own root variable (a
+/// provider reads no other).
+fn point_at<'a>(command: &'a mut Command, mock: &Mock) -> &'a mut Command {
+    for variable in SCRUBBED.iter().filter(|name| name.ends_with("_BASE_URL")) {
+        command.env(variable, mock.base());
+    }
+    command
+}
+
 /// A fresh durable store with the fixture, seeded by a CLI script.
 struct Store {
     dir: PathBuf,
@@ -322,12 +448,13 @@ impl Store {
         store
     }
 
-    /// A CLI invocation against this store, pointed at `mock`, with the key.
+    /// A CLI invocation against this store, pointed at `mock` as the `zai`
+    /// provider, with a sentinel in zai's own key variable.
     fn command(&self, mock: &Mock) -> Command {
         let mut command = self.plain_command();
-        command
-            .env("PINKDB_AGENT_API_KEY", sentinel("env"))
-            .env("PINKDB_AGENT_BASE_URL", mock.url());
+        point_at(&mut command, mock)
+            .env("PINKDB_AGENT_PROVIDER", "zai")
+            .env("ZAI_API_KEY", sentinel("env"));
         command
     }
 
@@ -335,6 +462,12 @@ impl Store {
     /// agent library, so replay needs the opt-in and an extension root.
     fn plain_command(&self) -> Command {
         let mut command = Command::new(cli());
+        // A developer's shell may export real keys or a provider. None of it
+        // may reach a child here: the tests must not depend on it, and a real
+        // key must never be sent to a mock.
+        for variable in SCRUBBED {
+            command.env_remove(variable);
+        }
         let root = agent_library()
             .parent()
             .map(|dir| dir.to_path_buf())
@@ -646,16 +779,29 @@ fn a_401_stops_with_a_clear_error_and_no_key() {
     );
 }
 
+/// A distinct sentinel in each provider's own key variable, all exported at
+/// once: `(variable, sentinel)`.
+fn all_sentinels(tag: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("ZAI_API_KEY", sentinel(&format!("{tag}-zai"))),
+        ("ANTHROPIC_API_KEY", sentinel(&format!("{tag}-anthropic"))),
+        ("OPENROUTER_API_KEY", sentinel(&format!("{tag}-openrouter"))),
+        ("PINKDB_AGENT_API_KEY", sentinel(&format!("{tag}-custom"))),
+    ]
+}
+
 #[test]
 fn the_key_never_reaches_the_store_or_the_output() {
     let store = Store::new("sentinel");
-    let key = sentinel("leak");
+    let keys = all_sentinels("leak");
     let mock = Mock::start(vec![
         tool_calls(&[("call_1", "databases", "{}")]),
         answer("one database"),
     ]);
     let mut command = store.command(&mock);
-    command.env("PINKDB_AGENT_API_KEY", &key);
+    for (variable, key) in &keys {
+        command.env(variable, key);
+    }
     let (out, status) = run_merged(
         command,
         &store.script(&[".agent ask \"list the databases\"".to_string()]),
@@ -663,20 +809,132 @@ fn the_key_never_reaches_the_store_or_the_output() {
     assert!(status.success(), "the run failed:\n{out}");
     assert!(out.contains("one database"), "output: {out}");
 
-    // The output the operator sees.
-    assert!(!out.contains(&key), "the key reached stdout/stderr: {out}");
-    // The store's bytes, snapshot and WAL.
     let bytes = store.bytes();
-    assert!(
-        !bytes
-            .windows(key.len())
-            .any(|window| window == key.as_bytes()),
-        "the key reached the .pink file"
-    );
-    // Every table, including the session's own.
-    for table in ["sessions", "messages", "tool_calls", "checkpoints", "usage"] {
-        let rows = store.query(&format!("SELECT * FROM pinkdb_agent.{table}"));
-        assert!(!rows.contains(&key), "the key reached {table}:\n{rows}");
+    let tables: Vec<(&str, String)> =
+        ["sessions", "messages", "tool_calls", "checkpoints", "usage"]
+            .into_iter()
+            .map(|table| {
+                (
+                    table,
+                    store.query(&format!("SELECT * FROM pinkdb_agent.{table}")),
+                )
+            })
+            .collect();
+    for (variable, key) in &keys {
+        // The output the operator sees.
+        assert!(
+            !out.contains(key),
+            "{variable} reached stdout/stderr: {out}"
+        );
+        // The store's bytes, snapshot and WAL.
+        assert!(
+            !bytes
+                .windows(key.len())
+                .any(|window| window == key.as_bytes()),
+            "{variable} reached the .pink file"
+        );
+        // Every table, including the session's own.
+        for (table, rows) in &tables {
+            assert!(!rows.contains(key), "{variable} reached {table}:\n{rows}");
+        }
+    }
+}
+
+/// The security rule of wave 106b, across the process boundary: with every
+/// sentinel exported, a run against each provider's mock carries exactly that
+/// provider's key, in that protocol's header, and no other sentinel anywhere.
+#[test]
+fn each_provider_receives_only_its_own_key() {
+    let store = Store::new("isolation");
+    let keys = all_sentinels("iso");
+    let key_of = |variable: &str| {
+        keys.iter()
+            .find(|(name, _)| *name == variable)
+            .map(|(_, key)| key.clone())
+    };
+    // (provider, the reply it speaks, the header its key must arrive in).
+    let cases: [(&str, Reply, Option<String>); 5] = [
+        (
+            "zai",
+            answer("zai answered"),
+            key_of("ZAI_API_KEY").map(|k| format!("authorization: bearer {k}")),
+        ),
+        (
+            "anthropic",
+            anthropic_answer("anthropic answered"),
+            key_of("ANTHROPIC_API_KEY").map(|k| format!("x-api-key: {k}")),
+        ),
+        (
+            "openrouter",
+            answer("openrouter answered"),
+            key_of("OPENROUTER_API_KEY").map(|k| format!("authorization: bearer {k}")),
+        ),
+        (
+            "custom",
+            answer("custom answered"),
+            key_of("PINKDB_AGENT_API_KEY").map(|k| format!("authorization: bearer {k}")),
+        ),
+        ("ollama", answer("ollama answered"), None),
+    ];
+    for (provider, reply, expected) in cases {
+        let mock = Mock::start(vec![reply]);
+        let mut command = store.plain_command();
+        for (variable, key) in &keys {
+            command.env(variable, key);
+        }
+        point_at(&mut command, &mock);
+        let (out, status) = run_merged(
+            command,
+            &store.script(&[format!(
+                ".agent ask \"who are you?\" provider {provider} model mock-model"
+            )]),
+        );
+        assert!(status.success(), "{provider} run failed:\n{out}");
+        assert!(out.contains(&format!("{provider} answered")), "{out}");
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "{provider}: one request");
+        let request = &requests[0];
+        let head = request.head.to_lowercase();
+        let path = if provider == "anthropic" {
+            "post /v1/messages "
+        } else {
+            "post /v1/chat/completions "
+        };
+        assert!(head.starts_with(path), "{provider}: {head}");
+        match &expected {
+            Some(header) => assert!(
+                head.contains(&header.to_lowercase()),
+                "{provider} did not get its own key in {header:?}: {head}"
+            ),
+            None => {
+                assert!(!head.contains("authorization"), "{provider}: {head}");
+                assert!(!head.contains("x-api-key"), "{provider}: {head}");
+            }
+        }
+        // Exactly one credential header, and no stranger's key anywhere.
+        let credentials = head
+            .lines()
+            .filter(|line| line.starts_with("authorization:") || line.starts_with("x-api-key:"))
+            .count();
+        assert_eq!(
+            credentials,
+            usize::from(expected.is_some()),
+            "{provider}: {head}"
+        );
+        for (variable, key) in &keys {
+            let own = expected
+                .as_deref()
+                .is_some_and(|header| header.ends_with(key.as_str()));
+            let in_head = head.contains(&key.to_lowercase());
+            assert_eq!(
+                in_head, own,
+                "{provider}: {variable} in the headers: {head}"
+            );
+            assert!(
+                !request.body.contains(key.as_str()),
+                "{provider}: {variable} in the body"
+            );
+        }
     }
 }
 
@@ -982,30 +1240,554 @@ fn budgets_stop_a_run() {
     assert_eq!(mock.accepted(), 2, "the budget stops further calls");
 }
 
-/// The live provider: only with `PINKDB_AGENT_LIVE=1` and a key exported.
-/// Never run in CI, and never with a key checked into the repository.
+// ------------------------------------------------------- providers (wave 106b)
+
+/// A run with nothing but `extra` in the provider environment, against `mock`
+/// as its API root.
+fn run_with(store: &Store, mock: &Mock, extra: &[(&str, &str)], line: &str) -> (String, i32) {
+    let mut command = store.plain_command();
+    point_at(&mut command, mock);
+    for (variable, value) in extra {
+        command.env(variable, value);
+    }
+    let (out, status) = run_merged(command, &store.script(&[line.to_string()]));
+    (out, status.code().unwrap_or(-1))
+}
+
 #[test]
-#[ignore = "needs PINKDB_AGENT_LIVE=1, a real key in PINKDB_AGENT_API_KEY or Z_API_KEY, and network"]
-fn a_live_provider_answers() {
+fn no_provider_is_an_error_even_with_a_key_exported() {
+    let store = Store::new("noprovider");
+    let mock = Mock::start(vec![answer("never")]);
+    let key = sentinel("noprov");
+    let (out, _) = run_with(
+        &store,
+        &mock,
+        &[("ZAI_API_KEY", &key), ("ANTHROPIC_API_KEY", &key)],
+        ".agent ask \"anything\"",
+    );
+    assert!(
+        out.contains("no provider: pass provider <name> or set PINKDB_AGENT_PROVIDER"),
+        "{out}"
+    );
+    assert!(out.contains("one of: zai, anthropic"), "{out}");
+    assert_eq!(mock.accepted(), 0, "no provider was guessed from a key");
+    assert!(!out.contains(&key), "{out}");
+}
+
+#[test]
+fn an_unknown_provider_lists_the_valid_ones() {
+    let store = Store::new("unknown");
+    let mock = Mock::start(vec![answer("never")]);
+    let (out, _) = run_with(&store, &mock, &[], ".agent ask \"q\" provider groq");
+    assert!(out.contains("unknown provider \"groq\""), "{out}");
+    assert!(out.contains("zai, anthropic, openai"), "{out}");
+    assert_eq!(mock.accepted(), 0);
+}
+
+#[test]
+fn a_provider_without_a_default_model_needs_one() {
+    let store = Store::new("nomodel");
+    let mock = Mock::start(vec![answer("never")]);
+    let (out, _) = run_with(
+        &store,
+        &mock,
+        &[("OPENROUTER_API_KEY", "sk-unused")],
+        ".agent ask \"q\" provider openrouter",
+    );
+    assert!(
+        out.contains("provider openrouter has no default model"),
+        "{out}"
+    );
+    assert!(out.contains("model <name>"), "{out}");
+    assert!(out.contains("PINKDB_AGENT_MODEL"), "{out}");
+    assert_eq!(mock.accepted(), 0);
+}
+
+#[test]
+fn a_run_argument_beats_the_environment() {
+    let store = Store::new("precedence");
+    let mock = Mock::start(vec![anthropic_answer("from anthropic")]);
+    let (out, code) = run_with(
+        &store,
+        &mock,
+        &[
+            ("PINKDB_AGENT_PROVIDER", "zai"),
+            ("PINKDB_AGENT_MODEL", "glm-env"),
+            ("ZAI_API_KEY", "sk-zai-unused"),
+            ("ANTHROPIC_API_KEY", "sk-anthropic-used"),
+        ],
+        ".agent ask \"q\" provider anthropic model claude-arg",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("from anthropic"), "{out}");
+    let request = &mock.requests()[0];
+    assert!(
+        request.head.starts_with("POST /v1/messages "),
+        "{}",
+        request.head
+    );
+    let body = &mock.bodies()[0];
+    assert_eq!(body["model"], json!("claude-arg"));
+    assert_eq!(
+        store.cell("SELECT provider FROM pinkdb_agent.sessions"),
+        "anthropic"
+    );
+    assert_eq!(
+        store.cell("SELECT model FROM pinkdb_agent.sessions"),
+        "claude-arg"
+    );
+
+    // With no argument the environment decides, and zai keeps its default model.
+    let store = Store::new("precedence-env");
+    let mock = Mock::start(vec![answer("from zai")]);
+    let (out, code) = run_with(
+        &store,
+        &mock,
+        &[("PINKDB_AGENT_PROVIDER", "zai"), ("ZAI_API_KEY", "sk-zai")],
+        ".agent ask \"q\"",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(mock.bodies()[0]["model"], json!("glm-5.3"));
+}
+
+/// `--agent FILE "q" --agent-provider … --agent-model …` reaches the same
+/// grammar as `.agent ask … provider … model …`.
+#[test]
+fn the_cli_flags_select_the_provider() {
+    let store = Store::new("cliflags");
+    // Leave the WAL folded so `--agent` does not have to replay a LOAD.
+    store.fold();
+    let mock = Mock::start(vec![anthropic_answer("flagged")]);
+    let mut command = store.plain_command();
+    point_at(&mut command, &mock)
+        .env("ANTHROPIC_API_KEY", sentinel("flags"))
+        .arg("--agent")
+        .arg(&store.path)
+        .arg("how many customers?")
+        .arg("--agent-provider")
+        .arg("anthropic")
+        .arg("--agent-model")
+        .arg("claude-flag");
+    let output = command
+        .stdin(Stdio::null())
+        .output()
+        .expect("run pinkdb --agent");
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `--agent` loads the library installed next to the binary, which is
+    // where `agent_library()` (called by `Store::new`) built it.
+    assert!(output.status.success(), "{out}");
+    assert!(out.contains("flagged"), "{out}");
+    assert_eq!(mock.bodies()[0]["model"], json!("claude-flag"));
+    let flagless = Command::new(cli())
+        .arg("--agent-provider")
+        .arg("zai")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run pinkdb");
+    assert!(!flagless.status.success());
+    assert!(
+        String::from_utf8_lossy(&flagless.stderr).contains("configure one --agent FILE"),
+        "{}",
+        String::from_utf8_lossy(&flagless.stderr)
+    );
+}
+
+#[test]
+fn an_anthropic_tool_loop_runs_real_queries() {
+    let store = Store::new("anthropic-loop");
+    let mock = Mock::start(vec![
+        anthropic_tool_calls(&[
+            ("toolu_1", "tables", r#"{"database":"main"}"#),
+            (
+                "toolu_2",
+                "query",
+                r#"{"sql":"SELECT count(*) AS n FROM customers"}"#,
+            ),
+        ]),
+        anthropic_answer("There are 5 customers."),
+    ]);
+    let key = sentinel("anthropic-loop");
+    let (out, code) = run_with(
+        &store,
+        &mock,
+        &[
+            ("PINKDB_AGENT_PROVIDER", "anthropic"),
+            ("ANTHROPIC_API_KEY", &key),
+        ],
+        ".agent ask \"how many customers?\"",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("There are 5 customers."), "{out}");
+    assert_eq!(mock.accepted(), 2);
+    let second = &mock.bodies()[1];
+    // The system prompt is hoisted; the results ride in one user message.
+    assert!(
+        second["system"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("read-only"),
+        "{second}"
+    );
+    let messages = second["messages"].as_array().expect("messages");
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(roles, ["user", "assistant", "user"], "{second}");
+    let results = messages[2]["content"].as_array().expect("result blocks");
+    assert_eq!(results.len(), 2, "{second}");
+    assert_eq!(results[0]["tool_use_id"], json!("toolu_1"));
+    assert_eq!(results[1]["tool_use_id"], json!("toolu_2"));
+    assert!(
+        results[1]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains('5'),
+        "{second}"
+    );
+    assert_eq!(
+        store.cell("SELECT count(*) FROM pinkdb_agent.usage WHERE provider = 'anthropic' AND model = 'claude-sonnet-5-5'"),
+        "2",
+        "usage is attributed per step"
+    );
+    assert!(!out.contains(&key), "{out}");
+}
+
+/// A 529 from Anthropic is retried like a 5xx, through the whole stack.
+#[test]
+fn an_anthropic_529_is_retried() {
+    let store = Store::new("529");
+    let mock = Mock::start(vec![
+        Reply::Status(
+            529,
+            r#"{"type":"error","error":{"type":"overloaded_error"}}"#.to_string(),
+        ),
+        anthropic_answer("after the overload"),
+    ]);
+    let (out, code) = run_with(
+        &store,
+        &mock,
+        &[("ANTHROPIC_API_KEY", "sk-x")],
+        ".agent ask \"q\" provider anthropic",
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("after the overload"), "{out}");
+    assert!(out.contains("overloaded (HTTP 529)"), "{out}");
+    assert_eq!(mock.accepted(), 2);
+}
+
+/// A `PINKDB_AGENT_BASE_URL` left over from a `custom` run never carries
+/// `ANTHROPIC_API_KEY` to that host: anthropic reads only its own root.
+#[test]
+fn the_custom_root_never_receives_a_builtin_providers_key() {
+    let store = Store::new("custom-root");
+    let anthropic = Mock::start(vec![anthropic_answer("from the anthropic root")]);
+    let custom = Mock::start(vec![answer("hijacked")]);
+    let key = sentinel("custom-root");
+    let mut command = store.plain_command();
+    command
+        .env("PINKDB_AGENT_BASE_URL", custom.base())
+        .env("PINKDB_AGENT_ANTHROPIC_BASE_URL", anthropic.base())
+        .env("ANTHROPIC_API_KEY", &key);
+    let (out, status) = run_merged(
+        command,
+        &store.script(&[".agent ask \"q\" provider anthropic".to_string()]),
+    );
+    assert!(status.success(), "{out}");
+    assert!(out.contains("from the anthropic root"), "{out}");
+    let requests = anthropic.requests();
+    assert_eq!(requests.len(), 1, "{out}");
+    assert!(
+        requests[0]
+            .head
+            .to_lowercase()
+            .contains(&format!("x-api-key: {key}")),
+        "{}",
+        requests[0].head
+    );
+    assert_eq!(custom.accepted(), 0, "the custom root was contacted");
+    assert!(
+        custom
+            .requests()
+            .iter()
+            .all(|request| !request.head.contains(&key) && !request.body.contains(&key)),
+        "the anthropic key reached the custom root"
+    );
+}
+
+#[test]
+fn resume_keeps_the_sessions_provider() {
+    let store = Store::new("resume-provider");
+    // An Anthropic run that fails on its first call leaves a resumable session.
+    let first = Mock::start(vec![
+        Reply::Status(500, "{}".to_string()),
+        Reply::Status(500, "{}".to_string()),
+        Reply::Status(500, "{}".to_string()),
+    ]);
+    let (out, _) = run_with(
+        &store,
+        &first,
+        &[("ANTHROPIC_API_KEY", "sk-a")],
+        ".agent ask \"how many?\" provider anthropic model claude-recorded",
+    );
+    assert!(out.contains("HTTP 500"), "{out}");
+    let id = store.cell("SELECT id FROM pinkdb_agent.sessions");
+    assert_eq!(
+        store.cell("SELECT status FROM pinkdb_agent.sessions"),
+        "failed"
+    );
+
+    // The resume names no provider, and the environment names a different
+    // one: the session's record wins over the environment.
+    let second = Mock::start(vec![anthropic_answer("resumed on anthropic")]);
+    let (out, code) = run_with(
+        &store,
+        &second,
+        &[
+            ("PINKDB_AGENT_PROVIDER", "zai"),
+            ("ZAI_API_KEY", "sk-z"),
+            ("ANTHROPIC_API_KEY", "sk-a"),
+        ],
+        &format!(".agent resume {id}"),
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("resumed on anthropic"), "{out}");
+    let request = &second.requests()[0];
+    assert!(
+        request.head.starts_with("POST /v1/messages "),
+        "{}",
+        request.head
+    );
+    assert_eq!(second.bodies()[0]["model"], json!("claude-recorded"));
+    assert_eq!(
+        store.cell("SELECT provider FROM pinkdb_agent.sessions"),
+        "anthropic"
+    );
+}
+
+/// A z.ai session forked onto Anthropic: the recorded transcript is re-encoded
+/// for the other protocol, and the original is untouched.
+#[test]
+fn a_fork_moves_a_session_from_zai_to_anthropic() {
+    let store = Store::new("fork-provider");
+    let zai = Mock::start(vec![
+        tool_calls(&[(
+            "call_1",
+            "query",
+            r#"{"sql":"SELECT count(*) FROM customers"}"#,
+        )]),
+        answer("5 customers."),
+    ]);
+    let out = store.ask(&zai, "how many customers?");
+    assert!(out.contains("5 customers."), "{out}");
+    let original = store.cell("SELECT id FROM pinkdb_agent.sessions");
+    assert_eq!(
+        store.cell("SELECT provider FROM pinkdb_agent.sessions"),
+        "zai"
+    );
+    let before = store.query(&format!(
+        "SELECT step, seq, role, content FROM pinkdb_agent.messages WHERE session = '{original}' ORDER BY step, seq"
+    ));
+
+    let anthropic = Mock::start(vec![anthropic_answer("Bravo is second.")]);
+    let (out, code) = run_with(
+        &store,
+        &anthropic,
+        &[
+            ("ANTHROPIC_API_KEY", "sk-fork"),
+            ("ZAI_API_KEY", "sk-zai-fork"),
+        ],
+        &format!(".agent fork {original} 2 provider anthropic \"who is second?\""),
+    );
+    assert_eq!(code, 0, "fork failed:\n{out}");
+    assert!(out.contains("Bravo is second."), "{out}");
+
+    // The fork's request is the z.ai transcript in Anthropic's shape.
+    let request = &anthropic.requests()[0];
+    assert!(
+        request.head.starts_with("POST /v1/messages "),
+        "{}",
+        request.head
+    );
+    assert!(!request.body.contains("sk-zai-fork"), "{}", request.body);
+    let body = &anthropic.bodies()[0];
+    assert_eq!(body["model"], json!("claude-sonnet-5-5"));
+    assert!(body["system"].is_string(), "{body}");
+    let messages = body["messages"].as_array().expect("messages");
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap_or_default())
+        .collect();
+    // question, the tool call, its result, the answer, then the new question.
+    assert_eq!(
+        roles,
+        ["user", "assistant", "user", "assistant", "user"],
+        "{body}"
+    );
+    assert_eq!(messages[1]["content"][0]["type"], json!("tool_use"));
+    assert_eq!(messages[1]["content"][0]["id"], json!("call_1"));
+    assert_eq!(messages[2]["content"][0]["type"], json!("tool_result"));
+    assert_eq!(messages[2]["content"][0]["tool_use_id"], json!("call_1"));
+    assert!(body.to_string().contains("who is second?"), "{body}");
+
+    // The original is untouched; the fork records the switch.
+    assert_eq!(
+        store.query(&format!(
+            "SELECT step, seq, role, content FROM pinkdb_agent.messages WHERE session = '{original}' ORDER BY step, seq"
+        )),
+        before
+    );
+    assert_eq!(
+        store.cell(&format!(
+            "SELECT provider FROM pinkdb_agent.sessions WHERE id = '{original}'"
+        )),
+        "zai"
+    );
+    let fork = store.cell(&format!(
+        "SELECT id FROM pinkdb_agent.sessions WHERE origin = '{original}'"
+    ));
+    assert_eq!(
+        store.cell(&format!(
+            "SELECT provider FROM pinkdb_agent.sessions WHERE id = '{fork}'"
+        )),
+        "anthropic"
+    );
+    // The copied steps keep the provider that earned them; the new step is
+    // Anthropic's.
+    assert_eq!(
+        store.cell(&format!(
+            "SELECT count(*) FROM pinkdb_agent.usage WHERE session = '{fork}' AND provider = 'zai'"
+        )),
+        "2"
+    );
+    assert_eq!(
+        store.cell(&format!(
+            "SELECT count(*) FROM pinkdb_agent.usage WHERE session = '{fork}' AND provider = 'anthropic'"
+        )),
+        "1"
+    );
+}
+
+#[test]
+fn providers_lists_the_table_and_never_a_key() {
+    let store = Store::new("providers");
+    let mock = Mock::start(Vec::new());
+    let keys = all_sentinels("list");
+    let mut command = store.plain_command();
+    for (variable, key) in &keys {
+        command.env(variable, key);
+    }
+    let openrouter_root = "http://127.0.0.1:9/openrouter-proxy";
+    command
+        .env("PINKDB_AGENT_BASE_URL", mock.base())
+        .env("PINKDB_AGENT_OPENROUTER_BASE_URL", openrouter_root);
+    let (out, status) = run_merged(command, &store.script(&[".agent providers".to_string()]));
+    assert!(status.success(), "{out}");
+    let line = |name: &str| {
+        out.lines()
+            .find(|line| line.split_whitespace().next() == Some(name))
+            .unwrap_or_else(|| panic!("no {name} line in:\n{out}"))
+            .to_string()
+    };
+    // Each row names its own override variable and shows the root in effect:
+    // custom's and openrouter's are overridden, nobody else's moved.
+    for name in [
+        "zai",
+        "anthropic",
+        "openai",
+        "deepseek",
+        "openrouter",
+        "gemini",
+        "ollama",
+    ] {
+        let variable = format!("PINKDB_AGENT_{}_BASE_URL", name.to_uppercase());
+        assert!(line(name).contains(&variable), "{out}");
+        assert!(!line(name).contains(&mock.base()), "{out}");
+    }
+    assert!(line("custom").contains("PINKDB_AGENT_BASE_URL"), "{out}");
+    assert!(line("custom").contains(&mock.base()), "{out}");
+    assert!(line("openrouter").contains(openrouter_root), "{out}");
+    assert!(
+        !line("openrouter").contains("https://openrouter.ai"),
+        "{out}"
+    );
+    let zai = line("zai");
+    assert!(zai.contains("openai"), "{zai}");
+    assert!(zai.contains("https://api.z.ai/api/paas/v4"), "{zai}");
+    assert!(zai.contains("glm-5.3"), "{zai}");
+    assert!(zai.contains("key: set"), "{zai}");
+    let anthropic = line("anthropic");
+    assert!(
+        anthropic.contains("https://api.anthropic.com/v1"),
+        "{anthropic}"
+    );
+    assert!(anthropic.contains("claude-sonnet-5-5"), "{anthropic}");
+    assert!(anthropic.contains("key: set"), "{anthropic}");
+    assert!(line("openai").contains("key: missing"), "{out}");
+    assert!(line("openai").contains("(model required)"), "{out}");
+    assert!(line("openrouter").contains("key: set"), "{out}");
+    assert!(line("ollama").contains("no key needed"), "{out}");
+    assert!(line("custom").contains("key: set"), "{out}");
+    for name in ["deepseek", "gemini"] {
+        assert!(line(name).contains("key: missing"), "{out}");
+    }
+    for (variable, key) in &keys {
+        assert!(!out.contains(key.as_str()), "{variable} printed:\n{out}");
+        // Not a prefix of it either.
+        assert!(
+            !out.contains(&key[..key.len() - 4]),
+            "{variable} prefix:\n{out}"
+        );
+    }
+    assert!(out.contains("there is no default provider"), "{out}");
+    assert_eq!(mock.accepted(), 0, "listing calls no provider");
+}
+
+/// The live providers: only with `PINKDB_AGENT_LIVE=1` and that provider's key
+/// exported. Never run in CI, and never with a key checked into the
+/// repository. The run names its provider explicitly, so only that provider's
+/// key variable is read.
+fn live(provider: &str, variables: &[&str]) {
     if std::env::var("PINKDB_AGENT_LIVE").ok().as_deref() != Some("1") {
         return;
     }
-    let key = std::env::var("PINKDB_AGENT_API_KEY")
-        .or_else(|_| std::env::var("Z_API_KEY"))
-        .unwrap_or_default();
-    if key.trim().is_empty() {
-        eprintln!("no API key exported; the live test has nothing to run");
+    let has_key = variables.iter().any(|name| {
+        std::env::var(name)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    if !has_key {
+        eprintln!(
+            "no {} exported; the live test has nothing to run",
+            variables.join(" or ")
+        );
         return;
     }
-    let store = Store::new("live");
+    let store = Store::new(&format!("live-{provider}"));
     let path = store.path.display();
     let script = format!(
-        ".open {path}\nLOAD EXTENSION '{}';\n.agent ask \"How many rows are in the customers table? Answer with the number.\"\n",
+        ".open {path}\nLOAD EXTENSION '{}';\n.agent ask \"How many rows are in the customers table? Answer with the number.\" provider {provider}\n",
         agent_library().display()
     );
     let mut command = Command::new(cli());
     command.arg("--allow-load-extension");
     let (out, status) = run_merged(command, &script);
-    assert!(status.success(), "the live run failed:\n{out}");
+    assert!(status.success(), "the live {provider} run failed:\n{out}");
     assert!(out.contains('5'), "the answer should be 5:\n{out}");
+}
+
+#[test]
+#[ignore = "needs PINKDB_AGENT_LIVE=1, a real key in ZAI_API_KEY or Z_API_KEY, and network"]
+fn a_live_zai_provider_answers() {
+    live("zai", &["ZAI_API_KEY", "Z_API_KEY"]);
+}
+
+#[test]
+#[ignore = "needs PINKDB_AGENT_LIVE=1, a real key in ANTHROPIC_API_KEY, and network"]
+fn a_live_anthropic_provider_answers() {
+    live("anthropic", &["ANTHROPIC_API_KEY"]);
 }

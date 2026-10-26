@@ -9,6 +9,51 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-26
+### Wave 106b — several model providers for pinkdb-agent ✅
+- **No default provider.** Every run names one: `.agent ask "…" provider
+  <name> [model <name>]`, `pinkdb --agent FILE "q" --agent-provider <name>
+  --agent-model <name>`, or `PINKDB_AGENT_PROVIDER`/`PINKDB_AGENT_MODEL` (a run
+  argument beats the environment). With none, the run fails with
+  `no provider: pass provider <name> or set PINKDB_AGENT_PROVIDER (one of: …)`
+  and the agent never infers a provider from an exported key.
+- **Eight built-in providers:** `zai` (`glm-5.3`), `anthropic`
+  (`claude-sonnet-5-5`), `openai`, `deepseek`, `openrouter`, `gemini`,
+  `ollama` (no auth header) and `custom` (`PINKDB_AGENT_BASE_URL`,
+  `PINKDB_AGENT_PROTOCOL`, optional `PINKDB_AGENT_API_KEY`). Base URLs are
+  roots, each overridden only by its own variable:
+  `PINKDB_AGENT_ZAI_BASE_URL`, `PINKDB_AGENT_ANTHROPIC_BASE_URL`,
+  `PINKDB_AGENT_OPENAI_BASE_URL`, `PINKDB_AGENT_DEEPSEEK_BASE_URL`,
+  `PINKDB_AGENT_OPENROUTER_BASE_URL`, `PINKDB_AGENT_GEMINI_BASE_URL`,
+  `PINKDB_AGENT_OLLAMA_BASE_URL`. `PINKDB_AGENT_BASE_URL` is `custom`'s alone;
+  built-in providers ignore it, so a root exported for a custom endpoint never
+  receives a built-in provider's key. A provider without a default model needs
+  `model <name>`. `.agent providers` lists them with each override variable,
+  the root in effect, and `key: set` / `key: missing` / `no key needed`, never
+  a key.
+- **Key isolation.** A key variable is only ever sent to its own provider
+  (`ZAI_API_KEY`/`Z_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …), in
+  that protocol's header. This replaces wave 106's "`PINKDB_AGENT_API_KEY`
+  then `Z_API_KEY`" rule: `PINKDB_AGENT_API_KEY` now belongs to `custom` only.
+- **The Anthropic Messages API** as a second wire protocol: `x-api-key` and
+  `anthropic-version: 2023-06-01`, the system prompt hoisted into `system`,
+  `tool_use`/`tool_result` blocks paired by id with consecutive results merged
+  and roles alternating, `input_schema` tools, `max_tokens` 8192
+  (`PINKDB_AGENT_MAX_TOKENS`), no extended thinking, and a hand-parsed event
+  stream (`message_start` … `message_stop`, `ping`, `error`). 529
+  (overloaded) is retried like 429/5xx; 401/403 name the provider and its key
+  variable. OpenAI-compatible reasoners' `reasoning_content` is dropped, never
+  recorded or sent back.
+- **Sessions record the provider.** `pinkdb_agent.sessions` gains `provider`
+  and `usage` gains `provider`/`model` per step (schema changed outright; no
+  migration). `.agent resume` keeps the recorded provider and model unless it
+  names others; `.agent fork <s> <step> [provider …] [model …]` may switch
+  provider — a z.ai session forked onto Anthropic is the same provider-neutral
+  transcript re-encoded.
+- **`extensions/llm` (`pinkdb-llm`)**, a new rlib holding the transcript, the
+  registry, both protocols and the client, for the agent and wave 109's
+  memory extension. Zero new crates in `Cargo.lock`; the release
+  `libpinkdb_agent.dylib` grew 2,471,968 → 2,548,240 bytes (+76,272, +3.1%).
+
 ### pinkdb-agent: GLM-5.3 by default
 - The agent's default model is now z.ai's `glm-5.3` (was `glm-4.6`);
   `PINKDB_AGENT_MODEL=glm-5.3-flash` picks the faster, cheaper variant. Both

@@ -63,6 +63,11 @@ members = [
     # The data agent (wave 106): an LLM loop whose whole state lives in the
     # store. Loaded like the MCP bridge, never linked.
     "extensions/agent",
+    # The shared model client (wave 106b): the provider-neutral transcript, the
+    # provider registry and the OpenAI and Anthropic wire protocols. An rlib
+    # linked into an extension (the agent now, agent memory next), never loaded
+    # on its own, and the only owner of the agent-side `ureq` dependency.
+    "extensions/llm",
     # The embeddings extension (wave 107c): `embed(text)` turns text into a
     # `FLOAT[N]` array from an OpenAI-compatible endpoint. Engine-adjacent
     # like fts (it needs the package host hooks), opt-in behind the CLI's

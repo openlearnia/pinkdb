@@ -9,9 +9,9 @@
 
 use serde_json::json;
 
-use crate::chat::{Message, ToolCall, Usage};
+use pinkdb_llm::{Message, Provider, ToolCall, Usage};
+
 use crate::host::{ANSWER, DIAGNOSTIC, Host};
-use crate::provider::Provider;
 use crate::store::{self, NewSession, Session};
 
 /// What the model is told about the session it is driving.
@@ -56,6 +56,7 @@ pub fn ask(
 ) -> Result<String, String> {
     store::ensure_schema(host)?;
     let id = store::new_id();
+    let name = provider.provider().to_string();
     let model = provider.model().to_string();
     let base_url = provider.base_url().to_string();
     store::create_session(
@@ -63,6 +64,7 @@ pub fn ask(
         &id,
         &NewSession {
             question: &options.question,
+            provider: &name,
             model: &model,
             base_url: &base_url,
             max_steps: options.max_steps,
@@ -114,7 +116,22 @@ pub fn continue_with(
 }
 
 /// Copy a session's prefix up to `step` into a new session.
-pub fn fork(host: &mut dyn Host, id: &str, step: u32) -> Result<String, String> {
+///
+/// `provider` and `model` are the fork's run arguments; each falls back to
+/// what the source session recorded, then to the environment. A fork may
+/// therefore land on a different provider than the session it came from: the
+/// transcript is provider-neutral, so continuing it is a re-encode.
+///
+/// The plan is settled *before* anything is written, so an unknown provider or
+/// a missing model fails without leaving a half-made session behind. No key is
+/// read: a fork with no new question never calls a provider.
+pub fn fork(
+    host: &mut dyn Host,
+    id: &str,
+    step: u32,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<String, String> {
     store::ensure_schema(host)?;
     let session = store::session(host, id)?.ok_or_else(|| unknown_session(id))?;
     let recorded = store::last_step(host, id)?;
@@ -123,9 +140,22 @@ pub fn fork(host: &mut dyn Host, id: &str, step: u32) -> Result<String, String> 
             "session {id} has steps up to {recorded}; fork at a step in 1..={recorded}"
         ));
     }
+    // A recorded model belongs to the recorded provider: carried onto another
+    // provider it names a model that provider does not serve.
+    let switched = provider.is_some_and(|name| name != session.provider);
+    let recorded_model = if switched { None } else { some(&session.model) };
+    let plan = pinkdb_llm::Plan::resolve(
+        provider.or(some(&session.provider)),
+        model.or(recorded_model),
+    )?;
     let forked = store::new_id();
-    store::copy_into(host, &session, &forked, step)?;
+    store::copy_into(host, &session, &forked, step, plan.provider, &plan.model)?;
     Ok(forked)
+}
+
+/// A recorded field, or `None` when the session never had one.
+fn some(recorded: &str) -> Option<&str> {
+    (!recorded.is_empty()).then_some(recorded)
 }
 
 fn unknown_session(id: &str) -> String {
@@ -137,7 +167,23 @@ fn continue_session(
     provider: &mut dyn Provider,
     id: &str,
 ) -> Result<(), String> {
-    let session = store::session(host, id)?.ok_or_else(|| unknown_session(id))?;
+    let mut session = store::session(host, id)?.ok_or_else(|| unknown_session(id))?;
+    // A resume or a fork may name a different provider than the session last
+    // ran on. The row follows the run, so `.agent show` never describes a
+    // provider that is not the one answering; the per-step `usage` rows keep
+    // the earlier provider's share.
+    if session.provider != provider.provider() || session.model != provider.model() {
+        session.provider = provider.provider().to_string();
+        session.model = provider.model().to_string();
+        session.base_url = provider.base_url().to_string();
+        store::set_provider(
+            host,
+            id,
+            &session.provider,
+            &session.model,
+            &session.base_url,
+        )?;
+    }
     let tools = pinkdb_warehouse_tools::schemas();
     let mut history: Option<Vec<Message>> = None;
     loop {
@@ -191,7 +237,7 @@ fn continue_session(
             }
         };
         if !resumed {
-            store::record_assistant(host, id, step, &turn, session.allow_writes)?;
+            store::record_assistant(host, &session, step, &turn)?;
         }
         if turn.tool_calls.is_empty() {
             store::checkpoint(host, id, step, store::CHECKPOINT)?;

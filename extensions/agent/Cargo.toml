@@ -3,7 +3,7 @@ name = "pinkdb-agent"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-description = "The pinkdb data agent: an OpenAI-compatible model that answers questions by running warehouse tools against the store (ABI minor 4 command extension)"
+description = "The pinkdb data agent: a model that answers questions by running warehouse tools against the store (ABI minor 4 command extension)"
 license = "MIT"
 
 [lib]
@@ -19,16 +19,10 @@ pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
 # The warehouse tool set (wave 106), shared with the MCP bridge: same JSON
 # schemas, same statements, same dispatch to the host.
 pinkdb-warehouse-tools = { path = "../warehouse-tools" }
-# The provider speaks JSON; serde_json is already in the workspace, so this
-# adds no new external crate.
+# The model client (wave 106b): the transcript, the provider registry and the
+# two wire protocols, shared with the agent-memory extension. It owns the only
+# third-party dependency the agent has (blocking `ureq` with rustls).
+pinkdb-llm = { path = "../llm" }
+# The transcript and the tool arguments are JSON; serde_json is already in the
+# workspace, so this adds no new external crate.
 serde_json = "1"
-# Blocking HTTP with rustls: the crate and features pinkdb-httpfs already
-# locks, without linking that crate (it links the whole engine). No async
-# runtime, no SSE or OpenAI client crate.
-ureq = { version = "3.4", default-features = false, features = ["rustls"] }
-
-[dev-dependencies]
-# The tests drive the real engine's policy and a real durable store; the
-# engine never depends on this crate, so it is not a cycle.
-pinkdb = { path = "../../crates/pinkdb" }
-pinkdb-ext-loader = { path = "../../crates/pinkdb-ext-loader" }

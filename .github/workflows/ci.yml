@@ -55,6 +55,12 @@ jobs:
         # extensions' own tests run in the same workspace test pass.
         run: cargo build -p pinkdb-cli -p pinkdb-mcp -p pinkdb-agent
 
+      - name: cargo test -p pinkdb-llm
+        # The shared model client (wave 106b): both wire protocols against
+        # recorded fixtures on 127.0.0.1, the registry and key isolation. Its
+        # own step so a provider regression is named in the CI summary.
+        run: cargo test -q -p pinkdb-llm
+
       - name: cargo test
         run: cargo test -q
 
@@ -583,7 +589,7 @@ jobs:
           key: macos
 
       - name: cargo build the extensions
-        run: cargo build -p pinkdb-mcp -p pinkdb-agent
+        run: cargo build -p pinkdb-mcp -p pinkdb-agent -p pinkdb-llm
 
       - name: cargo test --workspace
         run: cargo test --workspace
