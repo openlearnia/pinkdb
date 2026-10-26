@@ -191,6 +191,11 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-26">2026-10-26<a class="anchor" href="#2026-10-26" aria-label="Permalink: 2026-10-26">#</a></h2>
+<h3>pinkdb-agent: GLM-5.3 by default</h3>
+<ul>
+<li>The agent's default model is now z.ai's <code>glm-5.3</code> (was <code>glm-4.6</code>); <code>PINKDB_AGENT_MODEL=glm-5.3-flash</code> picks the faster, cheaper variant. Both are reasoning models: their hidden reasoning tokens count against the token budget and are recorded in <code>usage</code> like any other completion tokens.</li>
+</ul>
 <h2 id="2026-10-25">2026-10-25<a class="anchor" href="#2026-10-25" aria-label="Permalink: 2026-10-25">#</a></h2>
 <h3>Wave 107a — the fixed-size <code>ARRAY</code> type ✅</h3>
 <ul>
@@ -873,6 +878,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-26">2026-10-26</a></li>
   <li><a href="#2026-10-25">2026-10-25</a></li>
   <li><a href="#2026-10-25-2">2026-10-25</a></li>
   <li><a href="#2026-10-24">2026-10-24</a></li>

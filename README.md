@@ -1826,7 +1826,7 @@ The extension reads its key from the environment when a run starts —
 directory is a footgun. It talks to one OpenAI-compatible
 `/chat/completions` endpoint: `PINKDB_AGENT_BASE_URL` and `PINKDB_AGENT_MODEL`
 override the defaults (`https://api.z.ai/api/paas/v4/chat/completions`,
-`glm-4.6`), the stream is parsed as SSE, and 429s and 5xx answers are retried
+`glm-5.3`), the stream is parsed as SSE, and 429s and 5xx answers are retried
 three times with backoff. A 401 stops with a clear message and never echoes
 the key. The key is not stored: not in a table, not in the WAL, not in a log
 line, not in an error — `PINKDB_AGENT_API_KEY` is not reachable through `SET`

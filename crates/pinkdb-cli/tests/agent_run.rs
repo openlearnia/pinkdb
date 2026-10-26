@@ -112,7 +112,7 @@ fn chunk(delta: Value, finish: Option<&str>) -> String {
         "id": "mock",
         "object": "chat.completion.chunk",
         "created": 1,
-        "model": "glm-4.6",
+        "model": "glm-5.3",
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
     })
     .to_string()
@@ -121,7 +121,7 @@ fn chunk(delta: Value, finish: Option<&str>) -> String {
 fn usage_chunk(prompt: u64, completion: u64) -> String {
     json!({
         "id": "mock",
-        "model": "glm-4.6",
+        "model": "glm-5.3",
         "choices": [],
         "usage": {"prompt_tokens": prompt, "completion_tokens": completion},
     })
@@ -465,7 +465,7 @@ fn a_single_answer_is_printed_and_recorded() {
     assert!(out.contains("pinkdb agent: session "), "output: {out}");
     assert_eq!(mock.accepted(), 1, "one model call");
     let body = &mock.bodies()[0];
-    assert_eq!(body["model"], json!("glm-4.6"));
+    assert_eq!(body["model"], json!("glm-5.3"));
     assert_eq!(body["stream"], json!(true));
     // The system prompt names the tools and states the policy.
     let system = body["messages"][0]["content"].as_str().unwrap_or_default();

@@ -15,8 +15,9 @@ use crate::sse;
 
 /// z.ai's OpenAI-compatible endpoint.
 pub const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4/chat/completions";
-/// The model this harness was developed against (GLM 4.6).
-pub const DEFAULT_MODEL: &str = "glm-4.6";
+/// z.ai's current flagship (GLM-5.3). `glm-5.3-flash` is the cheaper, faster
+/// alternative through `PINKDB_AGENT_MODEL`.
+pub const DEFAULT_MODEL: &str = "glm-5.3";
 /// The key, in order of preference. `Z_API_KEY` is what z.ai's own CLI uses.
 pub const KEY_VARIABLES: [&str; 2] = ["PINKDB_AGENT_API_KEY", "Z_API_KEY"];
 
@@ -270,7 +271,7 @@ mod tests {
             DEFAULT_BASE_URL,
             "https://api.z.ai/api/paas/v4/chat/completions"
         );
-        assert_eq!(DEFAULT_MODEL, "glm-4.6");
+        assert_eq!(DEFAULT_MODEL, "glm-5.3");
         assert_eq!(KEY_VARIABLES, ["PINKDB_AGENT_API_KEY", "Z_API_KEY"]);
     }
 }

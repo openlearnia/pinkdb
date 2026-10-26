@@ -8,6 +8,13 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-26
+### pinkdb-agent: GLM-5.3 by default
+- The agent's default model is now z.ai's `glm-5.3` (was `glm-4.6`);
+  `PINKDB_AGENT_MODEL=glm-5.3-flash` picks the faster, cheaper variant. Both
+  are reasoning models: their hidden reasoning tokens count against the token
+  budget and are recorded in `usage` like any other completion tokens.
+
 ## 2026-10-25
 ### Wave 107a — the fixed-size `ARRAY` type ✅
 - **The type.** A column can now be `FLOAT[N]`/`REAL[N]`, `DOUBLE[N]`,
