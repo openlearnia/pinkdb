@@ -1,0 +1,814 @@
+{
+  "meta": {
+    "host": "Kartiks-MacBook-Air-2.local",
+    "os": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "os_version": "27.0.1",
+    "cpu": "Apple M4",
+    "physical_cores": 10,
+    "logical_cores": 10,
+    "memory_gb": 17.18,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)",
+    "duckdb": "v2.0.0 (Cyanoptera) d54cbbe3df",
+    "branch": "stream-c",
+    "commit": "bc4da2aa7084ee5715ad0a6bfa74306d6d0f13a3",
+    "commit_short": "bc4da2a",
+    "dirty": true,
+    "dirty_files": 16,
+    "python": "3.14.7",
+    "started": "2026-10-27T00:17:01",
+    "finished": "2026-10-27T00:20:10",
+    "scale": 1.0,
+    "threads": 8,
+    "runs": 5,
+    "warmup": 1,
+    "families": [
+      "tpch"
+    ],
+    "loads": [
+      {
+        "stage": "start",
+        "at": "00:17:01",
+        "load": [
+          2.08056640625,
+          2.1982421875,
+          2.4560546875
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q1",
+        "at": "00:17:13",
+        "load": [
+          1.9873046875,
+          2.1748046875,
+          2.4443359375
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q2",
+        "at": "00:17:15",
+        "load": [
+          2.068359375,
+          2.1884765625,
+          2.447265625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q3",
+        "at": "00:17:17",
+        "load": [
+          2.068359375,
+          2.1884765625,
+          2.447265625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q4",
+        "at": "00:17:19",
+        "load": [
+          2.54296875,
+          2.28466796875,
+          2.4794921875
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q5",
+        "at": "00:17:21",
+        "load": [
+          2.54296875,
+          2.28466796875,
+          2.4794921875
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q6",
+        "at": "00:17:24",
+        "load": [
+          3.0595703125,
+          2.39599609375,
+          2.517578125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q7",
+        "at": "00:17:25",
+        "load": [
+          3.0595703125,
+          2.39599609375,
+          2.517578125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q8",
+        "at": "00:17:35",
+        "load": [
+          3.537109375,
+          2.51513671875,
+          2.5576171875
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q9",
+        "at": "00:17:39",
+        "load": [
+          3.537109375,
+          2.51513671875,
+          2.5576171875
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q10",
+        "at": "00:17:45",
+        "load": [
+          4.0146484375,
+          2.64697265625,
+          2.603515625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q11",
+        "at": "00:17:47",
+        "load": [
+          4.0146484375,
+          2.64697265625,
+          2.603515625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q12",
+        "at": "00:17:52",
+        "load": [
+          4.33349609375,
+          2.73583984375,
+          2.634765625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q13",
+        "at": "00:17:53",
+        "load": [
+          4.33349609375,
+          2.73583984375,
+          2.634765625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q14",
+        "at": "00:17:57",
+        "load": [
+          4.466796875,
+          2.78955078125,
+          2.654296875
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q15",
+        "at": "00:17:59",
+        "load": [
+          4.34912109375,
+          2.79296875,
+          2.65625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q16",
+        "at": "00:18:00",
+        "load": [
+          4.34912109375,
+          2.79296875,
+          2.65625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q17",
+        "at": "00:18:01",
+        "load": [
+          4.34912109375,
+          2.79296875,
+          2.65625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q18",
+        "at": "00:18:03",
+        "load": [
+          4.34912109375,
+          2.79296875,
+          2.65625
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q19",
+        "at": "00:18:40",
+        "load": [
+          6.251953125,
+          3.47607421875,
+          2.9111328125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q20",
+        "at": "00:18:58",
+        "load": [
+          6.853515625,
+          3.74560546875,
+          3.01708984375
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q21",
+        "at": "00:19:13",
+        "load": [
+          7.1806640625,
+          3.9697265625,
+          3.109375
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q22",
+        "at": "00:20:03",
+        "load": [
+          7.466796875,
+          4.57861328125,
+          3.38427734375
+        ],
+        "busy": null
+      },
+      {
+        "stage": "after tpch",
+        "at": "00:20:10",
+        "load": [
+          8.02880859375,
+          4.79052734375,
+          3.47314453125
+        ],
+        "busy": null
+      }
+    ]
+  },
+  "families": {
+    "tpch": {
+      "scale": 1.0,
+      "threads": {
+        "pinkdb": 8,
+        "duckdb": 8
+      },
+      "warmup": 1,
+      "runs": 5,
+      "parquet": "/var/folders/c6/6s90fg_10l9873q01hjny22r0000gn/T/pinkdb_bench_suite/tpch_sf1/parquet",
+      "pinkdb_store_bytes": 320819449,
+      "duckdb_store_bytes": 298070016,
+      "queries": [
+        {
+          "query": 1,
+          "status": "ok",
+          "pinkdb_ms": 170.0,
+          "duckdb_ms": 14.0,
+          "ratio": 12.142857142857142,
+          "pinkdb_runs_ms": [
+            178.0,
+            175.0,
+            170.0,
+            168.0,
+            170.0
+          ],
+          "duckdb_runs_ms": [
+            14.0,
+            14.0,
+            14.0,
+            14.0,
+            14.0
+          ],
+          "rows": 4,
+          "checksum": "9fcb2f1e639d8332",
+          "error": null
+        },
+        {
+          "query": 2,
+          "status": "ok",
+          "pinkdb_ms": 195.0,
+          "duckdb_ms": 3.0,
+          "ratio": 65.0,
+          "pinkdb_runs_ms": [
+            197.0,
+            193.0,
+            197.0,
+            195.0,
+            195.0
+          ],
+          "duckdb_runs_ms": [
+            4.0,
+            4.0,
+            3.0,
+            3.0,
+            3.0
+          ],
+          "rows": 100,
+          "checksum": "10fabea89022fb2a",
+          "error": null
+        },
+        {
+          "query": 3,
+          "status": "ok",
+          "pinkdb_ms": 196.0,
+          "duckdb_ms": 8.0,
+          "ratio": 24.5,
+          "pinkdb_runs_ms": [
+            204.0,
+            194.0,
+            199.0,
+            196.0,
+            196.0
+          ],
+          "duckdb_runs_ms": [
+            9.0,
+            9.0,
+            8.0,
+            8.0,
+            8.0
+          ],
+          "rows": 10,
+          "checksum": "cdad719bd879ff54",
+          "error": null
+        },
+        {
+          "query": 4,
+          "status": "ok",
+          "pinkdb_ms": 163.0,
+          "duckdb_ms": 7.0,
+          "ratio": 23.285714285714285,
+          "pinkdb_runs_ms": [
+            179.0,
+            169.0,
+            162.0,
+            163.0,
+            159.0
+          ],
+          "duckdb_runs_ms": [
+            8.0,
+            7.0,
+            8.0,
+            7.0,
+            7.0
+          ],
+          "rows": 5,
+          "checksum": "5e2cbe1c9f259274",
+          "error": null
+        },
+        {
+          "query": 5,
+          "status": "ok",
+          "pinkdb_ms": 369.0,
+          "duckdb_ms": 9.0,
+          "ratio": 41.0,
+          "pinkdb_runs_ms": [
+            378.0,
+            349.0,
+            375.0,
+            353.0,
+            369.0
+          ],
+          "duckdb_runs_ms": [
+            10.0,
+            11.0,
+            9.0,
+            9.0,
+            9.0
+          ],
+          "rows": 5,
+          "checksum": "4292fc131c0053d4",
+          "error": null
+        },
+        {
+          "query": 6,
+          "status": "ok",
+          "pinkdb_ms": 82.0,
+          "duckdb_ms": 4.0,
+          "ratio": 20.5,
+          "pinkdb_runs_ms": [
+            82.0,
+            82.0,
+            82.0,
+            84.0,
+            83.0
+          ],
+          "duckdb_runs_ms": [
+            4.0,
+            4.0,
+            4.0,
+            3.0,
+            4.0
+          ],
+          "rows": 1,
+          "checksum": "f4c5a9cf91e02315",
+          "error": null
+        },
+        {
+          "query": 7,
+          "status": "ok",
+          "pinkdb_ms": 1277.0,
+          "duckdb_ms": 9.0,
+          "ratio": 141.88888888888889,
+          "pinkdb_runs_ms": [
+            1377.0,
+            1264.0,
+            1248.0,
+            1277.0,
+            1290.0
+          ],
+          "duckdb_runs_ms": [
+            9.0,
+            9.0,
+            9.0,
+            9.0,
+            9.0
+          ],
+          "rows": 4,
+          "checksum": "2376679691a964f4",
+          "error": null
+        },
+        {
+          "query": 8,
+          "status": "ok",
+          "pinkdb_ms": 255.0,
+          "duckdb_ms": 9.0,
+          "ratio": 28.333333333333332,
+          "pinkdb_runs_ms": [
+            360.0,
+            299.0,
+            255.0,
+            255.0,
+            254.0
+          ],
+          "duckdb_runs_ms": [
+            9.0,
+            8.0,
+            9.0,
+            8.0,
+            9.0
+          ],
+          "rows": 2,
+          "checksum": "a16faad72cc3c7ad",
+          "error": null
+        },
+        {
+          "query": 9,
+          "status": "ok",
+          "pinkdb_ms": 688.0,
+          "duckdb_ms": 29.0,
+          "ratio": 23.724137931034484,
+          "pinkdb_runs_ms": [
+            792.0,
+            713.0,
+            668.0,
+            680.0,
+            688.0
+          ],
+          "duckdb_runs_ms": [
+            30.0,
+            29.0,
+            29.0,
+            28.0,
+            29.0
+          ],
+          "rows": 175,
+          "checksum": "398c8af2cbbe624e",
+          "error": null
+        },
+        {
+          "query": 10,
+          "status": "ok",
+          "pinkdb_ms": 222.0,
+          "duckdb_ms": 17.0,
+          "ratio": 13.058823529411764,
+          "pinkdb_runs_ms": [
+            241.0,
+            217.0,
+            223.0,
+            222.0,
+            203.0
+          ],
+          "duckdb_runs_ms": [
+            16.0,
+            17.0,
+            17.0,
+            17.0,
+            17.0
+          ],
+          "rows": 20,
+          "checksum": "9dce78a24201bb7d",
+          "error": null
+        },
+        {
+          "query": 11,
+          "status": "ok",
+          "pinkdb_ms": 517.0,
+          "duckdb_ms": 3.0,
+          "ratio": 172.33333333333334,
+          "pinkdb_runs_ms": [
+            526.0,
+            517.0,
+            515.0,
+            520.0,
+            504.0
+          ],
+          "duckdb_runs_ms": [
+            3.0,
+            3.0,
+            3.0,
+            3.0,
+            3.0
+          ],
+          "rows": 1048,
+          "checksum": "57508a638dd64d86",
+          "error": null
+        },
+        {
+          "query": 12,
+          "status": "ok",
+          "pinkdb_ms": 149.0,
+          "duckdb_ms": 10.0,
+          "ratio": 14.9,
+          "pinkdb_runs_ms": [
+            149.0,
+            148.0,
+            150.0,
+            150.0,
+            149.0
+          ],
+          "duckdb_runs_ms": [
+            10.0,
+            9.0,
+            10.0,
+            10.0,
+            10.0
+          ],
+          "rows": 2,
+          "checksum": "18951f6d3ebd7894",
+          "error": null
+        },
+        {
+          "query": 13,
+          "status": "ok",
+          "pinkdb_ms": 433.0,
+          "duckdb_ms": 40.0,
+          "ratio": 10.825,
+          "pinkdb_runs_ms": [
+            444.0,
+            436.0,
+            433.0,
+            433.0,
+            430.0
+          ],
+          "duckdb_runs_ms": [
+            39.0,
+            40.0,
+            41.0,
+            40.0,
+            42.0
+          ],
+          "rows": 42,
+          "checksum": "50d5399b767d8bdb",
+          "error": null
+        },
+        {
+          "query": 14,
+          "status": "ok",
+          "pinkdb_ms": 71.0,
+          "duckdb_ms": 8.0,
+          "ratio": 8.875,
+          "pinkdb_runs_ms": [
+            99.0,
+            81.0,
+            70.0,
+            70.0,
+            71.0
+          ],
+          "duckdb_runs_ms": [
+            8.0,
+            8.0,
+            8.0,
+            8.0,
+            8.0
+          ],
+          "rows": 1,
+          "checksum": "f665cc9a7eadbc58",
+          "error": null
+        },
+        {
+          "query": 15,
+          "status": "ok",
+          "pinkdb_ms": 35.0,
+          "duckdb_ms": 5.0,
+          "ratio": 7.0,
+          "pinkdb_runs_ms": [
+            39.0,
+            37.0,
+            35.0,
+            35.0,
+            35.0
+          ],
+          "duckdb_runs_ms": [
+            5.0,
+            5.0,
+            5.0,
+            5.0,
+            5.0
+          ],
+          "rows": 1,
+          "checksum": "5e83c491765b7e0f",
+          "error": null
+        },
+        {
+          "query": 16,
+          "status": "ok",
+          "pinkdb_ms": 69.0,
+          "duckdb_ms": 11.0,
+          "ratio": 6.2727272727272725,
+          "pinkdb_runs_ms": [
+            72.0,
+            70.0,
+            68.0,
+            69.0,
+            69.0
+          ],
+          "duckdb_runs_ms": [
+            12.0,
+            11.0,
+            12.0,
+            11.0,
+            11.0
+          ],
+          "rows": 18314,
+          "checksum": "7184fc2628034403",
+          "error": null
+        },
+        {
+          "query": 17,
+          "status": "ok",
+          "pinkdb_ms": 94.0,
+          "duckdb_ms": 8.0,
+          "ratio": 11.75,
+          "pinkdb_runs_ms": [
+            109.0,
+            92.0,
+            92.0,
+            94.0,
+            97.0
+          ],
+          "duckdb_runs_ms": [
+            8.0,
+            8.0,
+            7.0,
+            8.0,
+            7.0
+          ],
+          "rows": 1,
+          "checksum": "56872ca9aed22baa",
+          "error": null
+        },
+        {
+          "query": 18,
+          "status": "ok",
+          "pinkdb_ms": 5368.0,
+          "duckdb_ms": 25.0,
+          "ratio": 214.72,
+          "pinkdb_runs_ms": [
+            4948.0,
+            5149.0,
+            5407.0,
+            5368.0,
+            5396.0
+          ],
+          "duckdb_runs_ms": [
+            24.0,
+            24.0,
+            25.0,
+            25.0,
+            25.0
+          ],
+          "rows": 57,
+          "checksum": "2ddc27ffeafcb886",
+          "error": null
+        },
+        {
+          "query": 19,
+          "status": "ok",
+          "pinkdb_ms": 2415.0,
+          "duckdb_ms": 10.0,
+          "ratio": 241.5,
+          "pinkdb_runs_ms": [
+            2415.0,
+            2407.0,
+            2413.0,
+            2416.0,
+            2456.0
+          ],
+          "duckdb_runs_ms": [
+            10.0,
+            10.0,
+            10.0,
+            10.0,
+            11.0
+          ],
+          "rows": 1,
+          "checksum": "aeda62c83b4e49f9",
+          "error": null
+        },
+        {
+          "query": 20,
+          "status": "ok",
+          "pinkdb_ms": 1933.0,
+          "duckdb_ms": 11.0,
+          "ratio": 175.72727272727272,
+          "pinkdb_runs_ms": [
+            2061.0,
+            2099.0,
+            1921.0,
+            1933.0,
+            1904.0
+          ],
+          "duckdb_runs_ms": [
+            11.0,
+            11.0,
+            10.0,
+            10.0,
+            11.0
+          ],
+          "rows": 186,
+          "checksum": "26c1c9eee61af4ed",
+          "error": null
+        },
+        {
+          "query": 21,
+          "status": "ok",
+          "pinkdb_ms": 7222.0,
+          "duckdb_ms": 18.0,
+          "ratio": 401.22222222222223,
+          "pinkdb_runs_ms": [
+            6585.0,
+            7106.0,
+            7222.0,
+            7395.0,
+            7446.0
+          ],
+          "duckdb_runs_ms": [
+            18.0,
+            18.0,
+            18.0,
+            18.0,
+            18.0
+          ],
+          "rows": 100,
+          "checksum": "95d1d5b3a84d85f5",
+          "error": null
+        },
+        {
+          "query": 22,
+          "status": "ok",
+          "pinkdb_ms": 794.0,
+          "duckdb_ms": 14.0,
+          "ratio": 56.714285714285715,
+          "pinkdb_runs_ms": [
+            829.0,
+            794.0,
+            771.0,
+            786.0,
+            817.0
+          ],
+          "duckdb_runs_ms": [
+            14.0,
+            14.0,
+            14.0,
+            14.0,
+            14.0
+          ],
+          "rows": 7,
+          "checksum": "23e883a6757a28e0",
+          "error": null
+        }
+      ]
+    }
+  }
+}

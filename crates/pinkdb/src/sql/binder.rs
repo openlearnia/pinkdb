@@ -14,6 +14,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use super::ast::*;
 use crate::attached::AtSpec;
@@ -369,6 +370,124 @@ pub struct BoundWindow {
     pub dtype: DataType,
 }
 
+/// How a subquery body reaches the block its expression sits in (wave 120).
+///
+/// Collected while binding, so neither the planner nor the executor has to
+/// search a body for references: a body that never named an outer column
+/// carries an empty list and keeps the uncorrelated path unchanged.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OuterBind {
+    /// `(depth, index)` of every enclosing-block column the body reads, in the
+    /// body's own plan frame: depth 0 is the block holding this expression, 1
+    /// its parent. `index` addresses that block's FROM row (a reference binds
+    /// `FROM`, not the select list).
+    pub refs: Arc<[(usize, usize)]>,
+    /// A subquery inside the body reads a row *above* the block holding this
+    /// expression. Unnesting would have to carry that row along, which the
+    /// dependent join does not do yet, so such a body stays on the per-row
+    /// path (`docs/wave-120-plan.md`).
+    pub deep: bool,
+    /// For an expression in a block that evaluates over an aggregate: maps a
+    /// column of the block's FROM row to its position in the aggregate output
+    /// (`None` when it is not a group key). `None` when the block's row *is*
+    /// its FROM row.
+    pub keys: Option<Arc<[Option<usize>]>>,
+}
+
+impl OuterBind {
+    /// The enclosing row this body reads, built from `chunk`'s row: the
+    /// depth-0 columns at their FROM-row positions, NULL elsewhere. That is
+    /// the space the body's `OuterRef` indexes (a reference binds `FROM`), and
+    /// a block above an aggregate reaches it through `keys`.
+    pub fn snapshot(&self, chunk: &crate::vector::DataChunk, row: usize) -> Vec<Value> {
+        let refs = self.row_refs();
+        let width = refs.iter().copied().max().map_or(0, |m| m + 1);
+        let mut out = vec![Value::Null; width];
+        for &i in &refs {
+            let pos = match &self.keys {
+                Some(map) => map.get(i).copied().flatten(),
+                None => Some(i),
+            };
+            if let Some(col) = pos.and_then(|p| chunk.columns.get(p)) {
+                out[i] = col.get(row);
+            }
+        }
+        out
+    }
+
+    /// Columns of the expression's own plan the body depends on: its depth-0
+    /// references, moved to their group-key position when the expression sits
+    /// above an aggregate.
+    pub(crate) fn row_columns(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for &i in &self.row_refs() {
+            let pos = match &self.keys {
+                Some(map) => map.get(i).copied().flatten(),
+                None => Some(i),
+            };
+            if let Some(p) = pos
+                && !out.contains(&p)
+            {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// Outer depth-0 columns the body reads, deduplicated, in first-use order.
+    /// FROM-space columns the body reads that the enclosing grouping does not
+    /// carry. SQL (and DuckDB) reject those: a group has no single value for
+    /// them, so reading one would silently pick an arbitrary group member.
+    fn ungrouped_refs(&self) -> Vec<usize> {
+        match &self.keys {
+            None => Vec::new(),
+            Some(map) => self
+                .row_refs()
+                .into_iter()
+                .filter(|i| map.get(*i).copied().flatten().is_none())
+                .collect(),
+        }
+    }
+
+    fn row_refs(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        for (depth, index) in self.refs.iter() {
+            if *depth == 0 && !out.contains(index) {
+                out.push(*index);
+            }
+        }
+        out
+    }
+
+    /// Whether the body reads a block beyond the one holding the expression:
+    /// such a body cannot be decorrelated into a join with this block alone.
+    fn reaches_past_row(&self) -> bool {
+        self.refs.iter().any(|(depth, _)| *depth > 0)
+    }
+
+    /// Rewrite the depth-0 row positions through `keys`, an aggregate's group
+    /// keys, so a reference still finds its value in the aggregate output.
+    fn through_keys(mut self, keys: &[BoundExpr]) -> Self {
+        let Some(width) = self
+            .refs
+            .iter()
+            .filter(|(depth, _)| *depth == 0)
+            .map(|(_, index)| index + 1)
+            .max()
+        else {
+            return self;
+        };
+        let map: Vec<Option<usize>> = (0..width)
+            .map(|i| {
+                keys.iter()
+                    .position(|k| matches!(k, BoundExpr::Column { index, .. } if *index == i))
+            })
+            .collect();
+        self.keys = Some(Arc::from(map));
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
     Literal(Value),
@@ -427,21 +546,39 @@ pub enum BoundExpr {
         else_: Option<Box<BoundExpr>>,
         dtype: DataType,
     },
-    /// Uncorrelated scalar subquery (1 col by construction; rows at runtime).
+    /// A column of an enclosing query block (wave 120): `depth` 0 is the
+    /// immediately enclosing block, 1 its parent, and so on; `index` addresses
+    /// that block's row like [`BoundExpr::Column`]. Only a subquery body can
+    /// hold one, and only until it is either decorrelated into a join or
+    /// evaluated with an outer row on the executor's stack.
+    OuterRef {
+        depth: usize,
+        index: usize,
+        dtype: DataType,
+    },
+    /// Scalar subquery (1 col by construction; rows at runtime). Uncorrelated
+    /// bodies are memoised once per statement; a correlated body runs per
+    /// distinct outer key (or is decorrelated into a join).
     ScalarSubquery {
         query: Box<LogicalPlan>,
         dtype: DataType,
+        outer: OuterBind,
     },
     /// `expr [NOT] IN (query)` — `expr` may reference the outer scope.
     InSubquery {
         expr: Box<BoundExpr>,
         query: Box<LogicalPlan>,
         negated: bool,
+        /// Comparison applied to each set member: `Eq` for `IN`, the written
+        /// operator for `ANY` (`ALL` is desugared into `NOT` + inverse).
+        op: BinaryOp,
+        outer: OuterBind,
     },
     /// `[NOT] EXISTS (query)` — scope-independent.
     Exists {
         query: Box<LogicalPlan>,
         negated: bool,
+        outer: OuterBind,
     },
     /// Call into a scalar function registered by a loaded extension — a
     /// native `dlopen` callback or a linked registry function
@@ -484,8 +621,9 @@ impl BoundExpr {
             BoundExpr::Cast { dtype, .. } => *dtype,
             BoundExpr::Coalesce { dtype, .. } => *dtype,
             BoundExpr::Case { dtype, .. } => *dtype,
-            BoundExpr::ScalarSubquery { dtype, .. } => *dtype,
-            BoundExpr::DynamicScalar { dtype, .. } => *dtype,
+            BoundExpr::ScalarSubquery { dtype, .. }
+            | BoundExpr::OuterRef { dtype, .. }
+            | BoundExpr::DynamicScalar { dtype, .. } => *dtype,
             BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } => DataType::Boolean,
         }
     }
@@ -510,6 +648,7 @@ impl BoundExpr {
             }
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
+            | BoundExpr::OuterRef { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. } => true,
             BoundExpr::InSubquery { expr, .. } => expr.is_aggregate_free(),
@@ -535,6 +674,9 @@ impl BoundExpr {
             | BoundExpr::WindowRef { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. } => false,
+            // An outer column is a column of *this* row too, for folding: it
+            // must not become a literal just because it names another block.
+            BoundExpr::OuterRef { .. } => true,
             BoundExpr::InSubquery { expr, .. } => expr.has_column_ref(),
             BoundExpr::Cast { expr, .. } => expr.has_column_ref(),
             BoundExpr::Coalesce { args, .. } => args.iter().any(|a| a.has_column_ref()),
@@ -565,6 +707,7 @@ impl BoundExpr {
             | BoundExpr::Exists { .. } => true,
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
+            | BoundExpr::OuterRef { .. }
             | BoundExpr::AggRef { .. }
             | BoundExpr::WindowRef { .. } => false,
             BoundExpr::Not(e)
@@ -600,6 +743,7 @@ impl BoundExpr {
             BoundExpr::DynamicScalar { .. } => true,
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
+            | BoundExpr::OuterRef { .. }
             | BoundExpr::AggRef { .. }
             | BoundExpr::WindowRef { .. }
             | BoundExpr::ScalarSubquery { .. }
@@ -1269,11 +1413,32 @@ impl ScopeTable {
     }
 }
 
+/// One enclosing query block's FROM scope, for a correlated column reference.
+/// A block's tables are fixed by the time a subquery in its WHERE/SELECT/
+/// HAVING/ON binds, so the chain is snapshotted at that moment.
+struct OuterScope {
+    tables: Vec<ScopeTable>,
+    parent: Option<Rc<OuterScope>>,
+}
+
 struct Binder<'a> {
     db: &'a PinkDb,
     /// Session database for unqualified names (lowercased when used).
     default_db: String,
     tables: Vec<ScopeTable>,
+    /// The enclosing blocks, innermost first: a subquery resolves a name its
+    /// own FROM does not have here (wave 120). `None` for a top-level block
+    /// and for every block that must not see one (a view or CTE body, a UNION
+    /// branch).
+    outer: Option<Rc<OuterScope>>,
+    /// Outer columns this block's expressions reference, as `(depth, index)`
+    /// with depth 0 naming this block's enclosing block. Fresh per block, and
+    /// read by [`Binder::bind_subquery`] to fill in the subquery expression's
+    /// [`OuterBind`].
+    outer_uses: Rc<RefCell<Vec<(usize, usize)>>>,
+    /// Whether a subquery bound in this block's scope reads a row above it;
+    /// see [`OuterBind::deep`].
+    past: bool,
     /// Select alias (lowercased) → AST, for cross-clause references.
     aliases: HashMap<String, Expr>,
     /// Aliases currently being resolved (cycle guard: `SELECT x AS x`).
@@ -1342,6 +1507,9 @@ impl<'a> Binder<'a> {
             db,
             default_db: default_db.to_string(),
             tables: Vec::new(),
+            outer: None,
+            outer_uses: Rc::new(RefCell::new(Vec::new())),
+            past: false,
             aliases: HashMap::new(),
             resolving: Vec::new(),
             allow_alias: true,
@@ -1389,13 +1557,20 @@ impl<'a> Binder<'a> {
         self
     }
 
-    /// A child scope for a subquery: no tables/aliases leak in, CTEs do.
-    /// (Subqueries are uncorrelated in v1 — outer columns are invisible.)
+    /// A child scope for a subquery: no tables/aliases leak in, CTEs do, and
+    /// the parent's FROM scope becomes visible as the outer block.
     fn child(&self) -> Self {
         Self {
             db: self.db,
             default_db: self.default_db.clone(),
             tables: Vec::new(),
+            outer: self.outer.clone(),
+            // A nested block that keeps the same outer chain — a derived
+            // table, a UNION branch, a view body — reads the same enclosing
+            // rows as the block it sits in, so its outer references belong to
+            // that block's census. Only a subquery installs its own list.
+            outer_uses: Rc::clone(&self.outer_uses),
+            past: false,
             aliases: HashMap::new(),
             resolving: Vec::new(),
             allow_alias: true,
@@ -1417,6 +1592,20 @@ impl<'a> Binder<'a> {
             macro_nodes: Rc::clone(&self.macro_nodes),
             views_expanding: Rc::clone(&self.views_expanding),
         }
+    }
+
+    /// A child scope for a subquery body: the body may name this block's
+    /// columns, so this block's FROM scope joins the outer chain.
+    fn subquery_scope(&self) -> Self {
+        let mut child = self.child();
+        // The body's references are counted in the body's own frame: depth 0
+        // is this block's row, so they start a fresh list.
+        child.outer_uses = Rc::new(RefCell::new(Vec::new()));
+        child.outer = Some(Rc::new(OuterScope {
+            tables: self.tables.clone(),
+            parent: self.outer.clone(),
+        }));
+        child
     }
 
     /// Bind one `?` as a literal of the slot's inferred type; a plain
@@ -1568,7 +1757,97 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Resolve a column reference against the FROM scope.
+    /// Resolve a column reference against the FROM scope, then the enclosing
+    /// blocks (wave 120). A hit in an enclosing block is an
+    /// [`BoundExpr::OuterRef`]; a name no block has keeps the innermost
+    /// block's error message.
+    fn lookup_column(&self, db: Option<&str>, table: Option<&str>, col: &str) -> Result<BoundExpr> {
+        if let Some((index, dtype)) = Self::lookup_in_scope(&self.tables, db, table, col)? {
+            return Ok(BoundExpr::Column { index, dtype });
+        }
+        let miss = Self::missing_column_message(&self.tables, db, table, col);
+        let mut scope = self.outer.as_deref();
+        let mut depth = 0usize;
+        while let Some(outer) = scope {
+            if let Some((index, dtype)) = Self::lookup_in_scope(&outer.tables, db, table, col)? {
+                let mut uses = self.outer_uses.borrow_mut();
+                if !uses.contains(&(depth, index)) {
+                    uses.push((depth, index));
+                }
+                return Ok(BoundExpr::OuterRef {
+                    depth,
+                    index,
+                    dtype,
+                });
+            }
+            depth += 1;
+            scope = outer.parent.as_deref();
+        }
+        Err(miss)
+    }
+
+    /// Bind a subquery body in its own scope and collect how it reaches this
+    /// block. The body sees this block's FROM row as outer depth 0; the
+    /// returned list is in exactly that frame, and every reference that
+    /// reaches *past* this block is handed up so this block's own parent sees
+    /// it as an outer reference too.
+    fn bind_subquery(&mut self, query: &Select) -> Result<(OuterBind, LogicalPlan)> {
+        let mut child = self.subquery_scope();
+        let plan = bind_select_in(child.db, &mut child, query)?;
+        let refs = std::mem::take(&mut *child.outer_uses.borrow_mut());
+        let outer = OuterBind {
+            refs: Arc::from(refs.clone()),
+            deep: child.past,
+            keys: None,
+        };
+        if outer.deep || refs.iter().any(|(depth, _)| *depth > 0) {
+            self.past = true;
+        }
+        for (depth, index) in refs {
+            // Depth 0 addresses this block's own row, which is the row a
+            // decorator or the executor supplies from this block's input;
+            // only a reference beyond it concerns this block's parent.
+            if depth > 0 {
+                let mut uses = self.outer_uses.borrow_mut();
+                if !uses.contains(&(depth - 1, index)) {
+                    uses.push((depth - 1, index));
+                }
+            }
+        }
+        Ok((outer, plan))
+    }
+
+    /// The error for a name this scope does not have, in the shape the
+    /// reference used.
+    fn missing_column_message(
+        tables: &[ScopeTable],
+        db: Option<&str>,
+        table: Option<&str>,
+        col: &str,
+    ) -> PinkDbError {
+        match (db, table) {
+            (Some(qdb), Some(qtable)) => {
+                let in_scope = tables.iter().any(|t| {
+                    t.db.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(qdb))
+                        && t.original
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(qtable))
+                });
+                if in_scope {
+                    PinkDbError::Catalog(format!("no column \"{qdb}.{qtable}.{col}\""))
+                } else {
+                    PinkDbError::Catalog(format!(
+                        "no table \"{qdb}.{qtable}\" in this query's FROM clause"
+                    ))
+                }
+            }
+            (None, Some(q)) => PinkDbError::Catalog(format!("no column \"{q}.{col}\"")),
+            (None, None) => PinkDbError::Catalog(format!("no column \"{col}\"")),
+            (Some(_), None) => unreachable!("a database qualifier implies a table qualifier"),
+        }
+    }
+
+    /// Resolve a column reference against this block's FROM scope alone.
     ///
     /// - `db.table.column` (wave 94): `db.table` must be an **unaliased** base
     ///   table or view of database `db` (an alias hides the original name);
@@ -1576,24 +1855,24 @@ impl<'a> Binder<'a> {
     /// - `table.column`: matches by effective name; a name shared by two
     ///   entries (only possible across databases) is ambiguous.
     /// - `column`: today's bare-name ambiguity rule.
-    fn lookup_column(
-        &self,
+    ///
+    /// `Ok(None)` means "this block does not have it" and lets the caller try
+    /// the enclosing blocks; `Err` is a decision only this block can make.
+    fn lookup_in_scope(
+        tables: &[ScopeTable],
         db: Option<&str>,
         table: Option<&str>,
         col: &str,
-    ) -> Result<(usize, DataType)> {
+    ) -> Result<Option<(usize, DataType)>> {
         if let Some(qdb) = db {
             let qtable = table.expect("a database qualifier implies a table qualifier");
             let mut found: Option<(usize, DataType)> = None;
             let mut aliased_as: Option<&str> = None;
-            // Whether any FROM entry is the named base table/view of `qdb`
-            // (aliased or not) separates "not in scope" from "aliased".
-            let mut in_scope = false;
             // An unaliased entry wins over any aliased one of the same name:
             // `db.t` stays visible when `db.t AS x` is also joined in.
             let mut unaliased_in_scope = false;
             let mut base = 0;
-            for t in &self.tables {
+            for t in tables {
                 let same_table = t.db.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(qdb))
                     && t.original
                         .as_deref()
@@ -1602,7 +1881,6 @@ impl<'a> Binder<'a> {
                     base += t.columns.len();
                     continue;
                 }
-                in_scope = true;
                 if t.is_alias {
                     // An alias hides the original table name (Postgres /
                     // DuckDB rule): remember it to name the workaround.
@@ -1625,7 +1903,7 @@ impl<'a> Binder<'a> {
                 base += t.columns.len();
             }
             if let Some(hit) = found {
-                return Ok(hit);
+                return Ok(Some(hit));
             }
             if let Some(alias) = aliased_as
                 && !unaliased_in_scope
@@ -1635,14 +1913,7 @@ impl<'a> Binder<'a> {
                      refer to its columns as {alias}.{col}"
                 )));
             }
-            if in_scope {
-                return Err(PinkDbError::Catalog(format!(
-                    "no column \"{qdb}.{qtable}.{col}\""
-                )));
-            }
-            return Err(PinkDbError::Catalog(format!(
-                "no table \"{qdb}.{qtable}\" in this query's FROM clause"
-            )));
+            return Ok(None);
         }
 
         if let Some(q) = table {
@@ -1651,21 +1922,21 @@ impl<'a> Binder<'a> {
             // database are rejected when the FROM clause binds).
             let mut matches: Vec<(&ScopeTable, usize)> = Vec::new();
             let mut base = 0;
-            for t in &self.tables {
+            for t in tables {
                 if t.name.eq_ignore_ascii_case(q) {
                     matches.push((t, base));
                 }
                 base += t.columns.len();
             }
             match matches.as_slice() {
-                [] => Err(PinkDbError::Catalog(format!("no column \"{q}.{col}\""))),
+                [] => Ok(None),
                 [(t, base)] => {
                     for (i, (name, dtype)) in t.columns.iter().enumerate() {
                         if name.eq_ignore_ascii_case(col) {
-                            return Ok((base + i, *dtype));
+                            return Ok(Some((base + i, *dtype)));
                         }
                     }
-                    Err(PinkDbError::Catalog(format!("no column \"{q}.{col}\"")))
+                    Ok(None)
                 }
                 many => {
                     // Wave 94: `FROM db1.t JOIN db2.t` — both are effective
@@ -1682,7 +1953,7 @@ impl<'a> Binder<'a> {
         } else {
             let mut found: Option<(usize, DataType)> = None;
             let mut base = 0;
-            for t in &self.tables {
+            for t in tables {
                 if t.qualified_only {
                     base += t.columns.len();
                     continue;
@@ -1699,7 +1970,7 @@ impl<'a> Binder<'a> {
                 }
                 base += t.columns.len();
             }
-            found.ok_or_else(|| PinkDbError::Catalog(format!("no column \"{col}\"")))
+            Ok(found)
         }
     }
 
@@ -1784,9 +2055,8 @@ impl<'a> Binder<'a> {
                 {
                     return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
                 }
-                let (index, dtype) = match self.lookup_column(db.as_deref(), table.as_deref(), name)
-                {
-                    Ok(hit) => hit,
+                match self.lookup_column(db.as_deref(), table.as_deref(), name) {
+                    Ok(bound) => Ok(bound),
                     Err(e) => {
                         // `v.a` where `v` is a VARIANT *column*, not a table:
                         // the qualifier lookup failed, so fold a field access
@@ -1795,8 +2065,10 @@ impl<'a> Binder<'a> {
                         // never changes meaning.)
                         if db.is_none()
                             && let Some(qualifier) = table
-                            && let Ok((index, DataType::Variant)) =
-                                self.lookup_column(None, None, qualifier)
+                            && let Ok(BoundExpr::Column {
+                                index,
+                                dtype: DataType::Variant,
+                            }) = self.lookup_column(None, None, qualifier)
                         {
                             let mut acc = BoundExpr::Column {
                                 index,
@@ -1814,10 +2086,9 @@ impl<'a> Binder<'a> {
                             }
                             return Ok(acc);
                         }
-                        return Err(e);
+                        Err(e)
                     }
-                };
-                Ok(BoundExpr::Column { index, dtype })
+                }
             }
             Expr::Binary { op, left, right } => {
                 // A row constructor compared with another row: per-field
@@ -2170,9 +2441,8 @@ impl<'a> Binder<'a> {
                 })
             }
             Expr::ScalarSubquery(q) => {
-                let mut child = self.child();
-                let query = bind_select_in(child.db, &mut child, q)?;
-                let schema = plan_schema(child.db, &child.default_db, &child.ctes, &query)?;
+                let (outer, query) = self.bind_subquery(q)?;
+                let schema = plan_schema(self.db, &self.default_db, &self.ctes, &query)?;
                 if schema.len() != 1 {
                     return Err(PinkDbError::Execution(
                         "scalar subquery must return exactly one column".to_string(),
@@ -2182,13 +2452,18 @@ impl<'a> Binder<'a> {
                 // The optimizer does not descend into a subquery body later,
                 // so optimize it here or it keeps the binder's nested-loop
                 // joins.
-                let query = optimize_subquery(child.db, query);
-                Ok(BoundExpr::ScalarSubquery { query, dtype })
+                let query = optimize_subquery(self.db, query);
+                Ok(BoundExpr::ScalarSubquery {
+                    query,
+                    dtype,
+                    outer,
+                })
             }
             Expr::InSubquery {
                 expr,
                 query,
                 negated,
+                op,
             } => {
                 if row_args(expr).is_some() {
                     // The single-column set probe in the executor cannot carry
@@ -2199,33 +2474,39 @@ impl<'a> Binder<'a> {
                     ));
                 }
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
-                let mut child = self.child();
-                let sub = bind_select_in(child.db, &mut child, query)?;
-                let schema = plan_schema(child.db, &child.default_db, &child.ctes, &sub)?;
+                let (outer, sub) = self.bind_subquery(query)?;
+                let schema = plan_schema(self.db, &self.default_db, &self.ctes, &sub)?;
                 if schema.len() != 1 {
                     return Err(PinkDbError::Execution(
                         "IN subquery must return exactly one column".to_string(),
                     ));
                 }
-                comparison_ok(BinaryOp::Eq, bound.dtype(), schema[0].1).map_err(|_| {
+                comparison_ok(*op, bound.dtype(), schema[0].1).map_err(|_| {
                     PinkDbError::Type(format!(
-                        "cannot compare {} with IN-subquery {}",
+                        "cannot compare {} with {} (subquery {})",
                         bound.dtype(),
+                        if *op == BinaryOp::Eq && !*negated {
+                            "IN"
+                        } else {
+                            "ANY"
+                        },
                         schema[0].1
                     ))
                 })?;
                 Ok(BoundExpr::InSubquery {
                     expr: Box::new(bound),
-                    query: optimize_subquery(child.db, sub),
+                    query: optimize_subquery(self.db, sub),
                     negated: *negated,
+                    op: *op,
+                    outer,
                 })
             }
             Expr::Exists { query, negated } => {
-                let mut child = self.child();
-                let sub = bind_select_in(child.db, &mut child, query)?;
+                let (outer, sub) = self.bind_subquery(query)?;
                 Ok(BoundExpr::Exists {
-                    query: optimize_subquery(child.db, sub),
+                    query: optimize_subquery(self.db, sub),
                     negated: *negated,
+                    outer,
                 })
             }
         }
@@ -4567,6 +4848,8 @@ fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
         | BoundExpr::WindowRef { .. }
         | BoundExpr::Literal(_)
         | BoundExpr::Column { .. }
+        // An outer value is loop-invariant for this block's grouping.
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => Ok(()),
         BoundExpr::Not(e)
@@ -4611,13 +4894,1094 @@ fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Correlated-subquery unnesting (wave 120)
+//
+// The rewrite is Neumann & Kemper, "Unnesting Arbitrary Queries" (BTW 2015),
+// as DuckDB implements it in src/planner/subquery/flatten_dependent_join.cpp:
+// a correlated body is joined against the *distinct* enclosing rows it reads,
+// so every outer column becomes an ordinary column of the body's input and the
+// clause above it becomes a join on those columns. The enclosing side then
+// sees one row per outer row instead of a subquery re-run per row.
+//
+// A body the rewrite does not cover keeps the executor's per-row path
+// (`eval_correlated` in exec/expr.rs). The fallback is correct but does the
+// work per outer row; docs/wave-120-plan.md lists the shapes it takes.
+// ---------------------------------------------------------------------------
+
+/// What a subquery body looks like once the pieces unnesting needs are split
+/// out of it.
+struct CorrelatedBody {
+    /// The body's from-tree: the left side of the dependent join.
+    base: LogicalPlan,
+    /// Width of `base`.
+    base_width: usize,
+    /// Filters stripped off the body, correlation conjuncts included.
+    conjuncts: Vec<BoundExpr>,
+    /// `IN`: the set element, in `base`'s frame.
+    value: Option<BoundExpr>,
+    /// Scalar: the body's aggregates, whether each is a count, and the
+    /// expression over their output.
+    aggs: Vec<BoundAgg>,
+    counts: Vec<bool>,
+    output: Option<BoundExpr>,
+}
+
+/// Which of the three body shapes to split out.
+#[derive(Clone, Copy, PartialEq)]
+enum BodyKind {
+    Exists,
+    In,
+    Scalar,
+}
+
+/// A body joined against the enclosing rows it reads.
+struct DependentJoin {
+    /// The joined body: `body` when the body alone can be probed (the plain
+    /// shape), `filtered(body ⨯ keys)` when it carries a residual that reads
+    /// an enclosing column (the keyed shape, whose key columns start at
+    /// `key_base`).
+    plan: LogicalPlan,
+    /// Key expressions, evaluated over the enclosing plan.
+    keys: Vec<BoundExpr>,
+    key_base: usize,
+    /// The body's own columns the keys compare against. Non-empty only in the
+    /// plain shape, where `plan` is the body itself.
+    body_keys: Vec<BoundExpr>,
+}
+
+impl DependentJoin {
+    /// The key columns of `plan`.
+    fn key_columns(&self) -> Vec<BoundExpr> {
+        self.keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| BoundExpr::Column {
+                index: self.key_base + i,
+                dtype: k.dtype(),
+            })
+            .collect()
+    }
+}
+
+/// Apply `f` to every node of an expression tree, children first. Used by the
+/// correlation rewrites, which replace leaves only.
+fn map_bound_expr(
+    expr: BoundExpr,
+    f: &mut impl FnMut(BoundExpr) -> Result<BoundExpr>,
+) -> Result<BoundExpr> {
+    fn go(
+        expr: BoundExpr,
+        f: &mut impl FnMut(BoundExpr) -> Result<BoundExpr>,
+    ) -> Result<BoundExpr> {
+        let out = match expr {
+            BoundExpr::Column { .. }
+            | BoundExpr::Literal(_)
+            | BoundExpr::AggRef { .. }
+            | BoundExpr::WindowRef { .. }
+            | BoundExpr::OuterRef { .. } => expr,
+            BoundExpr::Binary {
+                op,
+                left,
+                right,
+                dtype,
+            } => BoundExpr::Binary {
+                op,
+                left: Box::new(go(*left, f)?),
+                right: Box::new(go(*right, f)?),
+                dtype,
+            },
+            BoundExpr::Not(inner) => BoundExpr::Not(Box::new(go(*inner, f)?)),
+            BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
+                expr: Box::new(go(*expr, f)?),
+                dtype,
+            },
+            BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+                expr: Box::new(go(*expr, f)?),
+                negated,
+            },
+            BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+                func,
+                args: args.into_iter().map(|a| go(a, f)).collect::<Result<_>>()?,
+                dtype,
+            },
+            BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+                expr: Box::new(go(*expr, f)?),
+                dtype,
+            },
+            BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+                args: args.into_iter().map(|a| go(a, f)).collect::<Result<_>>()?,
+                dtype,
+            },
+            BoundExpr::Case {
+                branches,
+                else_,
+                dtype,
+            } => BoundExpr::Case {
+                branches: branches
+                    .into_iter()
+                    .map(|(c, v)| Ok((go(c, f)?, go(v, f)?)))
+                    .collect::<Result<_>>()?,
+                else_: else_.map(|e| go(*e, f).map(Box::new)).transpose()?,
+                dtype,
+            },
+            BoundExpr::ScalarSubquery {
+                query,
+                dtype,
+                outer,
+            } => BoundExpr::ScalarSubquery {
+                query,
+                dtype,
+                outer,
+            },
+            BoundExpr::InSubquery {
+                expr,
+                query,
+                negated,
+                outer,
+                op,
+            } => BoundExpr::InSubquery {
+                expr: Box::new(go(*expr, f)?),
+                query,
+                negated,
+                outer,
+                op,
+            },
+            BoundExpr::Exists {
+                query,
+                negated,
+                outer,
+            } => BoundExpr::Exists {
+                query,
+                negated,
+                outer,
+            },
+            BoundExpr::DynamicScalar {
+                name,
+                args,
+                dtype,
+                reads,
+            } => BoundExpr::DynamicScalar {
+                name,
+                args: args.into_iter().map(|a| go(a, f)).collect::<Result<_>>()?,
+                dtype,
+                reads,
+            },
+        };
+        f(out)
+    }
+    go(expr, f)
+}
+
+/// Visit every node of `expr`, children first.
+pub(crate) fn walk_bound_expr(expr: &BoundExpr, f: &mut impl FnMut(&BoundExpr)) {
+    match expr {
+        BoundExpr::Literal(_)
+        | BoundExpr::Column { .. }
+        | BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. }
+        | BoundExpr::OuterRef { .. } => {}
+        BoundExpr::Binary { left, right, .. } => {
+            walk_bound_expr(left, f);
+            walk_bound_expr(right, f);
+        }
+        BoundExpr::Not(inner) => walk_bound_expr(inner, f),
+        BoundExpr::Negate { expr, .. } | BoundExpr::Cast { expr, .. } => walk_bound_expr(expr, f),
+        BoundExpr::IsNull { expr, .. } => walk_bound_expr(expr, f),
+        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
+            for a in args {
+                walk_bound_expr(a, f);
+            }
+        }
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
+            for (c, v) in branches {
+                walk_bound_expr(c, f);
+                walk_bound_expr(v, f);
+            }
+            if let Some(e) = else_ {
+                walk_bound_expr(e, f);
+            }
+        }
+        // The body of a nested subquery is a separate scope; its own
+        // `OuterBind` carries its references.
+        BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
+        BoundExpr::InSubquery { expr, .. } => walk_bound_expr(expr, f),
+        BoundExpr::DynamicScalar { args, .. } => {
+            for a in args {
+                walk_bound_expr(a, f);
+            }
+        }
+    }
+    f(expr);
+}
+
+/// The distinct enclosing-row columns `exprs` read, sorted.
+fn outer_refs_in(exprs: &[&BoundExpr]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for e in exprs {
+        walk_bound_expr(e, &mut |node| {
+            if let BoundExpr::OuterRef { depth, index, .. } = node {
+                let key = (*depth, *index);
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        });
+    }
+    out
+}
+
+/// `a = b` where exactly one side reads the enclosing block and the other does
+/// not: a correlation a hash join can carry as a key.
+fn split_correlation_eq(conjunct: &BoundExpr) -> Option<(BoundExpr, BoundExpr)> {
+    let BoundExpr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = conjunct
+    else {
+        return None;
+    };
+    let outer_left = !outer_refs_in(&[left]).is_empty();
+    let outer_right = !outer_refs_in(&[right]).is_empty();
+    match (outer_left, outer_right) {
+        (true, false) => Some(((**right).clone(), (**left).clone())),
+        (false, true) => Some(((**left).clone(), (**right).clone())),
+        _ => None,
+    }
+}
+
+/// Replace every enclosing reference with the plan-space column the block's
+/// row holds for it: a FROM column of a block above an aggregate sits at its
+/// group-key position (`outer.keys`).
+fn rewire_to_row(expr: BoundExpr, row: &[(usize, BoundExpr)]) -> Result<BoundExpr> {
+    map_bound_expr(expr, &mut |e| {
+        let BoundExpr::OuterRef { depth, index, .. } = e else {
+            return Ok(e);
+        };
+        match (depth, row.iter().find(|(i, _)| *i == index)) {
+            (0, Some((_, col))) => Ok(col.clone()),
+            // `dependent_join` checks the reference list before rewriting.
+            _ => Err(PinkDbError::Execution(
+                "internal: degenerate correlated rewrite".to_string(),
+            )),
+        }
+    })
+}
+
+/// Replace every enclosing reference with the dependent join's key column, so
+/// a correlation conjunct filters the joined rows.
+fn rewire_to_keys(expr: BoundExpr, keys: &[(usize, usize)], key_base: usize) -> Result<BoundExpr> {
+    map_bound_expr(expr, &mut |e| {
+        let BoundExpr::OuterRef {
+            depth,
+            index,
+            dtype,
+        } = e
+        else {
+            return Ok(e);
+        };
+        match (depth, keys.iter().find(|(i, _)| *i == index)) {
+            (0, Some((_, pos))) => Ok(BoundExpr::Column {
+                index: key_base + pos,
+                dtype,
+            }),
+            _ => Err(PinkDbError::Execution(
+                "internal: degenerate correlated rewrite".to_string(),
+            )),
+        }
+    })
+}
+
+/// Whether `plan` is built only from FROM-clause nodes, so a conjunction above
+/// it filters the rows it produces without changing their meaning.
+/// Replace every `Filter` in a from-tree with its input, collecting the
+/// conjuncts and renumbering them into the tree's own column space (`offset`
+/// is the tree's first column in it).
+///
+/// A subquery body is optimized before it is bound here, and pushdown leaves a
+/// predicate on the table it reads with that table's local indices; over the
+/// inner and cross joins a from-tree may contain, a conjunct sees the same row
+/// either way.
+fn strip_from_filters(plan: &LogicalPlan, out: &mut Vec<BoundExpr>, offset: usize) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            let mut flat = Vec::new();
+            split_conjuncts(predicate.clone(), &mut flat);
+            out.extend(
+                flat.into_iter()
+                    .map(|c| crate::plan::map_columns(c, &|i| i + offset)),
+            );
+            strip_from_filters(input, out, offset)
+        }
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_keys,
+            right_keys,
+            left_cols,
+        } => LogicalPlan::Join {
+            kind: *kind,
+            left: Box::new(strip_from_filters(left, out, offset)),
+            right: Box::new(strip_from_filters(right, out, offset + left_cols)),
+            left_keys: left_keys.clone(),
+            right_keys: right_keys.clone(),
+            left_cols: *left_cols,
+        },
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            left_cols,
+        } => LogicalPlan::NestedLoopJoin {
+            kind: *kind,
+            left: Box::new(strip_from_filters(left, out, offset)),
+            right: Box::new(strip_from_filters(right, out, offset + left_cols)),
+            on: on.clone(),
+            left_cols: *left_cols,
+        },
+        other => other.clone(),
+    }
+}
+
+fn is_from_tree(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::Values { .. }
+        | LogicalPlan::SingleRow
+        | LogicalPlan::TableFunction { .. } => true,
+        LogicalPlan::Join {
+            kind: JoinKind::Inner | JoinKind::Cross,
+            left,
+            right,
+            ..
+        }
+        | LogicalPlan::NestedLoopJoin {
+            kind: JoinKind::Inner | JoinKind::Cross,
+            left,
+            right,
+            ..
+        } => is_from_tree(left) && is_from_tree(right),
+        _ => false,
+    }
+}
+
+impl Binder<'_> {
+    /// Unnest the correlated subqueries of one clause.
+    ///
+    /// `plan` is the clause's input and `pred` its predicate, which is
+    /// evaluated over `plan`'s row. Every subquery this cannot unnest stays in
+    /// the predicate for the executor's per-row path, so the result is always
+    /// equivalent to the input.
+    fn decorrelate_clause(
+        &mut self,
+        mut plan: LogicalPlan,
+        pred: Option<BoundExpr>,
+    ) -> Result<(LogicalPlan, Option<BoundExpr>)> {
+        let Some(pred) = pred else {
+            return Ok((plan, None));
+        };
+        let mut flat = Vec::new();
+        split_conjuncts(pred, &mut flat);
+        // Only a subquery that *is* a conjunct can become a join without a
+        // general expression rewrite; one nested deeper keeps the fallback.
+        let mut i = 0;
+        while i < flat.len() {
+            let dtypes: Vec<DataType> = plan_schema(self.db, &self.default_db, &self.ctes, &plan)?
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect();
+            let width = dtypes.len();
+            // The block's other conjuncts, for the key side of the unnest (a
+            // copy of this block that keeps its predicates is the same join
+            // tree, not a cartesian product).
+            let mut siblings = flat.clone();
+            siblings.remove(i);
+            match self.decorrelate_conjunct(&plan, &dtypes, width, &flat[i], &siblings)? {
+                Some((new_plan, Some(new_pred))) => {
+                    plan = new_plan;
+                    flat[i] = new_pred;
+                    i += 1;
+                }
+                Some((new_plan, None)) => {
+                    plan = new_plan;
+                    flat.remove(i);
+                }
+                None => i += 1,
+            }
+        }
+        Ok((plan, and_all(flat)))
+    }
+
+    /// Unnest the select list's correlated scalar subqueries. Each becomes a
+    /// left join against its own aggregate, appended below the projection.
+    fn decorrelate_project(
+        &mut self,
+        mut plan: LogicalPlan,
+        exprs: Vec<BoundExpr>,
+    ) -> Result<(LogicalPlan, Vec<BoundExpr>)> {
+        let mut out = Vec::with_capacity(exprs.len());
+        for e in exprs {
+            // A projection item that is a whole `EXISTS` / `IN` / scalar
+            // subquery (or a negation of one) becomes the join itself, exactly
+            // as it would in a `WHERE`; a scalar nested inside a larger
+            // expression grows a left join instead.
+            let rewrite = if matches!(
+                e,
+                BoundExpr::ScalarSubquery { .. }
+                    | BoundExpr::Exists { .. }
+                    | BoundExpr::InSubquery { .. }
+                    | BoundExpr::Not(_)
+            ) {
+                let dtypes: Vec<DataType> =
+                    plan_schema(self.db, &self.default_db, &self.ctes, &plan)?
+                        .into_iter()
+                        .map(|(_, t)| t)
+                        .collect();
+                let width = dtypes.len();
+                self.decorrelate_conjunct(&plan, &dtypes, width, &e, &[])?
+            } else {
+                None
+            };
+            match rewrite {
+                Some((input, Some(rewritten))) => {
+                    plan = input;
+                    out.push(rewritten);
+                }
+                _ => out.push(e),
+            }
+        }
+        Ok((plan, out))
+    }
+
+    /// Unnest one conjunct. A conjunct that *is* an `EXISTS` / `IN` / scalar
+    /// subquery becomes the join itself; otherwise every correlated scalar
+    /// subquery inside the expression is turned into a left join and the
+    /// expression is rewritten to read its column.
+    fn decorrelate_conjunct(
+        &mut self,
+        plan: &LogicalPlan,
+        dtypes: &[DataType],
+        width: usize,
+        conjunct: &BoundExpr,
+        siblings: &[BoundExpr],
+    ) -> Result<Option<(LogicalPlan, Option<BoundExpr>)>> {
+        if let Some(hit) = self.decorrelate_predicate(plan, dtypes, width, conjunct, siblings)? {
+            return Ok(Some(hit));
+        }
+        let mut plan = plan.clone();
+        let mut expr = conjunct.clone();
+        let mut changed = false;
+        loop {
+            let dtypes: Vec<DataType> = plan_schema(self.db, &self.default_db, &self.ctes, &plan)?
+                .into_iter()
+                .map(|(_, d)| d)
+                .collect();
+            let width = dtypes.len();
+            let Some((input, rewritten)) =
+                self.decorrelate_expr(&plan, &dtypes, width, &expr, siblings)?
+            else {
+                break;
+            };
+            plan = input;
+            expr = rewritten;
+            changed = true;
+        }
+        Ok(changed.then_some((plan, Some(expr))))
+    }
+
+    /// Unnest the first correlated scalar subquery inside `expr`, so an
+    /// expression such as `l_quantity < (SELECT avg …)` can compare against a
+    /// joined column instead of re-running the body per row.
+    fn decorrelate_expr(
+        &self,
+        plan: &LogicalPlan,
+        dtypes: &[DataType],
+        width: usize,
+        expr: &BoundExpr,
+        siblings: &[BoundExpr],
+    ) -> Result<Option<(LogicalPlan, BoundExpr)>> {
+        let mut hit: Option<LogicalPlan> = None;
+        let rewritten = map_bound_expr(expr.clone(), &mut |e| {
+            // One rewrite per pass: the plan widens, so the next pass needs
+            // the new schema.
+            if hit.is_some() {
+                return Ok(e);
+            }
+            let BoundExpr::ScalarSubquery { query, outer, .. } = &e else {
+                return Ok(e);
+            };
+            match self.scalar_join(plan, dtypes, width, query, outer, siblings)? {
+                Some((input, col)) => {
+                    hit = Some(input);
+                    Ok(col)
+                }
+                None => Ok(e),
+            }
+        })?;
+        Ok(hit.map(|input| (input, rewritten)))
+    }
+
+    /// Left-join the body's ungrouped aggregate against this block, and
+    /// return the expression that reads the aggregate's per-row value.
+    fn scalar_join(
+        &self,
+        plan: &LogicalPlan,
+        dtypes: &[DataType],
+        width: usize,
+        query: &LogicalPlan,
+        outer: &OuterBind,
+        siblings: &[BoundExpr],
+    ) -> Result<Option<(LogicalPlan, BoundExpr)>> {
+        if outer.deep || outer.reaches_past_row() {
+            return Ok(None);
+        }
+        let Some(mut body) = self.correlated_body(query, BodyKind::Scalar)? else {
+            return Ok(None);
+        };
+        let Some(dep) = self.dependent_join(plan, dtypes, outer, &body, siblings, false)? else {
+            return Ok(None);
+        };
+        let keys = if dep.body_keys.is_empty() {
+            dep.key_columns()
+        } else {
+            dep.body_keys
+        };
+        let nkeys = keys.len();
+        let aggs = std::mem::take(&mut body.aggs);
+        let counts = std::mem::take(&mut body.counts);
+        let output = body.output.take().expect("scalar body binds a projection");
+        let agg = LogicalPlan::Aggregate {
+            input: Box::new(dep.plan),
+            keys: keys.clone(),
+            aggs,
+        };
+        // The aggregate emits its group keys first, so the right keys are the
+        // leading columns of its output.
+        let agg_keys: Vec<BoundExpr> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| BoundExpr::Column {
+                index: i,
+                dtype: k.dtype(),
+            })
+            .collect();
+        let joined = LogicalPlan::Join {
+            kind: JoinKind::Left,
+            left: Box::new(plan.clone()),
+            right: Box::new(agg),
+            left_keys: dep.keys,
+            right_keys: agg_keys,
+            left_cols: width,
+        };
+        // The scalar is the body's projection over the aggregate output, which
+        // the left join places after the enclosing columns and the group keys.
+        let out = map_bound_expr(output, &mut |e| {
+            let BoundExpr::AggRef { index, dtype } = e else {
+                return Ok(e);
+            };
+            let col = BoundExpr::Column {
+                index: width + nkeys + index,
+                dtype,
+            };
+            // The COUNT bug: `count(*)` over no rows is 0, and the left join
+            // NULL-extends the group that is missing. DuckDB reaches the same
+            // value with a marker aggregate and a CASE
+            // (RewriteCorrelatedAggregates in
+            // src/planner/subquery/rewrite_correlated_expressions.cpp); with
+            // count's empty-group value being 0 that is a coalesce.
+            Ok(if counts.get(index).copied().unwrap_or(false) {
+                BoundExpr::Coalesce {
+                    args: vec![col, BoundExpr::Literal(Value::Bigint(0))],
+                    dtype,
+                }
+            } else {
+                col
+            })
+        })?;
+        Ok(Some((joined, out)))
+    }
+
+    /// Unnest a conjunct that is one bare subquery form.
+    fn decorrelate_predicate(
+        &mut self,
+        plan: &LogicalPlan,
+        dtypes: &[DataType],
+        width: usize,
+        conjunct: &BoundExpr,
+        siblings: &[BoundExpr],
+    ) -> Result<Option<(LogicalPlan, Option<BoundExpr>)>> {
+        // `NOT EXISTS (...)` and `NOT (x IN (...))` bind as `NOT (<form>)`;
+        // the join carries the polarity, so look through the negation.
+        let (form, outside_negation) = match conjunct {
+            BoundExpr::Not(inner) => (&**inner, true),
+            other => (other, false),
+        };
+        let (kind, body, negated) = match form {
+            BoundExpr::Exists {
+                query,
+                negated,
+                outer,
+            } => {
+                if outer.deep || outer.reaches_past_row() {
+                    return Ok(None);
+                }
+                (
+                    BodyKind::Exists,
+                    self.correlated_body(query, BodyKind::Exists)?,
+                    *negated,
+                )
+            }
+            BoundExpr::InSubquery {
+                expr: _,
+                query,
+                negated,
+                outer,
+                op,
+            } => {
+                // Only the equality probe has a hashable join key; an ordered
+                // ANY keeps the per-row path (see the plan's follow-ups).
+                if *op != BinaryOp::Eq || outer.deep || outer.reaches_past_row() {
+                    return Ok(None);
+                }
+                (
+                    BodyKind::In,
+                    self.correlated_body(query, BodyKind::In)?,
+                    *negated,
+                )
+            }
+            // A scalar subquery, bare or inside a comparison, goes through
+            // `decorrelate_expr`: it yields a column, not a join predicate.
+            BoundExpr::ScalarSubquery { .. } => return Ok(None),
+            _ => return Ok(None),
+        };
+        let negated = negated != outside_negation;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let outer = match form {
+            BoundExpr::Exists { outer, .. }
+            | BoundExpr::InSubquery { outer, .. }
+            | BoundExpr::ScalarSubquery { outer, .. } => outer,
+            _ => unreachable!(),
+        };
+        // A semi/anti join does not care about duplicate body rows, so the
+        // body's own key columns suffice; a scalar aggregate needs one row per
+        // correlation key, which the duplicate-eliminated key side provides.
+        let plain = matches!(kind, BodyKind::Exists);
+        // The mark join's value column stays in body space: the dependent join
+        // puts the body on its left, unshifted, so a body expression is still
+        // an expression over the join's output.
+        let value = body.value.clone();
+        let Some(dep) = self.dependent_join(plan, dtypes, outer, &body, siblings, plain)? else {
+            return Ok(None);
+        };
+        let keys = dep.key_columns();
+        match kind {
+            BodyKind::Exists => {
+                // In the plain shape the body's own key columns are probed; a
+                // duplicate body row can only add matches, which a semi or
+                // anti join ignores.
+                let right_keys = if dep.body_keys.is_empty() {
+                    keys
+                } else {
+                    dep.body_keys
+                };
+                let joined = LogicalPlan::Join {
+                    kind: if negated {
+                        JoinKind::Anti
+                    } else {
+                        JoinKind::Semi
+                    },
+                    left: Box::new(plan.clone()),
+                    right: Box::new(dep.plan),
+                    left_keys: dep.keys,
+                    right_keys,
+                    left_cols: width,
+                };
+                Ok(Some((joined, None)))
+            }
+            BodyKind::In => {
+                let lhs = match form {
+                    BoundExpr::InSubquery { expr, .. } => (**expr).clone(),
+                    _ => unreachable!(),
+                };
+                let Some(value) = value else {
+                    return Ok(None);
+                };
+                let mut left_keys = dep.keys;
+                let mut right_keys = keys;
+                left_keys.push(lhs.clone());
+                right_keys.push(value);
+                let joined = LogicalPlan::Join {
+                    kind: JoinKind::Mark,
+                    left: Box::new(plan.clone()),
+                    right: Box::new(dep.plan),
+                    left_keys,
+                    right_keys,
+                    left_cols: width,
+                };
+                let marker = BoundExpr::Column {
+                    index: width,
+                    dtype: DataType::Boolean,
+                };
+                let pred = if negated {
+                    BoundExpr::Not(Box::new(marker))
+                } else {
+                    marker
+                };
+                Ok(Some((joined, Some(pred))))
+            }
+            BodyKind::Scalar => unreachable!("scalars go through decorrelate_expr"),
+        }
+    }
+
+    /// Split a bound body plan into the pieces the dependent join needs.
+    /// Returns `None` for a shape whose rows a conjunction above cannot
+    /// describe (a projection over an aggregate that is not the scalar shape,
+    /// a nested set operation, a limit, ...).
+    fn correlated_body(
+        &self,
+        query: &LogicalPlan,
+        kind: BodyKind,
+    ) -> Result<Option<CorrelatedBody>> {
+        let mut plan = query;
+        let mut value = None;
+        let mut aggs = Vec::new();
+        let mut counts = Vec::new();
+        let mut output = None;
+        match kind {
+            BodyKind::Exists => {
+                while let LogicalPlan::Project { input, .. } = plan {
+                    plan = input;
+                }
+            }
+            BodyKind::In => match plan {
+                LogicalPlan::Project { exprs, input, .. } if exprs.len() == 1 => {
+                    value = Some(exprs[0].clone());
+                    plan = input;
+                }
+                _ => return Ok(None),
+            },
+            BodyKind::Scalar => match plan {
+                LogicalPlan::Project { exprs, input, .. } if exprs.len() == 1 => match &**input {
+                    // A grouped aggregate can return several rows, which must
+                    // stay a runtime error, so only the ungrouped shape is
+                    // unnestable.
+                    LogicalPlan::Aggregate {
+                        keys,
+                        aggs: body_aggs,
+                        input,
+                    } if keys.is_empty() => {
+                        output = Some(exprs[0].clone());
+                        counts = body_aggs
+                            .iter()
+                            .map(|a| matches!(a.func, AggFunc::Count))
+                            .collect();
+                        aggs = body_aggs.clone();
+                        plan = input;
+                    }
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            },
+        }
+        // A comma-join extraction can leave a correlation predicate as a
+        // `Filter` above a leaf (`p_partkey = ps_partkey` over the `partsupp`
+        // scan), so splice away every filter in the tree: over inner and cross
+        // joins those conjuncts are ordinary conditions on the row the tree
+        // produces.
+        let mut conjuncts = Vec::new();
+        let plan = &strip_from_filters(plan, &mut conjuncts, 0);
+        if !is_from_tree(plan) {
+            return Ok(None);
+        }
+        let base_width = plan_schema(self.db, &self.default_db, &self.ctes, plan)?.len();
+        Ok(Some(CorrelatedBody {
+            base: plan.clone(),
+            base_width,
+            conjuncts,
+            value,
+            aggs,
+            counts,
+            output,
+        }))
+    }
+
+    /// Join `body` against the distinct enclosing rows it reads, so its
+    /// correlation conjuncts become ordinary predicates.
+    fn dependent_join(
+        &self,
+        left: &LogicalPlan,
+        dtypes: &[DataType],
+        outer: &OuterBind,
+        body: &CorrelatedBody,
+        siblings: &[BoundExpr],
+        plain: bool,
+    ) -> Result<Option<DependentJoin>> {
+        let mut read = outer_refs_in(&body.conjuncts.iter().collect::<Vec<_>>());
+        read.sort_unstable();
+        read.dedup();
+        let mut want = outer.refs.to_vec();
+        want.sort_unstable();
+        want.dedup();
+        if read != want || read.iter().any(|(depth, _)| *depth > 0) {
+            return Ok(None);
+        }
+        // The body's own output must not read the enclosing block: nkeys
+        // group keys cannot describe a per-row output column.
+        let mut side: Vec<&BoundExpr> = Vec::new();
+        if let Some(v) = &body.value {
+            side.push(v);
+        }
+        if let Some(o) = &body.output {
+            side.push(o);
+        }
+        for a in &body.aggs {
+            if let Some(arg) = &a.arg {
+                side.push(arg);
+            }
+            if let Some(filter) = &a.filter {
+                side.push(filter);
+            }
+        }
+        if !outer_refs_in(&side).is_empty() {
+            return Ok(None);
+        }
+        // One key per enclosing row column the body reads, plus any expression
+        // a correlation equality compares against. `row` maps a FROM-row
+        // position to the column of this block's row that holds it.
+        let mut row: Vec<(usize, BoundExpr)> = Vec::new();
+        let mut keys: Vec<BoundExpr> = Vec::new();
+        for (_, index) in read.iter() {
+            let pos = match &outer.keys {
+                Some(map) => match map.get(*index).copied().flatten() {
+                    Some(p) => p,
+                    // The binder rejects a grouped reference to a column that
+                    // is not a group key, so this cannot happen.
+                    None => return Ok(None),
+                },
+                None => *index,
+            };
+            let Some(dtype) = dtypes.get(pos) else {
+                return Ok(None);
+            };
+            row.push((
+                *index,
+                BoundExpr::Column {
+                    index: pos,
+                    dtype: *dtype,
+                },
+            ));
+            keys.push(BoundExpr::Column {
+                index: pos,
+                dtype: *dtype,
+            });
+        }
+        let mut key_pos: Vec<(usize, usize)> = read
+            .iter()
+            .enumerate()
+            .map(|(i, (_, index))| (*index, i))
+            .collect();
+        let mut body_keys = Vec::new();
+        let mut key_columns = Vec::new();
+        let mut body_only = Vec::new();
+        let mut residual = Vec::new();
+        for c in &body.conjuncts {
+            match split_correlation_eq(c) {
+                Some((body_side, outer_side)) => {
+                    let pos = match key_pos.iter().find(|(from, p)| {
+                        keys[*p] == outer_side
+                            || matches!(outer_side,
+                                BoundExpr::OuterRef { depth: 0, index, .. } if &index == from)
+                    }) {
+                        Some((_, p)) => *p,
+                        None => {
+                            let expr = rewire_to_row(outer_side, &row)?;
+                            keys.push(expr);
+                            key_pos.push((usize::MAX, keys.len() - 1));
+                            keys.len() - 1
+                        }
+                    };
+                    body_keys.push(body_side);
+                    key_columns.push(BoundExpr::Column {
+                        index: pos,
+                        dtype: keys[pos].dtype(),
+                    });
+                }
+                // A conjunct that reads no enclosing column is a plain body
+                // filter: it belongs in the body and cannot force the keyed
+                // shape.
+                None if outer_refs_in(&[c]).is_empty() => body_only.push(c.clone()),
+                None => residual.push(c.clone()),
+            }
+        }
+        // A range correlation needs the enclosing row present, and would
+        // otherwise become a cartesian product; the per-row path is cheaper.
+        if body_keys.is_empty() {
+            return Ok(None);
+        }
+        let names: Vec<String> = (0..keys.len()).map(|i| format!("__key{i}")).collect();
+        // The copy of the block that produces the keys carries the block's
+        // other conjuncts, so the optimizer can turn it into the same hash
+        // joins as the outer plan instead of a cartesian product. A conjunct
+        // with a subquery or a dynamic call is left out: it would run twice.
+        let mut carried = Vec::new();
+        for c in siblings {
+            if !c.contains_dynamic_scalar() && !c.has_subquery() {
+                carried.push(c.clone());
+            }
+        }
+        let mut key_input = left.clone();
+        if let Some(predicate) = and_all(carried) {
+            key_input = LogicalPlan::Filter {
+                input: Box::new(key_input),
+                predicate,
+            };
+        }
+        let key_side = LogicalPlan::Distinct {
+            input: Box::new(LogicalPlan::Project {
+                input: Box::new(key_input),
+                exprs: keys.clone(),
+                names,
+            }),
+            on: None,
+        };
+        let mut body_plan = body.base.clone();
+        if let Some(predicate) = and_all(body_only) {
+            body_plan = LogicalPlan::Filter {
+                input: Box::new(body_plan),
+                predicate,
+            };
+        }
+        // Without a residual the body can be probed directly: its own key
+        // columns stand in for the duplicate-eliminated key side, which saves
+        // a full copy of this block. A body row that matches nothing leaves
+        // the enclosing row unmatched, exactly as the keyed shape does.
+        if plain && residual.is_empty() {
+            // Two body columns can compare against the same enclosing column
+            // (`mc.k = oc.k AND mc.j = oc.k`), so the left keys repeat.
+            let plain_keys = key_columns
+                .iter()
+                .map(|kc| match kc {
+                    BoundExpr::Column { index, .. } => keys[*index].clone(),
+                    _ => unreachable!("key columns are plain columns"),
+                })
+                .collect();
+            return Ok(Some(DependentJoin {
+                plan: body_plan,
+                keys: plain_keys,
+                key_base: 0,
+                body_keys,
+            }));
+        }
+        let mut plan = LogicalPlan::Join {
+            kind: JoinKind::Inner,
+            left: Box::new(body_plan.clone()),
+            right: Box::new(key_side),
+            left_keys: body_keys,
+            right_keys: key_columns,
+            left_cols: body.base_width,
+        };
+        if !residual.is_empty() {
+            let preds = residual
+                .into_iter()
+                .map(|c| rewire_to_keys(c, &key_pos, body.base_width))
+                .collect::<Result<Vec<_>>>()?;
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: and_all(preds).expect("residual conjuncts"),
+            };
+        }
+        Ok(Some(DependentJoin {
+            plan,
+            keys,
+            key_base: body.base_width,
+            body_keys: Vec::new(),
+        }))
+    }
+}
+
 /// Rebase a post-aggregation expression onto Aggregate-output scope:
 /// maximal aggregate-free fragments become `Column{key position}`, AggRefs
 /// and literals pass through. Returns `None` if a fragment matches no key.
+/// Every outer column a correlated subquery reads must be a group key of the
+/// block it sits in. Only meaningful after `rebase_to_keys` filled the key map.
+fn validate_correlated_grouped(expr: &BoundExpr) -> Result<()> {
+    let mut bad = false;
+    walk_bound_expr(expr, &mut |e| {
+        let outer = match e {
+            BoundExpr::ScalarSubquery { outer, .. }
+            | BoundExpr::InSubquery { outer, .. }
+            | BoundExpr::Exists { outer, .. } => outer,
+            _ => return,
+        };
+        if !outer.ungrouped_refs().is_empty() {
+            bad = true;
+        }
+    });
+    if bad {
+        return Err(PinkDbError::Execution(
+            "SELECT/HAVING expression must be an aggregate or appear in GROUP BY".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
+    // A subquery is aggregate-free *here* — it evaluates in its own block — but
+    // the outer columns its body reads address this block's aggregate output,
+    // so it takes the key map before the scope-free shortcut below.
+    match expr {
+        BoundExpr::ScalarSubquery {
+            query,
+            dtype,
+            outer,
+        } => {
+            return Some(BoundExpr::ScalarSubquery {
+                query: query.clone(),
+                dtype: *dtype,
+                outer: outer.clone().through_keys(keys),
+            });
+        }
+        BoundExpr::Exists {
+            query,
+            negated,
+            outer,
+        } => {
+            return Some(BoundExpr::Exists {
+                query: query.clone(),
+                negated: *negated,
+                outer: outer.clone().through_keys(keys),
+            });
+        }
+        BoundExpr::InSubquery {
+            expr: lhs,
+            query,
+            negated,
+            outer,
+            op,
+        } => {
+            return Some(BoundExpr::InSubquery {
+                expr: Box::new(rebase_to_keys(lhs, keys)?),
+                query: query.clone(),
+                negated: *negated,
+                outer: outer.clone().through_keys(keys),
+                op: *op,
+            });
+        }
+        _ => {}
+    }
     if expr.is_aggregate_free() {
         // Constants (no columns) are scope-free: the same value in every group.
-        if !expr.has_column_ref() {
+        // A correlated subquery has no column here either, yet its body reads
+        // this block's row, so it must walk down to pick up the key map.
+        if !expr.has_column_ref() && !crate::plan::has_correlated_subquery(expr) {
             return Some(expr.clone());
         }
         // The expression itself may be the key (a computed key like `upper(b)`).
@@ -4639,7 +6003,7 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
                 dtype: *dtype,
             }
         }
-        BoundExpr::Literal(_) => expr.clone(),
+        BoundExpr::Literal(_) | BoundExpr::OuterRef { .. } => expr.clone(),
         BoundExpr::Not(e) => BoundExpr::Not(Box::new(rebase_to_keys(e, keys)?)),
         BoundExpr::Negate { expr: e, dtype } => BoundExpr::Negate {
             expr: Box::new(rebase_to_keys(e, keys)?),
@@ -4683,15 +6047,6 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
             dtype: *dtype,
             reads: reads.clone(),
         },
-        BoundExpr::InSubquery {
-            expr,
-            query,
-            negated,
-        } => BoundExpr::InSubquery {
-            expr: Box::new(rebase_to_keys(expr, keys)?),
-            query: query.clone(),
-            negated: *negated,
-        },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(rebase_to_keys(expr, keys)?),
             dtype: *dtype,
@@ -4718,11 +6073,12 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
             },
             dtype: *dtype,
         },
-        // ScalarSubquery/Exists bodies live in their own scope; WindowRef
-        // already addresses window output.
-        BoundExpr::ScalarSubquery { .. }
-        | BoundExpr::Exists { .. }
-        | BoundExpr::WindowRef { .. } => expr.clone(),
+        // WindowRef already addresses window output. The subquery nodes were
+        // handled above, before the scope-free shortcut.
+        BoundExpr::WindowRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::InSubquery { .. }
+        | BoundExpr::Exists { .. } => expr.clone(),
     })
 }
 
@@ -4781,10 +6137,14 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
             expr,
             query,
             negated,
+            outer,
+            op,
         } => BoundExpr::InSubquery {
             expr: Box::new(resolve_window_refs(*expr, input_width)),
             query,
             negated,
+            outer,
+            op,
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(resolve_window_refs(*expr, input_width)),
@@ -4873,10 +6233,14 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
             expr,
             query,
             negated,
+            outer,
+            op,
         } => BoundExpr::InSubquery {
             expr: Box::new(resolve_agg_refs(*expr, num_keys)),
             query,
             negated,
+            outer,
+            op,
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(resolve_agg_refs(*expr, num_keys)),
@@ -8389,9 +9753,18 @@ pub(crate) fn plan_schema(
             let (names, types) = crate::plan::agg_output_schema(keys, aggs);
             Ok(names.into_iter().zip(types).collect())
         }
-        LogicalPlan::Join { left, right, .. } | LogicalPlan::NestedLoopJoin { left, right, .. } => {
+        LogicalPlan::Join { kind, left, right, .. }
+        | LogicalPlan::NestedLoopJoin { kind, left, right, .. } => {
             let mut out = plan_schema(db, default_db, ctes, left)?;
-            out.extend(plan_schema(db, default_db, ctes, right)?);
+            // Semi/anti join output is the left side; a mark join appends its
+            // marker column (wave 120).
+            match kind {
+                JoinKind::Semi | JoinKind::Anti => {}
+                JoinKind::Mark => {
+                    out.push((crate::exec::MARK_NAME.to_string(), DataType::Boolean));
+                }
+                _ => out.extend(plan_schema(db, default_db, ctes, right)?),
+            }
             Ok(out)
         }
         LogicalPlan::SetOp { left, types, .. } => {
@@ -9596,6 +10969,17 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 .collect();
         }
     }
+    if is_agg {
+        for (e, _) in &select {
+            validate_correlated_grouped(e)?;
+        }
+        if let Some(h) = &having {
+            validate_correlated_grouped(h)?;
+        }
+        if let Some(q) = &qualify {
+            validate_correlated_grouped(q)?;
+        }
+    }
     let keys_for_order = keys.clone();
     // Aggregate output width, unchanged by grouping sets (every branch emits
     // all keys and all aggregates).
@@ -9603,11 +10987,19 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
 
     // Scan / join → filter → aggregate → having-filter → window.
     let mut plan = base;
+    // Correlated subqueries in the clauses below are unnestable here, where
+    // the block's row space is known: WHERE sees the FROM tree, HAVING the
+    // aggregate output, QUALIFY the window output and the select list the
+    // clause input below its projection.
     if let Some(pred) = filter {
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate: pred,
-        };
+        let (input, pred) = binder.decorrelate_clause(plan, Some(pred))?;
+        plan = input;
+        if let Some(predicate) = pred {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate,
+            };
+        }
     }
     if is_agg {
         plan = match &group_sets {
@@ -9619,10 +11011,14 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             },
         };
         if let Some(h) = having {
-            plan = LogicalPlan::Filter {
-                input: Box::new(plan),
-                predicate: h,
-            };
+            let (input, h) = binder.decorrelate_clause(plan, Some(h))?;
+            plan = input;
+            if let Some(predicate) = h {
+                plan = LogicalPlan::Filter {
+                    input: Box::new(plan),
+                    predicate,
+                };
+            }
         }
     }
     // Windows see the aggregate output (or the scan). Their results append
@@ -9641,10 +11037,14 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         };
     }
     if let Some(pred) = qualify.map(|q| resolve_window_refs(q, input_cols)) {
-        plan = LogicalPlan::Filter {
-            input: Box::new(plan),
-            predicate: pred,
-        };
+        let (input, pred) = binder.decorrelate_clause(plan, Some(pred))?;
+        plan = input;
+        if let Some(predicate) = pred {
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate,
+            };
+        }
     }
     // NOTE: select items are rebound below (resolve_window_refs) once the
     // projection is built — see the projection section.
@@ -9657,6 +11057,14 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         .into_iter()
         .map(|(e, _)| resolve_window_refs(e, input_cols))
         .collect();
+    {
+        // A correlated scalar subquery in the select list becomes a left join
+        // against its aggregate, so the block still emits one row per input
+        // row.
+        let (input, exprs) = binder.decorrelate_project(plan, proj_exprs)?;
+        plan = input;
+        proj_exprs = exprs;
+    }
     let mut proj_names = visible_names.clone();
     let mut hidden = 0usize;
     let mut sort_keys: Vec<(BoundExpr, SortSpec)> = Vec::new();

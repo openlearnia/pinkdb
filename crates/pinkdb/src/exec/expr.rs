@@ -16,7 +16,7 @@ use super::{Cx, Memo, eval};
 use crate::array::ArrayElems;
 use crate::plan::compare_values;
 use crate::sql::ast::BinaryOp;
-use crate::sql::binder::{BoundExpr, ScalarFunc, common_numeric};
+use crate::sql::binder::{BoundExpr, OuterBind, ScalarFunc, common_numeric};
 use crate::types::FastSet;
 use crate::types::{
     DataType, POW10_I128, PinkDbError, Result, Value, decimal_fits, format_decimal, rescale_decimal,
@@ -34,7 +34,28 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
         BoundExpr::Column { index, .. } => Ok(chunk.expect_column(*index)?.as_ref().clone()),
         BoundExpr::AggRef { index, .. } => Ok(chunk.expect_column(*index)?.as_ref().clone()),
         BoundExpr::WindowRef { index, .. } => Ok(chunk.expect_column(*index)?.as_ref().clone()),
-        BoundExpr::ScalarSubquery { query, .. } => eval_scalar_subquery(query, chunk, cx),
+        BoundExpr::ScalarSubquery {
+            query,
+            dtype,
+            outer,
+        } => eval_scalar_subquery(query, *dtype, outer, chunk, cx),
+        // A correlated body reads the enclosing block's row from the context
+        // its own evaluation was given (see `eval_correlated`).
+        BoundExpr::OuterRef {
+            depth,
+            index,
+            dtype,
+        } => {
+            let level = cx.outer_rows.len().checked_sub(*depth + 1).ok_or_else(|| {
+                PinkDbError::Execution(format!(
+                    "correlated column reference at depth {depth} has no enclosing row"
+                ))
+            })?;
+            match cx.outer_rows[level].get(*index) {
+                Some(Value::Null) | None => Ok(null_vector(*dtype, n)),
+                Some(v) => const_vector(v.clone(), n),
+            }
+        }
         BoundExpr::Cast { expr, dtype } => {
             let v = eval_expr(expr, chunk, cx)?;
             eval_cast(&v, *dtype)
@@ -49,8 +70,14 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             expr,
             query,
             negated,
-        } => eval_in_subquery(expr, query, *negated, chunk, cx),
-        BoundExpr::Exists { query, negated } => eval_exists(query, *negated, chunk, cx),
+            outer,
+            op,
+        } => eval_in_subquery(expr, query, *negated, *op, outer, chunk, cx),
+        BoundExpr::Exists {
+            query,
+            negated,
+            outer,
+        } => eval_exists(query, *negated, outer, chunk, cx),
         BoundExpr::Not(e) => {
             let v = eval_expr(e, chunk, cx)?;
             ensure_dtype(&v, DataType::Boolean, "NOT")?;
@@ -334,13 +361,34 @@ fn memo_key(query: &crate::plan::LogicalPlan) -> usize {
 /// Memoised per plan node: uncorrelated ⇒ stable within a statement.
 fn eval_scalar_subquery(
     query: &crate::plan::LogicalPlan,
+    dtype: DataType,
+    outer: &OuterBind,
     chunk: &DataChunk,
     cx: &Cx,
 ) -> Result<Vector> {
-    let key = memo_key(query);
-    if let Some(Memo::Scalar(v)) = cx.memo.lock().expect("memo").get(&key) {
-        return const_vector(v.clone(), chunk.num_rows());
+    if outer.refs.is_empty() {
+        let key = memo_key(query);
+        if let Some(Memo::Scalar(v)) = cx.memo.lock().expect("memo").get(&key) {
+            return const_vector(v.clone(), chunk.num_rows());
+        }
+        let v = scalar_body(query, dtype, chunk, cx)?;
+        cx.memo
+            .lock()
+            .expect("memo")
+            .insert(key, Memo::Scalar(v.0.clone()));
+        return Ok(v.1);
     }
+    eval_correlated(outer, dtype, chunk, cx, |cx, chunk| {
+        Ok(scalar_body(query, dtype, chunk, cx)?.1)
+    })
+}
+
+fn scalar_body(
+    query: &crate::plan::LogicalPlan,
+    dtype: DataType,
+    chunk: &DataChunk,
+    cx: &Cx,
+) -> Result<(Value, Vector)> {
     let out = eval(cx, query)?;
     let mut rows = 0usize;
     let mut value = Value::Null;
@@ -358,11 +406,54 @@ fn eval_scalar_subquery(
             value = col.get(i);
         }
     }
-    cx.memo
-        .lock()
-        .expect("memo")
-        .insert(key, Memo::Scalar(value.clone()));
-    const_vector(value, chunk.num_rows())
+    let column = if matches!(value, Value::Null) {
+        // Zero rows (or a NULL value): keep the column's type, so the
+        // enclosing expression's arithmetic and comparison stay typed.
+        null_vector(dtype, chunk.num_rows())
+    } else {
+        const_vector(value.clone(), chunk.num_rows())?
+    };
+    Ok((value, column))
+}
+
+/// Evaluate a subquery expression once per chunk row, with that row's
+/// enclosing-block values pushed on the outer stack (wave 120).
+///
+/// This is the correctness fallback for a correlated shape the planner cannot
+/// decorrelate into a join (see `docs/wave-120-plan.md`): it executes the body
+/// per row, so it is never memoised. An uncorrelated body takes the caller's
+/// own path untouched.
+fn eval_correlated(
+    outer: &OuterBind,
+    dtype: DataType,
+    chunk: &DataChunk,
+    cx: &Cx,
+    f: impl Fn(&Cx, &DataChunk) -> Result<Vector>,
+) -> Result<Vector> {
+    if outer.refs.is_empty() {
+        return f(cx, chunk);
+    }
+    let mut out: Option<Vector> = None;
+    for row in 0..chunk.num_rows() {
+        let sub = cx.with_outer_row(std::sync::Arc::from(outer.snapshot(chunk, row)));
+        let v = f(&sub, &chunk.gather(&[row]))?;
+        let acc = match &mut out {
+            Some(acc) => acc,
+            None => out.insert(Vector::with_capacity(v.dtype(), chunk.num_rows())),
+        };
+        acc.push_from(&v, 0)?;
+    }
+    Ok(out.unwrap_or_else(|| null_vector(dtype, 0)))
+}
+
+/// An all-NULL vector of `dtype` (the typed counterpart of
+/// [`const_vector`]'s untyped NULL).
+fn null_vector(dtype: DataType, n: usize) -> Vector {
+    let mut v = Vector::with_capacity(dtype, n);
+    for _ in 0..n {
+        v.push_null().expect("a NULL fits any column");
+    }
+    v
 }
 
 /// `lhs [NOT] IN (query)` with SQL three-valued logic: a match is TRUE;
@@ -371,16 +462,192 @@ fn eval_in_subquery(
     lhs: &BoundExpr,
     query: &crate::plan::LogicalPlan,
     negated: bool,
+    op: BinaryOp,
+    outer: &OuterBind,
     chunk: &DataChunk,
     cx: &Cx,
 ) -> Result<Vector> {
-    let key = memo_key(query);
-    let l = eval_expr(lhs, chunk, cx)?;
-    // Hit path borrows the set (no clone); the borrow ends at return.
-    if let Some(Memo::Set(set, has_null, common)) = cx.memo.lock().expect("memo").get(&key) {
-        return probe_in(&l, set, *has_null, *common, negated);
+    if op == BinaryOp::Eq {
+        if outer.refs.is_empty() {
+            let key = memo_key(query);
+            let l = eval_expr(lhs, chunk, cx)?;
+            // Hit path borrows the set (no clone); the borrow ends at return.
+            if let Some(Memo::Set(set, has_null, common)) = cx.memo.lock().expect("memo").get(&key)
+            {
+                return probe_in(&l, set, *has_null, *common, negated);
+            }
+            let out = eval(cx, query)?;
+            let (set, has_null, common) = in_set(&out, &l)?;
+            let result = probe_in(&l, &set, has_null, common, negated)?;
+            cx.memo
+                .lock()
+                .expect("memo")
+                .insert(key, Memo::Set(set, has_null, common));
+            return Ok(result);
+        }
+        // A correlated set differs per row, so it can neither be memorised nor
+        // shared: build it inside the row's own evaluation.
+        return eval_correlated(outer, DataType::Boolean, chunk, cx, |cx, chunk| {
+            let l = eval_expr(lhs, chunk, cx)?;
+            let out = eval(cx, query)?;
+            let (set, has_null, common) = in_set(&out, &l)?;
+            probe_in(&l, &set, has_null, common, negated)
+        });
     }
-    let out = eval(cx, query)?;
+    // An ordered ANY: `x < ANY (s)` holds iff `x < max(s)`, `x > ANY (s)` iff
+    // `x > min(s)`, and `x <> ANY (s)` iff `x` differs from `min(s)` or
+    // `max(s)`. So the whole set collapses to its extremes.
+    if outer.refs.is_empty() {
+        let key = memo_key(query);
+        if let Some(Memo::Extremes(lo, hi, has_null)) = cx.memo.lock().expect("memo").get(&key) {
+            return probe_any(
+                lhs,
+                op,
+                lo.clone(),
+                hi.clone(),
+                *has_null,
+                negated,
+                chunk,
+                cx,
+            );
+        }
+        let out = eval(cx, query)?;
+        let (lo, hi, has_null) = extremes(&out)?;
+        let result = probe_any(
+            lhs,
+            op,
+            lo.clone(),
+            hi.clone(),
+            has_null,
+            negated,
+            chunk,
+            cx,
+        )?;
+        cx.memo
+            .lock()
+            .expect("memo")
+            .insert(key, Memo::Extremes(lo, hi, has_null));
+        return Ok(result);
+    }
+    eval_correlated(outer, DataType::Boolean, chunk, cx, |cx, chunk| {
+        let out = eval(cx, query)?;
+        let (lo, hi, has_null) = extremes(&out)?;
+        probe_any(lhs, op, lo, hi, has_null, negated, chunk, cx)
+    })
+}
+
+/// The smallest and largest non-NULL value of a one-column set, and whether it
+/// held a NULL at all.
+fn extremes(out: &crate::exec::Output) -> Result<(Option<Value>, Option<Value>, bool)> {
+    let mut lo: Option<Value> = None;
+    let mut hi: Option<Value> = None;
+    let mut has_null = false;
+    for c in &out.chunks {
+        let Some(col) = c.columns.first() else {
+            continue;
+        };
+        for i in 0..col.len() {
+            if col.is_null(i) {
+                has_null = true;
+                continue;
+            }
+            let v = col.get(i);
+            if lo
+                .as_ref()
+                .is_none_or(|cur| compare_values(&v, cur) == std::cmp::Ordering::Less)
+            {
+                lo = Some(v.clone());
+            }
+            if hi
+                .as_ref()
+                .is_none_or(|cur| compare_values(&v, cur) == std::cmp::Ordering::Greater)
+            {
+                hi = Some(v);
+            }
+        }
+    }
+    Ok((lo, hi, has_null))
+}
+
+/// `x op ANY (set)` from the set's extremes: OR over the rows, in three-valued
+/// logic, so a set that matches nothing but holds a NULL gives NULL and an
+/// empty set gives FALSE.
+#[allow(clippy::too_many_arguments)]
+fn probe_any(
+    lhs: &BoundExpr,
+    op: BinaryOp,
+    lo: Option<Value>,
+    hi: Option<Value>,
+    has_null: bool,
+    negated: bool,
+    chunk: &DataChunk,
+    cx: &Cx,
+) -> Result<Vector> {
+    let n = chunk.num_rows();
+    // `FALSE` is the identity of the OR over the set's rows.
+    let mut acc: Vec<Option<bool>> = vec![Some(false); n];
+    let extremum = match op {
+        BinaryOp::Lt | BinaryOp::LtEq => hi.clone(),
+        BinaryOp::Gt | BinaryOp::GtEq => lo.clone(),
+        _ => None,
+    };
+    // `<> ANY` differs from every set member iff it differs from one extreme.
+    let probes: Vec<BoundExpr> = match op {
+        BinaryOp::NotEq => [lo.clone(), hi.clone()]
+            .into_iter()
+            .flatten()
+            .map(BoundExpr::Literal)
+            .collect(),
+        _ => extremum.map(BoundExpr::Literal).into_iter().collect(),
+    };
+    if probes.is_empty() {
+        // Nothing to match: FALSE, or NULL when the set held only NULLs.
+        let v: Option<bool> = if has_null && lo.is_none() {
+            None
+        } else {
+            Some(false)
+        };
+        acc = vec![v; n];
+    }
+    for probe in &probes {
+        let cmp = eval_comparison(op, lhs, probe, chunk, cx)?;
+        for (i, slot) in acc.iter_mut().enumerate() {
+            let cur = match cmp.get(i) {
+                Value::Boolean(b) => Some(b),
+                _ => None,
+            };
+            *slot = match (*slot, cur) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            };
+        }
+    }
+    if !probes.is_empty() {
+        // A row that matched nothing sees the NULL rows of the set.
+        for slot in acc.iter_mut() {
+            if *slot == Some(false) && has_null {
+                *slot = None;
+            }
+        }
+    }
+    let mut out = Vector::new_empty(DataType::Boolean);
+    for slot in acc {
+        let slot = if negated { slot.map(|b| !b) } else { slot };
+        match slot {
+            Some(b) => out.push_value(Value::Boolean(b))?,
+            None => out.push_null()?,
+        }
+    }
+    Ok(out)
+}
+
+/// The set an `IN` subquery builds, whether it held a NULL (such a row is
+/// noted, never stored), and the type both sides compare at.
+fn in_set(
+    out: &crate::exec::Output,
+    l: &Vector,
+) -> Result<(FastSet<Vec<u8>>, bool, Option<DataType>)> {
     let rhs_t = out.types.first().copied().unwrap_or(DataType::Integer);
     let common = common_numeric(l.dtype(), rhs_t).ok();
     // Reserve the whole result up front: a large IN set (one entry per row)
@@ -408,12 +675,7 @@ fn eval_in_subquery(
             set.insert(buf.clone());
         }
     }
-    let result = probe_in(&l, &set, has_null, common, negated)?;
-    cx.memo
-        .lock()
-        .expect("memo")
-        .insert(key, Memo::Set(set, has_null, common));
-    Ok(result)
+    Ok((set, has_null, common))
 }
 
 fn probe_in(
@@ -429,6 +691,9 @@ fn probe_in(
     };
     let mut out = Vector::new_empty(DataType::Boolean);
     let mut buf = Vec::new();
+    // "x IN (no rows)" is FALSE even when x is NULL, so an empty set decides
+    // before the NULL rule: `NOT IN` over it is TRUE.
+    let empty = set.is_empty() && !has_null;
     for i in 0..l.len() {
         let hit = if l.is_null(i) {
             false
@@ -437,7 +702,9 @@ fn probe_in(
             encode_row(&mut buf, &[l.get(i)]);
             set.contains(&buf)
         };
-        let v: Option<bool> = if hit {
+        let v: Option<bool> = if empty {
+            Some(negated)
+        } else if hit {
             Some(!negated)
         } else if l.is_null(i) || has_null {
             None
@@ -456,17 +723,29 @@ fn probe_in(
 fn eval_exists(
     query: &crate::plan::LogicalPlan,
     negated: bool,
+    outer: &OuterBind,
     chunk: &DataChunk,
     cx: &Cx,
 ) -> Result<Vector> {
-    let key = memo_key(query);
-    if let Some(Memo::Flag(b)) = cx.memo.lock().expect("memo").get(&key) {
-        return const_vector(Value::Boolean(*b != negated), chunk.num_rows());
+    if outer.refs.is_empty() {
+        let key = memo_key(query);
+        if let Some(Memo::Flag(b)) = cx.memo.lock().expect("memo").get(&key) {
+            return const_vector(Value::Boolean(*b != negated), chunk.num_rows());
+        }
+        let any = exists_body(query, cx)?;
+        cx.memo.lock().expect("memo").insert(key, Memo::Flag(any));
+        return const_vector(Value::Boolean(any != negated), chunk.num_rows());
     }
+    eval_correlated(outer, DataType::Boolean, chunk, cx, |cx, chunk| {
+        let any = exists_body(query, cx)?;
+        const_vector(Value::Boolean(any != negated), chunk.num_rows())
+    })
+}
+
+/// Whether the body produces any row under the current enclosing row.
+fn exists_body(query: &crate::plan::LogicalPlan, cx: &Cx) -> Result<bool> {
     let out = eval(cx, query)?;
-    let any = out.chunks.iter().any(|c| c.num_rows() > 0);
-    cx.memo.lock().expect("memo").insert(key, Memo::Flag(any));
-    const_vector(Value::Boolean(any != negated), chunk.num_rows())
+    Ok(out.chunks.iter().any(|c| c.num_rows() > 0))
 }
 
 /// Broadcast a scalar to `n` rows. `NULL` ⇒ INTEGER-typed all-NULL vector

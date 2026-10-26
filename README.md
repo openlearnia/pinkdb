@@ -249,7 +249,10 @@ FROM t [<join> u ON <cond>] ...    -- multi-way; INNER / LEFT [OUTER] / RIGHT [O
 [WINDOW w AS (PARTITION BY … ORDER BY …), ...]   -- a window may build on another:
                                    -- OVER (w ORDER BY x), WINDOW v AS (w ROWS …)
 WHERE expr                        -- incl. IS [NOT] NULL, IS [NOT] DISTINCT FROM,
-                                  -- BETWEEN, IN (subquery|list), EXISTS (subquery)
+                                  -- BETWEEN, IN (list|correlated subquery),
+                                  -- EXISTS (correlated subquery),
+                                  -- x = ANY (…) / x <> ALL (…)
+                                  -- (a subquery sees the enclosing blocks' rows)
 GROUP BY [DISTINCT] expr, ... | GROUPING SETS (…), ROLLUP (…), CUBE (…)
   HAVING ...                      -- GROUPING(x) / GROUPING() mark the set
 QUALIFY expr                      -- after WINDOW, before ORDER BY
@@ -258,8 +261,9 @@ ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...  -- default NULLS LAST both way
 LIMIT n | FETCH FIRST|NEXT n ROW|ROWS ONLY | OFFSET n [ROW|ROWS]
 <query> UNION|INTERSECT|EXCEPT [ALL] <query>      -- INTERSECT binds tighter
 SELECT DISTINCT ON (expr, ...) ...                -- first row per key, in ORDER BY order
--- Scalar subqueries `(SELECT ...)` anywhere an expression goes
--- (uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL).
+-- Scalar subqueries `(SELECT ...)` anywhere an expression goes, correlated or
+-- not (1 row × 1 col; 0 rows → NULL; >1 row is an error), including aggregates
+-- over the enclosing row (`l_quantity < (SELECT 0.2*avg(l_quantity) …)`).
 -- Expressions: CAST / TRY_CAST (NULL on failure), `x IS [NOT] DISTINCT FROM y`,
 -- `s LIKE p [ESCAPE e]`, `s SIMILAR TO regex`, subscripts `v['a']`, `v[0]`,
 -- `v.a`, `s[2]`, `s[2:4]`; aggregates and window aggregates may take
@@ -3289,8 +3293,11 @@ to the old semantics (duckdiff 60/60 + the 1M battery 64/64).
   words; quote identifiers to use them as names (`"use"` works)
 - Durable commits refuse statements that read a session-local view (views are
   never persisted); `.import` checkpoints, so it needs a settled transaction
-- Correlated subqueries are rejected (uncorrelated only); `NATURAL` and `USING`
-  joins are rejected (write an explicit `ON` condition instead)
+- `NATURAL` and `USING` joins are rejected (write an explicit `ON` condition
+  instead); a correlated subquery whose body is not a plain FROM tree
+  (`LIMIT`/`DISTINCT`/`GROUP BY`, two levels deep, no equality key, a scalar
+  under `NOT`, `ON`/`ORDER BY` sites) runs once per distinct outer key instead of
+  being unnested into a join — correct, linear, and shown in `EXPLAIN`
 - Window functions are SELECT/ORDER-BY only (not WHERE/GROUP BY/HAVING)
 - Aggregates in ORDER BY need a select alias or position
 - General ORDER BY expressions must be aliases, positions, or GROUP BY keys

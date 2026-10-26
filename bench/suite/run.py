@@ -53,11 +53,6 @@ TPCH_TABLES = [
     "region",
 ]
 
-# Queries pinkdb cannot bind: the binder keeps subqueries uncorrelated in v1
-# (binder.rs documents this; three_part_columns.rs pins the refusal). They are
-# reported as unsupported, never silently dropped.
-UNSUPPORTED_BY_DESIGN = {2, 4, 17, 20, 21, 22}
-
 TIMER_RE = re.compile(r"Run Time \(s\): real ([0-9.]+)")
 IMPORT_RE = re.compile(r"Imported (\d+) rows in ([0-9.]+)s")
 
@@ -388,18 +383,6 @@ class Suite:
             q = queries[nr]
             self.note_load(f"tpch q{nr}")
             duck_rows = self._output_rows("duck", q, db, timeout)
-            if nr in UNSUPPORTED_BY_DESIGN:
-                rows.append(
-                    {
-                        "query": nr,
-                        "status": "unsupported",
-                        "reason": "correlated subquery is out of scope for the v1 binder",
-                        "duckdb_ms": (self._timed("duck", q, db, 1, 0, timeout)[0] or [None])[0],
-                        "duckdb_rows": len(duck_rows),
-                    }
-                )
-                print(f"  q{nr:<2} unsupported by design", flush=True)
-                continue
             pink_rows = self._output_rows("pink", q, store, timeout)
             ok, why = rows_equal(pink_rows, duck_rows)
             if not ok:
@@ -969,8 +952,9 @@ class Suite:
 
     def ci(self):
         """The small, DuckDB-free guard: a deterministic TPC-H-shaped lineitem
-        at SF 0.01, two queries, a micro insert and the binary size. Baselines
-        live in bench/suite/baseline-ci.json; a 2x regression fails."""
+        at SF 0.01, the scan and correlated-subquery shapes, a micro insert and
+        the binary size. Baselines live in bench/suite/baseline-ci.json; a 2x
+        regression fails."""
         rows = 60_000
         csv = self.work / "ci_lineitem.csv"
         gen_ci_lineitem(csv, rows)
@@ -980,7 +964,8 @@ class Suite:
         if r.returncode != 0:
             raise SystemExit(f"ci import failed: {(r.stdout + r.stderr)[-1000:]}")
         out = {"rows": rows}
-        for name, sql in (("q1", CI_Q1), ("q6", CI_Q6)):
+        queries = (("q1", CI_Q1), ("q6", CI_Q6)) + CI_CORRELATED
+        for name, sql in queries:
             r = pink(f".open {store}\n.timer on\n" + (sql + "\n") * 6)
             tv = timer_values(r.stdout + r.stderr)
             out[name] = {"median_ms": median([t * 1000 for t in tv[1:]]), "runs_ms": [t * 1000 for t in tv]}
@@ -993,7 +978,7 @@ class Suite:
         baseline = json.loads(baseline_path.read_text()) if baseline_path.exists() else None
         regressions = []
         if baseline and not self.args.update_baseline:
-            for key in ("q1", "q6"):
+            for key, _ in queries:
                 base = baseline.get(key, {}).get("median_ms")
                 got = out[key]["median_ms"]
                 if base and got and got > max(2 * base, base + 5):
@@ -1007,7 +992,7 @@ class Suite:
             baseline_path.write_text(json.dumps(out, indent=2) + "\n")
             print(f"  ci baseline written to {baseline_path}", flush=True)
         self.results["ci"] = out
-        for name in ("q1", "q6"):
+        for name, _ in queries:
             print(f"  ci {name}: {out[name]['median_ms']:.1f} ms", flush=True)
         if regressions:
             print("  CI REGRESSIONS: " + "; ".join(regressions), flush=True)
@@ -1062,6 +1047,27 @@ CI_Q1 = (
     "sum(l_extendedprice * (1 - l_discount)), avg(l_discount), count(*) "
     "FROM lineitem WHERE CAST(l_shipdate AS DATE) <= CAST('1998-09-02' AS date) "
     "GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;"
+)
+# Wave 120 shapes: a correlated scalar aggregate (the Q17 rewrite), a
+# correlated EXISTS (semi join) and a correlated NOT IN (mark join with
+# three-valued logic). l_returnflag repeats, so it is the correlation key.
+CI_CORRELATED = (
+    (
+        "corr_scalar",
+        "SELECT count(*) FROM lineitem WHERE l_quantity < (SELECT 0.2 * avg(l_quantity) "
+        "FROM lineitem i2 WHERE i2.l_returnflag = lineitem.l_returnflag);",
+    ),
+    (
+        "corr_exists",
+        "SELECT count(*) FROM lineitem WHERE EXISTS (SELECT 1 FROM lineitem i2 "
+        "WHERE i2.l_returnflag = lineitem.l_returnflag AND i2.l_quantity > 40);",
+    ),
+    (
+        "corr_not_in",
+        "SELECT count(*) FROM lineitem WHERE l_quantity NOT IN (SELECT l_quantity "
+        "FROM lineitem i2 WHERE i2.l_returnflag = lineitem.l_returnflag "
+        "AND i2.l_discount = 0.10);",
+    ),
 )
 CI_Q6 = (
     "SELECT sum(l_extendedprice * l_discount) FROM lineitem "

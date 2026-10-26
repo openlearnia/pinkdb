@@ -733,6 +733,18 @@ pub enum JoinKind {
     Full,
     /// `CROSS JOIN`: the cartesian product (never has an `ON`).
     Cross,
+    /// Semi join: emit a left row once if any right row matches its keys.
+    /// Output is the left schema only. Produced by unnesting `EXISTS`
+    /// (wave 120), never by SQL text.
+    Semi,
+    /// Anti join: emit a left row once if no right row matches its keys.
+    /// Output is the left schema only. Produced by unnesting `NOT EXISTS`.
+    Anti,
+    /// Mark join: output is the left schema plus one BOOLEAN column that is
+    /// TRUE when a right row matches, NULL when no row matches but the
+    /// matching correlation group holds a NULL, and FALSE otherwise. Produced
+    /// by unnesting `[NOT] IN` and by a non-top-level `[NOT] EXISTS`.
+    Mark,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -943,11 +955,17 @@ pub enum Expr {
     /// `(SELECT ...)` — uncorrelated scalar subquery (exactly 1 row × 1 col;
     /// 0 rows → NULL).
     ScalarSubquery(Box<Select>),
-    /// `expr [NOT] IN (SELECT ...)` — uncorrelated.
+    /// `expr [NOT] IN (SELECT ...)` and `expr <op> ANY (SELECT ...)`.
+    ///
+    /// `op` is the comparison the set probe applies: [`BinaryOp::Eq`] for `IN`,
+    /// the written operator for `ANY`/`SOME`. `op ALL` is desugared by the
+    /// parser into `NOT (op' ANY)` with `op'` the inverse comparison, which is
+    /// the identity DuckDB applies (see `pin_transform_expression.cpp`).
     InSubquery {
         expr: Box<Expr>,
         query: Box<Select>,
         negated: bool,
+        op: BinaryOp,
     },
     /// `[NOT] EXISTS (SELECT ...)` — true iff the query returns any row.
     Exists {

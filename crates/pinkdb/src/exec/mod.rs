@@ -502,12 +502,22 @@ pub(crate) struct Cx<'a> {
     /// network connection's own, never the store's); a read path that only
     /// holds a read lock passes it explicitly.
     pub(crate) session: crate::storage::Session,
+    /// Rows of the enclosing query blocks, innermost last (wave 120): a
+    /// correlated subquery's `OuterRef` reads them. A correlated body runs
+    /// with a context that already has its block's row pushed, so nesting
+    /// stacks without any shared mutable state and the parallel executor
+    /// reads them freely.
+    pub(crate) outer_rows: Vec<std::sync::Arc<[Value]>>,
 }
 
 #[derive(Clone)]
 pub(crate) enum Memo {
     Scalar(Value),
     Set(FastSet<Vec<u8>>, bool, Option<DataType>),
+    /// The extremes of a set an ordered `ANY` comparison probes: a left value
+    /// satisfies `op ANY (set)` exactly when it satisfies `op` the extreme, and
+    /// whether the set held a NULL decides the rows that match none.
+    Extremes(Option<Value>, Option<Value>, bool),
     Flag(bool),
 }
 
@@ -539,6 +549,26 @@ impl<'a> Cx<'a> {
             budget,
             dml_ctes,
             session: db.session.clone(),
+            outer_rows: Vec::new(),
+        }
+    }
+
+    /// This context with one enclosing-block row pushed (wave 120).
+    pub(crate) fn with_outer_row(&self, row: std::sync::Arc<[Value]>) -> Self {
+        Self {
+            db: self.db,
+            ctes: self.ctes.clone(),
+            memo: self.memo.clone(),
+            projections: self.projections.clone(),
+            prunes: self.prunes.clone(),
+            budget: self.budget.clone(),
+            dml_ctes: self.dml_ctes.clone(),
+            session: self.session.clone(),
+            outer_rows: {
+                let mut rows = self.outer_rows.clone();
+                rows.push(row);
+                rows
+            },
         }
     }
 
@@ -3010,9 +3040,19 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let l = eval(cx, left)?;
             let r = eval(cx, right)?;
             let mut names = l.names.clone();
-            names.extend(r.names.iter().cloned());
             let mut types = l.types.clone();
-            types.extend(r.types.iter().copied());
+            // Semi/anti emit the left schema only; mark appends its marker.
+            match kind {
+                JoinKind::Semi | JoinKind::Anti => {}
+                JoinKind::Mark => {
+                    names.push(MARK_NAME.to_string());
+                    types.push(DataType::Boolean);
+                }
+                _ => {
+                    names.extend(r.names.iter().cloned());
+                    types.extend(r.types.iter().copied());
+                }
+            }
             let lside = JoinSide {
                 chunks: &l.chunks,
                 types: &l.types,
@@ -3222,6 +3262,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     budget: cx.budget.clone(),
                     dml_ctes: cx.dml_ctes.clone(),
                     session: cx.session.clone(),
+                    outer_rows: cx.outer_rows.clone(),
                 };
                 return eval(&child, body);
             }
@@ -3258,6 +3299,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         budget: cx.budget.clone(),
                         dml_ctes: cx.dml_ctes.clone(),
                         session: cx.session.clone(),
+                        outer_rows: cx.outer_rows.clone(),
                     };
                     let produced = eval(&child, &step.step)?;
                     let fresh = if step.all {
@@ -3298,6 +3340,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 budget: cx.budget.clone(),
                 dml_ctes: cx.dml_ctes.clone(),
                 session: cx.session.clone(),
+                outer_rows: cx.outer_rows.clone(),
             };
             eval(&child, body)
         }
@@ -3952,12 +3995,184 @@ fn hash_join(
         JoinKind::Full => {
             hash_join_probe(cx, left, right, left_keys, right_keys, false, true, true)
         }
+        JoinKind::Semi | JoinKind::Anti | JoinKind::Mark => {
+            hash_mark_join(cx, left, right, left_keys, right_keys, kind)
+        }
         // Cross joins never reach the hash path (the binder emits a
         // condition-less nested loop).
         JoinKind::Cross => Err(PinkDbError::Execution(
             "internal: CROSS JOIN cannot use the hash join".to_string(),
         )),
     }
+}
+
+/// Name of the marker column a mark join appends (wave 120).
+pub(crate) const MARK_NAME: &str = "__mark";
+
+/// SEMI/ANTI/MARK hash join (wave 120): hash the right side on `right_keys`,
+/// probe with the left, and emit the left schema — plus the BOOLEAN marker for
+/// MARK. Semi/anti are produced by unnesting `EXISTS`/`NOT EXISTS`, mark by
+/// `[NOT] IN`; both come from `Binder::decorrelate_clause`.
+///
+/// For MARK the last key pair is the value comparison and every earlier pair
+/// is a correlation key. A left row whose full key hits is TRUE; a row that
+/// misses is NULL when its correlation group's match column held a NULL, and
+/// FALSE otherwise (DuckDB's `ScanStructure::NextMarkJoin` in
+/// src/execution/join_hashtable.cpp — a group with `count(*) > count(value)`
+/// has a NULL in it). A NULL key makes the marker NULL, because `NULL IN (…)`
+/// is never TRUE.
+fn hash_mark_join(
+    cx: &Cx,
+    left: JoinSide<'_>,
+    right: JoinSide<'_>,
+    left_keys: &[BoundExpr],
+    right_keys: &[BoundExpr],
+    kind: JoinKind,
+) -> Result<Vec<DataChunk>> {
+    let mark = kind == JoinKind::Mark;
+    if left_keys.is_empty() {
+        return Err(PinkDbError::Execution(
+            "internal: semi/anti/mark join without keys".to_string(),
+        ));
+    }
+    let ints = left_keys.len() == 1
+        && is_int_key(left_keys[0].dtype())
+        && is_int_key(right_keys[0].dtype());
+    let commons: Vec<Option<DataType>> = left_keys
+        .iter()
+        .zip(right_keys.iter())
+        .map(|(l, r)| common_numeric(l.dtype(), r.dtype()).ok())
+        .collect();
+    let build_rows: usize = right.chunks.iter().map(|c| c.num_rows()).sum();
+    let table = MatchTable::build(
+        cx,
+        right.chunks,
+        right_keys,
+        &commons,
+        ints,
+        build_rows.min(1 << 20),
+    )?;
+    // Per correlation group: rows seen, and rows whose match value was not
+    // NULL. Only a mark join reads them.
+    let mut groups: std::collections::HashMap<Vec<u8>, (u32, u32)> =
+        std::collections::HashMap::new();
+    if mark && left_keys.len() > 1 {
+        let mut buf = Vec::new();
+        for chunk in right.chunks {
+            let kvs: Vec<Vector> = right_keys
+                .iter()
+                .zip(commons.iter())
+                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
+                .collect::<Result<_>>()?;
+            for i in 0..chunk.num_rows() {
+                if kvs[..kvs.len() - 1].iter().any(|kv| kv.is_null(i)) {
+                    continue;
+                }
+                buf.clear();
+                for kv in &kvs[..kvs.len() - 1] {
+                    kv.encode_into(&mut buf, i);
+                }
+                let entry = groups.entry(buf.clone()).or_insert((0, 0));
+                entry.0 += 1;
+                if !kvs[kvs.len() - 1].is_null(i) {
+                    entry.1 += 1;
+                }
+            }
+        }
+    }
+
+    let mut dtypes: Vec<DataType> = left.types.to_vec();
+    if mark {
+        dtypes.push(DataType::Boolean);
+    }
+    let partitions: Vec<Vec<DataChunk>> = left
+        .chunks
+        .par_iter()
+        .map(|chunk| -> Result<Vec<DataChunk>> {
+            cx.check_deadline()?;
+            let kvs: Vec<Vector> = left_keys
+                .iter()
+                .zip(commons.iter())
+                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
+                .collect::<Result<_>>()?;
+            let mut finished = Vec::new();
+            let mut cur: Vec<Vector> = dtypes
+                .iter()
+                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+                .collect();
+            let mut cur_rows = 0usize;
+            let mut buf = Vec::new();
+            for i in 0..chunk.num_rows() {
+                let null_key = kvs.iter().any(|kv| kv.is_null(i));
+                let hit = !null_key
+                    && if ints {
+                        table.head_int(int_key_at(&kvs[0], i)).is_some()
+                    } else {
+                        buf.clear();
+                        for kv in &kvs {
+                            kv.encode_into(&mut buf, i);
+                        }
+                        table.head_bytes(&buf).is_some()
+                    };
+                if !mark && hit != (kind == JoinKind::Semi) {
+                    continue;
+                }
+                if cur_rows >= CHUNK_SIZE {
+                    let full = DataChunk::new(std::mem::take(&mut cur))?;
+                    cx.add_materialized(full.num_rows(), chunk_approx_bytes(&full))?;
+                    finished.push(full);
+                    cur = dtypes
+                        .iter()
+                        .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+                        .collect();
+                    cur_rows = 0;
+                }
+                for (dst, col) in cur
+                    .iter_mut()
+                    .take(left.types.len())
+                    .zip(chunk.columns.iter())
+                {
+                    dst.push_from(col, i)?;
+                }
+                if mark {
+                    // Three-valued IN: the correlation-key group decides the
+                    // empty case first, because "x IN (no rows)" is FALSE even
+                    // when x is NULL — `NOT IN` over an empty set is TRUE.
+                    // Inside a group that exists, a NULL operand is unknown, a
+                    // hit is TRUE, a NULL in the group's values is unknown, and
+                    // anything else is FALSE.
+                    let marker = if kvs[..kvs.len() - 1].iter().any(|kv| kv.is_null(i)) {
+                        Some(false)
+                    } else {
+                        buf.clear();
+                        for kv in &kvs[..kvs.len() - 1] {
+                            kv.encode_into(&mut buf, i);
+                        }
+                        match groups.get(&buf) {
+                            None => Some(false),
+                            Some((star, nonnull)) if kvs[kvs.len() - 1].is_null(i) => None,
+                            Some(_) if hit => Some(true),
+                            Some((star, nonnull)) if star > nonnull => None,
+                            Some(_) => Some(false),
+                        }
+                    };
+                    let dst = cur.last_mut().expect("marker column");
+                    match marker {
+                        Some(b) => dst.push_valid(Value::Boolean(b))?,
+                        None => dst.push_null()?,
+                    }
+                }
+                cur_rows += 1;
+            }
+            if cur_rows > 0 {
+                let full = DataChunk::new(cur)?;
+                cx.add_materialized(full.num_rows(), chunk_approx_bytes(&full))?;
+                finished.push(full);
+            }
+            Ok(finished)
+        })
+        .collect::<Result<_>>()?;
+    Ok(partitions.into_iter().flatten().collect())
 }
 
 /// Shared hash-join probe/assembly loop. `preserved` is the side whose rows
@@ -4277,6 +4492,7 @@ fn classify_side(expr: &BoundExpr, left_cols: usize) -> Option<Side> {
         | BoundExpr::WindowRef { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::InSubquery { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::DynamicScalar { .. }
         | BoundExpr::Exists { .. } => None,
     }
@@ -4372,6 +4588,7 @@ fn rewrite_through_project(expr: &BoundExpr, project: Option<&[BoundExpr]>) -> O
         | BoundExpr::WindowRef { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::InSubquery { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::DynamicScalar { .. }
         | BoundExpr::Exists { .. } => None,
     }
@@ -4389,7 +4606,8 @@ fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
             index: index - left_cols,
             dtype: *dtype,
         },
-        BoundExpr::Literal(v) => BoundExpr::Literal(v.clone()),
+        // An outer ref is not a column of either side of this join.
+        BoundExpr::Literal(_) | BoundExpr::OuterRef { .. } => expr.clone(),
         BoundExpr::Binary {
             op,
             left,
@@ -4531,6 +4749,8 @@ fn fusible_expr(
 fn expr_is_total(e: &BoundExpr) -> bool {
     match e {
         BoundExpr::Literal(_) | BoundExpr::Column { .. } => true,
+        // An outer value may be NULL and is not the fused path's to inspect.
+        BoundExpr::OuterRef { .. } => false,
         BoundExpr::Not(x) | BoundExpr::IsNull { expr: x, .. } => expr_is_total(x),
         BoundExpr::Negate { expr, dtype } => *dtype == DataType::Double && expr_is_total(expr),
         BoundExpr::Binary {
@@ -6571,6 +6791,9 @@ fn join_name(kind: JoinKind) -> &'static str {
         JoinKind::Right => "right",
         JoinKind::Full => "full",
         JoinKind::Cross => "cross",
+        JoinKind::Semi => "semi",
+        JoinKind::Anti => "anti",
+        JoinKind::Mark => "mark",
     }
 }
 
@@ -6589,6 +6812,7 @@ fn expr_text(e: &BoundExpr) -> String {
             other => other.to_string(),
         },
         BoundExpr::Column { index, .. } => format!("#{index}"),
+        BoundExpr::OuterRef { depth, index, .. } => format!("outer#{depth}.{index}"),
         BoundExpr::AggRef { index, .. } => format!("agg#{index}"),
         BoundExpr::WindowRef { index, .. } => format!("win#{index}"),
         BoundExpr::Binary {
@@ -8930,15 +9154,30 @@ mod tests {
         assert_eq!(rows, vec![vec![V::Bigint(0)]]);
     }
 
+    /// Wave 120: the subquery reads the enclosing block's row, so it decides
+    /// each department by that department's employees.
     #[test]
-    fn correlated_is_rejected() {
+    fn correlated_exists_reads_the_outer_row() {
         let mut db = sub_db();
-        assert!(
-            db.execute(
-                "SELECT dname FROM dept WHERE EXISTS (SELECT * FROM emp WHERE emp.did = dept.did);"
-            )
-            .is_err()
+        let rows = select(
+            &mut db,
+            "SELECT dname FROM dept WHERE EXISTS (SELECT * FROM emp WHERE emp.did = dept.did) \
+             ORDER BY dname;",
         );
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Varchar("eng".to_string())],
+                vec![V::Varchar("ops".to_string())]
+            ]
+        );
+        // `emp` has no NULL `did`, so an anti join keeps every department.
+        let rows = select(
+            &mut db,
+            "SELECT dname FROM dept WHERE NOT EXISTS (SELECT * FROM emp WHERE emp.did = dept.did) \
+             ORDER BY dname;",
+        );
+        assert!(rows.is_empty(), "{rows:?}");
     }
 
     fn join_db() -> PinkDb {

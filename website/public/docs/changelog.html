@@ -193,6 +193,20 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-27">2026-10-27<a class="anchor" href="#2026-10-27" aria-label="Permalink: 2026-10-27">#</a></h2>
+<h3>Wave 120 — correlated subqueries ✅</h3>
+<p>A subquery can now read the row around it, which is the last thing that kept pinkdb from running the whole TPC-H set.</p>
+<ul>
+<li><strong>Any enclosing block, any depth.</strong> <code>WHERE EXISTS (SELECT 1 FROM lineitem WHERE l_orderkey = orders.o_orderkey)</code>, <code>l_quantity &lt; (SELECT 0.2 * avg(l_quantity) …)</code>, <code>x IN (…)</code> inside <code>CASE</code>, a correlated derived table, a correlation two levels deep: the binder resolves an outer name through a scope chain and remembers which enclosing columns each body reads.</li>
+<li><strong>Planned as joins, not rerun per row.</strong> <code>EXISTS</code>/<code>NOT EXISTS</code> become semi/anti hash joins, <code>IN</code>/<code>NOT IN</code> become a <strong>mark join</strong> that computes SQL's three-valued answer (<code>1 NOT IN (2, NULL)</code> is NULL, <code>NOT IN (empty)</code> is TRUE), and a correlated scalar aggregate groups by the correlation keys and left-joins the block. <code>count</code> is coalesced to 0 for a group the body never produced — the classic COUNT bug — while <code>sum</code>/<code>avg</code>/<code>min</code>/<code>max</code> stay NULL, as DuckDB does.</li>
+<li><strong><code>= ANY</code> / <code>&lt;&gt; ALL</code> and friends</strong> are in the grammar now (<code>ALL</code> is <code>NOT(inv(op) ANY …)</code>, so it rides the same machinery).</li>
+<li><strong>What runs where.</strong> The rewrites cover the shapes TPC-H and real queries use; the rest (a body with <code>LIMIT</code>/<code>GROUP BY</code>/<code>DISTINCT</code>, two-level correlation, a pure range correlation, a scalar under <code>NOT</code>) run once per distinct outer key, which is correct and linear, and <code>EXPLAIN</code> shows which one you got.</li>
+<li><strong>Measured.</strong> All 22 TPC-H queries now match DuckDB's rows exactly at SF 0.01, 0.1 and 1. At SF 0.1 the suite's geometric mean over all 22 is <strong>9.3×</strong> DuckDB (8.0× over the 16 queries wave 111 could run); Q4 16 ms, Q17 7 ms, Q20 50 ms, Q21 407 ms, Q22 57 ms. The remaining gap for this family is the duplicate-eliminated key side being recomputed per subquery (DuckDB shares it with a delim join) — recorded as a follow-up, with Q20's scaling as the evidence.</li>
+</ul>
+<ul>
+<li><strong>Review round.</strong> An <code>IN</code>/<code>NOT IN</code> whose operand column is not the column that drives the correlation read one column past the mark join's output; the empty-group rule (<code>x NOT IN (no rows)</code> is TRUE even for a NULL <code>x</code>) was also applied after the NULL checks instead of before. A correlated subquery in a grouped block now refuses an outer column the grouping does not carry, as DuckDB does, instead of reading an arbitrary group member, and a derived table inside a body that reads the enclosing row is counted in the body's references. A seeded differential test (<code>correlated_fuzz.rs</code>, 500 cases per run, soaks to thousands) compares generated cases against DuckDB, which is where the last two came from.</li>
+</ul>
+<p>Design and the shape measurements are in <code>docs/wave-120-plan.md</code>.</p>
 <h2 id="2026-10-26">2026-10-26<a class="anchor" href="#2026-10-26" aria-label="Permalink: 2026-10-26">#</a></h2>
 <h3>Wave 109 — agent memory ✅</h3>
 <p>Long-term memory for agents, stored in pinkdb tables and served by a new native extension (<code>pinkdb-memory</code>). A conversation becomes facts, facts become projects, projects become a profile — and a later run starts from all three instead of from nothing.</p>
@@ -941,6 +955,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-27">2026-10-27</a></li>
   <li><a href="#2026-10-26">2026-10-26</a></li>
   <li><a href="#2026-10-25">2026-10-25</a></li>
   <li><a href="#2026-10-25-2">2026-10-25</a></li>

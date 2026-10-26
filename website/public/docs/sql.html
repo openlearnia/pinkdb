@@ -277,47 +277,49 @@ second committer with a write-conflict error instead of a silent lost update.</p
 
 <h2 id="select">SELECT<a class="anchor" href="#select" aria-label="Permalink: SELECT">#</a></h2>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">SELECT</span> [<span class="tok-k">DISTINCT</span>] expr [<span class="tok-k">AS</span> alias], ...
-<span class="tok-k">FROM</span> t [<span class="tok-k">JOIN</span> u <span class="tok-k">ON</span> t.x = u.y]      <span class="tok-c">-- INNER / LEFT / RIGHT / FULL [OUTER], CROSS</span>
-  | <span class="tok-k">FROM</span> a <span class="tok-k">JOIN</span> b <span class="tok-k">ON</span> ... <span class="tok-k">JOIN</span> c <span class="tok-k">ON</span> ...   <span class="tok-c">-- multi-way (n-ary) joins</span>
-  | <span class="tok-k">FROM</span> t, u [<span class="tok-k">JOIN</span> v <span class="tok-k">ON</span> t.x = v.z]  <span class="tok-c">-- a comma is a CROSS JOIN in the same</span>
-                                  <span class="tok-c">-- left-deep chain (ON sees the items left of it)</span>
-  | <span class="tok-k">FROM</span> LATERAL (<span class="tok-k">SELECT</span> ...) <span class="tok-k">AS</span> s <span class="tok-c">-- LATERAL subqueries (uncorrelated only)</span>
-  | <span class="tok-k">FROM</span> t USING SAMPLE <span class="tok-n">10</span> <span class="tok-k">ROWS</span>   <span class="tok-c">-- TABLESAMPLE / USING SAMPLE: n ROWS | n PERCENT,</span>
-  | <span class="tok-k">FROM</span> t TABLESAMPLE BERNOULLI(<span class="tok-n">10</span> PERCENT)  <span class="tok-c">-- bernoulli | system | reservoir,</span>
-                                  <span class="tok-c">-- REPEATABLE (seed) for a deterministic draw</span>
-  | <span class="tok-k">FROM</span> db1.t                    <span class="tok-c">-- qualified tables resolve in that database</span>
-  | <span class="tok-k">FROM</span> (<span class="tok-k">SELECT</span> ...) <span class="tok-k">AS</span> s         <span class="tok-c">-- derived tables (alias required)</span>
-  | <span class="tok-k">FROM</span> (<span class="tok-k">VALUES</span> (<span class="tok-n">1</span>,<span class="tok-s">'a'</span>), (<span class="tok-n">2</span>,<span class="tok-s">'b'</span>)) t(x, y)  <span class="tok-c">-- VALUES, column aliases optional</span>
-  | <span class="tok-k">FROM</span> <span class="tok-s">'file.csv'</span> / read_csv(...) <span class="tok-c">-- extension table functions (waves 70-75)</span>
-  | <span class="tok-k">WITH</span> [RECURSIVE] w <span class="tok-k">AS</span> (<span class="tok-k">SELECT</span> ...) ...  <span class="tok-c">-- CTEs, incl. WITH w(a, b) AS column</span>
-                                  <span class="tok-c">-- aliases; RECURSIVE needs an anchor plus a</span>
-                                  <span class="tok-c">-- UNION [ALL] step (bounded, see below)</span>
-[WINDOW w <span class="tok-k">AS</span> (<span class="tok-k">PARTITION</span> <span class="tok-k">BY</span> ... <span class="tok-k">ORDER</span> <span class="tok-k">BY</span> ...), ...]   <span class="tok-c">-- a window may build on</span>
-                                  <span class="tok-c">-- another: OVER (w ORDER BY x), WINDOW v AS (w ROWS ...)</span>
-<span class="tok-k">WHERE</span> expr                        <span class="tok-c">-- IS [NOT] NULL, IS [NOT] DISTINCT FROM,</span>
-                                  <span class="tok-c">-- BETWEEN, IN (subquery|list), EXISTS</span>
-<span class="tok-k">GROUP</span> <span class="tok-k">BY</span> ... | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)   <span class="tok-k">HAVING</span> ...
-QUALIFY expr                      <span class="tok-c">-- after WINDOW, before ORDER BY</span>
-<span class="tok-k">ORDER</span> <span class="tok-k">BY</span> expr [<span class="tok-k">ASC</span>|<span class="tok-k">DESC</span>] [<span class="tok-k">NULLS</span> <span class="tok-k">FIRST</span>|<span class="tok-k">NULLS</span> <span class="tok-k">LAST</span>], ...   <span class="tok-c">-- ORDER BY 2 positional</span>
-<span class="tok-k">LIMIT</span> n | FETCH <span class="tok-k">FIRST</span>|NEXT n ROW|<span class="tok-k">ROWS</span> ONLY | <span class="tok-k">OFFSET</span> n [ROW|<span class="tok-k">ROWS</span>];
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code>SELECT [DISTINCT] expr [AS alias], ...
+FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT / RIGHT / FULL [OUTER], CROSS
+  | FROM a JOIN b ON ... JOIN c ON ...   -- multi-way (n-ary) joins
+  | FROM t, u [JOIN v ON t.x = v.z]  -- a comma is a CROSS JOIN in the same
+                                  -- left-deep chain (ON sees the items left of it)
+  | FROM LATERAL (SELECT ...) AS s -- LATERAL subqueries (uncorrelated only)
+  | FROM t USING SAMPLE 10 ROWS   -- TABLESAMPLE / USING SAMPLE: n ROWS | n PERCENT,
+  | FROM t TABLESAMPLE BERNOULLI(10 PERCENT)  -- bernoulli | system | reservoir,
+                                  -- REPEATABLE (seed) for a deterministic draw
+  | FROM db1.t                    -- qualified tables resolve in that database
+  | FROM (SELECT ...) AS s         -- derived tables (alias required)
+  | FROM (VALUES (1,'a'), (2,'b')) t(x, y)  -- VALUES, column aliases optional
+  | FROM 'file.csv' / read_csv(...) -- extension table functions (waves 70-75)
+  | WITH [RECURSIVE] w AS (SELECT ...) ...  -- CTEs, incl. WITH w(a, b) AS column
+                                  -- aliases; RECURSIVE needs an anchor plus a
+                                  -- UNION [ALL] step (bounded, see below)
+[WINDOW w AS (PARTITION BY ... ORDER BY ...), ...]   -- a window may build on
+                                  -- another: OVER (w ORDER BY x), WINDOW v AS (w ROWS ...)
+WHERE expr                        -- IS [NOT] NULL, IS [NOT] DISTINCT FROM,
+                                  -- BETWEEN, IN (list|correlated subquery),
+                                  -- EXISTS (correlated subquery),
+                                  -- x = ANY (...) / x <> ALL (...)
+GROUP BY ... | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)   HAVING ...
+QUALIFY expr                      -- after WINDOW, before ORDER BY
+ORDER BY expr [ASC|DESC] [NULLS FIRST|NULLS LAST], ...   -- ORDER BY 2 positional
+LIMIT n | FETCH FIRST|NEXT n ROW|ROWS ONLY | OFFSET n [ROW|ROWS];
 
-<span class="tok-k">SELECT</span> <span class="tok-k">DISTINCT</span> <span class="tok-k">ON</span> (expr, ...) ...  <span class="tok-c">-- first row per key in ORDER BY order</span>
-<span class="tok-k">SELECT</span> ... <span class="tok-k">TABLE</span> t;                 <span class="tok-c">-- the whole table (plus any trailing clauses)</span>
-<span class="tok-k">VALUES</span> (<span class="tok-n">1</span>, <span class="tok-s">'a'</span>), (<span class="tok-n">2</span>, <span class="tok-s">'b'</span>);          <span class="tok-c">-- column names col0, col1, ...</span>
+SELECT DISTINCT ON (expr, ...) ...  -- first row per key in ORDER BY order
+SELECT ... TABLE t;                 -- the whole table (plus any trailing clauses)
+VALUES (1, 'a'), (2, 'b');          -- column names col0, col1, ...
 
-COUNT(<span class="tok-k">DISTINCT</span> x)                 <span class="tok-c">-- inside aggregates</span>
-SUM(x) FILTER (<span class="tok-k">WHERE</span> ...)         <span class="tok-c">-- filtered aggregates, window aggregates too</span>
-PERCENTILE_CONT(<span class="tok-n">0.5</span>) WITHIN <span class="tok-k">GROUP</span> (<span class="tok-k">ORDER</span> <span class="tok-k">BY</span> x)   <span class="tok-c">-- ordered-set aggregates:</span>
-PERCENTILE_DISC(<span class="tok-n">0.9</span>) WITHIN <span class="tok-k">GROUP</span> (<span class="tok-k">ORDER</span> <span class="tok-k">BY</span> x)   <span class="tok-c">-- percentile_cont/disc, and</span>
-MODE() WITHIN <span class="tok-k">GROUP</span> (<span class="tok-k">ORDER</span> <span class="tok-k">BY</span> x)                 <span class="tok-c">-- mode(); FILTER allowed too</span>
-<span class="tok-k">SET</span> VARIABLE x = <span class="tok-n">41</span>;              <span class="tok-c">-- session variable (per connection),</span>
-<span class="tok-k">SELECT</span> getvariable(<span class="tok-s">'x'</span>), $x;      <span class="tok-c">-- read back by getvariable or $x</span>
-<span class="tok-k">SELECT</span> ... <span class="tok-k">UNION</span> [<span class="tok-k">ALL</span>|<span class="tok-k">DISTINCT</span>] <span class="tok-k">SELECT</span> ...
-<span class="tok-k">SELECT</span> ... INTERSECT [<span class="tok-k">ALL</span>] <span class="tok-k">SELECT</span> ...
-<span class="tok-k">SELECT</span> ... EXCEPT [<span class="tok-k">ALL</span>] <span class="tok-k">SELECT</span> ...
-EXPLAIN <span class="tok-k">SELECT</span> ...                <span class="tok-c">-- the query plan</span>
-SHOW TABLES;  DESCRIBE t;         <span class="tok-c">-- introspection</span></code></pre></div>
+COUNT(DISTINCT x)                 -- inside aggregates
+SUM(x) FILTER (WHERE ...)         -- filtered aggregates, window aggregates too
+PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x)   -- ordered-set aggregates:
+PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY x)   -- percentile_cont/disc, and
+MODE() WITHIN GROUP (ORDER BY x)                 -- mode(); FILTER allowed too
+SET VARIABLE x = 41;              -- session variable (per connection),
+SELECT getvariable('x'), $x;      -- read back by getvariable or $x
+SELECT ... UNION [ALL|DISTINCT] SELECT ...
+SELECT ... INTERSECT [ALL] SELECT ...
+SELECT ... EXCEPT [ALL] SELECT ...
+EXPLAIN SELECT ...                -- the query plan
+SHOW TABLES;  DESCRIBE t;         -- introspection</code></pre></div>
 
 <h3>Joins</h3>
 
@@ -357,8 +359,20 @@ SHOW TABLES;  DESCRIBE t;         <span class="tok-c">-- introspection</span></c
   constants; each column takes the common type of its cells.</li>
   <li><code>TABLE t</code> is shorthand for <code>SELECT * FROM t</code> and takes
   the same trailing <code>ORDER BY</code>/<code>LIMIT</code>.</li>
-  <li>Scalar subqueries, <code>IN (subquery)</code> and <code>EXISTS (subquery)</code>
-  — uncorrelated only; correlated subqueries are rejected.</li>
+  <li><strong>Correlated subqueries</strong> — <code>EXISTS</code>,
+  <code>IN</code>, <code>= ANY</code>/<code>&lt;&gt; ALL</code> and scalar
+  subqueries may read a column of any enclosing query block, at any depth, in
+  <code>WHERE</code>, <code>SELECT</code>, <code>HAVING</code>,
+  <code>ON</code> and <code>CASE</code>. The planner turns them into
+  semi/anti/mark joins or an aggregate grouped by the correlation keys and
+  left-joined (with <code>count</code> coalesced to 0, the classical COUNT
+  bug), so they are not rerun per row. <code>IN</code> keeps SQL's
+  three-valued logic: <code>1 NOT IN (2, NULL)</code> is NULL and
+  <code>NOT IN</code> over an empty set is TRUE. Shapes the unnesting does not
+  cover yet — a body with <code>LIMIT</code>/<code>DISTINCT</code>/<code>GROUP
+  BY</code>, two-level correlation, a correlation with no equality key, a
+  scalar under <code>NOT</code> — run once per distinct outer key, which is
+  correct and linear, and <code>EXPLAIN</code> shows which plan you got.</li>
   <li><code>WITH w AS (...)</code> plus <code>WITH w(a, b) AS (...)</code> column
   aliases. CTEs shadow unqualified names only; a qualified name never resolves to a
   CTE.</li>
@@ -1138,8 +1152,13 @@ CALL hnsw_index_stats(<span class="tok-s">'docs'</span>, <span class="tok-s">'do
 <a href="../docs/roadmap">roadmap</a>.</p>
 
 <ul>
-  <li><strong>Correlated subqueries</strong> are rejected (uncorrelated subqueries
-  and <code>EXISTS</code> work).</li>
+  <li><strong>Unnesting gaps</strong> — a correlated subquery whose body is not a
+  plain FROM tree (it has <code>LIMIT</code>, <code>DISTINCT</code>,
+  <code>GROUP BY</code> or a set operation), a correlation two levels deep, one
+  with no equality key, a scalar under <code>NOT</code>, and a subquery in
+  <code>ON</code>/<code>ORDER BY</code>/<code>GROUP BY</code>/a window argument
+  still run once per distinct outer key instead of becoming a join. Correct,
+  linear, and visible in <code>EXPLAIN</code>.</li>
   <li><strong>MySQL DML spellings</strong> — <code>ON DUPLICATE KEY UPDATE</code>
   and <code>REPLACE INTO</code> are refused by name; write
   <code>ON CONFLICT … DO UPDATE SET</code> or <code>INSERT OR REPLACE</code>.

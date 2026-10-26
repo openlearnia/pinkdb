@@ -1,0 +1,814 @@
+{
+  "meta": {
+    "host": "Kartiks-MacBook-Air-2.local",
+    "os": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+    "os_version": "27.0.1",
+    "cpu": "Apple M4",
+    "physical_cores": 10,
+    "logical_cores": 10,
+    "memory_gb": 17.18,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14) (Homebrew)",
+    "duckdb": "v2.0.0 (Cyanoptera) d54cbbe3df",
+    "branch": "stream-c",
+    "commit": "bc4da2aa7084ee5715ad0a6bfa74306d6d0f13a3",
+    "commit_short": "bc4da2a",
+    "dirty": true,
+    "dirty_files": 30,
+    "python": "3.14.7",
+    "started": "2026-10-27T00:39:54",
+    "finished": "2026-10-27T00:39:58",
+    "scale": 0.01,
+    "threads": 8,
+    "runs": 5,
+    "warmup": 1,
+    "families": [
+      "tpch"
+    ],
+    "loads": [
+      {
+        "stage": "start",
+        "at": "00:39:54",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q1",
+        "at": "00:39:54",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q2",
+        "at": "00:39:55",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q3",
+        "at": "00:39:55",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q4",
+        "at": "00:39:55",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q5",
+        "at": "00:39:55",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q6",
+        "at": "00:39:56",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q7",
+        "at": "00:39:56",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q8",
+        "at": "00:39:56",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q9",
+        "at": "00:39:56",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q10",
+        "at": "00:39:56",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q11",
+        "at": "00:39:56",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q12",
+        "at": "00:39:56",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q13",
+        "at": "00:39:56",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q14",
+        "at": "00:39:57",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q15",
+        "at": "00:39:57",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q16",
+        "at": "00:39:57",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q17",
+        "at": "00:39:57",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q18",
+        "at": "00:39:57",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q19",
+        "at": "00:39:57",
+        "load": [
+          3.7451171875,
+          3.5546875,
+          3.2001953125
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q20",
+        "at": "00:39:57",
+        "load": [
+          4.24560546875,
+          3.66162109375,
+          3.23974609375
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q21",
+        "at": "00:39:58",
+        "load": [
+          4.24560546875,
+          3.66162109375,
+          3.23974609375
+        ],
+        "busy": null
+      },
+      {
+        "stage": "tpch q22",
+        "at": "00:39:58",
+        "load": [
+          4.24560546875,
+          3.66162109375,
+          3.23974609375
+        ],
+        "busy": null
+      },
+      {
+        "stage": "after tpch",
+        "at": "00:39:58",
+        "load": [
+          4.24560546875,
+          3.66162109375,
+          3.23974609375
+        ],
+        "busy": null
+      }
+    ]
+  },
+  "families": {
+    "tpch": {
+      "scale": 0.01,
+      "threads": {
+        "pinkdb": 8,
+        "duckdb": 8
+      },
+      "warmup": 1,
+      "runs": 5,
+      "parquet": "/var/folders/c6/6s90fg_10l9873q01hjny22r0000gn/T/pinkdb_bench_suite/tpch_sf0.01/parquet",
+      "pinkdb_store_bytes": 3103841,
+      "duckdb_store_bytes": 4468736,
+      "queries": [
+        {
+          "query": 1,
+          "status": "ok",
+          "pinkdb_ms": 2.0,
+          "duckdb_ms": 1.0,
+          "ratio": 2.0,
+          "pinkdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "duckdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "rows": 4,
+          "checksum": "1cfe5c8031738720",
+          "error": null
+        },
+        {
+          "query": 2,
+          "status": "ok",
+          "pinkdb_ms": 4.0,
+          "duckdb_ms": 2.0,
+          "ratio": 2.0,
+          "pinkdb_runs_ms": [
+            4.0,
+            4.0,
+            4.0,
+            4.0,
+            4.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 4,
+          "checksum": "f7362399a29df185",
+          "error": null
+        },
+        {
+          "query": 3,
+          "status": "ok",
+          "pinkdb_ms": 2.0,
+          "duckdb_ms": 1.0,
+          "ratio": 2.0,
+          "pinkdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "duckdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "rows": 10,
+          "checksum": "14a4553562f1d919",
+          "error": null
+        },
+        {
+          "query": 4,
+          "status": "ok",
+          "pinkdb_ms": 2.0,
+          "duckdb_ms": 1.0,
+          "ratio": 2.0,
+          "pinkdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "duckdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "rows": 5,
+          "checksum": "580e96eddaf64b69",
+          "error": null
+        },
+        {
+          "query": 5,
+          "status": "ok",
+          "pinkdb_ms": 4.0,
+          "duckdb_ms": 2.0,
+          "ratio": 2.0,
+          "pinkdb_runs_ms": [
+            4.0,
+            4.0,
+            4.0,
+            4.0,
+            4.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 5,
+          "checksum": "ee9708137866f642",
+          "error": null
+        },
+        {
+          "query": 6,
+          "status": "ok",
+          "pinkdb_ms": 1.0,
+          "duckdb_ms": 0.0,
+          "ratio": null,
+          "pinkdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duckdb_runs_ms": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rows": 1,
+          "checksum": "0137961b0d16619b",
+          "error": null
+        },
+        {
+          "query": 7,
+          "status": "ok",
+          "pinkdb_ms": 11.0,
+          "duckdb_ms": 2.0,
+          "ratio": 5.5,
+          "pinkdb_runs_ms": [
+            11.0,
+            11.0,
+            11.0,
+            11.0,
+            11.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 4,
+          "checksum": "c95b8bfa2a06d193",
+          "error": null
+        },
+        {
+          "query": 8,
+          "status": "ok",
+          "pinkdb_ms": 3.0,
+          "duckdb_ms": 2.0,
+          "ratio": 1.5,
+          "pinkdb_runs_ms": [
+            3.0,
+            3.0,
+            3.0,
+            3.0,
+            3.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 2,
+          "checksum": "28373b4d7775f675",
+          "error": null
+        },
+        {
+          "query": 9,
+          "status": "ok",
+          "pinkdb_ms": 7.0,
+          "duckdb_ms": 2.0,
+          "ratio": 3.5,
+          "pinkdb_runs_ms": [
+            7.0,
+            7.0,
+            7.0,
+            7.0,
+            7.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 173,
+          "checksum": "aaa0c48cf39f42b4",
+          "error": null
+        },
+        {
+          "query": 10,
+          "status": "ok",
+          "pinkdb_ms": 3.0,
+          "duckdb_ms": 2.0,
+          "ratio": 1.5,
+          "pinkdb_runs_ms": [
+            3.0,
+            3.0,
+            3.0,
+            3.0,
+            3.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 20,
+          "checksum": "fab075b58d8ea3a5",
+          "error": null
+        },
+        {
+          "query": 11,
+          "status": "ok",
+          "pinkdb_ms": 2.0,
+          "duckdb_ms": 1.0,
+          "ratio": 2.0,
+          "pinkdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "duckdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "rows": 359,
+          "checksum": "d6ac366b4faaae7f",
+          "error": null
+        },
+        {
+          "query": 12,
+          "status": "ok",
+          "pinkdb_ms": 2.0,
+          "duckdb_ms": 1.0,
+          "ratio": 2.0,
+          "pinkdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "duckdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "rows": 2,
+          "checksum": "03f54e41de56be6b",
+          "error": null
+        },
+        {
+          "query": 13,
+          "status": "ok",
+          "pinkdb_ms": 8.0,
+          "duckdb_ms": 2.0,
+          "ratio": 4.0,
+          "pinkdb_runs_ms": [
+            8.0,
+            8.0,
+            8.0,
+            8.0,
+            8.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 33,
+          "checksum": "6407610897532c6a",
+          "error": null
+        },
+        {
+          "query": 14,
+          "status": "ok",
+          "pinkdb_ms": 1.0,
+          "duckdb_ms": 1.0,
+          "ratio": 1.0,
+          "pinkdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duckdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "rows": 1,
+          "checksum": "e14a5bc051f5715d",
+          "error": null
+        },
+        {
+          "query": 15,
+          "status": "ok",
+          "pinkdb_ms": 1.0,
+          "duckdb_ms": 1.0,
+          "ratio": 1.0,
+          "pinkdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "duckdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "rows": 1,
+          "checksum": "7fbcbb39c532211a",
+          "error": null
+        },
+        {
+          "query": 16,
+          "status": "ok",
+          "pinkdb_ms": 2.0,
+          "duckdb_ms": 2.0,
+          "ratio": 1.0,
+          "pinkdb_runs_ms": [
+            2.0,
+            2.0,
+            1.0,
+            1.0,
+            2.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 296,
+          "checksum": "e616b1f802f9ef1c",
+          "error": null
+        },
+        {
+          "query": 17,
+          "status": "ok",
+          "pinkdb_ms": 0.0,
+          "duckdb_ms": 1.0,
+          "ratio": null,
+          "pinkdb_runs_ms": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "duckdb_runs_ms": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "rows": 1,
+          "checksum": "73c8ffe9553f8c24",
+          "error": null
+        },
+        {
+          "query": 18,
+          "status": "ok",
+          "pinkdb_ms": 7.0,
+          "duckdb_ms": 2.0,
+          "ratio": 3.5,
+          "pinkdb_runs_ms": [
+            7.0,
+            7.0,
+            7.0,
+            6.0,
+            7.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 2,
+          "checksum": "630b3733f8c93372",
+          "error": null
+        },
+        {
+          "query": 19,
+          "status": "ok",
+          "pinkdb_ms": 31.0,
+          "duckdb_ms": 2.0,
+          "ratio": 15.5,
+          "pinkdb_runs_ms": [
+            29.0,
+            31.0,
+            30.0,
+            31.0,
+            31.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 1,
+          "checksum": "34e30feffa16b3f0",
+          "error": null
+        },
+        {
+          "query": 20,
+          "status": "ok",
+          "pinkdb_ms": 5.0,
+          "duckdb_ms": 2.0,
+          "ratio": 2.5,
+          "pinkdb_runs_ms": [
+            5.0,
+            5.0,
+            5.0,
+            5.0,
+            5.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 1,
+          "checksum": "3a25a0223fed9650",
+          "error": null
+        },
+        {
+          "query": 21,
+          "status": "ok",
+          "pinkdb_ms": 39.0,
+          "duckdb_ms": 2.0,
+          "ratio": 19.5,
+          "pinkdb_runs_ms": [
+            39.0,
+            40.0,
+            39.0,
+            39.0,
+            39.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            2.0
+          ],
+          "rows": 1,
+          "checksum": "f2360ee4559b632c",
+          "error": null
+        },
+        {
+          "query": 22,
+          "status": "ok",
+          "pinkdb_ms": 5.0,
+          "duckdb_ms": 2.0,
+          "ratio": 2.5,
+          "pinkdb_runs_ms": [
+            5.0,
+            5.0,
+            5.0,
+            5.0,
+            5.0
+          ],
+          "duckdb_runs_ms": [
+            2.0,
+            2.0,
+            2.0,
+            2.0,
+            1.0
+          ],
+          "rows": 7,
+          "checksum": "adade4c74d33dc74",
+          "error": null
+        }
+      ]
+    }
+  }
+}

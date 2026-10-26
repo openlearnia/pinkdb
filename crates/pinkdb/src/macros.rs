@@ -377,10 +377,12 @@ pub(crate) fn substitute_expr(
             expr,
             query,
             negated,
+            op,
         } => Expr::InSubquery {
             expr: Box::new(substitute_expr(expr, args, used)?),
             query: Box::new(substitute_select(query, args, used)?),
             negated: *negated,
+            op: *op,
         },
         Expr::Exists { query, negated } => Expr::Exists {
             query: Box::new(substitute_select(query, args, used)?),

@@ -727,7 +727,12 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
 pub(crate) fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
     match expr {
         BoundExpr::Column { index, .. } => out.push(*index),
-        BoundExpr::Literal(_) | BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
+        // An outer column is no column of this plan: it must not make a
+        // predicate look side-specific.
+        BoundExpr::Literal(_)
+        | BoundExpr::OuterRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. } => {}
         BoundExpr::InSubquery { expr, .. } => columns_in(expr, out),
         BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => out.push(usize::MAX),
         BoundExpr::Not(e)
@@ -1346,9 +1351,12 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
             BoundExpr::Column { .. } | BoundExpr::AggRef { .. } => Some(exprs[*index].clone()),
             _ => None,
         },
-        BoundExpr::Literal(_) | BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => {
-            Some(pred.clone())
-        }
+        // An outer ref means the same thing in any plan of this block, so it
+        // survives the projection rewrite unchanged.
+        BoundExpr::Literal(_)
+        | BoundExpr::OuterRef { .. }
+        | BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. } => Some(pred.clone()),
         BoundExpr::Cast { expr, dtype } => Some(BoundExpr::Cast {
             expr: Box::new(rewrite_through_project(expr, exprs)?),
             dtype: *dtype,
@@ -1387,10 +1395,14 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
             expr,
             query,
             negated,
+            outer,
+            op,
         } => Some(BoundExpr::InSubquery {
             expr: Box::new(rewrite_through_project(expr, exprs)?),
             query: query.clone(),
             negated: *negated,
+            outer: outer.clone(),
+            op: *op,
         }),
         BoundExpr::Not(e) => Some(BoundExpr::Not(Box::new(rewrite_through_project(e, exprs)?))),
         BoundExpr::Negate { expr, dtype } => Some(BoundExpr::Negate {
@@ -1452,18 +1464,23 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
 fn rewrite_through_keys(pred: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
     match pred {
         BoundExpr::Column { index, .. } => keys.get(*index).cloned(),
-        BoundExpr::Literal(_) | BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => {
-            Some(pred.clone())
-        }
+        BoundExpr::Literal(_)
+        | BoundExpr::OuterRef { .. }
+        | BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. } => Some(pred.clone()),
         BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => Some(pred.clone()),
         BoundExpr::InSubquery {
             expr,
             query,
             negated,
+            outer,
+            op,
         } => Some(BoundExpr::InSubquery {
             expr: Box::new(rewrite_through_keys(expr, keys)?),
             query: query.clone(),
             negated: *negated,
+            outer: outer.clone(),
+            op: *op,
         }),
         BoundExpr::Binary {
             op,
@@ -1549,6 +1566,18 @@ fn push_one_level(
     pred: BoundExpr,
     pdb: Option<&crate::storage::PinkDb>,
 ) -> (LogicalPlan, bool) {
+    // A correlated subquery reads the row of the block it was bound in, so a
+    // conjunct holding one cannot cross a node that renumbers or narrows that
+    // row.
+    if crate::plan::has_correlated_subquery(&pred) {
+        return (
+            LogicalPlan::Filter {
+                input: Box::new(input),
+                predicate: pred,
+            },
+            false,
+        );
+    }
     match input {
         LogicalPlan::Project {
             input: inner,
@@ -1669,9 +1698,20 @@ fn push_one_level(
                             keep.push(c);
                         }
                     }
-                    // FULL: both sides can be NULL-extended, so nothing moves
-                    // (conservative; see the join pushdown tests).
-                    JoinKind::Full => keep.push(c),
+                    // FULL: both sides can be NULL-extended, so nothing
+                    // moves (conservative; see the join pushdown tests).
+                    JoinKind::Full | JoinKind::Mark => keep.push(c),
+                    // Semi/anti (wave 120) emit exactly their left columns, so
+                    // a conjunct over the left side decides the same rows
+                    // below the join. A mark join appends the marker column
+                    // after them, so only semi/anti qualify.
+                    JoinKind::Semi | JoinKind::Anti => {
+                        if !cols.is_empty() && left_only {
+                            left_push.push(c);
+                        } else {
+                            keep.push(c);
+                        }
+                    }
                 }
             }
             let pushed = !left_push.is_empty() || !right_push.is_empty();
@@ -2264,6 +2304,7 @@ impl Live {
     fn mark_expr(&mut self, e: &BoundExpr) {
         let mut cols = Vec::new();
         columns_in(e, &mut cols);
+        cols.extend(crate::plan::correlated_columns(e));
         for c in cols {
             if c != usize::MAX {
                 self.mark(c);
@@ -2387,6 +2428,9 @@ fn column_origin(
             let mut origin = column_origin(db, side, index - base)?;
             origin.3 |= match kind {
                 JoinKind::Inner | JoinKind::Cross => false,
+                // Semi/anti/mark never NULL-extend the left side, and it is
+                // the only side they emit.
+                JoinKind::Semi | JoinKind::Anti | JoinKind::Mark => false,
                 // LEFT null-extends only its right side, RIGHT only its left.
                 JoinKind::Left => !on_left,
                 JoinKind::Right => on_left,

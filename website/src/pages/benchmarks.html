@@ -13,10 +13,16 @@ timing, so any table below can be reproduced or disputed.</p>
     <tr><th>Workload</th><th>pinkdb</th><th>DuckDB</th><th>Ratio</th></tr>
   </thead>
   <tbody>
-    <tr><td>TPC-H SF 1, 16 supported queries (geomean)</td>
-        <td>—</td><td>—</td><td>32× slower (15 queries)</td></tr>
-    <tr><td>TPC-H SF 0.1, 16 supported queries (geomean)</td>
-        <td>—</td><td>—</td><td>8.6× slower</td></tr>
+    <tr><td>TPC-H SF 1, all 22 queries (geomean)</td>
+        <td>—</td><td>—</td><td>35.5× slower</td></tr>
+    <tr><td>TPC-H SF 0.1, all 22 queries (geomean)</td>
+        <td>—</td><td>—</td><td>9.3× slower</td></tr>
+    <tr><td>TPC-H Q4, SF 0.1 (correlated <code>EXISTS</code>)</td>
+        <td>16 ms</td><td>2 ms</td><td>8×</td></tr>
+    <tr><td>TPC-H Q17, SF 0.1 (correlated <code>avg</code>)</td>
+        <td>7 ms</td><td>2 ms</td><td>3.5×</td></tr>
+    <tr><td>TPC-H Q21, SF 0.1 (anti join with a residual)</td>
+        <td>407 ms</td><td>5 ms</td><td>81×</td></tr>
     <tr><td>TPC-H Q1, SF 1</td><td>156 ms</td><td>13 ms</td><td>12×</td></tr>
     <tr><td>TPC-H Q6, SF 1</td><td>79 ms</td><td>3 ms</td><td>26×</td></tr>
     <tr><td>TPC-H Q13, SF 1</td><td>439 ms</td><td>38 ms</td><td>12×</td></tr>
@@ -49,9 +55,14 @@ timing, so any table below can be reproduced or disputed.</p>
   </tbody>
 </table>
 
-<p>The six TPC-H queries not listed (2, 4, 17, 20, 21, 22) use correlated
-subqueries. pinkdb's binder refuses those on purpose, with a clear error; they
-are missing features, not slow ones.</p>
+<p>All 22 TPC-H queries run now: wave 120 turned correlated subqueries into
+semi/anti/mark joins and a grouped join for correlated aggregates, so Q2, Q4,
+Q17, Q20, Q21 and Q22 answer instead of failing to bind. Their cost profile is
+the general one — the three shown are the extremes: Q17's correlated
+<code>avg</code> is as cheap as the rest of the scan-bound queries, Q21 pays for
+the duplicate-eliminated key side and for keeping its non-equality condition as
+a filter above the join. The full 22-query tables for SF 0.1 and SF 1 are in
+<a href="/docs/">the docs</a> (<code>docs/benchmarks.md</code>).</p>
 
 <h2>Method</h2>
 

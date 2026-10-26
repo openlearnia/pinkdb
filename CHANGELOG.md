@@ -8,6 +8,51 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-27
+### Wave 120 — correlated subqueries ✅
+
+A subquery can now read the row around it, which is the last thing that kept
+pinkdb from running the whole TPC-H set.
+
+- **Any enclosing block, any depth.** `WHERE EXISTS (SELECT 1 FROM lineitem
+  WHERE l_orderkey = orders.o_orderkey)`, `l_quantity < (SELECT 0.2 *
+  avg(l_quantity) …)`, `x IN (…)` inside `CASE`, a correlated derived table, a
+  correlation two levels deep: the binder resolves an outer name through a
+  scope chain and remembers which enclosing columns each body reads.
+- **Planned as joins, not rerun per row.** `EXISTS`/`NOT EXISTS` become
+  semi/anti hash joins, `IN`/`NOT IN` become a **mark join** that computes SQL's
+  three-valued answer (`1 NOT IN (2, NULL)` is NULL, `NOT IN (empty)` is TRUE),
+  and a correlated scalar aggregate groups by the correlation keys and
+  left-joins the block. `count` is coalesced to 0 for a group the body never
+  produced — the classic COUNT bug — while `sum`/`avg`/`min`/`max` stay NULL,
+  as DuckDB does.
+- **`= ANY` / `<> ALL` and friends** are in the grammar now (`ALL` is
+  `NOT(inv(op) ANY …)`, so it rides the same machinery).
+- **What runs where.** The rewrites cover the shapes TPC-H and real queries use;
+  the rest (a body with `LIMIT`/`GROUP BY`/`DISTINCT`, two-level correlation, a
+  pure range correlation, a scalar under `NOT`) run once per distinct outer key,
+  which is correct and linear, and `EXPLAIN` shows which one you got.
+- **Measured.** All 22 TPC-H queries now match DuckDB's rows exactly at SF 0.01,
+  0.1 and 1. At SF 0.1 the suite's geometric mean over all 22 is **9.3×**
+  DuckDB (8.0× over the 16 queries wave 111 could run); Q4 16 ms, Q17 7 ms, Q20
+  50 ms, Q21 407 ms, Q22 57 ms. The remaining gap for this family is the
+  duplicate-eliminated key side being recomputed per subquery (DuckDB shares it
+  with a delim join) — recorded as a follow-up, with Q20's scaling as the
+  evidence.
+
+- **Review round.** An `IN`/`NOT IN` whose operand column is not the column
+  that drives the correlation read one column past the mark join's output; the
+  empty-group rule (`x NOT IN (no rows)` is TRUE even for a NULL `x`) was also
+  applied after the NULL checks instead of before. A correlated subquery in a
+  grouped block now refuses an outer column the grouping does not carry, as
+  DuckDB does, instead of reading an arbitrary group member, and a derived table
+  inside a body that reads the enclosing row is counted in the body's
+  references. A seeded differential test (`correlated_fuzz.rs`, 500 cases per
+  run, soaks to thousands) compares generated cases against DuckDB, which is
+  where the last two came from.
+
+Design and the shape measurements are in `docs/wave-120-plan.md`.
+
 ## 2026-10-26
 ### Wave 109 — agent memory ✅
 

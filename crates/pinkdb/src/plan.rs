@@ -1222,6 +1222,7 @@ fn expr_tables_read(
     match expr {
         BoundExpr::Literal(_)
         | BoundExpr::Column { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::AggRef { .. }
         | BoundExpr::WindowRef { .. } => {}
         BoundExpr::Binary { left, right, .. } => {
@@ -1510,6 +1511,7 @@ fn expr_contains_table_function(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::Literal(_)
         | BoundExpr::Column { .. }
+        | BoundExpr::OuterRef { .. }
         | BoundExpr::AggRef { .. }
         | BoundExpr::WindowRef { .. } => false,
         BoundExpr::Binary { left, right, .. } => {
@@ -1823,7 +1825,7 @@ fn walk_expr_subquery_filters(
 ) {
     use crate::sql::binder::BoundExpr;
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::Column { .. } => {}
+        BoundExpr::Literal(_) | BoundExpr::Column { .. } | BoundExpr::OuterRef { .. } => {}
         BoundExpr::Binary { left, right, .. } => {
             walk_expr_subquery_filters(left, out);
             walk_expr_subquery_filters(right, out);
@@ -2265,7 +2267,11 @@ fn expr_dynamic(expr: &BoundExpr, found: &mut Vec<String>) {
                 found.push(name.to_string());
             }
         }
-        E::Literal(_) | E::Column { .. } | E::AggRef { .. } | E::WindowRef { .. } => {}
+        E::Literal(_)
+        | E::Column { .. }
+        | E::OuterRef { .. }
+        | E::AggRef { .. }
+        | E::WindowRef { .. } => {}
         E::Not(e)
         | E::Negate { expr: e, .. }
         | E::IsNull { expr: e, .. }
@@ -2551,7 +2557,10 @@ fn collect_expr_projections(
     out: &mut HashMap<usize, Vec<usize>>,
 ) {
     match expr {
-        BoundExpr::Literal(_) | BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => {}
+        BoundExpr::Literal(_)
+        | BoundExpr::OuterRef { .. }
+        | BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. } => {}
         BoundExpr::Column { index, .. } => need.add_col(*index),
         BoundExpr::Binary { left, right, .. } => {
             collect_expr_projections(left, need, out);
@@ -2582,14 +2591,60 @@ fn collect_expr_projections(
                 collect_expr_projections(e, need, out);
             }
         }
-        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+        BoundExpr::ScalarSubquery { query, outer, .. } | BoundExpr::Exists { query, outer, .. } => {
+            // A correlated body reads columns of the row this expression sits
+            // on, so they stay live in the enclosing plan.
+            for c in outer.row_columns() {
+                need.add_col(c);
+            }
             walk_scan_projections(query, &Needed::All, out);
         }
-        BoundExpr::InSubquery { expr, query, .. } => {
+        BoundExpr::InSubquery {
+            expr, query, outer, ..
+        } => {
             collect_expr_projections(expr, need, out);
+            for c in outer.row_columns() {
+                need.add_col(c);
+            }
             walk_scan_projections(query, &Needed::All, out);
         }
     }
+}
+
+/// Whether `expr` holds a subquery that reads an enclosing block. Such a
+/// subquery is evaluated against the row of the block it was bound in, so the
+/// expression holding it must not move to another node (a filter pushdown into
+/// a join side renumbers that row).
+pub(crate) fn has_correlated_subquery(expr: &BoundExpr) -> bool {
+    let mut found = false;
+    crate::sql::binder::walk_bound_expr(expr, &mut |e| {
+        found |= match e {
+            BoundExpr::ScalarSubquery { outer, .. }
+            | BoundExpr::Exists { outer, .. }
+            | BoundExpr::InSubquery { outer, .. } => !outer.refs.is_empty(),
+            _ => false,
+        };
+    });
+    found
+}
+
+/// Columns of the row an expression sits on that its correlated subqueries
+/// read, in the expression's own column space.
+pub(crate) fn correlated_columns(expr: &BoundExpr) -> Vec<usize> {
+    let mut out = Vec::new();
+    crate::sql::binder::walk_bound_expr(expr, &mut |e| {
+        if let BoundExpr::ScalarSubquery { outer, .. }
+        | BoundExpr::Exists { outer, .. }
+        | BoundExpr::InSubquery { outer, .. } = e
+        {
+            for c in outer.row_columns() {
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+    });
+    out
 }
 
 /// Compare two non-null values. Cross-type numerics compare in i64 when both
@@ -2723,10 +2778,14 @@ pub(crate) fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
             expr,
             query,
             negated,
+            outer,
+            op,
         } => BoundExpr::InSubquery {
             expr: Box::new(shift_columns(*expr, by)),
             query,
             negated,
+            outer,
+            op,
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(shift_columns(*expr, by)),
@@ -2805,10 +2864,14 @@ pub(crate) fn map_columns(expr: BoundExpr, f: &dyn Fn(usize) -> usize) -> BoundE
             expr,
             query,
             negated,
+            outer,
+            op,
         } => BoundExpr::InSubquery {
             expr: Box::new(map_columns(*expr, f)),
             query,
             negated,
+            outer,
+            op,
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(map_columns(*expr, f)),

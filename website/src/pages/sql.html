@@ -111,7 +111,9 @@ FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT / RIGHT / FULL [OUTER], CROSS
 [WINDOW w AS (PARTITION BY ... ORDER BY ...), ...]   -- a window may build on
                                   -- another: OVER (w ORDER BY x), WINDOW v AS (w ROWS ...)
 WHERE expr                        -- IS [NOT] NULL, IS [NOT] DISTINCT FROM,
-                                  -- BETWEEN, IN (subquery|list), EXISTS
+                                  -- BETWEEN, IN (list|correlated subquery),
+                                  -- EXISTS (correlated subquery),
+                                  -- x = ANY (...) / x <> ALL (...)
 GROUP BY ... | GROUPING SETS (...) | ROLLUP (...) | CUBE (...)   HAVING ...
 QUALIFY expr                      -- after WINDOW, before ORDER BY
 ORDER BY expr [ASC|DESC] [NULLS FIRST|NULLS LAST], ...   -- ORDER BY 2 positional
@@ -172,8 +174,20 @@ SHOW TABLES;  DESCRIBE t;         -- introspection</code></pre>
   constants; each column takes the common type of its cells.</li>
   <li><code>TABLE t</code> is shorthand for <code>SELECT * FROM t</code> and takes
   the same trailing <code>ORDER BY</code>/<code>LIMIT</code>.</li>
-  <li>Scalar subqueries, <code>IN (subquery)</code> and <code>EXISTS (subquery)</code>
-  — uncorrelated only; correlated subqueries are rejected.</li>
+  <li><strong>Correlated subqueries</strong> — <code>EXISTS</code>,
+  <code>IN</code>, <code>= ANY</code>/<code>&lt;&gt; ALL</code> and scalar
+  subqueries may read a column of any enclosing query block, at any depth, in
+  <code>WHERE</code>, <code>SELECT</code>, <code>HAVING</code>,
+  <code>ON</code> and <code>CASE</code>. The planner turns them into
+  semi/anti/mark joins or an aggregate grouped by the correlation keys and
+  left-joined (with <code>count</code> coalesced to 0, the classical COUNT
+  bug), so they are not rerun per row. <code>IN</code> keeps SQL's
+  three-valued logic: <code>1 NOT IN (2, NULL)</code> is NULL and
+  <code>NOT IN</code> over an empty set is TRUE. Shapes the unnesting does not
+  cover yet — a body with <code>LIMIT</code>/<code>DISTINCT</code>/<code>GROUP
+  BY</code>, two-level correlation, a correlation with no equality key, a
+  scalar under <code>NOT</code> — run once per distinct outer key, which is
+  correct and linear, and <code>EXPLAIN</code> shows which plan you got.</li>
   <li><code>WITH w AS (...)</code> plus <code>WITH w(a, b) AS (...)</code> column
   aliases. CTEs shadow unqualified names only; a qualified name never resolves to a
   CTE.</li>
@@ -953,8 +967,13 @@ CALL hnsw_index_stats('docs', 'docs_vec');</code></pre>
 <a href="{{root}}docs/roadmap.html">roadmap</a>.</p>
 
 <ul>
-  <li><strong>Correlated subqueries</strong> are rejected (uncorrelated subqueries
-  and <code>EXISTS</code> work).</li>
+  <li><strong>Unnesting gaps</strong> — a correlated subquery whose body is not a
+  plain FROM tree (it has <code>LIMIT</code>, <code>DISTINCT</code>,
+  <code>GROUP BY</code> or a set operation), a correlation two levels deep, one
+  with no equality key, a scalar under <code>NOT</code>, and a subquery in
+  <code>ON</code>/<code>ORDER BY</code>/<code>GROUP BY</code>/a window argument
+  still run once per distinct outer key instead of becoming a join. Correct,
+  linear, and visible in <code>EXPLAIN</code>.</li>
   <li><strong>MySQL DML spellings</strong> — <code>ON DUPLICATE KEY UPDATE</code>
   and <code>REPLACE INTO</code> are refused by name; write
   <code>ON CONFLICT … DO UPDATE SET</code> or <code>INSERT OR REPLACE</code>.

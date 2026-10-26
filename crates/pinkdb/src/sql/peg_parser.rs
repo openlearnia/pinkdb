@@ -878,6 +878,9 @@ enum CmpTail {
     InSubquery {
         negated: bool,
         query: Box<Select>,
+        op: BinaryOp,
+        /// `op ALL (...)` — desugared to `NOT (inv(op) ANY (...))`.
+        all: bool,
     },
     Like {
         negated: bool,
@@ -979,6 +982,19 @@ fn table_select(db: Option<String>, name: String, tail: QueryTail) -> Select {
     }
 }
 
+/// The comparison that fails exactly when `op` holds, for the `ALL` desugar.
+fn invert_cmp(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Eq => BinaryOp::NotEq,
+        BinaryOp::NotEq => BinaryOp::Eq,
+        BinaryOp::Lt => BinaryOp::GtEq,
+        BinaryOp::LtEq => BinaryOp::Gt,
+        BinaryOp::Gt => BinaryOp::LtEq,
+        BinaryOp::GtEq => BinaryOp::Lt,
+        other => other,
+    }
+}
+
 fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
     match tail {
         CmpTail::IsNull { negated } => Expr::IsNull {
@@ -992,11 +1008,30 @@ fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
             negated,
         },
         CmpTail::InList { negated, items } => desugar_in_list(left, items, negated),
-        CmpTail::InSubquery { negated, query } => Expr::InSubquery {
-            expr: Box::new(left),
-            query,
+        CmpTail::InSubquery {
             negated,
-        },
+            query,
+            op,
+            all,
+        } => {
+            // `x op ALL (q)` holds iff no row of q fails `x op r`, which is
+            // `NOT (x inv(op) ANY (q))`; the empty set therefore gives TRUE.
+            let op = if all { invert_cmp(op) } else { op };
+            let probe = Expr::InSubquery {
+                expr: Box::new(left),
+                query,
+                negated,
+                op,
+            };
+            if all {
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    expr: Box::new(probe),
+                }
+            } else {
+                probe
+            }
+        }
         CmpTail::Like {
             negated,
             right,
@@ -2766,18 +2801,29 @@ peg::parser! {
             / neg:not_flag() word("similar") word("to") right:concat_expr() {
                   CmpTail::SimilarTo { negated: neg, right }
               }
+            / op:cmp_op() all:quantifier() lparen() q:query() rparen() {
+                  CmpTail::InSubquery { negated: false, query: Box::new(q), op, all }
+              }
             / op:cmp_op() right:concat_expr() { CmpTail::Binary { op, right } }
 
         /// `ESCAPE '<one char>'` after a `LIKE` pattern.
         rule escape_clause() -> Expr = word("escape") e:concat_expr() { e }
 
         rule in_tail(negated: bool) -> CmpTail
-            = q:query() rparen() { CmpTail::InSubquery { negated, query: Box::new(q) } }
+            = q:query() rparen() {
+                  CmpTail::InSubquery { negated, query: Box::new(q), op: BinaryOp::Eq, all: false }
+              }
             / items:expr_list()? rparen() { CmpTail::InList { negated, items: items.unwrap_or_default() } }
 
         rule not_flag() -> bool
             = kw(Keyword::Not) { true }
             / { false }
+
+        /// `ANY` / `SOME` (synonyms) / `ALL` after a comparison operator.
+        rule quantifier() -> bool
+            = word("any") { false }
+            / word("some") { false }
+            / word("all") { true }
 
         rule additive() -> Expr
             = first:multiplicative() rest:(op:add_op() r:multiplicative() { (op, r) })* {

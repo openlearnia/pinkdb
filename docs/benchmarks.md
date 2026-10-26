@@ -20,7 +20,7 @@ the table.
 | OS | macOS 27.0.1 arm64 |
 | rustc | 1.97.1 |
 | DuckDB | v2.0.0 `d54cbbe3df` |
-| pinkdb | commit `2c7ee92` plus the uncommitted wave-111 tree |
+| pinkdb | commit `bc4da2a` plus the uncommitted wave-120 tree |
 | threads | 8 for both engines (`RAYON_NUM_THREADS=8`, `SET threads=8`) |
 | runs | 1 warm-up + 5 timed, median reported |
 | load average | 2.5–2.9, recorded per stage in the JSON |
@@ -34,58 +34,73 @@ bounds.
 
 ### SF 0.1 (default)
 
+All 22 queries, which is the whole TPC-H set: wave 120 made the six correlated
+ones bindable.
+
 | query | pinkdb ms | DuckDB ms | ratio | rows |
 |---|---:|---:|---:|---:|
-| 1 | 18 | 3 | 6.0× | 4 |
-| 3 | 19 | 2 | 9.5× | 10 |
+| 1 | 16 | 3 | 5.3× | 4 |
+| 2 | 20 | 2 | 10.0× | 44 |
+| 3 | 18 | 2 | 9.0× | 10 |
+| 4 | 16 | 2 | 8.0× | 5 |
 | 5 | 31 | 3 | 10.3× | 5 |
 | 6 | 8 | 1 | 8.0× | 1 |
-| 7 | 114 | 3 | 38.0× | 4 |
-| 8 | 24 | 3 | 8.0× | 2 |
-| 9 | 60 | 6 | 10.0× | 175 |
+| 7 | 113 | 3 | 37.7× | 4 |
+| 8 | 22 | 3 | 7.3× | 2 |
+| 9 | 57 | 6 | 9.5× | 175 |
 | 10 | 18 | 4 | 4.5× | 20 |
-| 11 | 19 | 2 | 9.5× | 2541 |
-| 12 | 14 | 2 | 7.0× | 2 |
-| 13 | 42 | 11 | 3.8× | 37 |
+| 11 | 17 | 2 | 8.5× | 2541 |
+| 12 | 13 | 2 | 6.5× | 2 |
+| 13 | 39 | 12 | 3.3× | 37 |
 | 14 | 7 | 2 | 3.5× | 1 |
 | 15 | 3 | 1 | 3.0× | 1 |
-| 16 | 8 | 3 | 2.7× | 2762 |
-| 18 | 76 | 5 | 15.2× | 5 |
-| 19 | 236 | 2 | 118.0× | 1 |
+| 16 | 7 | 3 | 2.3× | 2762 |
+| 17 | 7 | 2 | 3.5× | 1 |
+| 18 | 70 | 4 | 17.5× | 5 |
+| 19 | 228 | 3 | 76.0× | 1 |
+| 20 | 50 | 3 | 16.7× | 9 |
+| 21 | 407 | 5 | 81.4× | 47 |
+| 22 | 57 | 3 | 19.0× | 7 |
 
-Geometric mean over the 16 supported queries: **8.6×** slower than DuckDB.
+Geometric mean over all 22 queries: **9.3×** slower than DuckDB. Over the 16
+queries wave 111 could run, the same run is **8.0×** (wave 111 measured 8.6×:
+the gap moved, it did not grow).
 
 ### SF 1
 
-| query | pinkdb ms | DuckDB ms | ratio |
-|---|---:|---:|---:|
-| 1 | 156 | 13 | 12.0× |
-| 3 | 181 | 8 | 22.6× |
-| 5 | 321 | 8 | 40.1× |
-| 6 | 79 | 3 | 26.3× |
-| 7 | 1199 | 9 | 133.2× |
-| 8 | 290 | 9 | 32.2× |
-| 9 | 659 | 26 | 25.3× |
-| 10 | 198 | 16 | 12.4× |
-| 11 | 486 | 3 | 162.0× |
-| 12 | 141 | 9 | 15.7× |
-| 13 | 439 | 38 | 11.6× |
-| 14 | 69 | 7 | 9.9× |
-| 15 | 34 | 5 | 6.8× |
-| 16 | 66 | 10 | 6.6× |
-| 18 | 4960 | 25 | 198.4× |
-| 19 | 2457 | 10 | 245.7× |
+| query | pinkdb ms | DuckDB ms | ratio | rows |
+|---|---:|---:|---:|---:|
+| 1 | 170 | 14 | 12.1× | 4 |
+| 2 | 195 | 3 | 65.0× | 100 |
+| 3 | 196 | 8 | 24.5× | 10 |
+| 4 | 163 | 7 | 23.3× | 5 |
+| 5 | 369 | 9 | 41.0× | 5 |
+| 6 | 82 | 4 | 20.5× | 1 |
+| 7 | 1277 | 9 | 141.9× | 4 |
+| 8 | 255 | 9 | 28.3× | 2 |
+| 9 | 688 | 29 | 23.7× | 175 |
+| 10 | 222 | 17 | 13.1× | 20 |
+| 11 | 517 | 3 | 172.3× | 1048 |
+| 12 | 149 | 10 | 14.9× | 2 |
+| 13 | 433 | 40 | 10.8× | 42 |
+| 14 | 71 | 8 | 8.9× | 1 |
+| 15 | 35 | 5 | 7.0× | 1 |
+| 16 | 69 | 11 | 6.3× | 18314 |
+| 17 | 94 | 8 | 11.8× | 1 |
+| 18 | 5368 | 25 | 214.7× | 57 |
+| 19 | 2415 | 10 | 241.5× | 1 |
+| 20 | 1933 | 11 | 175.7× | 186 |
+| 21 | 7222 | 18 | 401.2× | 100 |
+| 22 | 794 | 14 | 56.7× | 7 |
 
-Geometric mean: **32.0×** slower over the 15 queries measured before tuning
-(33.1× before), or **29.0×** over all 16 — Q16 was not comparable in the
-earlier run because the CLI's 10,000-row display cap cut its output, which the
-suite's correctness check now bypasses. The same run's stores are 321 MB
-(pinkdb) and 298 MB (DuckDB), built in 9.3 s and 1.3 s respectively.
+Geometric mean: **35.5×** slower over all 22 queries, **28.4×** over the 16
+wave 111 could run (wave 111: 29.0×). Stores are 321 MB (pinkdb) and 298 MB
+(DuckDB), built in 8.7 s and 1.3 s. Load average was 2.1 when the run started
+and 7.2 during Q21, which is the run's own eight worker threads.
 
-TPC-H queries 2, 4, 17, 20, 21 and 22 are absent: they reference an outer
-column from a subquery, and pinkdb's binder refuses correlated subqueries with
-a clear error ("subqueries are uncorrelated in v1"). That is a missing feature
-scheduled for wave 120, not a slow query hidden here.
+The six correlated queries are not the slowest per-row work here — Q18 and Q11
+were already the worst and have no correlation — but they pay a specific cost
+the others do not, described under "Correlated subqueries" below.
 
 ## Ingest (SF 0.1)
 
@@ -196,6 +211,43 @@ shortcuts; that is most of the 8–26× gap.
 
 **Parquet ingest.** DuckDB reads and decodes in larger parallel batches; pinkdb
 decodes column chunk by column chunk.
+
+## Correlated subqueries
+
+Wave 120 rewrites a correlated subquery into a join (see
+[docs/wave-120-plan.md](wave-120-plan.md)): `EXISTS`/`NOT EXISTS` become a
+semi/anti hash join on the correlation keys, `IN`/`NOT IN`/`ANY`/`ALL` a mark
+join that computes SQL's three-valued answer, and a correlated scalar
+aggregate groups by the correlation keys and left-joins the block, with
+`count` coalesced to 0. Q2, Q4, Q17, Q20, Q21 and Q22 therefore answer at all,
+and they answer in the same time class as the rest.
+
+Two shape choices were measured rather than assumed, at SF 0.1 on the same
+store, one release binary and the same suite:
+
+| shape | Q4 | Q17 | Q20 | Q21 | Q22 |
+|---|---:|---:|---:|---:|---:|
+| duplicate-eliminated key side for every form | 16 | 7 | 50 | 407 | 57 |
+| body's own key columns for `EXISTS`/`NOT EXISTS` | 16 | 39 | 30 | 427 | 66 |
+
+So `EXISTS`/anti joins use the body's own keys (no second scan of the outer
+block, which is the asymptotically important half) and scalar aggregates keep
+the key side (the aggregate then groups rows the join has already narrowed,
+which is what makes Q17 cheap). Both are visible in `EXPLAIN`; nothing is
+hidden.
+
+The remaining gap for this family is the duplicate-eliminated key side: it is
+a `Distinct(Project(…))` over a copy of the enclosing block, computed once per
+subquery, where DuckDB's delim join materialises the outer keys once and shares
+them across a query. Q20 shows the cost scaling: 50 ms at SF 0.1 → 1933 ms at
+SF 1 for 10× the rows is 38×, while Q4 (16 → 163 ms) and Q17 (7 → 94 ms) are
+linear. Q21 also keeps its non-equality condition (`l3_suppkey <> l1_suppkey`)
+as a filter above the join instead of a join residual, which is why 407 ms → 7.2 s
+is 17.7×. Both are recorded as follow-ups in the plan, not as done work.
+
+For reference, the pre-existing gap is unchanged and unrelated: Q18 (214×) and
+Q19 (241×) have no correlated subquery at all — Q18 is the aggregate inside a
+plain `IN`, Q19 the nested `OR` lists that defeat the derived filters.
 
 ## What changed in wave 111
 

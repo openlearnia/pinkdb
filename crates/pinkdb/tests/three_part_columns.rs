@@ -367,17 +367,23 @@ fn ctes_and_derived_tables_never_match_a_three_part_reference() {
 /// reference gets the same clean, full-reference error as any other outer
 /// column. This test pins that boundary for wave 94.
 #[test]
-fn correlated_outer_three_part_reference_is_refused_cleanly() {
+fn correlated_outer_three_part_reference_resolves_like_two_part() {
     let mut db = seeded();
-    let e = err(
+    // The subquery names `db1.t`, which its own FROM lacks but the enclosing
+    // block has: that is an outer reference, and the two-part spelling must
+    // resolve to the same row.
+    let three = ints(
         &mut db,
         "SELECT a FROM db1.t WHERE EXISTS \
-         (SELECT 1 FROM db1.u WHERE db1.t.a = db1.u.a);",
+         (SELECT 1 FROM db1.u WHERE db1.t.a = db1.u.a) ORDER BY a;",
     );
-    assert!(
-        e.contains("no table \"db1.t\" in this query's FROM clause"),
-        "{e}"
+    let two = ints(
+        &mut db,
+        "SELECT a FROM db1.t WHERE EXISTS \
+         (SELECT 1 FROM db1.u WHERE t.a = u.a) ORDER BY a;",
     );
+    assert_eq!(three, two);
+    assert_eq!(three, vec![1, 2]);
 }
 
 // ---------- grouping / ordering equivalence (rule 7) ----------
