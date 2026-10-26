@@ -152,6 +152,8 @@ const FLAG_MATERIALIZED_VIEWS: u32 = 0x4;
 /// statistics, see the module docs) after its row-group directory. Set iff
 /// at least one table has an index.
 const FLAG_INDEXES: u32 = 0x8;
+/// Vector index definitions + serialized graphs (wave 107b).
+const FLAG_VECTOR_INDEXES: u32 = 0x100;
 
 /// [`FLAG_PROCEDURES`], visible to the crate's tests (the store's flags word
 /// is asserted from `crate::procedure`'s persistence tests).
@@ -3073,6 +3075,16 @@ struct IndexDef {
     indexed_rows: u64,
 }
 
+/// One vector index definition and its serialized graph.
+#[derive(Debug, Clone)]
+struct VectorIndexFile {
+    name: String,
+    column: usize,
+    provider: String,
+    options: Vec<(String, String)>,
+    blob: Vec<u8>,
+}
+
 /// One table's footer entry: its schema, its catalog metadata and the
 /// row-group directory of its data.
 #[derive(Debug, Clone)]
@@ -3082,6 +3094,7 @@ struct TableDir {
     constraints: TableConstraints,
     defaults: Vec<Option<Value>>,
     indexes: Vec<IndexDef>,
+    vector_indexes: Vec<VectorIndexFile>,
     row_count: u64,
     row_groups: Vec<RowGroupDir>,
 }
@@ -3287,6 +3300,97 @@ fn write_index_defs(w: &mut Writer, defs: &[IndexDef]) {
     }
 }
 
+/// Serialize one table's vector indexes (graphs included). Sorted by name so
+/// a save is deterministic.
+fn vector_index_defs(t: &DataTable) -> Result<Vec<VectorIndexFile>> {
+    let mut defs: Vec<&crate::storage::VectorIndexDef> = t
+        .vector_indexes
+        .iter()
+        .filter(|i| i.column < t.columns.len())
+        .collect();
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = Vec::with_capacity(defs.len());
+    for def in defs {
+        // Mutations are refused while a graph is pending, so its stored blob
+        // is still current: a default build can save such a store untouched.
+        let blob = match (&def.index, &def.blob) {
+            (Some(index), _) => index.serialize()?,
+            (None, Some(blob)) => blob.to_vec(),
+            (None, None) => return Err(def.pending_error(&t.name)),
+        };
+        out.push(VectorIndexFile {
+            name: def.name.clone(),
+            column: def.column,
+            provider: def.provider.clone(),
+            options: def.options.clone(),
+            blob,
+        });
+    }
+    Ok(out)
+}
+
+fn write_vector_index_defs(w: &mut Writer, defs: &[VectorIndexFile]) {
+    w.u32(defs.len() as u32);
+    for d in defs {
+        w.str(&d.name);
+        w.u32(d.column as u32);
+        w.str(&d.provider);
+        w.u32(d.options.len() as u32);
+        for (k, v) in &d.options {
+            w.str(k);
+            w.str(v);
+        }
+        w.u64(d.blob.len() as u64);
+        w.bytes(&d.blob);
+    }
+}
+
+fn read_vector_index_defs(r: &mut Reader) -> Result<Vec<VectorIndexFile>> {
+    let n = r.u32()? as usize;
+    if n > r.remaining() / 16 {
+        return r.err("vector index count exceeds the remaining file");
+    }
+    let mut out: Vec<VectorIndexFile> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        if name.is_empty() {
+            return r.err("empty vector index name");
+        }
+        if let Some(prev) = out.last()
+            && prev.name >= name
+        {
+            return r.err(&format!(
+                "vector index \"{name}\" is duplicated or out of name order"
+            ));
+        }
+        let column = r.u32()? as usize;
+        let provider = r.str()?;
+        if provider.is_empty() {
+            return r.err("empty vector index provider");
+        }
+        let n_options = r.u32()? as usize;
+        if n_options > r.remaining() / 8 + 1 {
+            return r.err("vector index option count exceeds the remaining file");
+        }
+        let mut options = Vec::with_capacity(n_options);
+        for _ in 0..n_options {
+            options.push((r.str()?, r.str()?));
+        }
+        let blob_len = r.u64()?;
+        let blob_len = usize::try_from(blob_len)
+            .map_err(|_| PinkDbError::Execution("corrupt file: vector graph too large".into()))?;
+        let blob = r.take(blob_len)?.to_vec();
+        out.push(VectorIndexFile {
+            name,
+            column,
+            provider,
+            options,
+            blob,
+        });
+    }
+    Ok(out)
+}
+
 /// Read one table's index definitions.
 fn read_index_defs(r: &mut Reader) -> Result<Vec<IndexDef>> {
     let n = r.u32()? as usize;
@@ -3415,6 +3519,12 @@ impl PinkDb {
                 .iter()
                 .any(|t| self.table_in(db, t).is_ok_and(|t| !t.indexes.is_empty()))
         });
+        let with_vectors = self.list_databases().iter().any(|db| {
+            self.list_tables_in(db).iter().any(|t| {
+                self.table_in(db, t)
+                    .is_ok_and(|t| !t.vector_indexes.is_empty())
+            })
+        });
         let flags = if with_constraints {
             FLAG_CONSTRAINTS
         } else {
@@ -3422,6 +3532,7 @@ impl PinkDb {
         } | if with_defaults { FLAG_DEFAULTS } else { 0 }
             | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 }
             | if with_indexes { FLAG_INDEXES } else { 0 }
+            | if with_vectors { FLAG_VECTOR_INDEXES } else { 0 }
             | if with_procedures { FLAG_PROCEDURES } else { 0 }
             | if with_triggers { FLAG_TRIGGERS } else { 0 }
             | if with_macros { FLAG_MACROS } else { 0 }
@@ -3448,6 +3559,10 @@ impl PinkDb {
                         constraints: t.constraints.clone(),
                         defaults: t.columns.iter().map(|c| c.default.clone()).collect(),
                         indexes: index_defs_without_rows(t),
+                        // A rows-free catalog image cannot carry a graph
+                        // whose nodes are row ids; vector indexes are only
+                        // built on native tables, whose rows are omitted too.
+                        vector_indexes: Vec::new(),
                         row_count: 0,
                         row_groups: Vec::new(),
                     }
@@ -3529,6 +3644,9 @@ impl PinkDb {
                 }
                 if with_indexes {
                     write_index_defs(&mut fw, &tdir.indexes);
+                }
+                if with_vectors {
+                    write_vector_index_defs(&mut fw, &tdir.vector_indexes);
                 }
                 fw.u64(tdir.row_count);
                 fw.u32(tdir.row_groups.len() as u32);
@@ -3790,6 +3908,48 @@ impl PinkDb {
                 apply_indexes(t, &tdir.indexes)?;
             }
         }
+        // Vector index definitions keep their serialized graph until the
+        // provider extension is loaded (CLI/server do that right after open;
+        // any mutation or indexed query before that is a clear refusal).
+        for dbdir in &footer.databases {
+            for tdir in &dbdir.tables {
+                if tdir.vector_indexes.is_empty() {
+                    continue;
+                }
+                let t = db.table_mut_in(&dbdir.name, &tdir.name)?;
+                let mut defs = Vec::with_capacity(tdir.vector_indexes.len());
+                for def in &tdir.vector_indexes {
+                    if def.column >= t.columns.len() {
+                        return Err(PinkDbError::Execution(format!(
+                            "corrupt file: vector index \"{}\" names column {} of a {}-column \
+                             table",
+                            def.name,
+                            def.column,
+                            t.columns.len()
+                        )));
+                    }
+                    if t.indexes.iter().any(|i| i.name == def.name)
+                        || defs
+                            .iter()
+                            .any(|d: &crate::storage::VectorIndexDef| d.name == def.name)
+                    {
+                        return Err(PinkDbError::Execution(format!(
+                            "corrupt file: index \"{}\" is defined twice",
+                            def.name
+                        )));
+                    }
+                    defs.push(crate::storage::VectorIndexDef {
+                        name: def.name.clone(),
+                        column: def.column,
+                        provider: def.provider.to_ascii_lowercase(),
+                        options: def.options.clone(),
+                        index: None,
+                        blob: Some(std::sync::Arc::from(def.blob.clone().into_boxed_slice())),
+                    });
+                }
+                t.vector_indexes = defs;
+            }
+        }
         // The catalog sections: macros first (an MV's defining SQL may call
         // a macro and is rebound at load), then the materialized views, then
         // the procedures, then the store-global RBAC section.
@@ -3983,6 +4143,7 @@ fn write_table(
         constraints: t.constraints.clone(),
         defaults: t.columns.iter().map(|c| c.default.clone()).collect(),
         indexes: index_defs(t),
+        vector_indexes: vector_index_defs(t)?,
         row_count: t.num_rows() as u64,
         row_groups,
     })
@@ -4534,6 +4695,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
             | FLAG_DEFAULTS
             | FLAG_MATERIALIZED_VIEWS
             | FLAG_INDEXES
+            | FLAG_VECTOR_INDEXES
             | FLAG_PROCEDURES
             | FLAG_MACROS
             | FLAG_TRIGGERS
@@ -4547,6 +4709,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
     let constraints = flags & FLAG_CONSTRAINTS != 0;
     let defaults = flags & FLAG_DEFAULTS != 0;
     let indexes = flags & FLAG_INDEXES != 0;
+    let vectors = flags & FLAG_VECTOR_INDEXES != 0;
     let macros = flags & FLAG_MACROS != 0;
     let mvs = flags & FLAG_MATERIALIZED_VIEWS != 0;
     let procedures = flags & FLAG_PROCEDURES != 0;
@@ -4632,6 +4795,11 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
             } else {
                 Vec::new()
             };
+            let tvectors = if vectors {
+                read_vector_index_defs(&mut r)?
+            } else {
+                Vec::new()
+            };
             let row_count = r.u64()?;
             let n_groups = r.u32()? as usize;
             // Each row group costs at least 8 bytes (its row count) plus one
@@ -4673,6 +4841,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
                 constraints: tconstraints,
                 defaults: tdefaults,
                 indexes: tindexes,
+                vector_indexes: tvectors,
                 row_count,
                 row_groups,
             });

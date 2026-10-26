@@ -202,7 +202,7 @@ is <a href="https://github.com/openlearnia/pinkdb/blob/main/docs/sql-conformance
     <tr><td><code>CREATE TABLE [IF NOT EXISTS]</code></td><td>✅</td><td>column and table-form constraints (<code>PRIMARY KEY</code>/<code>UNIQUE</code>/<code>NOT NULL</code>/<code>REFERENCES</code>, <code>CONSTRAINT</code> names, <code>RELY</code>/<code>[NOT] ENFORCED</code> accepted and dropped); <code>PRIMARY KEY</code>/<code>UNIQUE</code> are enforced per statement, foreign keys stay declarations</td></tr>
     <tr><td><code>CREATE TABLE … AS SELECT</code></td><td>✅</td><td>CTAS</td></tr>
     <tr><td><code>ALTER TABLE</code></td><td>✗</td><td>engine tables: not supported; lake tables get schema evolution in wave 65</td></tr>
-    <tr><td><code>CREATE INDEX</code> / <code>DROP INDEX</code></td><td>✗</td><td>planned (wave 42)</td></tr>
+    <tr><td><code>CREATE INDEX</code> / <code>DROP INDEX</code></td><td>✓</td><td>hash indexes on one column; <code>USING HNSW</code> with the <code>vss</code> feature</td></tr>
     <tr><td><code>CREATE MATERIALIZED VIEW</code></td><td>✗</td><td>planned (wave 43)</td></tr>
     <tr><td><code>CREATE VIEW</code> / <code>DROP VIEW</code></td><td>✅</td><td>session-local and per-database; bodies rebound per use</td></tr>
     <tr><td><code>INSERT … VALUES</code> / <code>INSERT … SELECT</code></td><td>✅</td><td>explicit column lists supported</td></tr>

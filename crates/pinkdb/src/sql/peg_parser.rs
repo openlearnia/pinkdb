@@ -1600,8 +1600,20 @@ peg::parser! {
             / kw(Keyword::Create) kw(Keyword::Database) ifne:if_not_exists() name:ident() {
                   Statement::CreateDatabase { name, if_not_exists: ifne }
               }
-            / kw(Keyword::Create) kw(Keyword::Index) ifne:if_not_exists() name:ident() kw(Keyword::On) t:table_ref() lparen() col:ident() rparen() {
-                  Statement::CreateIndex { db: t.0, name, table: t.1, column: col, if_not_exists: ifne }
+            / kw(Keyword::Create) kw(Keyword::Index) ifne:if_not_exists() name:ident() kw(Keyword::On) t:table_ref()
+              before:index_using()? lparen() col:ident() rparen() after:index_using()? options:index_options()? {?
+                  if before.is_some() && after.is_some() {
+                      return Err("USING is given twice");
+                  }
+                  Ok(Statement::CreateIndex {
+                      db: t.0,
+                      name,
+                      table: t.1,
+                      column: col,
+                      if_not_exists: ifne,
+                      using: before.or(after),
+                      options: options.unwrap_or_default(),
+                  })
               }
             / kw(Keyword::Create) word("materialized") kw(Keyword::View) ifne:if_not_exists() t:table_ref() policy:refresh_policy() kw(Keyword::As) query:select() {
                   Statement::CreateMaterializedView { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne, policy }
@@ -2204,6 +2216,21 @@ peg::parser! {
             / word("rename") word("to") to:ident() {
                   AlterTableOp::RenameTable { to }
               }
+
+        /// `USING <provider>` on `CREATE INDEX` (wave 107b).
+        rule index_using() -> String
+            = word("using") name:ident() { name }
+
+        /// `WITH (key = value, …)` on `CREATE INDEX`.
+        rule index_options() -> Vec<(String, Expr)>
+            = kw(Keyword::With) lparen() first:index_option() rest:(comma() o:index_option() { o })* rparen() {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        rule index_option() -> (String, Expr)
+            = key:ident() eq() value:expr() { (key, value) }
 
         rule alter_default() -> Expr
             = word("default") e:expr() { e }

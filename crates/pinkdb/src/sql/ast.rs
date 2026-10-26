@@ -185,13 +185,16 @@ pub enum Statement {
     /// `SHOW MATERIALIZED VIEWS` (wave 80): name, schedule, last refresh,
     /// refresh count, staleness and the last refresh error, sorted by name.
     ShowMaterializedViews,
-    /// `CREATE INDEX [IF NOT EXISTS] <name> ON <table>(<col>)`.
+    /// `CREATE INDEX [IF NOT EXISTS] <name> ON <table>(<col>) [USING
+    /// <provider>] [WITH (key = value, …)]`.
     CreateIndex {
         db: Option<String>,
         name: String,
         table: String,
         column: String,
         if_not_exists: bool,
+        using: Option<String>,
+        options: Vec<(String, Expr)>,
     },
     /// `DROP INDEX [IF EXISTS] <name>`.
     DropIndex {

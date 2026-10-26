@@ -89,6 +89,7 @@ pub struct ExtensionPackage {
     file_formats: Vec<Arc<dyn FileFormat>>,
     host_scalars: Vec<HostScalar>,
     host_statements: Vec<HostStatement>,
+    vector_provider: Option<Arc<dyn crate::vector_index::VectorIndexProvider>>,
 }
 
 impl ExtensionPackage {
@@ -102,6 +103,7 @@ impl ExtensionPackage {
             file_formats: Vec::new(),
             host_scalars: Vec::new(),
             host_statements: Vec::new(),
+            vector_provider: None,
         }
     }
 
@@ -144,6 +146,17 @@ impl ExtensionPackage {
         self
     }
 
+    /// Attach a vector index provider (wave 107b): `CREATE INDEX … USING
+    /// <name>` resolves it while the package is loaded, and loading the
+    /// package restores every serialized graph that names it.
+    pub fn with_vector_index_provider(
+        mut self,
+        provider: Arc<dyn crate::vector_index::VectorIndexProvider>,
+    ) -> Self {
+        self.vector_provider = Some(provider);
+        self
+    }
+
     /// The package's registry key, as registered (original case).
     pub fn name(&self) -> &str {
         &self.name
@@ -167,6 +180,12 @@ impl ExtensionPackage {
 
     pub(crate) fn host_statements(&self) -> &[HostStatement] {
         &self.host_statements
+    }
+
+    pub(crate) fn vector_provider(
+        &self,
+    ) -> Option<&Arc<dyn crate::vector_index::VectorIndexProvider>> {
+        self.vector_provider.as_ref()
     }
 }
 
@@ -277,6 +296,17 @@ pub(crate) fn registered_extension_package(name: &str) -> Option<ExtensionPackag
         .cloned()
 }
 
+/// The registered package that owns vector-index provider `provider`.
+pub(crate) fn registered_vector_provider_package(provider: &str) -> Option<String> {
+    lock_registry()
+        .iter()
+        .find(|p| {
+            p.vector_provider()
+                .is_some_and(|v| v.name().eq_ignore_ascii_case(provider))
+        })
+        .map(|p| p.name().to_string())
+}
+
 impl PinkDb {
     /// Activate the registered extension package `name` on this store.
     /// Returns the package's declared name.
@@ -361,6 +391,27 @@ impl PinkDb {
                 )));
             }
         }
+        let hydration = match pkg.vector_provider() {
+            Some(provider) => {
+                if self.vector_provider(provider.name()).is_some() {
+                    return Err(PinkDbError::Execution(format!(
+                        "extension package \"{}\" cannot be loaded: vector index provider \"{}\" is \
+                         already registered",
+                        pkg.name(),
+                        provider.name()
+                    )));
+                }
+                // A graph is restored from bytes only; deserialize now so a
+                // corrupt or foreign section rejects the whole load before any
+                // surface is installed, then install the parsed graphs without
+                // parsing them a second time.
+                Some((
+                    Arc::clone(provider),
+                    self.take_hydrated_vector_indexes(provider.as_ref())?,
+                ))
+            }
+            None => None,
+        };
         // Install. Nothing below can fail.
         let declared = pkg.name().to_string();
         if let Some(scalars) = pkg.scalars() {
@@ -392,6 +443,12 @@ impl PinkDb {
             self.host_statements
                 .insert(statement.name().to_ascii_lowercase(), statement);
         }
+        if let Some((provider, ready)) = hydration {
+            self.package_vector_providers
+                .insert(provider.name().to_ascii_lowercase(), declared.clone());
+            self.vector_providers.push(provider);
+            self.install_hydrated_vector_indexes(ready);
+        }
         Ok(declared)
     }
 
@@ -418,6 +475,14 @@ impl PinkDb {
     /// (case-insensitive).
     pub(crate) fn package_of_file_format(&self, name: &str) -> Option<&str> {
         self.package_file_formats
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    /// The package that installed the active vector index provider `name`,
+    /// if any (case-insensitive).
+    pub(crate) fn package_of_vector_provider(&self, name: &str) -> Option<&str> {
+        self.package_vector_providers
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
     }
@@ -675,6 +740,14 @@ impl<'a> HostCtx<'a> {
 
     /// The store, read-only.
     pub fn db(&self) -> &PinkDb {
+        self.db
+    }
+
+    /// The store, mutable. A host statement that maintains an engine-side
+    /// structure (a vector index's graph) uses this; ordinary catalog/data
+    /// changes should go through [`Self::execute`] so they keep their usual
+    /// validation.
+    pub fn db_mut(&mut self) -> &mut PinkDb {
         self.db
     }
 

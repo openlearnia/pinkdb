@@ -215,6 +215,11 @@ pub enum LogicalPlan {
         /// text must name the column, not its ordinal).
         column_name: String,
         if_not_exists: bool,
+        /// `USING <provider>`: `None` is the hash index, `Some` a vector
+        /// index built by that extension provider.
+        using: Option<String>,
+        /// `WITH (...)` pairs, already reduced to literal strings.
+        options: Vec<(String, String)>,
     },
     DropIndex {
         db: Option<String>,
@@ -230,6 +235,23 @@ pub enum LogicalPlan {
         table: String,
         index: String,
         value: BoundExpr,
+    },
+    /// `ORDER BY <distance>(col, <constant>) LIMIT k` rewritten onto a
+    /// vector index (wave 107b). Produces the table's full rows in ascending
+    /// distance order, at most `k` of them.
+    VectorTopK {
+        db: Option<String>,
+        table: String,
+        /// Column ordinal of the indexed `FLOAT[N]`/`DOUBLE[N]` column.
+        column: usize,
+        column_name: String,
+        /// Name of the vector index on that column.
+        index: String,
+        /// The query vector, folded to a literal array of `dim` elements.
+        query: Value,
+        metric: crate::distance::Metric,
+        dim: usize,
+        k: usize,
     },
     DropView {
         db: Option<String>,
@@ -1055,7 +1077,7 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::DropUser { .. }
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::DropRole { .. } => {}
-        LogicalPlan::IndexScan { db, table, .. } => {
+        LogicalPlan::IndexScan { db, table, .. } | LogicalPlan::VectorTopK { db, table, .. } => {
             out.insert(key(db, table));
         }
         // A table-function scan (wave 70) reads external state, not a catalog
@@ -1419,6 +1441,7 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
             contains_table_function(left) || contains_table_function(right)
         }
         LogicalPlan::IndexScan { value, .. } => expr_contains_table_function(value),
+        LogicalPlan::VectorTopK { .. } => false,
         LogicalPlan::Call { args, .. } => args.iter().any(expr_contains_table_function),
         LogicalPlan::Insert { .. }
         | LogicalPlan::InsertSelect { .. }
@@ -1633,6 +1656,7 @@ fn walk_scan_filters(
             collect_prune_predicates(predicate, &mut here);
             walk_scan_filters(input, &here, out);
         }
+        LogicalPlan::VectorTopK { .. } => {}
         LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. }
         | LogicalPlan::Sample { input, .. } => {
@@ -2133,6 +2157,7 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
         | LogicalPlan::CopyTo { .. }
         => {}
         LogicalPlan::IndexScan { value, .. } => exprs.push(value),
+        LogicalPlan::VectorTopK { .. } => {}
         LogicalPlan::Call { args, .. } => exprs.extend(args.iter()),
         LogicalPlan::CreateTableAs { query, .. }
         | LogicalPlan::CreateMaterializedView { query, .. } => children.push(query),
@@ -2485,6 +2510,7 @@ fn walk_scan_projections(
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::IndexScan { .. }
+        | LogicalPlan::VectorTopK { .. }
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedViews { .. }

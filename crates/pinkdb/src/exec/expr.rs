@@ -13,6 +13,7 @@ use pinkdb_ext_loader::ExtArg;
 
 use super::aggregate::encode_row;
 use super::{Cx, Memo, eval};
+use crate::array::ArrayElems;
 use crate::plan::compare_values;
 use crate::sql::ast::BinaryOp;
 use crate::sql::binder::{BoundExpr, ScalarFunc, common_numeric};
@@ -1789,6 +1790,15 @@ fn eval_scalar_typed(func: ScalarFunc, args: &[Vector]) -> Result<Option<Vector>
         // `a[i]`: read the element out of the flat buffer. `INTEGER` indices
         // are the common case (`a[1]`, a vector column); other index layouts
         // take the generic path.
+        ScalarFunc::ArrayDistance
+        | ScalarFunc::ArrayCosineDistance
+        | ScalarFunc::ArrayCosineSimilarity
+        | ScalarFunc::ArrayInnerProduct
+        | ScalarFunc::ArrayNegativeInnerProduct
+            if args.len() == 2 =>
+        {
+            eval_distance(func, &args[0], &args[1])?
+        }
         ScalarFunc::ArrayExtract if args.len() == 2 && src.dtype().is_array() => {
             let VectorData::Array {
                 elem,
@@ -2164,6 +2174,17 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
                 None => Value::Null,
             }),
             v => Err(PinkDbError::Execution(format!("array_extract of {v}"))),
+        },
+        ScalarFunc::ArrayDistance
+        | ScalarFunc::ArrayCosineDistance
+        | ScalarFunc::ArrayCosineSimilarity
+        | ScalarFunc::ArrayInnerProduct
+        | ScalarFunc::ArrayNegativeInnerProduct => match (&row[0], &row[1]) {
+            (Value::Array(a), Value::Array(b)) => distance_value(func, a, b),
+            (a, b) => Err(PinkDbError::Execution(format!(
+                "{}: Arguments must be arrays of FLOAT or DOUBLE, got {a} and {b}",
+                func.sql_name()
+            ))),
         },
         ScalarFunc::Year | ScalarFunc::Month | ScalarFunc::Day => {
             let days = match &row[0] {
@@ -3011,6 +3032,198 @@ fn eval_coalesce(
     }
     Ok(out)
 }
+/// One row of an ARRAY column, borrowed from the flat buffer.
+enum ArrayCell<'a> {
+    F32(&'a [f32]),
+    F64(&'a [f64]),
+}
+
+fn array_cell<'a>(
+    elem: crate::types::ArrayElem,
+    values: &'a ArrayElems,
+    start: usize,
+    len: usize,
+) -> Option<ArrayCell<'a>> {
+    match (elem, values) {
+        (crate::types::ArrayElem::Float, ArrayElems::Floats32(v)) => {
+            Some(ArrayCell::F32(v.get(start..start + len)?))
+        }
+        (crate::types::ArrayElem::Double, ArrayElems::Floats(v)) => {
+            Some(ArrayCell::F64(v.get(start..start + len)?))
+        }
+        _ => None,
+    }
+}
+
+fn any_null_elem(valid: Option<&[u8]>, start: usize, len: usize) -> bool {
+    valid.is_some_and(|m| {
+        (0..len).any(|i| {
+            let k = start + i;
+            (m[k / 8] >> (k % 8)) & 1 == 0
+        })
+    })
+}
+
+fn distance_of_cells(func: ScalarFunc, a: &ArrayCell<'_>, b: &ArrayCell<'_>) -> f64 {
+    use crate::distance;
+    match (a, b) {
+        (ArrayCell::F32(a), ArrayCell::F32(b)) => {
+            let x = match func {
+                ScalarFunc::ArrayDistance => distance::l2sq_f32(a, b).sqrt(),
+                ScalarFunc::ArrayCosineDistance => distance::cosine_distance_f32(a, b),
+                ScalarFunc::ArrayCosineSimilarity => distance::cosine_similarity_f32(a, b),
+                ScalarFunc::ArrayInnerProduct => distance::dot_f32(a, b),
+                ScalarFunc::ArrayNegativeInnerProduct => -distance::dot_f32(a, b),
+                _ => unreachable!("guarded by the caller"),
+            };
+            f64::from(x)
+        }
+        (ArrayCell::F64(a), ArrayCell::F64(b)) => match func {
+            ScalarFunc::ArrayDistance => distance::l2sq_f64(a, b).sqrt(),
+            ScalarFunc::ArrayCosineDistance => distance::cosine_distance_f64(a, b),
+            ScalarFunc::ArrayCosineSimilarity => distance::cosine_similarity_f64(a, b),
+            ScalarFunc::ArrayInnerProduct => distance::dot_f64(a, b),
+            ScalarFunc::ArrayNegativeInnerProduct => -distance::dot_f64(a, b),
+            _ => unreachable!("guarded by the caller"),
+        },
+        // Mixed FLOAT/DOUBLE widens. Materialising one side per call is fine:
+        // this is the uncommon overload.
+        (a, b) => {
+            let (a, b): (Vec<f64>, Vec<f64>) = match (a, b) {
+                (ArrayCell::F32(a), b) => (a.iter().map(|x| f64::from(*x)).collect(), cell_f64(b)),
+                (a, b) => (cell_f64(a), cell_f64(b)),
+            };
+            match func {
+                ScalarFunc::ArrayDistance => distance::l2sq_f64(&a, &b).sqrt(),
+                ScalarFunc::ArrayCosineDistance => distance::cosine_distance_f64(&a, &b),
+                ScalarFunc::ArrayCosineSimilarity => distance::cosine_similarity_f64(&a, &b),
+                ScalarFunc::ArrayInnerProduct => distance::dot_f64(&a, &b),
+                ScalarFunc::ArrayNegativeInnerProduct => -distance::dot_f64(&a, &b),
+                _ => unreachable!("guarded by the caller"),
+            }
+        }
+    }
+}
+
+fn cell_f64(cell: &ArrayCell<'_>) -> Vec<f64> {
+    match cell {
+        ArrayCell::F32(v) => v.iter().map(|x| f64::from(*x)).collect(),
+        ArrayCell::F64(v) => v.to_vec(),
+    }
+}
+
+fn eval_distance(func: ScalarFunc, a: &Vector, b: &Vector) -> Result<Vector> {
+    let VectorData::Array {
+        elem: ea,
+        len: la,
+        values: va,
+        valid: ba,
+    } = a.data()
+    else {
+        return Err(PinkDbError::Type(format!(
+            "{}: Arguments must be arrays of FLOAT or DOUBLE",
+            func.sql_name()
+        )));
+    };
+    let VectorData::Array {
+        elem: eb,
+        len: lb,
+        values: vb,
+        valid: bb,
+    } = b.data()
+    else {
+        return Err(PinkDbError::Type(format!(
+            "{}: Arguments must be arrays of FLOAT or DOUBLE",
+            func.sql_name()
+        )));
+    };
+    if la != lb {
+        return Err(PinkDbError::Type(format!(
+            "{}: Array arguments must be of the same size",
+            func.sql_name()
+        )));
+    }
+    let (ea, eb) = (*ea, *eb);
+    if !matches!(
+        ea,
+        crate::types::ArrayElem::Float | crate::types::ArrayElem::Double
+    ) || !matches!(
+        eb,
+        crate::types::ArrayElem::Float | crate::types::ArrayElem::Double
+    ) {
+        return Err(PinkDbError::Type(format!(
+            "{}: Arguments must be arrays of FLOAT or DOUBLE",
+            func.sql_name()
+        )));
+    }
+    let n = *la as usize;
+    let mut out = Vector::new_empty(DataType::Double);
+    for i in 0..a.len() {
+        if a.is_null(i) || b.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        if any_null_elem(ba.as_deref(), i * n, n) {
+            return Err(PinkDbError::Execution(format!(
+                "{}: left argument can not contain NULL values",
+                func.sql_name()
+            )));
+        }
+        if any_null_elem(bb.as_deref(), i * n, n) {
+            return Err(PinkDbError::Execution(format!(
+                "{}: right argument can not contain NULL values",
+                func.sql_name()
+            )));
+        }
+        let ca = array_cell(ea, va, i * n, n).ok_or_else(|| {
+            PinkDbError::Execution("corrupt file: ARRAY element kind mismatch".to_string())
+        })?;
+        let cb = array_cell(eb, vb, i * n, n).ok_or_else(|| {
+            PinkDbError::Execution("corrupt file: ARRAY element kind mismatch".to_string())
+        })?;
+        out.push_valid(Value::Double(distance_of_cells(func, &ca, &cb)))?;
+    }
+    Ok(out)
+}
+
+fn distance_value(
+    func: ScalarFunc,
+    a: &crate::array::ArrayValue,
+    b: &crate::array::ArrayValue,
+) -> Result<Value> {
+    if a.len() != b.len() {
+        return Err(PinkDbError::Type(format!(
+            "{}: Array arguments must be of the same size",
+            func.sql_name()
+        )));
+    }
+    if a.has_null_elems() {
+        return Err(PinkDbError::Execution(format!(
+            "{}: left argument can not contain NULL values",
+            func.sql_name()
+        )));
+    }
+    if b.has_null_elems() {
+        return Err(PinkDbError::Execution(format!(
+            "{}: right argument can not contain NULL values",
+            func.sql_name()
+        )));
+    }
+    let ca = array_cell(a.elem, &a.values, 0, a.len()).ok_or_else(|| {
+        PinkDbError::Type(format!(
+            "{}: Arguments must be arrays of FLOAT or DOUBLE",
+            func.sql_name()
+        ))
+    })?;
+    let cb = array_cell(b.elem, &b.values, 0, b.len()).ok_or_else(|| {
+        PinkDbError::Type(format!(
+            "{}: Arguments must be arrays of FLOAT or DOUBLE",
+            func.sql_name()
+        ))
+    })?;
+    Ok(Value::Double(distance_of_cells(func, &ca, &cb)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

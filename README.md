@@ -2094,6 +2094,114 @@ backoff; a timeout is `PINKDB_EMBEDDINGS_TIMEOUT_MS`. The model is a setting,
 not a second argument (`embed(text, model)` was optional in the plan). No
 embeddings are computed by the default build.
 
+## Vector search (feature `vss`, wave 107b)
+
+The distance functions are **core SQL**, like DuckDB 2.0's: no extension is
+needed to rank vectors exactly. The HNSW index is a linked extension
+(`pinkdb-vss`) behind the CLI/server `vss` feature, off by default.
+
+```sh
+cargo build --release -p pinkdb-cli --features vss
+```
+
+```sql
+CREATE TABLE docs (id INTEGER, v FLOAT[3]);
+INSERT INTO docs VALUES (1, [1.0, 2.0, 3.0]), (2, [3.0, 2.0, 1.0]);
+
+SELECT id, array_distance(v, [1.0, 2.0, 2.0]) AS d
+FROM docs ORDER BY d LIMIT 1;                       -- 1
+
+CREATE INDEX docs_vec ON docs USING HNSW (v)
+  WITH (metric = 'l2sq', M = 16, ef_construction = 128, ef_search = 64);
+
+EXPLAIN SELECT id FROM docs ORDER BY array_distance(v, [1.0, 2.0, 2.0]) LIMIT 1;
+-- VectorTopK main.docs using docs_vec (l2sq, k = 1)
+-- Limit 1
+```
+
+| function | result |
+|---|---|
+| `array_distance(a, b)` / `array_l2_distance(a, b)` | Euclidean distance (not squared) |
+| `array_cosine_distance(a, b)` | `1 − cosine similarity`; a zero vector gives `nan` |
+| `array_cosine_similarity(a, b)` | cosine similarity |
+| `array_inner_product(a, b)` | dot product |
+| `array_negative_inner_product(a, b)` | `−dot`, for `ORDER BY … ASC LIMIT k` |
+
+Both arguments must be fixed-length `FLOAT[N]`/`DOUBLE[N]` arrays of the same
+`N`; `INTEGER`/`BIGINT` arrays are refused. A `NULL` array returns `NULL`; a
+`NULL` *element* is an error (`array_distance: left argument can not contain
+NULL values`). Different lengths are a bind error. `DOUBLE` or mixed arguments
+compute in `f64`; `FLOAT`/`FLOAT` computes in `f32` and returns `DOUBLE`
+(pinkdb has no scalar `FLOAT`; DuckDB returns `FLOAT` — the values agree when
+widened). The constant query vector is folded at bind time and broadcast per
+chunk, never cast per row.
+
+**The index.** `CREATE INDEX … USING HNSW (col) WITH (…)` accepts `metric`
+(`l2sq` default, `cosine`, `ip`), `M` (16), `ef_construction` (128),
+`ef_search` (64) and `M0` (`2*M`). The graph is deterministic: levels come
+from a serialized seeded PRNG, so the same insert order builds the same graph,
+including after a crash replay. `FLOAT[N]` and `DOUBLE[N]` columns are
+indexed; a `DOUBLE` vector is narrowed to `f32` in the graph, while the exact
+path keeps `f64`.
+
+**The rewrite.** The optimizer replaces exactly
+`ORDER BY <distance>(col, constant) ASC LIMIT k` over a native table's indexed
+`ARRAY` column with a `VectorTopK` index scan, when the function matches the
+index metric and the dimension matches. Everything else — `DESC`, a second
+sort key, a `WHERE`, another function/metric/dimension — falls back to the
+exact scan and sort, never to a wrong answer. `EXPLAIN` shows
+`VectorTopK db.table using index (metric, k = …)`.
+
+**Exact mode and search width.** Per-session variables:
+
+```sql
+SET VARIABLE hnsw_exact = true;      -- force the exact top-k heap
+SET VARIABLE hnsw_ef_search = 128;   -- wider search, better recall
+```
+
+The index is approximate (DuckDB's is too). `hnsw_ef_search` overrides the
+index's default for the session, `hnsw_exact` bypasses it for an exact answer.
+Deletes are tombstones; `CALL hnsw_compact_index('docs', 'docs_vec')` rebuilds
+the graph without them. Updating the vector is delete + insert. `CALL
+hnsw_index_stats('docs', 'docs_vec')` reports node/live/tombstone counts.
+
+**Persistence.** The graph is a `.pink` footer section (flag `0x100`), written
+by `CHECKPOINT`/`.save` and loaded when the store is opened with the `vss`
+package available; opening without it leaves the graph opaque and queries fall
+back to exact. WAL replay applies inserts, updates and deletes to the graph.
+Unlike DuckDB, no `hnsw_enable_experimental_persistence` is needed: the graph
+is an ordinary checksummed section in an atomically replaced file, and the WAL
+replays on top.
+
+**Limits and permissions.** Only native tables; a lake table, a view, a
+non-`ARRAY` column and a second index on the same column are refused by name.
+`CREATE INDEX`/`DROP INDEX` need the same privilege as a hash index; the
+read-only MCP `query` tool allows top-k and refuses index changes. A filtered
+top-k (`WHERE`) uses the exact path, so it still returns up to `k` rows
+(DuckDB's index path documents that it may return fewer).
+
+**Cost and measured behaviour.** The CLI grows from 5,304,688 to 5,390,816
+bytes (+1.6%) with `--features vss`. Clustered Gaussian-mixture data, 200
+queries, release build, `recall@10` against exact:
+
+| set | build | graph | ef | recall@10 | p50 / p95 |
+|---|---|---|---|---|---|
+| 100k × 768 | 94.5 s | 318 MB | 16 | 0.522 | 0.53 / 0.58 ms |
+| | | | 64 | 0.874 | 0.86 / 0.92 ms |
+| | | | 128 | 0.963 | 1.13 / 1.22 ms |
+| | | | 256 | 0.992 | 1.43 / 1.55 ms |
+| 1M × 128 | 867 s | 617 MB | 16 | 0.414 | 0.26 / 0.43 ms |
+| | | | 64 | 0.740 | 0.49 / 0.56 ms |
+| | | | 128 | 0.862 | 0.76 / 0.87 ms |
+| | | | 256 | 0.926 | 1.22 / 1.36 ms |
+
+Exact brute force over the same stores takes 18.0/18.4 ms and 69.6/94.3 ms
+(p50/p95) with the plain `ORDER BY … LIMIT` top-k heap; the index is 20–140×
+faster at `ef_search = 64`. Recall at the DuckDB default (64) is below 0.95 on
+these high-dimensional sets; raise `ef_search` for ≥ 0.95. On 100k×8 clustered
+data the default reaches ≥ 0.95 (the recall test). Non-vector TPC-H Q1 is
+unchanged (1.004×) and Q6 is 1.7% slower (1.017×) against the base commit.
+
 ## C ABI (`pinkdb-ffi`)
 
 The `pinkdb-ffi` crate exposes the engine over a small C ABI as

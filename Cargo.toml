@@ -37,6 +37,10 @@ members = [
     # tables, so the extension needs the package host hooks. Wired behind the
     # CLI's opt-in `fts` feature.
     "extensions/fts",
+    # Vector similarity search (wave 107b): HNSW indexes for ARRAY columns,
+    # attached through the engine's vector-index provider hook. Wired behind
+    # the CLI/server opt-in `vss` feature.
+    "extensions/vss",
     # Core arrow extension (wave 71): Arrow IPC file read/write. Engine-adjacent
     # (it depends on `pinkdb` and implements the host table-source and COPY-sink
     # hooks); the CLI wires it behind the opt-in `arrow` feature.

@@ -100,6 +100,11 @@ pub struct DataTable {
     pub constraints: TableConstraints,
     /// In-memory hash indexes for equality lookups.
     pub indexes: Vec<Index>,
+    /// Vector indexes (wave 107b), in creation order. A definition whose
+    /// `index` is `None` is waiting for its provider extension to be loaded;
+    /// `blob` holds the serialized graph until then. Mutating such a table is
+    /// refused rather than silently leaving the graph behind.
+    pub vector_indexes: Vec<VectorIndexDef>,
     /// Set by every mutation (INSERT/UPDATE/DELETE/bulk load/COPY) when the
     /// table has indexes: the maps describe a pre-mutation snapshot. The
     /// statement path rebuilds them lazily from the live chunks at the next
@@ -121,6 +126,48 @@ pub struct DataTable {
     /// stamp (a transaction based on the old table must conflict).
     /// Process-lifetime only (not persisted — save/load draws fresh stamps).
     pub version: u64,
+}
+
+/// One vector index definition on a table. `index` is the live graph; the
+/// engine only sees it through [`crate::vector_index::VectorIndex`]. The
+/// graph is cloned on first write after a transaction snapshot shares the
+/// `Arc` (copy-on-write), exactly like the column chunks.
+#[derive(Debug, Clone)]
+pub struct VectorIndexDef {
+    pub name: String,
+    pub column: usize,
+    /// Registered provider name, lowercased.
+    pub provider: String,
+    /// `WITH (...)` pairs as written (provider-specific; the graph carries
+    /// its own copy after deserialization).
+    pub options: Vec<(String, String)>,
+    pub index: Option<std::sync::Arc<dyn crate::vector_index::VectorIndex>>,
+    /// Serialized graph read from the `.pink` footer, kept until the
+    /// provider is loaded.
+    pub blob: Option<std::sync::Arc<[u8]>>,
+}
+
+impl VectorIndexDef {
+    pub(crate) fn pending_error(&self, table: &str) -> PinkDbError {
+        PinkDbError::Execution(format!(
+            "vector index \"{}\" on table \"{table}\" needs the \"{}\" extension; run \
+             LOAD EXTENSION '{}' first",
+            self.name, self.provider, self.provider
+        ))
+    }
+
+    /// The graph as a mutable reference, deep-copying it first when a
+    /// transaction snapshot still shares the `Arc`.
+    fn writable(&mut self, table: &str) -> Result<&mut dyn crate::vector_index::VectorIndex> {
+        if self.index.is_none() {
+            return Err(self.pending_error(table));
+        }
+        let slot = self.index.as_mut().expect("checked above");
+        if std::sync::Arc::get_mut(slot).is_none() {
+            *slot = std::sync::Arc::from(slot.clone_box());
+        }
+        Ok(std::sync::Arc::get_mut(slot).expect("just made unique"))
+    }
 }
 
 /// A single-column hash index: maps a key value to the global row indices
@@ -298,6 +345,7 @@ impl DataTable {
             num_rows: 0,
             constraints,
             indexes: Vec::new(),
+            vector_indexes: Vec::new(),
             indexes_stale: false,
             key_index: None,
             version: next_table_version(),
@@ -336,6 +384,7 @@ impl DataTable {
             num_rows,
             constraints: TableConstraints::default(),
             indexes: Vec::new(),
+            vector_indexes: Vec::new(),
             indexes_stale: false,
             key_index: None,
             version: next_table_version(),
@@ -452,6 +501,10 @@ impl DataTable {
         for i in &mut self.indexes {
             reindex(&mut i.column);
         }
+        self.vector_indexes.retain(|i| i.column != idx);
+        for i in &mut self.vector_indexes {
+            reindex(&mut i.column);
+        }
         self.version = next_table_version();
         Ok(())
     }
@@ -496,10 +549,11 @@ impl DataTable {
     /// DELETE left a map describing an older snapshot), leave the flag alone:
     /// [`Self::rebuild_indexes`] will rebuild it from the final rows. This is
     /// why a stale map is always a missed optimization, never a wrong answer.
-    fn extend_indexes(&mut self, start: usize) {
+    fn extend_indexes(&mut self, start: usize) -> Result<()> {
         self.extend_key_index(start);
+        self.extend_vector_indexes(start)?;
         if self.indexes.is_empty() || self.indexes_stale || start >= self.num_rows {
-            return;
+            return Ok(());
         }
         let mut indexes = std::mem::take(&mut self.indexes);
         for index in &mut indexes {
@@ -531,6 +585,56 @@ impl DataTable {
             }
         }
         self.indexes = indexes;
+        Ok(())
+    }
+
+    /// Keep every vector index in step with rows appended in `start..`.
+    /// NULL rows (and rows with a NULL element) are not vectors and are not
+    /// indexed; they are still visible through the exact path.
+    fn extend_vector_indexes(&mut self, start: usize) -> Result<()> {
+        if self.vector_indexes.is_empty() || start >= self.num_rows {
+            return Ok(());
+        }
+        let mut defs = std::mem::take(&mut self.vector_indexes);
+        let result = (|| -> Result<()> {
+            for def in &mut defs {
+                let Some(column) = self.columns.get(def.column) else {
+                    continue;
+                };
+                let crate::types::DataType::Array { len: n, .. } = column.dtype else {
+                    continue;
+                };
+                let n = n as usize;
+                let mut offset = 0usize;
+                for chunk in &column.chunks {
+                    let len = chunk.len();
+                    if offset + len > start {
+                        for local in start.saturating_sub(offset)..len {
+                            let global = (offset + local) as u64;
+                            let Some(vector) = crate::vector_index::row_vector(chunk, local, n)
+                            else {
+                                continue;
+                            };
+                            def.writable(&self.name)?.insert(global, &vector)?;
+                        }
+                    }
+                    offset += len;
+                }
+            }
+            Ok(())
+        })();
+        self.vector_indexes = defs;
+        result
+    }
+
+    /// Refuse a mutation that would leave a not-yet-hydrated graph behind.
+    fn require_vector_indexes_loaded(&self) -> Result<()> {
+        for def in &self.vector_indexes {
+            if def.index.is_none() {
+                return Err(def.pending_error(&self.name));
+            }
+        }
+        Ok(())
     }
 
     /// Rebuild every hash index on this table from the live chunks, clearing
@@ -683,6 +787,7 @@ impl DataTable {
                 self.columns.len()
             )));
         }
+        self.require_vector_indexes_loaded()?;
         // Open a new tail chunk everywhere if the tail is full, so columns
         // stay aligned even at chunk boundaries.
         let tail_full = self.columns[0]
@@ -703,7 +808,7 @@ impl DataTable {
         }
         self.num_rows += 1;
         self.version = next_table_version();
-        self.extend_indexes(start);
+        self.extend_indexes(start)?;
         Ok(())
     }
 
@@ -732,6 +837,7 @@ impl DataTable {
                 self.columns.len()
             )));
         }
+        self.require_vector_indexes_loaded()?;
         let rows = chunk.first().map(|c| c.len()).unwrap_or(0);
         if rows > CHUNK_SIZE {
             return Err(PinkDbError::Execution(format!(
@@ -776,7 +882,7 @@ impl DataTable {
             }
             self.num_rows += rows;
             self.version = next_table_version();
-            self.extend_indexes(start);
+            self.extend_indexes(start)?;
             return Ok(());
         }
         // Partial tail: merge, splitting at chunk boundaries as needed.
@@ -805,7 +911,7 @@ impl DataTable {
             self.num_rows += take;
         }
         self.version = next_table_version();
-        self.extend_indexes(start);
+        self.extend_indexes(start)?;
         Ok(())
     }
 
@@ -836,6 +942,7 @@ impl DataTable {
                 "chunk {chunk} out of range"
             )));
         }
+        self.require_vector_indexes_loaded()?;
         // Validate + coerce up front for atomicity.
         let mut staged: Vec<(usize, usize, Value)> = Vec::with_capacity(updates.len());
         for (col, row, v) in updates {
@@ -851,8 +958,8 @@ impl DataTable {
             }
             staged.push((*col, *row, Self::coerce(v.clone(), dtype)?));
         }
-        for (col, row, v) in staged {
-            Arc::make_mut(&mut self.columns[col].chunks[chunk]).set_value(row, v)?;
+        for (col, row, v) in &staged {
+            Arc::make_mut(&mut self.columns[*col].chunks[chunk]).set_value(*row, v.clone())?;
         }
         if !updates.is_empty() {
             self.version = next_table_version();
@@ -867,8 +974,58 @@ impl DataTable {
             {
                 self.key_index = None;
             }
+            self.update_vector_indexes(chunk, &staged)?;
         }
         Ok(())
+    }
+
+    /// An UPDATE of a vector column is a delete + insert in every graph, so
+    /// the new vector is searchable immediately.
+    fn update_vector_indexes(
+        &mut self,
+        chunk: usize,
+        staged: &[(usize, usize, Value)],
+    ) -> Result<()> {
+        if self.vector_indexes.is_empty() {
+            return Ok(());
+        }
+        let chunk_start = self.chunk_start(chunk);
+        let mut defs = std::mem::take(&mut self.vector_indexes);
+        let result = (|| -> Result<()> {
+            for def in &mut defs {
+                let mut rows: Vec<usize> = staged
+                    .iter()
+                    .filter(|(col, _, _)| *col == def.column)
+                    .map(|(_, row, _)| *row)
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                rows.sort_unstable();
+                rows.dedup();
+                let Some(column) = self.columns.get(def.column) else {
+                    continue;
+                };
+                let crate::types::DataType::Array { len: n, .. } = column.dtype else {
+                    continue;
+                };
+                let n = n as usize;
+                let table = self.name.clone();
+                let index = def.writable(&table)?;
+                for row in rows {
+                    let global = chunk_start + row as u64;
+                    index.delete(global);
+                    if let Some(vector) =
+                        crate::vector_index::row_vector(&column.chunks[chunk], row, n)
+                    {
+                        index.insert(global, &vector)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.vector_indexes = defs;
+        result
     }
 
     /// Remove rows (chunk-relative positions) from one stored chunk.
@@ -882,7 +1039,10 @@ impl DataTable {
         if drop.is_empty() {
             return Ok(0);
         }
+        self.require_vector_indexes_loaded()?;
         let len = self.columns[0].chunks[chunk].len();
+        let chunk_start = self.chunk_start(chunk);
+        let chunks_before = self.columns[0].chunks.len();
         let mut drop_sorted = drop.to_vec();
         drop_sorted.sort_unstable();
         drop_sorted.dedup();
@@ -915,6 +1075,16 @@ impl DataTable {
         if removed > 0 {
             self.version = next_table_version();
             self.invalidate_indexes();
+            let shift = crate::vector_index::DeleteShift {
+                chunk_start,
+                chunk_len: len as u64,
+                deleted: drop_sorted,
+                chunk_dropped: self.columns[0].chunks.len() < chunks_before,
+            };
+            let table = self.name.clone();
+            for def in &mut self.vector_indexes {
+                def.writable(&table)?.remap_after_delete(&shift);
+            }
         }
         Ok(removed)
     }
@@ -922,6 +1092,16 @@ impl DataTable {
     /// Number of stored chunks (all columns share the same count).
     pub fn num_chunks(&self) -> usize {
         self.columns.first().map(|c| c.chunks.len()).unwrap_or(0)
+    }
+
+    /// Global row id of the first row in `chunk`. Deleting rows leaves
+    /// interior chunks partially full, so this cannot assume full chunks
+    /// before the tail.
+    fn chunk_start(&self, chunk: usize) -> u64 {
+        self.columns[0].chunks[..chunk]
+            .iter()
+            .map(|c| c.len() as u64)
+            .sum()
     }
 
     /// Read chunk `idx` as a `DataChunk` (columns shared by reference —
@@ -1331,6 +1511,15 @@ pub struct PinkDb {
     /// this map keeps the WAL prefix pointing at the **package** — the name
     /// replay can resolve.
     pub(crate) package_dynamic_functions: HashMap<String, String>,
+    /// The package that installed each active vector index provider, keyed
+    /// by the provider's lowercased name. A `CREATE INDEX … USING <provider>`
+    /// found it so its WAL record is prefixed with the package's
+    /// `LOAD EXTENSION`, which replay needs before the provider exists.
+    pub(crate) package_vector_providers: HashMap<String, String>,
+    /// Vector index providers (wave 107b) registered through an extension
+    /// package, in load order. Process-level like the host scalars: cloned
+    /// with the store, never persisted.
+    pub(crate) vector_providers: Vec<Arc<dyn crate::vector_index::VectorIndexProvider>>,
     /// Active host scalars and host statements (wave 108a), keyed by
     /// lowercased name. The package that installed each is inside the value.
     pub(crate) host_scalars: HashMap<String, crate::package::HostScalar>,
@@ -1435,6 +1624,8 @@ impl Clone for PinkDb {
             package_table_sources: self.package_table_sources.clone(),
             package_file_formats: self.package_file_formats.clone(),
             package_dynamic_functions: self.package_dynamic_functions.clone(),
+            package_vector_providers: self.package_vector_providers.clone(),
+            vector_providers: self.vector_providers.clone(),
             host_scalars: self.host_scalars.clone(),
             host_statements: self.host_statements.clone(),
             store_id: self.store_id,
@@ -1530,6 +1721,8 @@ impl PinkDb {
             package_table_sources: HashMap::new(),
             package_file_formats: HashMap::new(),
             package_dynamic_functions: HashMap::new(),
+            package_vector_providers: HashMap::new(),
+            vector_providers: Vec::new(),
             host_scalars: HashMap::new(),
             host_statements: HashMap::new(),
             store_id: next_store_id(),
@@ -2662,6 +2855,227 @@ impl PinkDb {
         Ok(())
     }
 
+    /// Build a vector index on `table.column` through a registered provider.
+    /// The column must be `FLOAT[N]` or `DOUBLE[N]`; DOUBLE is narrowed to
+    /// f32 for the graph (the exact path still uses f64). A row that is NULL
+    /// or has a NULL element is not a vector and is skipped.
+    pub fn create_vector_index_in(
+        &mut self,
+        db: &str,
+        table: &str,
+        name: &str,
+        column: usize,
+        provider_name: &str,
+        options: &[(String, String)],
+    ) -> Result<()> {
+        if let Some(err) = self.attached_read_only(db, table) {
+            return Err(err);
+        }
+        let provider = self
+            .vector_providers
+            .iter()
+            .find(|p| p.name().eq_ignore_ascii_case(provider_name))
+            .cloned()
+            .ok_or_else(|| {
+                PinkDbError::Catalog(format!(
+                    "vector index provider \"{provider_name}\" is not loaded; run LOAD \
+                     EXTENSION '{provider_name}' first"
+                ))
+            })?;
+        let dim = {
+            let t = self.table_in(db, table)?;
+            if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name))
+                || t.vector_indexes
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(name))
+            {
+                return Err(PinkDbError::Catalog(format!(
+                    "index \"{name}\" already exists"
+                )));
+            }
+            let Some(col) = t.columns.get(column) else {
+                return Err(PinkDbError::Catalog(format!(
+                    "column {column} out of range for table \"{table}\""
+                )));
+            };
+            if let Some(existing) = t.vector_indexes.iter().find(|i| i.column == column) {
+                return Err(PinkDbError::Catalog(format!(
+                    "column \"{}\" already has vector index \"{}\"",
+                    col.name, existing.name
+                )));
+            }
+            match col.dtype {
+                crate::types::DataType::Array {
+                    elem: crate::types::ArrayElem::Float | crate::types::ArrayElem::Double,
+                    len,
+                } if len > 0 => len as usize,
+                other => {
+                    return Err(PinkDbError::Catalog(format!(
+                        "vector index \"{name}\" needs an ARRAY column of FLOAT or DOUBLE, but \
+                         \"{}\" is {other}",
+                        col.name
+                    )));
+                }
+            }
+        };
+        let mut index = provider.create(dim, options)?;
+        // Build before touching the catalog: a failed build leaves no index.
+        {
+            let t = self.table_in(db, table)?;
+            let col = &t.columns[column];
+            let mut offset = 0usize;
+            for chunk in &col.chunks {
+                for row in 0..chunk.len() {
+                    if let Some(vector) = crate::vector_index::row_vector(chunk, row, dim) {
+                        index.insert((offset + row) as u64, &vector)?;
+                    }
+                }
+                offset += chunk.len();
+            }
+        }
+        let t = self.table_mut_in(db, table)?;
+        t.vector_indexes.push(VectorIndexDef {
+            name: name.to_string(),
+            column,
+            provider: provider.name().to_ascii_lowercase(),
+            options: options.to_vec(),
+            index: Some(std::sync::Arc::from(index)),
+            blob: None,
+        });
+        Ok(())
+    }
+
+    /// Drop tombstones from a vector index (`ALTER INDEX … COMPACT`).
+    pub fn compact_vector_index_in(&mut self, db: &str, table: &str, name: &str) -> Result<()> {
+        if let Some(err) = self.attached_read_only(db, table) {
+            return Err(err);
+        }
+        let t = self.table_mut_in(db, table)?;
+        let table_name = t.name.clone();
+        let def = t
+            .vector_indexes
+            .iter_mut()
+            .find(|i| i.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                PinkDbError::Catalog(format!("vector index \"{name}\" not found on \"{table}\""))
+            })?;
+        def.writable(&table_name)?.compact();
+        t.version = next_table_version();
+        Ok(())
+    }
+
+    /// Live/tombstone counts of a vector index (tests and diagnostics).
+    pub fn vector_index_stats_in(
+        &self,
+        db: &str,
+        table: &str,
+        name: &str,
+    ) -> Result<crate::vector_index::VectorIndexStats> {
+        let t = self.table_in(db, table)?;
+        let def = t
+            .vector_indexes
+            .iter()
+            .find(|i| i.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                PinkDbError::Catalog(format!("vector index \"{name}\" not found on \"{table}\""))
+            })?;
+        let index = def.index.as_ref().ok_or_else(|| def.pending_error(table))?;
+        Ok(index.stats())
+    }
+
+    /// The provider registered for `name`, if it is loaded on this store.
+    pub(crate) fn vector_provider(
+        &self,
+        name: &str,
+    ) -> Option<Arc<dyn crate::vector_index::VectorIndexProvider>> {
+        self.vector_providers
+            .iter()
+            .find(|p| p.name().eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    /// Attach every pending graph whose provider is already loaded. Used
+    /// after a refresh adopts a checkpoint without reloading the package.
+    pub(crate) fn hydrate_pending_vector_indexes(&mut self) -> Result<()> {
+        for provider in self.vector_providers.clone() {
+            let ready = self.take_hydrated_vector_indexes(provider.as_ref())?;
+            self.install_hydrated_vector_indexes(ready);
+        }
+        Ok(())
+    }
+
+    /// Activate the registered package that owns each pending graph, so a
+    /// checkpointed store can replay WAL writes that target the graph. Only
+    /// packages already registered (linked into this process) are activated;
+    /// an unknown provider stays pending and fails later with its own error.
+    pub(crate) fn hydrate_registered_vector_packages(&mut self) -> Result<()> {
+        loop {
+            let pending = self
+                .databases
+                .values()
+                .flat_map(|c| c.tables.values())
+                .flat_map(|t| t.vector_indexes.iter())
+                .filter(|d| d.index.is_none() && d.blob.is_some())
+                .map(|d| d.provider.clone())
+                .find(|p| self.vector_provider(p).is_none());
+            let Some(provider) = pending else {
+                return Ok(());
+            };
+            let Some(package) = crate::package::registered_vector_provider_package(&provider)
+            else {
+                return Ok(());
+            };
+            self.load_extension_package(&package)?;
+        }
+    }
+
+    /// Deserialize every pending graph for `provider` without installing it.
+    /// Called before the package's other surfaces are installed, so a corrupt
+    /// blob rejects the whole load atomically; the returned graphs are then
+    /// installed without a second parse.
+    pub(crate) fn take_hydrated_vector_indexes(
+        &self,
+        provider: &dyn crate::vector_index::VectorIndexProvider,
+    ) -> Result<Vec<crate::vector_index::HydratedVectorIndex>> {
+        let mut ready = Vec::new();
+        for (db_key, cat) in &self.databases {
+            for (table_key, t) in &cat.tables {
+                for (i, def) in t.vector_indexes.iter().enumerate() {
+                    if def.index.is_none()
+                        && def.provider.eq_ignore_ascii_case(provider.name())
+                        && let Some(blob) = &def.blob
+                    {
+                        ready.push((
+                            db_key.clone(),
+                            table_key.clone(),
+                            i,
+                            provider.deserialize(blob)?,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(ready)
+    }
+
+    /// Install graphs returned by [`Self::take_hydrated_vector_indexes`].
+    /// The store is not mutated between the two calls, so the slots still
+    /// exist; this step cannot fail.
+    pub(crate) fn install_hydrated_vector_indexes(
+        &mut self,
+        ready: Vec<crate::vector_index::HydratedVectorIndex>,
+    ) {
+        for (db_key, table_key, slot, index) in ready {
+            let t = self
+                .databases
+                .get_mut(&db_key)
+                .and_then(|c| c.tables.get_mut(&table_key))
+                .expect("table still present");
+            t.vector_indexes[slot].index = Some(std::sync::Arc::from(index));
+            t.vector_indexes[slot].blob = None;
+        }
+    }
+
     /// Rebuild one table's stale hash indexes from its live chunks. The
     /// optimizer calls this lazily, just before it rewrites an equality lookup
     /// into an `IndexScan` (see [`DataTable::invalidate_indexes`]).
@@ -2691,10 +3105,15 @@ impl PinkDb {
     }
 
     pub fn drop_index_in(&mut self, db: &str, table: &str, name: &str) -> Result<()> {
+        if let Some(err) = self.attached_read_only(db, table) {
+            return Err(err);
+        }
         let t = self.table_mut_in(db, table)?;
-        let before = t.indexes.len();
-        t.indexes.retain(|i| i.name != name);
-        if t.indexes.len() == before {
+        let before = t.indexes.len() + t.vector_indexes.len();
+        t.indexes.retain(|i| !i.name.eq_ignore_ascii_case(name));
+        t.vector_indexes
+            .retain(|i| !i.name.eq_ignore_ascii_case(name));
+        if t.indexes.len() + t.vector_indexes.len() == before {
             return Err(PinkDbError::Catalog(format!("index \"{name}\" not found")));
         }
         if t.indexes.is_empty() {

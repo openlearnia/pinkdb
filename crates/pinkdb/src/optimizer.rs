@@ -29,6 +29,7 @@ use crate::vector::DataChunk;
 /// declarative constraints the elimination rule reads.
 pub fn optimize(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
     let plan = pushdown(fold_plan(db, plan));
+    let plan = apply_vector_topk(db, plan);
     let plan = eliminate_fk_joins(db, plan);
     let plan = drop_count_star_projections(plan);
     let plan = apply_indexes(db, plan);
@@ -2078,6 +2079,168 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
     }
 }
 
+/// Rewrite `ORDER BY <metric-distance>(vec, <constant>) LIMIT k` onto a
+/// vector index (wave 107b). The rewrite is deliberately narrow: a single
+/// ascending sort key, a projection directly over a native table scan, a
+/// folded literal query vector of the index's width, and the index's own
+/// metric. A `WHERE` clause puts a `Filter` between the scan and the
+/// projection, so filtered top-k falls back to the exact path rather than
+/// silently returning fewer than `k` rows.
+fn apply_vector_topk(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+            plan: Box::new(apply_vector_topk(db, *plan)),
+        },
+        LogicalPlan::Limit { input, limit } => {
+            let Some(new_input) = rewrite_limit_input(db, (*input).clone(), limit) else {
+                return LogicalPlan::Limit { input, limit };
+            };
+            LogicalPlan::Limit {
+                input: Box::new(new_input),
+                limit,
+            }
+        }
+        other => other,
+    }
+}
+
+/// `LIMIT` input is `Sort(Project(Scan))`, optionally under the binder's
+/// identity projection that hides `ORDER BY` expressions.
+fn rewrite_limit_input(
+    db: &crate::storage::PinkDb,
+    input: LogicalPlan,
+    limit: usize,
+) -> Option<LogicalPlan> {
+    if limit == 0 {
+        return None;
+    }
+    match input {
+        LogicalPlan::Sort { keys, input } => rewrite_sort(db, keys, *input, limit),
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => match *input {
+            LogicalPlan::Sort { keys, input: inner } => Some(LogicalPlan::Project {
+                input: Box::new(rewrite_sort(db, keys, *inner, limit)?),
+                exprs,
+                names,
+            }),
+            other => {
+                let _ = other;
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+fn rewrite_sort(
+    db: &crate::storage::PinkDb,
+    keys: Vec<(BoundExpr, crate::sql::ast::SortSpec)>,
+    input: LogicalPlan,
+    limit: usize,
+) -> Option<LogicalPlan> {
+    // Exactly one ascending key: any other key changes the order the index
+    // cannot produce.
+    let [(key, spec)] = keys.as_slice() else {
+        return None;
+    };
+    if spec.desc || spec.nulls_first {
+        return None;
+    }
+    let LogicalPlan::Project {
+        input: scan,
+        exprs,
+        names,
+    } = input
+    else {
+        return None;
+    };
+    let LogicalPlan::Scan {
+        db: qdb,
+        table,
+        at: None,
+    } = *scan
+    else {
+        return None;
+    };
+    let expr = match key {
+        BoundExpr::Column { index, .. } => exprs.get(*index)?,
+        other => other,
+    };
+    let BoundExpr::Scalar { func, args, .. } = expr else {
+        return None;
+    };
+    let want_metric = match func {
+        crate::sql::binder::ScalarFunc::ArrayDistance => crate::distance::Metric::L2Sq,
+        crate::sql::binder::ScalarFunc::ArrayCosineDistance => crate::distance::Metric::Cosine,
+        crate::sql::binder::ScalarFunc::ArrayNegativeInnerProduct => {
+            crate::distance::Metric::InnerProduct
+        }
+        _ => return None,
+    };
+    let [left, right] = args.as_slice() else {
+        return None;
+    };
+    let (col_idx, query) = match (left, right) {
+        (BoundExpr::Column { index, .. }, BoundExpr::Literal(v)) => (*index, v),
+        (BoundExpr::Literal(v), BoundExpr::Column { index, .. }) => (*index, v),
+        _ => return None,
+    };
+    let lookup = qdb.as_deref().unwrap_or_else(|| db.current_db());
+    let t = db.table_in(lookup, &table).ok()?;
+    let col = t.columns.get(col_idx)?;
+    let dtype @ crate::types::DataType::Array { len, .. } = col.dtype else {
+        return None;
+    };
+    if !matches!(
+        dtype,
+        crate::types::DataType::Array {
+            elem: crate::types::ArrayElem::Float | crate::types::ArrayElem::Double,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let def = t.vector_indexes.iter().find(|d| {
+        d.column == col_idx
+            && d.index.is_some()
+            && d.options
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("metric"))
+                .and_then(|(_, v)| crate::distance::Metric::parse(v))
+                .unwrap_or(crate::distance::Metric::L2Sq)
+                == want_metric
+    })?;
+    let crate::types::Value::Array(a) = query else {
+        return None;
+    };
+    if a.len() != len as usize {
+        return None;
+    }
+    if !matches!(
+        a.values,
+        crate::array::ArrayElems::Floats32(_) | crate::array::ArrayElems::Floats(_)
+    ) {
+        return None;
+    }
+    Some(LogicalPlan::Project {
+        input: Box::new(LogicalPlan::VectorTopK {
+            db: qdb,
+            table: table.clone(),
+            column: col_idx,
+            column_name: col.name.clone(),
+            index: def.name.clone(),
+            query: query.clone(),
+            metric: want_metric,
+            dim: len as usize,
+            k: limit,
+        }),
+        exprs,
+        names,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

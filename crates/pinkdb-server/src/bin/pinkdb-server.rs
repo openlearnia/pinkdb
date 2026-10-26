@@ -823,6 +823,13 @@ fn main() -> ExitCode {
         None => None,
     };
 
+    // A durable open replays the WAL, which may write to a checkpointed
+    // vector graph; the owning package must be registered before that.
+    #[cfg(feature = "vss")]
+    if let Err(e) = pinkdb_vss::ensure_registered() {
+        eprintln!("warning: the vss extension could not be registered: {e}");
+    }
+
     // Kept alive for the whole process: dropping it stops the lease heartbeat
     // and releases the catalog lease.
     #[cfg(feature = "catalog")]
@@ -884,6 +891,14 @@ fn main() -> ExitCode {
     // loaded into the store this server serves. A durable store whose log
     // already recorded the load keeps it (that is what the replay guard is
     // for), so the load is skipped rather than reported as a duplicate.
+    #[cfg(feature = "vss")]
+    {
+        if !db.is_extension_loaded(pinkdb_vss::EXTENSION_NAME)
+            && let Err(e) = db.load_extension(pinkdb_vss::EXTENSION_NAME)
+        {
+            eprintln!("warning: the vss extension could not be loaded: {e}");
+        }
+    }
     #[cfg(feature = "fts")]
     {
         if let Err(e) = pinkdb_fts::ensure_registered() {

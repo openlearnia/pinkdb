@@ -484,6 +484,29 @@ impl Vector {
         }
     }
 
+    /// Borrow one ARRAY row (wave 107b): the element kind, the flat buffer
+    /// and the optional element-validity bitmap. `None` for a NULL row or a
+    /// non-ARRAY vector. The index build path uses this to avoid materialising
+    /// an `ArrayValue` per row.
+    pub(crate) fn array_row(&self, idx: usize) -> Option<(ArrayElem, &ArrayElems, Option<&[u8]>)> {
+        if idx >= self.len || !self.is_valid(idx) {
+            return None;
+        }
+        match &self.data {
+            VectorData::Array {
+                elem,
+                len,
+                values,
+                valid,
+            } => {
+                let n = *len as usize;
+                let _ = (idx, n);
+                Some((*elem, values, valid.as_deref()))
+            }
+            _ => None,
+        }
+    }
+
     /// Append a NULL.
     pub fn push_null(&mut self) -> Result<()> {
         self.check_room()?;

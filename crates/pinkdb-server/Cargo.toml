@@ -44,6 +44,9 @@ fts-regex = ["fts", "pinkdb-fts/custom-ignore"]
 # client `LOAD EXTENSION`. Off by default: the default server binary is
 # unchanged.
 embeddings = ["dep:pinkdb-embeddings"]
+# Opt-in vector similarity search (wave 107b), the same package the CLI's
+# `vss` feature publishes.
+vss = ["dep:pinkdb-vss"]
 [lib]
 name = "pinkdb_server"
 path = "src/lib.rs"
@@ -58,6 +61,7 @@ pinkdb = { path = "../pinkdb" }
 pinkdb-fts = { path = "../../extensions/fts", optional = true }
 # Opt-in embeddings (wave 107c): the `embed(text)` package.
 pinkdb-embeddings = { path = "../../extensions/embeddings", optional = true }
+pinkdb-vss = { path = "../../extensions/vss", optional = true }
 # `--catalog` mode (wave 96b): the lake catalog and data store, only with the
 # `catalog` feature (see above).
 pink-lake = { path = "../pink-lake", optional = true }

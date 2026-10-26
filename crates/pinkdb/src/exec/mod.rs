@@ -1225,6 +1225,8 @@ pub(crate) fn run_plain(
             table,
             column,
             if_not_exists,
+            using,
+            options,
             ..
         } => {
             let target = resolve_db(db, qdb);
@@ -1236,7 +1238,11 @@ pub(crate) fn run_plain(
             }
             // Check if index already exists.
             let t = db.table_in(&target, table)?;
-            if t.indexes.iter().any(|i| i.name == *name) {
+            if t.indexes.iter().any(|i| i.name == *name)
+                || t.vector_indexes
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(name))
+            {
                 if *if_not_exists {
                     return Ok(QueryResult::CreatedIndex { name: name.clone() });
                 }
@@ -1244,8 +1250,12 @@ pub(crate) fn run_plain(
                     "index \"{name}\" already exists"
                 )));
             }
-            // Build index.
-            db.create_index_in(&target, table, name, *column)?;
+            match using {
+                Some(provider) => {
+                    db.create_vector_index_in(&target, table, name, *column, provider, options)?
+                }
+                None => db.create_index_in(&target, table, name, *column)?,
+            }
             Ok(QueryResult::CreatedIndex { name: name.clone() })
         }
         LogicalPlan::DropIndex {
@@ -1261,7 +1271,10 @@ pub(crate) fn run_plain(
             let mut found = false;
             if let Some(tbl) = table
                 && let Ok(t) = db.table_in(&target, tbl)
-                && t.indexes.iter().any(|i| i.name == *name)
+                && (t.indexes.iter().any(|i| i.name == *name)
+                    || t.vector_indexes
+                        .iter()
+                        .any(|i| i.name.eq_ignore_ascii_case(name)))
             {
                 db.drop_index_in(&target, tbl, name)?;
                 found = true;
@@ -2125,6 +2138,127 @@ fn check_source_chunk(
     Ok(())
 }
 
+/// The query vector in both widths. The HNSW graph stores f32 even for
+/// `DOUBLE[N]` columns, so the index uses `.0`; the exact path keeps the
+/// original f64 so a DOUBLE query is not narrowed before ranking.
+fn query_vector(query: &Value, dim: usize) -> Result<(Vec<f32>, Vec<f64>, bool)> {
+    let Value::Array(a) = query else {
+        return Err(PinkDbError::Execution(
+            "vector top-k needs an ARRAY query vector".to_string(),
+        ));
+    };
+    if a.len() != dim {
+        return Err(PinkDbError::Execution(format!(
+            "vector top-k query has {} elements, the index expects {dim}",
+            a.len()
+        )));
+    }
+    match &a.values {
+        crate::array::ArrayElems::Floats32(v) => {
+            Ok((v.clone(), v.iter().map(|x| f64::from(*x)).collect(), false))
+        }
+        crate::array::ArrayElems::Floats(v) => {
+            Ok((v.iter().map(|x| *x as f32).collect(), v.clone(), true))
+        }
+        crate::array::ArrayElems::Ints(_) => Err(PinkDbError::Execution(
+            "vector top-k query must be FLOAT or DOUBLE".to_string(),
+        )),
+    }
+}
+
+/// One hit in the exact top-k heap; a max-heap keeps the worst of the best.
+#[derive(PartialEq)]
+struct ExactHit {
+    dist: f64,
+    row: u64,
+}
+
+impl Eq for ExactHit {}
+
+impl Ord for ExactHit {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then_with(|| self.row.cmp(&other.row))
+    }
+}
+
+impl PartialOrd for ExactHit {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Brute-force top-k over the live rows, using the same metric as the index.
+/// This is the `hnsw_exact = true` path and the fallback when the optimizer
+/// cannot prove the index safe. Rows whose vector is NULL (or has a NULL
+/// element) are not ranked, matching the index, which never indexes them.
+#[allow(clippy::too_many_arguments)]
+fn exact_topk_rows(
+    cx: &Cx,
+    db: &str,
+    table: &str,
+    column: usize,
+    dim: usize,
+    metric: crate::distance::Metric,
+    query: &Value,
+    k: usize,
+) -> Result<Vec<usize>> {
+    let t = cx.db.table_in(db, table)?;
+    let col = &t.columns[column];
+    let (start32, start64, query_is_f64) = query_vector(query, dim)?;
+    let mut heap: std::collections::BinaryHeap<ExactHit> = std::collections::BinaryHeap::new();
+    let mut row = 0u64;
+    for chunk in &col.chunks {
+        for r in 0..chunk.len() {
+            if let Some((_elem, values, valid)) = chunk.array_row(r) {
+                let off = r * dim;
+                let live = match valid {
+                    Some(bits) => (0..dim).all(|i| crate::array::bit_get(bits, off + i)),
+                    None => true,
+                };
+                if live {
+                    let dist =
+                        match values {
+                            crate::array::ArrayElems::Floats32(v) => {
+                                if query_is_f64 {
+                                    let row64: Vec<f64> =
+                                        v[off..off + dim].iter().map(|x| f64::from(*x)).collect();
+                                    Some(crate::distance::metric_f64(metric, &start64, &row64))
+                                } else {
+                                    Some(crate::distance::metric_f32(
+                                        metric,
+                                        &start32,
+                                        &v[off..off + dim],
+                                    ) as f64)
+                                }
+                            }
+                            crate::array::ArrayElems::Floats(v) => Some(
+                                crate::distance::metric_f64(metric, &start64, &v[off..off + dim]),
+                            ),
+                            crate::array::ArrayElems::Ints(_) => None,
+                        };
+                    if let Some(dist) = dist
+                        && !dist.is_nan()
+                    {
+                        let hit = ExactHit { dist, row };
+                        if heap.len() < k {
+                            heap.push(hit);
+                        } else if heap.peek().is_some_and(|worst| hit < *worst) {
+                            heap.pop();
+                            heap.push(hit);
+                        }
+                    }
+                }
+            }
+            row += 1;
+        }
+    }
+    let mut hits = heap.into_vec();
+    hits.sort();
+    Ok(hits.into_iter().map(|h| h.row as usize).collect())
+}
+
 /// Gather output for an index scan: produce chunks containing only the rows
 /// whose global indices are in `row_indices`, with the table's full column set.
 ///
@@ -2527,6 +2661,48 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             crate::exec::aggregate::encode_value(&mut key_buf, &key_val);
             let row_indices = idx.map.get(&key_buf).cloned().unwrap_or_default();
             index_scan_output(cx, &target, table, idx.column, &row_indices)
+        }
+        LogicalPlan::VectorTopK {
+            db,
+            table,
+            column,
+            index,
+            query,
+            metric,
+            dim,
+            k,
+            ..
+        } => {
+            let target = resolve_db(cx.db, db);
+            let t = cx.db.table_in(&target, table)?;
+            let def = t
+                .vector_indexes
+                .iter()
+                .find(|i| i.name.eq_ignore_ascii_case(index))
+                .ok_or_else(|| {
+                    PinkDbError::Catalog(format!("vector index \"{index}\" not found"))
+                })?;
+            let exact = matches!(
+                cx.session.get("hnsw_exact"),
+                Some(Value::Boolean(true))
+            );
+            let rows = if exact {
+                exact_topk_rows(cx, &target, table, *column, *dim, *metric, query, *k)?
+            } else {
+                let idx = def
+                    .index
+                    .as_ref()
+                    .ok_or_else(|| def.pending_error(table))?;
+                let q = query_vector(query, *dim)?.0;
+                let ef = match cx.session.get("hnsw_ef_search") {
+                    Some(Value::Integer(n)) => n.clamp(1, 16384) as usize,
+                    Some(Value::Bigint(n)) => n.clamp(1, 16384) as usize,
+                    _ => 0,
+                };
+                let hits = idx.search(&q, *k, (ef > 0).then_some(ef))?;
+                hits.into_iter().map(|(_, row)| row as usize).collect()
+            };
+            index_scan_output(cx, &target, table, *column, &rows)
         }
         LogicalPlan::ShowTables { db } => {
             // DuckDB lists tables and views together, sorted by name.
@@ -6039,8 +6215,37 @@ fn explain_into(
         LogicalPlan::CreateView { db, name, .. } => format!("CreateView {}", qualify(db, name)),
         LogicalPlan::DropTable { db, name, .. } => format!("DropTable {}", qualify(db, name)),
         LogicalPlan::CreateIndex {
-            db, name, table, ..
-        } => format!("CreateIndex {} ON {}", name, qualify(db, table)),
+            db,
+            name,
+            table,
+            using,
+            options,
+            ..
+        } => match using {
+            Some(provider) => {
+                let opts: Vec<String> = options
+                    .iter()
+                    .map(|(k, v)| format!("{k} = '{v}'"))
+                    .collect();
+                if opts.is_empty() {
+                    format!(
+                        "CreateIndex {} ON {} USING {}",
+                        name,
+                        qualify(db, table),
+                        provider.to_uppercase()
+                    )
+                } else {
+                    format!(
+                        "CreateIndex {} ON {} USING {} ({})",
+                        name,
+                        qualify(db, table),
+                        provider.to_uppercase(),
+                        opts.join(", ")
+                    )
+                }
+            }
+            None => format!("CreateIndex {} ON {}", name, qualify(db, table)),
+        },
         LogicalPlan::DropIndex { db, name, .. } => format!("DropIndex {}", qualify(db, name)),
         LogicalPlan::CreateMaterializedView { db, name, .. } => {
             format!("CreateMaterializedView {}", qualify(db, name))
@@ -6088,6 +6293,19 @@ fn explain_into(
         LogicalPlan::IndexScan {
             db, table, index, ..
         } => format!("IndexScan {} using {}", qualify(db, table), index),
+        LogicalPlan::VectorTopK {
+            db,
+            table,
+            index,
+            metric,
+            k,
+            ..
+        } => format!(
+            "VectorTopK {} using {} ({}, k = {k})",
+            qualify(db, table),
+            index,
+            metric.name()
+        ),
         LogicalPlan::TableFunction {
             source,
             call,

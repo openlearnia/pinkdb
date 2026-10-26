@@ -874,6 +874,77 @@ FROM docs d, q ORDER BY distance LIMIT 5;</code></pre>
   sent. <code>401</code> is not retried; <code>429</code> and
   <code>5xx</code> are retried (three attempts, 250/500 ms). The model is a
   setting, not a second argument.</li>
+
+<h2>Vector search</h2>
+
+<p>Vector similarity search (wave 107b) has two halves. The distance
+functions are <strong>core SQL</strong>, so exact top-k works without an
+extension. The HNSW index is the linked <code>vss</code> extension
+(CLI/server feature <code>vss</code>, off by default). Vectors are
+fixed-length <a href="#array"><code>ARRAY</code></a> columns.</p>
+
+<pre class="code" data-lang="sql"><code>CREATE TABLE docs (id INTEGER, v FLOAT[3]);
+INSERT INTO docs VALUES (1, [1.0, 2.0, 3.0]), (2, [3.0, 2.0, 1.0]);
+
+SELECT id, array_cosine_distance(v, [1.0, 2.0, 2.0]) AS d
+FROM docs ORDER BY d LIMIT 1;
+
+CREATE INDEX docs_vec ON docs USING HNSW (v)
+  WITH (metric = 'l2sq', M = 16, ef_construction = 128, ef_search = 64);
+-- EXPLAIN now shows: VectorTopK main.docs using docs_vec (l2sq, k = 1)
+SET VARIABLE hnsw_ef_search = 128;    -- per session
+SET VARIABLE hnsw_exact = true;       -- force brute force
+CALL hnsw_compact_index('docs', 'docs_vec');
+CALL hnsw_index_stats('docs', 'docs_vec');</code></pre>
+
+<ul>
+  <li><code>array_distance(a, b)</code> / <code>array_l2_distance(a, b)</code>
+  is Euclidean (not squared); <code>array_cosine_distance</code>,
+  <code>array_cosine_similarity</code>, <code>array_inner_product</code> and
+  <code>array_negative_inner_product</code> cover the other metrics. Both
+  arguments must be <code>FLOAT[N]</code>/<code>DOUBLE[N]</code> of the same
+  <code>N</code>; <code>INTEGER</code>/<code>BIGINT</code> arrays are
+  refused. A <code>NULL</code> array gives <code>NULL</code>; a
+  <code>NULL</code> element is an error. <code>DOUBLE</code>/mixed inputs
+  compute in <code>f64</code>; <code>FLOAT</code>/<code>FLOAT</code> computes
+  in <code>f32</code> and returns <code>DOUBLE</code> (pinkdb has no scalar
+  <code>FLOAT</code>; DuckDB returns <code>FLOAT</code>).</li>
+  <li><code>CREATE INDEX … USING HNSW (col) WITH (metric, M, ef_construction,
+  ef_search, M0)</code> defaults to DuckDB vss's <code>l2sq</code>,
+  <code>M = 16</code>, <code>ef_construction = 128</code>,
+  <code>ef_search = 64</code> and <code>M0 = 2*M</code>.
+  <code>metric</code> is <code>'l2sq'</code>, <code>'cosine'</code> or
+  <code>'ip'</code>. A <code>DOUBLE[N]</code> column is narrowed to
+  <code>f32</code> in the graph; exact mode keeps <code>f64</code>.</li>
+  <li>The optimizer rewrites exactly
+  <code>ORDER BY &lt;distance&gt;(col, constant) ASC LIMIT k</code> over a
+  native table's indexed column when the distance function matches the index
+  metric and the dimension matches. <code>DESC</code>, a second sort key, a
+  <code>WHERE</code>, or a metric/dimension/function mismatch falls back to
+  the exact scan + top-k heap, never to a wrong answer. The result is
+  approximate when the index is used; <code>hnsw_exact</code> forces exact.
+  A filtered top-k uses the exact path, so it returns up to <code>k</code>
+  rows (DuckDB's index path may return fewer).</li>
+  <li>Deletes are tombstones, an <code>UPDATE</code> of the vector is
+  delete + insert, and <code>CALL hnsw_compact_index('table', 'index')</code>
+  rebuilds without tombstones. Only native tables are indexed: a lake table,
+  a view, a non-<code>ARRAY</code> column or a second index on the same column
+  is refused by name. Index creation follows the ordinary
+  <code>CREATE INDEX</code> privilege; a read-only MCP <code>query</code>
+  session may run top-k but not create or compact an index.</li>
+  <li>The graph is stored in the <code>.pink</code> file (a new footer
+  section), written at checkpoint and loaded on open when the
+  <code>vss</code> package is available; opening without it leaves the graph
+  opaque and falls back to exact. WAL replay applies inserts, updates and
+  deletes. There is no experimental-persistence setting: the graph rides the
+  ordinary checksummed, atomically replaced store section.</li>
+  <li><strong>Differences from DuckDB vss:</strong> <code>CALL
+  hnsw_compact_index</code> instead of <code>PRAGMA hnsw_compact_index</code>,
+  <code>SET VARIABLE hnsw_exact</code>/<code>hnsw_ef_search</code> instead of
+  <code>SET hnsw_*</code>, persistence always on, <code>DOUBLE[N]</code>
+  columns accepted (narrowed to <code>f32</code>), and a filtered top-k uses
+  the exact path. <code>array_l2_distance</code> is a pinkdb alias;
+  DuckDB 2.0 names the function <code>array_distance</code>.</li>
 </ul>
 
 <h2>Not supported yet</h2>
@@ -895,9 +966,9 @@ FROM docs d, q ORDER BY distance LIMIT 5;</code></pre>
   that references an earlier <code>FROM</code> item, and
   <code>(a, b) IN (SELECT ...)</code> (compare the columns one by one). None of
   them degrades into a generic syntax error.</li>
-  <li><strong>Indexes</strong> (<code>CREATE INDEX</code>), <strong>materialized
-  views</strong> and <strong>stored procedures</strong> are planned
-  (waves 42–44).</li>
+  <li><strong>Indexes</strong> are equality hash indexes and, with the
+  <code>vss</code> feature, HNSW vector indexes; there is no B-tree/range
+  index yet.</li>
   <li><strong>Function packs</strong> — <code>json</code>, <code>string</code>,
   <code>math</code> and <code>datetime</code> as core extensions — are queued.</li>
   <li><strong>File-format extensions</strong> — parquet, Arrow and Iceberg — are

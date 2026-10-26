@@ -138,6 +138,17 @@ pub enum ScalarFunc {
     /// `[a, b, …]` / `array_value(a, b, …)`: build one ARRAY from a row's
     /// scalar arguments. Not strict: a NULL argument is a NULL element.
     ArrayValue,
+    /// `array_distance(a, b)` / `array_l2_distance(a, b)`: Euclidean distance.
+    ArrayDistance,
+    /// `array_cosine_distance(a, b)`: `1 - cosine similarity`.
+    ArrayCosineDistance,
+    /// `array_cosine_similarity(a, b)`.
+    ArrayCosineSimilarity,
+    /// `array_inner_product(a, b)`.
+    ArrayInnerProduct,
+    /// `array_negative_inner_product(a, b)`: the metric an HNSW `ip` index
+    /// sorts by.
+    ArrayNegativeInnerProduct,
 }
 
 impl ScalarFunc {
@@ -178,10 +189,27 @@ impl ScalarFunc {
             "array_value" => ScalarFunc::ArrayValue,
             "array_extract" => ScalarFunc::ArrayExtract,
             "array_length" => ScalarFunc::ArrayLength,
+            "array_distance" | "array_l2_distance" => ScalarFunc::ArrayDistance,
+            "array_cosine_distance" => ScalarFunc::ArrayCosineDistance,
+            "array_cosine_similarity" => ScalarFunc::ArrayCosineSimilarity,
+            "array_inner_product" => ScalarFunc::ArrayInnerProduct,
+            "array_negative_inner_product" => ScalarFunc::ArrayNegativeInnerProduct,
             "like_escape" => ScalarFunc::LikeEscape,
             "similar_to" => ScalarFunc::SimilarTo,
             _ => return None,
         })
+    }
+
+    /// The name DuckDB prints in a distance-function error.
+    pub(crate) fn sql_name(self) -> &'static str {
+        match self {
+            ScalarFunc::ArrayDistance => "array_distance",
+            ScalarFunc::ArrayCosineDistance => "array_cosine_distance",
+            ScalarFunc::ArrayCosineSimilarity => "array_cosine_similarity",
+            ScalarFunc::ArrayInnerProduct => "array_inner_product",
+            ScalarFunc::ArrayNegativeInnerProduct => "array_negative_inner_product",
+            _ => "function",
+        }
     }
 
     /// False for the functions that handle NULLs themselves (they are not
@@ -804,6 +832,13 @@ fn coalesce_common(a: DataType, b: DataType) -> Result<DataType> {
 }
 
 /// Whether `CAST(from AS to)` is allowed in v1.
+fn distance_type_error(func: ScalarFunc) -> PinkDbError {
+    PinkDbError::Type(format!(
+        "{}: Arguments must be arrays of FLOAT or DOUBLE",
+        func.sql_name()
+    ))
+}
+
 /// Element type and length of an ARRAY constructor: the numeric tower over
 /// the argument types (DECIMAL widens to DOUBLE, as in a CAST into a DOUBLE
 /// column) and the argument count. All-NULL arguments have no type to infer.
@@ -3876,6 +3911,35 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
             }
             Ok(DataType::Integer)
         }
+        ScalarFunc::ArrayDistance
+        | ScalarFunc::ArrayCosineDistance
+        | ScalarFunc::ArrayCosineSimilarity
+        | ScalarFunc::ArrayInnerProduct
+        | ScalarFunc::ArrayNegativeInnerProduct => {
+            arity(&[2])?;
+            let (ea, la) = match args[0].dtype() {
+                DataType::Array { elem, len } => (elem, len),
+                _ => return Err(distance_type_error(func)),
+            };
+            let (eb, lb) = match args[1].dtype() {
+                DataType::Array { elem, len } => (elem, len),
+                _ => return Err(distance_type_error(func)),
+            };
+            if !matches!(ea, ArrayElem::Float | ArrayElem::Double)
+                || !matches!(eb, ArrayElem::Float | ArrayElem::Double)
+            {
+                return Err(distance_type_error(func));
+            }
+            if la != lb {
+                return Err(PinkDbError::Type(format!(
+                    "{}: Array arguments must be of the same size",
+                    func.sql_name()
+                )));
+            }
+            // pinkdb has no scalar FLOAT: a FLOAT[N] distance is computed in
+            // f32 and returned widened to DOUBLE.
+            Ok(DataType::Double)
+        }
         // `TRY_CAST(x AS t)`: a NULL instead of an error.
         ScalarFunc::TryCast => {
             arity(&[1])?;
@@ -5276,6 +5340,8 @@ fn bind_tracked_plan(
             table,
             column,
             if_not_exists,
+            using,
+            options,
         } => {
             // Validate table + column exist.
             let target_db = Binder::new(db, default_db).resolve_db(qdb)?;
@@ -5294,14 +5360,54 @@ fn bind_tracked_plan(
                 }
                 0
             };
-            empty(LogicalPlan::CreateIndex {
-                db: Some(target_db),
-                name: name.clone(),
-                table: table.clone(),
-                column: col_idx,
-                column_name: column.clone(),
-                if_not_exists: *if_not_exists,
-            })
+            let provider = using.as_ref().map(|s| s.to_ascii_lowercase());
+            if provider.is_none() && !options.is_empty() {
+                return Err(PinkDbError::Execution(
+                    "CREATE INDEX: WITH (...) needs USING <provider>".to_string(),
+                ));
+            }
+            let mut opts = Vec::with_capacity(options.len());
+            for (key, value) in options {
+                let value = match value {
+                    Expr::Literal(Value::Varchar(s)) => s.clone(),
+                    Expr::Literal(v) => v.to_string(),
+                    _ => {
+                        return Err(PinkDbError::Execution(format!(
+                            "CREATE INDEX: option \"{key}\" must be a literal"
+                        )));
+                    }
+                };
+                if opts
+                    .iter()
+                    .any(|(k, _): &(String, String)| k.eq_ignore_ascii_case(key))
+                {
+                    return Err(PinkDbError::Execution(format!(
+                        "CREATE INDEX: option \"{key}\" is set twice"
+                    )));
+                }
+                opts.push((key.to_ascii_lowercase(), value));
+            }
+            // The provider comes from a package: replay must have loaded it
+            // before this record runs, so the WAL prefix carries the load.
+            let package = provider
+                .as_deref()
+                .and_then(|p| db.package_of_vector_provider(p))
+                .map(|p| p.to_ascii_lowercase())
+                .into_iter()
+                .collect();
+            Ok((
+                LogicalPlan::CreateIndex {
+                    db: Some(target_db),
+                    name: name.clone(),
+                    table: table.clone(),
+                    column: col_idx,
+                    column_name: column.clone(),
+                    if_not_exists: *if_not_exists,
+                    using: provider,
+                    options: opts,
+                },
+                package,
+            ))
         }
         Statement::DropIndex {
             db: qdb,
@@ -5314,8 +5420,12 @@ fn bind_tracked_plan(
             // (`.pink` has no index section). A missing index stays `None`
             // (`IF EXISTS` no-op), and the statement still logs.
             let table = db.list_tables_in(&target_db).into_iter().find(|tbl| {
-                db.table_in(&target_db, tbl)
-                    .is_ok_and(|t| t.indexes.iter().any(|i| i.name == *name))
+                db.table_in(&target_db, tbl).is_ok_and(|t| {
+                    t.indexes.iter().any(|i| i.name == *name)
+                        || t.vector_indexes
+                            .iter()
+                            .any(|i| i.name.eq_ignore_ascii_case(name))
+                })
             });
             empty(LogicalPlan::DropIndex {
                 db: Some(target_db),
@@ -8205,7 +8315,8 @@ pub(crate) fn plan_schema(
         | LogicalPlan::DropRole { .. }
         | LogicalPlan::Grant { .. }
         | LogicalPlan::Revoke { .. } => Ok(Vec::new()),
-        LogicalPlan::IndexScan { db: qdb, table, .. } => {
+        LogicalPlan::IndexScan { db: qdb, table, .. }
+        | LogicalPlan::VectorTopK { db: qdb, table, .. } => {
             let lookup = qdb.as_deref().unwrap_or(default_db);
             db.visible_table_schema(lookup, table)
         }

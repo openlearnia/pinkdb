@@ -154,7 +154,7 @@ fn bitmap_len(n: usize) -> usize {
 }
 
 #[inline]
-fn bit_get(mask: &[u8], idx: usize) -> bool {
+pub(crate) fn bit_get(mask: &[u8], idx: usize) -> bool {
     (mask[idx / 8] >> (idx % 8)) & 1 == 1
 }
 

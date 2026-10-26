@@ -42,6 +42,12 @@ fts-regex = ["fts", "pinkdb-fts/custom-ignore"]
 # a key in the environment. `embed()` is external I/O, so the agent read-only
 # policy refuses it unless the session started with `allow-files`.
 embeddings = ["dep:pinkdb-embeddings"]
+# Opt-in vector similarity search (wave 107b): HNSW indexes over ARRAY
+# columns (`CREATE INDEX … USING HNSW`, top-k `ORDER BY` acceleration).
+# Off by default: a store whose graph is persisted needs the feature to
+# restore and mutate it; without it, opening keeps the bytes pending and any
+# indexed query or write refuses with a clear message.
+vss = ["dep:pinkdb-vss"]
 # Opt-in core arrow extension (wave 71): Arrow IPC (Feather v2) file
 # read/write over arrow-rs — `FROM 'f.arrow'`, `read_arrow('f.arrow')` and
 # `COPY t TO 'f.arrow' (FORMAT arrow)`. Registers the table source and the
@@ -157,6 +163,7 @@ pinkdb-fts = { path = "../../extensions/fts", optional = true }
 # Opt-in embeddings (wave 107c): `embed(text)` through an OpenAI-compatible
 # provider, behind the `embeddings` feature.
 pinkdb-embeddings = { path = "../../extensions/embeddings", optional = true }
+pinkdb-vss = { path = "../../extensions/vss", optional = true }
 # Core arrow extension (opt-in `arrow` feature): Arrow IPC file read/write —
 # the engine-adjacent crate that implements `pinkdb::FileFormat` over the
 # arrow-rs crates (`arrow-array`/`arrow-ipc`/`arrow-schema`, pinned to the

@@ -15,6 +15,115 @@ one-liners below.
   are reasoning models: their hidden reasoning tokens count against the token
   budget and are recorded in `usage` like any other completion tokens.
 
+### Wave 107b — vector similarity search ✅
+- **Distance functions (core SQL).** `array_distance` / `array_l2_distance`
+  (Euclidean, not squared), `array_cosine_distance`,
+  `array_cosine_similarity`, `array_inner_product` and
+  `array_negative_inner_product` over fixed-length `FLOAT[N]`/`DOUBLE[N]`
+  arrays. `DOUBLE`/mixed inputs compute in `f64`, `FLOAT`/`FLOAT` in `f32` and
+  return `DOUBLE` (pinkdb has no scalar `FLOAT`; DuckDB returns `FLOAT`, and
+  the widened values agree). A `NULL` array gives `NULL`; a `NULL` element or
+  mismatched lengths is a clear error, as in DuckDB. The constant query vector
+  is folded once at bind time and broadcast per chunk.
+- **HNSW (`--features vss`).** `extensions/vss` (`pinkdb-vss`) is a linked
+  extension package, off by default, with no new dependency. `CREATE INDEX …
+  USING HNSW (v) WITH (metric = 'l2sq'|'cosine'|'ip', M = 16,
+  ef_construction = 128, ef_search = 64, M0 = 2*M)` builds a deterministic
+  graph: levels come from a seeded, serialized PRNG, so the same insert order
+  (including crash replay) builds the same graph. The optimizer turns exactly
+  `ORDER BY <matching distance>(col, constant) ASC LIMIT k` into a
+  `VectorTopK` index scan shown by `EXPLAIN`; `DESC`, a second key, a `WHERE`,
+  a metric/dimension mismatch or a different function fall back to an exact
+  top-k heap. Results are approximate when the index is used; `SET VARIABLE
+  hnsw_exact = true` forces exact and `SET VARIABLE hnsw_ef_search = N`
+  widens the search.
+- **Mutations and persistence.** Insert, update (delete + insert) and delete
+  are applied to the graph; deletes are tombstones and `CALL
+  hnsw_compact_index('table', 'index')` rebuilds without them. The graph is a
+  `.pink` footer section (new flag `0x100`) written at checkpoint and loaded
+  on open when the `vss` package is available; opening without it keeps the
+  graph opaque and falls back to exact. WAL replay re-applies the statements.
+  No experimental-persistence flag: the graph rides the ordinary checksummed,
+  atomically replaced store section.
+- **Limits.** Native tables only; lake tables, views, non-`ARRAY` columns and
+  a second index on the same column are refused by name. `CREATE INDEX` and
+  `DROP INDEX` use the existing index privilege, and a read-only MCP session
+  can run top-k but not create or compact an index.
+- **Measured (release, clustered Gaussian mixture, 200 queries).**
+  100k × 768: build 94.5 s, graph 318 MB, recall@10 0.522/0.874/0.963 at
+  ef_search 16/64/128, p50 0.53/0.86/1.13 ms versus 17.99 ms brute force.
+  1M × 128: build 867 s, graph 617 MB, recall 0.414/0.740/0.862, p50
+  0.26/0.49/0.76 ms versus 69.6 ms brute force. Exact-mode and the plain
+  `ORDER BY` heap take 15.2 ms and 29.4 ms respectively. The default build's
+  CLI is 5,304,688 bytes, `--features vss` 5,390,816 bytes (+1.6%); TPC-H Q1
+  is unchanged and Q6 is 1.7% slower.
+
+### Wave 107c — the `embeddings` extension: `embed(text)` → `FLOAT[N]` ✅
+- **`extensions/embeddings` = `pinkdb-embeddings`.** `embed(text)` calls an
+  OpenAI-compatible `POST {base_url}` endpoint and returns a `FLOAT[N]`
+  vector, so a table gets its embedding column with `UPDATE docs SET v =
+  embed(body)` and no client glue. The width is
+  `PINKDB_EMBEDDINGS_DIMENSIONS` (default 1024): read when the package is
+  published, sent as the request's `dimensions`, and a provider answering
+  another width is an error that names the variable. **There is no default
+  provider:** `PINKDB_EMBEDDINGS_BASE_URL` (any OpenAI-compatible `/embeddings`
+  URL) and `PINKDB_EMBEDDINGS_MODEL` must both be set, or `embed()` errors
+  before any request. (z.ai's global API, the live-test provider for the
+  agent, answers "Unknown Model" for every embedding model; `embedding-3`
+  lives only on Zhipu's `open.bigmodel.cn`.) The key is only
+  `PINKDB_EMBEDDINGS_API_KEY`: another provider's key (`PINKDB_AGENT_API_KEY`,
+  `Z_API_KEY`) is never sent to the embeddings endpoint. The key is environment-only (no
+  `.env`, no `SET`, no store, WAL, log or `Debug`), a 401 is reported without
+  the provider's body, and a sentinel-key test scans the store's files.
+- **Batching, in the engine.** `HostScalar::batched` (a chunk-at-a-time host
+  scalar; the engine's `eval_dynamic_scalar` calls it once per chunk and
+  checks the row count and dtype) plus the extension's dedupe inside the
+  chunk: 1000 rows with 300 distinct texts make 3 requests at the default 128
+  inputs per request, `NULL`s make none, duplicates cost nothing.
+- **Cache.** A 64 MiB in-process LRU keyed by (base URL, model, dimensions,
+  SHA-256(text)), plus optional content-addressed files under
+  `PINKDB_EMBEDDINGS_CACHE_DIR` written atomically, so a second query makes
+  no request and the cache survives a restart. Nothing is written into the
+  user's store from a `SELECT`.
+- **Not WAL-volatile; a replay memo instead.** `embed()` is opaque to the
+  planner (never constant-folded, never evaluated at bind or optimize,
+  `WHERE false` makes no call) and is *not* declared volatile in the sense
+  that refuses WAL-logged statements: that guard would refuse `UPDATE … SET v
+  = embed(body)`, the function's whole use. Instead a logged statement's
+  record carries a **replay memo** — every `external_io` host-scalar
+  `(name, arguments) → result`, deduplicated, in a new trailing payload
+  section (WAL format v5; older builds refuse the file with the usual version
+  message, and no converter is kept). Replay answers from the memo and never
+  invokes the function, so a crash-replay needs neither a key nor the
+  provider and cannot diverge from the first run; a miss is a hard error
+  naming the function. Price, measured: 1,000 rows at 1024 dimensions add
+  4 133 005 bytes (4.0 KiB per distinct text) to the record — a wide
+  backfill should be checkpointed.
+- **Policy at the call site.** `HostScalar::external_io()` also rides in the
+  executor: with `allow-files` off, a call is refused with the same
+  `SERVICES_HINT` permission error *before any request*, however it is
+  reached — a batch whose `SELECT` cannot bind at check time, a macro, a
+  view, a trigger action, or a `CALL`/`DO` body. The bind-time check stays as
+  the early, friendlier error, and `PinkDbError::Permission` keeps the kind
+  for the client. Retries: 3 attempts with 250/500 ms backoff on 429/5xx,
+  `PINKDB_EMBEDDINGS_TIMEOUT_MS` (default 30 s) per request.
+- **Tests.** 19 engine tests against a recorded loopback provider (request
+  shape, batching counts, cache across a process, dimension mismatch, NULL,
+  429→success, 401, timeout, key order, missing key, EXPLAIN/`WHERE false`
+  without calls, replay from the WAL memo with the provider stopped and the
+  key unset, a two-statement transaction's memo, a provider that answers
+  differently the second time, the execution-time policy for a batch, a
+  macro, a view, a trigger and a `DO` block, the store/WAL sentinel scan, the
+  policy both ways and an insert → `UPDATE` → brute-force top-k pipeline),
+  4 CLI tests (the feature loads without `LOAD EXTENSION`; the persistent
+  cache answers a second process; a replay answers offline from a fresh
+  cache; the sentinel is absent from the store; the 1024-wide memo size) and
+  one `#[ignore]`d live test gated on `PINKDB_EMBEDDINGS_LIVE=1`.
+- **Cost.** Off by default; no new dependencies (ureq 3.4 + rustls and sha2
+  were already in the lock file; the lock only gains the workspace crate).
+  Release binaries: `pinkdb` 5 208 656 → 7 252 992 B (+2 044 336 B, +39.2%),
+  `pinkdb-server` 4 821 232 → 6 845 456 B (+2 024 224 B, +42.0%).
+
 ## 2026-10-25
 ### Wave 107a — the fixed-size `ARRAY` type ✅
 - **The type.** A column can now be `FLOAT[N]`/`REAL[N]`, `DOUBLE[N]`,
@@ -86,72 +195,6 @@ one-liners below.
   takes the same path as before. Release binaries: `pinkdb` 5 073 744 →
   5 129 344 bytes (+1.10%), `pinkdb-server` 4 686 080 → 4 761 344 (+1.61%).
   No new dependencies.
-
-### Wave 107c — the `embeddings` extension: `embed(text)` → `FLOAT[N]` ✅
-- **`extensions/embeddings` = `pinkdb-embeddings`.** `embed(text)` calls an
-  OpenAI-compatible `POST {base_url}` endpoint and returns a `FLOAT[N]`
-  vector, so a table gets its embedding column with `UPDATE docs SET v =
-  embed(body)` and no client glue. The width is
-  `PINKDB_EMBEDDINGS_DIMENSIONS` (default 1024): read when the package is
-  published, sent as the request's `dimensions`, and a provider answering
-  another width is an error that names the variable. **There is no default
-  provider:** `PINKDB_EMBEDDINGS_BASE_URL` (any OpenAI-compatible `/embeddings`
-  URL) and `PINKDB_EMBEDDINGS_MODEL` must both be set, or `embed()` errors
-  before any request. (z.ai's global API, the live-test provider for the
-  agent, answers "Unknown Model" for every embedding model; `embedding-3`
-  lives only on Zhipu's `open.bigmodel.cn`.) The key is only
-  `PINKDB_EMBEDDINGS_API_KEY`: another provider's key (`PINKDB_AGENT_API_KEY`,
-  `Z_API_KEY`) is never sent to the embeddings endpoint. The key is environment-only (no
-  `.env`, no `SET`, no store, WAL, log or `Debug`), a 401 is reported without
-  the provider's body, and a sentinel-key test scans the store's files.
-- **Batching, in the engine.** `HostScalar::batched` (a chunk-at-a-time host
-  scalar; the engine's `eval_dynamic_scalar` calls it once per chunk and
-  checks the row count and dtype) plus the extension's dedupe inside the
-  chunk: 1000 rows with 300 distinct texts make 3 requests at the default 128
-  inputs per request, `NULL`s make none, duplicates cost nothing.
-- **Cache.** A 64 MiB in-process LRU keyed by (base URL, model, dimensions,
-  SHA-256(text)), plus optional content-addressed files under
-  `PINKDB_EMBEDDINGS_CACHE_DIR` written atomically, so a second query makes
-  no request and the cache survives a restart. Nothing is written into the
-  user's store from a `SELECT`.
-- **Not WAL-volatile; a replay memo instead.** `embed()` is opaque to the
-  planner (never constant-folded, never evaluated at bind or optimize,
-  `WHERE false` makes no call) and is *not* declared volatile in the sense
-  that refuses WAL-logged statements: that guard would refuse `UPDATE … SET v
-  = embed(body)`, the function's whole use. Instead a logged statement's
-  record carries a **replay memo** — every `external_io` host-scalar
-  `(name, arguments) → result`, deduplicated, in a new trailing payload
-  section (WAL format v5; older builds refuse the file with the usual version
-  message, and no converter is kept). Replay answers from the memo and never
-  invokes the function, so a crash-replay needs neither a key nor the
-  provider and cannot diverge from the first run; a miss is a hard error
-  naming the function. Price, measured: 1,000 rows at 1024 dimensions add
-  4 133 005 bytes (4.0 KiB per distinct text) to the record — a wide
-  backfill should be checkpointed.
-- **Policy at the call site.** `HostScalar::external_io()` also rides in the
-  executor: with `allow-files` off, a call is refused with the same
-  `SERVICES_HINT` permission error *before any request*, however it is
-  reached — a batch whose `SELECT` cannot bind at check time, a macro, a
-  view, a trigger action, or a `CALL`/`DO` body. The bind-time check stays as
-  the early, friendlier error, and `PinkDbError::Permission` keeps the kind
-  for the client. Retries: 3 attempts with 250/500 ms backoff on 429/5xx,
-  `PINKDB_EMBEDDINGS_TIMEOUT_MS` (default 30 s) per request.
-- **Tests.** 19 engine tests against a recorded loopback provider (request
-  shape, batching counts, cache across a process, dimension mismatch, NULL,
-  429→success, 401, timeout, key order, missing key, EXPLAIN/`WHERE false`
-  without calls, replay from the WAL memo with the provider stopped and the
-  key unset, a two-statement transaction's memo, a provider that answers
-  differently the second time, the execution-time policy for a batch, a
-  macro, a view, a trigger and a `DO` block, the store/WAL sentinel scan, the
-  policy both ways and an insert → `UPDATE` → brute-force top-k pipeline),
-  4 CLI tests (the feature loads without `LOAD EXTENSION`; the persistent
-  cache answers a second process; a replay answers offline from a fresh
-  cache; the sentinel is absent from the store; the 1024-wide memo size) and
-  one `#[ignore]`d live test gated on `PINKDB_EMBEDDINGS_LIVE=1`.
-- **Cost.** Off by default; no new dependencies (ureq 3.4 + rustls and sha2
-  were already in the lock file; the lock only gains the workspace crate).
-  Release binaries: `pinkdb` 5 208 656 → 7 252 992 B (+2 044 336 B, +39.2%),
-  `pinkdb-server` 4 821 232 → 6 845 456 B (+2 024 224 B, +42.0%).
 
 ### Wave 108a — full-text search: a BM25 index with DuckDB-fts parity ✅
 - **`extensions/fts` = `pinkdb-fts`.** DuckDB's `fts` surface over pinkdb

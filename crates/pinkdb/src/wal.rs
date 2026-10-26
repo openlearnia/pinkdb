@@ -3996,6 +3996,10 @@ impl PinkDb {
         // (see `PinkDb::resolve_replay_extension`), never auto-loaded.
         db.allow_extension_replay = opts.allow_extension_replay;
         db.extension_root = opts.extension_root.clone();
+        // A checkpointed vector graph is inert until its provider is loaded;
+        // replay of the WAL above must find it. Activate the registered
+        // (linked-in) package before replaying, never a file the store names.
+        db.hydrate_registered_vector_packages()?;
         // When the live WAL is missing or torn, continue the generation
         // sequence past every roll (recovery has already recreated the file
         // with this generation when that was needed).
@@ -4200,6 +4204,7 @@ impl PinkDb {
         let (records, end) = if full {
             let other = self.load_checkpoint_for_refresh(&key, &ckpt)?;
             self.adopt(other);
+            self.hydrate_pending_vector_indexes()?;
             wal.reopen_under_lease(&key)?
         } else {
             match wal.scan_increment()? {
@@ -4209,6 +4214,7 @@ impl PinkDb {
                     // (only possible outside the protocol) — rebuild.
                     let other = self.load_checkpoint_for_refresh(&key, &ckpt)?;
                     self.adopt(other);
+                    self.hydrate_pending_vector_indexes()?;
                     let x = wal.reopen_under_lease(&key)?;
                     mutated = true;
                     x

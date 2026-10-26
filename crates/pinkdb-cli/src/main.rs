@@ -149,6 +149,10 @@ fn register_builtin_extensions() {
     if let Err(e) = pinkdb_embeddings::ensure_registered() {
         eprintln!("warning: the embeddings extension could not be registered: {e}");
     }
+    #[cfg(feature = "vss")]
+    if let Err(e) = pinkdb_vss::ensure_registered() {
+        eprintln!("warning: the vss extension could not be registered: {e}");
+    }
     // The arrow and parquet extensions are engine-adjacent, not scalar
     // extensions: they register their file surfaces process-wide, before any
     // store is created, so a durable `.open` can resolve file sources while
@@ -204,6 +208,12 @@ fn load_builtin_extensions(#[allow(unused_variables)] db: &mut PinkDb) {
         && let Err(e) = db.load_extension_package(pinkdb_embeddings::EXTENSION_NAME)
     {
         eprintln!("warning: the embeddings extension could not be loaded: {e}");
+    }
+    #[cfg(feature = "vss")]
+    if !db.is_extension_loaded(pinkdb_vss::EXTENSION_NAME)
+        && let Err(e) = db.load_extension_package(pinkdb_vss::EXTENSION_NAME)
+    {
+        eprintln!("warning: the vss extension could not be loaded: {e}");
     }
 }
 

@@ -1,0 +1,24 @@
+[package]
+name = "pinkdb-vss"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb vector similarity search extension: HNSW indexes for ARRAY columns (wave 107b)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "pinkdb_vss"
+
+[dependencies]
+# The engine. The HNSW graph is attached through the engine's vector-index
+# provider hook (wave 107b): `CREATE INDEX … USING HNSW` resolves it and the
+# engine serializes the graph into `.pink`.
+pinkdb = { path = "../../crates/pinkdb" }
+
+[dev-dependencies]
+pinkdb = { path = "../../crates/pinkdb" }
+
+[[example]]
+name = "bench_vector"
+required-features = []

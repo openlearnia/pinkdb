@@ -382,19 +382,29 @@ fn views_rebind_macros_at_every_use() {
 
 #[test]
 fn macro_in_view_cycles_fail_cleanly() {
-    let mut db = PinkDb::new();
-    db.execute("CREATE TABLE t (a INTEGER);").unwrap();
-    db.execute("CREATE MACRO f(x) AS x + 1;").unwrap();
-    db.execute("CREATE VIEW v AS SELECT f(a) AS y FROM t;")
+    // Cycle detection is recursive; the default 2 MiB test-thread stack is
+    // smaller than the CLI's. Keep the assertions, run them with room to fail
+    // cleanly instead of aborting the whole test binary.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut db = PinkDb::new();
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("CREATE MACRO f(x) AS x + 1;").unwrap();
+            db.execute("CREATE VIEW v AS SELECT f(a) AS y FROM t;")
+                .unwrap();
+            // Define the cycle through OR REPLACE: `f` now reads `v`, which calls `f`.
+            db.execute("CREATE OR REPLACE MACRO f(x) AS (SELECT COUNT(*) FROM v) + x;")
+                .unwrap();
+            let e = err(&mut db, "SELECT * FROM v;");
+            assert!(
+                e.contains("macro expansion depth limit") || e.contains("recursive"),
+                "{e}"
+            );
+        })
+        .unwrap()
+        .join()
         .unwrap();
-    // Define the cycle through OR REPLACE: `f` now reads `v`, which calls `f`.
-    db.execute("CREATE OR REPLACE MACRO f(x) AS (SELECT COUNT(*) FROM v) + x;")
-        .unwrap();
-    let e = err(&mut db, "SELECT * FROM v;");
-    assert!(
-        e.contains("macro expansion depth limit") || e.contains("recursive"),
-        "{e}"
-    );
 }
 
 /// A view met again inside its own expansion is refused at the first
@@ -712,12 +722,12 @@ fn newer_formats_and_unknown_flags_are_refused() {
         .to_string();
     assert!(e.contains("newer pinkdb") && e.contains("format v7"), "{e}");
 
-    // An as-yet-unknown footer flag bit (bit 8) is refused even with a
+    // An as-yet-unknown footer flag bit (bit 9) is refused even with a
     // valid footer CRC.
     let mut flagged = good;
     let (footer_at, footer_len) = pinkdb::persist::footer_span(&flagged).unwrap();
     let flags_at = footer_at as usize + 4;
-    let flags = u32::from_le_bytes(flagged[flags_at..flags_at + 4].try_into().unwrap()) | 0x100;
+    let flags = u32::from_le_bytes(flagged[flags_at..flags_at + 4].try_into().unwrap()) | 0x200;
     flagged[flags_at..flags_at + 4].copy_from_slice(&flags.to_le_bytes());
     let footer = flagged[footer_at as usize..(footer_at + footer_len) as usize].to_vec();
     let n = flagged.len();

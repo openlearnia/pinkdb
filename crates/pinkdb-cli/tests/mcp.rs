@@ -425,6 +425,40 @@ fn full_text_search_reads_but_index_creation_is_refused() {
     assert!(text.contains("| 2 |"), "{text}");
 }
 
+/// Wave 107b: an HNSW top-k is a read, so the read-only `query` tool may use
+/// it; creating or compacting an index writes and is refused.
+#[cfg(feature = "vss")]
+#[test]
+fn vector_topk_reads_but_index_creation_is_refused() {
+    let fixture = Fixture::new(
+        "vss",
+        "CREATE TABLE items (id INTEGER, v FLOAT[4]);\n\
+         INSERT INTO items VALUES (1, [0.0, 1.0, 0.0, 0.0]), (2, [1.0, 0.0, 0.0, 0.0]);\n\
+         CREATE INDEX items_vec ON items USING HNSW (v) WITH (metric = 'l2sq');\n",
+    );
+    let mut client = fixture.client();
+    client.initialize();
+    let (is_error, text) = client.query(
+        "SELECT id FROM items ORDER BY array_distance(v, CAST([0.0, 0.0, 0.0, 0.0] AS FLOAT[4])) LIMIT 1",
+    );
+    assert!(!is_error, "{text}");
+    assert!(text.contains("| 1 |"), "{text}");
+    for sql in [
+        "CREATE INDEX other ON items USING HNSW (v)",
+        "CALL hnsw_compact_index('items', 'items_vec')",
+    ] {
+        let (is_error, text) = client.query(sql);
+        assert!(is_error, "{sql} must be refused: {text}");
+        assert!(text.contains("read-only"), "{sql}: {text}");
+    }
+    // The refused calls left the index in place.
+    let (is_error, text) = client.query(
+        "SELECT id FROM items ORDER BY array_distance(v, CAST([1.0, 0.0, 0.0, 0.0] AS FLOAT[4])) LIMIT 1",
+    );
+    assert!(!is_error, "{text}");
+    assert!(text.contains("| 2 |"), "{text}");
+}
+
 /// Reading files and URLs is its own switch: `allow-writes` does not imply
 /// it, and the default session must not open anything a prompt injection
 /// names. The default build registers no file source, so with the switch the

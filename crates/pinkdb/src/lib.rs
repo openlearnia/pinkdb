@@ -44,6 +44,7 @@ pub mod catalog_image;
 pub mod crypto;
 pub mod csv;
 pub mod db;
+pub mod distance;
 pub mod exec;
 mod ext;
 /// Registered file formats (wave 71): the engine half of the first-party
@@ -95,6 +96,7 @@ pub mod types;
 pub mod variant;
 pub mod variant_shred;
 pub mod vector;
+pub mod vector_index;
 pub mod wal;
 
 pub use attached::{

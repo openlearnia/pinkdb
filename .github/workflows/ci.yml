@@ -131,6 +131,13 @@ jobs:
               cargo test -p pinkdb-server --features ui
               cargo test -p pinkdb-server --features ui,tls
               ! cargo tree -p pinkdb-server | grep -q tokio
+          - name: vss
+            run: |
+              cargo test -p pinkdb-vss
+              cargo test -p pinkdb-cli --features vss
+              cargo test -p pinkdb-server --features vss
+              # The HNSW index is opt-in; the default binary must not link it.
+              ! cargo tree -p pinkdb-cli -e normal | grep -q pinkdb-vss
           - name: fts
             run: |
               cargo test -p pinkdb-fts

@@ -1528,14 +1528,29 @@ pub(crate) fn wal_statement_text(plan: &LogicalPlan, sql: &str) -> String {
             table,
             column_name,
             if_not_exists,
+            using,
+            options,
             ..
-        } => format!(
-            "CREATE INDEX {}{} ON {}({})",
-            if *if_not_exists { "IF NOT EXISTS " } else { "" },
-            quote_ident(name),
-            qualified_ident(db, table),
-            quote_ident(column_name)
-        ),
+        } => {
+            let mut out = format!(
+                "CREATE INDEX {}{} ON {}({})",
+                if *if_not_exists { "IF NOT EXISTS " } else { "" },
+                quote_ident(name),
+                qualified_ident(db, table),
+                quote_ident(column_name)
+            );
+            if let Some(provider) = using {
+                out.push_str(&format!(" USING {provider}"));
+                if !options.is_empty() {
+                    let opts: Vec<String> = options
+                        .iter()
+                        .map(|(k, v)| format!("{k} = '{}'", v.replace('\'', "''")))
+                        .collect();
+                    out.push_str(&format!(" WITH ({})", opts.join(", ")));
+                }
+            }
+            out
+        }
         LogicalPlan::DropIndex {
             db,
             name,
@@ -1761,6 +1776,8 @@ mod tests {
             column: 0,
             column_name: "a\"b".to_string(),
             if_not_exists: true,
+            using: None,
+            options: Vec::new(),
         };
         assert_eq!(
             wal_statement_text(&create, "CREATE INDEX IF NOT EXISTS select ON t(a);"),
