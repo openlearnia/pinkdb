@@ -353,6 +353,79 @@ fn eval_dynamic_scalar(
     Ok(out)
 }
 
+/// Evaluate every uncorrelated subquery of `exprs` once, on this thread.
+///
+/// A subquery body runs its own plan on the same worker pool. An operator must
+/// therefore fill the memo for the subqueries its chunks share *before* it fans
+/// them out: a worker that waits on a lock another worker holds, while that
+/// worker waits for a pool job, deadlocks — the per-key flight lock wave 111ab
+/// shipped did exactly that wherever the subquery was not in a filter. After
+/// this call `Cx::memoized` only reads; its miss path computes without waiting,
+/// so it is a fallback, never a rendezvous.
+pub(crate) fn prime<'e>(cx: &Cx, exprs: impl IntoIterator<Item = &'e BoundExpr>) -> Result<()> {
+    for expr in exprs {
+        let mut out = Ok(());
+        crate::sql::binder::walk_bound_expr(expr, &mut |e| {
+            if out.is_err() {
+                return;
+            }
+            out = prime_one(cx, e);
+        });
+        out?;
+    }
+    Ok(())
+}
+
+/// Fill the memo for one expression node, if it is an uncorrelated subquery.
+/// A correlated body depends on the outer row, so it is never memoised and is
+/// left to [`eval_correlated`].
+fn prime_one(cx: &Cx, e: &BoundExpr) -> Result<()> {
+    match e {
+        BoundExpr::ScalarSubquery { query, outer, .. } if outer.refs.is_empty() => {
+            prime_memo(cx, memo_key(query), || {
+                Ok(Memo::Scalar(scalar_value(query, cx)?))
+            })
+        }
+        BoundExpr::Exists { query, outer, .. } if outer.refs.is_empty() => {
+            prime_memo(cx, memo_key(query), || {
+                Ok(Memo::Flag(exists_body(query, cx)?))
+            })
+        }
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            op,
+            outer,
+            ..
+        } if outer.refs.is_empty() => {
+            let key = memo_key(query);
+            if *op == BinaryOp::Eq {
+                prime_memo(cx, key, || {
+                    let out = eval(cx, query)?;
+                    let (set, has_null, common) = in_set(&out, expr.dtype())?;
+                    Ok(Memo::Set(std::sync::Arc::new(set), has_null, common))
+                })
+            } else {
+                prime_memo(cx, key, || {
+                    let out = eval(cx, query)?;
+                    let (lo, hi, has_null) = extremes(&out)?;
+                    Ok(Memo::Extremes(lo, hi, has_null))
+                })
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn prime_memo(cx: &Cx, key: usize, f: impl FnOnce() -> Result<Memo>) -> Result<()> {
+    if cx.memo.lock().expect("memo").contains_key(&key) {
+        return Ok(());
+    }
+    let m = f()?;
+    cx.memo.lock().expect("memo").entry(key).or_insert(m);
+    Ok(())
+}
+
 fn memo_key(query: &crate::plan::LogicalPlan) -> usize {
     (query as *const crate::plan::LogicalPlan) as usize
 }
@@ -368,27 +441,26 @@ fn eval_scalar_subquery(
 ) -> Result<Vector> {
     if outer.refs.is_empty() {
         let key = memo_key(query);
-        if let Some(Memo::Scalar(v)) = cx.memo.lock().expect("memo").get(&key) {
-            return const_vector(v.clone(), chunk.num_rows());
-        }
-        let v = scalar_body(query, dtype, chunk, cx)?;
-        cx.memo
-            .lock()
-            .expect("memo")
-            .insert(key, Memo::Scalar(v.0.clone()));
-        return Ok(v.1);
+        let v = cx.memoized(key, || Ok(Memo::Scalar(scalar_value(query, cx)?)))?;
+        let Memo::Scalar(v) = v else {
+            unreachable!("a memo key names one subquery kind")
+        };
+        return const_vector(v, chunk.num_rows());
     }
     eval_correlated(outer, dtype, chunk, cx, |cx, chunk| {
-        Ok(scalar_body(query, dtype, chunk, cx)?.1)
+        let value = scalar_value(query, cx)?;
+        if matches!(value, Value::Null) {
+            // Zero rows: keep the column's type, so the enclosing expression's
+            // arithmetic and comparison stay typed.
+            Ok(null_vector(dtype, chunk.num_rows()))
+        } else {
+            const_vector(value, chunk.num_rows())
+        }
     })
 }
 
-fn scalar_body(
-    query: &crate::plan::LogicalPlan,
-    dtype: DataType,
-    chunk: &DataChunk,
-    cx: &Cx,
-) -> Result<(Value, Vector)> {
+/// A scalar subquery's value: 0 rows → NULL, 1 row → the value, else error.
+fn scalar_value(query: &crate::plan::LogicalPlan, cx: &Cx) -> Result<Value> {
     let out = eval(cx, query)?;
     let mut rows = 0usize;
     let mut value = Value::Null;
@@ -406,14 +478,7 @@ fn scalar_body(
             value = col.get(i);
         }
     }
-    let column = if matches!(value, Value::Null) {
-        // Zero rows (or a NULL value): keep the column's type, so the
-        // enclosing expression's arithmetic and comparison stay typed.
-        null_vector(dtype, chunk.num_rows())
-    } else {
-        const_vector(value.clone(), chunk.num_rows())?
-    };
-    Ok((value, column))
+    Ok(value)
 }
 
 /// Evaluate a subquery expression once per chunk row, with that row's
@@ -471,26 +536,22 @@ fn eval_in_subquery(
         if outer.refs.is_empty() {
             let key = memo_key(query);
             let l = eval_expr(lhs, chunk, cx)?;
-            // Hit path borrows the set (no clone); the borrow ends at return.
-            if let Some(Memo::Set(set, has_null, common)) = cx.memo.lock().expect("memo").get(&key)
-            {
-                return probe_in(&l, set, *has_null, *common, negated);
-            }
-            let out = eval(cx, query)?;
-            let (set, has_null, common) = in_set(&out, &l)?;
-            let result = probe_in(&l, &set, has_null, common, negated)?;
-            cx.memo
-                .lock()
-                .expect("memo")
-                .insert(key, Memo::Set(set, has_null, common));
-            return Ok(result);
+            let memo = cx.memoized(key, || {
+                let out = eval(cx, query)?;
+                let (set, has_null, common) = in_set(&out, lhs.dtype())?;
+                Ok(Memo::Set(std::sync::Arc::new(set), has_null, common))
+            })?;
+            let Memo::Set(set, has_null, common) = memo else {
+                unreachable!("a memo key names one subquery kind")
+            };
+            return probe_in(&l, &set, has_null, common, negated);
         }
         // A correlated set differs per row, so it can neither be memorised nor
         // shared: build it inside the row's own evaluation.
         return eval_correlated(outer, DataType::Boolean, chunk, cx, |cx, chunk| {
             let l = eval_expr(lhs, chunk, cx)?;
             let out = eval(cx, query)?;
-            let (set, has_null, common) = in_set(&out, &l)?;
+            let (set, has_null, common) = in_set(&out, lhs.dtype())?;
             probe_in(&l, &set, has_null, common, negated)
         });
     }
@@ -499,35 +560,15 @@ fn eval_in_subquery(
     // `max(s)`. So the whole set collapses to its extremes.
     if outer.refs.is_empty() {
         let key = memo_key(query);
-        if let Some(Memo::Extremes(lo, hi, has_null)) = cx.memo.lock().expect("memo").get(&key) {
-            return probe_any(
-                lhs,
-                op,
-                lo.clone(),
-                hi.clone(),
-                *has_null,
-                negated,
-                chunk,
-                cx,
-            );
-        }
-        let out = eval(cx, query)?;
-        let (lo, hi, has_null) = extremes(&out)?;
-        let result = probe_any(
-            lhs,
-            op,
-            lo.clone(),
-            hi.clone(),
-            has_null,
-            negated,
-            chunk,
-            cx,
-        )?;
-        cx.memo
-            .lock()
-            .expect("memo")
-            .insert(key, Memo::Extremes(lo, hi, has_null));
-        return Ok(result);
+        let memo = cx.memoized(key, || {
+            let out = eval(cx, query)?;
+            let (lo, hi, has_null) = extremes(&out)?;
+            Ok(Memo::Extremes(lo, hi, has_null))
+        })?;
+        let Memo::Extremes(lo, hi, has_null) = memo else {
+            unreachable!("a memo key names one subquery kind")
+        };
+        return probe_any(lhs, op, lo, hi, has_null, negated, chunk, cx);
     }
     eval_correlated(outer, DataType::Boolean, chunk, cx, |cx, chunk| {
         let out = eval(cx, query)?;
@@ -646,10 +687,10 @@ fn probe_any(
 /// noted, never stored), and the type both sides compare at.
 fn in_set(
     out: &crate::exec::Output,
-    l: &Vector,
+    lhs: DataType,
 ) -> Result<(FastSet<Vec<u8>>, bool, Option<DataType>)> {
     let rhs_t = out.types.first().copied().unwrap_or(DataType::Integer);
-    let common = common_numeric(l.dtype(), rhs_t).ok();
+    let common = common_numeric(lhs, rhs_t).ok();
     // Reserve the whole result up front: a large IN set (one entry per row)
     // otherwise rehashes ~log2(n) times while the filter scans the outer side.
     let rows: usize = out.chunks.iter().map(|c| c.num_rows()).sum();
@@ -729,11 +770,10 @@ fn eval_exists(
 ) -> Result<Vector> {
     if outer.refs.is_empty() {
         let key = memo_key(query);
-        if let Some(Memo::Flag(b)) = cx.memo.lock().expect("memo").get(&key) {
-            return const_vector(Value::Boolean(*b != negated), chunk.num_rows());
-        }
-        let any = exists_body(query, cx)?;
-        cx.memo.lock().expect("memo").insert(key, Memo::Flag(any));
+        let memo = cx.memoized(key, || Ok(Memo::Flag(exists_body(query, cx)?)))?;
+        let Memo::Flag(any) = memo else {
+            unreachable!("a memo key names one subquery kind")
+        };
         return const_vector(Value::Boolean(any != negated), chunk.num_rows());
     }
     eval_correlated(outer, DataType::Boolean, chunk, cx, |cx, chunk| {

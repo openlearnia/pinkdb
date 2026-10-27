@@ -135,3 +135,49 @@ fn an_outer_joins_preserved_side_condition_keeps_every_preserved_row() {
         ]
     );
 }
+
+/// The FROM order may cross: here `s` has no equality to `r`, its neighbour.
+/// Cost-based ordering picks the join order, and the answer must be the one
+/// the explicit order gives.
+#[test]
+fn a_reordered_chain_returns_the_same_rows() {
+    let mut db = db();
+    for stmt in [
+        "CREATE TABLE s (k INTEGER, w INTEGER);",
+        "INSERT INTO s VALUES (1,100),(2,200),(4,400);",
+    ] {
+        db.execute(stmt).unwrap();
+    }
+    let comma = "SELECT count(*), sum(l.q), sum(s.w) FROM r, s, l WHERE l.k = r.k AND r.k = s.k";
+    let explicit =
+        "SELECT count(*), sum(l.q), sum(s.w) FROM l JOIN r ON l.k = r.k JOIN s ON r.k = s.k";
+    assert_eq!(rows(&mut db, comma), rows(&mut db, explicit));
+    assert_eq!(
+        rows(&mut db, comma),
+        vec![vec![
+            Value::Bigint(2),
+            Value::Bigint(30),
+            Value::Bigint(300)
+        ]]
+    );
+    // Every neighbouring pair has an equality, so nothing stays a cross join.
+    assert!(!explain(&mut db, comma).contains("cross"));
+}
+
+/// A predicate that is one `OR` over join conditions derives per-column facts
+/// (the `l.q >= 10` bound is the union of the branches). Deriving once and
+/// leaving the `OR` above the join must not re-derive and push forever.
+#[test]
+fn an_or_over_join_conditions_derives_filters_without_looping() {
+    let mut db = db();
+    let got = rows(
+        &mut db,
+        "SELECT count(*) FROM l, r WHERE (l.k = r.k AND l.q >= 20) OR (l.k = r.k AND l.q >= 10)",
+    );
+    assert_eq!(got, vec![vec![Value::Bigint(2)]]);
+    let plan = explain(
+        &mut db,
+        "SELECT l.k FROM l, r WHERE (l.k = r.k AND l.q >= 20) OR (l.k = r.k AND l.q >= 10)",
+    );
+    assert!(plan.contains("Join inner on [#0=#0]"), "{plan}");
+}

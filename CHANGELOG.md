@@ -9,6 +9,47 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-27
+### Wave 111ab — query planning and execution tuning ✅
+
+Two roadmap rows in one wave: cost-based join ordering (111a) and the
+execution/subquery paths (111b). No SQL syntax was added and every TPC-H
+answer is row-for-row DuckDB's.
+
+- **The planner orders comma chains by cost now.** A query graph over the
+  chain's equality edges, cardinalities from base row counts plus predicate
+  selectivities (0.2 per equality or `IN` value capped at one, 0.5 per range;
+  no histograms), a subset DP up to twelve relations and a greedy path above,
+  anchored at the FROM clause's first relation. The restore projection keeps
+  the output column order, and predicates that span the chain's boundary stay
+  above it. Q7 SF 1 1.25 s → 246 ms.
+- **`OR` predicates filter through.** A lone `OR`, or an `OR` of conjunctions
+  with `IN` lists inside the branches, now derives per-column `IN`/range
+  filters that reach the scans, with the *union* bound across branches (the
+  old code kept the tighter bound, which is only valid for an intersection).
+  Q19 SF 1 3.86 s → 112 ms.
+- **Uncorrelated subqueries run once, and nothing waits.** The memo stores the
+  `IN` set behind an `Arc`, and every operator fills it for the subqueries of
+  an expression *before* its chunks fan out, so no thread holds or waits on a
+  lock while a parallel evaluation is pending. That is the review fix for the
+  first version's deadlock (a per-key flight lock held across the body's own
+  evaluation, which starved the worker pool whenever the subquery sat outside
+  a filter) and for wave 120's Q20 hang — 30 runs of the reviewer's repro, 0
+  hangs. Q18 5.5 s → 1.45 s, Q20 4.9 s → 0.61 s, Q21 10.4 s → 2.25 s, Q22
+  680 → 166 ms at SF 1.
+- **Measured.** TPC-H SF 1 geometric mean **38.5× → 21.8×** DuckDB (30.3 s →
+  8.0 s of pinkdb time); SF 0.1 **9.5× → 6.5×**. Q9 (57 → 60 ms at SF 0.1) is
+  within the run-to-run spread and Q5 is 31 → 31 ms (it measured 35 ms mid-wave
+  and recovered with the review fix); both are recorded rather than hidden. The
+  default CLI grew 37.8 kB (+0.68 %) with no new dependencies.
+- **What is left** is written down as follow-ups: parallelising the aggregate
+  merge (Q18's remaining 1.4 s), a delim join sharing the decorrelated key
+  side (Q21), selection-vector join output, perfect-hash aggregation, and
+  Parquet decode throughput. All 22 TPC-H queries still match DuckDB's rows at
+  SF 0.01 and 0.1; `bench/duckdiff.py` is green.
+
+Design, defaults and the before/after tables are in
+`docs/wave-111ab-plan.md` and `docs/benchmarks.md`.
+
 ### Wave 120 — correlated subqueries ✅
 
 A subquery can now read the row around it, which is the last thing that kept

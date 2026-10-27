@@ -86,9 +86,12 @@ def sh(
             cwd=str(cwd),
         )
     except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(
-            args, 124, exc.stdout or "", exc.stderr or ""
-        )
+        # The timeout payload is bytes even with text=True, and callers
+        # concatenate it with str.
+        def text(x):
+            return x.decode("utf-8", "replace") if isinstance(x, bytes) else (x or "")
+
+        return subprocess.CompletedProcess(args, 124, text(exc.stdout), text(exc.stderr))
 
 
 def timer_values(out: str) -> list[float]:

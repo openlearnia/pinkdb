@@ -478,11 +478,9 @@ pub(crate) fn output_from_rows(
 /// Per-statement execution context: the database, visible CTE outputs
 /// (CTEs shadow catalog tables), memoised subquery results keyed by
 /// plan-node address (the tree is immutable during execution, so a memo hit
-/// skips the work; under `par_iter` two chunks racing on the same first probe
-/// may both evaluate one uncorrelated subquery — redundant, but the result is
-/// still correct), and the per-statement scan projections (which columns each
-/// scan's consumers read — the attached-lake read path decodes only those, and
-/// a store scan materializes only those).
+/// skips the work), and the per-statement scan projections (which columns
+/// each scan's consumers read — the attached-lake read path decodes only
+/// those, and a store scan materializes only those).
 pub(crate) struct Cx<'a> {
     pub(crate) db: &'a PinkDb,
     pub(crate) ctes: HashMap<String, Output>,
@@ -513,7 +511,9 @@ pub(crate) struct Cx<'a> {
 #[derive(Clone)]
 pub(crate) enum Memo {
     Scalar(Value),
-    Set(FastSet<Vec<u8>>, bool, Option<DataType>),
+    /// An `IN` set is shared by every chunk that probes it (an `Arc` clone per
+    /// probe, not a rehash of the set).
+    Set(std::sync::Arc<FastSet<Vec<u8>>>, bool, Option<DataType>),
     /// The extremes of a set an ordered `ANY` comparison probes: a left value
     /// satisfies `op ANY (set)` exactly when it satisfies `op` the extreme, and
     /// whether the set held a NULL decides the rows that match none.
@@ -551,6 +551,24 @@ impl<'a> Cx<'a> {
             session: db.session.clone(),
             outer_rows: Vec::new(),
         }
+    }
+
+    /// The memoised result of one uncorrelated subquery.
+    ///
+    /// Operators fill the memo with [`crate::exec::expr::prime`] before their
+    /// chunks fan out, so the steady state here is a hit. The miss branch is a
+    /// plain compute-and-insert and never *waits* for another thread: a worker
+    /// blocked on a lock while a subquery body wants the worker pool it is
+    /// blocking deadlocks (wave 111ab shipped that with a per-key flight
+    /// lock), and the worst a duplicated evaluation costs is time. Only the
+    /// memo map's own lock is held, for the map lookup or the insert.
+    pub(crate) fn memoized(&self, key: usize, f: impl FnOnce() -> Result<Memo>) -> Result<Memo> {
+        if let Some(m) = self.memo.lock().expect("memo").get(&key) {
+            return Ok(m.clone());
+        }
+        let m = f()?;
+        self.memo.lock().expect("memo").insert(key, m.clone());
+        Ok(m)
     }
 
     /// This context with one enclosing-block row pushed (wave 120).
@@ -3017,11 +3035,11 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         LogicalPlan::Filter { input, predicate } => {
             let inner = eval(cx, input)?;
             // Per-chunk predicates evaluate in parallel; order is preserved.
-            let chunks: Vec<Option<DataChunk>> = inner
-                .chunks
-                .par_iter()
-                .map(|chunk| filter_chunk(cx, predicate, chunk))
-                .collect::<Result<_>>()?;
+            // A subquery inside one is evaluated once, here, before the fan-out
+            // (see `expr::prime`).
+            expr::prime(cx, [predicate])?;
+            let chunks: Vec<Option<DataChunk>> =
+                inner.chunks.par_iter().map(|chunk| filter_chunk(cx, predicate, chunk)).collect::<Result<_>>()?;
             let chunks = chunks.into_iter().flatten().collect();
             Ok(Output {
                 chunks,
@@ -3037,6 +3055,9 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             right_keys,
             ..
         } => {
+            // A key expression may hold a subquery: evaluate it once, on this
+            // thread, before the join's own parallel probing starts.
+            expr::prime(cx, left_keys.iter().chain(right_keys.iter()))?;
             let l = eval(cx, left)?;
             let r = eval(cx, right)?;
             let mut names = l.names.clone();
@@ -3082,6 +3103,9 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             on,
             left_cols: _,
         } => {
+            if let Some(on) = on {
+                expr::prime(cx, [on])?;
+            }
             let l = eval(cx, left)?;
             let r = eval(cx, right)?;
             let mut names = l.names.clone();
@@ -3096,6 +3120,13 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             })
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
+            expr::prime(
+                cx,
+                keys.iter().chain(
+                    aggs.iter()
+                        .flat_map(|a| a.arg.iter().chain(a.filter.iter())),
+                ),
+            )?;
             // `FILTER (WHERE …)` is not modeled by the fused paths below, which
             // read whole columns; a filtered aggregate takes the general path.
             let filtered = aggs.iter().any(|a| a.filter.is_some());
@@ -3187,6 +3218,16 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             })
         }
         LogicalPlan::Window { input, windows, .. } => {
+            expr::prime(
+                cx,
+                windows.iter().flat_map(|w| {
+                    w.arg
+                        .iter()
+                        .chain(w.default.iter())
+                        .chain(w.partition.iter())
+                        .chain(w.order.iter().map(|(e, _)| e))
+                }),
+            )?;
             let inner = eval(cx, input)?;
             let chunks = eval_window(cx, &inner.chunks, windows)?;
             let (names, types) = win_output_schema(windows);
@@ -3294,7 +3335,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         db: cx.db,
                         ctes,
                         memo: cx.memo.clone(),
-                        projections: cx.projections.clone(),
+                            projections: cx.projections.clone(),
                         prunes: cx.prunes.clone(),
                         budget: cx.budget.clone(),
                         dml_ctes: cx.dml_ctes.clone(),
@@ -3353,11 +3394,12 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let types: Vec<DataType> = exprs.iter().map(|e| e.dtype()).collect();
             // Project over zero input chunks → zero output chunks (0 rows).
             // (Aggregates always emit ≥1 chunk, so COUNT(*) over ∅ still works.)
+            expr::prime(cx, exprs)?;
             let chunks = inner
                 .chunks
                 .par_iter()
                 .map(|chunk| project_chunk(cx, exprs, chunk))
-                .collect::<Result<_>>()?;
+                .collect::<Result<Vec<_>>>()?;
             Ok(Output {
                 chunks,
                 names: names.clone(),
@@ -3377,6 +3419,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             })
         }
         LogicalPlan::Sort { input, keys } => {
+            expr::prime(cx, keys.iter().map(|(e, _)| e))?;
             let inner = eval(cx, input)?;
             let chunks = sort(cx, &inner.chunks, keys)?;
             Ok(Output {

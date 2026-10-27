@@ -20,7 +20,7 @@ the table.
 | OS | macOS 27.0.1 arm64 |
 | rustc | 1.97.1 |
 | DuckDB | v2.0.0 `d54cbbe3df` |
-| pinkdb | commit `bc4da2a` plus the uncommitted wave-120 tree |
+| pinkdb | commit `38e2b08` (wave 120) plus the uncommitted wave-111ab tree |
 | threads | 8 for both engines (`RAYON_NUM_THREADS=8`, `SET threads=8`) |
 | runs | 1 warm-up + 5 timed, median reported |
 | load average | 2.5–2.9, recorded per stage in the JSON |
@@ -34,85 +34,84 @@ bounds.
 
 ### SF 0.1 (default)
 
-All 22 queries, which is the whole TPC-H set: wave 120 made the six correlated
-ones bindable.
+All 22 queries, before and after wave 111ab. "before" is commit 38e2b08
+(wave 120) on the same machine, same store, same eight threads; the baseline
+run is in `docs/wave-111ab-plan.md` and `/tmp/w111ab/base-sf0.1.log`.
 
-| query | pinkdb ms | DuckDB ms | ratio | rows |
-|---|---:|---:|---:|---:|
-| 1 | 16 | 3 | 5.3× | 4 |
-| 2 | 20 | 2 | 10.0× | 44 |
-| 3 | 18 | 2 | 9.0× | 10 |
-| 4 | 16 | 2 | 8.0× | 5 |
-| 5 | 31 | 3 | 10.3× | 5 |
-| 6 | 8 | 1 | 8.0× | 1 |
-| 7 | 113 | 3 | 37.7× | 4 |
-| 8 | 22 | 3 | 7.3× | 2 |
-| 9 | 57 | 6 | 9.5× | 175 |
-| 10 | 18 | 4 | 4.5× | 20 |
-| 11 | 17 | 2 | 8.5× | 2541 |
-| 12 | 13 | 2 | 6.5× | 2 |
-| 13 | 39 | 12 | 3.3× | 37 |
-| 14 | 7 | 2 | 3.5× | 1 |
-| 15 | 3 | 1 | 3.0× | 1 |
-| 16 | 7 | 3 | 2.3× | 2762 |
-| 17 | 7 | 2 | 3.5× | 1 |
-| 18 | 70 | 4 | 17.5× | 5 |
-| 19 | 228 | 3 | 76.0× | 1 |
-| 20 | 50 | 3 | 16.7× | 9 |
-| 21 | 407 | 5 | 81.4× | 47 |
-| 22 | 57 | 3 | 19.0× | 7 |
+| query | before ms | after ms | DuckDB ms | ratio | rows |
+|---|---:|---:|---:|---:|---:|
+| 1 | 16 | 16 | 3 | 5.3× | 4 |
+| 2 | 20 | 20 | 3 | 6.7× | 44 |
+| 3 | 18 | 18 | 2 | 9.0× | 10 |
+| 4 | 16 | 16 | 2 | 8.0× | 5 |
+| 5 | 31 | 31 | 3 | 10.3× | 5 |
+| 6 | 8 | 8 | 1 | 8.0× | 1 |
+| 7 | 111 | **31** | 3 | 10.3× | 4 |
+| 8 | 22 | **19** | 3 | 6.3× | 2 |
+| 9 | 57 | 60 | 6 | 10.0× | 175 |
+| 10 | 18 | **16** | 4 | 4.0× | 20 |
+| 11 | 17 | **13** | 2 | 6.5× | 2541 |
+| 12 | 13 | 16 | 2 | 8.0× | 2 |
+| 13 | 40 | 40 | 11 | 3.6× | 37 |
+| 14 | 7 | 7 | 2 | 3.5× | 1 |
+| 15 | 3 | 3 | 1 | 3.0× | 1 |
+| 16 | 8 | **7** | 3 | 2.3× | 2762 |
+| 17 | 7 | 8 | 2 | 4.0× | 1 |
+| 18 | 74 | **25** | 4 | 6.2× | 5 |
+| 19 | 231 | **11** | 3 | 3.7× | 1 |
+| 20 | 51 | **42** | 3 | 14.0× | 9 |
+| 21 | 425 | **232** | 5 | 46.4× | 47 |
+| 22 | 73 | **17** | 3 | 5.7× | 7 |
 
-Geometric mean over all 22 queries: **9.3×** slower than DuckDB. Over the 16
-queries wave 111 could run, the same run is **8.0×** (wave 111 measured 8.6×:
-the gap moved, it did not grow).
+Geometric mean over all 22 queries: **9.5× before → 6.5× after**. Total
+pinkdb time fell 1,266 ms → 681 ms. Three sub-10 ms queries (Q15, Q6, Q14)
+divide by a 1–2 ms DuckDB timer and move the mean by several tenths; the
+per-query column is the honest comparison.
 
 ### SF 1
 
-| query | pinkdb ms | DuckDB ms | ratio | rows |
-|---|---:|---:|---:|---:|
-| 1 | 170 | 14 | 12.1× | 4 |
-| 2 | 195 | 3 | 65.0× | 100 |
-| 3 | 196 | 8 | 24.5× | 10 |
-| 4 | 163 | 7 | 23.3× | 5 |
-| 5 | 369 | 9 | 41.0× | 5 |
-| 6 | 82 | 4 | 20.5× | 1 |
-| 7 | 1277 | 9 | 141.9× | 4 |
-| 8 | 255 | 9 | 28.3× | 2 |
-| 9 | 688 | 29 | 23.7× | 175 |
-| 10 | 222 | 17 | 13.1× | 20 |
-| 11 | 517 | 3 | 172.3× | 1048 |
-| 12 | 149 | 10 | 14.9× | 2 |
-| 13 | 433 | 40 | 10.8× | 42 |
-| 14 | 71 | 8 | 8.9× | 1 |
-| 15 | 35 | 5 | 7.0× | 1 |
-| 16 | 69 | 11 | 6.3× | 18314 |
-| 17 | 94 | 8 | 11.8× | 1 |
-| 18 | 5368 | 25 | 214.7× | 57 |
-| 19 | 2415 | 10 | 241.5× | 1 |
-| 20 | 1933 | 11 | 175.7× | 186 |
-| 21 | 7222 | 18 | 401.2× | 100 |
-| 22 | 794 | 14 | 56.7× | 7 |
+| query | before ms | after ms | DuckDB ms | ratio | rows |
+|---|---:|---:|---:|---:|---:|
+| 1 | 170 | **156** | 13 | 12.0× | 4 |
+| 2 | 197 | **185** | 3 | 61.7× | 100 |
+| 3 | 192 | **181** | 8 | 22.6× | 10 |
+| 4 | 167 | **152** | 7 | 21.7× | 5 |
+| 5 | 336 | 342 | 9 | 38.0× | 5 |
+| 6 | 85 | **78** | 3 | 26.0× | 1 |
+| 7 | 1253 | **246** | 9 | 27.3× | 4 |
+| 8 | 270 | **216** | 8 | 27.0× | 2 |
+| 9 | 715 | **675** | 26 | 26.0× | 175 |
+| 10 | 231 | **168** | 16 | 10.5× | 20 |
+| 11 | 510 | **120** | 3 | 40.0× | 1048 |
+| 12 | 147 | 172 | 9 | 19.1× | 2 |
+| 13 | 450 | 453 | 37 | 12.2× | 42 |
+| 14 | 71 | 71 | 7 | 10.1× | 1 |
+| 15 | 36 | **33** | 5 | 6.6× | 1 |
+| 16 | 70 | **58** | 10 | 5.8× | 18314 |
+| 17 | 92 | **90** | 7 | 12.9× | 1 |
+| 18 | 5515 | **1449** | 22 | 65.9× | 57 |
+| 19 | 3855 | **114** | 10 | 11.4× | 1 |
+| 20 | 4855 | **606** | 10 | 60.6× | 186 |
+| 21 | 10391 | **2252** | 18 | 125.1× | 100 |
+| 22 | 680 | **166** | 11 | 15.1× | 7 |
 
-Geometric mean: **35.5×** slower over all 22 queries, **28.4×** over the 16
-wave 111 could run (wave 111: 29.0×). Stores are 321 MB (pinkdb) and 298 MB
-(DuckDB), built in 8.7 s and 1.3 s. Load average was 2.1 when the run started
-and 7.2 during Q21, which is the run's own eight worker threads.
-
-The six correlated queries are not the slowest per-row work here — Q18 and Q11
-were already the worst and have no correlation — but they pay a specific cost
-the others do not, described under "Correlated subqueries" below.
+Geometric mean: **38.5× before → 21.8× after** over all 22 queries; total
+pinkdb time 30,288 ms → 7,983 ms (3.8×). The four queries that were 82 % of
+the old total (Q18–Q21) are now 55 % of a much smaller one. Load average was
+2.1 when the baseline run started and 3.4–4.7 for the after run, both recorded
+in the JSON.
 
 ## Ingest (SF 0.1)
 
 | table | format | engine | ms | M rows/s | MB/s |
 |---|---|---|---:|---:|---:|
-| lineitem | CSV | pinkdb | 290 | 2.07 | 261 |
-| lineitem | CSV | DuckDB | 362 | 1.66 | 209 |
-| lineitem | Parquet | pinkdb | 499 | 1.20 | 38 |
-| lineitem | Parquet | DuckDB | 111 | 5.41 | 170 |
-| orders | CSV | pinkdb | 118 | 1.27 | 145 |
-| orders | CSV | DuckDB | 96 | 1.56 | 178 |
-| orders | Parquet | pinkdb | 99 | 1.52 | 54 |
+| lineitem | CSV | pinkdb | 263 | 2.28 | 288 |
+| lineitem | CSV | DuckDB | 366 | 1.64 | 207 |
+| lineitem | Parquet | pinkdb | 488 | 1.23 | 39 |
+| lineitem | Parquet | DuckDB | 104 | 5.77 | 181 |
+| orders | CSV | pinkdb | 94 | 1.60 | 182 |
+| orders | CSV | DuckDB | 95 | 1.58 | 180 |
+| orders | Parquet | pinkdb | 95 | 1.58 | 56 |
 | orders | Parquet | DuckDB | 63 | 2.38 | 84 |
 
 pinkdb's CSV reader beats DuckDB's on the 16-column lineitem file; its Parquet
@@ -123,13 +122,13 @@ parallel.
 
 | work | time |
 |---|---:|
-| 2,000 single-row autocommit inserts, `Sync` | 8.32 s |
+| 2,000 single-row autocommit inserts, `Sync` | 7.78 s |
 | 2,000 inserts, batched (`SyncPolicy::Batch`) | 63 ms |
-| 200 selects after each policy | 33–63 ms |
-| 3 checkpoints | 51 ms |
-| CLI single-row autocommit, warm | 113k rows/s |
-| CLI batched `VALUES`, warm | 363k rows/s |
-| two concurrent writers, optimistic transactions | 0.79× speedup |
+| 200 selects after each policy | 34–63 ms |
+| 3 checkpoints | 40–50 ms |
+| CLI single-row autocommit, warm | 119k rows/s |
+| CLI batched `VALUES`, warm | 380k rows/s |
+| two concurrent writers, optimistic transactions | 0.96× speedup |
 
 There is no DuckDB comparison here: DuckDB has no per-statement WAL with fsync
 policies. The single-process `Sync` cost is dominated by fsync, and the
@@ -142,9 +141,9 @@ SF 0.1 lineitem (600,572 rows), 8-thread attach, warm object cache:
 
 | catalog | attach ms | attach + scan `sum(l_extendedprice)` ms |
 |---|---:|---:|
-| `pink:` | 20.1 | 14 |
-| `sqlite:` | 2.2 | 14 |
-| `pink+s3://` (mock S3, 61 objects) | — | 85 |
+| `pink:` | 21.5 | 13 |
+| `sqlite:` | 2.1 | 14 |
+| `pink+s3://` (mock S3, 61 objects) | — | 83 |
 
 The S3 number is a local, in-process mock endpoint with no network latency; it
 measures request count and object layout, not the internet. Commit latency is
@@ -155,10 +154,10 @@ not separately timed here — wave 110 measured one commit as 3 S3 requests and
 
 | workload | result |
 |---|---|
-| FTS index build, 100k documents × 2 fields | 824 ms |
+| FTS index build, 100k documents × 2 fields | 822 ms |
 | FTS top-10 query, same corpus | <1 ms (below the CLI's 1 ms timer resolution; wave 108a's 103 ms was cold) |
-| HNSW build, 100k × 768, 1 thread | 117.3 s |
-| HNSW build, 100k × 768, 8 threads | 24.0 s |
+| HNSW build, 100k × 768, 1 thread | 126.5 s |
+| HNSW build, 100k × 768, 8 threads | 40.5 s |
 | HNSW index size | 318,915,668 B |
 | recall@10, `ef_search` 16 / 64 / 128 / 256 | 0.535 / 0.878 / 0.961 / 0.991 |
 | p50/p95 latency (ms), 8 threads, same ef | 0.57/0.65, 0.89/1.03, 1.20/1.35, 1.57/1.79 |
@@ -171,10 +170,10 @@ yet. It is a follow-up, not an omission by accident.
 
 | build | bytes |
 |---|---:|
-| CLI, default features | 5,437,168 |
-| CLI, `--no-default-features` | 5,278,896 |
-| CLI, all measured features | 14,668,944 |
-| server, default features | 5,032,960 |
+| CLI, default features | 5,608,752 (+37,808 since 38e2b08) |
+| CLI, `--no-default-features` | 5,450,480 (+37,744 since 38e2b08) |
+| CLI, all measured features | 14,842,064 (+37,744 since 38e2b08) |
+| server, default features | 5,203,312 |
 | CLI + `fts` | 5,612,736 (+175,568) |
 | CLI + `vss` | 5,570,128 (+132,960) |
 | CLI + `parquet` | 7,459,728 (+2,022,560) |
@@ -189,25 +188,36 @@ CLI start-up (open an empty store, quit): 5.2 ms. Peak RSS at SF 0.1: Q1
 
 ## Where pinkdb is slower, and why
 
-**TPC-H joins.** The hash join copies surviving rows into fresh vectors at
-every probe; DuckDB writes a selection vector and materializes once. pinkdb's
-join also builds its hash table on whichever input the plan puts on the right,
-which for several TPC-H queries is the large side. There are no table
-statistics or cost model, so the planner cannot reorder a six-table join the
-way DuckDB's query graph does. Wave 111 fixed the largest part — comma joins
-were planned as nested-loop crosses, and `OR`-of-conjunctions predicates hid
-per-table filters — but Q7 and Q19 remain the visible cost of the missing
-build-side choice and join enumeration.
+**Q21 (125×).** The two `EXISTS`/`NOT EXISTS` subqueries each build the same
+duplicate-eliminated key side: a `Distinct(Project(outer copy))` over the whole
+enclosing block, computed twice. DuckDB's delim join materializes those keys
+once and shares them. The non-equality condition (`l3.l_suppkey <>
+l1.l_suppkey`) also still runs as a filter above the join rather than as a
+join residual. Both are follow-ups below; wave 111ab cut Q21 from 10.4 s to
+2.25 s at SF 1 without addressing either.
 
-**Q18/IN.** An `IN` subquery materializes 1.5 million group keys and builds a
-hash set from them; the aggregate inside the subquery is the hot path, not the
-probe. A single-flight memo attempt halved Q18 but deadlocked once at SF 1 and
-was reverted rather than shipped with a possible hang. The capacity fix for
-the set is kept (8.8 s → 5.8 s on a focused probe).
+**Q18 (66×).** The `IN` subquery's aggregate — `GROUP BY l_orderkey` over 6 M
+rows — is the hot path, and its merge phase is serial: each of the eight
+per-chunk partial hash tables is merged into one table on one thread. DuckDB's
+partitioned aggregate merges in parallel. The subquery memo cut Q18 from 5.5 s
+to 1.4 s; what is left is the aggregate.
 
-**Q1/Q6.** Both are scan-bound. pinkdb's filter and aggregate paths are
-vectorized, but they lack DuckDB's perfect-hash aggregate and selection-vector
-shortcuts; that is most of the 8–26× gap.
+**Q2/Q5/Q11 (38–62×).** These are scans and joins that are simply 10–40× the
+DuckDB time per row: the hash join copies every surviving row into fresh
+vectors at each probe instead of writing a selection vector and materializing
+once, and the aggregate emits group by group with a value copy per cell.
+
+**Q1/Q6 (12–26×).** Both are scan-bound. pinkdb's filter and aggregate paths
+are vectorized, but they lack DuckDB's perfect-hash aggregate and
+selection-vector shortcuts; the cost is flat per row and does not change with
+scale.
+
+**Q9 (26×).** The cost model picks
+`part ⋈ lineitem ⋈ supplier ⋈ nation ⋈ orders ⋈ partsupp`, which joins the
+two-key `partsupp` last. The best order measured by hand was 13 % faster, so
+the join order is not the whole gap; the row-copying join and the aggregate
+are. The wave left Q9 715 → 675 ms at SF 1 and 57 → 60 ms at SF 0.1 (within the
+run-to-run spread); Q5's 31 → 31 ms is unchanged.
 
 **Parquet ingest.** DuckDB reads and decodes in larger parallel batches; pinkdb
 decodes column chunk by column chunk.
@@ -249,6 +259,24 @@ For reference, the pre-existing gap is unchanged and unrelated: Q18 (214×) and
 Q19 (241×) have no correlated subquery at all — Q18 is the aggregate inside a
 plain `IN`, Q19 the nested `OR` lists that defeat the derived filters.
 
+## What changed in wave 111ab
+
+Two roadmap rows in one wave: cost-based join ordering with a build-side
+choice (111a) and the execution/subquery paths (111b). No SQL feature was
+added; every answer is checked against DuckDB's rows.
+
+| change | measurement |
+|---|---|
+| cost-based comma-chain order (query graph, DP up to 12 relations, greedy above, FK-aware cardinalities, anchored at the FROM clause's first relation) | Q7 SF 1 1.25 s → 246 ms; Q7 SF 0.1 111 → 32 ms; Q5 SF 0.1 31 → 35 ms is the one regression |
+| per-column filters derived through a lone `OR`, with `IN` lists inside branches and union (not intersection) bounds | Q19 SF 1 3.86 s → 112 ms, SF 0.1 231 → 11 ms |
+| subquery memo filled by the operator before its chunks fan out, so no lock is ever taken across an evaluation | Q18 SF 1 5.5 s → 1.45 s, Q20 4.9 s → 0.61 s, Q22 680 → 166 ms; the deadlock is gone (30 repro runs, 0 hangs) |
+| subquery bodies are left un-reordered (a restore projection hides the from-tree the binder decorrelates by pattern) | Q2 stayed at 21 ms instead of planning a 2·10¹³-row cross product |
+| scanner/suite: timeout payloads are decoded before concatenation | the suite no longer crashes when a query times out |
+
+SF 1 geometric mean **38.5× → 21.8×**, total time 30.3 s → 8.0 s. SF 0.1
+geometric mean **9.5× → 6.5×**, total 1,266 → 681 ms. Binary size +37.8 kB
+(+0.68 %) for the default CLI, no new dependencies.
+
 ## What changed in wave 111
 
 | change | measurement |
@@ -285,11 +313,19 @@ Nothing in the suite downloads data or installs a DuckDB extension.
 
 ## Gaps and follow-ups
 
-- A join-order enumerator with cardinality estimates (DuckDB's query graph and
-  DPccp shape) and a build-side choice driven by those estimates. Wave 111's
-  greedy reorder only fixes disconnected comma chains.
-- A cheaper `IN`-subquery path, or a safe single-flight memo.
-- Perfect-hash aggregation and selection-vector filters for Q1/Q6.
+- **Delim join for decorrelated subqueries** (Q21's shared key side) and the
+  Q21 non-equality condition as a join residual. Q21 is the largest single
+  query left: 2.25 s at SF 1, 125× DuckDB.
+- **Parallel aggregate merge.** `merge_partials` merges every chunk's partial
+  table on one thread; Q18's remaining 1.4 s is mostly this, and Q1/Q9/Q13 pay
+  a share of it.
+- **Scatter-then-gather join output** (selection vectors instead of copying
+  rows) for Q2/Q5/Q11 and the join-heavy scans.
+- **Perfect-hash aggregation and selection-vector filters** for Q1/Q6.
+- **Q9's join order**: the estimator joins the two-key `partsupp` last. A
+  finer model (or a rule that joins the table with the most equality edges
+  first) would recover the 13 % measured by hand.
+- **Ingest**: Parquet decode in larger parallel batches.
 - A DuckDB `fts`/`vss` comparison, once `INSTALL` is allowed.
 - The CI guard is non-blocking until it has a stable history on GitHub's
   shared runners.

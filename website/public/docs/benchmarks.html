@@ -199,43 +199,43 @@ timing, so any table below can be reproduced or disputed.</p>
   </thead>
   <tbody>
     <tr><td>TPC-H SF 1, all 22 queries (geomean)</td>
-        <td>—</td><td>—</td><td>35.5× slower</td></tr>
+        <td>—</td><td>—</td><td>21.8× slower</td></tr>
     <tr><td>TPC-H SF 0.1, all 22 queries (geomean)</td>
-        <td>—</td><td>—</td><td>9.3× slower</td></tr>
+        <td>—</td><td>—</td><td>6.5× slower</td></tr>
     <tr><td>TPC-H Q4, SF 0.1 (correlated <code>EXISTS</code>)</td>
         <td>16 ms</td><td>2 ms</td><td>8×</td></tr>
     <tr><td>TPC-H Q17, SF 0.1 (correlated <code>avg</code>)</td>
-        <td>7 ms</td><td>2 ms</td><td>3.5×</td></tr>
+        <td>8 ms</td><td>2 ms</td><td>4×</td></tr>
     <tr><td>TPC-H Q21, SF 0.1 (anti join with a residual)</td>
-        <td>407 ms</td><td>5 ms</td><td>81×</td></tr>
+        <td>232 ms</td><td>5 ms</td><td>46×</td></tr>
     <tr><td>TPC-H Q1, SF 1</td><td>156 ms</td><td>13 ms</td><td>12×</td></tr>
-    <tr><td>TPC-H Q6, SF 1</td><td>79 ms</td><td>3 ms</td><td>26×</td></tr>
-    <tr><td>TPC-H Q13, SF 1</td><td>439 ms</td><td>38 ms</td><td>12×</td></tr>
-    <tr><td>TPC-H Q9, SF 1</td><td>659 ms</td><td>26 ms</td><td>25×</td></tr>
-    <tr><td>TPC-H Q7, SF 1</td><td>1.20 s</td><td>9 ms</td><td>133×</td></tr>
-    <tr><td>CSV ingest, lineitem SF 0.1</td><td>2.07 M rows/s</td>
-        <td>1.66 M rows/s</td><td>1.2× faster</td></tr>
-    <tr><td>Parquet ingest, lineitem SF 0.1</td><td>1.20 M rows/s</td>
-        <td>5.41 M rows/s</td><td>4.5× slower</td></tr>
-    <tr><td>Single-row autocommit inserts</td><td>113k rows/s</td>
+    <tr><td>TPC-H Q6, SF 1</td><td>78 ms</td><td>3 ms</td><td>26×</td></tr>
+    <tr><td>TPC-H Q13, SF 1</td><td>453 ms</td><td>37 ms</td><td>12×</td></tr>
+    <tr><td>TPC-H Q9, SF 1</td><td>675 ms</td><td>26 ms</td><td>26×</td></tr>
+    <tr><td>TPC-H Q7, SF 1</td><td>246 ms</td><td>9 ms</td><td>27×</td></tr>
+    <tr><td>CSV ingest, lineitem SF 0.1</td><td>2.28 M rows/s</td>
+        <td>1.64 M rows/s</td><td>1.4× faster</td></tr>
+    <tr><td>Parquet ingest, lineitem SF 0.1</td><td>1.23 M rows/s</td>
+        <td>5.77 M rows/s</td><td>4.7× slower</td></tr>
+    <tr><td>Single-row autocommit inserts</td><td>119k rows/s</td>
         <td>—</td><td>—</td></tr>
-    <tr><td>Batched inserts</td><td>363k rows/s</td>
+    <tr><td>Batched inserts</td><td>380k rows/s</td>
         <td>—</td><td>—</td></tr>
     <tr><td>Lake open, <code>pink:</code> catalog (SF 0.1)</td>
         <td>20 ms</td><td>—</td><td>—</td></tr>
     <tr><td>Lake open, <code>pink+s3://</code> (mock S3)</td>
-        <td>85 ms</td><td>—</td><td>—</td></tr>
-    <tr><td>FTS index build, 100k documents</td><td>824 ms</td>
+        <td>83 ms</td><td>—</td><td>—</td></tr>
+    <tr><td>FTS index build, 100k documents</td><td>822 ms</td>
         <td>—</td><td>—</td></tr>
     <tr><td>FTS top-10 query, 100k documents</td><td>&lt;1 ms</td>
         <td>—</td><td>—</td></tr>
-    <tr><td>HNSW build, 100k × 768, 1 thread</td><td>117.3 s</td>
+    <tr><td>HNSW build, 100k × 768, 1 thread</td><td>126.5 s</td>
         <td>—</td><td>—</td></tr>
-    <tr><td>HNSW build, 100k × 768, 8 threads</td><td>24.0 s</td>
+    <tr><td>HNSW build, 100k × 768, 8 threads</td><td>40.5 s</td>
         <td>—</td><td>—</td></tr>
     <tr><td>HNSW recall@10, <code>ef_search=128</code></td><td>0.961</td>
         <td>—</td><td>—</td></tr>
-    <tr><td>Default binary</td><td>5.4 MB</td><td>—</td><td>—</td></tr>
+    <tr><td>Default binary</td><td>5.6 MB</td><td>—</td><td>—</td></tr>
     <tr><td>CLI start-up</td><td>5.2 ms</td><td>—</td><td>—</td></tr>
   </tbody>
 </table>
@@ -270,19 +270,20 @@ rounded to the millisecond.</p>
 
 <p>The join operator is the honest answer for TPC-H. pinkdb copies rows into
 new vectors at every hash-join probe; DuckDB's probe writes only the surviving
-selection vector. pinkdb's hash join also builds on the input the plan happens
-to put on the right, which for several TPC-H queries is the large side. The
-optimizer now rewrites comma joins into hash joins and derives per-table
-filters from an <code>OR</code> of conjunctions (that is what halved Q7 at SF
-0.1), but it still has no statistics or cost model, so it cannot reorder a
-six-table join the way DuckDB's query graph does.</p>
+selection vector. The optimizer now reorders comma chains by cost (a query
+graph with foreign-key-aware cardinalities, a subset DP up to twelve
+relations, anchored at the query's own filtered relation, and the smaller
+input builds the hash table from exact row counts), and it derives per-table
+filters from an <code>OR</code> of conjunctions, including <code>IN</code>
+lists inside the branches — that is what took Q7 from 133× to 27× and Q19
+from 246× to 11×.</p>
 
-<p>Q7 remains the worst gap because both nation filters start above a join
-rather than on a scan, and the join that needs them most is built on the wrong
-side. Q18 is dominated by materialising 1.5 million group keys for an
-<code>IN</code> subquery. Q1 and Q6 are scan-bound: pinkdb's filter and
-aggregate paths are vectorised but do not use DuckDB's perfect-hash or
-selection-vector tricks, which is most of the 8–26× gap on those queries.</p>
+<p>Q21 is the worst gap left (125×): its two <code>EXISTS</code> subqueries
+each materialise the same duplicate-eliminated key side, which a delim join
+would share. Q18 (66×) is the aggregate's serial merge of eight partial hash
+tables. Q1 and Q6 are scan-bound: pinkdb's filter and aggregate paths are
+vectorised but do not use DuckDB's perfect-hash or selection-vector tricks,
+which is most of the 12–26× gap on those queries.</p>
 
 <p>Ingest is mixed: pinkdb's CSV reader is faster than DuckDB's on a wide
 lineitem file, while its Parquet reader is about 4.6× slower because DuckDB
