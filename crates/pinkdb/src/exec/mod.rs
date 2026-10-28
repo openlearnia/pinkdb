@@ -4129,13 +4129,13 @@ fn hash_int_key(key: i64) -> u64 {
 #[inline]
 fn hash_bytes_key(key: &[u8]) -> u64 {
     let mut h = 0x9e37_79b9_7f4a_7c15u64 ^ key.len() as u64;
-    let mut words = key.chunks_exact(8);
-    for w in &mut words {
-        let x = u64::from_le_bytes(w.try_into().expect("eight bytes"));
+    let (words, rest) = key.as_chunks::<8>();
+    for w in words {
+        let x = u64::from_le_bytes(*w);
         h = (h ^ x).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(31);
     }
     let mut tail = [0u8; 8];
-    tail[..words.remainder().len()].copy_from_slice(words.remainder());
+    tail[..rest.len()].copy_from_slice(rest);
     h ^= u64::from_le_bytes(tail);
     mix64(h)
 }
