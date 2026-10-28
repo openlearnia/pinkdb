@@ -1075,9 +1075,20 @@ mod tests {
                 "SELECT (SELECT SUM(i) FROM t) AS a, (SELECT AVG(d) FROM t) AS b;",
                 vec![Some(vec![0]), Some(vec![2])],
             ),
-            // Unbounded shapes: a join assembles every column of both sides.
+            // A hash join reads only what its consumers and its own keys and
+            // residual need (wave 127): COUNT(*) over the join needs the key
+            // column on each side and nothing else.
             (
                 "SELECT COUNT(*) FROM t AS a JOIN t AS b ON a.i = b.i;",
+                vec![Some(vec![0]), Some(vec![0])],
+            ),
+            (
+                "SELECT a.s FROM t AS a JOIN t AS b ON a.i = b.i WHERE b.b IS NOT NULL;",
+                vec![Some(vec![0, 3]), Some(vec![0, 4])],
+            ),
+            // A nested-loop join stays unbounded: it assembles every column.
+            (
+                "SELECT COUNT(*) FROM t AS a JOIN t AS b ON a.i < b.i;",
                 vec![None, None],
             ),
             ("SELECT * FROM t;", vec![Some(vec![0, 1, 2, 3, 4])]),

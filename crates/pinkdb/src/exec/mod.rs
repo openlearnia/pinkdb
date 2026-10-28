@@ -3446,6 +3446,21 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             } else {
                 residual.as_ref()
             };
+            // The output columns a consumer reads (wave 127): the probe
+            // assembles only those and hands the rest on as placeholders.
+            // Semi/anti/mark emit the left schema through their own path.
+            let present: Option<Vec<bool>> = match kind {
+                JoinKind::Semi | JoinKind::Anti | JoinKind::Mark => None,
+                _ => cx.projections.for_join(plan).map(|cols| {
+                    let mut mask = vec![false; l.types.len() + r.types.len()];
+                    for &c in cols {
+                        if let Some(slot) = mask.get_mut(c) {
+                            *slot = true;
+                        }
+                    }
+                    mask
+                }),
+            };
             let chunks = if build_left {
                 // The estimated-smaller left side feeds the match table and
                 // the right side probes it: output rows are right-row major,
@@ -3461,6 +3476,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     false,
                     filters.as_deref(),
                     residual,
+                    present.as_deref(),
                 )?
             } else {
                 // INNER with the build side on the right, or SEMI: the usual
@@ -3474,6 +3490,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     right_keys,
                     filters.as_deref(),
                     residual,
+                    present.as_deref(),
                 )?
             };
             Ok(Output {
@@ -4537,6 +4554,7 @@ fn hash_join(
     right_keys: &[BoundExpr],
     filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
     residual: Option<&BoundExpr>,
+    present: Option<&[bool]>,
 ) -> Result<Vec<DataChunk>> {
     // The preserved side is the probing side: left for Inner/Left/Full, right
     // for Right. `preserved_is_right` places it in the declared left ++ right
@@ -4556,16 +4574,16 @@ fn hash_join(
     };
     match kind {
         JoinKind::Inner => hash_join_probe(
-            cx, left, right, left_keys, right_keys, false, false, false, filters, residual,
+            cx, left, right, left_keys, right_keys, false, false, false, filters, residual, present,
         ),
         JoinKind::Left => hash_join_probe(
-            cx, left, right, left_keys, right_keys, false, true, false, None, residual,
+            cx, left, right, left_keys, right_keys, false, true, false, None, residual, present,
         ),
         JoinKind::Right => hash_join_probe(
-            cx, right, left, right_keys, left_keys, true, true, false, None, residual,
+            cx, right, left, right_keys, left_keys, true, true, false, None, residual, present,
         ),
         JoinKind::Full => hash_join_probe(
-            cx, left, right, left_keys, right_keys, false, true, true, None, residual,
+            cx, left, right, left_keys, right_keys, false, true, true, None, residual, present,
         ),
         JoinKind::Semi | JoinKind::Anti | JoinKind::Mark => hash_mark_join(
             cx, left, right, left_keys, right_keys, kind, filters, residual,
@@ -4701,6 +4719,26 @@ fn hash_mark_join(
                     Some(pass)
                 }
             };
+            // Left columns no consumer reads arrive as placeholders (wave
+            // 127): they are never copied, and the output carries the
+            // input's placeholder in their slot.
+            let absent: Vec<bool> = (0..left.types.len())
+                .map(|c| !chunk.is_present(c))
+                .collect();
+            let assemble = |cur: Vec<Vector>, rows: usize| -> DataChunk {
+                let columns = cur
+                    .into_iter()
+                    .enumerate()
+                    .map(|(c, v)| {
+                        if absent.get(c).copied().unwrap_or(false) {
+                            std::sync::Arc::clone(&chunk.columns[c])
+                        } else {
+                            std::sync::Arc::new(v)
+                        }
+                    })
+                    .collect();
+                DataChunk::projected(columns, rows)
+            };
             let mut finished = Vec::new();
             let mut cur: Vec<Vector> = dtypes
                 .iter()
@@ -4736,7 +4774,7 @@ fn hash_mark_join(
                     continue;
                 }
                 if cur_rows >= CHUNK_SIZE {
-                    let full = DataChunk::new(std::mem::take(&mut cur))?;
+                    let full = assemble(std::mem::take(&mut cur), cur_rows);
                     cx.add_materialized(full.num_rows(), chunk_approx_bytes(&full))?;
                     finished.push(full);
                     cur = dtypes
@@ -4745,12 +4783,15 @@ fn hash_mark_join(
                         .collect();
                     cur_rows = 0;
                 }
-                for (dst, col) in cur
+                for ((dst, col), skip) in cur
                     .iter_mut()
                     .take(left.types.len())
                     .zip(chunk.columns.iter())
+                    .zip(&absent)
                 {
-                    dst.push_from(col, i)?;
+                    if !*skip {
+                        dst.push_from(col, i)?;
+                    }
                 }
                 if mark {
                     // Three-valued IN: the correlation-key group decides the
@@ -4783,7 +4824,7 @@ fn hash_mark_join(
                 cur_rows += 1;
             }
             if cur_rows > 0 {
-                let full = DataChunk::new(cur)?;
+                let full = assemble(cur, cur_rows);
                 cx.add_materialized(full.num_rows(), chunk_approx_bytes(&full))?;
                 finished.push(full);
             }
@@ -4878,6 +4919,10 @@ struct ProbeSink<'a> {
     dtypes: &'a [DataType],
     n_left: usize,
     preserved_is_right: bool,
+    /// Which output columns are assembled (wave 127); the rest are emitted as
+    /// one shared zero-length placeholder each, because no consumer reads them.
+    present: Vec<bool>,
+    placeholders: Vec<Option<std::sync::Arc<Vector>>>,
     cur: Vec<Vector>,
     cur_rows: usize,
     finished: Vec<DataChunk>,
@@ -4889,19 +4934,60 @@ impl<'a> ProbeSink<'a> {
         dtypes: &'a [DataType],
         n_left: usize,
         preserved_is_right: bool,
+        present: Option<&[bool]>,
     ) -> Self {
-        ProbeSink {
+        let present: Vec<bool> = match present {
+            Some(mask) if mask.len() == dtypes.len() => mask.to_vec(),
+            _ => vec![true; dtypes.len()],
+        };
+        let placeholders = dtypes
+            .iter()
+            .zip(&present)
+            .map(|(t, keep)| (!keep).then(|| std::sync::Arc::new(Vector::new_empty(*t))))
+            .collect();
+        let mut sink = ProbeSink {
             cx,
             dtypes,
             n_left,
             preserved_is_right,
-            cur: dtypes
-                .iter()
-                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
-                .collect(),
+            present,
+            placeholders,
+            cur: Vec::new(),
             cur_rows: 0,
             finished: Vec::new(),
-        }
+        };
+        sink.cur = sink.fresh();
+        sink
+    }
+
+    /// Output vectors for the next chunk: absent columns stay empty and are
+    /// never pushed to.
+    fn fresh(&self) -> Vec<Vector> {
+        self.dtypes
+            .iter()
+            .zip(&self.present)
+            .map(|(t, keep)| {
+                if *keep {
+                    Vector::with_capacity(*t, CHUNK_SIZE)
+                } else {
+                    Vector::new_empty(*t)
+                }
+            })
+            .collect()
+    }
+
+    /// The current vectors as a chunk, placeholders in the absent slots.
+    fn take_chunk(&mut self) -> DataChunk {
+        let cur = std::mem::take(&mut self.cur);
+        let columns = cur
+            .into_iter()
+            .zip(&self.placeholders)
+            .map(|(v, placeholder)| match placeholder {
+                Some(p) => std::sync::Arc::clone(p),
+                None => std::sync::Arc::new(v),
+            })
+            .collect();
+        DataChunk::projected(columns, self.cur_rows)
     }
 
     /// Emit the current chunk when it is full.
@@ -4909,15 +4995,11 @@ impl<'a> ProbeSink<'a> {
         if self.cur_rows < CHUNK_SIZE {
             return Ok(());
         }
-        let chunk = DataChunk::new(std::mem::take(&mut self.cur))?;
+        let chunk = self.take_chunk();
         self.cx
             .add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
         self.finished.push(chunk);
-        self.cur = self
-            .dtypes
-            .iter()
-            .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
-            .collect();
+        self.cur = self.fresh();
         self.cur_rows = 0;
         Ok(())
     }
@@ -4936,21 +5018,27 @@ impl<'a> ProbeSink<'a> {
         } else {
             (chunk, row, bchunk, brow)
         };
-        for (dst, col) in self
+        for ((dst, col), keep) in self
             .cur
             .iter_mut()
             .take(self.n_left)
             .zip(left.columns.iter())
+            .zip(&self.present)
         {
-            dst.push_from(col, lrow)?;
+            if *keep {
+                dst.push_from(col, lrow)?;
+            }
         }
-        for (dst, col) in self
+        for ((dst, col), keep) in self
             .cur
             .iter_mut()
             .skip(self.n_left)
             .zip(right.columns.iter())
+            .zip(self.present.iter().skip(self.n_left))
         {
-            dst.push_from(col, rrow)?;
+            if *keep {
+                dst.push_from(col, rrow)?;
+            }
         }
         self.cur_rows += 1;
         Ok(())
@@ -4965,6 +5053,9 @@ impl<'a> ProbeSink<'a> {
             0
         };
         for (k, dst) in self.cur.iter_mut().enumerate() {
+            if !self.present[k] {
+                continue;
+            }
             let preserved = if self.preserved_is_right {
                 k >= self.n_left
             } else {
@@ -4983,7 +5074,7 @@ impl<'a> ProbeSink<'a> {
     /// Close the partition's last chunk.
     fn finish(mut self) -> Result<Vec<DataChunk>> {
         if self.cur_rows > 0 {
-            let chunk = DataChunk::new(std::mem::take(&mut self.cur))?;
+            let chunk = self.take_chunk();
             self.cx
                 .add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
             self.finished.push(chunk);
@@ -5004,6 +5095,7 @@ fn hash_join_probe(
     full: bool,
     filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
     residual: Option<&BoundExpr>,
+    present: Option<&[bool]>,
 ) -> Result<Vec<DataChunk>> {
     if residual.is_some() && extend_unmatched {
         return Err(PinkDbError::Execution(
@@ -5064,7 +5156,7 @@ fn hash_join_probe(
                 .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
                 .collect::<Result<_>>()?;
             let mut buf = Vec::new();
-            let mut sink = ProbeSink::new(cx, &dtypes, n_left, preserved_is_right);
+            let mut sink = ProbeSink::new(cx, &dtypes, n_left, preserved_is_right, present);
             if let Some(residual) = residual {
                 // Two passes: the residual decides which candidate pairs are
                 // matches before any of them is assembled.
@@ -5156,30 +5248,38 @@ fn hash_join_probe(
                 continue;
             }
             let gathered = bchunk.gather(&unmatched);
+            // NULL-extend the preserved side's columns, except the ones no
+            // consumer reads (wave 127): those stay placeholders, like the
+            // build columns `gather` already carried through.
+            let nulls = |t: &DataType, out_col: usize| -> Result<std::sync::Arc<Vector>> {
+                if present.is_some_and(|m| !m.get(out_col).copied().unwrap_or(true)) {
+                    return Ok(std::sync::Arc::new(Vector::new_empty(*t)));
+                }
+                let mut v = Vector::with_capacity(*t, unmatched.len());
+                for _ in 0..unmatched.len() {
+                    v.push_null()?;
+                }
+                Ok(std::sync::Arc::new(v))
+            };
             let mut cols: Vec<std::sync::Arc<Vector>> = Vec::with_capacity(dtypes.len());
             if preserved_is_right {
                 // Output is build ++ preserved: NULLs come second.
                 cols.extend(gathered.columns.iter().cloned());
-                for t in preserved.types {
-                    let mut v = Vector::with_capacity(*t, unmatched.len());
-                    for _ in 0..unmatched.len() {
-                        v.push_null()?;
-                    }
-                    cols.push(std::sync::Arc::new(v));
+                for (i, t) in preserved.types.iter().enumerate() {
+                    cols.push(nulls(t, n_left + i)?);
                 }
             } else {
-                for t in preserved.types {
-                    let mut v = Vector::with_capacity(*t, unmatched.len());
-                    for _ in 0..unmatched.len() {
-                        v.push_null()?;
-                    }
-                    cols.push(std::sync::Arc::new(v));
+                for (i, t) in preserved.types.iter().enumerate() {
+                    cols.push(nulls(t, i)?);
                 }
                 cols.extend(gathered.columns.iter().cloned());
             }
-            out.push(DataChunk::from_arcs(cols).ok_or_else(|| {
-                PinkDbError::Execution("full-join assembly produced mismatched columns".to_string())
-            })?);
+            if cols.len() != dtypes.len() {
+                return Err(PinkDbError::Execution(
+                    "full-join assembly produced mismatched columns".to_string(),
+                ));
+            }
+            out.push(DataChunk::projected(cols, unmatched.len()));
         }
     }
     Ok(out)

@@ -1591,11 +1591,13 @@ fn expr_contains_table_function(expr: &BoundExpr) -> bool {
 ///
 /// The rules mirror what the executor actually evaluates, not what the query
 /// eventually displays: `Project` and `Window` evaluate every expression
-/// they hold (`fused_join_aggregate` is the one exception, and joins are
-/// unbounded here), `Filter`/`Sort` evaluate their predicates/keys, and the
-/// operators that read whole rows (`Distinct`, `Union`, `Join`) or
-/// materialize an output once and reuse it (`Cte`) are conservatively
-/// unbounded. The matches are exhaustive on purpose, like
+/// they hold, `Filter`/`Sort` evaluate their predicates/keys, a hash `Join`
+/// passes its consumer's bound to each side plus its own keys and residual
+/// (and records the bound on its output under its own address, see
+/// [`ScanProjections::for_join`], so the probe assembles only those columns),
+/// and the operators that read whole rows (`Distinct`, `Union`, the
+/// nested-loop join) or materialize an output once and reuse it (`Cte`) are
+/// conservatively unbounded. The matches are exhaustive on purpose, like
 /// [`collect_tables_read`]: a new plan variant must decide here what its
 /// inputs reference.
 #[derive(Debug, Default)]
@@ -1622,6 +1624,14 @@ impl ScanProjections {
             LogicalPlan::Scan { .. } | LogicalPlan::TableFunction { .. }
         ));
         self.map.get(&node_addr(scan)).map(Vec::as_slice)
+    }
+
+    /// The output columns of a hash [`LogicalPlan::Join`] its consumers read,
+    /// or `None` when unbounded (assemble every column). Every other output
+    /// column may be handed on as a zero-length placeholder.
+    pub(crate) fn for_join(&self, join: &LogicalPlan) -> Option<&[usize]> {
+        debug_assert!(matches!(join, LogicalPlan::Join { .. }));
+        self.map.get(&node_addr(join)).map(Vec::as_slice)
     }
 }
 
@@ -2481,20 +2491,73 @@ fn walk_scan_projections(
             walk_scan_projections(left, &Needed::All, out);
             walk_scan_projections(right, &Needed::All, out);
         }
+        // A hash join's output is `left ++ right` (semi/anti: left only;
+        // mark: left plus its marker). The consumer's bound splits across the
+        // sides, and each side also needs what the join itself evaluates: its
+        // keys (side-relative) and the residual (joined space). The bound on
+        // the join's *output* is recorded under the join's own address, so
+        // the probe assembles only those columns (`ProbeSink`) and hands the
+        // rest on as shared placeholders (after DuckDB's
+        // `optimizer/remove_unused_columns.cpp`: columns nobody reads are not
+        // carried through joins).
         LogicalPlan::Join {
+            kind,
             left,
             right,
             left_keys,
             right_keys,
-            ..
+            left_cols,
+            residual,
         } => {
-            let mut l = Needed::All;
+            let right_out = !matches!(kind, JoinKind::Semi | JoinKind::Anti | JoinKind::Mark);
+            let (mut l, mut r) = match needed {
+                Needed::All => (
+                    Needed::All,
+                    if right_out {
+                        Needed::All
+                    } else {
+                        Needed::Cols(Vec::new())
+                    },
+                ),
+                Needed::Cols(set) => {
+                    out.insert(
+                        node_addr(plan),
+                        set.iter()
+                            .enumerate()
+                            .filter(|(_, used)| **used)
+                            .map(|(i, _)| i)
+                            .collect(),
+                    );
+                    let lset = set[..set.len().min(*left_cols)].to_vec();
+                    let rset = if right_out && set.len() > *left_cols {
+                        set[*left_cols..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    (Needed::Cols(lset), Needed::Cols(rset))
+                }
+            };
             for k in left_keys {
                 collect_expr_projections(k, &mut l, out);
             }
-            let mut r = Needed::All;
             for k in right_keys {
                 collect_expr_projections(k, &mut r, out);
+            }
+            if let Some(residual) = residual {
+                let mut joined = Needed::Cols(Vec::new());
+                collect_expr_projections(residual, &mut joined, out);
+                if let Needed::Cols(set) = joined {
+                    for (i, used) in set.iter().enumerate() {
+                        if !*used {
+                            continue;
+                        }
+                        if i < *left_cols {
+                            l.add_col(i);
+                        } else {
+                            r.add_col(i - *left_cols);
+                        }
+                    }
+                }
             }
             walk_scan_projections(left, &l, out);
             walk_scan_projections(right, &r, out);
@@ -2601,11 +2664,14 @@ fn collect_expr_projections(
     out: &mut HashMap<usize, Vec<usize>>,
 ) {
     match expr {
-        BoundExpr::Literal(_)
-        | BoundExpr::OuterRef { .. }
-        | BoundExpr::AggRef { .. }
-        | BoundExpr::WindowRef { .. } => {}
-        BoundExpr::Column { index, .. } => need.add_col(*index),
+        BoundExpr::Literal(_) | BoundExpr::OuterRef { .. } => {}
+        // Once rebased, an aggregate or window reference reads its input chunk
+        // at `index` exactly like a column (`chunk.expect_column`). A
+        // `HAVING` filter can sit above a join whose left input is the
+        // aggregate (a decorrelated subquery), so it must count (wave 127).
+        BoundExpr::Column { index, .. }
+        | BoundExpr::AggRef { index, .. }
+        | BoundExpr::WindowRef { index, .. } => need.add_col(*index),
         BoundExpr::Binary { left, right, .. } => {
             collect_expr_projections(left, need, out);
             collect_expr_projections(right, need, out);

@@ -9,6 +9,30 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 127 — joins carry only the columns their consumers read ✅
+
+Column pruning used to stop at every join: a table under a join produced every
+column, and the join copied every column of both sides into its output, one
+value at a time. Now the column analysis runs through hash joins.
+
+- **Each join knows which of its output columns are read.** The bound splits
+  across the two sides, plus each side's own keys and residual columns;
+  semi/anti/mark joins need only key and residual columns from the right.
+- **The probe assembles only those columns**; every other output column is a
+  shared zero-length placeholder (the same mechanism scans already used), so
+  nothing is copied for it. `SELECT COUNT(*) FROM t a JOIN t b ON a.i = b.i`
+  reads one column per side instead of all of them.
+- **Fail-safe by construction:** a column the analysis leaves out is a hard
+  internal error when read, never a NULL. Two gaps it surfaced are fixed:
+  aggregate/window references (`AggRef`/`WindowRef`) now count as column
+  reads, and semi/anti/mark joins carry placeholders through.
+- **TPC-H SF 1** (vs main, same machine): total 7.2 s → 3.7 s; geometric mean
+  vs DuckDB 14.1× → 8.0×. Q21 2,407 → 393 ms, Q5 412 → 108, Q2 185 → 53,
+  Q14 99 → 34, Q3/Q4/Q12/Q13/Q20 −53 to −59%. Q1/Q6/Q7/Q9 unchanged
+  (head-to-head A/B); Q7/Q9's reordered chains end in a restore projection
+  that still references every column (follow-up). All 22 queries match
+  DuckDB.
+
 ### Wave 111c — join residuals and a parallel aggregate merge ✅
 
 The three TPC-H queries that were still 60–130× DuckDB at SF 1 fell to 10–75×,
