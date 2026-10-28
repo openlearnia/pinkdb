@@ -9,6 +9,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-28</h2>
+<h3>Fix — join residuals over more candidate pairs than a chunk holds ✅</h3>
+<ul>
+<li>A join with a residual condition (an <code>ON</code> or decorrelated <code>EXISTS</code> with a non-equality, like TPC-H Q21's <code>l2.l_suppkey &lt;&gt; l1.l_suppkey</code>) failed with "vector overflow: len 2048 &gt;= CHUNK_SIZE 2048" when one probe chunk had more than 2,048 candidate pairs. The residual is now tested a chunk's worth of pairs at a time. (Present since wave 111c; TPC-H's plans happened not to reach it.)</li>
+</ul>
 <h3>Wave 127c — filter conjuncts run cheapest first ✅</h3>
 <ul>
 <li>A filter's conditions are ordered by estimated cost (DuckDB's expression heuristics): integer and date comparisons run before string comparisons, <code>LIKE</code> and <code>IN</code> lists, which then only see the rows that survive. The order only changes when no condition can raise an error, so a guard like <code>v &lt;&gt; 'x' AND CAST(v AS INTEGER) &gt; 6</code> keeps its written order.</li>

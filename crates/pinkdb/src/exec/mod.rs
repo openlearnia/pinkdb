@@ -4446,35 +4446,40 @@ fn residual_selection(
             (0..pairs.len() as u32).collect()
         });
     }
-    let mut dense = Vec::with_capacity(cols.len());
-    for &c in &cols {
-        let mut v = if c < preserved_cols {
-            Vector::with_capacity(preserved.columns[c].dtype(), pairs.len())
-        } else {
-            // Every build chunk shares one schema.
-            Vector::with_capacity(build[0].columns[c - preserved_cols].dtype(), pairs.len())
-        };
-        for &(pi, bci, bi) in pairs {
-            let (col, row) = if c < preserved_cols {
-                (&preserved.columns[c], pi as usize)
-            } else {
-                (
-                    &build[bci as usize].columns[c - preserved_cols],
-                    bi as usize,
-                )
-            };
-            v.push_from(col, row)?;
-        }
-        dense.push(v);
-    }
     let pred = crate::plan::map_columns(residual.clone(), &|i| {
         cols.binary_search(&i)
             .expect("residual column was gathered")
     });
-    let chunk = DataChunk::new(dense)?;
-    let mut sel = selection::all_rows(chunk.num_rows());
-    expr::select_predicate(&pred, &chunk, cx, &mut sel)?;
-    Ok(sel)
+    // A chunk is at most `CHUNK_SIZE` rows, and a probe chunk can have many
+    // more candidate pairs than that (several matches per row), so the pairs
+    // are gathered and tested a chunk's worth at a time.
+    let mut out = Vec::new();
+    for (batch, part) in pairs.chunks(CHUNK_SIZE).enumerate() {
+        let rows: Vec<u32> = part.iter().map(|&(pi, _, _)| pi).collect();
+        let picks: Vec<(u32, u32)> = part.iter().map(|&(_, bci, bi)| (bci, bi)).collect();
+        let dense = cols
+            .iter()
+            .map(|&c| {
+                if c < preserved_cols {
+                    preserved.columns[c].take(&rows)
+                } else {
+                    let sources: Vec<&Vector> = build
+                        .iter()
+                        .map(|chunk| chunk.columns[c - preserved_cols].as_ref())
+                        .collect();
+                    // Every build chunk shares one schema.
+                    let dtype = build[0].columns[c - preserved_cols].dtype();
+                    Vector::gather_located(dtype, &sources, &picks)
+                }
+            })
+            .collect();
+        let chunk = DataChunk::new(dense)?;
+        let mut sel = selection::all_rows(chunk.num_rows());
+        expr::select_predicate(&pred, &chunk, cx, &mut sel)?;
+        let base = (batch * CHUNK_SIZE) as u32;
+        out.extend(sel.into_iter().map(|k| base + k));
+    }
+    Ok(out)
 }
 
 /// Hash index over a DML statement's source rows. `UPDATE … FROM`,

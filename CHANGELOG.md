@@ -9,6 +9,15 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Fix — join residuals over more candidate pairs than a chunk holds ✅
+
+- A join with a residual condition (an `ON` or decorrelated `EXISTS` with a
+  non-equality, like TPC-H Q21's `l2.l_suppkey <> l1.l_suppkey`) failed with
+  "vector overflow: len 2048 >= CHUNK_SIZE 2048" when one probe chunk had
+  more than 2,048 candidate pairs. The residual is now tested a chunk's
+  worth of pairs at a time. (Present since wave 111c; TPC-H's plans
+  happened not to reach it.)
+
 ### Wave 127c — filter conjuncts run cheapest first ✅
 
 - A filter's conditions are ordered by estimated cost (DuckDB's expression

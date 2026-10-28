@@ -344,3 +344,46 @@ fn residual_joins_match_nested_loop_and_duckdb() {
     eprintln!("{checked} residual join cases matched");
     assert!(checked > 0);
 }
+
+#[test]
+fn a_probe_chunk_with_more_candidate_pairs_than_a_chunk_holds() {
+    // 2,048 probe rows that each match 4 build rows: 8,192 candidate pairs
+    // in one probe chunk, which the residual used to gather into a single
+    // vector (an overflow error past 2,048).
+    let mut db = PinkDb::new();
+    let a: Vec<String> = (0..2048).map(|i| format!("(1, {})", i % 3)).collect();
+    for sql in [
+        "CREATE TABLE a (k INTEGER, v INTEGER);".to_string(),
+        format!("INSERT INTO a VALUES {};", a.join(",")),
+        "CREATE TABLE b (k INTEGER, v INTEGER);".to_string(),
+        "INSERT INTO b VALUES (1, 0), (1, 1), (1, 2), (1, 3);".to_string(),
+    ] {
+        db.execute(&sql).unwrap();
+    }
+    let count = |db: &mut PinkDb, sql: &str| match db.execute(sql).unwrap().pop().unwrap() {
+        pinkdb::QueryResult::Selected { rows, .. } => rows[0][0].clone(),
+        other => panic!("expected rows from {sql}, got {other:?}"),
+    };
+    // Each probe row equals exactly one build value, so 3 of its 4 pairs pass.
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT count(*) FROM a JOIN b ON a.k = b.k AND a.v <> b.v"
+        ),
+        pinkdb::Value::Bigint(6144)
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.v <> a.v)"
+        ),
+        pinkdb::Value::Bigint(2048)
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT count(*) FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.v <> a.v)"
+        ),
+        pinkdb::Value::Bigint(0)
+    );
+}
