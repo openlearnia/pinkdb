@@ -193,3 +193,55 @@ fn an_or_over_join_conditions_derives_filters_without_looping() {
     );
     assert!(plan.contains("Join inner on [#0=#0]"), "{plan}");
 }
+
+#[test]
+fn a_chain_under_nested_decorrelated_joins_starts_from_its_filtered_table() {
+    // TPC-H Q21's shape: `EXISTS` and `NOT EXISTS` decorrelate into an anti
+    // join over a semi join over the comma chain. The chain must still be
+    // ordered so the one-row `nat` filter joins `sup` first, not last.
+    let mut db = PinkDb::new();
+    let nat: Vec<String> = (0..25)
+        .map(|i| {
+            let name = if i == 7 {
+                "TARGET".to_string()
+            } else {
+                format!("N{i}")
+            };
+            format!("({i}, '{name}')")
+        })
+        .collect();
+    let sup: Vec<String> = (0..2000).map(|i| format!("({i}, {})", i % 25)).collect();
+    let item: Vec<String> = (0..40000)
+        .map(|i| format!("({i}, {}, {}, {})", i / 4, (i * 7) % 2000, i % 4 == 0))
+        .collect();
+    for sql in [
+        "CREATE TABLE nat (n INTEGER, name VARCHAR);".to_string(),
+        format!("INSERT INTO nat VALUES {};", nat.join(",")),
+        "CREATE TABLE sup (s INTEGER, n INTEGER);".to_string(),
+        format!("INSERT INTO sup VALUES {};", sup.join(",")),
+        "CREATE TABLE item (id INTEGER, o INTEGER, s INTEGER, late BOOLEAN);".to_string(),
+        format!("INSERT INTO item VALUES {};", item.join(",")),
+    ] {
+        db.execute(&sql).unwrap();
+    }
+    let sql = "SELECT count(*), count(DISTINCT s.s), sum(a.id) FROM sup s, item a, nat n \
+               WHERE s.s = a.s AND s.n = n.n AND n.name = 'TARGET' AND a.late \
+               AND EXISTS (SELECT 1 FROM item b WHERE b.o = a.o AND b.s <> a.s) \
+               AND NOT EXISTS (SELECT 1 FROM item c WHERE c.o = a.o AND c.s <> a.s AND c.late)";
+    let plan = explain(&mut db, sql);
+    let nat_at = plan.find("Scan main.nat").expect("nat scan");
+    let item_at = plan.find("Scan main.item").expect("item scan");
+    assert!(
+        nat_at < item_at,
+        "the filtered table should join first:\n{plan}"
+    );
+    // DuckDB 2.0 on the same data.
+    assert_eq!(
+        rows(&mut db, sql),
+        vec![vec![
+            Value::Bigint(400),
+            Value::Bigint(20),
+            Value::Bigint(8010400)
+        ]]
+    );
+}

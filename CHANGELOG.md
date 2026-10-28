@@ -9,6 +9,14 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 111d — join order reaches chains under nested `EXISTS` ✅
+
+- The cost-based join order (wave 111a) now also reorders a comma-join chain
+  that sits under several decorrelated joins, such as TPC-H Q21's
+  `EXISTS ... AND NOT EXISTS ...` (an anti join over a semi join over the
+  chain). Q21 now joins `nation = 'SAUDI ARABIA'` to `supplier` first
+  instead of last. TPC-H SF 1: **Q21 −30 %**.
+
 ### Fix — join residuals over more candidate pairs than a chunk holds ✅
 
 - A join with a residual condition (an `ON` or decorrelated `EXISTS` with a

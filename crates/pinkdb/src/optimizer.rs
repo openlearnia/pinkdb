@@ -2182,8 +2182,9 @@ fn order_chains(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
     }
 }
 
-/// Order the chain under a join's left input: decorrelation puts the chain
-/// there, out of reach of the filter above the join. Column indices of the
+/// Order the chain under a join's left input — at any depth of the left
+/// spine: decorrelation puts the chain there, out of reach of the filter
+/// above the join. Column indices of the
 /// left input are unchanged and its projection restores the order the join's
 /// keys and the parent predicate expect, so this only changes the join order.
 fn reorder_left_spine(
@@ -2202,7 +2203,14 @@ fn reorder_left_spine(
             left_cols,
             residual,
         } => {
-            let left = reorder_comma_join(predicate, &left, Some(db), false).unwrap_or(*left);
+            let left = match reorder_comma_join(predicate, &left, Some(db), false) {
+                Some(reordered) => reordered,
+                // Nested decorrelation (TPC-H Q21's `EXISTS` and `NOT
+                // EXISTS` give an anti join over a semi join over the chain):
+                // keep walking the left spine. Each level keeps its left
+                // input's column indices, so the parent's keys still match.
+                None => reorder_left_spine(db, *left, predicate),
+            };
             P::Join {
                 kind,
                 left: Box::new(left),
@@ -2220,7 +2228,10 @@ fn reorder_left_spine(
             on: Some(on),
             left_cols,
         } => {
-            let left = reorder_comma_join(predicate, &left, Some(db), false).unwrap_or(*left);
+            let left = match reorder_comma_join(predicate, &left, Some(db), false) {
+                Some(reordered) => reordered,
+                None => reorder_left_spine(db, *left, predicate),
+            };
             P::NestedLoopJoin {
                 kind,
                 left: Box::new(left),
