@@ -9,6 +9,29 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 125 — hash joins: flat hash table, vector-at-a-time assembly ✅
+
+- **A new join hash table, after DuckDB's `JoinHashTable`:** build keys and
+  their 64-bit hashes are computed in parallel per chunk into flat per-row
+  arrays, and a power-of-two bucket array chains the rows. A probe compares
+  the full hash before the key, so other keys in its bucket cost no key
+  compare. It replaces a single-threaded `HashMap` with an allocation per
+  distinct key. Matches still come out in build input order, so results and
+  their order are unchanged.
+- **Join output is assembled a vector at a time:** the probe collects
+  matched (probe row, build row) pairs for a chunk, then builds each output
+  column with one typed gather, instead of copying every column of every
+  matched row one value at a time.
+- **Cheaper everywhere:** `Vector::take`/`gather` copy by type instead of
+  row by row (filters, sorts and every gather use them), memory accounting
+  reads string lengths instead of building a `Value` per cell, and the join
+  filter's range check (wave 122) compares payloads.
+- TPC-H SF 1 (A/B against 126c, alternating, median of 5 rounds, rechecks
+  at 10): all 22 **3.0 → 1.9 s (−37 %)**; Q9 −70 %, Q17 −63 %, Q21 −51 %,
+  Q12 −47 %, Q2 −46 %, Q11 −46 %, Q7 −41 %, Q22 −39 %, Q5 −37 %, Q3 −36 %,
+  Q4 −32 %, Q8 −31 %; no query slower. Results match DuckDB at SF 0.01 and
+  SF 1.
+
 ### Wave 126c — `LIKE` compiled once, no per-row allocation ✅
 
 - **Faster `LIKE`/`NOT LIKE`:** a constant pattern is compiled once per

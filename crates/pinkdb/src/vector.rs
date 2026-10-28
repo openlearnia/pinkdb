@@ -199,6 +199,29 @@ pub struct Vector {
     len: usize,
 }
 
+/// The source index of a [`Vector::gather_located`] pick that is NULL.
+pub(crate) const GATHER_NULL: u32 = u32::MAX;
+
+/// A row index type a selection may use (`u32` selection vectors, `usize`
+/// gathers).
+trait RowIndex: Copy {
+    fn index(self) -> usize;
+}
+
+impl RowIndex for u32 {
+    #[inline]
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+impl RowIndex for usize {
+    #[inline]
+    fn index(self) -> usize {
+        self
+    }
+}
+
 fn mask_len(len: usize) -> usize {
     len.div_ceil(64)
 }
@@ -1038,14 +1061,7 @@ impl Vector {
     }
     /// Build a new vector with rows in `selection` order. Used by Filter.
     pub fn gather(&self, selection: &[usize]) -> Vector {
-        let mut out = Vector::with_capacity(self.dtype(), selection.len());
-        for &i in selection {
-            debug_assert!(i < self.len);
-            // push_from shares string Arcs instead of cloning.
-            out.push_from(self, i)
-                .expect("gather push_from cannot fail");
-        }
-        out
+        self.select_rows(selection)
     }
 
     /// Build a new vector with the rows of a selection (ascending `u32`
@@ -1053,13 +1069,158 @@ impl Vector {
     /// selection-vector form of [`Vector::gather`], for the boundaries that
     /// must materialize a filtered chunk.
     pub fn take(&self, selection: &[u32]) -> Vector {
-        let mut out = Vector::with_capacity(self.dtype(), selection.len());
-        for &i in selection {
-            let i = i as usize;
-            debug_assert!(i < self.len);
-            out.push_from(self, i).expect("take push_from cannot fail");
+        self.select_rows(selection)
+    }
+
+    /// One output vector gathered across several source vectors of type
+    /// `dtype` (a hash join's build columns, one per build chunk): row `k` is
+    /// `sources[c][r]` for `picks[k] = (c, r)`, or NULL when `c` is
+    /// [`GATHER_NULL`] (an outer join's unmatched row). Copied payload by
+    /// payload; ARRAY columns and an empty `sources` take the per-row path.
+    pub(crate) fn gather_located(
+        dtype: DataType,
+        sources: &[&Vector],
+        picks: &[(u32, u32)],
+    ) -> Vector {
+        let n = picks.len();
+        let per_row = || {
+            let mut out = Vector::with_capacity(dtype, n);
+            for &(c, r) in picks {
+                if c == GATHER_NULL {
+                    out.push_null().expect("gather push_null cannot fail");
+                } else {
+                    out.push_from(sources[c as usize], r as usize)
+                        .expect("gather push_from cannot fail");
+                }
+            }
+            out
+        };
+        if sources.is_empty() {
+            return per_row();
         }
-        out
+        macro_rules! gather {
+            ($variant:ident, $default:expr, $copy:expr) => {
+                picks
+                    .iter()
+                    .map(|&(c, r)| {
+                        if c == GATHER_NULL {
+                            return $default;
+                        }
+                        match sources[c as usize].data() {
+                            VectorData::$variant(v) => $copy(&v[r as usize]),
+                            _ => unreachable!("gather sources of mixed types"),
+                        }
+                    })
+                    .collect()
+            };
+        }
+        let data = match sources[0].data() {
+            VectorData::Boolean(_) => VectorData::Boolean(gather!(Boolean, false, |x: &bool| *x)),
+            VectorData::Int32(_) => VectorData::Int32(gather!(Int32, 0, |x: &i32| *x)),
+            VectorData::Int64(_) => VectorData::Int64(gather!(Int64, 0, |x: &i64| *x)),
+            VectorData::Float64(_) => VectorData::Float64(gather!(Float64, 0.0, |x: &f64| *x)),
+            VectorData::VarChar(_) => {
+                let empty: Arc<str> = Arc::from("");
+                VectorData::VarChar(gather!(VarChar, Arc::clone(&empty), |x: &Arc<str>| {
+                    Arc::clone(x)
+                }))
+            }
+            VectorData::Date32(_) => VectorData::Date32(gather!(Date32, 0, |x: &i32| *x)),
+            VectorData::TimestampMicros(_) => {
+                VectorData::TimestampMicros(gather!(TimestampMicros, 0, |x: &i64| *x))
+            }
+            VectorData::Decimal {
+                precision, scale, ..
+            } => VectorData::Decimal {
+                values: picks
+                    .iter()
+                    .map(|&(c, r)| {
+                        if c == GATHER_NULL {
+                            return 0;
+                        }
+                        match sources[c as usize].data() {
+                            VectorData::Decimal { values, .. } => values[r as usize],
+                            _ => unreachable!("gather sources of mixed types"),
+                        }
+                    })
+                    .collect(),
+                precision: *precision,
+                scale: *scale,
+            },
+            VectorData::Interval(_) => {
+                VectorData::Interval(gather!(Interval, Interval::default(), |x: &Interval| *x))
+            }
+            VectorData::Variant(_) => VectorData::Variant(gather!(
+                Variant,
+                Arc::new(crate::variant::Variant::Null),
+                |x: &Arc<crate::variant::Variant>| Arc::clone(x)
+            )),
+            VectorData::Array { .. } => return per_row(),
+        };
+        let mut validity = vec![0u64; mask_len(n)];
+        for (o, &(c, r)) in picks.iter().enumerate() {
+            if c != GATHER_NULL && bit_get(&sources[c as usize].validity, r as usize) {
+                validity[o / 64] |= 1 << (o % 64);
+            }
+        }
+        Vector::from_parts(data, validity, n)
+    }
+
+    /// The rows at `selection` (any order, repeats allowed), copied payload
+    /// by payload instead of one `push_from` per row; strings and variants
+    /// share their `Arc`s. ARRAY columns, whose elements and element bitmap
+    /// are row-major, keep the per-row path.
+    fn select_rows<I: RowIndex>(&self, selection: &[I]) -> Vector {
+        let n = selection.len();
+        let pick = |i: &I| {
+            let i = i.index();
+            debug_assert!(i < self.len);
+            i
+        };
+        let data = match &self.data {
+            VectorData::Boolean(v) => VectorData::Boolean(selection.iter().map(|i| v[pick(i)]).collect()),
+            VectorData::Int32(v) => VectorData::Int32(selection.iter().map(|i| v[pick(i)]).collect()),
+            VectorData::Int64(v) => VectorData::Int64(selection.iter().map(|i| v[pick(i)]).collect()),
+            VectorData::Float64(v) => {
+                VectorData::Float64(selection.iter().map(|i| v[pick(i)]).collect())
+            }
+            VectorData::VarChar(v) => {
+                VectorData::VarChar(selection.iter().map(|i| Arc::clone(&v[pick(i)])).collect())
+            }
+            VectorData::Date32(v) => VectorData::Date32(selection.iter().map(|i| v[pick(i)]).collect()),
+            VectorData::TimestampMicros(v) => {
+                VectorData::TimestampMicros(selection.iter().map(|i| v[pick(i)]).collect())
+            }
+            VectorData::Decimal {
+                values,
+                precision,
+                scale,
+            } => VectorData::Decimal {
+                values: selection.iter().map(|i| values[pick(i)]).collect(),
+                precision: *precision,
+                scale: *scale,
+            },
+            VectorData::Interval(v) => {
+                VectorData::Interval(selection.iter().map(|i| v[pick(i)]).collect())
+            }
+            VectorData::Variant(v) => {
+                VectorData::Variant(selection.iter().map(|i| Arc::clone(&v[pick(i)])).collect())
+            }
+            VectorData::Array { .. } => {
+                let mut out = Vector::with_capacity(self.dtype(), n);
+                for i in selection {
+                    out.push_from(self, pick(i)).expect("take push_from cannot fail");
+                }
+                return out;
+            }
+        };
+        let mut validity = vec![0u64; mask_len(n)];
+        for (o, i) in selection.iter().enumerate() {
+            if bit_get(&self.validity, i.index()) {
+                validity[o / 64] |= 1 << (o % 64);
+            }
+        }
+        Vector::from_parts(data, validity, n)
     }
 
     /// Count of NULLs (linear scan; fine for ≤2048 rows).

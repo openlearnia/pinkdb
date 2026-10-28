@@ -803,6 +803,27 @@ pub(crate) struct JoinFilter {
     /// has exactly this dtype, because [`key_hash`] is type-directed.
     pub dtype: DataType,
     pub bloom: Arc<Bloom>,
+    /// `min`/`max` as integers when the keys are INTEGER, BIGINT, DATE or
+    /// TIMESTAMP, so the probe compares payloads instead of `Value`s.
+    int_range: Option<(i64, i64)>,
+}
+
+/// An integer-family key bound as `i64`.
+fn int_bound(v: &Value) -> Option<i64> {
+    match v {
+        Value::Integer(x) | Value::Date(x) => Some(i64::from(*x)),
+        Value::Bigint(x) | Value::Timestamp(x) => Some(*x),
+        _ => None,
+    }
+}
+
+/// An integer-family probe cell as `i64`.
+fn int_cell(v: &Vector, row: usize) -> Option<i64> {
+    match v.data() {
+        VectorData::Int32(d) | VectorData::Date32(d) => Some(i64::from(d[row])),
+        VectorData::Int64(d) | VectorData::TimestampMicros(d) => Some(d[row]),
+        _ => None,
+    }
 }
 
 /// Accumulates a [`JoinFilter`] for one build key, chunk by chunk, without
@@ -836,11 +857,16 @@ impl JoinFilterBuilder {
     }
 
     pub(crate) fn finish(self) -> JoinFilter {
+        let int_range = match (&self.zone.min, &self.zone.max) {
+            (Some(lo), Some(hi)) => int_bound(lo).zip(int_bound(hi)),
+            _ => None,
+        };
         JoinFilter {
             min: self.zone.min,
             max: self.zone.max,
             dtype: self.dtype,
             bloom: Arc::new(self.bloom),
+            int_range,
         }
     }
 }
@@ -858,22 +884,43 @@ impl JoinFilter {
         }
         // A NaN key matches itself in this engine, and no bound is meaningful
         // for it, so the range below would reject a row the join keeps.
-        if self.dtype == DataType::Double
-            && let Value::Double(d) = v.get(row)
-            && d.is_nan()
+        if let VectorData::Float64(d) = v.data()
+            && d[row].is_nan()
         {
             return true;
         }
-        if let Some(min) = &self.min {
-            let value = v.get(row);
-            if compare_values(&value, min).is_lt() {
+        // The range check reads the payload where it can: integers against
+        // the precomputed range, strings borrowed (no `Value` per row).
+        if let Some((lo, hi)) = self.int_range
+            && let Some(x) = int_cell(v, row)
+        {
+            if x < lo || x > hi {
                 return false;
             }
-        }
-        if let Some(max) = &self.max {
-            let value = v.get(row);
-            if compare_values(&value, max).is_gt() {
+        } else if let VectorData::VarChar(d) = v.data() {
+            let s: &str = &d[row];
+            if let Some(Value::Varchar(min)) = &self.min
+                && s < min.as_str()
+            {
                 return false;
+            }
+            if let Some(Value::Varchar(max)) = &self.max
+                && s > max.as_str()
+            {
+                return false;
+            }
+        } else {
+            if let Some(min) = &self.min {
+                let value = v.get(row);
+                if compare_values(&value, min).is_lt() {
+                    return false;
+                }
+            }
+            if let Some(max) = &self.max {
+                let value = v.get(row);
+                if compare_values(&value, max).is_gt() {
+                    return false;
+                }
             }
         }
         self.bloom.contains(key_hash(v, row))

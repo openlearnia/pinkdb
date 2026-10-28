@@ -280,11 +280,19 @@ fn row_approx_bytes(row: &[Value]) -> usize {
     row.iter().map(value_approx_bytes).sum()
 }
 
+/// [`value_approx_bytes`] summed over a chunk, read off the payloads: one
+/// `Value` per cell plus the bytes of every non-NULL string.
 fn chunk_approx_bytes(chunk: &DataChunk) -> usize {
     let mut total = 0usize;
     for column in &chunk.columns {
-        for i in 0..column.len() {
-            total += value_approx_bytes(&column.get(i));
+        total += column.len() * std::mem::size_of::<Value>();
+        if let VectorData::VarChar(strings) = column.data() {
+            total += strings
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| column.is_valid(*i))
+                .map(|(_, s)| s.len())
+                .sum::<usize>();
         }
     }
     total
@@ -4053,9 +4061,6 @@ fn sample_output(input: Output, sample: &crate::sql::ast::SampleSpec) -> Output 
 /// Sentinel ending a match chain in [`MatchTable`]'s arena.
 const NIL: u32 = u32::MAX;
 
-/// One arena node: (right chunk, right row, next node in the key's chain).
-type MatchNode = (u32, u32, u32);
-
 /// Key dtypes whose payload is a single integer that widens losslessly to
 /// i64. The int path requires BOTH dtypes in the integer family, so
 /// INTEGER=BIGINT is the only cross-type pairing (DATE and TIMESTAMP pair
@@ -4102,135 +4107,255 @@ fn eval_join_key(
     }
 }
 
-/// Build-side match table of a hash join: key → (head, tail) of that key's
-/// match chain. The arena holds one `(right_chunk, right_row, next)` node per
-/// match in right input order (sentinel [`NIL`] ends a chain); appending links
-/// the new node after the tail. This replaces a small `Vec` allocation per
-/// distinct key while keeping one hash lookup per row. (A `(start, len)` slice
-/// into a flat arena cannot work in one pass: matches of distinct keys
-/// interleave, so a key's rows are not contiguous.)
+/// Finalizer of MurmurHash3 (`fmix64`), DuckDB's integer hash
+/// (`MurmurHash64` in src/include/duckdb/common/types/hash.hpp): spreads a
+/// key's bits over the whole word so the low bits index buckets well.
+#[inline]
+fn mix64(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
+}
+
+/// Hash of an integer join key.
+#[inline]
+fn hash_int_key(key: i64) -> u64 {
+    mix64(key as u64)
+}
+
+/// Hash of an encoded (byte) join key: eight bytes at a time, then mixed.
+#[inline]
+fn hash_bytes_key(key: &[u8]) -> u64 {
+    let mut h = 0x9e37_79b9_7f4a_7c15u64 ^ key.len() as u64;
+    let mut words = key.chunks_exact(8);
+    for w in &mut words {
+        let x = u64::from_le_bytes(w.try_into().expect("eight bytes"));
+        h = (h ^ x).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(31);
+    }
+    let mut tail = [0u8; 8];
+    tail[..words.remainder().len()].copy_from_slice(words.remainder());
+    h ^= u64::from_le_bytes(tail);
+    mix64(h)
+}
+
+/// The build side's keys, one entry per build row in input order.
+enum BuildKeys {
+    /// INTEGER/BIGINT/DATE/TIMESTAMP payloads widened to i64 — no encoding
+    /// and no `coerce_to`.
+    Ints(Vec<i64>),
+    /// The generic `Vector::encode_into` encoding for every other dtype
+    /// (VARCHAR, DOUBLE, BOOLEAN, mixed numeric): row `r`'s key is
+    /// `data[offsets[r]..offsets[r + 1]]`.
+    Bytes { data: Vec<u8>, offsets: Vec<usize> },
+}
+
+/// One build chunk's keys, evaluated (in parallel) before linking.
+struct ChunkKeys {
+    hashes: Vec<u64>,
+    /// False for a row with a NULL key cell: it never matches.
+    valid: Vec<bool>,
+    ints: Vec<i64>,
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+/// Build-side match table of a hash join, after DuckDB's `JoinHashTable`
+/// (src/execution/join_hashtable.cpp): every build row keeps its key and its
+/// 64-bit hash in flat per-row arrays, and a power-of-two bucket array
+/// chains the rows by `hash & mask` through a per-row `next` link. A probe
+/// walks its bucket's chain and compares the full hash before the key, so
+/// rows of other keys in the bucket are rejected without a key compare.
 ///
-/// Two key representations, chosen by the bound key dtypes:
-/// - `Ints`: INTEGER/BIGINT/DATE/TIMESTAMP payloads widened to i64 — no
-///   encoding and no `coerce_to`;
-/// - `Bytes`: the generic `Vector::encode_into` encoding for every other
-///   dtype (VARCHAR, DOUBLE, BOOLEAN, mixed numeric).
+/// Keys and hashes are computed in parallel per chunk; rows are linked in
+/// reverse input order, so every chain — and so every key's matches — comes
+/// out in build input order, the order the probe emits them. A row whose
+/// *any* key cell is NULL never matches and is not linked.
 ///
-/// Probe/assembly reads either variant through the same accessors, so the
-/// future fused join→aggregate path can reuse the table as-is.
-enum MatchTable {
-    Ints {
-        map: FastMap<i64, (u32, u32)>,
-        arena: Vec<MatchNode>,
-    },
-    Bytes {
-        map: FastMap<Vec<u8>, (u32, u32)>,
-        arena: Vec<MatchNode>,
-    },
+/// Rows are global build row ids (input order across chunks); `loc` maps one
+/// back to its `(chunk, row)`.
+struct MatchTable {
+    heads: Vec<u32>,
+    next: Vec<u32>,
+    hashes: Vec<u64>,
+    keys: BuildKeys,
+    locs: Vec<(u32, u32)>,
+    mask: u64,
 }
 
 impl MatchTable {
-    /// Build over the right input. `reserve` is the caller's capacity policy
-    /// (distinct keys, not rows: a skewed join must not preallocate one slot
-    /// per right row; both containers grow on demand past the cap). A row
-    /// whose *any* key cell is NULL never matches and is not inserted.
+    /// Build over the right input.
     fn build(
         cx: &Cx,
         right_chunks: &[DataChunk],
         right_keys: &[BoundExpr],
         commons: &[Option<DataType>],
         ints: bool,
-        reserve: usize,
     ) -> Result<MatchTable> {
-        let mut table = if ints {
-            MatchTable::Ints {
-                map: FastMap::with_capacity_and_hasher(reserve, Default::default()),
-                arena: Vec::with_capacity(reserve),
-            }
+        let per_chunk: Vec<ChunkKeys> = right_chunks
+            .par_iter()
+            .map(|chunk| -> Result<ChunkKeys> {
+                let kvs: Vec<Vector> = right_keys
+                    .iter()
+                    .zip(commons.iter())
+                    .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
+                    .collect::<Result<_>>()?;
+                let n = chunk.num_rows();
+                let mut keys = ChunkKeys {
+                    hashes: Vec::with_capacity(n),
+                    valid: Vec::with_capacity(n),
+                    ints: Vec::new(),
+                    bytes: Vec::new(),
+                    ends: Vec::new(),
+                };
+                if ints {
+                    keys.ints.reserve(n);
+                } else {
+                    keys.ends.reserve(n);
+                }
+                for i in 0..n {
+                    let valid = !kvs.iter().any(|kv| kv.is_null(i));
+                    keys.valid.push(valid);
+                    if ints {
+                        let key = if valid { int_key_at(&kvs[0], i) } else { 0 };
+                        keys.ints.push(key);
+                        keys.hashes.push(hash_int_key(key));
+                    } else {
+                        let start = keys.bytes.len();
+                        if valid {
+                            for kv in &kvs {
+                                kv.encode_into(&mut keys.bytes, i);
+                            }
+                        }
+                        keys.ends.push(keys.bytes.len());
+                        keys.hashes.push(hash_bytes_key(&keys.bytes[start..]));
+                    }
+                }
+                Ok(keys)
+            })
+            .collect::<Result<_>>()?;
+        let rows: usize = per_chunk.iter().map(|k| k.hashes.len()).sum();
+        let mut hashes = Vec::with_capacity(rows);
+        let mut valid = Vec::with_capacity(rows);
+        let mut locs = Vec::with_capacity(rows);
+        let mut keys = if ints {
+            BuildKeys::Ints(Vec::with_capacity(rows))
         } else {
-            MatchTable::Bytes {
-                map: FastMap::with_capacity_and_hasher(reserve, Default::default()),
-                arena: Vec::with_capacity(reserve),
+            let mut offsets = Vec::with_capacity(rows + 1);
+            offsets.push(0);
+            BuildKeys::Bytes {
+                data: Vec::new(),
+                offsets,
             }
         };
-        let mut buf = Vec::new();
-        for (ci, chunk) in right_chunks.iter().enumerate() {
-            let kvs: Vec<Vector> = right_keys
-                .iter()
-                .zip(commons.iter())
-                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
-                .collect::<Result<_>>()?;
-            for i in 0..chunk.num_rows() {
-                if kvs.iter().any(|kv| kv.is_null(i)) {
-                    continue;
-                }
-                match &mut table {
-                    MatchTable::Ints { map, arena } => {
-                        let key = int_key_at(&kvs[0], i);
-                        let node = arena.len() as u32;
-                        arena.push((ci as u32, i as u32, NIL));
-                        match map.get_mut(&key) {
-                            Some(slot) => {
-                                arena[slot.1 as usize].2 = node;
-                                slot.1 = node;
-                            }
-                            None => {
-                                map.insert(key, (node, node));
-                            }
-                        }
-                    }
-                    MatchTable::Bytes { map, arena } => {
-                        // Borrowed encoding, get-first: hits allocate nothing.
-                        buf.clear();
-                        for kv in &kvs {
-                            kv.encode_into(&mut buf, i);
-                        }
-                        let node = arena.len() as u32;
-                        arena.push((ci as u32, i as u32, NIL));
-                        match map.get_mut(&buf) {
-                            Some(slot) => {
-                                arena[slot.1 as usize].2 = node;
-                                slot.1 = node;
-                            }
-                            None => {
-                                map.insert(buf.clone(), (node, node));
-                            }
-                        }
-                    }
+        for (ci, k) in per_chunk.into_iter().enumerate() {
+            locs.extend((0..k.hashes.len() as u32).map(|r| (ci as u32, r)));
+            hashes.extend_from_slice(&k.hashes);
+            valid.extend_from_slice(&k.valid);
+            match &mut keys {
+                BuildKeys::Ints(all) => all.extend_from_slice(&k.ints),
+                BuildKeys::Bytes { data, offsets } => {
+                    let base = data.len();
+                    data.extend_from_slice(&k.bytes);
+                    offsets.extend(k.ends.iter().map(|e| base + e));
                 }
             }
         }
-        Ok(table)
+        // DuckDB sizes the pointer table at twice the row count, a power of
+        // two (`JoinHashTable::PointerTableCapacity`).
+        let buckets = (rows.max(1) * 2).next_power_of_two().max(1024);
+        let mask = buckets as u64 - 1;
+        let mut heads = vec![NIL; buckets];
+        let mut next = vec![NIL; rows];
+        for r in (0..rows).rev() {
+            if !valid[r] {
+                continue;
+            }
+            let b = (hashes[r] & mask) as usize;
+            next[r] = heads[b];
+            heads[b] = r as u32;
+        }
+        Ok(MatchTable {
+            heads,
+            next,
+            hashes,
+            keys,
+            locs,
+            mask,
+        })
     }
 
-    /// Probe accessor: head node of `key`'s match chain, if any. The caller
-    /// picks the accessor matching the representation the table was built
-    /// with (`ints`).
+    /// The build rows whose key equals the integer `key`, in input order.
     #[inline]
-    fn head_int(&self, key: i64) -> Option<u32> {
-        match self {
-            MatchTable::Ints { map, .. } => map.get(&key).map(|&(head, _)| head),
-            MatchTable::Bytes { .. } => unreachable!("int key probed against a byte match table"),
+    fn matches_int(&self, key: i64) -> Matches<'_> {
+        let hash = hash_int_key(key);
+        Matches {
+            table: self,
+            row: self.heads[(hash & self.mask) as usize],
+            hash,
+            key: ProbeKey::Int(key),
         }
     }
 
-    /// Probe accessor for byte-encoded keys.
+    /// The build rows whose encoded key equals `key`, in input order.
     #[inline]
-    fn head_bytes(&self, key: &[u8]) -> Option<u32> {
-        match self {
-            MatchTable::Bytes { map, .. } => map.get(key).map(|&(head, _)| head),
-            MatchTable::Ints { .. } => unreachable!("byte key probed against an int match table"),
+    fn matches_bytes<'k>(&'k self, key: &'k [u8]) -> Matches<'k> {
+        let hash = hash_bytes_key(key);
+        Matches {
+            table: self,
+            row: self.heads[(hash & self.mask) as usize],
+            hash,
+            key: ProbeKey::Bytes(key),
         }
     }
 
-    /// `(right_chunk, right_row, next)` of arena node `node`.
+    /// `(chunk, row)` of global build row `row`.
     #[inline]
-    fn node(&self, node: u32) -> MatchNode {
-        match self {
-            MatchTable::Ints { arena, .. } | MatchTable::Bytes { arena, .. } => {
-                arena[node as usize]
+    fn loc(&self, row: u32) -> (u32, u32) {
+        self.locs[row as usize]
+    }
+}
+
+/// A probe key, borrowed for the walk of its bucket chain.
+#[derive(Clone, Copy)]
+enum ProbeKey<'k> {
+    Int(i64),
+    Bytes(&'k [u8]),
+}
+
+/// Iterator over one key's matching build rows (global ids, input order).
+struct Matches<'t> {
+    table: &'t MatchTable,
+    row: u32,
+    hash: u64,
+    key: ProbeKey<'t>,
+}
+
+impl Iterator for Matches<'_> {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        let t = self.table;
+        while self.row != NIL {
+            let r = self.row as usize;
+            self.row = t.next[r];
+            if t.hashes[r] != self.hash {
+                continue;
+            }
+            let equal = match (&t.keys, self.key) {
+                (BuildKeys::Ints(keys), ProbeKey::Int(k)) => keys[r] == k,
+                (BuildKeys::Bytes { data, offsets }, ProbeKey::Bytes(k)) => {
+                    &data[offsets[r]..offsets[r + 1]] == k
+                }
+                _ => unreachable!("probe key representation differs from the build's"),
+            };
+            if equal {
+                return Some(r as u32);
             }
         }
+        None
     }
 }
 
@@ -4264,20 +4389,18 @@ fn candidate_pairs(
         if kvs.iter().any(|kv| kv.is_null(i)) {
             continue;
         }
-        let head = if ints {
-            table.head_int(int_key_at(&kvs[0], i))
+        let matches = if ints {
+            table.matches_int(int_key_at(&kvs[0], i))
         } else {
             buf.clear();
             for kv in kvs {
                 kv.encode_into(buf, i);
             }
-            table.head_bytes(buf)
+            table.matches_bytes(buf)
         };
-        let mut node = head.unwrap_or(NIL);
-        while node != NIL {
-            let (bci, bi, next) = table.node(node);
+        for r in matches {
+            let (bci, bi) = table.loc(r);
             pairs.push((i as u32, bci, bi));
-            node = next;
         }
     }
     pairs
@@ -4416,8 +4539,7 @@ impl DmlIndex {
                 "DML source exceeds u32 rows".to_string(),
             ));
         }
-        let reserve = rows.min(1 << 20);
-        let table = MatchTable::build(cx, source, &src_keys, &commons, ints, reserve)?;
+        let table = MatchTable::build(cx, source, &src_keys, &commons, ints)?;
         Ok(Some(DmlIndex {
             table,
             keys,
@@ -4444,22 +4566,16 @@ impl DmlIndex {
         if kvs.iter().any(|kv| kv.is_null(row)) {
             return Ok(Vec::new());
         }
-        let mut head = if self.ints {
-            self.table.head_int(int_key_at(&kvs[0], row))
+        let matches = if self.ints {
+            self.table.matches_int(int_key_at(&kvs[0], row))
         } else {
             buf.clear();
             for kv in &kvs {
                 kv.encode_into(buf, row);
             }
-            self.table.head_bytes(buf)
+            self.table.matches_bytes(buf)
         };
-        let mut out = Vec::new();
-        while let Some(node) = head {
-            let (sc, sr, next) = self.table.node(node);
-            out.push((sc, sr));
-            head = (next != NIL).then_some(next);
-        }
-        Ok(out)
+        Ok(matches.map(|r| self.table.loc(r)).collect())
     }
 }
 
@@ -4687,15 +4803,7 @@ fn hash_mark_join(
     // the row". ANTI and MARK still have to answer for it.
     debug_assert!(filters.is_none() || kind == JoinKind::Semi);
     let (ints, commons) = key_encoding(left_keys, right_keys);
-    let build_rows: usize = right.chunks.iter().map(|c| c.num_rows()).sum();
-    let table = MatchTable::build(
-        cx,
-        right.chunks,
-        right_keys,
-        &commons,
-        ints,
-        build_rows.min(1 << 20),
-    )?;
+    let table = MatchTable::build(cx, right.chunks, right_keys, &commons, ints)?;
     // Per correlation group: rows seen, and rows whose match value was not
     // NULL. Only a mark join reads them.
     let mut groups: std::collections::HashMap<Vec<u8>, (u32, u32)> =
@@ -4804,13 +4912,13 @@ fn hash_mark_join(
                 let null_key = kvs.iter().any(|kv| kv.is_null(i));
                 let mut hit = !null_key
                     && if ints {
-                        table.head_int(int_key_at(&kvs[0], i)).is_some()
+                        table.matches_int(int_key_at(&kvs[0], i)).next().is_some()
                     } else {
                         buf.clear();
                         for kv in &kvs {
                             kv.encode_into(&mut buf, i);
                         }
-                        table.head_bytes(&buf).is_some()
+                        table.matches_bytes(&buf).next().is_some()
                     };
                 if let Some(pass) = &row_pass {
                     hit = hit && pass[i];
@@ -4957,29 +5065,38 @@ fn swap_join_space(expr: &BoundExpr, left_cols: usize, right_cols: usize) -> Bou
     })
 }
 
-/// Output assembly of one probe partition: matched pairs and unmatched
-/// preserved rows land in `CHUNK_SIZE`-row chunks in visit order.
-struct ProbeSink<'a> {
+/// Output assembly of a hash join probe (wave 125): matched pairs are
+/// collected as `(preserved row, build location)` until a chunk's worth, then
+/// every output column is built in one typed gather — the preserved side by
+/// `Vector::take` over the preserved chunk, the build side by
+/// `Vector::gather_located` across the build chunks (NULL for an outer
+/// join's unmatched row). DuckDB assembles its join output the same way, a
+/// vector at a time (`ScanStructure::NextInnerJoin` gathers the build
+/// columns for a selection of probe rows).
+///
+/// Columns no consumer reads (wave 127) are one shared zero-length
+/// placeholder each and are never gathered.
+struct JoinAssembler<'a> {
     cx: &'a Cx<'a>,
     dtypes: &'a [DataType],
     n_left: usize,
     preserved_is_right: bool,
-    /// Which output columns are assembled (wave 127); the rest are emitted as
-    /// one shared zero-length placeholder each, because no consumer reads them.
-    present: Vec<bool>,
     placeholders: Vec<Option<std::sync::Arc<Vector>>>,
-    cur: Vec<Vector>,
-    cur_rows: usize,
+    /// Per build-side column, that column of every build chunk.
+    build_cols: &'a [Vec<&'a Vector>],
+    rows: Vec<u32>,
+    picks: Vec<(u32, u32)>,
     finished: Vec<DataChunk>,
 }
 
-impl<'a> ProbeSink<'a> {
+impl<'a> JoinAssembler<'a> {
     fn new(
         cx: &'a Cx<'a>,
         dtypes: &'a [DataType],
         n_left: usize,
         preserved_is_right: bool,
         present: Option<&[bool]>,
+        build_cols: &'a [Vec<&'a Vector>],
     ) -> Self {
         let present: Vec<bool> = match present {
             Some(mask) if mask.len() == dtypes.len() => mask.to_vec(),
@@ -4990,140 +5107,80 @@ impl<'a> ProbeSink<'a> {
             .zip(&present)
             .map(|(t, keep)| (!keep).then(|| std::sync::Arc::new(Vector::new_empty(*t))))
             .collect();
-        let mut sink = ProbeSink {
+        JoinAssembler {
             cx,
             dtypes,
             n_left,
             preserved_is_right,
-            present,
             placeholders,
-            cur: Vec::new(),
-            cur_rows: 0,
+            build_cols,
+            rows: Vec::with_capacity(CHUNK_SIZE),
+            picks: Vec::with_capacity(CHUNK_SIZE),
             finished: Vec::new(),
-        };
-        sink.cur = sink.fresh();
-        sink
+        }
     }
 
-    /// Output vectors for the next chunk: absent columns stay empty and are
-    /// never pushed to.
-    fn fresh(&self) -> Vec<Vector> {
-        self.dtypes
-            .iter()
-            .zip(&self.present)
-            .map(|(t, keep)| {
-                if *keep {
-                    Vector::with_capacity(*t, CHUNK_SIZE)
-                } else {
-                    Vector::new_empty(*t)
-                }
-            })
+    /// The build-side columns of every chunk, per column (what
+    /// [`JoinAssembler::new`] borrows).
+    fn build_columns(build: &'a [DataChunk], width: usize) -> Vec<Vec<&'a Vector>> {
+        (0..width)
+            .map(|c| build.iter().map(|chunk| chunk.columns[c].as_ref()).collect())
             .collect()
     }
 
-    /// The current vectors as a chunk, placeholders in the absent slots.
-    fn take_chunk(&mut self) -> DataChunk {
-        let cur = std::mem::take(&mut self.cur);
-        let columns = cur
-            .into_iter()
-            .zip(&self.placeholders)
-            .map(|(v, placeholder)| match placeholder {
-                Some(p) => std::sync::Arc::clone(p),
-                None => std::sync::Arc::new(v),
-            })
-            .collect();
-        DataChunk::projected(columns, self.cur_rows)
+    /// One output row: preserved row `row` of `chunk` joined with the build
+    /// row at `(build chunk, row)`, or NULL-extended when the location is
+    /// `(GATHER_NULL, _)`.
+    #[inline]
+    fn push(&mut self, chunk: &DataChunk, row: usize, at: (u32, u32)) -> Result<()> {
+        self.rows.push(row as u32);
+        self.picks.push(at);
+        if self.rows.len() == CHUNK_SIZE {
+            self.emit(chunk)?;
+        }
+        Ok(())
     }
 
-    /// Emit the current chunk when it is full.
-    fn flush(&mut self) -> Result<()> {
-        if self.cur_rows < CHUNK_SIZE {
+    /// Gather the pending rows into one output chunk.
+    fn emit(&mut self, chunk: &DataChunk) -> Result<()> {
+        if self.rows.is_empty() {
             return Ok(());
         }
-        let chunk = self.take_chunk();
+        let n_build = self.dtypes.len() - chunk.columns.len();
+        let columns = (0..self.dtypes.len())
+            .map(|k| {
+                if let Some(p) = &self.placeholders[k] {
+                    return std::sync::Arc::clone(p);
+                }
+                // Output is left ++ right; the preserved side is left unless
+                // a RIGHT join probes with its right side.
+                let build_side = if self.preserved_is_right {
+                    k < self.n_left
+                } else {
+                    k >= self.n_left
+                };
+                std::sync::Arc::new(if build_side {
+                    let j = if self.preserved_is_right { k } else { k - self.n_left };
+                    debug_assert!(j < n_build);
+                    Vector::gather_located(self.dtypes[k], &self.build_cols[j], &self.picks)
+                } else {
+                    let j = if self.preserved_is_right { k - self.n_left } else { k };
+                    chunk.columns[j].take(&self.rows)
+                })
+            })
+            .collect();
+        let out = DataChunk::projected(columns, self.rows.len());
         self.cx
-            .add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
-        self.finished.push(chunk);
-        self.cur = self.fresh();
-        self.cur_rows = 0;
+            .add_materialized(out.num_rows(), chunk_approx_bytes(&out))?;
+        self.finished.push(out);
+        self.rows.clear();
+        self.picks.clear();
         Ok(())
     }
 
-    /// One matched pair, emitted in declared `left ++ right` order.
-    fn push(
-        &mut self,
-        row: usize,
-        chunk: &DataChunk,
-        bchunk: &DataChunk,
-        brow: usize,
-    ) -> Result<()> {
-        self.flush()?;
-        let (left, lrow, right, rrow) = if self.preserved_is_right {
-            (bchunk, brow, chunk, row)
-        } else {
-            (chunk, row, bchunk, brow)
-        };
-        for ((dst, col), keep) in self
-            .cur
-            .iter_mut()
-            .take(self.n_left)
-            .zip(left.columns.iter())
-            .zip(&self.present)
-        {
-            if *keep {
-                dst.push_from(col, lrow)?;
-            }
-        }
-        for ((dst, col), keep) in self
-            .cur
-            .iter_mut()
-            .skip(self.n_left)
-            .zip(right.columns.iter())
-            .zip(self.present.iter().skip(self.n_left))
-        {
-            if *keep {
-                dst.push_from(col, rrow)?;
-            }
-        }
-        self.cur_rows += 1;
-        Ok(())
-    }
-
-    /// A preserved row without a match: its own columns plus NULLs.
-    fn push_unmatched(&mut self, row: usize, chunk: &DataChunk) -> Result<()> {
-        self.flush()?;
-        let base = if self.preserved_is_right {
-            self.n_left
-        } else {
-            0
-        };
-        for (k, dst) in self.cur.iter_mut().enumerate() {
-            if !self.present[k] {
-                continue;
-            }
-            let preserved = if self.preserved_is_right {
-                k >= self.n_left
-            } else {
-                k < self.n_left
-            };
-            if preserved {
-                dst.push_from(&chunk.columns[k - base], row)?;
-            } else {
-                dst.push_null()?;
-            }
-        }
-        self.cur_rows += 1;
-        Ok(())
-    }
-
-    /// Close the partition's last chunk.
-    fn finish(mut self) -> Result<Vec<DataChunk>> {
-        if self.cur_rows > 0 {
-            let chunk = self.take_chunk();
-            self.cx
-                .add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
-            self.finished.push(chunk);
-        }
+    /// Close the preserved chunk's last output chunk.
+    fn finish(mut self, chunk: &DataChunk) -> Result<Vec<DataChunk>> {
+        self.emit(chunk)?;
         Ok(self.finished)
     }
 }
@@ -5154,11 +5211,7 @@ fn hash_join_probe(
             "hash join build side exceeds u32 rows".to_string(),
         ));
     }
-    // Reserve for distinct keys, not rows: a skewed join would otherwise
-    // allocate `build_rows` map/arena slots for a handful of keys. Both grow
-    // on demand past the cap.
-    let reserve = build_rows.min(1 << 20);
-    let table = MatchTable::build(cx, build.chunks, build_keys, &commons, ints, reserve)?;
+    let table = MatchTable::build(cx, build.chunks, build_keys, &commons, ints)?;
     // FULL JOIN bookkeeping: global build-row index per chunk, and one flag
     // per build row (shared across the parallel probe).
     let build_chunk_starts: Vec<u32> = {
@@ -5190,6 +5243,7 @@ fn hash_join_probe(
     let mut dtypes: Vec<DataType> = left_types.to_vec();
     dtypes.extend(right_types.iter().copied());
     let n_left = left_types.len();
+    let build_cols = JoinAssembler::build_columns(build.chunks, build.types.len());
     let partitions: Vec<Vec<DataChunk>> = preserved
         .chunks
         .par_iter()
@@ -5201,7 +5255,8 @@ fn hash_join_probe(
                 .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
                 .collect::<Result<_>>()?;
             let mut buf = Vec::new();
-            let mut sink = ProbeSink::new(cx, &dtypes, n_left, preserved_is_right, present);
+            let mut sink =
+                JoinAssembler::new(cx, &dtypes, n_left, preserved_is_right, present, &build_cols);
             if let Some(residual) = residual {
                 // Two passes: the residual decides which candidate pairs are
                 // matches before any of them is assembled.
@@ -5216,14 +5271,9 @@ fn hash_join_probe(
                 )?;
                 for k in kept {
                     let (row, bci, bi) = pairs[k as usize];
-                    sink.push(
-                        row as usize,
-                        chunk,
-                        &build.chunks[bci as usize],
-                        bi as usize,
-                    )?;
+                    sink.push(chunk, row as usize, (bci, bi))?;
                 }
-                return sink.finish();
+                return sink.finish(chunk);
             }
             for i in 0..chunk.num_rows() {
                 // A row the build side's bloom rules out cannot match, so it is
@@ -5240,44 +5290,41 @@ fn hash_join_probe(
                     continue;
                 }
                 let null_key = kvs.iter().any(|kv| kv.is_null(i));
-                let head = if null_key {
-                    if !extend_unmatched {
-                        continue;
-                    }
-                    None
-                } else if ints {
-                    table.head_int(int_key_at(&kvs[0], i))
-                } else {
-                    buf.clear();
-                    for kv in &kvs {
-                        kv.encode_into(&mut buf, i);
-                    }
-                    table.head_bytes(&buf)
-                };
-                match head {
-                    Some(mut node) => {
-                        while node != NIL {
-                            let (bci, bi, next) = table.node(node);
-                            if let Some(marked) = &marked {
-                                let global =
-                                    build_chunk_starts[bci as usize] as usize + bi as usize;
-                                marked[global].store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            sink.push(i, chunk, &build.chunks[bci as usize], bi as usize)?;
-                            node = next;
+                if null_key && !extend_unmatched {
+                    continue;
+                }
+                let mut matched = false;
+                if !null_key {
+                    let matches = if ints {
+                        table.matches_int(int_key_at(&kvs[0], i))
+                    } else {
+                        buf.clear();
+                        for kv in &kvs {
+                            kv.encode_into(&mut buf, i);
                         }
+                        table.matches_bytes(&buf)
+                    };
+                    for r in matches {
+                        matched = true;
+                        if let Some(marked) = &marked {
+                            marked[r as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        sink.push(chunk, i, table.loc(r))?;
                     }
-                    None => {
+                }
+                match matched {
+                    true => {}
+                    false => {
                         // Inner: no match, drop the row. Outer: unmatched (or
                         // NULL-keyed) preserved row — NULL-extend.
                         if !extend_unmatched {
                             continue;
                         }
-                        sink.push_unmatched(i, chunk)?;
+                        sink.push(chunk, i, (crate::vector::GATHER_NULL, 0))?;
                     }
                 }
             }
-            sink.finish()
+            sink.finish(chunk)
         })
         .collect::<Result<_>>()?;
     let mut out: Vec<DataChunk> = partitions.into_iter().flatten().collect();
@@ -5937,14 +5984,12 @@ fn fused_join_aggregate(
             "hash join build side exceeds u32 rows".to_string(),
         ));
     }
-    let reserve = build_rows.min(1 << 20);
     let table = MatchTable::build(
         cx,
         &build.chunks,
         std::slice::from_ref(build_key),
         std::slice::from_ref(&common),
         ints,
-        reserve,
     )?;
 
     // Fast path: keys-free pure COUNT(*) counts matched pairs by walking the
@@ -5969,18 +6014,14 @@ fn fused_join_aggregate(
                     if kv.is_null(pi) {
                         continue;
                     }
-                    let head = if ints {
-                        table.head_int(int_key_at(&kv, pi))
+                    let matches = if ints {
+                        table.matches_int(int_key_at(&kv, pi))
                     } else {
                         buf.clear();
                         kv.encode_into(&mut buf, pi);
-                        table.head_bytes(&buf)
+                        table.matches_bytes(&buf)
                     };
-                    let Some(mut node) = head else { continue };
-                    while node != NIL {
-                        count += 1;
-                        node = table.node(node).2;
-                    }
+                    count += matches.count() as i64;
                 }
                 Ok(count)
             })
@@ -6034,21 +6075,21 @@ fn fused_join_aggregate(
                 ),
             };
             let mut buf = Vec::new();
+            let mut kbuf = Vec::new();
             let mut full_reserved = false;
             for pi in 0..chunk.num_rows() {
                 if kv.is_null(pi) {
                     continue;
                 }
-                let head = if ints {
-                    table.head_int(int_key_at(&kv, pi))
+                let matches = if ints {
+                    table.matches_int(int_key_at(&kv, pi))
                 } else {
-                    buf.clear();
-                    kv.encode_into(&mut buf, pi);
-                    table.head_bytes(&buf)
+                    kbuf.clear();
+                    kv.encode_into(&mut kbuf, pi);
+                    table.matches_bytes(&kbuf)
                 };
-                let Some(mut node) = head else { continue };
-                while node != NIL {
-                    let (bci, bi, next) = table.node(node);
+                for r in matches {
+                    let (bci, bi) = table.loc(r);
                     let (bci, bi) = (bci as usize, bi as usize);
                     // Group key encoding byte-identical to `aggregate()`:
                     // the same source vectors, indexed by the probe row for
@@ -6114,7 +6155,6 @@ fn fused_join_aggregate(
                             }
                         }
                     }
-                    node = next;
                 }
             }
             Ok(partial)
