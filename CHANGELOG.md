@@ -9,6 +9,18 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 127c — filter conjuncts run cheapest first ✅
+
+- A filter's conditions are ordered by estimated cost (DuckDB's expression
+  heuristics): integer and date comparisons run before string comparisons,
+  `LIKE` and `IN` lists, which then only see the rows that survive. The
+  order only changes when no condition can raise an error, so a guard like
+  `v <> 'x' AND CAST(v AS INTEGER) > 6` keeps its written order.
+- **Fix:** an `IN` list was evaluated twice when the optimizer derived it
+  again from an `OR` (TPC-H Q12 compared every row's `l_shipmode` four
+  times). `false OR x` and `true AND x` now fold to `x`, and a derived
+  condition equal to one already present is dropped.
+- TPC-H SF 1: **Q12 −34 %**.
 ### Wave 123c (first part) — faster `GROUP BY`: parallel merge and emit, small key domains, bulk decimal sums ✅
 
 - A `GROUP BY` with many groups no longer ends in a single-threaded tail.

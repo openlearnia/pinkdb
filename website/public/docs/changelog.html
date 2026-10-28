@@ -194,6 +194,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-28">2026-10-28<a class="anchor" href="#2026-10-28" aria-label="Permalink: 2026-10-28">#</a></h2>
+<h3>Wave 127c — filter conjuncts run cheapest first ✅</h3>
+<ul>
+<li>A filter's conditions are ordered by estimated cost (DuckDB's expression heuristics): integer and date comparisons run before string comparisons, <code>LIKE</code> and <code>IN</code> lists, which then only see the rows that survive. The order only changes when no condition can raise an error, so a guard like <code>v &lt;&gt; 'x' AND CAST(v AS INTEGER) &gt; 6</code> keeps its written order.</li>
+<li><strong>Fix:</strong> an <code>IN</code> list was evaluated twice when the optimizer derived it again from an <code>OR</code> (TPC-H Q12 compared every row's <code>l_shipmode</code> four times). <code>false OR x</code> and <code>true AND x</code> now fold to <code>x</code>, and a derived condition equal to one already present is dropped.</li>
+</ul>
+<li>TPC-H SF 1: <strong>Q12 −34 %</strong>.</li>
 <h3>Wave 123c (first part) — faster <code>GROUP BY</code>: parallel merge and emit, small key domains, bulk decimal sums ✅</h3>
 <ul>
 <li>A <code>GROUP BY</code> with many groups no longer ends in a single-threaded tail. The output chunks are finalized and built in parallel. A large merge also sorts its group order in parallel and emits each chunk straight from the merge partitions, instead of moving every group into one list first.</li>

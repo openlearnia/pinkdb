@@ -403,12 +403,32 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
             left,
             right,
             dtype,
-        } => BoundExpr::Binary {
-            op,
-            left: Box::new(fold_expr(cx, *left)),
-            right: Box::new(fold_expr(cx, *right)),
-            dtype,
-        },
+        } => {
+            let (left, right) = (fold_expr(cx, *left), fold_expr(cx, *right));
+            // `false OR x` and `true AND x` are `x` for every x, NULL
+            // included (the binder seeds an `IN` list's `OR` chain with
+            // `false`); dropping the constant lets an `IN` list compare equal
+            // to the same list derived elsewhere.
+            let neutral = match op {
+                BinaryOp::Or => Some(false),
+                BinaryOp::And => Some(true),
+                _ => None,
+            };
+            if let Some(b) = neutral {
+                if left == BoundExpr::Literal(Value::Boolean(b)) {
+                    return right;
+                }
+                if right == BoundExpr::Literal(Value::Boolean(b)) {
+                    return left;
+                }
+            }
+            BoundExpr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+                dtype,
+            }
+        }
         BoundExpr::Not(e) => BoundExpr::Not(Box::new(fold_expr(cx, *e))),
         BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
             expr: Box::new(fold_expr(cx, *expr)),
@@ -561,7 +581,7 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(fold_plan(db, *input)),
-            predicate: fold_expr(&cx, predicate),
+            predicate: order_conjuncts(fold_expr(&cx, predicate)),
         },
         LogicalPlan::Join {
             kind,
@@ -954,6 +974,128 @@ fn eq_set(atom: &BoundExpr, c: usize) -> Option<Vec<Value>> {
     Some(got)
 }
 
+/// Whether `a` and `b` both pin one column to the same set of values (`c IN
+/// (…)` in any order, or `c = v`): a derived fact equal to a conjunct already
+/// present adds nothing but a second evaluation.
+fn same_value_set(a: &BoundExpr, b: &BoundExpr) -> bool {
+    let column = |e: &BoundExpr| {
+        let mut cols = Vec::new();
+        columns_in(e, &mut cols);
+        cols.sort_unstable();
+        cols.dedup();
+        match cols.as_slice() {
+            [c] if *c != usize::MAX => Some(*c),
+            _ => None,
+        }
+    };
+    let (Some(c), Some(d)) = (column(a), column(b)) else {
+        return false;
+    };
+    if c != d {
+        return false;
+    }
+    match (eq_set(a, c), eq_set(b, c)) {
+        (Some(x), Some(y)) => x.iter().all(|v| y.contains(v)) && y.iter().all(|v| x.contains(v)),
+        _ => false,
+    }
+}
+
+/// A filter's conjuncts in ascending estimated cost, so the cheap ones run
+/// first and the costly ones (string compares, `LIKE`, long `IN` lists) only
+/// see the rows that survive them — the selection narrows conjunct by
+/// conjunct. A port of DuckDB's `ExpressionHeuristics`
+/// (src/optimizer/expression_heuristics.cpp) and its cost table.
+///
+/// Stricter than DuckDB: conjuncts are reordered only when none of them can
+/// raise an error, because a conjunct's error fires only for the rows that
+/// reach it (wave 123a) and a reorder must not change which rows those are.
+/// Identical conjuncts are evaluated once. A stable sort keeps equal-cost
+/// conjuncts in written order.
+fn order_conjuncts(pred: BoundExpr) -> BoundExpr {
+    if !matches!(
+        pred,
+        BoundExpr::Binary {
+            op: BinaryOp::And,
+            ..
+        }
+    ) {
+        return pred;
+    }
+    let mut parts = Vec::new();
+    split_conjuncts(pred.clone(), &mut parts);
+    if parts.len() < 2 || !parts.iter().all(infallible) {
+        return pred;
+    }
+    let mut unique: Vec<BoundExpr> = Vec::with_capacity(parts.len());
+    for p in parts {
+        if !unique.contains(&p) {
+            unique.push(p);
+        }
+    }
+    unique.sort_by_key(expr_cost);
+    and_all(unique).expect("at least one conjunct")
+}
+
+/// Whether evaluating `e` can never raise an error: comparisons, `LIKE`,
+/// `AND`/`OR`/`NOT` and `IS [NOT] NULL` over columns and literals.
+fn infallible(e: &BoundExpr) -> bool {
+    match e {
+        BoundExpr::Literal(_) | BoundExpr::Column { .. } => true,
+        BoundExpr::Binary {
+            op, left, right, ..
+        } => {
+            matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+                    | BinaryOp::Like
+                    | BinaryOp::NotLike
+                    | BinaryOp::And
+                    | BinaryOp::Or
+            ) && infallible(left)
+                && infallible(right)
+        }
+        BoundExpr::Not(x) | BoundExpr::IsNull { expr: x, .. } => infallible(x),
+        _ => false,
+    }
+}
+
+/// DuckDB's per-type weight: strings cost most to compare, doubles more than
+/// fixed-width integers.
+fn type_cost(t: DataType) -> u64 {
+    match t {
+        DataType::Varchar => 5,
+        DataType::Double => 2,
+        _ => 1,
+    }
+}
+
+/// DuckDB's expression cost (`ExpressionHeuristics::Cost`) for the shapes
+/// [`infallible`] admits; anything else is 1000 there and here.
+fn expr_cost(e: &BoundExpr) -> u64 {
+    match e {
+        BoundExpr::Column { dtype, .. } => type_cost(*dtype) * 8,
+        BoundExpr::Literal(v) => v.data_type().map_or(1, type_cost),
+        BoundExpr::Binary {
+            op, left, right, ..
+        } => {
+            let children = expr_cost(left) + expr_cost(right);
+            children
+                + match op {
+                    BinaryOp::Like | BinaryOp::NotLike => 200,
+                    _ => 5,
+                }
+        }
+        BoundExpr::Not(x) => expr_cost(x) + 10,
+        BoundExpr::IsNull { expr, .. } => expr_cost(expr) + 5,
+        _ => 1000,
+    }
+}
+
 /// Facts every branch of an `OR` agrees on, as one conjunct per column:
 /// `(a = 1 AND …) OR (a = 2 AND …)` implies `a IN (1, 2)`, and bounds imply
 /// the union's bound — any row that satisfies one branch satisfies those. The
@@ -1138,7 +1280,9 @@ fn push_filter(
             split_conjuncts(predicate.clone(), &mut have);
             let mut add = Vec::new();
             split_conjuncts(extra, &mut add);
-            add.retain(|e| *e != predicate && !have.contains(e));
+            add.retain(|e| {
+                *e != predicate && !have.contains(e) && !have.iter().any(|h| same_value_set(h, e))
+            });
             added = !add.is_empty();
             match and_all(add) {
                 Some(extra) => and_all(vec![extra, predicate]).unwrap(),
