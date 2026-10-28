@@ -542,6 +542,14 @@ pub enum LogicalPlan {
         left_keys: Vec<BoundExpr>,
         right_keys: Vec<BoundExpr>,
         left_cols: usize,
+        /// Extra predicate on a candidate key match, evaluated in joined space
+        /// (`left ++ right`) on that pair alone. A pair that fails it is not a
+        /// match: `Inner` drops the pair, `Semi`/`Anti` treat the pair as absent
+        /// (so a left row can match zero times). Outer joins never carry one —
+        /// their unmatched-row bookkeeping has no pair to test — and neither
+        /// does `Mark`, whose NULL counts are per matching key value; the binder
+        /// produces neither.
+        residual: Option<BoundExpr>,
     },
     /// Nested-loop join: `on` evaluates in joined space (left ++ right
     /// indices); `None` = CROSS JOIN (every pair). Used for non-equi and
@@ -1180,6 +1188,7 @@ pub(crate) fn collect_tables_read(
             right,
             left_keys,
             right_keys,
+            residual,
             ..
         } => {
             collect_tables_read(left, default_db, out);
@@ -1189,6 +1198,9 @@ pub(crate) fn collect_tables_read(
             }
             for k in right_keys {
                 expr_tables_read(k, default_db, out);
+            }
+            if let Some(residual) = residual {
+                expr_tables_read(residual, default_db, out);
             }
         }
         LogicalPlan::NestedLoopJoin {
@@ -1418,6 +1430,7 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
             right,
             left_keys,
             right_keys,
+            residual,
             ..
         } => {
             contains_table_function(left)
@@ -1426,6 +1439,7 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
                     .iter()
                     .chain(right_keys.iter())
                     .any(expr_contains_table_function)
+                || residual.as_ref().is_some_and(expr_contains_table_function)
         }
         LogicalPlan::NestedLoopJoin {
             left, right, on, ..
@@ -1797,12 +1811,16 @@ fn walk_scan_filters(
             right,
             left_keys,
             right_keys,
+            residual,
             ..
         } => {
             walk_scan_filters(left, &[], out);
             walk_scan_filters(right, &[], out);
             for k in left_keys.iter().chain(right_keys) {
                 walk_expr_subquery_filters(k, out);
+            }
+            if let Some(residual) = residual {
+                walk_expr_subquery_filters(residual, out);
             }
         }
         LogicalPlan::NestedLoopJoin {
@@ -2231,12 +2249,14 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
             right,
             left_keys,
             right_keys,
+            residual,
             ..
         } => {
             children.push(left);
             children.push(right);
             exprs.extend(left_keys.iter());
             exprs.extend(right_keys.iter());
+            exprs.extend(residual.as_ref());
         }
         LogicalPlan::NestedLoopJoin {
             left, right, on, ..

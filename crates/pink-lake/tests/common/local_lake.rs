@@ -142,9 +142,20 @@ pub fn s3_catalog(config: &S3Config) -> String {
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect()
     };
+    // Stable within this process (create and reopen must find the same
+    // catalog) but unique across runs: a bare PID is recycled, and a later
+    // run then inherited an old run's catalog, WAL format and all.
+    static RUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let run = RUN.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{}-{nanos}", std::process::id())
+    });
     let dir = std::env::temp_dir()
         .join("pinkdb-s3-catalogs")
-        .join(std::process::id().to_string())
+        .join(run)
         .join(sanitize(&config.bucket))
         .join(sanitize(&config.prefix));
     std::fs::create_dir_all(&dir).ok();

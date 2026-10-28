@@ -69,19 +69,31 @@ fn comma_join_returns_the_same_rows_as_explicit_join() {
 }
 
 #[test]
-fn comma_join_plans_a_hash_join_and_keeps_residuals_above_it() {
+fn comma_join_plans_a_hash_join_and_puts_residuals_on_it() {
     let mut db = db();
     let plan = explain(&mut db, "SELECT l.k FROM l, r WHERE l.k = r.k");
     assert!(plan.contains("Join inner on [#0=#0]"), "{plan}");
     assert!(!plan.contains("NestedLoopJoin"), "{plan}");
 
-    // A predicate that spans both sides is not a key and must stay a filter.
+    // A predicate that spans both sides is not a key, but it is a predicate on
+    // a matched pair, so the join carries it (wave 111c) and only pairs that
+    // pass it are emitted.
     let plan = explain(
         &mut db,
         "SELECT l.k FROM l, r WHERE l.k = r.k AND l.q > length(r.v)",
     );
-    assert!(plan.contains("Join inner on [#0=#0]"), "{plan}");
-    assert!(plan.contains("Filter"), "{plan}");
+    assert!(plan.contains("Join inner on [#0=#0] residual"), "{plan}");
+    assert!(!plan.contains("Filter"), "{plan}");
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT l.k, r.v FROM l, r WHERE l.k = r.k AND l.q > length(r.v) ORDER BY l.k",
+        ),
+        vec![
+            vec![Value::Integer(1), Value::Varchar("a".into())],
+            vec![Value::Integer(2), Value::Varchar("b".into())],
+        ]
+    );
 }
 
 /// An outer join's condition on its *preserved* side must not become a filter

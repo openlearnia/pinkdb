@@ -4948,6 +4948,10 @@ struct DependentJoin {
     /// The body's own columns the keys compare against. Non-empty only in the
     /// plain shape, where `plan` is the body itself.
     body_keys: Vec<BoundExpr>,
+    /// A correlation conjunct that is not an equality, in `plan`'s joined
+    /// space. The plain shape hands it to the join as its residual predicate
+    /// instead of filtering above a deduplicated key side.
+    residual: Option<BoundExpr>,
 }
 
 impl DependentJoin {
@@ -5172,6 +5176,32 @@ fn rewire_to_row(expr: BoundExpr, row: &[(usize, BoundExpr)]) -> Result<BoundExp
     })
 }
 
+/// Rewrite a correlation conjunct into the plain dependent join's joined
+/// space, `enclosing row ++ body`: an enclosing reference becomes the row
+/// column that holds it, and a body column shifts past the enclosing plan.
+fn rewire_to_plain(
+    expr: BoundExpr,
+    row: &[(usize, BoundExpr)],
+    left_cols: usize,
+) -> Result<BoundExpr> {
+    map_bound_expr(expr, &mut |e| match e {
+        BoundExpr::OuterRef { depth, index, .. } => {
+            match (depth, row.iter().find(|(i, _)| *i == index)) {
+                (0, Some((_, col))) => Ok(col.clone()),
+                // `dependent_join` checks the reference list before rewriting.
+                _ => Err(PinkDbError::Execution(
+                    "internal: degenerate correlated rewrite".to_string(),
+                )),
+            }
+        }
+        BoundExpr::Column { index, dtype } => Ok(BoundExpr::Column {
+            index: left_cols + index,
+            dtype,
+        }),
+        e => Ok(e),
+    })
+}
+
 /// Replace every enclosing reference with the dependent join's key column, so
 /// a correlation conjunct filters the joined rows.
 fn rewire_to_keys(expr: BoundExpr, keys: &[(usize, usize)], key_base: usize) -> Result<BoundExpr> {
@@ -5224,6 +5254,7 @@ fn strip_from_filters(plan: &LogicalPlan, out: &mut Vec<BoundExpr>, offset: usiz
             left_keys,
             right_keys,
             left_cols,
+            residual,
         } => LogicalPlan::Join {
             kind: *kind,
             left: Box::new(strip_from_filters(left, out, offset)),
@@ -5231,6 +5262,7 @@ fn strip_from_filters(plan: &LogicalPlan, out: &mut Vec<BoundExpr>, offset: usiz
             left_keys: left_keys.clone(),
             right_keys: right_keys.clone(),
             left_cols: *left_cols,
+            residual: residual.clone(),
         },
         LogicalPlan::NestedLoopJoin {
             kind,
@@ -5478,6 +5510,7 @@ impl Binder<'_> {
             left_keys: dep.keys,
             right_keys: agg_keys,
             left_cols: width,
+            residual: None,
         };
         // The scalar is the body's projection over the aggregate output, which
         // the left join places after the enclosing columns and the group keys.
@@ -5582,6 +5615,7 @@ impl Binder<'_> {
             return Ok(None);
         };
         let keys = dep.key_columns();
+        let residual = dep.residual.clone();
         match kind {
             BodyKind::Exists => {
                 // In the plain shape the body's own key columns are probed; a
@@ -5603,6 +5637,7 @@ impl Binder<'_> {
                     left_keys: dep.keys,
                     right_keys,
                     left_cols: width,
+                    residual,
                 };
                 Ok(Some((joined, None)))
             }
@@ -5618,6 +5653,8 @@ impl Binder<'_> {
                 let mut right_keys = keys;
                 left_keys.push(lhs.clone());
                 right_keys.push(value);
+                // A mark join keeps its NULL bookkeeping per body row, so it
+                // never carries a residual (the binder produces none here).
                 let joined = LogicalPlan::Join {
                     kind: JoinKind::Mark,
                     left: Box::new(plan.clone()),
@@ -5625,6 +5662,7 @@ impl Binder<'_> {
                     left_keys,
                     right_keys,
                     left_cols: width,
+                    residual: None,
                 };
                 let marker = BoundExpr::Column {
                     index: width,
@@ -5826,14 +5864,64 @@ impl Binder<'_> {
         if body_keys.is_empty() {
             return Ok(None);
         }
+        let mut body_plan = body.base.clone();
+        if let Some(predicate) = and_all(body_only) {
+            body_plan = LogicalPlan::Filter {
+                input: Box::new(body_plan),
+                predicate,
+            };
+        }
+        // Without a residual the body can be probed directly: its own key
+        // columns stand in for the duplicate-eliminated key side, which saves
+        // a full copy of this block. A body row that matches nothing leaves
+        // the enclosing row unmatched, exactly as the keyed shape does. A
+        // residual conjunct rides on the join itself (see
+        // `LogicalPlan::Join`), so it does not bring the key side back; one
+        // with a subquery or a dynamic call cannot be evaluated per candidate
+        // pair, so it keeps the keyed shape.
+        if plain
+            && residual
+                .iter()
+                .all(|c| !c.has_subquery() && !c.contains_dynamic_scalar())
+        {
+            // Two body columns can compare against the same enclosing column
+            // (`mc.k = oc.k AND mc.j = oc.k`), so the left keys repeat.
+            let plain_keys = key_columns
+                .iter()
+                .map(|kc| match kc {
+                    BoundExpr::Column { index, .. } => keys[*index].clone(),
+                    _ => unreachable!("key columns are plain columns"),
+                })
+                .collect();
+            let residual = if residual.is_empty() {
+                None
+            } else {
+                let preds = residual
+                    .into_iter()
+                    .map(|c| rewire_to_plain(c, &row, dtypes.len()))
+                    .collect::<Result<Vec<_>>>()?;
+                and_all(preds)
+            };
+            return Ok(Some(DependentJoin {
+                plan: body_plan,
+                keys: plain_keys,
+                key_base: 0,
+                body_keys,
+                residual,
+            }));
+        }
         let names: Vec<String> = (0..keys.len()).map(|i| format!("__key{i}")).collect();
         // The copy of the block that produces the keys carries the block's
         // other conjuncts, so the optimizer can turn it into the same hash
-        // joins as the outer plan instead of a cartesian product. A conjunct
-        // with a subquery or a dynamic call is left out: it would run twice.
+        // joins as the outer plan instead of a cartesian product, and so a
+        // selective one (`partsupp.ps_partkey IN (…)` below a correlated
+        // aggregate) shrinks the duplicate-eliminated key side instead of
+        // leaving it to probe the full input. An uncorrelated subquery is
+        // worth the second evaluation, which only filters rows the key side
+        // reads anyway; a dynamic call is impure, so it is left out.
         let mut carried = Vec::new();
         for c in siblings {
-            if !c.contains_dynamic_scalar() && !c.has_subquery() {
+            if !c.contains_dynamic_scalar() {
                 carried.push(c.clone());
             }
         }
@@ -5852,41 +5940,14 @@ impl Binder<'_> {
             }),
             on: None,
         };
-        let mut body_plan = body.base.clone();
-        if let Some(predicate) = and_all(body_only) {
-            body_plan = LogicalPlan::Filter {
-                input: Box::new(body_plan),
-                predicate,
-            };
-        }
-        // Without a residual the body can be probed directly: its own key
-        // columns stand in for the duplicate-eliminated key side, which saves
-        // a full copy of this block. A body row that matches nothing leaves
-        // the enclosing row unmatched, exactly as the keyed shape does.
-        if plain && residual.is_empty() {
-            // Two body columns can compare against the same enclosing column
-            // (`mc.k = oc.k AND mc.j = oc.k`), so the left keys repeat.
-            let plain_keys = key_columns
-                .iter()
-                .map(|kc| match kc {
-                    BoundExpr::Column { index, .. } => keys[*index].clone(),
-                    _ => unreachable!("key columns are plain columns"),
-                })
-                .collect();
-            return Ok(Some(DependentJoin {
-                plan: body_plan,
-                keys: plain_keys,
-                key_base: 0,
-                body_keys,
-            }));
-        }
         let mut plan = LogicalPlan::Join {
             kind: JoinKind::Inner,
-            left: Box::new(body_plan.clone()),
+            left: Box::new(body_plan),
             right: Box::new(key_side),
             left_keys: body_keys,
             right_keys: key_columns,
             left_cols: body.base_width,
+            residual: None,
         };
         if !residual.is_empty() {
             let preds = residual
@@ -5903,6 +5964,7 @@ impl Binder<'_> {
             keys,
             key_base: body.base_width,
             body_keys: Vec::new(),
+            residual: None,
         }))
     }
 }
@@ -6276,7 +6338,9 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
 /// How one join step will execute.
 enum BoundJoin {
     /// Hash join on extracted equi pairs (side-relative keys), plus an
-    /// optional residual predicate over the joined output (INNER only).
+    /// optional residual predicate over the joined output (INNER only: the
+    /// executor filters candidate key matches with it, which is the same set
+    /// of rows as a filter above the join).
     Hash {
         left_keys: Vec<BoundExpr>,
         right_keys: Vec<BoundExpr>,
@@ -10777,23 +10841,15 @@ fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Resul
                 left_keys,
                 right_keys,
                 residual,
-            } => {
-                let mut join = LogicalPlan::Join {
-                    kind: join.kind,
-                    left: Box::new(base),
-                    right: Box::new(right_plan),
-                    left_keys,
-                    right_keys,
-                    left_cols,
-                };
-                if let Some(predicate) = residual {
-                    join = LogicalPlan::Filter {
-                        input: Box::new(join),
-                        predicate,
-                    };
-                }
-                join
-            }
+            } => LogicalPlan::Join {
+                kind: join.kind,
+                left: Box::new(base),
+                right: Box::new(right_plan),
+                left_keys,
+                right_keys,
+                left_cols,
+                residual,
+            },
             BoundJoin::Nested { on } => LogicalPlan::NestedLoopJoin {
                 kind: join.kind,
                 left: Box::new(base),

@@ -2409,12 +2409,16 @@ pub fn save_store_url_with_key(db: &PinkDb, location: &str, key: EncryptionKey) 
 }
 
 #[cfg(feature = "s3")]
-pub fn save_store_s3(db: &PinkDb, config: S3Config) -> Result<u64> {
+/// [`save_store_url`] for an explicit S3 configuration: the lake's catalog
+/// lives at `catalog_url` (`pink:`/`sqlite:`/`postgres://`), its data on the
+/// bucket. The store is validated before any lake is created, so a rejected
+/// store leaves nothing behind. There is no default catalog location: a
+/// catalog in a temp directory would be lost metadata.
+pub fn save_store_s3(db: &PinkDb, catalog_url: &str, config: S3Config) -> Result<u64> {
     validate_store(db)?;
-    let (catalog, _) = s3_test_catalog(&config);
-    let mut lake = match Lake::open_with_catalog_s3(&catalog, config.clone()) {
+    let mut lake = match Lake::open_with_catalog_s3(catalog_url, config.clone()) {
         Ok(lake) => lake,
-        Err(LakeError::NotALake { .. }) => Lake::create_with_catalog_s3(&catalog, config)?,
+        Err(LakeError::NotALake { .. }) => Lake::create_with_catalog_s3(catalog_url, config)?,
         Err(e) => return Err(e),
     };
     lake.write_from_store(db)
@@ -2612,28 +2616,6 @@ fn s3_location(config: &S3Config) -> String {
     } else {
         format!("s3://{}/{}", config.bucket, config.prefix)
     }
-}
-
-#[cfg(feature = "s3")]
-fn s3_test_catalog(config: &S3Config) -> (String, String) {
-    let sanitize = |text: &str| -> String {
-        text.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect()
-    };
-    let dir = std::env::temp_dir()
-        .join("pinkdb-s3-catalogs")
-        .join(format!("{}", std::process::id()))
-        .join(sanitize(&config.bucket))
-        .join(sanitize(&config.prefix));
-    std::fs::create_dir_all(&dir).ok();
-    let catalog = format!("pink:{}", dir.join("catalog.pink").display());
-    let data = if config.prefix.is_empty() {
-        format!("s3://{}", config.bucket)
-    } else {
-        format!("s3://{}/{}", config.bucket, config.prefix)
-    };
-    (catalog, data)
 }
 
 fn keyed_data_storage(

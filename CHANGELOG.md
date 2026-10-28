@@ -9,6 +9,76 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 111c — join residuals and a parallel aggregate merge ✅
+
+The three TPC-H queries that were still 60–130× DuckDB at SF 1 fell to 10–75×,
+and no query result changed: every answer is compared with DuckDB's rows at
+three scales, and two new differential tests pin the new paths against a
+hand-written reference.
+
+- **A hash join can carry a residual predicate.** `LogicalPlan::Join` gained
+  `residual`: a predicate on a *candidate key match*, evaluated in joined space
+  on that pair alone, before anything is materialized. A pair that fails it is
+  not a match — `INNER` drops the pair, `SEMI`/`ANTI` treat the pair as absent,
+  so a preserved row can end up with zero matches. The executor gathers only
+  the columns the residual reads for the candidate pairs, evaluates the
+  predicate once vectorized over that dense chunk, and emits the surviving
+  pairs (DuckDB's `physical_hash_join.cpp` design). With no residual the probe
+  loop is the old one.
+- **`EXISTS` with a non-equality correlation uses it.** A correlated `EXISTS`
+  whose body has an equality key plus another comparison — Q21's
+  `l2.l_suppkey <> l1.l_suppkey` — used to fall back to
+  `body ⨯ Distinct(Project(outer))` with the comparison in a `Filter` above the
+  join: the 36-column outer chain was cloned and deduplicated once per
+  subquery, three times in Q21. It now keeps the plain shape and hands the
+  comparison to the semi/anti join. Q21 SF 1 **2,333 → 1,352 ms**, SF 0.1
+  232 → 114 ms, and its plan is one outer chain instead of three.
+- **The aggregate merge is parallel.** After the per-chunk partial tables are
+  built (already parallel), `merge_partials` hashed the keys into up to 64
+  partitions, merged the partitions in parallel, and restored the exact
+  first-seen group order with one `u32` sort — the order a serial walk would
+  produce, so results are bit-identical. The first attempt did not scale at all
+  (1.46 s, the same as serial): it masked the low bits of an FNV hash, which
+  barely mix, so nearly every key landed in one partition. Q18 SF 1
+  **1,390 → 251 ms** (merge alone 1,284 → 56 ms).
+- **A duplicate-eliminated key side carries the enclosing filters.** The key
+  side that a correlated `IN`/scalar subquery probes was built from an
+  unfiltered scan plus a `Distinct`, and an enclosing conjunct containing a
+  subquery was dropped from it ("it would run twice"). It is now carried — the
+  subquery is uncorrelated and only filters rows the key side reads anyway — so
+  Q20's key side is `Distinct(Filter(ps_partkey IN (…))(partsupp))` (11k keys
+  instead of 800k). Q20 SF 1 **604 → 100 ms**, and its SF 0.1 → SF 1 scaling
+  went from 15.1× to 10.0× for 10× the rows (the wave-120 superlinearity).
+- **Join order may start from any leaf when the chain is small.** The dynamic
+  program anchored the FROM clause's first relation, which made an
+  intermediate blow up before the fact table arrived (Q11 built 800k rows from
+  `partsupp ⋈ supplier` first). With at most four leaves any relation may
+  start. Q11 SF 1 **129 → 26 ms**; five- and six-leaf chains keep the anchor
+  (freeing it cost Q5 3.6× and Q9 2.6×).
+- **Measured.** TPC-H SF 1 total 7,782 → 5,023 ms, geomean 166.5 → 128.1 ms
+  (1.30×); SF 0.1 geomean 14.6 → 12.4 ms. Q18 5.5×, Q20 6.0×, Q11 5.0×, Q21
+  1.7×. No query regressed beyond run-to-run noise. No new dependencies; the
+  CLI binary grew 123 KB (+0.8 %).
+
+```sql
+-- one outer chain, two joins, no materialized key copies; same answer
+SELECT s_name, count(*) AS numwait FROM supplier, lineitem l1, orders, nation
+ WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey AND o_orderstatus = 'F'
+   AND l1.l_receiptdate > l1.l_commitdate AND EXISTS (SELECT 1 FROM lineitem l2
+   WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey)
+   AND NOT EXISTS (SELECT 1 FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey
+   AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate)
+   AND s_nationkey = n_nationkey AND n_name = 'SAUDI ARABIA'
+ GROUP BY s_name ORDER BY numwait DESC, s_name LIMIT 100;
+```
+
+- **`pink_lake::save_store_s3` takes an explicit catalog** (reviewer fix,
+  found by a test flake): it used to put the lake's catalog under
+  `$TMPDIR/pinkdb-s3-catalogs/<pid>/`, so the metadata lived in a temp
+  directory and a recycled process id inherited another run's catalog. The
+  catalog location is now an argument (`pink:`/`sqlite:`/`postgres://`); the
+  temp default is gone, and the test helper keys its catalogs per run.
+
 ### Wave 123a — selection vectors and fixed-width expression kernels ✅
 
 Filters no longer copy the rows that survive them, and comparisons and decimal

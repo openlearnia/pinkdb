@@ -119,14 +119,19 @@ fn setup_sql(tables: &[Table]) -> String {
 /// A predicate over `fb` correlated to the outer `fa` row, and whether it
 /// mentions an outer column at all (an uncorrelated body must still work).
 fn body_pred(rng: &mut Rng) -> String {
-    let mut pred = match rng.below(7) {
+    let mut pred = match rng.below(9) {
         0 => "fb.d = fa.a".to_string(),
         1 => "fb.e = fa.b".to_string(),
         2 => "fb.d < fa.b".to_string(),
         3 => "fb.e BETWEEN fa.a AND fa.c".to_string(),
         4 => "fb.d = fa.a AND fb.e = fa.b".to_string(),
         5 => "fb.f = fa.c".to_string(),
-        _ => "fb.d = fa.a + 1".to_string(),
+        6 => "fb.d = fa.a + 1".to_string(),
+        // An equality correlation plus one that is not: the body still unnests
+        // on the equality keys, and the other conjunct rides on the join as its
+        // residual (the shape TPC-H Q21's EXISTS takes).
+        7 => "fb.d = fa.a AND fb.e <> fa.b".to_string(),
+        _ => "fb.d = fa.a AND fb.f >= fa.c".to_string(),
     };
     if rng.chance(30) {
         pred.push_str(&format!(" AND fb.e > {}", rng.below(4)));
@@ -201,7 +206,7 @@ fn predicate(rng: &mut Rng) -> String {
 }
 
 fn case_sql(rng: &mut Rng) -> String {
-    match rng.below(8) {
+    match rng.below(9) {
         0 => format!("SELECT * FROM fa WHERE {}", predicate(rng)),
         1 => format!("SELECT fa.a, ({}) AS p FROM fa", predicate(rng)),
         2 => format!(
@@ -229,7 +234,13 @@ fn case_sql(rng: &mut Rng) -> String {
             predicate(rng),
             predicate(rng)
         ),
-        _ => format!("SELECT * FROM fa WHERE {} ORDER BY fa.a", predicate(rng)),
+        7 => format!("SELECT * FROM fa WHERE {} ORDER BY fa.a", predicate(rng)),
+        // Two subqueries over the same outer key: one duplicate-eliminated key
+        // side can serve both, and each keeps its own residual.
+        _ => "SELECT * FROM fa WHERE EXISTS \
+              (SELECT 1 FROM fb WHERE fb.d = fa.a AND fb.e <> fa.b) \
+              AND NOT EXISTS (SELECT 1 FROM fb WHERE fb.d = fa.a AND fb.f <> fa.c)"
+            .to_string(),
     }
 }
 

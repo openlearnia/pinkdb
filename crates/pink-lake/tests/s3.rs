@@ -449,7 +449,12 @@ fn save_store_helpers_work_for_local_and_s3() {
     // back.
     let mock = MockS3::start();
     assert_eq!(
-        pink_lake::save_store_s3(&db, mock_config(&mock, "helpers-bucket", "h")).unwrap(),
+        pink_lake::save_store_s3(
+            &db,
+            &s3_catalog(&mock_config(&mock, "helpers-bucket", "h")),
+            mock_config(&mock, "helpers-bucket", "h"),
+        )
+        .unwrap(),
         2
     );
     let mut lake = open_s3_lake(mock_config(&mock, "helpers-bucket", "h")).unwrap();
@@ -463,8 +468,12 @@ fn save_store_helpers_work_for_local_and_s3() {
         .execute("CREATE TABLE \"a.b\".t (x INTEGER);")
         .unwrap();
     let before = mock.keys().len();
-    let err =
-        pink_lake::save_store_s3(&dotted, mock_config(&mock, "helpers-bucket", "h2")).unwrap_err();
+    let err = pink_lake::save_store_s3(
+        &dotted,
+        &s3_catalog(&mock_config(&mock, "helpers-bucket", "h2")),
+        mock_config(&mock, "helpers-bucket", "h2"),
+    )
+    .unwrap_err();
     assert!(err.to_string().contains("contains \".\""), "{err}");
     assert_eq!(mock.keys().len(), before, "a rejected save writes nothing");
     std::fs::remove_dir_all(&dir).ok();

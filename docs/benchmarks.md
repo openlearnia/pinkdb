@@ -20,10 +20,10 @@ the table.
 | OS | macOS 27.0.1 arm64 |
 | rustc | 1.97.1 |
 | DuckDB | v2.0.0 `d54cbbe3df` |
-| pinkdb | commit `38e2b08` (wave 120) plus the uncommitted wave-111ab tree |
+| pinkdb | commit `9f7df56` plus the uncommitted wave-111c tree |
 | threads | 8 for both engines (`RAYON_NUM_THREADS=8`, `SET threads=8`) |
-| runs | 1 warm-up + 5 timed, median reported |
-| load average | 2.5–2.9, recorded per stage in the JSON |
+| runs | 1 warm-up + 3 timed, median reported |
+| load average | 2.3–3.0, recorded per stage in the JSON |
 
 TPC-H data is generated once by DuckDB's built-in `dbgen`, written to Parquet,
 and the *same* Parquet files are loaded into a `.pink` store and a DuckDB
@@ -100,6 +100,98 @@ pinkdb time 30,288 ms → 7,983 ms (3.8×). The four queries that were 82 % of
 the old total (Q18–Q21) are now 55 % of a much smaller one. Load average was
 2.1 when the baseline run started and 3.4–4.7 for the after run, both recorded
 in the JSON.
+
+## Wave 111c — join residuals and a parallel aggregate merge
+
+This wave changes no answer either. Measured as an A/B between two release
+builds of the same sources — the baseline binary built from `HEAD` (`15,009,008`
+bytes, same diff as the recorded wave-123a tree) and the branch — back to back
+on the same stores, `bench/suite --only tpch --runs 3 --skip-build`. Load
+average 2.3–3.0 for the baseline runs and 2.6–3.0 for the after runs (the
+machine could not be made quieter); run-to-run spread is ±5 %, larger on the
+sub-20 ms queries.
+
+### SF 1
+
+| query | before ms | after ms | DuckDB ms | ratio before → after |
+| --- | ---: | ---: | ---: | --- |
+| Q1 | 70 | 70 | 13 | 5.4× → 5.4× |
+| Q2 | 174 | 177 | 4 | 43.5× → 44.2× |
+| Q3 | 178 | 177 | 8 | 22.3× → 22.1× |
+| Q4 | 161 | 162 | 7 | 23.0× → 23.1× |
+| Q5 | 325 | 325 | 8 | 40.6× → 40.6× |
+| Q6 | 13 | 13 | 4 | 3.3× → 3.2× |
+| Q7 | 253 | 241 | 9 | 28.1× → 26.8× |
+| Q8 | 215 | 198 | 9 | 23.9× → 22.0× |
+| Q9 | 763 | 756 | 26 | 29.3× → 29.1× |
+| Q10 | 163 | 158 | 16 | 10.2× → 9.9× |
+| **Q11** | **129** | **26** | 3 | 43.0× → **8.7×** |
+| Q12 | 171 | 171 | 9 | 19.0× → 19.0× |
+| Q13 | 440 | 436 | 38 | 11.6× → 11.5× |
+| Q14 | 74 | 72 | 7 | 10.6× → 10.3× |
+| Q15 | 24 | 25 | 5 | 4.8× → 5.0× |
+| Q16 | 46 | 43 | 10 | 4.6× → 4.3× |
+| Q17 | 88 | 83 | 7 | 12.6× → 11.9× |
+| **Q18** | **1,390** | **251** | 22 | 63.2× → **11.4×** |
+| Q19 | 44 | 45 | 11 | 4.0× → 4.1× |
+| **Q20** | **604** | **100** | 10 | 60.4× → **10.0×** |
+| **Q21** | **2,333** | **1,352** | 18 | 129.6× → **75.1×** |
+| Q22 | 124 | 142 | 12 | 10.3× → 11.8× |
+
+Geometric mean **166.5 ms → 128.1 ms (1.30×)**, total over the 22 queries
+7,782 → 5,023 ms (1.55×). Q18 5.5×, Q20 6.0×, Q11 5.0×, Q21 1.7×. Q22's
+124 → 142 ms is the suite's ordering, not the query: timed alone, three runs
+each on the same store, it is 65/74/65 ms before and 78/60/68 ms after. Q9's
+756 ms carries a ±3 % spread and is unchanged by this wave.
+
+### SF 0.1
+
+Same two binaries, same store.
+
+| query | before ms | after ms | | query | before ms | after ms |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| Q1 | 7 | 7 | | Q12 | 16 | 16 |
+| Q2 | 19 | 18 | | Q13 | 42 | 40 |
+| Q3 | 17 | 17 | | Q14 | 6 | 6 |
+| Q4 | 15 | 15 | | Q15 | 2 | 2 |
+| Q5 | 31 | 30 | | Q16 | 6 | 6 |
+| Q6 | 1 | 1 | | Q17 | 7 | 7 |
+| Q7 | 30 | 30 | | Q18 | 25 | **20** |
+| Q8 | 18 | 18 | | Q19 | 5 | 4 |
+| Q9 | 61 | 60 | | Q20 | 40 | **10** |
+| Q10 | 16 | 16 | | Q21 | 232 | **114** |
+| Q11 | 13 | **5** | | Q22 | 15 | 15 |
+
+Geometric mean **14.6 ms → 12.4 ms (1.18×)**, total 624 → 457 ms.
+
+### Scaling SF 0.1 → SF 1
+
+| query | before | after |
+| --- | --- | --- |
+| Q20 | 40 → 604 ms = **15.1×** for 10× the rows | 10 → 100 ms = **10.0×** |
+| Q21 | 232 → 2,333 ms = 10.1× | 114 → 1,352 ms = 11.9× |
+| Q18 | 25 → 1,390 ms = 55.6× | 20 → 251 ms = 12.6× |
+
+The wave-120 report's superlinearity (Q20 38.7× for 10× the rows) is gone: the
+key side that Q20's subquery probes is now built from the filtered `partsupp`
+(11k keys instead of 800k), so the probe side's work is linear in the data it
+actually has to touch. Q21's 11.9× is its two 6 M-row `lineitem` scans — that
+is the query, and it was 10.1× on the duplicated-plan version because the
+duplicated plan was dominated by the *outer* chain, which does not grow with SF.
+
+### Where the time went
+
+Q21 at SF 1, `sample` of 12 back-to-back runs, share of samples (before →
+after): `Vector::push_from` 5.1 % → 5.2 %, `Vector::take` 3.2 % → 1.8 %,
+`filter_chunk` 3.6 % → 1.9 %, `DataChunk::take` 3.1 % → 1.8 %,
+`Vector::with_capacity` 2.2 % → 2.1 %; the residual path's own frames are
+`ProbeSink::push` 2.7 % and `chunk_approx_bytes` 2.7 %. The top is rayon's
+bridge (8.7 %) and `join_context` (6.0 %) — the two 6 M-row `lineitem` scans,
+their filters and the match-table builds, which is what Q21 now *is*.
+
+Q18 after: rayon bridge 11.2 % + `join_context` 11.0 %, phase-1 `fold_chunk`
+4.6 %, allocation 7 %; the merge no longer appears (it was the single largest
+frame before).
 
 ## Wave 123a — selection vectors and fixed-width kernels
 
@@ -408,9 +500,9 @@ yet. It is a follow-up, not an omission by accident.
 
 | build | bytes |
 |---|---:|
-| CLI, default features | 5,608,752 (+37,808 since 38e2b08) |
-| CLI, `--no-default-features` | 5,450,480 (+37,744 since 38e2b08) |
-| CLI, all measured features | 14,842,064 (+37,744 since 38e2b08) |
+| CLI, default features | 5,880,048 (+122,608 since 9f7df56) |
+| CLI, `--no-default-features` | 5,722,000 |
+| CLI, all measured features | 15,131,904 (+122,896 since 9f7df56, +0.8 %) |
 | server, default features | 5,203,312 |
 | CLI + `fts` | 5,612,736 (+175,568) |
 | CLI + `vss` | 5,570,128 (+132,960) |
@@ -426,24 +518,43 @@ CLI start-up (open an empty store, quit): 5.2 ms. Peak RSS at SF 0.1: Q1
 
 ## Where pinkdb is slower, and why
 
-**Q21 (125×).** The two `EXISTS`/`NOT EXISTS` subqueries each build the same
-duplicate-eliminated key side: a `Distinct(Project(outer copy))` over the whole
-enclosing block, computed twice. DuckDB's delim join materializes those keys
-once and shares them. The non-equality condition (`l3.l_suppkey <>
-l1.l_suppkey`) also still runs as a filter above the join rather than as a
-join residual. Both are follow-ups below; wave 111ab cut Q21 from 10.4 s to
-2.25 s at SF 1 without addressing either.
+**Q21 (75×).** Wave 111c removed the duplicated outer chain and the two
+36-column distincts: the non-equality conditions are join residuals now, so the
+plan is one outer chain plus `Semi`/`Anti` over the body's own keys. What is
+left is the query itself — two `lineitem` scans of 6 M rows, each filtered on
+`l_receiptdate > l_commitdate`, and a 6 M-row match table built for each. The
+next real lever is bloom-filtering *inside* the scan (test the join key while
+the filter runs, before the payload columns are materialized); wave 122's
+dynamic filter only skips whole chunks by zone bounds, which cannot help a
+bloom over 6 M rows ordered by `l_orderkey`.
 
-**Q18 (66×).** The `IN` subquery's aggregate — `GROUP BY l_orderkey` over 6 M
-rows — is the hot path, and its merge phase is serial: each of the eight
-per-chunk partial hash tables is merged into one table on one thread. DuckDB's
-partitioned aggregate merges in parallel. The subquery memo cut Q18 from 5.5 s
-to 1.4 s; what is left is the aggregate.
+**Q18 (11.4×).** The `IN` subquery's aggregate — `GROUP BY l_orderkey` over
+6 M rows — was the whole cost, and its phase-2 merge was serial. It is now
+hash-partitioned and merged in parallel (merge 1,284 → 56 ms), so what is left
+is phase 1's per-chunk fold plus the join probe above it. A perfect-hash or
+partitioned *phase 1* (one table per thread rather than one per chunk) is the
+next step; row 111b1 (2) and (3) record it.
 
-**Q2/Q5/Q11 (38–62×).** These are scans and joins that are simply 10–40× the
-DuckDB time per row: the hash join copies every surviving row into fresh
-vectors at each probe instead of writing a selection vector and materializing
-once, and the aggregate emits group by group with a value copy per cell.
+**Q2 (44×).** A correlated subquery's body is optimized when it is *bound*,
+while its correlation conjunct still carries an outer column — and
+`reorder_comma_join` refuses a chain whose predicate reads an outer column
+because the unnester pattern-matches that body's from-tree. The statement-level
+optimizer then only sees converted hash joins, so the body keeps the FROM
+clause's own order: Q2's `partsupp ⋈ supplier ⋈ nation ⋈ region` runs
+partsupp-first (115 ms) where region-first is 9 ms, and it materializes 19
+columns to use one. Fixing it needs the join ordering to run after
+decorrelation, which means a pass over `Join` trees (or statement-level
+recursion into `BoundExpr` subquery plans — `fold_expr` has no subquery arms
+today). Wave 111c left Q2 at 174 → 177 ms and recorded the two causes.
+
+**Q5 (41×).** Scans and joins at 10–40× the DuckDB time per row: the hash join
+copies every surviving row into fresh vectors at each probe instead of writing
+a selection vector and materializing once, and the aggregate emits group by
+group with a value copy per cell. Q11 used to be the same shape and is now
+8.7×, because its chain was small enough (four leaves) for the join order to
+start from `supplier` instead of `partsupp`; Q5's five- and Q9's six-leaf
+chains keep the anchored start, since freeing it there was measured worse
+(Q5 3.6×, Q9 2.6×).
 
 **Q1/Q6 (12–26×).** Both are scan-bound. pinkdb's filter and aggregate paths
 are vectorized, but they lack DuckDB's perfect-hash aggregate and
@@ -484,18 +595,38 @@ the key side (the aggregate then groups rows the join has already narrowed,
 which is what makes Q17 cheap). Both are visible in `EXPLAIN`; nothing is
 hidden.
 
-The remaining gap for this family is the duplicate-eliminated key side: it is
-a `Distinct(Project(…))` over a copy of the enclosing block, computed once per
-subquery, where DuckDB's delim join materialises the outer keys once and shares
-them across a query. Q20 shows the cost scaling: 50 ms at SF 0.1 → 1933 ms at
-SF 1 for 10× the rows is 38×, while Q4 (16 → 163 ms) and Q17 (7 → 94 ms) are
-linear. Q21 also keeps its non-equality condition (`l3_suppkey <> l1_suppkey`)
-as a filter above the join instead of a join residual, which is why 407 ms → 7.2 s
-is 17.7×. Both are recorded as follow-ups in the plan, not as done work.
+Wave 111c closed two of the three gaps this section used to record. Q21's
+non-equality condition (`l3_suppkey <> l1_suppkey`) is a join residual now, so
+`EXISTS`/`NOT EXISTS` keep the plain shape and the outer chain appears once:
+232 → 114 ms at SF 0.1 and 2,333 → 1,352 ms at SF 1. The duplicate-eliminated
+key side also carries the enclosing filters, so Q20's keys come from 11k
+filtered `partsupp` rows instead of 800k and its scaling is 10.0× for 10× the
+rows instead of 15.1× (it was 38.7× when wave 120 recorded it). What is still
+a follow-up is *sharing* one key side across several subqueries of a statement
+(a delim join or a materialised CTE-like node); no TPC-H query needs it now,
+since Q20 and Q21 are the only delim shapes left and both are linear.
 
-For reference, the pre-existing gap is unchanged and unrelated: Q18 (214×) and
-Q19 (241×) have no correlated subquery at all — Q18 is the aggregate inside a
-plain `IN`, Q19 the nested `OR` lists that defeat the derived filters.
+Q2's 44× is a different cause and is recorded above: its subquery body is
+ordered before decorrelation, and its projection copies columns nobody reads.
+
+For reference, the pre-existing gap is unrelated: Q18 (11.4×) and Q19 (4.1×)
+have no correlated subquery at all — Q18 is the aggregate inside a plain `IN`,
+Q19 the nested `OR` lists.
+
+## What changed in wave 111c
+
+| change | measurement |
+| --- | --- |
+| a hash join carries an optional residual predicate on candidate key matches, evaluated in joined space on that pair before anything is materialized (only the residual's columns are gathered, into one dense chunk); `INNER` drops a failing pair, `SEMI`/`ANTI` treat it as absent | Q21 SF 1 2,333 → 1,352 ms (−42 %), SF 0.1 232 → 114 ms; 3 clones of a 36-column chain + 2 distincts → one chain |
+| `dependent_join` keeps the *plain* shape for an `EXISTS` whose body has equality keys plus a residual, with the residual rewritten into joined space; outer and mark joins reject one at execution | the Q21 plan above; `tests/residual_joins.rs` compares inner/semi/anti × 5 residual forms against a nested-loop reference and DuckDB |
+| the duplicate-eliminated key side carries the enclosing predicate, including one that holds an uncorrelated subquery (the second evaluation only filters rows the key side reads anyway) | Q20 SF 1 604 → 100 ms (−83 %), SF 0.1 40 → 10 ms; keys 800k → 11k; SF 0.1→1 scaling 15.1× → 10.0× |
+| `merge_partials` hash-partitions the partial group tables and merges the partitions in parallel, then restores the exact first-seen order with one sort over `(partial, position)` | Q18 SF 1 1,390 → 251 ms (5.5×); merge alone 1,284 → 56 ms (scatter 22 + merge 56 + sort 17 + assemble 9) |
+| join order may start from any leaf when the chain has at most four relations (found while diagnosing Q11) | Q11 SF 1 129 → 26 ms (5.0×), SF 0.1 13 → 5 ms; five/six-leaf chains keep the anchor, because freeing it there cost Q5 3.6× and Q9 2.6× |
+
+SF 1 geometric mean 166.5 → 128.1 ms (1.30×), total 7,782 → 5,023 ms (1.55×);
+SF 0.1 geomean 14.6 → 12.4 ms. Every answer is identical to DuckDB's (row
+counts and checksums) at SF 0.01, 0.1 and 1. No new dependencies; the CLI grew
+123 KB (+0.8 %).
 
 ## What changed in wave 123a
 

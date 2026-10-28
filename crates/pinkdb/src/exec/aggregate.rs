@@ -1724,17 +1724,36 @@ fn accumulate(
     }
 }
 
+/// Above this many local groups, phase 2 partitions the keys by hash and
+/// merges the partitions in parallel ([`merge_by_bucket`]).
+const PARALLEL_MERGE_MIN: usize = 1 << 14;
+
+/// Local groups per radix partition: large enough to amortize the per-bucket
+/// table, small enough that a bucket's table stays in cache.
+const MERGE_BUCKET_GROUPS: usize = 4096;
+
+/// Cap on partitions: more tasks than this only adds per-bucket overhead.
+const MERGE_BUCKETS_MAX: usize = 64;
+
 /// Merge per-chunk partials in chunk order (deterministic first-seen order).
 /// Partial groups already sit in first-seen order, so each partial is walked
 /// directly; the global table only maps encoded keys to slots for later
 /// partials. Reserve the upper bound (Σ local groups) so neither the table
 /// nor the output vec rehashes/regrows while it grows.
+///
+/// A large merge (wave 111c) walks the partials per hash partition instead, in
+/// parallel: the serial walk's cost is one cache miss per local group in a
+/// table sized for *every* distinct key of the input, which dwarfed the fold
+/// that produced them (TPC-H Q18: 6M local groups into a 1.5M-entry table).
 pub(crate) fn merge_partials(
     partials: Vec<Partial>,
     has_keys: bool,
     aggs: &[BoundAgg],
 ) -> Vec<Group> {
     let total_groups: usize = partials.iter().map(|p| p.groups.len()).sum();
+    if has_keys && total_groups >= PARALLEL_MERGE_MIN {
+        return merge_by_bucket(partials, total_groups);
+    }
     let mut table: FastMap<Vec<u8>, usize> =
         FastMap::with_capacity_and_hasher(total_groups, Default::default());
     let mut groups: Vec<Group> = Vec::with_capacity(total_groups);
@@ -1790,6 +1809,104 @@ pub(crate) fn merge_partials(
                 .map(|a| Acc::new(a.func, a.distinct, a.direct))
                 .collect(),
         });
+    }
+    groups
+}
+
+/// One partition's share of one partial table, still in first-seen order.
+type Bucket = Vec<(Vec<u8>, Group)>;
+
+/// Hash-partitioned phase-2 merge: every partition gets its own table of a
+/// few thousand entries and the partitions merge in parallel; the first-seen
+/// position of each merged group is recorded so the output comes back in the
+/// order the serial walk would have produced.
+///
+/// Each group moves exactly once — out of its partial, into a per-partition
+/// list on the thread that produced the partial — and only list *headers*
+/// move between threads afterwards. Sizing follows DuckDB's radix-partitioned
+/// aggregate (`radix_partitioned_hashtable.cpp`); the partitioning keeps the
+/// probe working set cache-resident instead of one table per distinct key.
+fn merge_by_bucket(partials: Vec<Partial>, total_groups: usize) -> Vec<Group> {
+    let buckets = (total_groups / MERGE_BUCKET_GROUPS)
+        .next_power_of_two()
+        .clamp(1, MERGE_BUCKETS_MAX);
+    // Any hash works as long as equal keys agree, but FNV's low bits barely
+    // mix (each step only multiplies upward), so take the top bits of a
+    // Fibonacci scramble instead of masking — masking put every key of the
+    // same length into a handful of buckets, which cost all of the speedup.
+    let shift = (64 - buckets.trailing_zeros()).min(63);
+    let bucket_of = |enc: &[u8]| {
+        let mut h = std::hash::BuildHasher::build_hasher(&crate::types::FnvBuild);
+        std::hash::Hasher::write(&mut h, enc);
+        let h = std::hash::Hasher::finish(&h);
+        (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
+    };
+    let scattered: Vec<Vec<Bucket>> = partials
+        .into_par_iter()
+        .map(|partial| {
+            let mut out: Vec<Vec<(Vec<u8>, Group)>> = (0..buckets).map(|_| Vec::new()).collect();
+            for (enc, group) in partial.groups {
+                let b = bucket_of(&enc);
+                out[b].push((enc, group));
+            }
+            out
+        })
+        .collect();
+    // Hand each partition its lists in partial order: bucket order then
+    // in-list order is the order the serial walk visits groups in.
+    let mut work: Vec<Vec<Bucket>> = (0..buckets)
+        .map(|_| Vec::with_capacity(scattered.len()))
+        .collect();
+    for lists in scattered {
+        for (b, list) in lists.into_iter().enumerate() {
+            work[b].push(list);
+        }
+    }
+    let merged: Vec<Vec<(u64, Option<Group>)>> = work
+        .into_par_iter()
+        .map(|lists| {
+            let total: usize = lists.iter().map(|l| l.len()).sum();
+            let mut table: FastMap<Vec<u8>, usize> =
+                FastMap::with_capacity_and_hasher(total, Default::default());
+            let mut out: Vec<(u64, Option<Group>)> = Vec::with_capacity(total);
+            for (partial, list) in lists.into_iter().enumerate() {
+                for (pos, (enc, group)) in list.into_iter().enumerate() {
+                    match table.entry(enc) {
+                        std::collections::hash_map::Entry::Occupied(slot) => {
+                            let target = out[*slot.get()].1.as_mut().expect("live group");
+                            for (a, b) in target.accs.iter_mut().zip(group.accs) {
+                                a.merge(b);
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(out.len());
+                            // First-seen position: partial, then in-partial order.
+                            let seen = (partial as u64) << 32 | pos as u64;
+                            out.push((seen, Some(group)));
+                        }
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+    // Every partition is already in first-seen order, so sorting the runs by
+    // their head position restores the serial walk's global order.
+    let mut order: Vec<(u64, u32, u32)> = Vec::with_capacity(total_groups);
+    for (b, list) in merged.iter().enumerate() {
+        for (i, (seen, _)) in list.iter().enumerate() {
+            order.push((*seen, b as u32, i as u32));
+        }
+    }
+    order.sort_unstable_by_key(|e| e.0);
+    let mut merged = merged;
+    let mut groups = Vec::with_capacity(order.len());
+    for (_, b, i) in order {
+        let group = merged[b as usize][i as usize]
+            .1
+            .take()
+            .expect("each merged group is emitted once");
+        groups.push(group);
     }
     groups
 }

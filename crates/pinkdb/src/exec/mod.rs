@@ -3350,11 +3350,18 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             right,
             left_keys,
             right_keys,
+            residual,
             ..
         } => {
             // A key expression may hold a subquery: evaluate it once, on this
             // thread, before the join's own parallel probing starts.
-            expr::prime(cx, left_keys.iter().chain(right_keys.iter()))?;
+            expr::prime(
+                cx,
+                left_keys
+                    .iter()
+                    .chain(right_keys.iter())
+                    .chain(residual.iter()),
+            )?;
             let build_left = build_on_left(cx, *kind, left, right);
             // Dynamic join filters (wave 122): once the build side is
             // complete, its key bounds and bloom prune the probe side's scans
@@ -3428,6 +3435,17 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 chunks: &r.chunks,
                 types: &r.types,
             };
+            // The residual reads `left ++ right`; a build-left probe assembles
+            // the preserved (right) side first.
+            let swapped;
+            let residual = if build_left {
+                swapped = residual
+                    .as_ref()
+                    .map(|expr| swap_join_space(expr, l.types.len(), r.types.len()));
+                swapped.as_ref()
+            } else {
+                residual.as_ref()
+            };
             let chunks = if build_left {
                 // The estimated-smaller left side feeds the match table and
                 // the right side probes it: output rows are right-row major,
@@ -3442,6 +3460,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     false,
                     false,
                     filters.as_deref(),
+                    residual,
                 )?
             } else {
                 // INNER with the build side on the right, or SEMI: the usual
@@ -3454,6 +3473,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     left_keys,
                     right_keys,
                     filters.as_deref(),
+                    residual,
                 )?
             };
             Ok(Output {
@@ -4152,6 +4172,126 @@ impl MatchTable {
     }
 }
 
+/// One candidate key match: `(preserved row, build chunk, build row)`.
+type MatchPair = (u32, u32, u32);
+
+/// Candidate matches of one preserved chunk, in visit order (preserved-row
+/// order, then the build side's input order within a key). Only a join with a
+/// residual needs them: it must know every candidate of a row before it can
+/// tell whether the row matched. The rules mirror the assembling probe loop —
+/// a bloom-rejected or NULL-keyed row has no candidates — so the residual
+/// filters exactly the pairs the join would otherwise materialize.
+fn candidate_pairs(
+    chunk: &DataChunk,
+    kvs: &[Vector],
+    table: &MatchTable,
+    ints: bool,
+    filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
+    buf: &mut Vec<u8>,
+) -> Vec<MatchPair> {
+    let mut pairs: Vec<MatchPair> = Vec::new();
+    for i in 0..chunk.num_rows() {
+        if let Some(filters) = filters
+            && !filters
+                .iter()
+                .zip(kvs.iter())
+                .all(|(f, kv)| f.may_match(kv, i))
+        {
+            continue;
+        }
+        if kvs.iter().any(|kv| kv.is_null(i)) {
+            continue;
+        }
+        let head = if ints {
+            table.head_int(int_key_at(&kvs[0], i))
+        } else {
+            buf.clear();
+            for kv in kvs {
+                kv.encode_into(buf, i);
+            }
+            table.head_bytes(buf)
+        };
+        let mut node = head.unwrap_or(NIL);
+        while node != NIL {
+            let (bci, bi, next) = table.node(node);
+            pairs.push((i as u32, bci, bi));
+            node = next;
+        }
+    }
+    pairs
+}
+
+/// The candidate pairs that satisfy `residual`, as indices into `pairs`. The
+/// predicate reads the joined row in `preserved ++ build` space; only the
+/// columns it mentions are gathered into a dense chunk, so it evaluates once
+/// per candidate chunk instead of once per pair, and a pair it rejects is
+/// never assembled. A pair whose predicate is NULL is not a match.
+///
+/// DuckDB's residual conditions (`InitializeResidualPredicate`,
+/// `MapResidualBuildColumns` in
+/// src/execution/operator/join/physical_hash_join.cpp) gather the same way.
+fn residual_selection(
+    cx: &Cx,
+    residual: &BoundExpr,
+    pairs: &[MatchPair],
+    preserved: &DataChunk,
+    preserved_cols: usize,
+    build: &[DataChunk],
+) -> Result<selection::Selection> {
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cols = Vec::new();
+    columns_in(residual, &mut cols);
+    cols.sort_unstable();
+    cols.dedup();
+    if cols.contains(&usize::MAX) {
+        return Err(PinkDbError::Execution(
+            "internal: join residual reads an aggregate or window column".to_string(),
+        ));
+    }
+    if cols.is_empty() {
+        // A residual folded to a constant reads no column, so the column space
+        // is irrelevant: one evaluation answers for every pair.
+        let mut sel = selection::all_rows(preserved.num_rows());
+        expr::select_predicate(residual, preserved, cx, &mut sel)?;
+        return Ok(if sel.is_empty() {
+            Vec::new()
+        } else {
+            (0..pairs.len() as u32).collect()
+        });
+    }
+    let mut dense = Vec::with_capacity(cols.len());
+    for &c in &cols {
+        let mut v = if c < preserved_cols {
+            Vector::with_capacity(preserved.columns[c].dtype(), pairs.len())
+        } else {
+            // Every build chunk shares one schema.
+            Vector::with_capacity(build[0].columns[c - preserved_cols].dtype(), pairs.len())
+        };
+        for &(pi, bci, bi) in pairs {
+            let (col, row) = if c < preserved_cols {
+                (&preserved.columns[c], pi as usize)
+            } else {
+                (
+                    &build[bci as usize].columns[c - preserved_cols],
+                    bi as usize,
+                )
+            };
+            v.push_from(col, row)?;
+        }
+        dense.push(v);
+    }
+    let pred = crate::plan::map_columns(residual.clone(), &|i| {
+        cols.binary_search(&i)
+            .expect("residual column was gathered")
+    });
+    let chunk = DataChunk::new(dense)?;
+    let mut sel = selection::all_rows(chunk.num_rows());
+    expr::select_predicate(&pred, &chunk, cx, &mut sel)?;
+    Ok(sel)
+}
+
 /// Hash index over a DML statement's source rows. `UPDATE … FROM`,
 /// `DELETE … USING` and `MERGE` match every target row against the source;
 /// the predicate's equality conjuncts (the same split the binder applies to a
@@ -4387,6 +4527,7 @@ fn build_on_left(cx: &Cx, kind: JoinKind, left: &LogicalPlan, right: &LogicalPla
 /// An INNER join whose left input estimates smaller than its right one is
 /// instead run through `hash_join_probe` directly (build left, probe right)
 /// — see `build_on_left`.
+#[allow(clippy::too_many_arguments)]
 fn hash_join(
     cx: &Cx,
     left: JoinSide<'_>,
@@ -4395,6 +4536,7 @@ fn hash_join(
     left_keys: &[BoundExpr],
     right_keys: &[BoundExpr],
     filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
+    residual: Option<&BoundExpr>,
 ) -> Result<Vec<DataChunk>> {
     // The preserved side is the probing side: left for Inner/Left/Full, right
     // for Right. `preserved_is_right` places it in the declared left ++ right
@@ -4403,22 +4545,31 @@ fn hash_join(
     // Only an inner or semi join accepts probe filters: every other shape
     // owes its probe rows an output (or a "no match" answer).
     debug_assert!(filters.is_none() || matches!(kind, JoinKind::Inner | JoinKind::Semi));
+    // A RIGHT join probes with its right side, so the residual has to move
+    // from `left ++ right` into the probe's `right ++ left` space.
+    let swapped;
+    let residual = if matches!(kind, JoinKind::Right) {
+        swapped = residual.map(|r| swap_join_space(r, left.types.len(), right.types.len()));
+        swapped.as_ref()
+    } else {
+        residual
+    };
     match kind {
         JoinKind::Inner => hash_join_probe(
-            cx, left, right, left_keys, right_keys, false, false, false, filters,
+            cx, left, right, left_keys, right_keys, false, false, false, filters, residual,
         ),
         JoinKind::Left => hash_join_probe(
-            cx, left, right, left_keys, right_keys, false, true, false, None,
+            cx, left, right, left_keys, right_keys, false, true, false, None, residual,
         ),
         JoinKind::Right => hash_join_probe(
-            cx, right, left, right_keys, left_keys, true, true, false, None,
+            cx, right, left, right_keys, left_keys, true, true, false, None, residual,
         ),
         JoinKind::Full => hash_join_probe(
-            cx, left, right, left_keys, right_keys, false, true, true, None,
+            cx, left, right, left_keys, right_keys, false, true, true, None, residual,
         ),
-        JoinKind::Semi | JoinKind::Anti | JoinKind::Mark => {
-            hash_mark_join(cx, left, right, left_keys, right_keys, kind, filters)
-        }
+        JoinKind::Semi | JoinKind::Anti | JoinKind::Mark => hash_mark_join(
+            cx, left, right, left_keys, right_keys, kind, filters, residual,
+        ),
         // Cross joins never reach the hash path (the binder emits a
         // condition-less nested loop).
         JoinKind::Cross => Err(PinkDbError::Execution(
@@ -4442,6 +4593,7 @@ pub(crate) const MARK_NAME: &str = "__mark";
 /// src/execution/join_hashtable.cpp — a group with `count(*) > count(value)`
 /// has a NULL in it). A NULL key makes the marker NULL, because `NULL IN (…)`
 /// is never TRUE.
+#[allow(clippy::too_many_arguments)]
 fn hash_mark_join(
     cx: &Cx,
     left: JoinSide<'_>,
@@ -4450,8 +4602,19 @@ fn hash_mark_join(
     right_keys: &[BoundExpr],
     kind: JoinKind,
     filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
+    residual: Option<&BoundExpr>,
 ) -> Result<Vec<DataChunk>> {
     let mark = kind == JoinKind::Mark;
+    // A mark join answers "did *any* body row match", and its NULL bookkeeping
+    // counts the matching rows' key values: a residual would have to narrow
+    // those counts too. The binder never gives a mark join a residual (an `IN`
+    // subquery keeps its extra conjuncts in the keyed shape), so refuse instead
+    // of returning a marker the counts do not back.
+    if mark && residual.is_some() {
+        return Err(PinkDbError::Execution(
+            "internal: a mark join cannot carry a residual".to_string(),
+        ));
+    }
     if left_keys.is_empty() {
         return Err(PinkDbError::Execution(
             "internal: semi/anti/mark join without keys".to_string(),
@@ -4513,13 +4676,37 @@ fn hash_mark_join(
                 .zip(commons.iter())
                 .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
                 .collect::<Result<_>>()?;
+            let mut buf = Vec::new();
+            // A row hits only when one of its key matches survives the
+            // residual: a pair the predicate rejects is not a match, so the
+            // row answers exactly as if that right row did not exist.
+            // A residual can only arrive on a semi/anti join (see the guard above), so
+            // a row "passes" when at least one candidate pair survives it.
+            let row_pass: Option<Vec<bool>> = match residual {
+                None => None,
+                Some(residual) => {
+                    let pairs = candidate_pairs(chunk, &kvs, &table, ints, filters, &mut buf);
+                    let kept = residual_selection(
+                        cx,
+                        residual,
+                        &pairs,
+                        chunk,
+                        left.types.len(),
+                        right.chunks,
+                    )?;
+                    let mut pass = vec![false; chunk.num_rows()];
+                    for k in kept {
+                        pass[pairs[k as usize].0 as usize] = true;
+                    }
+                    Some(pass)
+                }
+            };
             let mut finished = Vec::new();
             let mut cur: Vec<Vector> = dtypes
                 .iter()
                 .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
                 .collect();
             let mut cur_rows = 0usize;
-            let mut buf = Vec::new();
             for i in 0..chunk.num_rows() {
                 // Build keys the bloom rejects cannot match, and a SEMI join
                 // emits nothing for them (wave 122).
@@ -4532,7 +4719,7 @@ fn hash_mark_join(
                     continue;
                 }
                 let null_key = kvs.iter().any(|kv| kv.is_null(i));
-                let hit = !null_key
+                let mut hit = !null_key
                     && if ints {
                         table.head_int(int_key_at(&kvs[0], i)).is_some()
                     } else {
@@ -4542,6 +4729,9 @@ fn hash_mark_join(
                         }
                         table.head_bytes(&buf).is_some()
                     };
+                if let Some(pass) = &row_pass {
+                    hit = hit && pass[i];
+                }
                 if !mark && hit != (kind == JoinKind::Semi) {
                     continue;
                 }
@@ -4669,6 +4859,139 @@ fn derive_join_filters(
     Ok(filters)
 }
 
+/// Re-express a predicate from `left ++ right` joined space into
+/// `right ++ left`, the space a RIGHT join's probe assembles.
+fn swap_join_space(expr: &BoundExpr, left_cols: usize, right_cols: usize) -> BoundExpr {
+    crate::plan::map_columns(expr.clone(), &|i| {
+        if i < left_cols {
+            right_cols + i
+        } else {
+            i - left_cols
+        }
+    })
+}
+
+/// Output assembly of one probe partition: matched pairs and unmatched
+/// preserved rows land in `CHUNK_SIZE`-row chunks in visit order.
+struct ProbeSink<'a> {
+    cx: &'a Cx<'a>,
+    dtypes: &'a [DataType],
+    n_left: usize,
+    preserved_is_right: bool,
+    cur: Vec<Vector>,
+    cur_rows: usize,
+    finished: Vec<DataChunk>,
+}
+
+impl<'a> ProbeSink<'a> {
+    fn new(
+        cx: &'a Cx<'a>,
+        dtypes: &'a [DataType],
+        n_left: usize,
+        preserved_is_right: bool,
+    ) -> Self {
+        ProbeSink {
+            cx,
+            dtypes,
+            n_left,
+            preserved_is_right,
+            cur: dtypes
+                .iter()
+                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+                .collect(),
+            cur_rows: 0,
+            finished: Vec::new(),
+        }
+    }
+
+    /// Emit the current chunk when it is full.
+    fn flush(&mut self) -> Result<()> {
+        if self.cur_rows < CHUNK_SIZE {
+            return Ok(());
+        }
+        let chunk = DataChunk::new(std::mem::take(&mut self.cur))?;
+        self.cx
+            .add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
+        self.finished.push(chunk);
+        self.cur = self
+            .dtypes
+            .iter()
+            .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+            .collect();
+        self.cur_rows = 0;
+        Ok(())
+    }
+
+    /// One matched pair, emitted in declared `left ++ right` order.
+    fn push(
+        &mut self,
+        row: usize,
+        chunk: &DataChunk,
+        bchunk: &DataChunk,
+        brow: usize,
+    ) -> Result<()> {
+        self.flush()?;
+        let (left, lrow, right, rrow) = if self.preserved_is_right {
+            (bchunk, brow, chunk, row)
+        } else {
+            (chunk, row, bchunk, brow)
+        };
+        for (dst, col) in self
+            .cur
+            .iter_mut()
+            .take(self.n_left)
+            .zip(left.columns.iter())
+        {
+            dst.push_from(col, lrow)?;
+        }
+        for (dst, col) in self
+            .cur
+            .iter_mut()
+            .skip(self.n_left)
+            .zip(right.columns.iter())
+        {
+            dst.push_from(col, rrow)?;
+        }
+        self.cur_rows += 1;
+        Ok(())
+    }
+
+    /// A preserved row without a match: its own columns plus NULLs.
+    fn push_unmatched(&mut self, row: usize, chunk: &DataChunk) -> Result<()> {
+        self.flush()?;
+        let base = if self.preserved_is_right {
+            self.n_left
+        } else {
+            0
+        };
+        for (k, dst) in self.cur.iter_mut().enumerate() {
+            let preserved = if self.preserved_is_right {
+                k >= self.n_left
+            } else {
+                k < self.n_left
+            };
+            if preserved {
+                dst.push_from(&chunk.columns[k - base], row)?;
+            } else {
+                dst.push_null()?;
+            }
+        }
+        self.cur_rows += 1;
+        Ok(())
+    }
+
+    /// Close the partition's last chunk.
+    fn finish(mut self) -> Result<Vec<DataChunk>> {
+        if self.cur_rows > 0 {
+            let chunk = DataChunk::new(std::mem::take(&mut self.cur))?;
+            self.cx
+                .add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
+            self.finished.push(chunk);
+        }
+        Ok(self.finished)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hash_join_probe(
     cx: &Cx,
@@ -4680,7 +5003,13 @@ fn hash_join_probe(
     extend_unmatched: bool,
     full: bool,
     filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
+    residual: Option<&BoundExpr>,
 ) -> Result<Vec<DataChunk>> {
+    if residual.is_some() && extend_unmatched {
+        return Err(PinkDbError::Execution(
+            "internal: an outer join cannot carry a residual".to_string(),
+        ));
+    }
     let (ints, commons) = key_encoding(preserved_keys, build_keys);
     let build_rows: usize = build.chunks.iter().map(|c| c.num_rows()).sum();
     if build_rows > u32::MAX as usize {
@@ -4734,13 +5063,31 @@ fn hash_join_probe(
                 .zip(commons.iter())
                 .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
                 .collect::<Result<_>>()?;
-            let mut finished = Vec::new();
-            let mut cur: Vec<Vector> = dtypes
-                .iter()
-                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
-                .collect();
-            let mut cur_rows = 0usize;
             let mut buf = Vec::new();
+            let mut sink = ProbeSink::new(cx, &dtypes, n_left, preserved_is_right);
+            if let Some(residual) = residual {
+                // Two passes: the residual decides which candidate pairs are
+                // matches before any of them is assembled.
+                let pairs = candidate_pairs(chunk, &kvs, &table, ints, filters, &mut buf);
+                let kept = residual_selection(
+                    cx,
+                    residual,
+                    &pairs,
+                    chunk,
+                    preserved.types.len(),
+                    build.chunks,
+                )?;
+                for k in kept {
+                    let (row, bci, bi) = pairs[k as usize];
+                    sink.push(
+                        row as usize,
+                        chunk,
+                        &build.chunks[bci as usize],
+                        bi as usize,
+                    )?;
+                }
+                return sink.finish();
+            }
             for i in 0..chunk.num_rows() {
                 // A row the build side's bloom rules out cannot match, so it is
                 // dropped before any of its columns are materialized (wave
@@ -4779,41 +5126,7 @@ fn hash_join_probe(
                                     build_chunk_starts[bci as usize] as usize + bi as usize;
                                 marked[global].store(true, std::sync::atomic::Ordering::Relaxed);
                             }
-                            if cur_rows >= CHUNK_SIZE {
-                                let chunk = DataChunk::new(std::mem::take(&mut cur))?;
-                                cx.add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
-                                finished.push(chunk);
-                                cur = dtypes
-                                    .iter()
-                                    .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
-                                    .collect();
-                                cur_rows = 0;
-                            }
-                            let bchunk = &build.chunks[bci as usize];
-                            if preserved_is_right {
-                                for (dst, col) in
-                                    cur.iter_mut().take(n_left).zip(bchunk.columns.iter())
-                                {
-                                    dst.push_from(col, bi as usize)?;
-                                }
-                                for (dst, col) in
-                                    cur.iter_mut().skip(n_left).zip(chunk.columns.iter())
-                                {
-                                    dst.push_from(col, i)?;
-                                }
-                            } else {
-                                for (dst, col) in
-                                    cur.iter_mut().take(n_left).zip(chunk.columns.iter())
-                                {
-                                    dst.push_from(col, i)?;
-                                }
-                                for (dst, col) in
-                                    cur.iter_mut().skip(n_left).zip(bchunk.columns.iter())
-                                {
-                                    dst.push_from(col, bi as usize)?;
-                                }
-                            }
-                            cur_rows += 1;
+                            sink.push(i, chunk, &build.chunks[bci as usize], bi as usize)?;
                             node = next;
                         }
                     }
@@ -4823,43 +5136,11 @@ fn hash_join_probe(
                         if !extend_unmatched {
                             continue;
                         }
-                        if cur_rows >= CHUNK_SIZE {
-                            let chunk = DataChunk::new(std::mem::take(&mut cur))?;
-                            cx.add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
-                            finished.push(chunk);
-                            cur = dtypes
-                                .iter()
-                                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
-                                .collect();
-                            cur_rows = 0;
-                        }
-                        if preserved_is_right {
-                            for dst in cur.iter_mut().take(n_left) {
-                                dst.push_null()?;
-                            }
-                            for (dst, col) in cur.iter_mut().skip(n_left).zip(chunk.columns.iter())
-                            {
-                                dst.push_from(col, i)?;
-                            }
-                        } else {
-                            for (dst, col) in cur.iter_mut().take(n_left).zip(chunk.columns.iter())
-                            {
-                                dst.push_from(col, i)?;
-                            }
-                            for dst in cur.iter_mut().skip(n_left) {
-                                dst.push_null()?;
-                            }
-                        }
-                        cur_rows += 1;
+                        sink.push_unmatched(i, chunk)?;
                     }
                 }
             }
-            if cur_rows > 0 {
-                let chunk = DataChunk::new(cur)?;
-                cx.add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
-                finished.push(chunk);
-            }
-            Ok(finished)
+            sink.finish()
         })
         .collect::<Result<_>>()?;
     let mut out: Vec<DataChunk> = partitions.into_iter().flatten().collect();
@@ -5341,6 +5622,7 @@ fn fused_join_aggregate(
             left_keys,
             right_keys,
             left_cols,
+            residual: None,
         } => (
             *kind, &**left, &**right, left_keys, right_keys, *left_cols, None,
         ),
@@ -5356,6 +5638,7 @@ fn fused_join_aggregate(
                 left_keys,
                 right_keys,
                 left_cols,
+                residual: None,
             } => (
                 *kind,
                 &**left,
@@ -7170,6 +7453,7 @@ fn explain_into(
             right,
             left_keys,
             right_keys,
+            residual,
             ..
         } => {
             children.push(left);
@@ -7181,7 +7465,11 @@ fn explain_into(
                 }
                 key_text.push_str(&format!("{}={}", expr_text(l), expr_text(r)));
             }
-            format!("Join {} on [{key_text}]", join_name(*kind))
+            let residual_text = match residual {
+                Some(e) => format!(" residual {}", expr_text(e)),
+                None => String::new(),
+            };
+            format!("Join {} on [{key_text}]{residual_text}", join_name(*kind))
         }
         LogicalPlan::NestedLoopJoin {
             kind,

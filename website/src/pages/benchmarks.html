@@ -14,21 +14,25 @@ timing, so any table below can be reproduced or disputed.</p>
   </thead>
   <tbody>
     <tr><td>TPC-H SF 1, all 22 queries (geomean)</td>
-        <td>—</td><td>—</td><td>17.3× slower</td></tr>
+        <td>128 ms</td><td>9.6 ms</td><td>13.4× slower</td></tr>
     <tr><td>TPC-H SF 0.1, all 22 queries (geomean)</td>
-        <td>—</td><td>—</td><td>5.0× slower</td></tr>
+        <td>12.4 ms</td><td>2.8 ms</td><td>4.4× slower</td></tr>
     <tr><td>TPC-H Q4, SF 0.1 (correlated <code>EXISTS</code>)</td>
         <td>16 ms</td><td>2 ms</td><td>8×</td></tr>
     <tr><td>TPC-H Q17, SF 0.1 (correlated <code>avg</code>)</td>
         <td>8 ms</td><td>2 ms</td><td>4×</td></tr>
-    <tr><td>TPC-H Q21, SF 0.1 (anti join with a residual)</td>
-        <td>232 ms</td><td>5 ms</td><td>46×</td></tr>
+    <tr><td>TPC-H Q21, SF 1 (anti join with a residual)</td>
+        <td>1,352 ms</td><td>18 ms</td><td>75×</td></tr>
+    <tr><td>TPC-H Q18, SF 1 (grouped <code>IN</code> subquery)</td>
+        <td>251 ms</td><td>22 ms</td><td>11×</td></tr>
+    <tr><td>TPC-H Q20, SF 1 (correlated <code>IN</code>)</td>
+        <td>100 ms</td><td>10 ms</td><td>10×</td></tr>
     <tr><td>TPC-H Q1, SF 1</td><td>64 ms</td><td>13 ms</td><td>≈5×</td></tr>
     <tr><td>TPC-H Q6, SF 1</td><td>13 ms</td><td>3 ms</td><td>≈4×</td></tr>
     <tr><td>TPC-H Q19, SF 1</td><td>50 ms</td><td>10 ms</td><td>≈5×</td></tr>
-    <tr><td>TPC-H Q13, SF 1</td><td>453 ms</td><td>37 ms</td><td>12×</td></tr>
-    <tr><td>TPC-H Q9, SF 1</td><td>675 ms</td><td>26 ms</td><td>26×</td></tr>
-    <tr><td>TPC-H Q7, SF 1</td><td>246 ms</td><td>9 ms</td><td>27×</td></tr>
+    <tr><td>TPC-H Q13, SF 1</td><td>436 ms</td><td>38 ms</td><td>12×</td></tr>
+    <tr><td>TPC-H Q9, SF 1</td><td>756 ms</td><td>26 ms</td><td>29×</td></tr>
+    <tr><td>TPC-H Q7, SF 1</td><td>241 ms</td><td>9 ms</td><td>27×</td></tr>
     <tr><td>CSV ingest, lineitem SF 0.1</td><td>2.31 M rows/s</td>
         <td>1.64 M rows/s</td><td>1.4× faster</td></tr>
     <tr><td>Parquet ingest, lineitem SF 0.1</td><td>1.23 M rows/s</td>
@@ -51,7 +55,7 @@ timing, so any table below can be reproduced or disputed.</p>
         <td>—</td><td>—</td></tr>
     <tr><td>HNSW recall@10, <code>ef_search=128</code></td><td>0.961</td>
         <td>—</td><td>—</td></tr>
-    <tr><td>Default binary</td><td>5.6 MB</td><td>—</td><td>—</td></tr>
+    <tr><td>Default binary</td><td>5.9 MB</td><td>—</td><td>—</td></tr>
     <tr><td>CLI start-up</td><td>5.2 ms</td><td>—</td><td>—</td></tr>
   </tbody>
 </table>
@@ -60,10 +64,48 @@ timing, so any table below can be reproduced or disputed.</p>
 semi/anti/mark joins and a grouped join for correlated aggregates, so Q2, Q4,
 Q17, Q20, Q21 and Q22 answer instead of failing to bind. Their cost profile is
 the general one — the three shown are the extremes: Q17's correlated
-<code>avg</code> is as cheap as the rest of the scan-bound queries, Q21 pays for
-the duplicate-eliminated key side and for keeping its non-equality condition as
-a filter above the join. The full 22-query tables for SF 0.1 and SF 1 are in
-<a href="/docs/">the docs</a> (<code>docs/benchmarks.md</code>).</p>
+<code>avg</code> is as cheap as the rest of the scan-bound queries, while Q21 is
+two 6 M-row <code>lineitem</code> scans, Q18 the grouped <code>IN</code>
+subquery's aggregate and Q20 a correlated <code>IN</code>. The full 22-query
+tables for SF 0.1 and SF 1 are in <a href="/docs/">the docs</a>
+(<code>docs/benchmarks.md</code>).</p>
+
+<h2>Wave 111c: join residuals and a parallel aggregate merge</h2>
+
+<p>A hash join can carry a <em>residual</em> now: a predicate on a candidate
+key match, evaluated on that pair before anything is materialized, where a pair
+that fails it is not a match (an inner join drops the pair; a semi/anti join
+treats it as absent). A correlated <code>EXISTS</code> with a non-equality
+condition therefore keeps the cheap shape instead of falling back to
+<code>body ⨯ Distinct(Project(outer))</code> — Q21's 36-column outer chain used
+to be cloned and deduplicated three times and is now one chain with two joins.
+The duplicate-eliminated key side also carries the enclosing filters now, so
+Q20's 800k keys became 11k, and the merge of a parallel aggregation's partial
+tables is hash-partitioned and runs in parallel, where it used to be a serial
+walk over 6 M entries. Nothing about an answer changed: all 22 TPC-H queries
+still match DuckDB's rows and checksums at SF 0.01, 0.1 and 1, and two new
+differential tests compare the new join and aggregate paths with a hand-written
+reference.</p>
+
+<table>
+  <thead>
+    <tr><th>TPC-H SF 1</th><th>before</th><th>after</th><th>Δ</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Q21 (anti join with a residual)</td><td>2,333 ms</td><td>1,352 ms</td><td>−42 %</td></tr>
+    <tr><td>Q18 (grouped <code>IN</code> subquery)</td><td>1,390 ms</td><td>251 ms</td><td>−82 %</td></tr>
+    <tr><td>Q20 (correlated <code>IN</code>)</td><td>604 ms</td><td>100 ms</td><td>−83 %</td></tr>
+    <tr><td>Q11 (four-relation aggregate)</td><td>129 ms</td><td>26 ms</td><td>−80 %</td></tr>
+    <tr><td>all 22 (geomean)</td><td>166.5 ms</td><td>128.1 ms</td><td>−23 %</td></tr>
+    <tr><td>all 22 (total)</td><td>7,782 ms</td><td>5,023 ms</td><td>−35 %</td></tr>
+  </tbody>
+</table>
+
+<p>SF 0.1 moved the same four (Q21 232 → 114 ms, Q18 25 → 20, Q20 40 → 10, Q11
+13 → 5) and its geomean 14.6 → 12.4 ms. The wave also removed the superlinear
+scaling wave 120 recorded: Q20 was 15.1× for 10× the rows and is 10.0× now. No
+dependency was added; the CLI grew by 123 KB — +2.1 % on the default build
+(5,757 → 5,880 kB) and +0.8 % with the lake, Parquet, FTS and VSS features.</p>
 
 <h2>Wave 122: statistics and join filters</h2>
 
@@ -176,12 +218,15 @@ filters from an <code>OR</code> of conjunctions, including <code>IN</code>
 lists inside the branches — that is what took Q7 from 133× to 27× and Q19
 from 246× to 11×.</p>
 
-<p>Q21 is the worst gap left (125×): its two <code>EXISTS</code> subqueries
-each materialise the same duplicate-eliminated key side, which a delim join
-would share. Q18 (66×) is the aggregate's serial merge of eight partial hash
-tables. Q1 and Q6 are scan-bound: pinkdb's filter and aggregate paths are
-vectorised but do not use DuckDB's perfect-hash or selection-vector tricks,
-which is most of the 12–26× gap on those queries.</p>
+<p>Q21 is the worst gap left (75×) and it is the query itself now: two 6 M-row
+<code>lineitem</code> scans with a date filter and a match table built for
+each. Filtering the join key <em>inside</em> the scan is the next lever there —
+wave 122's dynamic filter only skips whole chunks by zone bounds. Q2 (44×) is a
+different story: its correlated subquery body is ordered before decorrelation
+removes the outer column, so it joins partsupp-first (115 ms against 9 ms for
+the same relations ordered region-first) and copies 19 columns to use one. Q18
+(11×) is the aggregate's phase one now that the merge is parallel, and Q9/Q5
+(29×/41×) are the row-copying join probe.</p>
 
 <p>Ingest is mixed: pinkdb's CSV reader is faster than DuckDB's on a wide
 lineitem file, while its Parquet reader is about 4.6× slower because DuckDB
@@ -210,7 +255,9 @@ suite downloads data or installs a DuckDB extension.</p>
 
 <p>DuckDB's <code>fts</code> and <code>vss</code> extensions need
 <code>INSTALL</code>, which this project does not run without an explicit
-go-ahead, so the search family has no cross-engine comparison yet. Join-order
-enumeration, a build-side choice driven by cardinalities, and a cheaper
-<code>IN</code>-subquery path are the known next steps; each is a ROADMAP row,
-not a hidden caveat in these tables.</p>
+go-ahead, so the search family has no cross-engine comparison yet. A shared
+materialized key side for several correlated subqueries of one statement (a
+delim join), scan-level Bloom filtering of a join key, join ordering after
+decorrelation, and a perfect-hash phase one for low-cardinality aggregation are
+the known next steps; each is a ROADMAP row, not a hidden caveat in these
+tables.</p>

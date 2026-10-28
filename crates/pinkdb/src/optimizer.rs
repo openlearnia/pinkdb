@@ -167,6 +167,7 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
             left_keys,
             right_keys,
             left_cols,
+            residual,
         } => LogicalPlan::Join {
             kind,
             left: Box::new(apply_indexes(db, *left)),
@@ -174,6 +175,7 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
             left_keys,
             right_keys,
             left_cols,
+            residual,
         },
         LogicalPlan::NestedLoopJoin {
             kind,
@@ -308,6 +310,7 @@ fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
             left_keys,
             right_keys,
             left_cols,
+            residual,
         } => LogicalPlan::Join {
             kind,
             left: Box::new(drop_count_star_projections(*left)),
@@ -315,6 +318,7 @@ fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
             left_keys,
             right_keys,
             left_cols,
+            residual,
         },
         LogicalPlan::NestedLoopJoin {
             kind,
@@ -566,6 +570,7 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             left_keys,
             right_keys,
             left_cols,
+            residual,
         } => LogicalPlan::Join {
             kind,
             left: Box::new(fold_plan(db, *left)),
@@ -573,6 +578,7 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             left_keys: left_keys.into_iter().map(|k| fold_expr(&cx, k)).collect(),
             right_keys: right_keys.into_iter().map(|k| fold_expr(&cx, k)).collect(),
             left_cols,
+            residual: residual.map(|e| fold_expr(&cx, e)),
         },
         LogicalPlan::NestedLoopJoin {
             kind,
@@ -1204,6 +1210,17 @@ fn implied_equi(expr: &BoundExpr, left_cols: usize) -> (Vec<(BoundExpr, BoundExp
     }
 }
 
+/// Split conjuncts into those a join may evaluate itself and those that must
+/// stay in a `Filter` above it. A dynamic call is opaque and impure, and a
+/// subquery is evaluated once per input row: below the join they would run a
+/// different number of times (on candidate pairs rather than on rows), so both
+/// kinds stay above.
+fn split_residual(preds: Vec<BoundExpr>) -> (Vec<BoundExpr>, Vec<BoundExpr>) {
+    preds
+        .into_iter()
+        .partition(|c| !c.contains_dynamic_scalar() && !c.has_subquery())
+}
+
 /// Split conjuncts into hash keys and the residual that must still run, in
 /// the order the predicate listed them.
 fn equi_keys(
@@ -1695,9 +1712,19 @@ fn dp_order(stats: &ChainStats) -> Option<Vec<usize>> {
     // Anchor the FROM clause's first relation. It is the one a query filters,
     // and without statistics a small dimension looks cheaper to start from even
     // when joining it first fans out through a many-to-many key and leaves the
-    // fact table for last (TPC-H Q5 region-first: 315 ms against 49).
-    cost[1] = stats.rows(0);
-    last[1] = 0;
+    // fact table for last (TPC-H Q5 region-first: 315 ms against 49). With at
+    // most three joins the estimate cannot compound far, so any leaf may start
+    // there (TPC-H Q11: partsupp-first builds an 800k-row intermediate,
+    // supplier-first 400).
+    if n <= 4 {
+        for i in 0..n {
+            cost[1 << i] = stats.rows(i);
+            last[1 << i] = i;
+        }
+    } else {
+        cost[1] = stats.rows(0);
+        last[1] = 0;
+    }
     for mask in 1..=full {
         if mask.count_ones() < 2 {
             continue;
@@ -1964,6 +1991,7 @@ fn order_chains(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             left_keys,
             right_keys,
             left_cols,
+            residual,
         } => P::Join {
             kind,
             left: Box::new(order_chains(db, *left)),
@@ -1971,6 +1999,7 @@ fn order_chains(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             left_keys,
             right_keys,
             left_cols,
+            residual,
         },
         P::NestedLoopJoin {
             kind,
@@ -2027,6 +2056,7 @@ fn reorder_left_spine(
             left_keys,
             right_keys,
             left_cols,
+            residual,
         } => {
             let left = reorder_comma_join(predicate, &left, Some(db), false).unwrap_or(*left);
             P::Join {
@@ -2036,6 +2066,7 @@ fn reorder_left_spine(
                 left_keys,
                 right_keys,
                 left_cols,
+                residual,
             }
         }
         P::NestedLoopJoin {
@@ -2484,6 +2515,7 @@ fn push_one_level(
             left_keys,
             right_keys,
             left_cols,
+            residual,
         } => {
             let mut conjuncts = Vec::new();
             split_conjuncts(pred, &mut conjuncts);
@@ -2569,6 +2601,7 @@ fn push_one_level(
                 left_keys,
                 right_keys,
                 left_cols,
+                residual,
             };
             match and_all(keep) {
                 // Nothing moved below: report unmoved so pushdown terminates.
@@ -2744,6 +2777,7 @@ fn push_one_level(
                     pushed,
                 )
             } else {
+                let (residual, keep) = split_residual(above);
                 let join = LogicalPlan::Join {
                     kind: JoinKind::Inner,
                     left: Box::new(left),
@@ -2751,9 +2785,10 @@ fn push_one_level(
                     left_keys,
                     right_keys,
                     left_cols,
+                    residual: and_all(residual),
                 };
                 (
-                    match and_all(above) {
+                    match and_all(keep) {
                         Some(predicate) => LogicalPlan::Filter {
                             input: Box::new(join),
                             predicate,
@@ -2881,6 +2916,7 @@ fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> Lo
             left_keys,
             right_keys,
             left_cols,
+            residual,
         } => LogicalPlan::Join {
             kind,
             left: Box::new(pushdown_inner(*left, pdb)),
@@ -2888,6 +2924,7 @@ fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> Lo
             left_keys,
             right_keys,
             left_cols,
+            residual,
         },
         LogicalPlan::NestedLoopJoin {
             kind,
@@ -2951,17 +2988,37 @@ fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> Lo
                             };
                         let left = with_filter(left, left_only);
                         let right = with_filter(right, right_only);
-                        let join = LogicalPlan::Join {
+                        // An inner join's remaining `ON` conjuncts decide
+                        // whether a candidate pair is a match, so the join
+                        // evaluates them itself. An outer join only gets here
+                        // when every conjunct was side-only and is now a filter
+                        // on the null-supplying side, so it carries none.
+                        let residual = match kind {
+                            JoinKind::Inner => {
+                                let (residual, keep) = split_residual(residual);
+                                return with_filter(
+                                    LogicalPlan::Join {
+                                        kind,
+                                        left: Box::new(left),
+                                        right: Box::new(right),
+                                        left_keys,
+                                        right_keys,
+                                        left_cols,
+                                        residual: and_all(residual),
+                                    },
+                                    keep,
+                                );
+                            }
+                            _ => None,
+                        };
+                        return LogicalPlan::Join {
                             kind,
                             left: Box::new(left),
                             right: Box::new(right),
                             left_keys,
                             right_keys,
                             left_cols,
-                        };
-                        return match kind {
-                            JoinKind::Inner => with_filter(join, residual),
-                            _ => join,
+                            residual,
                         };
                     }
                 }
@@ -3373,6 +3430,7 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
             left_keys,
             right_keys,
             left_cols,
+            residual,
         } => {
             // Child liveness: what is live above, plus this join's own keys.
             let (mut left_live, mut right_live) =
@@ -3383,13 +3441,23 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
                     ),
                     _ => (Live::All, Live::All),
                 };
+            // A residual reads both sides in joined space; keeping both sides
+            // fully live costs at most the columns this join would have
+            // pruned.
+            if residual.is_some() {
+                left_live = Live::All;
+                right_live = Live::All;
+            }
             for e in &left_keys {
                 left_live.mark_expr(e);
             }
             for e in &right_keys {
                 right_live.mark_expr(e);
             }
+            // A residual can drop pairs, so the join is not an identity on the
+            // child side.
             if kind == JoinKind::Inner
+                && residual.is_none()
                 && live.dead_from(left_cols)
                 && fk_join_eliminable(db, &left, &right, &left_keys, &right_keys)
             {
@@ -3405,6 +3473,7 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
                 left_keys,
                 right_keys,
                 left_cols,
+                residual,
             }
         }
         LogicalPlan::NestedLoopJoin {
@@ -3942,6 +4011,7 @@ mod tests {
                 left_keys: vec![col(0)],
                 right_keys: vec![col(0)],
                 left_cols: 2,
+                residual: None,
             }),
             predicate: B::Binary {
                 op: BinaryOp::And,
@@ -3995,7 +4065,8 @@ mod tests {
             other => panic!("comma join stayed nested: {other:?}"),
         }
 
-        // A mixed-side residual cannot hash: it stays a filter above the join.
+        // A mixed-side residual cannot hash, but it is a predicate on a matched
+        // pair: the join carries it and drops the pairs that fail it.
         let residual = B::Binary {
             op: BinaryOp::Gt,
             left: Box::new(col(1)),
@@ -4005,16 +4076,27 @@ mod tests {
         let pred = B::Binary {
             op: BinaryOp::And,
             left: Box::new(eq),
-            right: Box::new(residual),
+            right: Box::new(residual.clone()),
             dtype: T::Boolean,
         };
         let out = pushdown(LogicalPlan::Filter {
             input: Box::new(cross),
             predicate: pred,
         });
-        assert!(matches!(out, LogicalPlan::Filter { .. }), "{out:?}");
-        if let LogicalPlan::Filter { input, .. } = out {
-            assert!(matches!(*input, LogicalPlan::Join { .. }));
+        match out {
+            LogicalPlan::Join {
+                kind,
+                left_keys,
+                right_keys,
+                residual: carried,
+                ..
+            } => {
+                assert_eq!(kind, JoinKind::Inner);
+                assert_eq!(left_keys, vec![col(0)]);
+                assert_eq!(right_keys, vec![col(0)]);
+                assert_eq!(carried, Some(residual));
+            }
+            other => panic!("comma join residual did not ride the join: {other:?}"),
         }
     }
 
@@ -4119,6 +4201,7 @@ mod tests {
                 left_keys: vec![col(0)],
                 right_keys: vec![col(0)],
                 left_cols: 2,
+                residual: None,
             }),
             predicate: B::Binary {
                 op: BinaryOp::And,
@@ -4167,6 +4250,7 @@ mod tests {
             left_keys: vec![col(0)],
             right_keys: vec![col(0)],
             left_cols: 2,
+            residual: None,
         }
     }
 
