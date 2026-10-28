@@ -9,6 +9,28 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 123c (first part) — faster `GROUP BY`: parallel merge and emit, small key domains, bulk decimal sums ✅
+
+- A `GROUP BY` with many groups no longer ends in a single-threaded tail.
+  The output chunks are finalized and built in parallel. A large merge also
+  sorts its group order in parallel and emits each chunk straight from the
+  merge partitions, instead of moving every group into one list first.
+- The merge's scatter sorts each chunk's groups by partition once instead
+  of growing a list per partition per chunk (about 190,000 small lists for
+  Q18), and orders groups by their exact first-seen position.
+- A `GROUP BY` over 2–3 columns with few distinct values per chunk (Q1's
+  `l_returnflag, l_linestatus`) codes each column with a short scan and
+  indexes a dense table, instead of encoding and hashing every row's key.
+- `SUM`/`AVG` of a `DECIMAL` of up to 18 digits add each chunk's values per
+  group into one local sum, and hand every accumulator one total.
+- **Fix (DuckDB parity):** a `DECIMAL` `AVG` divided its exact sum by
+  `count × 10^scale` in one step; DuckDB divides the sum, as a double, by the
+  count (its optimizer rewrites `avg` to `sum / count`). The last digit of
+  some averages now matches.
+- TPC-H SF 1: Q18 (1.5 million groups in its `IN` subquery) **−45 %**
+  (−29 % parallel emit, −13 % scatter, −12 % bulk sums); **Q1 −11 %**; Q13,
+  Q3 and Q16 −6 to −9 %.
+
 ### Wave 126d — `LIKE` segment search without per-call setup ✅
 
 - A `%`-pattern segment is now found by scanning for its rarest byte and

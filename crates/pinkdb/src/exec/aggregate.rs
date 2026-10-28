@@ -146,9 +146,10 @@ pub(crate) fn eval_agg_vec<'a>(
 /// The state of one AVG (wave 126). INTEGER/BIGINT/DECIMAL inputs are summed
 /// exactly in an i128 at the input's scale and divided once in `finalize`,
 /// as DuckDB's `IntegerAverageOperationHugeint` / decimal average do
-/// (`extension/core_functions/aggregate/algebraic/avg.cpp`): faster than a
-/// float add per row, independent of the order rows arrive in, and the same
-/// double DuckDB returns. A DOUBLE input switches to a float sum, kept in the
+/// (`extension/core_functions/aggregate/algebraic/avg.cpp`, after its
+/// optimizer's `sum / count` rewrite): faster than a float add per row,
+/// independent of the order rows arrive in, and the same double DuckDB
+/// returns. A DOUBLE input switches to a float sum, kept in the
 /// same i128 slot as its bits so `Acc` does not grow.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct AvgState {
@@ -198,6 +199,24 @@ impl AvgState {
         self.count += 1;
     }
 
+    /// `n` decimal cells at once, `sum` being their exact sum at `scale`
+    /// (exactly `n` calls of [`AvgState::add_decimal`]: the sum wraps the
+    /// same way, and alignment only ever raises the scale).
+    #[inline]
+    fn add_decimal_n(&mut self, sum: i128, n: i64, scale: u8) {
+        debug_assert!(!self.float);
+        if scale != self.scale {
+            self.align(scale);
+        }
+        let sum = if scale < self.scale {
+            sum * crate::types::POW10_I128[(self.scale - scale) as usize]
+        } else {
+            sum
+        };
+        self.sum = self.sum.wrapping_add(sum);
+        self.count += n;
+    }
+
     /// Raise the exact sum's scale to `scale` (one column has one scale, so
     /// this happens at most once, on the first cell).
     fn align(&mut self, scale: u8) {
@@ -238,8 +257,13 @@ impl AvgState {
         if self.float {
             return Value::Double(self.float_sum() / self.count as f64);
         }
-        let divident = self.count as f64 * crate::types::POW10_F64[self.scale as usize];
-        Value::Double(self.sum as f64 / divident)
+        // DuckDB's optimizer rewrites `avg(x)` to
+        // `CAST(sum(x) AS DOUBLE) / CAST(count(x) AS DOUBLE)` (its plan shows
+        // `sum_no_overflow`), so the exact sum becomes a double at its own
+        // scale first and is then divided by the count. Dividing by
+        // `count * 10^scale` in one step differs in the last bit.
+        let sum = self.sum as f64 / crate::types::POW10_F64[self.scale as usize];
+        Value::Double(sum / self.count as f64)
     }
 }
 
@@ -680,6 +704,29 @@ impl Acc {
     /// DECIMAL SUM cell: exact i128 add at the accumulator's scale. A
     /// different-scale cell (which the binder never produces for one SUM
     /// slot) rescales first.
+    /// Whether a chunk's cells of a `scale` DECIMAL column can reach this
+    /// accumulator as one per-group sum ([`Acc::add_decimal_bulk`]) with the
+    /// same result as cell by cell: SUM at the column's own scale (or still
+    /// fresh) and an exact (non-float) AVG.
+    #[inline]
+    fn takes_decimal_bulk(&self, scale: u8) -> bool {
+        match self {
+            Acc::SumInt { .. } => true,
+            Acc::SumDecimal { scale: s, .. } => *s == scale,
+            Acc::Avg(a) => !a.float,
+            _ => false,
+        }
+    }
+
+    /// `n` cells of a `scale` DECIMAL column summing (exactly) to `sum`.
+    #[inline]
+    fn add_decimal_bulk(&mut self, sum: i128, n: i64, scale: u8) {
+        match self {
+            Acc::Avg(avg) => avg.add_decimal_n(sum, n, scale),
+            _ => self.add_decimal(sum, scale),
+        }
+    }
+
     #[inline]
     fn add_decimal(&mut self, x: i128, scale: u8) {
         // A fresh SUM accumulator starts as `SumInt` (no dtype at `Acc::new`
@@ -1487,9 +1534,8 @@ pub(crate) fn aggregate(
 
     // Phase 2 + emit, shared with the fused join→aggregate executor (which
     // builds the same `Partial`s from joined rows it never materializes).
-    let groups = merge_partials(partials, !keys.is_empty(), aggs);
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    emit_groups(groups, &key_types, aggs)
+    merge_and_emit(partials, &key_types, aggs)
 }
 
 /// [`aggregate`] over chunks that carry a selection: every partial folds only
@@ -1512,9 +1558,8 @@ pub(crate) fn aggregate_selected(
             }
         })
         .collect::<Result<_>>()?;
-    let groups = merge_partials(partials, !keys.is_empty(), aggs);
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    emit_groups(groups, &key_types, aggs)
+    merge_and_emit(partials, &key_types, aggs)
 }
 
 /// The selection fold evaluates keys and arguments over the whole chunk, so
@@ -1691,6 +1736,13 @@ fn group_ids(
             _ => {}
         }
     }
+    if start == 0
+        && (2..=3).contains(&key_vecs.len())
+        && partial.groups.is_empty()
+        && let Some(gids) = small_domain_gids(partial, key_vecs, aggs, rows, sel)
+    {
+        return gids;
+    }
     let mut full_reserved = false;
     for k in start..rows {
         let i = row(k);
@@ -1717,6 +1769,111 @@ fn group_ids(
         gids.push(gid);
     }
     gids
+}
+
+/// Per-row codes of one key column whose chunk holds at most
+/// [`SMALL_KEY_SET`] distinct values (NULL counts as one): `None` past that,
+/// or for a key type without a cheap equality here.
+fn small_column_codes(
+    v: &Vector,
+    rows: usize,
+    row: impl Fn(usize) -> usize,
+) -> Option<(Vec<u16>, usize)> {
+    fn codes_of<T: PartialEq + Copy>(
+        v: &Vector,
+        rows: usize,
+        row: &impl Fn(usize) -> usize,
+        cell: impl Fn(usize) -> T,
+    ) -> Option<(Vec<u16>, usize)> {
+        // Codes are handed out in first-seen order from one counter, so a
+        // NULL and the values share one dense code space.
+        let mut seen: Vec<(T, u16)> = Vec::new();
+        let mut null_code: Option<u16> = None;
+        let mut next: u16 = 0;
+        let mut codes = Vec::with_capacity(rows);
+        for k in 0..rows {
+            let i = row(k);
+            let code = if v.is_null(i) {
+                match null_code {
+                    Some(c) => c,
+                    None => {
+                        null_code = Some(next);
+                        next += 1;
+                        next - 1
+                    }
+                }
+            } else {
+                let x = cell(i);
+                match seen.iter().find(|(y, _)| *y == x) {
+                    Some(&(_, c)) => c,
+                    None => {
+                        seen.push((x, next));
+                        next += 1;
+                        next - 1
+                    }
+                }
+            };
+            if usize::from(next) > SMALL_KEY_SET {
+                return None;
+            }
+            codes.push(code);
+        }
+        Some((codes, usize::from(next)))
+    }
+    match v.data() {
+        VectorData::VarChar(d) => codes_of(v, rows, &row, |i| &*d[i]),
+        VectorData::Int32(d) | VectorData::Date32(d) => codes_of(v, rows, &row, |i| d[i]),
+        VectorData::Int64(d) | VectorData::TimestampMicros(d) => codes_of(v, rows, &row, |i| d[i]),
+        VectorData::Boolean(d) => codes_of(v, rows, &row, |i| d[i]),
+        _ => None,
+    }
+}
+
+/// Group slots for a 2–3 column key whose columns each hold few distinct
+/// values in the chunk (Q1's `l_returnflag, l_linestatus`): every column is
+/// coded by a short linear scan and the combined code indexes a dense table,
+/// so rows are neither encoded nor hashed — a perfect hash over the chunk's
+/// own key domain (DuckDB's `PerfectHashAggregate` does this from column
+/// statistics). Groups still record their encoded key for the merge, and
+/// are created in first-seen row order. `None` hands the chunk back to the
+/// hashed path (a column with too many distinct values).
+fn small_domain_gids(
+    partial: &mut Partial,
+    key_vecs: &[EvalVec],
+    aggs: &[BoundAgg],
+    rows: usize,
+    sel: Option<&[u32]>,
+) -> Option<Vec<usize>> {
+    let row = |k: usize| sel.map_or(k, |s| s[k] as usize);
+    let mut columns = Vec::with_capacity(key_vecs.len());
+    for kv in key_vecs {
+        columns.push(small_column_codes(kv.v(), rows, row)?);
+    }
+    let size: usize = columns.iter().map(|(_, n)| (*n).max(1)).product();
+    let mut slots = vec![usize::MAX; size];
+    let mut gids = Vec::with_capacity(rows);
+    let mut buf = Vec::new();
+    for k in 0..rows {
+        let mut code = 0usize;
+        for (codes, n) in columns.iter().rev() {
+            code = code * (*n).max(1) + codes[k] as usize;
+        }
+        let gid = match slots[code] {
+            usize::MAX => {
+                let i = row(k);
+                buf.clear();
+                for kv in key_vecs {
+                    kv.v().encode_into(&mut buf, i);
+                }
+                let g = new_group(partial, key_vecs, aggs, i, buf.clone(), true);
+                slots[code] = g;
+                g
+            }
+            g => g,
+        };
+        gids.push(gid);
+    }
+    Some(gids)
 }
 
 /// Feed one aggregate's argument column (or COUNT(*)) into the per-row
@@ -1795,6 +1952,36 @@ fn accumulate(
         }
         // DECIMAL is `accumulate`'s other hot payload type (a decimal SUM or
         // AVG over a scan); `update_vec` would re-dispatch per row.
+        // Bulk: sum each group's cells of the chunk in a local `i128` and
+        // hand every accumulator one sum. Exact for DECIMAL(≤18): a chunk's
+        // cells cannot overflow the local sum, and the accumulators' own
+        // overflow rules see the same totals (see `takes_decimal_bulk`).
+        VectorData::Decimal {
+            values,
+            scale,
+            precision,
+        } if !generic
+            && *precision <= 18
+            && groups.len() <= DECIMAL_BULK_GROUPS
+            && groups
+                .iter()
+                .all(|(_, g)| g.accs[j].takes_decimal_bulk(*scale)) =>
+        {
+            let mut sums = vec![0i128; groups.len()];
+            let mut counts = vec![0i64; groups.len()];
+            for (k, &g) in gids.iter().enumerate() {
+                let i = row(k);
+                if keep(i) && v.is_valid(i) {
+                    sums[g] += values[i];
+                    counts[g] += 1;
+                }
+            }
+            for (g, (_, group)) in groups.iter_mut().enumerate() {
+                if counts[g] > 0 {
+                    group.accs[j].add_decimal_bulk(sums[g], counts[g], *scale);
+                }
+            }
+        }
         VectorData::Decimal { values, scale, .. } if !generic => {
             for (k, &g) in gids.iter().enumerate() {
                 let i = row(k);
@@ -1813,6 +2000,10 @@ fn accumulate(
         }
     }
 }
+
+/// Most local groups the bulk DECIMAL accumulation sizes its per-group sums
+/// for (a chunk has at most `CHUNK_SIZE` groups of its own).
+const DECIMAL_BULK_GROUPS: usize = 2 * CHUNK_SIZE;
 
 /// Above this many local groups, phase 2 partitions the keys by hash and
 /// merges the partitions in parallel ([`merge_by_bucket`]).
@@ -1841,9 +2032,6 @@ pub(crate) fn merge_partials(
     aggs: &[BoundAgg],
 ) -> Vec<Group> {
     let total_groups: usize = partials.iter().map(|p| p.groups.len()).sum();
-    if has_keys && total_groups >= PARALLEL_MERGE_MIN {
-        return merge_by_bucket(partials, total_groups);
-    }
     let mut table: FastMap<Vec<u8>, usize> =
         FastMap::with_capacity_and_hasher(total_groups, Default::default());
     let mut groups: Vec<Group> = Vec::with_capacity(total_groups);
@@ -1903,20 +2091,27 @@ pub(crate) fn merge_partials(
     groups
 }
 
-/// One partition's share of one partial table, still in first-seen order.
-type Bucket = Vec<(Vec<u8>, Group)>;
+/// One group of a partial on its way to its merge partition: the partition,
+/// its index in the partial (first-seen order), its encoded key, and the
+/// group itself until the partition's merge takes it.
+struct ScatteredGroup {
+    bucket: u32,
+    pos: u32,
+    enc: Vec<u8>,
+    group: Option<Group>,
+}
 
 /// Hash-partitioned phase-2 merge: every partition gets its own table of a
 /// few thousand entries and the partitions merge in parallel; the first-seen
 /// position of each merged group is recorded so the output comes back in the
 /// order the serial walk would have produced.
 ///
-/// Each group moves exactly once — out of its partial, into a per-partition
-/// list on the thread that produced the partial — and only list *headers*
-/// move between threads afterwards. Sizing follows DuckDB's radix-partitioned
+/// Each partial is sorted by partition once, on the thread that produced it,
+/// and each partition merges its contiguous run of every partial; only slice
+/// borrows move between threads. Sizing follows DuckDB's radix-partitioned
 /// aggregate (`radix_partitioned_hashtable.cpp`); the partitioning keeps the
 /// probe working set cache-resident instead of one table per distinct key.
-fn merge_by_bucket(partials: Vec<Partial>, total_groups: usize) -> Vec<Group> {
+fn merge_by_bucket(partials: Vec<Partial>, total_groups: usize) -> MergedBuckets {
     let buckets = (total_groups / MERGE_BUCKET_GROUPS)
         .next_power_of_two()
         .clamp(1, MERGE_BUCKETS_MAX);
@@ -1931,48 +2126,73 @@ fn merge_by_bucket(partials: Vec<Partial>, total_groups: usize) -> Vec<Group> {
         let h = std::hash::Hasher::finish(&h);
         (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize
     };
-    let scattered: Vec<Vec<Bucket>> = partials
+    // Scatter: each partial's groups are stably sorted by partition, so a
+    // partition's share of the partial is one contiguous run (in first-seen
+    // order) and the partial costs one allocation instead of one growing
+    // list per partition. Each entry keeps its index in the partial — its
+    // exact first-seen position there.
+    let mut scattered: Vec<(Vec<ScatteredGroup>, Vec<usize>)> = partials
         .into_par_iter()
         .map(|partial| {
-            let mut out: Vec<Vec<(Vec<u8>, Group)>> = (0..buckets).map(|_| Vec::new()).collect();
-            for (enc, group) in partial.groups {
-                let b = bucket_of(&enc);
-                out[b].push((enc, group));
+            let mut entries: Vec<ScatteredGroup> = partial
+                .groups
+                .into_iter()
+                .enumerate()
+                .map(|(pos, (enc, group))| ScatteredGroup {
+                    bucket: bucket_of(&enc) as u32,
+                    pos: pos as u32,
+                    enc,
+                    group: Some(group),
+                })
+                .collect();
+            entries.sort_by_key(|e| e.bucket);
+            let mut starts = vec![0usize; buckets + 1];
+            for e in &entries {
+                starts[e.bucket as usize + 1] += 1;
             }
-            out
+            for b in 0..buckets {
+                starts[b + 1] += starts[b];
+            }
+            (entries, starts)
         })
         .collect();
-    // Hand each partition its lists in partial order: bucket order then
-    // in-list order is the order the serial walk visits groups in.
-    let mut work: Vec<Vec<Bucket>> = (0..buckets)
+    // Hand each partition its run of every partial, in partial order.
+    let mut work: Vec<Vec<(u32, &mut [ScatteredGroup])>> = (0..buckets)
         .map(|_| Vec::with_capacity(scattered.len()))
         .collect();
-    for lists in scattered {
-        for (b, list) in lists.into_iter().enumerate() {
-            work[b].push(list);
+    for (partial, (entries, starts)) in scattered.iter_mut().enumerate() {
+        let mut rest: &mut [ScatteredGroup] = entries;
+        for b in 0..buckets {
+            let (run, tail) = rest.split_at_mut(starts[b + 1] - starts[b]);
+            rest = tail;
+            if !run.is_empty() {
+                work[b].push((partial as u32, run));
+            }
         }
     }
-    let merged: Vec<Vec<(u64, Option<Group>)>> = work
+    let merged: Vec<Vec<(u64, Group)>> = work
         .into_par_iter()
-        .map(|lists| {
-            let total: usize = lists.iter().map(|l| l.len()).sum();
+        .map(|runs| {
+            let total: usize = runs.iter().map(|(_, r)| r.len()).sum();
             let mut table: FastMap<Vec<u8>, usize> =
                 FastMap::with_capacity_and_hasher(total, Default::default());
-            let mut out: Vec<(u64, Option<Group>)> = Vec::with_capacity(total);
-            for (partial, list) in lists.into_iter().enumerate() {
-                for (pos, (enc, group)) in list.into_iter().enumerate() {
-                    match table.entry(enc) {
+            let mut out: Vec<(u64, Group)> = Vec::with_capacity(total);
+            for (partial, run) in runs {
+                for e in run.iter_mut() {
+                    let group = e.group.take().expect("each group merges once");
+                    match table.entry(std::mem::take(&mut e.enc)) {
                         std::collections::hash_map::Entry::Occupied(slot) => {
-                            let target = out[*slot.get()].1.as_mut().expect("live group");
+                            let target = &mut out[*slot.get()].1;
                             for (a, b) in target.accs.iter_mut().zip(group.accs) {
                                 a.merge(b);
                             }
                         }
                         std::collections::hash_map::Entry::Vacant(slot) => {
                             slot.insert(out.len());
-                            // First-seen position: partial, then in-partial order.
-                            let seen = (partial as u64) << 32 | pos as u64;
-                            out.push((seen, Some(group)));
+                            // First-seen position: partial, then the group's
+                            // index in it.
+                            let seen = u64::from(partial) << 32 | u64::from(e.pos);
+                            out.push((seen, group));
                         }
                     }
                 }
@@ -1988,60 +2208,109 @@ fn merge_by_bucket(partials: Vec<Partial>, total_groups: usize) -> Vec<Group> {
             order.push((*seen, b as u32, i as u32));
         }
     }
-    order.sort_unstable_by_key(|e| e.0);
-    let mut merged = merged;
-    let mut groups = Vec::with_capacity(order.len());
-    for (_, b, i) in order {
-        let group = merged[b as usize][i as usize]
-            .1
-            .take()
-            .expect("each merged group is emitted once");
-        groups.push(group);
+    // Positions are unique, so an unstable (parallel) sort is exact.
+    order.par_sort_unstable_by_key(|e| e.0);
+    MergedBuckets { merged, order }
+}
+
+/// The partitions [`merge_by_bucket`] merged, plus every group's
+/// `(first-seen position, partition, index)` sorted into the serial walk's
+/// order. The groups stay where their partition put them; emitting reads
+/// them in `order` by reference, so millions of groups are never moved into
+/// one list just to be split into chunks again.
+struct MergedBuckets {
+    merged: Vec<Vec<(u64, Group)>>,
+    order: Vec<(u64, u32, u32)>,
+}
+
+/// Merge per-chunk partials and emit the groups as output chunks: phase 2 and
+/// the emit of every hash aggregate. A large keyed merge (at least
+/// [`PARALLEL_MERGE_MIN`] partial groups) merges by partition in parallel and
+/// builds each output chunk in parallel straight from the partitions; smaller
+/// ones merge serially and go through [`emit_groups`]. Both produce the
+/// groups in first-seen order.
+pub(crate) fn merge_and_emit(
+    partials: Vec<Partial>,
+    key_types: &[DataType],
+    aggs: &[BoundAgg],
+) -> Result<Vec<DataChunk>> {
+    let has_keys = !key_types.is_empty();
+    let total_groups: usize = partials.iter().map(|p| p.groups.len()).sum();
+    if !(has_keys && total_groups >= PARALLEL_MERGE_MIN) {
+        return emit_groups(merge_partials(partials, has_keys, aggs), key_types, aggs);
     }
-    groups
+    let MergedBuckets { merged, order } = merge_by_bucket(partials, total_groups);
+    let built: Vec<Result<DataChunk>> = order
+        .par_chunks(CHUNK_SIZE)
+        .map(|part| {
+            let mut cols = Vec::with_capacity(key_types.len() + aggs.len());
+            for t in key_types {
+                cols.push(Vector::with_capacity(*t, part.len()));
+            }
+            for a in aggs {
+                cols.push(Vector::with_capacity(a.dtype, part.len()));
+            }
+            for &(_, b, i) in part {
+                let g = &merged[b as usize][i as usize].1;
+                for (col, v) in cols.iter_mut().zip(g.keys.iter()) {
+                    col.push_value(v.clone())?;
+                }
+                for (col, (acc, a)) in cols[key_types.len()..]
+                    .iter_mut()
+                    .zip(g.accs.iter().zip(aggs))
+                {
+                    col.push_value(acc.finalize_ref(a.dtype)?)?;
+                }
+            }
+            DataChunk::new(cols)
+        })
+        .collect();
+    built.into_iter().collect()
 }
 
 /// Emit merged groups as output chunks: `[keys..., aggs...]`, chunked at
 /// [`CHUNK_SIZE`]. `key_types` are the group keys' bound output dtypes.
+///
+/// Each output chunk is finalized and built on its own (in parallel: a
+/// high-cardinality `GROUP BY` emits millions of groups, and this was its
+/// serial tail). Chunks stay in group order, and when several groups fail to
+/// finalize (an out-of-range sum), the error reported is the first in that
+/// order, as the serial loop reported it.
 pub(crate) fn emit_groups(
     groups: Vec<Group>,
     key_types: &[DataType],
     aggs: &[BoundAgg],
 ) -> Result<Vec<DataChunk>> {
-    let mut out_chunks = Vec::new();
-    let fresh = || {
+    let build = |part: Vec<Group>| -> Result<DataChunk> {
         let mut cols = Vec::with_capacity(key_types.len() + aggs.len());
         for t in key_types {
-            cols.push(Vector::with_capacity(*t, CHUNK_SIZE));
+            cols.push(Vector::with_capacity(*t, part.len()));
         }
         for a in aggs {
-            cols.push(Vector::with_capacity(a.dtype, CHUNK_SIZE));
+            cols.push(Vector::with_capacity(a.dtype, part.len()));
         }
-        cols
+        for g in part {
+            let finalized: Vec<Value> = g
+                .accs
+                .into_iter()
+                .zip(aggs.iter())
+                .map(|(acc, a)| acc.finalize(a.dtype))
+                .collect::<Result<_>>()?;
+            for (col, v) in cols.iter_mut().zip(g.keys.into_iter().chain(finalized)) {
+                col.push_value(v)?;
+            }
+        }
+        DataChunk::new(cols)
     };
-    let mut cur = fresh();
-    let mut cur_rows = 0;
-    for g in groups {
-        if cur_rows >= CHUNK_SIZE {
-            out_chunks.push(DataChunk::new(cur)?);
-            cur = fresh();
-            cur_rows = 0;
-        }
-        let finalized: Vec<Value> = g
-            .accs
-            .into_iter()
-            .zip(aggs.iter())
-            .map(|(acc, a)| acc.finalize(a.dtype))
-            .collect::<Result<_>>()?;
-        for (col, v) in cur.iter_mut().zip(g.keys.into_iter().chain(finalized)) {
-            col.push_value(v)?;
-        }
-        cur_rows += 1;
+    if groups.is_empty() {
+        return Ok(vec![build(Vec::new())?]);
     }
-    if cur_rows > 0 || out_chunks.is_empty() {
-        out_chunks.push(DataChunk::new(cur)?);
-    }
-    Ok(out_chunks)
+    let built: Vec<Result<DataChunk>> = groups
+        .into_par_iter()
+        .chunks(CHUNK_SIZE)
+        .map(build)
+        .collect();
+    built.into_iter().collect()
 }
 
 #[cfg(test)]

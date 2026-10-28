@@ -9,6 +9,15 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-28</h2>
+<h3>Wave 123c (first part) — faster <code>GROUP BY</code>: parallel merge and emit, small key domains, bulk decimal sums ✅</h3>
+<ul>
+<li>A <code>GROUP BY</code> with many groups no longer ends in a single-threaded tail. The output chunks are finalized and built in parallel. A large merge also sorts its group order in parallel and emits each chunk straight from the merge partitions, instead of moving every group into one list first.</li>
+<li>The merge's scatter sorts each chunk's groups by partition once instead of growing a list per partition per chunk (about 190,000 small lists for Q18), and orders groups by their exact first-seen position.</li>
+<li>A <code>GROUP BY</code> over 2–3 columns with few distinct values per chunk (Q1's <code>l_returnflag, l_linestatus</code>) codes each column with a short scan and indexes a dense table, instead of encoding and hashing every row's key.</li>
+<li><code>SUM</code>/<code>AVG</code> of a <code>DECIMAL</code> of up to 18 digits add each chunk's values per group into one local sum, and hand every accumulator one total.</li>
+<li><strong>Fix (DuckDB parity):</strong> a <code>DECIMAL</code> <code>AVG</code> divided its exact sum by <code>count × 10^scale</code> in one step; DuckDB divides the sum, as a double, by the count (its optimizer rewrites <code>avg</code> to <code>sum / count</code>). The last digit of some averages now matches.</li>
+<li>TPC-H SF 1: Q18 (1.5 million groups in its <code>IN</code> subquery) <strong>−45 %</strong> (−29 % parallel emit, −13 % scatter, −12 % bulk sums); <strong>Q1 −11 %</strong>; Q13, Q3 and Q16 −6 to −9 %.</li>
+</ul>
 <h3>Wave 126d — <code>LIKE</code> segment search without per-call setup ✅</h3>
 <ul>
 <li>A <code>%</code>-pattern segment is now found by scanning for its rarest byte and comparing the segment in place, instead of setting up a substring searcher for every segment of every row. TPC-H SF 1: Q20 −13 %, Q13 −7 %, Q16 −5 %.</li>

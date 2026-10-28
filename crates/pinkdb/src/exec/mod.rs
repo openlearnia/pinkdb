@@ -17,8 +17,8 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use aggregate::{
-    Acc, Group, HIGH_CARDINALITY_KEYS, Partial, aggregate, aggregate_selected, emit_groups,
-    fold_stream, local_index_capacity, merge_partials,
+    Acc, Group, HIGH_CARDINALITY_KEYS, Partial, aggregate, aggregate_selected, fold_stream,
+    local_index_capacity, merge_and_emit,
 };
 use aggregate::{EvalVec as FusedVec, eval_agg_vec as eval_fused_vec};
 use dml::{captured, returning_result};
@@ -6182,9 +6182,8 @@ fn fused_join_aggregate(
 
     // Merge in probe-chunk order and emit through the shared post-partial
     // phase, exactly like `aggregate()`.
-    let groups = merge_partials(partials, !keys.is_empty(), aggs);
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    let chunks = emit_groups(groups, &key_types, aggs)?;
+    let chunks = merge_and_emit(partials, &key_types, aggs)?;
     let (names, types) = agg_output_schema(keys, aggs);
     Ok(Some(Output {
         chunks,
@@ -6254,9 +6253,8 @@ fn fused_scan_aggregate(
     })?;
     // Merge and emit through the shared post-partial phase, exactly like
     // `aggregate()`.
-    let groups = merge_partials(partials, !keys.is_empty(), aggs);
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    let chunks = emit_groups(groups, &key_types, aggs)?;
+    let chunks = merge_and_emit(partials, &key_types, aggs)?;
     let (names, types) = agg_output_schema(keys, aggs);
     Ok(Some(Output {
         chunks,
