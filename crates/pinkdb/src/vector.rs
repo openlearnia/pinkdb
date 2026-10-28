@@ -1178,16 +1178,24 @@ impl Vector {
             i
         };
         let data = match &self.data {
-            VectorData::Boolean(v) => VectorData::Boolean(selection.iter().map(|i| v[pick(i)]).collect()),
-            VectorData::Int32(v) => VectorData::Int32(selection.iter().map(|i| v[pick(i)]).collect()),
-            VectorData::Int64(v) => VectorData::Int64(selection.iter().map(|i| v[pick(i)]).collect()),
+            VectorData::Boolean(v) => {
+                VectorData::Boolean(selection.iter().map(|i| v[pick(i)]).collect())
+            }
+            VectorData::Int32(v) => {
+                VectorData::Int32(selection.iter().map(|i| v[pick(i)]).collect())
+            }
+            VectorData::Int64(v) => {
+                VectorData::Int64(selection.iter().map(|i| v[pick(i)]).collect())
+            }
             VectorData::Float64(v) => {
                 VectorData::Float64(selection.iter().map(|i| v[pick(i)]).collect())
             }
             VectorData::VarChar(v) => {
                 VectorData::VarChar(selection.iter().map(|i| Arc::clone(&v[pick(i)])).collect())
             }
-            VectorData::Date32(v) => VectorData::Date32(selection.iter().map(|i| v[pick(i)]).collect()),
+            VectorData::Date32(v) => {
+                VectorData::Date32(selection.iter().map(|i| v[pick(i)]).collect())
+            }
             VectorData::TimestampMicros(v) => {
                 VectorData::TimestampMicros(selection.iter().map(|i| v[pick(i)]).collect())
             }
@@ -1209,7 +1217,8 @@ impl Vector {
             VectorData::Array { .. } => {
                 let mut out = Vector::with_capacity(self.dtype(), n);
                 for i in selection {
-                    out.push_from(self, pick(i)).expect("take push_from cannot fail");
+                    out.push_from(self, pick(i))
+                        .expect("take push_from cannot fail");
                 }
                 return out;
             }

@@ -9,6 +9,12 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 126d — `LIKE` segment search without per-call setup ✅
+
+- A `%`-pattern segment is now found by scanning for its rarest byte and
+  comparing the segment in place, instead of setting up a substring searcher
+  for every segment of every row. TPC-H SF 1: Q20 −13 %, Q13 −7 %, Q16 −5 %.
+
 ### Wave 125 — hash joins: flat hash table, vector-at-a-time assembly ✅
 
 - **A new join hash table, after DuckDB's `JoinHashTable`:** build keys and

@@ -3586,13 +3586,13 @@ impl LikeMatcher {
                 }
                 let (last, middle) = middle.split_last().expect("at least one segment");
                 for seg in middle {
-                    match rest.find(seg.as_str()) {
+                    match find_segment(rest, seg) {
                         Some(at) => rest = &rest[at + seg.len()..],
                         None => return false,
                     }
                 }
                 if *end_any {
-                    rest.contains(last.as_str())
+                    find_segment(rest, last).is_some()
                 } else {
                     rest.ends_with(last.as_str())
                 }
@@ -3635,6 +3635,52 @@ impl LikeMatcher {
             }
         }
     }
+}
+
+/// How common an ASCII byte is in text, lower = rarer (letters by English
+/// frequency, then digits and punctuation as rare). memchr's `memmem` picks
+/// the rarest needle byte to scan for the same way.
+fn byte_rank(b: u8) -> u8 {
+    const COMMON: &[u8] = b" etaoinshrdlcumwfgypbvkjxqz";
+    let lower = b.to_ascii_lowercase();
+    match COMMON.iter().position(|&c| c == lower) {
+        Some(i) => 100 - i as u8,
+        None => 0,
+    }
+}
+
+/// Byte offset of `needle` in `hay`. `str::find(&str)` sets up a two-way
+/// searcher on every call, which costs more than the search for the short
+/// needles and strings `LIKE` sees row after row. For an ASCII needle, scan
+/// for its rarest byte (`str::find(char)` uses the optimized byte search) and
+/// compare the needle in place around each hit.
+#[inline]
+fn find_segment(hay: &str, needle: &str) -> Option<usize> {
+    let nb = needle.as_bytes();
+    if !needle.is_ascii() {
+        return hay.find(needle);
+    }
+    let (k, &rare) = nb
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, b)| byte_rank(**b))
+        .expect("segments are non-empty");
+    let hb = hay.as_bytes();
+    let mut from = k;
+    while from < hb.len() {
+        // `from` may fall inside a multi-byte char of a non-ASCII string;
+        // the rare byte is ASCII, so it can only sit on a char boundary.
+        while !hay.is_char_boundary(from) {
+            from += 1;
+        }
+        let p = hay[from..].find(rare as char)?;
+        let at = from + p - k;
+        if hb[at..].starts_with(nb) {
+            return Some(at);
+        }
+        from += p + 1;
+    }
+    None
 }
 
 /// `%`/`_` wildcard match with an optional escape char (`LIKE … ESCAPE '\'`).

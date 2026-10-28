@@ -9,6 +9,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-28</h2>
+<h3>Wave 126d — <code>LIKE</code> segment search without per-call setup ✅</h3>
+<ul>
+<li>A <code>%</code>-pattern segment is now found by scanning for its rarest byte and comparing the segment in place, instead of setting up a substring searcher for every segment of every row. TPC-H SF 1: Q20 −13 %, Q13 −7 %, Q16 −5 %.</li>
+</ul>
 <h3>Wave 125 — hash joins: flat hash table, vector-at-a-time assembly ✅</h3>
 <ul>
 <li><strong>A new join hash table, after DuckDB's <code>JoinHashTable</code>:</strong> build keys and their 64-bit hashes are computed in parallel per chunk into flat per-row arrays, and a power-of-two bucket array chains the rows. A probe compares the full hash before the key, so other keys in its bucket cost no key compare. It replaces a single-threaded <code>HashMap</code> with an allocation per distinct key. Matches still come out in build input order, so results and their order are unchanged.</li>

@@ -5124,7 +5124,12 @@ impl<'a> JoinAssembler<'a> {
     /// [`JoinAssembler::new`] borrows).
     fn build_columns(build: &'a [DataChunk], width: usize) -> Vec<Vec<&'a Vector>> {
         (0..width)
-            .map(|c| build.iter().map(|chunk| chunk.columns[c].as_ref()).collect())
+            .map(|c| {
+                build
+                    .iter()
+                    .map(|chunk| chunk.columns[c].as_ref())
+                    .collect()
+            })
             .collect()
     }
 
@@ -5160,11 +5165,19 @@ impl<'a> JoinAssembler<'a> {
                     k >= self.n_left
                 };
                 std::sync::Arc::new(if build_side {
-                    let j = if self.preserved_is_right { k } else { k - self.n_left };
+                    let j = if self.preserved_is_right {
+                        k
+                    } else {
+                        k - self.n_left
+                    };
                     debug_assert!(j < n_build);
                     Vector::gather_located(self.dtypes[k], &self.build_cols[j], &self.picks)
                 } else {
-                    let j = if self.preserved_is_right { k - self.n_left } else { k };
+                    let j = if self.preserved_is_right {
+                        k - self.n_left
+                    } else {
+                        k
+                    };
                     chunk.columns[j].take(&self.rows)
                 })
             })
@@ -5255,8 +5268,14 @@ fn hash_join_probe(
                 .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
                 .collect::<Result<_>>()?;
             let mut buf = Vec::new();
-            let mut sink =
-                JoinAssembler::new(cx, &dtypes, n_left, preserved_is_right, present, &build_cols);
+            let mut sink = JoinAssembler::new(
+                cx,
+                &dtypes,
+                n_left,
+                preserved_is_right,
+                present,
+                &build_cols,
+            );
             if let Some(residual) = residual {
                 // Two passes: the residual decides which candidate pairs are
                 // matches before any of them is assembled.

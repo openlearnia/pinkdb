@@ -172,3 +172,17 @@ fn like_nulls_and_escape() {
         ["NULL", "NULL", "NULL", "true", "false", "true", "false"]
     );
 }
+
+#[test]
+fn ascii_segments_in_non_ascii_strings() {
+    // The segment search scans for the needle's rarest byte (`b` here) and
+    // starts at its offset in the needle, which can fall inside a
+    // multi-byte character of the string.
+    let mut db = PinkDb::new();
+    let got = rows(
+        &mut db,
+        "SELECT 'éab' LIKE '%ab%', 'ééxab' LIKE '%ab', 'é' LIKE '%ab%';",
+    );
+    let got: Vec<String> = got[0].iter().map(|v| v.to_string()).collect();
+    assert_eq!(got, ["true", "true", "false"]);
+}
