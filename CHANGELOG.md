@@ -9,6 +9,15 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 123c (second part) — hash tables no longer collide on encoded keys ✅
+
+- The engine's fast hash (FNV, used by every grouping, `DISTINCT` and
+  `IN`-set table) now ends with a mixing step. Without it, every encoded
+  integer group key produced the same low 8 bits — the bits the hash table
+  picks buckets from — so a table of a million groups degenerated into long
+  probe chains. TPC-H SF 1: **Q18 −20 %** (its 1.5-million-group merge);
+  the rest unchanged.
+
 ### Wave 111d — join order reaches chains under nested `EXISTS` ✅
 
 - The cost-based join order (wave 111a) now also reorders a comma-join chain

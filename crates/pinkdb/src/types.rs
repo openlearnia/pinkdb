@@ -59,8 +59,19 @@ impl std::hash::Hasher for FnvHash {
         self.write_u64(x as u64);
     }
 
+    /// The FNV state run through MurmurHash3's `fmix64` finalizer. FNV's
+    /// low bits depend only on the low bits of each word it absorbs, and an
+    /// encoded group key starts with a constant type-tag byte, so without
+    /// the finalizer every encoded integer key shared its low 8 bits — the
+    /// bits `HashMap` picks buckets from — and a large table degenerated into
+    /// long probe chains (Q18's 1.5M-group merge spent ~400 ns per insert).
     fn finish(&self) -> u64 {
-        self.0
+        let mut h = self.0;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h ^ (h >> 33)
     }
 }
 

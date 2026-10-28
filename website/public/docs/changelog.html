@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-28">2026-10-28<a class="anchor" href="#2026-10-28" aria-label="Permalink: 2026-10-28">#</a></h2>
+<h3>Wave 123c (second part) — hash tables no longer collide on encoded keys ✅</h3>
+<ul>
+<li>The engine's fast hash (FNV, used by every grouping, <code>DISTINCT</code> and <code>IN</code>-set table) now ends with a mixing step. Without it, every encoded integer group key produced the same low 8 bits — the bits the hash table picks buckets from — so a table of a million groups degenerated into long probe chains. TPC-H SF 1: <strong>Q18 −20 %</strong> (its 1.5-million-group merge); the rest unchanged.</li>
+</ul>
 <h3>Wave 111d — join order reaches chains under nested <code>EXISTS</code> ✅</h3>
 <ul>
 <li>The cost-based join order (wave 111a) now also reorders a comma-join chain that sits under several decorrelated joins, such as TPC-H Q21's <code>EXISTS ... AND NOT EXISTS ...</code> (an anti join over a semi join over the chain). Q21 now joins <code>nation = 'SAUDI ARABIA'</code> to <code>supplier</code> first instead of last. TPC-H SF 1: <strong>Q21 −30 %</strong>.</li>
