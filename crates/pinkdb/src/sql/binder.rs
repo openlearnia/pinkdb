@@ -6951,6 +6951,25 @@ fn bind_tracked_plan(
             empty(LogicalPlan::LoadInstalledExtension { name: name.clone() })
         }
         Statement::Checkpoint => empty(LogicalPlan::Checkpoint),
+        Statement::Analyze { db: qdb, table } => {
+            let target = match qdb {
+                Some(d) => d.to_ascii_lowercase(),
+                None => default_db.to_ascii_lowercase(),
+            };
+            // Resolve the target now: ANALYZE of a missing table must fail
+            // before a single table is touched (bare ANALYZE covers all).
+            if let Some(name) = table {
+                db.table_in(&target, name)?;
+            } else if !db.database_exists(&target) {
+                return Err(PinkDbError::Catalog(format!(
+                    "database \"{target}\" not found"
+                )));
+            }
+            empty(LogicalPlan::Analyze {
+                db: target,
+                table: table.as_ref().map(|t| t.to_ascii_lowercase()),
+            })
+        }
         Statement::CreateProcedure {
             db: qdb,
             name,
@@ -9655,6 +9674,9 @@ pub(crate) fn plan_schema(
                 Some(at) => db.visible_table_schema_at(lookup, table, *at),
             }
         }
+        // Statements that produce no relation (or, for ANALYZE, its
+        // DuckDB-shaped one-row Success result at execution time).
+        LogicalPlan::Analyze { .. } => Ok(vec![("Success".to_string(), DataType::Boolean)]),
         LogicalPlan::SingleRow => Ok(Vec::new()),
         LogicalPlan::Values { names, types, .. } => Ok(names
             .iter()
@@ -9849,6 +9871,12 @@ fn bind_table_function(
     args: &[TableFunctionArg],
     alias: &Option<String>,
 ) -> Result<(ScopeTable, LogicalPlan)> {
+    // Catalog statistics are engine data, not a table source (a registered
+    // source cannot see the catalog), so they bind to a constant relation
+    // here — the snapshot the statement sees, like any other catalog read.
+    if name.eq_ignore_ascii_case("pinkdb_column_stats") {
+        return bind_column_stats(db, binder, args, alias);
+    }
     let call = TableFunctionCall::Function {
         name: name.to_string(),
         args: args.to_vec(),
@@ -9878,6 +9906,168 @@ fn bind_table_function(
         "unknown table function \"{name}\": {}",
         no_file_source_hint(db)
     )))
+}
+
+/// `pinkdb_column_stats(['table'])`: one row per column of every table in
+/// the store, DuckDB `duckdb_columns()`-shaped (wave 122).
+///
+/// The argument optionally narrows to one table, written `table` or
+/// `db.table` (case-insensitive). `distinct_count` is `NULL` when the sketch
+/// cannot answer (`ANALYZE` rebuilds it); `stats_approximate` is true when a
+/// delete left the estimate an upper bound.
+fn bind_column_stats(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    let narrow = match args {
+        [] => None,
+        [arg] => match &arg.value {
+            Value::Varchar(name) => Some(name.to_ascii_lowercase()),
+            _ => {
+                return Err(PinkDbError::Type(
+                    "pinkdb_column_stats() takes an optional table name (VARCHAR)".to_string(),
+                ));
+            }
+        },
+        _ => {
+            return Err(PinkDbError::Type(
+                "pinkdb_column_stats() takes an optional table name (VARCHAR)".to_string(),
+            ));
+        }
+    };
+    let names: Vec<String> = [
+        "database",
+        "table_name",
+        "column_name",
+        "data_type",
+        "row_count",
+        "null_count",
+        "distinct_count",
+        "min",
+        "max",
+        "stats_approximate",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let types = vec![
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Bigint,
+        DataType::Bigint,
+        DataType::Bigint,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Boolean,
+    ];
+    let big = |n: u64| BoundExpr::Literal(Value::Bigint(n as i64));
+    let principal = binder.session.principal();
+    let mut rows: Vec<Vec<BoundExpr>> = Vec::new();
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut matched = false;
+    let mut denied: Option<(String, String)> = None;
+    let mut databases = db.list_databases();
+    databases.sort();
+    for dbname in databases {
+        let mut tables = db.list_tables_in(&dbname);
+        tables.sort();
+        for tname in tables {
+            if let Some(narrow) = &narrow
+                && !narrow.eq_ignore_ascii_case(&tname)
+                && !narrow.eq_ignore_ascii_case(&format!("{dbname}.{tname}"))
+            {
+                continue;
+            }
+            matched = true;
+            // These rows quote the table's own contents (its bounds are
+            // values), so a principal that cannot `SELECT` it must not see
+            // them. The all-tables form lists what the principal may read.
+            if let Some(principal) = &principal {
+                let object = crate::rbac::GrantObject::Table {
+                    db: dbname.clone(),
+                    table: tname.clone(),
+                };
+                if !db
+                    .rbac()
+                    .allowed(principal, &object, crate::rbac::Privilege::Select)
+                {
+                    denied.get_or_insert_with(|| (dbname.clone(), tname.clone()));
+                    continue;
+                }
+            }
+            sources.push((dbname.clone(), tname.clone()));
+            let t = db.table_in(&dbname, &tname)?;
+            for (ci, (col, dtype)) in t.schema().into_iter().enumerate() {
+                // A table mid-schema-change (a dropped column) carries fewer
+                // statistics than columns; skip rather than panic.
+                let Some(stats) = t.stats().col(ci) else {
+                    continue;
+                };
+                let text = |v: &Option<Value>| match v {
+                    Some(v) => crate::exec::expr::cast_value(v.clone(), DataType::Varchar)
+                        .map(BoundExpr::Literal)
+                        .unwrap_or(BoundExpr::Literal(Value::Null)),
+                    None => BoundExpr::Literal(Value::Null),
+                };
+                rows.push(vec![
+                    BoundExpr::Literal(Value::Varchar(dbname.clone())),
+                    BoundExpr::Literal(Value::Varchar(tname.clone())),
+                    BoundExpr::Literal(Value::Varchar(col)),
+                    BoundExpr::Literal(Value::Varchar(dtype.to_string())),
+                    big(t.stats().rows),
+                    big(stats.null_count),
+                    match stats.distinct_count() {
+                        Some(n) => big(n),
+                        None => BoundExpr::Literal(Value::Null),
+                    },
+                    text(&stats.min),
+                    text(&stats.max),
+                    BoundExpr::Literal(Value::Boolean(stats.dirty)),
+                ]);
+            }
+        }
+    }
+    // A name that matched nothing is a typo, not an empty result.
+    if let Some(narrow) = &narrow
+        && !matched
+    {
+        return Err(PinkDbError::Catalog(format!(
+            "table \"{narrow}\" not found"
+        )));
+    }
+    // Naming a table you cannot read is refused like a `SELECT` on it, not
+    // reported as a missing name. A name that matched both a readable and an
+    // unreadable table reports the readable one.
+    if narrow.is_some()
+        && sources.is_empty()
+        && let (Some(principal), Some((dbname, tname))) = (&principal, &denied)
+    {
+        crate::rbac::check_select(db, principal, dbname, tname)?;
+    }
+    let scope = ScopeTable {
+        name: alias
+            .clone()
+            .unwrap_or_else(|| "pinkdb_column_stats".to_string())
+            .to_ascii_lowercase(),
+        original: None,
+        db: None,
+        is_alias: alias.is_some(),
+        qualified_only: false,
+        columns: names.iter().cloned().zip(types.iter().copied()).collect(),
+    };
+    Ok((
+        scope,
+        LogicalPlan::Values {
+            rows,
+            names,
+            types,
+            sources,
+        },
+    ))
 }
 
 /// The hint appended to "unknown table function" / "cannot read by path"
@@ -10048,6 +10238,7 @@ fn bind_source_raw(
                     rows: bound,
                     names,
                     types,
+                    sources: Vec::new(),
                 },
             ))
         }

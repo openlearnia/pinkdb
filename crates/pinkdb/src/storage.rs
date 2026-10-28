@@ -11,6 +11,7 @@ use pinkdb_ext_loader::{ExtFunction, ExtHandle};
 
 use crate::crypto::EncryptionKey;
 use crate::sql::ast::Select;
+use crate::stats::{ColStats, Hll, TableStats, Zone};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector};
 use crate::wal::Wal;
@@ -126,6 +127,13 @@ pub struct DataTable {
     /// stamp (a transaction based on the old table must conflict).
     /// Process-lifetime only (not persisted — save/load draws fresh stamps).
     pub version: u64,
+    /// Catalog statistics (wave 122): row/NULL counts, min/max and a
+    /// distinct-count sketch, maintained by every mutation and read by the
+    /// cost model and `pinkdb_column_stats()`.
+    pub(crate) stats: TableStats,
+    /// Zone maps: `zones[column][chunk]`, aligned with each column's chunks.
+    /// Exact per chunk when written, widened (never narrowed) by mutations.
+    pub(crate) zones: Vec<Vec<Zone>>,
 }
 
 /// One vector index definition on a table. `index` is the live graph; the
@@ -351,6 +359,7 @@ impl DataTable {
                 )));
             }
         }
+        let schema_len = schema.len();
         // Constraint indices address this schema (the binder and the `.pink`
         // reader both validate before constructing; a hand-built set that
         // does not is a programming error).
@@ -380,6 +389,8 @@ impl DataTable {
             indexes_stale: false,
             key_index: None,
             version: next_table_version(),
+            stats: TableStats::new(schema_len),
+            zones: (0..schema_len).map(|_| vec![Zone::empty()]).collect(),
         })
     }
 
@@ -409,6 +420,10 @@ impl DataTable {
             },
             "from_columns needs chunk-aligned columns"
         );
+        // Exact statistics in one pass: a constructor sees the data it is
+        // handed, and no caller has a cheaper source (the `.pink` loader reads
+        // its footer instead, via `set_loaded_stats`).
+        let (stats, zones) = TableStats::scan(&columns, num_rows as u64);
         Self {
             name,
             columns,
@@ -419,6 +434,177 @@ impl DataTable {
             indexes_stale: false,
             key_index: None,
             version: next_table_version(),
+            stats,
+            zones,
+        }
+    }
+
+    /// The table's catalog statistics.
+    pub fn stats(&self) -> &TableStats {
+        &self.stats
+    }
+
+    /// The zone maps: `zones[column][chunk]`, aligned with the column chunks.
+    pub(crate) fn zones(&self) -> &[Vec<Zone>] {
+        &self.zones
+    }
+
+    /// Adopt the statistics a `.pink` footer carries, without rescanning the
+    /// rows: the reader appends its chunks with stats tracking off and installs
+    /// the persisted (already exact-or-flagged) facts here.
+    ///
+    /// `zones` is only adopted when the caller knows the loaded chunks have
+    /// exactly the writer's boundaries (`zones_aligned`); otherwise, and
+    /// whenever the shapes disagree, the zones are rebuilt from the rows. A
+    /// zone map applied to the wrong chunk would skip rows that match, so
+    /// this is a runtime check, never a debug-only one.
+    pub(crate) fn set_loaded_stats(
+        &mut self,
+        stats: TableStats,
+        zones: Vec<Vec<Zone>>,
+        zones_aligned: bool,
+    ) {
+        let shaped = stats.cols.len() == self.columns.len()
+            && zones.len() == self.columns.len()
+            && zones
+                .iter()
+                .zip(&self.columns)
+                .all(|(z, c)| z.len() == c.chunks.len());
+        if stats.cols.len() == self.columns.len() {
+            self.stats = stats;
+        } else {
+            self.stats = TableStats::unknown(self.columns.len(), self.num_rows as u64);
+        }
+        self.zones = if zones_aligned && shaped {
+            zones
+        } else {
+            self.rebuilt_zones()
+        };
+    }
+
+    /// Zone maps recomputed from the rows, one per column chunk.
+    fn rebuilt_zones(&self) -> Vec<Vec<Zone>> {
+        self.columns
+            .iter()
+            .map(|c| c.chunks.iter().map(|v| Zone::of_vector(v)).collect())
+            .collect()
+    }
+
+    /// Replace the statistics with an exact recomputation (`ANALYZE`): every
+    /// zone rebuilt from the rows, every sketch emptied and refilled, `dirty`
+    /// cleared. O(rows), which is the point — it is the repair path.
+    pub(crate) fn analyze(&mut self) {
+        let (stats, zones) = TableStats::scan(&self.columns, self.num_rows as u64);
+        self.stats = stats;
+        self.zones = zones;
+    }
+
+    /// Drop every row in place (materialized-view refresh): the column
+    /// metadata and indexes survive, the statistics start over.
+    pub(crate) fn clear_rows(&mut self) {
+        self.num_rows = 0;
+        for col in &mut self.columns {
+            col.chunks = vec![Arc::new(Vector::new_empty(col.dtype))];
+        }
+        self.stats = TableStats::new(self.columns.len());
+        self.zones = self.columns.iter().map(|_| vec![Zone::empty()]).collect();
+    }
+
+    /// The zone map of one column chunk (empty when the map is not built).
+    pub(crate) fn zone(&self, col: usize, chunk: usize) -> &Zone {
+        static EMPTY: Zone = Zone {
+            null_count: 0,
+            min: None,
+            max: None,
+            nan_count: 0,
+        };
+        self.zones
+            .get(col)
+            .and_then(|c| c.get(chunk))
+            .unwrap_or(&EMPTY)
+    }
+
+    /// Recompute one column's table-level aggregates from its zone maps: the
+    /// exact repair after a mutation touched the chunk a bound came from.
+    /// Per-column `(zone, folded sketch)` for one appended batch. Bulk
+    /// ingestion is the write hot path and its columns are independent, so the
+    /// min/max/NULL pass and the sketch's hashing run on the worker pool; the
+    /// sketch is cloned per column and installed by the caller, which keeps
+    /// the fold free of mutable table access. Small batches stay serial
+    /// (the pool costs more than a few thousand cells).
+    fn fold_chunk_stats(&self, chunk: &[std::sync::Arc<Vector>]) -> Vec<(Zone, Option<Hll>)> {
+        use rayon::prelude::*;
+        let cells = chunk.first().map(|c| c.len()).unwrap_or(0) * chunk.len();
+        let fold = |ci: usize, src: &Vector| -> (Zone, Option<Hll>) {
+            let zone = Zone::of_vector(src);
+            let hll = self.stats.cols[ci].hll.as_ref().map(|hll| {
+                let mut hll = (**hll).clone();
+                for row in 0..src.len() {
+                    hll.insert_cell(src, row);
+                }
+                hll
+            });
+            (zone, hll)
+        };
+        if cells >= 4096 {
+            chunk
+                .par_iter()
+                .enumerate()
+                .map(|(ci, src)| fold(ci, src))
+                .collect()
+        } else {
+            chunk
+                .iter()
+                .enumerate()
+                .map(|(ci, src)| fold(ci, src))
+                .collect()
+        }
+    }
+
+    fn rebuild_column_stats(&mut self, col: usize) {
+        let mut st = ColStats {
+            null_count: 0,
+            min: None,
+            max: None,
+            hll: self.stats.cols[col].hll.clone(),
+            dirty: self.stats.cols[col].dirty,
+        };
+        for zone in &self.zones[col] {
+            st.null_count += zone.null_count;
+            if let Some(min) = &zone.min {
+                st.widen(min);
+            }
+            if let Some(max) = &zone.max {
+                st.widen(max);
+            }
+        }
+        self.stats.cols[col] = st;
+    }
+
+    /// After a chunk of `col` changed in place: recompute its zone, keep the
+    /// NULL count exact, and rebuild the column's bounds only when the old
+    /// zone was where a bound came from (widening is otherwise enough — a
+    /// deleted or overwritten extreme value is the one case that can shrink a
+    /// bound).
+    fn refresh_zone(&mut self, col: usize, chunk: usize, dirty: bool) {
+        let new = Zone::of_vector(&self.columns[col].chunks[chunk]);
+        let old = std::mem::replace(&mut self.zones[col][chunk], new.clone());
+        let st = &mut self.stats.cols[col];
+        let held = old.holds(&st.min, &st.max);
+        st.null_count = st.null_count + new.null_count - old.null_count;
+        if dirty {
+            st.dirty = true;
+        }
+        if held {
+            self.rebuild_column_stats(col);
+        } else {
+            let st = &mut self.stats.cols[col];
+            if let Some(min) = &new.min {
+                st.widen(min);
+            }
+            if let Some(max) = &new.max {
+                st.widen(max);
+            }
         }
     }
 
@@ -488,7 +674,18 @@ impl DataTable {
             }
             col.chunks.push(Arc::new(v));
         }
+        // A new column's statistics are exact from birth: every existing row
+        // just received the same DEFAULT (usually NULL).
+        let mut stats = ColStats::new();
+        let mut zones = Vec::with_capacity(col.chunks.len());
+        for chunk in &col.chunks {
+            let zone = Zone::of_vector(chunk);
+            stats.observe_chunk(chunk, &zone);
+            zones.push(zone);
+        }
         self.columns.push(col);
+        self.stats.cols.push(stats);
+        self.zones.push(zones);
         Ok(())
     }
 
@@ -511,6 +708,8 @@ impl DataTable {
             ));
         }
         self.columns.remove(idx);
+        self.stats.cols.remove(idx);
+        self.zones.remove(idx);
         let reindex = |c: &mut usize| {
             if *c > idx {
                 *c -= 1;
@@ -833,17 +1032,28 @@ impl DataTable {
             .map(|c| c.len() >= CHUNK_SIZE)
             .unwrap_or(true);
         if tail_full {
-            for col in &mut self.columns {
+            for (ci, col) in self.columns.iter_mut().enumerate() {
                 col.chunks
                     .push(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
+                self.zones[ci].push(Zone::empty());
             }
         }
         let start = self.num_rows;
+        let mut coerced = Vec::with_capacity(self.columns.len());
         for (col, val) in self.columns.iter_mut().zip(values) {
-            let coerced = Self::coerce(val, col.dtype)?;
-            Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists")).push_value(coerced)?;
+            let value = Self::coerce(val, col.dtype)?;
+            Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
+                .push_value(value.clone())?;
+            coerced.push(value);
         }
         self.num_rows += 1;
+        // Exact incremental statistics: one value, one zone, one hash.
+        self.stats.rows += 1;
+        let chunk = self.columns[0].chunks.len() - 1;
+        for (ci, value) in coerced.iter().enumerate() {
+            self.stats.cols[ci].observe(value);
+            self.zones[ci][chunk].observe(value);
+        }
         self.version = next_table_version();
         self.extend_indexes(start)?;
         Ok(())
@@ -858,6 +1068,14 @@ impl DataTable {
         self.append_shared_chunk(&chunk)
     }
 
+    /// [`DataTable::append_shared_chunk`] for the `.pink` loader: the footer
+    /// carries this table's statistics, so folding the loaded rows in again
+    /// would repeat a full pass for nothing. The caller installs them with
+    /// [`DataTable::set_loaded_stats`].
+    pub(crate) fn append_loaded_chunk(&mut self, chunk: &[Arc<Vector>]) -> Result<()> {
+        self.append_shared_chunk_inner(chunk, false)
+    }
+
     /// [`DataTable::append_chunk`] for already-shared columns: appends the
     /// caller's `Arc<Vector>`s (shared, never copied) where the chunking
     /// rules allow. Validation, values, chunk boundaries and version bumps
@@ -866,6 +1084,14 @@ impl DataTable {
     /// The lake loader uses this to hand decoded chunks straight to the
     /// destination table without deep-cloning megabytes of payload.
     pub fn append_shared_chunk(&mut self, chunk: &[Arc<Vector>]) -> Result<()> {
+        self.append_shared_chunk_inner(chunk, true)
+    }
+
+    fn append_shared_chunk_inner(
+        &mut self,
+        chunk: &[Arc<Vector>],
+        track_stats: bool,
+    ) -> Result<()> {
         if chunk.len() != self.columns.len() {
             return Err(PinkDbError::Execution(format!(
                 "chunk has {} columns but table \"{}\" has {}",
@@ -908,7 +1134,8 @@ impl DataTable {
         // append lands behind a full tail and takes the second fast path.
         let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
         if tail_len == 0 || tail_len >= CHUNK_SIZE {
-            if tail_len == 0 && !self.columns[0].chunks.is_empty() {
+            let replacing = tail_len == 0 && !self.columns[0].chunks.is_empty();
+            if replacing {
                 for (col, src) in self.columns.iter_mut().zip(chunk) {
                     *col.chunks.last_mut().expect("tail chunk exists") = Arc::clone(src);
                 }
@@ -917,12 +1144,25 @@ impl DataTable {
                     col.chunks.push(Arc::clone(src));
                 }
             }
+            if track_stats {
+                for (ci, (zone, hll)) in self.fold_chunk_stats(chunk).into_iter().enumerate() {
+                    self.stats.cols[ci].absorb_zone(&zone);
+                    self.stats.cols[ci].set_sketch(hll.map(std::sync::Arc::new));
+                    if replacing {
+                        *self.zones[ci].last_mut().expect("tail zone exists") = zone;
+                    } else {
+                        self.zones[ci].push(zone);
+                    }
+                }
+            }
             self.num_rows += rows;
+            self.stats.rows += rows as u64;
             self.version = next_table_version();
             self.extend_indexes(start)?;
             return Ok(());
         }
         // Partial tail: merge, splitting at chunk boundaries as needed.
+        let first_chunk = self.columns[0].chunks.len().saturating_sub(1);
         let mut offset = 0;
         while offset < rows {
             let tail_full = self.columns[0]
@@ -935,6 +1175,11 @@ impl DataTable {
                     col.chunks
                         .push(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
                 }
+                if track_stats {
+                    for zones in &mut self.zones {
+                        zones.push(Zone::empty());
+                    }
+                }
             }
             let take = {
                 let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
@@ -946,6 +1191,23 @@ impl DataTable {
             }
             offset += take;
             self.num_rows += take;
+        }
+        self.stats.rows += rows as u64;
+        if track_stats {
+            // Only the touched chunks are re-derived, and only their appended
+            // source rows are hashed (folded from the whole chunk instead
+            // would count the existing rows twice).
+            for (ci, src) in chunk.iter().enumerate() {
+                for c in first_chunk..self.columns[0].chunks.len() {
+                    self.refresh_zone(ci, c, false);
+                }
+                if let Some(hll) = &mut self.stats.cols[ci].hll {
+                    let hll = Arc::make_mut(hll);
+                    for row in 0..rows {
+                        hll.insert_cell(src, row);
+                    }
+                }
+            }
         }
         self.version = next_table_version();
         self.extend_indexes(start)?;
@@ -997,6 +1259,25 @@ impl DataTable {
         }
         for (col, row, v) in &staged {
             Arc::make_mut(&mut self.columns[*col].chunks[chunk]).set_value(*row, v.clone())?;
+        }
+        if !staged.is_empty() {
+            // The new values join the sketch and the zone is re-derived from
+            // the rewritten chunk; the replaced values stay in the sketch, so
+            // the distinct estimate becomes an upper bound (`dirty`).
+            let mut touched: Vec<usize> = staged.iter().map(|(c, _, _)| *c).collect();
+            touched.sort_unstable();
+            touched.dedup();
+            for col in touched {
+                if let Some(hll) = &mut self.stats.cols[col].hll {
+                    let hll = Arc::make_mut(hll);
+                    for (c, _, v) in &staged {
+                        if *c == col {
+                            hll.insert_value(v);
+                        }
+                    }
+                }
+                self.refresh_zone(col, chunk, true);
+            }
         }
         if !updates.is_empty() {
             self.version = next_table_version();
@@ -1102,12 +1383,29 @@ impl DataTable {
             col.chunks[chunk] = Arc::new(col.chunks[chunk].gather(&keep));
         }
         // Drop chunks left empty (all columns share chunk boundaries).
-        if self.columns[0].chunks[chunk].is_empty() {
+        let dropped_chunk = self.columns[0].chunks[chunk].is_empty();
+        if dropped_chunk {
             for col in &mut self.columns {
                 col.chunks.remove(chunk);
             }
         }
+        if removed > 0 {
+            // Deletes can only widen bounds (the sketch cannot subtract, so
+            // every column's distinct estimate becomes an upper bound). A
+            // dropped chunk is the one case that shrinks them: re-derive the
+            // column from its remaining zones.
+            for col in 0..self.columns.len() {
+                if dropped_chunk {
+                    self.zones[col].remove(chunk);
+                    self.rebuild_column_stats(col);
+                    self.stats.cols[col].dirty = true;
+                } else {
+                    self.refresh_zone(col, chunk, true);
+                }
+            }
+        }
         self.num_rows -= removed;
+        self.stats.rows -= removed as u64;
         self.key_index = None;
         if removed > 0 {
             self.version = next_table_version();

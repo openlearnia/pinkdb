@@ -147,6 +147,34 @@ fn a_user_table_is_refused_every_way_a_read_can_reach_it() {
     }
 }
 
+/// The catalog statistics quote table values, so they are a read of the same
+/// table and the channel's allow-list applies: a listing that reaches into
+/// another database is refused, while its own tables stay inspectable.
+#[test]
+fn the_channel_reads_only_its_own_statistics() {
+    let db = store();
+    let policy = memory_channel(false);
+    for sql in [
+        // Inside the allowed database: allowed below, refused nowhere.
+        "SELECT * FROM pinkdb_column_stats('main.secret')",
+        "SELECT * FROM pinkdb_column_stats('pinkdb_agent.sessions')",
+        // The all-tables form spans every database, so it is refused too.
+        "SELECT * FROM pinkdb_column_stats()",
+    ] {
+        let text = refused(&db, &policy, sql);
+        assert!(
+            text.contains(MEMORY),
+            "{sql} must name the channel's own database: {text}"
+        );
+    }
+    let text = ok(
+        &db,
+        &policy,
+        "SELECT * FROM pinkdb_column_stats('pinkdb_memory.atoms')",
+    );
+    assert!(text.contains(MEMORY), "{text}");
+}
+
 #[test]
 fn a_file_source_is_refused_before_it_could_be_bound() {
     let db = store();

@@ -8,6 +8,62 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-28
+### Wave 122 — statistics and join-filter pushdown ✅
+
+The optimizer now knows what is in a table, and a hash join can tell the scan
+under its probe side which rows cannot match. No query result changed; every
+answer is checked against DuckDB's rows.
+
+- **Column statistics live in the catalog.** Per column: exact row and NULL
+  counts, min/max, and a hand-written HyperLogLog distinct estimate (4,096
+  registers, 1.6 % standard error, no new dependency); per 2,048-row chunk: its
+  own bounds and NULL/NaN counts. They are maintained on every write path —
+  INSERT, UPDATE, DELETE, COPY/import, CTAS, lake inlining — not recomputed by
+  rescanning: a delete only widens the bounds when the deleted rows held one
+  (as DuckDB does), and the sketch becomes an upper bound, which
+  `pinkdb_column_stats()` reports as `stats_approximate`. `ANALYZE [TABLE] t`
+  recomputes everything exactly.
+- **They persist.** The `.pink` footer (version 1 → 2) carries the sketches and
+  the per-chunk zone maps, so `.open` restores statistics instead of hashing
+  the data again.
+- **You can see them.** `SELECT * FROM pinkdb_column_stats(['db.]table')`
+  returns database, table, column, data type, row count, NULL count, distinct,
+  min, max and `stats_approximate` — for local tables and, for lake tables, the
+  per-file statistics DuckLake already keeps.
+- **The cost model uses them.** Equality and `IN` selectivities come from the
+  distinct estimate, ranges from the min/max spread, `IS [NOT] NULL` from the
+  NULL count; equality-class domains take the smallest exact distinct. The
+  fixed `0.2`/`0.5` defaults remain the fallback for columns without
+  statistics, and the inner-join build-side choice now uses the same estimates.
+- **Zone maps skip chunks.** A `.pink` scan drops a chunk whose `[min,max]`
+  cannot satisfy the filter, exact at the boundaries and for NULL-only chunks;
+  lake Parquet row-group skipping already existed and now shares the predicates.
+- **Join filters.** An inner or semi hash join builds first, derives the build
+  key's range and a blocked Bloom filter (2 probes, 1 % false positives, sized
+  from the build key's distinct estimate), and hands them to the probe side
+  before it runs: local scans skip chunks and test each row before reading its
+  other columns, lake scans get the bounds as row-group predicates. Left/right/
+  full joins (they owe every preserved row an output) and anti/mark joins (a
+  false positive would drop a surviving row) are excluded. `SET
+  join_filter_pushdown = false` turns it off for debugging.
+- **Measured.** TPC-H SF 1 total 9.70 s → 9.14 s (−5.8 %), essentially all of it
+  **Q21 3,831 → 3,196 ms (−16.6 %)**; the switch alone shows **−12.9 %** on
+  that query. Q3/Q5/Q7/Q8/Q9/Q10 are flat (within ±7 %): their build sides are
+  millions of rows, where a filter was measured slower, so `filter_pays` only
+  filters a build of ≤ 10,000 rows. SF 0.1 flat (728 → 726 ms). CSV ingest pays
+  12–15 % for the exact fold (lineitem 227 → 260 ms); Parquet and durable
+  inserts are unchanged — the 5 % write-path bound is missed on CSV only, and
+  row 122a is opened for it. A statistics-driven join-cardinality estimate was
+  tried and reverted (Q8 −47 % but Q7 +41 %, Q21 +23 %).
+- **Size.** Default CLI 5,608,752 → 5,690,064 B (+1.4 %), all-features
+  14,842,064 → 14,942,048 B (+0.7 %), no new dependencies.
+- **Tests.** New `crates/pinkdb/tests/stats.rs` (7): seeded random
+  insert/update/delete against exact SQL recomputation, sketch error bound,
+  persist/reload, `ANALYZE`, zone-map boundaries and NULL-only chunks, 330
+  differential join cases with filters on versus off, joins against DuckDB, and
+  the catalog function. Late materialization measured and deferred to row 122b.
+
 ## 2026-10-27
 ### Wave 111ab — query planning and execution tuning ✅
 

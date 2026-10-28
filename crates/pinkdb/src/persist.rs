@@ -131,7 +131,7 @@ pub const ROW_GROUP_ROWS: usize = 122_880;
 pub const CHUNKS_PER_ROW_GROUP: usize = ROW_GROUP_ROWS / CHUNK_SIZE;
 
 /// The footer's own version word (bumped when the footer layout changes).
-const FOOTER_VERSION: u32 = 1;
+const FOOTER_VERSION: u32 = 2;
 
 /// Flags bit 0: every table carries the constraint section described in the
 /// module docs. Set iff at least one table has constraints.
@@ -389,294 +389,9 @@ pub struct SavedTableStats {
     pub columns: Vec<SavedColumnStats>,
 }
 
-/// One chunk's contribution to a column's exact statistics (merged across
-/// chunks into a [`SavedColumnStats`]).
-#[derive(Debug, Clone, PartialEq)]
-struct ChunkColumnStats {
-    null_count: u64,
-    min: Option<Value>,
-    max: Option<Value>,
-    nan_count: u64,
-}
-
-/// The running merge of a column's chunk statistics (few comparisons per
-/// chunk; uses the engine's own [`crate::plan::compare_values`] so ties
-/// behave exactly like the MIN/MAX accumulators; NaN never reaches it — the
-/// chunk stats count NaN separately).
-#[derive(Debug, Clone, PartialEq)]
-struct ColumnStatsAcc {
-    null_count: u64,
-    min: Option<Value>,
-    max: Option<Value>,
-    nan_count: u64,
-}
-
-impl ColumnStatsAcc {
-    fn new() -> Self {
-        Self {
-            null_count: 0,
-            min: None,
-            max: None,
-            nan_count: 0,
-        }
-    }
-
-    fn merge(&mut self, chunk: &ChunkColumnStats) {
-        self.null_count += chunk.null_count;
-        self.nan_count += chunk.nan_count;
-        if let Some(v) = &chunk.min
-            && self
-                .min
-                .as_ref()
-                .is_none_or(|m| crate::plan::compare_values(v, m).is_lt())
-        {
-            self.min = Some(v.clone());
-        }
-        if let Some(v) = &chunk.max
-            && self
-                .max
-                .as_ref()
-                .is_none_or(|m| crate::plan::compare_values(v, m).is_gt())
-        {
-            self.max = Some(v.clone());
-        }
-    }
-}
-
-/// Exact statistics of one chunk of one column: the same strict comparisons
-/// the MIN/MAX accumulators use (a tie never replaces the first-seen value).
-fn chunk_column_stats(v: &Vector) -> ChunkColumnStats {
-    let null_count = v.null_count() as u64;
-    match v.data() {
-        VectorData::Boolean(data) => {
-            let (mut has_false, mut has_true) = (false, false);
-            let mut see = |x: bool| {
-                if x {
-                    has_true = true;
-                } else {
-                    has_false = true;
-                }
-            };
-            if v.has_nulls() {
-                for (i, &x) in data.iter().enumerate() {
-                    if v.is_valid(i) {
-                        see(x);
-                    }
-                }
-            } else {
-                for &x in data {
-                    see(x);
-                }
-            }
-            // Min/max are the actual extreme values (DuckDB semantics): a
-            // column of only `true` is min = max = true, and only `false` is
-            // min = max = false — never "one of min/max" (a stats block must
-            // carry both or neither).
-            let any = has_false || has_true;
-            ChunkColumnStats {
-                null_count,
-                min: any.then_some(Value::Boolean(!has_false)),
-                max: any.then_some(Value::Boolean(has_true)),
-                nan_count: 0,
-            }
-        }
-        VectorData::Int32(data) => {
-            let (min, max) = int_stats(v, data);
-            ChunkColumnStats {
-                null_count,
-                min: min.map(Value::Integer),
-                max: max.map(Value::Integer),
-                nan_count: 0,
-            }
-        }
-        VectorData::Int64(data) => {
-            let (min, max) = int_stats(v, data);
-            ChunkColumnStats {
-                null_count,
-                min: min.map(Value::Bigint),
-                max: max.map(Value::Bigint),
-                nan_count: 0,
-            }
-        }
-        VectorData::Date32(data) => {
-            let (min, max) = int_stats(v, data);
-            ChunkColumnStats {
-                null_count,
-                min: min.map(Value::Date),
-                max: max.map(Value::Date),
-                nan_count: 0,
-            }
-        }
-        VectorData::TimestampMicros(data) => {
-            let (min, max) = int_stats(v, data);
-            ChunkColumnStats {
-                null_count,
-                min: min.map(Value::Timestamp),
-                max: max.map(Value::Timestamp),
-                nan_count: 0,
-            }
-        }
-        VectorData::Float64(data) => {
-            let (mut min, mut max): (Option<f64>, Option<f64>) = (None, None);
-            let mut nan_count = 0u64;
-            let mut see = |x: f64| {
-                if x.is_nan() {
-                    nan_count += 1;
-                    return;
-                }
-                if min.is_none_or(|m| x < m) {
-                    min = Some(x);
-                }
-                if max.is_none_or(|m| x > m) {
-                    max = Some(x);
-                }
-            };
-            if v.has_nulls() {
-                for (i, &x) in data.iter().enumerate() {
-                    if v.is_valid(i) {
-                        see(x);
-                    }
-                }
-            } else {
-                for &x in data {
-                    see(x);
-                }
-            }
-            ChunkColumnStats {
-                null_count,
-                min: min.map(Value::Double),
-                max: max.map(Value::Double),
-                nan_count,
-            }
-        }
-        VectorData::VarChar(data) => {
-            let (min, max) = str_stats(v, data);
-            ChunkColumnStats {
-                null_count,
-                min: min.map(|s| Value::Varchar(s.to_string())),
-                max: max.map(|s| Value::Varchar(s.to_string())),
-                nan_count: 0,
-            }
-        }
-        VectorData::Decimal { values, scale, .. } => {
-            let (min, max) = int_stats(v, values);
-            ChunkColumnStats {
-                null_count,
-                min: min.map(|x| Value::Decimal(x, *scale)),
-                max: max.map(|x| Value::Decimal(x, *scale)),
-                nan_count: 0,
-            }
-        }
-        VectorData::Interval(data) => {
-            let (mut min, mut max): (Option<Interval>, Option<Interval>) = (None, None);
-            let mut see = |x: Interval| {
-                if min.is_none_or(|m| crate::types::interval_cmp(x, m) == std::cmp::Ordering::Less)
-                {
-                    min = Some(x);
-                }
-                if max
-                    .is_none_or(|m| crate::types::interval_cmp(x, m) == std::cmp::Ordering::Greater)
-                {
-                    max = Some(x);
-                }
-            };
-            if v.has_nulls() {
-                for (i, &x) in data.iter().enumerate() {
-                    if v.is_valid(i) {
-                        see(x);
-                    }
-                }
-            } else {
-                for &x in data {
-                    see(x);
-                }
-            }
-            ChunkColumnStats {
-                null_count,
-                min: min.map(|iv| Value::Interval {
-                    months: iv.months,
-                    days: iv.days,
-                    micros: iv.micros,
-                }),
-                max: max.map(|iv| Value::Interval {
-                    months: iv.months,
-                    days: iv.days,
-                    micros: iv.micros,
-                }),
-                nan_count: 0,
-            }
-        }
-        // VARIANT: no min/max. The total order spans kinds, so a chunk extreme
-        // says nothing about a later point lookup; the row-group prune would
-        // have to compare a VARIANT literal with the same code either way.
-        VectorData::Variant(_) => ChunkColumnStats {
-            null_count,
-            min: None,
-            max: None,
-            nan_count: 0,
-        },
-        // ARRAY: no min/max for the same reason as VARIANT (element-wise
-        // order, NULL elements sort last) — a bound would need the whole
-        // element comparator to prune with.
-        VectorData::Array { .. } => ChunkColumnStats {
-            null_count,
-            min: None,
-            max: None,
-            nan_count: 0,
-        },
-    }
-}
-
-/// min/max over the valid elements of an integer chunk, first-seen on ties.
-fn int_stats<T: Copy + Ord>(v: &Vector, data: &[T]) -> (Option<T>, Option<T>) {
-    let (mut min, mut max): (Option<T>, Option<T>) = (None, None);
-    let mut see = |x: T| {
-        if min.is_none_or(|m| x < m) {
-            min = Some(x);
-        }
-        if max.is_none_or(|m| x > m) {
-            max = Some(x);
-        }
-    };
-    if v.has_nulls() {
-        for (i, &x) in data.iter().enumerate() {
-            if v.is_valid(i) {
-                see(x);
-            }
-        }
-    } else {
-        for &x in data {
-            see(x);
-        }
-    }
-    (min, max)
-}
-
-/// min/max over the valid elements of a string chunk, first-seen on ties
-/// (byte order, exactly `Value::Varchar`'s `compare_values`).
-fn str_stats<'a>(v: &Vector, data: &'a [Arc<str>]) -> (Option<&'a str>, Option<&'a str>) {
-    let (mut min, mut max): (Option<&'a str>, Option<&'a str>) = (None, None);
-    let mut see = |x: &'a str| {
-        if min.is_none_or(|m| x < m) {
-            min = Some(x);
-        }
-        if max.is_none_or(|m| x > m) {
-            max = Some(x);
-        }
-    };
-    if v.has_nulls() {
-        for (i, s) in data.iter().enumerate() {
-            if v.is_valid(i) {
-                see(s);
-            }
-        }
-    } else {
-        for s in data {
-            see(s);
-        }
-    }
-    (min, max)
-}
+/// The zone map type the `.pink` writer collects while encoding: the same
+/// [`crate::stats::Zone`] the local tables keep and the scans prune with.
+type ChunkColumnStats = crate::stats::Zone;
 
 fn dtype_tag(t: DataType) -> u8 {
     match t {
@@ -3097,6 +2812,11 @@ struct TableDir {
     vector_indexes: Vec<VectorIndexFile>,
     row_count: u64,
     row_groups: Vec<RowGroupDir>,
+    /// Catalog statistics and per-chunk zone maps (wave 122), written after
+    /// the row groups. A rows-free catalog image carries
+    /// [`crate::stats::TableStats::unknown`] and no zones.
+    stats: crate::stats::TableStats,
+    zones: Vec<Vec<crate::stats::Zone>>,
 }
 
 /// One database's footer entry: its tables and its catalog sections.
@@ -3138,13 +2858,119 @@ fn encode_page(v: &Vector) -> EncodedPage {
     w.bytes(&payload);
     EncodedPage {
         frame: w.buf,
-        stats: chunk_column_stats(v),
+        stats: crate::stats::Zone::of_vector(v),
         rows: v.len(),
     }
 }
 
 /// Write one statistics value (the footer's per-chunk min/max): a tag byte
 /// plus the value's payload.
+/// Write one table's catalog statistics and per-chunk zone maps: the
+/// footer's stats block (wave 122).
+///
+/// One entry per column: the NULL count, the min/max bounds, whether the
+/// distinct sketch is an upper bound after a delete (`dirty`), and the sketch
+/// itself (`hll_len` 0 = unknown). Then the zone maps: one entry per engine
+/// chunk, in chunk order, so a load restores the per-chunk pruning facts
+/// without rescanning the data (`RowGroupDir`'s entries are per *row group*,
+/// far too coarse to prune a 2048-row chunk with).
+fn write_table_stats(
+    w: &mut Writer,
+    stats: &crate::stats::TableStats,
+    zones: &[Vec<crate::stats::Zone>],
+) {
+    for col in &stats.cols {
+        w.u64(col.null_count);
+        write_stat_value(w, col.min.as_ref());
+        write_stat_value(w, col.max.as_ref());
+        w.u8(u8::from(col.dirty));
+        match &col.hll {
+            Some(hll) => {
+                let bytes = hll.to_bytes();
+                w.u32(bytes.len() as u32);
+                w.bytes(&bytes);
+            }
+            // Unknown (a rows-free catalog image, or a column whose sketch
+            // was never built): readers treat the distinct count as unknown
+            // rather than as zero.
+            None => w.u32(0),
+        }
+    }
+    w.u32(zones.len() as u32);
+    for col in zones {
+        w.u32(col.len() as u32);
+        for zone in col {
+            w.u64(zone.null_count);
+            write_stat_value(w, zone.min.as_ref());
+            write_stat_value(w, zone.max.as_ref());
+            w.u64(zone.nan_count);
+        }
+    }
+}
+
+/// Read [`write_table_stats`]; every count is checked against the remaining
+/// bytes before it sizes an allocation.
+fn read_table_stats(
+    r: &mut Reader,
+    n_cols: usize,
+    rows: u64,
+) -> Result<(crate::stats::TableStats, Vec<Vec<crate::stats::Zone>>)> {
+    let mut cols = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        let null_count = r.u64()?;
+        let min = read_stat_value(r)?;
+        let max = read_stat_value(r)?;
+        let dirty = match r.u8()? {
+            0 => false,
+            1 => true,
+            other => return r.err(&format!("bad statistics dirty byte {other}")),
+        };
+        let hll_len = r.u32()? as usize;
+        // A sketch is either absent or within one precision's bound.
+        if hll_len > crate::stats::HLL_MAX_BYTES {
+            return r.err(&format!("bad distinct sketch length {hll_len}"));
+        }
+        let hll = if hll_len == 0 {
+            None
+        } else {
+            let sketch = crate::stats::Hll::from_bytes(r.take(hll_len)?)
+                .ok_or_else(|| PinkDbError::Execution("corrupt file: bad sketch".to_string()))?;
+            Some(std::sync::Arc::new(sketch))
+        };
+        cols.push(crate::stats::ColStats {
+            null_count,
+            min,
+            max,
+            hll,
+            dirty,
+        });
+    }
+    let n_zone_cols = r.u32()? as usize;
+    if n_zone_cols != n_cols {
+        return r.err("zone-map column count does not match the schema");
+    }
+    let mut zones = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        let n_zones = r.u32()? as usize;
+        // Each zone costs at least 18 bytes (NULL count, two empty bounds,
+        // the NaN count).
+        if n_zones > r.remaining() / 18 + 1 {
+            return r.err("zone count exceeds the remaining file");
+        }
+        let mut col = Vec::with_capacity(n_zones);
+        for _ in 0..n_zones {
+            col.push(crate::stats::Zone {
+                null_count: r.u64()?,
+                min: read_stat_value(r)?,
+                max: read_stat_value(r)?,
+                nan_count: r.u64()?,
+            });
+        }
+        zones.push(col);
+    }
+    Ok((crate::stats::TableStats { rows, cols }, zones))
+}
+
 fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
     match v {
         None => w.u8(SV_NONE),
@@ -3565,6 +3391,10 @@ impl PinkDb {
                         vector_indexes: Vec::new(),
                         row_count: 0,
                         row_groups: Vec::new(),
+                        // No rows, no statistics: readers treat the column
+                        // facts as unknown until the rows arrive.
+                        stats: crate::stats::TableStats::unknown(t.columns.len(), 0),
+                        zones: vec![Vec::new(); t.columns.len()],
                     }
                 } else {
                     write_table(
@@ -3664,6 +3494,7 @@ impl PinkDb {
                         write_stat_value(&mut fw, col.max.as_ref());
                     }
                 }
+                write_table_stats(&mut fw, &tdir.stats, &tdir.zones);
             }
             if with_macros {
                 write_macro_defs(&mut fw, &dbdir.macros);
@@ -4083,7 +3914,8 @@ fn write_table(
     };
     // The per-column statistics of the whole table (the lake's stats
     // block).
-    let mut accs: Vec<ColumnStatsAcc> = schema.iter().map(|_| ColumnStatsAcc::new()).collect();
+    let mut accs: Vec<ChunkColumnStats> =
+        schema.iter().map(|_| ChunkColumnStats::empty()).collect();
     for chunk in &pages {
         for (acc, page) in accs.iter_mut().zip(chunk.iter()) {
             acc.merge(&page.stats);
@@ -4153,7 +3985,7 @@ fn write_table(
             let length = bytes.len() as u64;
             data.bytes(&bytes);
             // The chunk's exact statistics and encoding summary.
-            let mut acc = ColumnStatsAcc::new();
+            let mut acc = ChunkColumnStats::empty();
             let mut encodings = 0u32;
             for page in group {
                 acc.merge(&page.stats);
@@ -4182,6 +4014,8 @@ fn write_table(
         vector_indexes: vector_index_defs(t)?,
         row_count: t.num_rows() as u64,
         row_groups,
+        stats: t.stats().clone(),
+        zones: t.zones().to_vec(),
     })
 }
 
@@ -4871,6 +4705,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
                 }
                 row_groups.push(RowGroupDir { rows, columns });
             }
+            let (tstats, tzones) = read_table_stats(&mut r, n_cols, row_count)?;
             tables.push(TableDir {
                 name: tname,
                 schema,
@@ -4880,6 +4715,8 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
                 vector_indexes: tvectors,
                 row_count,
                 row_groups,
+                stats: tstats,
+                zones: tzones,
             });
         }
         let dmacros = if macros {
@@ -4945,6 +4782,12 @@ fn load_table_data(data: &[u8], db: &mut PinkDb, dbname: &str, tdir: &TableDir) 
     // Assemble the table chunk by chunk (every column shares the chunk
     // boundaries: the writer's invariant).
     let t = db.table_mut_in(dbname, &tdir.name)?;
+    // The append merges a short page into a partly filled tail chunk, so the
+    // loaded chunks keep the writer's boundaries only when every page but
+    // the last is full. A table whose interior chunks shrank (deletes, small
+    // appends) reloads with different boundaries, and its persisted zone
+    // maps no longer line up: they are then rebuilt from the rows.
+    let mut page_rows: Vec<usize> = Vec::new();
     for (g, rg) in tdir.row_groups.iter().enumerate() {
         let n_pages = rg.columns[0].page_count as usize;
         for p in 0..n_pages {
@@ -4952,9 +4795,16 @@ fn load_table_data(data: &[u8], db: &mut PinkDb, dbname: &str, tdir: &TableDir) 
                 .iter()
                 .map(|column| Arc::clone(&column[g][p]))
                 .collect();
-            t.append_shared_chunk(&chunk)?;
+            page_rows.push(chunk.first().map(|c| c.len()).unwrap_or(0));
+            t.append_loaded_chunk(&chunk)?;
         }
     }
+    let zones_aligned = page_rows
+        .split_last()
+        .is_none_or(|(_, interior)| interior.iter().all(|&n| n == crate::vector::CHUNK_SIZE));
+    // The footer carries the statistics the writer observed, so a load
+    // restores them instead of hashing every value again.
+    t.set_loaded_stats(tdir.stats.clone(), tdir.zones.clone(), zones_aligned);
     Ok(())
 }
 
@@ -5817,11 +5667,12 @@ fn read_principal_grants(
 /// drift apart.
 pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
     let schema = src.schema();
-    let mut accs: Vec<ColumnStatsAcc> = schema.iter().map(|_| ColumnStatsAcc::new()).collect();
+    let mut accs: Vec<ChunkColumnStats> =
+        schema.iter().map(|_| ChunkColumnStats::empty()).collect();
     for c in 0..src.num_chunks() {
         if let Some(chunk) = src.scan_chunk(c) {
             for (acc, v) in accs.iter_mut().zip(chunk.columns.iter()) {
-                acc.merge(&chunk_column_stats(v));
+                acc.merge(&crate::stats::Zone::of_vector(v));
             }
         }
     }
@@ -6141,9 +5992,9 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
 /// The pinned length and footer checksum of the golden corpus's `PINKDB06`
 /// image (see `golden_pinkdb06_bytes_are_pinned`).
 #[cfg(test)]
-const GOLDEN_V6_LEN: usize = 113_321;
+const GOLDEN_V6_LEN: usize = 143_712;
 #[cfg(test)]
-const GOLDEN_V6_FOOTER_CRC: u32 = 3_044_878_001;
+const GOLDEN_V6_FOOTER_CRC: u32 = 3_066_041_510;
 
 #[cfg(test)]
 mod tests {
@@ -6974,7 +6825,10 @@ mod tests {
             }
         }
         let small = db.to_bytes().unwrap();
-        assert!(small.len() < 4096, "{}", small.len());
+        // Small enough for the byte-by-byte loop below. The footer carries an
+        // exact distinct sketch per column (wave 122), so a 7-column table
+        // pays a few hundred bytes per column even when tiny.
+        assert!(small.len() < 8192, "{}", small.len());
         for cut in 0..small.len() {
             assert!(
                 PinkDb::load_bytes(&small[..cut]).is_err(),
@@ -8937,6 +8791,14 @@ mod tests {
             fw.u8(1); // INTEGER
             fw.u64(0); // row count
             fw.u32(0); // no row groups
+            // The stats block: unknown sketch, no bounds, one empty zone.
+            fw.u64(0);
+            write_stat_value(&mut fw, None);
+            write_stat_value(&mut fw, None);
+            fw.u8(1);
+            fw.u32(0);
+            fw.u32(1);
+            fw.u32(0);
             fw.bytes(rbac);
             let footer = fw.buf;
             let mut out = Vec::new();

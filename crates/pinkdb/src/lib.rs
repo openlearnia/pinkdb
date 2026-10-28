@@ -85,6 +85,7 @@ pub mod repo;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod serve;
 pub mod sql;
+pub mod stats;
 pub mod storage;
 /// Host-registered table sources (wave 70): the engine-adjacent surface the
 /// `pinkdb-parquet` crate (`read_parquet`, `FROM 'file.parquet'`) plugs into.

@@ -277,11 +277,71 @@ SELECT DISTINCT ON (expr, ...) ...                -- first row per key, in ORDER
 -- `current_roles()`: who is asking, as the logged-in principal and its
 -- transitive roles, comma-joined (bound per statement; `pinkdb` on an embedded
 -- store that has no users).
+-- `ANALYZE [TABLE] <table>` / `ANALYZE` recomputes a table's catalog
+-- statistics exactly (see "Column statistics" below); `SELECT * FROM
+-- pinkdb_column_stats(['<table>'])` reads them.
 -- `FOR UPDATE` / `FOR SHARE` are refused by name (MVCC already serializes
 -- writers); so are list literals — the engine has no LIST type.
 -- Over a few hundred forms either answer or refuse by name: the full matrix of
 -- what is supported, what differs from DuckDB 2.0 and what is refused with an
 -- exact error is [docs/sql-conformance.md](docs/sql-conformance.md).
+```
+
+### Column statistics (wave 122)
+
+Every table keeps a statistics row per column in the catalog: the exact row and
+NULL counts, `min`/`max` of the values that took part, and a HyperLogLog sketch
+(p = 12, about 1.6 % standard error) for the distinct count. The write path
+maintains them, no rescan: an append folds the new chunk in exactly, an update
+replaces the touched chunk's contribution and folds the new values into the
+sketch, and a delete only ever *widens* what it cannot prove any more — the
+sketch keeps counting values that were deleted (an upper bound) and its row is
+flagged `stats_approximate`. `ANALYZE` is the exact answer:
+
+```sql
+ANALYZE orders;                          -- one table, or ANALYZE for every table
+SELECT * FROM pinkdb_column_stats();     -- or pinkdb_column_stats('orders')
+```
+
+```text
+database | table_name | column_name | data_type | row_count | null_count |
+distinct_count | min | max | stats_approximate
+```
+
+`pinkdb_column_stats()` is a read-only catalog function (no data scan), shaped
+like `duckdb_columns`; `min`/`max` come back as text, and `ANALYZE` needs the
+`ADMIN` privilege like `CHECKPOINT`. Its rows quote table values, so it counts
+as a read of every table it reports: a principal without `SELECT` gets the same
+refusal a scan gets (the all-tables form lists only the tables it may read),
+and a served session's read policy applies to the named tables too, so a masked
+or confined database is refused rather than reported. The lake path keeps using
+the per-file statistics DuckLake stores, and Parquet row-group min/max remain
+the zone maps there.
+
+The statistics feed two things:
+
+* the cost model — filter selectivity (`=`, `IN`, ranges, `IS NULL`, `<>`) and
+  the equality-class domain a join cardinality is computed from, both falling
+  back to wave 111ab's fixed 0.2/0.5 when a column has no statistics;
+* the zone maps and join filters — each column chunk (2048 rows) stores its own
+  min/max/NULL count, so a scan skips a chunk that cannot satisfy the
+  predicate. When a hash join's build side is small (≤ 10k rows) the engine
+  also hands the probe-side scan the build keys' range and a blocked Bloom
+  filter; the scan skips chunks whose zone cannot overlap and drops rows the
+  Bloom rejects before materializing other columns. Only `INNER` and `SEMI`
+  joins do this — their probe rows without a match can never be emitted.
+  `LEFT`/`RIGHT`/`FULL` (which owe every preserved row an output) and
+  `ANTI`/`MARK` (which need the absence of a match) are excluded, and the
+  filter is only a pre-filter: the join still decides every row.
+
+Statistics travel with the store: `.pink` footer version 2 stores the sketch and
+the zone maps per table, so reopening a file does not rescan it. There is no
+legacy format — an older `.pink` fails with "written by an older pinkdb". One
+session switch exists, for debugging and for the differential tests:
+
+```sql
+SET join_filter_pushdown = false;   -- no probe-side bloom/range filters
+SET VARIABLE join_filter_pushdown = true;   -- the long form still parses
 ```
 
 ### VARIANT (wave 101)

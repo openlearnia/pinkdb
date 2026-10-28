@@ -28,7 +28,7 @@ timing, so any table below can be reproduced or disputed.</p>
     <tr><td>TPC-H Q13, SF 1</td><td>453 ms</td><td>37 ms</td><td>12×</td></tr>
     <tr><td>TPC-H Q9, SF 1</td><td>675 ms</td><td>26 ms</td><td>26×</td></tr>
     <tr><td>TPC-H Q7, SF 1</td><td>246 ms</td><td>9 ms</td><td>27×</td></tr>
-    <tr><td>CSV ingest, lineitem SF 0.1</td><td>2.28 M rows/s</td>
+    <tr><td>CSV ingest, lineitem SF 0.1</td><td>2.31 M rows/s</td>
         <td>1.64 M rows/s</td><td>1.4× faster</td></tr>
     <tr><td>Parquet ingest, lineitem SF 0.1</td><td>1.23 M rows/s</td>
         <td>5.77 M rows/s</td><td>4.7× slower</td></tr>
@@ -63,6 +63,47 @@ the general one — the three shown are the extremes: Q17's correlated
 the duplicate-eliminated key side and for keeping its non-equality condition as
 a filter above the join. The full 22-query tables for SF 0.1 and SF 1 are in
 <a href="/docs/">the docs</a> (<code>docs/benchmarks.md</code>).</p>
+
+<h2>Wave 122: statistics and join filters</h2>
+
+<p>pinkdb keeps per-column statistics now — row and NULL counts, min/max, a
+HyperLogLog distinct estimate — and per-chunk zone maps, maintained on every
+write and persisted in the <code>.pink</code> footer. <code>ANALYZE</code>
+recomputes them exactly, <code>pinkdb_column_stats()</code> shows them, the
+optimizer prices filters and joins with them, and a scan skips chunks whose
+bounds cannot satisfy a filter. An inner or semi hash join also builds a range
+and a Bloom filter from its build keys and hands them to the scan under its
+probe side, so non-matching rows are dropped before their columns are read.
+Left/right/full and anti/mark joins are excluded — they owe rows an output that
+a probabilistic filter cannot promise. Nothing about an answer changed: all 22
+TPC-H queries still match DuckDB's rows and checksums.</p>
+
+<table>
+  <thead>
+    <tr><th>TPC-H SF 1</th><th>wave 111ab</th><th>wave 122</th><th>Δ</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Q3</td><td>200 ms</td><td>192 ms</td><td>−4 %</td></tr>
+    <tr><td>Q5</td><td>354 ms</td><td>369 ms</td><td>+4 %</td></tr>
+    <tr><td>Q7</td><td>255 ms</td><td>272 ms</td><td>+7 %</td></tr>
+    <tr><td>Q8</td><td>220 ms</td><td>234 ms</td><td>+6 %</td></tr>
+    <tr><td>Q9</td><td>763 ms</td><td>778 ms</td><td>+2 %</td></tr>
+    <tr><td>Q10</td><td>180 ms</td><td>172 ms</td><td>−4 %</td></tr>
+    <tr><td>Q21</td><td>3,831 ms</td><td>3,196 ms</td><td>−17 %</td></tr>
+    <tr><td>all 22 (total)</td><td>9,704 ms</td><td>9,141 ms</td><td>−5.8 %</td></tr>
+  </tbody>
+</table>
+
+<p>Q21 is the one TPC-H query whose build side is small enough to filter: it
+builds 10,000 <code>supplier</code> rows against a 3M-row probe, and the
+filters alone (same binary, <code>SET join_filter_pushdown = false</code>) are
+worth 12.9 % there. The other star queries build millions of rows, and every
+such build measured <em>slower</em> with a filter, so the join prices one and
+skips it above 10,000 rows — they are unchanged within the noise, not by
+accident. At SF 0.1 the whole 22-query set is flat (728 → 726 ms). The write
+path pays for exactness on CSV only: lineitem ingest 227 → 260 ms (+14.5 %),
+orders 91 → 102 ms; Parquet CTAS and durable inserts are unchanged. The default
+CLI grew 1.4 % (5.61 → 5.69 MB) and no dependency was added.</p>
 
 <h2>Method</h2>
 

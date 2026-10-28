@@ -304,6 +304,14 @@ pub enum LogicalPlan {
     /// `CHECKPOINT`: persist + roll the WAL of a durable store (no-op
     /// otherwise). Never WAL-logged and refused inside a transaction.
     Checkpoint,
+    /// `ANALYZE [TABLE] <table>` / bare `ANALYZE`: recompute catalog
+    /// statistics exactly. Advisory data: never WAL-logged (the next
+    /// checkpoint persists it) and refused inside a transaction, where a
+    /// rollback would leave statistics for rows that no longer exist.
+    Analyze {
+        db: String,
+        table: Option<String>,
+    },
     /// `SHOW TABLES`: the given database's tables, sorted by name.
     ShowTables {
         db: String,
@@ -505,6 +513,11 @@ pub enum LogicalPlan {
         rows: Vec<Vec<BoundExpr>>,
         names: Vec<String>,
         types: Vec<DataType>,
+        /// Catalog tables the rows were read from, as `(database, table)`.
+        /// A literal `VALUES` list reads none; a catalog function that folds
+        /// table contents or statistics into literals at bind time names them
+        /// here so every read check sees what the statement touched.
+        sources: Vec<(String, String)>,
     },
     /// Window functions: output is input columns ++ one column per window.
     /// Partition/order/arg expressions address the input (scan-relative, or
@@ -886,6 +899,7 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
         LogicalPlan::InstallExtension { .. } => "INSTALL",
         LogicalPlan::LoadInstalledExtension { .. } => "LOAD",
         LogicalPlan::Checkpoint => "CHECKPOINT",
+        LogicalPlan::Analyze { .. } => "ANALYZE",
         // Wave 80: materialized-view statements carry catalog metadata
         // (definition, schedule, refresh counters) that the per-table
         // transaction merge does not cover, and auto-refresh is deferred to
@@ -1042,6 +1056,7 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::Describe { .. }
         | LogicalPlan::DescribeMacro { .. }
         | LogicalPlan::Checkpoint
+        | LogicalPlan::Analyze { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
@@ -1103,7 +1118,10 @@ pub(crate) fn collect_tables_read(
         }
         LogicalPlan::Explain { plan } => collect_tables_read(plan, default_db, out),
         LogicalPlan::CreateTableAs { query, .. } => collect_tables_read(query, default_db, out),
-        LogicalPlan::Values { rows, .. } => {
+        LogicalPlan::Values { rows, sources, .. } => {
+            for (database, table) in sources {
+                out.insert((database.to_ascii_lowercase(), table.to_ascii_lowercase()));
+            }
             for e in rows.iter().flatten() {
                 expr_tables_read(e, default_db, out);
             }
@@ -1484,6 +1502,7 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
         | LogicalPlan::Checkpoint
+        | LogicalPlan::Analyze { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::Describe { .. }
@@ -1595,7 +1614,7 @@ impl ScanProjections {
 /// A scan node's identity for [`ScanProjections`]: plans are immutable trees
 /// during one statement, so the address of the node is stable across the
 /// analysis walk and execution.
-fn node_addr(plan: &LogicalPlan) -> usize {
+pub(crate) fn node_addr(plan: &LogicalPlan) -> usize {
     plan as *const LogicalPlan as usize
 }
 
@@ -1664,7 +1683,10 @@ fn walk_scan_filters(
         | LogicalPlan::Sample { input, .. } => {
             walk_scan_filters(input, inherited, out);
         }
-        LogicalPlan::Scan { db: Some(_), .. } | LogicalPlan::TableFunction { .. } => {
+        // A local table's chunks carry their own zone maps now (wave 122),
+        // so the same conjuncts prune an in-memory scan; a CTE reference
+        // never reaches the table scan path that reads them.
+        LogicalPlan::Scan { .. } | LogicalPlan::TableFunction { .. } => {
             if !inherited.is_empty() {
                 out.entry(node_addr(plan))
                     // The same node reached through two parents may only use
@@ -1678,7 +1700,6 @@ fn walk_scan_filters(
         // inherited predicates (columns are rebound/reordered there). The
         // match mirrors `collect_tables_read`; a variant listed as a leaf
         // holds no child plan to analyze.
-        LogicalPlan::Scan { db: None, .. }
         | LogicalPlan::SingleRow
         | LogicalPlan::Values { .. }
         | LogicalPlan::Begin
@@ -1701,6 +1722,7 @@ fn walk_scan_filters(
         | LogicalPlan::Describe { .. }
         | LogicalPlan::DescribeMacro { .. }
         | LogicalPlan::Checkpoint
+        | LogicalPlan::Analyze { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
@@ -2134,6 +2156,7 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
         | LogicalPlan::Describe { .. }
         | LogicalPlan::DescribeMacro { .. }
         | LogicalPlan::Checkpoint
+        | LogicalPlan::Analyze { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateProcedure { .. }
@@ -2513,6 +2536,7 @@ fn walk_scan_projections(
         | LogicalPlan::Describe { .. }
         | LogicalPlan::DescribeMacro { .. }
         | LogicalPlan::Checkpoint
+        | LogicalPlan::Analyze { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::IndexScan { .. }

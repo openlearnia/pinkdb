@@ -25,7 +25,7 @@ use expr::{coerce_to, count_true, eval_expr, select_true};
 use rayon::prelude::*;
 use window::eval_window;
 
-use crate::attached::{AttachedTable, PruneOp};
+use crate::attached::{AttachedTable, PruneOp, PrunePredicate};
 use crate::optimizer::columns_in;
 use crate::plan::{
     AlterTablePlan, LogicalPlan, MAX_RECURSIVE_ITERATIONS, MAX_RECURSIVE_ROWS, agg_output_schema,
@@ -506,6 +506,120 @@ pub(crate) struct Cx<'a> {
     /// stacks without any shared mutable state and the parallel executor
     /// reads them freely.
     pub(crate) outer_rows: Vec<std::sync::Arc<[Value]>>,
+    /// Join filters a completed build side handed to the probe side's scans
+    /// (wave 122). Shared by the statement's contexts, so a child context
+    /// (recursive CTE, subquery) still sees the frame its outer join pushed.
+    pub(crate) dynamic: std::sync::Arc<DynamicFilters>,
+}
+
+/// Join filters derived from a completed hash-join build side (wave 122), keyed
+/// by the plan-node address of the probe-side scan they prune. Frames are
+/// pushed and popped around the probe side's evaluation so a nested join's
+/// filters coexist with the outer join's, and nothing outlives the statement
+/// (a stale address is never read: the plan tree outlives the frame).
+/// `(scan node address, scan column, filter)`.
+type ScanFilterEntry = (usize, usize, std::sync::Arc<crate::stats::JoinFilter>);
+
+#[derive(Default)]
+pub(crate) struct DynamicFilters {
+    frames: std::sync::Mutex<Vec<Vec<ScanFilterEntry>>>,
+}
+
+impl DynamicFilters {
+    /// Register `filters` (one per probe key) on every scan `plan` reaches
+    /// through that key's lineage; returns the frame to [`pop`](Self::pop).
+    fn push_plan(
+        &self,
+        plan: &LogicalPlan,
+        keys: &[BoundExpr],
+        filters: &[std::sync::Arc<crate::stats::JoinFilter>],
+    ) -> usize {
+        let mut entries = Vec::new();
+        let mut targets = Vec::new();
+        for (i, filter) in filters.iter().enumerate() {
+            // The filter belongs to the key's *column* in the probe plan, not
+            // to the key's ordinal: `ON p.k = b.k` with `p (id, k)` prunes `k`,
+            // never `id`. A key the walk cannot follow is simply not pushed.
+            let Some(BoundExpr::Column { index, .. }) = keys.get(i) else {
+                continue;
+            };
+            targets.clear();
+            scan_targets(plan, *index, &mut targets);
+            for (node, col) in targets.drain(..) {
+                entries.push((node, col, filter.clone()));
+            }
+        }
+        let mut frames = self.frames.lock().expect("dynamic filters");
+        frames.push(entries);
+        frames.len() - 1
+    }
+
+    fn pop(&self, frame: usize) {
+        self.frames.lock().expect("dynamic filters").truncate(frame);
+    }
+
+    /// The filters registered for one scan: `(column, filter)` pairs.
+    fn for_scan(
+        &self,
+        scan: &LogicalPlan,
+    ) -> Vec<(usize, std::sync::Arc<crate::stats::JoinFilter>)> {
+        let addr = crate::plan::node_addr(scan);
+        let frames = self.frames.lock().expect("dynamic filters");
+        frames
+            .iter()
+            .flatten()
+            .filter(|(node, _, _)| *node == addr)
+            .map(|(_, col, filter)| (*col, filter.clone()))
+            .collect()
+    }
+}
+
+/// Follow `col`'s lineage from `plan` down to the scans it comes from,
+/// appending `(scan node, scan column)` for each. Only shapes that pass a
+/// column through unchanged are followed: a projection that computes a value,
+/// an aggregate or a set operation changes what the scan's zones describe, so
+/// the walk stops. Branching (a CTE read twice) yields several targets.
+fn scan_targets(plan: &LogicalPlan, col: usize, out: &mut Vec<(usize, usize)>) {
+    use LogicalPlan as P;
+    match plan {
+        P::Scan { .. } => out.push((crate::plan::node_addr(plan), col)),
+        P::Filter { input, .. }
+        | P::Sort { input, .. }
+        | P::Limit { input, .. }
+        | P::Distinct { input, .. } => scan_targets(input, col, out),
+        P::Project { input, exprs, .. } => {
+            if let Some(BoundExpr::Column { index, .. }) = exprs.get(col) {
+                scan_targets(input, *index, out);
+            }
+        }
+        P::Join {
+            left,
+            right,
+            left_cols,
+            ..
+        } => {
+            if col < *left_cols {
+                scan_targets(left, col, out);
+            } else {
+                scan_targets(right, col - left_cols, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a bloom over the build keys is worth deriving at all. Hashing the
+/// whole build side is the filter's own cost, and the probe scan's per-row
+/// range/bloom test is a second one, so only a small build pays: it is the
+/// case where the bloom rejects nearly every probe row. The measurements are
+/// blunt about the rest — every TPC-H join with a build side above ten thousand
+/// rows got slower with a filter, whatever the probe size, because the scan's
+/// per-row test then costs more than the rows it saves (the join still has to
+/// hash the surviving rows). DuckDB reaches the same conclusion per operator
+/// (`PushdownFilter` exists only where the build side is the smaller one).
+fn filter_pays(build_rows: f64) -> bool {
+    const SMALL_BUILD: f64 = 10_000.0;
+    build_rows <= SMALL_BUILD
 }
 
 #[derive(Clone)]
@@ -550,6 +664,7 @@ impl<'a> Cx<'a> {
             dml_ctes,
             session: db.session.clone(),
             outer_rows: Vec::new(),
+            dynamic: std::sync::Arc::new(DynamicFilters::default()),
         }
     }
 
@@ -587,6 +702,24 @@ impl<'a> Cx<'a> {
                 rows.push(row);
                 rows
             },
+            dynamic: self.dynamic.clone(),
+        }
+    }
+
+    /// Whether this statement may prune probe scans with join filters. The
+    /// `join_filter_pushdown` session variable turns it off; kept as a
+    /// debugging and differential-testing switch, never as a hint that
+    /// changes a result.
+    pub(crate) fn join_filter_pushdown(&self) -> bool {
+        match self.session.get("join_filter_pushdown") {
+            None => true,
+            Some(Value::Boolean(b)) => b,
+            Some(Value::Bigint(n)) => n != 0,
+            Some(Value::Varchar(s)) => !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "off" | "false" | "no"
+            ),
+            Some(_) => true,
         }
     }
 
@@ -644,6 +777,21 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
     Ok(QueryResult::SetVariable {
         name: name.to_string(),
     })
+}
+
+/// Recompute catalog statistics exactly for one table, or for every table of
+/// `dbname` when `table` is `None` (wave 122). Statistics are advisory: this
+/// touches no rows, writes no WAL record, and the next checkpoint persists
+/// the result.
+fn analyze_tables(db: &mut PinkDb, dbname: &str, table: Option<&str>) -> Result<usize> {
+    let names = match table {
+        Some(name) => vec![name.to_string()],
+        None => db.list_tables_in(dbname),
+    };
+    for name in &names {
+        db.table_mut_in(dbname, name)?.analyze();
+    }
+    Ok(names.len())
 }
 
 /// The shared gate for the statements that load native code (`LOAD EXTENSION`,
@@ -720,12 +868,10 @@ fn store_materialized_view(db: &mut PinkDb, target: &str, name: &str, out: &Outp
         db.create_table_in(target, name, schema.clone())?;
     } else {
         // Same schema: clear in place (the chunk layout and column metadata,
-        // including any indexes, survive).
+        // including any indexes, survive). `clear_rows` also resets the
+        // statistics a refresh replaces wholesale (wave 122).
         let t = db.table_mut_in(target, name)?;
-        t.num_rows = 0;
-        for col in &mut t.columns {
-            col.chunks = vec![std::sync::Arc::new(Vector::new_empty(col.dtype))];
-        }
+        t.clear_rows();
         t.invalidate_indexes();
     }
     let t = db.table_mut_in(target, name)?;
@@ -1598,6 +1744,15 @@ pub(crate) fn run_plain(
             }
             Ok(QueryResult::Checkpointed)
         }
+        LogicalPlan::Analyze { db: adb, table } => {
+            analyze_tables(db, adb, table.as_deref())?;
+            // DuckDB-shaped outcome: one BOOLEAN row.
+            Ok(QueryResult::Selected {
+                names: vec!["Success".to_string()],
+                types: vec![crate::types::DataType::Boolean],
+                rows: vec![vec![crate::types::Value::Boolean(true)]],
+            })
+        }
         LogicalPlan::LoadExtension { path } => {
             if db.replaying {
                 // WAL replay (hazard H5): a recorded path is never loaded on
@@ -2063,14 +2218,67 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 
 /// Every stored chunk of `t`, in order (columns shared by `Arc`, never
 /// copied).
-fn scan_chunks(t: &DataTable) -> Vec<DataChunk> {
-    let mut chunks = Vec::with_capacity(t.num_chunks());
-    for i in 0..t.num_chunks() {
-        if let Some(c) = t.scan_chunk(i) {
-            chunks.push(c);
+/// The chunks of `t` selected by `keep` (`None` reads every chunk).
+fn scan_chunks_of(t: &DataTable, keep: Option<&[usize]>) -> Vec<DataChunk> {
+    match keep {
+        None => {
+            let mut chunks = Vec::with_capacity(t.num_chunks());
+            for i in 0..t.num_chunks() {
+                if let Some(c) = t.scan_chunk(i) {
+                    chunks.push(c);
+                }
+            }
+            chunks
+        }
+        Some(keep) => keep.iter().filter_map(|&i| t.scan_chunk(i)).collect(),
+    }
+}
+
+/// The chunks of `t` whose stored zone maps leave every simple predicate
+/// satisfiable (wave 122). `None` means nothing prunes — read everything.
+///
+/// Only whole-chunk proofs skip a chunk: a predicate the zones cannot answer
+/// keeps it. Static `WHERE` conjuncts and the bounds of a join filter derived
+/// from a completed build side are treated the same way; the bloom has no
+/// chunk-level form (it filters probe rows in the join).
+fn scan_candidates(
+    t: &DataTable,
+    prunes: &[PrunePredicate],
+    dynamic: &[(usize, std::sync::Arc<crate::stats::JoinFilter>)],
+) -> Option<Vec<usize>> {
+    let ncols = t.num_cols();
+    let prunes: Vec<&PrunePredicate> = prunes
+        .iter()
+        .filter(|p| p.path.is_none() && p.column < ncols)
+        .collect();
+    let dynamic: Vec<&(usize, std::sync::Arc<crate::stats::JoinFilter>)> =
+        dynamic.iter().filter(|(col, _)| *col < ncols).collect();
+    if prunes.is_empty() && dynamic.is_empty() {
+        return None;
+    }
+    let mut keep = Vec::with_capacity(t.num_chunks());
+    for chunk in 0..t.num_chunks() {
+        let Some(c) = t.scan_chunk(chunk) else {
+            continue;
+        };
+        let rows = c.num_rows() as u64;
+        let static_ok = prunes.iter().all(|p| {
+            t.zone(p.column, chunk)
+                .may_match(rows, p.op, p.value.as_ref())
+        });
+        if !static_ok {
+            continue;
+        }
+        let dynamic_ok = dynamic.iter().all(|(col, f)| {
+            let zone = t.zone(*col, chunk);
+            zone.may_match(rows, PruneOp::GtEq, f.min.as_ref())
+                && zone.may_match(rows, PruneOp::LtEq, f.max.as_ref())
+        });
+        if dynamic_ok {
+            keep.push(chunk);
         }
     }
-    chunks
+    Some(keep)
 }
 
 /// Evaluate one `Scan` plan node.
@@ -2093,14 +2301,26 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     }
     let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
     let projected = cx.projections.for_scan(plan);
+    // Join filters a completed build side registered for this scan (wave 122).
+    let dynamic = cx.dynamic.for_scan(plan);
     if let Some((_, lake)) = cx.db.attached_lookup(lookup, table) {
         // The simple `WHERE` conjuncts this scan may be pruned by (analyzed
         // with the projections). The lake decodes only the files whose zone
         // maps leave the predicate satisfiable.
-        let prunes = cx.prunes.for_scan(plan);
+        let mut prunes = cx.prunes.for_scan(plan).to_vec();
+        // A build side's key bounds prune files exactly like a literal range.
+        // Parquet has no bloom filter here, so only the bounds go.
+        for (col, f) in &dynamic {
+            if let Some(min) = &f.min {
+                prunes.push(PrunePredicate::compare(*col, PruneOp::GtEq, min.clone()));
+            }
+            if let Some(max) = &f.max {
+                prunes.push(PrunePredicate::compare(*col, PruneOp::LtEq, max.clone()));
+            }
+        }
         let scan = match at {
-            None => lake.load_filtered(lookup, table, projected, prunes)?,
-            Some(at) => lake.load_filtered_at(lookup, table, *at, projected, prunes)?,
+            None => lake.load_filtered(lookup, table, projected, &prunes)?,
+            Some(at) => lake.load_filtered_at(lookup, table, *at, projected, &prunes)?,
         };
         let (names, types) = scan.table.schema().into_iter().unzip();
         return Ok(Output {
@@ -2111,9 +2331,10 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     }
     let t = cx.db.table_in(lookup, table)?;
     let (names, types) = t.schema().into_iter().unzip();
+    let keep = scan_candidates(t, cx.prunes.for_scan(plan), &dynamic);
     let chunks = match projected {
-        Some(cols) => project_scan_chunks(t, cols),
-        None => scan_chunks(t),
+        Some(cols) => project_scan_chunks_of(t, cols, keep.as_deref()),
+        None => scan_chunks_of(t, keep.as_deref()),
     };
     cx.check_deadline()?;
     Ok(Output {
@@ -2398,10 +2619,17 @@ fn index_scan_output(
 /// emits it that way); an out-of-range index falls back to a full scan,
 /// mirroring the lake reader's always-correct fallback. An empty `cols`
 /// still materializes column 0: a chunk carries its shape on its columns.
+#[cfg(test)]
 fn project_scan_chunks(t: &DataTable, cols: &[usize]) -> Vec<DataChunk> {
+    project_scan_chunks_of(t, cols, None)
+}
+
+/// [`project_scan_chunks`] over the chunks `keep` selects (`None` reads every
+/// chunk; a zone-map pruned scan passes the surviving indices).
+fn project_scan_chunks_of(t: &DataTable, cols: &[usize], keep: Option<&[usize]>) -> Vec<DataChunk> {
     let ncols = t.num_cols();
     if cols.iter().any(|&i| i >= ncols) {
-        return scan_chunks(t);
+        return scan_chunks_of(t, keep);
     }
     let mut present = vec![false; ncols];
     for &i in cols {
@@ -2411,7 +2639,7 @@ fn project_scan_chunks(t: &DataTable, cols: &[usize]) -> Vec<DataChunk> {
         present[0] = true;
     }
     if present.iter().all(|&p| p) {
-        return scan_chunks(t);
+        return scan_chunks_of(t, keep);
     }
     let absent: Vec<Option<std::sync::Arc<Vector>>> = t
         .columns
@@ -2419,8 +2647,12 @@ fn project_scan_chunks(t: &DataTable, cols: &[usize]) -> Vec<DataChunk> {
         .enumerate()
         .map(|(i, c)| (!present[i]).then(|| std::sync::Arc::new(Vector::new_empty(c.dtype))))
         .collect();
-    let mut chunks = Vec::with_capacity(t.num_chunks());
-    for i in 0..t.num_chunks() {
+    let selected: Vec<usize> = match keep {
+        Some(keep) => keep.to_vec(),
+        None => (0..t.num_chunks()).collect(),
+    };
+    let mut chunks = Vec::with_capacity(selected.len());
+    for i in selected {
         let Some(chunk) = t.scan_chunk(i) else {
             continue;
         };
@@ -2633,6 +2865,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
         | LogicalPlan::Checkpoint
+        | LogicalPlan::Analyze { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::CreateIndex { .. }
@@ -3001,7 +3234,9 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types: vec![DataType::Varchar],
             })
         }
-        LogicalPlan::Values { rows, names, types } => {
+        LogicalPlan::Values {
+            rows, names, types, ..
+        } => {
             // Constant rows: each expression evaluates against the empty
             // one-row scope, so only literals (and casts of them) are legal
             // here — the binder guarantees it.
@@ -3058,8 +3293,57 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // A key expression may hold a subquery: evaluate it once, on this
             // thread, before the join's own parallel probing starts.
             expr::prime(cx, left_keys.iter().chain(right_keys.iter()))?;
-            let l = eval(cx, left)?;
-            let r = eval(cx, right)?;
+            let build_left = build_on_left(cx, *kind, left, right);
+            // Dynamic join filters (wave 122): once the build side is
+            // complete, its key bounds and bloom prune the probe side's scans
+            // before they run. Only INNER and SEMI may drop a probe row that
+            // the bloom rejects — a probe row without a match is exactly what
+            // they discard. LEFT/RIGHT/FULL must emit every preserved row and
+            // ANTI/MARK must still answer "no match", so they keep both sides
+            // unfiltered.
+            let dynamic =
+                matches!(kind, JoinKind::Inner | JoinKind::Semi) && cx.join_filter_pushdown();
+            let (l, r, filters) = if dynamic {
+                let (build_plan, build_keys, probe_plan, probe_keys) = if build_left {
+                    (left, left_keys, right, right_keys)
+                } else {
+                    (right, right_keys, left, left_keys)
+                };
+                let build = eval(cx, build_plan)?;
+                let build_rows: f64 = build.chunks.iter().map(|c| c.num_rows() as f64).sum();
+                // Derive only where a filter can pay: the probe side must
+                // reach a scan through the key's lineage (otherwise the bloom
+                // is built and never read), and the build must be much smaller
+                // than that scan (see `filter_pays`).
+                let reachable = probe_keys.iter().any(|key| match key {
+                    BoundExpr::Column { index, .. } => {
+                        let mut targets = Vec::new();
+                        scan_targets(probe_plan, *index, &mut targets);
+                        !targets.is_empty()
+                    }
+                    _ => false,
+                });
+                let worth = reachable && filter_pays(build_rows);
+                let filters = if worth {
+                    Some(derive_join_filters(cx, &build, build_plan, probe_keys, build_keys)?)
+                } else {
+                    None
+                };
+                let frame = match &filters {
+                    Some(filters) => cx.dynamic.push_plan(probe_plan, probe_keys, filters),
+                    None => cx.dynamic.push_plan(probe_plan, probe_keys, &[]),
+                };
+                let probe = eval(cx, probe_plan);
+                cx.dynamic.pop(frame);
+                let probe = probe?;
+                if build_left {
+                    (build, probe, filters)
+                } else {
+                    (probe, build, filters)
+                }
+            } else {
+                (eval(cx, left)?, eval(cx, right)?, None)
+            };
             let mut names = l.names.clone();
             let mut types = l.types.clone();
             // Semi/anti emit the left schema only; mark appends its marker.
@@ -3082,13 +3366,33 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 chunks: &r.chunks,
                 types: &r.types,
             };
-            let chunks = if build_on_left(cx, *kind, left, right) {
+            let chunks = if build_left {
                 // The estimated-smaller left side feeds the match table and
                 // the right side probes it: output rows are right-row major,
                 // the probe side's deterministic order.
-                hash_join_probe(cx, rside, lside, right_keys, left_keys, true, false, false)?
+                hash_join_probe(
+                    cx,
+                    rside,
+                    lside,
+                    right_keys,
+                    left_keys,
+                    true,
+                    false,
+                    false,
+                    filters.as_deref(),
+                )?
             } else {
-                hash_join(cx, lside, rside, *kind, left_keys, right_keys)?
+                // INNER with the build side on the right, or SEMI: the usual
+                // probe-left path, carrying the filters when they were built.
+                hash_join(
+                    cx,
+                    lside,
+                    rside,
+                    *kind,
+                    left_keys,
+                    right_keys,
+                    filters.as_deref(),
+                )?
             };
             Ok(Output {
                 chunks,
@@ -3304,6 +3608,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     dml_ctes: cx.dml_ctes.clone(),
                     session: cx.session.clone(),
                     outer_rows: cx.outer_rows.clone(),
+                    dynamic: cx.dynamic.clone(),
                 };
                 return eval(&child, body);
             }
@@ -3341,6 +3646,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         dml_ctes: cx.dml_ctes.clone(),
                         session: cx.session.clone(),
                         outer_rows: cx.outer_rows.clone(),
+                        dynamic: cx.dynamic.clone(),
                     };
                     let produced = eval(&child, &step.step)?;
                     let fresh = if step.all {
@@ -3382,6 +3688,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 dml_ctes: cx.dml_ctes.clone(),
                 session: cx.session.clone(),
                 outer_rows: cx.outer_rows.clone(),
+                dynamic: cx.dynamic.clone(),
             };
             eval(&child, body)
         }
@@ -3938,8 +4245,9 @@ struct JoinSide<'a> {
 /// - `Scan` → the store/attached table's row count (a CTE scan: the rows its
 ///   query materialized);
 /// - `Limit(n)` → `min(input, n)`; `SingleRow` → 1;
-/// - `Filter`/`Sort`/`Distinct`/`Project`/`Window` → the input's estimate
-///   (a filter's selectivity is unknown, so it is estimated at 1.0);
+/// - `Filter` → the input's estimate times the predicate's selectivity from
+///   catalog statistics (1.0 when they cannot answer);
+/// - `Sort`/`Distinct`/`Project`/`Window` → the input's estimate;
 /// - `Union` → the sum of both branches.
 ///
 /// Anything else (`Aggregate`, `Join`, subquery shapes) is `None`: an
@@ -3969,8 +4277,12 @@ fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
                 .map(|t| t.num_rows() as u64)
         }
         LogicalPlan::SingleRow => Some(1),
-        LogicalPlan::Filter { input, .. }
-        | LogicalPlan::Sort { input, .. }
+        LogicalPlan::Filter { input, predicate } => {
+            let rows = estimate_rows(cx, input)? as f64;
+            let sel = crate::optimizer::filter_selectivity(cx.db, input, predicate);
+            Some((rows * sel).round().max(0.0) as u64)
+        }
+        LogicalPlan::Sort { input, .. }
         | LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Window { input, .. } => estimate_rows(cx, input),
@@ -4020,26 +4332,30 @@ fn hash_join(
     kind: JoinKind,
     left_keys: &[BoundExpr],
     right_keys: &[BoundExpr],
+    filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
 ) -> Result<Vec<DataChunk>> {
     // The preserved side is the probing side: left for Inner/Left/Full, right
     // for Right. `preserved_is_right` places it in the declared left ++ right
     // output order; `extend_unmatched` turns unmatched preserved rows into
     // NULL-extended rows (outer) instead of dropping them (inner).
+    // Only an inner or semi join accepts probe filters: every other shape
+    // owes its probe rows an output (or a "no match" answer).
+    debug_assert!(filters.is_none() || matches!(kind, JoinKind::Inner | JoinKind::Semi));
     match kind {
-        JoinKind::Inner => {
-            hash_join_probe(cx, left, right, left_keys, right_keys, false, false, false)
-        }
-        JoinKind::Left => {
-            hash_join_probe(cx, left, right, left_keys, right_keys, false, true, false)
-        }
-        JoinKind::Right => {
-            hash_join_probe(cx, right, left, right_keys, left_keys, true, true, false)
-        }
-        JoinKind::Full => {
-            hash_join_probe(cx, left, right, left_keys, right_keys, false, true, true)
-        }
+        JoinKind::Inner => hash_join_probe(
+            cx, left, right, left_keys, right_keys, false, false, false, filters,
+        ),
+        JoinKind::Left => hash_join_probe(
+            cx, left, right, left_keys, right_keys, false, true, false, None,
+        ),
+        JoinKind::Right => hash_join_probe(
+            cx, right, left, right_keys, left_keys, true, true, false, None,
+        ),
+        JoinKind::Full => hash_join_probe(
+            cx, left, right, left_keys, right_keys, false, true, true, None,
+        ),
         JoinKind::Semi | JoinKind::Anti | JoinKind::Mark => {
-            hash_mark_join(cx, left, right, left_keys, right_keys, kind)
+            hash_mark_join(cx, left, right, left_keys, right_keys, kind, filters)
         }
         // Cross joins never reach the hash path (the binder emits a
         // condition-less nested loop).
@@ -4071,6 +4387,7 @@ fn hash_mark_join(
     left_keys: &[BoundExpr],
     right_keys: &[BoundExpr],
     kind: JoinKind,
+    filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
 ) -> Result<Vec<DataChunk>> {
     let mark = kind == JoinKind::Mark;
     if left_keys.is_empty() {
@@ -4078,14 +4395,10 @@ fn hash_mark_join(
             "internal: semi/anti/mark join without keys".to_string(),
         ));
     }
-    let ints = left_keys.len() == 1
-        && is_int_key(left_keys[0].dtype())
-        && is_int_key(right_keys[0].dtype());
-    let commons: Vec<Option<DataType>> = left_keys
-        .iter()
-        .zip(right_keys.iter())
-        .map(|(l, r)| common_numeric(l.dtype(), r.dtype()).ok())
-        .collect();
+    // A rejected probe row is a "no match"; only SEMI turns that into "drop
+    // the row". ANTI and MARK still have to answer for it.
+    debug_assert!(filters.is_none() || kind == JoinKind::Semi);
+    let (ints, commons) = key_encoding(left_keys, right_keys);
     let build_rows: usize = right.chunks.iter().map(|c| c.num_rows()).sum();
     let table = MatchTable::build(
         cx,
@@ -4146,6 +4459,16 @@ fn hash_mark_join(
             let mut cur_rows = 0usize;
             let mut buf = Vec::new();
             for i in 0..chunk.num_rows() {
+                // Build keys the bloom rejects cannot match, and a SEMI join
+                // emits nothing for them (wave 122).
+                if let Some(filters) = filters
+                    && !filters
+                        .iter()
+                        .zip(kvs.iter())
+                        .all(|(f, kv)| f.may_match(kv, i))
+                {
+                    continue;
+                }
                 let null_key = kvs.iter().any(|kv| kv.is_null(i));
                 let hit = !null_key
                     && if ints {
@@ -4231,6 +4554,59 @@ fn hash_mark_join(
 /// an unmatched preserved row emits its own columns plus NULLs for the other
 /// side. Probe order and per-key build-row order are deterministic (left-row
 /// order for Inner/Left/Full, right-row order for Right).
+/// How a hash join canonicalizes its key pairs: whether it takes the
+/// i64-specialized path, and the common type each pair widens to otherwise.
+/// The int check and common-type resolution are symmetric in the two key
+/// dtypes, so the build side's filter derivation can use the same answer as
+/// the match table.
+fn key_encoding(
+    preserved_keys: &[BoundExpr],
+    build_keys: &[BoundExpr],
+) -> (bool, Vec<Option<DataType>>) {
+    let ints = preserved_keys.len() == 1
+        && is_int_key(preserved_keys[0].dtype())
+        && is_int_key(build_keys[0].dtype());
+    let commons = preserved_keys
+        .iter()
+        .zip(build_keys.iter())
+        .map(|(p, b)| common_numeric(p.dtype(), b.dtype()).ok())
+        .collect();
+    (ints, commons)
+}
+
+/// Filters for the probe keys from a completed build side (wave 122): the
+/// build keys' bounds and a blocked bloom over their canonical encodings. The
+/// build keys are normalized exactly as [`MatchTable::build`] does it, so a
+/// probe cell is compared and hashed in the same form.
+fn derive_join_filters(
+    cx: &Cx,
+    build: &Output,
+    build_plan: &LogicalPlan,
+    preserved_keys: &[BoundExpr],
+    build_keys: &[BoundExpr],
+) -> Result<Vec<std::sync::Arc<crate::stats::JoinFilter>>> {
+    let (ints, commons) = key_encoding(preserved_keys, build_keys);
+    let rows: u64 = build.chunks.iter().map(|c| c.num_rows() as u64).sum();
+    let mut filters = Vec::with_capacity(build_keys.len());
+    for (i, key) in build_keys.iter().enumerate() {
+        // Bloom size from the catalog's exact distinct estimate: the row count
+        // is only an upper bound and over-allocates a skewed key.
+        let distinct = match key {
+            BoundExpr::Column { index, .. } => {
+                crate::optimizer::estimate_distinct(cx.db, build_plan, *index)
+            }
+            _ => None,
+        };
+        let mut builder = crate::stats::JoinFilterBuilder::new(key.dtype(), distinct, rows);
+        for chunk in &build.chunks {
+            let kv = eval_join_key(cx, key, chunk, commons[i], ints)?;
+            builder.push(&kv);
+        }
+        filters.push(std::sync::Arc::new(builder.finish()));
+    }
+    Ok(filters)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hash_join_probe(
     cx: &Cx,
@@ -4241,21 +4617,9 @@ fn hash_join_probe(
     preserved_is_right: bool,
     extend_unmatched: bool,
     full: bool,
+    filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
 ) -> Result<Vec<DataChunk>> {
-    // Integer-payload keys take the i64-specialized match table: no byte
-    // encoding and no `coerce_to` (INTEGER=BIGINT widens per cell). Every
-    // other shape (VARCHAR, DOUBLE, mixed numeric, composite keys) keeps the
-    // byte path, canonicalizing each key pair to its common numeric type
-    // first. The int check and common-type resolution are symmetric in the
-    // two key dtypes.
-    let ints = preserved_keys.len() == 1
-        && is_int_key(preserved_keys[0].dtype())
-        && is_int_key(build_keys[0].dtype());
-    let commons: Vec<Option<DataType>> = preserved_keys
-        .iter()
-        .zip(build_keys.iter())
-        .map(|(p, b)| common_numeric(p.dtype(), b.dtype()).ok())
-        .collect();
+    let (ints, commons) = key_encoding(preserved_keys, build_keys);
     let build_rows: usize = build.chunks.iter().map(|c| c.num_rows()).sum();
     if build_rows > u32::MAX as usize {
         return Err(PinkDbError::Execution(
@@ -4316,6 +4680,19 @@ fn hash_join_probe(
             let mut cur_rows = 0usize;
             let mut buf = Vec::new();
             for i in 0..chunk.num_rows() {
+                // A row the build side's bloom rules out cannot match, so it is
+                // dropped before any of its columns are materialized (wave
+                // 122). Filters are only set for an INNER join, where no
+                // preserved row is owed an output.
+                if let Some(filters) = filters
+                    && !filters
+                        .iter()
+                        .zip(kvs.iter())
+                        .all(|(f, kv)| f.may_match(kv, i))
+                {
+                    debug_assert!(!extend_unmatched);
+                    continue;
+                }
                 let null_key = kvs.iter().any(|kv| kv.is_null(i));
                 let head = if null_key {
                     if !extend_unmatched {
@@ -6663,6 +7040,10 @@ fn explain_into(
             format!("LoadInstalledExtension {name}")
         }
         LogicalPlan::Checkpoint => "Checkpoint".to_string(),
+        LogicalPlan::Analyze { db, table } => match table {
+            Some(t) => format!("Analyze {}.{t}", db),
+            None => format!("Analyze {db}"),
+        },
         LogicalPlan::ShowTables { db } => format!("ShowTables {db}"),
         LogicalPlan::ShowDatabases => "ShowDatabases".to_string(),
         LogicalPlan::Describe { columns } => format!("Describe ({} cols)", columns.len()),
@@ -13398,7 +13779,8 @@ mod tests {
         assert!(db.execute("SELECT CAST(s AS INTEGER) FROM t;").is_err());
     }
 
-    /// The estimation rule, node by node (no statistics — shapes only).
+    /// The estimation rule, node by node (catalog statistics when they
+    /// answer, shapes otherwise).
     #[test]
     fn row_estimates_are_shape_based() {
         let db = wide_table();
@@ -14122,6 +14504,109 @@ mod tests {
                 "SELECT c.cid FROM c JOIN d2.p AS x ON c.pid = x.id;"
             ),
             vec![vec![V::Integer(7)]]
+        );
+    }
+
+    // ---------- wave 122: zone maps ----------
+
+    /// Zone maps prune whole chunks, so the interesting rows are the first and
+    /// last of a chunk and the chunks that hold no non-NULL value at all: a
+    /// NULL never satisfies a comparison, and a bound that only *touches* the
+    /// literal still has to keep the chunk.
+    #[test]
+    fn zone_maps_skip_chunks_at_boundaries_and_null_only_chunks() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (k INTEGER);").unwrap();
+        {
+            let t = db.table_mut_in("main", "t").unwrap();
+            let chunk = |values: &[Option<i32>]| -> std::sync::Arc<Vector> {
+                let mut v = Vector::with_capacity(DataType::Integer, values.len());
+                for value in values {
+                    match value {
+                        Some(x) => v.push_valid(V::Integer(*x)).unwrap(),
+                        None => v.push_null().unwrap(),
+                    }
+                }
+                std::sync::Arc::new(v)
+            };
+            let nulls = vec![None; CHUNK_SIZE];
+            let low: Vec<Option<i32>> = (0..CHUNK_SIZE as i32).map(Some).collect();
+            let high: Vec<Option<i32>> = (5000..5000 + CHUNK_SIZE as i32).map(Some).collect();
+            for values in [&nulls, &low, &high] {
+                t.append_shared_chunk(&[chunk(values)]).unwrap();
+            }
+        }
+        let t = db.table_in("main", "t").unwrap();
+        assert_eq!(t.num_chunks(), 3);
+        let kept = |prunes: &[PrunePredicate]| -> Vec<usize> {
+            scan_candidates(t, prunes, &[]).unwrap_or_default()
+        };
+        // Every chunk satisfies `k >= 0` except the NULL-only one, and the
+        // last row of chunk 1 is the boundary `k >= 2047` still keeps.
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::GtEq, V::Integer(0))]),
+            vec![1, 2]
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::GtEq, V::Integer(2047))]),
+            vec![1, 2]
+        );
+        // 2048 is past chunk 1's maximum, so only chunk 2 can match.
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::GtEq, V::Integer(2048))]),
+            vec![2]
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::Lt, V::Integer(0))]),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::Eq, V::Integer(2047))]),
+            vec![1]
+        );
+        // The boundary row decides: chunk 1 holds 0..=2047, so `< 0` cannot
+        // match it while `<= 0` can, and `> 2047` cannot while `>= 2047` can.
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::Lt, V::Integer(0))]),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::LtEq, V::Integer(0))]),
+            vec![1]
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::Gt, V::Integer(2047))]),
+            vec![2]
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::GtEq, V::Integer(2047))]),
+            vec![1, 2]
+        );
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::Eq, V::Integer(7047))]),
+            vec![2]
+        );
+        // A literal no chunk can hold prunes every chunk; none of the above
+        // may skip a chunk that could match.
+        assert_eq!(
+            kept(&[PrunePredicate::compare(0, PruneOp::Eq, V::Integer(9000))]),
+            Vec::<usize>::new()
+        );
+        // The dynamic filter's bounds prune exactly like a literal range
+        // (wave 122): a build side holding 0..=100 rejects chunk 2's 5000..,
+        // keeps chunk 1, and the NULL-only chunk is provably empty for any
+        // comparison (a NULL key never matches).
+        let mut builder =
+            crate::stats::JoinFilterBuilder::new(DataType::Integer, Some(101), CHUNK_SIZE as u64);
+        let mut build = Vector::with_capacity(DataType::Integer, 101);
+        for i in 0..=100 {
+            build.push_valid(V::Integer(i)).unwrap();
+        }
+        builder.push(&build);
+        let filter = std::sync::Arc::new(builder.finish());
+        assert_eq!(
+            scan_candidates(t, &[], &[(0, filter.clone())]).unwrap_or_default(),
+            vec![1]
         );
     }
 }

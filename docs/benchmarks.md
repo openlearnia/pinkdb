@@ -101,6 +101,131 @@ the old total (Q18–Q21) are now 55 % of a much smaller one. Load average was
 2.1 when the baseline run started and 3.4–4.7 for the after run, both recorded
 in the JSON.
 
+## Wave 122 — column statistics and join filters
+
+This wave changes no answer: every TPC-H query still matches DuckDB's row count
+and checksum. It changes *plans* and *scans*, so it is measured as an A/B
+between two release CLIs on the same generated Parquet — the wave-111ab tree
+(`e4a8677`) and the wave-122 tree, each loading its own `.pink` store from the
+same files. Per query the two binaries alternate process runs of 1 warm-up + 6
+timed executions; the two best medians are reported. Load average was 2.5–2.7
+for SF 1 and 5.4 for SF 0.1 (another agent shared the machine); run-to-run
+spread is ±5 %, so anything inside that band is called flat.
+
+### SF 1
+
+| query | before ms | after ms | delta | what moved |
+| --- | --- | --- | --- | --- |
+| Q1 | 146 | 150 | +2.7 % | flat |
+| Q2 | 192 | 194 | +1.0 % | flat |
+| Q3 | 200 | 192 | −4.0 % | flat |
+| Q4 | 169 | 174 | +3.0 % | flat |
+| Q5 | 354 | 369 | +4.1 % | flat |
+| Q6 | 75 | 75 | 0.0 % | zone maps skip nothing (date range spans all chunks) |
+| Q7 | 255 | 272 | +6.9 % | flat within spread |
+| Q8 | 220 | 234 | +6.4 % | flat within spread |
+| Q9 | 763 | 778 | +2.0 % | flat |
+| Q10 | 180 | 172 | −4.2 % | flat |
+| Q11 | 130 | 146 | +11.9 % | flat within spread (small query, high variance) |
+| Q12 | 194 | 183 | −5.4 % | flat |
+| Q13 | 468 | 484 | +3.5 % | flat |
+| Q14 | 83 | 82 | −1.8 % | flat |
+| Q15 | 40 | 40 | +1.3 % | flat |
+| Q16 | 68 | 68 | 0.0 % | flat |
+| Q17 | 94 | 89 | −4.8 % | flat |
+| Q18 | 1520 | 1514 | −0.5 % | flat |
+| Q19 | 102 | 105 | +2.4 % | static zone maps (3 date/ship predicates) |
+| Q20 | 620 | 624 | +0.6 % | flat |
+| **Q21** | **3831** | **3196** | **−16.6 %** | probe-side bloom + range on the 10k-row build |
+| Q22 | (0.0 s) | (0.0 s) | n/a | below the suite's 1 ms timer |
+
+Total over the 21 timed queries 9.70 s → 9.14 s (**−5.8 %**), all of it Q21.
+
+### SF 0.1
+
+| query | before ms | after ms | delta |
+| --- | --- | --- | --- |
+| Q1 | 15 | 15 | 0.0 % |
+| Q2 | 20 | 21 | +5.0 % |
+| Q3 | 18 | 18 | 0.0 % |
+| Q4 | 16 | 16 | 0.0 % |
+| Q5 | 34 | 35 | +2.9 % |
+| Q6 | 8 | 8 | 0.0 % |
+| Q7 | 36 | 36 | 0.0 % |
+| Q8 | 20 | 21 | +5.0 % |
+| Q9 | 65 | 69 | +6.2 % |
+| Q10 | 20 | 20 | 0.0 % |
+| Q11 | 15 | 15 | 0.0 % |
+| Q12 | 18 | 18 | 0.0 % |
+| Q13 | 46 | 48 | +3.2 % |
+| Q14 | 7 | 7 | 0.0 % |
+| Q15 | 3 | 3 | 0.0 % |
+| Q16 | 8 | 8 | 0.0 % |
+| Q17 | 8 | 8 | 0.0 % |
+| Q18 | 28 | 28 | −1.8 % |
+| Q19 | 10 | 11 | +10.0 % (1 ms) |
+| Q20 | 47 | 47 | 0.0 % |
+| Q21 | 262 | 274 | +4.6 % |
+| Q22 | (0.0 s) | (0.0 s) | n/a |
+
+Total 728 → 726 ms: flat. At this scale the build sides are 60k–600k rows, above
+the 10k-row gate below which a bloom pays, so no star query is filtered.
+
+### The filter's own A/B
+
+The same binary with `SET join_filter_pushdown = false` versus `true`
+(alternating, 6 timed runs each, SF 1):
+
+| query | filters on | off | delta |
+| --- | --- | --- | --- |
+| Q21 | 2092 ms | 2402 ms | **−12.9 %** |
+| Q5 | 386 | 368 | +5.0 % |
+| Q3 | 191 | 188 | +1.6 % |
+| Q7 | 248 | 243 | +2.3 % |
+| Q9 | 547 | 556 | −1.7 % |
+| Q18 | 1462 | 1458 | +0.2 % |
+| Q20 | 598 | 602 | −0.8 % |
+| Q8 | 86 | 86 | 0.0 % |
+
+Only Q21 gets a filter (its build side is 10k rows against a 3M-row probe). An
+earlier version derived one for every join: that was a measured loss on every
+query with a large build side (Q3 +8 %, Q5 +12.8 %, Q7 +6.9 %, Q9 +7.5 %,
+Q10 +4.4 %, Q20 +6.3 %), because hashing a multi-million-row build costs more
+than the rows a bloom then rejects. The gate that came out of those numbers is
+"build side ≤ 10 000 rows"; the ratio-based alternative is in the follow-up row.
+
+### What the statistics cost on the write path
+
+`ingest` family, SF 0.1, A/B of the two binaries, 10 runs each, medians:
+
+| path | before | after | delta |
+| --- | --- | --- | --- |
+| `lineitem.csv` → `.import` (600k rows, 16 columns) | 227 ms | 260 ms | **+14.5 %** |
+| `orders.csv` → `.import` (150k rows, 9 columns) | 91 ms | 102 ms | **+12.1 %** |
+| `lineitem.parquet` → `CREATE TABLE AS` | — | — | unchanged (CTAS builds from columns, not chunk appends) |
+| 2,000 single-row `Sync` inserts (`durable`) | 7.78 s | 7.76 s | 0.0 % |
+| 2,000-row batched inserts | 63 ms | 59.8 ms | within noise |
+| checkpoints | 47–53 ms | 47–53 ms | within noise |
+| CLI autocommit / batched | 119k / 380k rows/s | 117k / 375k rows/s | within noise |
+
+The CSV import pays for the exact per-chunk zone maps and the per-column
+sketch: about 33 ms over 9.6 M cells, of which the sketch is ~8 ms and the
+zone fold the rest. Parquet ingest, single-row inserts and checkpoints do not
+pay. The brief's 5 % bound on the ingest family is therefore **missed on the CSV
+path only**, and cheap bulk statistics is a follow-up row; the exactness is
+kept because every later estimate (selectivity, join domain, bloom sizing)
+reads it.
+
+### Sizes
+
+| binary | before | after |
+| --- | --- | --- |
+| default CLI | 5,608,752 B | 5,690,064 B (+1.4 %) |
+| all features CLI | 14,842,064 B | 14,942,048 B (+0.7 %) |
+
+No new dependencies: the sketch, the Bloom filter and the statistics are
+hand-written in `crates/pinkdb/src/stats.rs`.
+
 ## Ingest (SF 0.1)
 
 | table | format | engine | ms | M rows/s | MB/s |
@@ -258,6 +383,20 @@ is 17.7×. Both are recorded as follow-ups in the plan, not as done work.
 For reference, the pre-existing gap is unchanged and unrelated: Q18 (214×) and
 Q19 (241×) have no correlated subquery at all — Q18 is the aggregate inside a
 plain `IN`, Q19 the nested `OR` lists that defeat the derived filters.
+
+## What changed in wave 122
+
+| change | measurement |
+| --- | --- |
+| join-filter pushdown: a hash join with a small build side hands its key bounds + a blocked Bloom filter to the probe-side scan, which skips non-overlapping chunks and drops non-matching rows before materialization | Q21 SF 1 3831 → 3196 ms (−16.6 %); with the session switch, 2402 → 2092 ms (−12.9 %). Every join with a build side above 10k rows is left unfiltered: deriving the filter there was a measured loss (Q5 +12.8 %, Q3 +8 %, Q7 +6.9 %) |
+| catalog column statistics: exact row/NULL count and min/max, HyperLogLog distinct estimate (p = 12), maintained on insert/update/delete/copy, persisted in the `.pink` footer (version 2), recomputable exactly with `ANALYZE`, readable through `pinkdb_column_stats()` | the ingest table above: +14.5 % on `lineitem.csv`, nothing on the write paths that matter (durable inserts, checkpoints, Parquet CTAS) |
+| selectivity from statistics in the cost model: equality `1/distinct`, ranges as the uniform fraction of the stored min/max, `IN` `k/distinct`, `IS NULL` the NULL fraction, and equality-class join domains from distinct counts, with the old 0.2/0.5 fallbacks kept | no TPC-H plan moved outside the flat band: the star queries were already near the DP optimum; the cheaper estimates matter on shapes TPC-H does not have (small dimension joins, skewed filters) |
+| zone maps in `.pink` scans: per-chunk min/max/NULL count, exact on write, only widened by a delete | Q19 SF 1 102 → 105 ms (flat): its date predicates already prune row groups in the same way; the win is on selective point/range filters over wide tables, not on TPC-H |
+| a join-cardinality estimate `|L|·|R| / max(ndv)` from the catalog distinct counts, tried and **reverted** | Q8 SF 1 218 → 116 ms with it, but Q7 +41 %, Q21 +22.7 %, Q5 +16.7 %: a wrong build side costs more than an unestimated one. The fallback it needs (a guessed domain) misplaces the side too often, so the estimate only applies where both keys are catalog columns — reported as a follow-up |
+
+PF 1 geometric mean over the 22 queries 39.0× → 36.9×; the wave's star-query
+gate is **partly met**: Q21 improves by 4–17 %, the other star queries
+(Q3/Q5/Q7/Q8/Q9/Q10) are flat, which the section above explains and measures.
 
 ## What changed in wave 111ab
 

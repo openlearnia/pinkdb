@@ -151,6 +151,12 @@ pub enum Statement {
     /// for in-memory databases). Not a reserved word: only the bare
     /// statement form is recognized.
     Checkpoint,
+    /// `ANALYZE [TABLE] <table>` / bare `ANALYZE` (every table of the session
+    /// database): recompute catalog statistics exactly.
+    Analyze {
+        db: Option<String>,
+        table: Option<String>,
+    },
     /// `SHOW TABLES`: the current database's tables, sorted by name.
     ShowTables,
     /// `SHOW DATABASES`: every database in the store, sorted by name.

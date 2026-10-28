@@ -253,6 +253,7 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
         | ShowMacros
         | ShowTriggers { .. }
         | Use { .. }
+        | Analyze { .. }
         // Transaction control and session variables change no table by
         // themselves; every statement inside the transaction is checked.
         | Begin
@@ -737,17 +738,19 @@ fn statement_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) ->
 /// own error.
 fn read_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Option<String> {
     let allowed = policy.read_databases.as_deref();
-    // A table function or a bare path names no table to check, and it is how a
-    // file would be read, which an allow-list never permits. Asked before
-    // binding so a source whose function is not installed is still refused for
-    // the right reason.
-    if let Some(allowed) = allowed
-        && ast_scans_files(statement)
-    {
-        return Some(confined_read_hint(allowed));
-    }
     let session_db = db.current_db().to_string();
-    let (plan, _) = crate::sql::bind_tracked(db, statement, &session_db).ok()?;
+    let Ok((plan, _)) = crate::sql::bind_tracked(db, statement, &session_db) else {
+        // Nothing to check: the statement fails at bind time with its own
+        // error. A file source whose function is not installed is the
+        // exception — it must be refused for reading a file, not for an
+        // unknown function.
+        if let Some(allowed) = allowed
+            && ast_scans_files(statement)
+        {
+            return Some(confined_read_hint(allowed));
+        }
+        return None;
+    };
     let mut reads = std::collections::HashSet::new();
     crate::plan::collect_tables_read(&plan, &session_db, &mut reads);
     if let Some(allowed) = allowed {
@@ -797,12 +800,12 @@ fn external_reason(
     if policy.allow_files && policy.allow_external_services {
         return None;
     }
-    if !policy.allow_files && ast_scans_files(statement) {
-        return Some(FILES_HINT);
-    }
     let session_db = db.current_db().to_string();
     let Ok((plan, dynamic)) = crate::sql::bind_tracked(db, statement, &session_db) else {
-        return None;
+        // The bound plan is the sharper test; the syntax alone is all there is
+        // when a source's function is not installed, and reading files is
+        // still the reason to refuse it.
+        return (!policy.allow_files && ast_scans_files(statement)).then_some(FILES_HINT);
     };
     if !policy.allow_external_services
         && dynamic

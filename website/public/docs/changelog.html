@@ -193,6 +193,20 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-28">2026-10-28<a class="anchor" href="#2026-10-28" aria-label="Permalink: 2026-10-28">#</a></h2>
+<h3>Wave 122 — statistics and join-filter pushdown ✅</h3>
+<p>The optimizer now knows what is in a table, and a hash join can tell the scan under its probe side which rows cannot match. No query result changed; every answer is checked against DuckDB's rows.</p>
+<ul>
+<li><strong>Column statistics live in the catalog.</strong> Per column: exact row and NULL counts, min/max, and a hand-written HyperLogLog distinct estimate (4,096 registers, 1.6 % standard error, no new dependency); per 2,048-row chunk: its own bounds and NULL/NaN counts. They are maintained on every write path — INSERT, UPDATE, DELETE, COPY/import, CTAS, lake inlining — not recomputed by rescanning: a delete only widens the bounds when the deleted rows held one (as DuckDB does), and the sketch becomes an upper bound, which <code>pinkdb_column_stats()</code> reports as <code>stats_approximate</code>. <code>ANALYZE [TABLE] t</code> recomputes everything exactly.</li>
+<li><strong>They persist.</strong> The <code>.pink</code> footer (version 1 → 2) carries the sketches and the per-chunk zone maps, so <code>.open</code> restores statistics instead of hashing the data again.</li>
+<li><strong>You can see them.</strong> <code>SELECT * FROM pinkdb_column_stats(['db.]table')</code> returns database, table, column, data type, row count, NULL count, distinct, min, max and <code>stats_approximate</code> — for local tables and, for lake tables, the per-file statistics DuckLake already keeps.</li>
+<li><strong>The cost model uses them.</strong> Equality and <code>IN</code> selectivities come from the distinct estimate, ranges from the min/max spread, <code>IS [NOT] NULL</code> from the NULL count; equality-class domains take the smallest exact distinct. The fixed <code>0.2</code>/<code>0.5</code> defaults remain the fallback for columns without statistics, and the inner-join build-side choice now uses the same estimates.</li>
+<li><strong>Zone maps skip chunks.</strong> A <code>.pink</code> scan drops a chunk whose <code>[min,max]</code> cannot satisfy the filter, exact at the boundaries and for NULL-only chunks; lake Parquet row-group skipping already existed and now shares the predicates.</li>
+<li><strong>Join filters.</strong> An inner or semi hash join builds first, derives the build key's range and a blocked Bloom filter (2 probes, 1 % false positives, sized from the build key's distinct estimate), and hands them to the probe side before it runs: local scans skip chunks and test each row before reading its other columns, lake scans get the bounds as row-group predicates. Left/right/ full joins (they owe every preserved row an output) and anti/mark joins (a false positive would drop a surviving row) are excluded. <code>SET join_filter_pushdown = false</code> turns it off for debugging.</li>
+<li><strong>Measured.</strong> TPC-H SF 1 total 9.70 s → 9.14 s (−5.8 %), essentially all of it <strong>Q21 3,831 → 3,196 ms (−16.6 %)</strong>; the switch alone shows <strong>−12.9 %</strong> on that query. Q3/Q5/Q7/Q8/Q9/Q10 are flat (within ±7 %): their build sides are millions of rows, where a filter was measured slower, so <code>filter_pays</code> only filters a build of ≤ 10,000 rows. SF 0.1 flat (728 → 726 ms). CSV ingest pays 12–15 % for the exact fold (lineitem 227 → 260 ms); Parquet and durable inserts are unchanged — the 5 % write-path bound is missed on CSV only, and row 122a is opened for it. A statistics-driven join-cardinality estimate was tried and reverted (Q8 −47 % but Q7 +41 %, Q21 +23 %).</li>
+<li><strong>Size.</strong> Default CLI 5,608,752 → 5,690,064 B (+1.4 %), all-features 14,842,064 → 14,942,048 B (+0.7 %), no new dependencies.</li>
+<li><strong>Tests.</strong> New <code>crates/pinkdb/tests/stats.rs</code> (7): seeded random insert/update/delete against exact SQL recomputation, sketch error bound, persist/reload, <code>ANALYZE</code>, zone-map boundaries and NULL-only chunks, 330 differential join cases with filters on versus off, joins against DuckDB, and the catalog function. Late materialization measured and deferred to row 122b.</li>
+</ul>
 <h2 id="2026-10-27">2026-10-27<a class="anchor" href="#2026-10-27" aria-label="Permalink: 2026-10-27">#</a></h2>
 <h3>Wave 111ab — query planning and execution tuning ✅</h3>
 <p>Two roadmap rows in one wave: cost-based join ordering (111a) and the execution/subquery paths (111b). No SQL syntax was added and every TPC-H answer is row-for-row DuckDB's.</p>
@@ -965,6 +979,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-28">2026-10-28</a></li>
   <li><a href="#2026-10-27">2026-10-27</a></li>
   <li><a href="#2026-10-26">2026-10-26</a></li>
   <li><a href="#2026-10-25">2026-10-25</a></li>

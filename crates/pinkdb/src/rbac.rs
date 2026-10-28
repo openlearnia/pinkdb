@@ -1211,6 +1211,7 @@ fn read_checked(plan: &LogicalPlan) -> bool {
             | LogicalPlan::CreateDatabase { .. }
             | LogicalPlan::DropDatabase { .. }
             | LogicalPlan::Checkpoint
+            | LogicalPlan::Analyze { .. }
             | LogicalPlan::LoadExtension { .. }
             | LogicalPlan::InstallExtension { .. }
             | LogicalPlan::LoadInstalledExtension { .. }
@@ -1325,6 +1326,10 @@ pub(crate) fn check_statement(
             return admin_only("database management");
         }
         LogicalPlan::Checkpoint => return admin_only("CHECKPOINT"),
+        // ANALYZE rewrites optimizer statistics every session can read; keep
+        // it with the other maintenance statements instead of letting any
+        // SELECT grant reshape other sessions' plans.
+        LogicalPlan::Analyze { .. } => return admin_only("ANALYZE"),
         LogicalPlan::LoadExtension { .. } => return admin_only("LOAD EXTENSION"),
         LogicalPlan::InstallExtension { .. } => return admin_only("INSTALL"),
         LogicalPlan::LoadInstalledExtension { .. } => return admin_only("LOAD"),
@@ -1501,6 +1506,14 @@ fn check_table(
             store.rbac().display_of(principal)
         ),
     ))
+}
+
+/// Require `SELECT` on one table. A catalog function that folds a table's
+/// contents or statistics into a plan at bind time refuses through this, so it
+/// fails exactly as a scan of that table would.
+pub(crate) fn check_select(store: &PinkDb, principal: &str, db: &str, table: &str) -> Result<()> {
+    let qdb = Some(db.to_string());
+    check_table(store, principal, &qdb, table, db, Privilege::Select)
 }
 
 /// The statement text a committed statement is logged with. `CREATE/ALTER

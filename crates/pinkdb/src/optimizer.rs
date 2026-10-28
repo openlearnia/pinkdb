@@ -637,13 +637,19 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(fold_plan(db, *input)),
             on,
         },
-        LogicalPlan::Values { rows, names, types } => LogicalPlan::Values {
+        LogicalPlan::Values {
+            rows,
+            names,
+            types,
+            sources,
+        } => LogicalPlan::Values {
             rows: rows
                 .into_iter()
                 .map(|row| row.into_iter().map(|e| fold_expr(&cx, e)).collect())
                 .collect(),
             names,
             types,
+            sources,
         },
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
             input: Box::new(fold_plan(db, *input)),
@@ -1269,13 +1275,14 @@ fn leaf_of(g: usize, offsets: &[usize], widths: &[usize]) -> Option<usize> {
         .position(|(&off, &w)| g >= off && g < off + w)
 }
 
-/// Row-count defaults for the join-order cost model. There are no statistics:
-/// a literal equality keeps a fifth of the rows and anything else keeps half,
-/// and an equality edge divides by the larger distinct count of its two
-/// columns, which without histograms is the relation's row count (DuckDB's
-/// fallbacks — `DEFAULT_SELECTIVITY` in
+/// Row-count fallbacks for the join-order cost model, used only where the
+/// catalog statistics cannot answer: a literal equality keeps a fifth of the
+/// rows and anything else keeps half, and an equality edge divides by the
+/// larger distinct count of its two columns, which without a sketch is the
+/// relation's row count (DuckDB's fallbacks — `DEFAULT_SELECTIVITY` in
 /// `src/optimizer/relation_statistics/relation_statistics_helper.hpp`, and the
-/// no-distinct-count path of `src/optimizer/join_order/cardinality_estimator.cpp`).
+/// no-distinct-count path of
+/// `src/optimizer/join_order/cardinality_estimator.cpp` in the DuckDB sources).
 const EQ_SELECTIVITY: f64 = 0.2;
 const OTHER_SELECTIVITY: f64 = 0.5;
 /// A leaf whose row count cannot be read (an aggregate or a subquery) is
@@ -1314,20 +1321,236 @@ fn leaf_base_rows(db: &crate::storage::PinkDb, leaf: &LogicalPlan) -> Option<f64
     }
 }
 
-/// Selectivity of one conjunct, without statistics: a literal equality keeps
-/// a fifth, and an equality list (`IN`) keeps a fifth per member.
-fn conjunct_selectivity(c: &BoundExpr) -> f64 {
+/// Catalog statistics of a leaf whose columns keep their base table's
+/// numbering (a scan, possibly under a filter/limit/sort). A projection
+/// renumbers, and an attached lake table has per-file statistics instead of a
+/// catalog row, so both answer `None` and keep the fallbacks.
+pub(crate) fn leaf_stats<'a>(
+    db: &'a crate::storage::PinkDb,
+    leaf: &LogicalPlan,
+) -> Option<&'a crate::stats::TableStats> {
+    match leaf {
+        LogicalPlan::Scan {
+            db: qdb,
+            table,
+            at: None,
+        } => {
+            let name = qdb.clone().unwrap_or_else(|| db.current_db().to_string());
+            db.table_in(&name, table).ok().map(|t| t.stats())
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => leaf_stats(db, input),
+        _ => None,
+    }
+}
+
+/// The catalog's exact distinct estimate for one column of a leaf plan, if it
+/// has one. Used to size a join's bloom filter (wave 122).
+pub(crate) fn estimate_distinct(
+    db: &crate::storage::PinkDb,
+    plan: &LogicalPlan,
+    col: usize,
+) -> Option<u64> {
+    leaf_stats(db, plan)?.distinct(col)
+}
+
+/// A value on the number line, for the uniform range assumption. `None` for
+/// kinds without a meaningful distance (strings, intervals, variants).
+fn numeric(v: &Value) -> Option<f64> {
+    match v {
+        Value::Integer(i) => Some(f64::from(*i)),
+        Value::Bigint(i) => Some(*i as f64),
+        Value::Double(d) if d.is_finite() => Some(*d),
+        Value::Date(d) => Some(f64::from(*d)),
+        Value::Timestamp(t) => Some(*t as f64),
+        Value::Decimal(v, scale) => Some(*v as f64 / 10f64.powi(i32::from(*scale))),
+        _ => None,
+    }
+}
+
+/// The comparison a one-column conjunct states: the operator, oriented so the
+/// column is on the left, and the literal.
+fn column_comparison(atom: &BoundExpr, col: usize) -> Option<(BinaryOp, Value)> {
+    let BoundExpr::Binary {
+        op, left, right, ..
+    } = atom
+    else {
+        return None;
+    };
+    let op = match op {
+        BinaryOp::Eq
+        | BinaryOp::NotEq
+        | BinaryOp::Lt
+        | BinaryOp::LtEq
+        | BinaryOp::Gt
+        | BinaryOp::GtEq => *op,
+        _ => return None,
+    };
+    let is_col = |e: &BoundExpr| matches!(e, BoundExpr::Column { index, .. } if *index == col);
+    let literal = |e: &BoundExpr| match e {
+        BoundExpr::Literal(v) => Some(v.clone()),
+        BoundExpr::Cast { expr, .. } => match &**expr {
+            BoundExpr::Literal(v) => Some(v.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match (literal(left), literal(right)) {
+        (Some(v), None) if is_col(right) => {
+            let flipped = match op {
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::LtEq => BinaryOp::GtEq,
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::GtEq => BinaryOp::LtEq,
+                other => other,
+            };
+            Some((flipped, v))
+        }
+        (None, Some(v)) if is_col(left) => Some((op, v)),
+        _ => None,
+    }
+}
+
+/// Selectivity of one conjunct from catalog statistics: equality from the
+/// distinct estimate, a range from the uniform spread between the column's
+/// min and max (`src/optimizer/statistics_propagator.cpp` in the DuckDB
+/// sources), and `IS [NOT] NULL` from the null count. `None` when the
+/// statistics cannot answer, so the caller keeps its fallback.
+fn stats_selectivity(
+    stats: &crate::stats::TableStats,
+    rows: f64,
+    global_col: usize,
+    local_col: usize,
+    c: &BoundExpr,
+) -> Option<f64> {
+    let st = stats.col(local_col)?;
+    if rows < 1.0 {
+        return None;
+    }
+    if let BoundExpr::IsNull { expr, negated } = c
+        && matches!(**expr, BoundExpr::Column { index, .. } if index == global_col)
+    {
+        let nulls = st.null_count as f64 / rows;
+        return Some(if *negated { 1.0 - nulls } else { nulls });
+    }
+    if let Some(values) = eq_set(c, local_col)
+        && !values.is_empty()
+        && values.len() <= 64
+    {
+        let distinct = stats.distinct(local_col)? as f64;
+        return Some(if distinct < 1.0 {
+            0.0
+        } else {
+            (values.len() as f64 / distinct).min(1.0)
+        });
+    }
+    let (op, literal) = column_comparison(c, global_col)?;
+    if matches!(literal, Value::Null) {
+        return Some(0.0);
+    }
+    if op == BinaryOp::NotEq {
+        let distinct = stats.distinct(local_col)? as f64;
+        return Some(if distinct < 1.0 {
+            0.0
+        } else {
+            1.0 - (1.0 / distinct).min(1.0)
+        });
+    }
+    let (lo, hi) = (numeric(st.min.as_ref()?)?, numeric(st.max.as_ref()?)?);
+    let v = numeric(&literal)?;
+    if hi <= lo {
+        // One distinct value (or a constant column): the comparison is
+        // either always true or always false.
+        return Some(if v >= lo { 1.0 } else { 0.0 });
+    }
+    let sel = match op {
+        BinaryOp::Lt | BinaryOp::LtEq => (v - lo) / (hi - lo),
+        BinaryOp::Gt | BinaryOp::GtEq => (hi - v) / (hi - lo),
+        _ => return None,
+    };
+    Some(sel.clamp(0.0, 1.0))
+}
+
+/// Selectivity of one conjunct: statistics when the conjunct pins exactly one
+/// column of one leaf, else the fixed defaults. A literal equality keeps a
+/// fifth, and an equality list (`IN`) keeps a fifth per member.
+fn conjunct_selectivity(
+    stats: Option<&crate::stats::TableStats>,
+    rows: f64,
+    local_col: Option<usize>,
+    c: &BoundExpr,
+) -> f64 {
     let mut cols = Vec::new();
     columns_in(c, &mut cols);
     cols.sort_unstable();
     cols.dedup();
-    if cols.len() == 1
-        && let Some(values) = eq_set(c, cols[0])
-        && !values.is_empty()
-    {
-        return (EQ_SELECTIVITY * values.len() as f64).min(1.0);
+    if cols.len() == 1 {
+        if let (Some(stats), Some(local)) = (stats, local_col)
+            && let Some(sel) = stats_selectivity(stats, rows, cols[0], local, c)
+        {
+            return sel;
+        }
+        if let Some(values) = eq_set(c, cols[0])
+            && !values.is_empty()
+        {
+            return (EQ_SELECTIVITY * values.len() as f64).min(1.0);
+        }
     }
     OTHER_SELECTIVITY
+}
+
+/// Selectivity of a filter predicate over `input`, from catalog statistics
+/// (wave 122). `1.0` when the plan shape or the statistics cannot answer.
+pub(crate) fn filter_selectivity(
+    db: &crate::storage::PinkDb,
+    input: &LogicalPlan,
+    predicate: &BoundExpr,
+) -> f64 {
+    let Some(stats) = leaf_stats(db, input) else {
+        return 1.0;
+    };
+    let rows = leaf_base_rows(db, input).unwrap_or(stats.rows as f64);
+    fn walk(stats: &crate::stats::TableStats, rows: f64, e: &BoundExpr) -> f64 {
+        if let BoundExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } = e
+        {
+            return walk(stats, rows, left) * walk(stats, rows, right);
+        }
+        let mut cols = Vec::new();
+        columns_in(e, &mut cols);
+        cols.sort_unstable();
+        cols.dedup();
+        match cols.as_slice() {
+            [col] => stats_selectivity(stats, rows, *col, *col, e).unwrap_or(OTHER_SELECTIVITY),
+            // A conjunct over no column at all (a constant, a scalar
+            // subquery) keeps every row as far as the statistics know; only a
+            // conjunct over *several* columns is genuinely unknown.
+            [] => 1.0,
+            _ => OTHER_SELECTIVITY,
+        }
+    }
+    walk(stats, rows, predicate)
+}
+
+/// Exact distinct count of one column, for the equality-class domain. An
+/// approximate sketch (a delete ran since the last `ANALYZE`) is left out:
+/// the caller's row-count default is a safe upper bound, a dirty lower one is
+/// not.
+fn column_domain(
+    db: &crate::storage::PinkDb,
+    leaf: &LogicalPlan,
+    local_col: usize,
+    base_rows: f64,
+) -> f64 {
+    match leaf_stats(db, leaf).and_then(|s| s.distinct(local_col)) {
+        Some(d) => (d as f64).min(base_rows),
+        None => base_rows,
+    }
 }
 
 /// Equality column pairs a conjunct implies: an `AND` contributes all of
@@ -1576,7 +1799,14 @@ fn cost_join_order(
             }
         }
         if touched.len() == 1 {
-            sels[touched[0]] *= conjunct_selectivity(c);
+            let leaf = touched[0];
+            // A conjunct that pins several columns is not a single-column
+            // restriction on this leaf (the fallbacks apply).
+            let local = (cols.len() == 1)
+                .then(|| cols[0].checked_sub(offsets[leaf]))
+                .flatten();
+            let stats = leaf_stats(db, &leaves[leaf]);
+            sels[leaf] *= conjunct_selectivity(stats, bases[leaf], local, c);
         }
         pairs.clear();
         implied_pairs(c, &mut pairs);
@@ -1598,8 +1828,13 @@ fn cost_join_order(
         let Some(leaf) = leaf_of(col, &offsets, widths) else {
             continue;
         };
+        let local = col.checked_sub(offsets[leaf]);
+        let domain = match local {
+            Some(local) => column_domain(db, &leaves[leaf], local, bases[leaf]),
+            None => bases[leaf],
+        };
         let entry = ndv.entry(root).or_insert(f64::INFINITY);
-        *entry = entry.min(bases[leaf]);
+        *entry = entry.min(domain);
     }
     // One denominator per pair of leaves, so a composite key join divides once.
     let mut denoms: std::collections::HashMap<(usize, usize), f64> =

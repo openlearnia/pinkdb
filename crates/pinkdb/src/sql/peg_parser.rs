@@ -1395,6 +1395,7 @@ peg::parser! {
             / drop()
             / refresh_stmt()
             / checkpoint()
+            / analyze_stmt()
             / call_stmt()
             / do_stmt()
             / grant_stmt()
@@ -1496,6 +1497,18 @@ peg::parser! {
                       Err("CHECKPOINT")
                   }
               }
+
+              /// `ANALYZE [TABLE] <table>` and bare `ANALYZE`: recompute
+              /// catalog statistics exactly (wave 122). Matched as words, so
+              /// `analyze` stays usable as a name.
+              rule analyze_stmt() -> Statement
+                  = word("analyze") word("table") t:table_ref() {
+                        Statement::Analyze { db: t.0, table: Some(t.1) }
+                    }
+                  / word("analyze") t:table_ref() {
+                        Statement::Analyze { db: t.0, table: Some(t.1) }
+                    }
+                  / word("analyze") { Statement::Analyze { db: None, table: None } }
 
               /// `REFRESH MATERIALIZED VIEWS` (wave 80: every view of the
               /// session database, all-or-nothing), `REFRESH MATERIALIZED
@@ -2157,10 +2170,12 @@ peg::parser! {
                   MergeAction::Insert { columns, values }
               }
 
-        /// `SET VARIABLE name = expr`. `SET`, `VARIABLE` and the name are
-        /// words, so both stay usable as identifiers elsewhere.
+        /// `SET VARIABLE name = expr`, and `SET name = expr` — the engine
+        /// switches (`join_filter_pushdown`) read like DuckDB's settings.
+        /// `SET`, `VARIABLE` and the name are words, so both stay usable as
+        /// identifiers elsewhere.
         rule set_variable_stmt() -> Statement
-            = kw(Keyword::Set) word("variable") name:ident() eq() value:expr() {
+            = kw(Keyword::Set) word("variable")? name:ident() eq() value:expr() {
                   Statement::SetVariable { name, value }
               }
 
