@@ -3449,7 +3449,9 @@ fn eval_concat(left: &BoundExpr, right: &BoundExpr, chunk: &DataChunk, cx: &Cx) 
 }
 
 /// `LIKE` / `NOT LIKE` with three-valued logic (`%` = any run, `_` = one
-/// char; no ESCAPE clause in v1 — backslash is literal).
+/// char; no ESCAPE clause here — backslash is literal; `like_escape` takes
+/// one). Reads the string payloads in place and compiles a constant pattern
+/// once per chunk.
 fn eval_like(
     op: BinaryOp,
     left: &BoundExpr,
@@ -3459,95 +3461,186 @@ fn eval_like(
 ) -> Result<Vector> {
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
-    let mut out = Vector::new_empty(DataType::Boolean);
-    for i in 0..l.len() {
-        if l.is_null(i) || r.is_null(i) {
-            out.push_null()?;
-            continue;
-        }
-        let (s, p) = match (l.get(i), r.get(i)) {
-            (Value::Varchar(s), Value::Varchar(p)) => (s, p),
-            _ => {
+    let negate = op == BinaryOp::NotLike;
+    let (VectorData::VarChar(ls), VectorData::VarChar(ps)) = (l.data(), r.data()) else {
+        // A NULL literal on either side (typed INTEGER) is NULL throughout;
+        // anything else is a type error.
+        let mut out = Vector::new_empty(DataType::Boolean);
+        for i in 0..l.len() {
+            if !(l.is_null(i) || r.is_null(i)) {
                 return Err(PinkDbError::Execution(
                     "LIKE needs VARCHAR on both sides".to_string(),
                 ));
             }
-        };
-        let hit = like_match(&s, &p);
-        out.push_valid(Value::Boolean(if op == BinaryOp::Like {
-            hit
-        } else {
-            !hit
-        }))?;
+            out.push_null()?;
+        }
+        return Ok(out);
+    };
+    let mut validity = l.validity().to_vec();
+    for (w, m) in validity.iter_mut().zip(r.validity()) {
+        *w &= m;
     }
-    Ok(out)
-}
-
-/// Classic `%`/`_` wildcard match (iterative backtracking over chars).
-fn like_match(s: &str, pat: &str) -> bool {
-    like_match_escape(s, pat, None)
+    let constant = match right {
+        BoundExpr::Literal(Value::Varchar(p)) => Some(LikeMatcher::new(p, None)),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(ls.len());
+    for (i, s) in ls.iter().enumerate() {
+        let hit = if validity[i / 64] >> (i % 64) & 1 == 0 {
+            false
+        } else {
+            match &constant {
+                Some(m) => m.matches(s),
+                None => LikeMatcher::new(&ps[i], None).matches(s),
+            }
+        };
+        out.push(hit != negate);
+    }
+    Ok(Vector::from_parts(
+        VectorData::Boolean(out),
+        validity,
+        ls.len(),
+    ))
 }
 
 /// One pattern atom: a literal char, "any char" (`_`), or "any run" (`%`).
+#[derive(Clone, Copy, PartialEq)]
 enum LikeAtom {
     Any,
     Lit(char),
     Many,
 }
 
-/// The atom at `pi` and how many pattern chars it spans. An escape char makes
-/// the next char literal (a trailing escape is a literal escape).
-fn like_atom(p: &[char], pi: usize, escape: Option<char>) -> Option<(usize, LikeAtom)> {
-    let c = *p.get(pi)?;
-    if Some(c) == escape {
-        return Some(match p.get(pi + 1) {
-            Some(&lit) => (2, LikeAtom::Lit(lit)),
-            None => (1, LikeAtom::Lit(c)),
-        });
+/// A compiled `LIKE` pattern.
+enum LikeMatcher {
+    /// Only `%` and literal text: DuckDB's `LikeMatcher`
+    /// (src/function/scalar/string/like.cpp). The first segment is a prefix
+    /// unless the pattern starts with `%`, the last a suffix unless it ends
+    /// with `%`, and the segments between are found in order with a
+    /// substring search — no per-character backtracking.
+    Segments {
+        segments: Vec<String>,
+        start_any: bool,
+        end_any: bool,
+    },
+    /// Anything else (`_`, an escape, an empty or all-`%` pattern): the
+    /// wildcard matcher over atoms, walking the string in place.
+    Atoms(Vec<LikeAtom>),
+}
+
+impl LikeMatcher {
+    /// Compile `pat`; `escape` makes the next char literal (a trailing
+    /// escape is a literal escape).
+    fn new(pat: &str, escape: Option<char>) -> LikeMatcher {
+        let simple = escape.is_none() && !pat.contains('_');
+        let segments: Vec<String> = pat
+            .split('%')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if simple && !segments.is_empty() {
+            return LikeMatcher::Segments {
+                segments,
+                start_any: pat.starts_with('%'),
+                end_any: pat.ends_with('%'),
+            };
+        }
+        let chars: Vec<char> = pat.chars().collect();
+        let mut atoms = Vec::with_capacity(chars.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if Some(c) == escape {
+                atoms.push(LikeAtom::Lit(chars.get(i + 1).copied().unwrap_or(c)));
+                i += 2;
+                continue;
+            }
+            atoms.push(match c {
+                '_' => LikeAtom::Any,
+                '%' => LikeAtom::Many,
+                c => LikeAtom::Lit(c),
+            });
+            i += 1;
+        }
+        LikeMatcher::Atoms(atoms)
     }
-    Some(match c {
-        '_' => (1, LikeAtom::Any),
-        '%' => (1, LikeAtom::Many),
-        c => (1, LikeAtom::Lit(c)),
-    })
+
+    fn matches(&self, s: &str) -> bool {
+        match self {
+            LikeMatcher::Segments {
+                segments,
+                start_any,
+                end_any,
+            } => {
+                let mut rest = s;
+                let mut middle = &segments[..];
+                if !start_any {
+                    let Some(r) = rest.strip_prefix(segments[0].as_str()) else {
+                        return false;
+                    };
+                    if segments.len() == 1 {
+                        return *end_any || r.is_empty();
+                    }
+                    rest = r;
+                    middle = &middle[1..];
+                }
+                let (last, middle) = middle.split_last().expect("at least one segment");
+                for seg in middle {
+                    match rest.find(seg.as_str()) {
+                        Some(at) => rest = &rest[at + seg.len()..],
+                        None => return false,
+                    }
+                }
+                if *end_any {
+                    rest.contains(last.as_str())
+                } else {
+                    rest.ends_with(last.as_str())
+                }
+            }
+            LikeMatcher::Atoms(p) => {
+                // Iterative backtracking: `star` is the last `%` seen and
+                // `mark` the byte where its current run ends.
+                let (mut si, mut pi) = (0usize, 0usize);
+                let (mut star, mut mark) = (None, 0usize);
+                while si < s.len() {
+                    let c = s[si..].chars().next().expect("si is a char boundary");
+                    match p.get(pi) {
+                        Some(LikeAtom::Any) => {
+                            si += c.len_utf8();
+                            pi += 1;
+                        }
+                        Some(LikeAtom::Lit(x)) if *x == c => {
+                            si += c.len_utf8();
+                            pi += 1;
+                        }
+                        Some(LikeAtom::Many) => {
+                            star = Some(pi);
+                            mark = si;
+                            pi += 1;
+                        }
+                        _ => match star {
+                            Some(st) => {
+                                pi = st + 1;
+                                mark += s[mark..].chars().next().map_or(1, char::len_utf8);
+                                si = mark;
+                            }
+                            None => return false,
+                        },
+                    }
+                }
+                while p.get(pi) == Some(&LikeAtom::Many) {
+                    pi += 1;
+                }
+                pi == p.len()
+            }
+        }
+    }
 }
 
 /// `%`/`_` wildcard match with an optional escape char (`LIKE … ESCAPE '\'`).
 /// The escape must be a single char or none; the binder checks that.
 fn like_match_escape(s: &str, pat: &str, escape: Option<char>) -> bool {
-    let s: Vec<char> = s.chars().collect();
-    let p: Vec<char> = pat.chars().collect();
-    let (mut si, mut pi) = (0usize, 0usize);
-    let (mut star, mut mark) = (None, 0usize);
-    while si < s.len() {
-        match like_atom(&p, pi, escape) {
-            Some((len, LikeAtom::Any)) => {
-                si += 1;
-                pi += len;
-            }
-            Some((len, LikeAtom::Lit(c))) if c == s[si] => {
-                si += 1;
-                pi += len;
-            }
-            Some((len, LikeAtom::Many)) => {
-                star = Some(pi);
-                mark = si;
-                pi += len;
-            }
-            _ => match star {
-                Some(st) => {
-                    pi = st + 1;
-                    mark += 1;
-                    si = mark;
-                }
-                None => return false,
-            },
-        }
-    }
-    while matches!(like_atom(&p, pi, escape), Some((_, LikeAtom::Many))) {
-        pi += 1;
-    }
-    pi == p.len()
+    LikeMatcher::new(pat, escape).matches(s)
 }
 
 /// `s[from:to]` over chars: 1-based, inclusive, negative = from the end, and

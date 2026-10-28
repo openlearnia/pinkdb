@@ -9,6 +9,20 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 126c — `LIKE` compiled once, no per-row allocation ✅
+
+- **Faster `LIKE`/`NOT LIKE`:** a constant pattern is compiled once per
+  chunk. A pattern of only `%` and literal text (`'%special%requests%'`) is
+  matched the way DuckDB's `LikeMatcher` does it: prefix, suffix, and the
+  segments between found in order with a substring search. Other patterns
+  (`_`, `ESCAPE`) use a wildcard matcher that walks the string in place.
+  Before, every row copied both strings and collected their characters.
+  TPC-H SF 1: **Q13 250 → 108 ms (−57 %)**, Q20 −34 %, Q14 −15 %, Q16 −11 %,
+  Q9 −8 %.
+- **Fix (DuckDB parity):** a bare `NULL` in a comparison or `LIKE` takes the
+  other side's type, so `NULL LIKE 'a%'`, `'a' = NULL` and
+  `NULL < DATE '2020-01-01'` are `NULL` instead of a type error.
+
 ### Wave 126b — `substr` with DuckDB's semantics, vectorized ✅
 
 - **Behaviour change (DuckDB parity):** `substr`/`substring` now follow

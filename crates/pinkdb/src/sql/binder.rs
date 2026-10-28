@@ -1175,6 +1175,18 @@ fn distinct_from_bound(op: BinaryOp, l: BoundExpr, r: BoundExpr) -> BoundExpr {
     }
 }
 
+/// A NULL literal of type `dtype` (a bare `Literal(Null)` is INTEGER).
+fn null_of(dtype: DataType) -> BoundExpr {
+    if dtype == DataType::Integer {
+        BoundExpr::Literal(Value::Null)
+    } else {
+        BoundExpr::Cast {
+            expr: Box::new(BoundExpr::Literal(Value::Null)),
+            dtype,
+        }
+    }
+}
+
 pub(crate) fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
     if (is_numeric(l) && is_numeric(r))
         || (l == DataType::Varchar && r == DataType::Varchar)
@@ -2126,6 +2138,21 @@ impl<'a> Binder<'a> {
                     | BinaryOp::GtEq
                     | BinaryOp::Like
                     | BinaryOp::NotLike => {
+                        // A bare NULL (INTEGER-typed) takes the other side's
+                        // type: `NULL LIKE 'a%'` and `NULL = 'a'` are NULL,
+                        // as in DuckDB, not a type error.
+                        let null = |e: &BoundExpr| matches!(e, BoundExpr::Literal(Value::Null));
+                        let (l, r) = match (null(&l), null(&r)) {
+                            (true, false) => (null_of(r.dtype()), r),
+                            (false, true) => {
+                                let dtype = l.dtype();
+                                (l, null_of(dtype))
+                            }
+                            (true, true) if matches!(op, BinaryOp::Like | BinaryOp::NotLike) => {
+                                (null_of(DataType::Varchar), null_of(DataType::Varchar))
+                            }
+                            _ => (l, r),
+                        };
                         let (l, r) = match comparison_ok(*op, l.dtype(), r.dtype()) {
                             Ok(()) => (l, r),
                             Err(error) => {

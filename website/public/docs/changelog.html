@@ -194,6 +194,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-28">2026-10-28<a class="anchor" href="#2026-10-28" aria-label="Permalink: 2026-10-28">#</a></h2>
+<h3>Wave 126c — <code>LIKE</code> compiled once, no per-row allocation ✅</h3>
+<ul>
+<li><strong>Faster <code>LIKE</code>/<code>NOT LIKE</code>:</strong> a constant pattern is compiled once per chunk. A pattern of only <code>%</code> and literal text (<code>'%special%requests%'</code>) is matched the way DuckDB's <code>LikeMatcher</code> does it: prefix, suffix, and the segments between found in order with a substring search. Other patterns (<code>_</code>, <code>ESCAPE</code>) use a wildcard matcher that walks the string in place. Before, every row copied both strings and collected their characters. TPC-H SF 1: <strong>Q13 250 → 108 ms (−57 %)</strong>, Q20 −34 %, Q14 −15 %, Q16 −11 %, Q9 −8 %.</li>
+<li><strong>Fix (DuckDB parity):</strong> a bare <code>NULL</code> in a comparison or <code>LIKE</code> takes the other side's type, so <code>NULL LIKE 'a%'</code>, <code>'a' = NULL</code> and <code>NULL &lt; DATE '2020-01-01'</code> are <code>NULL</code> instead of a type error.</li>
+</ul>
 <h3>Wave 126b — <code>substr</code> with DuckDB's semantics, vectorized ✅</h3>
 <ul>
 <li><strong>Behaviour change (DuckDB parity):</strong> <code>substr</code>/<code>substring</code> now follow DuckDB for every offset and length. A start of 0 begins one character before the first, a negative start counts from the end, and a negative length reaches backwards: <code>substr('hello', 0, 2)</code> is <code>h</code>, <code>substr('hello', -2)</code> is <code>lo</code>, <code>substr('hello', -3, 2)</code> is <code>ll</code> and <code>substr('hello', 2, -1)</code> is <code>h</code> (they were <code>he</code>, <code>hello</code>, <code>he</code> and an empty string). Characters are code points.</li>
