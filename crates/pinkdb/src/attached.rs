@@ -1047,8 +1047,10 @@ mod tests {
                 vec![],
             ),
             (
+                // Only `i` is read through the subquery's projection (wave
+                // 127b): `s` is projected but never consumed.
                 "SELECT MAX(i) FROM (SELECT i, s FROM t) x;",
-                vec![Some(vec![0, 3])],
+                vec![Some(vec![0])],
             ),
             (
                 "SELECT i, ROW_NUMBER() OVER (PARTITION BY b ORDER BY g) FROM t;",

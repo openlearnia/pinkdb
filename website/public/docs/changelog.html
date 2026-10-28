@@ -194,6 +194,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-28">2026-10-28<a class="anchor" href="#2026-10-28" aria-label="Permalink: 2026-10-28">#</a></h2>
+<h3>Wave 127b — projections evaluate only the outputs that are read ✅</h3>
+<ul>
+<li>A <code>Project</code> whose consumer reads only some of its outputs now evaluates only those expressions; the rest are zero-length placeholders, and only the read expressions bound the columns its input must produce. The restore projection a join reorder adds (which lists every column) no longer pins the whole join chain, so wave 127's pruning reaches Q7/Q9-shaped plans.</li>
+<li><strong>Behaviour change (DuckDB parity):</strong> a projected expression no consumer reads is no longer evaluated, so it can no longer raise an error. DuckDB removes such columns before execution: <code>SELECT region, COUNT(*) FROM (SELECT region, CAST(x AS INTEGER) AS junk FROM t) s GROUP BY region</code> now answers, as it does in DuckDB, instead of failing on the unused cast.</li>
+</ul>
 <h3>Wave 127 — joins carry only the columns their consumers read ✅</h3>
 <p>Column pruning used to stop at every join: a table under a join produced every column, and the join copied every column of both sides into its output, one value at a time. Now the column analysis runs through hash joins.</p>
 <ul>

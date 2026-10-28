@@ -9,6 +9,20 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 127b — projections evaluate only the outputs that are read ✅
+
+- A `Project` whose consumer reads only some of its outputs now evaluates
+  only those expressions; the rest are zero-length placeholders, and only the
+  read expressions bound the columns its input must produce. The restore
+  projection a join reorder adds (which lists every column) no longer pins
+  the whole join chain, so wave 127's pruning reaches Q7/Q9-shaped plans.
+- **Behaviour change (DuckDB parity):** a projected expression no consumer
+  reads is no longer evaluated, so it can no longer raise an error. DuckDB
+  removes such columns before execution:
+  `SELECT region, COUNT(*) FROM (SELECT region, CAST(x AS INTEGER) AS junk
+  FROM t) s GROUP BY region` now answers, as it does in DuckDB, instead of
+  failing on the unused cast.
+
 ### Wave 127 — joins carry only the columns their consumers read ✅
 
 Column pruning used to stop at every join: a table under a join produced every

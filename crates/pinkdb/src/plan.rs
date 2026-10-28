@@ -1633,6 +1633,14 @@ impl ScanProjections {
         debug_assert!(matches!(join, LogicalPlan::Join { .. }));
         self.map.get(&node_addr(join)).map(Vec::as_slice)
     }
+
+    /// The output columns of a [`LogicalPlan::Project`] its consumer reads,
+    /// or `None` when unbounded (evaluate every expression). An unread
+    /// expression is not evaluated: its column is a zero-length placeholder.
+    pub(crate) fn for_project(&self, project: &LogicalPlan) -> Option<&[usize]> {
+        debug_assert!(matches!(project, LogicalPlan::Project { .. }));
+        self.map.get(&node_addr(project)).map(Vec::as_slice)
+    }
 }
 
 /// A scan node's identity for [`ScanProjections`]: plans are immutable trees
@@ -2461,14 +2469,30 @@ fn walk_scan_projections(
             }
             walk_scan_projections(input, &need, out);
         }
-        // Every project expression is evaluated (only the fused
-        // join→aggregate path skips unused ones, and joins are unbounded
-        // here), so the bound is the union of all of them — plus each
-        // expression's subquery plans, which are analyzed in full.
+        // A bounded consumer reads only some of a projection's outputs: the
+        // others are never evaluated (the executor emits placeholders for
+        // them, see [`ScanProjections::for_project`]), so only the read
+        // expressions bound the input (wave 127b). This is what lets the
+        // restore projection of a reordered join chain, which lists every
+        // column, stop pinning the whole chain. An unbounded consumer (the
+        // statement's result) evaluates every expression, as before.
         LogicalPlan::Project { input, exprs, .. } => {
             let mut need = Needed::Cols(Vec::new());
-            for e in exprs {
-                collect_expr_projections(e, &mut need, out);
+            match needed {
+                Needed::All => {
+                    for e in exprs {
+                        collect_expr_projections(e, &mut need, out);
+                    }
+                }
+                Needed::Cols(set) => {
+                    let read: Vec<usize> = (0..exprs.len())
+                        .filter(|i| set.get(*i).copied().unwrap_or(false))
+                        .collect();
+                    for &i in &read {
+                        collect_expr_projections(&exprs[i], &mut need, out);
+                    }
+                    out.insert(node_addr(plan), read);
+                }
             }
             walk_scan_projections(input, &need, out);
         }

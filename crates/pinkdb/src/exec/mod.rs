@@ -2884,21 +2884,54 @@ pub(crate) fn selected_chunks(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Vec<
 /// aggregate/window output columns) share the input chunk's `Arc<Vector>`
 /// instead of deep-copying the payload. A pass-through of an undecoded
 /// projection placeholder fails loudly (`expect_column`), never as NULLs.
-fn project_chunk(cx: &Cx, exprs: &[BoundExpr], chunk: &DataChunk) -> Result<DataChunk> {
+fn project_chunk(
+    cx: &Cx,
+    exprs: &[BoundExpr],
+    chunk: &DataChunk,
+    read: Option<&[bool]>,
+) -> Result<DataChunk> {
     cx.check_deadline()?;
     let cols: Vec<std::sync::Arc<Vector>> = exprs
         .iter()
-        .map(|e| match e {
-            BoundExpr::Column { index, .. }
-            | BoundExpr::AggRef { index, .. }
-            | BoundExpr::WindowRef { index, .. } => {
-                Ok(std::sync::Arc::clone(chunk.expect_column(*index)?))
+        .enumerate()
+        .map(|(i, e)| {
+            // No consumer reads this output (wave 127b): a placeholder, the
+            // expression is never evaluated.
+            if read.is_some_and(|r| !r.get(i).copied().unwrap_or(true)) {
+                return Ok(std::sync::Arc::new(Vector::new_empty(e.dtype())));
             }
-            e => Ok(std::sync::Arc::new(eval_expr(e, chunk, cx)?)),
+            match e {
+                BoundExpr::Column { index, .. }
+                | BoundExpr::AggRef { index, .. }
+                | BoundExpr::WindowRef { index, .. } => {
+                    Ok(std::sync::Arc::clone(chunk.expect_column(*index)?))
+                }
+                e => Ok(std::sync::Arc::new(eval_expr(e, chunk, cx)?)),
+            }
         })
         .collect::<Result<_>>()?;
-    DataChunk::from_arcs(cols)
-        .ok_or_else(|| PinkDbError::Execution("project column length mismatch".to_string()))
+    if cols
+        .iter()
+        .any(|c| c.len() != chunk.num_rows() && !c.is_empty())
+    {
+        return Err(PinkDbError::Execution(
+            "project column length mismatch".to_string(),
+        ));
+    }
+    Ok(DataChunk::projected(cols, chunk.num_rows()))
+}
+
+/// The read mask of a projection's outputs (wave 127b), `None` = all read.
+fn project_mask(cx: &Cx, plan: &LogicalPlan, width: usize) -> Option<Vec<bool>> {
+    cx.projections.for_project(plan).map(|cols| {
+        let mut mask = vec![false; width];
+        for &c in cols {
+            if let Some(slot) = mask.get_mut(c) {
+                *slot = true;
+            }
+        }
+        mask
+    })
 }
 
 fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
@@ -3798,13 +3831,25 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         } => {
             let inner = eval(cx, input)?;
             let types: Vec<DataType> = exprs.iter().map(|e| e.dtype()).collect();
+            let read = project_mask(cx, plan, exprs.len());
             // Project over zero input chunks → zero output chunks (0 rows).
             // (Aggregates always emit ≥1 chunk, so COUNT(*) over ∅ still works.)
-            expr::prime(cx, exprs)?;
+            // Only the read expressions are primed and evaluated.
+            match &read {
+                Some(mask) => expr::prime(
+                    cx,
+                    exprs
+                        .iter()
+                        .zip(mask)
+                        .filter(|(_, keep)| **keep)
+                        .map(|(e, _)| e),
+                )?,
+                None => expr::prime(cx, exprs)?,
+            }
             let chunks = inner
                 .chunks
                 .par_iter()
-                .map(|chunk| project_chunk(cx, exprs, chunk))
+                .map(|chunk| project_chunk(cx, exprs, chunk, read.as_deref()))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Output {
                 chunks,
@@ -7789,6 +7834,8 @@ enum StreamKind<'p> {
     Project {
         input: Box<Stream<'p>>,
         exprs: &'p [BoundExpr],
+        /// Which outputs a consumer reads (wave 127b), `None` = all.
+        read: Option<Vec<bool>>,
     },
     /// `UNION ALL` (a distinct union is blocking): left chunks, then right.
     Union {
@@ -7835,6 +7882,7 @@ impl<'p> Stream<'p> {
                 exprs,
                 names,
             } => {
+                let read = project_mask(cx, plan, exprs.len());
                 let Some(input) = Stream::build(cx, input)? else {
                     return Ok(None);
                 };
@@ -7842,6 +7890,7 @@ impl<'p> Stream<'p> {
                     StreamKind::Project {
                         input: Box::new(input),
                         exprs,
+                        read,
                     },
                     names.clone(),
                     exprs.iter().map(|e| e.dtype()).collect(),
@@ -7938,15 +7987,16 @@ impl<'p> Stream<'p> {
                     }
                     return Ok(pending.pop_front());
                 }
-                StreamKind::Project { input, exprs } => {
+                StreamKind::Project { input, exprs, read } => {
                     if pending.is_empty() {
                         let batch = pull_batch(cx, input)?;
                         if batch.is_empty() {
                             return Ok(None);
                         }
+                        let read = read.as_deref();
                         let outs = batch
                             .par_iter()
-                            .map(|chunk| project_chunk(cx, exprs, chunk))
+                            .map(|chunk| project_chunk(cx, exprs, chunk, read))
                             .collect::<Result<Vec<_>>>()?;
                         pending.extend(outs);
                     }
@@ -13523,17 +13573,27 @@ mod tests {
                 "erroring projection must not fuse: {sql}"
             );
         }
-        // Engine check: both variants error, fused exactly like materialized.
+        // Engine check (wave 127b, DuckDB 2.0 parity): an output column no
+        // consumer reads is never evaluated, so the unused erroring
+        // expression does not error on either path, and both variants return
+        // the same rows. (DuckDB removes unused columns before execution and
+        // answers these queries; the old rule forced an error instead.)
         for sql in erroring {
             let fallback = sql.replace(
                 "FROM fa JOIN fb ON fa.id = fb.id) s",
                 "FROM fa JOIN fb ON fa.id = fb.id WHERE fa.id = fb.id) s",
             );
             assert_ne!(fallback, sql);
-            assert!(db.execute(sql).is_err(), "fused variant must error: {sql}");
-            assert!(
-                db.execute(&fallback).is_err(),
-                "materialized variant must error: {fallback}"
+            let fused = db
+                .execute(sql)
+                .unwrap_or_else(|e| panic!("unused junk must not be evaluated: {sql}: {e}"));
+            let materialized = db
+                .execute(&fallback)
+                .unwrap_or_else(|e| panic!("unused junk must not be evaluated: {fallback}: {e}"));
+            assert_eq!(
+                format!("{fused:?}"),
+                format!("{materialized:?}"),
+                "fused and materialized variants differ: {sql}"
             );
         }
         // A total unused projection expression is safe to skip: fusion
