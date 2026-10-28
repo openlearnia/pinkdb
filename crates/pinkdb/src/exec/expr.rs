@@ -1626,8 +1626,37 @@ fn eval_decimal_mul(l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
     for (word, other) in validity.iter_mut().zip(r.validity()) {
         *word &= *other;
     }
-    let mut values: Vec<i128> = Vec::with_capacity(len);
     let all_valid = !l.has_nulls() && !r.has_nulls();
+    // Chunk-bound fast path (wave 126): when the largest operands multiply
+    // to less than 10^precision, no row can overflow `i128` or the result's
+    // precision, so the checks are dropped; operands that fit in i64 also
+    // make the product one widening multiply. Any other chunk takes the
+    // checked loop below, which raises the error at the offending row.
+    let (ma, mb) = (max_abs_i128(&lv), max_abs_i128(&rv));
+    let limit = crate::types::POW10_I128[precision as usize] as u128;
+    if ma <= i64::MAX as u128
+        && mb <= i64::MAX as u128
+        && ma.checked_mul(mb).is_some_and(|p| p < limit)
+    {
+        let mut values: Vec<i128> = lv
+            .iter()
+            .zip(rv.iter())
+            .map(|(&a, &b)| (a as i64 as i128) * (b as i64 as i128))
+            .collect();
+        if !all_valid {
+            zero_invalid(&mut values, &validity);
+        }
+        return Ok(Vector::from_parts(
+            VectorData::Decimal {
+                values,
+                precision,
+                scale: ls + rs,
+            },
+            validity,
+            len,
+        ));
+    }
+    let mut values: Vec<i128> = Vec::with_capacity(len);
     for i in 0..len {
         let (a, b) = (lv[i], rv[i]);
         if !all_valid && (validity[i / 64] >> (i % 64)) & 1 == 0 {
@@ -1638,11 +1667,19 @@ fn eval_decimal_mul(l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
             .checked_mul(b)
             .filter(|p| crate::types::decimal_fits(*p, precision));
         let product = product.ok_or_else(|| {
-            PinkDbError::Execution(format!(
-                "Overflow in multiplication of DECIMAL({precision}) ({} * {})",
-                crate::types::format_decimal(a, ls),
-                crate::types::format_decimal(b, rs)
-            ))
+            // DuckDB's text (DecimalMultiplyOverflowCheck): the physical width
+            // and the unscaled operands.
+            if precision <= 18 {
+                PinkDbError::Execution(format!(
+                    "Overflow in multiplication of DECIMAL(18) ({a} * {b}). You might want to \
+                     add an explicit cast to a bigger decimal."
+                ))
+            } else {
+                PinkDbError::Execution(format!(
+                    "Overflow in multiplication of DECIMAL(38) ({a} * {b}). You might want to \
+                     add an explicit cast to a decimal with a smaller scale."
+                ))
+            }
         })?;
         values.push(product);
     }
@@ -1655,6 +1692,23 @@ fn eval_decimal_mul(l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
         validity,
         len,
     ))
+}
+
+/// The largest `|x|` in a decimal payload. NULL slots hold some valid value
+/// (zero when this module wrote them), so the bound is conservative.
+#[inline]
+fn max_abs_i128(values: &[i128]) -> u128 {
+    values.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0)
+}
+
+/// Zero the payload of NULL rows, as the checked loops do, so a vector's
+/// payload never depends on which path computed it.
+fn zero_invalid(values: &mut [i128], validity: &[u64]) {
+    for (i, v) in values.iter_mut().enumerate() {
+        if (validity[i / 64] >> (i % 64)) & 1 == 0 {
+            *v = 0;
+        }
+    }
 }
 
 /// A DECIMAL operand as unscaled i128 values plus their scale. Integer
@@ -1794,6 +1848,31 @@ fn arith_decimal(
     for (word, other) in validity.iter_mut().zip(r.validity()) {
         *word &= *other;
     }
+    // Chunk-bound fast path (wave 126): `|x ± y| <= max|x| + max|y|`, so
+    // when that sum is below 10^precision no row can overflow and the
+    // per-row checked op is dropped. Modulo keeps the checked loop (its
+    // error is division by zero, not overflow).
+    if matches!(op, BinaryOp::Add | BinaryOp::Subtract)
+        && max_abs_i128(a)
+            .checked_add(max_abs_i128(b))
+            .is_some_and(|s| s < crate::types::POW10_I128[precision as usize] as u128)
+    {
+        let mut values: Vec<i128> = if op == BinaryOp::Add {
+            a.iter().zip(b).map(|(&x, &y)| x + y).collect()
+        } else {
+            a.iter().zip(b).map(|(&x, &y)| x - y).collect()
+        };
+        zero_invalid(&mut values, &validity);
+        return Ok(Vector::from_parts(
+            VectorData::Decimal {
+                values,
+                precision,
+                scale,
+            },
+            validity,
+            len,
+        ));
+    }
     let mut values: Vec<i128> = Vec::with_capacity(len);
     for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
         if (validity[i / 64] >> (i % 64)) & 1 == 0 {
@@ -1828,6 +1907,28 @@ fn arith_decimal_const(
     // The constant is never NULL, so the column's mask is the result's.
     let mut validity = col.validity().to_vec();
     validity.resize(len.div_ceil(64), 0);
+    // Chunk-bound fast path (wave 126), as in `arith_decimal`.
+    if matches!(op, BinaryOp::Add | BinaryOp::Subtract)
+        && max_abs_i128(a)
+            .checked_add(k.unsigned_abs())
+            .is_some_and(|s| s < crate::types::POW10_I128[precision as usize] as u128)
+    {
+        let mut values: Vec<i128> = match (op, const_left) {
+            (BinaryOp::Add, _) => a.iter().map(|&x| x + k).collect(),
+            (_, true) => a.iter().map(|&x| k - x).collect(),
+            (_, false) => a.iter().map(|&x| x - k).collect(),
+        };
+        zero_invalid(&mut values, &validity);
+        return Ok(Vector::from_parts(
+            VectorData::Decimal {
+                values,
+                precision,
+                scale,
+            },
+            validity,
+            len,
+        ));
+    }
     let mut values: Vec<i128> = Vec::with_capacity(len);
     for (i, &x) in a.iter().enumerate() {
         if (validity[i / 64] >> (i % 64)) & 1 == 0 {

@@ -143,6 +143,106 @@ pub(crate) fn eval_agg_vec<'a>(
     }
 }
 
+/// The state of one AVG (wave 126). INTEGER/BIGINT/DECIMAL inputs are summed
+/// exactly in an i128 at the input's scale and divided once in `finalize`,
+/// as DuckDB's `IntegerAverageOperationHugeint` / decimal average do
+/// (`extension/core_functions/aggregate/algebraic/avg.cpp`): faster than a
+/// float add per row, independent of the order rows arrive in, and the same
+/// double DuckDB returns. A DOUBLE input switches to a float sum, kept in the
+/// same i128 slot as its bits so `Acc` does not grow.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AvgState {
+    sum: i128,
+    count: i64,
+    scale: u8,
+    float: bool,
+}
+
+impl AvgState {
+    #[inline]
+    fn float_sum(&self) -> f64 {
+        if self.float {
+            f64::from_bits(self.sum as u64)
+        } else {
+            self.sum as f64 / crate::types::POW10_F64[self.scale as usize]
+        }
+    }
+
+    #[inline]
+    fn set_float(&mut self, x: f64) {
+        self.sum = x.to_bits() as i128;
+        self.float = true;
+    }
+
+    #[inline]
+    pub(crate) fn add_int(&mut self, x: i128) {
+        self.add_decimal(x, 0);
+    }
+
+    #[inline]
+    pub(crate) fn add_decimal(&mut self, x: i128, scale: u8) {
+        if self.float {
+            let f = self.float_sum() + x as f64 / crate::types::POW10_F64[scale as usize];
+            self.set_float(f);
+        } else {
+            if scale != self.scale {
+                self.align(scale);
+            }
+            let x = if scale < self.scale {
+                x * crate::types::POW10_I128[(self.scale - scale) as usize]
+            } else {
+                x
+            };
+            self.sum = self.sum.wrapping_add(x);
+        }
+        self.count += 1;
+    }
+
+    /// Raise the exact sum's scale to `scale` (one column has one scale, so
+    /// this happens at most once, on the first cell).
+    fn align(&mut self, scale: u8) {
+        if scale > self.scale {
+            self.sum *= crate::types::POW10_I128[(scale - self.scale) as usize];
+            self.scale = scale;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_f64(&mut self, x: f64) {
+        let f = if self.count == 0 && !self.float {
+            0.0
+        } else {
+            self.float_sum()
+        };
+        self.set_float(f + x);
+        self.count += 1;
+    }
+
+    pub(crate) fn merge(&mut self, other: AvgState) {
+        if self.float || other.float {
+            let f = self.float_sum() + other.float_sum();
+            self.set_float(f);
+        } else {
+            let scale = self.scale.max(other.scale);
+            self.align(scale);
+            let b = other.sum * crate::types::POW10_I128[(scale - other.scale) as usize];
+            self.sum = self.sum.wrapping_add(b);
+        }
+        self.count += other.count;
+    }
+
+    pub(crate) fn finalize(&self) -> Value {
+        if self.count == 0 {
+            return Value::Null;
+        }
+        if self.float {
+            return Value::Double(self.float_sum() / self.count as f64);
+        }
+        let divident = self.count as f64 * crate::types::POW10_F64[self.scale as usize];
+        Value::Double(self.sum as f64 / divident)
+    }
+}
+
 pub(crate) enum Acc {
     Count(i64),
     /// Integer SUM is exact like DuckDB's HUGEINT sum: the true total is
@@ -169,10 +269,9 @@ pub(crate) enum Acc {
         overflow: bool,
         non_null: bool,
     },
-    Avg {
-        sum: f64,
-        count: i64,
-    },
+    /// AVG: exact for INTEGER/BIGINT/DECIMAL like DuckDB (an i128 sum at the
+    /// input's scale, divided once in `finalize`), a float sum for DOUBLE.
+    Avg(AvgState),
     MinMax {
         cur: Option<Value>,
         is_min: bool,
@@ -318,7 +417,7 @@ impl Acc {
                 wraps: 0,
                 non_null: false,
             },
-            AggFunc::Avg => Acc::Avg { sum: 0.0, count: 0 },
+            AggFunc::Avg => Acc::Avg(AvgState::default()),
             AggFunc::Min => Acc::MinMax {
                 cur: None,
                 is_min: true,
@@ -374,10 +473,7 @@ impl Acc {
             // column is DECIMAL); route it through `update` for the same
             // conversion the generic path would apply.
             Acc::SumDecimal { .. } => self.update(Some(&Value::Bigint(x))),
-            Acc::Avg { sum, count } => {
-                *sum += x as f64;
-                *count += 1;
-            }
+            Acc::Avg(avg) => avg.add_int(x as i128),
             Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
             // DISTINCT accumulators take the generic per-row path.
             Acc::Collect(_) => {
@@ -404,10 +500,7 @@ impl Acc {
             // A decimal SUM slot never sees a DOUBLE cell; route it through
             // `update` (which folds it like the generic path would).
             Acc::SumDecimal { .. } => self.update(Some(&Value::Double(x))),
-            Acc::Avg { sum, count } => {
-                *sum += x;
-                *count += 1;
-            }
+            Acc::Avg(avg) => avg.add_f64(x),
             Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
             Acc::Collect(_) => {
                 unreachable!("COUNT(DISTINCT) and ordered-set aggregates use update_vec")
@@ -428,7 +521,7 @@ impl Acc {
         if let VectorData::Decimal { values, scale, .. } = v.data()
             && matches!(
                 self,
-                Acc::SumInt { .. } | Acc::SumDecimal { .. } | Acc::Avg { .. }
+                Acc::SumInt { .. } | Acc::SumDecimal { .. } | Acc::Avg(_)
             )
         {
             return self.add_decimal(values[i], *scale);
@@ -481,23 +574,11 @@ impl Acc {
                     self.add_decimal(values[i], *scale);
                 }
             }
-            Acc::Avg { sum, count } => match v.data() {
-                VectorData::Int32(d) => {
-                    *sum += d[i] as f64;
-                    *count += 1;
-                }
-                VectorData::Int64(d) => {
-                    *sum += d[i] as f64;
-                    *count += 1;
-                }
-                VectorData::Float64(d) => {
-                    *sum += d[i];
-                    *count += 1;
-                }
-                VectorData::Decimal { values, scale, .. } => {
-                    *sum += crate::types::decimal_to_f64(values[i], *scale);
-                    *count += 1;
-                }
+            Acc::Avg(avg) => match v.data() {
+                VectorData::Int32(d) => avg.add_int(d[i] as i128),
+                VectorData::Int64(d) => avg.add_int(d[i] as i128),
+                VectorData::Float64(d) => avg.add_f64(d[i]),
+                VectorData::Decimal { values, scale, .. } => avg.add_decimal(values[i], *scale),
                 _ => {}
             },
             Acc::MinMax { cur, is_min } => {
@@ -568,23 +649,11 @@ impl Acc {
                     self.add_decimal(*x, *scale);
                 }
             }
-            Acc::Avg { sum, count } => match arg {
-                Some(Value::Integer(i)) => {
-                    *sum += *i as f64;
-                    *count += 1;
-                }
-                Some(Value::Bigint(i)) => {
-                    *sum += *i as f64;
-                    *count += 1;
-                }
-                Some(Value::Double(x)) => {
-                    *sum += *x;
-                    *count += 1;
-                }
-                Some(Value::Decimal(x, scale)) => {
-                    *sum += crate::types::decimal_to_f64(*x, *scale);
-                    *count += 1;
-                }
+            Acc::Avg(avg) => match arg {
+                Some(Value::Integer(i)) => avg.add_int(*i as i128),
+                Some(Value::Bigint(i)) => avg.add_int(*i as i128),
+                Some(Value::Double(x)) => avg.add_f64(*x),
+                Some(Value::Decimal(x, scale)) => avg.add_decimal(*x, *scale),
                 _ => {}
             },
             Acc::MinMax { cur, is_min } => {
@@ -654,10 +723,7 @@ impl Acc {
                 }
                 *non_null = true;
             }
-            Acc::Avg { sum, count } => {
-                *sum += crate::types::decimal_to_f64(x, scale);
-                *count += 1;
-            }
+            Acc::Avg(avg) => avg.add_decimal(x, scale),
             Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
             Acc::Collect(_) => {
                 unreachable!("COUNT(DISTINCT) and ordered-set aggregates use update_vec")
@@ -808,10 +874,10 @@ impl Acc {
                     non_null: an || bn,
                 }
             }
-            (Acc::Avg { sum: a, count: ac }, Acc::Avg { sum: b, count: bc }) => Acc::Avg {
-                sum: a + b,
-                count: ac + bc,
-            },
+            (Acc::Avg(mut a), Acc::Avg(b)) => {
+                a.merge(b);
+                Acc::Avg(a)
+            }
             (Acc::MinMax { cur: a, is_min }, Acc::MinMax { cur: b, .. }) => {
                 let better = match (&a, &b) {
                     (_, None) => false,
@@ -882,13 +948,7 @@ impl Acc {
                     Value::Decimal(*sum, *scale)
                 }
             }
-            Acc::Avg { sum, count } => {
-                if *count == 0 {
-                    Value::Null
-                } else {
-                    Value::Double(*sum / *count as f64)
-                }
-            }
+            Acc::Avg(avg) => avg.finalize(),
             Acc::MinMax { cur, .. } => cur.clone().unwrap_or(Value::Null),
             Acc::Collect(c) => c.result(dtype)?,
         })
@@ -1446,13 +1506,43 @@ pub(crate) fn aggregate_selected(
         .par_iter()
         .map(|input| {
             let mut partial = Partial::for_rows(input.sel.len());
-            fold_chunk(cx, &mut partial, &input.chunk, Some(&input.sel), keys, aggs)?;
-            Ok(partial)
+            match fold_chunk(cx, &mut partial, &input.chunk, Some(&input.sel), keys, aggs) {
+                Ok(()) => Ok(partial),
+                Err(_) => fold_kept_rows(cx, input, keys, aggs),
+            }
         })
         .collect::<Result<_>>()?;
     let groups = merge_partials(partials, !keys.is_empty(), aggs);
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
     emit_groups(groups, &key_types, aggs)
+}
+
+/// The selection fold evaluates keys and arguments over the whole chunk, so
+/// a row the filter dropped can raise an error (a decimal overflow, a
+/// division by zero) that no kept row would. On an error, fold the kept rows
+/// alone: the error stands only if one of them raises it, as in DuckDB.
+/// `fold_chunk` evaluates everything before it touches the partial, so the
+/// retry starts from a clean one. Kept out of line: it is the rare path, and
+/// inlining a second `fold_chunk` into the per-chunk closure measurably slows
+/// the common one.
+#[cold]
+#[inline(never)]
+fn fold_kept_rows(
+    cx: &Cx,
+    input: &Selected,
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+) -> Result<Partial> {
+    let mut partial = Partial::for_rows(input.sel.len());
+    fold_chunk(
+        cx,
+        &mut partial,
+        &input.chunk.take(&input.sel),
+        None,
+        keys,
+        aggs,
+    )?;
+    Ok(partial)
 }
 
 /// Distinct keys a single-VARCHAR-key chunk resolves by linear scan before

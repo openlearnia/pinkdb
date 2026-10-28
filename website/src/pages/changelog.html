@@ -9,6 +9,14 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-28</h2>
+<h3>Wave 126 — faster decimal arithmetic, DuckDB's multiply typing, exact AVG ✅</h3>
+<ul>
+<li>**Decimal <code>+</code>, <code>-</code> and <code>*</code> skip the per-row overflow check when a chunk can't overflow.** One pass over each operand finds its largest magnitude; when the result is provably in range, the loop runs unchecked, and a product of operands that fit 64 bits uses a 64-bit multiply instead of a 128-bit one. A chunk that might overflow takes the checked loop, so errors are unchanged.</li>
+<li><strong>Behaviour change (DuckDB parity): multiplying two decimals of at most 18 digits is typed <code>DECIMAL(18, s1 + s2)</code></strong>, as in DuckDB, instead of widening to <code>DECIMAL(p1 + p2)</code>. <code>DECIMAL(15,2) * DECIMAL(15,2)</code> is now <code>DECIMAL(18,4)</code>, and a product past 18 digits raises DuckDB's error word for word ("Overflow in multiplication of DECIMAL(18) (… * …). You might want to add an explicit cast to a bigger decimal."). Inputs wider than 18 digits still widen, capped at 38.</li>
+<li><strong><code>AVG</code> is exact, like DuckDB:</strong> integer and decimal averages keep an exact 128-bit sum and divide once at the end, so <code>AVG</code> of large <code>BIGINT</code>s no longer loses digits to a running <code>DOUBLE</code>.</li>
+<li><strong>Fix:</strong> an aggregate reading through a filter (wave 123a) evaluated its arguments over the whole chunk, so a row the <code>WHERE</code> clause dropped could still raise an error, such as a decimal overflow. It now retries over the kept rows only, and the error stands only if one of them raises it, as in DuckDB.</li>
+<li>Measured at TPC-H SF 1 (two release binaries, alternating, median of 5 rounds): <strong>Q1 65 → 48 ms (−26 %)</strong>; the other 21 queries are within noise (all 22: 2,065 → 2,047 ms). Q22 measures +4.7 % over 10 rounds; its time is in <code>substr</code>, which allocates per row and makes the query sensitive to code layout (follow-up 126b).</li>
+</ul>
 <h3>Wave 127b — projections evaluate only the outputs that are read ✅</h3>
 <ul>
 <li>A <code>Project</code> whose consumer reads only some of its outputs now evaluates only those expressions; the rest are zero-length placeholders, and only the read expressions bound the columns its input must produce. The restore projection a join reorder adds (which lists every column) no longer pins the whole join chain, so wave 127's pruning reaches Q7/Q9-shaped plans.</li>

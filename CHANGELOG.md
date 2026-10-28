@@ -9,6 +9,35 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 126 — faster decimal arithmetic, DuckDB's multiply typing, exact AVG ✅
+
+- **Decimal `+`, `-` and `*` skip the per-row overflow check when a chunk
+  can't overflow.** One pass over each operand finds its largest magnitude;
+  when the result is provably in range, the loop runs unchecked, and a product
+  of operands that fit 64 bits uses a 64-bit multiply instead of a 128-bit
+  one. A chunk that might overflow takes the checked loop, so errors are
+  unchanged.
+- **Behaviour change (DuckDB parity): multiplying two decimals of at most 18
+  digits is typed `DECIMAL(18, s1 + s2)`**, as in DuckDB, instead of widening
+  to `DECIMAL(p1 + p2)`. `DECIMAL(15,2) * DECIMAL(15,2)` is now
+  `DECIMAL(18,4)`, and a product past 18 digits raises DuckDB's error word for
+  word ("Overflow in multiplication of DECIMAL(18) (… * …). You might want to
+  add an explicit cast to a bigger decimal."). Inputs wider than 18 digits
+  still widen, capped at 38.
+- **`AVG` is exact, like DuckDB:** integer and decimal averages keep an exact
+  128-bit sum and divide once at the end, so `AVG` of large `BIGINT`s no
+  longer loses digits to a running `DOUBLE`.
+- **Fix:** an aggregate reading through a filter (wave 123a) evaluated its
+  arguments over the whole chunk, so a row the `WHERE` clause dropped could
+  still raise an error, such as a decimal overflow. It now retries over the
+  kept rows only, and the error stands only if one of them raises it, as in
+  DuckDB.
+- Measured at TPC-H SF 1 (two release binaries, alternating, median of 5
+  rounds): **Q1 65 → 48 ms (−26 %)**; the other 21 queries are within noise
+  (all 22: 2,065 → 2,047 ms). Q22 measures +4.7 % over 10 rounds; its time is
+  in `substr`, which allocates per row and makes the query sensitive to code
+  layout (follow-up 126b).
+
 ### Wave 127b — projections evaluate only the outputs that are read ✅
 
 - A `Project` whose consumer reads only some of its outputs now evaluates

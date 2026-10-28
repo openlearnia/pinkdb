@@ -941,7 +941,16 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
                         )));
                     }
                     let scale = scale as u8;
-                    let p = (wa.0 as u16 + wb.0 as u16).min(DECIMAL_MAX_PRECISION as u16) as u8;
+                    let mut p = (wa.0 as u16 + wb.0 as u16).min(DECIMAL_MAX_PRECISION as u16) as u8;
+                    // DuckDB's 18-digit cap (BindDecimalMultiply in
+                    // src/function/scalar/operator/arithmetic.cpp): when both
+                    // inputs fit 18 digits and the scale stays below 18, the
+                    // product is typed DECIMAL(18, s) and a value past it is an
+                    // overflow error, rather than widening to DECIMAL(p1+p2).
+                    // `DECIMAL(15,2) * DECIMAL(15,2)` is DECIMAL(18,4).
+                    if p > 18 && wa.0.max(wb.0) <= 18 && scale < 18 {
+                        p = 18;
+                    }
                     (p.max(scale), scale)
                 }
             };
