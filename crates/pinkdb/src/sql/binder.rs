@@ -160,7 +160,7 @@ impl ScalarFunc {
             "upper" => ScalarFunc::Upper,
             "lower" => ScalarFunc::Lower,
             "length" | "len" => ScalarFunc::Length,
-            "substr" => ScalarFunc::Substr,
+            "substr" | "substring" => ScalarFunc::Substr,
             "year" => ScalarFunc::Year,
             "month" => ScalarFunc::Month,
             "day" => ScalarFunc::Day,
@@ -4310,14 +4310,18 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
         ScalarFunc::JsonRemove => unreachable!("bound by bind_json_mutator"),
         ScalarFunc::Substr => {
             arity(&[2, 3])?;
-            if args[0].dtype() != DataType::Varchar {
+            // DuckDB's signatures: substring(VARCHAR, BIGINT[, BIGINT]); a
+            // NULL literal fits any argument (the result is NULL).
+            let null = |a: &BoundExpr| matches!(a, BoundExpr::Literal(Value::Null));
+            if args[0].dtype() != DataType::Varchar && !null(&args[0]) {
                 return Err(PinkDbError::Type("substr needs VARCHAR input".to_string()));
             }
             for a in &args[1..] {
-                if !is_numeric(a.dtype()) {
-                    return Err(PinkDbError::Type(
-                        "substr start/length must be numeric".to_string(),
-                    ));
+                if !matches!(a.dtype(), DataType::Integer | DataType::Bigint) && !null(a) {
+                    return Err(PinkDbError::Type(format!(
+                        "substr start/length must be integers, got {}",
+                        a.dtype()
+                    )));
                 }
             }
             Ok(DataType::Varchar)

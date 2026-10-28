@@ -329,14 +329,9 @@ def tpch_queries() -> dict[int, str]:
     rows = json.loads(r.stdout)
     queries = {}
     for row in rows:
-        q = row["query"].replace("substring(c_phone FROM 1 FOR 2)", "substr(c_phone, 1, 2)")
-        q = re.sub(
-            r"substring\(\s*c_phone\s+from\s+1\s+for\s+2\s*\)",
-            "substr(c_phone, 1, 2)",
-            q,
-            flags=re.I,
-        )
-        queries[int(row["query_nr"])] = q.strip()
+        # DuckDB's text runs unchanged (Q22's `substring(... FROM 1 FOR 2)`
+        # parses since wave 126b).
+        queries[int(row["query_nr"])] = row["query"].strip()
     return queries
 
 

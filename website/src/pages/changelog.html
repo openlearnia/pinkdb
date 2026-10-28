@@ -9,6 +9,13 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-28</h2>
+<h3>Wave 126b — <code>substr</code> with DuckDB's semantics, vectorized ✅</h3>
+<ul>
+<li><strong>Behaviour change (DuckDB parity):</strong> <code>substr</code>/<code>substring</code> now follow DuckDB for every offset and length. A start of 0 begins one character before the first, a negative start counts from the end, and a negative length reaches backwards: <code>substr('hello', 0, 2)</code> is <code>h</code>, <code>substr('hello', -2)</code> is <code>lo</code>, <code>substr('hello', -3, 2)</code> is <code>ll</code> and <code>substr('hello', 2, -1)</code> is <code>h</code> (they were <code>he</code>, <code>hello</code>, <code>he</code> and an empty string). Characters are code points.</li>
+<li><strong><code>substring</code> works as a name, and the SQL forms parse:</strong> <code>substring(s FROM 2 FOR 3)</code>, <code>substring(s FROM 2)</code> and <code>substring(s FOR 2)</code>, as in DuckDB (TPC-H Q22 uses them).</li>
+<li><strong>Start and length must be integers</strong>, as in DuckDB (<code>substr('hello', 1.5)</code> is an error), and values outside ±2³² raise DuckDB's range error. A <code>NULL</code> argument gives <code>NULL</code>.</li>
+<li><strong>Faster:</strong> a column kernel slices each string in place and returns the input string itself when the result is the whole of it, instead of copying the string and collecting its characters per row. TPC-H Q22 at SF 1: 182 → 70 ms (−62 %).</li>
+</ul>
 <h3>Wave 126 — faster decimal arithmetic, DuckDB's multiply typing, exact AVG ✅</h3>
 <ul>
 <li>**Decimal <code>+</code>, <code>-</code> and <code>*</code> skip the per-row overflow check when a chunk can't overflow.** One pass over each operand finds its largest magnitude; when the result is provably in range, the loop runs unchecked, and a product of operands that fit 64 bits uses a 64-bit multiply instead of a 128-bit one. A chunk that might overflow takes the checked loop, so errors are unchanged.</li>

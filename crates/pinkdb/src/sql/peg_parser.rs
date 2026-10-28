@@ -2935,6 +2935,7 @@ peg::parser! {
             / star() { Expr::Star }
             / exists_expr()
             / extract_call()
+            / substring_call()
             / lparen() q:query() rparen() { Expr::ScalarSubquery(Box::new(q)) }
             / lparen() first:expr() comma() second:expr() rest:(comma() e:expr() { e })* rparen() {
                   let mut args = vec![first, second];
@@ -2995,6 +2996,27 @@ peg::parser! {
                   Expr::Function {
                       name: "extract".to_string(),
                       args: vec![Expr::Literal(Value::Varchar(part)), e],
+                      distinct: false,
+                      filter: None,
+                  }
+              }
+
+        /// SQL's `SUBSTRING(s FROM start [FOR length])` and
+        /// `SUBSTRING(s FOR length)`, as DuckDB accepts them: desugars to
+        /// `substring(s, start[, length])` (start 1 when only `FOR` is
+        /// given). The ordinary `substring(s, a, b)` call is a plain
+        /// function call; this rule only matches the keyword forms.
+        rule substring_call() -> Expr
+            = word("substring") lparen() e:expr() kw(Keyword::From) start:expr()
+              len:(word("for") l:expr() { l })? rparen() {
+                  let mut args = vec![e, start];
+                  args.extend(len);
+                  Expr::Function { name: "substring".to_string(), args, distinct: false, filter: None }
+              }
+            / word("substring") lparen() e:expr() word("for") l:expr() rparen() {
+                  Expr::Function {
+                      name: "substring".to_string(),
+                      args: vec![e, Expr::Literal(Value::Integer(1)), l],
                       distinct: false,
                       filter: None,
                   }

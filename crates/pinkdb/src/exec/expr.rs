@@ -2560,6 +2560,110 @@ fn eval_scalar_typed(func: ScalarFunc, args: &[Vector]) -> Result<Option<Vector>
     Ok(Some(out))
 }
 
+/// `substr(s, offset)` without a length: DuckDB passes `u32::MAX`.
+const SUBSTR_TO_END: i64 = u32::MAX as i64;
+
+/// An INTEGER or BIGINT argument read per row without a `Value`.
+enum IntArg<'a> {
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+}
+
+impl<'a> IntArg<'a> {
+    fn of(v: &'a Vector) -> Option<IntArg<'a>> {
+        match v.data() {
+            VectorData::Int32(x) => Some(IntArg::I32(x)),
+            VectorData::Int64(x) => Some(IntArg::I64(x)),
+            _ => None,
+        }
+    }
+
+    fn get(&self, i: usize) -> i64 {
+        match self {
+            IntArg::I32(x) => i64::from(x[i]),
+            IntArg::I64(x) => x[i],
+        }
+    }
+}
+
+/// `substr`'s result `[start, end)` in characters of a string `n` characters
+/// long, or `None` for the empty string. A port of DuckDB's
+/// `SubstringStartEnd` + `SubstringASCIIBounds`
+/// (src/function/scalar/string/substring.cpp): a positive offset counts from
+/// 1, a negative one from the end, offset 0 starts one character before the
+/// first (so it eats one character of the length), and a negative length
+/// reaches backwards from the start.
+fn substr_range(n: i64, offset: i64, mut length: i64) -> Option<(usize, usize)> {
+    if length == 0 {
+        return None;
+    }
+    let mut start = match offset {
+        o if o > 0 => o - 1,
+        o if o < 0 => o,
+        _ => {
+            length -= 1;
+            if length <= 0 {
+                return None;
+            }
+            0
+        }
+    };
+    let mut end = if length > 0 {
+        start + length
+    } else {
+        let end = start;
+        start += length;
+        end
+    };
+    if offset < 0 {
+        start += n;
+        end += n;
+    }
+    let start = start.clamp(0, n);
+    let end = end.clamp(0, n);
+    (start < end).then_some((start as usize, end as usize))
+}
+
+/// `substr(s, offset, length)` with DuckDB's semantics and range errors,
+/// borrowed from `s`. Characters are code points; ASCII strings slice bytes.
+fn substr_slice(s: &str, offset: i64, length: i64) -> Result<&str> {
+    const UPPER: i64 = u32::MAX as i64;
+    const LOWER: i64 = -UPPER - 1;
+    for (what, x) in [("offset", offset), ("length", length)] {
+        if x > UPPER {
+            return Err(PinkDbError::Execution(format!(
+                "Substring {what} outside of supported range (> {UPPER})"
+            )));
+        }
+        if x < LOWER {
+            return Err(PinkDbError::Execution(format!(
+                "Substring {what} outside of supported range (< {LOWER})"
+            )));
+        }
+    }
+    if s.is_ascii() {
+        return Ok(match substr_range(s.len() as i64, offset, length) {
+            Some((a, b)) => &s[a..b],
+            None => "",
+        });
+    }
+    let n = s.chars().count();
+    let Some((a, b)) = substr_range(n as i64, offset, length) else {
+        return Ok("");
+    };
+    let mut bytes = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()));
+    let from = bytes.nth(a).unwrap_or(s.len());
+    let to = if b == a {
+        from
+    } else {
+        bytes.nth(b - a - 1).unwrap_or(s.len())
+    };
+    Ok(&s[from..to])
+}
+
 /// Typed fast paths for the common scalar functions. `Ok(None)` ⇒ arg
 /// shape not covered: caller runs the generic `apply_scalar` loop, which
 /// preserves the old errors for bad shapes/types.
@@ -2584,6 +2688,50 @@ fn eval_scalar_fast(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Resul
                 }
             }
             Ok(Some(out))
+        }
+        ScalarFunc::Substr if dtype == DataType::Varchar && (2..=3).contains(&args.len()) => {
+            let v = &args[0];
+            let VectorData::VarChar(src) = v.data() else {
+                // A NULL literal input (typed INTEGER) takes the generic path.
+                return Ok(None);
+            };
+            let (Some(offsets), lengths) = (IntArg::of(&args[1]), args.get(2).map(IntArg::of))
+            else {
+                return Ok(None);
+            };
+            let lengths = match lengths {
+                Some(Some(l)) => Some(l),
+                Some(None) => return Ok(None),
+                None => None,
+            };
+            let mut validity = v.validity().to_vec();
+            for a in &args[1..] {
+                for (w, m) in validity.iter_mut().zip(a.validity()) {
+                    *w &= m;
+                }
+            }
+            let empty: std::sync::Arc<str> = std::sync::Arc::from("");
+            let mut out = Vec::with_capacity(src.len());
+            for (i, s) in src.iter().enumerate() {
+                if validity[i / 64] >> (i % 64) & 1 == 0 {
+                    out.push(empty.clone());
+                    continue;
+                }
+                let length = lengths.as_ref().map_or(SUBSTR_TO_END, |l| l.get(i));
+                let part = substr_slice(s, offsets.get(i), length)?;
+                out.push(if part.len() == s.len() {
+                    s.clone()
+                } else if part.is_empty() {
+                    empty.clone()
+                } else {
+                    std::sync::Arc::from(part)
+                });
+            }
+            Ok(Some(Vector::from_parts(
+                VectorData::VarChar(out),
+                validity,
+                src.len(),
+            )))
         }
         ScalarFunc::Length if args.len() == 1 && dtype == DataType::Integer => {
             let v = &args[0];
@@ -2986,19 +3134,15 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
         }
         ScalarFunc::Substr => {
             let s = match &row[0] {
-                Value::Varchar(s) => s.clone(),
+                Value::Varchar(s) => s.as_str(),
                 v => return Err(PinkDbError::Execution(format!("substr of {v}"))),
             };
-            // 1-indexed; start clamps to ≥1, negative/zero length → "".
-            let start = as_i64(&row[1])?.max(1) as usize;
-            let chars: Vec<char> = s.chars().collect();
-            let from = (start - 1).min(chars.len());
-            let take = if row.len() > 2 {
-                as_i64(&row[2])?.max(0) as usize
-            } else {
-                chars.len()
+            let offset = as_i64(&row[1])?;
+            let length = match row.get(2) {
+                Some(l) => as_i64(l)?,
+                None => SUBSTR_TO_END,
             };
-            Ok(Value::Varchar(chars[from..].iter().take(take).collect()))
+            Ok(Value::Varchar(substr_slice(s, offset, length)?.to_string()))
         }
         ScalarFunc::Trim | ScalarFunc::LTrim | ScalarFunc::RTrim => {
             let s = match &row[0] {

@@ -9,6 +9,26 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 126b — `substr` with DuckDB's semantics, vectorized ✅
+
+- **Behaviour change (DuckDB parity):** `substr`/`substring` now follow
+  DuckDB for every offset and length. A start of 0 begins one character
+  before the first, a negative start counts from the end, and a negative
+  length reaches backwards: `substr('hello', 0, 2)` is `h`,
+  `substr('hello', -2)` is `lo`, `substr('hello', -3, 2)` is `ll` and
+  `substr('hello', 2, -1)` is `h` (they were `he`, `hello`, `he` and an empty
+  string). Characters are code points.
+- **`substring` works as a name, and the SQL forms parse:**
+  `substring(s FROM 2 FOR 3)`, `substring(s FROM 2)` and
+  `substring(s FOR 2)`, as in DuckDB (TPC-H Q22 uses them).
+- **Start and length must be integers**, as in DuckDB
+  (`substr('hello', 1.5)` is an error), and values outside ±2³² raise
+  DuckDB's range error. A `NULL` argument gives `NULL`.
+- **Faster:** a column kernel slices each string in place and returns the
+  input string itself when the result is the whole of it, instead of copying
+  the string and collecting its characters per row. TPC-H Q22 at SF 1:
+  182 → 70 ms (−62 %).
+
 ### Wave 126 — faster decimal arithmetic, DuckDB's multiply typing, exact AVG ✅
 
 - **Decimal `+`, `-` and `*` skip the per-row overflow check when a chunk
