@@ -10,6 +10,7 @@ use crate::types::FastSet;
 
 use super::Cx;
 use super::expr::eval_expr;
+use super::selection::Selected;
 use crate::plan::{compare_values, num_cmp};
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
 use crate::types::{DataType, PinkDbError, Result, Value, decimal_fits};
@@ -1181,7 +1182,7 @@ fn filter_and_fold(
             None => return Ok(()),
         }
     }
-    fold_chunk(cx, partial, &chunk, keys, aggs)
+    fold_chunk(cx, partial, &chunk, None, keys, aggs)
 }
 
 /// Fold one chunk into `partial` — phase 1 of [`aggregate`] for a single
@@ -1192,10 +1193,16 @@ fn filter_and_fold(
 /// Rows are read through the same `eval_agg_vec` / `group_ids` / `accumulate`
 /// calls the materialized path makes, in the same order, so groups and
 /// accumulator updates are identical.
+///
+/// `sel` (ascending row indices) folds only those rows of `chunk`: key and
+/// argument vectors are still evaluated over the whole chunk, which is what
+/// keeps this path free of the filtered copy `filter_chunk` would otherwise
+/// build, so the index is applied here and in [`accumulate`] last.
 pub(crate) fn fold_chunk(
     cx: &Cx,
     partial: &mut Partial,
     chunk: &DataChunk,
+    sel: Option<&[u32]>,
     keys: &[BoundExpr],
     aggs: &[BoundAgg],
 ) -> Result<()> {
@@ -1221,7 +1228,8 @@ pub(crate) fn fold_chunk(
         })
         .collect::<Result<_>>()?;
     // Pass 1: one group id per row (first-seen order).
-    let gids = group_ids(partial, &key_vecs, aggs, chunk.num_rows());
+    let rows = sel.map_or(chunk.num_rows(), |s| s.len());
+    let gids = group_ids(partial, &key_vecs, aggs, rows, sel);
     // Pass 2: each aggregate runs as one typed loop over the chunk.
     // Accumulators are independent, so feeding agg by agg instead of row by
     // row gives every accumulator the same rows in the same order — results
@@ -1233,6 +1241,7 @@ pub(crate) fn fold_chunk(
             j,
             av.as_ref().map(|v| v.v()),
             keeps[j].as_deref(),
+            sel,
         );
     }
     Ok(())
@@ -1411,13 +1420,36 @@ pub(crate) fn aggregate(
         .par_iter()
         .map(|chunk| {
             let mut partial = Partial::for_rows(chunk.num_rows());
-            fold_chunk(cx, &mut partial, chunk, keys, aggs)?;
+            fold_chunk(cx, &mut partial, chunk, None, keys, aggs)?;
             Ok(partial)
         })
         .collect::<Result<_>>()?;
 
     // Phase 2 + emit, shared with the fused join→aggregate executor (which
     // builds the same `Partial`s from joined rows it never materializes).
+    let groups = merge_partials(partials, !keys.is_empty(), aggs);
+    let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
+    emit_groups(groups, &key_types, aggs)
+}
+
+/// [`aggregate`] over chunks that carry a selection: every partial folds only
+/// the rows its filter kept, reading the key and argument columns through the
+/// selection instead of from a materialized filtered copy.
+pub(crate) fn aggregate_selected(
+    cx: &Cx,
+    inputs: &[Selected],
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+) -> Result<Vec<DataChunk>> {
+    debug_assert!(!aggs.is_empty(), "the DISTINCT path stays in `aggregate`");
+    let partials: Vec<Partial> = inputs
+        .par_iter()
+        .map(|input| {
+            let mut partial = Partial::for_rows(input.sel.len());
+            fold_chunk(cx, &mut partial, &input.chunk, Some(&input.sel), keys, aggs)?;
+            Ok(partial)
+        })
+        .collect::<Result<_>>()?;
     let groups = merge_partials(partials, !keys.is_empty(), aggs);
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
     emit_groups(groups, &key_types, aggs)
@@ -1467,7 +1499,11 @@ fn group_ids(
     key_vecs: &[EvalVec],
     aggs: &[BoundAgg],
     rows: usize,
+    sel: Option<&[u32]>,
 ) -> Vec<usize> {
+    // `rows` counts selection entries, not chunk rows: the key vectors are
+    // still whole-chunk, so every index goes through the selection.
+    let row = |k: usize| sel.map_or(k, |s| s[k] as usize);
     let mut gids = Vec::with_capacity(rows);
     let mut buf = Vec::new();
     let encode = |buf: &mut Vec<u8>, i: usize| {
@@ -1494,7 +1530,8 @@ fn group_ids(
                     Default::default(),
                 );
                 let mut null_gid = None;
-                for i in 0..rows {
+                for k in 0..rows {
+                    let i = row(k);
                     let gid = if v.is_null(i) {
                         match null_gid {
                             Some(g) => g,
@@ -1528,7 +1565,7 @@ fn group_ids(
                 let mut small: Vec<(&str, usize)> = Vec::new();
                 let mut null_gid = None;
                 while start < rows {
-                    let i = start;
+                    let i = row(start);
                     let gid = if v.is_null(i) {
                         match null_gid {
                             Some(g) => g,
@@ -1565,7 +1602,8 @@ fn group_ids(
         }
     }
     let mut full_reserved = false;
-    for i in start..rows {
+    for k in start..rows {
+        let i = row(k);
         // Borrowed encoding + get-first lookup: hits (the common case)
         // allocate nothing and probe the map exactly once; only misses
         // materialize Values and insert.
@@ -1613,18 +1651,24 @@ fn keep_mask(pred: &Vector) -> Result<Vec<bool>> {
     Ok(keep)
 }
 
+///
+/// `sel` maps each selection entry back to its row of `arg` and of the
+/// `FILTER` mask, which are both whole-chunk.
 fn accumulate(
     groups: &mut [(Vec<u8>, Group)],
     gids: &[usize],
     j: usize,
     arg: Option<&Vector>,
     keep: Option<&[bool]>,
+    sel: Option<&[u32]>,
 ) {
+    let row = |k: usize| sel.map_or(k, |s| s[k] as usize);
     // A filtered-out row contributes nothing to this aggregate: it must not
     // reach the accumulator at all, which is what `count(*) FILTER` needs.
     let keep = |i: usize| keep.is_none_or(|k| k[i]);
     let Some(v) = arg else {
-        for (i, &g) in gids.iter().enumerate() {
+        for (k, &g) in gids.iter().enumerate() {
+            let i = row(k);
             if keep(i) {
                 groups[g].1.accs[j].count_star();
             }
@@ -1636,28 +1680,42 @@ fn accumulate(
         .is_some_and(|&g| matches!(groups[g].1.accs[j], Acc::MinMax { .. } | Acc::Collect(_)));
     match v.data() {
         VectorData::Int32(d) if !generic => {
-            for (i, &g) in gids.iter().enumerate() {
+            for (k, &g) in gids.iter().enumerate() {
+                let i = row(k);
                 if keep(i) && v.is_valid(i) {
                     groups[g].1.accs[j].add_int(d[i] as i64);
                 }
             }
         }
         VectorData::Int64(d) if !generic => {
-            for (i, &g) in gids.iter().enumerate() {
+            for (k, &g) in gids.iter().enumerate() {
+                let i = row(k);
                 if keep(i) && v.is_valid(i) {
                     groups[g].1.accs[j].add_int(d[i]);
                 }
             }
         }
         VectorData::Float64(d) if !generic => {
-            for (i, &g) in gids.iter().enumerate() {
+            for (k, &g) in gids.iter().enumerate() {
+                let i = row(k);
                 if keep(i) && v.is_valid(i) {
                     groups[g].1.accs[j].add_f64(d[i]);
                 }
             }
         }
+        // DECIMAL is `accumulate`'s other hot payload type (a decimal SUM or
+        // AVG over a scan); `update_vec` would re-dispatch per row.
+        VectorData::Decimal { values, scale, .. } if !generic => {
+            for (k, &g) in gids.iter().enumerate() {
+                let i = row(k);
+                if keep(i) && v.is_valid(i) {
+                    groups[g].1.accs[j].add_decimal(values[i], *scale);
+                }
+            }
+        }
         _ => {
-            for (i, &g) in gids.iter().enumerate() {
+            for (k, &g) in gids.iter().enumerate() {
+                let i = row(k);
                 if keep(i) {
                     groups[g].1.accs[j].update_vec(v, i);
                 }
@@ -1823,5 +1881,190 @@ mod tests {
             big.finalize(DataType::Double).unwrap(),
             Value::Double(i64::MAX as f64 + 1.0 + 0.5)
         );
+    }
+
+    /// xorshift64, so the differential case is repeatable.
+    fn next_rand(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn test_chunk(rows: usize, state: &mut u64) -> DataChunk {
+        let mut k = Vector::new_empty(DataType::Integer);
+        let mut s = Vector::new_empty(DataType::Varchar);
+        let mut d = Vector::new_empty(DataType::Decimal {
+            precision: 15,
+            scale: 2,
+        });
+        let mut b = Vector::new_empty(DataType::Bigint);
+        let mut x = Vector::new_empty(DataType::Double);
+        for i in 0..rows {
+            let roll = next_rand(state) % 7;
+            if i == 0 || roll == 0 {
+                k.push_null().unwrap();
+                s.push_null().unwrap();
+                d.push_null().unwrap();
+                b.push_null().unwrap();
+                x.push_null().unwrap();
+                continue;
+            }
+            k.push_valid(Value::Integer((next_rand(state) % 4) as i32))
+                .unwrap();
+            s.push_str(["", "apple", "banana", "cherry"][(next_rand(state) % 4) as usize])
+                .unwrap();
+            let mag = (next_rand(state) % 100_000) as i128;
+            let value = if next_rand(state).is_multiple_of(2) {
+                mag
+            } else {
+                -mag
+            };
+            d.push_valid(Value::Decimal(value, 2)).unwrap();
+            b.push_valid(Value::Bigint((next_rand(state) % 2001) as i64 - 1000))
+                .unwrap();
+            x.push_valid(Value::Double((next_rand(state) % 2001) as f64 / 8.0 - 12.5))
+                .unwrap();
+        }
+        DataChunk::new(vec![k, s, d, b, x]).unwrap()
+    }
+
+    fn aggs() -> Vec<BoundAgg> {
+        let col = |index: usize, dtype: DataType| Some(BoundExpr::Column { index, dtype });
+        let decimal = DataType::Decimal {
+            precision: 15,
+            scale: 2,
+        };
+        let mk = |func, arg, dtype, filter| BoundAgg {
+            func,
+            arg,
+            dtype,
+            distinct: false,
+            filter,
+            direct: None,
+        };
+        vec![
+            mk(AggFunc::Count, None, DataType::Bigint, None),
+            mk(AggFunc::Sum, col(2, decimal), decimal, None),
+            mk(AggFunc::Avg, col(2, decimal), DataType::Double, None),
+            mk(
+                AggFunc::Min,
+                col(3, DataType::Bigint),
+                DataType::Bigint,
+                None,
+            ),
+            mk(AggFunc::Max, col(2, decimal), decimal, None),
+            mk(
+                AggFunc::Sum,
+                col(3, DataType::Bigint),
+                DataType::Bigint,
+                None,
+            ),
+            mk(
+                AggFunc::Avg,
+                col(4, DataType::Double),
+                DataType::Double,
+                None,
+            ),
+            // A FILTER under a selection: `keep` stays indexed by the chunk's
+            // absolute row while the fold walks the selection.
+            mk(
+                AggFunc::Sum,
+                col(3, DataType::Bigint),
+                DataType::Bigint,
+                Some(BoundExpr::Binary {
+                    op: crate::sql::ast::BinaryOp::Gt,
+                    left: Box::new(BoundExpr::Column {
+                        index: 4,
+                        dtype: DataType::Double,
+                    }),
+                    right: Box::new(BoundExpr::Literal(Value::Double(0.0))),
+                    dtype: DataType::Boolean,
+                }),
+            ),
+        ]
+    }
+
+    fn rows_of(chunks: &[DataChunk]) -> Vec<Vec<Value>> {
+        chunks
+            .iter()
+            .flat_map(|c| (0..c.num_rows()).map(move |i| (c, i)))
+            .map(|(c, i)| {
+                (0..c.columns.len())
+                    .map(|j| c.expect_column(j).unwrap().get(i))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folding_through_a_selection_matches_folding_a_compacted_copy() {
+        // The selection path indexes the key/argument vectors instead of
+        // copying them; a compacted copy has to produce the same groups, in
+        // the same first-seen order, with the same accumulators.
+        let db = crate::storage::PinkDb::new();
+        let cx = Cx::new(&db);
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let chunk = test_chunk(300, &mut state);
+        let keysets = [
+            vec![BoundExpr::Column {
+                index: 0,
+                dtype: DataType::Integer,
+            }],
+            vec![BoundExpr::Column {
+                index: 1,
+                dtype: DataType::Varchar,
+            }],
+            vec![
+                BoundExpr::Column {
+                    index: 0,
+                    dtype: DataType::Integer,
+                },
+                BoundExpr::Column {
+                    index: 1,
+                    dtype: DataType::Varchar,
+                },
+            ],
+        ];
+        for keys in &keysets {
+            let aggs = aggs();
+            // Everything selected: the two folds must agree with the plain
+            // unfiltered aggregate.
+            let all: Vec<u32> = (0..chunk.num_rows() as u32).collect();
+            let plain = aggregate(&cx, std::slice::from_ref(&chunk), keys, &aggs).unwrap();
+            let via_selection = aggregate_selected(
+                &cx,
+                &[Selected {
+                    chunk: chunk.clone(),
+                    sel: all.clone(),
+                }],
+                keys,
+                &aggs,
+            )
+            .unwrap();
+            assert_eq!(rows_of(&via_selection), rows_of(&plain));
+            // A sparse selection, with holes and a NULL-key row dropped.
+            let mut sel: Vec<u32> = all
+                .iter()
+                .copied()
+                .filter(|&r| r % 3 == 0 || r % 7 == 0)
+                .collect();
+            sel.sort_unstable();
+            let compacted = chunk.take(&sel);
+            let want = aggregate(&cx, &[compacted], keys, &aggs).unwrap();
+            let got = aggregate_selected(
+                &cx,
+                &[Selected {
+                    chunk: chunk.clone(),
+                    sel: sel.clone(),
+                }],
+                keys,
+                &aggs,
+            )
+            .unwrap();
+            assert_eq!(rows_of(&got), rows_of(&want), "keys {keys:?} sel {sel:?}");
+        }
     }
 }

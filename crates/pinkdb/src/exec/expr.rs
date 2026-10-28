@@ -14,7 +14,7 @@ use pinkdb_ext_loader::ExtArg;
 use super::aggregate::encode_row;
 use super::{Cx, Memo, eval};
 use crate::array::ArrayElems;
-use crate::plan::compare_values;
+use crate::plan::{compare_values, num_cmp};
 use crate::sql::ast::BinaryOp;
 use crate::sql::binder::{BoundExpr, OuterBind, ScalarFunc, common_numeric};
 use crate::types::FastSet;
@@ -871,122 +871,29 @@ fn eval_comparison(
     // Column-vs-literal fast path: evaluate only the column and compare each
     // row against the scalar. The general path builds the literal's constant
     // Vector per chunk (an `Arc` clone per element on VARCHAR, a `Value`
-    // clone elsewhere), which for a 1M-row filter dwarfs the comparison
-    // itself. Same-dtype only: mixed numeric widths keep the generic
-    // value-by-value path below.
-    if left.dtype() == right.dtype() {
-        let fast = match (left, right) {
-            (BoundExpr::Literal(v), col)
-                if !v.is_null() && !matches!(col, BoundExpr::Literal(_)) =>
-            {
-                Some((v, col, true))
-            }
-            (col, BoundExpr::Literal(v))
-                if !v.is_null() && !matches!(col, BoundExpr::Literal(_)) =>
-            {
-                Some((v, col, false))
-            }
-            _ => None,
-        };
-        if let Some((scalar, col_expr, scalar_left)) = fast {
-            let col = eval_expr(col_expr, chunk, cx)?;
-            let mut out = Vector::with_capacity(DataType::Boolean, col.len());
-            let handled = match (col.data(), scalar) {
-                (VectorData::Boolean(a), Value::Boolean(s)) => {
-                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
-                    true
-                }
-                (VectorData::Int32(a), Value::Integer(s)) => {
-                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
-                    true
-                }
-                (VectorData::Int64(a), Value::Bigint(s)) => {
-                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
-                    true
-                }
-                (VectorData::Float64(a), Value::Double(s)) => {
-                    cmp_scalar(
-                        op,
-                        &col,
-                        a,
-                        s,
-                        scalar_left,
-                        |x, y| crate::plan::num_cmp(*x, *y),
-                        &mut out,
-                    )?;
-                    true
-                }
-                (VectorData::VarChar(a), Value::Varchar(s)) => {
-                    // One `Arc<str>` for the scalar (one allocation per chunk)
-                    // instead of one clone per element.
-                    let s: std::sync::Arc<str> = std::sync::Arc::from(s.as_str());
-                    cmp_scalar(
-                        op,
-                        &col,
-                        a,
-                        &s,
-                        scalar_left,
-                        |x, y| (**x).cmp(&**y),
-                        &mut out,
-                    )?;
-                    true
-                }
-                (VectorData::Date32(a), Value::Date(s)) => {
-                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
-                    true
-                }
-                (VectorData::TimestampMicros(a), Value::Timestamp(s)) => {
-                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
-                    true
-                }
-                // DECIMAL vs DECIMAL literal of the same scale: no rescaling.
-                (VectorData::Decimal { values, scale, .. }, Value::Decimal(sv, ss))
-                    if scale == ss =>
-                {
-                    cmp_scalar(
-                        op,
-                        &col,
-                        values.as_slice(),
-                        sv,
-                        scalar_left,
-                        |x, y| x.cmp(y),
-                        &mut out,
-                    )?;
-                    true
-                }
-                (
-                    VectorData::Interval(a),
-                    Value::Interval {
-                        months,
-                        days,
-                        micros,
-                    },
-                ) => {
-                    let sv = crate::types::Interval {
-                        months: *months,
-                        days: *days,
-                        micros: *micros,
-                    };
-                    cmp_scalar(
-                        op,
-                        &col,
-                        a.as_slice(),
-                        &sv,
-                        scalar_left,
-                        |x, y| crate::types::interval_cmp(*x, *y),
-                        &mut out,
-                    )?;
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                return Ok(out);
-            }
-            // A shape the binder cannot produce for this dtype: fall through
-            // to the general path (re-evaluating the column has no side
-            // effects).
+    // clone elsewhere), which for a 6M-row filter dwarfs the comparison
+    // itself. Mixed numeric widths use the same kernel (a DECIMAL column
+    // against a DOUBLE literal, a BIGINT column against an INTEGER literal,
+    // ...) so no row is ever compared through a `Value`.
+    let fast = match (left, right) {
+        (BoundExpr::Literal(v), col) if !v.is_null() && !matches!(col, BoundExpr::Literal(_)) => {
+            Some((v, col, true))
         }
+        (col, BoundExpr::Literal(v)) if !v.is_null() && !matches!(col, BoundExpr::Literal(_)) => {
+            Some((v, col, false))
+        }
+        _ => None,
+    };
+    if let Some((scalar, col_expr, scalar_left)) = fast {
+        let col = eval_expr(col_expr, chunk, cx)?;
+        if let Some(kernel) = ScalarCmp::new(&col, scalar, scalar_left) {
+            let mut out = Vector::with_capacity(DataType::Boolean, col.len());
+            kernel.push_bool(op, &mut out)?;
+            return Ok(out);
+        }
+        // A pair with no typed form (a VARIANT or ARRAY column, an integer
+        // column against a DECIMAL literal): the general path below keeps the
+        // old behavior, re-evaluating the column (which has no side effects).
     }
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
@@ -1109,28 +1016,6 @@ fn eval_comparison(
 /// Typed comparison loop: NULL when either side is invalid, else `cmp` under
 /// the SQL operator. `bool::cmp` gives `false < true`; DATE/TIMESTAMP compare
 /// their raw payloads.
-/// Scalar companion of [`cmp_loop`] for the column-vs-literal fast path:
-/// `col op scalar` (or `scalar op col` when `scalar_left`), NULL-preserving.
-fn cmp_scalar<T>(
-    op: BinaryOp,
-    col: &Vector,
-    a: &[T],
-    s: &T,
-    scalar_left: bool,
-    cmp: impl Fn(&T, &T) -> Ordering,
-    out: &mut Vector,
-) -> Result<()> {
-    for (i, x) in a.iter().enumerate() {
-        if col.is_null(i) {
-            out.push_null()?;
-        } else {
-            let ord = if scalar_left { cmp(s, x) } else { cmp(x, s) };
-            out.push_bool(ord_matches(ord, op))?;
-        }
-    }
-    Ok(())
-}
-
 fn cmp_loop<T>(
     op: BinaryOp,
     l: &Vector,
@@ -1148,6 +1033,310 @@ fn cmp_loop<T>(
         }
     }
     Ok(())
+}
+
+/// A `column <op> literal` comparison compiled once per chunk into a typed
+/// kernel over the column's payload slice.
+///
+/// One kernel, two consumers: [`ScalarCmp::push_bool`] builds the BOOLEAN
+/// vector the materializing path returns, [`ScalarCmp::retain`] narrows a
+/// selection in place (the select-style path), and because both walk the same
+/// arms they cannot disagree. Every arm mirrors one arm of
+/// `plan::compare_values` for its pair of types — `num_cmp` wherever a DOUBLE
+/// is involved, `decimal_cmp` for DECIMAL payloads, plain `Ord` for the rest —
+/// so no row is ever compared through a `Value`.
+struct ScalarCmp<'a> {
+    col: &'a Vector,
+    /// The literal is the left operand: `literal op column`. Comparing the
+    /// column to the literal and reversing the ordering is the same answer
+    /// under the flipped operator, so the row loop stays monomorphic.
+    reversed: bool,
+    kind: CmpKind<'a>,
+}
+
+/// The typed payload/scalar pair of one [`ScalarCmp`]. Integral scalars widen
+/// to `i128` and doubles stay `f64`, so every numeric mix has exactly one arm
+/// and none of them loses a bit relative to `compare_values`.
+enum CmpKind<'a> {
+    Int32Int(&'a [i32], i128),
+    Int32Float(&'a [i32], f64),
+    Int64Int(&'a [i64], i128),
+    Int64Float(&'a [i64], f64),
+    FloatInt(&'a [f64], i128),
+    FloatFloat(&'a [f64], f64),
+    FloatDec(&'a [f64], i128, u8),
+    DecInt(&'a [i128], u8, i128),
+    DecFloat(&'a [i128], u8, f64),
+    DecDec(&'a [i128], u8, i128, u8),
+    Bool(&'a [bool], bool),
+    VarChar(&'a [std::sync::Arc<str>], std::sync::Arc<str>),
+    Date(&'a [i32], i32),
+    Timestamp(&'a [i64], i64),
+    Interval(&'a [crate::types::Interval], crate::types::Interval),
+}
+
+impl<'a> ScalarCmp<'a> {
+    /// The kernel for `col` against `scalar`, or `None` when the pair has no
+    /// typed form; the caller then falls back to `compare_values` row by row.
+    fn new(col: &'a Vector, scalar: &Value, reversed: bool) -> Option<ScalarCmp<'a>> {
+        use VectorData as V;
+        let kind = match (col.data(), scalar) {
+            (V::Int32(a), Value::Integer(s)) => CmpKind::Int32Int(a, *s as i128),
+            (V::Int32(a), Value::Bigint(s)) => CmpKind::Int32Int(a, *s as i128),
+            (V::Int32(a), Value::Double(s)) => CmpKind::Int32Float(a, *s),
+            (V::Int64(a), Value::Integer(s)) => CmpKind::Int64Int(a, *s as i128),
+            (V::Int64(a), Value::Bigint(s)) => CmpKind::Int64Int(a, *s as i128),
+            (V::Int64(a), Value::Double(s)) => CmpKind::Int64Float(a, *s),
+            (V::Float64(a), Value::Integer(s)) => CmpKind::FloatInt(a, *s as i128),
+            (V::Float64(a), Value::Bigint(s)) => CmpKind::FloatInt(a, *s as i128),
+            (V::Float64(a), Value::Double(s)) => CmpKind::FloatFloat(a, *s),
+            (V::Float64(a), Value::Decimal(s, ss)) => CmpKind::FloatDec(a, *s, *ss),
+            (V::Decimal { values, scale, .. }, Value::Integer(s)) => {
+                CmpKind::DecInt(values, *scale, *s as i128)
+            }
+            (V::Decimal { values, scale, .. }, Value::Bigint(s)) => {
+                CmpKind::DecInt(values, *scale, *s as i128)
+            }
+            (V::Decimal { values, scale, .. }, Value::Double(s)) => {
+                CmpKind::DecFloat(values, *scale, *s)
+            }
+            (V::Decimal { values, scale, .. }, Value::Decimal(s, ss)) => {
+                CmpKind::DecDec(values, *scale, *s, *ss)
+            }
+            (V::Boolean(a), Value::Boolean(s)) => CmpKind::Bool(a, *s),
+            // One `Arc<str>` for the scalar (one allocation per chunk)
+            // instead of one clone per element.
+            (V::VarChar(a), Value::Varchar(s)) => {
+                CmpKind::VarChar(a, std::sync::Arc::from(s.as_str()))
+            }
+            (V::Date32(a), Value::Date(s)) => CmpKind::Date(a, *s),
+            (V::TimestampMicros(a), Value::Timestamp(s)) => CmpKind::Timestamp(a, *s),
+            (
+                V::Interval(a),
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                },
+            ) => CmpKind::Interval(
+                a,
+                crate::types::Interval {
+                    months: *months,
+                    days: *days,
+                    micros: *micros,
+                },
+            ),
+            _ => return None,
+        };
+        Some(ScalarCmp {
+            col,
+            reversed,
+            kind,
+        })
+    }
+
+    /// `column <op> literal` for every row, NULL where the column is NULL.
+    fn push_bool(&self, op: BinaryOp, out: &mut Vector) -> Result<()> {
+        let (col, flipped) = (self.col, self.reversed);
+        match &self.kind {
+            CmpKind::Int32Int(a, s) => push_cmp(col, a, op, flipped, |x| (*x as i128).cmp(s), out),
+            CmpKind::Int32Float(a, s) => {
+                push_cmp(col, a, op, flipped, |x| num_cmp(*x as f64, *s), out)
+            }
+            CmpKind::Int64Int(a, s) => push_cmp(col, a, op, flipped, |x| (*x as i128).cmp(s), out),
+            CmpKind::Int64Float(a, s) => {
+                push_cmp(col, a, op, flipped, |x| num_cmp(*x as f64, *s), out)
+            }
+            CmpKind::FloatInt(a, s) => {
+                push_cmp(col, a, op, flipped, |x| num_cmp(*x, *s as f64), out)
+            }
+            CmpKind::FloatFloat(a, s) => push_cmp(col, a, op, flipped, |x| num_cmp(*x, *s), out),
+            CmpKind::FloatDec(a, s, ss) => push_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| num_cmp(*x, crate::types::decimal_to_f64(*s, *ss)),
+                out,
+            ),
+            CmpKind::DecInt(a, sa, s) => push_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(*x, *sa, *s, 0),
+                out,
+            ),
+            CmpKind::DecFloat(a, sa, s) => push_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| num_cmp(crate::types::decimal_to_f64(*x, *sa), *s),
+                out,
+            ),
+            CmpKind::DecDec(a, sa, s, ss) => push_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(*x, *sa, *s, *ss),
+                out,
+            ),
+            CmpKind::Bool(a, s) => push_cmp(col, a, op, flipped, |x| x.cmp(s), out),
+            CmpKind::VarChar(a, s) => push_cmp(col, a, op, flipped, |x| (**x).cmp(&**s), out),
+            CmpKind::Date(a, s) => push_cmp(col, a, op, flipped, |x| x.cmp(s), out),
+            CmpKind::Timestamp(a, s) => push_cmp(col, a, op, flipped, |x| x.cmp(s), out),
+            CmpKind::Interval(a, s) => push_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::interval_cmp(*x, *s),
+                out,
+            ),
+        }
+    }
+
+    /// Keep only the rows of `sel` where `column <op> literal` is TRUE: the
+    /// select-style form, which never builds the BOOLEAN vector.
+    fn retain(&self, op: BinaryOp, sel: &mut Vec<u32>) {
+        let (col, flipped) = (self.col, self.reversed);
+        match &self.kind {
+            CmpKind::Int32Int(a, s) => {
+                retain_cmp(col, a, op, flipped, |x| (*x as i128).cmp(s), sel)
+            }
+            CmpKind::Int32Float(a, s) => {
+                retain_cmp(col, a, op, flipped, |x| num_cmp(*x as f64, *s), sel)
+            }
+            CmpKind::Int64Int(a, s) => {
+                retain_cmp(col, a, op, flipped, |x| (*x as i128).cmp(s), sel)
+            }
+            CmpKind::Int64Float(a, s) => {
+                retain_cmp(col, a, op, flipped, |x| num_cmp(*x as f64, *s), sel)
+            }
+            CmpKind::FloatInt(a, s) => {
+                retain_cmp(col, a, op, flipped, |x| num_cmp(*x, *s as f64), sel)
+            }
+            CmpKind::FloatFloat(a, s) => retain_cmp(col, a, op, flipped, |x| num_cmp(*x, *s), sel),
+            CmpKind::FloatDec(a, s, ss) => retain_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| num_cmp(*x, crate::types::decimal_to_f64(*s, *ss)),
+                sel,
+            ),
+            CmpKind::DecInt(a, sa, s) => retain_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(*x, *sa, *s, 0),
+                sel,
+            ),
+            CmpKind::DecFloat(a, sa, s) => retain_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| num_cmp(crate::types::decimal_to_f64(*x, *sa), *s),
+                sel,
+            ),
+            CmpKind::DecDec(a, sa, s, ss) => retain_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::decimal_cmp(*x, *sa, *s, *ss),
+                sel,
+            ),
+            CmpKind::Bool(a, s) => retain_cmp(col, a, op, flipped, |x| x.cmp(s), sel),
+            CmpKind::VarChar(a, s) => retain_cmp(col, a, op, flipped, |x| (**x).cmp(&**s), sel),
+            CmpKind::Date(a, s) => retain_cmp(col, a, op, flipped, |x| x.cmp(s), sel),
+            CmpKind::Timestamp(a, s) => retain_cmp(col, a, op, flipped, |x| x.cmp(s), sel),
+            CmpKind::Interval(a, s) => retain_cmp(
+                col,
+                a,
+                op,
+                flipped,
+                |x| crate::types::interval_cmp(*x, *s),
+                sel,
+            ),
+        }
+    }
+}
+
+/// `column <op> literal` for every row of `a`, NULL-preserving.
+fn push_cmp<T>(
+    col: &Vector,
+    a: &[T],
+    op: BinaryOp,
+    flipped: bool,
+    ord: impl Fn(&T) -> Ordering,
+    out: &mut Vector,
+) -> Result<()> {
+    for (i, x) in a.iter().enumerate() {
+        if col.is_null(i) {
+            out.push_null()?;
+        } else {
+            let ord = ord(x);
+            out.push_bool(ord_matches(if flipped { ord.reverse() } else { ord }, op))?;
+        }
+    }
+    Ok(())
+}
+
+/// Drop the rows of `sel` where `column <op> literal` is not TRUE (NULL is
+/// not TRUE, exactly as in [`select_true`]).
+fn retain_cmp<T>(
+    col: &Vector,
+    a: &[T],
+    op: BinaryOp,
+    flipped: bool,
+    ord: impl Fn(&T) -> Ordering,
+    sel: &mut Vec<u32>,
+) {
+    sel.retain(|&row| {
+        let i = row as usize;
+        if col.is_null(i) {
+            return false;
+        }
+        let ord = ord(&a[i]);
+        ord_matches(if flipped { ord.reverse() } else { ord }, op)
+    });
+}
+
+/// Rescale integer payloads to `DECIMAL(precision, scale)` with the cast's
+/// range check and error text.
+fn decimal_from_int(
+    v: &Vector,
+    src: impl Iterator<Item = i128>,
+    precision: u8,
+    scale: u8,
+) -> Result<Vector> {
+    let mut values: Vec<i128> = Vec::with_capacity(v.len());
+    for (i, x) in src.enumerate() {
+        if v.is_null(i) {
+            values.push(0);
+            continue;
+        }
+        let y = crate::types::int_to_decimal(x, precision, scale).ok_or_else(|| {
+            PinkDbError::Execution(format!(
+                "cannot coerce {x} to DECIMAL({precision},{scale}): value out of range"
+            ))
+        })?;
+        values.push(y);
+    }
+    Ok(Vector::from_parts(
+        VectorData::Decimal {
+            values,
+            precision,
+            scale,
+        },
+        v.validity().to_vec(),
+        v.len(),
+    ))
 }
 
 /// SQL operator truth for an ordering: `= <> < <= > >=`.
@@ -1196,6 +1385,16 @@ pub(crate) fn coerce_to(v: &Vector, target: DataType) -> Result<Vector> {
             );
             Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
         }
+        // INTEGER/BIGINT → DECIMAL: the same `i * 10^scale` the per-row cast
+        // does, without a `Value` per row. Mixed decimal arithmetic coerces
+        // its integer operands here once per chunk (TPC-H Q1's `1 - l_discount`
+        // and `1 + l_tax`), so the roundtrip is on a hot path.
+        (VectorData::Int32(src), DataType::Decimal { precision, scale }) => {
+            decimal_from_int(v, src.iter().map(|&x| x as i128), precision, scale)
+        }
+        (VectorData::Int64(src), DataType::Decimal { precision, scale }) => {
+            decimal_from_int(v, src.iter().map(|&x| x as i128), precision, scale)
+        }
         // DECIMAL → DECIMAL rescale: exact when widening the scale, rounding
         // half away from zero when narrowing (DuckDB's cast rule).
         (
@@ -1225,50 +1424,6 @@ pub(crate) fn coerce_to(v: &Vector, target: DataType) -> Result<Vector> {
                 values: out,
                 precision,
                 scale: want,
-            };
-            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
-        }
-        (VectorData::Int32(src), DataType::Decimal { precision, scale }) => {
-            let mut out: Vec<i128> = Vec::with_capacity(src.len());
-            for (i, &x) in src.iter().enumerate() {
-                if v.is_null(i) {
-                    out.push(0);
-                    continue;
-                }
-                out.push(
-                    crate::types::int_to_decimal(x as i128, precision, scale).ok_or_else(|| {
-                        PinkDbError::Execution(format!(
-                            "cannot coerce {x} to DECIMAL({precision},{scale}): value out of range"
-                        ))
-                    })?,
-                );
-            }
-            let data = VectorData::Decimal {
-                values: out,
-                precision,
-                scale,
-            };
-            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
-        }
-        (VectorData::Int64(src), DataType::Decimal { precision, scale }) => {
-            let mut out: Vec<i128> = Vec::with_capacity(src.len());
-            for (i, &x) in src.iter().enumerate() {
-                if v.is_null(i) {
-                    out.push(0);
-                    continue;
-                }
-                out.push(
-                    crate::types::int_to_decimal(x as i128, precision, scale).ok_or_else(|| {
-                        PinkDbError::Execution(format!(
-                            "cannot coerce {x} to DECIMAL({precision},{scale}): value out of range"
-                        ))
-                    })?,
-                );
-            }
-            let data = VectorData::Decimal {
-                values: out,
-                precision,
-                scale,
             };
             Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
         }
@@ -1396,6 +1551,12 @@ fn eval_arith(
     chunk: &DataChunk,
     cx: &Cx,
 ) -> Result<Vector> {
+    // One side a literal: a constant operand needs neither a chunk-wide
+    // constant vector nor a coercion of every row, so it gets its own loop
+    // (TPC-H Q1's `1 - l_discount`).
+    if let Some(out) = eval_decimal_const(op, dtype, left, right, chunk, cx)? {
+        return Ok(out);
+    }
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
     // Temporal types skip numeric coercion (it rejects them): day/month
@@ -1456,13 +1617,23 @@ fn eval_decimal_mul(l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
     let DataType::Decimal { precision, .. } = dtype else {
         unreachable!("eval_decimal_mul on non-decimal result type")
     };
-    let mut out = Vector::new_empty(dtype);
-    for i in 0..l.len() {
-        if l.is_null(i) || r.is_null(i) {
-            out.push_null()?;
+    let len = l.len();
+    // A row is NULL when either operand is, so the result mask is the AND of
+    // the operand masks: the loop below then writes payload only, where a
+    // `push_decimal` per row would re-test room and re-set a mask bit.
+    let mut validity = l.validity().to_vec();
+    validity.resize(len.div_ceil(64), 0);
+    for (word, other) in validity.iter_mut().zip(r.validity()) {
+        *word &= *other;
+    }
+    let mut values: Vec<i128> = Vec::with_capacity(len);
+    let all_valid = !l.has_nulls() && !r.has_nulls();
+    for i in 0..len {
+        let (a, b) = (lv[i], rv[i]);
+        if !all_valid && (validity[i / 64] >> (i % 64)) & 1 == 0 {
+            values.push(0);
             continue;
         }
-        let (a, b) = (lv[i], rv[i]);
         let product = a
             .checked_mul(b)
             .filter(|p| crate::types::decimal_fits(*p, precision));
@@ -1473,19 +1644,35 @@ fn eval_decimal_mul(l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
                 crate::types::format_decimal(b, rs)
             ))
         })?;
-        out.push_decimal(product, ls + rs)?;
+        values.push(product);
     }
-    Ok(out)
+    Ok(Vector::from_parts(
+        VectorData::Decimal {
+            values,
+            precision,
+            scale: ls + rs,
+        },
+        validity,
+        len,
+    ))
 }
 
 /// A DECIMAL operand as unscaled i128 values plus their scale. Integer
 /// operands are scale-0 values (the decimal *widths* only matter at bind
-/// time, for the result precision).
-fn decimal_operand(v: &Vector) -> Result<(Vec<i128>, u8)> {
+/// time, for the result precision). A DECIMAL payload is borrowed: the
+/// caller only reads it, and a per-chunk copy of 2048 `i128`s is a visible
+/// share of a multiply-heavy aggregate (TPC-H Q1).
+fn decimal_operand(v: &Vector) -> Result<(std::borrow::Cow<'_, [i128]>, u8)> {
     Ok(match v.data() {
-        VectorData::Decimal { values, scale, .. } => (values.clone(), *scale),
-        VectorData::Int32(src) => (src.iter().map(|&x| x as i128).collect(), 0),
-        VectorData::Int64(src) => (src.iter().map(|&x| x as i128).collect(), 0),
+        VectorData::Decimal { values, scale, .. } => (std::borrow::Cow::Borrowed(values), *scale),
+        VectorData::Int32(src) => (
+            std::borrow::Cow::Owned(src.iter().map(|&x| x as i128).collect()),
+            0,
+        ),
+        VectorData::Int64(src) => (
+            std::borrow::Cow::Owned(src.iter().map(|&x| x as i128).collect()),
+            0,
+        ),
         other => {
             return Err(PinkDbError::Execution(format!(
                 "decimal multiplication needs numeric operands, got {:?}",
@@ -1540,6 +1727,54 @@ fn arith_typed(op: BinaryOp, int_div: bool, l: &Vector, r: &Vector) -> Result<Op
     }
 }
 
+/// One DECIMAL `+`/`-`/`%` cell at a shared scale, with DuckDB's overflow and
+/// division-by-zero errors (the two loops below share this, so the text cannot
+/// drift between them).
+#[inline]
+fn decimal_arith_row(op: BinaryOp, x: i128, y: i128, precision: u8, scale: u8) -> Result<i128> {
+    let detail = || {
+        format!(
+            "({} {} {})",
+            crate::types::format_decimal(x, scale),
+            match op {
+                BinaryOp::Add => "+",
+                BinaryOp::Subtract => "-",
+                _ => "%",
+            },
+            crate::types::format_decimal(y, scale)
+        )
+    };
+    match op {
+        BinaryOp::Add => x
+            .checked_add(y)
+            .filter(|v| crate::types::decimal_fits(*v, precision)),
+        BinaryOp::Subtract => x
+            .checked_sub(y)
+            .filter(|v| crate::types::decimal_fits(*v, precision)),
+        BinaryOp::Modulo => {
+            if y == 0 {
+                return Err(PinkDbError::Execution(format!(
+                    "Division by zero in expression {}",
+                    detail()
+                )));
+            }
+            Some(x.wrapping_rem(y))
+        }
+        _ => unreachable!("decimal_arith_row: {op:?}"),
+    }
+    .ok_or_else(|| {
+        let what = match op {
+            BinaryOp::Add => "addition",
+            BinaryOp::Subtract => "subtraction",
+            _ => "modulo",
+        };
+        PinkDbError::Execution(format!(
+            "Overflow in {what} of DECIMAL({precision}) {}",
+            detail()
+        ))
+    })
+}
+
 /// DECIMAL `+`/`-`/`%` at a shared scale, with DuckDB's overflow error.
 fn arith_decimal(
     op: BinaryOp,
@@ -1550,56 +1785,122 @@ fn arith_decimal(
     precision: u8,
     scale: u8,
 ) -> Result<Vector> {
-    let what = match op {
-        BinaryOp::Add => "addition",
-        BinaryOp::Subtract => "subtraction",
-        BinaryOp::Modulo => "modulo",
-        _ => unreachable!("arith_decimal: {op:?}"),
-    };
-    let mut out = Vector::new_empty(DataType::Decimal { precision, scale });
+    let len = a.len();
+    // Same shape as `eval_decimal_mul`: AND the operand masks, then write the
+    // payload directly. `push_decimal` re-tests room and re-sets a mask bit per
+    // row, and this loop is a visible share of a decimal-heavy aggregate.
+    let mut validity = l.validity().to_vec();
+    validity.resize(len.div_ceil(64), 0);
+    for (word, other) in validity.iter_mut().zip(r.validity()) {
+        *word &= *other;
+    }
+    let mut values: Vec<i128> = Vec::with_capacity(len);
     for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
-        if l.is_null(i) || r.is_null(i) {
-            out.push_null()?;
+        if (validity[i / 64] >> (i % 64)) & 1 == 0 {
+            values.push(0);
             continue;
         }
-        let detail = || {
-            format!(
-                "({} {} {})",
-                crate::types::format_decimal(x, scale),
-                match op {
-                    BinaryOp::Add => "+",
-                    BinaryOp::Subtract => "-",
-                    _ => "%",
-                },
-                crate::types::format_decimal(y, scale)
-            )
-        };
-        let v = match op {
-            BinaryOp::Add => x
-                .checked_add(y)
-                .filter(|v| crate::types::decimal_fits(*v, precision)),
-            BinaryOp::Subtract => x
-                .checked_sub(y)
-                .filter(|v| crate::types::decimal_fits(*v, precision)),
-            _ => {
-                if y == 0 {
-                    return Err(PinkDbError::Execution(format!(
-                        "Division by zero in expression {}",
-                        detail()
-                    )));
-                }
-                Some(x.wrapping_rem(y))
-            }
-        }
-        .ok_or_else(|| {
-            PinkDbError::Execution(format!(
-                "Overflow in {what} of DECIMAL({precision}) {}",
-                detail()
-            ))
-        })?;
-        out.push_decimal(v, scale)?;
+        values.push(decimal_arith_row(op, x, y, precision, scale)?);
     }
-    Ok(out)
+    Ok(Vector::from_parts(
+        VectorData::Decimal {
+            values,
+            precision,
+            scale,
+        },
+        validity,
+        len,
+    ))
+}
+
+/// DECIMAL `+`/`-`/`%` with one constant operand: the same cells as
+/// `arith_decimal`, read against a scalar instead of a second payload.
+fn arith_decimal_const(
+    op: BinaryOp,
+    col: &Vector,
+    a: &[i128],
+    k: i128,
+    precision: u8,
+    scale: u8,
+    const_left: bool,
+) -> Result<Vector> {
+    let len = a.len();
+    // The constant is never NULL, so the column's mask is the result's.
+    let mut validity = col.validity().to_vec();
+    validity.resize(len.div_ceil(64), 0);
+    let mut values: Vec<i128> = Vec::with_capacity(len);
+    for (i, &x) in a.iter().enumerate() {
+        if (validity[i / 64] >> (i % 64)) & 1 == 0 {
+            values.push(0);
+            continue;
+        }
+        values.push(if const_left {
+            decimal_arith_row(op, k, x, precision, scale)?
+        } else {
+            decimal_arith_row(op, x, k, precision, scale)?
+        });
+    }
+    Ok(Vector::from_parts(
+        VectorData::Decimal {
+            values,
+            precision,
+            scale,
+        },
+        validity,
+        len,
+    ))
+}
+
+/// `literal op column` / `column op literal` on DECIMAL: `Ok(None)` for every
+/// other shape, and `eval_arith` then runs its own path.
+fn eval_decimal_const(
+    op: BinaryOp,
+    dtype: DataType,
+    left: &BoundExpr,
+    right: &BoundExpr,
+    chunk: &DataChunk,
+    cx: &Cx,
+) -> Result<Option<Vector>> {
+    let DataType::Decimal { precision, scale } = dtype else {
+        return Ok(None);
+    };
+    if !matches!(op, BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Modulo) {
+        return Ok(None);
+    }
+    let (lit, column, const_left) = match (left, right) {
+        (BoundExpr::Literal(v), column) => (v, column, true),
+        (column, BoundExpr::Literal(v)) => (v, column, false),
+        _ => return Ok(None),
+    };
+    if !matches!(
+        lit,
+        Value::Integer(_) | Value::Bigint(_) | Value::Decimal(..)
+    ) || matches!(column, BoundExpr::Literal(_))
+    {
+        return Ok(None);
+    }
+    // The column keeps its own layout: rescaling it would need a vector
+    // anyway. A source precision that fits the result's means the coercion
+    // the other path performs can never reject a value, so only the scale has
+    // to agree.
+    let v = eval_expr(column, chunk, cx)?;
+    let VectorData::Decimal {
+        values,
+        precision: src,
+        scale: col_scale,
+    } = v.data()
+    else {
+        return Ok(None);
+    };
+    if *col_scale != scale || *src > precision {
+        return Ok(None);
+    }
+    let Value::Decimal(k, _) = coerce_value(lit.clone(), dtype)? else {
+        return Ok(None);
+    };
+    Ok(Some(arith_decimal_const(
+        op, &v, values, k, precision, scale, const_left,
+    )?))
 }
 
 /// DuckDB-style integer overflow error (`+`/`-`/`*`, negation, `abs`).
@@ -1637,7 +1938,7 @@ macro_rules! checked_int_arith {
 
 /// INTEGER `+`/`-`/`*`/`%` with `arith_values`' checked semantics.
 fn arith_int32(op: BinaryOp, l: &Vector, r: &Vector, a: &[i32], b: &[i32]) -> Result<Vector> {
-    let mut out = Vector::new_empty(DataType::Integer);
+    let mut out = Vector::with_capacity(DataType::Integer, a.len());
     for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
         if l.is_null(i) || r.is_null(i) {
             out.push_null()?;
@@ -1651,7 +1952,7 @@ fn arith_int32(op: BinaryOp, l: &Vector, r: &Vector, a: &[i32], b: &[i32]) -> Re
 
 /// BIGINT `+`/`-`/`*`/`%` with `arith_values`' checked semantics.
 fn arith_int64(op: BinaryOp, l: &Vector, r: &Vector, a: &[i64], b: &[i64]) -> Result<Vector> {
-    let mut out = Vector::new_empty(DataType::Bigint);
+    let mut out = Vector::with_capacity(DataType::Bigint, a.len());
     for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
         if l.is_null(i) || r.is_null(i) {
             out.push_null()?;
@@ -1674,7 +1975,7 @@ fn arith_f64(
     a: &[f64],
     b: &[f64],
 ) -> Result<Vector> {
-    let mut out = Vector::new_empty(DataType::Double);
+    let mut out = Vector::with_capacity(DataType::Double, a.len());
     for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
         if l.is_null(i) || r.is_null(i) {
             out.push_null()?;
@@ -3080,6 +3381,199 @@ pub fn count_true(pred: &Vector) -> Result<i64> {
     Ok(n)
 }
 
+/// Narrow `sel` (ascending rows of `chunk`) to the rows where `expr` is
+/// TRUE, without materializing a filtered copy of the chunk.
+///
+/// The shapes with a typed kernel (DuckDB's `*Executor::Select`, see
+/// `src/execution/expression_executor/execute_comparison.cpp`):
+///
+/// - `a AND b` narrows one selection in turn, so `b` — comparisons and all —
+///   only looks at the rows `a` kept;
+/// - `a OR b` evaluates both sides over the same rows and unions them;
+/// - `column <op> literal` runs the monomorphic comparison kernel.
+///
+/// Anything else evaluates the expression over the whole chunk and walks its
+/// BOOLEAN payload (`NULL` is not TRUE). Because conjuncts narrow, an error
+/// inside a later conjunct (division by zero, DECIMAL overflow) is raised
+/// only when a row that survived the earlier ones reaches it, and never for
+/// an empty selection — the behaviour of DuckDB's conjunction path, which
+/// also stops evaluating once nothing is selected.
+pub(crate) fn select_predicate(
+    expr: &BoundExpr,
+    chunk: &DataChunk,
+    cx: &Cx,
+    sel: &mut super::selection::Selection,
+) -> Result<()> {
+    match expr {
+        BoundExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            select_predicate(left, chunk, cx, sel)?;
+            if !sel.is_empty() {
+                select_predicate(right, chunk, cx, sel)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            // Only rows the left side did not settle as TRUE have to look at
+            // the right one (DuckDB's `OrSelectOperation`): the result is the
+            // same, and a right-side error stays limited to rows that reach
+            // it, as a per-row evaluation would report.
+            let mut left_true = sel.clone();
+            select_predicate(left, chunk, cx, &mut left_true)?;
+            let rest = difference_selections(sel, &left_true);
+            let mut right_true = rest;
+            select_predicate(right, chunk, cx, &mut right_true)?;
+            *sel = merge_selections(&left_true, &right_true);
+            Ok(())
+        }
+        BoundExpr::Binary {
+            op, left, right, ..
+        } if is_ordering(*op) => {
+            if let Some(kernel) = scalar_cmp_of(left, right, chunk) {
+                kernel.retain(*op, sel);
+                return Ok(());
+            }
+            select_bool_vector(expr, chunk, cx, sel)
+        }
+        _ => select_bool_vector(expr, chunk, cx, sel),
+    }
+}
+
+/// `column <op> literal` (either side, negated operator when the column is on
+/// the right) when both sides have that shape.
+fn scalar_cmp_of<'a>(
+    left: &BoundExpr,
+    right: &BoundExpr,
+    chunk: &'a DataChunk,
+) -> Option<ScalarCmp<'a>> {
+    let (index, scalar, reversed) = match (left, right) {
+        (BoundExpr::Literal(v), BoundExpr::Column { index, .. }) if !v.is_null() => {
+            (index, v, true)
+        }
+        (BoundExpr::Column { index, .. }, BoundExpr::Literal(v)) if !v.is_null() => {
+            (index, v, false)
+        }
+        _ => return None,
+    };
+    let col = match chunk.expect_column(*index) {
+        Ok(col) => col,
+        // A projection placeholder fails here and raises its own error when
+        // the fallback evaluates the expression.
+        Err(_) => return None,
+    };
+    ScalarCmp::new(col, scalar, reversed)
+}
+
+/// The generic select: evaluate to BOOLEAN and intersect with its TRUE rows.
+fn select_bool_vector(
+    expr: &BoundExpr,
+    chunk: &DataChunk,
+    cx: &Cx,
+    sel: &mut super::selection::Selection,
+) -> Result<()> {
+    let bits = bool_bits;
+    // A conjunct this fallback covers evaluates over the rows still selected,
+    // never the whole chunk: a row the narrowing already excluded must not pay
+    // for the predicate, nor raise its error (DuckDB's `Select` sees the same
+    // rows). An equal-length selection is the identity, so nothing to gather.
+    if sel.len() == chunk.num_rows() {
+        let pred = eval_expr(expr, chunk, cx)?;
+        ensure_dtype(&pred, DataType::Boolean, "WHERE")?;
+        let bits = bits(&pred);
+        sel.retain(|&row| {
+            let i = row as usize;
+            // Validity bit + payload bit directly; no `Value` per row.
+            pred.is_valid(i) && bits[i]
+        });
+        return Ok(());
+    }
+    let rows = std::mem::take(sel);
+    let sub = chunk.take(&rows);
+    let pred = eval_expr(expr, &sub, cx)?;
+    ensure_dtype(&pred, DataType::Boolean, "WHERE")?;
+    let bits = bits(&pred);
+    let mut out = Vec::with_capacity(rows.len());
+    for (k, &row) in rows.iter().enumerate() {
+        if pred.is_valid(k) && bits[k] {
+            out.push(row);
+        }
+    }
+    *sel = out;
+    Ok(())
+}
+
+/// The payload of a BOOLEAN vector.
+fn bool_bits(v: &Vector) -> &[bool] {
+    match v.data() {
+        VectorData::Boolean(b) => b,
+        _ => unreachable!("BOOLEAN dtype implies BOOLEAN layout"),
+    }
+}
+
+/// `a` without the rows of `b`, both ascending selections of the same chunk.
+fn difference_selections(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len().saturating_sub(b.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() {
+        while j < b.len() && b[j] < a[i] {
+            j += 1;
+        }
+        if j == b.len() || b[j] != a[i] {
+            out.push(a[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Union of two ascending selections of the same rows.
+fn merge_selections(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
+}
+
+/// True for the six operators `ord_matches` answers.
+fn is_ordering(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+    )
+}
+
 fn cast_out_of_range(v: &Value, target: DataType) -> PinkDbError {
     PinkDbError::Execution(format!("cannot CAST {v} AS {target}: value out of range"))
 }
@@ -4083,5 +4577,461 @@ mod tests {
         };
         let out = eval_expr(&round, &chunk2, &cx).unwrap();
         assert_eq!((out.get(0), out.get(1)), (V::Double(3.0), V::Double(-3.0)));
+    }
+
+    // ---------- selection vectors vs a row-at-a-time reference ----------
+
+    /// xorshift64: repeatable cases without a dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> usize {
+            (self.next() % n) as usize
+        }
+        fn one_in(&mut self, n: u64) -> bool {
+            self.below(n) == 0
+        }
+    }
+
+    /// The fixed-width types the vector kernels cover, plus VARCHAR.
+    const FUZZ_DTYPES: [DataType; 7] = [
+        DataType::Integer,
+        DataType::Bigint,
+        DataType::Double,
+        DataType::Date,
+        DataType::Timestamp,
+        DataType::Decimal {
+            precision: 15,
+            scale: 2,
+        },
+        DataType::Varchar,
+    ];
+
+    /// One random cell. The extremes (INTEGER/BIGINT limits, a full-width
+    /// DECIMAL, NaN/±Inf/±0.0) are common enough that the overflow and
+    /// comparison edge cases are reached inside a few hundred cases.
+    fn fuzz_value(rng: &mut Rng, dtype: DataType) -> V {
+        match dtype {
+            DataType::Integer => V::Integer(match rng.below(4) {
+                0 => 0,
+                1 => i32::MAX,
+                2 => i32::MIN,
+                _ => rng.below(200) as i32 - 100,
+            }),
+            DataType::Bigint => V::Bigint(match rng.below(4) {
+                0 => 0,
+                1 => i64::MAX,
+                2 => i64::MIN,
+                _ => rng.below(2000) as i64 - 1000,
+            }),
+            DataType::Double => V::Double(match rng.below(7) {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f64::NAN,
+                3 => f64::INFINITY,
+                4 => f64::NEG_INFINITY,
+                _ => (rng.below(2000) as f64 - 1000.0) / 8.0,
+            }),
+            DataType::Date => V::Date(rng.below(200) as i32 - 100),
+            DataType::Timestamp => V::Timestamp(rng.below(200) as i64 * 86_400_000_000 - 1000),
+            DataType::Decimal { precision, scale } => {
+                let wide = 10i128.pow(precision as u32 - scale as u32) - 1;
+                V::Decimal(
+                    match rng.below(5) {
+                        0 => 0,
+                        1 => wide,
+                        2 => -wide,
+                        _ => rng.below(2000) as i128 - 1000,
+                    },
+                    scale,
+                )
+            }
+            _ => V::Varchar(["", "apple", "banana", "apple pie"][rng.below(4)].to_string()),
+        }
+    }
+
+    struct FuzzChunk {
+        chunk: DataChunk,
+        dtypes: [DataType; 7],
+    }
+
+    fn fuzz_chunk(rng: &mut Rng, rows: usize) -> FuzzChunk {
+        let dtypes = FUZZ_DTYPES;
+        let mut cols: Vec<Vector> = dtypes.iter().map(|&d| Vector::new_empty(d)).collect();
+        for i in 0..rows {
+            for (c, &dtype) in cols.iter_mut().zip(dtypes.iter()) {
+                // Row 0 is all NULL and row 1 all valid, so every chunk has an
+                // all-NULL row and a row the validity masking must keep.
+                let null = i == 0 || (i != 1 && rng.one_in(5));
+                if null {
+                    c.push_null().unwrap();
+                } else {
+                    c.push_valid(fuzz_value(rng, dtype)).unwrap();
+                }
+            }
+        }
+        FuzzChunk {
+            chunk: DataChunk::new(cols).unwrap(),
+            dtypes,
+        }
+    }
+
+    impl FuzzChunk {
+        fn column(&self, index: usize) -> B {
+            B::Column {
+                index,
+                dtype: self.dtypes[index],
+            }
+        }
+        fn index(&self, dtype: DataType) -> usize {
+            self.dtypes.iter().position(|&d| d == dtype).unwrap()
+        }
+    }
+
+    /// A random expression of one SQL type and that type: a column, a
+    /// literal, or same-type arithmetic (`+ - * %`), which is where the
+    /// overflow, modulo-by-zero and DECIMAL rescale paths live.
+    fn fuzz_scalar(rng: &mut Rng, fc: &FuzzChunk, dtype: DataType, depth: u32) -> (B, DataType) {
+        // Arithmetic only on the numeric types: the binder rejects the rest,
+        // so a shape it would not build is not worth fuzzing.
+        let numeric = matches!(
+            dtype,
+            DataType::Integer | DataType::Bigint | DataType::Double | DataType::Decimal { .. }
+        );
+        if !numeric || depth == 0 || rng.one_in(2) {
+            let leaf = if rng.one_in(3) {
+                B::Literal(fuzz_value(rng, dtype))
+            } else {
+                fc.column(fc.index(dtype))
+            };
+            return (leaf, dtype);
+        }
+        // DOUBLE has no `%` (the binder never types one).
+        let ops: &[BinaryOp] = if dtype == DataType::Double {
+            &[BinaryOp::Add, BinaryOp::Subtract, BinaryOp::Multiply]
+        } else {
+            &[
+                BinaryOp::Add,
+                BinaryOp::Subtract,
+                BinaryOp::Multiply,
+                BinaryOp::Modulo,
+            ]
+        };
+        let op = ops[rng.below(ops.len() as u64)];
+        // The binder's decimal width rules, so the case shapes are ones a query
+        // can actually produce.
+        let out = match (op, dtype) {
+            (BinaryOp::Multiply, DataType::Decimal { precision, scale }) => DataType::Decimal {
+                precision: (precision * 2).min(38),
+                scale: (scale * 2).min(38),
+            },
+            (BinaryOp::Add | BinaryOp::Subtract, DataType::Decimal { precision, scale }) => {
+                DataType::Decimal {
+                    precision: (precision + 1).min(38),
+                    scale,
+                }
+            }
+            _ => dtype,
+        };
+        let l = fuzz_scalar(rng, fc, dtype, depth - 1).0;
+        let r = fuzz_scalar(rng, fc, dtype, depth - 1).0;
+        (
+            B::Binary {
+                op,
+                left: Box::new(l),
+                right: Box::new(r),
+                dtype: out,
+            },
+            out,
+        )
+    }
+
+    /// One side of a comparison whose other side has type `dtype`: a numeric
+    /// mix is allowed (the binder accepts any numeric pair, and the mixed-type
+    /// path is what TPC-H Q6's DECIMAL predicates used to take), everything
+    /// else stays on its own type.
+    fn fuzz_operand(rng: &mut Rng, fc: &FuzzChunk, dtype: DataType, depth: u32) -> B {
+        let numeric = matches!(
+            dtype,
+            DataType::Integer | DataType::Bigint | DataType::Double | DataType::Decimal { .. }
+        );
+        if numeric && rng.one_in(2) {
+            let other = [
+                DataType::Integer,
+                DataType::Bigint,
+                DataType::Double,
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+            ][rng.below(4)];
+            return if rng.one_in(2) {
+                B::Literal(fuzz_value(rng, other))
+            } else {
+                fc.column(fc.index(other))
+            };
+        }
+        if rng.one_in(3) {
+            B::Literal(fuzz_value(rng, dtype))
+        } else {
+            fuzz_scalar(rng, fc, dtype, depth.saturating_sub(1)).0
+        }
+    }
+
+    fn fuzz_predicate(rng: &mut Rng, fc: &FuzzChunk, depth: u32) -> B {
+        match rng.below(if depth < 3 { 8 } else { 3 }) {
+            0 | 1 => {
+                let dtype = fc.dtypes[rng.below(7)];
+                let op = [
+                    BinaryOp::Eq,
+                    BinaryOp::NotEq,
+                    BinaryOp::Lt,
+                    BinaryOp::LtEq,
+                    BinaryOp::Gt,
+                    BinaryOp::GtEq,
+                ][rng.below(6)];
+                let left = fuzz_operand(rng, fc, dtype, depth);
+                let right = fuzz_operand(rng, fc, dtype, depth);
+                B::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    dtype: DataType::Boolean,
+                }
+            }
+            2 => {
+                let dtype = fc.dtypes[rng.below(7)];
+                let expr = fuzz_operand(rng, fc, dtype, depth);
+                B::IsNull {
+                    expr: Box::new(expr),
+                    negated: rng.one_in(2),
+                }
+            }
+            3 | 4 => B::Binary {
+                op: BinaryOp::And,
+                left: Box::new(fuzz_predicate(rng, fc, depth + 1)),
+                right: Box::new(fuzz_predicate(rng, fc, depth + 1)),
+                dtype: DataType::Boolean,
+            },
+            5 | 6 => B::Binary {
+                op: BinaryOp::Or,
+                left: Box::new(fuzz_predicate(rng, fc, depth + 1)),
+                right: Box::new(fuzz_predicate(rng, fc, depth + 1)),
+                dtype: DataType::Boolean,
+            },
+            _ => B::Not(Box::new(fuzz_predicate(rng, fc, depth + 1))),
+        }
+    }
+
+    /// The reference: every row is evaluated on its own, so it shares nothing
+    /// with the vector kernels. `AND`/`OR` narrow the way a per-row evaluation
+    /// does — the right side only sees rows the left side left undecided.
+    fn reference_rows(expr: &B, chunk: &DataChunk, cx: &Cx, sel: &[u32]) -> Result<Vec<u32>> {
+        match expr {
+            B::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+                ..
+            } => {
+                let kept = reference_rows(left, chunk, cx, sel)?;
+                reference_rows(right, chunk, cx, &kept)
+            }
+            B::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => {
+                let kept = reference_rows(left, chunk, cx, sel)?;
+                let rest: Vec<u32> = sel.iter().copied().filter(|r| !kept.contains(r)).collect();
+                let mut out = kept;
+                out.extend(reference_rows(right, chunk, cx, &rest)?);
+                out.sort_unstable();
+                Ok(out)
+            }
+            _ => {
+                let mut out = Vec::new();
+                for &row in sel {
+                    let one = chunk.take(&[row]);
+                    let v = eval_expr(expr, &one, cx)?;
+                    if v.is_valid(0) && v.get(0) == V::Boolean(true) {
+                        out.push(row);
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    fn selection_of(expr: &B, chunk: &DataChunk, cx: &Cx, sel: &[u32]) -> Result<Vec<u32>> {
+        let mut out = sel.to_vec();
+        select_predicate(expr, chunk, cx, &mut out)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn select_predicate_matches_a_row_at_a_time_reference() {
+        let db = PinkDb::new();
+        let cx = test_cx(&db);
+        let (mut checked, mut failures, mut narrowed_errors) = (0, 0, 0);
+        for seed in 1..=24u64 {
+            let mut rng = Rng::new(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            // Row counts either side of a validity word and of a chunk.
+            let rows = [0, 1, 2, 63, 64, 65, 130][(seed % 7) as usize];
+            let fc = fuzz_chunk(&mut rng, rows);
+            for _ in 0..10 {
+                let expr = fuzz_predicate(&mut rng, &fc, 0);
+                let all = crate::exec::selection::all_rows(rows);
+                let want = reference_rows(&expr, &fc.chunk, &cx, &all);
+                let got = selection_of(&expr, &fc.chunk, &cx, &all);
+                match (&want, &got) {
+                    (Ok(want), Ok(got)) => assert_eq!(got, want, "case {checked}: {expr:?}"),
+                    (Err(_), Err(_)) => {
+                        // Which of several erroring rows reports first depends
+                        // on the evaluation order, so only the fact that both
+                        // paths fail is comparable here; the exact text is
+                        // pinned by `a_conjunct_error_fires_only_for_…`.
+                        failures += 1;
+                    }
+                    _ => panic!(
+                        "case {checked}: reference {want:?} vs selection {got:?} for {expr:?}"
+                    ),
+                }
+                // The vector path must agree wherever the reference has a
+                // value: its errors can land on rows the narrowing skipped, so
+                // it is compared on success only.
+                if let Ok(want) = &want {
+                    match eval_expr(&expr, &fc.chunk, &cx) {
+                        Ok(v) => {
+                            let vector: Vec<u32> = select_true(&v)
+                                .unwrap()
+                                .into_iter()
+                                .map(|i| i as u32)
+                                .collect();
+                            assert_eq!(&vector, want, "vector path, case {checked}: {expr:?}");
+                        }
+                        // The whole-chunk evaluation runs expressions on rows
+                        // the narrowing excluded; the selection path must not
+                        // report those rows (see `a_conjunct_error_fires_…`).
+                        Err(_) => narrowed_errors += 1,
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 200, "only {checked} cases");
+        // The generator must reach the error paths too, not only clean rows.
+        assert!(failures > 0, "no error cases generated");
+        assert!(
+            narrowed_errors > 0,
+            "no rows excluded from an erroring conjunct"
+        );
+    }
+
+    #[test]
+    fn a_conjunct_error_fires_only_for_rows_that_reach_it() {
+        // `q <= 24 AND 100 % (q - 24) > 3`: the rows above 24 never reach the
+        // modulo, so a chunk of them is not an error even though the same
+        // expression on its own divides by zero.
+        let build = |q: &[i32]| {
+            let mut col = Vector::new_empty(DataType::Integer);
+            for &v in q {
+                col.push_valid(V::Integer(v)).unwrap();
+            }
+            DataChunk::new(vec![col]).unwrap()
+        };
+        let column = B::Column {
+            index: 0,
+            dtype: DataType::Integer,
+        };
+        let minus = B::Binary {
+            op: BinaryOp::Subtract,
+            left: Box::new(column.clone()),
+            right: Box::new(B::Literal(V::Integer(24))),
+            dtype: DataType::Integer,
+        };
+        let modulo = B::Binary {
+            op: BinaryOp::Modulo,
+            left: Box::new(B::Literal(V::Integer(100))),
+            right: Box::new(minus),
+            dtype: DataType::Integer,
+        };
+        let guard = B::Binary {
+            op: BinaryOp::LtEq,
+            left: Box::new(column),
+            right: Box::new(B::Literal(V::Integer(24))),
+            dtype: DataType::Boolean,
+        };
+        let pred = B::Binary {
+            op: BinaryOp::And,
+            left: Box::new(guard),
+            right: Box::new(B::Binary {
+                op: BinaryOp::Gt,
+                left: Box::new(modulo.clone()),
+                right: Box::new(B::Literal(V::Integer(3))),
+                dtype: DataType::Boolean,
+            }),
+            dtype: DataType::Boolean,
+        };
+        let db = PinkDb::new();
+        let cx = test_cx(&db);
+
+        let above = build(&[30, 40, 50]);
+        let mut sel = crate::exec::selection::all_rows(3);
+        select_predicate(&pred, &above, &cx, &mut sel).unwrap();
+        assert!(sel.is_empty());
+
+        // A row that does reach the modulo reports exactly the old error.
+        let at = build(&[24]);
+        let mut sel = crate::exec::selection::all_rows(1);
+        let got = select_predicate(&pred, &at, &cx, &mut sel).unwrap_err();
+        let old = eval_expr(&modulo, &at, &cx).unwrap_err();
+        assert_eq!(format!("{got:?}"), format!("{old:?}"));
+    }
+
+    #[test]
+    fn empty_and_all_null_chunks_select_nothing() {
+        let db = PinkDb::new();
+        let cx = test_cx(&db);
+        let column = B::Column {
+            index: 0,
+            dtype: DataType::Integer,
+        };
+        let pred = B::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(column),
+            right: Box::new(B::Literal(V::Integer(5))),
+            dtype: DataType::Boolean,
+        };
+        // Zero rows.
+        let empty = DataChunk::new(vec![Vector::new_empty(DataType::Integer)]).unwrap();
+        let mut sel = crate::exec::selection::all_rows(0);
+        select_predicate(&pred, &empty, &cx, &mut sel).unwrap();
+        assert!(sel.is_empty());
+        // Five NULL rows: no row is TRUE, and no value is ever boxed.
+        let mut nulls = Vector::new_empty(DataType::Integer);
+        for _ in 0..5 {
+            nulls.push_null().unwrap();
+        }
+        let all_null = DataChunk::new(vec![nulls]).unwrap();
+        let mut sel = crate::exec::selection::all_rows(5);
+        select_predicate(&pred, &all_null, &cx, &mut sel).unwrap();
+        assert!(sel.is_empty());
+        // A literal TRUE predicate keeps every row of the same chunk.
+        let mut sel = crate::exec::selection::all_rows(5);
+        select_predicate(&B::Literal(V::Boolean(true)), &all_null, &cx, &mut sel).unwrap();
+        assert_eq!(sel, crate::exec::selection::all_rows(5));
     }
 }

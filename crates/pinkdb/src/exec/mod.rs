@@ -9,6 +9,7 @@
 pub mod aggregate;
 pub(crate) mod dml;
 pub mod expr;
+pub(crate) mod selection;
 pub(crate) mod window;
 
 use crate::types::{FastMap, FastSet};
@@ -16,13 +17,14 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use aggregate::{
-    Acc, Group, HIGH_CARDINALITY_KEYS, Partial, aggregate, emit_groups, fold_stream,
-    local_index_capacity, merge_partials,
+    Acc, Group, HIGH_CARDINALITY_KEYS, Partial, aggregate, aggregate_selected, emit_groups,
+    fold_stream, local_index_capacity, merge_partials,
 };
 use aggregate::{EvalVec as FusedVec, eval_agg_vec as eval_fused_vec};
 use dml::{captured, returning_result};
-use expr::{coerce_to, count_true, eval_expr, select_true};
+use expr::{coerce_to, eval_expr, select_true};
 use rayon::prelude::*;
+use selection::Selected;
 use window::eval_window;
 
 use crate::attached::{AttachedTable, PruneOp, PrunePredicate};
@@ -2807,15 +2809,75 @@ pub(crate) fn filter_chunk(
     chunk: &DataChunk,
 ) -> Result<Option<DataChunk>> {
     cx.check_deadline()?;
-    let pred = eval_expr(predicate, chunk, cx)?;
-    let sel = select_true(&pred)?;
+    let mut sel = selection::all_rows(chunk.num_rows());
+    expr::select_predicate(predicate, chunk, cx, &mut sel)?;
     Ok(if sel.len() == chunk.num_rows() {
         Some(chunk.clone())
     } else if sel.is_empty() {
         None
     } else {
-        Some(chunk.gather(&sel))
+        Some(chunk.take(&sel))
     })
+}
+
+/// Rows below `plan` that pass its filter, counted through the selection:
+/// the COUNT(*) shape needs neither the rows nor a filtered copy.
+fn count_selected(cx: &Cx, plan: &LogicalPlan) -> Result<Option<i64>> {
+    let LogicalPlan::Filter { input, predicate } = plan else {
+        return Ok(None);
+    };
+    let inner = eval(cx, input)?;
+    expr::prime(cx, [predicate])?;
+    let counts: Vec<i64> = inner
+        .chunks
+        .par_iter()
+        .map(|chunk| {
+            let mut sel = selection::all_rows(chunk.num_rows());
+            expr::select_predicate(predicate, chunk, cx, &mut sel)?;
+            Ok(sel.len() as i64)
+        })
+        .collect::<Result<_>>()?;
+    Ok(Some(counts.into_iter().sum()))
+}
+
+/// The chunks below `plan` with their filter's selection still attached, or
+/// `None` when the shape has none to offer (the caller then goes through
+/// `filter_chunk` and materializes).
+///
+/// Only a `Filter` hands a selection on, and only to a consumer that reads
+/// through it; its own input is evaluated the ordinary way.
+pub(crate) fn selected_chunks(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Vec<Selected>>> {
+    let LogicalPlan::Filter { input, predicate } = plan else {
+        return Ok(None);
+    };
+    let inner = eval(cx, input)?;
+    expr::prime(cx, [predicate])?;
+    let selected: Vec<Option<Selected>> = inner
+        .chunks
+        .par_iter()
+        .map(|chunk| {
+            let mut sel = selection::all_rows(chunk.num_rows());
+            expr::select_predicate(predicate, chunk, cx, &mut sel)?;
+            if sel.is_empty() {
+                return Ok(None);
+            }
+            // Sparse enough that one compaction beats one indirection per
+            // column read from here on.
+            if selection::worth_materializing(sel.len(), chunk.num_rows()) {
+                let rows = sel.len();
+                let chunk = chunk.take(&sel);
+                return Ok(Some(Selected {
+                    chunk,
+                    sel: selection::all_rows(rows),
+                }));
+            }
+            Ok(Some(Selected {
+                chunk: chunk.clone(),
+                sel,
+            }))
+        })
+        .collect::<Result<_>>()?;
+    Ok(Some(selected.into_iter().flatten().collect()))
 }
 
 /// Evaluate one Project chunk. Pass-through column references (and
@@ -3475,24 +3537,9 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 // all-COUNT(*) shape reaching here is a single COUNT(*) —
                 // and this path emits exactly one column.
                 debug_assert_eq!(aggs.len(), 1);
-                let total: i64 = match &**input {
-                    LogicalPlan::Filter {
-                        input: fin,
-                        predicate,
-                    } => {
-                        let inner = eval(cx, fin)?;
-                        inner
-                            .chunks
-                            .par_iter()
-                            .map(|chunk| {
-                                let pred = eval_expr(predicate, chunk, cx)?;
-                                count_true(&pred)
-                            })
-                            .collect::<Result<Vec<i64>>>()?
-                            .into_iter()
-                            .sum()
-                    }
-                    _ => {
+                let total: i64 = match count_selected(cx, input)? {
+                    Some(n) => n,
+                    None => {
                         let inner = eval(cx, input)?;
                         inner.chunks.iter().map(|c| c.num_rows() as i64).sum()
                     }
@@ -3506,6 +3553,21 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     names.push(format!("__agg{i}"));
                     types.push(a.dtype);
                 }
+                return Ok(Output {
+                    chunks,
+                    names,
+                    types,
+                });
+            }
+            // Selection path: a Filter hands on the rows it kept, so the fold
+            // reads through them and the filtered copy `filter_chunk` builds
+            // is never made.
+            if !filtered
+                && !aggs.is_empty()
+                && let Some(selected) = selected_chunks(cx, input)?
+            {
+                let chunks = aggregate_selected(cx, &selected, keys, aggs)?;
+                let (names, types) = agg_output_schema(keys, aggs);
                 return Ok(Output {
                     chunks,
                     names,

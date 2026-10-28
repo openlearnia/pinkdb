@@ -101,6 +101,119 @@ the old total (Q18–Q21) are now 55 % of a much smaller one. Load average was
 2.1 when the baseline run started and 3.4–4.7 for the after run, both recorded
 in the JSON.
 
+## Wave 123a — selection vectors and fixed-width kernels
+
+This wave changes no answer either: a filter now produces a *selection* (row
+indices) instead of copying survivors out, aggregates fold through it, and
+comparisons and decimal arithmetic run in typed loops instead of boxing a
+`Value` per row. Measured as an A/B between two release builds of the same
+tree, back to back on the same store: the baseline rebuilt from `HEAD`, then
+the branch, `bench/suite --only tpch --runs 3`. Load average 2.5–3.2 (the
+machine could not be made quieter than that); run-to-run spread is ±5–10 %.
+
+### SF 1
+
+| query | before ms | after ms | DuckDB ms | ratio before → after |
+| --- | ---: | ---: | ---: | --- |
+| **Q1** | **164** | **64** | 13 | 12.6× → **4.6×** |
+| Q2 | 190 | 173 | 4 | 47.5× → 43.3× |
+| Q3 | 180 | 180 | 9 | 22.5× → 20.0× |
+| Q4 | 165 | 161 | 7 | 23.6× → 23.0× |
+| Q5 | 332 | 342 | 9 | 36.9× → 38.0× |
+| **Q6** | **80** | **13** | 3 | 26.7× → **3.3×** |
+| Q7 | 262 | 254 | 9 | 29.1× → 28.2× |
+| Q8 | 239 | 209 | 9 | 26.6× → 23.2× |
+| Q9 | 713 | 702 | 26 | 27.4× → 27.0× |
+| Q10 | 169 | 165 | 16 | 10.6× → 10.3× |
+| Q11 | 124 | 128 | 3 | 41.3× → 42.7× |
+| Q12 | 165 | 172 | 9 | 18.3× → 19.1× |
+| Q13 | 442 | 440 | 39 | 11.3× → 11.0× |
+| Q14 | 80 | 73 | 8 | 10.0× → 9.1× |
+| Q15 | 35 | 25 | 5 | 7.0× → 5.0× |
+| Q16 | 60 | 45 | 10 | 6.0× → 4.5× |
+| Q17 | 89 | 84 | 8 | 11.1× → 12.0× |
+| Q18 | 1499 | 1500 | 22 | 68.1× → 68.2× |
+| **Q19** | **115** | **50** | 10 | 11.5× → **5.0×** |
+| Q20 | 616 | 609 | 10 | 61.6× → 60.9× |
+| Q21 | 2300 | 2371 | 18 | 127.8× → 131.7× |
+| Q22 | 152 | 154 | 12 | 12.7× → 14.0× |
+
+Geometric mean **21.56× → 17.30×** (−19.8 %). Row counts and checksums are
+identical to DuckDB's on every query, at SF 0.01, 0.1 and 1.
+
+The four filter-heavy targets moved (Q1 2.6×, Q6 6.2×, Q19 2.3×, Q16 1.3×).
+Q12 and Q14 are join-shaped, so their cost is the join and the projection, not
+the filter; Q12 165→172 and Q14 80→73 are inside the spread. Q18/Q21 never
+enter this path (join and subquery bound).
+
+### SF 0.1
+
+| query | before ms | after ms | | query | before ms | after ms |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| Q1 | 17 | **7** | | Q12 | 16 | 16 |
+| Q2 | 19 | 19 | | Q13 | 41 | 39 |
+| Q3 | 18 | 18 | | Q14 | 7 | 6 |
+| Q4 | 16 | 16 | | Q15 | 2 | 2 |
+| Q5 | 30 | 30 | | Q16 | 6 | 6 |
+| Q6 | 8 | **1** | | Q17 | 7 | 7 |
+| Q7 | 30 | 30 | | Q18 | 25 | 25 |
+| Q8 | 18 | 18 | | Q19 | 11 | **5** |
+| Q9 | 60 | 60 | | Q20 | 41 | 41 |
+| Q10 | 16 | 16 | | Q21 | 235 | 240 |
+| Q11 | 13 | 13 | | Q22 | 14 | 14 |
+
+Geometric mean **6.35× → 5.04×**. At SF 0.01 all 22 pass; Q1 is 1 ms and Q6
+below the 1 ms timer.
+
+### Where the time went
+
+Q1 at SF 1, `sample`, top of stack, before → after (share of samples):
+
+| frame | before | after |
+| --- | ---: | ---: |
+| `Vector::push_from` (filter's copy) | 11.4 % | — |
+| `expr::eval_arith` | 9.8 % | 28 % |
+| `aggregate::Acc::add_decimal` | 3.9 % | 20 % |
+| `aggregate::fold_chunk` | 5.0 % | 16 % |
+| `expr::coerce_to` | 1.4 % | 15 % |
+| `Vector::encode_into` (key encoding) | — | 7 % |
+| rayon waits | ~30 % | 18 % |
+| filter (`select_predicate` + kernels) | — | 3 % |
+
+The copy is gone and the filter is no longer a phase; what is left is decimal
+arithmetic feeding the accumulators plus the two-key grouping. Both are
+follow-up rows (123b projector fusion, 123c perfect-hash/radix aggregation).
+
+### Compacting a sparse selection: measured threshold
+
+Q1 keeps 98 % of rows, Q6 1.8 %. The aggregate reads through the selection and
+compacts only when the selection is sparser than 1/8; both extremes were built
+and measured (median of 7, SF 1):
+
+| compaction | Q1 | Q6 |
+| --- | ---: | ---: |
+| always | 138.3 ms | 13.4 ms |
+| below 1/8 (shipped) | **58.5 ms** | **11.9 ms** |
+| never | 66.1 ms | 16.7 ms |
+
+Copying a dense selection costs more than the indirection; reading a sparse one
+indirectly loses locality. Any divisor in 2..=55 behaves the same for these two
+queries, so 1/8 is a middle value rather than a sharp optimum.
+
+### Ingest, durable and size
+
+| case | before | after |
+| --- | ---: | ---: |
+| `lineitem.csv` import | 2.10 M rows/s | 2.11 M rows/s |
+| `lineitem.parquet` CTAS | 0.80 M rows/s | 0.80 M rows/s |
+| `orders.csv` import | 1.39 M rows/s | 1.44 M rows/s |
+| 2,000 single-row `Sync` inserts | 7744.9 ms | 7746.8 ms |
+| checkpoints | 50.4 ms | 49.8 ms |
+| CLI autocommit / batched | 115.9k / 373.0k rows/s | 113.9k / 379.0k rows/s |
+| all-features CLI binary | 14,958,864 B | 15,009,008 B (+0.34 %) |
+
+No new dependencies. Ingest and durable are unchanged within noise.
+
 ## Wave 122 — column statistics and join filters
 
 This wave changes no answer: every TPC-H query still matches DuckDB's row count
@@ -383,6 +496,22 @@ is 17.7×. Both are recorded as follow-ups in the plan, not as done work.
 For reference, the pre-existing gap is unchanged and unrelated: Q18 (214×) and
 Q19 (241×) have no correlated subquery at all — Q18 is the aggregate inside a
 plain `IN`, Q19 the nested `OR` lists that defeat the derived filters.
+
+## What changed in wave 123a
+
+| change | measurement |
+| --- | --- |
+| filters produce a selection (row indices) instead of a compacted copy, and `GROUP BY` / `COUNT(*)` fold through it | Q1 SF 1 164 → 64 ms (2.6×), Q19 115 → 50 ms (2.3×); the copy was 11 % of Q1's profile |
+| select-style predicate evaluation: comparisons and `AND`/`OR` build the selection directly, `AND` narrows progressively and `OR` only looks at the rows its left side did not take; a conjunct's error fires only for rows that reach it | Q6 SF 1 80 → 13 ms (6.2×); the filter is < 3 % of Q1's remaining profile |
+| one typed comparison kernel (15 layouts) for both the vector and the selection path, so `DECIMAL` against `DOUBLE`/`INTEGER`/`BIGINT`/any-scale `DECIMAL` stops going through a `Value` per row | `l_discount BETWEEN 0.05 AND 0.07` over 6 M rows 38.3 → 19.7 ms; Q6's filter is where that landed |
+| decimal arithmetic borrows its payloads, reuses the column validity mask and writes a pre-sized result; column-vs-constant decimal arithmetic skips the constant vector | Q1 73.5 → 65.7 ms from the constant-operand path alone |
+| compaction threshold for a sparse selection, measured rather than guessed | always 138.3 ms / 1/8 58.5 / never 66.1 on Q1, and 13.4 / 11.9 / 16.7 on Q6 |
+
+SF 1 geometric mean 21.56× → 17.30×, SF 0.1 6.35× → 5.04×, ingest and
+durable flat. The wave gate (Q1/Q6 within 3× of DuckDB at SF 1) is **partly
+met**: Q6 is at 3.3×, Q1 at 4.6×. The rest of Q1 is the grouping and the
+accumulator updates, which are 123b/123c work — the numbers are in the section
+above.
 
 ## What changed in wave 122
 

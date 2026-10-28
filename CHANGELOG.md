@@ -9,6 +9,38 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-28
+### Wave 123a — selection vectors and fixed-width expression kernels ✅
+
+Filters no longer copy the rows that survive them, and comparisons and decimal
+arithmetic stopped boxing each value. TPC-H Q1 went from 164 ms to 64 ms and Q6
+from 80 ms to 13 ms at SF 1. No query result changed: every answer is checked
+against DuckDB's rows at three scales, and a seeded fuzz compares the new
+selection path against a row-at-a-time reference evaluator.
+
+- **A filter produces a selection, not a copy.** `WHERE` evaluation returns the
+  row indices that survive the chunk; comparisons and `AND`/`OR` build them
+  directly, so a later conjunct only looks at rows the earlier ones kept, and a
+  later `OR` term only at the rows the earlier ones did not take. An error in a
+  conjunct (division by zero, decimal overflow) is raised only for rows that
+  actually reach it — the same behaviour DuckDB's `Select` path has.
+- **Aggregates read through the selection.** `GROUP BY` over a filtered scan
+  folds the chunk through the surviving row indices instead of a compacted
+  copy, and only copies when fewer than one row in eight survives.
+- **Typed comparison and arithmetic kernels.** `DECIMAL` compared with a
+  `DOUBLE`, an integer or a differently-scaled `DECIMAL` now runs in a tight
+  typed loop instead of a `Value` per row (a `BETWEEN` on a decimal column went
+  from 38 ms to 20 ms at SF 1). Decimal arithmetic borrows its operands, reuses
+  the column's validity mask and writes directly into a pre-sized result.
+- **No new dependencies**; the CLI binary grew 50 KB (+0.34 %).
+
+```sql
+-- both now run typed kernels end to end; results unchanged
+SELECT l_returnflag, l_linestatus, sum(l_extendedprice * (1 - l_discount)) …
+  FROM lineitem WHERE l_shipdate <= DATE '1998-08-15' GROUP BY 1, 2;
+SELECT sum(l_extendedprice * l_discount) FROM lineitem
+ WHERE l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24;
+```
+
 ### Wave 122 — statistics and join-filter pushdown ✅
 
 The optimizer now knows what is in a table, and a hash join can tell the scan

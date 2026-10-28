@@ -199,17 +199,18 @@ timing, so any table below can be reproduced or disputed.</p>
   </thead>
   <tbody>
     <tr><td>TPC-H SF 1, all 22 queries (geomean)</td>
-        <td>—</td><td>—</td><td>21.8× slower</td></tr>
+        <td>—</td><td>—</td><td>17.3× slower</td></tr>
     <tr><td>TPC-H SF 0.1, all 22 queries (geomean)</td>
-        <td>—</td><td>—</td><td>6.5× slower</td></tr>
+        <td>—</td><td>—</td><td>5.0× slower</td></tr>
     <tr><td>TPC-H Q4, SF 0.1 (correlated <code>EXISTS</code>)</td>
         <td>16 ms</td><td>2 ms</td><td>8×</td></tr>
     <tr><td>TPC-H Q17, SF 0.1 (correlated <code>avg</code>)</td>
         <td>8 ms</td><td>2 ms</td><td>4×</td></tr>
     <tr><td>TPC-H Q21, SF 0.1 (anti join with a residual)</td>
         <td>232 ms</td><td>5 ms</td><td>46×</td></tr>
-    <tr><td>TPC-H Q1, SF 1</td><td>156 ms</td><td>13 ms</td><td>12×</td></tr>
-    <tr><td>TPC-H Q6, SF 1</td><td>78 ms</td><td>3 ms</td><td>26×</td></tr>
+    <tr><td>TPC-H Q1, SF 1</td><td>64 ms</td><td>13 ms</td><td>≈5×</td></tr>
+    <tr><td>TPC-H Q6, SF 1</td><td>13 ms</td><td>3 ms</td><td>≈4×</td></tr>
+    <tr><td>TPC-H Q19, SF 1</td><td>50 ms</td><td>10 ms</td><td>≈5×</td></tr>
     <tr><td>TPC-H Q13, SF 1</td><td>453 ms</td><td>37 ms</td><td>12×</td></tr>
     <tr><td>TPC-H Q9, SF 1</td><td>675 ms</td><td>26 ms</td><td>26×</td></tr>
     <tr><td>TPC-H Q7, SF 1</td><td>246 ms</td><td>9 ms</td><td>27×</td></tr>
@@ -290,6 +291,47 @@ path pays for exactness on CSV only: lineitem ingest 227 → 260 ms (+14.5 %),
 orders 91 → 102 ms; Parquet CTAS and durable inserts are unchanged. The default
 CLI grew 1.4 % (5.61 → 5.69 MB) and no dependency was added.</p>
 
+<h2 id="wave-123a-selection-vectors-and-fixed-width-kernels">Wave 123a: selection vectors and fixed-width kernels<a class="anchor" href="#wave-123a-selection-vectors-and-fixed-width-kernels" aria-label="Permalink: Wave 123a: selection vectors and fixed-width kernels">#</a></h2>
+
+<p>A filter used to copy the rows that survived it out of the chunk, and a
+comparison against a <code>DECIMAL</code> column used to box both sides into a
+value object row by row. Neither happens now. <code>WHERE</code> evaluation
+produces a <em>selection</em> — the row indices that survive — directly from
+typed comparison kernels; <code>AND</code> narrows it progressively so later
+conjuncts only look at survivors, and <code>OR</code> only at the rows its left
+side did not take. A <code>GROUP BY</code> above the filter folds the chunk
+through that selection instead of a compacted copy, and copies only when fewer
+than one row in eight survives. Decimals compare against doubles, integers and
+differently-scaled decimals in a typed loop, and decimal arithmetic writes into
+a pre-sized payload instead of per-row. No answer changed: all 22 TPC-H queries
+still match DuckDB's rows and checksums at SF 0.01, 0.1 and 1, and a seeded
+fuzz compares the selection path against a row-at-a-time reference evaluator
+over seven types, NULLs, type extremes, and division-by-zero and decimal
+overflow.</p>
+
+<table>
+  <thead>
+    <tr><th>TPC-H</th><th>before</th><th>after</th><th>DuckDB</th><th>Δ</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Q1, SF 1</td><td>164 ms</td><td>64 ms</td><td>13 ms</td><td>−61 %</td></tr>
+    <tr><td>Q6, SF 1</td><td>80 ms</td><td>13 ms</td><td>3 ms</td><td>−84 %</td></tr>
+    <tr><td>Q19, SF 1</td><td>115 ms</td><td>50 ms</td><td>10 ms</td><td>−57 %</td></tr>
+    <tr><td>Q16, SF 1</td><td>60 ms</td><td>45 ms</td><td>10 ms</td><td>−25 %</td></tr>
+    <tr><td>Q14, SF 1</td><td>80 ms</td><td>73 ms</td><td>8 ms</td><td>−9 %</td></tr>
+    <tr><td>all 22 (geomean, SF 1)</td><td>21.6×</td><td>17.3×</td><td>—</td><td>−20 %</td></tr>
+    <tr><td>all 22 (geomean, SF 0.1)</td><td>6.35×</td><td>5.04×</td><td>—</td><td>−21 %</td></tr>
+  </tbody>
+</table>
+
+<p>Q12 and Q14 are join-shaped, so their cost is the join and the projection,
+not the filter; Q18 and Q21 never enter the selection path at all. What is left
+in Q1 is the two-key grouping (a byte-encoded key per row) and the accumulator
+updates — the 123b and 123c roadmap rows. A typed <code>CASE</code> scatter was
+measured at 6 % of Q14 and deferred rather than rewriting a path every
+<code>CASE</code> in the engine depends on for that. Ingest and durable writes
+are unchanged, and no dependency was added.</p>
+
 <h2 id="method">Method<a class="anchor" href="#method" aria-label="Permalink: Method">#</a></h2>
 
 <p>The suite generates TPC-H with DuckDB's built-in <code>dbgen</code>, writes
@@ -368,6 +410,7 @@ not a hidden caveat in these tables.</p>
 <ul>
   <li><a href="#the-short-version">The short version</a></li>
   <li><a href="#wave-122-statistics-and-join-filters">Wave 122: statistics and join filters</a></li>
+  <li><a href="#wave-123a-selection-vectors-and-fixed-width-kernels">Wave 123a: selection vectors and fixed-width kernels</a></li>
   <li><a href="#method">Method</a></li>
   <li><a href="#where-pinkdb-is-slower-and-why">Where pinkdb is slower, and why</a></li>
   <li><a href="#reproduce-it">Reproduce it</a></li>

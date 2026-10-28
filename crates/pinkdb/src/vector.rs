@@ -1048,6 +1048,20 @@ impl Vector {
         out
     }
 
+    /// Build a new vector with the rows of a selection (ascending `u32`
+    /// indices into this vector, at most `CHUNK_SIZE` of them): the
+    /// selection-vector form of [`Vector::gather`], for the boundaries that
+    /// must materialize a filtered chunk.
+    pub fn take(&self, selection: &[u32]) -> Vector {
+        let mut out = Vector::with_capacity(self.dtype(), selection.len());
+        for &i in selection {
+            let i = i as usize;
+            debug_assert!(i < self.len);
+            out.push_from(self, i).expect("take push_from cannot fail");
+        }
+        out
+    }
+
     /// Count of NULLs (linear scan; fine for ≤2048 rows).
     pub fn null_count(&self) -> usize {
         (0..self.len).filter(|&i| self.is_null(i)).count()
@@ -1178,6 +1192,27 @@ impl DataChunk {
             .map(|(i, c)| {
                 if self.is_present(i) {
                     Arc::new(c.gather(selection))
+                } else {
+                    Arc::clone(c)
+                }
+            })
+            .collect();
+        DataChunk {
+            columns,
+            num_rows: selection.len(),
+        }
+    }
+
+    /// [`DataChunk::gather`] for a selection vector: materializes the rows
+    /// `selection` names, placeholders carried through as in `gather`.
+    pub fn take(&self, selection: &[u32]) -> DataChunk {
+        let columns = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if self.is_present(i) {
+                    Arc::new(c.take(selection))
                 } else {
                     Arc::clone(c)
                 }
