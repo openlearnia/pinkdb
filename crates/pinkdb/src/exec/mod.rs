@@ -2876,6 +2876,20 @@ pub(crate) fn filter_chunk(
     predicate: &BoundExpr,
     chunk: &DataChunk,
 ) -> Result<Option<DataChunk>> {
+    filter_chunk_reading(cx, predicate, chunk, None)
+}
+
+/// [`filter_chunk`] that copies only the `read` columns of the kept rows
+/// (the filter's consumers' bound, [`crate::plan::ScanProjections::for_filter`]);
+/// every other column becomes a zero-length placeholder. TPC-H Q21's
+/// `l_receiptdate > l_commitdate` copied both dates of 3.8M kept rows that
+/// no join above it reads.
+fn filter_chunk_reading(
+    cx: &Cx,
+    predicate: &BoundExpr,
+    chunk: &DataChunk,
+    read: Option<&[usize]>,
+) -> Result<Option<DataChunk>> {
     cx.check_deadline()?;
     let mut sel = selection::all_rows(chunk.num_rows());
     expr::select_predicate(predicate, chunk, cx, &mut sel)?;
@@ -2883,6 +2897,20 @@ pub(crate) fn filter_chunk(
         Some(chunk.clone())
     } else if sel.is_empty() {
         None
+    } else if let Some(read) = read {
+        let columns = chunk
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(c, col)| {
+                if read.binary_search(&c).is_ok() && chunk.is_present(c) {
+                    std::sync::Arc::new(col.take(&sel))
+                } else {
+                    std::sync::Arc::new(Vector::new_empty(col.dtype()))
+                }
+            })
+            .collect();
+        Some(DataChunk::projected(columns, sel.len()))
     } else {
         Some(chunk.take(&sel))
     })
@@ -3436,8 +3464,12 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // A subquery inside one is evaluated once, here, before the fan-out
             // (see `expr::prime`).
             expr::prime(cx, [predicate])?;
-            let chunks: Vec<Option<DataChunk>> =
-                inner.chunks.par_iter().map(|chunk| filter_chunk(cx, predicate, chunk)).collect::<Result<_>>()?;
+            let read = cx.projections.for_filter(plan);
+            let chunks: Vec<Option<DataChunk>> = inner
+                .chunks
+                .par_iter()
+                .map(|chunk| filter_chunk_reading(cx, predicate, chunk, read))
+                .collect::<Result<_>>()?;
             let chunks = chunks.into_iter().flatten().collect();
             Ok(Output {
                 chunks,

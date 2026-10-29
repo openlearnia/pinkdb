@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 127i — filters copy only the columns used above them ✅</h3>
+<ul>
+<li>A filter used to copy every column of the rows it kept, including the ones only its own condition reads (TPC-H Q21's two dates on 3.8 million <code>lineitem</code> rows). It now copies just what the operators above it read. TPC-H SF 1: Q4 −21 %, Q21 −10 %, Q10 −9 %, Q13 −7 %.</li>
+</ul>
 <h3>Wave 123h — <code>IN</code> subqueries skip ordering their groups ✅</h3>
 <ul>
 <li>A <code>GROUP BY</code> inside an <code>IN (…)</code> subquery is only used as a set of values, so it no longer sorts its groups back into first-seen order (unless a <code>LIMIT</code> or window inside the subquery depends on that order). TPC-H SF 1: <strong>Q18 −15 %</strong>.</li>

@@ -295,3 +295,74 @@ fn text_comparisons_over_shared_and_separate_strings() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A filter copies only the columns its consumers read (wave 127i): a column
+/// only the predicate reads stays a placeholder. Joins, aggregates, DISTINCT
+/// and a consumer that does read the filtered column all answer as before.
+#[test]
+fn a_filter_copies_only_the_columns_read_above_it() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE f (k INTEGER, a INTEGER, b DATE, c DATE, s VARCHAR);")
+        .unwrap();
+    db.execute("CREATE TABLE d (k INTEGER, name VARCHAR);")
+        .unwrap();
+    let values: Vec<String> = (0..6000i64)
+        .map(|n| {
+            format!(
+                "({}, {}, DATE '2024-01-{:02}', DATE '2024-01-{:02}', 's{}')",
+                n % 50,
+                n % 97,
+                1 + n % 28,
+                1 + n * 7 % 28,
+                n % 13
+            )
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO f VALUES {};", values.join(",")))
+        .unwrap();
+    let dims: Vec<String> = (0..50).map(|k| format!("({k}, 'n{}')", k % 7)).collect();
+    db.execute(&format!("INSERT INTO d VALUES {};", dims.join(",")))
+        .unwrap();
+    let keep = |n: i64| 1 + n % 28 > 1 + n * 7 % 28;
+    let total: i64 = (0..6000).filter(|&n| keep(n)).map(|n| n % 97).sum();
+    let kept = (0..6000).filter(|&n| keep(n)).count() as i64;
+    // Join above the filter reads neither date.
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT sum(f.a) FROM f, d WHERE f.k = d.k AND f.b > f.c;"
+        ),
+        total
+    );
+    // DISTINCT reads whole rows; an aggregate reads one column.
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT count(*) FROM (SELECT DISTINCT * FROM f WHERE b > c) q;"
+        ),
+        kept
+    );
+    // A consumer that reads a filtered column still sees it.
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT count(*) FROM f, d WHERE f.k = d.k AND f.b > f.c AND f.b >= DATE '2024-01-01';"
+        ),
+        kept
+    );
+    let max_b = (0..6000)
+        .filter(|&n| keep(n))
+        .map(|n| 1 + n % 28)
+        .max()
+        .unwrap();
+    let got = match db
+        .execute("SELECT max(b) FROM f, d WHERE f.k = d.k AND f.b > f.c;")
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        QueryResult::Selected { rows, .. } => rows[0][0].to_string(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(got, format!("2024-01-{max_b:02}"));
+}

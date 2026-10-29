@@ -1634,6 +1634,14 @@ impl ScanProjections {
         self.map.get(&node_addr(join)).map(Vec::as_slice)
     }
 
+    /// The output columns of a [`LogicalPlan::Filter`] its consumer reads,
+    /// or `None` when unbounded (copy every column of the kept rows). A
+    /// column only the predicate reads stays a placeholder in the output.
+    pub(crate) fn for_filter(&self, filter: &LogicalPlan) -> Option<&[usize]> {
+        debug_assert!(matches!(filter, LogicalPlan::Filter { .. }));
+        self.map.get(&node_addr(filter)).map(Vec::as_slice)
+    }
+
     /// The output columns of a [`LogicalPlan::Project`] its consumer reads,
     /// or `None` when unbounded (evaluate every expression). An unread
     /// expression is not evaluated: its column is a zero-length placeholder.
@@ -2421,6 +2429,19 @@ fn walk_scan_projections(
         // pushdown into an IPC file yet), and COPY reads its whole table.
         LogicalPlan::CopyTo { .. } => {}
         LogicalPlan::Filter { input, predicate } => {
+            // The consumer's bound is the filter's output bound: a column
+            // only the predicate reads is not copied into the kept rows
+            // ([`ScanProjections::for_filter`]).
+            if let Needed::Cols(set) = needed {
+                out.insert(
+                    node_addr(plan),
+                    set.iter()
+                        .enumerate()
+                        .filter(|(_, used)| **used)
+                        .map(|(i, _)| i)
+                        .collect(),
+                );
+            }
             let mut need = needed.clone();
             collect_expr_projections(predicate, &mut need, out);
             walk_scan_projections(input, &need, out);

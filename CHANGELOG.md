@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 127i — filters copy only the columns used above them ✅
+
+- A filter used to copy every column of the rows it kept, including the
+  ones only its own condition reads (TPC-H Q21's two dates on 3.8 million
+  `lineitem` rows). It now copies just what the operators above it read.
+  TPC-H SF 1: Q4 −21 %, Q21 −10 %, Q10 −9 %, Q13 −7 %.
+
 ### Wave 123h — `IN` subqueries skip ordering their groups ✅
 
 - A `GROUP BY` inside an `IN (…)` subquery is only used as a set of
