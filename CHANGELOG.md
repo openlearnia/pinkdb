@@ -9,6 +9,14 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 127f — `IN` lists evaluate their operand once ✅
+
+- A filter like `substring(c_phone, 1, 2) IN ('13', '31', …)` computed the
+  substring once per listed value; it is now computed once per row and
+  looked up in the list. A filter that only needs a few columns of a row
+  also stops copying the others. TPC-H SF 1: **Q22 −72 %**, Q19 −9 %,
+  Q16 −6 %.
+
 ### Wave 125a — `EXISTS` hashes the smaller side ✅
 
 - An `EXISTS` / `NOT EXISTS` join whose outer side is smaller than the

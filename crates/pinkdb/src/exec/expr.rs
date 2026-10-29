@@ -3959,6 +3959,11 @@ pub(crate) fn select_predicate(
             // the right one (DuckDB's `OrSelectOperation`): the result is the
             // same, and a right-side error stays limited to rows that reach
             // it, as a per-row evaluation would report.
+            if let Some((operand, values)) = in_list_of(expr)
+                && select_in_list(operand, &values, chunk, cx, sel)?
+            {
+                return Ok(());
+            }
             let mut left_true = sel.clone();
             select_predicate(left, chunk, cx, &mut left_true)?;
             let rest = difference_selections(sel, &left_true);
@@ -4006,6 +4011,165 @@ fn scalar_cmp_of<'a>(
         Err(_) => return None,
     };
     ScalarCmp::new(col, scalar, reversed)
+}
+
+/// `e = v1 OR e = v2 OR …` with one shared non-literal operand `e` and
+/// non-NULL literals of `e`'s own type — how the binder lowers
+/// `e IN (v1, v2, …)` — as the operand and its values.
+fn in_list_of(expr: &BoundExpr) -> Option<(&BoundExpr, Vec<&Value>)> {
+    fn leaves<'a>(e: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+        match e {
+            BoundExpr::Binary {
+                op: BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => {
+                leaves(left, out);
+                leaves(right, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let mut all = Vec::new();
+    leaves(expr, &mut all);
+    let mut operand: Option<&BoundExpr> = None;
+    let mut values = Vec::with_capacity(all.len());
+    for leaf in all {
+        let BoundExpr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } = leaf
+        else {
+            return None;
+        };
+        let (e, v) = match (&**left, &**right) {
+            (BoundExpr::Literal(_), BoundExpr::Literal(_)) => return None,
+            (e, BoundExpr::Literal(v)) | (BoundExpr::Literal(v), e) => (e, v),
+            _ => return None,
+        };
+        if v.is_null() || v.data_type() != Some(e.dtype()) {
+            return None;
+        }
+        match operand {
+            None => operand = Some(e),
+            Some(o) if o == e => {}
+            Some(_) => return None,
+        }
+        values.push(v);
+    }
+    (values.len() >= 2).then(|| (operand.expect("two leaves"), values))
+}
+
+/// Keep the rows of `sel` whose `operand` equals one of `values`: the
+/// operand is evaluated once over the selected rows (an `IN` list lowered to
+/// an `OR` chain otherwise evaluates it once per value — TPC-H Q22's
+/// `substring(c_phone, 1, 2)` seven times) and each row is looked up in the
+/// value list. `false` leaves the chain to the generic path (a payload with
+/// no exact equality here).
+fn select_in_list(
+    operand: &BoundExpr,
+    values: &[&Value],
+    chunk: &DataChunk,
+    cx: &Cx,
+    sel: &mut Vec<u32>,
+) -> Result<bool> {
+    // A bare column is read in place, by chunk row; anything else is
+    // evaluated once, over the whole chunk when nothing is filtered yet and
+    // over the selected rows otherwise (row `k` = selection entry `k`).
+    let column = match operand {
+        BoundExpr::Column { index, .. } if chunk.is_present(*index) => {
+            Some(chunk.expect_column(*index)?)
+        }
+        _ => None,
+    };
+    let whole = column.is_some() || sel.len() == chunk.num_rows();
+    let owned;
+    let v: &Vector = match column {
+        Some(col) => col,
+        None => {
+            owned = if sel.len() == chunk.num_rows() {
+                eval_expr(operand, chunk, cx)?
+            } else {
+                eval_expr(operand, &take_referenced(operand, chunk, sel), cx)?
+            };
+            &owned
+        }
+    };
+    // Row `k` of `v` is selection entry `k` (or chunk row `k` when whole).
+    fn keep(sel: &mut Vec<u32>, whole: bool, v: &Vector, test: impl Fn(usize) -> bool) {
+        let mut w = 0;
+        for k in 0..sel.len() {
+            let row = sel[k];
+            let i = if whole { row as usize } else { k };
+            if v.is_valid(i) && test(i) {
+                sel[w] = row;
+                w += 1;
+            }
+        }
+        sel.truncate(w);
+    }
+    match v.data() {
+        VectorData::VarChar(d) => {
+            let set: Vec<&str> = values
+                .iter()
+                .filter_map(|x| match x {
+                    Value::Varchar(s) => Some(&**s),
+                    _ => None,
+                })
+                .collect();
+            keep(sel, whole, v, |i| set.contains(&&*d[i]));
+        }
+        VectorData::Int32(d) | VectorData::Date32(d) => {
+            let set: Vec<i32> = values
+                .iter()
+                .filter_map(|x| match x {
+                    Value::Integer(n) | Value::Date(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            keep(sel, whole, v, |i| set.contains(&d[i]));
+        }
+        VectorData::Int64(d) | VectorData::TimestampMicros(d) => {
+            let set: Vec<i64> = values
+                .iter()
+                .filter_map(|x| match x {
+                    Value::Bigint(n) | Value::Timestamp(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            keep(sel, whole, v, |i| set.contains(&d[i]));
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The rows `sel` of the columns `expr` reads, every other column an absent
+/// placeholder: gathering the whole chunk to evaluate one expression over a
+/// selection copies columns nothing reads.
+fn take_referenced(expr: &BoundExpr, chunk: &DataChunk, sel: &[u32]) -> DataChunk {
+    let mut cols = Vec::new();
+    crate::optimizer::columns_in(expr, &mut cols);
+    if cols.contains(&usize::MAX) {
+        return chunk.take(sel);
+    }
+    let empty: std::sync::Arc<Vector> = std::sync::Arc::new(Vector::new_empty(DataType::Integer));
+    let columns = chunk
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(c, col)| {
+            if cols.contains(&c) && chunk.is_present(c) {
+                std::sync::Arc::new(col.take(sel))
+            } else {
+                std::sync::Arc::clone(&empty)
+            }
+        })
+        .collect();
+    DataChunk::projected(columns, sel.len())
 }
 
 /// `column <op> column` over two payloads of one ordered layout (TPC-H Q4's

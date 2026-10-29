@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 127f — <code>IN</code> lists evaluate their operand once ✅</h3>
+<ul>
+<li>A filter like <code>substring(c_phone, 1, 2) IN ('13', '31', …)</code> computed the substring once per listed value; it is now computed once per row and looked up in the list. A filter that only needs a few columns of a row also stops copying the others. TPC-H SF 1: <strong>Q22 −72 %</strong>, Q19 −9 %, Q16 −6 %.</li>
+</ul>
 <h3>Wave 125a — <code>EXISTS</code> hashes the smaller side ✅</h3>
 <ul>
 <li>An <code>EXISTS</code> / <code>NOT EXISTS</code> join whose outer side is smaller than the subquery's now hashes the outer rows and lets the subquery's rows mark them, as DuckDB's <code>RIGHT_SEMI</code> join does: TPC-H Q4 hashes 57 thousand orders instead of 3.8 million <code>lineitem</code> rows. An extra non-equality condition (Q21's <code>l2.l_suppkey &lt;&gt; l1.l_suppkey</code>) is checked on every matching pair. TPC-H SF 1: <strong>Q4 −68 %</strong>, <strong>Q21 −38 %</strong>, Q22 −9 %.</li>

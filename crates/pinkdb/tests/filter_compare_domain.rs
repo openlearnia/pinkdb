@@ -180,3 +180,61 @@ fn column_against_column_of_the_same_type() {
         }
     }
 }
+
+/// `e IN (v1, v2, …)` — lowered to `e = v1 OR e = v2 OR …` — evaluates `e`
+/// once and looks each row up in the value list (TPC-H Q22's
+/// `substring(c_phone, 1, 2) IN (…)`). The filter keeps what the projection
+/// marks TRUE: computed and bare-column operands, NULL cells, a list with a
+/// NULL or a value of another type (the generic path), a narrowed selection.
+#[test]
+fn in_lists_evaluate_their_operand_once() {
+    let mut db = store();
+    db.execute("CREATE TABLE w (s VARCHAR, i INTEGER, b BIGINT, d DATE);")
+        .unwrap();
+    let values: Vec<String> = (0..4000i64)
+        .map(|n| {
+            let s = if n % 13 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'{}-{}'", n * 7 % 40, n % 9)
+            };
+            let i = if n % 17 == 0 {
+                "NULL".to_string()
+            } else {
+                (n % 50).to_string()
+            };
+            format!(
+                "({s}, {i}, {}, DATE '2024-02-{:02}')",
+                n * 1_000_003 % 77,
+                1 + n % 28
+            )
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO w VALUES {};", values.join(",")))
+        .unwrap();
+    for list in [
+        "substring(s, 1, 2) IN ('13', '31', '2-', '17', '9-')",
+        "substring(s, 1, 2) IN ('13', NULL, '31')",
+        "s IN ('13-4', '31-1', '0-0', '7-7')",
+        "i IN (3, 7, 49, 50)",
+        "i IN (3, 7.5)",
+        "b IN (0, 3, 76)",
+        "d IN (DATE '2024-02-03', DATE '2024-02-28')",
+        "i + 1 IN (1, 2, 3)",
+    ] {
+        for (filter, all) in [
+            (format!("WHERE {list}"), String::new()),
+            (
+                format!("WHERE i > 20 AND {list}"),
+                "WHERE i > 20".to_string(),
+            ),
+        ] {
+            let kept = count(&mut db, &format!("SELECT count(*) FROM w {filter};"));
+            let marked = count(
+                &mut db,
+                &format!("SELECT sum(CASE WHEN {list} THEN 1 ELSE 0 END) FROM w {all};"),
+            );
+            assert_eq!(kept, marked, "{filter}");
+        }
+    }
+}
