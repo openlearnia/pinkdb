@@ -238,3 +238,60 @@ fn in_lists_evaluate_their_operand_once() {
         }
     }
 }
+
+/// `text_column <op> 'literal'` decides each shared string once (wave
+/// 127h): a store reopened from disk gives a dictionary-encoded column's rows
+/// shared strings, an in-memory table separate ones, and a high-cardinality
+/// column overflows the per-chunk memo. All three keep what the projection
+/// marks TRUE.
+#[test]
+fn text_comparisons_over_shared_and_separate_strings() {
+    let dir = std::env::temp_dir().join(format!(
+        "pinkdb_text_cmp_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("db.pink");
+    let path = path.to_str().unwrap();
+    let values: Vec<String> = (0..6000i64)
+        .map(|n| {
+            let flag = if n % 23 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'{}'", ["R", "A", "N", "", "Rx"][n as usize % 5])
+            };
+            let wide = if n % 29 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'w{}'", n % 700)
+            };
+            format!("({flag}, {wide})")
+        })
+        .collect();
+    {
+        let mut db = PinkDb::open_durable(path).unwrap();
+        db.execute("CREATE TABLE t (f VARCHAR, w VARCHAR);")
+            .unwrap();
+        db.execute(&format!("INSERT INTO t VALUES {};", values.join(",")))
+            .unwrap();
+        db.checkpoint().unwrap();
+        for (col, lit) in [("f", "'R'"), ("f", "''"), ("f", "'N'"), ("w", "'w350'")] {
+            check(&mut db, col, lit);
+        }
+    }
+    let mut db = PinkDb::open_durable(path).unwrap();
+    for (col, lit) in [
+        ("f", "'R'"),
+        ("f", "''"),
+        ("f", "'N'"),
+        ("w", "'w350'"),
+        ("w", "'w7'"),
+    ] {
+        check(&mut db, col, lit);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 127h — text filters decide each stored string once ✅</h3>
+<ul>
+<li>A filter comparing a text column with a constant (<code>l_returnflag = 'R'</code>, <code>p_brand &lt;&gt; 'Brand#45'</code>) remembers its answer per stored string, so rows sharing one dictionary-encoded string are not compared again. TPC-H SF 1: Q12 −7 %, Q7 −6 %, Q19 −6 %.</li>
+</ul>
 <h3>Wave 127g — <code>CASE</code> a vector at a time ✅</h3>
 <ul>
 <li><code>CASE WHEN … THEN … ELSE … END</code> now tests each condition over the rows still undecided as a filter, takes constant results without evaluating them, and builds its output in one typed pass instead of one value per row. TPC-H SF 1: <strong>Q12 −52 %</strong>.</li>

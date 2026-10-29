@@ -1304,6 +1304,23 @@ impl ScalarCmp<'_> {
                     None => return false,
                 }
             }
+            CmpKind::VarChar(a, s) => retain_strings(
+                col,
+                a,
+                |x| {
+                    let ord = x.cmp(&**s);
+                    match op {
+                        BinaryOp::Eq => ord == Ordering::Equal,
+                        BinaryOp::NotEq => ord != Ordering::Equal,
+                        BinaryOp::Lt => ord == Ordering::Less,
+                        BinaryOp::LtEq => ord != Ordering::Greater,
+                        BinaryOp::Gt => ord == Ordering::Greater,
+                        BinaryOp::GtEq => ord != Ordering::Less,
+                        _ => unreachable!("retain_in_domain called with {op:?}"),
+                    }
+                },
+                sel,
+            ),
             CmpKind::DecFloat(a, sa, s) => {
                 let at_least =
                     |strict| first_passing(*s, strict, |x| crate::types::decimal_to_f64(x, *sa));
@@ -1318,6 +1335,57 @@ impl ScalarCmp<'_> {
         true
     }
 }
+
+/// Keep the rows of `sel` whose valid string passes `test`, deciding each
+/// distinct shared string once: a dictionary-encoded column (the `.pink`
+/// store's low-cardinality strings) hands every row of a value the same
+/// `Arc<str>`, so the answer is remembered by pointer for up to
+/// [`STRING_MEMO`] pointers and the string itself is only read for a pointer
+/// not seen yet (TPC-H Q10's `l_returnflag = 'R'` compared six million
+/// one-letter strings).
+fn retain_strings(
+    col: &Vector,
+    a: &[std::sync::Arc<str>],
+    test: impl Fn(&str) -> bool,
+    sel: &mut Vec<u32>,
+) {
+    let nulls = col.has_nulls();
+    let mut memo: Vec<(*const u8, bool)> = Vec::new();
+    // A pointer not seen once the memo is full means the strings are not
+    // shared (or too many): test the rest directly.
+    let mut direct = false;
+    let mut w = 0;
+    for r in 0..sel.len() {
+        let row = sel[r];
+        let i = row as usize;
+        if nulls && !col.is_valid(i) {
+            continue;
+        }
+        let keep = if direct {
+            test(&a[i])
+        } else {
+            let p = std::sync::Arc::as_ptr(&a[i]) as *const u8;
+            match memo.iter().find(|(q, _)| *q == p) {
+                Some(&(_, k)) => k,
+                None => {
+                    let k = test(&a[i]);
+                    if memo.len() < STRING_MEMO {
+                        memo.push((p, k));
+                    } else {
+                        direct = true;
+                    }
+                    k
+                }
+            }
+        };
+        sel[w] = row;
+        w += usize::from(keep);
+    }
+    sel.truncate(w);
+}
+
+/// Distinct string pointers [`retain_strings`] remembers per chunk.
+const STRING_MEMO: usize = 16;
 
 /// The comparison `literal <op> column` read as `column <op'> literal`.
 fn flip_ordering(op: BinaryOp) -> BinaryOp {

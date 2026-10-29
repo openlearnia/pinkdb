@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 127h — text filters decide each stored string once ✅
+
+- A filter comparing a text column with a constant (`l_returnflag = 'R'`,
+  `p_brand <> 'Brand#45'`) remembers its answer per stored string, so rows
+  sharing one dictionary-encoded string are not compared again. TPC-H SF 1:
+  Q12 −7 %, Q7 −6 %, Q19 −6 %.
+
 ### Wave 127g — `CASE` a vector at a time ✅
 
 - `CASE WHEN … THEN … ELSE … END` now tests each condition over the rows
