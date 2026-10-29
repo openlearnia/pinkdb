@@ -182,3 +182,63 @@ fn a_row_the_filter_dropped_raises_no_error() {
     );
     assert!(out.iter().all(|r| r[1] == "true"), "{out:?}");
 }
+
+/// VARCHAR keys (wave 123e): the group keeps its string, an empty string and
+/// NULL stay different groups, a text key mixes with integer keys, and a
+/// chunk whose key columns hold few values takes the dense coded path —
+/// first-seen order and every aggregate as before.
+#[test]
+fn text_keys_with_nulls_and_empty_strings() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE s (name VARCHAR, flag VARCHAR, n INTEGER, v INTEGER);")
+        .unwrap();
+    let name = |i: i64| match i % 23 {
+        0 => None,
+        1 => Some(String::new()),
+        _ => Some(format!("name-{}", i * 7919 % 9001)),
+    };
+    let flag = |i: i64| match i % 7 {
+        0 => None,
+        1 => Some(String::new()),
+        r => Some(["A", "N", "R"][r as usize % 3].to_string()),
+    };
+    let lit = |s: Option<String>| s.map_or_else(|| "NULL".to_string(), |s| format!("'{s}'"));
+    let values: Vec<String> = (0..ROWS)
+        .map(|i| {
+            format!(
+                "({}, {}, {}, {})",
+                lit(name(i)),
+                lit(flag(i)),
+                i % 5,
+                i * 7 % 1000
+            )
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO s VALUES {};", values.join(",")))
+        .unwrap();
+    let show = |s: Option<String>| s.unwrap_or_else(|| "NULL".into());
+    // Many groups, partitioned merge.
+    let out = rows(
+        &mut db,
+        "SELECT name, count(*), sum(v), min(v), max(v) FROM s GROUP BY name;",
+    );
+    assert_eq!(joined(out), expected(|_| true, |i| show(name(i))));
+    // A text key next to an integer key.
+    let out = rows(
+        &mut db,
+        "SELECT name, n, count(*), sum(v), min(v), max(v) FROM s GROUP BY name, n;",
+    );
+    assert_eq!(
+        joined(out),
+        expected(|_| true, |i| format!("{}|{}", show(name(i)), i % 5))
+    );
+    // Few values per column: the dense coded path.
+    let out = rows(
+        &mut db,
+        "SELECT flag, n, count(*), sum(v), min(v), max(v) FROM s GROUP BY flag, n;",
+    );
+    assert_eq!(
+        joined(out),
+        expected(|_| true, |i| format!("{}|{}", show(flag(i)), i % 5))
+    );
+}

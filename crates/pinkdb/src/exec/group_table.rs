@@ -5,7 +5,8 @@
 //! accumulators, so a chunk of 2,048 distinct keys allocates thousands of
 //! times and the cross-chunk merge moves every one of them. When every key
 //! is a fixed-width number (INTEGER, BIGINT, DATE, TIMESTAMP, BOOLEAN,
-//! DECIMAL(≤18)) and no aggregate collects values (`COUNT(DISTINCT)`, the
+//! DECIMAL(≤18)) or a VARCHAR (wave 123e: its word is the string's hash and
+//! the group keeps the shared string) and no aggregate collects values (`COUNT(DISTINCT)`, the
 //! ordered-set aggregates), a group is instead one row of three flat arrays:
 //! its key as `u64` words (plus one word of NULL bits), its hash, and its
 //! accumulators. The layout follows DuckDB's `GroupedAggregateHashTable`
@@ -21,13 +22,14 @@
 use super::Cx;
 use super::aggregate::{
     Acc, AccSlots, EvalVec, MERGE_BUCKET_GROUPS, MERGE_BUCKETS_MAX, PARALLEL_MERGE_MIN, accumulate,
-    eval_agg_vec, keep_mask,
+    eval_agg_vec, keep_mask, small_column_codes,
 };
 use super::selection::Selected;
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
 use crate::types::{DataType, Result};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 use rayon::prelude::*;
+use std::sync::Arc;
 
 /// How one key column's cells become a `u64` word, and back.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,7 +39,13 @@ enum KeyKind {
     Date32,
     Int64,
     Timestamp,
-    Decimal { precision: u8, scale: u8 },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
+    /// VARCHAR: the word is the string's hash, and the group keeps the
+    /// string itself (a shared `Arc<str>`, no copy) to compare and emit.
+    Varchar,
 }
 
 impl KeyKind {
@@ -48,6 +56,7 @@ impl KeyKind {
             DataType::Date => KeyKind::Date32,
             DataType::Bigint => KeyKind::Int64,
             DataType::Timestamp => KeyKind::Timestamp,
+            DataType::Varchar => KeyKind::Varchar,
             DataType::Decimal { precision, scale } if precision <= 18 => {
                 KeyKind::Decimal { precision, scale }
             }
@@ -64,7 +73,8 @@ impl KeyKind {
             | (KeyKind::Int32, VectorData::Int32(_))
             | (KeyKind::Date32, VectorData::Date32(_))
             | (KeyKind::Int64, VectorData::Int64(_))
-            | (KeyKind::Timestamp, VectorData::TimestampMicros(_)) => true,
+            | (KeyKind::Timestamp, VectorData::TimestampMicros(_))
+            | (KeyKind::Varchar, VectorData::VarChar(_)) => true,
             (
                 KeyKind::Decimal { scale, .. },
                 VectorData::Decimal {
@@ -104,6 +114,10 @@ fn eligible(keys: &[BoundExpr], aggs: &[BoundAgg]) -> Option<Vec<KeyKind>> {
 struct FlatPartial {
     width: usize,
     naggs: usize,
+    /// VARCHAR key columns: `strs` holds `nstr` strings per group (an empty
+    /// one for a NULL cell, whose NULL bit tells it apart from `''`).
+    nstr: usize,
+    strs: Vec<Arc<str>>,
     keys: Vec<u64>,
     hashes: Vec<u64>,
     accs: Vec<Acc>,
@@ -116,6 +130,8 @@ struct FlatPartial {
 struct Spec<'a> {
     keys: &'a [BoundExpr],
     kinds: Vec<KeyKind>,
+    /// The key columns that are VARCHAR, in order.
+    str_cols: Vec<usize>,
     aggs: &'a [BoundAgg],
     fresh: Vec<Acc>,
     buckets: usize,
@@ -124,8 +140,12 @@ struct Spec<'a> {
 impl<'a> Spec<'a> {
     /// `None` when the GROUP BY is not one the flat table handles.
     fn new(keys: &'a [BoundExpr], aggs: &'a [BoundAgg], rows: usize) -> Option<Spec<'a>> {
+        let kinds = eligible(keys, aggs)?;
         Some(Spec {
-            kinds: eligible(keys, aggs)?,
+            str_cols: (0..kinds.len())
+                .filter(|&c| kinds[c] == KeyKind::Varchar)
+                .collect(),
+            kinds,
             keys,
             aggs,
             fresh: aggs
@@ -146,6 +166,11 @@ impl FlatPartial {
     #[inline]
     fn len(&self) -> usize {
         self.hashes.len()
+    }
+
+    #[inline]
+    fn strs_of(&self, g: usize) -> &[Arc<str>] {
+        &self.strs[g * self.nstr..(g + 1) * self.nstr]
     }
 }
 
@@ -177,9 +202,11 @@ impl FlatPartial {
         let mut keys = Vec::with_capacity(self.keys.len());
         let mut hashes = Vec::with_capacity(n);
         let mut accs = Vec::with_capacity(self.accs.len());
+        let mut strs = Vec::with_capacity(self.strs.len());
         for &g in &perm {
             let g = g as usize;
             keys.extend_from_slice(&self.keys[g * width..(g + 1) * width]);
+            strs.extend_from_slice(self.strs_of(g));
             hashes.push(self.hashes[g]);
             for acc in &mut self.accs[g * naggs..(g + 1) * naggs] {
                 accs.push(std::mem::replace(acc, Acc::Count(0)));
@@ -188,6 +215,7 @@ impl FlatPartial {
         self.keys = keys;
         self.hashes = hashes;
         self.accs = accs;
+        self.strs = strs;
         self.pos = perm;
         self.starts = starts;
     }
@@ -283,6 +311,7 @@ fn fill_words(
         VectorData::Int64(d) | VectorData::TimestampMicros(d) => put(&|i| d[i] as u64),
         // DECIMAL(≤18) values fit an i64 (`KeyKind::matches`).
         VectorData::Decimal { values, .. } => put(&|i| values[i] as i64 as u64),
+        VectorData::VarChar(d) => put(&|i| super::hash_bytes_key(d[i].as_bytes())),
         _ => unreachable!("KeyKind::matches admits only fixed-width payloads"),
     }
 }
@@ -325,40 +354,101 @@ fn fold(
         .collect::<Result<_>>()?;
     let rows = sel.map_or(chunk.num_rows(), |s| s.len());
     let width = keys.len() + 1;
-    let mut words = vec![0u64; rows * width];
-    for (c, kv) in key_vecs.iter().enumerate() {
-        fill_words(&mut words, width, c, kv.v(), rows, sel);
-    }
+    let nstr = spec.str_cols.len();
+    // Row `k`'s string in VARCHAR key column `c` (`""` for NULL).
+    let empty: Arc<str> = Arc::from("");
+    let cell = |c: usize, k: usize| -> &Arc<str> {
+        let v = key_vecs[c].v();
+        let i = sel.map_or(k, |s| s[k] as usize);
+        match v.data() {
+            VectorData::VarChar(d) if v.is_valid(i) => &d[i],
+            _ => &empty,
+        }
+    };
     let mut part = FlatPartial {
         width,
         naggs: aggs.len(),
+        nstr,
+        strs: Vec::new(),
         keys: Vec::new(),
         hashes: Vec::new(),
         accs: Vec::new(),
         pos: Vec::new(),
         starts: Vec::new(),
     };
-    let (mut slots, mask) = slot_table(rows);
+    let new_group = |part: &mut FlatPartial, key: &[u64], h: u64, k: usize| -> u32 {
+        let g = part.len() as u32;
+        part.keys.extend_from_slice(key);
+        part.hashes.push(h);
+        part.accs.extend_from_slice(&spec.fresh);
+        for &c in &spec.str_cols {
+            part.strs.push(Arc::clone(cell(c, k)));
+        }
+        g
+    };
     let mut gids = Vec::with_capacity(rows);
-    for key in words.chunks_exact(width) {
-        let h = hash_words(key);
-        let mut s = h as usize & mask;
-        let gid = loop {
-            let g = slots[s];
-            if g == u32::MAX {
-                let g = part.len() as u32;
-                slots[s] = g;
-                part.keys.extend_from_slice(key);
-                part.hashes.push(h);
-                part.accs.extend_from_slice(&spec.fresh);
-                break g;
+    // A chunk whose key columns each hold few values (TPC-H Q1's two flags)
+    // codes every column by a short scan and indexes a dense table, so only
+    // a group's first row is turned into words and hashed (DuckDB's
+    // `PerfectHashAggregate`; the general path's `small_domain_gids`).
+    let small = if key_vecs.len() <= 3 {
+        key_vecs
+            .iter()
+            .map(|kv| small_column_codes(kv.v(), rows, |k| sel.map_or(k, |s| s[k] as usize)))
+            .collect::<Option<Vec<_>>>()
+    } else {
+        None
+    };
+    if let Some(columns) = small {
+        let size: usize = columns.iter().map(|(_, n)| (*n).max(1)).product();
+        let mut slots = vec![u32::MAX; size];
+        let mut one = vec![0u64; width];
+        for k in 0..rows {
+            let mut code = 0usize;
+            for (codes, n) in columns.iter().rev() {
+                code = code * (*n).max(1) + codes[k] as usize;
             }
-            if part.hashes[g as usize] == h && part.key(g as usize) == key {
-                break g;
+            if slots[code] == u32::MAX {
+                let row = [sel.map_or(k as u32, |s| s[k])];
+                one.fill(0);
+                for (c, kv) in key_vecs.iter().enumerate() {
+                    fill_words(&mut one, width, c, kv.v(), 1, Some(&row));
+                }
+                let h = hash_words(&one);
+                slots[code] = new_group(&mut part, &one, h, k);
             }
-            s = (s + 1) & mask;
-        };
-        gids.push(gid as usize);
+            gids.push(slots[code] as usize);
+        }
+    } else {
+        let mut words = vec![0u64; rows * width];
+        for (c, kv) in key_vecs.iter().enumerate() {
+            fill_words(&mut words, width, c, kv.v(), rows, sel);
+        }
+        let (mut slots, mask) = slot_table(rows);
+        for (k, key) in words.chunks_exact(width).enumerate() {
+            let h = hash_words(key);
+            let mut s = h as usize & mask;
+            let gid = loop {
+                let g = slots[s];
+                if g == u32::MAX {
+                    let g = new_group(&mut part, key, h, k);
+                    slots[s] = g;
+                    break g;
+                }
+                if part.hashes[g as usize] == h
+                    && part.key(g as usize) == key
+                    && spec
+                        .str_cols
+                        .iter()
+                        .zip(part.strs_of(g as usize))
+                        .all(|(&c, s)| **s == **cell(c, k))
+                {
+                    break g;
+                }
+                s = (s + 1) & mask;
+            };
+            gids.push(gid as usize);
+        }
     }
     for (j, av) in arg_vecs.iter().enumerate() {
         accumulate(
@@ -378,6 +468,7 @@ fn fold(
 /// (`partial << 32 | index in the partial`).
 struct Merged {
     keys: Vec<u64>,
+    strs: Vec<Arc<str>>,
     accs: Vec<Acc>,
     first: Vec<u64>,
 }
@@ -393,6 +484,7 @@ fn merge_and_emit(
 ) -> Result<Vec<DataChunk>> {
     let width = kinds.len() + 1;
     let naggs = aggs.len();
+    let nstr = kinds.iter().filter(|k| **k == KeyKind::Varchar).count();
     let total: usize = partials.iter().map(FlatPartial::len).sum();
     let buckets = partials.first().map_or(1, |p| p.starts.len() - 1);
     let merged: Vec<Merged> = (0..buckets)
@@ -402,6 +494,7 @@ fn merge_and_emit(
             let (mut slots, mask) = slot_table(size);
             let mut out = Merged {
                 keys: Vec::with_capacity(size * width),
+                strs: Vec::with_capacity(size * nstr),
                 accs: Vec::with_capacity(size * naggs),
                 first: Vec::with_capacity(size),
             };
@@ -410,6 +503,7 @@ fn merge_and_emit(
                 for g in p.starts[b]..p.starts[b + 1] {
                     let h = p.hashes[g];
                     let key = p.key(g);
+                    let strs = p.strs_of(g);
                     let src = &p.accs[g * naggs..(g + 1) * naggs];
                     let mut s = h as usize & mask;
                     loop {
@@ -417,13 +511,17 @@ fn merge_and_emit(
                         if t == u32::MAX {
                             slots[s] = out.first.len() as u32;
                             out.keys.extend_from_slice(key);
+                            out.strs.extend_from_slice(strs);
                             out.accs.extend_from_slice(src);
                             out.first.push((pi as u64) << 32 | u64::from(p.pos[g]));
                             hashes.push(h);
                             break;
                         }
                         let t = t as usize;
-                        if hashes[t] == h && out.keys[t * width..(t + 1) * width] == *key {
+                        if hashes[t] == h
+                            && out.keys[t * width..(t + 1) * width] == *key
+                            && out.strs[t * nstr..(t + 1) * nstr] == *strs
+                        {
                             for (acc, other) in
                                 out.accs[t * naggs..(t + 1) * naggs].iter_mut().zip(src)
                             {
@@ -455,6 +553,7 @@ fn merge_and_emit(
     }
     let build = |part: &[(u64, u32, u32)]| -> Result<DataChunk> {
         let mut cols = Vec::with_capacity(kinds.len() + naggs);
+        let mut slot = 0;
         for (c, kind) in kinds.iter().enumerate() {
             let word =
                 |&(_, b, i): &(u64, u32, u32)| merged[b as usize].keys[i as usize * width + c];
@@ -475,6 +574,17 @@ fn merge_and_emit(
                     precision,
                     scale,
                 },
+                KeyKind::Varchar => {
+                    let at = slot;
+                    slot += 1;
+                    VectorData::VarChar(
+                        part.iter()
+                            .map(|&(_, b, i)| {
+                                Arc::clone(&merged[b as usize].strs[i as usize * nstr + at])
+                            })
+                            .collect(),
+                    )
+                }
             };
             let mut validity = vec![u64::MAX; part.len().div_ceil(64)];
             for (r, &(_, b, i)) in part.iter().enumerate() {

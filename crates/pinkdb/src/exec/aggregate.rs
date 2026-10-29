@@ -1831,7 +1831,7 @@ fn group_ids(
 /// Per-row codes of one key column whose chunk holds at most
 /// [`SMALL_KEY_SET`] distinct values (NULL counts as one): `None` past that,
 /// or for a key type without a cheap equality here.
-fn small_column_codes(
+pub(crate) fn small_column_codes(
     v: &Vector,
     rows: usize,
     row: impl Fn(usize) -> usize,

@@ -9,6 +9,14 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 123e — GROUP BY on text keys in flat tables ✅
+
+- Text group keys (`GROUP BY n_name`, `c_name`, …) now use the flat group
+  tables of wave 123d too: a group keeps a shared reference to its string
+  instead of a copy, and a chunk whose keys hold only a few values (TPC-H
+  Q1's two flags) is grouped through a small dense table. TPC-H SF 1:
+  **Q10 −27 %**, Q9 −5 %.
+
 ### Wave 125b — hash join probes load their buckets in one pass ✅
 
 - A join on an integer key now hashes a whole chunk of probe keys and

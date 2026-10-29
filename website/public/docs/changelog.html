@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 123e — GROUP BY on text keys in flat tables ✅</h3>
+<ul>
+<li>Text group keys (<code>GROUP BY n_name</code>, <code>c_name</code>, …) now use the flat group tables of wave 123d too: a group keeps a shared reference to its string instead of a copy, and a chunk whose keys hold only a few values (TPC-H Q1's two flags) is grouped through a small dense table. TPC-H SF 1: <strong>Q10 −27 %</strong>, Q9 −5 %.</li>
+</ul>
 <h3>Wave 125b — hash join probes load their buckets in one pass ✅</h3>
 <ul>
 <li>A join on an integer key now hashes a whole chunk of probe keys and loads their buckets before walking any of them, so the memory reads of different rows overlap instead of waiting one after another. TPC-H SF 1: Q13 −16 %, Q18 −8 %, Q21 −8 %.</li>
