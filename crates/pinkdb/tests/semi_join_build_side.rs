@@ -142,3 +142,45 @@ fn two_keys_and_text_keys() {
         expected(false, text)
     );
 }
+
+/// A non-equality condition next to the key (TPC-H Q21's
+/// `l2.l_suppkey <> l1.l_suppkey`) becomes the join's residual: a left row
+/// counts as matched only through a pair that passes it.
+#[test]
+fn a_residual_decides_which_pairs_match() {
+    let mut db = store();
+    type Row = (Option<i64>, i64, Option<String>);
+    let other_j = |s: &Row, b: &Row| s.0.is_some() && s.0 == b.0 && s.1 != b.1;
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT id FROM small WHERE EXISTS \
+             (SELECT 1 FROM big WHERE big.k = small.k AND big.j <> small.j);"
+        ),
+        expected(true, other_j)
+    );
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT id FROM small WHERE NOT EXISTS \
+             (SELECT 1 FROM big WHERE big.k = small.k AND big.j <> small.j);"
+        ),
+        expected(false, other_j)
+    );
+    // Columns of both sides mixed in one expression, and a text column.
+    // (NULL text on either side compares NULL, so it never passes.)
+    let mixed = |s: &Row, b: &Row| {
+        s.0.is_some()
+            && s.0 == b.0
+            && b.1 + s.1 > 3
+            && matches!((&b.2, &s.2), (Some(x), Some(y)) if x > y)
+    };
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT id FROM small WHERE EXISTS \
+             (SELECT 1 FROM big WHERE big.k = small.k AND big.j + small.j > 3 AND big.s > small.s);"
+        ),
+        expected(true, mixed)
+    );
+}

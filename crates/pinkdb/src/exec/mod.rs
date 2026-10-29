@@ -4766,6 +4766,15 @@ fn hash_join(
 /// Name of the marker column a mark join appends (wave 120).
 pub(crate) const MARK_NAME: &str = "__mark";
 
+/// How [`semi_by_marking_left`] joins: the join kind, the key encoding
+/// (`key_encoding`'s answer) and the residual in `left ++ right` space.
+struct MarkingSemi<'a> {
+    kind: JoinKind,
+    ints: bool,
+    commons: &'a [Option<DataType>],
+    residual: Option<&'a BoundExpr>,
+}
+
 /// SEMI/ANTI with the smaller left side hashed instead (DuckDB's
 /// `RIGHT_SEMI`/`RIGHT_ANTI`): the right rows probe the left table and mark
 /// every left row they match, then each left chunk keeps its marked (semi)
@@ -4774,19 +4783,23 @@ pub(crate) const MARK_NAME: &str = "__mark";
 /// left-probing path's: a left row is emitted once, iff some right row has
 /// equal non-NULL keys (a NULL key never matches, so ANTI keeps its row).
 /// Probe-side join filters only ever drop rows that cannot match, so they
-/// are not needed here.
-#[allow(clippy::too_many_arguments)]
+/// are not needed here. A residual (TPC-H Q21's `l2.l_suppkey <>
+/// l1.l_suppkey`) is tested on every candidate pair, moved into the probe's
+/// `right ++ left` column space, so a left row is marked only by a pair that
+/// passes it — the pairs the left-probing path tests.
 fn semi_by_marking_left(
     cx: &Cx,
     left: JoinSide<'_>,
     right: JoinSide<'_>,
     left_keys: &[BoundExpr],
     right_keys: &[BoundExpr],
-    kind: JoinKind,
-    ints: bool,
-    commons: &[Option<DataType>],
+    how: &MarkingSemi<'_>,
 ) -> Result<Vec<DataChunk>> {
     use std::sync::atomic::{AtomicBool, Ordering};
+    let (kind, ints, commons) = (how.kind, how.ints, how.commons);
+    let residual = how
+        .residual
+        .map(|r| swap_join_space(r, left.types.len(), right.types.len()));
     let table = MatchTable::build(cx, left.chunks, left_keys, commons, ints)?;
     let marks: Vec<Vec<AtomicBool>> = left
         .chunks
@@ -4804,12 +4817,31 @@ fn semi_by_marking_left(
                 .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
                 .collect::<Result<_>>()?;
             let mut buf = Vec::new();
-            let mut mark = |r: u32| {
-                let (c, i) = table.loc(r);
+            let set = |c: u32, i: u32| {
                 let m = &marks[c as usize][i as usize];
                 if !m.load(Ordering::Relaxed) {
                     m.store(true, Ordering::Relaxed);
                 }
+            };
+            if let Some(residual) = &residual {
+                let pairs = candidate_pairs(chunk, &kvs, &table, ints, None, &mut buf);
+                let kept = residual_selection(
+                    cx,
+                    residual,
+                    &pairs,
+                    chunk,
+                    right.types.len(),
+                    left.chunks,
+                )?;
+                for k in kept {
+                    let (_, c, i) = pairs[k as usize];
+                    set(c, i);
+                }
+                return Ok(());
+            }
+            let mut mark = |r: u32| {
+                let (c, i) = table.loc(r);
+                set(c, i);
             };
             for i in 0..chunk.num_rows() {
                 if kvs.iter().any(|kv| kv.is_null(i)) {
@@ -4898,8 +4930,14 @@ fn hash_mark_join(
     let (ints, commons) = key_encoding(left_keys, right_keys);
     let left_rows: usize = left.chunks.iter().map(DataChunk::num_rows).sum();
     let right_rows: usize = right.chunks.iter().map(DataChunk::num_rows).sum();
-    if !mark && residual.is_none() && left_rows < right_rows {
-        return semi_by_marking_left(cx, left, right, left_keys, right_keys, kind, ints, &commons);
+    if !mark && left_rows < right_rows {
+        let marking = MarkingSemi {
+            kind,
+            ints,
+            commons: &commons,
+            residual,
+        };
+        return semi_by_marking_left(cx, left, right, left_keys, right_keys, &marking);
     }
     let table = MatchTable::build(cx, right.chunks, right_keys, &commons, ints)?;
     // Per correlation group: rows seen, and rows whose match value was not

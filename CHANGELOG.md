@@ -14,8 +14,9 @@ one-liners below.
 - An `EXISTS` / `NOT EXISTS` join whose outer side is smaller than the
   subquery's now hashes the outer rows and lets the subquery's rows mark
   them, as DuckDB's `RIGHT_SEMI` join does: TPC-H Q4 hashes 57 thousand
-  orders instead of 3.8 million `lineitem` rows. TPC-H SF 1: **Q4 −68 %**,
-  Q22 −9 %, Q21 −9 %.
+  orders instead of 3.8 million `lineitem` rows. An extra non-equality
+  condition (Q21's `l2.l_suppkey <> l1.l_suppkey`) is checked on every
+  matching pair. TPC-H SF 1: **Q4 −68 %**, **Q21 −38 %**, Q22 −9 %.
 
 ### Wave 127e — `column < column` filters compare in place ✅
 
