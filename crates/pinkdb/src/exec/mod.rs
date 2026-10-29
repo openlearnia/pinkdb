@@ -3138,6 +3138,57 @@ pub(crate) fn selected_chunks(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Vec<
     Ok(Some(selected.into_iter().flatten().collect()))
 }
 
+/// An INNER join's probe side, read through its filter's selection when it
+/// is a filter (TPC-H Q3's `l_shipdate > …` keeps 3.2M of 6M `lineitem` rows,
+/// and the filtered copy was its largest cost): the probe walks the kept
+/// rows of the unfiltered chunks and the join's output copies only matched
+/// rows. Probe keys must be plain columns, so nothing is evaluated on a row
+/// the filter dropped. Otherwise the side is evaluated as usual.
+fn probe_through_selection(
+    cx: &Cx,
+    plan: &LogicalPlan,
+    keys: &[BoundExpr],
+) -> Result<(Output, Option<Vec<selection::Selection>>)> {
+    if !keys.iter().all(|k| matches!(k, BoundExpr::Column { .. }))
+        || !matches!(plan, LogicalPlan::Filter { .. })
+    {
+        return eval(cx, plan).map(|out| (out, None));
+    }
+    let LogicalPlan::Filter { input, predicate } = plan else {
+        unreachable!("matched above");
+    };
+    let inner = eval(cx, input)?;
+    expr::prime(cx, [predicate])?;
+    let kept: Vec<Option<(DataChunk, selection::Selection)>> = inner
+        .chunks
+        .par_iter()
+        .map(|chunk| {
+            cx.check_deadline()?;
+            let mut sel = selection::all_rows(chunk.num_rows());
+            expr::select_predicate(predicate, chunk, cx, &mut sel)?;
+            if sel.is_empty() {
+                return Ok(None);
+            }
+            // A sparse selection is cheaper compacted once than probed
+            // through (keys are read and hashed for every row of the chunk).
+            if selection::worth_materializing(sel.len(), chunk.num_rows()) {
+                let rows = sel.len();
+                return Ok(Some((chunk.take(&sel), selection::all_rows(rows))));
+            }
+            Ok(Some((chunk.clone(), sel)))
+        })
+        .collect::<Result<_>>()?;
+    let (chunks, sels) = kept.into_iter().flatten().unzip();
+    Ok((
+        Output {
+            chunks,
+            names: inner.names,
+            types: inner.types,
+        },
+        Some(sels),
+    ))
+}
+
 /// Evaluate one Project chunk. Pass-through column references (and
 /// aggregate/window output columns) share the input chunk's `Arc<Vector>`
 /// instead of deep-copying the payload. A pass-through of an undecoded
@@ -3711,6 +3762,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // unfiltered.
             let dynamic =
                 matches!(kind, JoinKind::Inner | JoinKind::Semi) && cx.join_filter_pushdown();
+            // The probe side's filter selections, when it is read through them.
+            let mut probe_sels: Option<Vec<selection::Selection>> = None;
             let (l, r, filters) = if dynamic {
                 let (build_plan, build_keys, probe_plan, probe_keys) = if build_left {
                     (left, left_keys, right, right_keys)
@@ -3741,9 +3794,14 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     Some(filters) => cx.dynamic.push_plan(probe_plan, probe_keys, filters),
                     None => cx.dynamic.push_plan(probe_plan, probe_keys, &[]),
                 };
-                let probe = eval(cx, probe_plan);
+                let probe = if *kind == JoinKind::Inner {
+                    probe_through_selection(cx, probe_plan, probe_keys)
+                } else {
+                    eval(cx, probe_plan).map(|out| (out, None))
+                };
                 cx.dynamic.pop(frame);
-                let probe = probe?;
+                let (probe, sels) = probe?;
+                probe_sels = sels;
                 if build_left {
                     (build, probe, filters)
                 } else {
@@ -3766,13 +3824,22 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     types.extend(r.types.iter().copied());
                 }
             }
+            // Selections ride on the probe side: the right one when the left
+            // side was built.
+            let (lsels, rsels) = if build_left {
+                (None, probe_sels.as_deref())
+            } else {
+                (probe_sels.as_deref(), None)
+            };
             let lside = JoinSide {
                 chunks: &l.chunks,
                 types: &l.types,
+                sels: lsels,
             };
             let rside = JoinSide {
                 chunks: &r.chunks,
                 types: &r.types,
+                sels: rsels,
             };
             // The residual reads `left ++ right`; a build-left probe assembles
             // the preserved (right) side first.
@@ -5088,6 +5155,10 @@ fn split_sides<'e>(
 struct JoinSide<'a> {
     chunks: &'a [DataChunk],
     types: &'a [DataType],
+    /// The rows of each chunk a filter kept (ascending), when the side is a
+    /// filter's input read through its selection instead of a filtered copy
+    /// (only an INNER join's probe side; see [`probe_through_selection`]).
+    sels: Option<&'a [selection::Selection]>,
 }
 
 /// Estimated row count of a join input, for the build-side choice. Table
@@ -5895,8 +5966,24 @@ fn hash_join_probe(
     let partitions: Vec<Vec<DataChunk>> = preserved
         .chunks
         .par_iter()
-        .map(|chunk| -> Result<Vec<DataChunk>> {
+        .enumerate()
+        .map(|(ci, chunk)| -> Result<Vec<DataChunk>> {
             cx.check_deadline()?;
+            // The rows to probe: a filter's selection, or every row. A
+            // residual tests gathered pairs, so it gets a compacted chunk.
+            let sel = preserved.sels.map(|s| s[ci].as_slice());
+            let compacted;
+            let (chunk, sel) = match (sel, residual) {
+                (Some(sel), Some(_)) => {
+                    compacted = chunk.take(sel);
+                    (&compacted, None)
+                }
+                (sel, _) => (chunk, sel),
+            };
+            let rows: Vec<u32> = match sel {
+                Some(sel) => sel.to_vec(),
+                None => (0..chunk.num_rows() as u32).collect(),
+            };
             let kvs = table.probe_keys(cx, preserved_keys, chunk, &commons, ints)?;
             let mut buf = Vec::new();
             let mut sink = JoinAssembler::new(
@@ -5927,7 +6014,8 @@ fn hash_join_probe(
             }
             let probe = ints.then(|| table.probe_ints(&kvs[0]));
             let pass = filters.map(|f| row_filter_pass(f, &kvs, chunk.num_rows()));
-            for i in 0..chunk.num_rows() {
+            for &i in &rows {
+                let i = i as usize;
                 // A row the build side's bloom rules out cannot match, so it is
                 // dropped before any of its columns are materialized (wave
                 // 122). Filters are only set for an INNER join, where no

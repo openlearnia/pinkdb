@@ -8,6 +8,15 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-30
+### Wave 125e — joins read a filtered side through its selection ✅
+
+- An inner join whose probe side is filtered (TPC-H Q3's `l_shipdate >
+  DATE '1995-03-15'` keeps half of `lineitem`) now probes the unfiltered
+  rows through the filter's list of kept rows instead of copying them
+  first; only matched rows are copied into the join's output. TPC-H SF 1:
+  **Q3 −29 %**, Q7 −12 %, Q10 −6 %.
+
 ## 2026-10-29
 ### Wave 125d — a repeated join is computed once ✅
 

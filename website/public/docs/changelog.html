@@ -193,6 +193,11 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-30">2026-10-30<a class="anchor" href="#2026-10-30" aria-label="Permalink: 2026-10-30">#</a></h2>
+<h3>Wave 125e — joins read a filtered side through its selection ✅</h3>
+<ul>
+<li>An inner join whose probe side is filtered (TPC-H Q3's <code>l_shipdate &gt; DATE '1995-03-15'</code> keeps half of <code>lineitem</code>) now probes the unfiltered rows through the filter's list of kept rows instead of copying them first; only matched rows are copied into the join's output. TPC-H SF 1: <strong>Q3 −29 %</strong>, Q7 −12 %, Q10 −6 %.</li>
+</ul>
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
 <h3>Wave 125d — a repeated join is computed once ✅</h3>
 <ul>
@@ -1151,6 +1156,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-30">2026-10-30</a></li>
   <li><a href="#2026-10-29">2026-10-29</a></li>
   <li><a href="#2026-10-28">2026-10-28</a></li>
   <li><a href="#2026-10-27">2026-10-27</a></li>
