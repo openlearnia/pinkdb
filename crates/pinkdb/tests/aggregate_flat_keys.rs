@@ -290,3 +290,48 @@ fn shared_dictionary_strings_group_like_separate_ones() {
     assert_eq!(joined(reopened), want);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Arithmetic shared between aggregate arguments (wave 123g; TPC-H Q1's
+/// `l_extendedprice * (1 - l_discount)` inside two SUMs) is evaluated once
+/// per chunk; every aggregate keeps its value, NULLs included, and an error
+/// in the shared part is still raised.
+#[test]
+fn shared_argument_arithmetic_keeps_every_aggregate() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE m (k INTEGER, a DECIMAL(10,2), b DECIMAL(4,2), c INTEGER);")
+        .unwrap();
+    let values: Vec<String> = (0..ROWS)
+        .map(|i| {
+            let a = if i % 31 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("{}.{:02}", i % 997, i % 100)
+            };
+            let b = format!("0.{:02}", i % 11);
+            format!("({}, {a}, {b}, {})", i % 4, i % 5)
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO m VALUES {};", values.join(",")))
+        .unwrap();
+    let sql = |shared: bool| {
+        // The unshared spelling gives each argument its own copy of the
+        // arithmetic by a cast that changes nothing but the tree.
+        let ab = if shared {
+            "a * (1 - b)"
+        } else {
+            "CAST(a AS DECIMAL(10,2)) * (1 - b)"
+        };
+        format!(
+            "SELECT k, sum(a * (1 - b)), sum({ab} * (1 + c)), avg(a * (1 - b)), count(a) \
+             FROM m GROUP BY k ORDER BY k;"
+        )
+    };
+    let shared = rows(&mut db, &sql(true));
+    assert_eq!(shared, rows(&mut db, &sql(false)));
+    assert_eq!(shared.len(), 4);
+    // An error inside the shared part still fails the query.
+    let e = db
+        .execute("SELECT k, sum(10 / c), sum(10 / c + 1) FROM m GROUP BY k;")
+        .expect_err("c is 0 on some rows");
+    assert!(e.to_string().contains("division by zero"), "{e}");
+}

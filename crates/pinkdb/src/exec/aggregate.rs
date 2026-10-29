@@ -12,6 +12,7 @@ use super::Cx;
 use super::expr::eval_expr;
 use super::selection::Selected;
 use crate::plan::{compare_values, num_cmp};
+use crate::sql::ast::BinaryOp;
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
 use crate::types::{DataType, PinkDbError, Result, Value, decimal_fits};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
@@ -2011,6 +2012,115 @@ fn small_domain_gids(
         gids.push(gid);
     }
     Some(gids)
+}
+
+/// Arithmetic subexpressions the aggregate arguments of one GROUP BY share
+/// (TPC-H Q1: `l_extendedprice * (1 - l_discount)` is the argument of one
+/// SUM and the left operand of the next), evaluated once per chunk into
+/// extra columns that the rewritten arguments read — DuckDB's common
+/// subexpression elimination (`src/optimizer/cse_optimizer.cpp`) for the
+/// shape that matters here. Evaluating a subexpression once instead of twice
+/// raises the same errors on the same rows.
+pub(crate) struct SharedArgs {
+    temps: Vec<BoundExpr>,
+    args: Vec<Option<BoundExpr>>,
+}
+
+fn is_arith(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
+    )
+}
+
+/// The arithmetic nodes of `e`, outermost first, through casts.
+fn arith_nodes<'a>(e: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
+    match e {
+        BoundExpr::Binary {
+            op, left, right, ..
+        } if is_arith(*op) => {
+            out.push(e);
+            arith_nodes(left, out);
+            arith_nodes(right, out);
+        }
+        BoundExpr::Cast { expr, .. } => arith_nodes(expr, out),
+        _ => {}
+    }
+}
+
+/// `e` with every occurrence of `target` (inside arithmetic and casts)
+/// replaced by `with`.
+fn replace_node(e: BoundExpr, target: &BoundExpr, with: &BoundExpr) -> BoundExpr {
+    if &e == target {
+        return with.clone();
+    }
+    match e {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } if is_arith(op) => BoundExpr::Binary {
+            op,
+            left: Box::new(replace_node(*left, target, with)),
+            right: Box::new(replace_node(*right, target, with)),
+            dtype,
+        },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(replace_node(*expr, target, with)),
+            dtype,
+        },
+        other => other,
+    }
+}
+
+impl SharedArgs {
+    /// `None` when no arithmetic node appears twice. `width` is the input
+    /// chunks' column count: shared node `t` becomes column `width + t`.
+    pub(crate) fn new(aggs: &[BoundAgg], width: usize) -> Option<SharedArgs> {
+        let mut args: Vec<Option<BoundExpr>> = aggs.iter().map(|a| a.arg.clone()).collect();
+        let mut temps: Vec<BoundExpr> = Vec::new();
+        while temps.len() < 8 {
+            let mut nodes = Vec::new();
+            for a in args.iter().flatten() {
+                arith_nodes(a, &mut nodes);
+            }
+            // The first repeated node in outermost-first order is a largest
+            // one: a node's enclosing nodes come before it.
+            let Some(shared) = nodes
+                .iter()
+                .find(|n| nodes.iter().filter(|m| m == n).count() >= 2)
+                .map(|n| (*n).clone())
+            else {
+                break;
+            };
+            let column = BoundExpr::Column {
+                index: width + temps.len(),
+                dtype: shared.dtype(),
+            };
+            args = args
+                .into_iter()
+                .map(|a| a.map(|e| replace_node(e, &shared, &column)))
+                .collect();
+            temps.push(shared);
+        }
+        (!temps.is_empty()).then_some(SharedArgs { temps, args })
+    }
+
+    /// `chunk` with the shared nodes appended as columns.
+    pub(crate) fn extend(&self, chunk: &DataChunk, cx: &Cx) -> Result<DataChunk> {
+        let mut ext = chunk.clone();
+        for t in &self.temps {
+            let v = eval_expr(t, &ext, cx)?;
+            ext.columns.push(std::sync::Arc::new(v));
+        }
+        Ok(ext)
+    }
+
+    /// Aggregate `j`'s argument, reading the shared columns.
+    pub(crate) fn arg(&self, j: usize) -> Option<&BoundExpr> {
+        self.args[j].as_ref()
+    }
 }
 
 /// The per-group accumulators [`accumulate`] feeds: a partial's group list,

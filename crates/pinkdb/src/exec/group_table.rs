@@ -21,8 +21,8 @@
 
 use super::Cx;
 use super::aggregate::{
-    Acc, AccSlots, EvalVec, MERGE_BUCKET_GROUPS, MERGE_BUCKETS_MAX, PARALLEL_MERGE_MIN, accumulate,
-    eval_agg_vec, keep_mask, small_column_codes,
+    Acc, AccSlots, EvalVec, MERGE_BUCKET_GROUPS, MERGE_BUCKETS_MAX, PARALLEL_MERGE_MIN, SharedArgs,
+    accumulate, eval_agg_vec, keep_mask, small_column_codes,
 };
 use super::selection::Selected;
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
@@ -135,11 +135,18 @@ struct Spec<'a> {
     aggs: &'a [BoundAgg],
     fresh: Vec<Acc>,
     buckets: usize,
+    /// Arithmetic the aggregate arguments share, evaluated once per chunk.
+    shared: Option<SharedArgs>,
 }
 
 impl<'a> Spec<'a> {
     /// `None` when the GROUP BY is not one the flat table handles.
-    fn new(keys: &'a [BoundExpr], aggs: &'a [BoundAgg], rows: usize) -> Option<Spec<'a>> {
+    fn new(
+        keys: &'a [BoundExpr],
+        aggs: &'a [BoundAgg],
+        rows: usize,
+        width: usize,
+    ) -> Option<Spec<'a>> {
         let kinds = eligible(keys, aggs)?;
         Some(Spec {
             str_cols: (0..kinds.len())
@@ -153,6 +160,7 @@ impl<'a> Spec<'a> {
                 .map(|a| Acc::new(a.func, a.distinct, a.direct))
                 .collect(),
             buckets: partitions_for(rows),
+            shared: SharedArgs::new(aggs, width),
         })
     }
 }
@@ -338,9 +346,17 @@ fn fold(
     {
         return Ok(None);
     }
-    let arg_vecs: Vec<Option<EvalVec>> = aggs
+    let extended;
+    let (chunk, args): (&DataChunk, Vec<Option<&BoundExpr>>) = match &spec.shared {
+        Some(shared) => {
+            extended = shared.extend(chunk, cx)?;
+            (&extended, (0..aggs.len()).map(|j| shared.arg(j)).collect())
+        }
+        None => (chunk, aggs.iter().map(|a| a.arg.as_ref()).collect()),
+    };
+    let arg_vecs: Vec<Option<EvalVec>> = args
         .iter()
-        .map(|a| match &a.arg {
+        .map(|a| match a {
             Some(e) => eval_agg_vec(e, chunk, cx).map(Some),
             None => Ok(None),
         })
@@ -622,7 +638,8 @@ pub(crate) fn aggregate(
     aggs: &[BoundAgg],
 ) -> Result<Option<Vec<DataChunk>>> {
     let rows = inputs.iter().map(DataChunk::num_rows).sum();
-    let Some(spec) = Spec::new(keys, aggs, rows) else {
+    let width = inputs.first().map_or(0, DataChunk::num_cols);
+    let Some(spec) = Spec::new(keys, aggs, rows, width) else {
         return Ok(None);
     };
     let partials: Option<Vec<FlatPartial>> = inputs
@@ -645,7 +662,8 @@ pub(crate) fn aggregate_selected(
     aggs: &[BoundAgg],
 ) -> Result<Option<Vec<DataChunk>>> {
     let rows = inputs.iter().map(|i| i.sel.len()).sum();
-    let Some(spec) = Spec::new(keys, aggs, rows) else {
+    let width = inputs.first().map_or(0, |i| i.chunk.num_cols());
+    let Some(spec) = Spec::new(keys, aggs, rows, width) else {
         return Ok(None);
     };
     let partials: Option<Vec<FlatPartial>> = inputs

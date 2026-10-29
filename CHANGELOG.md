@@ -9,6 +9,12 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 123g — shared arithmetic in aggregate arguments computed once ✅
+
+- When several aggregates of a `GROUP BY` share a calculation (TPC-H Q1
+  sums `l_extendedprice * (1 - l_discount)` on its own and again times
+  `(1 + l_tax)`), it is now computed once per chunk. TPC-H SF 1: Q1 −8 %.
+
 ### Wave 123f — low-cardinality text keys grouped by reference ✅
 
 - Grouping by a text column with a handful of values (TPC-H Q1's flags)
