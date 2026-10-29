@@ -199,6 +199,11 @@ progress log</a>.</p>
 <li>A <code>GROUP BY</code> whose keys are all fixed-width numbers (INTEGER, BIGINT, DATE, TIMESTAMP, BOOLEAN, DECIMAL up to 18 digits) and whose aggregates are <code>COUNT</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code> or <code>MAX</code> now keeps its groups in flat arrays: keys as machine words, accumulators side by side, each chunk's groups already laid out by merge partition. Before, every group of every chunk allocated its own key and accumulator lists. Results and their order are unchanged.</li>
 <li><code>GROUP BY l_orderkey</code> over TPC-H SF 1's 6 million <code>lineitem</code> rows: 3× faster. TPC-H SF 1: <strong>Q18 −58 %</strong>, Q15 −38 %, Q11 −20 %, Q13 −12 %.</li>
 </ul>
+<h3>Wave 127d — filters compare in the column's own type ✅</h3>
+<ul>
+<li>A filter like <code>l_discount BETWEEN 0.05 AND 0.07</code> or <code>l_quantity &lt; 24</code> compares each row as one integer comparison: the literal is converted to the column's type once, not each row to the literal's. A DECIMAL column against a DOUBLE literal keeps exactly the rows it kept before.</li>
+<li>TPC-H SF 1: <strong>Q6 −42 %</strong>, Q19 −24 %, Q14 −20 %, Q20 −14 %.</li>
+</ul>
 <h2 id="2026-10-28">2026-10-28<a class="anchor" href="#2026-10-28" aria-label="Permalink: 2026-10-28">#</a></h2>
 <h3>Wave 123c (second part) — hash tables no longer collide on encoded keys ✅</h3>
 <ul>

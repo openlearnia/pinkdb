@@ -21,6 +21,14 @@ one-liners below.
 - `GROUP BY l_orderkey` over TPC-H SF 1's 6 million `lineitem` rows: 3×
   faster. TPC-H SF 1: **Q18 −58 %**, Q15 −38 %, Q11 −20 %, Q13 −12 %.
 
+### Wave 127d — filters compare in the column's own type ✅
+
+- A filter like `l_discount BETWEEN 0.05 AND 0.07` or `l_quantity < 24`
+  compares each row as one integer comparison: the literal is converted to
+  the column's type once, not each row to the literal's. A DECIMAL column
+  against a DOUBLE literal keeps exactly the rows it kept before.
+- TPC-H SF 1: **Q6 −42 %**, Q19 −24 %, Q14 −20 %, Q20 −14 %.
+
 ## 2026-10-28
 ### Wave 123c (second part) — hash tables no longer collide on encoded keys ✅
 

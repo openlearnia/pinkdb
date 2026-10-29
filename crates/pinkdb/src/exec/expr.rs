@@ -1201,6 +1201,9 @@ impl<'a> ScalarCmp<'a> {
     /// Keep only the rows of `sel` where `column <op> literal` is TRUE: the
     /// select-style form, which never builds the BOOLEAN vector.
     fn retain(&self, op: BinaryOp, sel: &mut Vec<u32>) {
+        if self.retain_in_domain(op, sel) {
+            return;
+        }
         let (col, flipped) = (self.col, self.reversed);
         match &self.kind {
             CmpKind::Int32Int(a, s) => {
@@ -1265,6 +1268,151 @@ impl<'a> ScalarCmp<'a> {
             ),
         }
     }
+}
+
+impl ScalarCmp<'_> {
+    /// [`ScalarCmp::retain`] with the literal moved into the column's own
+    /// domain once per chunk, so each row is one integer comparison under an
+    /// operator matched outside the loop (DuckDB's `SelectFlat` loops). A
+    /// DECIMAL against a DOUBLE literal (pinkdb types `0.05` as DOUBLE) keeps
+    /// its exact meaning: the row test `decimal_to_f64(x) <op> s` is monotone
+    /// in `x`, so it equals an integer range whose bounds are found with that
+    /// same conversion. `false` leaves the pair to the generic loop.
+    fn retain_in_domain(&self, op: BinaryOp, sel: &mut Vec<u32>) -> bool {
+        let op = if self.reversed { flip_ordering(op) } else { op };
+        let col = self.col;
+        match &self.kind {
+            CmpKind::Date(a, s) => retain_ordered(col, a, *s, op, sel),
+            CmpKind::Timestamp(a, s) => retain_ordered(col, a, *s, op, sel),
+            CmpKind::Int64Int(a, s) => match i64::try_from(*s) {
+                Ok(s) => retain_ordered(col, a, s, op, sel),
+                Err(_) => return false,
+            },
+            CmpKind::Int32Int(a, s) => match i32::try_from(*s) {
+                Ok(s) => retain_ordered(col, a, s, op, sel),
+                Err(_) => return false,
+            },
+            CmpKind::DecDec(a, sa, s, ss) if sa >= ss => {
+                match s.checked_mul(crate::types::POW10_I128[(sa - ss) as usize]) {
+                    Some(s) => retain_ordered(col, a, s, op, sel),
+                    None => return false,
+                }
+            }
+            CmpKind::DecInt(a, sa, s) => {
+                match s.checked_mul(crate::types::POW10_I128[*sa as usize]) {
+                    Some(s) => retain_ordered(col, a, s, op, sel),
+                    None => return false,
+                }
+            }
+            CmpKind::DecFloat(a, sa, s) => {
+                let at_least =
+                    |strict| first_passing(*s, strict, |x| crate::types::decimal_to_f64(x, *sa));
+                // `lo`: the first x with value >= s; `hi`: the first > s.
+                let (Some(lo), Some(hi)) = (at_least(false), at_least(true)) else {
+                    return false;
+                };
+                retain_int_range(col, a, op, lo, hi, sel)
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// The comparison `literal <op> column` read as `column <op'> literal`.
+fn flip_ordering(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
+/// Keep the rows of `sel` whose cell is valid and passes `keep`: a
+/// branch-free compaction (every row is written, the cursor only advances
+/// for a kept one).
+#[inline(always)]
+fn retain_rows<T: Copy>(col: &Vector, a: &[T], sel: &mut Vec<u32>, keep: impl Fn(T) -> bool) {
+    let nulls = col.has_nulls();
+    let mut w = 0;
+    for r in 0..sel.len() {
+        let row = sel[r];
+        let i = row as usize;
+        let ok = keep(a[i]) & (!nulls || col.is_valid(i));
+        sel[w] = row;
+        w += usize::from(ok);
+    }
+    sel.truncate(w);
+}
+
+/// `column <op> s` over one ordered payload, the operator matched once.
+fn retain_ordered<T: Copy + Ord>(col: &Vector, a: &[T], s: T, op: BinaryOp, sel: &mut Vec<u32>) {
+    match op {
+        BinaryOp::Eq => retain_rows(col, a, sel, |x| x == s),
+        BinaryOp::NotEq => retain_rows(col, a, sel, |x| x != s),
+        BinaryOp::Lt => retain_rows(col, a, sel, |x| x < s),
+        BinaryOp::LtEq => retain_rows(col, a, sel, |x| x <= s),
+        BinaryOp::Gt => retain_rows(col, a, sel, |x| x > s),
+        BinaryOp::GtEq => retain_rows(col, a, sel, |x| x >= s),
+        _ => unreachable!("retain_ordered called with {op:?}"),
+    }
+}
+
+/// `column <op> s` for a monotone row test given as integer bounds: `lo` is
+/// the first payload value comparing `>= s`, `hi` the first comparing `> s`.
+fn retain_int_range(
+    col: &Vector,
+    a: &[i128],
+    op: BinaryOp,
+    lo: i128,
+    hi: i128,
+    sel: &mut Vec<u32>,
+) {
+    match op {
+        BinaryOp::Eq => retain_rows(col, a, sel, |x| lo <= x && x < hi),
+        BinaryOp::NotEq => retain_rows(col, a, sel, |x| x < lo || hi <= x),
+        BinaryOp::Lt => retain_rows(col, a, sel, |x| x < lo),
+        BinaryOp::LtEq => retain_rows(col, a, sel, |x| x < hi),
+        BinaryOp::Gt => retain_rows(col, a, sel, |x| x >= hi),
+        BinaryOp::GtEq => retain_rows(col, a, sel, |x| x >= lo),
+        _ => unreachable!("retain_int_range called with {op:?}"),
+    }
+}
+
+/// The smallest integer `x` whose `value(x)` compares `>= s` (or `> s` when
+/// `strict`) under `num_cmp`, for a non-decreasing `value`: searched from
+/// the rounded estimate with the exact conversion the row test uses. `None`
+/// for a literal without such a bound nearby (NaN, infinities, huge values).
+fn first_passing(s: f64, strict: bool, value: impl Fn(i128) -> f64) -> Option<i128> {
+    if !s.is_finite() {
+        return None;
+    }
+    let passes = |x: i128| {
+        let ord = num_cmp(value(x), s);
+        if strict {
+            ord == Ordering::Greater
+        } else {
+            ord != Ordering::Less
+        }
+    };
+    // Estimate in the payload's units: `value` divides by 10^scale, so the
+    // probe at 1 tells the factor without knowing the scale.
+    let unit = value(1);
+    let guess = (s / unit).floor();
+    if !guess.is_finite() || guess.abs() > 1e30 {
+        return None;
+    }
+    let mut x = guess as i128;
+    for _ in 0..64 {
+        match (passes(x - 1), passes(x)) {
+            (false, true) => return Some(x),
+            (true, _) => x -= 1,
+            (false, false) => x += 1,
+        }
+    }
+    None
 }
 
 /// `column <op> literal` for every row of `a`, NULL-preserving.
