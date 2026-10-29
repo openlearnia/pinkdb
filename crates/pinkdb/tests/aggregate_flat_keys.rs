@@ -242,3 +242,51 @@ fn text_keys_with_nulls_and_empty_strings() {
         expected(|_| true, |i| format!("{}|{}", show(flag(i)), i % 5))
     );
 }
+
+/// A store reopened from disk hands a dictionary-encoded VARCHAR column's
+/// rows shared strings, which the small-domain coding matches by pointer
+/// (wave 123f); the groups must be the in-memory table's, with NULL and `''`
+/// apart.
+#[test]
+fn shared_dictionary_strings_group_like_separate_ones() {
+    let dir = std::env::temp_dir().join(format!(
+        "pinkdb_flat_keys_dict_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("db.pink");
+    let path = path.to_str().unwrap();
+    let flag = |i: i64| match i % 9 {
+        0 => None,
+        1 => Some(String::new()),
+        r => Some(["R", "A", "N", "a longer flag value"][r as usize % 4].to_string()),
+    };
+    let lit = |s: Option<String>| s.map_or_else(|| "NULL".to_string(), |s| format!("'{s}'"));
+    let values: Vec<String> = (0..ROWS)
+        .map(|i| format!("({}, {}, {})", lit(flag(i)), lit(flag(i / 7)), i * 7 % 1000))
+        .collect();
+    let sql = "SELECT f, g, count(*), sum(v), min(v), max(v) FROM t GROUP BY f, g;";
+    let fresh = {
+        let mut db = PinkDb::open_durable(path).unwrap();
+        db.execute("CREATE TABLE t (f VARCHAR, g VARCHAR, v INTEGER);")
+            .unwrap();
+        db.execute(&format!("INSERT INTO t VALUES {};", values.join(",")))
+            .unwrap();
+        db.checkpoint().unwrap();
+        rows(&mut db, sql)
+    };
+    let mut db = PinkDb::open_durable(path).unwrap();
+    let reopened = rows(&mut db, sql);
+    let show = |s: Option<String>| s.unwrap_or_else(|| "NULL".into());
+    let want = expected(
+        |_| true,
+        |i| format!("{}|{}", show(flag(i)), show(flag(i / 7))),
+    );
+    assert_eq!(joined(fresh), want);
+    assert_eq!(joined(reopened), want);
+    std::fs::remove_dir_all(&dir).ok();
+}

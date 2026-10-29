@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 123f — low-cardinality text keys grouped by reference ✅
+
+- Grouping by a text column with a handful of values (TPC-H Q1's flags)
+  now recognizes rows that share one stored string — which the store's
+  dictionary encoding gives them — without reading the string again.
+  TPC-H SF 1: Q1 −9 % (CPU time −9 to −30 %).
+
 ### Wave 122d — join filters test a chunk at a time ✅
 
 - The filter a join hands its probe side (the build keys' range and

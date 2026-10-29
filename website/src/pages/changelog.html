@@ -9,6 +9,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-29</h2>
+<h3>Wave 123f — low-cardinality text keys grouped by reference ✅</h3>
+<ul>
+<li>Grouping by a text column with a handful of values (TPC-H Q1's flags) now recognizes rows that share one stored string — which the store's dictionary encoding gives them — without reading the string again. TPC-H SF 1: Q1 −9 % (CPU time −9 to −30 %).</li>
+</ul>
 <h3>Wave 122d — join filters test a chunk at a time ✅</h3>
 <ul>
 <li>The filter a join hands its probe side (the build keys' range and bloom filter, wave 122) is now applied to a whole chunk of integer keys in one tight loop instead of row by row. TPC-H SF 1: Q8 −18 %, Q17 −17 %, Q2 −14 %.</li>

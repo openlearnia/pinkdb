@@ -1828,6 +1828,32 @@ fn group_ids(
     gids
 }
 
+/// A string as a value that compares without a `memcmp` call when short:
+/// up to eight bytes are one word plus the length (TPC-H Q1's one-letter
+/// flags compared byte slices on every row of the small-domain scan).
+#[derive(Clone, Copy, PartialEq)]
+enum ShortStr<'a> {
+    Word(u64, u8),
+    Long(&'a str),
+}
+
+impl<'a> ShortStr<'a> {
+    #[inline]
+    fn of(s: &'a str) -> ShortStr<'a> {
+        if s.len() <= 8 {
+            // Byte by byte: a variable-length `copy_from_slice` is a
+            // `memmove` call, the cost this type exists to avoid.
+            let mut word = 0u64;
+            for (k, &b) in s.as_bytes().iter().enumerate() {
+                word |= u64::from(b) << (8 * k);
+            }
+            ShortStr::Word(word, s.len() as u8)
+        } else {
+            ShortStr::Long(s)
+        }
+    }
+}
+
 /// Per-row codes of one key column whose chunk holds at most
 /// [`SMALL_KEY_SET`] distinct values (NULL counts as one): `None` past that,
 /// or for a key type without a cheap equality here.
@@ -1878,12 +1904,66 @@ pub(crate) fn small_column_codes(
         Some((codes, usize::from(next)))
     }
     match v.data() {
-        VectorData::VarChar(d) => codes_of(v, rows, &row, |i| &*d[i]),
+        VectorData::VarChar(d) => varchar_codes(v, d, rows, &row),
         VectorData::Int32(d) | VectorData::Date32(d) => codes_of(v, rows, &row, |i| d[i]),
         VectorData::Int64(d) | VectorData::TimestampMicros(d) => codes_of(v, rows, &row, |i| d[i]),
         VectorData::Boolean(d) => codes_of(v, rows, &row, |i| d[i]),
         _ => None,
     }
+}
+
+/// [`small_column_codes`] for a VARCHAR column. A dictionary-encoded column
+/// (the `.pink` store's low-cardinality strings) hands every row of a value
+/// the same shared string, so rows are first matched by pointer — no read of
+/// the string itself, which for TPC-H Q1's flags was a cache miss per row
+/// into six million separate cells' worth of pointers — and only a pointer
+/// not seen yet is compared by content.
+fn varchar_codes(
+    v: &Vector,
+    d: &[std::sync::Arc<str>],
+    rows: usize,
+    row: &impl Fn(usize) -> usize,
+) -> Option<(Vec<u16>, usize)> {
+    const POINTERS: usize = 64;
+    let mut pointers: Vec<(*const u8, u16)> = Vec::new();
+    let mut seen: Vec<(ShortStr, u16)> = Vec::new();
+    let mut null_code: Option<u16> = None;
+    let mut next: u16 = 0;
+    let mut codes = Vec::with_capacity(rows);
+    for k in 0..rows {
+        let i = row(k);
+        let code = if v.is_null(i) {
+            *null_code.get_or_insert_with(|| {
+                next += 1;
+                next - 1
+            })
+        } else {
+            let p = std::sync::Arc::as_ptr(&d[i]) as *const u8;
+            match pointers.iter().find(|(q, _)| *q == p) {
+                Some(&(_, c)) => c,
+                None => {
+                    let x = ShortStr::of(&d[i]);
+                    let c = match seen.iter().find(|(y, _)| *y == x) {
+                        Some(&(_, c)) => c,
+                        None => {
+                            seen.push((x, next));
+                            next += 1;
+                            next - 1
+                        }
+                    };
+                    if pointers.len() < POINTERS {
+                        pointers.push((p, c));
+                    }
+                    c
+                }
+            }
+        };
+        if usize::from(next) > SMALL_KEY_SET {
+            return None;
+        }
+        codes.push(code);
+    }
+    Some((codes, usize::from(next)))
 }
 
 /// Group slots for a 2–3 column key whose columns each hold few distinct
