@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-30">2026-10-30<a class="anchor" href="#2026-10-30" aria-label="Permalink: 2026-10-30">#</a></h2>
+<h3>Wave 125f — EXISTS reads a filtered subquery side through its selection ✅</h3>
+<ul>
+<li><code>EXISTS</code> / <code>NOT EXISTS</code> over a filtered table (TPC-H Q4's <code>l_commitdate &lt; l_receiptdate</code>) now reads the kept rows of the filtered side in place instead of copying them first. TPC-H SF 1: Q4 −18 %.</li>
+</ul>
 <h3>Wave 125e — joins read a filtered side through its selection ✅</h3>
 <ul>
 <li>An inner join whose probe side is filtered (TPC-H Q3's <code>l_shipdate &gt; DATE '1995-03-15'</code> keeps half of <code>lineitem</code>) now probes the unfiltered rows through the filter's list of kept rows instead of copying them first; only matched rows are copied into the join's output. TPC-H SF 1: <strong>Q3 −29 %</strong>, Q7 −12 %, Q10 −6 %.</li>

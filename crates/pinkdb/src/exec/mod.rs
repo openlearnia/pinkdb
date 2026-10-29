@@ -3764,14 +3764,27 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 matches!(kind, JoinKind::Inner | JoinKind::Semi) && cx.join_filter_pushdown();
             // The probe side's filter selections, when it is read through them.
             let mut probe_sels: Option<Vec<selection::Selection>> = None;
+            // A SEMI/ANTI join's right side read through its filter's
+            // selection the same way (TPC-H Q4/Q21's filtered `lineitem`).
+            let semi_like = matches!(kind, JoinKind::Semi | JoinKind::Anti);
+            let mut right_sels: Option<Vec<selection::Selection>> = None;
             let (l, r, filters) = if dynamic {
                 let (build_plan, build_keys, probe_plan, probe_keys) = if build_left {
                     (left, left_keys, right, right_keys)
                 } else {
                     (right, right_keys, left, left_keys)
                 };
-                let build = eval(cx, build_plan)?;
-                let build_rows: f64 = build.chunks.iter().map(|c| c.num_rows() as f64).sum();
+                let build = if semi_like && !build_left {
+                    let (out, sels) = probe_through_selection(cx, build_plan, build_keys)?;
+                    right_sels = sels;
+                    out
+                } else {
+                    eval(cx, build_plan)?
+                };
+                let build_rows: f64 = match &right_sels {
+                    Some(sels) => sels.iter().map(|s| s.len() as f64).sum(),
+                    None => build.chunks.iter().map(|c| c.num_rows() as f64).sum(),
+                };
                 // Derive only where a filter can pay: the probe side must
                 // reach a scan through the key's lineage (otherwise the bloom
                 // is built and never read), and the build must be much smaller
@@ -3808,7 +3821,15 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     (probe, build, filters)
                 }
             } else {
-                (eval(cx, left)?, eval(cx, right)?, None)
+                let l = eval(cx, left)?;
+                let r = if semi_like {
+                    let (out, sels) = probe_through_selection(cx, right, right_keys)?;
+                    right_sels = sels;
+                    out
+                } else {
+                    eval(cx, right)?
+                };
+                (l, r, None)
             };
             let mut names = l.names.clone();
             let mut types = l.types.clone();
@@ -3826,7 +3847,9 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             }
             // Selections ride on the probe side: the right one when the left
             // side was built.
-            let (lsels, rsels) = if build_left {
+            let (lsels, rsels) = if semi_like {
+                (None, right_sels.as_deref())
+            } else if build_left {
                 (None, probe_sels.as_deref())
             } else {
                 (probe_sels.as_deref(), None)
@@ -5362,8 +5385,24 @@ fn semi_by_marking_left(
     right
         .chunks
         .par_iter()
-        .try_for_each(|chunk| -> Result<()> {
+        .enumerate()
+        .try_for_each(|(ci, chunk)| -> Result<()> {
             cx.check_deadline()?;
+            // The kept rows of a filtered right side; a residual tests
+            // gathered pairs, so it gets a compacted chunk.
+            let sel = right.sels.map(|s| s[ci].as_slice());
+            let compacted;
+            let (chunk, sel) = match (sel, &residual) {
+                (Some(sel), Some(_)) => {
+                    compacted = chunk.take(sel);
+                    (&compacted, None)
+                }
+                (sel, _) => (chunk, sel),
+            };
+            let rows: Vec<u32> = match sel {
+                Some(sel) => sel.to_vec(),
+                None => (0..chunk.num_rows() as u32).collect(),
+            };
             let kvs = table.probe_keys(cx, right_keys, chunk, commons, ints)?;
             let mut buf = Vec::new();
             let set = |c: u32, i: u32| {
@@ -5393,7 +5432,8 @@ fn semi_by_marking_left(
                 set(c, i);
             };
             let probe = ints.then(|| table.probe_ints(&kvs[0]));
-            for i in 0..chunk.num_rows() {
+            for &i in &rows {
+                let i = i as usize;
                 if kvs.iter().any(|kv| kv.is_null(i)) {
                     continue;
                 }
@@ -5479,7 +5519,10 @@ fn hash_mark_join(
     debug_assert!(filters.is_none() || kind == JoinKind::Semi);
     let (ints, commons) = key_encoding(left_keys, right_keys);
     let left_rows: usize = left.chunks.iter().map(DataChunk::num_rows).sum();
-    let right_rows: usize = right.chunks.iter().map(DataChunk::num_rows).sum();
+    let right_rows: usize = match right.sels {
+        Some(sels) => sels.iter().map(Vec::len).sum(),
+        None => right.chunks.iter().map(DataChunk::num_rows).sum(),
+    };
     if !mark && left_rows < right_rows {
         let marking = MarkingSemi {
             kind,
@@ -5489,6 +5532,30 @@ fn hash_mark_join(
         };
         return semi_by_marking_left(cx, left, right, left_keys, right_keys, &marking);
     }
+    // The right side is hashed: its kept rows, compacted.
+    let compacted: Vec<DataChunk>;
+    let right = match right.sels {
+        Some(sels) => {
+            compacted = right
+                .chunks
+                .par_iter()
+                .zip(sels)
+                .map(|(chunk, sel)| {
+                    if sel.len() == chunk.num_rows() {
+                        chunk.clone()
+                    } else {
+                        chunk.take(sel)
+                    }
+                })
+                .collect();
+            JoinSide {
+                chunks: &compacted,
+                types: right.types,
+                sels: None,
+            }
+        }
+        None => right,
+    };
     let (table, ints) = join_table(
         cx,
         right.chunks,

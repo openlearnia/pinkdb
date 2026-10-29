@@ -108,3 +108,54 @@ fn a_residual_on_a_filtered_probe_side() {
     );
     assert_eq!(got, vec![expected(|i| i % 100 < 70, |v, w| v < w)]);
 }
+
+/// EXISTS / NOT EXISTS over a filtered subquery table (TPC-H Q4's
+/// `l_commitdate < l_receiptdate`): the subquery side is read through the
+/// filter's selection whichever side gets hashed — the outer side when it is
+/// smaller (marking), the subquery side otherwise.
+#[test]
+fn semi_and_anti_joins_read_a_filtered_side_through_its_selection() {
+    let mut db = store();
+    // A small outer side (dim) and a large filtered inner side (fact), then
+    // the reverse.
+    for (cond, keep) in [
+        (
+            "f.d < 70",
+            Box::new(|i: i64| i % 100 < 70) as Box<dyn Fn(i64) -> bool>,
+        ),
+        ("f.d = 7", Box::new(|i: i64| i % 100 == 7)),
+    ] {
+        let hit: std::collections::HashSet<i64> = (0..N)
+            .filter(|&i| keep(i))
+            .filter_map(|i| fact(i).0)
+            .collect();
+        let semi = (0..1200i64).filter(|j| hit.contains(&(j % 600))).count();
+        let got = rows(
+            &mut db,
+            &format!(
+                "SELECT count(*) FROM dim WHERE EXISTS (SELECT 1 FROM fact f WHERE f.k = dim.k AND {cond});"
+            ),
+        );
+        assert_eq!(got, vec![semi.to_string()], "EXISTS {cond}");
+        let got = rows(
+            &mut db,
+            &format!(
+                "SELECT count(*) FROM dim WHERE NOT EXISTS (SELECT 1 FROM fact f WHERE f.k = dim.k AND {cond});"
+            ),
+        );
+        assert_eq!(got, vec![(1200 - semi).to_string()], "NOT EXISTS {cond}");
+    }
+    // The large side outside: fact rows with a dim partner whose w is odd.
+    let odd: std::collections::HashSet<i64> = (0..1200i64)
+        .filter(|j| j % 2 == 1)
+        .map(|j| j % 600)
+        .collect();
+    let want = (0..N)
+        .filter(|&i| fact(i).0.is_some_and(|k| odd.contains(&k)))
+        .count();
+    let got = rows(
+        &mut db,
+        "SELECT count(*) FROM fact WHERE EXISTS (SELECT 1 FROM dim d WHERE d.k = fact.k AND d.w % 2 = 1);",
+    );
+    assert_eq!(got, vec![want.to_string()]);
+}

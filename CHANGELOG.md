@@ -9,6 +9,12 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 125f — EXISTS reads a filtered subquery side through its selection ✅
+
+- `EXISTS` / `NOT EXISTS` over a filtered table (TPC-H Q4's
+  `l_commitdate < l_receiptdate`) now reads the kept rows of the filtered
+  side in place instead of copying them first. TPC-H SF 1: Q4 −18 %.
+
 ### Wave 125e — joins read a filtered side through its selection ✅
 
 - An inner join whose probe side is filtered (TPC-H Q3's `l_shipdate >
