@@ -4299,6 +4299,44 @@ impl MatchTable {
         }
     }
 
+    /// A probe chunk's integer keys with their hashes and chain heads, loaded
+    /// in one pass before any chain is walked: the bucket loads of different
+    /// rows do not depend on each other, so the CPU overlaps their cache
+    /// misses instead of taking them one probe at a time (DuckDB probes a
+    /// vector at a time the same way: hashes, then bucket pointers, then key
+    /// comparisons — `JoinHashTable::Probe`). A NULL row's slot holds a
+    /// placeholder key; callers skip NULL keys first.
+    fn probe_ints(&self, kv: &Vector) -> IntProbe {
+        let keys: Vec<i64> = match kv.data() {
+            VectorData::Int32(d) | VectorData::Date32(d) => {
+                d.iter().map(|&x| i64::from(x)).collect()
+            }
+            VectorData::Int64(d) | VectorData::TimestampMicros(d) => d.clone(),
+            _ => unreachable!("probe_ints called on a non-integer-payload key vector"),
+        };
+        let hashes: Vec<u64> = keys.iter().map(|&k| hash_int_key(k)).collect();
+        let heads = hashes
+            .iter()
+            .map(|&h| self.heads[(h & self.mask) as usize])
+            .collect();
+        IntProbe {
+            keys,
+            hashes,
+            heads,
+        }
+    }
+
+    /// The build rows matching row `i` of a [`MatchTable::probe_ints`] batch.
+    #[inline]
+    fn matches_at(&self, probe: &IntProbe, i: usize) -> Matches<'_> {
+        Matches {
+            table: self,
+            row: probe.heads[i],
+            hash: probe.hashes[i],
+            key: ProbeKey::Int(probe.keys[i]),
+        }
+    }
+
     /// The build rows whose encoded key equals `key`, in input order.
     #[inline]
     fn matches_bytes<'k>(&'k self, key: &'k [u8]) -> Matches<'k> {
@@ -4316,6 +4354,14 @@ impl MatchTable {
     fn loc(&self, row: u32) -> (u32, u32) {
         self.locs[row as usize]
     }
+}
+
+/// One probe chunk's integer keys, hashes and chain heads
+/// ([`MatchTable::probe_ints`]).
+struct IntProbe {
+    keys: Vec<i64>,
+    hashes: Vec<u64>,
+    heads: Vec<u32>,
 }
 
 /// A probe key, borrowed for the walk of its bucket chain.
@@ -4378,6 +4424,7 @@ fn candidate_pairs(
     buf: &mut Vec<u8>,
 ) -> Vec<MatchPair> {
     let mut pairs: Vec<MatchPair> = Vec::new();
+    let probe = ints.then(|| table.probe_ints(&kvs[0]));
     for i in 0..chunk.num_rows() {
         if let Some(filters) = filters
             && !filters
@@ -4391,7 +4438,7 @@ fn candidate_pairs(
             continue;
         }
         let matches = if ints {
-            table.matches_int(int_key_at(&kvs[0], i))
+            table.matches_at(probe.as_ref().expect("integer keys"), i)
         } else {
             buf.clear();
             for kv in kvs {
@@ -4843,13 +4890,14 @@ fn semi_by_marking_left(
                 let (c, i) = table.loc(r);
                 set(c, i);
             };
+            let probe = ints.then(|| table.probe_ints(&kvs[0]));
             for i in 0..chunk.num_rows() {
                 if kvs.iter().any(|kv| kv.is_null(i)) {
                     continue;
                 }
                 if ints {
                     table
-                        .matches_int(int_key_at(&kvs[0], i))
+                        .matches_at(probe.as_ref().expect("integer keys"), i)
                         .for_each(&mut mark);
                 } else {
                     buf.clear();
@@ -5034,6 +5082,7 @@ fn hash_mark_join(
                 .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
                 .collect();
             let mut cur_rows = 0usize;
+            let probe = ints.then(|| table.probe_ints(&kvs[0]));
             for i in 0..chunk.num_rows() {
                 // Build keys the bloom rejects cannot match, and a SEMI join
                 // emits nothing for them (wave 122).
@@ -5048,7 +5097,10 @@ fn hash_mark_join(
                 let null_key = kvs.iter().any(|kv| kv.is_null(i));
                 let mut hit = !null_key
                     && if ints {
-                        table.matches_int(int_key_at(&kvs[0], i)).next().is_some()
+                        table
+                            .matches_at(probe.as_ref().expect("integer keys"), i)
+                            .next()
+                            .is_some()
                     } else {
                         buf.clear();
                         for kv in &kvs {
@@ -5430,6 +5482,7 @@ fn hash_join_probe(
                 }
                 return sink.finish(chunk);
             }
+            let probe = ints.then(|| table.probe_ints(&kvs[0]));
             for i in 0..chunk.num_rows() {
                 // A row the build side's bloom rules out cannot match, so it is
                 // dropped before any of its columns are materialized (wave
@@ -5451,7 +5504,7 @@ fn hash_join_probe(
                 let mut matched = false;
                 if !null_key {
                     let matches = if ints {
-                        table.matches_int(int_key_at(&kvs[0], i))
+                        table.matches_at(probe.as_ref().expect("integer keys"), i)
                     } else {
                         buf.clear();
                         for kv in &kvs {
@@ -6165,12 +6218,13 @@ fn fused_join_aggregate(
                 let kv = eval_join_key(cx, probe_key, chunk, common, ints)?;
                 let mut count = 0i64;
                 let mut buf = Vec::new();
+                let probe = ints.then(|| table.probe_ints(&kv));
                 for pi in 0..chunk.num_rows() {
                     if kv.is_null(pi) {
                         continue;
                     }
                     let matches = if ints {
-                        table.matches_int(int_key_at(&kv, pi))
+                        table.matches_at(probe.as_ref().expect("integer keys"), pi)
                     } else {
                         buf.clear();
                         kv.encode_into(&mut buf, pi);
@@ -6232,12 +6286,13 @@ fn fused_join_aggregate(
             let mut buf = Vec::new();
             let mut kbuf = Vec::new();
             let mut full_reserved = false;
+            let probe = ints.then(|| table.probe_ints(&kv));
             for pi in 0..chunk.num_rows() {
                 if kv.is_null(pi) {
                     continue;
                 }
                 let matches = if ints {
-                    table.matches_int(int_key_at(&kv, pi))
+                    table.matches_at(probe.as_ref().expect("integer keys"), pi)
                 } else {
                     kbuf.clear();
                     kv.encode_into(&mut kbuf, pi);

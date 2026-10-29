@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 125b — hash join probes load their buckets in one pass ✅</h3>
+<ul>
+<li>A join on an integer key now hashes a whole chunk of probe keys and loads their buckets before walking any of them, so the memory reads of different rows overlap instead of waiting one after another. TPC-H SF 1: Q13 −16 %, Q18 −8 %, Q21 −8 %.</li>
+</ul>
 <h3>Wave 127f — <code>IN</code> lists evaluate their operand once ✅</h3>
 <ul>
 <li>A filter like <code>substring(c_phone, 1, 2) IN ('13', '31', …)</code> computed the substring once per listed value; it is now computed once per row and looked up in the list. A filter that only needs a few columns of a row also stops copying the others. TPC-H SF 1: <strong>Q22 −72 %</strong>, Q19 −9 %, Q16 −6 %.</li>

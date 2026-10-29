@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 125b — hash join probes load their buckets in one pass ✅
+
+- A join on an integer key now hashes a whole chunk of probe keys and
+  loads their buckets before walking any of them, so the memory reads of
+  different rows overlap instead of waiting one after another. TPC-H SF 1:
+  Q13 −16 %, Q18 −8 %, Q21 −8 %.
+
 ### Wave 127f — `IN` lists evaluate their operand once ✅
 
 - A filter like `substring(c_phone, 1, 2) IN ('13', '31', …)` computed the
