@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 125c — joins on two integer columns use one packed key ✅
+
+- A join on two integer columns (TPC-H Q9's `l_partkey = ps_partkey AND
+  l_suppkey = ps_suppkey`) packs both values into one 64-bit key when they
+  fit, and joins like a single-column integer join instead of encoding
+  both values per row. TPC-H SF 1: Q9 −12 %.
+
 ### Wave 123e — GROUP BY on text keys in flat tables ✅
 
 - Text group keys (`GROUP BY n_name`, `c_name`, …) now use the flat group

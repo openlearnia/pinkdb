@@ -4086,6 +4086,64 @@ fn int_key_at(v: &Vector, i: usize) -> i64 {
     }
 }
 
+/// Two integer key cells as one BIGINT, `(a << 32) | b` over their 32-bit
+/// forms, NULL when either cell is NULL. A value outside 32 bits makes the
+/// whole pack `None` for a build side (`probe` false) and the row's key NULL
+/// for a probe side.
+fn pack_pair(a: &Vector, b: &Vector, probe: bool) -> Option<Vector> {
+    let n = a.len();
+    let mut out = Vec::with_capacity(n);
+    let mut validity = vec![u64::MAX; n.div_ceil(64)];
+    for i in 0..n {
+        if a.is_valid(i) && b.is_valid(i) {
+            match (
+                i32::try_from(int_key_at(a, i)),
+                i32::try_from(int_key_at(b, i)),
+            ) {
+                (Ok(x), Ok(y)) => {
+                    out.push(((u64::from(x as u32) << 32) | u64::from(y as u32)) as i64);
+                    continue;
+                }
+                _ if !probe => return None,
+                _ => {}
+            }
+        }
+        out.push(0);
+        validity[i / 64] &= !(1u64 << (i % 64));
+    }
+    Some(Vector::from_raw(VectorData::Int64(out), validity))
+}
+
+/// The join table over `build_keys`: a pair of integer keys packed into one
+/// when `pack` allows it and the values fit ([`MatchTable::build_pair`]),
+/// else the plain table. Returns the table and whether probes take the
+/// integer path.
+fn join_table(
+    cx: &Cx,
+    chunks: &[DataChunk],
+    build_keys: &[BoundExpr],
+    probe_keys: &[BoundExpr],
+    commons: &[Option<DataType>],
+    ints: bool,
+    pack: bool,
+) -> Result<(MatchTable, bool)> {
+    if pack
+        && !ints
+        && build_keys.len() == 2
+        && build_keys
+            .iter()
+            .chain(probe_keys)
+            .all(|k| is_int_key(k.dtype()))
+        && let Some(table) = MatchTable::build_pair(cx, chunks, build_keys)?
+    {
+        return Ok((table, true));
+    }
+    Ok((
+        MatchTable::build(cx, chunks, build_keys, commons, ints)?,
+        ints,
+    ))
+}
+
 /// Evaluate one side's join key over `chunk`. Integer-payload keys are read
 /// directly through `int_key_at`, so they never go through `coerce_to` or the
 /// byte encoding; byte-path keys are canonicalized to the common numeric type
@@ -4183,6 +4241,9 @@ struct MatchTable {
     keys: BuildKeys,
     locs: Vec<(u32, u32)>,
     mask: u64,
+    /// The keys are a pair of integer columns packed into one BIGINT
+    /// ([`MatchTable::build_pair`]); probes must pack theirs the same way.
+    packed: bool,
 }
 
 impl MatchTable {
@@ -4194,15 +4255,26 @@ impl MatchTable {
         commons: &[Option<DataType>],
         ints: bool,
     ) -> Result<MatchTable> {
-        let per_chunk: Vec<ChunkKeys> = right_chunks
+        let key_vectors: Vec<Vec<Vector>> = right_chunks
             .par_iter()
-            .map(|chunk| -> Result<ChunkKeys> {
-                let kvs: Vec<Vector> = right_keys
+            .map(|chunk| -> Result<Vec<Vector>> {
+                right_keys
                     .iter()
                     .zip(commons.iter())
                     .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
-                    .collect::<Result<_>>()?;
-                let n = chunk.num_rows();
+                    .collect()
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self::from_key_vectors(&key_vectors, ints))
+    }
+
+    /// The table over already evaluated build keys, one list per build
+    /// chunk.
+    fn from_key_vectors(key_vectors: &[Vec<Vector>], ints: bool) -> MatchTable {
+        let per_chunk: Vec<ChunkKeys> = key_vectors
+            .par_iter()
+            .map(|kvs| -> ChunkKeys {
+                let n = kvs.first().map_or(0, Vector::len);
                 let mut keys = ChunkKeys {
                     hashes: Vec::with_capacity(n),
                     valid: Vec::with_capacity(n),
@@ -4225,7 +4297,7 @@ impl MatchTable {
                     } else {
                         let start = keys.bytes.len();
                         if valid {
-                            for kv in &kvs {
+                            for kv in kvs {
                                 kv.encode_into(&mut keys.bytes, i);
                             }
                         }
@@ -4233,9 +4305,9 @@ impl MatchTable {
                         keys.hashes.push(hash_bytes_key(&keys.bytes[start..]));
                     }
                 }
-                Ok(keys)
+                keys
             })
-            .collect::<Result<_>>()?;
+            .collect();
         let rows: usize = per_chunk.iter().map(|k| k.hashes.len()).sum();
         let mut hashes = Vec::with_capacity(rows);
         let mut valid = Vec::with_capacity(rows);
@@ -4277,14 +4349,59 @@ impl MatchTable {
             next[r] = heads[b];
             heads[b] = r as u32;
         }
-        Ok(MatchTable {
+        MatchTable {
             heads,
             next,
             hashes,
             keys,
             locs,
             mask,
-        })
+            packed: false,
+        }
+    }
+
+    /// A two-column integer key (TPC-H Q9's `(l_partkey, l_suppkey)`) as one
+    /// packed BIGINT per row, so the join takes the integer path — batched
+    /// probes, no byte encoding — instead of encoding both cells per row.
+    /// Exact when every build value fits 32 bits, which is checked here:
+    /// `None` keeps the encoded path. A probe value outside 32 bits matches
+    /// no build row, and [`MatchTable::probe_keys`] makes it a NULL key, the
+    /// cell every join already treats as "no match".
+    fn build_pair(cx: &Cx, chunks: &[DataChunk], keys: &[BoundExpr]) -> Result<Option<MatchTable>> {
+        let packed: Option<Vec<Vec<Vector>>> = chunks
+            .par_iter()
+            .map(|chunk| -> Result<Option<Vec<Vector>>> {
+                let a = eval_join_key(cx, &keys[0], chunk, None, true)?;
+                let b = eval_join_key(cx, &keys[1], chunk, None, true)?;
+                Ok(pack_pair(&a, &b, false).map(|v| vec![v]))
+            })
+            .collect::<Result<_>>()?;
+        Ok(packed.map(|kvs| MatchTable {
+            packed: true,
+            ..Self::from_key_vectors(&kvs, true)
+        }))
+    }
+
+    /// One probe chunk's key vectors in this table's encoding.
+    fn probe_keys(
+        &self,
+        cx: &Cx,
+        keys: &[BoundExpr],
+        chunk: &DataChunk,
+        commons: &[Option<DataType>],
+        ints: bool,
+    ) -> Result<Vec<Vector>> {
+        if self.packed {
+            let a = eval_join_key(cx, &keys[0], chunk, None, true)?;
+            let b = eval_join_key(cx, &keys[1], chunk, None, true)?;
+            return Ok(vec![
+                pack_pair(&a, &b, true).expect("a probe pair always packs"),
+            ]);
+        }
+        keys.iter()
+            .zip(commons.iter())
+            .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
+            .collect()
     }
 
     /// The build rows whose key equals the integer `key`, in input order.
@@ -4847,7 +4964,7 @@ fn semi_by_marking_left(
     let residual = how
         .residual
         .map(|r| swap_join_space(r, left.types.len(), right.types.len()));
-    let table = MatchTable::build(cx, left.chunks, left_keys, commons, ints)?;
+    let (table, ints) = join_table(cx, left.chunks, left_keys, right_keys, commons, ints, true)?;
     let marks: Vec<Vec<AtomicBool>> = left
         .chunks
         .iter()
@@ -4858,11 +4975,7 @@ fn semi_by_marking_left(
         .par_iter()
         .try_for_each(|chunk| -> Result<()> {
             cx.check_deadline()?;
-            let kvs: Vec<Vector> = right_keys
-                .iter()
-                .zip(commons.iter())
-                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
-                .collect::<Result<_>>()?;
+            let kvs = table.probe_keys(cx, right_keys, chunk, commons, ints)?;
             let mut buf = Vec::new();
             let set = |c: u32, i: u32| {
                 let m = &marks[c as usize][i as usize];
@@ -4987,7 +5100,18 @@ fn hash_mark_join(
         };
         return semi_by_marking_left(cx, left, right, left_keys, right_keys, &marking);
     }
-    let table = MatchTable::build(cx, right.chunks, right_keys, &commons, ints)?;
+    let (table, ints) = join_table(
+        cx,
+        right.chunks,
+        right_keys,
+        left_keys,
+        &commons,
+        ints,
+        !mark,
+    )?;
+    // A packed pair has one key vector, while row filters test each key
+    // column: they only save probes, so a packed table goes without.
+    let filters = if table.packed { None } else { filters };
     // Per correlation group: rows seen, and rows whose match value was not
     // NULL. Only a mark join reads them.
     let mut groups: std::collections::HashMap<Vec<u8>, (u32, u32)> =
@@ -5026,11 +5150,7 @@ fn hash_mark_join(
         .par_iter()
         .map(|chunk| -> Result<Vec<DataChunk>> {
             cx.check_deadline()?;
-            let kvs: Vec<Vector> = left_keys
-                .iter()
-                .zip(commons.iter())
-                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
-                .collect::<Result<_>>()?;
+            let kvs = table.probe_keys(cx, left_keys, chunk, &commons, ints)?;
             let mut buf = Vec::new();
             // A row hits only when one of its key matches survives the
             // residual: a pair the predicate rejects is not a match, so the
@@ -5412,7 +5532,18 @@ fn hash_join_probe(
             "hash join build side exceeds u32 rows".to_string(),
         ));
     }
-    let table = MatchTable::build(cx, build.chunks, build_keys, &commons, ints)?;
+    let (table, ints) = join_table(
+        cx,
+        build.chunks,
+        build_keys,
+        preserved_keys,
+        &commons,
+        ints,
+        true,
+    )?;
+    // A packed pair has one key vector, while row filters test each key
+    // column: they only save probes, so a packed table goes without.
+    let filters = if table.packed { None } else { filters };
     // FULL JOIN bookkeeping: global build-row index per chunk, and one flag
     // per build row (shared across the parallel probe).
     let build_chunk_starts: Vec<u32> = {
@@ -5450,11 +5581,7 @@ fn hash_join_probe(
         .par_iter()
         .map(|chunk| -> Result<Vec<DataChunk>> {
             cx.check_deadline()?;
-            let kvs: Vec<Vector> = preserved_keys
-                .iter()
-                .zip(commons.iter())
-                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
-                .collect::<Result<_>>()?;
+            let kvs = table.probe_keys(cx, preserved_keys, chunk, &commons, ints)?;
             let mut buf = Vec::new();
             let mut sink = JoinAssembler::new(
                 cx,

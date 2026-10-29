@@ -9,6 +9,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-29</h2>
+<h3>Wave 125c — joins on two integer columns use one packed key ✅</h3>
+<ul>
+<li>A join on two integer columns (TPC-H Q9's <code>l_partkey = ps_partkey AND l_suppkey = ps_suppkey</code>) packs both values into one 64-bit key when they fit, and joins like a single-column integer join instead of encoding both values per row. TPC-H SF 1: Q9 −12 %.</li>
+</ul>
 <h3>Wave 123e — GROUP BY on text keys in flat tables ✅</h3>
 <ul>
 <li>Text group keys (<code>GROUP BY n_name</code>, <code>c_name</code>, …) now use the flat group tables of wave 123d too: a group keeps a shared reference to its string instead of a copy, and a chunk whose keys hold only a few values (TPC-H Q1's two flags) is grouped through a small dense table. TPC-H SF 1: <strong>Q10 −27 %</strong>, Q9 −5 %.</li>
