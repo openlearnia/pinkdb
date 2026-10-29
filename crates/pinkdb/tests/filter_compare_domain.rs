@@ -124,3 +124,59 @@ fn integer_date_and_timestamp_columns() {
     }
     check(&mut db, "ts", "TIMESTAMP '2024-01-01 00:30:00'");
 }
+
+/// `column <op> column` of one layout (TPC-H Q4's `l_commitdate <
+/// l_receiptdate`) compares in place over the selection: the filter keeps
+/// what the projection marks TRUE, NULL on either side never kept.
+#[test]
+fn column_against_column_of_the_same_type() {
+    let mut db = PinkDb::new();
+    db.execute(
+        "CREATE TABLE u (a INTEGER, b INTEGER, c BIGINT, d BIGINT, x DECIMAL(9,2), y DECIMAL(9,2), \
+         p DATE, q DATE, s VARCHAR, t VARCHAR);",
+    )
+    .unwrap();
+    let cell = |n: i64, every: i64, v: String| if n % every == 0 { "NULL".into() } else { v };
+    let values: Vec<String> = (0..5000i64)
+        .map(|n| {
+            let (l, r) = (n * 31 % 97, n * 17 % 89);
+            format!(
+                "({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                cell(n, 23, l.to_string()),
+                cell(n, 29, r.to_string()),
+                cell(n, 31, (l * 1_000_000_007).to_string()),
+                cell(n, 37, (r * 1_000_000_007).to_string()),
+                cell(n, 41, format!("{}.{:02}", l / 10, l % 10 * 7)),
+                cell(n, 43, format!("{}.{:02}", r / 10, r % 10 * 7)),
+                cell(n, 47, format!("DATE '2024-01-{:02}'", 1 + l % 28)),
+                cell(n, 53, format!("DATE '2024-01-{:02}'", 1 + r % 28)),
+                cell(n, 59, format!("'v{}'", l % 30)),
+                cell(n, 61, format!("'v{}'", r % 30)),
+            )
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO u VALUES {};", values.join(",")))
+        .unwrap();
+    for (l, r) in [("a", "b"), ("c", "d"), ("x", "y"), ("p", "q"), ("s", "t")] {
+        for op in OPS {
+            let cond = format!("{l} {op} {r}");
+            // A first conjunct narrows the selection, so the pair compares
+            // through it rather than over the whole chunk.
+            for sql in [
+                format!("FROM u WHERE {cond}"),
+                format!("FROM u WHERE a > 10 AND {cond}"),
+            ] {
+                let kept = count(&mut db, &format!("SELECT count(*) {sql};"));
+                let marked = count(
+                    &mut db,
+                    &format!(
+                        "SELECT sum(CASE WHEN {cond} THEN 1 ELSE 0 END) {};",
+                        sql.replace(&format!(" AND {cond}"), "")
+                            .replace(&format!("WHERE {cond}"), "")
+                    ),
+                );
+                assert_eq!(kept, marked, "{sql}");
+            }
+        }
+    }
+}

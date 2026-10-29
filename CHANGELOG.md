@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 127e — `column < column` filters compare in place ✅
+
+- A filter comparing two columns of the same type (TPC-H Q4's
+  `l_commitdate < l_receiptdate`) compares the rows a filter still keeps
+  directly, instead of first building a TRUE/FALSE column over a copy of
+  them. TPC-H SF 1: Q12 −17 %, Q4 −12 %.
+
 ### Wave 123d — GROUP BY on integer keys without per-group allocations ✅
 
 - A `GROUP BY` whose keys are all fixed-width numbers (INTEGER, BIGINT,

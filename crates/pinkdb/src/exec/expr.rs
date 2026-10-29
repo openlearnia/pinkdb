@@ -3974,6 +3974,9 @@ pub(crate) fn select_predicate(
                 kernel.retain(*op, sel);
                 return Ok(());
             }
+            if retain_column_pair(left, right, *op, chunk, sel) {
+                return Ok(());
+            }
             select_bool_vector(expr, chunk, cx, sel)
         }
         _ => select_bool_vector(expr, chunk, cx, sel),
@@ -4003,6 +4006,93 @@ fn scalar_cmp_of<'a>(
         Err(_) => return None,
     };
     ScalarCmp::new(col, scalar, reversed)
+}
+
+/// `column <op> column` over two payloads of one ordered layout (TPC-H Q4's
+/// `l_commitdate < l_receiptdate`): compared in place over the selection,
+/// with the same order `eval_comparison` uses for the pair, instead of a
+/// BOOLEAN vector over the rows the selection gathers. `false` for any
+/// other shape.
+fn retain_column_pair(
+    left: &BoundExpr,
+    right: &BoundExpr,
+    op: BinaryOp,
+    chunk: &DataChunk,
+    sel: &mut Vec<u32>,
+) -> bool {
+    let (BoundExpr::Column { index: l, .. }, BoundExpr::Column { index: r, .. }) = (left, right)
+    else {
+        return false;
+    };
+    let (Ok(a), Ok(b)) = (chunk.expect_column(*l), chunk.expect_column(*r)) else {
+        return false;
+    };
+    use VectorData as V;
+    match (a.data(), b.data()) {
+        (V::Int32(x), V::Int32(y)) | (V::Date32(x), V::Date32(y)) => {
+            retain_pair(a, b, x, y, op, sel, |p, q| p.cmp(q))
+        }
+        (V::Int64(x), V::Int64(y)) | (V::TimestampMicros(x), V::TimestampMicros(y)) => {
+            retain_pair(a, b, x, y, op, sel, |p, q| p.cmp(q))
+        }
+        (
+            V::Decimal {
+                values: x,
+                scale: sx,
+                ..
+            },
+            V::Decimal {
+                values: y,
+                scale: sy,
+                ..
+            },
+        ) if sx == sy => retain_pair(a, b, x, y, op, sel, |p, q| p.cmp(q)),
+        (V::VarChar(x), V::VarChar(y)) => retain_pair(a, b, x, y, op, sel, |p, q| (**p).cmp(&**q)),
+        _ => return false,
+    }
+    true
+}
+
+/// Keep the rows of `sel` where both cells are valid and `ord(x, y) <op>`
+/// holds, the operator matched once.
+fn retain_pair<T>(
+    a: &Vector,
+    b: &Vector,
+    x: &[T],
+    y: &[T],
+    op: BinaryOp,
+    sel: &mut Vec<u32>,
+    ord: impl Fn(&T, &T) -> Ordering,
+) {
+    #[inline(always)]
+    fn keep<T>(
+        a: &Vector,
+        b: &Vector,
+        x: &[T],
+        y: &[T],
+        sel: &mut Vec<u32>,
+        test: impl Fn(&T, &T) -> bool,
+    ) {
+        let nulls = a.has_nulls() || b.has_nulls();
+        let mut w = 0;
+        for r in 0..sel.len() {
+            let row = sel[r];
+            let i = row as usize;
+            let ok = (!nulls || (a.is_valid(i) && b.is_valid(i))) && test(&x[i], &y[i]);
+            sel[w] = row;
+            w += usize::from(ok);
+        }
+        sel.truncate(w);
+    }
+    match op {
+        BinaryOp::Eq => keep(a, b, x, y, sel, |p, q| ord(p, q) == Ordering::Equal),
+        BinaryOp::NotEq => keep(a, b, x, y, sel, |p, q| ord(p, q) != Ordering::Equal),
+        BinaryOp::Lt => keep(a, b, x, y, sel, |p, q| ord(p, q) == Ordering::Less),
+        BinaryOp::LtEq => keep(a, b, x, y, sel, |p, q| ord(p, q) != Ordering::Greater),
+        BinaryOp::Gt => keep(a, b, x, y, sel, |p, q| ord(p, q) == Ordering::Greater),
+        BinaryOp::GtEq => keep(a, b, x, y, sel, |p, q| ord(p, q) != Ordering::Less),
+        _ => unreachable!("retain_pair called with {op:?}"),
+    }
 }
 
 /// The generic select: evaluate to BOOLEAN and intersect with its TRUE rows.
