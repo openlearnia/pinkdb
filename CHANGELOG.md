@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 122d — join filters test a chunk at a time ✅
+
+- The filter a join hands its probe side (the build keys' range and
+  bloom filter, wave 122) is now applied to a whole chunk of integer keys
+  in one tight loop instead of row by row. TPC-H SF 1: Q8 −18 %,
+  Q17 −17 %, Q2 −14 %.
+
 ### Wave 111e — join order follows inferred keys; joins hash their smaller input ✅
 
 - `a.k = b.k AND c.k = b.k` now also lets the join order join `a` with `c`

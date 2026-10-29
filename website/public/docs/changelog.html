@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 122d — join filters test a chunk at a time ✅</h3>
+<ul>
+<li>The filter a join hands its probe side (the build keys' range and bloom filter, wave 122) is now applied to a whole chunk of integer keys in one tight loop instead of row by row. TPC-H SF 1: Q8 −18 %, Q17 −17 %, Q2 −14 %.</li>
+</ul>
 <h3>Wave 111e — join order follows inferred keys; joins hash their smaller input ✅</h3>
 <ul>
 <li><code>a.k = b.k AND c.k = b.k</code> now also lets the join order join <code>a</code> with <code>c</code> directly (DuckDB infers these the same way): TPC-H Q9 joins <code>part</code> with <code>partsupp</code> before touching <code>lineitem</code>, and Q5 joins <code>customer</code> with <code>supplier</code> on their shared nation.</li>

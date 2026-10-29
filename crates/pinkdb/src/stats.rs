@@ -872,6 +872,48 @@ impl JoinFilterBuilder {
 }
 
 impl JoinFilter {
+    /// [`JoinFilter::may_match`] for every row of `v` at once into `pass`
+    /// (`pass[i] &= …`): integer payloads run one typed loop — range test,
+    /// [`key_hash`]'s hash and the bloom — instead of re-dispatching on the
+    /// payload per row; other payloads take the per-row test.
+    pub(crate) fn may_match_all(&self, v: &Vector, pass: &mut [bool]) {
+        if v.dtype() != self.dtype {
+            return;
+        }
+        #[inline(always)]
+        fn run(
+            f: &JoinFilter,
+            v: &Vector,
+            pass: &mut [bool],
+            salt: u64,
+            cell: impl Fn(usize) -> (i64, u64),
+        ) {
+            let (lo, hi) = f.int_range.unwrap_or((i64::MIN, i64::MAX));
+            let nulls = v.has_nulls();
+            for (i, p) in pass.iter_mut().enumerate() {
+                // A NULL cell never matches, but the join decides that.
+                if !*p || (nulls && !v.is_valid(i)) {
+                    continue;
+                }
+                let (x, bits) = cell(i);
+                *p = x >= lo && x <= hi && f.bloom.contains(mix(bits ^ salt));
+            }
+        }
+        match v.data() {
+            VectorData::Int32(d) => run(self, v, pass, 0, |i| (i64::from(d[i]), d[i] as u64)),
+            VectorData::Int64(d) => run(self, v, pass, 0x20, |i| (d[i], d[i] as u64)),
+            VectorData::Date32(d) => run(self, v, pass, 0x30, |i| (i64::from(d[i]), d[i] as u64)),
+            VectorData::TimestampMicros(d) => run(self, v, pass, 0x40, |i| (d[i], d[i] as u64)),
+            _ => {
+                for (i, p) in pass.iter_mut().enumerate() {
+                    if *p {
+                        *p = self.may_match(v, i);
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether a probe cell could be a build key. `false` is a proof (the row
     /// cannot match), `true` only means "let the join decide".
     pub(crate) fn may_match(&self, v: &Vector, row: usize) -> bool {
@@ -941,6 +983,55 @@ mod tests {
             }
         }
         v
+    }
+
+    /// The chunk-at-a-time test agrees with the per-row one on every integer
+    /// payload, NULLs and out-of-range cells included, and leaves rows a
+    /// previous filter already rejected rejected.
+    #[test]
+    fn may_match_all_agrees_with_may_match() {
+        for dtype in [
+            DataType::Integer,
+            DataType::Bigint,
+            DataType::Date,
+            DataType::Timestamp,
+            DataType::Varchar,
+        ] {
+            let cell = |i: i64| match dtype {
+                DataType::Integer => Value::Integer(i as i32),
+                DataType::Bigint => Value::Bigint(i),
+                DataType::Date => Value::Date(i as i32),
+                DataType::Timestamp => Value::Timestamp(i),
+                _ => Value::Varchar(format!("k{i}")),
+            };
+            let mut build = Vector::with_capacity(dtype, 300);
+            for i in (100..400).step_by(3) {
+                build.push_valid(cell(i)).expect("push");
+            }
+            let mut builder = JoinFilterBuilder::new(dtype, None, 100);
+            builder.push(&build);
+            let filter = builder.finish();
+            let mut probe = Vector::with_capacity(dtype, 600);
+            for i in 0..600i64 {
+                if i % 29 == 0 {
+                    probe.push_null().expect("push");
+                } else {
+                    probe.push_valid(cell(i)).expect("push");
+                }
+            }
+            let mut pass: Vec<bool> = (0..600).map(|i| i % 7 != 0).collect();
+            filter.may_match_all(&probe, &mut pass);
+            for (i, p) in pass.iter().enumerate() {
+                let want = i % 7 != 0 && filter.may_match(&probe, i);
+                assert_eq!(*p, want, "{dtype:?} row {i}");
+            }
+            // The build keys themselves always pass.
+            assert!(
+                (100..400)
+                    .step_by(3)
+                    .all(|i| pass[i] || i % 7 == 0 || i % 29 == 0)
+            );
+        }
     }
 
     #[test]

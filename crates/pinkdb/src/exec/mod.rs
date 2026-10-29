@@ -619,6 +619,22 @@ fn scan_targets(plan: &LogicalPlan, col: usize, out: &mut Vec<(usize, usize)>) {
     }
 }
 
+/// Which rows of a probe chunk its join's row filters leave (wave 122), as
+/// one mask computed a key column at a time ([`JoinFilter::may_match_all`])
+/// instead of one `may_match` dispatch per row and filter. A rejected row has
+/// no match, so the probe skips it.
+fn row_filter_pass(
+    filters: &[std::sync::Arc<crate::stats::JoinFilter>],
+    kvs: &[Vector],
+    rows: usize,
+) -> Vec<bool> {
+    let mut pass = vec![true; rows];
+    for (f, kv) in filters.iter().zip(kvs) {
+        f.may_match_all(kv, &mut pass);
+    }
+    pass
+}
+
 /// Whether a bloom over the build keys is worth deriving at all. Hashing the
 /// whole build side is the filter's own cost, and the probe scan's per-row
 /// range/bloom test is a second one, so only a small build pays: it is the
@@ -4542,12 +4558,10 @@ fn candidate_pairs(
 ) -> Vec<MatchPair> {
     let mut pairs: Vec<MatchPair> = Vec::new();
     let probe = ints.then(|| table.probe_ints(&kvs[0]));
+    let pass = filters.map(|f| row_filter_pass(f, kvs, chunk.num_rows()));
     for i in 0..chunk.num_rows() {
-        if let Some(filters) = filters
-            && !filters
-                .iter()
-                .zip(kvs.iter())
-                .all(|(f, kv)| f.may_match(kv, i))
+        if let Some(pass) = &pass
+            && !pass[i]
         {
             continue;
         }
@@ -5220,14 +5234,12 @@ fn hash_mark_join(
                 .collect();
             let mut cur_rows = 0usize;
             let probe = ints.then(|| table.probe_ints(&kvs[0]));
+            let pass = filters.map(|f| row_filter_pass(f, &kvs, chunk.num_rows()));
             for i in 0..chunk.num_rows() {
                 // Build keys the bloom rejects cannot match, and a SEMI join
                 // emits nothing for them (wave 122).
-                if let Some(filters) = filters
-                    && !filters
-                        .iter()
-                        .zip(kvs.iter())
-                        .all(|(f, kv)| f.may_match(kv, i))
+                if let Some(pass) = &pass
+                    && !pass[i]
                 {
                     continue;
                 }
@@ -5627,16 +5639,14 @@ fn hash_join_probe(
                 return sink.finish(chunk);
             }
             let probe = ints.then(|| table.probe_ints(&kvs[0]));
+            let pass = filters.map(|f| row_filter_pass(f, &kvs, chunk.num_rows()));
             for i in 0..chunk.num_rows() {
                 // A row the build side's bloom rules out cannot match, so it is
                 // dropped before any of its columns are materialized (wave
                 // 122). Filters are only set for an INNER join, where no
                 // preserved row is owed an output.
-                if let Some(filters) = filters
-                    && !filters
-                        .iter()
-                        .zip(kvs.iter())
-                        .all(|(f, kv)| f.may_match(kv, i))
+                if let Some(pass) = &pass
+                    && !pass[i]
                 {
                     debug_assert!(!extend_unmatched);
                     continue;
