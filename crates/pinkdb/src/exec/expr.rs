@@ -4529,6 +4529,97 @@ fn eval_case(
     chunk: &DataChunk,
     cx: &Cx,
 ) -> Result<Vector> {
+    if let Some(out) = eval_case_selected(branches, else_, dtype, chunk, cx)? {
+        return Ok(out);
+    }
+    eval_case_rows(branches, else_, dtype, chunk, cx)
+}
+
+/// `CASE` a vector at a time (DuckDB's `ExecuteCase`): each condition is a
+/// selection over the rows no earlier branch took (so a condition's error
+/// is only raised for rows that reach it, as before), a literal result needs
+/// no evaluation at all, and the output is one typed gather from the branch
+/// results — instead of a `Value` per row. TPC-H Q12's
+/// `SUM(CASE WHEN o_orderpriority = '1-URGENT' OR … THEN 1 ELSE 0 END)`.
+/// `None` when a branch result is not the CASE's own type; the per-row path
+/// then coerces as it always did.
+fn eval_case_selected(
+    branches: &[(BoundExpr, BoundExpr)],
+    else_: &Option<Box<BoundExpr>>,
+    dtype: DataType,
+    chunk: &DataChunk,
+    cx: &Cx,
+) -> Result<Option<Vector>> {
+    let n = chunk.num_rows();
+    let mut sources: Vec<Vector> = Vec::new();
+    let mut picks = vec![(crate::vector::GATHER_NULL, 0u32); n];
+    // The rows of `rows` take result `v`: a literal is one constant cell, an
+    // expression is evaluated over just those rows.
+    let mut take = |v: &BoundExpr, rows: &[u32], sources: &mut Vec<Vector>| -> Result<bool> {
+        let (vals, constant) = match v {
+            BoundExpr::Literal(Value::Null) => return Ok(true),
+            BoundExpr::Literal(lit) => (Vector::new_const(lit, 1), true),
+            _ if rows.len() == n => (eval_expr(v, chunk, cx)?, false),
+            _ => (eval_expr(v, &chunk.take(rows), cx)?, false),
+        };
+        // A literal of another type (`ELSE 0` in a DECIMAL CASE) is one
+        // cell to convert; a computed result of another type keeps the
+        // per-row path and its coercion.
+        let vals = if vals.dtype() == dtype {
+            vals
+        } else if constant {
+            match coerce_to(&vals, dtype) {
+                Ok(v) => v,
+                Err(_) => return Ok(false),
+            }
+        } else {
+            return Ok(false);
+        };
+        let src = sources.len() as u32;
+        sources.push(vals);
+        for (k, &row) in rows.iter().enumerate() {
+            let at = if constant { 0 } else { k as u32 };
+            picks[row as usize] = (src, at);
+        }
+        Ok(true)
+    };
+    let mut undecided: Vec<u32> = (0..n as u32).collect();
+    for (c, v) in branches {
+        if undecided.is_empty() {
+            break;
+        }
+        let mut selected = undecided.clone();
+        select_predicate(c, chunk, cx, &mut selected)?;
+        if !selected.is_empty() && !take(v, &selected, &mut sources)? {
+            return Ok(None);
+        }
+        undecided = difference_selections(&undecided, &selected);
+    }
+    if !undecided.is_empty()
+        && let Some(e) = else_
+        && !take(e, &undecided, &mut sources)?
+    {
+        return Ok(None);
+    }
+    if sources.is_empty() {
+        let mut out = Vector::with_capacity(dtype, n);
+        for _ in 0..n {
+            out.push_null()?;
+        }
+        return Ok(Some(out));
+    }
+    let refs: Vec<&Vector> = sources.iter().collect();
+    Ok(Some(Vector::gather_located(dtype, &refs, &picks)))
+}
+
+/// The row-at-a-time `CASE`, for branch results that need coercion.
+fn eval_case_rows(
+    branches: &[(BoundExpr, BoundExpr)],
+    else_: &Option<Box<BoundExpr>>,
+    dtype: DataType,
+    chunk: &DataChunk,
+    cx: &Cx,
+) -> Result<Vector> {
     let n = chunk.num_rows();
     let mut slots: Vec<Option<Value>> = vec![None; n];
     let mut undecided: Vec<usize> = (0..n).collect();

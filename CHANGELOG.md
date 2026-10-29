@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 127g — `CASE` a vector at a time ✅
+
+- `CASE WHEN … THEN … ELSE … END` now tests each condition over the rows
+  still undecided as a filter, takes constant results without evaluating
+  them, and builds its output in one typed pass instead of one value per
+  row. TPC-H SF 1: **Q12 −52 %**.
+
 ### Wave 123g — shared arithmetic in aggregate arguments computed once ✅
 
 - When several aggregates of a `GROUP BY` share a calculation (TPC-H Q1

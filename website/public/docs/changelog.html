@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 127g — <code>CASE</code> a vector at a time ✅</h3>
+<ul>
+<li><code>CASE WHEN … THEN … ELSE … END</code> now tests each condition over the rows still undecided as a filter, takes constant results without evaluating them, and builds its output in one typed pass instead of one value per row. TPC-H SF 1: <strong>Q12 −52 %</strong>.</li>
+</ul>
 <h3>Wave 123g — shared arithmetic in aggregate arguments computed once ✅</h3>
 <ul>
 <li>When several aggregates of a <code>GROUP BY</code> share a calculation (TPC-H Q1 sums <code>l_extendedprice * (1 - l_discount)</code> on its own and again times <code>(1 + l_tax)</code>), it is now computed once per chunk. TPC-H SF 1: Q1 −8 %.</li>
