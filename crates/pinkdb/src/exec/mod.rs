@@ -4766,6 +4766,93 @@ fn hash_join(
 /// Name of the marker column a mark join appends (wave 120).
 pub(crate) const MARK_NAME: &str = "__mark";
 
+/// SEMI/ANTI with the smaller left side hashed instead (DuckDB's
+/// `RIGHT_SEMI`/`RIGHT_ANTI`): the right rows probe the left table and mark
+/// every left row they match, then each left chunk keeps its marked (semi)
+/// or unmarked (anti) rows, in order. TPC-H Q4 hashes its 57k filtered
+/// orders instead of 3.8M lineitem rows. The answer is the same as the
+/// left-probing path's: a left row is emitted once, iff some right row has
+/// equal non-NULL keys (a NULL key never matches, so ANTI keeps its row).
+/// Probe-side join filters only ever drop rows that cannot match, so they
+/// are not needed here.
+#[allow(clippy::too_many_arguments)]
+fn semi_by_marking_left(
+    cx: &Cx,
+    left: JoinSide<'_>,
+    right: JoinSide<'_>,
+    left_keys: &[BoundExpr],
+    right_keys: &[BoundExpr],
+    kind: JoinKind,
+    ints: bool,
+    commons: &[Option<DataType>],
+) -> Result<Vec<DataChunk>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let table = MatchTable::build(cx, left.chunks, left_keys, commons, ints)?;
+    let marks: Vec<Vec<AtomicBool>> = left
+        .chunks
+        .iter()
+        .map(|c| (0..c.num_rows()).map(|_| AtomicBool::new(false)).collect())
+        .collect();
+    right
+        .chunks
+        .par_iter()
+        .try_for_each(|chunk| -> Result<()> {
+            cx.check_deadline()?;
+            let kvs: Vec<Vector> = right_keys
+                .iter()
+                .zip(commons.iter())
+                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
+                .collect::<Result<_>>()?;
+            let mut buf = Vec::new();
+            let mut mark = |r: u32| {
+                let (c, i) = table.loc(r);
+                let m = &marks[c as usize][i as usize];
+                if !m.load(Ordering::Relaxed) {
+                    m.store(true, Ordering::Relaxed);
+                }
+            };
+            for i in 0..chunk.num_rows() {
+                if kvs.iter().any(|kv| kv.is_null(i)) {
+                    continue;
+                }
+                if ints {
+                    table
+                        .matches_int(int_key_at(&kvs[0], i))
+                        .for_each(&mut mark);
+                } else {
+                    buf.clear();
+                    for kv in &kvs {
+                        kv.encode_into(&mut buf, i);
+                    }
+                    table.matches_bytes(&buf).for_each(&mut mark);
+                }
+            }
+            Ok(())
+        })?;
+    let keep = kind == JoinKind::Semi;
+    let parts: Vec<Option<DataChunk>> = left
+        .chunks
+        .par_iter()
+        .zip(&marks)
+        .map(|(chunk, marks)| -> Result<Option<DataChunk>> {
+            let sel: Vec<u32> = (0..chunk.num_rows() as u32)
+                .filter(|&i| marks[i as usize].load(Ordering::Relaxed) == keep)
+                .collect();
+            if sel.is_empty() {
+                return Ok(None);
+            }
+            let out = if sel.len() == chunk.num_rows() {
+                chunk.clone()
+            } else {
+                chunk.take(&sel)
+            };
+            cx.add_materialized(out.num_rows(), chunk_approx_bytes(&out))?;
+            Ok(Some(out))
+        })
+        .collect::<Result<_>>()?;
+    Ok(parts.into_iter().flatten().collect())
+}
+
 /// SEMI/ANTI/MARK hash join (wave 120): hash the right side on `right_keys`,
 /// probe with the left, and emit the left schema — plus the BOOLEAN marker for
 /// MARK. Semi/anti are produced by unnesting `EXISTS`/`NOT EXISTS`, mark by
@@ -4809,6 +4896,11 @@ fn hash_mark_join(
     // the row". ANTI and MARK still have to answer for it.
     debug_assert!(filters.is_none() || kind == JoinKind::Semi);
     let (ints, commons) = key_encoding(left_keys, right_keys);
+    let left_rows: usize = left.chunks.iter().map(DataChunk::num_rows).sum();
+    let right_rows: usize = right.chunks.iter().map(DataChunk::num_rows).sum();
+    if !mark && residual.is_none() && left_rows < right_rows {
+        return semi_by_marking_left(cx, left, right, left_keys, right_keys, kind, ints, &commons);
+    }
     let table = MatchTable::build(cx, right.chunks, right_keys, &commons, ints)?;
     // Per correlation group: rows seen, and rows whose match value was not
     // NULL. Only a mark join reads them.

@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 125a — <code>EXISTS</code> hashes the smaller side ✅</h3>
+<ul>
+<li>An <code>EXISTS</code> / <code>NOT EXISTS</code> join whose outer side is smaller than the subquery's now hashes the outer rows and lets the subquery's rows mark them, as DuckDB's <code>RIGHT_SEMI</code> join does: TPC-H Q4 hashes 57 thousand orders instead of 3.8 million <code>lineitem</code> rows. TPC-H SF 1: <strong>Q4 −68 %</strong>, Q22 −9 %, Q21 −9 %.</li>
+</ul>
 <h3>Wave 127e — <code>column &lt; column</code> filters compare in place ✅</h3>
 <ul>
 <li>A filter comparing two columns of the same type (TPC-H Q4's <code>l_commitdate &lt; l_receiptdate</code>) compares the rows a filter still keeps directly, instead of first building a TRUE/FALSE column over a copy of them. TPC-H SF 1: Q12 −17 %, Q4 −12 %.</li>

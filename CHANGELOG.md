@@ -9,6 +9,14 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 125a — `EXISTS` hashes the smaller side ✅
+
+- An `EXISTS` / `NOT EXISTS` join whose outer side is smaller than the
+  subquery's now hashes the outer rows and lets the subquery's rows mark
+  them, as DuckDB's `RIGHT_SEMI` join does: TPC-H Q4 hashes 57 thousand
+  orders instead of 3.8 million `lineitem` rows. TPC-H SF 1: **Q4 −68 %**,
+  Q22 −9 %, Q21 −9 %.
+
 ### Wave 127e — `column < column` filters compare in place ✅
 
 - A filter comparing two columns of the same type (TPC-H Q4's
