@@ -525,6 +525,150 @@ pub(crate) struct Cx<'a> {
     /// GROUP BY may emit its groups in any order instead of first-seen
     /// order (see [`Cx::order_free`]).
     pub(crate) unordered: bool,
+    /// Join subtrees the statement repeats, and their results once computed
+    /// ([`eval_shared_join`]).
+    pub(crate) subplans: std::sync::Arc<SharedSubplans>,
+}
+
+/// The join subtrees a statement repeats ([`eval_shared_join`]): each
+/// distinct repeated subtree once (outermost first; one nested in another
+/// candidate is left out), and its result once computed.
+#[derive(Default)]
+pub(crate) struct SharedSubplans {
+    candidates: Vec<LogicalPlan>,
+    results: std::sync::Mutex<Vec<Option<Output>>>,
+}
+
+impl SharedSubplans {
+    /// Most repeated subtrees tracked per statement.
+    const MAX: usize = 8;
+
+    fn of(plan: &LogicalPlan) -> SharedSubplans {
+        let mut joins = Vec::new();
+        join_nodes(plan, &mut joins);
+        let mut repeated: Vec<&LogicalPlan> = Vec::new();
+        for (i, a) in joins.iter().enumerate() {
+            if repeated.contains(a) {
+                continue;
+            }
+            if joins[i + 1..].iter().any(|b| b == a) {
+                repeated.push(a);
+            }
+        }
+        // `join_nodes` lists a join before the joins inside it, so the first
+        // repeated subtrees are the outermost ones.
+        let mut candidates: Vec<LogicalPlan> = Vec::new();
+        for r in repeated {
+            if candidates.len() == Self::MAX {
+                break;
+            }
+            // A CTE reference reads whatever the context binds the name to
+            // (a recursive CTE rebinds it every step): never shared.
+            if candidates.iter().any(|c| contains_plan(c, r)) || reads_cte(r) {
+                continue;
+            }
+            candidates.push(r.clone());
+        }
+        let results = std::sync::Mutex::new(vec![None; candidates.len()]);
+        SharedSubplans {
+            candidates,
+            results,
+        }
+    }
+
+    fn has_candidates(&self) -> bool {
+        !self.candidates.is_empty()
+    }
+
+    fn slot(&self, plan: &LogicalPlan) -> Option<usize> {
+        self.candidates.iter().position(|c| c == plan)
+    }
+
+    fn cached(&self, slot: usize) -> Option<Output> {
+        self.results.lock().expect("shared subplans")[slot].clone()
+    }
+
+    fn store(&self, slot: usize, out: &Output) {
+        let mut results = self.results.lock().expect("shared subplans");
+        if results[slot].is_none() {
+            results[slot] = Some(out.clone());
+        }
+    }
+}
+
+/// Every hash join in `plan`, outer before inner, through the query
+/// operators (subquery expressions are not entered).
+fn join_nodes<'p>(plan: &'p LogicalPlan, out: &mut Vec<&'p LogicalPlan>) {
+    use LogicalPlan as P;
+    match plan {
+        P::Join { left, right, .. } => {
+            out.push(plan);
+            join_nodes(left, out);
+            join_nodes(right, out);
+        }
+        P::NestedLoopJoin { left, right, .. } | P::SetOp { left, right, .. } => {
+            join_nodes(left, out);
+            join_nodes(right, out);
+        }
+        P::Filter { input, .. }
+        | P::Project { input, .. }
+        | P::Aggregate { input, .. }
+        | P::Sort { input, .. }
+        | P::Limit { input, .. }
+        | P::Distinct { input, .. }
+        | P::Window { input, .. } => join_nodes(input, out),
+        _ => {}
+    }
+}
+
+/// Whether `plan` scans a CTE (an unqualified scan, binder-resolved).
+fn reads_cte(plan: &LogicalPlan) -> bool {
+    use LogicalPlan as P;
+    match plan {
+        P::Scan { db: None, .. } => true,
+        P::Join { left, right, .. }
+        | P::NestedLoopJoin { left, right, .. }
+        | P::SetOp { left, right, .. } => reads_cte(left) || reads_cte(right),
+        P::Filter { input, .. }
+        | P::Project { input, .. }
+        | P::Aggregate { input, .. }
+        | P::Sort { input, .. }
+        | P::Limit { input, .. }
+        | P::Distinct { input, .. }
+        | P::Window { input, .. } => reads_cte(input),
+        P::Scan { .. } | P::TableFunction { .. } | P::SingleRow | P::Values { .. } => false,
+        // Anything else is not looked into: treat it as context-dependent.
+        _ => true,
+    }
+}
+
+/// Whether `outer` contains a subtree equal to `inner`.
+fn contains_plan(outer: &LogicalPlan, inner: &LogicalPlan) -> bool {
+    let mut joins = Vec::new();
+    join_nodes(outer, &mut joins);
+    joins.contains(&inner)
+}
+
+/// The addresses of every scan in `plan` (through the query operators).
+fn scan_nodes(plan: &LogicalPlan, out: &mut Vec<usize>) {
+    use LogicalPlan as P;
+    match plan {
+        P::Scan { .. } | P::TableFunction { .. } => out.push(crate::plan::node_addr(plan)),
+        P::Join { left, right, .. }
+        | P::NestedLoopJoin { left, right, .. }
+        | P::SetOp { left, right, .. } => {
+            scan_nodes(left, out);
+            scan_nodes(right, out);
+        }
+        P::Filter { input, .. }
+        | P::Project { input, .. }
+        | P::Aggregate { input, .. }
+        | P::Sort { input, .. }
+        | P::Limit { input, .. }
+        | P::Distinct { input, .. }
+        | P::Window { input, .. } => scan_nodes(input, out),
+        _ => {}
+    }
 }
 
 /// Join filters derived from a completed hash-join build side (wave 122), keyed
@@ -567,6 +711,20 @@ impl DynamicFilters {
         let mut frames = self.frames.lock().expect("dynamic filters");
         frames.push(entries);
         frames.len() - 1
+    }
+
+    /// Whether a registered filter prunes any scan inside `plan`.
+    fn prunes_any(&self, plan: &LogicalPlan) -> bool {
+        let frames = self.frames.lock().expect("dynamic filters");
+        if frames.iter().all(Vec::is_empty) {
+            return false;
+        }
+        let mut scans = Vec::new();
+        scan_nodes(plan, &mut scans);
+        frames
+            .iter()
+            .flatten()
+            .any(|(addr, _, _)| scans.contains(addr))
     }
 
     fn pop(&self, frame: usize) {
@@ -697,6 +855,7 @@ impl<'a> Cx<'a> {
             outer_rows: Vec::new(),
             dynamic: std::sync::Arc::new(DynamicFilters::default()),
             unordered: false,
+            subplans: std::sync::Arc::new(SharedSubplans::default()),
         }
     }
 
@@ -734,6 +893,7 @@ impl<'a> Cx<'a> {
             outer_rows: self.outer_rows.clone(),
             dynamic: self.dynamic.clone(),
             unordered: true,
+            subplans: self.subplans.clone(),
         })
     }
 
@@ -773,6 +933,7 @@ impl<'a> Cx<'a> {
             },
             dynamic: self.dynamic.clone(),
             unordered: self.unordered,
+            subplans: self.subplans.clone(),
         }
     }
 
@@ -819,6 +980,7 @@ impl<'a> Cx<'a> {
     pub(crate) fn with_projections(mut self, plan: &LogicalPlan) -> Self {
         self.projections = std::sync::Arc::new(crate::plan::ScanProjections::of(plan));
         self.prunes = std::sync::Arc::new(crate::plan::ScanFilters::of(plan));
+        self.subplans = std::sync::Arc::new(SharedSubplans::of(plan));
         self
     }
 }
@@ -3031,6 +3193,50 @@ fn project_mask(cx: &Cx, plan: &LogicalPlan, width: usize) -> Option<Vec<bool>> 
 }
 
 fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
+    if matches!(plan, LogicalPlan::Join { .. }) && cx.subplans.has_candidates() {
+        return eval_shared_join(cx, plan);
+    }
+    eval_node(cx, plan)
+}
+
+/// A join the statement contains more than once (TPC-H Q17 and Q2: the
+/// decorrelated subquery repeats the outer query's join to collect its
+/// correlation keys): evaluated once and reused, as DuckDB computes a delim
+/// join's outer side once. A result is only kept when nothing outside the
+/// join pruned its scans (a join filter from an enclosing join drops rows
+/// that join alone does not need), and only reused where the cached output
+/// holds every column this occurrence's consumers read. A correlated
+/// context never caches (an outer row could change the result).
+fn eval_shared_join(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
+    let Some(slot) = cx.subplans.slot(plan) else {
+        return eval_node(cx, plan);
+    };
+    if !cx.outer_rows.is_empty() {
+        return eval_node(cx, plan);
+    }
+    if let Some(out) = cx.subplans.cached(slot)
+        && covers(&out, cx.projections.for_join(plan))
+    {
+        return Ok(out);
+    }
+    let pure = !cx.dynamic.prunes_any(plan);
+    let out = eval_node(cx, plan)?;
+    if pure {
+        cx.subplans.store(slot, &out);
+    }
+    Ok(out)
+}
+
+/// Whether every column `needed` (all of them for `None`) is present in
+/// `out`'s chunks.
+fn covers(out: &Output, needed: Option<&[usize]>) -> bool {
+    out.chunks.iter().all(|chunk| match needed {
+        Some(cols) => cols.iter().all(|&c| chunk.is_present(c)),
+        None => (0..chunk.num_cols()).all(|c| chunk.is_present(c)),
+    })
+}
+
+fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     // Per-statement deadline: every plan node and every operator's chunk loop
     // below re-checks, so a timeout observed here unwinds before any write
     // back starts.
@@ -3842,6 +4048,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     outer_rows: cx.outer_rows.clone(),
                     dynamic: cx.dynamic.clone(),
                     unordered: cx.unordered,
+                    subplans: cx.subplans.clone(),
                 };
                 return eval(&child, body);
             }
@@ -3881,6 +4088,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         outer_rows: cx.outer_rows.clone(),
                         dynamic: cx.dynamic.clone(),
                         unordered: cx.unordered,
+                        subplans: cx.subplans.clone(),
                     };
                     let produced = eval(&child, &step.step)?;
                     let fresh = if step.all {
@@ -3924,6 +4132,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 outer_rows: cx.outer_rows.clone(),
                 dynamic: cx.dynamic.clone(),
                 unordered: cx.unordered,
+                subplans: cx.subplans.clone(),
             };
             eval(&child, body)
         }

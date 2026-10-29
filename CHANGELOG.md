@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 125d — a repeated join is computed once ✅
+
+- A query that contains the same join twice (TPC-H Q17 and Q2: the
+  correlated subquery repeats the outer query's join to find its keys)
+  now computes it once and reuses the result, like DuckDB's delim join.
+  TPC-H SF 1: Q17 −24 %, Q2 −17 %.
+
 ### Wave 128a — text stored as 16-byte string views ✅
 
 - Text values are now stored like DuckDB's strings: up to 12 bytes sit

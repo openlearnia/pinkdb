@@ -194,6 +194,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 125d — a repeated join is computed once ✅</h3>
+<ul>
+<li>A query that contains the same join twice (TPC-H Q17 and Q2: the correlated subquery repeats the outer query's join to find its keys) now computes it once and reuses the result, like DuckDB's delim join. TPC-H SF 1: Q17 −24 %, Q2 −17 %.</li>
+</ul>
 <h3>Wave 128a — text stored as 16-byte string views ✅</h3>
 <ul>
 <li>Text values are now stored like DuckDB's strings: up to 12 bytes sit inside a 16-byte view, longer ones point into byte buffers that copies of a column share. Copying a text column (through a join or filter) no longer touches every string's reference count, and short strings compare without leaving the view.</li>
