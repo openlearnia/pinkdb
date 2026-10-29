@@ -9,6 +9,18 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 111e — join order follows inferred keys; joins hash their smaller input ✅
+
+- `a.k = b.k AND c.k = b.k` now also lets the join order join `a` with `c`
+  directly (DuckDB infers these the same way): TPC-H Q9 joins `part` with
+  `partsupp` before touching `lineitem`, and Q5 joins `customer` with
+  `supplier` on their shared nation.
+- A join whose input is itself a join now has a size estimate, so the
+  engine hashes the smaller side there too instead of always the right one.
+- TPC-H SF 1: **Q5 −61 %**, **Q8 −54 %**, **Q3 −38 %**, **Q18 −34 %**,
+  Q9 −27 %, Q7 −28 %, Q21 −23 %, Q2 −12 %; Q10 +26 % (now hashes its
+  small, wide side — follow-up). All 22: 789 → 627 ms.
+
 ### Wave 125c — joins on two integer columns use one packed key ✅
 
 - A join on two integer columns (TPC-H Q9's `l_partkey = ps_partkey AND

@@ -194,6 +194,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 111e — join order follows inferred keys; joins hash their smaller input ✅</h3>
+<ul>
+<li><code>a.k = b.k AND c.k = b.k</code> now also lets the join order join <code>a</code> with <code>c</code> directly (DuckDB infers these the same way): TPC-H Q9 joins <code>part</code> with <code>partsupp</code> before touching <code>lineitem</code>, and Q5 joins <code>customer</code> with <code>supplier</code> on their shared nation.</li>
+<li>A join whose input is itself a join now has a size estimate, so the engine hashes the smaller side there too instead of always the right one.</li>
+<li>TPC-H SF 1: <strong>Q5 −61 %</strong>, <strong>Q8 −54 %</strong>, <strong>Q3 −38 %</strong>, <strong>Q18 −34 %</strong>, Q9 −27 %, Q7 −28 %, Q21 −23 %, Q2 −12 %; Q10 +26 % (now hashes its small, wide side — follow-up). All 22: 789 → 627 ms.</li>
+</ul>
 <h3>Wave 125c — joins on two integer columns use one packed key ✅</h3>
 <ul>
 <li>A join on two integer columns (TPC-H Q9's <code>l_partkey = ps_partkey AND l_suppkey = ps_suppkey</code>) packs both values into one 64-bit key when they fit, and joins like a single-column integer join instead of encoding both values per row. TPC-H SF 1: Q9 −12 %.</li>

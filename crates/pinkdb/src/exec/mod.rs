@@ -4842,6 +4842,23 @@ fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
         }
         LogicalPlan::Cte { body, .. } => estimate_rows(cx, body),
         LogicalPlan::Values { rows, .. } => Some(rows.len().max(1) as u64),
+        // A key join keeps about its smaller input: a foreign key join yields
+        // the fact rows its (filtered) dimension still matches, which the
+        // dimension side bounds. Only a hint for the build side — without it
+        // a joined input never compared, and TPC-H Q9 hashed 6M `lineitem`
+        // rows instead of the 42k `part ⋈ partsupp` rows. (A distinct-count
+        // estimate, `l * r / max(ndv)`, measured worse: a filter's default
+        // selectivity inflates it past the fact side.)
+        LogicalPlan::Join {
+            kind, left, right, ..
+        } => {
+            let l = estimate_rows(cx, left)?;
+            match kind {
+                JoinKind::Inner => Some(l.min(estimate_rows(cx, right)?)),
+                JoinKind::Semi | JoinKind::Anti | JoinKind::Mark | JoinKind::Left => Some(l),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

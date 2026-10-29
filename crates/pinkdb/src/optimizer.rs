@@ -2286,12 +2286,47 @@ fn reorder_comma_join(
     let (leaves, widths) = comma_join_leaves(plan, db)?;
     let mut conjuncts = Vec::new();
     split_conjuncts(pred.clone(), &mut conjuncts);
-    let order = cost_join_order(db, &leaves, &widths, &conjuncts)?;
     let mut offsets = Vec::with_capacity(leaves.len());
     let mut acc = 0;
     for w in &widths {
         offsets.push(acc);
         acc += w;
+    }
+    // Column equalities are transitive: `p = l AND ps = l` also joins `p`
+    // with `ps` (TPC-H Q9), so the order may join those two directly.
+    let classes = equality_classes(&conjuncts, &offsets, &widths);
+    let mut priced = conjuncts.clone();
+    for class in &classes {
+        for (k, a) in class.iter().enumerate() {
+            for b in &class[k + 1..] {
+                if leaf_of(a.0, &offsets, &widths) != leaf_of(b.0, &offsets, &widths) {
+                    priced.push(column_eq(*a, *b));
+                }
+            }
+        }
+    }
+    let order = cost_join_order(db, &leaves, &widths, &priced)?;
+    // Each class then joins every member to the class's first column in the
+    // new order: one key per join, whichever members it brings.
+    if !classes.is_empty() {
+        let position = |g: usize| {
+            let leaf = leaf_of(g, &offsets, &widths).unwrap_or(usize::MAX);
+            order.iter().position(|&l| l == leaf).unwrap_or(usize::MAX)
+        };
+        conjuncts.retain(|c| {
+            simple_column_eq(c).is_none_or(|(a, b)| {
+                !classes.iter().any(|class| {
+                    class.iter().any(|m| m.0 == a.0) && class.iter().any(|m| m.0 == b.0)
+                })
+            })
+        });
+        for class in &classes {
+            let mut members = class.clone();
+            members.sort_by_key(|m| (position(m.0), m.0));
+            for m in &members[1..] {
+                conjuncts.push(column_eq(members[0], *m));
+            }
+        }
     }
     let mut new_offsets = vec![0; leaves.len()];
     let mut acc = 0;
@@ -2360,6 +2395,85 @@ fn reorder_comma_join(
         },
         _ => plan,
     })
+}
+
+/// A conjunct `column = column` of one type, as `(index, dtype)` pairs.
+fn simple_column_eq(c: &BoundExpr) -> Option<((usize, DataType), (usize, DataType))> {
+    let BoundExpr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = c
+    else {
+        return None;
+    };
+    match (&**left, &**right) {
+        (BoundExpr::Column { index: a, dtype: x }, BoundExpr::Column { index: b, dtype: y })
+            if x == y && a != b =>
+        {
+            Some(((*a, *x), (*b, *y)))
+        }
+        _ => None,
+    }
+}
+
+/// `a = b` over two columns of one type.
+fn column_eq(a: (usize, DataType), b: (usize, DataType)) -> BoundExpr {
+    BoundExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(BoundExpr::Column {
+            index: a.0,
+            dtype: a.1,
+        }),
+        right: Box::new(BoundExpr::Column {
+            index: b.0,
+            dtype: b.1,
+        }),
+        dtype: DataType::Boolean,
+    }
+}
+
+/// The equality classes of a chain's `column = column` conjuncts that span
+/// at least three columns (two are already one direct equality), members
+/// in column order. Only same-type equalities of chain columns join a
+/// class, so every pair in it compares exactly as the written ones do; and
+/// `a = b AND b = c` keeps the same rows as `a = b AND a = c` — a NULL
+/// member fails some equality either way (DuckDB's equivalence sets in
+/// `src/optimizer/join_order/query_graph_manager.cpp` infer these edges).
+fn equality_classes(
+    conjuncts: &[BoundExpr],
+    offsets: &[usize],
+    widths: &[usize],
+) -> Vec<Vec<(usize, DataType)>> {
+    let mut parent: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut types: std::collections::HashMap<usize, DataType> = std::collections::HashMap::new();
+    for c in conjuncts {
+        let Some((a, b)) = simple_column_eq(c) else {
+            continue;
+        };
+        if leaf_of(a.0, offsets, widths).is_none() || leaf_of(b.0, offsets, widths).is_none() {
+            continue;
+        }
+        types.insert(a.0, a.1);
+        types.insert(b.0, b.1);
+        let (ra, rb) = (class_root(&mut parent, a.0), class_root(&mut parent, b.0));
+        if ra != rb {
+            parent.insert(ra, rb);
+        }
+    }
+    let mut groups: std::collections::BTreeMap<usize, Vec<(usize, DataType)>> =
+        std::collections::BTreeMap::new();
+    let mut columns: Vec<usize> = types.keys().copied().collect();
+    columns.sort_unstable();
+    for col in columns {
+        let root = class_root(&mut parent, col);
+        groups.entry(root).or_default().push((col, types[&col]));
+    }
+    groups
+        .into_values()
+        .filter(|members| members.len() >= 3 && members.iter().all(|m| m.1 == members[0].1))
+        .collect()
 }
 
 /// Remap a predicate through a transparent projection: every `Column{i}`

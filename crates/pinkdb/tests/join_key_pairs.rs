@@ -1,3 +1,7 @@
+//! Wave 111e: `a.k = b.k AND c.k = b.k` also joins `a` with `c`, so the
+//! cost-based order may join those two first (TPC-H Q9 joins `part` with
+//! `partsupp` before touching `lineitem`).
+//!
 //! Wave 125c: a join on two integer columns packs both into one BIGINT when
 //! the build side's values fit 32 bits and takes the integer path; a probe
 //! value outside 32 bits matches nothing, and a build side with such a value
@@ -143,4 +147,76 @@ fn two_integer_keys_join_the_same_with_or_without_packing() {
             "{case}"
         );
     }
+}
+
+/// A three-table chain whose only written edges go through the large table
+/// (`a.k = big.k AND c.k = big.k`): the order may join `a` and `c` first on
+/// the inferred `a.k = c.k`, and the answer is the written query's.
+#[test]
+fn an_equality_class_joins_its_members_directly() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE a (k BIGINT, f VARCHAR);").unwrap();
+    db.execute("CREATE TABLE c (k BIGINT, g INTEGER);").unwrap();
+    db.execute("CREATE TABLE big (k BIGINT, v INTEGER);")
+        .unwrap();
+    let a: Vec<String> = (0..300)
+        .map(|i| {
+            let k = if i % 11 == 0 {
+                "NULL".into()
+            } else {
+                (i % 150).to_string()
+            };
+            format!("({k}, '{}')", if i % 5 == 0 { "hot" } else { "cold" })
+        })
+        .collect();
+    let c: Vec<String> = (0..2000)
+        .map(|i| {
+            let k = if i % 13 == 0 {
+                "NULL".into()
+            } else {
+                (i % 400).to_string()
+            };
+            format!("({k}, {})", i % 9)
+        })
+        .collect();
+    let big: Vec<String> = (0..20000)
+        .map(|i| {
+            let k = if i % 17 == 0 {
+                "NULL".into()
+            } else {
+                (i % 1000).to_string()
+            };
+            format!("({k}, {})", i % 100)
+        })
+        .collect();
+    for (t, v) in [("a", a), ("c", c), ("big", big)] {
+        db.execute(&format!("INSERT INTO {t} VALUES {};", v.join(",")))
+            .unwrap();
+    }
+    let sql = "SELECT count(*), sum(v), sum(g) FROM a, big, c \
+               WHERE a.k = big.k AND c.k = big.k AND a.f = 'hot';";
+    // Reference: the same query written with explicit joins in one fixed
+    // order, which the reorder leaves alone (two joins).
+    let reference = "SELECT count(*), sum(v), sum(g) FROM a JOIN big ON a.k = big.k \
+                     JOIN c ON c.k = big.k WHERE a.f = 'hot';";
+    // `a` and `c` join first, on the inferred key, and `big` comes last.
+    let plan = rows(&mut db, &format!("EXPLAIN {sql}")).join("\n");
+    let (at_c, at_big) = (plan.find("Scan main.c"), plan.find("Scan main.big"));
+    assert!(at_c.is_some() && at_c < at_big, "{plan}");
+    let got = rows(&mut db, sql);
+    assert_eq!(got, rows(&mut db, reference));
+    // Count by hand: per key, hot `a` rows × `big` rows × `c` rows.
+    let count = |n: i64, modulus: i64, nulls: i64, k: i64| {
+        (0..n)
+            .filter(|i| i % nulls != 0 && i % modulus == k)
+            .count() as i64
+    };
+    let mut total = 0;
+    for k in 0..150 {
+        let hot = (0..300)
+            .filter(|i| i % 11 != 0 && i % 150 == k && i % 5 == 0)
+            .count() as i64;
+        total += hot * count(20000, 1000, 17, k) * count(2000, 400, 13, k);
+    }
+    assert_eq!(got[0].split('|').next().unwrap(), total.to_string());
 }
