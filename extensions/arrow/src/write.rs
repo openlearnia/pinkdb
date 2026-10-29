@@ -101,7 +101,7 @@ fn to_array(v: &Vector, arrow: &arrow_schema::DataType) -> Result<ArrayRef> {
         }
         (VectorData::VarChar(values), ArrowType::Utf8) => {
             let items: Vec<Option<&str>> = (0..v.len())
-                .map(|i| v.is_valid(i).then(|| values[i].as_ref()))
+                .map(|i| v.is_valid(i).then(|| &values[i]))
                 .collect();
             std::sync::Arc::new(StringArray::from(items))
         }

@@ -9,6 +9,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-29</h2>
+<h3>Wave 128a — text stored as 16-byte string views ✅</h3>
+<ul>
+<li>Text values are now stored like DuckDB's strings: up to 12 bytes sit inside a 16-byte view, longer ones point into byte buffers that copies of a column share. Copying a text column (through a join or filter) no longer touches every string's reference count, and short strings compare without leaving the view.</li>
+<li>Opening TPC-H SF 1 takes 22 % less CPU and 8 % less memory. TPC-H SF 1: Q22 −30 %, Q5 −15 %, Q7 −14 %, Q9 −11 %; Q1 and Q14 +6 %.</li>
+</ul>
 <h3>Wave 127i — filters copy only the columns used above them ✅</h3>
 <ul>
 <li>A filter used to copy every column of the rows it kept, including the ones only its own condition reads (TPC-H Q21's two dates on 3.8 million <code>lineitem</code> rows). It now copies just what the operators above it read. TPC-H SF 1: Q4 −21 %, Q21 −10 %, Q10 −9 %, Q13 −7 %.</li>

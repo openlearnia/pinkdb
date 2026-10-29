@@ -1140,7 +1140,7 @@ fn compare_cell(data: &VectorData, i: usize, c: &Value) -> std::cmp::Ordering {
         (VectorData::Int32(d), Value::Integer(y)) => d[i].cmp(y),
         (VectorData::Int64(d), Value::Bigint(y)) => d[i].cmp(y),
         (VectorData::Float64(d), Value::Double(y)) => num_cmp(d[i], *y),
-        (VectorData::VarChar(d), Value::Varchar(y)) => d[i].as_ref().cmp(y.as_str()),
+        (VectorData::VarChar(d), Value::Varchar(y)) => d[i].cmp(y.as_str()),
         (VectorData::Date32(d), Value::Date(y)) => d[i].cmp(y),
         (VectorData::TimestampMicros(d), Value::Timestamp(y)) => d[i].cmp(y),
         (VectorData::Decimal { values, scale, .. }, Value::Decimal(y, ys)) => {
@@ -1913,20 +1913,19 @@ pub(crate) fn small_column_codes(
     }
 }
 
-/// [`small_column_codes`] for a VARCHAR column. A dictionary-encoded column
-/// (the `.pink` store's low-cardinality strings) hands every row of a value
-/// the same shared string, so rows are first matched by pointer — no read of
-/// the string itself, which for TPC-H Q1's flags was a cache miss per row
-/// into six million separate cells' worth of pointers — and only a pointer
-/// not seen yet is compared by content.
+/// [`small_column_codes`] for a VARCHAR column. Rows are first matched by
+/// their 16-byte string view ([`crate::strings::StrView::key`]): a short
+/// string's view is the string, and a dictionary-encoded chunk's rows of one
+/// value share one location — so most rows are coded without reading any
+/// string bytes, and only a view not seen yet is compared by content.
 fn varchar_codes(
     v: &Vector,
-    d: &[std::sync::Arc<str>],
+    d: &crate::strings::StrVec,
     rows: usize,
     row: &impl Fn(usize) -> usize,
 ) -> Option<(Vec<u16>, usize)> {
-    const POINTERS: usize = 64;
-    let mut pointers: Vec<(*const u8, u16)> = Vec::new();
+    const VIEWS: usize = 64;
+    let mut views: Vec<(u128, u16)> = Vec::new();
     let mut seen: Vec<(ShortStr, u16)> = Vec::new();
     let mut null_code: Option<u16> = None;
     let mut next: u16 = 0;
@@ -1939,8 +1938,8 @@ fn varchar_codes(
                 next - 1
             })
         } else {
-            let p = std::sync::Arc::as_ptr(&d[i]) as *const u8;
-            match pointers.iter().find(|(q, _)| *q == p) {
+            let p = d.view(i).key();
+            match views.iter().find(|(q, _)| *q == p) {
                 Some(&(_, c)) => c,
                 None => {
                     let x = ShortStr::of(&d[i]);
@@ -1952,8 +1951,8 @@ fn varchar_codes(
                             next - 1
                         }
                     };
-                    if pointers.len() < POINTERS {
-                        pointers.push((p, c));
+                    if views.len() < VIEWS {
+                        views.push((p, c));
                     }
                     c
                 }

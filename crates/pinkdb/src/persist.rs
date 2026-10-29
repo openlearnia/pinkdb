@@ -109,6 +109,7 @@ use crate::crypto::EncryptionKey;
 use crate::storage::{
     DataTable, ForeignKeyConstraint, Index, KeyConstraint, KeyKind, PinkDb, TableConstraints,
 };
+use crate::strings::StrVec;
 #[cfg(test)]
 use crate::types::ArrayElem;
 use crate::types::{DataType, Interval, PinkDbError, Result, Value};
@@ -904,26 +905,17 @@ fn bool_payload(v: &Vector) -> Cow<'_, [bool]> {
     }
 }
 
-fn varchar_payload(v: &Vector) -> Cow<'_, [Arc<str>]> {
+fn varchar_payload(v: &Vector) -> Vec<&str> {
     match v.data() {
         VectorData::VarChar(data) => {
             if v.has_nulls() {
                 let words = v.validity_words();
-                let empty: Arc<str> = Arc::from("");
-                Cow::Owned(
-                    data.iter()
-                        .enumerate()
-                        .map(|(i, s)| {
-                            if valid_at(words, i) {
-                                s.clone()
-                            } else {
-                                empty.clone()
-                            }
-                        })
-                        .collect(),
-                )
+                data.iter()
+                    .enumerate()
+                    .map(|(i, s)| if valid_at(words, i) { s } else { "" })
+                    .collect()
             } else {
-                Cow::Borrowed(data.as_slice())
+                data.iter().collect()
             }
         }
         _ => unreachable!("varchar_payload on a non-VARCHAR vector"),
@@ -2018,26 +2010,46 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
 
 // ---------- chunk decode (typed) ----------
 
-/// Reads `count+1` offsets then the data block; returns one shared `Arc<str>`
-/// per entry (dictionary entries are shared by every row that uses them).
-fn decode_strs(reader: &mut Reader, count: usize) -> Result<Vec<Arc<str>>> {
+/// Reads `count+1` offsets then the data block; the strings stay in one
+/// shared buffer (dictionary rows point into it, wave 128a).
+fn decode_strs(reader: &mut Reader, count: usize) -> Result<StrVec> {
     let mut offsets = Vec::with_capacity(count + 1);
     for _ in 0..count + 1 {
         offsets.push(reader.u32()? as usize);
     }
     let total = *offsets.last().unwrap_or(&0);
     let data = reader.take(total)?;
-    let mut out = Vec::with_capacity(count);
+    strs_over(reader, &offsets, data)
+}
+
+/// The strings at `offsets` (`count + 1` boundaries) of `data`, validated as
+/// UTF-8 and kept in one shared buffer (wave 128a: rows of a chunk point
+/// into it instead of each owning a copy).
+fn strs_over(reader: &Reader, offsets: &[usize], data: &[u8]) -> Result<StrVec> {
+    let count = offsets.len().saturating_sub(1);
     for i in 0..count {
         let (a, b) = (offsets[i], offsets[i + 1]);
         if b < a || b > data.len() {
             return reader.err("bad string offsets");
         }
-        let s = std::str::from_utf8(&data[a..b])
+        std::str::from_utf8(&data[a..b])
             .map_err(|_| PinkDbError::Execution("corrupt file: bad UTF-8".to_string()))?;
-        out.push(Arc::from(s));
     }
-    Ok(out)
+    let buffer: Arc<[u8]> = Arc::from(data);
+    Ok(StrVec::over_buffer(
+        buffer,
+        (0..count).map(|i| (offsets[i], offsets[i + 1] - offsets[i])),
+    ))
+}
+
+/// Rows of a dictionary-coded chunk: each row shares its entry's bytes.
+fn dict_rows(dict: &StrVec, codes: &[usize]) -> Result<StrVec> {
+    if codes.iter().any(|&c| c >= dict.len()) {
+        return Err(PinkDbError::Execution(
+            "corrupt file: bad dict code".to_string(),
+        ));
+    }
+    Ok(dict.take(codes.iter().copied()))
 }
 
 /// Decode payload codes for the two integer widths.
@@ -2105,20 +2117,20 @@ fn decode_rle_bool(r: &mut Reader, n: usize, runs: usize) -> Result<Vec<bool>> {
     Ok(out)
 }
 
-fn decode_rle_strs(r: &mut Reader, n: usize, runs: usize) -> Result<Vec<Arc<str>>> {
+fn decode_rle_strs(r: &mut Reader, n: usize, runs: usize) -> Result<StrVec> {
     let vals = decode_strs(r, runs)?;
-    let mut out = Vec::with_capacity(n);
-    for v in vals {
+    let mut codes = Vec::with_capacity(n);
+    for v in 0..vals.len() {
         let len = r.u32()? as usize;
-        if out.len().checked_add(len).is_none_or(|total| total > n) {
+        if codes.len().checked_add(len).is_none_or(|total| total > n) {
             return r.err("RLE run overflows chunk length");
         }
-        out.extend(std::iter::repeat_n(v, len));
+        codes.extend(std::iter::repeat_n(v, len));
     }
-    if out.len() != n {
+    if codes.len() != n {
         return r.err("RLE runs underfill chunk length");
     }
-    Ok(out)
+    dict_rows(&vals, &codes)
 }
 
 /// Delta+bitpack body: `base` was already read; the remaining values are
@@ -2605,14 +2617,11 @@ fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorDat
             let n = r.chunk_count("chunk length")?;
             let dict_len = r.chunk_count("dictionary size")?;
             let dict = decode_strs(r, dict_len)?;
-            let mut out = Vec::with_capacity(n);
+            let mut codes = Vec::with_capacity(n);
             for _ in 0..n {
-                let code = r.u32()? as usize;
-                out.push(dict.get(code).cloned().ok_or_else(|| {
-                    PinkDbError::Execution("corrupt file: bad dict code".to_string())
-                })?);
+                codes.push(r.u32()? as usize);
             }
-            Ok((VectorData::VarChar(out), n))
+            Ok((VectorData::VarChar(dict_rows(&dict, &codes)?), n))
         }
         (DataType::Varchar, ENC_DICT_BITPACK) => {
             let n = r.chunk_count("chunk length")?;
@@ -2629,23 +2638,16 @@ fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorDat
             if width != expected {
                 return r.err("bad dictionary bit width");
             }
-            let mut out = Vec::with_capacity(n);
-            if width == 0 {
+            let codes: Vec<usize> = if width == 0 {
                 // At most one dictionary entry; every row (if any) is it.
-                let v = dict.first().cloned();
-                for _ in 0..n {
-                    out.push(v.clone().ok_or_else(|| {
-                        PinkDbError::Execution("corrupt file: bad dict code".to_string())
-                    })?);
-                }
+                vec![0; n]
             } else {
-                for c in fastlanes_unpack(r, n, width)? {
-                    out.push(dict.get(c as usize).cloned().ok_or_else(|| {
-                        PinkDbError::Execution("corrupt file: bad dict code".to_string())
-                    })?);
-                }
-            }
-            Ok((VectorData::VarChar(out), n))
+                fastlanes_unpack(r, n, width)?
+                    .into_iter()
+                    .map(|c| c as usize)
+                    .collect()
+            };
+            Ok((VectorData::VarChar(dict_rows(&dict, &codes)?), n))
         }
         (DataType::Varchar, ENC_RLE) => {
             let n = r.chunk_count("chunk length")?;
@@ -2722,17 +2724,7 @@ fn decode_fsst(r: &mut Reader) -> Result<(VectorData, usize)> {
         let escaped = codec.decompress(comp, raw_len)?;
         fsst_unescape(&escaped, &table, data_len)?
     };
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let (a, b) = (offsets[i], offsets[i + 1]);
-        if b < a || b > data.len() {
-            return r.err("bad string offsets");
-        }
-        let s = std::str::from_utf8(&data[a..b])
-            .map_err(|_| PinkDbError::Execution("corrupt file: bad UTF-8".to_string()))?;
-        out.push(Arc::from(s));
-    }
-    Ok((VectorData::VarChar(out), n))
+    Ok((VectorData::VarChar(strs_over(r, &offsets, &data)?), n))
 }
 
 /// Decode one framed chunk (validity + payload) into a [`Vector`].
@@ -4448,7 +4440,7 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
         DataType::Integer => VectorData::Int32(vec![0; rows]),
         DataType::Bigint => VectorData::Int64(vec![0; rows]),
         DataType::Double => VectorData::Float64(vec![0.0; rows]),
-        DataType::Varchar => VectorData::VarChar(vec![Arc::from(""); rows]),
+        DataType::Varchar => VectorData::VarChar(StrVec::repeat("", rows)),
         DataType::Date => VectorData::Date32(vec![0; rows]),
         DataType::Timestamp => VectorData::TimestampMicros(vec![0; rows]),
         DataType::Decimal { precision, scale } => VectorData::Decimal {

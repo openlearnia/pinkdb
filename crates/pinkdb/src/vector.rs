@@ -20,7 +20,7 @@ pub enum VectorData {
     Int32(Vec<i32>),
     Int64(Vec<i64>),
     Float64(Vec<f64>),
-    VarChar(Vec<Arc<str>>),
+    VarChar(crate::strings::StrVec),
     Date32(Vec<i32>),
     TimestampMicros(Vec<i64>),
     /// DECIMAL: unscaled i128 values. Precision/scale ride with the payload
@@ -170,7 +170,7 @@ impl VectorData {
             DataType::Integer => VectorData::Int32(Vec::with_capacity(cap)),
             DataType::Bigint => VectorData::Int64(Vec::with_capacity(cap)),
             DataType::Double => VectorData::Float64(Vec::with_capacity(cap)),
-            DataType::Varchar => VectorData::VarChar(Vec::with_capacity(cap)),
+            DataType::Varchar => VectorData::VarChar(crate::strings::StrVec::with_capacity(cap)),
             DataType::Date => VectorData::Date32(Vec::with_capacity(cap)),
             DataType::Timestamp => VectorData::TimestampMicros(Vec::with_capacity(cap)),
             DataType::Decimal { precision, scale } => VectorData::Decimal {
@@ -274,10 +274,10 @@ impl Vector {
             Value::Integer(i) => (VectorData::Int32(vec![*i; n]), true),
             Value::Bigint(i) => (VectorData::Int64(vec![*i; n]), true),
             Value::Double(x) => (VectorData::Float64(vec![*x; n]), true),
-            Value::Varchar(s) => {
-                let shared: Arc<str> = Arc::from(s.as_str());
-                (VectorData::VarChar(vec![shared; n]), true)
-            }
+            Value::Varchar(s) => (
+                VectorData::VarChar(crate::strings::StrVec::repeat(s, n)),
+                true,
+            ),
             Value::Date(d) => (VectorData::Date32(vec![*d; n]), true),
             Value::Timestamp(us) => (VectorData::TimestampMicros(vec![*us; n]), true),
             Value::Decimal(v, scale) => (
@@ -361,7 +361,7 @@ impl Vector {
             VectorData::Int32(v) => v.push(0),
             VectorData::Int64(v) => v.push(0),
             VectorData::Float64(v) => v.push(0.0),
-            VectorData::VarChar(v) => v.push(Arc::from("")),
+            VectorData::VarChar(v) => v.push(""),
             VectorData::Date32(v) => v.push(0),
             VectorData::TimestampMicros(v) => v.push(0),
             VectorData::Decimal { values, .. } => values.push(0),
@@ -553,7 +553,7 @@ impl Vector {
             (VectorData::Int32(v), Value::Integer(i)) => v.push(i),
             (VectorData::Int64(v), Value::Bigint(i)) => v.push(i),
             (VectorData::Float64(v), Value::Double(x)) => v.push(x),
-            (VectorData::VarChar(v), Value::Varchar(s)) => v.push(s.into()),
+            (VectorData::VarChar(v), Value::Varchar(s)) => v.push(&s),
             (VectorData::Date32(v), Value::Date(d)) => v.push(d),
             (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v.push(us),
             (VectorData::Decimal { values, scale, .. }, Value::Decimal(v, s)) if s == *scale => {
@@ -608,7 +608,7 @@ impl Vector {
         }
         self.check_room()?;
         if let VectorData::VarChar(v) = &mut self.data {
-            v.push(Arc::from(s));
+            v.push(s);
         }
         self.len += 1;
         self.ensure_mask();
@@ -710,8 +710,9 @@ impl Vector {
                 d.extend_from_slice(&s[start..start + len]);
             }
             (VectorData::VarChar(d), VectorData::VarChar(s)) => {
-                // Strings share their Arc instead of copying bytes.
-                d.extend(s[start..start + len].iter().cloned());
+                // Short strings copy their view; shared long ones keep
+                // pointing into their buffer.
+                d.extend_from(s, start, len);
             }
             (VectorData::Date32(d), VectorData::Date32(s)) => {
                 d.extend_from_slice(&s[start..start + len]);
@@ -797,7 +798,7 @@ impl Vector {
             (VectorData::Int32(v), Value::Integer(i)) => v[idx] = i,
             (VectorData::Int64(v), Value::Bigint(i)) => v[idx] = i,
             (VectorData::Float64(v), Value::Double(x)) => v[idx] = x,
-            (VectorData::VarChar(v), Value::Varchar(s)) => v[idx] = s.into(),
+            (VectorData::VarChar(v), Value::Varchar(s)) => v.set(idx, &s),
             (VectorData::Date32(v), Value::Date(d)) => v[idx] = d,
             (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v[idx] = us,
             (VectorData::Decimal { values, scale, .. }, Value::Decimal(v, s)) if s == *scale => {
@@ -1001,7 +1002,7 @@ impl Vector {
             (VectorData::Int32(d), VectorData::Int32(s)) => d.push(s[idx]),
             (VectorData::Int64(d), VectorData::Int64(s)) => d.push(s[idx]),
             (VectorData::Float64(d), VectorData::Float64(s)) => d.push(s[idx]),
-            (VectorData::VarChar(d), VectorData::VarChar(s)) => d.push(s[idx].clone()),
+            (VectorData::VarChar(d), VectorData::VarChar(s)) => d.push_from(s, idx),
             (VectorData::Date32(d), VectorData::Date32(s)) => d.push(s[idx]),
             (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => d.push(s[idx]),
             (VectorData::Decimal { values: d, .. }, VectorData::Decimal { values: s, .. }) => {
@@ -1120,10 +1121,14 @@ impl Vector {
             VectorData::Int64(_) => VectorData::Int64(gather!(Int64, 0, |x: &i64| *x)),
             VectorData::Float64(_) => VectorData::Float64(gather!(Float64, 0.0, |x: &f64| *x)),
             VectorData::VarChar(_) => {
-                let empty: Arc<str> = Arc::from("");
-                VectorData::VarChar(gather!(VarChar, Arc::clone(&empty), |x: &Arc<str>| {
-                    Arc::clone(x)
-                }))
+                let strs: Vec<&crate::strings::StrVec> = sources
+                    .iter()
+                    .map(|s| match s.data() {
+                        VectorData::VarChar(v) => v,
+                        _ => unreachable!("gather sources of mixed types"),
+                    })
+                    .collect();
+                VectorData::VarChar(crate::strings::StrVec::gather(&strs, picks, GATHER_NULL))
             }
             VectorData::Date32(_) => VectorData::Date32(gather!(Date32, 0, |x: &i32| *x)),
             VectorData::TimestampMicros(_) => {
@@ -1190,9 +1195,7 @@ impl Vector {
             VectorData::Float64(v) => {
                 VectorData::Float64(selection.iter().map(|i| v[pick(i)]).collect())
             }
-            VectorData::VarChar(v) => {
-                VectorData::VarChar(selection.iter().map(|i| Arc::clone(&v[pick(i)])).collect())
-            }
+            VectorData::VarChar(v) => VectorData::VarChar(v.take(selection.iter().map(pick))),
             VectorData::Date32(v) => {
                 VectorData::Date32(selection.iter().map(|i| v[pick(i)]).collect())
             }
@@ -1601,7 +1604,9 @@ mod tests {
             panic!("expected VARCHAR data");
         };
         assert_eq!(strings.len(), 100);
-        assert!(strings.iter().all(|s| Arc::ptr_eq(s, &strings[0])));
+        // One view repeated: no per-row copy of the bytes.
+        assert!((0..100).all(|i| strings.view(i) == strings.view(0)));
+        assert!(strings.iter().all(|s| s == "shared"));
     }
 
     /// GROUP BY / DISTINCT / JOIN keys use `encode_into`: FLOAT cells must

@@ -791,7 +791,7 @@ fn exists_body(query: &crate::plan::LogicalPlan, cx: &Cx) -> Result<bool> {
 }
 
 /// Broadcast a scalar to `n` rows. `NULL` ⇒ INTEGER-typed all-NULL vector
-/// (matches the old `push_value` loop); VARCHAR shares one `Arc<str>`.
+/// (matches the old `push_value` loop); VARCHAR repeats one string view.
 fn const_vector(value: Value, n: usize) -> Result<Vector> {
     Ok(Vector::new_const(&value, n))
 }
@@ -927,7 +927,8 @@ fn eval_comparison(
             }
             (VectorData::VarChar(a), VectorData::VarChar(b)) => {
                 // Borrowed `&str` compare — no per-row string clone.
-                cmp_loop(op, &l, &r, a, b, |x, y| (**x).cmp(&**y), &mut out)?;
+                let (a, b): (Vec<&str>, Vec<&str>) = (a.iter().collect(), b.iter().collect());
+                cmp_loop(op, &l, &r, &a, &b, |x, y| x.cmp(y), &mut out)?;
             }
             (VectorData::Date32(a), VectorData::Date32(b)) => {
                 cmp_loop(op, &l, &r, a, b, |x, y| x.cmp(y), &mut out)?;
@@ -1071,7 +1072,7 @@ enum CmpKind<'a> {
     DecFloat(&'a [i128], u8, f64),
     DecDec(&'a [i128], u8, i128, u8),
     Bool(&'a [bool], bool),
-    VarChar(&'a [std::sync::Arc<str>], std::sync::Arc<str>),
+    VarChar(&'a crate::strings::StrVec, std::sync::Arc<str>),
     Date(&'a [i32], i32),
     Timestamp(&'a [i64], i64),
     Interval(&'a [crate::types::Interval], crate::types::Interval),
@@ -1186,7 +1187,10 @@ impl<'a> ScalarCmp<'a> {
                 out,
             ),
             CmpKind::Bool(a, s) => push_cmp(col, a, op, flipped, |x| x.cmp(s), out),
-            CmpKind::VarChar(a, s) => push_cmp(col, a, op, flipped, |x| (**x).cmp(&**s), out),
+            CmpKind::VarChar(a, s) => {
+                let a: Vec<&str> = a.iter().collect();
+                push_cmp(col, &a, op, flipped, |x| (**x).cmp(&**s), out)
+            }
             CmpKind::Date(a, s) => push_cmp(col, a, op, flipped, |x| x.cmp(s), out),
             CmpKind::Timestamp(a, s) => push_cmp(col, a, op, flipped, |x| x.cmp(s), out),
             CmpKind::Interval(a, s) => push_cmp(
@@ -1257,7 +1261,10 @@ impl<'a> ScalarCmp<'a> {
                 sel,
             ),
             CmpKind::Bool(a, s) => retain_cmp(col, a, op, flipped, |x| x.cmp(s), sel),
-            CmpKind::VarChar(a, s) => retain_cmp(col, a, op, flipped, |x| (**x).cmp(&**s), sel),
+            CmpKind::VarChar(a, s) => {
+                let a: Vec<&str> = a.iter().collect();
+                retain_cmp(col, &a, op, flipped, |x| (**x).cmp(&**s), sel)
+            }
             CmpKind::Date(a, s) => retain_cmp(col, a, op, flipped, |x| x.cmp(s), sel),
             CmpKind::Timestamp(a, s) => retain_cmp(col, a, op, flipped, |x| x.cmp(s), sel),
             CmpKind::Interval(a, s) => retain_cmp(
@@ -1339,21 +1346,21 @@ impl ScalarCmp<'_> {
 }
 
 /// Keep the rows of `sel` whose valid string passes `test`, deciding each
-/// distinct shared string once: a dictionary-encoded column (the `.pink`
-/// store's low-cardinality strings) hands every row of a value the same
-/// `Arc<str>`, so the answer is remembered by pointer for up to
-/// [`STRING_MEMO`] pointers and the string itself is only read for a pointer
-/// not seen yet (TPC-H Q10's `l_returnflag = 'R'` compared six million
-/// one-letter strings).
+/// distinct string view once: a short string's view is the string, and the
+/// rows of a dictionary-encoded column (the `.pink` store's low-cardinality
+/// strings) share one location, so the answer is remembered by view for up
+/// to [`STRING_MEMO`] views and the string itself is only read for a view not
+/// seen yet (TPC-H Q10's `l_returnflag = 'R'` compared six million one-letter
+/// strings).
 fn retain_strings(
     col: &Vector,
-    a: &[std::sync::Arc<str>],
+    a: &crate::strings::StrVec,
     test: impl Fn(&str) -> bool,
     sel: &mut Vec<u32>,
 ) {
     let nulls = col.has_nulls();
-    let mut memo: Vec<(*const u8, bool)> = Vec::new();
-    // A pointer not seen once the memo is full means the strings are not
+    let mut memo: Vec<(u128, bool)> = Vec::new();
+    // A view not seen once the memo is full means the strings are not
     // shared (or too many): test the rest directly.
     let mut direct = false;
     let mut w = 0;
@@ -1366,7 +1373,7 @@ fn retain_strings(
         let keep = if direct {
             test(&a[i])
         } else {
-            let p = std::sync::Arc::as_ptr(&a[i]) as *const u8;
+            let p = a.view(i).key();
             match memo.iter().find(|(q, _)| *q == p) {
                 Some(&(_, k)) => k,
                 None => {
@@ -1386,7 +1393,7 @@ fn retain_strings(
     sel.truncate(w);
 }
 
-/// Distinct string pointers [`retain_strings`] remembers per chunk.
+/// Distinct string views [`retain_strings`] remembers per chunk.
 const STRING_MEMO: usize = 16;
 
 /// The comparison `literal <op> column` read as `column <op'> literal`.
@@ -2928,22 +2935,14 @@ fn eval_scalar_fast(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Resul
                     *w &= m;
                 }
             }
-            let empty: std::sync::Arc<str> = std::sync::Arc::from("");
-            let mut out = Vec::with_capacity(src.len());
+            let mut out = crate::strings::StrVec::with_capacity(src.len());
             for (i, s) in src.iter().enumerate() {
                 if validity[i / 64] >> (i % 64) & 1 == 0 {
-                    out.push(empty.clone());
+                    out.push("");
                     continue;
                 }
                 let length = lengths.as_ref().map_or(SUBSTR_TO_END, |l| l.get(i));
-                let part = substr_slice(s, offsets.get(i), length)?;
-                out.push(if part.len() == s.len() {
-                    s.clone()
-                } else if part.is_empty() {
-                    empty.clone()
-                } else {
-                    std::sync::Arc::from(part)
-                });
+                out.push(substr_slice(s, offsets.get(i), length)?);
             }
             Ok(Some(Vector::from_parts(
                 VectorData::VarChar(out),
@@ -4190,7 +4189,7 @@ fn select_in_list(
                     _ => None,
                 })
                 .collect();
-            keep(sel, whole, v, |i| set.contains(&&*d[i]));
+            keep(sel, whole, v, |i| set.contains(&&d[i]));
         }
         VectorData::Int32(d) | VectorData::Date32(d) => {
             let set: Vec<i32> = values
@@ -4281,7 +4280,10 @@ fn retain_column_pair(
                 ..
             },
         ) if sx == sy => retain_pair(a, b, x, y, op, sel, |p, q| p.cmp(q)),
-        (V::VarChar(x), V::VarChar(y)) => retain_pair(a, b, x, y, op, sel, |p, q| (**p).cmp(&**q)),
+        (V::VarChar(x), V::VarChar(y)) => {
+            let (x, y): (Vec<&str>, Vec<&str>) = (x.iter().collect(), y.iter().collect());
+            retain_pair(a, b, &x, &y, op, sel, |p, q| p.cmp(q))
+        }
         _ => return false,
     }
     true

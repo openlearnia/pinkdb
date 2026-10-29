@@ -534,7 +534,10 @@ fn int_stats<T: Copy + Ord>(v: &Vector, data: &[T]) -> (Option<T>, Option<T>) {
 
 /// min/max over the valid elements of a string chunk, first-seen on ties
 /// (byte order, exactly `Value::Varchar`'s `compare_values`).
-fn str_stats<'a>(v: &Vector, data: &'a [Arc<str>]) -> (Option<&'a str>, Option<&'a str>) {
+fn str_stats<'a>(
+    v: &Vector,
+    data: &'a crate::strings::StrVec,
+) -> (Option<&'a str>, Option<&'a str>) {
     let (mut min, mut max): (Option<&'a str>, Option<&'a str>) = (None, None);
     let mut see = |x: &'a str| {
         if min.is_none_or(|m| x < m) {
@@ -551,7 +554,7 @@ fn str_stats<'a>(v: &Vector, data: &'a [Arc<str>]) -> (Option<&'a str>, Option<&
             }
         }
     } else {
-        for s in data {
+        for s in data.iter() {
             see(s);
         }
     }

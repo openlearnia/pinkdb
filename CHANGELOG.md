@@ -9,6 +9,16 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 128a — text stored as 16-byte string views ✅
+
+- Text values are now stored like DuckDB's strings: up to 12 bytes sit
+  inside a 16-byte view, longer ones point into byte buffers that copies of
+  a column share. Copying a text column (through a join or filter) no
+  longer touches every string's reference count, and short strings compare
+  without leaving the view.
+- Opening TPC-H SF 1 takes 22 % less CPU and 8 % less memory. TPC-H SF 1:
+  Q22 −30 %, Q5 −15 %, Q7 −14 %, Q9 −11 %; Q1 and Q14 +6 %.
+
 ### Wave 127i — filters copy only the columns used above them ✅
 
 - A filter used to copy every column of the rows it kept, including the

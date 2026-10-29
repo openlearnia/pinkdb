@@ -26,10 +26,10 @@ use super::aggregate::{
 };
 use super::selection::Selected;
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
+use crate::strings::StrVec;
 use crate::types::{DataType, Result};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 use rayon::prelude::*;
-use std::sync::Arc;
 
 /// How one key column's cells become a `u64` word, and back.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,7 +44,7 @@ enum KeyKind {
         scale: u8,
     },
     /// VARCHAR: the word is the string's hash, and the group keeps the
-    /// string itself (a shared `Arc<str>`, no copy) to compare and emit.
+    /// string itself (a 16-byte view, wave 128a) to compare and emit.
     Varchar,
 }
 
@@ -117,7 +117,7 @@ struct FlatPartial {
     /// VARCHAR key columns: `strs` holds `nstr` strings per group (an empty
     /// one for a NULL cell, whose NULL bit tells it apart from `''`).
     nstr: usize,
-    strs: Vec<Arc<str>>,
+    strs: StrVec,
     keys: Vec<u64>,
     hashes: Vec<u64>,
     accs: Vec<Acc>,
@@ -176,9 +176,10 @@ impl FlatPartial {
         self.hashes.len()
     }
 
+    /// Group `g`'s string in VARCHAR key slot `slot`.
     #[inline]
-    fn strs_of(&self, g: usize) -> &[Arc<str>] {
-        &self.strs[g * self.nstr..(g + 1) * self.nstr]
+    fn str_at(&self, g: usize, slot: usize) -> &str {
+        &self.strs[g * self.nstr + slot]
     }
 }
 
@@ -210,11 +211,14 @@ impl FlatPartial {
         let mut keys = Vec::with_capacity(self.keys.len());
         let mut hashes = Vec::with_capacity(n);
         let mut accs = Vec::with_capacity(self.accs.len());
-        let mut strs = Vec::with_capacity(self.strs.len());
+        let nstr = self.nstr;
+        let strs = self.strs.take(
+            perm.iter()
+                .flat_map(|&g| (g as usize * nstr)..((g as usize + 1) * nstr)),
+        );
         for &g in &perm {
             let g = g as usize;
             keys.extend_from_slice(&self.keys[g * width..(g + 1) * width]);
-            strs.extend_from_slice(self.strs_of(g));
             hashes.push(self.hashes[g]);
             for acc in &mut self.accs[g * naggs..(g + 1) * naggs] {
                 accs.push(std::mem::replace(acc, Acc::Count(0)));
@@ -372,20 +376,19 @@ fn fold(
     let width = keys.len() + 1;
     let nstr = spec.str_cols.len();
     // Row `k`'s string in VARCHAR key column `c` (`""` for NULL).
-    let empty: Arc<str> = Arc::from("");
-    let cell = |c: usize, k: usize| -> &Arc<str> {
+    let cell = |c: usize, k: usize| -> (&StrVec, usize, bool) {
         let v = key_vecs[c].v();
         let i = sel.map_or(k, |s| s[k] as usize);
         match v.data() {
-            VectorData::VarChar(d) if v.is_valid(i) => &d[i],
-            _ => &empty,
+            VectorData::VarChar(d) => (d, i, v.is_valid(i)),
+            _ => unreachable!("KeyKind::Varchar admits only VARCHAR payloads"),
         }
     };
     let mut part = FlatPartial {
         width,
         naggs: aggs.len(),
         nstr,
-        strs: Vec::new(),
+        strs: StrVec::new(),
         keys: Vec::new(),
         hashes: Vec::new(),
         accs: Vec::new(),
@@ -398,7 +401,12 @@ fn fold(
         part.hashes.push(h);
         part.accs.extend_from_slice(&spec.fresh);
         for &c in &spec.str_cols {
-            part.strs.push(Arc::clone(cell(c, k)));
+            match cell(c, k) {
+                // Copied: a group's key outlives the chunk it came from, and
+                // a copy keeps the partial off the chunk's shared buffers.
+                (d, i, true) => part.strs.push(&d[i]),
+                _ => part.strs.push(""),
+            }
         }
         g
     };
@@ -453,11 +461,11 @@ fn fold(
                 }
                 if part.hashes[g as usize] == h
                     && part.key(g as usize) == key
-                    && spec
-                        .str_cols
-                        .iter()
-                        .zip(part.strs_of(g as usize))
-                        .all(|(&c, s)| **s == **cell(c, k))
+                    && spec.str_cols.iter().enumerate().all(|(slot, &c)| {
+                        let (d, i, valid) = cell(c, k);
+                        // A NULL's NULL bit already matched; its cell is "".
+                        !valid || part.str_at(g as usize, slot) == &d[i]
+                    })
                 {
                     break g;
                 }
@@ -484,7 +492,7 @@ fn fold(
 /// (`partial << 32 | index in the partial`).
 struct Merged {
     keys: Vec<u64>,
-    strs: Vec<Arc<str>>,
+    strs: StrVec,
     accs: Vec<Acc>,
     first: Vec<u64>,
 }
@@ -511,7 +519,7 @@ fn merge_and_emit(
             let (mut slots, mask) = slot_table(size);
             let mut out = Merged {
                 keys: Vec::with_capacity(size * width),
-                strs: Vec::with_capacity(size * nstr),
+                strs: StrVec::with_capacity(size * nstr),
                 accs: Vec::with_capacity(size * naggs),
                 first: Vec::with_capacity(size),
             };
@@ -520,7 +528,6 @@ fn merge_and_emit(
                 for g in p.starts[b]..p.starts[b + 1] {
                     let h = p.hashes[g];
                     let key = p.key(g);
-                    let strs = p.strs_of(g);
                     let src = &p.accs[g * naggs..(g + 1) * naggs];
                     let mut s = h as usize & mask;
                     loop {
@@ -528,7 +535,9 @@ fn merge_and_emit(
                         if t == u32::MAX {
                             slots[s] = out.first.len() as u32;
                             out.keys.extend_from_slice(key);
-                            out.strs.extend_from_slice(strs);
+                            for slot in 0..nstr {
+                                out.strs.push(p.str_at(g, slot));
+                            }
                             out.accs.extend_from_slice(src);
                             out.first.push((pi as u64) << 32 | u64::from(p.pos[g]));
                             hashes.push(h);
@@ -537,7 +546,7 @@ fn merge_and_emit(
                         let t = t as usize;
                         if hashes[t] == h
                             && out.keys[t * width..(t + 1) * width] == *key
-                            && out.strs[t * nstr..(t + 1) * nstr] == *strs
+                            && (0..nstr).all(|slot| &out.strs[t * nstr + slot] == p.str_at(g, slot))
                         {
                             for (acc, other) in
                                 out.accs[t * naggs..(t + 1) * naggs].iter_mut().zip(src)
@@ -595,13 +604,12 @@ fn merge_and_emit(
                 KeyKind::Varchar => {
                     let at = slot;
                     slot += 1;
-                    VectorData::VarChar(
-                        part.iter()
-                            .map(|&(_, b, i)| {
-                                Arc::clone(&merged[b as usize].strs[i as usize * nstr + at])
-                            })
-                            .collect(),
-                    )
+                    let sources: Vec<&StrVec> = merged.iter().map(|m| &m.strs).collect();
+                    let picks: Vec<(u32, u32)> = part
+                        .iter()
+                        .map(|&(_, b, i)| (b, (i as usize * nstr + at) as u32))
+                        .collect();
+                    VectorData::VarChar(StrVec::gather(&sources, &picks, u32::MAX))
                 }
             };
             let mut validity = vec![u64::MAX; part.len().div_ceil(64)];

@@ -13,7 +13,6 @@ use std::fs::File;
 use std::io::Cursor;
 use std::io::{BufReader, Read, Seek};
 use std::path::Path;
-use std::sync::Arc;
 
 use arrow_array::{
     Array, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float16Array, Float32Array,
@@ -394,7 +393,8 @@ macro_rules! prim_i32 {
 }
 use prim_i32;
 
-/// One `Arc<str>` per value for the three string layouts.
+/// A VARCHAR vector for the three string layouts (each value copied once
+/// into the vector's string storage; NULL cells hold `""`).
 fn str_column<'a>(
     nulls: Option<&NullBuffer>,
     start: usize,
@@ -402,13 +402,17 @@ fn str_column<'a>(
     value: impl Fn(usize) -> &'a str,
 ) -> Result<Vector> {
     let n = end - start;
-    build_column(
-        n,
-        |i| nulls.is_none_or(|nb| nb.is_valid(start + i)),
-        || Arc::from(""),
-        |i| Ok(Arc::from(value(start + i))),
-        |v, w| Vector::from_raw(VectorData::VarChar(v), w),
-    )
+    let mut strs = pinkdb::strings::StrVec::with_capacity(n);
+    let mut words = vec![0u64; n.div_ceil(64).max(1)];
+    for i in 0..n {
+        if nulls.is_none_or(|nb| nb.is_valid(start + i)) {
+            words[i / 64] |= 1u64 << (i % 64);
+            strs.push(value(start + i));
+        } else {
+            strs.push("");
+        }
+    }
+    Ok(Vector::from_raw(VectorData::VarChar(strs), words))
 }
 
 /// The unscaled values of one decimal column, with the column's declared
