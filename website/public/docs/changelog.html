@@ -193,6 +193,12 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-29">2026-10-29<a class="anchor" href="#2026-10-29" aria-label="Permalink: 2026-10-29">#</a></h2>
+<h3>Wave 123d — GROUP BY on integer keys without per-group allocations ✅</h3>
+<ul>
+<li>A <code>GROUP BY</code> whose keys are all fixed-width numbers (INTEGER, BIGINT, DATE, TIMESTAMP, BOOLEAN, DECIMAL up to 18 digits) and whose aggregates are <code>COUNT</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code> or <code>MAX</code> now keeps its groups in flat arrays: keys as machine words, accumulators side by side, each chunk's groups already laid out by merge partition. Before, every group of every chunk allocated its own key and accumulator lists. Results and their order are unchanged.</li>
+<li><code>GROUP BY l_orderkey</code> over TPC-H SF 1's 6 million <code>lineitem</code> rows: 3× faster. TPC-H SF 1: <strong>Q18 −58 %</strong>, Q15 −38 %, Q11 −20 %, Q13 −12 %.</li>
+</ul>
 <h2 id="2026-10-28">2026-10-28<a class="anchor" href="#2026-10-28" aria-label="Permalink: 2026-10-28">#</a></h2>
 <h3>Wave 123c (second part) — hash tables no longer collide on encoded keys ✅</h3>
 <ul>
@@ -1073,6 +1079,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-29">2026-10-29</a></li>
   <li><a href="#2026-10-28">2026-10-28</a></li>
   <li><a href="#2026-10-27">2026-10-27</a></li>
   <li><a href="#2026-10-26">2026-10-26</a></li>

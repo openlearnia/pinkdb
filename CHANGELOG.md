@@ -8,6 +8,19 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-29
+### Wave 123d — GROUP BY on integer keys without per-group allocations ✅
+
+- A `GROUP BY` whose keys are all fixed-width numbers (INTEGER, BIGINT,
+  DATE, TIMESTAMP, BOOLEAN, DECIMAL up to 18 digits) and whose aggregates
+  are `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` now keeps its groups in flat
+  arrays: keys as machine words, accumulators side by side, each chunk's
+  groups already laid out by merge partition. Before, every group of every
+  chunk allocated its own key and accumulator lists. Results and their
+  order are unchanged.
+- `GROUP BY l_orderkey` over TPC-H SF 1's 6 million `lineitem` rows: 3×
+  faster. TPC-H SF 1: **Q18 −58 %**, Q15 −38 %, Q11 −20 %, Q13 −12 %.
+
 ## 2026-10-28
 ### Wave 123c (second part) — hash tables no longer collide on encoded keys ✅
 

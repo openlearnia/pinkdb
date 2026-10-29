@@ -267,6 +267,7 @@ impl AvgState {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum Acc {
     Count(i64),
     /// Integer SUM is exact like DuckDB's HUGEINT sum: the true total is
@@ -310,6 +311,7 @@ pub(crate) enum Acc {
 /// per distinct cell (the encoding GROUP BY/DISTINCT use, so equality
 /// semantics — NULL skipped, −0.0/NaN canonical — are shared); the ordered-set
 /// aggregates keep every non-NULL value and sort once in `finalize`.
+#[derive(Clone)]
 pub(crate) enum Collect {
     Distinct(FastSet<Vec<u8>>),
     /// `percentile_cont(fraction)`.
@@ -776,6 +778,55 @@ impl Acc {
                 unreachable!("COUNT(DISTINCT) and ordered-set aggregates use update_vec")
             }
             other => other.update(Some(&Value::Decimal(x, scale))),
+        }
+    }
+
+    /// [`Acc::merge`] of a borrowed partial: the fixed-size states merge in
+    /// place with the same arithmetic (the flat GROUP BY table merges
+    /// millions of them); every other pair merges a clone.
+    #[inline]
+    pub(crate) fn merge_ref(&mut self, other: &Acc) {
+        match (&mut *self, other) {
+            (Acc::Count(a), Acc::Count(b)) => *a += b,
+            (
+                Acc::SumInt {
+                    sum,
+                    wraps,
+                    non_null,
+                },
+                Acc::SumInt {
+                    sum: b,
+                    wraps: bw,
+                    non_null: bn,
+                },
+            ) => {
+                *wraps = wraps.wrapping_add(*bw);
+                sum_add(sum, wraps, *b);
+                *non_null |= *bn;
+            }
+            (
+                Acc::SumDecimal {
+                    sum,
+                    scale,
+                    overflow,
+                    non_null,
+                },
+                Acc::SumDecimal {
+                    sum: b,
+                    scale: bscale,
+                    overflow: bov,
+                    non_null: bn,
+                },
+            ) if scale == bscale => {
+                match sum.checked_add(*b) {
+                    Some(next) => *sum = next,
+                    None => *overflow = true,
+                }
+                *overflow |= *bov;
+                *non_null |= *bn;
+            }
+            (Acc::Avg(a), Acc::Avg(b)) => a.merge(*b),
+            _ => self.merge(other.clone()),
         }
     }
 
@@ -1343,7 +1394,7 @@ pub(crate) fn fold_chunk(
     // are bit-identical.
     for (j, av) in arg_vecs.iter().enumerate() {
         accumulate(
-            &mut partial.groups,
+            partial.groups.as_mut_slice(),
             &gids,
             j,
             av.as_ref().map(|v| v.v()),
@@ -1522,6 +1573,9 @@ pub(crate) fn aggregate(
             return fast_distinct_int(cx, inputs, idx, *dtype);
         }
     }
+    if let Some(out) = super::group_table::aggregate(cx, inputs, keys, aggs)? {
+        return Ok(out);
+    }
     // Phase 1: per-chunk partials in parallel.
     let partials: Vec<Partial> = inputs
         .par_iter()
@@ -1548,6 +1602,9 @@ pub(crate) fn aggregate_selected(
     aggs: &[BoundAgg],
 ) -> Result<Vec<DataChunk>> {
     debug_assert!(!aggs.is_empty(), "the DISTINCT path stays in `aggregate`");
+    if let Some(out) = super::group_table::aggregate_selected(cx, inputs, keys, aggs)? {
+        return Ok(out);
+    }
     let partials: Vec<Partial> = inputs
         .par_iter()
         .map(|input| {
@@ -1876,13 +1933,36 @@ fn small_domain_gids(
     Some(gids)
 }
 
+/// The per-group accumulators [`accumulate`] feeds: a partial's group list,
+/// or the flat accumulator array of a [`super::group_table`] partial.
+pub(crate) trait AccSlots {
+    fn group_count(&self) -> usize;
+    fn acc(&mut self, g: usize, j: usize) -> &mut Acc;
+    fn acc_ref(&self, g: usize, j: usize) -> &Acc;
+}
+
+impl AccSlots for [(Vec<u8>, Group)] {
+    #[inline]
+    fn group_count(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    fn acc(&mut self, g: usize, j: usize) -> &mut Acc {
+        &mut self[g].1.accs[j]
+    }
+    #[inline]
+    fn acc_ref(&self, g: usize, j: usize) -> &Acc {
+        &self[g].1.accs[j]
+    }
+}
+
 /// Feed one aggregate's argument column (or COUNT(*)) into the per-row
 /// group slots: the payload type is matched once per chunk, NULL cells are
 /// skipped (`update(None)` is a no-op for every accumulator), and MIN/MAX
 /// plus non-numeric cells keep the exact `update_vec` comparison path.
 /// `FILTER (WHERE pred)` as a per-row keep mask: only TRUE rows pass (a NULL
 /// predicate is not TRUE, matching `WHERE`).
-fn keep_mask(pred: &Vector) -> Result<Vec<bool>> {
+pub(crate) fn keep_mask(pred: &Vector) -> Result<Vec<bool>> {
     if pred.dtype() != DataType::Boolean {
         return Err(PinkDbError::Type(
             "FILTER needs a BOOLEAN expression".to_string(),
@@ -1901,8 +1981,8 @@ fn keep_mask(pred: &Vector) -> Result<Vec<bool>> {
 ///
 /// `sel` maps each selection entry back to its row of `arg` and of the
 /// `FILTER` mask, which are both whole-chunk.
-fn accumulate(
-    groups: &mut [(Vec<u8>, Group)],
+pub(crate) fn accumulate<S: AccSlots + ?Sized>(
+    groups: &mut S,
     gids: &[usize],
     j: usize,
     arg: Option<&Vector>,
@@ -1917,20 +1997,20 @@ fn accumulate(
         for (k, &g) in gids.iter().enumerate() {
             let i = row(k);
             if keep(i) {
-                groups[g].1.accs[j].count_star();
+                groups.acc(g, j).count_star();
             }
         }
         return;
     };
     let generic = gids
         .first()
-        .is_some_and(|&g| matches!(groups[g].1.accs[j], Acc::MinMax { .. } | Acc::Collect(_)));
+        .is_some_and(|&g| matches!(groups.acc(g, j), Acc::MinMax { .. } | Acc::Collect(_)));
     match v.data() {
         VectorData::Int32(d) if !generic => {
             for (k, &g) in gids.iter().enumerate() {
                 let i = row(k);
                 if keep(i) && v.is_valid(i) {
-                    groups[g].1.accs[j].add_int(d[i] as i64);
+                    groups.acc(g, j).add_int(d[i] as i64);
                 }
             }
         }
@@ -1938,7 +2018,7 @@ fn accumulate(
             for (k, &g) in gids.iter().enumerate() {
                 let i = row(k);
                 if keep(i) && v.is_valid(i) {
-                    groups[g].1.accs[j].add_int(d[i]);
+                    groups.acc(g, j).add_int(d[i]);
                 }
             }
         }
@@ -1946,7 +2026,7 @@ fn accumulate(
             for (k, &g) in gids.iter().enumerate() {
                 let i = row(k);
                 if keep(i) && v.is_valid(i) {
-                    groups[g].1.accs[j].add_f64(d[i]);
+                    groups.acc(g, j).add_f64(d[i]);
                 }
             }
         }
@@ -1962,13 +2042,12 @@ fn accumulate(
             precision,
         } if !generic
             && *precision <= 18
-            && groups.len() <= DECIMAL_BULK_GROUPS
-            && groups
-                .iter()
-                .all(|(_, g)| g.accs[j].takes_decimal_bulk(*scale)) =>
+            && groups.group_count() <= DECIMAL_BULK_GROUPS
+            && (0..groups.group_count())
+                .all(|g| groups.acc_ref(g, j).takes_decimal_bulk(*scale)) =>
         {
-            let mut sums = vec![0i128; groups.len()];
-            let mut counts = vec![0i64; groups.len()];
+            let mut sums = vec![0i128; groups.group_count()];
+            let mut counts = vec![0i64; groups.group_count()];
             for (k, &g) in gids.iter().enumerate() {
                 let i = row(k);
                 if keep(i) && v.is_valid(i) {
@@ -1976,9 +2055,9 @@ fn accumulate(
                     counts[g] += 1;
                 }
             }
-            for (g, (_, group)) in groups.iter_mut().enumerate() {
-                if counts[g] > 0 {
-                    group.accs[j].add_decimal_bulk(sums[g], counts[g], *scale);
+            for (g, (&sum, &n)) in sums.iter().zip(&counts).enumerate() {
+                if n > 0 {
+                    groups.acc(g, j).add_decimal_bulk(sum, n, *scale);
                 }
             }
         }
@@ -1986,7 +2065,7 @@ fn accumulate(
             for (k, &g) in gids.iter().enumerate() {
                 let i = row(k);
                 if keep(i) && v.is_valid(i) {
-                    groups[g].1.accs[j].add_decimal(values[i], *scale);
+                    groups.acc(g, j).add_decimal(values[i], *scale);
                 }
             }
         }
@@ -1994,7 +2073,7 @@ fn accumulate(
             for (k, &g) in gids.iter().enumerate() {
                 let i = row(k);
                 if keep(i) {
-                    groups[g].1.accs[j].update_vec(v, i);
+                    groups.acc(g, j).update_vec(v, i);
                 }
             }
         }
@@ -2007,14 +2086,14 @@ const DECIMAL_BULK_GROUPS: usize = 2 * CHUNK_SIZE;
 
 /// Above this many local groups, phase 2 partitions the keys by hash and
 /// merges the partitions in parallel ([`merge_by_bucket`]).
-const PARALLEL_MERGE_MIN: usize = 1 << 14;
+pub(crate) const PARALLEL_MERGE_MIN: usize = 1 << 14;
 
 /// Local groups per radix partition: large enough to amortize the per-bucket
 /// table, small enough that a bucket's table stays in cache.
-const MERGE_BUCKET_GROUPS: usize = 4096;
+pub(crate) const MERGE_BUCKET_GROUPS: usize = 4096;
 
 /// Cap on partitions: more tasks than this only adds per-bucket overhead.
-const MERGE_BUCKETS_MAX: usize = 64;
+pub(crate) const MERGE_BUCKETS_MAX: usize = 64;
 
 /// Merge per-chunk partials in chunk order (deterministic first-seen order).
 /// Partial groups already sit in first-seen order, so each partial is walked

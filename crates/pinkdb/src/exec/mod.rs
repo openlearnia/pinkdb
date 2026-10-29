@@ -9,6 +9,7 @@
 pub mod aggregate;
 pub(crate) mod dml;
 pub mod expr;
+pub(crate) mod group_table;
 pub(crate) mod selection;
 pub(crate) mod window;
 
