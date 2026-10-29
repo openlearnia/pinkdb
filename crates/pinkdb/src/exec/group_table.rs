@@ -497,6 +497,7 @@ fn merge_and_emit(
     kinds: &[KeyKind],
     key_types: &[DataType],
     aggs: &[BoundAgg],
+    ordered: bool,
 ) -> Result<Vec<DataChunk>> {
     let width = kinds.len() + 1;
     let naggs = aggs.len();
@@ -564,7 +565,8 @@ fn merge_and_emit(
                 .map(|(i, &f)| (f, b as u32, i as u32)),
         );
     }
-    if buckets > 1 {
+    // A set consumer (`Cx::unordered`) takes the partitions as they are.
+    if buckets > 1 && ordered {
         order.par_sort_unstable_by_key(|e| e.0);
     }
     let build = |part: &[(u64, u32, u32)]| -> Result<DataChunk> {
@@ -650,7 +652,7 @@ pub(crate) fn aggregate(
         return Ok(None);
     };
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    merge_and_emit(partials, &spec.kinds, &key_types, aggs).map(Some)
+    merge_and_emit(partials, &spec.kinds, &key_types, aggs, !cx.unordered).map(Some)
 }
 
 /// [`super::aggregate::aggregate_selected`] on flat tables, or `Ok(None)`.
@@ -679,7 +681,7 @@ pub(crate) fn aggregate_selected(
         return Ok(None);
     };
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    merge_and_emit(partials, &spec.kinds, &key_types, aggs).map(Some)
+    merge_and_emit(partials, &spec.kinds, &key_types, aggs, !cx.unordered).map(Some)
 }
 
 /// The out-of-line retry of [`aggregate_selected`] (see

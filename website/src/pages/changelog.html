@@ -9,6 +9,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-29</h2>
+<h3>Wave 123h — <code>IN</code> subqueries skip ordering their groups ✅</h3>
+<ul>
+<li>A <code>GROUP BY</code> inside an <code>IN (…)</code> subquery is only used as a set of values, so it no longer sorts its groups back into first-seen order (unless a <code>LIMIT</code> or window inside the subquery depends on that order). TPC-H SF 1: <strong>Q18 −15 %</strong>.</li>
+</ul>
 <h3>Wave 127h — text filters decide each stored string once ✅</h3>
 <ul>
 <li>A filter comparing a text column with a constant (<code>l_returnflag = 'R'</code>, <code>p_brand &lt;&gt; 'Brand#45'</code>) remembers its answer per stored string, so rows sharing one dictionary-encoded string are not compared again. TPC-H SF 1: Q12 −7 %, Q7 −6 %, Q19 −6 %.</li>

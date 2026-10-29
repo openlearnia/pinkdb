@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-29
+### Wave 123h — `IN` subqueries skip ordering their groups ✅
+
+- A `GROUP BY` inside an `IN (…)` subquery is only used as a set of
+  values, so it no longer sorts its groups back into first-seen order
+  (unless a `LIMIT` or window inside the subquery depends on that order).
+  TPC-H SF 1: **Q18 −15 %**.
+
 ### Wave 127h — text filters decide each stored string once ✅
 
 - A filter comparing a text column with a constant (`l_returnflag = 'R'`,

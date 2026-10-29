@@ -521,6 +521,10 @@ pub(crate) struct Cx<'a> {
     /// (wave 122). Shared by the statement's contexts, so a child context
     /// (recursive CTE, subquery) still sees the frame its outer join pushed.
     pub(crate) dynamic: std::sync::Arc<DynamicFilters>,
+    /// The result is consumed as a set (an `IN` subquery's values), so a
+    /// GROUP BY may emit its groups in any order instead of first-seen
+    /// order (see [`Cx::order_free`]).
+    pub(crate) unordered: bool,
 }
 
 /// Join filters derived from a completed hash-join build side (wave 122), keyed
@@ -692,7 +696,45 @@ impl<'a> Cx<'a> {
             session: db.session.clone(),
             outer_rows: Vec::new(),
             dynamic: std::sync::Arc::new(DynamicFilters::default()),
+            unordered: false,
         }
+    }
+
+    /// This context for evaluating `plan` as a set: when nothing in it
+    /// depends on its input's row order (no `LIMIT`, no window), the GROUP
+    /// BYs inside skip restoring first-seen group order — TPC-H Q18's
+    /// `l_orderkey IN (SELECT … GROUP BY l_orderkey HAVING …)` sorted 1.5M
+    /// group positions it never used. `None` keeps the ordered context.
+    pub(crate) fn order_free(&self, plan: &LogicalPlan) -> Option<Cx<'a>> {
+        fn order_blind(plan: &LogicalPlan) -> bool {
+            use LogicalPlan as P;
+            match plan {
+                P::Limit { .. } | P::Window { .. } => false,
+                P::Scan { .. } => true,
+                P::Filter { input, .. }
+                | P::Project { input, .. }
+                | P::Sort { input, .. }
+                | P::Distinct { input, .. }
+                | P::Aggregate { input, .. } => order_blind(input),
+                P::Join { left, right, .. } | P::NestedLoopJoin { left, right, .. } => {
+                    order_blind(left) && order_blind(right)
+                }
+                _ => false,
+            }
+        }
+        order_blind(plan).then(|| Cx {
+            db: self.db,
+            ctes: self.ctes.clone(),
+            memo: self.memo.clone(),
+            projections: self.projections.clone(),
+            prunes: self.prunes.clone(),
+            budget: self.budget.clone(),
+            dml_ctes: self.dml_ctes.clone(),
+            session: self.session.clone(),
+            outer_rows: self.outer_rows.clone(),
+            dynamic: self.dynamic.clone(),
+            unordered: true,
+        })
     }
 
     /// The memoised result of one uncorrelated subquery.
@@ -730,6 +772,7 @@ impl<'a> Cx<'a> {
                 rows
             },
             dynamic: self.dynamic.clone(),
+            unordered: self.unordered,
         }
     }
 
@@ -3766,6 +3809,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     session: cx.session.clone(),
                     outer_rows: cx.outer_rows.clone(),
                     dynamic: cx.dynamic.clone(),
+                    unordered: cx.unordered,
                 };
                 return eval(&child, body);
             }
@@ -3804,6 +3848,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         session: cx.session.clone(),
                         outer_rows: cx.outer_rows.clone(),
                         dynamic: cx.dynamic.clone(),
+                        unordered: cx.unordered,
                     };
                     let produced = eval(&child, &step.step)?;
                     let fresh = if step.all {
@@ -3846,6 +3891,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 session: cx.session.clone(),
                 outer_rows: cx.outer_rows.clone(),
                 dynamic: cx.dynamic.clone(),
+                unordered: cx.unordered,
             };
             eval(&child, body)
         }

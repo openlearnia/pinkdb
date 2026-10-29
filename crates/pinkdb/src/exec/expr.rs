@@ -401,7 +401,8 @@ fn prime_one(cx: &Cx, e: &BoundExpr) -> Result<()> {
             let key = memo_key(query);
             if *op == BinaryOp::Eq {
                 prime_memo(cx, key, || {
-                    let out = eval(cx, query)?;
+                    let free = cx.order_free(query);
+                    let out = eval(free.as_ref().unwrap_or(cx), query)?;
                     let (set, has_null, common) = in_set(&out, expr.dtype())?;
                     Ok(Memo::Set(std::sync::Arc::new(set), has_null, common))
                 })
@@ -537,7 +538,8 @@ fn eval_in_subquery(
             let key = memo_key(query);
             let l = eval_expr(lhs, chunk, cx)?;
             let memo = cx.memoized(key, || {
-                let out = eval(cx, query)?;
+                let free = cx.order_free(query);
+                let out = eval(free.as_ref().unwrap_or(cx), query)?;
                 let (set, has_null, common) = in_set(&out, lhs.dtype())?;
                 Ok(Memo::Set(std::sync::Arc::new(set), has_null, common))
             })?;

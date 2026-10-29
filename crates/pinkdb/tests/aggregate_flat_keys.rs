@@ -335,3 +335,56 @@ fn shared_argument_arithmetic_keeps_every_aggregate() {
         .expect_err("c is 0 on some rows");
     assert!(e.to_string().contains("division by zero"), "{e}");
 }
+
+/// A GROUP BY inside an `IN` subquery is read as a set, so it may skip
+/// restoring first-seen order (wave 123h, TPC-H Q18's `HAVING` subquery);
+/// a `LIMIT` inside the subquery depends on that order and keeps it.
+#[test]
+fn in_subquery_groups_as_a_set_unless_a_limit_reads_their_order() {
+    let mut db = store();
+    // Keys whose v-sum passes a threshold, read through IN.
+    let out = rows(
+        &mut db,
+        "SELECT count(*), sum(v) FROM t WHERE k IN \
+         (SELECT k FROM t GROUP BY k HAVING sum(v) > 1500);",
+    );
+    let mut sums: HashMap<i64, i64> = HashMap::new();
+    for i in 0..ROWS {
+        if i % 37 != 0 {
+            *sums.entry(i * 7919 % 20011).or_default() += i * 7 % 1000;
+        }
+    }
+    let (mut n, mut s) = (0i64, 0i64);
+    for i in 0..ROWS {
+        if i % 37 != 0 && sums[&(i * 7919 % 20011)] > 1500 {
+            n += 1;
+            s += i * 7 % 1000;
+        }
+    }
+    assert_eq!(joined(out), vec![format!("{n}|{s}")]);
+    // LIMIT without ORDER BY takes the first five groups in first-seen order.
+    let first: Vec<i64> = {
+        let mut seen = Vec::new();
+        for i in 0..ROWS {
+            let k = i * 7919 % 20011;
+            if i % 37 != 0 && !seen.contains(&k) {
+                seen.push(k);
+            }
+            if seen.len() == 5 {
+                break;
+            }
+        }
+        seen
+    };
+    let out = rows(
+        &mut db,
+        "SELECT k FROM t WHERE k IN (SELECT k FROM t WHERE k IS NOT NULL GROUP BY k HAVING count(*) > 0 LIMIT 5) \
+         GROUP BY k ORDER BY k;",
+    );
+    let mut want = first.clone();
+    want.sort_unstable();
+    assert_eq!(
+        joined(out),
+        want.iter().map(|k| k.to_string()).collect::<Vec<_>>()
+    );
+}
