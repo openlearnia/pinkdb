@@ -795,6 +795,17 @@ fn the_catalog_lists_indexes_and_column_stats_but_not_plain_views() {
     assert_eq!(index["kind"], "INDEX");
     assert_eq!(index["table_name"], "t");
     assert_eq!(catalog["current"], "main");
+    // Wave 124: each database carries its storage facts, and none is an
+    // object.
+    let main = &catalog["databases"][0];
+    assert_eq!(main["name"], "main", "{catalog}");
+    assert_eq!(main["storage"], "local");
+    assert_eq!(main["status"], "ok");
+    assert!(main["location"].is_null() && main["version"].is_null());
+    assert!(
+        !objects.iter().any(|o| o["kind"] == "DATABASE"),
+        "{objects:?}"
+    );
     // Every object names its schema (one per database), and procedures are
     // listed with their signature.
     assert!(objects.iter().all(|o| o["schema"] == "main"), "{objects:?}");

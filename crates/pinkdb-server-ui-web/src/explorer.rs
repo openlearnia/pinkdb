@@ -234,6 +234,26 @@ pub fn Explorer(drag: RwSignal<Option<Drag>>) -> impl IntoView {
     }
 }
 
+/// A database's storage badge (wave 124): lakes say so, and an unavailable
+/// one says why (in its tooltip). Local databases carry none.
+pub fn storage_badge(info: &pinkdb_server_ui_api::DatabaseInfo) -> Option<AnyView> {
+    if let Some(reason) = info.unavailable() {
+        return Some(
+            view! { <span class="badge badge--danger" title=reason.to_string()>"Unavailable"</span> }
+                .into_any(),
+        );
+    }
+    info.is_lake().then(|| {
+        let title = info.location.clone().unwrap_or_default();
+        let text = if info.read_only {
+            "Lake · read-only"
+        } else {
+            "Lake"
+        };
+        view! { <span class="badge badge--info" title=title>{text}</span> }.into_any()
+    })
+}
+
 #[component]
 fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
     let app = expect_context::<App>();
@@ -250,7 +270,8 @@ fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
         let dbs = catalog
             .databases
             .iter()
-            .map(|db| {
+            .map(|info| {
+                let db = &info.name;
                 let objects: Vec<CatalogObject> = catalog
                     .objects
                     .iter()
@@ -342,6 +363,7 @@ fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
                                 <Icon name="chevron-right" class="tree__chev" />
                                 <Icon name="database" class="tree__kind" />
                                 <span class="tree__name">{db.clone()}</span>
+                                {storage_badge(info)}
                                 {if is_current {
                                     view! { <span class="badge badge--accent">"Current"</span> }.into_any()
                                 } else {

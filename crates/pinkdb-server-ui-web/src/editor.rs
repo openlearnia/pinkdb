@@ -120,10 +120,7 @@ fn candidates(app: &App, text: &str, pos: usize) -> (usize, Vec<Item>) {
             .map(|r| (r.db.clone(), r.name.clone()));
         // A qualifier that names no table of the statement and no database
         // (an alias not written yet): offer the current database's columns.
-        let names_database = catalog
-            .databases
-            .iter()
-            .any(|d| d.eq_ignore_ascii_case(qualifier));
+        let names_database = catalog.has_database(qualifier);
         if target.is_none() && !names_database {
             for object in &catalog.objects {
                 if object.table_name.is_none() && object.database.eq_ignore_ascii_case(&db) {
@@ -182,8 +179,8 @@ fn candidates(app: &App, text: &str, pos: usize) -> (usize, Vec<Item>) {
                 push(&object.name, "table", insert);
             }
         }
-        for name in &catalog.databases {
-            push(name, "database", sql::quote_ident(name));
+        for name in catalog.database_names() {
+            push(&name, "database", sql::quote_ident(&name));
         }
         for keyword in sql::KEYWORDS {
             push(keyword, "keyword", keyword.to_ascii_uppercase());

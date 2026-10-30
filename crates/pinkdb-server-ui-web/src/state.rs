@@ -534,18 +534,17 @@ impl App {
                     // The database statements run in must exist: a dropped
                     // one (or none chosen yet) falls back to the server's
                     // current database, else the first there is.
-                    let exists = |name: &str| {
-                        catalog
-                            .databases
-                            .iter()
-                            .any(|d| d.eq_ignore_ascii_case(name))
-                    };
+                    let exists = |name: &str| catalog.has_database(name);
                     let chosen = app.db.get_untracked();
                     if chosen.is_empty() || !exists(&chosen) {
                         let fallback = if exists(&catalog.current) {
                             catalog.current.clone()
                         } else {
-                            catalog.databases.first().cloned().unwrap_or_default()
+                            catalog
+                                .databases
+                                .first()
+                                .map(|d| d.name.clone())
+                                .unwrap_or_default()
                         };
                         if fallback != chosen {
                             app.db.set(fallback);

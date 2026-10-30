@@ -20,9 +20,9 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use pinkdb::{CancelFlag, Connection, ExecLimits, QueryProfile, QueryResult, Value};
 use pinkdb_server_ui_api::{
-    CancelRequest, Catalog, CatalogColumn, CatalogObject, DeleteWorksheet, ExportRequest,
-    HistoryList, Profile, QueryRequest, QueryResponse, ResultColumn, SaveWorksheet, StatementError,
-    StatementResult, WorksheetList,
+    CancelRequest, Catalog, CatalogColumn, CatalogObject, DatabaseInfo, DeleteWorksheet,
+    ExportRequest, HistoryList, Profile, QueryRequest, QueryResponse, ResultColumn, SaveWorksheet,
+    StatementError, StatementResult, WorksheetList,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -798,10 +798,21 @@ pub async fn catalog(
                 _ => Ok(Vec::new()),
             }
         };
-        let databases: Vec<String> = select("SHOW DATABASES")?
-            .into_iter()
-            .filter_map(|row| row.into_iter().next().map(|v| v.to_string()))
-            .collect();
+        // Wave 124: every database with its storage (the DATABASE rows).
+        let databases: Vec<DatabaseInfo> = select(
+            "SELECT \"name\", storage, location, read_only, version, status \
+             FROM pinkdb_catalog() WHERE kind = 'DATABASE' ORDER BY 1",
+        )?
+        .into_iter()
+        .map(|row| DatabaseInfo {
+            name: text(&row, 0).unwrap_or_default(),
+            storage: text(&row, 1).unwrap_or_else(|| "local".to_string()),
+            location: text(&row, 2),
+            read_only: matches!(row.get(3), Some(Value::Boolean(true))),
+            version: int(&row, 4),
+            status: text(&row, 5).unwrap_or_else(|| "ok".to_string()),
+        })
+        .collect();
         let mut objects: Vec<CatalogObject> = select(
             // Plain views are session-local (never stored), so the catalog
             // leaves them out; materialized views are listed. DATABASE rows

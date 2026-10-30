@@ -232,7 +232,7 @@ pub fn ImportDialog() -> impl IntoView {
         let current = database.get();
         app.catalog
             .get()
-            .databases
+            .database_names()
             .into_iter()
             .map(|db| {
                 let selected = db.eq_ignore_ascii_case(&current);

@@ -281,12 +281,61 @@ pub struct CatalogObject {
     pub columns: Vec<CatalogColumn>,
 }
 
+/// One database and its storage (wave 124): the `DATABASE` row of
+/// `pinkdb_catalog()`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DatabaseInfo {
+    pub name: String,
+    /// `local` or `lake`.
+    pub storage: String,
+    /// The lake's location (passwords masked); `None` for a local database.
+    pub location: Option<String>,
+    pub read_only: bool,
+    /// The lake version the database reflects; `None` for a local database.
+    pub version: Option<i64>,
+    /// `ok`, or `unavailable: <reason>`.
+    pub status: String,
+}
+
+impl DatabaseInfo {
+    /// A lake database.
+    pub fn is_lake(&self) -> bool {
+        self.storage == "lake"
+    }
+
+    /// Why the database cannot be used, if it cannot.
+    pub fn unavailable(&self) -> Option<&str> {
+        self.status.strip_prefix("unavailable: ")
+    }
+}
+
 /// `GET /api/catalog`
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
     pub current: String,
-    pub databases: Vec<String>,
+    pub databases: Vec<DatabaseInfo>,
     pub objects: Vec<CatalogObject>,
+}
+
+impl Catalog {
+    /// The database names, in catalog order.
+    pub fn database_names(&self) -> Vec<String> {
+        self.databases.iter().map(|d| d.name.clone()).collect()
+    }
+
+    /// Whether a database of that name exists (case-insensitive).
+    pub fn has_database(&self, name: &str) -> bool {
+        self.databases
+            .iter()
+            .any(|d| d.name.eq_ignore_ascii_case(name))
+    }
+
+    /// One database's facts.
+    pub fn database(&self, name: &str) -> Option<&DatabaseInfo> {
+        self.databases
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(name))
+    }
 }
 
 // ---------- access control (wave 121b) ----------

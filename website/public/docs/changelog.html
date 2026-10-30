@@ -195,6 +195,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-30">2026-10-30<a class="anchor" href="#2026-10-30" aria-label="Permalink: 2026-10-30">#</a></h2>
+<h3>Wave 124c — databases and lakes in the console ✅</h3>
+<ul>
+<li>The Storage page lists every database with its storage (local, lake, lake · read-only), location, lake version and status, and gives administrators <strong>New database</strong> (local, or a lake — managed under the data directory, or with a catalog and data location), <strong>Attach lake</strong> (read-only or writable) and <strong>Detach</strong> (the lake keeps its data). Each dialog shows the SQL it runs.</li>
+<li>The catalog tree marks lake databases, and an unavailable lake says why.</li>
+<li><code>/api/catalog</code> returns each database's <code>storage</code>, <code>location</code>, <code>read_only</code>, <code>version</code> and <code>status</code>.</li>
+</ul>
 <h3>Wave 124b — the server owns its data ✅</h3>
 <ul>
 <li><strong>A data directory.</strong> <code>pinkdb-server</code> keeps everything in <code>--data-dir</code> (default <code>./pinkdb-data</code>, created on first start): <code>pinkdb.pink</code> (local databases, users, grants, the lake databases' locations), <code>state.pink</code> (console worksheets, credentials, agent, memory), <code>lakes/</code> (lakes <code>CREATE DATABASE … (TYPE LAKE)</code> makes) and <code>tmp/</code> (upload staging). <code>--in-memory</code> saves nothing. <code>--file</code>, <code>--catalog</code>, <code>--data</code> and <code>--state</code> are gone: a lake is a database now (see 124a), and the server serves many of them.</li>

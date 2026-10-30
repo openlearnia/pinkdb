@@ -439,7 +439,7 @@ fn TopBar() -> impl IntoView {
         let current = app.db.get();
         app.catalog
             .get()
-            .databases
+            .database_names()
             .into_iter()
             .map(|db| {
                 let selected = db.eq_ignore_ascii_case(&current);

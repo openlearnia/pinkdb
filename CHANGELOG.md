@@ -9,6 +9,18 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 124c — databases and lakes in the console ✅
+
+- The Storage page lists every database with its storage (local, lake,
+  lake · read-only), location, lake version and status, and gives
+  administrators **New database** (local, or a lake — managed under the data
+  directory, or with a catalog and data location), **Attach lake** (read-only
+  or writable) and **Detach** (the lake keeps its data). Each dialog shows
+  the SQL it runs.
+- The catalog tree marks lake databases, and an unavailable lake says why.
+- `/api/catalog` returns each database's `storage`, `location`,
+  `read_only`, `version` and `status`.
+
 ### Wave 124b — the server owns its data ✅
 
 - **A data directory.** `pinkdb-server` keeps everything in `--data-dir`

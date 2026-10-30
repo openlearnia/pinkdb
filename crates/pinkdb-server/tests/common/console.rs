@@ -215,6 +215,19 @@ pub fn lake_round_trip(catalog: &str, data: &str, backend: &str) {
     assert!(!location.contains("password"), "{location}");
     let storage = session.get("/api/storage");
     assert_eq!(storage["mode"], "durable", "{storage}");
+    // The console's catalog names the lake database's storage (wave 124c).
+    let catalog = session.get("/api/catalog");
+    let lk = catalog["databases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "lk")
+        .unwrap_or_else(|| panic!("{catalog}"))
+        .clone();
+    assert_eq!(lk["storage"], "lake", "{lk}");
+    assert_eq!(lk["status"], "ok", "{lk}");
+    assert_eq!(lk["read_only"], false, "{lk}");
+    assert!(lk["version"].as_i64().is_some_and(|v| v > before), "{lk}");
     // Nothing the console staged stays behind.
     assert_eq!(std::fs::read_dir(dir.tmp()).unwrap().count(), 0);
 
