@@ -1008,6 +1008,39 @@ impl DataTable {
                     e => e,
                 })
             }
+            // DuckDB's assignment casts (see the binder's `can_assign`): a
+            // string parsed into a scalar column, a narrowing numeric cast.
+            (
+                v @ (Value::Varchar(_)
+                | Value::Integer(_)
+                | Value::Bigint(_)
+                | Value::Double(_)
+                | Value::Decimal(..)),
+                t @ (DataType::Boolean
+                | DataType::Integer
+                | DataType::Bigint
+                | DataType::Double
+                | DataType::Date
+                | DataType::Timestamp),
+            ) if matches!(v, Value::Varchar(_))
+                || !matches!(t, DataType::Boolean | DataType::Date | DataType::Timestamp) =>
+            {
+                crate::exec::expr::cast_value(v, t).map_err(|e| match e {
+                    PinkDbError::Execution(m) => PinkDbError::Type(m),
+                    e => e,
+                })
+            }
+            (
+                v @ (Value::Boolean(_)
+                | Value::Integer(_)
+                | Value::Bigint(_)
+                | Value::Double(_)
+                | Value::Decimal(..)
+                | Value::Date(_)
+                | Value::Timestamp(_)
+                | Value::Interval { .. }),
+                DataType::Varchar,
+            ) => crate::exec::expr::cast_value(v, DataType::Varchar),
             (v, t) => Err(PinkDbError::Type(format!("cannot coerce {v} to {t}"))),
         }
     }
@@ -2693,6 +2726,15 @@ impl PinkDb {
         self.ext_replay.as_deref()
     }
 
+    /// The result an earlier statement of the open transaction recorded for
+    /// `name(args)` in the transaction's replay memo, if any.
+    pub(crate) fn txn_memo_result(&self, name: &str, args: &[Value]) -> Option<&Value> {
+        self.wal_txn_memo
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name) && c.args == args)
+            .map(|c| &c.result)
+    }
+
     /// Permission for this session to call `external_io` host scalars (the
     /// serve policy's `allow-files` switch). The default is allowed: the
     /// embedded API and the CLI are not a shared service. The server and MCP
@@ -2837,6 +2879,16 @@ impl PinkDb {
         if self.replaying || !crate::plan::writes_tables(plan) {
             return Ok(());
         }
+        // A statement that read the clock (`now()`) carries the reading in
+        // its replay memo, so replay binds the same instant.
+        let with_clock;
+        let memo = match crate::sql::binder::clock_memo(dynamic_functions_used) {
+            Some(call) => {
+                with_clock = memo.iter().cloned().chain([call]).collect::<Vec<_>>();
+                &with_clock[..]
+            }
+            None => memo,
+        };
         // Wave 83: a CALL whose body used COMMIT/ROLLBACK already logged its
         // committed segments; what remains is the final segment (re-running
         // the CALL text would apply the committed part twice).

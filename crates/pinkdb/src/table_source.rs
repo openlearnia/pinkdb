@@ -378,6 +378,7 @@ impl PinkDb {
         self.table_sources
             .iter()
             .find(|s| s.name().eq_ignore_ascii_case(name))
+            .or_else(|| builtin_table_source(name))
     }
 
     /// Per-source scan counters, in registration order, each stamped with the
@@ -790,5 +791,217 @@ mod tests {
                 columns_decoded: 1,
             })
         }
+    }
+}
+
+/// The registry name of the engine's own `range()` / `generate_series()`
+/// source. It is not in a store's registry (so a host's source list and
+/// counters stay its own); [`PinkDb::table_source`] falls back to it, and the
+/// binder offers it before the registered sources.
+pub(crate) const RANGE_SOURCE: &str = "range";
+
+/// The engine's built-in table sources: `range()` / `generate_series()`.
+pub(crate) fn builtin_table_source(name: &str) -> Option<&'static Arc<dyn TableSource>> {
+    static RANGE: std::sync::OnceLock<Arc<dyn TableSource>> = std::sync::OnceLock::new();
+    name.eq_ignore_ascii_case(RANGE_SOURCE)
+        .then(|| RANGE.get_or_init(|| Arc::new(RangeSource)))
+}
+
+/// `range(stop)`, `range(start, stop [, step])` and `generate_series(…)`,
+/// DuckDB's integer and timestamp series (ported from the shape of DuckDB's
+/// `range` table function, `src/function/table/range.cpp`): `range` excludes
+/// `stop`, `generate_series` includes it; the one-argument form starts at 0;
+/// a NULL argument is an empty series. The timestamp form steps by an
+/// INTERVAL (a DATE argument counts as midnight) and yields TIMESTAMP.
+#[derive(Debug)]
+struct RangeSource;
+
+/// One bound series: the column name, whether `stop` is included, and the
+/// typed bounds (`None` when an argument is NULL).
+enum Series {
+    Int(Option<(i64, i64, i64)>),
+    Timestamp(Option<(i64, i64, crate::types::Interval)>),
+}
+
+impl RangeSource {
+    fn parse(call: &TableFunctionCall) -> Result<Option<(String, bool, Series)>> {
+        use crate::types::PinkDbError;
+        let TableFunctionCall::Function { name, args } = call else {
+            return Ok(None);
+        };
+        let lower = name.to_ascii_lowercase();
+        let inclusive = match lower.as_str() {
+            "range" => false,
+            "generate_series" => true,
+            _ => return Ok(None),
+        };
+        if args.iter().any(|a| a.name.is_some()) {
+            return Err(PinkDbError::Type(format!(
+                "{lower}() takes no named arguments"
+            )));
+        }
+        let values: Vec<&Value> = args.iter().map(|a| &a.value).collect();
+        let int = |v: &Value| match v {
+            Value::Integer(n) => Some(Some(i64::from(*n))),
+            Value::Bigint(n) => Some(Some(*n)),
+            Value::Null => Some(None),
+            _ => None,
+        };
+        let ts = |v: &Value| match v {
+            Value::Timestamp(t) => Some(Some(*t)),
+            Value::Date(d) => Some(Some(i64::from(*d) * 86_400_000_000)),
+            Value::Null => Some(None),
+            _ => None,
+        };
+        let usage = || {
+            PinkDbError::Type(format!(
+                "{lower}() takes (stop), (start, stop) or (start, stop, step) as BIGINT, \
+                 or (start, stop, step) as TIMESTAMP, TIMESTAMP, INTERVAL"
+            ))
+        };
+        let series = match values.as_slice() {
+            [stop] => Series::Int(int(stop).ok_or_else(usage)?.map(|s| (0, s, 1))),
+            [start, stop] => {
+                let (a, b) = (int(start).ok_or_else(usage)?, int(stop).ok_or_else(usage)?);
+                Series::Int(a.zip(b).map(|(a, b)| (a, b, 1)))
+            }
+            [start, stop, step] if int(start).is_some() => {
+                let (a, b, c) = (
+                    int(start).ok_or_else(usage)?,
+                    int(stop).ok_or_else(usage)?,
+                    int(step).ok_or_else(usage)?,
+                );
+                if c == Some(0) {
+                    return Err(PinkDbError::Execution("interval cannot be 0!".to_string()));
+                }
+                Series::Int(a.zip(b).zip(c).map(|((a, b), c)| (a, b, c)))
+            }
+            [start, stop, step] => {
+                let (a, b) = (ts(start).ok_or_else(usage)?, ts(stop).ok_or_else(usage)?);
+                let c = match step {
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => Some(crate::types::Interval {
+                        months: *months,
+                        days: *days,
+                        micros: *micros,
+                    }),
+                    Value::Null => None,
+                    _ => return Err(usage()),
+                };
+                if let Some(iv) = c {
+                    let sign = |x: i64| x.signum();
+                    let signs = [
+                        sign(i64::from(iv.months)),
+                        sign(i64::from(iv.days)),
+                        sign(iv.micros),
+                    ];
+                    if signs.iter().all(|s| *s == 0) {
+                        return Err(PinkDbError::Execution("interval cannot be 0!".to_string()));
+                    }
+                    if signs.contains(&1) && signs.contains(&-1) {
+                        return Err(PinkDbError::Execution(
+                            "Interval with mix of negative/positive entries not supported"
+                                .to_string(),
+                        ));
+                    }
+                }
+                Series::Timestamp(a.zip(b).zip(c).map(|((a, b), c)| (a, b, c)))
+            }
+            _ => return Err(usage()),
+        };
+        Ok(Some((lower, inclusive, series)))
+    }
+}
+
+impl TableSource for RangeSource {
+    fn name(&self) -> &str {
+        RANGE_SOURCE
+    }
+
+    fn bind(&self, call: &TableFunctionCall) -> Result<Option<Vec<(String, DataType)>>> {
+        Ok(Self::parse(call)?.map(|(name, _, series)| {
+            let dtype = match series {
+                Series::Int(_) => DataType::Bigint,
+                Series::Timestamp(_) => DataType::Timestamp,
+            };
+            vec![(name, dtype)]
+        }))
+    }
+
+    fn scan(
+        &self,
+        call: &TableFunctionCall,
+        _projection: Option<&[usize]>,
+        _filters: &[PrunePredicate],
+    ) -> Result<TableScanOutput> {
+        use crate::types::PinkDbError;
+        use crate::vector::{CHUNK_SIZE, Vector};
+        let Some((name, inclusive, series)) = Self::parse(call)? else {
+            return Err(PinkDbError::Execution(
+                "range() was bound to another call".to_string(),
+            ));
+        };
+        let mut chunks = Vec::new();
+        let mut flush = |vector: Vector| {
+            let num_rows = vector.len();
+            if num_rows > 0 {
+                chunks.push(DataChunk {
+                    columns: vec![Arc::new(vector)],
+                    num_rows,
+                });
+            }
+        };
+        // Whether `cur` is still inside the series running toward `stop`.
+        let inside = |cur: i64, stop: i64, up: bool| match (up, inclusive) {
+            (true, false) => cur < stop,
+            (true, true) => cur <= stop,
+            (false, false) => cur > stop,
+            (false, true) => cur >= stop,
+        };
+        match series {
+            Series::Int(None) | Series::Timestamp(None) => {}
+            Series::Int(Some((start, stop, step))) => {
+                let mut out = Vector::with_capacity(DataType::Bigint, CHUNK_SIZE);
+                let mut cur = Some(start);
+                while let Some(v) = cur.filter(|v| inside(*v, stop, step > 0)) {
+                    out.push_valid(Value::Bigint(v))?;
+                    if out.len() == CHUNK_SIZE {
+                        flush(std::mem::replace(
+                            &mut out,
+                            Vector::with_capacity(DataType::Bigint, CHUNK_SIZE),
+                        ));
+                    }
+                    cur = v.checked_add(step);
+                }
+                flush(out);
+            }
+            Series::Timestamp(Some((start, stop, step))) => {
+                let up = step.months > 0 || step.days > 0 || step.micros > 0;
+                let mut out = Vector::with_capacity(DataType::Timestamp, CHUNK_SIZE);
+                let mut cur = Some(start);
+                while let Some(v) = cur.filter(|v| inside(*v, stop, up)) {
+                    out.push_valid(Value::Timestamp(v))?;
+                    if out.len() == CHUNK_SIZE {
+                        flush(std::mem::replace(
+                            &mut out,
+                            Vector::with_capacity(DataType::Timestamp, CHUNK_SIZE),
+                        ));
+                    }
+                    cur = crate::types::timestamp_add_interval(v, step);
+                }
+                flush(out);
+            }
+        }
+        let _ = name;
+        Ok(TableScanOutput {
+            chunks,
+            files: 0,
+            row_groups: 0,
+            row_groups_pruned: 0,
+            columns_decoded: 0,
+        })
     }
 }

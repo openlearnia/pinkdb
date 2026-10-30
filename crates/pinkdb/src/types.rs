@@ -572,6 +572,13 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     Some(days * 86_400_000_000 + h * 3_600_000_000 + mi * 60_000_000 + sec * 1_000_000 + micros)
 }
 
+/// [`parse_timestamp`], plus a date-only text read as midnight: DuckDB's rule
+/// for a `TIMESTAMP '2026-01-01'` literal and a VARCHAR → TIMESTAMP cast. CSV
+/// sniffing keeps the strict form, so a date column still sniffs as DATE.
+pub fn parse_timestamp_or_date(s: &str) -> Option<i64> {
+    parse_timestamp(s).or_else(|| parse_date(s).map(|d| i64::from(d) * 86_400_000_000))
+}
+
 /// `YYYY-MM-DDTHH:MM:SS[.ffffff]Z` → microseconds since the Unix epoch: the
 /// ISO-8601 UTC form pink-lake manifests store as `updated` (millisecond
 /// precision). A missing fraction and up to 6 fractional digits are accepted;

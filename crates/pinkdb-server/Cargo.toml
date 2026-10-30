@@ -7,7 +7,15 @@ description = "pinkdb network server: TCP server + blocking client for the pinkd
 license = "MIT"
 
 [features]
-default = []
+# The core scalar extensions the CLI links too (json, datetime, math, string):
+# published before the store opens and loaded into it, so a client gets
+# DuckDB's `json_*`, date, math and string functions without a `LOAD
+# EXTENSION`. `--no-default-features` builds the lean server without them.
+default = ["json", "datetime", "math", "string"]
+json = ["dep:pinkdb-json"]
+datetime = ["dep:pinkdb-datetime"]
+math = ["dep:pinkdb-math"]
+string = ["dep:pinkdb-ext-string"]
 # Opt-in async transport (wave 47): a tokio-based listener that speaks the
 # same framed protocol (v8) and drives the same blocking engine calls through
 # `spawn_blocking`, so existing clients work unchanged. This is the documented
@@ -64,6 +72,10 @@ path = "src/bin/pinkdb-server.rs"
 [dependencies]
 pinkdb = { path = "../pinkdb" }
 # Opt-in full-text search (wave 108a): the BM25 package.
+pinkdb-json = { path = "../../extensions/json", optional = true }
+pinkdb-datetime = { path = "../../extensions/datetime", optional = true }
+pinkdb-math = { path = "../../extensions/math", optional = true }
+pinkdb-ext-string = { path = "../../extensions/string", optional = true }
 pinkdb-fts = { path = "../../extensions/fts", optional = true }
 # Opt-in embeddings (wave 107c): the `embed(text)` package.
 pinkdb-embeddings = { path = "../../extensions/embeddings", optional = true }

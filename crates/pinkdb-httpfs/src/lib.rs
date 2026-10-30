@@ -74,7 +74,9 @@
 //!
 //! - One object per read: no globs, no directory listing (the S3 client has
 //!   the operations; [`Fetcher`] does not expose them).
-//! - No compression, no gzip, no `COPY TO s3://` (follow-ups).
+//! - Gzip is the only compression `read_csv` reads (`compression = 'gzip'`
+//!   or a `.gz` path), and a compressed object is fetched whole rather than
+//!   streamed in windows. No `COPY TO s3://` (a follow-up).
 //! - `read_csv` is the default DuckDB dialect only (comma, double quote,
 //!   header row, UTF-8); the option parser is the extension point wave 76
 //!   fills in.

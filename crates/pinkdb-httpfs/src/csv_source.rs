@@ -63,12 +63,55 @@ pub struct Call {
     /// The local path or remote URL, as written.
     pub path: String,
     pub options: CsvOptions,
+    /// Whether the file is gzip-compressed: `compression = 'gzip'`, or
+    /// `'auto'` (the default) and a `.gz` path — DuckDB's rule.
+    pub gzip: bool,
 }
 
 impl Call {
-    fn cache_key(&self) -> String {
-        format!("{}|{:?}", self.path, self.options)
+    fn new(path: String, options: CsvOptions, compression: Option<&str>) -> Result<Self> {
+        let gzip = match compression.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("auto" | "infer") => is_gzip_path(&path),
+            Some("gzip") => true,
+            Some("none" | "uncompressed") => false,
+            Some(other) => {
+                return Err(PinkDbError::Parameter(format!(
+                    "CSV compression `{other}` is not supported: use auto, gzip or none"
+                )));
+            }
+        };
+        Ok(Self {
+            path,
+            options,
+            gzip,
+        })
     }
+
+    fn cache_key(&self) -> String {
+        format!("{}|{:?}|{}", self.path, self.options, self.gzip)
+    }
+}
+
+/// Whether a path names a gzip file (`.gz`, before any URL query).
+fn is_gzip_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(&lower)
+        .ends_with(".gz")
+}
+
+/// The decompressed bytes of a whole gzip file (every member, like `zcat`).
+fn gunzip(path: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(bytes)
+        .read_to_end(&mut out)
+        .map_err(|e| {
+            PinkDbError::Execution(format!("cannot decompress \"{path}\" as gzip: {e}"))
+        })?;
+    Ok(out)
 }
 
 /// Whether the replacement scan claims `path` (see the module docs).
@@ -80,12 +123,12 @@ pub fn claims_path(path: &str) -> bool {
             .map(|(_, rest)| rest)
             .unwrap_or(&lower);
         let path_part = rest.split(['?', '#']).next().unwrap_or(rest);
-        return path_part.ends_with(".csv");
+        return path_part.ends_with(".csv") || path_part.ends_with(".csv.gz");
     }
     if lower.contains("://") {
         return false;
     }
-    lower.ends_with(".csv")
+    lower.ends_with(".csv") || lower.ends_with(".csv.gz")
 }
 
 /// Parse a table-function call into a [`Call`], or `None` when this source
@@ -95,10 +138,7 @@ pub fn parse_call(call: &TableFunctionCall) -> Result<Option<Call>> {
     match call {
         TableFunctionCall::Path(path) => {
             if claims_path(path) {
-                Ok(Some(Call {
-                    path: path.clone(),
-                    options: CsvOptions::default(),
-                }))
+                Ok(Some(Call::new(path.clone(), CsvOptions::default(), None)?))
             } else {
                 Ok(None)
             }
@@ -106,7 +146,12 @@ pub fn parse_call(call: &TableFunctionCall) -> Result<Option<Call>> {
         TableFunctionCall::Function { name, args } if name.eq_ignore_ascii_case("read_csv") => {
             let path = positional_path(args)?;
             let options = parse_options(args)?;
-            Ok(Some(Call { path, options }))
+            let compression = args
+                .iter()
+                .find(|a| a.name_lower().as_deref() == Some("compression"))
+                .map(|a| option_text(a, "compression"))
+                .transpose()?;
+            Ok(Some(Call::new(path, options, compression.as_deref())?))
         }
         _ => Ok(None),
     }
@@ -143,6 +188,10 @@ fn parse_options(args: &[TableFunctionArg]) -> Result<CsvOptions> {
         let Some(name) = arg.name_lower() else {
             continue;
         };
+        // The file's compression is the source's business, not the parser's.
+        if name == "compression" {
+            continue;
+        }
         options.apply(&name, &option_text(arg, &name)?)?;
     }
     Ok(options)
@@ -236,9 +285,21 @@ impl CsvSource {
     /// file is always read whole (there is no window to bound).
     fn load(&self, call: &Call) -> Result<(Body, CsvSchema)> {
         if !is_remote(&call.path) {
-            let bytes = std::fs::read(&call.path).map_err(|e| {
+            let mut bytes = std::fs::read(&call.path).map_err(|e| {
                 PinkDbError::Execution(format!("cannot read CSV \"{}\": {e}", call.path))
             })?;
+            if call.gzip {
+                bytes = gunzip(&call.path, &bytes)?;
+            }
+            let schema = sniff_csv(&bytes, &call.options)?;
+            return Ok((Body::Whole(bytes), schema));
+        }
+        // A compressed object has no byte ranges to stream: fetch it whole.
+        if call.gzip {
+            let raw = self.open(&call.path)?.fetch().map_err(|e| {
+                PinkDbError::Execution(format!("cannot read \"{}\": {e}", call.path))
+            })?;
+            let bytes = gunzip(&call.path, &raw)?;
             let schema = sniff_csv(&bytes, &call.options)?;
             return Ok((Body::Whole(bytes), schema));
         }

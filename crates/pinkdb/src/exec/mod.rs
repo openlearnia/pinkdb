@@ -1036,6 +1036,20 @@ impl<'a> Cx<'a> {
 
 /// The database a DDL/DML plan targets: its binder-resolved qualifier, else
 /// the store's current database (the embedded session's).
+/// `CREATE OR REPLACE TABLE`: drop the existing table (if any) right before
+/// the new one is created. Its grants stay: replacing is how a pipeline
+/// rebuilds the same table, and losing access on every rebuild would be a
+/// surprise (a plain `DROP TABLE` does remove them).
+fn replace_table(db: &mut PinkDb, target: &str, name: &str) -> Result<()> {
+    if let Some(err) = db.attached_read_only(target, name) {
+        return Err(err);
+    }
+    if db.table_in(target, name).is_ok() {
+        db.drop_table_in(target, name)?;
+    }
+    Ok(())
+}
+
 fn resolve_db(db: &PinkDb, qdb: &Option<String>) -> String {
     qdb.clone().unwrap_or_else(|| db.current_db().to_string())
 }
@@ -1326,6 +1340,8 @@ pub(crate) fn run_plain(
             schema,
             constraints,
             if_not_exists,
+            or_replace,
+            defaults,
         } => {
             let target = resolve_db(db, qdb);
             // `IF NOT EXISTS`: an existing table makes the statement a no-op
@@ -1334,12 +1350,43 @@ pub(crate) fn run_plain(
             if *if_not_exists && db.table_in(&target, name).is_ok() {
                 return Ok(QueryResult::Created);
             }
+            // Evaluate every DEFAULT once, against an empty single-row chunk
+            // (like an INSERT cell), before anything changes.
+            let mut values = Vec::with_capacity(defaults.len());
+            for (default, (_, dtype)) in defaults.iter().zip(schema) {
+                values.push(match default {
+                    None => None,
+                    Some(expr) => {
+                        let single = DataChunk {
+                            columns: Vec::new(),
+                            num_rows: 1,
+                        };
+                        let cx = Cx::with_budget(db, budget.clone());
+                        let v = eval_expr(expr, &single, &cx)?;
+                        if v.len() != 1 {
+                            return Err(PinkDbError::Execution(
+                                "a column DEFAULT did not evaluate to one value".to_string(),
+                            ));
+                        }
+                        Some(DataTable::coerce(v.get(0), *dtype)?)
+                    }
+                });
+            }
+            if *or_replace {
+                replace_table(db, &target, name)?;
+            }
             db.create_table_with_constraints_in(
                 &target,
                 name,
                 schema.clone(),
                 constraints.clone(),
             )?;
+            if values.iter().any(Option::is_some) {
+                let t = db.table_mut_in(&target, name)?;
+                for (column, value) in t.columns.iter_mut().zip(values) {
+                    column.default = value;
+                }
+            }
             Ok(QueryResult::Created)
         }
         LogicalPlan::CreateTableAs {
@@ -1347,6 +1394,7 @@ pub(crate) fn run_plain(
             name,
             query,
             if_not_exists,
+            or_replace,
         } => {
             let target = resolve_db(db, qdb);
             if *if_not_exists && db.table_in(&target, name).is_ok() {
@@ -1375,6 +1423,9 @@ pub(crate) fn run_plain(
                     }
                     staged.push(values);
                 }
+            }
+            if *or_replace {
+                replace_table(db, &target, name)?;
             }
             db.create_table_in(&target, name, schema)?;
             let t = db.table_mut_in(&target, name)?;
@@ -1662,8 +1713,12 @@ pub(crate) fn run_plain(
             cols,
             query,
             source,
+            or_replace,
         } => {
             let target = resolve_db(db, qdb);
+            if *or_replace && db.view_in(&target, name).is_ok() {
+                db.drop_view_in(&target, name)?;
+            }
             // Validated at bind time; store the AST for per-use rebinding.
             db.create_view_in(&target, name, (**query).clone(), cols.clone())?;
             // Wave 96b: the catalog image rebuilds a view from its statement.
@@ -7052,10 +7107,7 @@ fn fused_join_aggregate(
                                             vecs[src.idx].v().get(row)
                                         })
                                         .collect(),
-                                    accs: aggs
-                                        .iter()
-                                        .map(|a| Acc::new(a.func, a.distinct, a.direct))
-                                        .collect(),
+                                    accs: aggs.iter().map(Acc::for_agg).collect(),
                                 },
                             ));
                             idx
@@ -8222,6 +8274,7 @@ fn explain_into(
             name,
             query,
             if_not_exists,
+            ..
         } => {
             children.push(query);
             let ine = if *if_not_exists { " IF NOT EXISTS" } else { "" };
@@ -8604,6 +8657,7 @@ fn explain_into(
                         AggFunc::PercentileCont => "percentile_cont".to_string(),
                         AggFunc::PercentileDisc => "percentile_disc".to_string(),
                         AggFunc::Mode => "mode".to_string(),
+                        AggFunc::StringAgg => "string_agg".to_string(),
                         func => format!("{func:?}").to_ascii_lowercase(),
                     };
                     match (&a.arg, a.direct) {
@@ -11596,10 +11650,12 @@ mod tests {
             .execute("INSERT INTO ins (p) SELECT x, z FROM wk;")
             .unwrap_err();
         assert!(err.to_string().contains("values for"), "{err}");
+        // A string that is not a number fails the INSERT's assignment cast
+        // (DuckDB's conversion error) at run time.
         let err = db
             .execute("INSERT INTO ins (p) SELECT z FROM wk;")
             .unwrap_err();
-        assert!(err.to_string().contains("cannot insert"), "{err}");
+        assert!(err.to_string().contains("cannot CAST"), "{err}");
         // A failed INSERT ... SELECT leaves the target untouched.
         assert_eq!(
             select(&mut db, "SELECT COUNT(*) FROM ins;"),
@@ -12553,10 +12609,11 @@ mod tests {
         db.execute("CREATE TABLE n (i INTEGER, g BIGINT, d DOUBLE);")
             .unwrap();
         db.execute("INSERT INTO n VALUES (1, 1, 1.0);").unwrap();
-        // Widening allowed.
+        // Widening allowed, and DuckDB's assignment casts: a narrowing
+        // numeric cast and a string that parses.
         assert_eq!(updated(&mut db, "UPDATE n SET g = i, d = g;"), 1);
-        // Narrowing / wrong types rejected, table untouched.
-        assert!(db.execute("UPDATE n SET i = g;").is_err());
+        assert_eq!(updated(&mut db, "UPDATE n SET i = g, g = '1';"), 1);
+        // A string that does not parse fails; table untouched.
         assert!(db.execute("UPDATE n SET i = 'x';").is_err());
         assert!(db.execute("UPDATE n SET missing = 1;").is_err());
         assert!(db.execute("UPDATE n SET i = 1, i = 2;").is_err());

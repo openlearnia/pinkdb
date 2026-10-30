@@ -67,10 +67,10 @@ statements=(
     "SELECT CASE WHEN COUNT(*) = 2 AND MIN(v) = 'cb' AND MAX(v) = 'zy' THEN 'insert ok' ELSE 'insert FAIL' END FROM t;"
 
     # Error paths: a bad group index, a refused option, and ABI v1 strict
-    # typing (no implicit INTEGER -> BIGINT cast).
+    # typing (a string is not cast to BIGINT).
     "SELECT regexp_extract('abc', 'a(b)c', 10, '');"
     "SELECT regexp_matches('a', 'a', 'g');"
-    "SELECT left('hello', 2);"
+    "SELECT left('hello', '2');"
 
     # SQL options with inline flags and an empty options string work.
     "SELECT CASE WHEN regexp_matches('abc', '(?i)ABC', '') THEN 'inline ok' ELSE 'inline FAIL' END;"
@@ -127,7 +127,7 @@ check_marker "inline regex flags"  "inline ok"
 # `cargo test -p pinkdb-ext-string`).
 check "group range refused"        "extension function regexp_extract() failed with code 1"
 check "'g' option refused"         "extension function regexp_matches() failed with code 1"
-check "strict typing refused"      "left argument 2 must be BIGINT, got INTEGER (use CAST)"
+check "strict typing refused"      "left argument 2 must be BIGINT, got VARCHAR (use CAST)"
 
 if [ "$failures" -ne 0 ]; then
     printf 'FAILED: %d of %d checks failed\n' "$failures" "$((checks + failures))" >&2

@@ -9,6 +9,38 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 129 — QuackLab's DuckDB dialect ✅
+
+pinkdb now runs every statement of QuackLab's golden fixtures that DuckDB
+runs (114 of 114, up from 56), given schemas and three-part names — those
+are their own wave.
+
+- **Fixed wrong results:** `COUNT(*) FILTER (WHERE c …)` over a subquery
+  whose only use of `c` is the filter failed with `column 0 out of range`.
+- **Stars:** `*`, `t.*` and `db.t.*` may sit anywhere in the SELECT list,
+  including a derived table's `s.*`, and take `EXCLUDE (…)`. A selected
+  `t.x` is named `x`, so a view or derived table over it exposes `x`.
+- **DDL:** column `DEFAULT` in `CREATE TABLE` (a constant, evaluated once);
+  `CREATE OR REPLACE TABLE` / `VIEW`. `CREATE TEMP TABLE` is refused with a
+  reason.
+- **DML:** `DELETE FROM t AS alias`; INSERT, UPDATE and MERGE apply DuckDB's
+  assignment casts (`'1.5'` into DOUBLE, `2.5` into VARCHAR, `2.4` into
+  BIGINT).
+- **Literals and clocks:** `TIMESTAMP '2026-01-01'`; `CURRENT_TIMESTAMP`,
+  `CURRENT_DATE`, `now()`, `today()` — one instant per transaction, recorded
+  in the WAL so a replay reads the same instant.
+- **Functions:** `string_agg`, `median`, `quantile_cont(x, p)` /
+  `quantile_disc(x, p)`, `contains`, `uuid()` / `gen_random_uuid()` (read
+  queries only), and the `range()` / `generate_series()` table functions
+  (integers, or timestamps by an interval). `PIVOT … ON … [IN (…)] [USING
+  …] [GROUP BY …]`, as a statement or a subquery.
+- **`read_csv`** takes `name = value` options and reads gzip files
+  (`compression = 'gzip'` or a `.gz` path).
+- **The `string` extension** (`split_part`, `regexp_*`, `starts_with`, …)
+  is linked into the CLI by default, and the server now links json,
+  datetime, math and string too. An INTEGER argument widens into an
+  extension's BIGINT parameter, so `split_part(s, ',', 1)` works.
+
 ### Wave 124c — databases and lakes in the console ✅
 
 - The Storage page lists every database with its storage (local, lake,

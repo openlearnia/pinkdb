@@ -193,6 +193,10 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             | BinaryOp::GtEq => eval_comparison(*op, left, right, chunk, cx),
             _ => eval_arith(*op, *dtype, left, right, chunk, cx),
         },
+        BoundExpr::Scalar {
+            func: ScalarFunc::Uuid,
+            ..
+        } => random_uuids(chunk.num_rows()),
         BoundExpr::Scalar { func, args, dtype } => {
             let mut vecs = Vec::with_capacity(args.len());
             for a in args {
@@ -2625,6 +2629,36 @@ fn decimal_scalar(func: ScalarFunc, dtype: DataType, v: &Value) -> Result<Option
     })
 }
 
+/// `n` random version-4 UUIDs in their canonical text form.
+#[cfg(not(target_arch = "wasm32"))]
+fn random_uuids(n: usize) -> Result<Vector> {
+    let mut bytes = vec![0u8; n * 16];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| PinkDbError::Execution(format!("cannot obtain randomness for uuid(): {e}")))?;
+    let mut out = Vector::new_empty(DataType::Varchar);
+    for raw in bytes.chunks_exact_mut(16) {
+        raw[6] = (raw[6] & 0x0f) | 0x40;
+        raw[8] = (raw[8] & 0x3f) | 0x80;
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        out.push_valid(Value::Varchar(format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )))?;
+    }
+    Ok(out)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn random_uuids(_n: usize) -> Result<Vector> {
+    Err(PinkDbError::Execution(
+        "uuid() needs OS randomness, which the wasm build has not".to_string(),
+    ))
+}
+
 fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vector> {
     let n = args.first().map(|v| v.len()).unwrap_or(0);
     for v in args {
@@ -3488,6 +3522,17 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
                 "like_escape of {s}, {pat} and {esc}"
             ))),
         },
+        ScalarFunc::Contains => match (&row[0], &row[1]) {
+            (Value::Varchar(s), Value::Varchar(search)) => {
+                Ok(Value::Boolean(s.contains(search.as_str())))
+            }
+            (s, search) => Err(PinkDbError::Execution(format!(
+                "contains of {s} and {search}"
+            ))),
+        },
+        ScalarFunc::Uuid => Err(PinkDbError::Execution(
+            "uuid() is evaluated per chunk".to_string(),
+        )),
         ScalarFunc::SimilarTo => match (&row[0], &row[1]) {
             (Value::Varchar(s), Value::Varchar(pat)) => {
                 Ok(Value::Boolean(crate::regex::full_match(pat, s)?))
@@ -4516,7 +4561,7 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         (Value::Varchar(s), DataType::Date) => crate::types::parse_date(s.trim())
             .map(Value::Date)
             .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS DATE"))),
-        (Value::Varchar(s), DataType::Timestamp) => crate::types::parse_timestamp(s.trim())
+        (Value::Varchar(s), DataType::Timestamp) => crate::types::parse_timestamp_or_date(s.trim())
             .map(Value::Timestamp)
             .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS TIMESTAMP"))),
         // Date ↔ timestamp. Microseconds since epoch overflow i64 for

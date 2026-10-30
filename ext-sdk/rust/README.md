@@ -197,14 +197,14 @@ registered argument/return types are *derived from the Rust types you write* —
 there is no separate metadata table to keep in sync.
 
 ABI v1 is strictly typed: the engine inserts **no implicit casts** for
-extension arguments, with one documented exception — a **numeric** argument
+extension arguments, with two documented exceptions — a **numeric** argument
 (INTEGER, BIGINT, DECIMAL) widens into a `DOUBLE` parameter, the implicit
-cast DuckDB applies to its math functions (`exp(1)`, `sqrt(4)`).
-`ext_rs_repeat('ab', 3)` is an error (`argument 2 must be BIGINT, got
-INTEGER (use CAST)`) because the literal is INTEGER and the parameter is
-BIGINT — write `CAST(3 AS BIGINT)`, or declare the parameter `i32`. A
-VARCHAR stays strict even for a `DOUBLE` parameter (`exp('1')` is an error;
-DuckDB parses the string — a documented divergence).
+cast DuckDB applies to its math functions (`exp(1)`, `sqrt(4)`), and an
+INTEGER widens into a `BIGINT` parameter (`ext_rs_repeat('ab', 3)` works).
+`ext_rs_repeat('ab', 1.5)` is an error (`argument 2 must be BIGINT, got
+DOUBLE (use CAST)`): a narrowing cast is never implicit. A VARCHAR stays
+strict even for a `DOUBLE` parameter (`exp('1')` is an error; DuckDB parses
+the string — a documented divergence).
 
 ### NULL handling is explicit
 

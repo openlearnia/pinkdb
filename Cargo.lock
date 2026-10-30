@@ -1666,6 +1666,7 @@ dependencies = [
  "pinkdb-datetime",
  "pinkdb-embeddings",
  "pinkdb-ext-loader",
+ "pinkdb-ext-string",
  "pinkdb-fts",
  "pinkdb-httpfs",
  "pinkdb-iceberg",
@@ -1757,6 +1758,7 @@ dependencies = [
 name = "pinkdb-httpfs"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "hmac 0.12.1",
  "pinkdb",
  "sha2 0.10.9",
@@ -1857,10 +1859,14 @@ dependencies = [
  "libc",
  "pink-lake",
  "pinkdb",
+ "pinkdb-datetime",
  "pinkdb-embeddings",
  "pinkdb-ext-loader",
+ "pinkdb-ext-string",
  "pinkdb-fts",
  "pinkdb-httpfs",
+ "pinkdb-json",
+ "pinkdb-math",
  "pinkdb-parquet",
  "pinkdb-server-ui",
  "pinkdb-vss",

@@ -572,24 +572,14 @@ QUERIES = [
 
 # ---- wave 53: core string extension (`extensions/string`) ----
 #
-# These probes need the loadable extension on the pinkdb side only; DuckDB
-# has the same functions built in. Build it first (`make -C extensions/string`,
-# or `cargo build --release -p pinkdb-ext-string --features abi-exports` — the
-# feature emits the ABI v1 symbols a cdylib needs; the default build is the
-# export-free rlib half), then the pinkdb side of
-# every probe is prefixed with `LOAD EXTENSION '<abs path>'` — engine-specific
-# setup outside the compared SQL, so both engines still run the SAME text.
+# The CLI's default `string` feature links the extension and loads it into
+# every store (the QuackLab dialect wave), like json, datetime and math, so the
+# probes need no setup; DuckDB has the same functions built in. The native
+# `LOAD EXTENSION '<path>'` route is pinned by `extensions/string/smoke.sh`.
 #
-# ABI v1 inserts no implicit casts for extension arguments, so BIGINT
-# parameters are spelled `CAST(n AS BIGINT)` (DuckDB accepts that too).
-STRING_EXT_SO = ".dylib" if sys.platform == "darwin" else ".so"
-STRING_EXT_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "target",
-    "release",
-    "libstring_ext" + STRING_EXT_SO,
-)
-STRING_EXT_SETUP = f"LOAD EXTENSION '{STRING_EXT_PATH}';"
+# The probes keep their `CAST(n AS BIGINT)` spellings from before the INTEGER
+# -> BIGINT widening; `str-integer-widening` covers the bare form.
+STRING_EXT_SETUP = ""
 
 # (label, sql, ordered, expect_error) — same shape as QUERIES.
 STRING_EXT_QUERIES = [
@@ -620,6 +610,7 @@ STRING_EXT_QUERIES = [
     ("str-where", "SELECT name FROM emp WHERE starts_with(name, 'a') OR strpos(name, 'ev') > 0 ORDER BY name;", True, False),
     ("str-group", "SELECT left(name, CAST(1 AS BIGINT)) AS initial, COUNT(*) FROM emp GROUP BY initial ORDER BY initial;", True, False),
     ("str-compose", "SELECT upper(reverse(name)) FROM emp ORDER BY 1;", True, False),
+    ("str-integer-widening", "SELECT left('hello', 2), right('hello', 2), split_part('a,b,c', ',', 3), split_part(name, 'a', 1) FROM emp ORDER BY id;", True, False),
     # ---- wave 54: core math extension (`extensions/math`) ----
     # The CLI's default `math` feature loads the extension into every store, so
     # `exp`/`ln`/`log`/... need no LOAD; `sqrt`/`pow`/`floor`/`ceil`/`sign`/
@@ -716,30 +707,11 @@ def run_small():
         print(f"reference: {version}")
     except (OSError, IndexError):
         pass
-    # Self-sufficient: CI (and fresh checkouts) have no extension built, and a
-    # stale artifact can predate the `abi-exports` feature — a cdylib built
-    # without it carries no ABI v1 symbols and `LOAD EXTENSION` refuses it
-    # (that is the wave-78 fix: linked-only rlibs stay export-free, only the
-    # shared-library build opts in). Build unconditionally: cargo no-ops when
-    # it is up to date.
-    print("building pinkdb-ext-string (release, `abi-exports`) ...")
-    subprocess.run(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "-p",
-            "pinkdb-ext-string",
-            "--features",
-            "abi-exports",
-        ],
-        check=True,
-    )
-    if not os.path.exists(STRING_EXT_PATH):
-        raise SystemExit(f"string extension still missing at {STRING_EXT_PATH}")
     for label, sql, ordered, expect_error in QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in DML_QUERIES:
+        run_case(label, sql, ordered, expect_error, SETUP)
+    for label, sql, ordered, expect_error in DIALECT_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in STRING_EXT_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP + "\n" + STRING_EXT_SETUP)
@@ -1035,6 +1007,56 @@ DML_QUERIES = [
     ("dml-pk-null", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (NULL,10); SELECT * FROM oc;", True, True),
 ]
 
+# ---- QuackLab dialect wave: the constructs QuackLab's generated SQL uses ----
+#
+# Each case builds what it needs (the shared SETUP's tables stay untouched)
+# and ends in a SELECT. Clock and uuid values differ between engines, so those
+# probes compare relations of them, never the values.
+DIALECT_QUERIES = [
+    ("dialect-filter-only-column", "SELECT COUNT(*) FILTER (WHERE a IS NULL), COUNT(*) FILTER (WHERE a = 1) FROM (SELECT 1 AS a) s;", False, False),
+    ("dialect-filter-only-column-grouped", "SELECT did, COUNT(*) FILTER (WHERE salary IS NULL) FROM (SELECT did, salary FROM emp) s GROUP BY did ORDER BY did;", True, False),
+    ("dialect-derived-star-mid-list", "SELECT 'x' AS t, s.* FROM (SELECT 1 AS a, 'b' AS b) s;", False, False),
+    ("dialect-star-anywhere", "SELECT id AS k, *, id + 1 AS n FROM emp WHERE id < 3 ORDER BY id;", True, False),
+    ("dialect-star-exclude", "SELECT * EXCLUDE (salary, hired) FROM emp ORDER BY id;", True, False),
+    ("dialect-qualified-star-exclude", "SELECT d.* EXCLUDE dname, e.name FROM emp e JOIN dept d ON e.did = d.did ORDER BY e.name;", True, False),
+    ("dialect-star-exclude-missing", "SELECT * EXCLUDE (nope) FROM emp;", False, True),
+    ("dialect-validation-union", "SELECT 'emp' AS table_name, checks.* FROM (SELECT 'row_count' AS check_name, CASE WHEN COUNT(*) > 0 THEN 'pass' ELSE 'fail' END AS result, COUNT(*) AS count FROM emp UNION ALL SELECT 'not_null:did', CASE WHEN COUNT(*) FILTER (WHERE did IS NULL) = 0 THEN 'pass' ELSE 'fail' END, COUNT(*) FILTER (WHERE did IS NULL) FROM emp) AS checks ORDER BY check_name;", True, False),
+    ("dialect-qualified-column-name", "SELECT x FROM (SELECT jx.x FROM jx) s ORDER BY x;", True, False),
+    ("dialect-column-default", "CREATE TABLE dd (a INTEGER DEFAULT 7, b VARCHAR DEFAULT 'x' NOT NULL, c INTEGER); INSERT INTO dd (c) VALUES (1); INSERT INTO dd VALUES (2, 'y', 3); SELECT * FROM dd ORDER BY c;", True, False),
+    ("dialect-delete-alias", "CREATE TABLE m (k INTEGER, v INTEGER); INSERT INTO m VALUES (1, 10), (2, 20), (3, 30); CREATE TABLE inc (k INTEGER); INSERT INTO inc VALUES (2), (3); DELETE FROM m AS target WHERE EXISTS (SELECT 1 FROM inc AS incoming WHERE incoming.k = target.k); SELECT * FROM m;", False, False),
+    ("dialect-insert-string-to-number", "CREATE TABLE n (d DOUBLE, b BIGINT, i INTEGER); INSERT INTO n VALUES ('1.5', '7', '3'); INSERT INTO n SELECT '2.25', '8', '-4'; SELECT * FROM n ORDER BY d;", True, False),
+    ("dialect-insert-number-to-string", "CREATE TABLE sv (v VARCHAR, w VARCHAR); INSERT INTO sv SELECT 2.5, 3; INSERT INTO sv VALUES (7, DATE '2024-01-02'); SELECT * FROM sv ORDER BY v;", True, False),
+    ("dialect-insert-narrowing", "CREATE TABLE nb (b BIGINT, i INTEGER); INSERT INTO nb VALUES (2.4, CAST(5 AS BIGINT)); SELECT * FROM nb;", False, False),
+    ("dialect-insert-bad-string", "CREATE TABLE nx (d DOUBLE); INSERT INTO nx VALUES ('abc'); SELECT * FROM nx;", False, True),
+    ("dialect-timestamp-date-only", "SELECT TIMESTAMP '2026-01-01', CAST('2026-01-02' AS TIMESTAMP), TIMESTAMP '2026-01-01' < TIMESTAMP '2026-01-01 00:00:01';", False, False),
+    ("dialect-clock-keywords", "SELECT CURRENT_TIMESTAMP = now(), current_date = CAST(now() AS DATE), now() > TIMESTAMP '2026-01-01', typeof(current_date);", False, False),
+    ("dialect-clock-in-writes", "CREATE TABLE bs (id VARCHAR, started TIMESTAMP, done TIMESTAMP); INSERT INTO bs VALUES ('b1', CURRENT_TIMESTAMP, NULL); UPDATE bs SET done = CURRENT_TIMESTAMP WHERE id = 'b1'; SELECT id, started IS NOT NULL, done >= started FROM bs;", False, False),
+    ("dialect-create-or-replace-table-as", "CREATE TABLE r AS SELECT 1 AS a; CREATE OR REPLACE TABLE r AS SELECT a + 1 AS a FROM r; SELECT * FROM r;", False, False),
+    ("dialect-create-or-replace-table", "CREATE TABLE r2 (a INTEGER); INSERT INTO r2 VALUES (1); CREATE OR REPLACE TABLE r2 (b VARCHAR); INSERT INTO r2 VALUES ('x'); SELECT * FROM r2;", False, False),
+    ("dialect-create-or-replace-view", "CREATE VIEW rv AS SELECT 1 AS a; CREATE OR REPLACE VIEW rv AS SELECT 2 AS a; SELECT * FROM rv;", False, False),
+    ("dialect-string-agg", "SELECT did, string_agg(name, '-') FROM (SELECT did, name FROM emp WHERE id IN (1, 2, 3)) s GROUP BY did ORDER BY did;", True, False),
+    ("dialect-string-agg-default-sep", "SELECT length(string_agg(name)), string_agg(name) FILTER (WHERE id = 1), string_agg(NULL) FROM emp;", False, False),
+    ("dialect-median", "SELECT median(salary), median(id), median(name) FROM emp;", False, False),
+    ("dialect-median-grouped", "SELECT did, median(salary) FROM emp GROUP BY did ORDER BY did;", True, False),
+    ("dialect-quantile", "SELECT quantile_cont(salary, 0.25), quantile_disc(id, 0.5) FROM emp;", False, False),
+    ("dialect-contains", "SELECT contains('hello', 'ell'), contains('hello', 'z'), contains(name, 'a') FROM emp ORDER BY id;", True, False),
+    ("dialect-uuid", "SELECT length(CAST(uuid() AS VARCHAR)), CAST(gen_random_uuid() AS VARCHAR) LIKE '________-____-4___-____-____________', count(DISTINCT CAST(uuid() AS VARCHAR)) FROM range(5);", False, False),
+    ("dialect-range", "SELECT * FROM range(3);", True, False),
+    ("dialect-range-step", "SELECT * FROM range(10, 1, -3);", True, False),
+    ("dialect-range-null", "SELECT count(*) FROM range(NULL);", False, False),
+    ("dialect-generate-series", "SELECT count(*), sum(generate_series) FROM generate_series(1, 100, 7);", False, False),
+    ("dialect-generate-series-one-arg", "SELECT * FROM generate_series(3);", True, False),
+    ("dialect-generate-series-timestamps", "SELECT * FROM generate_series(DATE '2020-01-31', DATE '2020-04-30', INTERVAL '1 month');", True, False),
+    ("dialect-range-alias", "SELECT x * 2 FROM range(2, 5) t(x) ORDER BY x;", True, False),
+    ("dialect-range-zero-step", "SELECT * FROM range(1, 2, 0);", False, True),
+    ("dialect-pivot", "SELECT * FROM (PIVOT emp ON did USING sum(salary) GROUP BY active) p ORDER BY active;", True, False),
+    ("dialect-pivot-in-list", "SELECT * FROM (PIVOT pn ON k IN (1, 3, 9) USING sum(v)) p;", False, False),
+    ("dialect-pivot-default-group", "CREATE TABLE pv AS SELECT * FROM (VALUES ('x','a',1),('x','b',2),('y','a',3),('y','a',4)) v(g,c,n); SELECT * FROM (PIVOT pv ON c) p ORDER BY g, n;", True, False),
+    ("dialect-pivot-multi-agg", "CREATE TABLE pv AS SELECT * FROM (VALUES ('x','a',1),('x','b',2),('y','a',3),('y','a',4)) v(g,c,n); SELECT * FROM (PIVOT pv ON c USING sum(n) AS s, max(n) AS m GROUP BY g) p ORDER BY g;", True, False),
+    ("dialect-split-part", "SELECT split_part('a,b,c', ',', 2), starts_with('abc', 'a'), ends_with('abc', 'bc'), reverse('abc');", False, False),
+]
+
+
 def run_case(label, sql, ordered, expect_error, setup, duck_setup=SETUP):
     """`setup` is pinkdb's; DuckDB runs `duck_setup` (the shared SETUP unless
     the battery's extra tables are plain SQL both engines accept)."""
@@ -1184,6 +1206,12 @@ CSV_PROBES = [
     ("csv-date-minmax", "SELECT COUNT(*), MIN(day), MAX(day), COUNT(day) FROM read_csv('{f}');", False),
     ("csv-replacement-scan", "SELECT COUNT(*) FROM '{f}';", False),
     ("csv-bool-where", "SELECT COUNT(*) FROM read_csv('{f}') WHERE active;", False),
+    # QuackLab dialect wave: `=` named arguments and gzip input (`{gz}` is the
+    # same body gzip-compressed, read by option and by its `.gz` suffix).
+    ("csv-eq-named-args", "SELECT * FROM read_csv('{f}', header=true, delim=',') ORDER BY id;", True),
+    ("csv-gzip-option", "SELECT * FROM read_csv('{gz}', compression='gzip', header=true, delim=',') ORDER BY id;", True),
+    ("csv-gzip-suffix", "SELECT COUNT(*), SUM(total) FROM read_csv('{gz}');", False),
+    ("csv-insert-select-casts", "CREATE TABLE st (id VARCHAR, total DOUBLE); INSERT INTO st SELECT id, total FROM read_csv('{gz}', compression='gzip', header=true); SELECT * FROM st ORDER BY id;", True),
 ]
 
 
@@ -1205,9 +1233,13 @@ def run_csv():
     path = os.path.join(directory, "probe.csv")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(CSV_BODY)
+    import gzip
+    gz_path = os.path.join(directory, "probe.csv.gz")
+    with gzip.open(gz_path, "wt", encoding="utf-8") as fh:
+        fh.write(CSV_BODY)
     try:
         for label, template, ordered in CSV_PROBES:
-            sql = template.replace("{f}", path)
+            sql = template.replace("{f}", path).replace("{gz}", gz_path)
             got = pink_query("", sql)
             if got[0] == "error":
                 check(label, False, f"pinkdb error: {got[1]}")

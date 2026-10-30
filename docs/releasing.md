@@ -43,8 +43,8 @@ CLI assets:
 
 | variant | cargo features | what it adds |
 | --- | --- | --- |
-| `default` | default (`json`, `datetime`, `math`) | REPL, CSV, `.pink` + WAL, built-in functions |
-| `lean` | `--no-default-features` | no linked json/datetime/math extensions |
+| `default` | default (`json`, `datetime`, `math`, `string`) | REPL, CSV, `.pink` + WAL, built-in functions |
+| `lean` | `--no-default-features` | no linked json/datetime/math/string extensions |
 | `pinklake` | `pinklake` | `.lake` over `.pink` data files |
 | `pinklake-s3` | `pinklake,s3` | pinklake + `s3://` storage |
 | `repo` | `repo` | SQL `INSTALL`/`LOAD <name>` and the `.install`/`.repositories`/`.installed` dot-commands (native only; adds the HTTPS client and the Ed25519 catalog verifier) |
@@ -53,7 +53,7 @@ Server assets:
 
 | variant | cargo features |
 | --- | --- |
-| `default` | default (blocking transport) |
+| `default` | default (blocking transport; json, datetime, math and string linked) |
 | `async-server` | `async-server` (tokio transport) |
 | `tls` | `tls` (rustls; sync transport only) |
 

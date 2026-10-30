@@ -20,6 +20,9 @@ pinkdb = { path = "../pinkdb" }
 # Blocking HTTP over rustls. No async runtime, no aws-sdk. One connection
 # pool per client.
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# `read_csv(…, compression = 'gzip')` and `.csv.gz` files: the pure-Rust
+# backend (miniz_oxide), the same flate2 the parquet and iceberg readers use.
+flate2 = "1"
 # SigV4 (`s3` feature): HMAC-SHA256 only.
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }

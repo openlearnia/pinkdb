@@ -9,15 +9,15 @@ name = "pinkdb"
 path = "src/main.rs"
 
 [features]
-# Default build: the first-party **json** (wave 52), **datetime** (wave 56) and
-# **math** (wave 54) extensions are linked and published in the linked registry
-# at startup, then loaded into every store the session opens, so `json_*`, the
-# datetime functions and `exp`/`log`/`random` work out of the box (the DuckDB
-# behavior). `--no-default-features` produces the lean binary without them.
+# Default build: the first-party **json** (wave 52), **datetime** (wave 56),
+# **math** (wave 54) and **string** (wave 53) extensions are linked and
+# published in the linked registry at startup, then loaded into every store the
+# session opens, so `json_*`, the datetime functions, `exp`/`log`/`random` and
+# `split_part`/`regexp_matches`/… work out of the box (the DuckDB behavior). `--no-default-features` produces the lean binary without them.
 # Like every extension each costs a `LOAD EXTENSION` prefix in the WAL of the
 # statements that call it, and a durable store replayed by a build without the
 # feature refuses those records instead of dropping them.
-default = ["json", "datetime", "math"]
+default = ["json", "datetime", "math", "string"]
 # Core json extension: `pinkdb-json` (JSON as VARCHAR in v1).
 json = ["dep:pinkdb-json"]
 # Core datetime extension: `pinkdb-datetime` (strftime, strptime, epoch,
@@ -25,6 +25,9 @@ json = ["dep:pinkdb-json"]
 datetime = ["dep:pinkdb-datetime"]
 # Core math extension: `pinkdb-math` (exp/ln/log, trigonometry, random()).
 math = ["dep:pinkdb-math"]
+# Core string extension: `pinkdb-ext-string` (split_part, reverse, left/right,
+# strpos, starts_with/ends_with, regexp_extract/regexp_matches).
+string = ["dep:pinkdb-ext-string"]
 # Opt-in full-text search (wave 108a): BM25 indexes with DuckDB's fts
 # surface (`CALL create_fts_index`, `match_bm25`, `stem`, `rrf`). Off by
 # default: it is the first extension that needs engine hooks beyond scalars
@@ -159,6 +162,9 @@ pinkdb-datetime = { path = "../../extensions/datetime", optional = true }
 # and the volatile random(), through the Rust extension SDK. Zero external
 # crates — `std`'s `f64` math and a hand-rolled PRNG.
 pinkdb-math = { path = "../../extensions/math", optional = true }
+# Core string extension (default feature): DuckDB's string functions the
+# engine does not build in. Links the `regex` crate (RE2-style, linear time).
+pinkdb-ext-string = { path = "../../extensions/string", optional = true }
 # Opt-in full-text search (wave 108a): the `pinkdb-fts` package — BM25
 # scoring, the Porter stemmer, the tokenizer, and the index tables it writes
 # through the engine's host hooks.

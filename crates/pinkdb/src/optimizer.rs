@@ -267,6 +267,8 @@ fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
                     matches!(a.func, crate::sql::binder::AggFunc::Count)
                         && a.arg.is_none()
                         && !a.distinct
+                        // `COUNT(*) FILTER (WHERE c …)` reads `c`.
+                        && a.filter.is_none()
                 });
             let new_input = if is_count_star_only {
                 // COUNT(*) ignores its input's columns and row order, so any
@@ -571,6 +573,7 @@ fn fold_aggs(
     aggs.into_iter()
         .map(|mut a| {
             a.arg = a.arg.map(|e| fold_expr(cx, e));
+            a.filter = a.filter.map(|e| fold_expr(cx, e));
             a
         })
         .collect()
@@ -742,11 +745,13 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             name,
             query,
             if_not_exists,
+            or_replace,
         } => LogicalPlan::CreateTableAs {
             db: qdb,
             name,
             query: Box::new(fold_plan(db, *query)),
             if_not_exists,
+            or_replace,
         },
         leaf => leaf,
     }
@@ -3345,11 +3350,13 @@ fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> Lo
             name,
             query,
             if_not_exists,
+            or_replace,
         } => LogicalPlan::CreateTableAs {
             db,
             name,
             query: Box::new(pushdown_inner(*query, pdb)),
             if_not_exists,
+            or_replace,
         },
         LogicalPlan::Explain { plan } => LogicalPlan::Explain {
             plan: Box::new(pushdown_inner(*plan, pdb)),
@@ -3852,7 +3859,7 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
                         m.mark_expr(k);
                     }
                     for a in &aggs {
-                        if let Some(e) = &a.arg {
+                        for e in a.arg.iter().chain(a.filter.iter()) {
                             m.mark_expr(e);
                         }
                     }
@@ -3965,11 +3972,13 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
             name,
             query,
             if_not_exists,
+            or_replace,
         } => LogicalPlan::CreateTableAs {
             db: qdb,
             name,
             query: Box::new(elim(db, *query, &Live::All)),
             if_not_exists,
+            or_replace,
         },
         LogicalPlan::Explain { plan } => LogicalPlan::Explain {
             plan: Box::new(elim(db, *plan, &Live::All)),
@@ -4630,6 +4639,7 @@ mod tests {
             distinct: false,
             filter: None,
             direct: None,
+            separator: None,
         }
     }
 

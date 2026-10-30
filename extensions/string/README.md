@@ -62,11 +62,11 @@ functions cannot shadow a built-in, so a re-registration here would make
    `regexp_matches(s, p, '')` (2-arg DuckDB form).
    The `regexp_match` pin is the exception: its one 2-argument form is the
    whole surface.
-2. **Strict typing: no implicit casts.** ABI v1 inserts no casts for
-   extension arguments, so a bare integer literal does **not** bind to a
-   `BIGINT` parameter: write `left(name, CAST(2 AS BIGINT))`. DuckDB widens
-   `2` automatically. (The engine's error names the fix: *argument 2 must be
-   BIGINT, got INTEGER (use CAST)*.)
+2. **Strict typing: few implicit casts.** ABI v1 widens an INTEGER into a
+   `BIGINT` parameter (`left(name, 2)`, like DuckDB) and any number into a
+   `DOUBLE` one, and inserts no other cast: `left(name, '2')` is an error
+   naming the fix (*argument 2 must be BIGINT, got VARCHAR (use CAST)*),
+   where DuckDB would parse the string.
 3. **No list type.** `regexp_matches` in *PostgreSQL* (and the roadmap's
    `regexp_match` sketch) returns an array of capture groups / matches.
    pinkdb's ABI v1 value model is `BOOLEAN | INTEGER | BIGINT | DOUBLE |

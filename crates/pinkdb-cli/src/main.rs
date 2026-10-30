@@ -122,13 +122,15 @@ const DISPLAY_CAP: usize = 10_000;
 /// Publish the linked extensions the CLI ships in the process-global
 /// registry — the host-bootstrap step `LOAD EXTENSION '<name>'` resolves
 /// against, on every target. With the default features those are
-/// `pinkdb-json`, `pinkdb-datetime` and `pinkdb-math`; the opt-in `arrow`
+/// `pinkdb-json`, `pinkdb-datetime`, `pinkdb-math` and `pinkdb-ext-string`;
+/// the opt-in `arrow`
 /// feature additionally registers the Arrow IPC **file format**
 /// process-wide, so every store created afterwards (including a durable
 /// reopen that replays a file-reading record) resolves `FROM 'x.arrow'`,
 /// `read_arrow` and `COPY … (FORMAT arrow)`. A host that uses the library
 /// instead does the same explicitly (`pinkdb_json::ensure_registered()`,
 /// `pinkdb_datetime::ensure_registered()`, `pinkdb_math::ensure_registered()`,
+/// `string_ext::ensure_registered()`,
 /// `pinkdb_arrow::ensure_registered()`).
 fn register_builtin_extensions() {
     // Wave 124: lake databases (`ATTACH 'lake:…'`, `CREATE DATABASE … (TYPE
@@ -148,6 +150,10 @@ fn register_builtin_extensions() {
     #[cfg(feature = "math")]
     if let Err(e) = pinkdb_math::ensure_registered() {
         eprintln!("warning: the math extension could not be registered: {e}");
+    }
+    #[cfg(feature = "string")]
+    if let Err(e) = string_ext::ensure_registered() {
+        eprintln!("warning: the string extension could not be registered: {e}");
     }
     #[cfg(feature = "fts")]
     if let Err(e) = pinkdb_fts::ensure_registered() {
@@ -205,6 +211,8 @@ fn load_builtin_extensions(#[allow(unused_variables)] db: &mut PinkDb) {
     load_builtin_extension(db, pinkdb_datetime::EXTENSION_NAME);
     #[cfg(feature = "math")]
     load_builtin_extension(db, pinkdb_math::EXTENSION_NAME);
+    #[cfg(feature = "string")]
+    load_builtin_extension(db, string_ext::EXTENSION_NAME);
     // fts is a package rather than a scalar extension: same rule, and a
     // replayed log that recorded its `LOAD EXTENSION` already loaded it.
     #[cfg(feature = "fts")]
@@ -229,7 +237,12 @@ fn load_builtin_extensions(#[allow(unused_variables)] db: &mut PinkDb) {
 
 /// Load one built-in extension by its registry name (shared by the feature
 /// blocks above; absent when no core-extension feature is built).
-#[cfg(any(feature = "json", feature = "datetime", feature = "math"))]
+#[cfg(any(
+    feature = "json",
+    feature = "datetime",
+    feature = "math",
+    feature = "string"
+))]
 fn load_builtin_extension(db: &mut PinkDb, name: &str) {
     if db.is_extension_loaded(name) {
         return;
@@ -639,6 +652,14 @@ fn print_help() {
             "MATH: the math functions (exp, log, sin, ..., random) are not built (rebuild with"
         );
         println!("      the `math` feature, or link `pinkdb-math` and register it).");
+    }
+    if cfg!(feature = "string") {
+        println!("STRING: split_part, reverse, left, right, strpos, starts_with, ends_with,");
+        println!("      regexp_extract, regexp_matches and regexp_match are built in and loaded");
+        println!("      into every store (`string` feature).");
+    } else {
+        println!("STRING: the string functions (split_part, regexp_*, ...) are not built");
+        println!("      (rebuild with the `string` feature, or link `pinkdb-ext-string`).");
     }
     if cfg!(feature = "arrow") {
         println!("ARROW: `FROM 'f.arrow'` / `read_arrow('f.arrow')` read an Arrow IPC file and");

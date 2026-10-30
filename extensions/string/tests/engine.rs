@@ -265,15 +265,22 @@ fn prepared_statements_bind_extension_arguments() {
         }
         other => panic!("{other:?}"),
     }
-    // An INTEGER parameter where ABI v1 declares BIGINT is a bind error
-    // naming the fix (strict typing: no implicit casts for extensions).
+    // An INTEGER parameter where ABI v1 declares BIGINT widens (DuckDB's
+    // implicit cast); a VARCHAR one is a bind error naming the fix.
     let stmt = db.prepare("SELECT left(?, ?);").unwrap();
-    let err = db
+    match db
         .execute_prepared(&stmt, &[text("hello"), Value::Integer(2)])
+        .unwrap()
+    {
+        QueryResult::Selected { rows, .. } => assert_eq!(rows, vec![vec![text("he")]]),
+        other => panic!("{other:?}"),
+    }
+    let err = db
+        .execute_prepared(&stmt, &[text("hello"), text("2")])
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("left argument 2 must be BIGINT, got INTEGER (use CAST)"),
+        err.contains("left argument 2 must be BIGINT, got VARCHAR (use CAST)"),
         "{err}"
     );
 }
@@ -322,16 +329,18 @@ fn re_registering_a_builtin_like_trim_is_refused_so_the_extension_omits_it() {
 }
 
 #[test]
-fn bare_integer_literals_need_an_explicit_cast() {
+fn integer_literals_widen_to_bigint_and_strings_stay_strict() {
     let mut db = test_db();
-    let err = error(&mut db, "SELECT left('hello', 2);");
-    assert!(
-        err.contains("left argument 2 must be BIGINT, got INTEGER (use CAST)"),
-        "{err}"
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT left('hello', 2), split_part('a,b', ',', 2);"
+        ),
+        vec![vec![text("he"), text("b")]]
     );
-    let err = error(&mut db, "SELECT split_part('a,b', ',', 3);");
+    let err = error(&mut db, "SELECT left('hello', '2');");
     assert!(
-        err.contains("split_part argument 3 must be BIGINT, got INTEGER (use CAST)"),
+        err.contains("left argument 2 must be BIGINT, got VARCHAR (use CAST)"),
         "{err}"
     );
     // Argument count is exact.

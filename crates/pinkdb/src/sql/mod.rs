@@ -387,6 +387,16 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                 } => {
                     work.push((NodeRef::Expr(e), child));
                 }
+                ast::Statement::CreateTable { items, .. } => {
+                    for item in items {
+                        if let ast::TableItem::Column(ast::ColumnDef {
+                            default: Some(e), ..
+                        }) = item
+                        {
+                            work.push((NodeRef::Expr(e), child));
+                        }
+                    }
+                }
                 _ => {}
             },
             NodeRef::Select(select) => {
@@ -737,6 +747,15 @@ fn take_statement_children(
         } => {
             if let Some(e) = default.take() {
                 exprs.push(e);
+            }
+        }
+        ast::Statement::CreateTable { items, .. } => {
+            for item in items.iter_mut() {
+                if let ast::TableItem::Column(col) = item
+                    && let Some(e) = col.default.take()
+                {
+                    exprs.push(e);
+                }
             }
         }
         _ => {}

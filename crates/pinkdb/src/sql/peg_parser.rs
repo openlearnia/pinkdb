@@ -494,6 +494,16 @@ fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
             },
             ..
         } => collect_expr_offsets(e, out),
+        Statement::CreateTable { items, .. } => {
+            for item in items {
+                if let TableItem::Column(ColumnDef {
+                    default: Some(e), ..
+                }) = item
+                {
+                    collect_expr_offsets(e, out);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -690,6 +700,16 @@ fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
             },
             ..
         } => apply_expr_ranks(e, offsets),
+        Statement::CreateTable { items, .. } => {
+            for item in items.iter_mut() {
+                if let TableItem::Column(ColumnDef {
+                    default: Some(e), ..
+                }) = item
+                {
+                    apply_expr_ranks(e, offsets);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -952,7 +972,9 @@ fn values_select(rows: Vec<Vec<Expr>>, tail: QueryTail) -> Select {
         with: Vec::new(),
         distinct: false,
         distinct_on: None,
-        projections: vec![Projection::Star],
+        projections: vec![Projection::Star {
+            exclude: Vec::new(),
+        }],
         from: Some(FromClause {
             source: FromSource::Values(rows),
             alias: None,
@@ -964,6 +986,57 @@ fn values_select(rows: Vec<Vec<Expr>>, tail: QueryTail) -> Select {
         }),
         where_clause: None,
         group_by: Vec::new(),
+        group_sets: Vec::new(),
+        having: None,
+        qualify: None,
+        windows: Vec::new(),
+        order_by: tail.order_by,
+        limit: tail.limit,
+        offset: tail.offset,
+        unions: Vec::new(),
+    }
+}
+
+/// The marker function a parsed `PIVOT` carries as its only projection:
+/// `pivot(on, in_list(v…), using(agg, alias, …))`. Keeping the clauses as
+/// ordinary expressions lets every AST walker (parameters, macros, views) see
+/// them; the binder expands the marker (`expand_pivot`).
+pub(crate) const PIVOT_MARKER: &str = "__pinkdb_pivot__";
+
+fn pivot_select(
+    from: FromClause,
+    on: Expr,
+    values: Option<Vec<Expr>>,
+    using: Vec<(Expr, Option<String>)>,
+    group_by: Vec<Expr>,
+    tail: QueryTail,
+) -> Select {
+    let call = |name: &str, args: Vec<Expr>| Expr::Function {
+        name: name.to_string(),
+        args,
+        distinct: false,
+        filter: None,
+    };
+    let mut using_args = Vec::new();
+    for (agg, alias) in using {
+        using_args.push(agg);
+        using_args.push(Expr::Literal(alias.map_or(Value::Null, Value::Varchar)));
+    }
+    let mut marker = vec![on, call("using", using_args)];
+    if let Some(values) = values {
+        marker.push(call("in", values));
+    }
+    Select {
+        with: Vec::new(),
+        distinct: false,
+        distinct_on: None,
+        projections: vec![Projection::Expr {
+            expr: call(PIVOT_MARKER, marker),
+            alias: None,
+        }],
+        from: Some(from),
+        where_clause: None,
+        group_by,
         group_sets: Vec::new(),
         having: None,
         qualify: None,
@@ -1163,7 +1236,7 @@ fn ordered_set_args(
             }
             args.push(item.expr);
         }
-        "percentile_cont" | "quantile_cont" | "percentile_disc" | "quantile_disc" => {
+        "percentile_cont" | "percentile_disc" => {
             if args.len() != 1 {
                 return Err(
                     "a percentile aggregate takes one fraction and one ORDER BY expression",
@@ -1423,7 +1496,40 @@ peg::parser! {
         /// (with CTEs), a `VALUES` row list, or `TABLE t`. All three bind to
         /// a [`Select`], so every consumer (EXPLAIN, CTE bodies, derived
         /// tables, scalar subqueries) accepts them uniformly.
-        rule query() -> Select = select() / values_query() / table_query()
+        rule query() -> Select = select() / values_query() / table_query() / pivot_query()
+
+        /// `PIVOT src ON expr [IN (v, …)] [USING agg [AS name], …] [GROUP BY
+        /// …]` plus the query tail — DuckDB's simplified PIVOT. The parser
+        /// only records it (see [`pivot_select`]); the binder reads the
+        /// source to find the pivot values and expands it.
+        rule pivot_query() -> Select
+            = word("pivot") source:from_source() suffix:source_suffix() word("on") on:concat_expr()
+              values:pivot_in()? using:pivot_using()? group:pivot_group_by()? tail:query_tail() {?
+                  let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
+                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
+                      return Err("derived table needs an alias");
+                  }
+                  let from = FromClause {
+                      source, alias, col_aliases, at, sample: None, lateral, joins: Vec::new(),
+                  };
+                  Ok(pivot_select(from, on, values, using.unwrap_or_default(), group.unwrap_or_default(), tail))
+              }
+
+        rule pivot_in() -> Vec<Expr>
+            = kw(Keyword::In) lparen() l:expr_list() rparen() { l }
+
+        rule pivot_using() -> Vec<(Expr, Option<String>)>
+            = word("using") first:pivot_agg() rest:(comma() a:pivot_agg() { a })* {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        rule pivot_agg() -> (Expr, Option<String>)
+            = e:expr() alias:(kw(Keyword::As) n:ident() { n })? { (e, alias) }
+
+        rule pivot_group_by() -> Vec<Expr>
+            = kw(Keyword::Group) kw(Keyword::By) l:expr_list() { l }
 
         rule values_query() -> Select
             = kw(Keyword::Values) rows:values_rows() tail:query_tail() { values_select(rows, tail) }
@@ -1729,17 +1835,27 @@ peg::parser! {
                       if_not_exists: ifne,
                   }
               }
-            / kw(Keyword::Create) kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
-                  Statement::CreateView { db: t.0, name: t.1, cols, query: Box::new(query) }
+            / kw(Keyword::Create) orr:or_replace() kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
+                  Statement::CreateView { db: t.0, name: t.1, cols, query: Box::new(query), or_replace: orr }
               }
-            / kw(Keyword::Create) kw(Keyword::Table) ifne:if_not_exists() t:table_ref() kw(Keyword::As) query:select() {
-                  Statement::CreateTableAs { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne }
+            / kw(Keyword::Create) or_replace() (word("temp") / word("temporary")) {?
+                  Err("CREATE TEMP is not supported: pinkdb has no session-local temporary \
+                       catalog yet; create a regular table and drop it when done")
               }
-            / kw(Keyword::Create) kw(Keyword::Table) ifne:if_not_exists() t:table_ref() lparen() first:table_item()
-              rest:(comma() i:table_item() { i })* rparen() {
+            / kw(Keyword::Create) orr:or_replace() kw(Keyword::Table) ifne:if_not_exists() t:table_ref() kw(Keyword::As) query:select() {?
+                  if orr && ifne {
+                      return Err("OR REPLACE and IF NOT EXISTS cannot both be used");
+                  }
+                  Ok(Statement::CreateTableAs { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne, or_replace: orr })
+              }
+            / kw(Keyword::Create) orr:or_replace() kw(Keyword::Table) ifne:if_not_exists() t:table_ref() lparen() first:table_item()
+              rest:(comma() i:table_item() { i })* rparen() {?
+                  if orr && ifne {
+                      return Err("OR REPLACE and IF NOT EXISTS cannot both be used");
+                  }
                   let mut items = vec![first];
                   items.extend(rest);
-                  Statement::CreateTable { db: t.0, name: t.1, items, if_not_exists: ifne }
+                  Ok(Statement::CreateTable { db: t.0, name: t.1, items, if_not_exists: ifne, or_replace: orr })
               }
             / kw(Keyword::Create) orr:or_replace() word("procedure") t:table_ref() params:proc_params()
               lang:procedure_language()? kw(Keyword::As) body:string_lit() lang2:procedure_language()? {
@@ -1776,7 +1892,7 @@ peg::parser! {
                   }
               }
 
-        /// `OR REPLACE` on `CREATE PROCEDURE`.
+        /// `OR REPLACE` on `CREATE TABLE/VIEW/MACRO/PROCEDURE/TRIGGER`.
         rule or_replace() -> bool
             = word("or") word("replace") { true }
             / { false }
@@ -1943,10 +2059,25 @@ peg::parser! {
             = c:table_constraint() { TableItem::Constraint(c) }
             / d:column_def() { TableItem::Column(d) }
 
+        /// `name TYPE` followed by constraints and at most one `DEFAULT`, in
+        /// any order (DuckDB's grammar).
         rule column_def() -> ColumnDef
-            = name:ident() ty:type_name() constraints:column_constraints() {
-                  ColumnDef { name, dtype: ty, constraints }
+            = name:ident() ty:type_name() parts:column_part()* {?
+                  let mut constraints = Vec::new();
+                  let mut default = None;
+                  for part in parts {
+                      match part {
+                          Ok(c) => constraints.push(c),
+                          Err(e) if default.is_none() => default = Some(e),
+                          Err(_) => return Err("only one DEFAULT clause"),
+                      }
+                  }
+                  Ok(ColumnDef { name, dtype: ty, constraints, default })
               }
+
+        rule column_part() -> std::result::Result<ColumnConstraint, Expr>
+            = c:column_constraint() { Ok(c) }
+            / e:alter_default() { Err(e) }
 
         rule column_constraints() -> Vec<ColumnConstraint>
             = c:(column_constraint()*) { c }
@@ -2155,11 +2286,23 @@ peg::parser! {
               }
 
         rule delete() -> Statement
-            = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() using:delete_using()?
-              where_:where_clause()? ret:returning_clause() {
+            = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() alias:delete_alias()?
+              using:delete_using()? where_:where_clause()? ret:returning_clause() {
                   Statement::Delete {
-                      db: t.0, table: t.1, where_clause: where_,
+                      db: t.0, table: t.1, alias, where_clause: where_,
                       using: using.map(Box::new), returning: ret,
+                  }
+              }
+
+        /// `[AS] alias` on the DELETE target. `USING` and `RETURNING` start
+        /// the next clause, so neither is a bare alias.
+        rule delete_alias() -> String
+            = kw(Keyword::As) name:ident() { name }
+            / name:ident() {?
+                  if name.eq_ignore_ascii_case("using") || name.eq_ignore_ascii_case("returning") {
+                      Err("identifier")
+                  } else {
+                      Ok(name)
                   }
               }
 
@@ -2304,7 +2447,7 @@ peg::parser! {
                       (None, d) => d,
                   };
                   Ok(AlterTableOp::AddColumn {
-                      column: ColumnDef { name, dtype: ty, constraints: cons },
+                      column: ColumnDef { name, dtype: ty, constraints: cons, default: None },
                       default,
                       if_not_exists: ifne,
                   })
@@ -2458,31 +2601,48 @@ peg::parser! {
               }
             / q:query() { CteBody::Query(Box::new(q)) }
 
-        /// A bare `*` and a two-part `t.*` are whole-list-only in v1 (a
-        /// mid-list one is rejected). A three-part `db.t.*` is an ordinary
-        /// projection and may sit next to other columns (wave 94).
+        /// The SELECT list: `*`, `t.*` and `db.t.*` (each with an optional
+        /// `EXCLUDE`) may sit anywhere next to ordinary items, DuckDB's rule.
         rule projection_list() -> Vec<Projection>
-            = star() !"," { vec![Projection::Star] }
-            / t:ident() dot() star() !"," {
-                  vec![Projection::QualifiedStar { db: None, table: t }]
-              }
-            / first:projection() rest:(comma() p:projection() { p })* {
+            = first:projection() rest:(comma() p:projection() { p })* {
                   let mut out = vec![first];
                   out.extend(rest);
                   out
               }
 
+        /// A star must end the item: `*` followed by an operator is an
+        /// expression (and refused below), not a star projection.
         rule projection() -> Projection
-            = db:ident() dot() t:ident() dot() star() {
-                  Projection::QualifiedStar { db: Some(db), table: t }
+            = star() exclude:star_exclude() &star_end() { Projection::Star { exclude } }
+            / db:ident() dot() t:ident() dot() star() exclude:star_exclude() &star_end() {
+                  Projection::QualifiedStar { db: Some(db), table: t, exclude }
+              }
+            / t:ident() dot() star() exclude:star_exclude() &star_end() {
+                  Projection::QualifiedStar { db: None, table: t, exclude }
               }
             / e:expr() alias:alias()? {?
                   if matches!(&e, Expr::Star | Expr::QualifiedStar { .. }) {
-                      Err("`*` must be the whole projection list in v1")
+                      Err("`*` cannot be used inside an expression")
                   } else {
                       Ok(Projection::Expr { expr: e, alias })
                   }
               }
+
+        rule star_end() = "," / ")" / ![_] / semi() / ident_raw()
+
+        /// `EXCLUDE (a, t.b)` or `EXCLUDE a` after a star.
+        rule star_exclude() -> Vec<crate::sql::ast::ExcludeColumn>
+            = word("exclude") lparen() first:exclude_column() rest:(comma() c:exclude_column() { c })* rparen() {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+            / word("exclude") c:exclude_column() { vec![c] }
+            / { Vec::new() }
+
+        rule exclude_column() -> crate::sql::ast::ExcludeColumn
+            = t:ident() dot() name:ident() { crate::sql::ast::ExcludeColumn { table: Some(t), name } }
+            / name:ident() { crate::sql::ast::ExcludeColumn { table: None, name } }
 
         /// `[AS] alias` — a bare alias must be a non-keyword identifier, and
         /// must not be a word that starts a trailing clause (`SELECT a FROM t
@@ -2551,6 +2711,10 @@ peg::parser! {
             / name:ident() lparen() args:table_function_args() rparen() {
                   (FromSource::Function { name, args }, false)
               }
+            // `RANGE` is a keyword (window frames) and a table function.
+            / kw(Keyword::Range) lparen() args:table_function_args() rparen() {
+                  (FromSource::Function { name: "range".to_string(), args }, false)
+              }
             / s:string_lit() { (FromSource::Path(s), false) }
             / t:table_ref() { (FromSource::Table { db: t.0, name: t.1 }, false) }
 
@@ -2618,9 +2782,12 @@ peg::parser! {
               }
             / { Vec::new() }
 
-        /// `expr` or `name := expr` / `name => expr`.
+        /// `expr` or `name := expr` / `name => expr` / `name = expr`. A
+        /// table function's arguments are constants, so `name = …` is a named
+        /// argument (DuckDB's `read_csv(f, header = true)`), never a
+        /// comparison.
         rule table_function_arg() -> crate::sql::ast::TableFunctionCallArg
-            = name:ident() named_arg_arrow() e:expr() {
+            = name:ident() (named_arg_arrow() / "=" !"=" ws()) e:expr() {
                   crate::sql::ast::TableFunctionCallArg { name: Some(name), expr: e }
               }
             / e:expr() {
@@ -2997,7 +3164,21 @@ peg::parser! {
             / lparen() e:expr() rparen() { e }
             // `ROW(a, b)`: `ROW` is a keyword, so `fn_call` cannot take it.
             / kw(Keyword::Row) lparen() args:expr_list() rparen() { row_ctor(args) }
+            / clock_keyword()
             / ident_expr()
+
+        /// `CURRENT_TIMESTAMP` / `CURRENT_DATE` / `CURRENT_TIME` without
+        /// parentheses: SQL's special clock functions (a quoted
+        /// `"current_date"` is still a column).
+        rule clock_keyword() -> Expr
+            = s:ident_raw() ws() !lparen() {?
+                  let lower = s.to_ascii_lowercase();
+                  if matches!(lower.as_str(), "current_timestamp" | "current_date" | "current_time") {
+                      Ok(Expr::Function { name: lower, args: Vec::new(), distinct: false, filter: None })
+                  } else {
+                      Err("CURRENT_TIMESTAMP")
+                  }
+              }
 
         /// `$name` — the variable shorthand that reads a `SET VARIABLE` back.
         /// `$$...$$` is a string literal and is matched earlier, so `$` here
@@ -3110,7 +3291,7 @@ peg::parser! {
 
         rule timestamp_literal() -> Expr
             = kw(Keyword::Timestamp) s:string_lit() {?
-                  crate::types::parse_timestamp(&s)
+                  crate::types::parse_timestamp_or_date(&s)
                       .map(|t| Expr::Literal(Value::Timestamp(t)))
                       .ok_or("valid TIMESTAMP literal")
               }
@@ -3384,6 +3565,19 @@ mod tests {
     /// 812 valid + 157 invalid entries.
     /// Every valid entry must parse (and split into the same statement count).
     const VALID: &[&str] = &[
+        // QuackLab dialect wave: stars anywhere, EXCLUDE, DEFAULT, `=` named
+        // table-function arguments, clock keywords, DELETE aliases, OR
+        // REPLACE, date-only TIMESTAMP literals, range(), PIVOT.
+        "SELECT a, t.*, * EXCLUDE (b), s.* EXCLUDE c FROM t, (SELECT 1 AS c) s;",
+        "CREATE TABLE d (a INTEGER DEFAULT 0 NOT NULL, b VARCHAR NOT NULL DEFAULT 'x');",
+        "SELECT * FROM read_csv('f.csv', header = true, delim = ',');",
+        "SELECT CURRENT_TIMESTAMP, current_date, now();",
+        "DELETE FROM t AS x WHERE EXISTS (SELECT 1 FROM u WHERE u.a = x.a);",
+        "CREATE OR REPLACE TABLE t AS SELECT 1;",
+        "CREATE OR REPLACE VIEW v AS SELECT 1;",
+        "SELECT TIMESTAMP '2026-01-01';",
+        "SELECT * FROM range(3);",
+        "PIVOT t ON c IN ('a', 'b') USING sum(n) AS s GROUP BY g ORDER BY g;",
         "SELECT COUNT(*) FROM sales;",
         "SELECT COUNT(*) FROM sales WHERE total > 500;",
         "SELECT COUNT(*) FROM sales WHERE region = 'west';",
@@ -4333,9 +4527,6 @@ mod tests {
         "SELECT CASE END;",
         "SELECT CASE WHEN a THEN b ELSE c;",
         "SELECT TIMESTAMP 123;",
-        "SELECT a, t.* FROM t;",
-        "SELECT *, a FROM t;",
-        "SELECT a, * FROM t;",
         "SELECT (*) FROM t;",
         "SELECT DISTINCT;",
         "SELECT a FROM t ORDER BY a ASC DESC;",
@@ -5314,7 +5505,7 @@ mod tests {
         }
         assert!(matches!(
             &sel.projections[1],
-            Projection::QualifiedStar { db: Some(db), table } if db == "db1" && table == "t"
+            Projection::QualifiedStar { db: Some(db), table, .. } if db == "db1" && table == "t"
         ));
         let Statement::Select(sel) =
             parse_one("SELECT \"My Db\".\"t 1\".\"a b\" FROM \"My Db\".\"t 1\";")

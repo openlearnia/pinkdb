@@ -329,6 +329,11 @@ pub(crate) enum Collect {
     Mode {
         vals: Vec<Value>,
     },
+    /// `string_agg(x, sep)`: the non-NULL values in input order.
+    StringAgg {
+        vals: Vec<Value>,
+        separator: std::sync::Arc<str>,
+    },
 }
 
 impl Collect {
@@ -340,8 +345,13 @@ impl Collect {
                 v.encode_into(&mut buf, i);
                 seen.insert(buf);
             }
-            Collect::Cont { vals, .. } | Collect::Disc { vals, .. } | Collect::Mode { vals } => {
-                vals.push(v.get(i))
+            Collect::Cont { vals, .. }
+            | Collect::Disc { vals, .. }
+            | Collect::Mode { vals }
+            | Collect::StringAgg { vals, .. } => {
+                if !v.is_null(i) {
+                    vals.push(v.get(i))
+                }
             }
         }
     }
@@ -356,8 +366,13 @@ impl Collect {
                     seen.insert(buf);
                 }
             }
-            Collect::Cont { vals, .. } | Collect::Disc { vals, .. } | Collect::Mode { vals } => {
-                if let Some(v) = arg {
+            Collect::Cont { vals, .. }
+            | Collect::Disc { vals, .. }
+            | Collect::Mode { vals }
+            | Collect::StringAgg { vals, .. } => {
+                if let Some(v) = arg
+                    && !v.is_null()
+                {
                     vals.push(v.clone());
                 }
             }
@@ -383,6 +398,16 @@ impl Collect {
                 vals.extend(more);
                 Collect::Mode { vals }
             }
+            (
+                Collect::StringAgg {
+                    mut vals,
+                    separator,
+                },
+                Collect::StringAgg { vals: more, .. },
+            ) => {
+                vals.extend(more);
+                Collect::StringAgg { vals, separator }
+            }
             // DISTINCT and ordered-set accumulators never meet: one `Collect`
             // per aggregate slot.
             (mine, _) => mine,
@@ -399,6 +424,22 @@ impl Collect {
                 ordered_set_result(vals, OrderedSet::PercentileDisc(*fraction), dtype)
             }
             Collect::Mode { vals } => ordered_set_result(vals, OrderedSet::Mode, dtype),
+            Collect::StringAgg { vals, separator } => {
+                if vals.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let mut out = String::new();
+                for (i, v) in vals.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(separator);
+                    }
+                    match v {
+                        Value::Varchar(s) => out.push_str(s),
+                        other => out.push_str(&other.to_string()),
+                    }
+                }
+                Ok(Value::Varchar(out))
+            }
         }
     }
 }
@@ -462,6 +503,21 @@ impl Acc {
                 fraction: direct.unwrap_or(0.0),
             }),
             AggFunc::Mode => Acc::Collect(Collect::Mode { vals: Vec::new() }),
+            AggFunc::StringAgg => Acc::Collect(Collect::StringAgg {
+                vals: Vec::new(),
+                separator: ",".into(),
+            }),
+        }
+    }
+
+    /// The accumulator of one bound aggregate.
+    pub(crate) fn for_agg(a: &crate::sql::binder::BoundAgg) -> Acc {
+        match (a.func, &a.separator) {
+            (AggFunc::StringAgg, Some(sep)) => Acc::Collect(Collect::StringAgg {
+                vals: Vec::new(),
+                separator: sep.as_str().into(),
+            }),
+            _ => Acc::new(a.func, a.distinct, a.direct),
         }
     }
 
@@ -1673,10 +1729,7 @@ fn new_group(
         enc,
         Group {
             keys: key_vecs.iter().map(|kv| kv.v().get(i)).collect(),
-            accs: aggs
-                .iter()
-                .map(|a| Acc::new(a.func, a.distinct, a.direct))
-                .collect(),
+            accs: aggs.iter().map(Acc::for_agg).collect(),
         },
     ));
     idx
@@ -2306,10 +2359,7 @@ pub(crate) fn merge_partials(
     // Fast path: no keys means a single global group — merge accumulators
     // directly instead of probing the table per row.
     if !has_keys {
-        let mut accs: Vec<Acc> = aggs
-            .iter()
-            .map(|a| Acc::new(a.func, a.distinct, a.direct))
-            .collect();
+        let mut accs: Vec<Acc> = aggs.iter().map(Acc::for_agg).collect();
         // Reuse the per-chunk partials computed above (each non-empty chunk
         // holds exactly one group; a fresh table scans as one 0-row chunk,
         // so an empty partial has no group to merge).
@@ -2350,10 +2400,7 @@ pub(crate) fn merge_partials(
     if groups.is_empty() && !has_keys {
         groups.push(Group {
             keys: Vec::new(),
-            accs: aggs
-                .iter()
-                .map(|a| Acc::new(a.func, a.distinct, a.direct))
-                .collect(),
+            accs: aggs.iter().map(Acc::for_agg).collect(),
         });
     }
     groups
@@ -2688,6 +2735,7 @@ mod tests {
             distinct: false,
             filter,
             direct: None,
+            separator: None,
         };
         vec![
             mk(AggFunc::Count, None, DataType::Bigint, None),

@@ -45,6 +45,9 @@ pub enum AggFunc {
     PercentileDisc,
     /// `mode() WITHIN GROUP (ORDER BY x)` — the most frequent input value.
     Mode,
+    /// `string_agg(x [, sep])` — the non-NULL values joined by the constant
+    /// separator ([`BoundAgg::separator`], default `,`), in input order.
+    StringAgg,
 }
 
 impl AggFunc {
@@ -150,6 +153,12 @@ pub enum ScalarFunc {
     /// `array_negative_inner_product(a, b)`: the metric an HNSW `ip` index
     /// sorts by.
     ArrayNegativeInnerProduct,
+    /// `contains(s, search)`: whether `search` occurs in `s`.
+    Contains,
+    /// `uuid()` / `gen_random_uuid()`: a random version-4 UUID per row, as
+    /// VARCHAR (pinkdb has no UUID type). Volatile: never folded, and refused
+    /// in a WAL-logged statement like any nondeterministic function.
+    Uuid,
 }
 
 impl ScalarFunc {
@@ -197,6 +206,8 @@ impl ScalarFunc {
             "array_negative_inner_product" => ScalarFunc::ArrayNegativeInnerProduct,
             "like_escape" => ScalarFunc::LikeEscape,
             "similar_to" => ScalarFunc::SimilarTo,
+            "contains" => ScalarFunc::Contains,
+            "uuid" | "gen_random_uuid" => ScalarFunc::Uuid,
             _ => return None,
         })
     }
@@ -242,6 +253,9 @@ pub struct BoundAgg {
     /// (`percentile_cont(0.5) WITHIN GROUP (…)`); `None` for every other
     /// aggregate.
     pub direct: Option<f64>,
+    /// The constant separator of `string_agg`; `None` for every other
+    /// aggregate.
+    pub separator: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -741,6 +755,11 @@ impl BoundExpr {
     pub fn contains_dynamic_scalar(&self) -> bool {
         match self {
             BoundExpr::DynamicScalar { .. } => true,
+            // Volatile: a constant-looking `uuid()` must run per row.
+            BoundExpr::Scalar {
+                func: ScalarFunc::Uuid,
+                ..
+            } => true,
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
             | BoundExpr::OuterRef { .. }
@@ -1090,6 +1109,111 @@ fn ordered_set_from_name(name: &str) -> Option<AggFunc> {
     })
 }
 
+/// The clock functions (`now()` and SQL's `CURRENT_*` keywords).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockKind {
+    Timestamp,
+    Date,
+    Time,
+}
+
+fn clock_function(name: &str) -> Option<ClockKind> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "now" | "current_timestamp" | "get_current_timestamp" | "transaction_timestamp" => {
+            ClockKind::Timestamp
+        }
+        "current_date" | "today" => ClockKind::Date,
+        "current_time" => ClockKind::Time,
+        _ => return None,
+    })
+}
+
+/// The dependency prefix a clock reading travels under (see
+/// [`Binder::bind_clock`]); no function name can contain `@`.
+pub(crate) const CLOCK_DEP: &str = "@clock:";
+
+/// The dependency `uuid()` records: no function name can contain `@`.
+const VOLATILE_UUID_DEP: &str = "@volatile:uuid";
+
+/// The replay-memo name a WAL record stores the statement clock under.
+pub(crate) const CLOCK_MEMO: &str = "@clock";
+
+/// The replay-memo entry of a statement whose dependencies include a clock
+/// reading.
+pub(crate) fn clock_memo(deps: &[String]) -> Option<crate::wal::ExtCall> {
+    let micros = deps.iter().find_map(|d| clock_reading(d))?;
+    Some(crate::wal::ExtCall {
+        name: CLOCK_MEMO.to_string(),
+        args: Vec::new(),
+        result: Value::Timestamp(micros),
+    })
+}
+
+/// The clock reading a `@clock:` dependency carries.
+pub(crate) fn clock_reading(dep: &str) -> Option<i64> {
+    dep.strip_prefix(CLOCK_DEP)?.parse().ok()
+}
+
+thread_local! {
+    /// `(scope open, reading)` of the statement being bound on this thread.
+    static STATEMENT_CLOCK: std::cell::Cell<(bool, Option<i64>)> =
+        const { std::cell::Cell::new((false, None)) };
+}
+
+/// One statement's clock scope: the outermost bind on a thread opens it, and
+/// every binder inside it shares the first reading. Nested binds (a view or
+/// macro body) join the open scope.
+struct ClockScope {
+    outer: bool,
+}
+
+impl ClockScope {
+    fn enter() -> Self {
+        let outer = !STATEMENT_CLOCK.with(|c| c.get().0);
+        if outer {
+            STATEMENT_CLOCK.with(|c| c.set((true, None)));
+        }
+        Self { outer }
+    }
+
+    fn reading() -> Option<i64> {
+        STATEMENT_CLOCK.with(|c| c.get().1)
+    }
+
+    fn record(micros: i64) {
+        STATEMENT_CLOCK.with(|c| {
+            if c.get().0 {
+                c.set((true, Some(micros)));
+            }
+        });
+    }
+}
+
+impl Drop for ClockScope {
+    fn drop(&mut self) {
+        if self.outer {
+            STATEMENT_CLOCK.with(|c| c.set((false, None)));
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wall_clock_micros() -> Result<i64> {
+    Ok(
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_micros() as i64,
+            Err(e) => -(e.duration().as_micros() as i64),
+        },
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wall_clock_micros() -> Result<i64> {
+    Err(PinkDbError::Execution(
+        "now() and CURRENT_TIMESTAMP need a system clock, which the wasm build has not".to_string(),
+    ))
+}
+
 /// The constant fraction of a percentile aggregate. DuckDB requires a
 /// constant here too (a column fraction is rejected).
 fn percentile_fraction(name: &str, e: &Expr) -> Result<f64> {
@@ -1129,10 +1253,14 @@ fn ordered_set_dtype(func: AggFunc, name: &str, input: DataType) -> Result<DataT
             "{name} needs a numeric ORDER BY expression, not {input}"
         ))),
         AggFunc::PercentileDisc
-            if !numeric && !matches!(input, DataType::Date | DataType::Timestamp) =>
+            if !numeric
+                && !matches!(
+                    input,
+                    DataType::Date | DataType::Timestamp | DataType::Varchar | DataType::Boolean
+                ) =>
         {
             Err(PinkDbError::Type(format!(
-                "{name} needs a numeric or temporal ORDER BY expression, not {input}"
+                "{name} needs an orderable ORDER BY expression, not {input}"
             )))
         }
         _ => Ok(input),
@@ -3052,6 +3180,7 @@ impl<'a> Binder<'a> {
             distinct,
             filter,
             direct,
+            separator: None,
         };
         let index = match aggs.iter().position(|a| a == &agg) {
             Some(i) => i,
@@ -3061,6 +3190,122 @@ impl<'a> Binder<'a> {
             }
         };
         Ok(BoundExpr::AggRef { index, dtype })
+    }
+
+    /// `median(x)`: `quantile_cont(x, 0.5)` over numbers (interpolated, DOUBLE
+    /// or the DECIMAL type) and `quantile_disc(x, 0.5)` over the other
+    /// orderable types, DuckDB's split. DuckDB interpolates DATE/TIMESTAMP
+    /// into a TIMESTAMP; pinkdb has no such interpolation yet, so those are
+    /// refused rather than answered differently.
+    fn bind_median(
+        &mut self,
+        args: &[Expr],
+        distinct: bool,
+        filter: Option<&Expr>,
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        let [x] = args else {
+            return Err(PinkDbError::Type(
+                "median takes exactly one argument".to_string(),
+            ));
+        };
+        let dtype = self.bind_expr(x, &mut Vec::new(), allow_agg)?.dtype();
+        let func = match dtype {
+            DataType::Integer | DataType::Bigint | DataType::Double | DataType::Decimal { .. } => {
+                AggFunc::PercentileCont
+            }
+            DataType::Varchar | DataType::Boolean => AggFunc::PercentileDisc,
+            other => {
+                return Err(PinkDbError::Type(format!(
+                    "median of {other} is not supported"
+                )));
+            }
+        };
+        let fraction = [Expr::Literal(Value::Double(0.5)), x.clone()];
+        self.bind_ordered_set(func, "median", &fraction, distinct, filter, aggs, allow_agg)
+    }
+
+    /// `string_agg(x [, sep])` (also `group_concat`, `listagg`): the separator
+    /// must be a constant string; NULL values are skipped and an all-NULL (or
+    /// empty) group is NULL. A non-VARCHAR argument is cast to VARCHAR.
+    fn bind_string_agg(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        distinct: bool,
+        filter: Option<&Expr>,
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        if !allow_agg {
+            return Err(PinkDbError::Execution(
+                "aggregate functions are not allowed in WHERE or GROUP BY".to_string(),
+            ));
+        }
+        if distinct {
+            return Err(PinkDbError::Execution(format!(
+                "DISTINCT is not supported in {name}()"
+            )));
+        }
+        let (x, separator) = match args {
+            [x] => (x, ",".to_string()),
+            [x, Expr::Literal(Value::Varchar(sep))] => (x, sep.clone()),
+            [_, _] => {
+                return Err(PinkDbError::Type(format!(
+                    "the separator of {name} must be a constant string"
+                )));
+            }
+            _ => {
+                return Err(PinkDbError::Type(format!(
+                    "{name} takes one or two arguments"
+                )));
+            }
+        };
+        let mut arg = self.bind_expr(x, aggs, allow_agg)?;
+        if !arg.is_aggregate_free() {
+            return Err(PinkDbError::Execution(
+                "nested aggregates are not supported in v1".to_string(),
+            ));
+        }
+        if arg.dtype() != DataType::Varchar {
+            arg = BoundExpr::Cast {
+                expr: Box::new(arg),
+                dtype: DataType::Varchar,
+            };
+        }
+        let filter = match filter {
+            None => None,
+            Some(pred) => {
+                let bound = self.bind_expr(pred, aggs, false)?;
+                if bound.dtype() != DataType::Boolean {
+                    return Err(PinkDbError::Type(
+                        "FILTER needs a BOOLEAN expression".to_string(),
+                    ));
+                }
+                Some(bound)
+            }
+        };
+        let agg = BoundAgg {
+            func: AggFunc::StringAgg,
+            arg: Some(arg),
+            dtype: DataType::Varchar,
+            distinct: false,
+            filter,
+            direct: None,
+            separator: Some(separator),
+        };
+        let index = match aggs.iter().position(|a| a == &agg) {
+            Some(i) => i,
+            None => {
+                aggs.push(agg);
+                aggs.len() - 1
+            }
+        };
+        Ok(BoundExpr::AggRef {
+            index,
+            dtype: DataType::Varchar,
+        })
     }
 
     fn bind_function(
@@ -3082,7 +3327,25 @@ impl<'a> Binder<'a> {
         // (see `ordered_set_args`), so this runs before the FILTER check — an
         // ordered-set aggregate takes a FILTER like any other aggregate.
         if let Some(func) = ordered_set_from_name(name) {
+            // DuckDB's `quantile_cont(x, p)` takes the fraction second (the
+            // `percentile_*` spelling folds `WITHIN GROUP` into `(p, x)`).
+            if let [x, p] = args
+                && name.to_ascii_lowercase().starts_with("quantile")
+            {
+                let swapped = [p.clone(), x.clone()];
+                return self
+                    .bind_ordered_set(func, name, &swapped, distinct, filter, aggs, allow_agg);
+            }
             return self.bind_ordered_set(func, name, args, distinct, filter, aggs, allow_agg);
+        }
+        if name.eq_ignore_ascii_case("median") {
+            return self.bind_median(args, distinct, filter, aggs, allow_agg);
+        }
+        if ["string_agg", "group_concat", "listagg"]
+            .iter()
+            .any(|n| name.eq_ignore_ascii_case(n))
+        {
+            return self.bind_string_agg(name, args, distinct, filter, aggs, allow_agg);
         }
         // Wave 77: a stored macro shadows every built-in of the same name
         // (DuckDB's rule: `CREATE MACRO abs(x) AS 42` wins). Expansion is a
@@ -3122,6 +3385,9 @@ impl<'a> Binder<'a> {
         }
         if let Some(bound) = self.bind_scalar_macro(name, args, distinct, aggs, allow_agg)? {
             return Ok(bound);
+        }
+        if let Some(kind) = clock_function(name) {
+            return self.bind_clock(name, kind, args);
         }
         if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
             // A host function declares its parameter names, so it takes named
@@ -3193,6 +3459,7 @@ impl<'a> Binder<'a> {
                 distinct,
                 filter,
                 direct: None,
+                separator: None,
             };
             // Dedupe identical aggregates so `SUM(x), SUM(x)` computes once.
             let index = match aggs.iter().position(|a| a == &agg) {
@@ -3221,6 +3488,14 @@ impl<'a> Binder<'a> {
             }
             let dtype = scalar_dtype(func, &bound)?;
             let bound = coerce_scalar_args(func, dtype, bound)?;
+            if func == ScalarFunc::Uuid {
+                // Volatile: a WAL-logged statement refuses it (see
+                // `bind_tracked_with`).
+                let mut deps = self.dynamic_functions_used.borrow_mut();
+                if !deps.iter().any(|d| d == VOLATILE_UUID_DEP) {
+                    deps.push(VOLATILE_UUID_DEP.to_string());
+                }
+            }
             return Ok(BoundExpr::Scalar {
                 func,
                 args: bound,
@@ -3313,6 +3588,62 @@ impl<'a> Binder<'a> {
             Value::Varchar(roles.join(","))
         };
         Ok(BoundExpr::Literal(value))
+    }
+
+    /// `now()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, …: the statement's clock,
+    /// spliced in at bind time as a literal (one value for the whole
+    /// statement, like DuckDB's; see [`Binder::statement_clock`]).
+    ///
+    /// The reading rides along as a `@clock:` dependency: a WAL-logged
+    /// statement records it in its frame's replay memo, so replaying the
+    /// logged text binds the same instant instead of the replay's.
+    fn bind_clock(&mut self, name: &str, kind: ClockKind, args: &[Expr]) -> Result<BoundExpr> {
+        if !args.is_empty() {
+            return Err(PinkDbError::Type(format!(
+                "{}() takes no arguments",
+                name.to_ascii_lowercase()
+            )));
+        }
+        if kind == ClockKind::Time {
+            return Err(PinkDbError::Type(
+                "CURRENT_TIME needs the TIME type, which pinkdb does not have: use \
+                 CURRENT_TIMESTAMP"
+                    .to_string(),
+            ));
+        }
+        let micros = self.statement_clock()?;
+        Ok(BoundExpr::Literal(match kind {
+            ClockKind::Date => Value::Date(micros.div_euclid(86_400_000_000) as i32),
+            _ => Value::Timestamp(micros),
+        }))
+    }
+
+    /// The statement's clock in microseconds since the Unix epoch (UTC): the
+    /// reading this bind already took, else the one the WAL record being
+    /// replayed carries, else the one the open transaction already logged,
+    /// else the wall clock. The chosen reading is recorded as a dependency.
+    fn statement_clock(&mut self) -> Result<i64> {
+        let mut deps = self.dynamic_functions_used.borrow_mut();
+        if let Some(micros) = deps.iter().find_map(|d| clock_reading(d)) {
+            return Ok(micros);
+        }
+        let recorded = |v: Option<&Value>| match v {
+            Some(Value::Timestamp(t)) => Some(*t),
+            _ => None,
+        };
+        let micros = match self
+            .db
+            .ext_replay()
+            .and_then(|memo| recorded(memo.get(CLOCK_MEMO, &[])))
+            .or_else(|| recorded(self.db.txn_memo_result(CLOCK_MEMO, &[])))
+            .or_else(ClockScope::reading)
+        {
+            Some(t) => t,
+            None => wall_clock_micros()?,
+        };
+        ClockScope::record(micros);
+        deps.push(format!("{CLOCK_DEP}{micros}"));
+        Ok(micros)
     }
 
     /// `timezone(zone, ts)` and `ts AT TIME ZONE zone`.
@@ -3566,15 +3897,17 @@ impl<'a> Binder<'a> {
             // callback `is_null` with the registered type tag.
             //
             // Everything else must equal the registered argument type — ABI
-            // v1 inserts no implicit casts — with two documented widening
+            // v1 inserts no implicit casts — with three documented widening
             // rules: a **DOUBLE parameter accepts any numeric argument**
             // (INTEGER, BIGINT, DECIMAL) and the engine inserts the CAST to
             // DOUBLE that DuckDB applies implicitly, so `exp(1)`, `log(100)`
-            // and an integer or DECIMAL column all work like DuckDB; and a
-            // **VARCHAR parameter accepts a VARIANT**, whose text form is its
-            // JSON value, so the `json_*` functions read VARIANT directly as
+            // and an integer or DECIMAL column all work like DuckDB; a
+            // **BIGINT parameter accepts an INTEGER** (lossless, DuckDB's
+            // implicit cast: `split_part(s, ',', 1)`); and a **VARCHAR
+            // parameter accepts a VARIANT**, whose text form is its JSON
+            // value, so the `json_*` functions read VARIANT directly as
             // DuckDB's do. Every other declared type stays exact and keeps
-            // the CAST hint (`json_array(1)` and `ext_repeat('x', 1)` keep
+            // the CAST hint (`json_array(1)` and `ext_repeat('x', 1.5)` keep
             // their documented errors): a string is not a number, and parsing
             // one is not this ABI's job.
             bound.push(coerce_host_arg(&func_name, i + 1, want, b)?);
@@ -3740,6 +4073,14 @@ fn coerce_host_arg(
         return Ok(BoundExpr::Cast {
             expr: Box::new(bound),
             dtype: DataType::Double,
+        });
+    }
+    // INTEGER → BIGINT is lossless, and DuckDB applies it implicitly
+    // (`split_part(s, ',', 1)`).
+    if want == crate::ext::ExtType::Bigint && bound.dtype() == DataType::Integer {
+        return Ok(BoundExpr::Cast {
+            expr: Box::new(bound),
+            dtype: DataType::Bigint,
         });
     }
     if want == crate::ext::ExtType::Varchar && bound.dtype() == DataType::Variant {
@@ -4043,6 +4384,7 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
         AggFunc::PercentileCont | AggFunc::PercentileDisc | AggFunc::Mode => {
             Ok(arg.unwrap_or(DataType::Double))
         }
+        AggFunc::StringAgg => Ok(DataType::Varchar),
         AggFunc::Min | AggFunc::Max => {
             let t = arg.expect("min/max has an arg");
             if !is_numeric(t)
@@ -4331,6 +4673,19 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
             }
             Ok(DataType::Boolean)
         }
+        ScalarFunc::Contains => {
+            arity(&[2])?;
+            if !args.iter().all(varchar_arg) {
+                return Err(PinkDbError::Type(
+                    "contains needs VARCHAR arguments".to_string(),
+                ));
+            }
+            Ok(DataType::Boolean)
+        }
+        ScalarFunc::Uuid => {
+            arity(&[0])?;
+            Ok(DataType::Varchar)
+        }
         ScalarFunc::JsonSet | ScalarFunc::JsonInsert | ScalarFunc::JsonReplace => {
             unreachable!("bound by bind_json_mutator")
         }
@@ -4535,6 +4890,16 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
 }
 
 /// Default output name for a projection (DuckDB-style expression text).
+/// The output name of an unaliased SELECT item: a column reference is named
+/// by its column alone (`SELECT t.x` yields `x`, DuckDB's rule, so a derived
+/// table or view over it exposes `x`); any other expression by its text.
+fn projection_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Column { name, .. } => name.clone(),
+        _ => default_name(expr),
+    }
+}
+
 fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Literal(v) => v.to_string(),
@@ -4634,10 +4999,7 @@ fn default_name(expr: &Expr) -> String {
                 ("mode", [_]) => {
                     return format!("mode() WITHIN GROUP (ORDER BY {})", inner[0]);
                 }
-                (
-                    "percentile_cont" | "quantile_cont" | "percentile_disc" | "quantile_disc",
-                    [_, _],
-                ) => {
+                ("percentile_cont" | "percentile_disc", [_, _]) => {
                     return format!("{lower}({} ORDER BY {})", inner[0], inner[1]);
                 }
                 _ => {}
@@ -6635,6 +6997,14 @@ pub(crate) fn bind_tracked_with(
             name.trim_start_matches('$')
         )));
     }
+    if crate::plan::writes_tables(&plan) && dynamic.iter().any(|d| d == VOLATILE_UUID_DEP) {
+        return Err(PinkDbError::Execution(
+            "uuid() is volatile (nondeterministic) and cannot be called in a statement the \
+             engine WAL-logs: replaying it would produce different values. Use it in a \
+             read-only statement"
+                .to_string(),
+        ));
+    }
     if crate::plan::writes_tables(&plan)
         && let Some(function) = db.first_volatile_dynamic_function(&dynamic)
     {
@@ -6655,6 +7025,9 @@ fn bind_tracked_plan(
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
+    // Every binder this statement creates (RETURNING, ON CONFLICT, …) reads
+    // one clock.
+    let _clock = ClockScope::enter();
     let empty = |plan| Ok((plan, Vec::new()));
     match stmt {
         Statement::CreateTable {
@@ -6662,6 +7035,7 @@ fn bind_tracked_plan(
             name,
             items,
             if_not_exists,
+            or_replace,
         } => bind_create_table(
             db,
             default_db,
@@ -6669,6 +7043,8 @@ fn bind_tracked_plan(
             name,
             items,
             *if_not_exists,
+            *or_replace,
+            params.clone(),
             session,
         ),
         Statement::CreateTableAs {
@@ -6676,6 +7052,7 @@ fn bind_tracked_plan(
             name,
             query,
             if_not_exists,
+            or_replace,
         } => bind_create_table_as(
             db,
             default_db,
@@ -6683,6 +7060,7 @@ fn bind_tracked_plan(
             name,
             query,
             *if_not_exists,
+            *or_replace,
             params.clone(),
             session,
         ),
@@ -6741,6 +7119,7 @@ fn bind_tracked_plan(
         Statement::Delete {
             db: qdb,
             table,
+            alias,
             using,
             where_clause,
             returning,
@@ -6749,6 +7128,7 @@ fn bind_tracked_plan(
             default_db,
             qdb,
             table,
+            alias.as_deref(),
             using.as_deref(),
             where_clause,
             returning.as_deref(),
@@ -6790,7 +7170,8 @@ fn bind_tracked_plan(
             name,
             cols,
             query,
-        } => bind_create_view(db, default_db, qdb, name, cols, query, session),
+            or_replace,
+        } => bind_create_view(db, default_db, qdb, name, cols, query, *or_replace, session),
         Statement::CreateMaterializedView {
             db: qdb,
             name,
@@ -7966,6 +8347,7 @@ fn bind_create_view(
     name: &str,
     cols: &Option<Vec<String>>,
     query: &Select,
+    or_replace: bool,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let view_db = Binder::new(db, default_db)
@@ -7991,6 +8373,7 @@ fn bind_create_view(
             cols: cols.clone(),
             query: Box::new(query.clone()),
             source: String::new(),
+            or_replace,
         },
         dynamic_functions,
     ))
@@ -8096,9 +8479,7 @@ fn bind_update(
             ));
         }
         // Subqueries are fine (uncorrelated; evaluated pre-mutation).
-        if !DataTable::can_coerce(bound.dtype(), target)
-            && !matches!(bound, BoundExpr::Literal(Value::Null))
-        {
+        if !can_assign(bound.dtype(), target) && !matches!(bound, BoundExpr::Literal(Value::Null)) {
             return Err(PinkDbError::Type(format!(
                 "cannot assign {} to {target} column \"{col}\"",
                 bound.dtype()
@@ -8149,6 +8530,7 @@ fn bind_delete(
     default_db: &str,
     qdb: &Option<String>,
     table: &str,
+    alias: Option<&str>,
     using: Option<&FromClause>,
     where_clause: &Option<Expr>,
     returning: Option<&[Projection]>,
@@ -8173,10 +8555,10 @@ fn bind_delete(
         None => None,
     };
     binder.tables.push(ScopeTable {
-        name: t.name.to_ascii_lowercase(),
+        name: alias.unwrap_or(&t.name).to_ascii_lowercase(),
         original: Some(t.name.to_ascii_lowercase()),
         db: Some(table_db.clone()),
-        is_alias: false,
+        is_alias: alias.is_some(),
         qualified_only: false,
         columns: t.schema(),
     });
@@ -8302,16 +8684,21 @@ fn bind_returning(
     let mut names = Vec::new();
     for proj in projections {
         match proj {
-            Projection::Star => {
+            Projection::Star { exclude } => {
+                let mut used = vec![false; exclude.len()];
                 for (i, (name, dtype)) in schema.iter().enumerate() {
+                    if star_excludes(exclude, &mut used, Some(&t.name), name) {
+                        continue;
+                    }
                     exprs.push(BoundExpr::Column {
                         index: i,
                         dtype: *dtype,
                     });
                     names.push(name.clone());
                 }
+                check_star_excludes(exclude, &used)?;
             }
-            Projection::QualifiedStar { db, table } => {
+            Projection::QualifiedStar { db, table, exclude } => {
                 if db
                     .as_deref()
                     .is_some_and(|d| !d.eq_ignore_ascii_case(table_db))
@@ -8323,13 +8710,18 @@ fn bind_returning(
                         t.name
                     )));
                 }
+                let mut used = vec![false; exclude.len()];
                 for (i, (name, dtype)) in schema.iter().enumerate() {
+                    if star_excludes(exclude, &mut used, Some(&t.name), name) {
+                        continue;
+                    }
                     exprs.push(BoundExpr::Column {
                         index: i,
                         dtype: *dtype,
                     });
                     names.push(name.clone());
                 }
+                check_star_excludes(exclude, &used)?;
             }
             Projection::Expr { expr, alias } => {
                 let mut aggs = Vec::new();
@@ -8339,7 +8731,7 @@ fn bind_returning(
                         "aggregates are not allowed in RETURNING".to_string(),
                     ));
                 }
-                names.push(alias.clone().unwrap_or_else(|| default_name(expr)));
+                names.push(alias.clone().unwrap_or_else(|| projection_name(expr)));
                 exprs.push(bound);
             }
         }
@@ -8348,6 +8740,290 @@ fn bind_returning(
         Some(crate::plan::Returning { exprs, names }),
         binder.dynamic_functions_used(),
     ))
+}
+
+/// Whether an INSERT/UPDATE/MERGE may store a `from` value in a `to` column:
+/// the storage widenings, plus DuckDB's assignment casts — a VARCHAR parsed
+/// into a scalar column, a scalar rendered into a VARCHAR column, and a
+/// narrowing numeric cast (`'1.5'` into DOUBLE, `1.5` into VARCHAR, `2.5`
+/// into BIGINT). The parsing ones can fail per row, with the CAST's error.
+fn can_assign(from: DataType, to: DataType) -> bool {
+    let scalar = |t: DataType| {
+        matches!(
+            t,
+            DataType::Boolean
+                | DataType::Integer
+                | DataType::Bigint
+                | DataType::Double
+                | DataType::Decimal { .. }
+                | DataType::Date
+                | DataType::Timestamp
+                | DataType::Interval
+        )
+    };
+    let numeric = |t: DataType| {
+        matches!(
+            t,
+            DataType::Integer | DataType::Bigint | DataType::Double | DataType::Decimal { .. }
+        )
+    };
+    DataTable::can_coerce(from, to)
+        || (from == DataType::Varchar && scalar(to))
+        || (scalar(from) && to == DataType::Varchar)
+        || (numeric(from) && numeric(to))
+}
+
+/// Expand a parsed `PIVOT` (the marker select `pivot_select` builds) into
+/// the grouped select it means, DuckDB's rewrite: one output column per pivot
+/// value and `USING` aggregate, `agg FILTER (WHERE on = value)`, grouped by
+/// the `GROUP BY` list — or, without one, by every source column the `ON`
+/// and `USING` expressions do not read. Without `IN (…)` the values are the
+/// source's distinct `ON` values in sorted order, read here (DuckDB runs the
+/// same query first). Without `USING` the aggregate is `count(*)`.
+fn expand_pivot(db: &PinkDb, binder: &Binder, sel: &Select) -> Result<Option<Select>> {
+    let [
+        Projection::Expr {
+            expr: Expr::Function {
+                name: marker, args, ..
+            },
+            ..
+        },
+    ] = sel.projections.as_slice()
+    else {
+        return Ok(None);
+    };
+    if marker != crate::sql::peg_parser::PIVOT_MARKER {
+        return Ok(None);
+    }
+    let from = sel
+        .from
+        .clone()
+        .ok_or_else(|| PinkDbError::Parse("PIVOT needs a source".to_string()))?;
+    let call_args = |e: Option<&Expr>| match e {
+        Some(Expr::Function { args, .. }) => args.clone(),
+        _ => Vec::new(),
+    };
+    let on = args
+        .first()
+        .cloned()
+        .ok_or_else(|| PinkDbError::Parse("PIVOT needs ON".to_string()))?;
+    let mut using: Vec<(Expr, Option<String>)> = call_args(args.get(1))
+        .chunks(2)
+        .map(|pair| {
+            let alias = match pair.get(1) {
+                Some(Expr::Literal(Value::Varchar(a))) => Some(a.clone()),
+                _ => None,
+            };
+            (pair[0].clone(), alias)
+        })
+        .collect();
+    if using.is_empty() {
+        using.push((
+            Expr::Function {
+                name: "count".to_string(),
+                args: vec![Expr::Star],
+                distinct: false,
+                filter: None,
+            },
+            None,
+        ));
+    }
+    for (agg, _) in &using {
+        if !matches!(agg, Expr::Function { filter: None, .. }) {
+            return Err(PinkDbError::Parse(
+                "PIVOT USING takes aggregate calls (sum(x), count(*), …)".to_string(),
+            ));
+        }
+    }
+    let star_select = |projections: Vec<Projection>| Select {
+        with: Vec::new(),
+        distinct: false,
+        distinct_on: None,
+        projections,
+        from: Some(from.clone()),
+        where_clause: None,
+        group_by: Vec::new(),
+        group_sets: Vec::new(),
+        having: None,
+        qualify: None,
+        windows: Vec::new(),
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        unions: Vec::new(),
+    };
+    // The pivot values: the IN list, or the source's distinct ON values.
+    let values: Vec<Expr> = match args.get(2) {
+        Some(list) => call_args(Some(list)),
+        None => {
+            let mut probe = star_select(vec![Projection::Expr {
+                expr: on.clone(),
+                alias: None,
+            }]);
+            probe.distinct = true;
+            probe.order_by = vec![OrderItem {
+                expr: Expr::Literal(Value::Integer(1)),
+                desc: false,
+                nulls_first: None,
+            }];
+            let plan = bind_select_in(db, &mut binder.child(), &probe)?;
+            let plan = crate::optimizer::optimize(db, plan);
+            match crate::exec::run_read(db, &plan)? {
+                // DuckDB makes no column for a NULL value.
+                crate::exec::QueryResult::Selected { rows, .. } => rows
+                    .into_iter()
+                    .filter_map(|row| row.into_iter().next())
+                    .filter(|v| !v.is_null())
+                    .map(Expr::Literal)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+    };
+    // The grouping columns: as written, or every source column ON/USING do
+    // not read.
+    let group_by = if sel.group_by.is_empty() {
+        let probe = star_select(vec![Projection::Star {
+            exclude: Vec::new(),
+        }]);
+        let mut child = binder.child();
+        let plan = bind_select_in(db, &mut child, &probe)?;
+        let schema = plan_schema(db, &child.default_db, &child.ctes, &plan)?;
+        let mut used = Vec::new();
+        expr_column_names(&on, &mut used);
+        for (agg, _) in &using {
+            expr_column_names(agg, &mut used);
+        }
+        schema
+            .into_iter()
+            .filter(|(name, _)| !used.iter().any(|u| u.eq_ignore_ascii_case(name)))
+            .map(|(name, _)| Expr::Column {
+                db: None,
+                table: None,
+                name,
+            })
+            .collect()
+    } else {
+        sel.group_by.clone()
+    };
+    let mut projections: Vec<Projection> = group_by
+        .iter()
+        .map(|g| Projection::Expr {
+            expr: g.clone(),
+            alias: None,
+        })
+        .collect();
+    for value in &values {
+        let label = match value {
+            Expr::Literal(Value::Varchar(s)) => s.clone(),
+            Expr::Literal(v) => v.to_string(),
+            other => default_name(other),
+        };
+        let matches = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(on.clone()),
+            right: Box::new(value.clone()),
+        };
+        for (agg, alias) in &using {
+            let Expr::Function {
+                name,
+                args,
+                distinct,
+                ..
+            } = agg
+            else {
+                unreachable!("checked above");
+            };
+            let column = if using.len() == 1 {
+                label.clone()
+            } else {
+                format!(
+                    "{label}_{}",
+                    alias.clone().unwrap_or_else(|| default_name(agg))
+                )
+            };
+            projections.push(Projection::Expr {
+                expr: Expr::Function {
+                    name: name.clone(),
+                    args: args.clone(),
+                    distinct: *distinct,
+                    filter: Some(Box::new(matches.clone())),
+                },
+                alias: Some(column),
+            });
+        }
+    }
+    let mut out = star_select(projections);
+    out.group_by = group_by;
+    out.order_by = sel.order_by.clone();
+    out.limit = sel.limit;
+    out.offset = sel.offset;
+    Ok(Some(out))
+}
+
+/// The bare names of the column references in `expr`.
+fn expr_column_names(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Column { name, .. } => out.push(name.clone()),
+        Expr::Function { args, filter, .. } => {
+            for a in args {
+                expr_column_names(a, out);
+            }
+            if let Some(f) = filter {
+                expr_column_names(f, out);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_column_names(left, out);
+            expr_column_names(right, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::TryCast { expr, .. } => {
+            expr_column_names(expr, out)
+        }
+        Expr::Coalesce(args) => {
+            for a in args {
+                expr_column_names(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a star's `EXCLUDE` list drops column `name` of the scope table
+/// `table`, marking the entries that matched (DuckDB refuses an entry that
+/// matches nothing).
+fn star_excludes(
+    exclude: &[crate::sql::ast::ExcludeColumn],
+    used: &mut [bool],
+    table: Option<&str>,
+    name: &str,
+) -> bool {
+    let mut hit = false;
+    for (entry, used) in exclude.iter().zip(used.iter_mut()) {
+        let table_ok = match (&entry.table, table) {
+            (None, _) => true,
+            (Some(q), Some(t)) => q.eq_ignore_ascii_case(t),
+            (Some(_), None) => false,
+        };
+        if table_ok && entry.name.eq_ignore_ascii_case(name) {
+            *used = true;
+            hit = true;
+        }
+    }
+    hit
+}
+
+fn check_star_excludes(exclude: &[crate::sql::ast::ExcludeColumn], used: &[bool]) -> Result<()> {
+    match exclude.iter().zip(used).find(|(_, used)| !**used) {
+        Some((entry, _)) => Err(PinkDbError::Catalog(format!(
+            "Column \"{}\" in EXCLUDE list not found in FROM clause",
+            match &entry.table {
+                Some(t) => format!("{t}.{}", entry.name),
+                None => entry.name.clone(),
+            }
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// The column indices of an explicit `ON CONFLICT (cols)` target, in the
@@ -8430,9 +9106,7 @@ fn bind_sets(
                 "aggregates are not allowed in {label} SET"
             )));
         }
-        if !DataTable::can_coerce(bound.dtype(), want)
-            && !matches!(bound, BoundExpr::Literal(Value::Null))
-        {
+        if !can_assign(bound.dtype(), want) && !matches!(bound, BoundExpr::Literal(Value::Null)) {
             return Err(PinkDbError::Type(format!(
                 "cannot assign {} to {want} column \"{}\"",
                 bound.dtype(),
@@ -8633,8 +9307,7 @@ fn bind_merge(
                             "aggregates are not allowed in MERGE INSERT".to_string(),
                         ));
                     }
-                    if !DataTable::can_coerce(e.dtype(), want)
-                        && !matches!(e, BoundExpr::Literal(Value::Null))
+                    if !can_assign(e.dtype(), want) && !matches!(e, BoundExpr::Literal(Value::Null))
                     {
                         return Err(PinkDbError::Type(format!(
                             "cannot insert {} into {} column \"{}\"",
@@ -8854,7 +9527,7 @@ fn bind_insert_select(
         )));
     }
     for ((_, src), &target) in source.iter().zip(order.iter()) {
-        if !DataTable::can_coerce(*src, schema[target].1) {
+        if !can_assign(*src, schema[target].1) {
             return Err(PinkDbError::Type(format!(
                 "cannot insert {src} into {} column \"{}\"",
                 schema[target].1, schema[target].0
@@ -8902,6 +9575,7 @@ fn bind_insert_select(
 /// `[NOT] ENFORCED` were already accepted (and dropped) by the parser. A
 /// dangling reference is therefore a `CREATE TABLE` error, exactly like
 /// DuckDB's; unenforced *data* is not.
+#[allow(clippy::too_many_arguments)]
 fn bind_create_table(
     db: &PinkDb,
     default_db: &str,
@@ -8909,12 +9583,16 @@ fn bind_create_table(
     name: &str,
     items: &[TableItem],
     if_not_exists: bool,
+    or_replace: bool,
+    params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let target = Binder::new(db, default_db)
         .with_session(session.clone())
         .resolve_db(&qdb.map(str::to_string))?;
     let mut schema: Vec<(String, DataType)> = Vec::new();
+    let mut defaults: Vec<Option<BoundExpr>> = Vec::new();
+    let mut dynamic: Vec<String> = Vec::new();
     let mut constraints = TableConstraints::default();
     // Named constraints are echoes of the DDL; only the declaration matters.
     for item in items {
@@ -8934,6 +9612,41 @@ fn bind_create_table(
                 for c in &col.constraints {
                     bind_column_constraint(db, &target, name, &schema, idx, c, &mut constraints)?;
                 }
+                // A DEFAULT binds in an empty scope (constants only), like
+                // `ALTER TABLE … ADD COLUMN … DEFAULT`, and is evaluated once
+                // when the table is created.
+                defaults.push(match &col.default {
+                    None => None,
+                    Some(expr) => {
+                        let mut binder = Binder::new(db, &target)
+                            .with_session(session.clone())
+                            .with_params(params.clone());
+                        binder.allow_win = false;
+                        binder.pin_parameter(expr, col.dtype)?;
+                        let mut aggs = Vec::new();
+                        let bound = binder.bind_expr(expr, &mut aggs, false)?;
+                        if !aggs.is_empty() {
+                            return Err(PinkDbError::Execution(
+                                "an aggregate is not allowed in a column DEFAULT".to_string(),
+                            ));
+                        }
+                        let used = binder.dynamic_functions_used();
+                        if used.iter().any(|d| clock_reading(d).is_some()) {
+                            return Err(PinkDbError::Execution(format!(
+                                "the DEFAULT of column \"{}\" reads the clock: pinkdb stores a \
+                                 constant default (evaluated once at CREATE TABLE), so a \
+                                 per-row now()/CURRENT_TIMESTAMP default is not supported yet",
+                                col.name
+                            )));
+                        }
+                        for d in used {
+                            if !dynamic.contains(&d) {
+                                dynamic.push(d);
+                            }
+                        }
+                        Some(bound)
+                    }
+                });
             }
             TableItem::Constraint(tc) => {
                 bind_table_constraint(db, &target, name, &schema, tc, &mut constraints)?;
@@ -8952,8 +9665,10 @@ fn bind_create_table(
             schema,
             constraints,
             if_not_exists,
+            or_replace,
+            defaults,
         },
-        Vec::new(),
+        dynamic,
     ))
 }
 
@@ -9389,6 +10104,7 @@ fn bind_create_table_as(
     name: &str,
     query: &Select,
     if_not_exists: bool,
+    or_replace: bool,
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
@@ -9410,6 +10126,7 @@ fn bind_create_table_as(
             name: name.to_string(),
             query: Box::new(query_plan),
             if_not_exists,
+            or_replace,
         },
         dynamic,
     ))
@@ -9589,7 +10306,9 @@ fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Logi
             with: Vec::new(),
             distinct: false,
             distinct_on: None,
-            projections: vec![Projection::Star],
+            projections: vec![Projection::Star {
+                exclude: Vec::new(),
+            }],
             from: Some(FromClause {
                 source: FromSource::Derived(Box::new(head)),
                 alias: Some("__setop".to_string()),
@@ -9969,6 +10688,10 @@ fn bind_table_function_args(
 fn literal_arg_value(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Literal(v) => Some(v.clone()),
+        // `'2020-01-01'::DATE`, `1::BIGINT`: a cast literal is still a literal.
+        Expr::Cast { expr, dtype } => {
+            crate::exec::expr::cast_value(literal_arg_value(expr)?, *dtype).ok()
+        }
         Expr::Unary {
             op: crate::sql::ast::UnaryOp::Negate,
             expr,
@@ -10010,7 +10733,8 @@ fn bind_table_function(
         name: name.to_string(),
         args: args.to_vec(),
     };
-    for source in db.table_sources() {
+    let builtin = crate::table_source::builtin_table_source(crate::table_source::RANGE_SOURCE);
+    for source in builtin.into_iter().chain(db.table_sources()) {
         if let Some(schema) = source.bind(&call)? {
             binder.note_extension_package(db.package_of_table_source(source.name()));
             let eff = alias.clone().unwrap_or_else(|| name.to_string());
@@ -11321,6 +12045,9 @@ fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Resul
 }
 
 fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<LogicalPlan> {
+    if let Some(expanded) = expand_pivot(db, binder, sel)? {
+        return bind_select_body(db, binder, &expanded);
+    }
     // FROM (+ left-deep join chain).
     let base = match &sel.from {
         Some(from) => bind_from_scope(db, binder, from)?,
@@ -11388,7 +12115,8 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     let mut pending: Vec<(Expr, String)> = Vec::new();
     for proj in &sel.projections {
         match proj {
-            Projection::Star => {
+            Projection::Star { exclude } => {
+                let mut used = vec![false; exclude.len()];
                 for t in &binder.tables {
                     // Qualify: with two tables in scope, bare names are
                     // ambiguous. An unaliased base table uses its three-part
@@ -11400,6 +12128,9 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                         _ => (None, t.name.clone()),
                     };
                     for (name, _) in &t.columns.clone() {
+                        if star_excludes(exclude, &mut used, Some(&t.name), name) {
+                            continue;
+                        }
                         pending.push((
                             Expr::Column {
                                 db: db.clone(),
@@ -11410,8 +12141,9 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                         ));
                     }
                 }
+                check_star_excludes(exclude, &used)?;
             }
-            Projection::QualifiedStar { db, table } => {
+            Projection::QualifiedStar { db, table, exclude } => {
                 let star = match db {
                     Some(d) => format!("{d}.{table}.*"),
                     None => format!("{table}.*"),
@@ -11477,7 +12209,11 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                         }
                     }
                 };
+                let mut used = vec![false; exclude.len()];
                 for (name, _) in &cols {
+                    if star_excludes(exclude, &mut used, Some(table), name) {
+                        continue;
+                    }
                     pending.push((
                         Expr::Column {
                             db: db.clone(),
@@ -11487,11 +12223,12 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                         name.clone(),
                     ));
                 }
+                check_star_excludes(exclude, &used)?;
             }
             Projection::Expr { expr, alias } => {
                 pending.push((
                     expr.clone(),
-                    alias.clone().unwrap_or_else(|| default_name(expr)),
+                    alias.clone().unwrap_or_else(|| projection_name(expr)),
                 ));
             }
         }

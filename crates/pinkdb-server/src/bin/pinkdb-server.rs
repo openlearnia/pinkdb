@@ -957,6 +957,25 @@ fn main() -> ExitCode {
     #[cfg(feature = "httpfs")]
     pinkdb_httpfs::ensure_registered();
 
+    // The core scalar extensions, published before any store opens: a
+    // durable open may replay a record prefixed with their `LOAD EXTENSION`.
+    #[cfg(feature = "json")]
+    if let Err(e) = pinkdb_json::ensure_registered() {
+        eprintln!("warning: the json extension could not be registered: {e}");
+    }
+    #[cfg(feature = "datetime")]
+    if let Err(e) = pinkdb_datetime::ensure_registered() {
+        eprintln!("warning: the datetime extension could not be registered: {e}");
+    }
+    #[cfg(feature = "math")]
+    if let Err(e) = pinkdb_math::ensure_registered() {
+        eprintln!("warning: the math extension could not be registered: {e}");
+    }
+    #[cfg(feature = "string")]
+    if let Err(e) = string_ext::ensure_registered() {
+        eprintln!("warning: the string extension could not be registered: {e}");
+    }
+
     // A durable open replays the WAL, which may write to a checkpointed
     // vector graph; the owning package must be registered before that.
     #[cfg(feature = "vss")]
@@ -1039,6 +1058,28 @@ fn main() -> ExitCode {
     // loaded into the store this server serves. A durable store whose log
     // already recorded the load keeps it (that is what the replay guard is
     // for), so the load is skipped rather than reported as a duplicate.
+    #[cfg(any(
+        feature = "json",
+        feature = "datetime",
+        feature = "math",
+        feature = "string"
+    ))]
+    for name in [
+        #[cfg(feature = "json")]
+        pinkdb_json::EXTENSION_NAME,
+        #[cfg(feature = "datetime")]
+        pinkdb_datetime::EXTENSION_NAME,
+        #[cfg(feature = "math")]
+        pinkdb_math::EXTENSION_NAME,
+        #[cfg(feature = "string")]
+        string_ext::EXTENSION_NAME,
+    ] {
+        if !db.is_extension_loaded(name)
+            && let Err(e) = db.load_extension(name)
+        {
+            eprintln!("warning: the {name} extension could not be loaded: {e}");
+        }
+    }
     #[cfg(feature = "vss")]
     {
         if !db.is_extension_loaded(pinkdb_vss::EXTENSION_NAME)

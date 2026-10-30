@@ -155,10 +155,7 @@ impl<'a> Spec<'a> {
             kinds,
             keys,
             aggs,
-            fresh: aggs
-                .iter()
-                .map(|a| Acc::new(a.func, a.distinct, a.direct))
-                .collect(),
+            fresh: aggs.iter().map(Acc::for_agg).collect(),
             buckets: partitions_for(rows),
             shared: SharedArgs::new(aggs, width),
         })

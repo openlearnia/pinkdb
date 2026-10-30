@@ -17,6 +17,8 @@ pub enum Statement {
         items: Vec<TableItem>,
         /// `IF NOT EXISTS`: an existing table makes the statement a no-op.
         if_not_exists: bool,
+        /// `CREATE OR REPLACE TABLE`: an existing table is dropped first.
+        or_replace: bool,
     },
     /// `CREATE TABLE t AS SELECT ...` (schema inferred from the query).
     CreateTableAs {
@@ -24,6 +26,9 @@ pub enum Statement {
         name: String,
         query: Box<Select>,
         if_not_exists: bool,
+        /// `CREATE OR REPLACE TABLE … AS`: the query runs first (it may read
+        /// the table it replaces), then the old table is dropped.
+        or_replace: bool,
     },
     Insert {
         db: Option<String>,
@@ -50,6 +55,9 @@ pub enum Statement {
     Delete {
         db: Option<String>,
         table: String,
+        /// `DELETE FROM t [AS] alias`: the name the statement's expressions
+        /// use for the target.
+        alias: Option<String>,
         where_clause: Option<Expr>,
         /// `DELETE … USING <from>` (wave 95b).
         using: Option<Box<FromClause>>,
@@ -84,6 +92,8 @@ pub enum Statement {
         name: String,
         cols: Option<Vec<String>>,
         query: Box<Select>,
+        /// `CREATE OR REPLACE VIEW`.
+        or_replace: bool,
     },
     DropTable {
         db: Option<String>,
@@ -445,6 +455,10 @@ pub struct ColumnDef {
     pub name: String,
     pub dtype: crate::types::DataType,
     pub constraints: Vec<ColumnConstraint>,
+    /// `DEFAULT <expr>` in `CREATE TABLE` (a constant, evaluated once when
+    /// the table is created). `ALTER TABLE … ADD COLUMN` carries its default
+    /// on the operation instead.
+    pub default: Option<Expr>,
 }
 
 /// `CONSTRAINT name <constraint>` (the name is optional).
@@ -554,13 +568,25 @@ pub enum GroupSet {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Projection {
-    /// `*`
-    Star,
-    /// `table.*` or `db.table.*` (wave 94). `db` is `None` for the two-part
-    /// form; a database qualifier is never present without a table.
-    QualifiedStar { db: Option<String>, table: String },
+    /// `* [EXCLUDE (…)]`
+    Star { exclude: Vec<ExcludeColumn> },
+    /// `table.*` or `db.table.*` (wave 94), with an optional `EXCLUDE` list.
+    /// `db` is `None` for the two-part form; a database qualifier is never
+    /// present without a table.
+    QualifiedStar {
+        db: Option<String>,
+        table: String,
+        exclude: Vec<ExcludeColumn>,
+    },
     /// `expr [AS alias]`
     Expr { expr: Expr, alias: Option<String> },
+}
+
+/// One `EXCLUDE` entry of a star projection: `col` or `t.col`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludeColumn {
+    pub table: Option<String>,
+    pub name: String,
 }
 
 /// One `UPDATE ... SET` target: `column`, `table.column` or

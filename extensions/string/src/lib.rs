@@ -323,6 +323,36 @@ pinkdb_extension! {
     ],
 }
 
+/// The registry name: `LOAD EXTENSION 'string'` once registered.
+pub const EXTENSION_NAME: &str = "string";
+
+/// Publish this extension in the process-global linked registry (the CLI and
+/// the server do this at startup, so the functions work without a `LOAD
+/// EXTENSION`). A second call for the same extension is a no-op, so every
+/// host and test binary can call it unconditionally.
+pub fn ensure_registered() -> Result<(), pinkdb_ext_sdk::ExtError> {
+    match pinkdb_register_linked() {
+        Ok(()) => Ok(()),
+        Err(error) => match pinkdb_ext_sdk::linked::get(EXTENSION_NAME) {
+            Some(existing) if same_shape(&existing) => Ok(()),
+            _ => Err(error),
+        },
+    }
+}
+
+/// Whether `existing` declares exactly our function names (a second
+/// bootstrap of *this* extension, not a foreign owner of the name).
+fn same_shape(existing: &pinkdb_ext_sdk::linked::LinkedExtension) -> bool {
+    let Ok(ours) = pinkdb_linked_extension() else {
+        return false;
+    };
+    let mut a: Vec<&str> = ours.functions().iter().map(|f| f.name()).collect();
+    let mut b: Vec<&str> = existing.functions().iter().map(|f| f.name()).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
+}
+
 // The cdylib half of this crate opts in to the ABI v1 `#[no_mangle]` exports
 // (`LOAD EXTENSION '<path>'` looks them up). They stay out of the default
 // build because this crate also builds the rlib the tests (and any linked

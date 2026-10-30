@@ -75,6 +75,11 @@ pub enum LogicalPlan {
         constraints: crate::storage::TableConstraints,
         /// `IF NOT EXISTS`: an existing table makes this a no-op.
         if_not_exists: bool,
+        /// `OR REPLACE`: an existing table is dropped first.
+        or_replace: bool,
+        /// Each column's bound `DEFAULT` (a constant expression the executor
+        /// evaluates once and stores as the column's default).
+        defaults: Vec<Option<BoundExpr>>,
     },
     /// `CREATE TABLE t AS SELECT ...`: schema from the query's output.
     CreateTableAs {
@@ -82,6 +87,8 @@ pub enum LogicalPlan {
         name: String,
         query: Box<LogicalPlan>,
         if_not_exists: bool,
+        /// `OR REPLACE`: the query runs first, then the old table is dropped.
+        or_replace: bool,
     },
     /// `ALTER TABLE` (wave 65): a bound add/drop/rename operation on one store
     /// table. The `ADD COLUMN` default is a bound constant expression the
@@ -167,6 +174,8 @@ pub enum LogicalPlan {
         /// [`LogicalPlan::with_mv_source`] and carried into the engine catalog
         /// image (wave 96b): a bound query cannot be rendered back to SQL.
         source: String,
+        /// `CREATE OR REPLACE VIEW`.
+        or_replace: bool,
     },
     CreateMaterializedView {
         db: Option<String>,
@@ -787,6 +796,7 @@ pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> Logical
             name,
             cols,
             query,
+            or_replace,
             ..
         } => LogicalPlan::CreateView {
             db,
@@ -794,6 +804,7 @@ pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> Logical
             cols,
             query,
             source: source.unwrap_or_default().to_string(),
+            or_replace,
         },
         // Wave 100: a trigger definition is persisted as its `CREATE TRIGGER`
         // text, for the same reason a macro's definition is.
@@ -1235,10 +1246,10 @@ pub(crate) fn collect_tables_read(
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
             collect_tables_read(input, default_db, out);
-            for e in keys
-                .iter()
-                .chain(aggs.iter().filter_map(|a| a.arg.as_ref()))
-            {
+            for e in keys.iter().chain(
+                aggs.iter()
+                    .flat_map(|a| a.arg.iter().chain(a.filter.iter())),
+            ) {
                 expr_tables_read(e, default_db, out);
             }
         }
@@ -1425,7 +1436,10 @@ fn dml_payload(plan: &LogicalPlan) -> (Vec<&BoundExpr>, Vec<&LogicalPlan>) {
 /// it carries a nested plan or expression.
 pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
     match plan {
-        LogicalPlan::TableFunction { .. } => true,
+        // The engine's own `range()` reads no file.
+        LogicalPlan::TableFunction { source, .. } => {
+            !source.eq_ignore_ascii_case(crate::table_source::RANGE_SOURCE)
+        }
         LogicalPlan::CreateTableAs { query, .. }
         | LogicalPlan::CreateMaterializedView { query, .. }
         | LogicalPlan::Explain { plan: query } => contains_table_function(query),
@@ -1887,7 +1901,7 @@ fn walk_scan_filters(
             walk_scan_filters(input, &[], out);
             for e in keys
                 .iter()
-                .chain(aggs.iter().filter_map(|a| a.arg.as_ref()))
+                .chain(aggs.iter().flat_map(|a| a.arg.iter().chain(a.filter.iter())))
             {
                 walk_expr_subquery_filters(e, out);
             }

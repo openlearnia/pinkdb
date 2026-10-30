@@ -195,6 +195,18 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-30">2026-10-30<a class="anchor" href="#2026-10-30" aria-label="Permalink: 2026-10-30">#</a></h2>
+<h3>Wave 129 — QuackLab's DuckDB dialect ✅</h3>
+<p>pinkdb now runs every statement of QuackLab's golden fixtures that DuckDB runs (114 of 114, up from 56), given schemas and three-part names — those are their own wave.</p>
+<ul>
+<li><strong>Fixed wrong results:</strong> <code>COUNT(*) FILTER (WHERE c …)</code> over a subquery whose only use of <code>c</code> is the filter failed with <code>column 0 out of range</code>.</li>
+<li><strong>Stars:</strong> <code>*</code>, <code>t.*</code> and <code>db.t.*</code> may sit anywhere in the SELECT list, including a derived table's <code>s.*</code>, and take <code>EXCLUDE (…)</code>. A selected <code>t.x</code> is named <code>x</code>, so a view or derived table over it exposes <code>x</code>.</li>
+<li><strong>DDL:</strong> column <code>DEFAULT</code> in <code>CREATE TABLE</code> (a constant, evaluated once); <code>CREATE OR REPLACE TABLE</code> / <code>VIEW</code>. <code>CREATE TEMP TABLE</code> is refused with a reason.</li>
+<li><strong>DML:</strong> <code>DELETE FROM t AS alias</code>; INSERT, UPDATE and MERGE apply DuckDB's assignment casts (<code>'1.5'</code> into DOUBLE, <code>2.5</code> into VARCHAR, <code>2.4</code> into BIGINT).</li>
+<li><strong>Literals and clocks:</strong> <code>TIMESTAMP '2026-01-01'</code>; <code>CURRENT_TIMESTAMP</code>, <code>CURRENT_DATE</code>, <code>now()</code>, <code>today()</code> — one instant per transaction, recorded in the WAL so a replay reads the same instant.</li>
+<li><strong>Functions:</strong> <code>string_agg</code>, <code>median</code>, <code>quantile_cont(x, p)</code> / <code>quantile_disc(x, p)</code>, <code>contains</code>, <code>uuid()</code> / <code>gen_random_uuid()</code> (read queries only), and the <code>range()</code> / <code>generate_series()</code> table functions (integers, or timestamps by an interval). <code>PIVOT … ON … [IN (…)] [USING …] [GROUP BY …]</code>, as a statement or a subquery.</li>
+<li><strong><code>read_csv</code></strong> takes <code>name = value</code> options and reads gzip files (<code>compression = 'gzip'</code> or a <code>.gz</code> path).</li>
+<li><strong>The <code>string</code> extension</strong> (<code>split_part</code>, <code>regexp_*</code>, <code>starts_with</code>, …) is linked into the CLI by default, and the server now links json, datetime, math and string too. An INTEGER argument widens into an extension's BIGINT parameter, so <code>split_part(s, ',', 1)</code> works.</li>
+</ul>
 <h3>Wave 124c — databases and lakes in the console ✅</h3>
 <ul>
 <li>The Storage page lists every database with its storage (local, lake, lake · read-only), location, lake version and status, and gives administrators <strong>New database</strong> (local, or a lake — managed under the data directory, or with a catalog and data location), <strong>Attach lake</strong> (read-only or writable) and <strong>Detach</strong> (the lake keeps its data). Each dialog shows the SQL it runs.</li>
