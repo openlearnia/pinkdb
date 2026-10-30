@@ -13,7 +13,7 @@
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinkdb::{QueryResult, Value};
