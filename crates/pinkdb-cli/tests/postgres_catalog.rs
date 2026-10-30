@@ -80,9 +80,20 @@ fn catalog(base: &str, tag: &str) -> (String, String) {
     (format!("{base}{separator}schema={schema}"), schema)
 }
 
+/// The password in the URL's userinfo, if it has one.
+fn url_password(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest
+        .split_once('/')
+        .map_or(rest, |(authority, _)| authority);
+    let (userinfo, _) = authority.rsplit_once('@')?;
+    let (_, password) = userinfo.split_once(':')?;
+    (!password.is_empty()).then(|| password.to_string())
+}
+
 /// Put a password into the URL's userinfo (preserving the user and host), so
-/// the test can prove no command prints it. The throwaway server trusts local
-/// connections, so the password is only ever display data.
+/// the test can prove no command prints it: the server's real password (CI),
+/// or any password for a local server that trusts its connections.
 fn with_password(base: &str, password: &str) -> String {
     let Some((scheme, rest)) = base.split_once("://") else {
         return base.to_string();
@@ -120,7 +131,10 @@ fn save_and_open_a_postgres_catalog_without_printing_the_password() {
     let dir = scratch("roundtrip");
     let data = dir.join("data-root").display().to_string();
     let (source, source_schema) = catalog(&base, "source");
-    let password = "w96a-s3cret";
+    // The configured URL's own password (CI's server checks it), or a
+    // made-up one for a local server that trusts every connection.
+    let configured = url_password(&source);
+    let password = configured.as_deref().unwrap_or("w96a-s3cret");
     let source_with_password = with_password(&source, password);
 
     let out = run(&format!(

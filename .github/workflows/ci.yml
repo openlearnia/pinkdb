@@ -205,7 +205,9 @@ jobs:
         image: postgres:17
         env:
           POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          # Distinctive, so the tests can check it never reaches the output
+          # (the word "postgres" is in every URL).
+          POSTGRES_PASSWORD: pinkdb-ci-s3cret
           POSTGRES_DB: pinktest
         ports:
           - 5432:5432
@@ -215,7 +217,7 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     env:
-      PINKDB_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/pinktest?sslmode=disable
+      PINKDB_TEST_POSTGRES_URL: postgres://postgres:pinkdb-ci-s3cret@127.0.0.1:5432/pinktest?sslmode=disable
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
