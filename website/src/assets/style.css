@@ -4,7 +4,7 @@
    Self-contained: no external fonts, images or scripts. Type is vendored in
    assets/fonts/ (Bricolage Grotesque, Public Sans, JetBrains Mono — all OFL,
    licence texts next to the files). Surface language: warm paper, warm ink,
-   one desaturated pink accent, ink-blue links, hard offset shadows from a
+   one raspberry pink accent, ink-blue links, hard offset shadows from a
    single top-left light source, dashed "cut lines", stickers and tape.
 
    Two editions: "day paper" (light) and "night paper" (dark). Every colour
@@ -56,10 +56,13 @@
   --line: light-dark(#ddcfba, #3b332b);
   --line-strong: light-dark(#b9a88f, #5c5044);
 
-  /* one desaturated pink accent + one ink blue for links */
-  --pink: light-dark(#c9557a, #dc7b9c);
-  --pink-deep: light-dark(#a63a5e, #f095b4);
-  --pink-soft: light-dark(#f4dbe2, #3a2129);
+  /* one raspberry pink accent (the brand pink, brand/README.md) + one ink
+     blue for links */
+  --pink: light-dark(#d6336c, #f06595);
+  --pink-deep: light-dark(#a61e4d, #faa2c1);
+  --pink-soft: light-dark(#f8dde6, #3b1a26);
+  /* the logo's dot: one pink in both editions (brand/README.md) */
+  --brand-pink: #d6336c;
   --blue: light-dark(#2c4a66, #9fbcd8);
   --blue-soft: light-dark(#dde7ef, #1d2833);
   --green-ink: light-dark(#2f6b4f, #92cfaa);
@@ -202,27 +205,22 @@ body::after {
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 0.55rem;
   flex: none;
   color: var(--ink);
-  font-family: var(--font-display);
-  font-weight: 750;
-  font-size: 1.22rem;
-  letter-spacing: -0.025em;
   text-decoration: none;
+  border-radius: 6px;
 }
-.brand .brand-dot {
-  width: 0.78rem;
-  height: 0.78rem;
-  flex: none;
-  border-radius: 50%;
-  background: var(--pink);
-  border: 1.6px solid var(--ink);
-  box-shadow: 2px 2px 0 color-mix(in srgb, var(--shadow-ink) calc(55% * var(--shadow-k)), transparent);
-  transition: rotate 0.2s var(--ease);
+.brand-logo {
+  display: block;
+  height: 1.7rem;
+  width: auto;
+  overflow: visible;
 }
-.brand:hover .brand-dot { rotate: -18deg; }
-.brand:hover { color: var(--pink-deep); }
+.brand-logo-dot {
+  fill: var(--brand-pink);
+  transition: translate 0.2s var(--ease);
+}
+.brand:hover .brand-logo-dot { translate: 0 -1.5px; }
 
 .site-nav { min-width: 0; flex: 1 1 auto; }
 
