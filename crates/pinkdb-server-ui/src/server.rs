@@ -655,6 +655,22 @@ fn build_router(shared: Arc<Shared>) -> Router {
         .route("/api/agent", get(ask::info).fallback(method_not_allowed))
         .route("/api/ask", post(ask::ask).fallback(method_not_allowed))
         .route("/", get(api::shell).fallback(method_not_allowed))
+        // The app's own URLs (wave 121c): a reload or a shared link of a
+        // section, a worksheet or a catalog object gets the same shell, and
+        // the app reads the path. Anything else stays a 404.
+        .route("/query", get(api::shell).fallback(method_not_allowed))
+        .route(
+            "/query/{worksheet}",
+            get(api::shell).fallback(method_not_allowed),
+        )
+        .route("/catalog", get(api::shell).fallback(method_not_allowed))
+        .route(
+            "/catalog/{database}/{object}",
+            get(api::shell).fallback(method_not_allowed),
+        )
+        .route("/history", get(api::shell).fallback(method_not_allowed))
+        .route("/access", get(api::shell).fallback(method_not_allowed))
+        .route("/storage", get(api::shell).fallback(method_not_allowed))
         .route("/preview", get(api::preview).fallback(method_not_allowed))
         .route("/assets/console.css", get(assets::css))
         .route("/assets/boot.js", get(assets::boot))

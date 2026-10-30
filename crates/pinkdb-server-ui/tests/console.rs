@@ -474,6 +474,34 @@ fn an_unknown_path_is_404() {
     assert_eq!(response.status, 404);
     let response = get(fixture.addr(), "/nope");
     assert_eq!(response.status, 404);
+    let response = get(fixture.addr(), "/catalog/main");
+    assert_eq!(
+        response.status, 404,
+        "a catalog path names a database and an object"
+    );
+}
+
+/// The app's own URLs serve the shell, so a reload or a shared link works.
+#[test]
+fn the_app_paths_serve_the_shell() {
+    let fixture = Fixture::start(store(), options());
+    for path in [
+        "/query",
+        "/query/w1",
+        "/catalog",
+        "/catalog/main/t",
+        "/catalog/my%20db/my%2Ftable",
+        "/history",
+        "/access",
+        "/storage",
+    ] {
+        let response = get(fixture.addr(), path);
+        assert_eq!(response.status, 200, "{path}");
+        assert!(
+            response.body.contains("/assets/boot.js"),
+            "{path} is not the shell"
+        );
+    }
 }
 
 #[test]

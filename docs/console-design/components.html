@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pinkdb console — components</title>
+<link rel="stylesheet" href="console.css">
+<style>
+  /* gallery-only layout */
+  body { overflow: auto; }
+  .gal { max-width: 1180px; margin: 0 auto; padding: 32px 40px 80px; display: flex; flex-direction: column; gap: 40px; }
+  .gal__head { display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 50; background: var(--bg-canvas); padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .gal h2 { font-size: var(--text-xl); line-height: var(--lh-xl); font-weight: 600; margin-bottom: 4px; }
+  .gal h2 + p { color: var(--text-muted); margin-bottom: 16px; }
+  .gal h3 { font-size: var(--text-sm); font-weight: 600; color: var(--text-muted); margin: 16px 0 8px; }
+  .demo { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 20px; background: var(--bg-surface); border: 1px solid var(--border); border-radius: var(--r-md); }
+  .demo--col { flex-direction: column; align-items: stretch; }
+  .demo--canvas { background: var(--bg-canvas); }
+  .swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+  .sw { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; background: var(--bg-surface); }
+  .sw__chip { height: 48px; border-bottom: 1px solid var(--border); }
+  .sw__meta { padding: 6px 8px; display: flex; flex-direction: column; }
+  .sw__name { font: 500 var(--text-sm)/16px var(--font-mono); }
+  .sw__val { font: var(--text-xs)/16px var(--font-mono); color: var(--text-subtle); }
+  .ramp { display: grid; grid-template-columns: repeat(13, 1fr); border-radius: var(--r-md); overflow: hidden; border: 1px solid var(--border); }
+  .ramp div { height: 40px; display: flex; align-items: flex-end; padding: 3px 4px; font: 10px var(--font-mono); }
+  .type-row { display: grid; grid-template-columns: 120px 120px 1fr; gap: 16px; align-items: baseline; padding: 8px 0; border-bottom: 1px solid var(--border-subtle); }
+  .space-row { display: grid; grid-template-columns: 80px 60px 1fr; gap: 12px; align-items: center; padding: 3px 0; }
+  .space-bar { height: 10px; background: var(--accent-soft-strong); border-radius: 2px; }
+  .icons { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 8px; }
+  .icons div { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px 4px; border-radius: var(--r-sm); font: var(--text-xs) var(--font-mono); color: var(--text-muted); }
+  .icons div:hover { background: var(--bg-muted); color: var(--text); }
+  .icons .icon { width: 20px; height: 20px; color: var(--text); }
+  .cols-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="gal">
+  <div class="gal__head">
+    <span class="brand__mark">p</span>
+    <span class="brand__name">pinkdb console <span class="brand__sub">Design system · components</span></span>
+    <span class="spacer"></span>
+    <a class="btn btn--ghost btn--sm" href="mockup.html">Open the mockup</a>
+    <a class="btn btn--ghost btn--sm" href="README.md">Spec</a>
+    <button class="btn btn--sm" onclick="toggleTheme()"><i data-i="moon" data-s="14" id="themeIcon"></i><span id="themeLabel">Dark</span></button>
+  </div>
+
+  <!-- ───── Color ───── -->
+  <section>
+    <h2>Color</h2>
+    <p>Components use only the semantic tokens. The ramps exist to define them. Switch the theme to see both mappings.</p>
+    <h3>Neutral and accent ramps</h3>
+    <div class="ramp" data-ramp="gray" data-steps="0 25 50 100 200 300 400 500 600 700 800 900 950"></div>
+    <div style="height:8px"></div>
+    <div class="ramp" style="grid-template-columns: repeat(10, 1fr)" data-ramp="pink" data-steps="50 100 200 300 400 500 600 700 800 900"></div>
+    <h3>Surfaces and lines</h3>
+    <div class="swatches" data-swatches="bg-canvas bg-surface bg-subtle bg-muted bg-inset border-subtle border border-strong"></div>
+    <h3>Text and accent</h3>
+    <div class="swatches" data-swatches="text text-muted text-subtle accent accent-hover accent-text accent-soft focus selection"></div>
+    <h3>Status</h3>
+    <div class="swatches" data-swatches="success success-soft warning warning-soft danger danger-soft info info-soft"></div>
+    <h3>Charts (categorical, in order)</h3>
+    <div class="swatches" data-swatches="viz-1 viz-2 viz-3 viz-4 viz-5 viz-6 viz-7 viz-8"></div>
+  </section>
+
+  <!-- ───── Type ───── -->
+  <section>
+    <h2>Typography</h2>
+    <p>System sans for UI, system mono for SQL, identifiers and data. Default UI text is 13/20.</p>
+    <div class="demo demo--col" style="gap:0">
+      <div class="type-row"><span class="mono subtle">--text-3xl</span><span class="subtle">26/32 · 600</span><span style="font-size:26px;line-height:32px;font-weight:600" class="num">1,500,000</span></div>
+      <div class="type-row"><span class="mono subtle">--text-2xl</span><span class="subtle">20/28 · 600</span><span style="font-size:20px;line-height:28px;font-weight:600">Query history</span></div>
+      <div class="type-row"><span class="mono subtle">--text-xl</span><span class="subtle">16/24 · 600</span><span style="font-size:16px;line-height:24px;font-weight:600">Import data</span></div>
+      <div class="type-row"><span class="mono subtle">--text-lg</span><span class="subtle">14/20 · 600</span><span style="font-size:14px;font-weight:600">Users and roles</span></div>
+      <div class="type-row"><span class="mono subtle">--text-md</span><span class="subtle">13/20 · 400</span><span>Every change runs as SQL under your session.</span></div>
+      <div class="type-row"><span class="mono subtle">--text-sm</span><span class="subtle">12/16 · 400</span><span style="font-size:12px" class="muted">12 rows · 38 ms · 5 columns</span></div>
+      <div class="type-row"><span class="mono subtle">--text-xs</span><span class="subtle">11/16 · 600</span><span class="overline">Tables · 8</span></div>
+      <div class="type-row"><span class="mono subtle">--font-mono</span><span class="subtle">12/24</span><span class="mono" style="font-size:12px">SELECT o_orderkey, o_totalprice FROM orders;</span></div>
+    </div>
+  </section>
+
+  <!-- ───── Space ───── -->
+  <section>
+    <h2>Space, size and shape</h2>
+    <p>A 4 px grid. Controls are 24 / 28 / 32 px; grid rows 24, tree rows 26, table rows 36.</p>
+    <div class="cols-2">
+      <div class="demo demo--col" style="gap:0" id="spaces"></div>
+      <div class="demo" style="align-items:flex-start; gap:16px">
+        <div class="stack" style="gap:8px; align-items:center"><div style="width:64px;height:64px;border:1px solid var(--border-strong);border-radius:var(--r-xs)"></div><span class="mono subtle" style="font-size:11px">r-xs 3</span></div>
+        <div class="stack" style="gap:8px; align-items:center"><div style="width:64px;height:64px;border:1px solid var(--border-strong);border-radius:var(--r-sm)"></div><span class="mono subtle" style="font-size:11px">r-sm 5</span></div>
+        <div class="stack" style="gap:8px; align-items:center"><div style="width:64px;height:64px;border:1px solid var(--border-strong);border-radius:var(--r-md)"></div><span class="mono subtle" style="font-size:11px">r-md 7</span></div>
+        <div class="stack" style="gap:8px; align-items:center"><div style="width:64px;height:64px;border:1px solid var(--border-strong);border-radius:var(--r-lg)"></div><span class="mono subtle" style="font-size:11px">r-lg 10</span></div>
+        <div class="stack" style="gap:8px; align-items:center"><div class="card" style="width:64px;height:64px;box-shadow:var(--shadow-sm)"></div><span class="mono subtle" style="font-size:11px">shadow-sm</span></div>
+        <div class="stack" style="gap:8px; align-items:center"><div style="width:64px;height:64px;border-radius:var(--r-md);background:var(--bg-surface);box-shadow:var(--shadow-md)"></div><span class="mono subtle" style="font-size:11px">shadow-md</span></div>
+        <div class="stack" style="gap:8px; align-items:center"><div style="width:64px;height:64px;border-radius:var(--r-lg);background:var(--bg-surface);box-shadow:var(--shadow-lg)"></div><span class="mono subtle" style="font-size:11px">shadow-lg</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ───── Icons ───── -->
+  <section>
+    <h2>Icons</h2>
+    <p>One stroke set on a 24-unit grid, 1.75 stroke, <span class="mono">currentColor</span>. Shown at 20 px; used at 14, 16 and 18.</p>
+    <div class="demo"><div class="icons" id="icons" style="width:100%"></div></div>
+  </section>
+
+  <!-- ───── Buttons ───── -->
+  <section>
+    <h2>Buttons</h2>
+    <p>One primary per view. Secondary is the default. Ghost lives in toolbars. Danger is for destructive actions, which always confirm.</p>
+    <h3>Variants</h3>
+    <div class="demo">
+      <button class="btn btn--primary"><i data-i="play" data-s="14"></i>Run</button>
+      <button class="btn">Secondary</button>
+      <button class="btn btn--ghost">Ghost</button>
+      <button class="btn btn--danger"><i data-i="trash" data-s="14"></i>Drop user</button>
+      <button class="btn btn--danger-solid">Drop user</button>
+      <button class="btn btn--ghost btn--icon" aria-label="More"><i data-i="more"></i></button>
+      <button class="btn btn--icon" aria-label="Refresh"><i data-i="refresh"></i></button>
+      <div class="split"><button class="btn btn--primary"><i data-i="play" data-s="14"></i>Run<span class="kbd">⌘↵</span></button><button class="btn btn--primary" aria-label="Run options"><i data-i="chevron-down" data-s="14"></i></button></div>
+    </div>
+    <h3>Sizes</h3>
+    <div class="demo">
+      <button class="btn btn--sm">Small · 24</button>
+      <button class="btn">Medium · 28</button>
+      <button class="btn btn--lg">Large · 32</button>
+      <button class="btn btn--primary btn--sm">Small</button>
+      <button class="btn btn--primary">Medium</button>
+      <button class="btn btn--primary btn--lg">Large</button>
+    </div>
+    <h3>States</h3>
+    <div class="demo">
+      <button class="btn">Default</button>
+      <button class="btn" style="border-color:var(--border-strong);background:var(--bg-subtle)">Hover</button>
+      <button class="btn" style="box-shadow:var(--ring)">Focus</button>
+      <button class="btn" disabled>Disabled</button>
+      <button class="btn"><span class="spinner"></span>Cancel</button>
+      <button class="btn btn--ghost is-active"><i data-i="sparkles" data-s="14"></i>Active toggle</button>
+    </div>
+  </section>
+
+  <!-- ───── Inputs ───── -->
+  <section>
+    <h2>Inputs</h2>
+    <p>Labels above controls, help or error below. Controls in a row align on the control.</p>
+    <div class="demo demo--col">
+      <div class="fields">
+        <label class="field"><span class="field__label">Table</span><input class="input mono" value="cities_2026"><span class="field__help">Letters, digits and _</span></label>
+        <label class="field"><span class="field__label">Database</span><select class="input"><option>staging</option></select></label>
+        <label class="field"><span class="field__label">Placeholder</span><input class="input" placeholder="to user or role"></label>
+        <label class="field"><span class="field__label">Invalid</span><input class="input is-invalid" value="1table"><span class="field__error">A name cannot start with a digit</span></label>
+      </div>
+      <div class="row">
+        <label class="search" style="width:280px"><i data-i="search"></i><input class="input" placeholder="Search tables, columns, worksheets…"><span class="kbd">⌘K</span></label>
+        <input class="input input--sm" placeholder="Small · 24">
+        <input class="input" placeholder="Focus" style="border-color:var(--focus);box-shadow:0 0 0 3px var(--accent-soft-strong)">
+        <input class="input" placeholder="Disabled" disabled style="opacity:.5">
+        <button class="switch is-on" aria-label="On" onclick="this.classList.toggle('is-on')"></button>
+        <button class="switch" aria-label="Off" onclick="this.classList.toggle('is-on')"></button>
+      </div>
+      <textarea class="input" placeholder="Ask about your data…"></textarea>
+    </div>
+  </section>
+
+  <!-- ───── Navigation ───── -->
+  <section>
+    <h2>Navigation</h2>
+    <p>Document tabs for worksheets, underline tabs for sections of one thing, segmented controls for views of the same data.</p>
+    <h3>Document tabs</h3>
+    <div class="demo" style="padding:0; overflow:hidden; display:block">
+      <nav class="doctabs">
+        <span class="doctab is-active"><i data-i="file-code" data-s="14"></i><span class="doctab__title">Active, edited</span><span class="doctab__dirty"></span><button class="doctab__close" aria-label="Close"><i data-i="x" data-s="14"></i></button></span>
+        <span class="doctab"><i data-i="file-code" data-s="14"></i><span class="doctab__title">Inactive</span><button class="doctab__close" aria-label="Close"><i data-i="x" data-s="14"></i></button></span>
+        <span class="doctab"><span class="spinner spinner--sm"></span><span class="doctab__title">Running</span><button class="doctab__close" aria-label="Close"><i data-i="x" data-s="14"></i></button></span>
+        <span class="doctab"><i data-i="file-code" data-s="14"></i><span class="doctab__title">A very long worksheet title that gets truncated</span><button class="doctab__close" aria-label="Close"><i data-i="x" data-s="14"></i></button></span>
+        <button class="btn btn--ghost btn--icon btn--sm doctabs__new" aria-label="New worksheet"><i data-i="plus" data-s="14"></i></button>
+      </nav>
+      <div style="height:40px; background:var(--bg-surface)"></div>
+    </div>
+    <h3>Underline tabs and segmented control</h3>
+    <div class="demo" style="padding:0; display:block">
+      <div class="results__head" style="border-radius: var(--r-md) var(--r-md) 0 0">
+        <div class="tabs"><button class="tabs__item is-active">Result 1 <span class="tabs__count">12</span></button><button class="tabs__item">Statement 2</button><button class="tabs__item is-error"><i data-i="alert-circle" data-s="14"></i>Error</button></div>
+        <div class="seg"><button class="seg__item is-active"><i data-i="grid" data-s="14"></i>Grid</button><button class="seg__item"><i data-i="chart" data-s="14"></i>Chart</button><button class="seg__item"><i data-i="plan" data-s="14"></i>Plan</button><button class="seg__item"><i data-i="gauge" data-s="14"></i>Profile</button></div>
+      </div>
+      <div style="height:24px"></div>
+    </div>
+    <h3>Rail, tree and breadcrumb</h3>
+    <div class="demo" style="align-items:flex-start; gap:24px">
+      <nav class="rail" style="border:1px solid var(--border); border-radius: var(--r-md)">
+        <button class="rail__item is-active"><i data-i="file-code" data-s="18"></i>Query</button>
+        <button class="rail__item"><i data-i="database" data-s="18"></i>Catalog</button>
+        <button class="rail__item"><i data-i="history" data-s="18"></i>History</button>
+        <span class="rail__sep"></span>
+        <button class="rail__item"><i data-i="users" data-s="18"></i>Access</button>
+      </nav>
+      <ul class="tree" style="width:280px">
+        <li><div class="tree__row is-open"><i data-i="chevron-right" class="tree__chev"></i><i data-i="database" class="tree__kind"></i><span class="tree__name">main</span><span class="badge badge--accent">Current</span></div></li>
+        <li class="tree__group overline" style="--depth:1">Tables · 2</li>
+        <li><div class="tree__row is-selected" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="table" class="tree__kind"></i><span class="tree__name tree__name--mono">orders</span><span class="tree__detail">1.5M</span><span class="tree__actions"><button class="btn btn--ghost btn--icon btn--sm" aria-label="Insert"><i data-i="insert" data-s="14"></i></button><button class="btn btn--ghost btn--icon btn--sm" aria-label="Preview"><i data-i="play" data-s="14"></i></button></span></div></li>
+        <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="lake" class="tree__kind"></i><span class="tree__name tree__name--mono">events</span><span class="tree__detail">v42</span><span class="tree__actions"><button class="btn btn--ghost btn--icon btn--sm" aria-label="History"><i data-i="clock" data-s="14"></i></button></span></div></li>
+        <li><div class="tree__row" style="--depth:2"><i data-i="chevron-right" class="tree__chev tree__chev--none"></i><i data-i="column" class="tree__kind" data-s="14"></i><span class="tree__name tree__name--mono">event_id</span><span class="tree__detail mono">uuid</span></div></li>
+      </ul>
+      <div class="stack">
+        <div class="crumbs"><i data-i="database" data-s="14"></i>main<span class="crumbs__sep">›</span>Tables<span class="crumbs__sep">›</span><span class="mono">orders</span></div>
+        <span class="muted" style="font-size:12px">Hover a tree row to reveal its actions.</span>
+      </div>
+    </div>
+    <h3>Menu</h3>
+    <div class="demo demo--canvas">
+      <div class="menu" style="width:260px">
+        <button class="menu__item"><i data-i="play"></i>Run statement at cursor<span class="kbd">⌘↵</span></button>
+        <button class="menu__item is-active"><i data-i="play"></i>Run all<span class="kbd">⇧⌘↵</span></button>
+        <div class="menu__sep"></div>
+        <button class="menu__item"><i data-i="copy"></i>Duplicate</button>
+        <button class="menu__item"><i data-i="share"></i>Share…</button>
+        <div class="menu__sep"></div>
+        <button class="menu__item menu__item--danger"><i data-i="trash"></i>Delete worksheet</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ───── Data display ───── -->
+  <section>
+    <h2>Data display</h2>
+    <p>Badges label, statuses report, the grid shows data in mono with tabular numbers.</p>
+    <h3>Badges, status, kbd</h3>
+    <div class="demo">
+      <span class="badge">Table</span><span class="badge badge--accent">Admin</span><span class="badge badge--success">Durable</span>
+      <span class="badge badge--warning">Read-only</span><span class="badge badge--danger mono">ADMIN</span><span class="badge badge--info mono">SELECT</span><span class="badge badge--outline">You</span>
+      <span class="statusbar__sep"></span>
+      <span class="status status--success">Succeeded</span><span class="status status--danger">Failed</span><span class="status status--warning">Cancelled</span><span class="status status--info">Running</span><span class="status">Queued</span>
+      <span class="statusbar__sep"></span>
+      <span class="kbd">⌘</span><span class="kbd">↵</span><span class="kbd">Esc</span><span class="kbd">/</span>
+    </div>
+    <h3>Data grid</h3>
+    <div class="demo" style="padding:0; overflow:hidden">
+      <div class="grid" style="max-height:220px">
+        <table>
+          <thead><tr><th class="grid__rn">#</th><th><span class="grid__name">o_orderkey</span><span class="grid__type">bigint</span></th><th><span class="grid__name">o_orderstatus</span><span class="grid__type">varchar</span></th><th class="is-num"><span class="grid__name">o_totalprice</span><span class="grid__type">decimal(15,2)</span></th><th><span class="grid__name">o_orderdate</span><span class="grid__type">date</span></th><th><span class="grid__name">is_late</span><span class="grid__type">boolean</span></th><th><span class="grid__name">meta</span><span class="grid__type">variant</span></th><th style="width:100%"></th></tr></thead>
+          <tbody>
+            <tr><td class="grid__rn">1</td><td class="is-num">1</td><td>O</td><td class="is-num">173,665.47</td><td>1996-01-02</td><td class="is-false">false</td><td>{"channel":"web"}</td><td></td></tr>
+            <tr><td class="grid__rn">2</td><td class="is-num">2</td><td>O</td><td class="is-num is-selected">46,929.18</td><td>1996-12-01</td><td class="is-true">true</td><td class="is-null">NULL</td><td></td></tr>
+            <tr><td class="grid__rn">3</td><td class="is-num">3</td><td>F</td><td class="is-num">193,846.25</td><td>1993-10-14</td><td class="is-false">false</td><td>{"channel":"store","id":8}</td><td></td></tr>
+            <tr><td class="grid__rn">4</td><td class="is-num">4</td><td>O</td><td class="is-num">32,151.78</td><td>1995-10-11</td><td class="is-null">NULL</td><td>[1,2,3]</td><td></td></tr>
+            <tr><td class="grid__rn">5</td><td class="is-num">5</td><td>F</td><td class="is-num">144,659.20</td><td>1994-07-30</td><td class="is-true">true</td><td>{}</td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <h3>Table, metric and key–value</h3>
+    <div class="cols-2">
+      <div class="card" style="overflow:hidden">
+        <div class="card__head"><span class="card__title">Grants</span><span class="badge">3</span><span class="spacer"></span><button class="btn btn--sm"><i data-i="shield" data-s="14"></i>Grant</button></div>
+        <table class="table">
+          <thead><tr><th>Grantee</th><th>Privilege</th><th>On</th><th class="t-actions"></th></tr></thead>
+          <tbody>
+            <tr><td class="mono">analyst</td><td><span class="badge badge--info mono">SELECT</span></td><td><span class="muted">Database</span> <span class="mono">main</span></td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger">Revoke</button></td></tr>
+            <tr><td class="mono">loader</td><td><span class="badge badge--warning mono">INSERT</span></td><td><span class="muted">Table</span> <span class="mono">staging.cities</span></td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger">Revoke</button></td></tr>
+            <tr><td class="mono">sam</td><td><span class="badge badge--success mono">CREATE</span></td><td><span class="muted">Database</span> <span class="mono">staging</span></td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger">Revoke</button></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="stack">
+        <div class="metrics"><div class="card metric"><span class="overline">Rows</span><span class="metric__value">1,500,000</span><span class="metric__caption">exact, from the catalog</span></div><div class="card metric"><span class="overline">WAL</span><span class="metric__value">6.2 MB</span><span class="metric__caption">412 records</span></div></div>
+        <div class="card"><div class="card__body" style="padding-top:4px;padding-bottom:4px"><dl class="kv"><dt>Location</dt><dd class="mono">/var/lib/pinkdb/warehouse.pink</dd><dt>Encryption</dt><dd><span class="badge badge--success">AES-256-GCM</span></dd><dt>Lock</dt><dd>Held by this server</dd></dl></div></div>
+      </div>
+    </div>
+    <h3>Code and syntax</h3>
+    <div class="demo demo--col">
+<pre class="code"><span class="t-comment">-- every token class the editor emits</span>
+<span class="t-keyword">SELECT</span> <span class="t-func">count</span>(<span class="t-op">*</span>) <span class="t-keyword">AS</span> n, <span class="t-qident">"Order Total"</span>, <span class="t-number">42.5</span>, <span class="t-string">'text'</span>, <span class="t-type">DATE</span> <span class="t-string">'2026-10-30'</span>
+<span class="t-keyword">FROM</span> orders <span class="t-keyword">WHERE</span> o_totalprice <span class="t-op">&gt;</span> <span class="t-number">1000</span>;</pre>
+    </div>
+  </section>
+
+  <!-- ───── Feedback ───── -->
+  <section>
+    <h2>Feedback</h2>
+    <p>Errors appear in place as callouts; results of actions that are not visible in place appear as toasts.</p>
+    <div class="cols-2">
+      <div class="stack">
+        <div class="callout"><i data-i="info"></i><div class="callout__body"><div class="callout__title">Info</div>Path and URL reads need ADMIN in a console with logins.</div></div>
+        <div class="callout callout--success"><i data-i="check-circle"></i><div class="callout__body"><div class="callout__title">Imported 48,213 rows</div>into <span class="mono">staging.cities</span> in 212 ms.</div></div>
+        <div class="callout callout--warning"><i data-i="alert"></i><div class="callout__body"><div class="callout__title">This console runs without logins</div>Creating the first user ends it: restart with <span class="mono">--ui-auth basic</span>.</div></div>
+        <div class="callout callout--danger"><i data-i="alert-circle"></i><div class="callout__body"><div class="callout__title">Statement 2 failed</div>Binder Error: column <span class="mono">"n_nam"</span> not found.<pre class="code">SELECT max(n_nam) FROM nation;</pre></div></div>
+      </div>
+      <div class="stack">
+        <div class="demo" style="padding:0; min-height:220px; display:flex">
+          <div class="empty"><i data-i="file-code" data-s="32"></i><div class="empty__title">No saved worksheets</div><div class="empty__body">Worksheets save as you type. Start one to keep a query around.</div><button class="btn btn--sm"><i data-i="plus" data-s="14"></i>New worksheet</button></div>
+        </div>
+        <div class="toast toast--success"><i data-i="check-circle"></i><div class="toast__body"><div class="toast__title">Checkpoint complete</div><div class="muted">WAL folded into the store file in 182 ms.</div></div><button class="btn btn--ghost btn--icon btn--sm" aria-label="Dismiss"><i data-i="x" data-s="14"></i></button></div>
+        <div class="demo">
+          <span class="spinner"></span><span class="muted">Spinner</span>
+          <div class="bar" style="width:160px"><div class="bar__fill" style="width:62%"></div></div><span class="muted">Bar</span>
+          <div class="stack" style="gap:6px; width:160px"><div class="skeleton" style="width:90%"></div><div class="skeleton" style="width:60%"></div><div class="skeleton" style="width:75%"></div></div>
+        </div>
+      </div>
+    </div>
+    <h3>Dialog</h3>
+    <div class="demo demo--canvas" style="justify-content:center; background: var(--bg-overlay)">
+      <div class="dialog dialog--sm" role="dialog" aria-labelledby="dropTitle">
+        <div class="dialog__head"><span class="dialog__title" id="dropTitle">Drop user ana?</span><button class="btn btn--ghost btn--icon btn--sm" aria-label="Close"><i data-i="x" data-s="14"></i></button></div>
+        <div class="dialog__body">
+          <p class="muted">ana loses access at once and their 3 grants are removed. Their worksheets stay, owned by nobody.</p>
+          <pre class="code"><span class="t-keyword">DROP USER</span> ana;</pre>
+        </div>
+        <div class="dialog__foot"><button class="btn">Cancel</button><button class="btn btn--danger-solid"><i data-i="trash" data-s="14"></i>Drop user</button></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+/* gallery behavior only */
+const ICONS = 'icons.svg';
+function icon(name, extra) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', ('icon ' + (extra || '')).trim());
+  svg.setAttribute('aria-hidden', 'true');
+  const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+  use.setAttribute('href', ICONS + '#i-' + name);
+  svg.appendChild(use);
+  return svg;
+}
+function hydrateIcons(root) {
+  root.querySelectorAll('i[data-i]').forEach(el => {
+    const svg = icon(el.dataset.i, [el.dataset.s ? 'icon--' + el.dataset.s : '', el.className].join(' '));
+    if (el.id) svg.id = el.id;
+    el.replaceWith(svg);
+  });
+}
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+function paintSwatches() {
+  const cs = getComputedStyle(document.documentElement);
+  document.querySelectorAll('[data-swatches]').forEach(box => {
+    box.replaceChildren();
+    box.dataset.swatches.split(' ').forEach(name => {
+      const sw = el('div', 'sw'), chip = el('div', 'sw__chip'), meta = el('div', 'sw__meta');
+      chip.style.background = `var(--${name})`;
+      meta.append(el('span', 'sw__name', '--' + name), el('span', 'sw__val', cs.getPropertyValue('--' + name).trim()));
+      sw.append(chip, meta); box.append(sw);
+    });
+  });
+  document.querySelectorAll('[data-ramp]').forEach(box => {
+    box.replaceChildren();
+    box.dataset.steps.split(' ').forEach((step, i, all) => {
+      const d = el('div', null, step);
+      d.style.background = `var(--${box.dataset.ramp}-${step})`;
+      d.style.color = i < all.length / 2 ? 'var(--gray-900)' : '#fff';
+      box.append(d);
+    });
+  });
+}
+const spaces = [['sp-0_5', 2], ['sp-1', 4], ['sp-1_5', 6], ['sp-2', 8], ['sp-2_5', 10], ['sp-3', 12], ['sp-4', 16], ['sp-5', 20], ['sp-6', 24], ['sp-8', 32], ['sp-10', 40]];
+spaces.forEach(([n, px]) => {
+  const row = el('div', 'space-row'), bar = el('div', 'space-bar');
+  bar.style.width = px * 4 + 'px';
+  row.append(el('span', 'mono subtle', '--' + n), el('span', 'muted', px + ' px'), bar);
+  document.getElementById('spaces').append(row);
+});
+fetch(ICONS).then(r => r.text()).then(text => {
+  const ids = [...text.matchAll(/id="i-([a-z-]+)"/g)].map(m => m[1]);
+  const box = document.getElementById('icons');
+  ids.forEach(id => { const d = el('div'); d.append(icon(id), el('span', null, id)); box.append(d); });
+});
+function toggleTheme() {
+  const dark = document.documentElement.dataset.theme !== 'dark';
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  document.querySelector('#themeIcon use').setAttribute('href', ICONS + (dark ? '#i-sun' : '#i-moon'));
+  document.getElementById('themeLabel').textContent = dark ? 'Light' : 'Dark';
+  paintSwatches();
+}
+hydrateIcons(document);
+paintSwatches();
+if (location.hash === '#dark') toggleTheme();
+</script>
+</body>
+</html>

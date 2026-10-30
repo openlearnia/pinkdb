@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pinkdb console — mockup</title>
+<link rel="stylesheet" href="console.css">
+<style>
+  /* mockup-only: view switching */
+  .app:not([data-view="query"]) .only-query,
+  .app:not([data-view="catalog"]) .only-catalog,
+  .app:not([data-view="history"]) .only-history,
+  .app:not([data-view="access"]) .only-access,
+  .app:not([data-view="storage"]) .only-storage { display: none !important; }
+  .app[data-view="history"] .explorer, .app[data-view="access"] .explorer, .app[data-view="storage"] .explorer { display: none; }
+  .app:not(.asking) .inspector { display: none; }
+  [hidden] { display: none !important; }
+  .pop { position: absolute; }
+</style>
+</head>
+<body>
+
+<!-- ═════════════════════ login ═════════════════════ -->
+<div class="login" id="login" hidden>
+  <form class="card login__card" onsubmit="event.preventDefault(); show('login', false)">
+    <div class="login__brand"><span class="brand__mark">p</span><span class="brand__name">pinkdb</span></div>
+    <div>
+      <h1 class="login__title">Sign in</h1>
+      <p class="muted">to the warehouse console on <span class="mono">localhost:8091</span></p>
+    </div>
+    <label class="field"><span class="field__label">User</span><input class="input input--lg" value="kartik" autocomplete="username"></label>
+    <label class="field"><span class="field__label">Password</span><input class="input input--lg" type="password" value="password" autocomplete="current-password"></label>
+    <button class="btn btn--primary btn--lg btn--block" type="submit">Sign in</button>
+    <p class="login__foot">Basic authentication · sessions end after 12 h idle</p>
+  </form>
+</div>
+
+<!-- ═════════════════════ app ═════════════════════ -->
+<div class="app asking" id="app" data-view="query">
+
+  <!-- top bar -->
+  <header class="topbar">
+    <div class="brand"><span class="brand__mark">p</span></div>
+    <span class="brand__name">pinkdb <span class="brand__sub">Warehouse</span></span>
+    <span class="topbar__sep"></span>
+    <button class="context" title="The database statements run in"><i data-i="database"></i>main<i data-i="chevron-down" data-s="14"></i></button>
+    <label class="search"><i data-i="search"></i><input class="input" placeholder="Search tables, columns, worksheets…"><span class="kbd">⌘K</span></label>
+    <button class="btn btn--ghost" onclick="show('import', true)"><i data-i="upload"></i>Import</button>
+    <button class="btn btn--ghost is-active" id="askBtn" onclick="toggleAsk()"><i data-i="sparkles"></i>Ask</button>
+    <span class="topbar__sep"></span>
+    <button class="btn btn--ghost btn--icon" aria-label="Switch theme" onclick="toggleTheme()"><i data-i="moon" id="themeIcon"></i></button>
+    <div style="position:relative">
+      <button class="avatar" onclick="toggle('userMenu')" aria-label="Account">KB</button>
+      <div class="menu pop" id="userMenu" hidden style="right:0; top:34px; width:240px">
+        <div class="menu__label"><div style="font-weight:600">kartik</div><div class="subtle" style="font-size:12px">Administrator · basic auth</div></div>
+        <div class="menu__sep"></div>
+        <button class="menu__item" onclick="toggleTheme()"><i data-i="moon"></i>Dark theme<span class="kbd">⇧⌘L</span></button>
+        <button class="menu__item"><i data-i="key"></i>Change password</button>
+        <div class="menu__sep"></div>
+        <button class="menu__item" onclick="toggle('userMenu'); show('login', true)"><i data-i="log-out"></i>Sign out</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- rail -->
+  <nav class="rail" aria-label="Sections">
+    <button class="rail__item is-active" data-go="query"><i data-i="file-code" data-s="18"></i>Query</button>
+    <button class="rail__item" data-go="catalog"><i data-i="database" data-s="18"></i>Catalog</button>
+    <button class="rail__item" data-go="history"><i data-i="history" data-s="18"></i>History</button>
+    <span class="rail__sep"></span>
+    <button class="rail__item" data-go="access"><i data-i="users" data-s="18"></i>Access</button>
+    <button class="rail__item" data-go="storage"><i data-i="hard-drive" data-s="18"></i>Storage</button>
+  </nav>
+
+  <!-- explorer -->
+  <aside class="explorer">
+    <div class="explorer__head">
+      <span class="explorer__title only-query">Explorer</span>
+      <span class="explorer__title only-catalog">Catalog</span>
+      <button class="btn btn--ghost btn--icon btn--sm" aria-label="Refresh"><i data-i="refresh" data-s="14"></i></button>
+      <button class="btn btn--ghost btn--icon btn--sm" aria-label="New worksheet"><i data-i="plus" data-s="14"></i></button>
+      <button class="btn btn--ghost btn--icon btn--sm" aria-label="Hide the explorer (⌘B)"><i data-i="panel-left" data-s="14"></i></button>
+    </div>
+    <div class="explorer__tools">
+      <div class="seg only-query" id="exSeg">
+        <button class="seg__item is-active" data-ex="objects">Objects</button>
+        <button class="seg__item" data-ex="sheets">Worksheets</button>
+      </div>
+      <label class="search"><i data-i="search" data-s="14"></i><input class="input input--sm" placeholder="Filter"><span class="kbd">/</span></label>
+    </div>
+    <div class="explorer__body" id="exObjects">
+      <ul class="tree" id="tree">
+        <li>
+          <div class="tree__row is-open"><i data-i="chevron-right" class="tree__chev"></i><i data-i="database" class="tree__kind"></i><span class="tree__name">main</span><span class="badge badge--accent">Current</span></div>
+          <ul>
+            <li class="tree__group overline" style="--depth:1">Tables · 8</li>
+            <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="table" class="tree__kind"></i><span class="tree__name tree__name--mono">customer</span><span class="tree__detail">150K</span><span class="tree__actions"><button class="btn btn--ghost btn--icon btn--sm" aria-label="Insert name"><i data-i="insert" data-s="14"></i></button><button class="btn btn--ghost btn--icon btn--sm" aria-label="Preview rows"><i data-i="play" data-s="14"></i></button></span></div></li>
+            <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="table" class="tree__kind"></i><span class="tree__name tree__name--mono">lineitem</span><span class="tree__detail">6.0M</span><span class="tree__actions"><button class="btn btn--ghost btn--icon btn--sm" aria-label="Insert name"><i data-i="insert" data-s="14"></i></button><button class="btn btn--ghost btn--icon btn--sm" aria-label="Preview rows"><i data-i="play" data-s="14"></i></button></span></div></li>
+            <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="table" class="tree__kind"></i><span class="tree__name tree__name--mono">nation</span><span class="tree__detail">25</span><span class="tree__actions"><button class="btn btn--ghost btn--icon btn--sm" aria-label="Insert name"><i data-i="insert" data-s="14"></i></button><button class="btn btn--ghost btn--icon btn--sm" aria-label="Preview rows"><i data-i="play" data-s="14"></i></button></span></div></li>
+            <li>
+              <div class="tree__row is-open is-selected" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="table" class="tree__kind"></i><span class="tree__name tree__name--mono">orders</span><span class="tree__detail">1.5M</span><span class="tree__actions"><button class="btn btn--ghost btn--icon btn--sm" aria-label="Insert name"><i data-i="insert" data-s="14"></i></button><button class="btn btn--ghost btn--icon btn--sm" aria-label="Preview rows"><i data-i="play" data-s="14"></i></button></span></div>
+              <ul>
+                <li><div class="tree__row" style="--depth:2"><i data-i="chevron-right" class="tree__chev tree__chev--none"></i><i data-i="column" class="tree__kind" data-s="14"></i><span class="tree__name tree__name--mono">o_orderkey</span><span class="tree__detail mono">bigint</span></div></li>
+                <li><div class="tree__row" style="--depth:2"><i data-i="chevron-right" class="tree__chev tree__chev--none"></i><i data-i="column" class="tree__kind" data-s="14"></i><span class="tree__name tree__name--mono">o_custkey</span><span class="tree__detail mono">bigint</span></div></li>
+                <li><div class="tree__row" style="--depth:2"><i data-i="chevron-right" class="tree__chev tree__chev--none"></i><i data-i="column" class="tree__kind" data-s="14"></i><span class="tree__name tree__name--mono">o_orderstatus</span><span class="tree__detail mono">varchar</span></div></li>
+                <li><div class="tree__row" style="--depth:2"><i data-i="chevron-right" class="tree__chev tree__chev--none"></i><i data-i="column" class="tree__kind" data-s="14"></i><span class="tree__name tree__name--mono">o_totalprice</span><span class="tree__detail mono">decimal(15,2)</span></div></li>
+                <li><div class="tree__row" style="--depth:2"><i data-i="chevron-right" class="tree__chev tree__chev--none"></i><i data-i="column" class="tree__kind" data-s="14"></i><span class="tree__name tree__name--mono">o_orderdate</span><span class="tree__detail mono">date</span></div></li>
+              </ul>
+            </li>
+            <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="table" class="tree__kind"></i><span class="tree__name tree__name--mono">part</span><span class="tree__detail">200K</span></div></li>
+            <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="table" class="tree__kind"></i><span class="tree__name tree__name--mono">supplier</span><span class="tree__detail">10K</span></div></li>
+            <li class="tree__group overline" style="--depth:1">Views · 2</li>
+            <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="view" class="tree__kind"></i><span class="tree__name tree__name--mono">monthly_revenue</span></div></li>
+            <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="layers" class="tree__kind"></i><span class="tree__name tree__name--mono">top_customers</span><span class="tree__detail">Materialized</span></div></li>
+            <li class="tree__group overline" style="--depth:1">Lake tables · 1</li>
+            <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev"></i><i data-i="lake" class="tree__kind"></i><span class="tree__name tree__name--mono">events</span><span class="tree__detail">v42</span></div></li>
+            <li class="tree__group overline" style="--depth:1">Indexes · 1</li>
+            <li><div class="tree__row" style="--depth:1"><i data-i="chevron-right" class="tree__chev tree__chev--none"></i><i data-i="index" class="tree__kind"></i><span class="tree__name tree__name--mono">orders_date_idx</span><span class="tree__detail">on orders</span></div></li>
+          </ul>
+        </li>
+        <li><div class="tree__row"><i data-i="chevron-right" class="tree__chev"></i><i data-i="database" class="tree__kind"></i><span class="tree__name">sales</span><span class="tree__detail">12 objects</span></div><ul><li class="tree__group overline" style="--depth:1">Tables · 12</li></ul></li>
+        <li><div class="tree__row"><i data-i="chevron-right" class="tree__chev"></i><i data-i="database" class="tree__kind"></i><span class="tree__name">staging</span><span class="tree__detail">3 objects</span></div><ul><li class="tree__group overline" style="--depth:1">Tables · 3</li></ul></li>
+      </ul>
+    </div>
+    <div class="explorer__body" id="exSheets" hidden>
+      <div class="overline" style="padding: 8px 8px 4px">Mine</div>
+      <ul class="tree">
+        <li><div class="tree__row is-selected"><i data-i="file-code" class="tree__kind"></i><span class="tree__name">Revenue by month</span><span class="tree__detail">2 min ago</span></div></li>
+        <li><div class="tree__row"><i data-i="file-code" class="tree__kind"></i><span class="tree__name">Orders preview</span><span class="tree__detail">1 h ago</span></div></li>
+        <li><div class="tree__row"><i data-i="file-code" class="tree__kind"></i><span class="tree__name">Late shipments by supplier</span><span class="tree__detail">Yesterday</span></div></li>
+        <li><div class="tree__row"><i data-i="file-code" class="tree__kind"></i><span class="tree__name">Lake events — change feed</span><i data-i="share" data-s="14" class="subtle"></i><span class="tree__detail">Oct 27</span></div></li>
+      </ul>
+      <div class="overline" style="padding: 12px 8px 4px">Shared with me</div>
+      <ul class="tree">
+        <li><div class="tree__row"><i data-i="file-code" class="tree__kind"></i><span class="tree__name">Churn cohort</span><span class="tree__detail">ana · Oct 24</span></div></li>
+        <li><div class="tree__row"><i data-i="file-code" class="tree__kind"></i><span class="tree__name">Weekly KPIs</span><span class="tree__detail">sam · Oct 20</span></div></li>
+      </ul>
+    </div>
+    <div class="resize-x" title="Drag to resize"></div>
+  </aside>
+
+  <!-- ═══════ workspace ═══════ -->
+  <main class="work">
+
+    <!-- Query -->
+    <div class="only-query" style="display:flex; flex-direction:column; flex:1; min-height:0">
+      <nav class="doctabs">
+        <span class="doctab is-active"><i data-i="file-code" data-s="14"></i><span class="doctab__title">Revenue by month</span><span class="doctab__dirty" title="Unsaved changes"></span><button class="doctab__close" aria-label="Close"><i data-i="x" data-s="14"></i></button></span>
+        <span class="doctab"><i data-i="file-code" data-s="14"></i><span class="doctab__title">Orders preview</span><button class="doctab__close" aria-label="Close"><i data-i="x" data-s="14"></i></button></span>
+        <span class="doctab" title="Running"><span class="spinner spinner--sm"></span><span class="doctab__title">Late shipments by supplier</span><button class="doctab__close" aria-label="Close"><i data-i="x" data-s="14"></i></button></span>
+        <button class="btn btn--ghost btn--icon btn--sm doctabs__new" aria-label="New worksheet"><i data-i="plus" data-s="14"></i></button>
+      </nav>
+      <div class="sheet">
+        <div class="sheet__bar">
+          <input class="input input--ghost sheet__title" value="Revenue by month" aria-label="Worksheet title">
+          <span class="sheet__state"><span class="doctab__dirty"></span>Edited · autosaves</span>
+          <span class="spacer"></span>
+          <select class="input input--sm" style="width:120px" aria-label="Database"><option>main</option><option>sales</option></select>
+          <button class="btn btn--sm"><i data-i="share" data-s="14"></i>Share</button>
+          <button class="btn btn--ghost btn--icon btn--sm" aria-label="More"><i data-i="more"></i></button>
+          <div style="position:relative">
+            <div class="split" id="runSplit">
+              <button class="btn btn--primary" onclick="runDemo()"><i data-i="play" data-s="14"></i>Run<span class="kbd">⌘↵</span></button>
+              <button class="btn btn--primary" aria-label="Run options" onclick="toggle('runMenu')"><i data-i="chevron-down" data-s="14"></i></button>
+            </div>
+            <button class="btn" id="cancelBtn" hidden onclick="stopDemo()"><span class="spinner"></span>Cancel<span class="kbd">Esc</span></button>
+            <div class="menu pop" id="runMenu" hidden style="right:0; top:32px; width:260px">
+              <button class="menu__item"><i data-i="play"></i>Run statement at cursor<span class="kbd">⌘↵</span></button>
+              <button class="menu__item"><i data-i="play"></i>Run all<span class="kbd">⇧⌘↵</span></button>
+              <div class="menu__sep"></div>
+              <button class="menu__item"><i data-i="plan"></i>Explain<span class="kbd">⌥⌘E</span></button>
+              <button class="menu__item"><i data-i="gauge"></i>Run with profile</button>
+            </div>
+          </div>
+        </div>
+        <div class="editor" style="height: 236px">
+          <div class="editor__gutter"><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div><div class="is-current">7</div><div>8</div><div>9</div><div>10</div><div>11</div></div>
+<pre class="editor__code"><span class="editor__line"><span class="t-comment">-- Revenue and order count by month, 1995</span></span><span class="editor__line"><span class="t-keyword">SELECT</span> <span class="t-func">date_trunc</span>(<span class="t-string">'month'</span>, o_orderdate) <span class="t-keyword">AS</span> month,</span><span class="editor__line">       <span class="t-func">sum</span>(o_totalprice) <span class="t-keyword">AS</span> revenue,</span><span class="editor__line">       <span class="t-func">count</span>(<span class="t-op">*</span>) <span class="t-keyword">AS</span> orders,</span><span class="editor__line">       <span class="t-func">round</span>(<span class="t-func">avg</span>(o_totalprice), <span class="t-number">2</span>) <span class="t-keyword">AS</span> avg_order,</span><span class="editor__line">       <span class="t-func">max</span>(n_name) <span class="t-keyword">AS</span> top_nation</span><span class="editor__line is-current"><span class="t-keyword">FROM</span> orders <span class="t-keyword">JOIN</span> customer <span class="t-keyword">ON</span> c_custkey <span class="t-op">=</span> o_cu<span class="caret"></span></span><span class="editor__line"><span class="t-keyword">LEFT JOIN</span> nation <span class="t-keyword">ON</span> n_nationkey <span class="t-op">=</span> c_nationkey</span><span class="editor__line"><span class="t-keyword">WHERE</span> o_orderdate <span class="t-op">&gt;=</span> <span class="t-type">DATE</span> <span class="t-string">'1995-01-01'</span> <span class="t-keyword">AND</span> o_orderdate <span class="t-op">&lt;</span> <span class="t-type">DATE</span> <span class="t-string">'1996-01-01'</span></span><span class="editor__line"><span class="t-keyword">GROUP BY</span> <span class="t-number">1</span> <span class="t-keyword">ORDER BY</span> <span class="t-number">1</span>;</span><span class="editor__line"><span class="t-keyword">SELECT</span> <span class="t-func">count</span>(<span class="t-op">*</span>) <span class="t-keyword">FROM</span> <span class="t-qident">"lineitem"</span>;</span></pre>
+          <ul class="completion" style="left: 440px; top: 150px">
+            <li class="is-selected"><i data-i="column"></i>o_custkey<span class="completion__kind">bigint · orders</span></li>
+            <li><i data-i="column"></i>o_comment<span class="completion__kind">varchar · orders</span></li>
+            <li><i data-i="function"></i>octet_length<span class="completion__kind">function</span></li>
+          </ul>
+        </div>
+        <div class="splitter" title="Drag to resize; double-click resets"></div>
+        <section class="results">
+          <div class="results__head">
+            <div class="tabs">
+              <button class="tabs__item is-active">Result 1 <span class="tabs__count">12</span></button>
+              <button class="tabs__item">Result 2 <span class="tabs__count">1</span></button>
+            </div>
+            <div class="seg" id="viewSeg">
+              <button class="seg__item is-active" data-pane="grid"><i data-i="grid" data-s="14"></i>Grid</button>
+              <button class="seg__item" data-pane="chart"><i data-i="chart" data-s="14"></i>Chart</button>
+              <button class="seg__item" data-pane="plan"><i data-i="plan" data-s="14"></i>Plan</button>
+              <button class="seg__item" data-pane="profile"><i data-i="gauge" data-s="14"></i>Profile</button>
+            </div>
+          </div>
+          <div class="results__bar">
+            <span class="status status--success">Succeeded</span>
+            <span class="results__dot">·</span><span><strong>12</strong> rows</span>
+            <span class="results__dot">·</span><span>38 ms</span>
+            <span class="results__dot">·</span><span>5 columns</span>
+            <span class="spacer"></span>
+            <span class="subtle" style="font-size:11px">Mockup states:</span>
+            <button class="btn btn--ghost btn--sm" onclick="pane('error')">Error</button>
+            <button class="btn btn--ghost btn--sm" onclick="pane('empty')">Empty</button>
+            <span class="statusbar__sep"></span>
+            <button class="btn btn--ghost btn--sm"><i data-i="copy" data-s="14"></i>Copy</button>
+            <button class="btn btn--ghost btn--sm"><i data-i="download" data-s="14"></i>CSV</button>
+            <button class="btn btn--ghost btn--sm"><i data-i="download" data-s="14"></i>JSON</button>
+          </div>
+          <div class="results__body">
+            <div class="grid" data-pane-body="grid">
+              <table>
+                <thead><tr>
+                  <th class="grid__rn">#</th>
+                  <th><span class="grid__name">month</span><span class="grid__type">date</span></th>
+                  <th class="is-num"><span class="grid__name">revenue</span><span class="grid__type">decimal(38,2)</span></th>
+                  <th class="is-num"><span class="grid__name">orders</span><span class="grid__type">bigint</span></th>
+                  <th class="is-num"><span class="grid__name">avg_order</span><span class="grid__type">double</span></th>
+                  <th><span class="grid__name">top_nation</span><span class="grid__type">varchar</span></th>
+                  <th style="width:100%"></th>
+                </tr></thead>
+                <tbody id="gridBody">
+<tr><td class="grid__rn">1</td><td>1995-01-01</td><td class="is-num">18,914,027.33</td><td class="is-num">19,251</td><td class="is-num">982.48</td><td>ALGERIA</td><td></td></tr>
+<tr><td class="grid__rn">2</td><td>1995-02-01</td><td class="is-num">17,201,554.10</td><td class="is-num">17,402</td><td class="is-num">988.48</td><td>ARGENTINA</td><td></td></tr>
+<tr><td class="grid__rn">3</td><td>1995-03-01</td><td class="is-num">19,004,211.87</td><td class="is-num">19,347</td><td class="is-num">982.28</td><td>BRAZIL</td><td></td></tr>
+<tr><td class="grid__rn">4</td><td>1995-04-01</td><td class="is-num">18,512,937.02</td><td class="is-num">18,733</td><td class="is-num">988.25</td><td>CANADA</td><td></td></tr>
+<tr><td class="grid__rn">5</td><td>1995-05-01</td><td class="is-num">19,108,446.51</td><td class="is-num">19,390</td><td class="is-num">985.48</td><td class="is-null">NULL</td><td></td></tr>
+<tr><td class="grid__rn">6</td><td>1995-06-01</td><td class="is-num is-selected">18,604,120.79</td><td class="is-num">18,881</td><td class="is-num">985.33</td><td>EGYPT</td><td></td></tr>
+<tr><td class="grid__rn">7</td><td>1995-07-01</td><td class="is-num">19,222,870.40</td><td class="is-num">19,502</td><td class="is-num">985.69</td><td>ETHIOPIA</td><td></td></tr>
+<tr><td class="grid__rn">8</td><td>1995-08-01</td><td class="is-num">19,190,331.12</td><td class="is-num">19,476</td><td class="is-num">985.33</td><td>FRANCE</td><td></td></tr>
+<tr><td class="grid__rn">9</td><td>1995-09-01</td><td class="is-num">18,466,918.45</td><td class="is-num">18,710</td><td class="is-num">987.01</td><td>GERMANY</td><td></td></tr>
+<tr><td class="grid__rn">10</td><td>1995-10-01</td><td class="is-num">19,163,001.98</td><td class="is-num">19,434</td><td class="is-num">986.06</td><td>INDIA</td><td></td></tr>
+<tr><td class="grid__rn">11</td><td>1995-11-01</td><td class="is-num">18,532,207.60</td><td class="is-num">18,822</td><td class="is-num">984.61</td><td>INDONESIA</td><td></td></tr>
+<tr><td class="grid__rn">12</td><td>1995-12-01</td><td class="is-num">19,213,640.27</td><td class="is-num">19,511</td><td class="is-num">984.76</td><td>IRAN</td><td></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="chart" data-pane-body="chart" hidden>
+              <svg viewBox="0 0 900 300" role="img" aria-label="revenue by month">
+<line class="gridline" x1="72" x2="884" y1="268" y2="268"/><text class="tick" x="64" y="272" text-anchor="end">0M</text>
+<line class="gridline" x1="72" x2="884" y1="205" y2="205"/><text class="tick" x="64" y="209" text-anchor="end">5M</text>
+<line class="gridline" x1="72" x2="884" y1="142" y2="142"/><text class="tick" x="64" y="146" text-anchor="end">10M</text>
+<line class="gridline" x1="72" x2="884" y1="79" y2="79"/><text class="tick" x="64" y="83" text-anchor="end">15M</text>
+<line class="gridline" x1="72" x2="884" y1="16" y2="16"/><text class="tick" x="64" y="20" text-anchor="end">20M</text>
+<rect class="mark" x="85.5" y="29.7" width="40.6" height="238.3" rx="2"><title>1995-01-01: 18,914,027.33</title></rect><text class="tick" x="105.8" y="286" text-anchor="middle">Jan</text>
+<rect class="mark" x="153.2" y="51.3" width="40.6" height="216.7" rx="2"><title>1995-02-01: 17,201,554.10</title></rect><text class="tick" x="173.5" y="286" text-anchor="middle">Feb</text>
+<rect class="mark" x="220.9" y="28.5" width="40.6" height="239.5" rx="2"><title>1995-03-01: 19,004,211.87</title></rect><text class="tick" x="241.2" y="286" text-anchor="middle">Mar</text>
+<rect class="mark" x="288.5" y="34.7" width="40.6" height="233.3" rx="2"><title>1995-04-01: 18,512,937.02</title></rect><text class="tick" x="308.8" y="286" text-anchor="middle">Apr</text>
+<rect class="mark" x="356.2" y="27.2" width="40.6" height="240.8" rx="2"><title>1995-05-01: 19,108,446.51</title></rect><text class="tick" x="376.5" y="286" text-anchor="middle">May</text>
+<rect class="mark" x="423.9" y="33.6" width="40.6" height="234.4" rx="2"><title>1995-06-01: 18,604,120.79</title></rect><text class="tick" x="444.2" y="286" text-anchor="middle">Jun</text>
+<rect class="mark" x="491.5" y="25.8" width="40.6" height="242.2" rx="2"><title>1995-07-01: 19,222,870.40</title></rect><text class="tick" x="511.8" y="286" text-anchor="middle">Jul</text>
+<rect class="mark" x="559.2" y="26.2" width="40.6" height="241.8" rx="2"><title>1995-08-01: 19,190,331.12</title></rect><text class="tick" x="579.5" y="286" text-anchor="middle">Aug</text>
+<rect class="mark" x="626.9" y="35.3" width="40.6" height="232.7" rx="2"><title>1995-09-01: 18,466,918.45</title></rect><text class="tick" x="647.2" y="286" text-anchor="middle">Sep</text>
+<rect class="mark" x="694.5" y="26.5" width="40.6" height="241.5" rx="2"><title>1995-10-01: 19,163,001.98</title></rect><text class="tick" x="714.8" y="286" text-anchor="middle">Oct</text>
+<rect class="mark" x="762.2" y="34.5" width="40.6" height="233.5" rx="2"><title>1995-11-01: 18,532,207.60</title></rect><text class="tick" x="782.5" y="286" text-anchor="middle">Nov</text>
+<rect class="mark" x="829.9" y="25.9" width="40.6" height="242.1" rx="2"><title>1995-12-01: 19,213,640.27</title></rect><text class="tick" x="850.2" y="286" text-anchor="middle">Dec</text>
+<line class="axis" x1="72" x2="884" y1="268" y2="268"/>
+              </svg>
+            </div>
+            <div class="plan" data-pane-body="plan" hidden>
+              <div class="plan__node"><span class="plan__op">ORDER</span><span class="plan__args">month ASC</span></div>
+              <div class="plan__node" style="--depth:1"><span class="plan__branch">└</span><span class="plan__op">HASH_GROUP_BY</span><span class="plan__args">#0 · sum(#1), count_star(), avg(#1), max(#2)</span></div>
+              <div class="plan__node" style="--depth:2"><span class="plan__branch">└</span><span class="plan__op">HASH_JOIN</span><span class="plan__args">LEFT · c_nationkey = n_nationkey</span></div>
+              <div class="plan__node" style="--depth:3"><span class="plan__branch">├</span><span class="plan__op">HASH_JOIN</span><span class="plan__args">INNER · o_custkey = c_custkey</span></div>
+              <div class="plan__node" style="--depth:4"><span class="plan__branch">├</span><span class="plan__op">SEQ_SCAN</span><span class="plan__args">orders · filter o_orderdate ∈ [1995-01-01, 1996-01-01) · ~228K rows</span></div>
+              <div class="plan__node" style="--depth:4"><span class="plan__branch">└</span><span class="plan__op">SEQ_SCAN</span><span class="plan__args">customer · 150K rows</span></div>
+              <div class="plan__node" style="--depth:3"><span class="plan__branch">└</span><span class="plan__op">SEQ_SCAN</span><span class="plan__args">nation · 25 rows</span></div>
+            </div>
+            <div class="profile" data-pane-body="profile" hidden>
+              <span class="profile__phase">Parse</span><div class="bar"><div class="bar__fill" style="width:1%"></div></div><span class="profile__ms">0.2 ms</span>
+              <span class="profile__phase">Bind</span><div class="bar"><div class="bar__fill" style="width:2%"></div></div><span class="profile__ms">0.6 ms</span>
+              <span class="profile__phase">Optimize</span><div class="bar"><div class="bar__fill" style="width:4%"></div></div><span class="profile__ms">1.4 ms</span>
+              <span class="profile__phase">Execute</span><div class="bar"><div class="bar__fill" style="width:92%"></div></div><span class="profile__ms">35.1 ms</span>
+              <span class="profile__phase">Log</span><div class="bar"><div class="bar__fill" style="width:1%"></div></div><span class="profile__ms">0.3 ms</span>
+              <span class="profile__phase profile__total">Total</span><span class="profile__total"></span><span class="profile__ms profile__total">37.6 ms</span>
+            </div>
+            <div data-pane-body="error" hidden style="padding:16px; flex:1">
+              <div class="callout callout--danger">
+                <i data-i="alert-circle"></i>
+                <div class="callout__body">
+                  <div class="callout__title">Statement 2 failed</div>
+                  <div>Binder Error: Referenced column <span class="mono">"n_nam"</span> not found in FROM clause. Did you mean <span class="mono">"n_name"</span>?</div>
+                  <pre class="code">SELECT max(n_nam) FROM nation;
+           ^</pre>
+                  <div class="row"><button class="btn btn--sm">Go to statement</button><button class="btn btn--ghost btn--sm"><i data-i="sparkles" data-s="14"></i>Ask to fix</button></div>
+                </div>
+              </div>
+            </div>
+            <div class="empty" data-pane-body="empty" hidden>
+              <i data-i="play" data-s="32"></i>
+              <div class="empty__title">Run a query</div>
+              <div class="empty__body">Results appear here. Press <span class="kbd">⌘↵</span> to run the statement at the cursor, or <span class="kbd">⇧⌘↵</span> to run them all.</div>
+            </div>
+            <div class="running" data-pane-body="running" hidden>
+              <span class="spinner" style="width:22px;height:22px"></span>
+              <span class="running__time" id="runTime">0.0 s</span>
+              <span>Running statement 1 of 2</span>
+              <button class="btn btn--sm" onclick="stopDemo()">Cancel <span class="kbd">Esc</span></button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- Catalog: object page -->
+    <div class="page only-catalog">
+      <div class="page__inner">
+        <div class="crumbs"><i data-i="database" data-s="14"></i>main<span class="crumbs__sep">›</span>Tables<span class="crumbs__sep">›</span><span class="mono">orders</span></div>
+        <div class="page-head">
+          <div class="page-head__text">
+            <h1 class="page-head__title"><span class="mono">orders</span><span class="badge">Table</span></h1>
+            <p class="page-head__desc">9 columns · owned by <span class="mono">kartik</span> · statistics refreshed 4 min ago</p>
+          </div>
+          <div class="page-head__actions">
+            <button class="btn"><i data-i="copy" data-s="14"></i>Copy name</button>
+            <button class="btn"><i data-i="file-code" data-s="14"></i>Open in worksheet</button>
+            <button class="btn btn--primary"><i data-i="play" data-s="14"></i>Preview rows</button>
+          </div>
+        </div>
+        <div class="metrics">
+          <div class="card metric"><span class="overline">Rows</span><span class="metric__value">1,500,000</span><span class="metric__caption">exact, from the catalog</span></div>
+          <div class="card metric"><span class="overline">Columns</span><span class="metric__value">9</span><span class="metric__caption">2 with NULLs</span></div>
+          <div class="card metric"><span class="overline">Indexes</span><span class="metric__value">1</span><span class="metric__caption mono">orders_date_idx</span></div>
+          <div class="card metric"><span class="overline">Grants</span><span class="metric__value">3</span><span class="metric__caption">SELECT to analyst, sam</span></div>
+        </div>
+        <div class="card" style="overflow:hidden">
+          <div class="tabs">
+            <button class="tabs__item is-active">Columns</button>
+            <button class="tabs__item">Preview</button>
+            <button class="tabs__item">Definition</button>
+            <button class="tabs__item">Access</button>
+          </div>
+          <table class="table">
+            <thead><tr><th>Column</th><th>Type</th><th class="t-num">Nulls</th><th class="t-num">Distinct ≈</th><th>Min</th><th>Max</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">o_orderkey</td><td class="mono muted">bigint</td><td class="t-num">0</td><td class="t-num">1,500,000</td><td class="mono">1</td><td class="mono">6,000,000</td></tr>
+              <tr><td class="mono">o_custkey</td><td class="mono muted">bigint</td><td class="t-num">0</td><td class="t-num">99,996</td><td class="mono">1</td><td class="mono">149,999</td></tr>
+              <tr><td class="mono">o_orderstatus</td><td class="mono muted">varchar</td><td class="t-num">0</td><td class="t-num">3</td><td class="mono">F</td><td class="mono">P</td></tr>
+              <tr><td class="mono">o_totalprice</td><td class="mono muted">decimal(15,2)</td><td class="t-num">0</td><td class="t-num">1,464,556</td><td class="mono">857.71</td><td class="mono">555,285.16</td></tr>
+              <tr><td class="mono">o_orderdate</td><td class="mono muted">date</td><td class="t-num">0</td><td class="t-num">2,406</td><td class="mono">1992-01-01</td><td class="mono">1998-08-02</td></tr>
+              <tr><td class="mono">o_orderpriority</td><td class="mono muted">varchar</td><td class="t-num">0</td><td class="t-num">5</td><td class="mono">1-URGENT</td><td class="mono">5-LOW</td></tr>
+              <tr><td class="mono">o_clerk</td><td class="mono muted">varchar</td><td class="t-num">0</td><td class="t-num">1,000</td><td class="mono">Clerk#000000001</td><td class="mono">Clerk#000001000</td></tr>
+              <tr><td class="mono">o_shippriority</td><td class="mono muted">integer</td><td class="t-num">1,204</td><td class="t-num">1</td><td class="mono">0</td><td class="mono">0</td></tr>
+              <tr><td class="mono">o_comment</td><td class="mono muted">varchar</td><td class="t-num">87</td><td class="t-num">1,482,071</td><td class="subtle">—</td><td class="subtle">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- History -->
+    <div class="page only-history">
+      <div class="page__inner" style="max-width:1280px">
+        <div class="page-head">
+          <div class="page-head__text">
+            <h1 class="page-head__title">Query history</h1>
+            <p class="page-head__desc">Every statement run from this console. Click a run to open its SQL in a new worksheet.</p>
+          </div>
+          <div class="page-head__actions"><button class="btn"><i data-i="refresh" data-s="14"></i>Refresh</button></div>
+        </div>
+        <div class="toolbar">
+          <label class="search" style="width:320px"><i data-i="search" data-s="14"></i><input class="input" placeholder="Search statements"></label>
+          <div class="seg"><button class="seg__item is-active">All</button><button class="seg__item">Succeeded</button><button class="seg__item">Failed</button><button class="seg__item">Cancelled</button></div>
+          <span class="spacer"></span>
+          <select class="input" style="width:140px"><option>Last 24 hours</option><option>Last 7 days</option></select>
+          <select class="input" style="width:140px"><option>All users</option><option>kartik</option></select>
+        </div>
+        <div class="card" style="overflow:hidden">
+          <table class="table">
+            <thead><tr><th style="width:120px">Status</th><th>Statement</th><th style="width:180px">Worksheet</th><th class="t-num" style="width:90px">Rows</th><th class="t-num" style="width:90px">Duration</th><th style="width:110px">Started</th><th class="t-actions"></th></tr></thead>
+            <tbody>
+              <tr class="is-clickable"><td><span class="status status--info">Running</span></td><td class="t-ellipsis mono">SELECT s_name, count(*) FROM lineitem JOIN supplier ON …</td><td class="muted">Late shipments</td><td class="t-num subtle">—</td><td class="t-num">4.2 s</td><td class="muted" title="2026-10-30 14:02:11">Just now</td><td class="t-actions"><button class="btn btn--sm btn--danger">Cancel</button></td></tr>
+              <tr class="is-clickable"><td><span class="status status--success">Succeeded</span></td><td class="t-ellipsis mono">SELECT date_trunc('month', o_orderdate) AS month, sum(o_totalprice) …</td><td class="muted">Revenue by month</td><td class="t-num">12</td><td class="t-num">38 ms</td><td class="muted">2 min ago</td><td class="t-actions"><button class="btn btn--ghost btn--sm"><i data-i="file-code" data-s="14"></i>Open</button></td></tr>
+              <tr class="is-clickable"><td><span class="status status--danger">Failed</span></td><td class="t-ellipsis mono">SELECT max(n_nam) FROM nation</td><td class="muted">Revenue by month</td><td class="t-num subtle">—</td><td class="t-num">1 ms</td><td class="muted">2 min ago</td><td class="t-actions"><button class="btn btn--ghost btn--sm"><i data-i="file-code" data-s="14"></i>Open</button></td></tr>
+              <tr class="is-clickable"><td><span class="status status--success">Succeeded</span></td><td class="t-ellipsis mono">SELECT * FROM main.orders LIMIT 100</td><td class="muted">Orders preview</td><td class="t-num">100</td><td class="t-num">4 ms</td><td class="muted">1 h ago</td><td class="t-actions"><button class="btn btn--ghost btn--sm"><i data-i="file-code" data-s="14"></i>Open</button></td></tr>
+              <tr class="is-clickable"><td><span class="status status--warning">Cancelled</span></td><td class="t-ellipsis mono">SELECT * FROM lineitem l1, lineitem l2 WHERE l1.l_orderkey &lt; l2.l_orderkey</td><td class="muted">Untitled</td><td class="t-num subtle">—</td><td class="t-num">31.0 s</td><td class="muted">3 h ago</td><td class="t-actions"><button class="btn btn--ghost btn--sm"><i data-i="file-code" data-s="14"></i>Open</button></td></tr>
+              <tr class="is-clickable"><td><span class="status status--success">Succeeded</span></td><td class="t-ellipsis mono">CREATE TABLE staging.cities AS SELECT * FROM read_csv('cities.csv')</td><td class="muted">Import</td><td class="t-num">48,213</td><td class="t-num">212 ms</td><td class="muted">Yesterday</td><td class="t-actions"><button class="btn btn--ghost btn--sm"><i data-i="file-code" data-s="14"></i>Open</button></td></tr>
+              <tr class="is-clickable"><td><span class="status status--success">Succeeded</span></td><td class="t-ellipsis mono">SELECT * FROM lake_changes('events') LIMIT 100</td><td class="muted">Lake events — change feed</td><td class="t-num">100</td><td class="t-num">61 ms</td><td class="muted">Oct 27</td><td class="t-actions"><button class="btn btn--ghost btn--sm"><i data-i="file-code" data-s="14"></i>Open</button></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Access -->
+    <div class="page only-access">
+      <div class="page__inner">
+        <div class="page-head">
+          <div class="page-head__text">
+            <h1 class="page-head__title">Access</h1>
+            <p class="page-head__desc">Users, roles and what they may read and write. Every change runs as SQL under your session.</p>
+          </div>
+          <div class="page-head__actions">
+            <button class="btn"><i data-i="plus" data-s="14"></i>New role</button>
+            <button class="btn btn--primary"><i data-i="plus" data-s="14"></i>New user</button>
+          </div>
+        </div>
+        <div class="card" style="overflow:hidden">
+          <div class="card__head"><span class="card__title">Users and roles</span><span class="badge">5</span><span class="spacer"></span>
+            <label class="search" style="width:220px"><i data-i="search" data-s="14"></i><input class="input input--sm" placeholder="Filter"></label></div>
+          <table class="table">
+            <thead><tr><th>Name</th><th style="width:100px">Kind</th><th>Member of</th><th style="width:120px">Privileges</th><th class="t-actions"></th></tr></thead>
+            <tbody>
+              <tr><td><span class="row"><i data-i="user" class="subtle"></i><span class="mono">kartik</span><span class="badge badge--outline">You</span></span></td><td class="muted">User</td><td class="muted">—</td><td><span class="badge badge--accent">Admin</span></td><td class="t-actions"></td></tr>
+              <tr><td><span class="row"><i data-i="user" class="subtle"></i><span class="mono">ana</span></span></td><td class="muted">User</td><td><span class="badge mono">analyst</span></td><td class="muted">3 grants</td><td class="t-actions"><button class="btn btn--ghost btn--sm"><i data-i="key" data-s="14"></i>Reset password</button><button class="btn btn--ghost btn--sm btn--danger"><i data-i="trash" data-s="14"></i>Drop</button></td></tr>
+              <tr><td><span class="row"><i data-i="user" class="subtle"></i><span class="mono">sam</span></span></td><td class="muted">User</td><td><span class="badge mono">analyst</span> <span class="badge mono">loader</span></td><td class="muted">5 grants</td><td class="t-actions"><button class="btn btn--ghost btn--sm"><i data-i="key" data-s="14"></i>Reset password</button><button class="btn btn--ghost btn--sm btn--danger"><i data-i="trash" data-s="14"></i>Drop</button></td></tr>
+              <tr><td><span class="row"><i data-i="users" class="subtle"></i><span class="mono">analyst</span></span></td><td class="muted">Role</td><td class="muted">—</td><td class="muted">2 grants</td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger"><i data-i="trash" data-s="14"></i>Drop</button></td></tr>
+              <tr><td><span class="row"><i data-i="users" class="subtle"></i><span class="mono">loader</span></span></td><td class="muted">Role</td><td class="muted">—</td><td class="muted">1 grant</td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger"><i data-i="trash" data-s="14"></i>Drop</button></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" style="overflow:hidden">
+          <div class="card__head"><span class="card__title">Grants</span><span class="badge">6</span><span class="spacer"></span><button class="btn btn--sm" onclick="show('grant', true)"><i data-i="shield" data-s="14"></i>Grant</button></div>
+          <table class="table">
+            <thead><tr><th>Grantee</th><th style="width:140px">Privilege</th><th>On</th><th class="t-actions"></th></tr></thead>
+            <tbody>
+              <tr><td class="mono">analyst</td><td><span class="badge badge--info mono">SELECT</span></td><td><span class="muted">Database</span> <span class="mono">main</span></td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger">Revoke</button></td></tr>
+              <tr><td class="mono">analyst</td><td><span class="badge badge--info mono">SELECT</span></td><td><span class="muted">Table</span> <span class="mono">sales.invoices</span></td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger">Revoke</button></td></tr>
+              <tr><td class="mono">loader</td><td><span class="badge badge--warning mono">INSERT</span></td><td><span class="muted">Table</span> <span class="mono">staging.cities</span></td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger">Revoke</button></td></tr>
+              <tr><td class="mono">sam</td><td><span class="badge badge--success mono">CREATE</span></td><td><span class="muted">Database</span> <span class="mono">staging</span></td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger">Revoke</button></td></tr>
+              <tr><td class="mono">ana</td><td><span class="badge badge--accent mono">MEMBER</span></td><td><span class="muted">Role</span> <span class="mono">analyst</span></td><td class="t-actions"><button class="btn btn--ghost btn--sm btn--danger">Revoke</button></td></tr>
+              <tr><td class="mono">kartik</td><td><span class="badge badge--danger mono">ADMIN</span></td><td class="muted">Everything</td><td class="t-actions"></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Storage -->
+    <div class="page only-storage">
+      <div class="page__inner">
+        <div class="page-head">
+          <div class="page-head__text">
+            <h1 class="page-head__title">Storage</h1>
+            <p class="page-head__desc">Where this warehouse keeps its data, and how to load more.</p>
+          </div>
+          <div class="page-head__actions">
+            <button class="btn" onclick="toast()"><i data-i="refresh" data-s="14"></i>Checkpoint</button>
+            <button class="btn btn--primary" onclick="show('import', true)"><i data-i="upload" data-s="14"></i>Import data</button>
+          </div>
+        </div>
+        <div class="metrics">
+          <div class="card metric"><span class="overline">Mode</span><span class="metric__value">Durable</span><span class="metric__caption">WAL + store file</span></div>
+          <div class="card metric"><span class="overline">Store file</span><span class="metric__value">1.84 GB</span><span class="metric__caption">checkpointed 12 min ago</span></div>
+          <div class="card metric"><span class="overline">WAL</span><span class="metric__value">6.2 MB</span><span class="metric__caption">412 records since checkpoint</span></div>
+          <div class="card metric"><span class="overline">Databases</span><span class="metric__value">3</span><span class="metric__caption">27 objects</span></div>
+        </div>
+        <div style="display:grid; grid-template-columns: 3fr 2fr; gap: 12px; align-items:start">
+          <div class="card">
+            <div class="card__head"><span class="card__title">Details</span></div>
+            <div class="card__body" style="padding-top:4px; padding-bottom:4px">
+              <dl class="kv">
+                <dt>Location</dt><dd class="mono">/var/lib/pinkdb/warehouse.pink</dd>
+                <dt>WAL</dt><dd class="mono">/var/lib/pinkdb/warehouse.pink.wal</dd>
+                <dt>Encryption</dt><dd><span class="badge badge--success">AES-256-GCM</span></dd>
+                <dt>Lock</dt><dd>Held by this server (pid 48211)</dd>
+                <dt>Server</dt><dd class="mono">pinkdb-server · :5491</dd>
+              </dl>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card__head"><span class="card__title">Import formats</span></div>
+            <div class="card__body stack" style="gap:8px">
+              <div class="row"><span class="badge">CSV</span><span class="badge">Parquet</span><span class="muted">from a path or URL</span></div>
+              <div class="row"><span class="badge">CSV</span><span class="badge">Parquet</span><span class="muted">upload from this browser</span></div>
+              <div class="callout"><i data-i="info"></i><div class="callout__body">Path and URL reads (<span class="mono">https://</span>, <span class="mono">s3://</span>) need ADMIN in a console with logins.</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- inspector: Ask -->
+  <aside class="inspector">
+    <div class="panel-head">
+      <span class="panel-head__title"><i data-i="sparkles"></i>Ask</span>
+      <span class="badge badge--outline">Read-only</span>
+      <button class="btn btn--ghost btn--icon btn--sm" aria-label="New conversation"><i data-i="plus" data-s="14"></i></button>
+      <button class="btn btn--ghost btn--icon btn--sm" aria-label="Close" onclick="toggleAsk()"><i data-i="x" data-s="14"></i></button>
+    </div>
+    <div class="inspector__body">
+      <div class="msg msg--user"><div class="msg__who"><i data-i="user" data-s="14"></i>You</div><div class="msg__text">Which nation had the most revenue in 1995, and how far ahead of second place?</div></div>
+      <div class="progress-line"><i data-i="check" data-s="14"></i>Read the catalog: orders, customer, nation</div>
+      <div class="step">
+        <div class="step__head"><i data-i="check-circle" data-s="14" style="color:var(--success)"></i>Ran a query<span class="spacer"></span><button class="btn btn--ghost btn--sm"><i data-i="insert" data-s="14"></i>Insert</button></div>
+        <pre class="code"><span class="t-keyword">SELECT</span> n_name, <span class="t-func">sum</span>(o_totalprice) <span class="t-keyword">AS</span> revenue
+<span class="t-keyword">FROM</span> orders <span class="t-keyword">JOIN</span> customer <span class="t-keyword">ON</span> c_custkey = o_custkey
+<span class="t-keyword">JOIN</span> nation <span class="t-keyword">ON</span> n_nationkey = c_nationkey
+<span class="t-keyword">WHERE</span> <span class="t-func">year</span>(o_orderdate) = <span class="t-number">1995</span>
+<span class="t-keyword">GROUP BY</span> <span class="t-number">1</span> <span class="t-keyword">ORDER BY</span> <span class="t-number">2</span> <span class="t-keyword">DESC LIMIT</span> <span class="t-number">2</span>;</pre>
+        <pre class="code step__reply">n_name   | revenue
+EGYPT    | 1,421,804,118.27
+MOROCCO  | 1,409,330,902.85</pre>
+      </div>
+      <div class="msg"><div class="msg__who"><i data-i="sparkles" data-s="14"></i>Agent</div><div class="msg__text"><strong>Egypt</strong> led 1995 with <span class="num">$1.42B</span> in order value, about <span class="num">$12.5M</span> (0.9 %) ahead of Morocco. The two are close enough that a single quarter could flip them.</div></div>
+      <div class="progress-line"><span class="spinner spinner--sm"></span>Thinking…</div>
+    </div>
+    <div class="inspector__foot">
+      <textarea class="input" rows="3" placeholder="Ask about your data…"></textarea>
+      <div class="row">
+        <select class="input input--sm" style="width:auto"><option>anthropic · claude-sonnet-5-5</option><option>openai</option></select>
+        <span class="spacer"></span>
+        <button class="btn btn--sm">Stop</button>
+        <button class="btn btn--primary btn--sm"><i data-i="send" data-s="14"></i>Ask<span class="kbd">⌘↵</span></button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- status bar -->
+  <footer class="statusbar">
+    <span class="statusbar__item"><span class="status status--success">Connected</span></span>
+    <span class="statusbar__sep"></span>
+    <span class="statusbar__item"><i data-i="database"></i>main</span>
+    <span class="statusbar__item"><i data-i="user"></i>kartik · admin</span>
+    <span class="statusbar__item"><i data-i="hard-drive"></i>Durable</span>
+    <span class="spacer"></span>
+    <span class="statusbar__item" id="cellInfo"></span>
+    <span class="statusbar__item">Result 1 · 12 rows · 38 ms</span>
+    <span class="statusbar__sep"></span>
+    <span class="statusbar__item">Ln 7, Col 52</span>
+  </footer>
+</div>
+
+<!-- ═════════════════════ import dialog ═════════════════════ -->
+<div class="overlay" id="import" hidden onclick="if (event.target === this) show('import', false)">
+  <div class="dialog dialog--lg" role="dialog" aria-labelledby="importTitle">
+    <div class="dialog__head"><span class="dialog__title" id="importTitle">Import data</span><button class="btn btn--ghost btn--icon btn--sm" aria-label="Close" onclick="show('import', false)"><i data-i="x" data-s="14"></i></button></div>
+    <div class="dialog__body">
+      <div class="seg" style="align-self:flex-start"><button class="seg__item is-active">From a path or URL</button><button class="seg__item">Upload a file</button></div>
+      <label class="field"><span class="field__label">Source</span><input class="input input--block" value="s3://acme-data/exports/cities_2026.csv"><span class="field__help">https://, s3:// or a path on the server. Read as you: URL and file reads need ADMIN.</span></label>
+      <div class="fields">
+        <label class="field"><span class="field__label">Format</span><select class="input"><option>Detect from name</option><option>CSV</option><option>Parquet</option></select></label>
+        <label class="field"><span class="field__label">Database</span><select class="input"><option>staging</option><option>main</option></select></label>
+        <label class="field"><span class="field__label">Table</span><input class="input mono" value="cities_2026"></label>
+        <label class="field"><span class="field__label">If the table exists</span><select class="input"><option>Fail</option><option>Replace</option><option>Append</option></select></label>
+      </div>
+      <div class="stack" style="gap:6px">
+        <div class="row"><span class="overline">Preview</span><span class="subtle" style="font-size:12px">first 5 of 50 rows read</span></div>
+        <div class="grid" style="border:1px solid var(--border); border-radius:var(--r-md); max-height:180px; flex:none">
+          <table>
+            <thead><tr><th class="grid__rn">#</th><th><span class="grid__name">city</span><span class="grid__type">varchar</span></th><th><span class="grid__name">country</span><span class="grid__type">varchar</span></th><th class="is-num"><span class="grid__name">population</span><span class="grid__type">bigint</span></th><th class="is-num"><span class="grid__name">lat</span><span class="grid__type">double</span></th><th style="width:100%"></th></tr></thead>
+            <tbody>
+              <tr><td class="grid__rn">1</td><td>Tokyo</td><td>Japan</td><td class="is-num">37,115,035</td><td class="is-num">35.6897</td><td></td></tr>
+              <tr><td class="grid__rn">2</td><td>Delhi</td><td>India</td><td class="is-num">33,807,403</td><td class="is-num">28.6100</td><td></td></tr>
+              <tr><td class="grid__rn">3</td><td>Shanghai</td><td>China</td><td class="is-num">29,867,918</td><td class="is-num">31.2286</td><td></td></tr>
+              <tr><td class="grid__rn">4</td><td>Dhaka</td><td>Bangladesh</td><td class="is-num is-null">NULL</td><td class="is-num">23.7639</td><td></td></tr>
+              <tr><td class="grid__rn">5</td><td>São Paulo</td><td>Brazil</td><td class="is-num">22,806,704</td><td class="is-num">-23.5504</td><td></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <details>
+        <summary class="muted" style="cursor:pointer; font-size:12px">SQL that will run</summary>
+        <pre class="code" style="margin-top:6px"><span class="t-keyword">CREATE TABLE</span> staging.cities_2026 <span class="t-keyword">AS</span>
+<span class="t-keyword">SELECT</span> <span class="t-op">*</span> <span class="t-keyword">FROM</span> <span class="t-func">read_csv</span>(<span class="t-string">'s3://acme-data/exports/cities_2026.csv'</span>);
+<span class="t-keyword">CHECKPOINT</span>;</pre>
+      </details>
+    </div>
+    <div class="dialog__foot">
+      <span class="subtle" style="font-size:12px; margin-right:auto">Durable store: a checkpoint follows the import.</span>
+      <button class="btn" onclick="show('import', false)">Cancel</button>
+      <button class="btn">Preview</button>
+      <button class="btn btn--primary" onclick="show('import', false); toast()"><i data-i="upload" data-s="14"></i>Import</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═════════════════════ grant dialog ═════════════════════ -->
+<div class="overlay" id="grant" hidden onclick="if (event.target === this) show('grant', false)">
+  <div class="dialog" role="dialog" aria-labelledby="grantTitle">
+    <div class="dialog__head"><span class="dialog__title" id="grantTitle">Grant a privilege</span><button class="btn btn--ghost btn--icon btn--sm" aria-label="Close" onclick="show('grant', false)"><i data-i="x" data-s="14"></i></button></div>
+    <div class="dialog__body">
+      <label class="field"><span class="field__label">Privilege</span><select class="input"><option>SELECT on a table</option><option>INSERT on a table</option><option>CREATE on a database</option><option>Membership of a role</option><option>ADMIN (everything)</option></select></label>
+      <div class="fields">
+        <label class="field"><span class="field__label">Table</span><input class="input mono" value="sales.invoices"></label>
+        <label class="field"><span class="field__label">To user or role</span><input class="input mono" value="analyst"></label>
+      </div>
+      <pre class="code"><span class="t-keyword">GRANT SELECT ON TABLE</span> sales.invoices <span class="t-keyword">TO</span> analyst;</pre>
+    </div>
+    <div class="dialog__foot">
+      <button class="btn" onclick="show('grant', false)">Cancel</button>
+      <button class="btn btn--primary" onclick="show('grant', false)"><i data-i="shield" data-s="14"></i>Grant</button>
+    </div>
+  </div>
+</div>
+
+<template id="toastTpl">
+  <div class="toast toast--success">
+    <i data-i="check-circle"></i>
+    <div class="toast__body"><div class="toast__title">Checkpoint complete</div><div class="muted">WAL folded into the store file in 182 ms.</div></div>
+    <button class="btn btn--ghost btn--icon btn--sm" aria-label="Dismiss"><i data-i="x" data-s="14"></i></button>
+  </div>
+</template>
+<div class="toasts" id="toasts"></div>
+
+<script>
+/* mockup behavior only — the real app is Leptos */
+const ICONS = 'icons.svg';
+function hydrateIcons(root) {
+  root.querySelectorAll('i[data-i]').forEach(el => {
+    const size = el.dataset.s;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', ['icon', size ? 'icon--' + size : '', el.className].join(' ').trim());
+    if (el.id) svg.id = el.id;
+    if (el.getAttribute('style')) svg.setAttribute('style', el.getAttribute('style'));
+    svg.setAttribute('aria-hidden', 'true');
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    use.setAttribute('href', ICONS + '#i-' + el.dataset.i);
+    svg.appendChild(use);
+    el.replaceWith(svg);
+  });
+}
+const $ = s => document.querySelector(s);
+const show = (id, on) => { document.getElementById(id).hidden = !on; };
+const toggle = id => { const el = document.getElementById(id); el.hidden = !el.hidden; };
+
+// grid cell selection
+document.querySelectorAll('#gridBody td:not(.grid__rn):not(:last-child)').forEach(td => td.addEventListener('click', () => {
+  document.querySelectorAll('#gridBody td.is-selected').forEach(x => x.classList.remove('is-selected'));
+  td.classList.add('is-selected');
+  const col = td.closest('table').querySelectorAll('th')[td.cellIndex].querySelector('.grid__name').textContent;
+  $('#cellInfo').textContent = `Row ${td.parentElement.rowIndex}, ${col}: ${td.textContent}`;
+}));
+
+// segmented controls
+function segs(id, attr, onPick) {
+  document.querySelectorAll(`#${id} [data-${attr}]`).forEach(b => b.addEventListener('click', () => {
+    document.querySelectorAll(`#${id} .seg__item`).forEach(x => x.classList.toggle('is-active', x === b));
+    onPick(b.dataset[attr]);
+  }));
+}
+const pane = p => document.querySelectorAll('[data-pane-body]').forEach(el => el.hidden = el.dataset.paneBody !== p);
+segs('viewSeg', 'pane', pane);
+segs('exSeg', 'ex', v => { $('#exObjects').hidden = v !== 'objects'; $('#exSheets').hidden = v !== 'sheets'; });
+
+// rail
+document.querySelectorAll('[data-go]').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('[data-go]').forEach(x => x.classList.toggle('is-active', x === b));
+  $('#app').dataset.view = b.dataset.go;
+  if (b.dataset.go === 'catalog') { $('#exObjects').hidden = false; $('#exSheets').hidden = true; }
+}));
+
+// tree
+document.querySelectorAll('.tree__row').forEach(r => r.addEventListener('click', e => {
+  if (e.target.closest('button')) return;
+  const sub = r.nextElementSibling;
+  if (sub && sub.tagName === 'UL') { r.classList.toggle('is-open'); sub.hidden = !r.classList.contains('is-open'); }
+}));
+document.querySelectorAll('.tree__row:not(.is-open)').forEach(r => { const s = r.nextElementSibling; if (s && s.tagName === 'UL') s.hidden = true; });
+
+// ask, theme
+function toggleAsk() { $('#app').classList.toggle('asking'); $('#askBtn').classList.toggle('is-active'); }
+function toggleTheme() {
+  const dark = document.documentElement.dataset.theme !== 'dark';
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  $('#themeIcon use').setAttribute('href', ICONS + (dark ? '#i-sun' : '#i-moon'));
+}
+
+// run demo
+let timer = null;
+function runDemo() {
+  $('#runSplit').hidden = true; $('#cancelBtn').hidden = false; pane('running');
+  const t0 = performance.now();
+  timer = setInterval(() => { $('#runTime').textContent = ((performance.now() - t0) / 1000).toFixed(1) + ' s'; }, 100);
+  setTimeout(stopDemo, 2600);
+}
+function stopDemo() {
+  clearInterval(timer); $('#runSplit').hidden = false; $('#cancelBtn').hidden = true; pane('grid');
+  document.querySelectorAll('#viewSeg .seg__item').forEach(x => x.classList.toggle('is-active', x.dataset.pane === 'grid'));
+}
+
+// toast
+function toast() {
+  const el = $('#toastTpl').content.firstElementChild.cloneNode(true);
+  hydrateIcons(el);
+  el.querySelector('button').onclick = () => el.remove();
+  $('#toasts').appendChild(el);
+  setTimeout(() => el.remove(), 5000);
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { show('import', false); show('grant', false); $('#runMenu').hidden = true; $('#userMenu').hidden = true; }
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') runDemo();
+});
+hydrateIcons(document);
+
+// deep links for screenshots: ?view=history, ?dialog=import, ?login, #dark
+const q = new URLSearchParams(location.search);
+if (q.get('view')) { document.querySelector(`[data-go="${q.get('view')}"]`)?.click(); if (q.get('view') !== 'query') toggleAsk(); }
+if (q.get('dialog')) show(q.get('dialog'), true);
+if (q.has('login')) show('login', true);
+if (q.get('pane')) pane(q.get('pane'));
+if (location.hash === '#dark') toggleTheme();
+</script>
+</body>
+</html>

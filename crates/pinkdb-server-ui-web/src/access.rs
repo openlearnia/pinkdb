@@ -1,4 +1,4 @@
-//! The Access panel (users, roles, grants) and the Storage panel.
+//! The Access section: users, roles and grants.
 //!
 //! Every change is a statement run as the session user, so the engine's RBAC
 //! decides; the forms only build the SQL (names quoted). A new user's
@@ -7,10 +7,12 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use pinkdb_server_ui_api::sql::quote_ident;
-use pinkdb_server_ui_api::{Access, GrantRow, Storage, UserRequest};
+use pinkdb_server_ui_api::{Access, GrantRow, UserRequest};
 
 use crate::api;
-use crate::state::App;
+use crate::icon::Icon;
+use crate::state::{App, Tone};
+use crate::ui::{Callout, Dialog, Empty};
 
 /// `GRANT`/`REVOKE` text for a grant row (the inverse of `pinkdb_grants()`).
 pub fn grant_sql(revoke: bool, g: &GrantRow) -> String {
@@ -48,139 +50,162 @@ fn split_object(text: &str, current: &str) -> (String, String) {
     }
 }
 
+/// The `GRANT` statement the grant form builds.
+pub fn grant_form_sql(privilege: &str, target: &str, grantee: &str, current: &str) -> String {
+    let to = quote_ident(grantee.trim());
+    let target = target.trim();
+    match privilege {
+        "ADMIN" => format!("GRANT ADMIN TO {to}"),
+        "ROLE" => format!("GRANT {} TO {to}", quote_ident(target)),
+        "CREATE" => format!(
+            "GRANT CREATE ON DATABASE {} TO {to}",
+            quote_ident(if target.is_empty() { current } else { target })
+        ),
+        privilege => {
+            let (db, table) = split_object(target, current);
+            format!(
+                "GRANT {privilege} ON TABLE {}.{} TO {to}",
+                quote_ident(&db),
+                quote_ident(&table)
+            )
+        }
+    }
+}
+
+/// The badge tone of a privilege.
+fn privilege_tone(privilege: &str) -> &'static str {
+    match privilege {
+        "SELECT" => "badge badge--info mono",
+        "INSERT" | "UPDATE" | "DELETE" | "ALL" => "badge badge--warning mono",
+        "CREATE" => "badge badge--success mono",
+        "ADMIN" => "badge badge--danger mono",
+        _ => "badge badge--accent mono",
+    }
+}
+
+/// Which dialog is open.
+#[derive(Clone, PartialEq)]
+enum Open {
+    NewUser,
+    NewRole,
+    Grant,
+    Password(String),
+}
+
 #[component]
-pub fn AccessPanel() -> impl IntoView {
+pub fn AccessPage() -> impl IntoView {
     let app = expect_context::<App>();
     let access = RwSignal::new(None::<Access>);
-    let message = RwSignal::new(None::<Result<String, String>>);
+    let failure = RwSignal::new(None::<String>);
+    let dialog = RwSignal::new(None::<Open>);
+    let filter = RwSignal::new(String::new());
     Effect::new(move |_| {
         app.access_epoch.track();
         spawn_local(async move {
             match api::get::<Access>("/api/access").await {
-                Ok(a) => access.set(Some(a)),
-                Err(e) => message.set(Some(Err(e.message))),
+                Ok(a) => {
+                    access.set(Some(a));
+                    failure.set(None);
+                }
+                Err(e) => failure.set(Some(e.message)),
             }
         });
     });
-    let run = move |sql: String| {
+    // Run a statement; report it as a toast and reload the lists.
+    let run = move |sql: String, done: &'static str| {
         app.run_statement(sql, move |outcome| {
-            message.set(Some(outcome));
-            app.access_epoch.update(|e| *e += 1);
-        });
-    };
-
-    // Form state.
-    let new_user = RwSignal::new(String::new());
-    let new_password = RwSignal::new(String::new());
-    let new_role = RwSignal::new(String::new());
-    let privilege = RwSignal::new("SELECT".to_string());
-    let object = RwSignal::new(String::new());
-    let grantee = RwSignal::new(String::new());
-
-    let create_user = move |_| {
-        let request = UserRequest {
-            name: new_user.get_untracked().trim().to_string(),
-            password: new_password.get_untracked(),
-            alter: false,
-        };
-        new_password.set(String::new());
-        let csrf = app.csrf();
-        spawn_local(async move {
-            let outcome = api::post::<_, serde_json::Value>("/api/access/user", &request, &csrf)
-                .await
-                .map(|v| v["message"].as_str().unwrap_or("done").to_string())
-                .map_err(|e| e.message);
-            message.set(Some(outcome));
-            app.access_epoch.update(|e| *e += 1);
-        });
-        new_user.set(String::new());
-    };
-    let grant = move |_| {
-        let what = privilege.get_untracked();
-        let to = quote_ident(grantee.get_untracked().trim());
-        let target = object.get_untracked();
-        let current = app.db.get_untracked();
-        let sql = match what.as_str() {
-            "ADMIN" => format!("GRANT ADMIN TO {to}"),
-            "ROLE" => format!("GRANT {} TO {to}", quote_ident(target.trim())),
-            "CREATE" => format!(
-                "GRANT CREATE ON DATABASE {} TO {to}",
-                quote_ident(if target.trim().is_empty() {
-                    &current
-                } else {
-                    target.trim()
-                })
-            ),
-            privilege => {
-                let (db, table) = split_object(&target, &current);
-                format!(
-                    "GRANT {privilege} ON TABLE {}.{} TO {to}",
-                    quote_ident(&db),
-                    quote_ident(&table)
-                )
+            match outcome {
+                Ok(_) => app.toast(Tone::Success, done, ""),
+                Err(e) => app.toast(Tone::Danger, "The change was refused", e),
             }
-        };
-        run(sql);
+            app.access_epoch.update(|e| *e += 1);
+        });
     };
 
-    let lists = move || {
+    let principals = move || {
         let a = access.get()?;
         let admin = a.admin;
-        let principals = a
+        let needle = filter.get().to_ascii_lowercase();
+        let grants_of = |name: &str| {
+            a.grants
+                .iter()
+                .filter(|g| g.principal.eq_ignore_ascii_case(name))
+                .count()
+        };
+        let rows = a
             .principals
             .iter()
+            .filter(|p| needle.is_empty() || p.name.to_ascii_lowercase().contains(&needle))
             .map(|p| {
-                let drop_sql = format!(
-                    "DROP {} {}",
-                    if p.kind == "ROLE" { "ROLE" } else { "USER" },
-                    quote_ident(&p.name)
-                );
-                let me = p.kind == "USER" && p.name.eq_ignore_ascii_case(&a.me);
-                view! {
-                    <li class="principal">
-                        <span class="pname">{p.name.clone()}</span>
-                        <span class="pkind">{p.kind.to_ascii_lowercase()}</span>
-                        {p.is_admin.then(|| view! { <span class="badge">"admin"</span> })}
-                        {(!p.roles.is_empty()).then(|| view! { <span class="hint">{format!("in {}", p.roles)}</span> })}
-                        {me.then(|| view! { <span class="hint">"(you)"</span> })}
-                        {(admin && !me)
-                            .then(|| {
-                                view! {
-                                    <button class="mini danger" title=drop_sql.clone() on:click=move |_| run(drop_sql.clone())>
-                                        "drop"
-                                    </button>
-                                }
-                            })}
-                    </li>
-                }
-            })
-            .collect_view();
-        let grants = a
-            .grants
-            .iter()
-            .map(|g| {
-                let object = match g.object_type.as_str() {
-                    "GLOBAL" => "everything".to_string(),
-                    "ROLE" => format!("role {}", g.name.clone().unwrap_or_default()),
-                    "DATABASE" => format!("database {}", g.database.clone().unwrap_or_default()),
-                    _ => format!(
-                        "{}.{}",
-                        g.database.clone().unwrap_or_default(),
-                        g.name.clone().unwrap_or_default()
-                    ),
-                };
-                let revoke = grant_sql(true, g);
+                let role = p.kind == "ROLE";
+                let drop_sql = format!("DROP {} {}", if role { "ROLE" } else { "USER" }, quote_ident(&p.name));
+                let me = !role && p.name.eq_ignore_ascii_case(&a.me);
+                let name = p.name.clone();
+                let reset_name = p.name.clone();
+                let n = grants_of(&p.name);
+                let memberships = p
+                    .roles
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .map(|r| view! { <span class="badge mono">{r.to_string()}</span> " " })
+                    .collect_view();
                 view! {
                     <tr>
-                        <td>{g.principal.clone()}</td>
-                        <td class="priv">{g.privilege.clone()}</td>
-                        <td>{object}</td>
                         <td>
-                            {admin
+                            <span class="row">
+                                <Icon name=if role { "users" } else { "user" } class="subtle" />
+                                <span class="mono">{p.name.clone()}</span>
+                                {me.then(|| view! { <span class="badge badge--outline">"You"</span> })}
+                            </span>
+                        </td>
+                        <td class="muted">{if role { "Role" } else { "User" }}</td>
+                        <td>
+                            {if p.roles.trim().is_empty() {
+                                view! { <span class="subtle">"—"</span> }.into_any()
+                            } else {
+                                memberships.into_any()
+                            }}
+                        </td>
+                        <td>
+                            {if p.is_admin {
+                                view! { <span class="badge badge--accent">"Admin"</span> }.into_any()
+                            } else {
+                                view! { <span class="muted">{format!("{n} grant{}", if n == 1 { "" } else { "s" })}</span> }.into_any()
+                            }}
+                        </td>
+                        <td class="t-actions">
+                            {(admin && !role)
                                 .then(|| {
                                     view! {
-                                        <button class="mini danger" title=revoke.clone() on:click=move |_| run(revoke.clone())>
-                                            "revoke"
+                                        <button
+                                            class="btn btn--ghost btn--sm"
+                                            on:click=move |_| dialog.set(Some(Open::Password(reset_name.clone())))
+                                        >
+                                            <Icon name="key" size=14 />
+                                            "Reset password"
+                                        </button>
+                                    }
+                                })}
+                            {(admin && !me)
+                                .then(|| {
+                                    view! {
+                                        <button
+                                            class="btn btn--ghost btn--sm btn--danger"
+                                            on:click=move |_| {
+                                                let sql = drop_sql.clone();
+                                                let what = if role { "role" } else { "user" };
+                                                app.ask_first(
+                                                    format!("Drop {what} {name}?"),
+                                                    format!("{name} loses its grants at once. This cannot be undone."),
+                                                    sql.clone(),
+                                                    if role { "Drop role" } else { "Drop user" },
+                                                    move |_| run(sql.clone(), "Dropped"),
+                                                );
+                                            }
+                                        >
+                                            <Icon name="trash" size=14 />
+                                            "Drop"
                                         </button>
                                     }
                                 })}
@@ -189,183 +214,439 @@ pub fn AccessPanel() -> impl IntoView {
                 }
             })
             .collect_view();
+        let n = a.principals.len();
         Some(view! {
-            <div class="group-label">{if admin { "Principals" } else { "You and your roles" }}</div>
-            <ul class="principals">{principals}</ul>
-            <div class="group-label">"Grants"</div>
-            <table class="grants">
-                <tr>
-                    <th>"to"</th>
-                    <th>"privilege"</th>
-                    <th>"on"</th>
-                    <th></th>
-                </tr>
-                {grants}
-            </table>
-            {a.grants.is_empty().then(|| view! { <p class="empty">"No grants."</p> })}
-        })
-    };
-
-    let forms = move || {
-        access.get().filter(|a| a.admin).map(|_| {
-            view! {
-                <div class="group-label">"New user"</div>
-                {move || {
-                    app.session
-                        .get()
-                        .filter(|s| s.auth == "none")
-                        .map(|_| {
-                            view! {
-                                <p class="warn">
-                                    "This console runs without logins because the store has no users. \
-                                     Creating the first user ends it: restart the server with \
-                                     --ui-auth basic and log in as that user."
-                                </p>
-                            }
-                        })
+            <div class="card card--flush">
+                <div class="card__head">
+                    <span class="card__title">{if admin { "Users and roles" } else { "You and your roles" }}</span>
+                    <span class="badge">{n}</span>
+                    <span class="spacer"></span>
+                    <label class="search search--sm">
+                        <Icon name="search" size=14 />
+                        <input
+                            class="input input--sm"
+                            type="search"
+                            placeholder="Filter"
+                            aria-label="Filter users and roles"
+                            prop:value=move || filter.get()
+                            on:input=move |ev| filter.set(event_target_value(&ev))
+                        />
+                    </label>
+                </div>
+                {if a.principals.is_empty() {
+                    view! {
+                        <Empty
+                            icon="users"
+                            title="No users or roles yet"
+                            body="Without users the console needs no sign-in. Create one to require it."
+                        />
+                    }
+                    .into_any()
+                } else {
+                view! {
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>"Name"</th>
+                            <th class="col-100">"Kind"</th>
+                            <th>"Member of"</th>
+                            <th class="col-130">"Privileges"</th>
+                            <th class="t-actions"></th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows}</tbody>
+                </table>
+                }
+                .into_any()
                 }}
-                <div class="form-row">
-                    <input placeholder="name" prop:value=move || new_user.get() on:input=move |ev| new_user.set(event_target_value(&ev)) />
-                    <input type="password" placeholder="password" autocomplete="new-password" prop:value=move || new_password.get() on:input=move |ev| new_password.set(event_target_value(&ev)) />
-                    <button on:click=create_user>"Create"</button>
-                </div>
-                <div class="group-label">"New role"</div>
-                <div class="form-row">
-                    <input placeholder="role name" prop:value=move || new_role.get() on:input=move |ev| new_role.set(event_target_value(&ev)) />
-                    <button on:click=move |_| {
-                        let name = new_role.get_untracked();
-                        new_role.set(String::new());
-                        run(format!("CREATE ROLE {}", quote_ident(name.trim())));
-                    }>"Create"</button>
-                </div>
-                <div class="group-label">"Grant"</div>
-                <div class="form-col">
-                    <select on:change=move |ev| privilege.set(event_target_value(&ev))>
-                        <option value="SELECT">"SELECT on a table"</option>
-                        <option value="INSERT">"INSERT on a table"</option>
-                        <option value="UPDATE">"UPDATE on a table"</option>
-                        <option value="DELETE">"DELETE on a table"</option>
-                        <option value="ALL">"ALL on a table"</option>
-                        <option value="CREATE">"CREATE on a database"</option>
-                        <option value="ROLE">"membership of a role"</option>
-                        <option value="ADMIN">"ADMIN (everything)"</option>
-                    </select>
-                    <input
-                        placeholder=move || match privilege.get().as_str() {
-                            "ROLE" => "role",
-                            "CREATE" => "database",
-                            "ADMIN" => "(nothing)",
-                            _ => "db.table or table",
-                        }
-                        prop:value=move || object.get()
-                        on:input=move |ev| object.set(event_target_value(&ev))
-                    />
-                    <input placeholder="to user or role" prop:value=move || grantee.get() on:input=move |ev| grantee.set(event_target_value(&ev)) />
-                    <button on:click=grant>"Grant"</button>
-                </div>
-            }
+            </div>
         })
     };
 
-    view! {
-        <div class="panel access">
-            {move || {
-                message
-                    .get()
-                    .map(|m| match m {
-                        Ok(text) => view! { <div class="ok-line">{text}</div> }.into_any(),
-                        Err(text) => view! { <div class="error-box">{text}</div> }.into_any(),
-                    })
-            }}
-            {lists}
-            {forms}
-        </div>
-    }
-}
-
-#[component]
-pub fn StoragePanel() -> impl IntoView {
-    let app = expect_context::<App>();
-    let storage = RwSignal::new(None::<Storage>);
-    let message = RwSignal::new(None::<Result<String, String>>);
-    let load = move || {
-        spawn_local(async move {
-            match api::get::<Storage>("/api/storage").await {
-                Ok(s) => storage.set(Some(s)),
-                Err(e) => message.set(Some(Err(e.message))),
-            }
-        });
-    };
-    load();
-    let body = move || {
-        let s = storage.get()?;
-        let facts = s
-            .facts
+    let grants = move || {
+        let a = access.get()?;
+        let admin = a.admin;
+        let rows = a
+            .grants
             .iter()
-            .map(|f| {
+            .map(|g| {
+                let (kind, target) = match g.object_type.as_str() {
+                    "GLOBAL" => (String::new(), "Everything".to_string()),
+                    "ROLE" => ("Role".to_string(), g.name.clone().unwrap_or_default()),
+                    "DATABASE" => ("Database".to_string(), g.database.clone().unwrap_or_default()),
+                    _ => (
+                        "Table".to_string(),
+                        format!("{}.{}", g.database.clone().unwrap_or_default(), g.name.clone().unwrap_or_default()),
+                    ),
+                };
+                let revoke = grant_sql(true, g);
+                let who = g.principal.clone();
+                let what = g.privilege.clone();
                 view! {
                     <tr>
-                        <td class="label">{f.label.clone()}</td>
-                        <td>{f.value.clone()}</td>
+                        <td class="mono">{g.principal.clone()}</td>
+                        <td><span class=privilege_tone(&g.privilege)>{g.privilege.clone()}</span></td>
+                        <td>
+                            {if kind.is_empty() {
+                                view! { <span class="muted">{target}</span> }.into_any()
+                            } else {
+                                view! { <span class="muted">{kind}</span> " " <span class="mono">{target}</span> }.into_any()
+                            }}
+                        </td>
+                        <td class="t-actions">
+                            {admin
+                                .then(|| {
+                                    view! {
+                                        <button
+                                            class="btn btn--ghost btn--sm btn--danger"
+                                            on:click=move |_| {
+                                                let sql = revoke.clone();
+                                                app.ask_first(
+                                                    format!("Revoke {what} from {who}?"),
+                                                    "The privilege is gone for every session at once.",
+                                                    sql.clone(),
+                                                    "Revoke",
+                                                    move |_| run(sql.clone(), "Revoked"),
+                                                );
+                                            }
+                                        >
+                                            "Revoke"
+                                        </button>
+                                    }
+                                })}
+                        </td>
                     </tr>
                 }
             })
             .collect_view();
-        let formats: Vec<String> = s
-            .import_formats
-            .iter()
-            .map(|f| {
-                f.replace("url:", "from a path or URL: ")
-                    .replace("upload:", "upload: ")
-            })
-            .collect();
-        let durable = s.mode != "in-memory";
+        let n = a.grants.len();
         Some(view! {
-            <table class="facts">
-                <tr>
-                    <td class="label">"mode"</td>
-                    <td><strong>{s.mode.clone()}</strong></td>
-                </tr>
-                <tr>
-                    <td class="label">"location"</td>
-                    <td class="mono">{s.location.clone()}</td>
-                </tr>
-                {facts}
-            </table>
-            <div class="group-label">"Imports"</div>
-            <ul class="formats">{formats.into_iter().map(|f| view! { <li>{f}</li> }).collect_view()}</ul>
-            <button class="wide" on:click=move |_| app.import_open.set(true)>"Import data…"</button>
-            {(durable && app.admin())
-                .then(|| {
-                    view! {
-                        <button
-                            class="wide"
-                            title="Fold the WAL into the store file (an administrator action)"
-                            on:click=move |_| {
-                                app.run_statement("CHECKPOINT".to_string(), move |outcome| {
-                                    message.set(Some(outcome));
-                                    load();
-                                });
+            <div class="card card--flush">
+                <div class="card__head">
+                    <span class="card__title">"Grants"</span>
+                    <span class="badge">{n}</span>
+                    <span class="spacer"></span>
+                    {admin
+                        .then(|| {
+                            view! {
+                                <button class="btn btn--sm" on:click=move |_| dialog.set(Some(Open::Grant))>
+                                    <Icon name="shield" size=14 />
+                                    "Grant"
+                                </button>
                             }
-                        >
-                            "Checkpoint"
-                        </button>
+                        })}
+                </div>
+                {if a.grants.is_empty() {
+                    view! { <Empty icon="shield" title="No grants" body="Administrators can do everything; others need grants." /> }.into_any()
+                } else {
+                    view! {
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>"Grantee"</th>
+                                    <th class="col-140">"Privilege"</th>
+                                    <th>"On"</th>
+                                    <th class="t-actions"></th>
+                                </tr>
+                            </thead>
+                            <tbody>{rows}</tbody>
+                        </table>
                     }
-                })}
+                        .into_any()
+                }}
+            </div>
         })
     };
+
+    let admin = move || access.get().is_some_and(|a| a.admin);
     view! {
-        <div class="panel storage">
-            {move || {
-                message
-                    .get()
-                    .map(|m| match m {
-                        Ok(text) => view! { <div class="ok-line">{text}</div> }.into_any(),
-                        Err(text) => view! { <div class="error-box">{text}</div> }.into_any(),
-                    })
-            }}
-            {body}
+        <div class="page">
+            <div class="page__inner">
+                <div class="page-head">
+                    <div class="page-head__text">
+                        <h1 class="page-head__title">"Access"</h1>
+                        <p class="page-head__desc">
+                            "Users, roles and what they may read and write. Every change runs as SQL under your session."
+                        </p>
+                    </div>
+                    <div class="page-head__actions">
+                        {move || {
+                            admin()
+                                .then(|| {
+                                    view! {
+                                        <button class="btn" on:click=move |_| dialog.set(Some(Open::NewRole))>
+                                            <Icon name="plus" size=14 />
+                                            "New role"
+                                        </button>
+                                        <button class="btn btn--primary" on:click=move |_| dialog.set(Some(Open::NewUser))>
+                                            <Icon name="plus" size=14 />
+                                            "New user"
+                                        </button>
+                                    }
+                                })
+                        }}
+                    </div>
+                </div>
+                {move || failure.get().map(|f| view! { <Callout tone=Tone::Danger title="Could not read the access catalog">{f}</Callout> })}
+                {move || {
+                    (access.get().is_none() && failure.get().is_none())
+                        .then(|| view! { <div class="empty"><span class="spinner"></span></div> })
+                }}
+                {principals}
+                {grants}
+            </div>
         </div>
+        {move || {
+            dialog
+                .get()
+                .map(|open| {
+                    let close = Callback::new(move |_: ()| dialog.set(None));
+                    match open {
+                        Open::NewUser => view! { <UserDialog name=None close /> }.into_any(),
+                        Open::Password(name) => view! { <UserDialog name=Some(name) close /> }.into_any(),
+                        Open::NewRole => view! { <RoleDialog close run /> }.into_any(),
+                        Open::Grant => view! { <GrantDialog close run /> }.into_any(),
+                    }
+                })
+        }}
+    }
+}
+
+/// Create a user, or set a user's password (`name` given). The password
+/// goes through its own endpoint, never a worksheet run.
+#[component]
+fn UserDialog(name: Option<String>, close: Callback<()>) -> impl IntoView {
+    let app = expect_context::<App>();
+    let alter = name.is_some();
+    let user = RwSignal::new(name.clone().unwrap_or_default());
+    let password = RwSignal::new(String::new());
+    let error = RwSignal::new(None::<String>);
+    let busy = RwSignal::new(false);
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let request = UserRequest {
+            name: user.get_untracked().trim().to_string(),
+            password: password.get_untracked(),
+            alter,
+        };
+        if request.name.is_empty() || request.password.is_empty() {
+            error.set(Some("A name and a password are needed.".to_string()));
+            return;
+        }
+        busy.set(true);
+        let csrf = app.csrf();
+        spawn_local(async move {
+            let who = request.name.clone();
+            match api::post::<_, serde_json::Value>("/api/access/user", &request, &csrf).await {
+                Ok(_) => {
+                    password.set(String::new());
+                    app.toast(
+                        Tone::Success,
+                        if alter {
+                            "Password changed"
+                        } else {
+                            "User created"
+                        },
+                        who,
+                    );
+                    app.access_epoch.update(|e| *e += 1);
+                    close.run(());
+                }
+                Err(e) => {
+                    busy.set(false);
+                    error.set(Some(e.message));
+                }
+            }
+        });
+    };
+    let title = match &name {
+        Some(n) => format!("Reset the password of {n}"),
+        None => "New user".to_string(),
+    };
+    let no_logins = move || app.session.get().is_some_and(|s| s.auth == "none");
+    view! {
+        <Dialog title size="sm" on_close=close>
+            <form on:submit=submit>
+                <div class="dialog__body">
+                    {move || {
+                        (!alter && no_logins())
+                            .then(|| {
+                                view! {
+                                    <Callout tone=Tone::Warning title="This console runs without sign-in">
+                                        "The store has no users yet. Creating the first one ends that: restart the server with "
+                                        <span class="mono">"--ui-auth basic"</span>
+                                        " and sign in as that user."
+                                    </Callout>
+                                }
+                            })
+                    }}
+                    {(!alter)
+                        .then(|| {
+                            view! {
+                                <label class="field">
+                                    <span class="field__label">"Name"</span>
+                                    <input
+                                        class="input mono"
+                                        autocomplete="off"
+                                        prop:value=move || user.get()
+                                        on:input=move |ev| user.set(event_target_value(&ev))
+                                    />
+                                </label>
+                            }
+                        })}
+                    <label class="field">
+                        <span class="field__label">{if alter { "New password" } else { "Password" }}</span>
+                        <input
+                            class="input"
+                            type="password"
+                            autocomplete="new-password"
+                            prop:value=move || password.get()
+                            on:input=move |ev| password.set(event_target_value(&ev))
+                        />
+                    </label>
+                    {move || error.get().map(|e| view! { <Callout tone=Tone::Danger>{e}</Callout> })}
+                </div>
+                <div class="dialog__foot">
+                    <button class="btn" type="button" on:click=move |_| close.run(())>"Cancel"</button>
+                    <button class="btn btn--primary" type="submit" disabled=move || busy.get()>
+                        {if alter { "Set password" } else { "Create user" }}
+                    </button>
+                </div>
+            </form>
+        </Dialog>
+    }
+}
+
+#[component]
+fn RoleDialog(
+    close: Callback<()>,
+    run: impl Fn(String, &'static str) + Copy + Send + Sync + 'static,
+) -> impl IntoView {
+    let name = RwSignal::new(String::new());
+    let sql = move || format!("CREATE ROLE {}", quote_ident(name.get().trim()));
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        if name.get_untracked().trim().is_empty() {
+            return;
+        }
+        run(sql(), "Role created");
+        close.run(());
+    };
+    view! {
+        <Dialog title="New role" size="sm" on_close=close>
+            <form on:submit=submit>
+                <div class="dialog__body">
+                    <label class="field">
+                        <span class="field__label">"Name"</span>
+                        <input
+                            class="input mono"
+                            autocomplete="off"
+                            prop:value=move || name.get()
+                            on:input=move |ev| name.set(event_target_value(&ev))
+                        />
+                        <span class="field__help">"Grant privileges to the role, then make users members of it."</span>
+                    </label>
+                    <pre class="code">{sql}</pre>
+                </div>
+                <div class="dialog__foot">
+                    <button class="btn" type="button" on:click=move |_| close.run(())>"Cancel"</button>
+                    <button class="btn btn--primary" type="submit">"Create role"</button>
+                </div>
+            </form>
+        </Dialog>
+    }
+}
+
+#[component]
+fn GrantDialog(
+    close: Callback<()>,
+    run: impl Fn(String, &'static str) + Copy + Send + Sync + 'static,
+) -> impl IntoView {
+    let app = expect_context::<App>();
+    let privilege = RwSignal::new("SELECT".to_string());
+    let target = RwSignal::new(String::new());
+    let grantee = RwSignal::new(String::new());
+    let sql = move || {
+        grant_form_sql(
+            &privilege.get(),
+            &target.get(),
+            &grantee.get(),
+            &app.db.get(),
+        )
+    };
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        if grantee.get_untracked().trim().is_empty() {
+            return;
+        }
+        run(sql(), "Granted");
+        close.run(());
+    };
+    let target_label = move || match privilege.get().as_str() {
+        "ROLE" => "Role",
+        "CREATE" => "Database",
+        "ADMIN" => "",
+        _ => "Table",
+    };
+    view! {
+        <Dialog title="Grant a privilege" on_close=close>
+            <form on:submit=submit>
+                <div class="dialog__body">
+                    <label class="field">
+                        <span class="field__label">"Privilege"</span>
+                        <select class="input" on:change=move |ev| privilege.set(event_target_value(&ev))>
+                            <option value="SELECT">"SELECT on a table"</option>
+                            <option value="INSERT">"INSERT on a table"</option>
+                            <option value="UPDATE">"UPDATE on a table"</option>
+                            <option value="DELETE">"DELETE on a table"</option>
+                            <option value="ALL">"ALL on a table"</option>
+                            <option value="CREATE">"CREATE on a database"</option>
+                            <option value="ROLE">"Membership of a role"</option>
+                            <option value="ADMIN">"ADMIN (everything)"</option>
+                        </select>
+                    </label>
+                    <div class="fields">
+                        {move || {
+                            let label = target_label();
+                            (!label.is_empty())
+                                .then(|| {
+                                    view! {
+                                        <label class="field">
+                                            <span class="field__label">{label}</span>
+                                            <input
+                                                class="input mono"
+                                                placeholder=move || match privilege.get().as_str() {
+                                                    "ROLE" => "analyst".to_string(),
+                                                    "CREATE" => app.db.get(),
+                                                    _ => "db.table or table".to_string(),
+                                                }
+                                                prop:value=move || target.get()
+                                                on:input=move |ev| target.set(event_target_value(&ev))
+                                            />
+                                        </label>
+                                    }
+                                })
+                        }}
+                        <label class="field">
+                            <span class="field__label">"To user or role"</span>
+                            <input
+                                class="input mono"
+                                prop:value=move || grantee.get()
+                                on:input=move |ev| grantee.set(event_target_value(&ev))
+                            />
+                        </label>
+                    </div>
+                    <pre class="code code--wrap">{sql}</pre>
+                </div>
+                <div class="dialog__foot">
+                    <button class="btn" type="button" on:click=move |_| close.run(())>"Cancel"</button>
+                    <button class="btn btn--primary" type="submit">
+                        <Icon name="shield" size=14 />
+                        "Grant"
+                    </button>
+                </div>
+            </form>
+        </Dialog>
     }
 }
 
@@ -408,6 +689,18 @@ mod tests {
         assert_eq!(
             split_object("orders", "main"),
             ("main".into(), "orders".into())
+        );
+        assert_eq!(
+            grant_form_sql("SELECT", "sales.orders", "Ana", "main"),
+            "GRANT SELECT ON TABLE sales.orders TO \"Ana\""
+        );
+        assert_eq!(
+            grant_form_sql("CREATE", "", "bob", "main"),
+            "GRANT CREATE ON DATABASE main TO bob"
+        );
+        assert_eq!(
+            grant_form_sql("ADMIN", "x", "bob", "main"),
+            "GRANT ADMIN TO bob"
         );
     }
 }

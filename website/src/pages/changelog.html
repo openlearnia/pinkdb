@@ -9,6 +9,14 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-30</h2>
+<h3>Wave 121c — the console's design system ✅</h3>
+<ul>
+<li>The warehouse console has a design system (<code>docs/console-design/README.md</code>, with a clickable mockup and a component gallery): color, type, spacing and elevation tokens in light and dark, one icon set, and specified buttons, inputs, tabs, trees, grids, tables, callouts, dialogs, toasts and empty states. Every text color meets WCAG AA contrast in both themes.</li>
+<li>The console is rebuilt on it. A <strong>rail</strong> picks the section; <strong>Access</strong>, <strong>Storage</strong> and <strong>History</strong> are full pages with tables, and the new <strong>Catalog</strong> page shows a database's objects and each object's columns, statistics, a live preview and its indexes and triggers. Users, roles and grants are created in dialogs that show the SQL they run; drops, revokes and worksheet deletes ask first.</li>
+<li>The worksheet has document tabs, a <strong>Run</strong> button with *Run all* and *Explain* in its menu, a line-number gutter with the current line, a draggable splitter, and a results bar with the status, row count, time and downloads. Ask moved to an inspector on the right. A <strong>status bar</strong> shows the connection, database, user, storage mode, the last run and the caret position; <strong>⌘K</strong> searches tables and worksheets; <strong>⌘B</strong> hides the explorer; the theme switch remembers light or dark.</li>
+<li>The no-JavaScript <code>/preview</code> page uses the same styles.</li>
+</ul>
+<li><strong>URLs</strong>: the place is in the address bar (<code>/query/{worksheet}</code>, <code>/catalog/{database}/{object}</code>, <code>/history</code>, <code>/access</code>, <code>/storage</code>), so Back and Forward move between views, a reload keeps the place, a link opens the same worksheet or table, and a modified click on the rail opens a section in a new tab. The tab title names the view.</li>
 <h3>Extension libraries load on macOS 27 ✅</h3>
 <ul>
 <li>On macOS 27 the release builds of the agent and memory extensions failed <code>LOAD EXTENSION</code> / <code>--agent-extension</code> with "mis-aligned LINKEDIT string pool": the new loader wants the symbol string table 8-byte aligned, and both Apple's ld and LLD leave it 4-byte aligned when a library imports an odd number of functions (which libraries hit it changes with the code). <code>scripts/macos-align-linkedit.py &lt;library&gt;</code> moves the table and re-signs the file (a no-op on an aligned library), and the loader's error now names the script.</li>

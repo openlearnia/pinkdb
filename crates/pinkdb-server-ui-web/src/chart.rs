@@ -5,6 +5,7 @@ use leptos::prelude::*;
 use pinkdb_server_ui_api::StatementResult;
 
 use crate::state::numeric;
+use crate::ui::Empty;
 
 const WIDTH: f64 = 720.0;
 const HEIGHT: f64 = 320.0;
@@ -83,7 +84,7 @@ pub fn Chart(result: StatementResult) -> impl IntoView {
         .collect();
     if numeric_columns.is_empty() || result.rows.is_empty() {
         return view! {
-            <div class="empty">"A chart needs a numeric column and at least one row."</div>
+            <Empty icon="chart" title="Nothing to chart" body="A chart needs a numeric column and at least one row." />
         }
         .into_any();
     }
@@ -132,7 +133,7 @@ pub fn Chart(result: StatementResult) -> impl IntoView {
                 .collect()
         });
         if points.is_empty() {
-            return view! { <div class="empty">"No numeric values to plot."</div> }.into_any();
+            return view! { <Empty icon="chart" title="No numeric values to plot" /> }.into_any();
         }
         let xs: Option<Vec<f64>> = (k != Kind::Bar)
             .then(|| points.iter().map(|(l, _)| l.parse::<f64>().ok()).collect())
@@ -200,7 +201,7 @@ pub fn Chart(result: StatementResult) -> impl IntoView {
         };
         let marks = match k {
             Kind::Bar => {
-                let w = (plot_w / n as f64 * 0.8).max(1.0);
+                let w = (plot_w / n as f64 * 0.6).max(1.0);
                 let zero = sy(0.0);
                 points
                     .iter()
@@ -209,7 +210,7 @@ pub fn Chart(result: StatementResult) -> impl IntoView {
                         let yy = sy(*v);
                         let title = format!("{l}: {v}");
                         view! {
-                            <rect class="mark" x=sx(i) - w / 2.0 y=yy.min(zero) width=w height=(zero - yy).abs().max(0.5)>
+                            <rect class="mark" rx="2" x=sx(i) - w / 2.0 y=yy.min(zero) width=w height=(zero - yy).abs().max(0.5)>
                                 <title>{title}</title>
                             </rect>
                         }
@@ -240,7 +241,7 @@ pub fn Chart(result: StatementResult) -> impl IntoView {
                 .into_any(),
         };
         view! {
-            <svg class="chart" viewBox=format!("0 0 {WIDTH} {HEIGHT}") role="img">
+            <svg viewBox=format!("0 0 {WIDTH} {HEIGHT}") role="img" aria-label="Chart of the result">
                 {grid}
                 <line class="axis" x1=LEFT x2=WIDTH - RIGHT y1=HEIGHT - BOTTOM y2=HEIGHT - BOTTOM></line>
                 {x_labels}
@@ -251,30 +252,30 @@ pub fn Chart(result: StatementResult) -> impl IntoView {
     };
     let kind_button = move |name: &'static str, k: Kind| {
         view! {
-            <button class="seg" class:active=move || kind.get() == k on:click=move |_| kind.set(k)>
+            <button class="seg__item" class:is-active=move || kind.get() == k on:click=move |_| kind.set(k)>
                 {name}
             </button>
         }
     };
     view! {
-        <div class="chart-wrap">
-            <div class="chart-controls">
-                <span class="segs">
+        <div class="chart">
+            <div class="chart__controls">
+                <div class="seg">
                     {kind_button("Bar", Kind::Bar)}
                     {kind_button("Line", Kind::Line)}
                     {kind_button("Scatter", Kind::Scatter)}
-                </span>
-                <label>
-                    "x "
-                    <select on:change=move |ev| {
+                </div>
+                <label class="field">
+                    <span class="field__label">"X"</span>
+                    <select class="input input--sm" on:change=move |ev| {
                         if let Ok(i) = event_target_value(&ev).parse() {
                             x.set(i)
                         }
                     }>{x_options}</select>
                 </label>
-                <label>
-                    "y "
-                    <select on:change=move |ev| {
+                <label class="field">
+                    <span class="field__label">"Y"</span>
+                    <select class="input input--sm" on:change=move |ev| {
                         if let Ok(i) = event_target_value(&ev).parse() {
                             y.set(i)
                         }

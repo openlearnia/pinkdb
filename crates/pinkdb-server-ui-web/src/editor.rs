@@ -7,11 +7,43 @@ use leptos::html;
 use leptos::prelude::*;
 use pinkdb_server_ui_api::sql::{self, TokenKind};
 
-use crate::state::{App, Sheet};
+use crate::icon::Icon;
+use crate::state::{App, ResultView, RunKind, Sheet};
 
-/// Editor metrics (they match `console.css`).
+/// Editor metrics (they match `console.css`: 20 px lines, 8 px above the
+/// text, 12 px left of it).
 const LINE_HEIGHT: f64 = 20.0;
-const PADDING: f64 = 10.0;
+const PAD_TOP: f64 = 8.0;
+const PAD_LEFT: f64 = 12.0;
+
+/// The 1-based `(line, column)` of a byte offset.
+pub fn line_col(text: &str, byte: usize) -> (usize, usize) {
+    let before = &text[..byte.min(text.len())];
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, column)
+}
+
+/// The statement to explain: `EXPLAIN` in front, unless it is there.
+pub fn explain_sql(statement: &str) -> String {
+    let trimmed = statement.trim_start();
+    if trimmed.to_ascii_lowercase().starts_with("explain") {
+        trimmed.to_string()
+    } else {
+        format!("EXPLAIN {trimmed}")
+    }
+}
+
+/// The icon of a completion kind.
+fn kind_icon(kind: &str) -> &'static str {
+    match kind {
+        "column" => "column",
+        "table" => "table",
+        "database" => "database",
+        "function" => "function",
+        _ => "chevron-right",
+    }
+}
 
 /// A UTF-16 offset (what the DOM reports) as a byte offset into `text`.
 pub fn utf16_to_byte(text: &str, units: u32) -> usize {
@@ -250,8 +282,8 @@ pub fn Editor(sheet: Sheet) -> impl IntoView {
             .map(|m| m.offset_width() as f64 / 10.0)
             .filter(|w| *w > 0.0)
             .unwrap_or(7.8);
-        let left = PADDING + column * char_width - el.scroll_left() as f64;
-        let top = PADDING + (line + 1.0) * LINE_HEIGHT - el.scroll_top() as f64;
+        let left = 48.0 + PAD_LEFT + column * char_width - el.scroll_left() as f64;
+        let top = PAD_TOP + (line + 1.0) * LINE_HEIGHT - el.scroll_top() as f64 + 2.0;
         popup.set(Some(Popup {
             items,
             selected: 0,
@@ -275,20 +307,53 @@ pub fn Editor(sheet: Sheet) -> impl IntoView {
         }
     };
 
-    let run = move |all: bool| {
+    // The caret's line and column (the status bar shows them; the current
+    // line is highlighted) and the scroll offset of the text.
+    let caret_line = RwSignal::new(1usize);
+    let scroll_top = RwSignal::new(0.0f64);
+    let track_caret = move || {
+        let (pos, _) = selection();
+        let (line, column) = line_col(&sheet.sql.get_untracked(), pos);
+        caret_line.set(line);
+        app.cursor.set((line, column));
+    };
+
+    let run = move |kind: RunKind| {
         let text = sheet.sql.get_untracked();
         let (start, end) = selection();
-        let sql = if all {
-            text.clone()
-        } else if start != end {
-            text[start..end].to_string()
-        } else {
-            sql::statement_at(&text, start)
-                .map(|s| s.text)
-                .unwrap_or_default()
+        let statement = || {
+            if start != end {
+                text[start..end].to_string()
+            } else {
+                sql::statement_at(&text, start)
+                    .map(|s| s.text)
+                    .unwrap_or_default()
+            }
+        };
+        let sql = match kind {
+            RunKind::All => text.clone(),
+            RunKind::Cursor => statement(),
+            RunKind::Explain => {
+                // The plan, not the grid or profile shown last.
+                sheet.view.set(ResultView::Grid);
+                let s = statement();
+                if s.trim().is_empty() {
+                    s
+                } else {
+                    explain_sql(&s)
+                }
+            }
         };
         app.run(sheet, sql);
     };
+
+    // A run the toolbar asked for.
+    Effect::new(move |_| {
+        if let Some(kind) = app.run_request.get() {
+            app.run_request.set(None);
+            run(kind);
+        }
+    });
 
     let on_keydown = move |ev: web_sys::KeyboardEvent| {
         let key = ev.key();
@@ -327,7 +392,11 @@ pub fn Editor(sheet: Sheet) -> impl IntoView {
         if command && key == "Enter" {
             ev.prevent_default();
             popup.set(None);
-            run(ev.shift_key());
+            run(if ev.shift_key() {
+                RunKind::All
+            } else {
+                RunKind::Cursor
+            });
         } else if command && (key == " " || key == "Spacebar") {
             ev.prevent_default();
             open_popup(true);
@@ -366,8 +435,18 @@ pub fn Editor(sheet: Sheet) -> impl IntoView {
         if let (Some(el), Some(pre)) = (area.get_untracked(), layer.get_untracked()) {
             pre.set_scroll_top(el.scroll_top());
             pre.set_scroll_left(el.scroll_left());
+            scroll_top.set(el.scroll_top() as f64);
         }
         popup.set(None);
+    };
+    let gutter = move || {
+        let lines = sheet.sql.with(|t| t.matches('\n').count() + 1);
+        let current = caret_line.get();
+        (1..=lines)
+            .map(|n| {
+                view! { <div class:is-current=n == current>{n}</div> }
+            })
+            .collect_view()
     };
 
     // Text another panel asked to insert (a catalog name, the agent's SQL).
@@ -387,7 +466,20 @@ pub fn Editor(sheet: Sheet) -> impl IntoView {
 
     let read_only = move || !sheet.mine.get();
     view! {
-        <div class="editor">
+        <div class="editor" style:height=move || format!("{}px", sheet.editor_px.get())>
+            <div class="editor__gutter" aria-hidden="true">
+                <div style:transform=move || format!("translateY({}px)", -scroll_top.get())>{gutter}</div>
+            </div>
+            <div class="editor__main">
+            <div
+                class="editor__current"
+                style:top=move || {
+                    format!(
+                        "{}px",
+                        PAD_TOP + (caret_line.get() as f64 - 1.0) * LINE_HEIGHT - scroll_top.get(),
+                    )
+                }
+            ></div>
             <pre class="hl" node_ref=layer aria-hidden="true">{move || highlight(&sheet.sql.get())}</pre>
             <textarea
                 node_ref=area
@@ -399,13 +491,20 @@ pub fn Editor(sheet: Sheet) -> impl IntoView {
                 aria-label="SQL"
                 prop:value=move || sheet.sql.get()
                 prop:readOnly=read_only
-                on:input=on_input
+                on:input=move |ev| {
+                    on_input(ev);
+                    track_caret();
+                }
                 on:keydown=on_keydown
+                on:keyup=move |_| track_caret()
+                on:click=move |_| track_caret()
+                on:focus=move |_| track_caret()
                 on:scroll=on_scroll
                 on:blur=move |_| {
                     set_timeout(move || popup.set(None), std::time::Duration::from_millis(150))
                 }
             ></textarea>
+            </div>
             <span class="measure" node_ref=measure aria-hidden="true">"xxxxxxxxxx"</span>
             {move || {
                 popup
@@ -423,14 +522,15 @@ pub fn Editor(sheet: Sheet) -> impl IntoView {
                                         let kind = item.kind;
                                         view! {
                                             <li
-                                                class:selected=i == selected
+                                                class:is-selected=i == selected
                                                 on:mousedown=move |ev: web_sys::MouseEvent| {
                                                     ev.prevent_default();
                                                     accept(i);
                                                 }
                                             >
-                                                <span class="label">{label}</span>
-                                                <span class="kind">{kind}</span>
+                                                <Icon name=kind_icon(kind) size=14 />
+                                                <span>{label}</span>
+                                                <span class="completion__kind">{kind}</span>
                                             </li>
                                         }
                                     })
@@ -446,6 +546,15 @@ pub fn Editor(sheet: Sheet) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carets_and_explains() {
+        assert_eq!(line_col("ab\ncd", 0), (1, 1));
+        assert_eq!(line_col("ab\ncd", 4), (2, 2));
+        assert_eq!(line_col("é\n", 2), (1, 2));
+        assert_eq!(explain_sql("  SELECT 1"), "EXPLAIN SELECT 1");
+        assert_eq!(explain_sql("explain select 1"), "explain select 1");
+    }
 
     #[test]
     fn offsets_convert_both_ways() {

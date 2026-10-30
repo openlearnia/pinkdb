@@ -10,10 +10,13 @@ use wasm_bindgen::JsValue;
 
 use crate::api;
 use crate::chart::Chart;
-use crate::state::{App, ResultView, Sheet, count, millis, numeric};
+use crate::icon::Icon;
+use crate::state::{App, ResultView, Sheet, Tone, count, millis, numeric, shortcut};
+use crate::ui::{Callout, Empty};
 
 /// Grid metrics (they match `console.css`).
 const ROW_HEIGHT: f64 = 24.0;
+const RN_WIDTH: f64 = 52.0;
 const OVERSCAN: usize = 8;
 
 /// Column widths in pixels, from the header and the first rows.
@@ -35,7 +38,7 @@ fn widths(result: &StatementResult) -> Vec<f64> {
                 })
                 .max()
                 .unwrap_or(0);
-            (header.max(longest) as f64 * 7.6 + 20.0).clamp(64.0, 420.0)
+            (header.max(longest) as f64 * 7.3 + 22.0).clamp(64.0, 420.0)
         })
         .collect()
 }
@@ -136,21 +139,64 @@ fn download(app: App, result: StatementResult, format: &'static str) {
         format: format.to_string(),
     };
     let csrf = app.csrf();
-    app.notice.set("exporting…".to_string());
+    app.toast(
+        Tone::Info,
+        "Exporting every row",
+        "The grid holds part of the result: the server runs the statement again.",
+    );
     spawn_local(async move {
         match api::post_raw("/api/export", &request, &csrf, None).await {
             Ok(response) => match response.blob() {
                 Ok(promise) => {
                     if let Ok(blob) = wasm_bindgen_futures::JsFuture::from(promise).await {
                         api::download_blob(&format!("result.{format}"), &blob.into());
-                        app.notice.set(String::new());
                     }
                 }
-                Err(_) => app.notice.set("export failed".to_string()),
+                Err(_) => app.toast(Tone::Danger, "Export failed", ""),
             },
-            Err(e) => app.notice.set(format!("export: {e}")),
+            Err(e) => app.toast(Tone::Danger, "Export failed", e.message),
         }
     });
+}
+
+/// The running state: a ticking timer and Cancel.
+#[component]
+fn Running(sheet: Sheet) -> impl IntoView {
+    let app = expect_context::<App>();
+    let now = RwSignal::new(js_sys::Date::now());
+    let tick = set_interval_with_handle(
+        move || now.set(js_sys::Date::now()),
+        std::time::Duration::from_millis(100),
+    )
+    .ok();
+    on_cleanup(move || {
+        if let Some(handle) = tick {
+            handle.clear();
+        }
+    });
+    view! {
+        <div class="running" role="status">
+            <span class="spinner spinner--lg"></span>
+            <span class="running__time">
+                {move || format!("{:.1} s", ((now.get() - sheet.started.get()) / 1000.0).max(0.0))}
+            </span>
+            <span>"Running"</span>
+            <button class="btn btn--sm" on:click=move |_| app.cancel(sheet)>
+                "Cancel"
+                <span class="kbd">"Esc"</span>
+            </button>
+        </div>
+    }
+}
+
+/// Whether a result is the plan of an `EXPLAIN`.
+fn is_explain(result: &StatementResult) -> bool {
+    result
+        .statement
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("explain")
+        && result.columns.len() == 1
 }
 
 #[component]
@@ -158,22 +204,29 @@ pub fn Results(sheet: Sheet) -> impl IntoView {
     let app = expect_context::<App>();
     let body = move || {
         if sheet.running.get().is_some() {
+            return view! { <div class="results__body"><Running sheet /></div> }.into_any();
+        }
+        if let Some(error) = sheet.run_error.get() {
             return view! {
-                <div class="running">
-                    <span class="spinner"></span>
-                    "Running… "
-                    <button on:click=move |_| app.cancel(sheet)>"Cancel"</button>
-                    <span class="hint">" (Esc)"</span>
+                <div class="results__error">
+                    <Callout tone=Tone::Danger title="The request failed">{error}</Callout>
                 </div>
             }
             .into_any();
         }
-        if let Some(error) = sheet.run_error.get() {
-            return view! { <div class="error-box">{error}</div> }.into_any();
-        }
         let Some(response) = sheet.result.get() else {
             return view! {
-                <div class="empty">"Run a statement to see its result here."</div>
+                <div class="results__body">
+                    <Empty icon="play" title="Run a query">
+                        <div class="empty__body">
+                            "Results appear here. "
+                            <span class="kbd">{shortcut("↵")}</span>
+                            " runs the statement at the cursor, "
+                            <span class="kbd">{shortcut("⇧↵")}</span>
+                            " runs them all."
+                        </div>
+                    </Empty>
+                </div>
             }
             .into_any();
         };
@@ -181,42 +234,82 @@ pub fn Results(sheet: Sheet) -> impl IntoView {
         let tab = sheet.tab.get().min(tabs.saturating_sub(1));
         let tab_bar = (0..tabs)
             .map(|i| {
-                let label = match response.results.get(i) {
-                    Some(r) if r.kind == "rows" => format!("Result {}", i + 1),
-                    Some(_) => format!("Statement {}", i + 1),
-                    None => "Error".to_string(),
+                let (label, rows) = match response.results.get(i) {
+                    Some(r) if r.kind == "rows" => (format!("Result {}", i + 1), Some(r.row_count)),
+                    Some(_) => (format!("Statement {}", i + 1), None),
+                    None => {
+                        let cancelled = response.error.as_ref().is_some_and(|e| e.cancelled);
+                        (
+                            (if cancelled { "Cancelled" } else { "Error" }).to_string(),
+                            None,
+                        )
+                    }
                 };
                 let is_error = i >= response.results.len();
                 view! {
                     <button
-                        class="rtab"
-                        class:active=i == tab
-                        class:bad=is_error
+                        class="tabs__item"
+                        class:is-active=i == tab
+                        class:is-error=is_error
+                        role="tab"
+                        aria-selected=(i == tab).to_string()
                         on:click=move |_| {
                             sheet.tab.set(i);
                             sheet.cell.set(None);
                         }
                     >
+                        {is_error.then(|| view! { <Icon name="alert-circle" size=14 /> })}
                         {label}
+                        {rows.map(|n| view! { <span class="tabs__count">{count(n)}</span> })}
                     </button>
                 }
             })
             .collect_view();
-        let content = match response.results.get(tab).cloned() {
+        let selected = response.results.get(tab).cloned();
+        let views = selected.as_ref().filter(|r| r.kind == "rows").map(|r| {
+            let explain = is_explain(r);
+            let button = move |label: &'static str, icon: &'static str, target: ResultView| {
+                view! {
+                    <button
+                        class="seg__item"
+                        class:is-active=move || sheet.view.get() == target
+                        on:click=move |_| sheet.view.set(target)
+                    >
+                        <Icon name=icon size=14 />
+                        {label}
+                    </button>
+                }
+            };
+            view! {
+                <div class="seg" aria-label="Result view">
+                    {if explain {
+                        button("Plan", "plan", ResultView::Grid)
+                    } else {
+                        button("Grid", "grid", ResultView::Grid)
+                    }}
+                    {button("Chart", "chart", ResultView::Chart)}
+                    {button("Profile", "gauge", ResultView::Profile)}
+                </div>
+            }
+        });
+        let content = match selected {
             Some(result) => view! { <ResultBody sheet result /> }.into_any(),
             None => {
                 let error = response.error.clone();
                 view! {
-                    <div class="error-box">
+                    <div class="results__error">
                         {error
                             .map(|e| {
+                                let (tone, title) = if e.cancelled {
+                                    (Tone::Warning, format!("Statement {} was cancelled", e.index + 1))
+                                } else {
+                                    (Tone::Danger, format!("Statement {} failed", e.index + 1))
+                                };
                                 view! {
-                                    <div class="error-title">
-                                        {if e.cancelled { "Cancelled" } else { "Error" }}
-                                        {format!(" in statement {}", e.index + 1)}
-                                    </div>
-                                    <pre class="error-sql">{e.statement}</pre>
-                                    <pre class="error-message">{e.message}</pre>
+                                    <Callout tone title>
+                                        <div class="code--wrap">{e.message}</div>
+                                        <pre class="code code--wrap">{e.statement}</pre>
+                                    </Callout>
                                 }
                             })}
                     </div>
@@ -224,16 +317,17 @@ pub fn Results(sheet: Sheet) -> impl IntoView {
                 .into_any()
             }
         };
+        let _ = app;
         view! {
-            <div class="rtabs">
-                {tab_bar}
-                <span class="elapsed">{format!("total {}", millis(response.elapsed_ms))}</span>
+            <div class="results__head">
+                <div class="tabs" role="tablist">{tab_bar}</div>
+                {views}
             </div>
             {content}
         }
         .into_any()
     };
-    view! { <section class="results">{body}</section> }
+    view! { <section class="results" aria-label="Results">{body}</section> }
 }
 
 #[component]
@@ -243,47 +337,30 @@ fn ResultBody(sheet: Sheet, result: StatementResult) -> impl IntoView {
         let message = result.message.clone();
         let total = millis(result.profile.total_ms);
         return view! {
-            <div class="ok-box">
-                <div class="ok-message">{message}</div>
-                <div class="hint">{total}</div>
-                <pre class="ok-sql">{result.statement.clone()}</pre>
+            <div class="results__ok">
+                <Callout tone=Tone::Success title=message>
+                    <span class="muted">{total}</span>
+                    <pre class="code code--wrap">{result.statement.clone()}</pre>
+                </Callout>
             </div>
         }
         .into_any();
     }
-    let explain = result
-        .statement
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("explain")
-        && result.columns.len() == 1;
-    let info = if result.truncated {
-        format!(
-            "showing {} of {} rows · {}",
-            count(result.rows.len() as u64),
-            count(result.row_count),
-            millis(result.profile.total_ms)
-        )
+    let explain = is_explain(&result);
+    let rows_text = if result.truncated {
+        view! {
+            <span>
+                "Showing " <strong>{count(result.rows.len() as u64)}</strong> " of "
+                <strong>{count(result.row_count)}</strong> " rows"
+            </span>
+        }
+        .into_any()
     } else {
-        format!(
-            "{} rows · {}",
-            count(result.row_count),
-            millis(result.profile.total_ms)
-        )
+        view! { <span><strong>{count(result.row_count)}</strong> " rows"</span> }.into_any()
     };
     let csv_result = result.clone();
     let json_result = result.clone();
-    let view_button = move |label: &'static str, target: ResultView| {
-        view! {
-            <button
-                class="seg"
-                class:active=move || sheet.view.get() == target
-                on:click=move |_| sheet.view.set(target)
-            >
-                {label}
-            </button>
-        }
-    };
+    let columns = result.columns.len();
     let main = {
         let result = result.clone();
         move || match sheet.view.get() {
@@ -296,17 +373,26 @@ fn ResultBody(sheet: Sheet, result: StatementResult) -> impl IntoView {
         }
     };
     view! {
-        <div class="rbar">
-            <span class="segs">
-                {view_button(if explain { "Plan" } else { "Grid" }, ResultView::Grid)}
-                {view_button("Chart", ResultView::Chart)}
-                {view_button("Profile", ResultView::Profile)}
-            </span>
-            <span class="info">{info}</span>
-            <button on:click=move |_| download(app, csv_result.clone(), "csv")>"CSV"</button>
-            <button on:click=move |_| download(app, json_result.clone(), "json")>"JSON"</button>
+        <div class="results__bar">
+            <span class="status status--success">"Succeeded"</span>
+            <span class="results__dot">"·"</span>
+            {rows_text}
+            <span class="results__dot">"·"</span>
+            <span>{millis(result.profile.total_ms)}</span>
+            <span class="results__dot">"·"</span>
+            <span>{format!("{columns} column{}", if columns == 1 { "" } else { "s" })}</span>
+            {result.truncated.then(|| view! { <span class="badge badge--warning" title="Downloads fetch every row">"Truncated"</span> })}
+            <span class="spacer"></span>
+            <button class="btn btn--ghost btn--sm" on:click=move |_| download(app, csv_result.clone(), "csv")>
+                <Icon name="download" size=14 />
+                "CSV"
+            </button>
+            <button class="btn btn--ghost btn--sm" on:click=move |_| download(app, json_result.clone(), "json")>
+                <Icon name="download" size=14 />
+                "JSON"
+            </button>
         </div>
-        {main}
+        <div class="results__body">{main}</div>
     }
     .into_any()
 }
@@ -317,8 +403,13 @@ fn Grid(sheet: Sheet, result: StatementResult) -> impl IntoView {
     let top = RwSignal::new(0.0f64);
     let height = RwSignal::new(400.0f64);
     let widths = widths(&result);
-    let total_width: f64 = widths.iter().sum::<f64>() + 56.0;
+    let total_width: f64 = widths.iter().sum::<f64>() + RN_WIDTH;
     let numeric: Vec<bool> = result.columns.iter().map(|c| numeric(&c.dtype)).collect();
+    let boolean: Vec<bool> = result
+        .columns
+        .iter()
+        .map(|c| c.dtype.eq_ignore_ascii_case("BOOLEAN"))
+        .collect();
     let rows = StoredValue::new(result.rows.clone());
     let row_count = result.rows.len();
     let on_scroll = move |_| {
@@ -332,23 +423,21 @@ fn Grid(sheet: Sheet, result: StatementResult) -> impl IntoView {
             height.set(el.client_height() as f64);
         }
     });
-    let header_widths = widths.clone();
     let header = result
         .columns
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let w = header_widths[i];
+            let w = widths[i];
             view! {
-                <div class="th" class:num=numeric[i] style:width=format!("{w}px")>
-                    <span class="name">{c.name.clone()}</span>
-                    <span class="type">{c.dtype.clone()}</span>
+                <div class="vgrid__th" class:is-num=numeric[i] style:width=format!("{w}px") title=c.name.clone()>
+                    <span class="grid__name">{c.name.clone()}</span>
+                    <span class="grid__type">{c.dtype.clone()}</span>
                 </div>
             }
         })
         .collect_view();
     let body_widths = widths.clone();
-    let body_numeric = numeric.clone();
     let visible = move || {
         let first = ((top.get() / ROW_HEIGHT) as usize).saturating_sub(OVERSCAN);
         let shown = (height.get() / ROW_HEIGHT) as usize + 2 * OVERSCAN;
@@ -363,13 +452,18 @@ fn Grid(sheet: Sheet, result: StatementResult) -> impl IntoView {
                         .map(|(c, cell)| {
                             let w = body_widths.get(c).copied().unwrap_or(80.0);
                             let is_null = cell.is_none();
+                            let is_bool = boolean.get(c).copied().unwrap_or(false);
                             let text = cell.clone().unwrap_or_else(|| "NULL".to_string());
+                            let truth = is_bool && text == "true";
+                            let falsity = is_bool && text == "false";
                             view! {
                                 <div
-                                    class="td"
-                                    class:num=body_numeric.get(c).copied().unwrap_or(false)
-                                    class:null=is_null
-                                    class:sel=selected == Some((r, c))
+                                    class="vgrid__td"
+                                    class:is-num=numeric.get(c).copied().unwrap_or(false)
+                                    class:is-null=is_null
+                                    class:is-true=truth
+                                    class:is-false=falsity
+                                    class:is-selected=selected == Some((r, c))
                                     style:width=format!("{w}px")
                                     on:click=move |_| sheet.cell.set(Some((r, c)))
                                 >
@@ -379,8 +473,8 @@ fn Grid(sheet: Sheet, result: StatementResult) -> impl IntoView {
                         })
                         .collect_view();
                     view! {
-                        <div class="tr" style:top=format!("{}px", r as f64 * ROW_HEIGHT)>
-                            <div class="rn">{r + 1}</div>
+                        <div class="vgrid__row" style:top=format!("{}px", r as f64 * ROW_HEIGHT)>
+                            <div class="vgrid__rn">{r + 1}</div>
                             {cells}
                         </div>
                     }
@@ -391,35 +485,41 @@ fn Grid(sheet: Sheet, result: StatementResult) -> impl IntoView {
     let viewer = move || {
         let (r, c) = sheet.cell.get()?;
         let text = rows.with_value(|rows| rows.get(r).and_then(|row| row.get(c)).cloned())?;
-        let column = result.columns.get(c)?.name.clone();
+        let column = result.columns.get(c)?;
+        let name = column.name.clone();
+        let dtype = column.dtype.to_ascii_lowercase();
         let shown = text.as_deref().map_or_else(|| "NULL".to_string(), pretty);
         Some(view! {
-            <div class="viewer">
-                <div class="viewer-head">
-                    <span>{format!("row {}, {}", r + 1, column)}</span>
-                    <button on:click=move |_| sheet.cell.set(None)>"×"</button>
+            <aside class="viewer" aria-label="Cell">
+                <div class="panel-head">
+                    <span class="panel-head__title">
+                        <span class="mono">{name}</span>
+                        <span class="subtle mono viewer__type">{dtype}</span>
+                    </span>
+                    <span class="subtle text-sm">{format!("Row {}", r + 1)}</span>
+                    <button class="btn btn--ghost btn--icon btn--sm" aria-label="Close" on:click=move |_| sheet.cell.set(None)>
+                        <Icon name="x" size=14 />
+                    </button>
                 </div>
-                <pre>{shown}</pre>
-            </div>
+                <pre class="code" class:is-null=text.is_none()>{shown}</pre>
+            </aside>
         })
     };
     view! {
-        <div class="grid-wrap">
-            <div class="grid" node_ref=scroller on:scroll=on_scroll>
-                <div class="thead" style:width=format!("{total_width}px")>
-                    <div class="rn">"#"</div>
-                    {header}
-                </div>
-                <div
-                    class="tbody"
-                    style:height=format!("{}px", row_count as f64 * ROW_HEIGHT)
-                    style:width=format!("{total_width}px")
-                >
-                    {visible}
-                </div>
+        <div class="vgrid" node_ref=scroller on:scroll=on_scroll role="grid" aria-rowcount=row_count>
+            <div class="vgrid__head" style:width=format!("{total_width}px")>
+                <div class="vgrid__rn">"#"</div>
+                {header}
             </div>
-            {viewer}
+            <div
+                class="vgrid__body"
+                style:height=format!("{}px", row_count as f64 * ROW_HEIGHT)
+                style:width=format!("{total_width}px")
+            >
+                {visible}
+            </div>
         </div>
+        {viewer}
     }
 }
 
@@ -438,10 +538,10 @@ fn ExplainTree(result: StatementResult) -> impl IntoView {
                 None => (text.clone(), String::new()),
             };
             view! {
-                <div class="node" style:padding-left=format!("{}px", 12 + depth * 18)>
-                    <span class="branch">{if depth > 0 { "└ " } else { "" }}</span>
-                    <span class="op">{op}</span>
-                    <span class="args">{rest}</span>
+                <div class="plan__node" style:padding-left=format!("{}px", depth * 20)>
+                    {(depth > 0).then(|| view! { <span class="plan__branch">"└"</span> })}
+                    <span class="plan__op">{op}</span>
+                    <span class="plan__args">{rest}</span>
                 </div>
             }
         })
@@ -455,38 +555,31 @@ fn ProfileView(result: StatementResult) -> impl IntoView {
     let p = result.profile.clone();
     let total = p.total_ms.max(0.001);
     let phases = [
-        ("parse", p.parse_ms),
-        ("bind", p.bind_ms),
-        ("optimize", p.optimize_ms),
-        ("execute", p.execute_ms),
-        ("log", p.log_ms),
+        ("Parse", p.parse_ms),
+        ("Bind", p.bind_ms),
+        ("Optimize", p.optimize_ms),
+        ("Execute", p.execute_ms),
+        ("Log", p.log_ms),
     ];
     let rows = phases
         .into_iter()
         .map(|(name, ms)| {
             let pct = (ms / total * 100.0).clamp(0.0, 100.0);
             view! {
-                <tr>
-                    <td class="phase">{name}</td>
-                    <td class="bar-cell">
-                        <div class="bar" style:width=format!("{pct:.1}%")></div>
-                    </td>
-                    <td class="num">{millis(ms)}</td>
-                </tr>
+                <span class="profile__phase">{name}</span>
+                <div class="bar"><div class="bar__fill" style:width=format!("{pct:.1}%")></div></div>
+                <span class="profile__ms">{millis(ms)}</span>
             }
         })
         .collect_view();
     view! {
         <div class="profile">
-            <table>
-                {rows}
-                <tr class="total">
-                    <td class="phase">"total"</td>
-                    <td></td>
-                    <td class="num">{millis(p.total_ms)}</td>
-                </tr>
-            </table>
-            <div class="hint">{format!("{} · {} rows", p.kind, count(p.rows))}</div>
+            {rows}
+            <span class="profile__phase profile__total">"Total"</span>
+            <span class="profile__total muted text-sm">
+                {format!("{} · {} rows", p.kind, count(p.rows))}
+            </span>
+            <span class="profile__ms profile__total">{millis(p.total_ms)}</span>
         </div>
     }
 }

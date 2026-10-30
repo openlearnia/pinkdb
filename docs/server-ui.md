@@ -239,6 +239,7 @@ PINKDB_AGENT_PROVIDER=zai ZAI_API_KEY=… \
 | Method and path | What |
 |---|---|
 | `GET /` | the shell: the stylesheet and the app's boot module, no data |
+| `GET /query[/{worksheet}]`, `/catalog[/{database}/{object}]`, `/history`, `/access`, `/storage` | the same shell: the app's own URLs, so a reload, Back and Forward and a shared link keep the place (wave 121c) |
 | `GET /assets/console.css`, `/assets/boot.js` | the stylesheet and the boot module |
 | `GET /assets/pinkdb-console.js`, `/assets/pinkdb-console_bg.wasm` | the app, served gzip-encoded (`406` to a client that refuses gzip) |
 | `GET /api/session` | the session (user, CSRF token, mode), or `401` with the login mode |
@@ -263,7 +264,12 @@ The request and response types are one Rust crate,
 `crates/pinkdb-server-ui-web` is a Leptos (client-side rendering) app
 compiled to wasm32: the editor (a `<textarea>` over a highlighted layer, so
 the browser's own editing, selection and undo work), the virtual grid, the
-SVG charts and the ask panel. The SQL tokenizer, statement splitter and
+SVG charts and the ask panel. Its look follows the console design system
+(`docs/console-design/README.md`, wave 121c): a section rail (Query,
+Catalog, History, Access, Storage), an explorer, the workspace, an
+inspector for Ask, and a status bar; tokens for color, type and spacing in
+light and dark; one icon set; no inline styles (the Content-Security-Policy
+forbids them). The SQL tokenizer, statement splitter and
 completion context are plain Rust in the shared API crate, unit-tested
 natively. Nothing is fetched from a CDN: the app, its stylesheet (system
 fonts only) and its boot module are embedded in the server binary.
@@ -277,9 +283,9 @@ refreshed. So building the server needs no wasm toolchain.
 
 | Asset | Size | Gzipped (served) |
 |---|---|---|
-| `pinkdb-console_bg.wasm` | 734 KB | 303 KB |
-| `pinkdb-console.js` (wasm-bindgen glue) | 43 KB | 8 KB |
-| `console.css` + `boot.js` | 17 KB | — |
+| `pinkdb-console_bg.wasm` | 857 KB | 339 KB |
+| `pinkdb-console.js` (wasm-bindgen glue) | 49 KB | 9 KB |
+| `console.css` + `boot.js` | 54 KB | — |
 
 ## The worker model and the async carve-out
 

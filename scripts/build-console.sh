@@ -15,6 +15,11 @@ WEB="$ROOT/crates/pinkdb-server-ui-web"
 OUT="$ROOT/crates/pinkdb-server-ui/web-dist"
 STAGE="$ROOT/target/console-dist"
 
+# erase_components type-erases every component's view (Leptos): the wasm is
+# about a quarter smaller (wave 121c: 449 KB gzipped without, 339 KB with).
+RUSTFLAGS="${RUSTFLAGS:-} --cfg erase_components"
+export RUSTFLAGS
+
 (cd "$WEB" && trunk build --release --filehash false --dist "$STAGE")
 
 mkdir -p "$OUT"

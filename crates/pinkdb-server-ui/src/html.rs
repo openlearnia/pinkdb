@@ -45,7 +45,7 @@ pub fn shell(_shared: &Shared) -> Markup {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "pinkdb console" }
+                title { "pinkdb warehouse console" }
                 link rel="stylesheet" href="/assets/console.css";
                 script type="module" src="/assets/boot.js" {}
             }
@@ -84,55 +84,64 @@ pub fn preview_page(page: &PreviewPage) -> Markup {
                 title { "pinkdb — " (page.db) "." (page.table) }
                 link rel="stylesheet" href="/assets/console.css";
             }
-            body {
+            body class="preview-page" {
                 header class="topbar" {
-                    h1 { "pinkdb console" }
-                    span class="badge" { "read-only" }
-                    span class="crumb" { (page.db) "." (page.table) }
-                }
-                main class="content" {
-                    div class="status" {
-                        (page.total_rows) " rows — page " (page.page) " of " (page.total_pages)
+                    span class="brand__mark" aria-hidden="true" { "p" }
+                    span class="brand__name" { "pinkdb " span class="brand__sub" { "Warehouse" } }
+                    span class="topbar__sep" {}
+                    span class="crumbs" {
+                        (page.db) span class="crumbs__sep" { "›" } span class="mono" { (page.table) }
                     }
-                    table class="grid" {
-                        thead {
-                            tr {
-                                @for column in &page.columns {
-                                    th { (column.name) }
-                                }
-                            }
-                            tr class="types" {
-                                @for column in &page.columns {
-                                    th { (column.dtype) }
-                                }
-                            }
-                        }
-                        tbody {
-                            @for row in &page.rows {
+                    span class="spacer" {}
+                    span class="badge badge--warning" { "Read-only preview" }
+                }
+                main class="preview" {
+                    div class="results__bar preview__summary" {
+                        strong { (page.total_rows) } " rows · page " (page.page) " of " (page.total_pages.max(1))
+                    }
+                    div class="grid" {
+                        table {
+                            thead {
                                 tr {
-                                    @for (text, is_null, truncated) in row {
-                                        @if *is_null {
-                                            td class="null" { "NULL" }
-                                        } @else if *truncated {
-                                            td class="truncated" title=(text) { (text) }
-                                        } @else {
-                                            td { (text) }
+                                    th class="grid__rn" { "#" }
+                                    @for column in &page.columns {
+                                        th {
+                                            span class="grid__name" { (column.name) }
+                                            span class="grid__type" { (column.dtype) }
                                         }
+                                    }
+                                    th class="col-fill" {}
+                                }
+                            }
+                            tbody {
+                                @for (i, row) in page.rows.iter().enumerate() {
+                                    tr {
+                                        td class="grid__rn" { (page.page.saturating_sub(1) * page.page_size as u64 + i as u64 + 1) }
+                                        @for (text, is_null, truncated) in row {
+                                            @if *is_null {
+                                                td class="is-null" { "NULL" }
+                                            } @else if *truncated {
+                                                td class="truncated" title=(text) { (text) }
+                                            } @else {
+                                                td { (text) }
+                                            }
+                                        }
+                                        td {}
                                     }
                                 }
                             }
                         }
                     }
                     @if page.rows.is_empty() {
-                        p class="empty" { "(no rows on this page)" }
+                        p class="empty" { "No rows on this page." }
                     }
-                    div class="pager" {
+                    nav class="pager" {
                         @if page.page > 1 {
-                            a class="button" href=(page_link(page, page.page - 1)) { "previous" }
+                            a class="btn btn--sm" href=(page_link(page, page.page - 1)) { "Previous" }
                         }
-                        span { "page " (page.page) " / " (page.total_pages.max(1)) }
+                        span { "Page " (page.page) " of " (page.total_pages.max(1)) }
                         @if page.page < page.total_pages {
-                            a class="button" href=(page_link(page, page.page + 1)) { "next" }
+                            a class="btn btn--sm" href=(page_link(page, page.page + 1)) { "Next" }
                         }
                     }
                 }

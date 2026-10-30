@@ -14,7 +14,10 @@ use pinkdb_server_ui_api::{QueryRequest, QueryResponse, StatementResult, Storage
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use crate::state::{App, encode};
+use crate::catalog::StaticGrid;
+use crate::icon::Icon;
+use crate::state::{App, Tone, encode};
+use crate::ui::{Callout, Dialog};
 
 /// The reader function for a source, from its extension or the choice.
 pub fn reader_for(source: &str, choice: &str) -> &'static str {
@@ -87,12 +90,16 @@ pub fn ImportDialog() -> impl IntoView {
     });
 
     let close = move || app.import_open.set(false);
+    // Success closes the dialog with a toast; an error stays in the dialog.
     let finished = move |outcome: Result<String, String>| {
         busy.set(false);
-        let ok = outcome.is_ok();
-        message.set(Some(outcome));
-        if ok {
-            app.load_catalog();
+        match outcome {
+            Ok(text) => {
+                app.load_catalog();
+                app.toast(Tone::Success, "Import complete", text);
+                close();
+            }
+            Err(e) => message.set(Some(Err(e))),
         }
     };
 
@@ -134,9 +141,9 @@ pub fn ImportDialog() -> impl IntoView {
         let src = source.get_untracked();
         let name = table.get_untracked();
         if src.trim().is_empty() || name.trim().is_empty() {
-            message.set(Some(
-                Err("a source and a table name are needed".to_string()),
-            ));
+            message.set(Some(Err(
+                "A source and a table name are needed.".to_string()
+            )));
             return;
         }
         let reader = reader_for(&src, &format.get_untracked());
@@ -158,7 +165,7 @@ pub fn ImportDialog() -> impl IntoView {
             return;
         };
         let Some(file) = input.files().and_then(|files| files.get(0)) else {
-            message.set(Some(Err("choose a file".to_string())));
+            message.set(Some(Err("Choose a file.".to_string())));
             return;
         };
         let name = table.get_untracked();
@@ -203,34 +210,20 @@ pub fn ImportDialog() -> impl IntoView {
 
     let preview_view = move || {
         preview.get().map(|result| {
-            let header = result
-                .columns
-                .iter()
-                .map(|c| view! { <th>{c.name.clone()}<span class="type">{c.dtype.clone()}</span></th> })
-                .collect_view();
-            let rows = result
-                .rows
-                .iter()
-                .take(20)
-                .map(|row| {
-                    let cells = row
-                        .iter()
-                        .map(|cell| match cell {
-                            Some(text) => view! { <td>{text.clone()}</td> }.into_any(),
-                            None => view! { <td class="null">"NULL"</td> }.into_any(),
-                        })
-                        .collect_view();
-                    view! { <tr>{cells}</tr> }
-                })
-                .collect_view();
+            let n = result.row_count;
+            let shown = result.rows.len().min(20);
+            let mut result = result;
+            result.rows.truncate(20);
             view! {
-                <div class="preview-scroll">
-                    <table class="preview-table">
-                        <tr>{header}</tr>
-                        {rows}
-                    </table>
+                <div class="stack stack--tight">
+                    <div class="row">
+                        <span class="overline">"Preview"</span>
+                        <span class="subtle text-sm">{format!("first {shown} of {n} rows read")}</span>
+                    </div>
+                    <div class="grid--framed">
+                        <StaticGrid result max_height=220 />
+                    </div>
                 </div>
-                <div class="hint">{format!("{} rows previewed", result.row_count)}</div>
             }
         })
     };
@@ -248,53 +241,68 @@ pub fn ImportDialog() -> impl IntoView {
             })
             .collect_view()
     };
+    // The statements a path or URL import runs (shown before it runs).
+    let planned = move || {
+        let src = source.get();
+        let name = table.get();
+        if src.trim().is_empty() || name.trim().is_empty() {
+            return None;
+        }
+        let mut sql = import_sql(
+            src.trim(),
+            reader_for(&src, &format.get()),
+            &database.get(),
+            name.trim(),
+            &mode.get(),
+        );
+        if durable.get() {
+            sql.push_str("\nCHECKPOINT;");
+        }
+        Some(sql)
+    };
+    let seg = move |label: &'static str, which: &'static str| {
+        view! {
+            <button class="seg__item" class:is-active=move || tab.get() == which on:click=move |_| tab.set(which)>
+                {label}
+            </button>
+        }
+    };
 
     view! {
-        <div
-            class="modal-backdrop"
-            tabindex="-1"
-            on:click=move |_| close()
-            on:keydown=move |ev: web_sys::KeyboardEvent| {
-                if ev.key() == "Escape" {
-                    close();
-                }
-            }
-        >
-            <div class="modal" on:click=|ev| ev.stop_propagation()>
-                <div class="modal-head">
-                    <span>"Import data"</span>
-                    <button class="mini" on:click=move |_| close()>"×"</button>
-                </div>
-                <div class="segs">
-                    <button class="seg" class:active=move || tab.get() == "url" on:click=move |_| tab.set("url")>
-                        "From a path or URL"
-                    </button>
-                    <button class="seg" class:active=move || tab.get() == "upload" on:click=move |_| tab.set("upload")>
-                        "Upload a file"
-                    </button>
+        <Dialog title="Import data" size="lg" on_close=Callback::new(move |_: ()| close())>
+            <div class="dialog__body">
+                <div class="seg seg--start">
+                    {seg("From a path or URL", "url")}
+                    {seg("Upload a file", "upload")}
                 </div>
                 {move || {
                     if tab.get() == "url" {
                         view! {
                             <label class="field">
-                                "Source"
+                                <span class="field__label">"Source"</span>
                                 <input
-                                    class="wide-input"
+                                    class="input input--block mono"
                                     placeholder="https://…/data.csv, s3://bucket/key.parquet or a server path"
                                     prop:value=move || source.get()
                                     on:input=move |ev| source.set(event_target_value(&ev))
+                                    on:change=move |ev| {
+                                        if table.get_untracked().is_empty() {
+                                            table.set(table_from(&event_target_value(&ev)));
+                                        }
+                                    }
                                 />
+                                <span class="field__help">
+                                    "The server reads the source as you: in a console with sign-in, file and URL reads need ADMIN."
+                                </span>
                             </label>
-                            <p class="hint">
-                                "The server reads the source as you: in a console with logins, file and URL reads need ADMIN."
-                            </p>
                         }
                             .into_any()
                     } else {
                         view! {
                             <label class="field">
-                                "File (CSV or Parquet)"
+                                <span class="field__label">"File (CSV or Parquet)"</span>
                                 <input
+                                    class="input input--block input--file"
                                     type="file"
                                     accept=".csv,.tsv,.txt,.parquet"
                                     node_ref=file_input
@@ -312,68 +320,108 @@ pub fn ImportDialog() -> impl IntoView {
                                         file_name.set(name);
                                     }
                                 />
+                                <span class="field__help">
+                                    "The server parses the file and inserts its rows as you (CREATE and INSERT grants apply)."
+                                </span>
                             </label>
-                            <p class="hint">
-                                "The server parses the file and inserts its rows as you (CREATE and INSERT grants apply)."
-                            </p>
                         }
                             .into_any()
                     }
                 }}
-                <div class="form-row">
+                <div class="fields">
                     <label class="field">
-                        "Format"
-                        <select on:change=move |ev| format.set(event_target_value(&ev))>
-                            <option value="auto">"from the name"</option>
+                        <span class="field__label">"Format"</span>
+                        <select class="input" on:change=move |ev| format.set(event_target_value(&ev))>
+                            <option value="auto">"Detect from the name"</option>
                             <option value="csv">"CSV"</option>
                             <option value="parquet">"Parquet"</option>
                         </select>
                     </label>
                     <label class="field">
-                        "Database"
-                        <select on:change=move |ev| database.set(event_target_value(&ev))>{databases}</select>
+                        <span class="field__label">"Database"</span>
+                        <select class="input" on:change=move |ev| database.set(event_target_value(&ev))>{databases}</select>
                     </label>
                     <label class="field">
-                        "Table"
-                        <input prop:value=move || table.get() on:input=move |ev| table.set(event_target_value(&ev)) />
+                        <span class="field__label">"Table"</span>
+                        <input class="input mono" prop:value=move || table.get() on:input=move |ev| table.set(event_target_value(&ev)) />
                     </label>
                     <label class="field">
-                        "If it exists"
-                        <select on:change=move |ev| mode.set(event_target_value(&ev))>
-                            <option value="create">"fail (create)"</option>
-                            <option value="replace">"replace"</option>
-                            <option value="append">"append"</option>
+                        <span class="field__label">"If the table exists"</span>
+                        <select class="input" on:change=move |ev| mode.set(event_target_value(&ev))>
+                            <option value="create">"Fail"</option>
+                            <option value="replace">"Replace it"</option>
+                            <option value="append">"Append to it"</option>
                         </select>
                     </label>
                 </div>
-                <div class="modal-actions">
-                    {move || {
-                        if tab.get() == "url" {
+                {move || {
+                    (mode.get() == "replace")
+                        .then(|| {
                             view! {
-                                <button disabled=move || busy.get() on:click=do_preview>"Preview"</button>
-                                <button class="primary" disabled=move || busy.get() on:click=do_import_url>"Import"</button>
+                                <Callout tone=Tone::Warning>
+                                    "Replace drops the existing table and its rows before loading the file."
+                                </Callout>
                             }
-                                .into_any()
-                        } else {
-                            view! {
-                                <button class="primary" disabled=move || busy.get() on:click=do_upload>"Upload and import"</button>
-                            }
-                                .into_any()
-                        }
-                    }}
-                    {move || busy.get().then(|| view! { <span class="spinner"></span> })}
-                </div>
+                        })
+                }}
                 {move || {
                     message
                         .get()
                         .map(|m| match m {
-                            Ok(text) => view! { <div class="ok-line">{text}</div> }.into_any(),
-                            Err(text) => view! { <div class="error-box">{text}</div> }.into_any(),
+                            Ok(text) => view! { <Callout tone=Tone::Success>{text}</Callout> }.into_any(),
+                            Err(text) => view! { <Callout tone=Tone::Danger title="The import failed">{text}</Callout> }.into_any(),
                         })
                 }}
                 {preview_view}
+                {move || {
+                    (tab.get() == "url")
+                        .then(|| {
+                            planned()
+                                .map(|sql| {
+                                    view! {
+                                        <details class="sql-preview">
+                                            <summary>"SQL that will run"</summary>
+                                            <pre class="code code--wrap">{sql}</pre>
+                                        </details>
+                                    }
+                                })
+                        })
+                }}
             </div>
-        </div>
+            <div class="dialog__foot">
+                <span class="subtle dialog__note">
+                    {move || {
+                        if durable.get() && tab.get() == "url" {
+                            "Durable store: a checkpoint follows the import."
+                        } else {
+                            ""
+                        }
+                    }}
+                </span>
+                {move || busy.get().then(|| view! { <span class="spinner"></span> })}
+                <button class="btn" on:click=move |_| close()>"Cancel"</button>
+                {move || {
+                    if tab.get() == "url" {
+                        view! {
+                            <button class="btn" disabled=move || busy.get() on:click=do_preview>"Preview"</button>
+                            <button class="btn btn--primary" disabled=move || busy.get() on:click=do_import_url>
+                                <Icon name="upload" size=14 />
+                                "Import"
+                            </button>
+                        }
+                            .into_any()
+                    } else {
+                        view! {
+                            <button class="btn btn--primary" disabled=move || busy.get() on:click=do_upload>
+                                <Icon name="upload" size=14 />
+                                "Upload and import"
+                            </button>
+                        }
+                            .into_any()
+                    }
+                }}
+            </div>
+        </Dialog>
     }
 }
 

@@ -9,6 +9,33 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 121c — the console's design system ✅
+
+- The warehouse console has a design system
+  (`docs/console-design/README.md`, with a clickable mockup and a component
+  gallery): color, type, spacing and elevation tokens in light and dark,
+  one icon set, and specified buttons, inputs, tabs, trees, grids, tables,
+  callouts, dialogs, toasts and empty states. Every text color meets WCAG
+  AA contrast in both themes.
+- The console is rebuilt on it. A **rail** picks the section; **Access**,
+  **Storage** and **History** are full pages with tables, and the new
+  **Catalog** page shows a database's objects and each object's columns,
+  statistics, a live preview and its indexes and triggers. Users, roles and
+  grants are created in dialogs that show the SQL they run; drops, revokes
+  and worksheet deletes ask first.
+- The worksheet has document tabs, a **Run** button with *Run all* and
+  *Explain* in its menu, a line-number gutter with the current line, a
+  draggable splitter, and a results bar with the status, row count, time
+  and downloads. Ask moved to an inspector on the right. A **status bar**
+  shows the connection, database, user, storage mode, the last run and the
+  caret position; **⌘K** searches tables and worksheets; **⌘B** hides the
+  explorer; the theme switch remembers light or dark.
+- The no-JavaScript `/preview` page uses the same styles.
+- **URLs**: the place is in the address bar (`/query/{worksheet}`,
+  `/catalog/{database}/{object}`, `/history`, `/access`, `/storage`), so
+  Back and Forward move between views, a reload keeps the place, a link
+  opens the same worksheet or table, and a modified click on the rail opens
+  a section in a new tab. The tab title names the view.
 ### Extension libraries load on macOS 27 ✅
 
 - On macOS 27 the release builds of the agent and memory extensions failed
