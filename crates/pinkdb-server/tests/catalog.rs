@@ -620,3 +620,31 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     }
     files
 }
+
+/// An explicit transaction publishes like a single statement: a table
+/// created and filled between `BEGIN` and `COMMIT` is in the catalog a new
+/// server opens (the console's upload writes this way).
+#[test]
+fn an_explicit_transaction_publishes_to_the_catalog() {
+    let dir = tempdir("txn");
+    let catalog = format!("pink:{}", dir.join("catalog.pink").display());
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data = data.to_str().unwrap().to_string();
+    {
+        let store = CatalogStore::open(&catalog, &data, "txn-first").unwrap();
+        let mut conn = store.database().connect();
+        conn.execute("CREATE TABLE before_txn (id INTEGER)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE TABLE in_txn (id INTEGER)").unwrap();
+        conn.execute("INSERT INTO in_txn VALUES (1), (2)").unwrap();
+        conn.execute("COMMIT").unwrap();
+    }
+    let store = CatalogStore::open(&catalog, &data, "txn-second").unwrap();
+    let mut conn = store.database().connect();
+    let out = conn
+        .execute("SELECT (SELECT count(*) FROM before_txn), (SELECT count(*) FROM in_txn)")
+        .unwrap();
+    assert!(format!("{out:?}").contains("Bigint(2)"), "{out:?}");
+}

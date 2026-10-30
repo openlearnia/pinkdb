@@ -2130,7 +2130,7 @@ impl PinkDb {
     }
 
     /// Run the host's commit hook, if any, after a commit was recorded.
-    fn run_commit_hook(&self) -> Result<()> {
+    pub(crate) fn run_commit_hook(&self) -> Result<()> {
         match &self.commit_hook {
             Some(hook) => {
                 let result = (hook.0)(self);
@@ -2971,6 +2971,32 @@ impl PinkDb {
         sets: Option<&crate::wal::FrameSets>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
+        self.wal_append_session_unhooked(
+            db_before,
+            db_after,
+            stmts,
+            touched_extensions,
+            loaded_extensions,
+            sets,
+            memo,
+        )?;
+        self.run_commit_hook()
+    }
+
+    /// [`PinkDb::wal_append_session`] without the commit hook: a transaction
+    /// logs its record before it merges its work into the store, and runs the
+    /// hook only after the merge, so the hook sees what was committed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wal_append_session_unhooked(
+        &self,
+        db_before: &str,
+        db_after: &str,
+        stmts: &[String],
+        touched_extensions: &[String],
+        loaded_extensions: &[String],
+        sets: Option<&crate::wal::FrameSets>,
+        memo: &[crate::wal::ExtCall],
+    ) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
             let mut guard = wal.lock().map_err(|_| {
                 PinkDbError::Execution("internal lock error (poisoned)".to_string())
@@ -2986,7 +3012,7 @@ impl PinkDb {
                 memo,
             )?;
         }
-        self.run_commit_hook()
+        Ok(())
     }
 
     /// Open a transaction: refresh (a short lease only when something was

@@ -1566,7 +1566,10 @@ impl Connection {
                 .unwrap_or_else(|| txn.wal_db_after.clone());
             let mut sets = txn.wal_sets.clone();
             sets.canonicalize();
-            shared.wal_append_session(
+            // The commit hook runs after the merge below: run here, it would
+            // see the store without this transaction's work (a lake catalog
+            // would publish the state before `BEGIN`).
+            shared.wal_append_session_unhooked(
                 &before,
                 &txn.wal_db_after,
                 &txn.wal_stmts,
@@ -1601,6 +1604,7 @@ impl Connection {
             }
         }
         if !txn.wal_stmts.is_empty() {
+            shared.run_commit_hook()?;
             shared.maybe_auto_checkpoint(lease.as_ref());
         }
         // Wave 80: the committed transaction's writes feed the ON COMMIT
