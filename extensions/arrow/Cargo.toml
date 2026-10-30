@@ -11,22 +11,22 @@ license = "MIT"
 # scalar cdylib: the engine owns the `FileFormat` trait and the registry
 # (`pinkdb::filefmt`), this crate implements it over arrow-rs, and the host
 # (the CLI's `arrow` feature, or an embedder) registers it at store creation.
-# Arrow crates are pinned to the 59.x line already in the workspace lock
-# (the parquet extension pins arrow-* 59.3.0), so a build that enables both
+# Arrow crates are pinned to the 60.x line already in the workspace lock
+# (the parquet extension pins arrow-* 60.x), so a build that enables both
 # shares those compile units instead of duplicating them.
 [dependencies]
 pinkdb = { path = "../../crates/pinkdb" }
 # Remote files (`remote` feature): the shared https/SigV4 transport.
 pinkdb-httpfs = { path = "../../crates/pinkdb-httpfs", optional = true }
-arrow-array = { version = "59", default-features = false }
-arrow-buffer = { version = "59", default-features = false }
-arrow-schema = { version = "59", default-features = false }
+arrow-array = { version = "60", default-features = false }
+arrow-buffer = { version = "60", default-features = false }
+arrow-schema = { version = "60", default-features = false }
 # IPC file reader/writer. `default-features = false` (no compression) would
 # be leaner, but a reader that cannot open a zstd/lz4-compressed IPC file
 # written by another tool is a functional gap: both decompressors are opt-in
 # features of arrow-ipc and are enabled here. Writing is always uncompressed
 # (DuckDB's and pyarrow's default).
-arrow-ipc = { version = "59", default-features = false, features = ["lz4", "zstd"] }
+arrow-ipc = { version = "60", default-features = false, features = ["lz4", "zstd"] }
 
 [features]
 default = []

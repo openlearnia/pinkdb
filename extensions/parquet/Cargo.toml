@@ -18,12 +18,12 @@ pinkdb-httpfs = { path = "../../crates/pinkdb-httpfs", optional = true }
 # (the lake's Parquet provider needs it without the httpfs transport), so this
 # is a normal dependency; it is already in the lock through parquet itself.
 bytes = "1"
-# The Apache Arrow `parquet` crate (arrow-rs), pinned to the 59.x family the
+# The Apache Arrow `parquet` crate (arrow-rs), pinned to the 60.x family the
 # workspace's Cargo.lock already carries (the arrow extension uses the same
 # line), so a build that also enables a lake consumes one arrow generation. Only the
 # low-level reader/writer half is used: the `arrow` feature stays **off** (no
 # arrow-array dependency, no duplicate compile units).
-parquet = { version = "59.3", default-features = false }
+parquet = { version = "60", default-features = false }
 
 [features]
 # Default codecs: snappy (DuckDB's parquet default) and gzip via flate2's pure

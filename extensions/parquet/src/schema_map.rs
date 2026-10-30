@@ -94,6 +94,7 @@ pub fn engine_type(
             LogicalType::Variant(_) => Err("VARIANT is not supported".to_string()),
             LogicalType::Geometry(_) => Err("GEOMETRY is not supported".to_string()),
             LogicalType::Geography(_) => Err("GEOGRAPHY is not supported".to_string()),
+            LogicalType::File => Err("FILE is not supported".to_string()),
             LogicalType::Unknown | LogicalType::_Unknown { .. } => {
                 Err("an unknown logical type".to_string())
             }
