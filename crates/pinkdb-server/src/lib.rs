@@ -99,11 +99,11 @@
 //! [`pinkdb_server_ui`](https://docs.rs/pinkdb-server-ui) and is re-exported
 //! by the [`ui`] module; the binary turns it on with `--enable-ui`.
 //!
-//! The console is **read-only by construction** (no DML, no DDL, no
-//! mutating route), it binds **loopback only** (a non-loopback bind is
-//! refused: the console has no TLS of its own), and a store that has users
-//! is never served unauthenticated (the server refuses to start without
-//! `--ui-auth basic` or `--ui-token`). It owns its own tokio runtime on its
+//! The console asks for **sign-in by default** (the store's users, an
+//! optional TOTP second factor, personal access tokens for scripts; a store
+//! without users starts in first-run setup), binds **loopback** unless it
+//! has its own certificate, and never serves a store that has users without
+//! sign-in (wave 121d). It owns its own tokio runtime on its
 //! own thread, so it works with either transport, and every synchronous
 //! engine call runs on a bounded blocking pool. See `docs/server-ui.md`.
 #[cfg(feature = "catalog")]

@@ -8,7 +8,7 @@
 //! | `/query/{worksheet id}` | that saved worksheet |
 //! | `/catalog` | the current database's objects |
 //! | `/catalog/{database}/{object}` | one object's page |
-//! | `/history`, `/access`, `/storage` | those pages |
+//! | `/history`, `/access`, `/storage`, `/account` | those pages |
 //!
 //! The server serves the same shell on each of these paths.
 
@@ -28,6 +28,7 @@ pub enum Route {
     History,
     Access,
     Storage,
+    Account,
 }
 
 /// Decode a percent-encoded path segment (a stray `%` stays as it is).
@@ -66,6 +67,7 @@ pub fn parse(path: &str) -> Route {
         ["history"] => Route::History,
         ["access"] => Route::Access,
         ["storage"] => Route::Storage,
+        ["account"] => Route::Account,
         _ => Route::Query(None),
     }
 }
@@ -80,6 +82,7 @@ pub fn path(route: &Route) -> String {
         Route::History => "/history".to_string(),
         Route::Access => "/access".to_string(),
         Route::Storage => "/storage".to_string(),
+        Route::Account => "/account".to_string(),
     }
 }
 
@@ -91,6 +94,7 @@ pub fn section_path(section: Section) -> &'static str {
         Section::History => "/history",
         Section::Access => "/access",
         Section::Storage => "/storage",
+        Section::Account => "/account",
     }
 }
 
@@ -127,6 +131,7 @@ pub fn apply(app: App, route: Route) {
         Route::History => app.go(Section::History),
         Route::Access => app.go(Section::Access),
         Route::Storage => app.go(Section::Storage),
+        Route::Account => app.go(Section::Account),
     }
 }
 
@@ -138,6 +143,7 @@ fn current(app: App) -> Route {
         Section::History => Route::History,
         Section::Access => Route::Access,
         Section::Storage => Route::Storage,
+        Section::Account => Route::Account,
     }
 }
 
@@ -156,6 +162,7 @@ fn title(app: App) -> String {
         Section::History => "Query history".to_string(),
         Section::Access => "Access".to_string(),
         Section::Storage => "Storage".to_string(),
+        Section::Account => "Account".to_string(),
     };
     format!("{place} · pinkdb")
 }
@@ -209,6 +216,7 @@ mod tests {
             Route::History,
             Route::Access,
             Route::Storage,
+            Route::Account,
         ] {
             assert_eq!(parse(&path(&route)), route, "{route:?}");
         }

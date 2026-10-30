@@ -17,6 +17,14 @@ use pinkdb::Database;
 use pinkdb_server_ui::{StorageInfo, UiAuth, UiHandle, UiOptions, UiServer};
 use serde_json::{Value, json};
 
+/// A console without sign-in (`--ui-auth none`): the store has no users.
+fn open_options() -> UiOptions {
+    UiOptions {
+        auth: UiAuth::None,
+        ..UiOptions::default()
+    }
+}
+
 #[path = "../../pink-lake/src/mock_s3.rs"]
 mod mock_s3;
 
@@ -278,8 +286,8 @@ fn start(db: Database, opts: UiOptions) -> Console {
 
 fn basic() -> UiOptions {
     UiOptions {
-        auth: UiAuth::Basic,
-        ..UiOptions::default()
+        auth: UiAuth::Password,
+        ..open_options()
     }
 }
 
@@ -355,10 +363,20 @@ fn admins_manage_users_and_grants_from_the_console() {
     // A new user, through the dedicated endpoint.
     let r = alice.post(
         "/api/access/user",
-        &json!({ "name": "dave", "password": "dave-pw" }),
+        &json!({ "name": "dave", "password": "dave-password" }),
     );
     assert_eq!(r.status, 200, "{}", r.body);
-    let dave = user(console.addr, "dave");
+    // A console-made password needs ten characters (wave 121d).
+    let r = alice.post(
+        "/api/access/user",
+        &json!({ "name": "erin", "password": "short" }),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    let dave = login(
+        console.addr,
+        json!({ "user": "dave", "password": "dave-password" }),
+    )
+    .unwrap();
     let message = dave.refused("SELECT * FROM t");
     assert!(message.to_lowercase().contains("permission"), "{message}");
 
@@ -375,20 +393,22 @@ fn admins_manage_users_and_grants_from_the_console() {
     // A password change: the old one stops working.
     let r = alice.post(
         "/api/access/user",
-        &json!({ "name": "dave", "password": "new-pw", "alter": true }),
+        &json!({ "name": "dave", "password": "new-password", "alter": true }),
     );
     assert_eq!(r.status, 200, "{}", r.body);
+    // A reset ends the user's sessions (wave 121d).
+    assert_eq!(dave.get("/api/session").status, 401);
     assert!(
         login(
             console.addr,
-            json!({ "user": "dave", "password": "dave-pw" })
+            json!({ "user": "dave", "password": "dave-password" })
         )
         .is_err()
     );
     assert!(
         login(
             console.addr,
-            json!({ "user": "dave", "password": "new-pw" })
+            json!({ "user": "dave", "password": "new-password" })
         )
         .is_ok()
     );
@@ -396,7 +416,7 @@ fn admins_manage_users_and_grants_from_the_console() {
     // A non-admin cannot create users or grant.
     let r = bob.post(
         "/api/access/user",
-        &json!({ "name": "eve", "password": "x" }),
+        &json!({ "name": "eve", "password": "a long password" }),
     );
     assert_eq!(r.status, 403, "{}", r.body);
     assert!(
@@ -451,7 +471,7 @@ fn url_imports_run_as_the_user() {
 #[test]
 fn s3_imports_read_csv_and_parquet() {
     let env = env();
-    let console = start(Database::new(), UiOptions::default());
+    let console = start(Database::new(), open_options());
     let operator = login(console.addr, json!({})).unwrap();
     let csv = env.mock.url("bucket", "data/sales.csv");
     let parquet = env.mock.url("bucket", "data/items.parquet");
@@ -551,7 +571,7 @@ fn an_upload_into_a_durable_store_survives_a_reopen() {
     env();
     let path = temp("durable.pink");
     let db = Database::open(path.to_str().unwrap()).unwrap();
-    let console = start(db, UiOptions::default());
+    let console = start(db, open_options());
     let operator = login(console.addr, json!({})).unwrap();
     let r = operator.upload("table=kept&name=kept.csv", SALES_CSV.as_bytes());
     assert_eq!(r.status, 200, "{}", r.body);
@@ -579,7 +599,7 @@ fn uploads_are_size_capped_and_refused_when_read_only() {
         Database::new(),
         UiOptions {
             max_upload_bytes: 16,
-            ..UiOptions::default()
+            ..open_options()
         },
     );
     let operator = login(console.addr, json!({})).unwrap();
@@ -590,7 +610,7 @@ fn uploads_are_size_capped_and_refused_when_read_only() {
         Database::new(),
         UiOptions {
             read_only: true,
-            ..UiOptions::default()
+            ..open_options()
         },
     );
     let operator = login(read_only.addr, json!({})).unwrap();
@@ -605,7 +625,7 @@ fn uploads_are_size_capped_and_refused_when_read_only() {
 #[test]
 fn the_storage_panel_reports_the_store() {
     env();
-    let console = start(Database::new(), UiOptions::default());
+    let console = start(Database::new(), open_options());
     let operator = login(console.addr, json!({})).unwrap();
     let storage = operator.get("/api/storage").json();
     assert_eq!(storage["mode"], "in-memory");
@@ -625,7 +645,7 @@ fn the_storage_panel_reports_the_store() {
         Database::open(path.to_str().unwrap()).unwrap(),
         UiOptions {
             storage: info,
-            ..UiOptions::default()
+            ..open_options()
         },
     );
     let operator = login(console.addr, json!({})).unwrap();
@@ -649,7 +669,7 @@ fn the_storage_panel_reports_the_store() {
 #[test]
 fn a_large_upload_loads_in_one_statement() {
     env();
-    let console = start(Database::new(), UiOptions::default());
+    let console = start(Database::new(), open_options());
     let operator = login(console.addr, json!({})).unwrap();
     let mut csv = String::from("id,name,price,day\n");
     for i in 0..50_000 {

@@ -799,3 +799,14 @@ details.sql-preview > .code { margin-top: var(--sp-1_5); }
 .preview__summary { border: 0; padding: 0; height: auto; }
 .table .t-clip { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 a.rail__item, a.rail__item:hover { text-decoration: none; }
+
+/* account and sign-in (wave 121d) */
+.page__inner--narrow { max-width: 920px; }
+.card__note { margin-right: auto; }
+.login__code { letter-spacing: 0.2em; font-size: var(--text-xl); text-align: center; }
+.enrol { display: grid; grid-template-columns: 200px 1fr; gap: var(--sp-5); align-items: start; }
+.qr { width: 200px; height: 200px; border-radius: var(--r-md); border: 1px solid var(--border); image-rendering: pixelated; }
+.codes { list-style: none; margin: 0; padding: var(--sp-3); display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--sp-2) var(--sp-6);
+  background: var(--bg-subtle); border: 1px solid var(--border-subtle); border-radius: var(--r-md); font-size: var(--text-lg); }
+.code.token { flex: 1; min-width: 0; }
+@media (max-width: 640px) { .enrol { grid-template-columns: 1fr; } }

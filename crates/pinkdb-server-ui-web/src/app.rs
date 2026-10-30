@@ -6,7 +6,9 @@ use leptos::ev;
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use pinkdb_server_ui_api::{LoginRequest, LoginRequired, SessionInfo, Worksheet};
+use pinkdb_server_ui_api::{
+    LoginAnswer, LoginRequest, LoginRequired, SessionInfo, SetupRequest, VerifyRequest, Worksheet,
+};
 use wasm_bindgen::JsCast;
 
 use crate::api;
@@ -59,9 +61,9 @@ pub fn Root() -> impl IntoView {
                 let body = api::text(&response).await.unwrap_or_default();
                 let mode = serde_json::from_str::<LoginRequired>(&body)
                     .map(|l| l.auth)
-                    .unwrap_or_else(|_| "basic".to_string());
+                    .unwrap_or_else(|_| "password".to_string());
                 if mode == "none" {
-                    login(app, LoginRequest::default());
+                    login_open(app);
                 } else {
                     app.login_mode.set(Some(mode));
                 }
@@ -96,49 +98,196 @@ pub fn Root() -> impl IntoView {
     }
 }
 
-/// Log in and start (the CSRF token arrives with the session).
-fn login(app: App, request: LoginRequest) {
+/// Sign in without credentials: a console with `--ui-auth none`.
+fn login_open(app: App) {
     spawn_local(async move {
-        match api::post::<_, SessionInfo>("/api/login", &request, "").await {
+        match api::post::<_, SessionInfo>("/api/login", &LoginRequest::default(), "").await {
             Ok(session) => start(app, session),
             Err(e) => {
                 app.notice.set(e.message);
-                if app.login_mode.get_untracked().is_none() {
-                    app.login_mode.set(Some("none".to_string()));
-                }
+                app.login_mode.set(Some("none".to_string()));
             }
         }
     });
 }
 
+/// The sign-in screen's step.
+#[derive(Clone, Debug, PartialEq)]
+enum Step {
+    /// The first account of a store without users.
+    Setup,
+    /// User and password.
+    Password,
+    /// The authenticator (or recovery) code for a challenge.
+    Code(String),
+}
+
 #[component]
 fn Login() -> impl IntoView {
     let app = expect_context::<App>();
+    let step = RwSignal::new(match app.login_mode.get_untracked().as_deref() {
+        Some("setup") => Step::Setup,
+        _ => Step::Password,
+    });
     let user = RwSignal::new(String::new());
     let secret = RwSignal::new(String::new());
-    let mode = move || app.login_mode.get().unwrap_or_default();
+    let confirm = RwSignal::new(String::new());
+    let setup_code = RwSignal::new(String::new());
+    let code = RwSignal::new(String::new());
+    let busy = RwSignal::new(false);
+    let fail = move |message: String| {
+        busy.set(false);
+        app.notice.set(message);
+    };
     let submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
-        let request = if mode() == "token" {
-            LoginRequest {
-                token: Some(secret.get_untracked()),
-                ..LoginRequest::default()
-            }
-        } else {
-            LoginRequest {
-                user: Some(user.get_untracked()),
-                password: Some(secret.get_untracked()),
-                ..LoginRequest::default()
-            }
-        };
-        secret.set(String::new());
+        if busy.get_untracked() {
+            return;
+        }
         app.notice.set(String::new());
-        login(app, request);
+        match step.get_untracked() {
+            Step::Setup => {
+                if secret.get_untracked() != confirm.get_untracked() {
+                    app.notice.set("The two passwords differ.".to_string());
+                    return;
+                }
+                let request = SetupRequest {
+                    code: setup_code.get_untracked(),
+                    user: user.get_untracked(),
+                    password: secret.get_untracked(),
+                };
+                busy.set(true);
+                spawn_local(async move {
+                    match api::post::<_, SessionInfo>("/api/setup", &request, "").await {
+                        Ok(session) => start(app, session),
+                        Err(e) => fail(e.message),
+                    }
+                });
+            }
+            Step::Password => {
+                let request = LoginRequest {
+                    user: Some(user.get_untracked()),
+                    password: Some(secret.get_untracked()),
+                };
+                busy.set(true);
+                spawn_local(async move {
+                    match api::post::<_, LoginAnswer>("/api/login", &request, "").await {
+                        Ok(LoginAnswer::Session(session)) => {
+                            secret.set(String::new());
+                            start(app, session);
+                        }
+                        Ok(LoginAnswer::SecondFactor(factor)) => {
+                            busy.set(false);
+                            secret.set(String::new());
+                            code.set(String::new());
+                            step.set(Step::Code(factor.challenge));
+                        }
+                        Err(e) => fail(e.message),
+                    }
+                });
+            }
+            Step::Code(challenge) => {
+                let request = VerifyRequest {
+                    challenge,
+                    code: code.get_untracked(),
+                };
+                busy.set(true);
+                spawn_local(async move {
+                    match api::post::<_, SessionInfo>("/api/login/verify", &request, "").await {
+                        Ok(session) => start(app, session),
+                        Err(e) => {
+                            // An expired or exhausted challenge starts over.
+                            if e.message.contains("expired") {
+                                step.set(Step::Password);
+                            }
+                            code.set(String::new());
+                            fail(e.message);
+                        }
+                    }
+                });
+            }
+        }
     };
     let host = leptos::prelude::window()
         .location()
         .host()
         .unwrap_or_default();
+    let field = move |label: &'static str,
+                      signal: RwSignal<String>,
+                      kind: &'static str,
+                      autocomplete: &'static str| {
+        view! {
+            <label class="field">
+                <span class="field__label">{label}</span>
+                <input
+                    class="input input--lg"
+                    type=kind
+                    autocomplete=autocomplete
+                    prop:value=move || signal.get()
+                    on:input=move |ev| signal.set(event_target_value(&ev))
+                />
+            </label>
+        }
+    };
+    let body = move || {
+        match step.get() {
+        Step::Setup => view! {
+            <div>
+                <h1 class="login__title">"Create the administrator"</h1>
+                <p class="muted">"This warehouse has no users yet. The first account can do everything."</p>
+            </div>
+            <label class="field">
+                <span class="field__label">"Setup code"</span>
+                <input
+                    class="input input--lg mono"
+                    autocomplete="off"
+                    placeholder="ABCD-EFGH-IJKL"
+                    prop:value=move || setup_code.get()
+                    on:input=move |ev| setup_code.set(event_target_value(&ev))
+                />
+                <span class="field__help">"Printed in the server's log when it started."</span>
+            </label>
+            {field("User name", user, "text", "username")}
+            {field("Password", secret, "password", "new-password")}
+            {field("Confirm the password", confirm, "password", "new-password")}
+            <p class="field__help">"At least 10 characters."</p>
+        }
+        .into_any(),
+        Step::Password => view! {
+            <div>
+                <h1 class="login__title">"Sign in"</h1>
+                <p class="muted">"to the warehouse console on " <span class="mono">{host.clone()}</span></p>
+            </div>
+            {field("User", user, "text", "username")}
+            {field("Password", secret, "password", "current-password")}
+        }
+        .into_any(),
+        Step::Code(_) => view! {
+            <div>
+                <h1 class="login__title">"Two-factor sign-in"</h1>
+                <p class="muted">"Enter the 6-digit code from your authenticator app."</p>
+            </div>
+            <label class="field">
+                <span class="field__label">"Code"</span>
+                <input
+                    class="input input--lg mono login__code"
+                    autocomplete="one-time-code"
+                    inputmode="numeric"
+                    placeholder="123 456"
+                    prop:value=move || code.get()
+                    on:input=move |ev| code.set(event_target_value(&ev))
+                />
+                <span class="field__help">"Lost your phone? A recovery code works here too, once."</span>
+            </label>
+        }
+        .into_any(),
+    }
+    };
+    let action = move || match step.get() {
+        Step::Setup => "Create and sign in",
+        Step::Password => "Sign in",
+        Step::Code(_) => "Verify",
+    };
     view! {
         <div class="login">
             <form class="card login__card" on:submit=submit>
@@ -146,43 +295,29 @@ fn Login() -> impl IntoView {
                     <span class="brand__mark" aria-hidden="true">"p"</span>
                     <span class="brand__name">"pinkdb"</span>
                 </div>
-                <div>
-                    <h1 class="login__title">"Sign in"</h1>
-                    <p class="muted">"to the warehouse console on " <span class="mono">{host}</span></p>
-                </div>
+                {body}
+                <button class="btn btn--primary btn--lg btn--block" type="submit" disabled=move || busy.get()>
+                    {move || busy.get().then(|| view! { <span class="spinner"></span> })}
+                    {action}
+                </button>
+                <div class="login__error" role="alert">{move || app.notice.get()}</div>
                 {move || {
-                    (mode() == "basic")
+                    matches!(step.get(), Step::Code(_))
                         .then(|| {
                             view! {
-                                <label class="field">
-                                    <span class="field__label">"User"</span>
-                                    <input
-                                        class="input input--lg"
-                                        autocomplete="username"
-                                        prop:value=move || user.get()
-                                        on:input=move |ev| user.set(event_target_value(&ev))
-                                    />
-                                </label>
+                                <button
+                                    class="btn btn--ghost btn--sm"
+                                    type="button"
+                                    on:click=move |_| {
+                                        app.notice.set(String::new());
+                                        step.set(Step::Password);
+                                    }
+                                >
+                                    "Use another account"
+                                </button>
                             }
                         })
                 }}
-                <label class="field">
-                    <span class="field__label">
-                        {move || if mode() == "token" { "Console token" } else { "Password" }}
-                    </span>
-                    <input
-                        class="input input--lg"
-                        type="password"
-                        autocomplete="current-password"
-                        prop:value=move || secret.get()
-                        on:input=move |ev| secret.set(event_target_value(&ev))
-                    />
-                </label>
-                <button class="btn btn--primary btn--lg btn--block" type="submit">"Sign in"</button>
-                <div class="login__error" role="alert">{move || app.notice.get()}</div>
-                <p class="login__foot">
-                    {move || if mode() == "token" { "Token authentication" } else { "Basic authentication" }}
-                </p>
             </form>
         </div>
     }
@@ -263,6 +398,7 @@ fn Workspace() -> impl IntoView {
         Section::History => view! { <crate::history::HistoryPage /> }.into_any(),
         Section::Access => view! { <crate::access::AccessPage /> }.into_any(),
         Section::Storage => view! { <crate::storage::StoragePage /> }.into_any(),
+        Section::Account => view! { <crate::account::AccountPage /> }.into_any(),
     };
     view! {
         <div
@@ -407,10 +543,10 @@ fn TopBar() -> impl IntoView {
                                 .unwrap_or_default();
                             let auth = session
                                 .as_ref()
-                                .map(|s| match s.auth.as_str() {
-                                    "none" => "no sign-in",
-                                    "token" => "token sign-in",
-                                    _ => "basic sign-in",
+                                .map(|s| match (s.auth.as_str(), s.two_factor) {
+                                    ("none", _) => "no sign-in",
+                                    (_, true) => "two-factor sign-in",
+                                    _ => "password sign-in",
                                 })
                                 .unwrap_or_default();
                             view! {
@@ -421,6 +557,19 @@ fn TopBar() -> impl IntoView {
                                         <div class="subtle text-sm">{format!("{role} · {auth}")}</div>
                                     </div>
                                     <div class="menu__sep"></div>
+                                    <a
+                                        class="menu__item"
+                                        role="menuitem"
+                                        href="/account"
+                                        on:click=move |ev: web_sys::MouseEvent| {
+                                            ev.prevent_default();
+                                            menu.set(false);
+                                            app.go(Section::Account);
+                                        }
+                                    >
+                                        <Icon name="user" />
+                                        "Account"
+                                    </a>
                                     <button
                                         class="menu__item"
                                         role="menuitem"

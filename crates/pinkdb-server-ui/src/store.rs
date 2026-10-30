@@ -123,17 +123,6 @@ impl Session {
         &self.db
     }
 
-    /// Verify a password through the engine's own path and adopt the user as
-    /// this session's principal: every later statement of the session then
-    /// runs under that user's grants (the engine's per-statement RBAC
-    /// check).
-    pub fn login(&mut self, user: &str, password: &str) -> Result<(), String> {
-        self.conn
-            .login(user, password)
-            .map(|_| ())
-            .map_err(|err| err.to_string())
-    }
-
     /// Adopt a user verified at login (a console session): later statements
     /// run under that user's grants.
     pub fn impersonate(&mut self, user: &str) -> Result<(), String> {

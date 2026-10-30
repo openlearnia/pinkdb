@@ -19,7 +19,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AuthFailure, Credentials, LoginPermit};
+use crate::auth::{AuthFailure, AuthState, Credentials};
 use crate::html;
 use crate::policy::UiAuth;
 use crate::preview::{preview_cell, type_width_bytes};
@@ -254,10 +254,10 @@ fn auth_failure_response(failure: AuthFailure, mode: &UiAuth) -> Response {
                     _ => "authentication failed",
                 },
             );
-            if matches!(mode, UiAuth::Basic) {
+            if matches!(mode, UiAuth::Password) {
                 response.headers_mut().insert(
                     header::WWW_AUTHENTICATE,
-                    header::HeaderValue::from_static("Basic realm=\"pinkdb\""),
+                    header::HeaderValue::from_static("Bearer realm=\"pinkdb\""),
                 );
             }
             response
@@ -265,10 +265,6 @@ fn auth_failure_response(failure: AuthFailure, mode: &UiAuth) -> Response {
         AuthFailure::Blocked => json_error(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed authentications from this address; try again later",
-        ),
-        AuthFailure::Busy => json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "too many concurrent logins; try again later",
         ),
     }
 }
@@ -281,59 +277,37 @@ enum AuthPlan {
     Session(Arc<crate::sessions::UiSession>),
     /// No credential is needed (the store has no users).
     Anonymous,
-    /// A bearer token was verified.
-    Token,
-    /// HTTP Basic credentials: the blocking task verifies them through the
-    /// engine and runs the statements under that user's grants.
-    Basic {
-        /// The user name.
-        user: String,
-        /// The password.
-        password: String,
-        /// The verification slot (dropped when the blocking task ends).
-        _permit: LoginPermit,
-    },
+    /// A personal access token (wave 121d): the blocking task resolves its
+    /// owner and runs the statements under that user's grants.
+    Token(String),
 }
 
 /// Decide what a request must prove, before any statement runs.
 fn plan_auth(
     shared: &Arc<Shared>,
     headers: &HeaderMap,
-    peer: Option<SocketAddr>,
+    peer: SocketAddr,
 ) -> Result<AuthPlan, ApiError> {
     if let Some(session) = crate::work::cookie_session(shared, headers) {
         return Ok(AuthPlan::Session(session));
     }
-    let mode = shared.auth.mode().clone();
-    let credentials = crate::work::header_credentials(headers);
-    match mode {
-        UiAuth::None => Ok(AuthPlan::Anonymous),
-        UiAuth::Token(_) => match credentials {
-            Credentials::Token(token) if shared.auth.token_matches(&token) => Ok(AuthPlan::Token),
-            _ => Err(ApiError::Auth(AuthFailure::Missing)),
-        },
-        UiAuth::Basic => {
-            let ip = peer.map(|addr| addr.ip());
-            if let Some(ip) = ip
-                && shared.auth.blocked_for(ip).is_some()
-            {
-                return Err(ApiError::Auth(AuthFailure::Blocked));
-            }
-            match credentials {
-                Credentials::Basic { user, password } => {
-                    let permit = shared
-                        .auth
-                        .try_verify()
-                        .ok_or(ApiError::Auth(AuthFailure::Busy))?;
-                    Ok(AuthPlan::Basic {
-                        user,
-                        password,
-                        _permit: permit,
-                    })
-                }
-                _ => Err(ApiError::Auth(AuthFailure::Missing)),
-            }
+    if matches!(shared.auth.mode(), UiAuth::None) {
+        return Ok(AuthPlan::Anonymous);
+    }
+    // An address that keeps presenting wrong tokens is blocked before any
+    // lookup, like a failing sign-in.
+    if shared.auth.blocked_for(peer.ip()).is_some() {
+        return Err(ApiError::Auth(AuthFailure::Blocked));
+    }
+    match AuthState::parse(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        Credentials::Token(token) if crate::factors::looks_like_token(&token) => {
+            Ok(AuthPlan::Token(token))
         }
+        _ => Err(ApiError::Auth(AuthFailure::Missing)),
     }
 }
 
@@ -635,7 +609,7 @@ where
     R: FnOnce(T) -> Response + Send + 'static,
 {
     let mode = shared.auth.mode().clone();
-    let plan = match plan_auth(&shared, &headers, Some(peer.0)) {
+    let plan = match plan_auth(&shared, &headers, peer.0) {
         Ok(plan) => plan,
         Err(err) => return err.into_response(&mode),
     };
@@ -657,14 +631,15 @@ where
             worker.put_session(session);
             return Err(ApiError::Auth(AuthFailure::Rejected));
         }
-        if let AuthPlan::Basic { user, password, .. } = &plan
-            && session.login(user, password).is_err()
-        {
-            worker.put_session(session);
-            if let Some(ip) = ip {
-                worker.auth.record_failure(ip);
+        if let AuthPlan::Token(token) = &plan {
+            let owner = worker.vault.token_owner(token).ok().flatten();
+            if owner.is_none_or(|user| session.impersonate(&user).is_err()) {
+                worker.put_session(session);
+                if let Some(ip) = ip {
+                    worker.auth.record_failure(ip);
+                }
+                return Err(ApiError::Auth(AuthFailure::Rejected));
             }
-            return Err(ApiError::Auth(AuthFailure::Rejected));
         }
         let result = body(&mut session, &worker);
         if let Some(ip) = ip

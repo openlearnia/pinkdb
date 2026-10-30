@@ -228,7 +228,7 @@ pub async fn upload(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let session = match post_session(&shared, &headers) {
+    let session = match post_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };

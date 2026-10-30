@@ -11,16 +11,48 @@ pub mod sql;
 
 // ---------- sessions ----------
 
-/// `POST /api/login`. Basic mode needs `user` and `password`, token mode
-/// `token`; a console without authentication takes an empty body.
+/// `POST /api/login`: a user and password (a console without
+/// authentication takes an empty body).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LoginRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
+}
+
+/// The answer to `POST /api/login`: a session, or (for a user with
+/// two-factor) the challenge `POST /api/login/verify` completes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LoginAnswer {
+    Session(SessionInfo),
+    SecondFactor(SecondFactor),
+}
+
+/// The password was right; a second factor is needed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SecondFactor {
+    /// `totp`.
+    pub second_factor: String,
+    /// The challenge id (5 minutes, 5 tries, the same address).
+    pub challenge: String,
+}
+
+/// `POST /api/login/verify`: an authenticator code, or a recovery code.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VerifyRequest {
+    pub challenge: String,
+    pub code: String,
+}
+
+/// `POST /api/setup`: the first account of a store without users, with the
+/// setup code the server printed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SetupRequest {
+    pub code: String,
+    pub user: String,
+    pub password: String,
 }
 
 /// `GET /api/session` and the answer to a login.
@@ -30,7 +62,7 @@ pub struct SessionInfo {
     pub user: String,
     /// The token every `POST` echoes in `X-CSRF-Token`.
     pub csrf: String,
-    /// `none`, `basic` or `token`.
+    /// `password` or `none`.
     pub auth: String,
     /// `--ui-read-only`.
     pub read_only: bool,
@@ -42,9 +74,13 @@ pub struct SessionInfo {
     pub admin: bool,
     /// The rows of one result the browser gets.
     pub max_shown_rows: usize,
+    /// The user signs in with a second factor.
+    #[serde(default)]
+    pub two_factor: bool,
 }
 
-/// The `401` body of `GET /api/session`: which login form to show.
+/// The `401` body of `GET /api/session`: which form to show — `password`
+/// (sign in) or `setup` (the first account of a store without users).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoginRequired {
     pub error: String,
@@ -258,6 +294,20 @@ pub struct Principal {
     pub is_admin: bool,
     /// Direct role memberships, comma-separated.
     pub roles: String,
+    /// The user signs in with a second factor (wave 121d; administrators
+    /// see it).
+    #[serde(default)]
+    pub two_factor: bool,
+    /// The user's live console sessions (administrators see it).
+    #[serde(default)]
+    pub sessions: usize,
+}
+
+/// `POST /api/access/sessions/end` and `/api/access/totp/reset`: an
+/// administrator's action on a user.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UserAction {
+    pub name: String,
 }
 
 /// One row of `pinkdb_grants()`.
@@ -290,6 +340,118 @@ pub struct UserRequest {
     pub password: String,
     #[serde(default)]
     pub alter: bool,
+}
+
+// ---------- the account (wave 121d) ----------
+
+/// One console session of the user (`GET /api/account`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionRow {
+    /// The public id (not the cookie).
+    pub id: String,
+    /// Unix seconds.
+    pub started: u64,
+    /// Seconds since the session's last request.
+    pub idle_secs: u64,
+    pub ip: String,
+    pub user_agent: String,
+    /// The session this request came from.
+    pub current: bool,
+}
+
+/// A personal access token, without its secret.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TokenRow {
+    pub id: String,
+    pub name: String,
+    /// The first characters (`pdbt_AbCd`), to recognize it.
+    pub hint: String,
+    /// Unix seconds.
+    pub created_at: u64,
+    /// Unix seconds; 0 = never.
+    pub expires_at: u64,
+    /// Unix seconds; 0 = never used.
+    pub last_used_at: u64,
+}
+
+/// `GET /api/account`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub user: String,
+    pub admin: bool,
+    /// Only a store user has a password, a second factor and tokens (not
+    /// the operator of a console without sign-in).
+    pub has_password: bool,
+    pub two_factor: bool,
+    pub recovery_left: usize,
+    pub sessions: Vec<SessionRow>,
+    pub tokens: Vec<TokenRow>,
+}
+
+/// `POST /api/account/password`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PasswordChange {
+    pub current: String,
+    pub new: String,
+}
+
+/// `POST /api/account/sessions/end`: one session by id, or every other one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EndSessions {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub others: bool,
+}
+
+/// `POST /api/account/tokens`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NewToken {
+    pub name: String,
+    /// Days until it expires; 0 = never.
+    pub days: u32,
+}
+
+/// The answer to `POST /api/account/tokens`: the secret, shown once.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreatedToken {
+    pub token: TokenRow,
+    pub secret: String,
+}
+
+/// `POST /api/account/tokens/revoke`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RevokeToken {
+    pub id: String,
+}
+
+/// The answer to `POST /api/account/totp/start`: what an authenticator app
+/// needs. The QR code is one SVG path on a `qr_size` square.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TotpEnrolment {
+    pub secret: String,
+    pub uri: String,
+    pub qr_path: String,
+    pub qr_size: usize,
+}
+
+/// `POST /api/account/totp/confirm`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TotpConfirm {
+    pub code: String,
+}
+
+/// `POST /api/account/totp/disable` and `/api/account/recovery`: the
+/// password, again.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PasswordCheck {
+    pub password: String,
+}
+
+/// New recovery codes, shown once.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryCodes {
+    pub codes: Vec<String>,
 }
 
 // ---------- storage (wave 121b) ----------

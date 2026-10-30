@@ -16,9 +16,13 @@ cargo build --release -p pinkdb-server --features ui,parquet,httpfs
 # pinkdb-server: warehouse console on http://127.0.0.1:8080 (worksheets)
 ```
 
-Open the address in a browser. A store without users logs you in by itself;
-a store with users asks for a user and password (`--ui-auth basic`) or the
-console token (`--ui-token`).
+Open the address in a browser and sign in with a user of the store. A store
+without users starts in **first-run setup**: the server prints a setup code,
+and the account you create with it becomes the administrator.
+
+```
+pinkdb-server-ui: first-run setup: the store has no users. Open http://127.0.0.1:8080 and create the administrator with the setup code OMRD-MSNQ-QH2F
+```
 
 Wave 78 shipped a read-only catalog browser. Wave 121 turned it into a
 worksheet console: the browser app is now Rust (Leptos) compiled to
@@ -71,9 +75,8 @@ agent.
 
 | Console mode | Statements run as |
 |---|---|
-| `--ui-auth basic` | the logged-in user: every statement is checked against that user's grants (wave 48), exactly like a protocol client |
-| `--ui-token TOKEN` | the operator (the token is the operator's own secret, as in wave 78) |
-| no authentication (a store without users only) | the implicit session of a store without users |
+| sign-in (the default) | the signed-in user — in the browser, or a script with that user's access token: every statement is checked against that user's grants (wave 48), exactly like a protocol client |
+| `--ui-auth none` (a store without users, on loopback) | the implicit session of a store without users |
 
 The password is verified once, at login, through the engine's own Argon2id
 path; the console keeps a server-side session and never the password. Later
@@ -89,6 +92,48 @@ at most two queries running per session at once.
 `--ui-read-only` limits **everyone** to queries (`SELECT`, `EXPLAIN`,
 `DESCRIBE`, `SHOW`, `USE`), whatever their grants; a run with any other
 statement is refused before its first statement runs.
+
+## Signing in (wave 121d)
+
+- **First-run setup.** A store without users shows *Create the
+  administrator*: the setup code from the server's log, a name and a
+  password. The account gets `GRANT ADMIN` and is signed in. The code is
+  60 random bits, compared in constant time, throttled like a sign-in, and
+  void once the store has a user (from the console or any client).
+- **Passwords** are the store's own (Argon2id, verified by the engine). A
+  password set in the console needs at least 10 characters. A user changes
+  their own on the **Account** page (the current password first); every
+  other session of theirs ends. An administrator's reset ends the user's
+  sessions too.
+- **Two-factor sign-in (TOTP).** On the Account page: scan the QR code with
+  an authenticator app, confirm a code, and keep the ten recovery codes
+  (shown once, stored hashed). Signing in then takes the password and a
+  6-digit code (30-second steps, one step of drift, a code is never
+  accepted twice) or a recovery code (once each). The challenge between the
+  two steps lives 5 minutes, allows 5 tries and only from the same address.
+  Turning it off needs the password; an administrator can reset it for a
+  user who lost their phone (their sessions end).
+- **Personal access tokens** are how scripts call the API: created on the
+  Account page (a name; 7, 30, 90, 365 days or no expiry), shown once,
+  stored as their SHA-256. `Authorization: Bearer pdbt_…` works on every
+  `/api` route as the token's owner, with their grants and without a CSRF
+  token (there is no cookie to ride on). A token cannot change a password,
+  the second factor or tokens. HTTP Basic is not accepted: a password in a
+  header would skip the second factor.
+- **Sessions** are listed on the Account page (device, address, start, last
+  use); a user signs out one of them or every other one, and an
+  administrator signs a user out everywhere from the Access page, which
+  also shows who uses two-factor.
+- **Where the credentials live.** Token hashes, TOTP secrets and recovery
+  code hashes are in `pinkdb_worksheets.access_tokens`, `.totp` and
+  `.recovery_codes`, written on trusted connections with bound parameters.
+  A dropped user's rows go at the next sweep (at start, every minute, and
+  whenever an administrator opens Access), so a later user of the same name
+  starts clean.
+- **HTTPS.** `--ui-tls-cert` and `--ui-tls-key` (PEM; rustls with ring)
+  make the console serve HTTPS: its cookie is `Secure`, every response
+  carries `Strict-Transport-Security`, and it may bind a non-loopback
+  address. Plain HTTP on that port gets no answer.
 
 ## Security
 
@@ -139,9 +184,9 @@ password goes through `POST /api/access/user`, never a worksheet, so the
 password is not in the run history; a worksheet run whose SQL mentions a
 password is recorded as `-- (a statement with a password: not recorded)`.
 
-On a console without logins (a store with no users), creating the first user
-ends that console: the store now has users, so unauthenticated sessions stop
-and the server must be restarted with `--ui-auth basic`. The form says so.
+On a console started with `--ui-auth none`, creating the first user ends
+that console: the store now has users, so unauthenticated sessions stop and
+the server must be restarted without that flag. The form says so.
 
 ## Imports
 
@@ -187,11 +232,13 @@ data, then reopen the lake under a new server and read the rows back.
 | Situation | What happens |
 |---|---|
 | The console was not asked for | It is not started at all (the default). |
-| `--ui-host` names a non-loopback address | **Refused** (exit 2): the console has no TLS of its own, so a non-localhost exposure needs console TLS and RBAC first. |
-| The store has users and no credential was configured | **Refused** (exit 2): start it with `--ui-auth basic` or `--ui-token <secret>`. |
-| `--ui-auth basic` and the store has no users | **Refused** (exit 2): there is nothing to authenticate against. |
-| The store has no users and no credential was configured | The console starts and prints a **loud warning**: every local process can run any SQL. |
-| The store gains a user while the console runs | Its unauthenticated sessions end and new logins are refused. |
+| `--ui-host` names a non-loopback address without `--ui-tls-cert` | **Refused** (exit 2): passwords and cookies would cross the network in clear text. |
+| A non-loopback address with `--ui-auth none` | **Refused** (exit 2): a console on the network must ask for sign-in. |
+| The store has no users (sign-in, the default) | The console starts in first-run setup and prints the setup code. |
+| `--ui-auth none` and the store has users | **Refused** (exit 2). |
+| `--ui-auth none` and the store has no users | The console starts and prints a **loud warning**: every local process can run any SQL. |
+| The store gains a user while an `--ui-auth none` console runs | Its unauthenticated sessions end and new logins are refused. |
+| `--ui-token` | **Refused** (exit 2): it was replaced by personal access tokens. |
 
 ## The ask box
 
@@ -243,7 +290,13 @@ PINKDB_AGENT_PROVIDER=zai ZAI_API_KEY=… \
 | `GET /assets/console.css`, `/assets/boot.js` | the stylesheet and the boot module |
 | `GET /assets/pinkdb-console.js`, `/assets/pinkdb-console_bg.wasm` | the app, served gzip-encoded (`406` to a client that refuses gzip) |
 | `GET /api/session` | the session (user, CSRF token, mode), or `401` with the login mode |
-| `POST /api/login`, `/api/logout` | start or end a session |
+| `POST /api/setup` | the first account of a store without users (the setup code) |
+| `POST /api/login`, `/api/login/verify`, `/api/logout` | the password (a session, or a two-factor challenge), the second factor, the end of a session |
+| `GET /api/account` | the user's sessions, tokens and two-factor state |
+| `POST /api/account/password`, `/api/account/sessions/end` | change the password; end one or every other session |
+| `POST /api/account/tokens`, `/api/account/tokens/revoke` | create (the secret, once) or revoke a personal access token |
+| `POST /api/account/totp/start`, `/confirm`, `/disable`, `POST /api/account/recovery` | enrol, turn on, turn off two-factor; new recovery codes |
+| `POST /api/access/sessions/end`, `/api/access/totp/reset` | an administrator signs a user out everywhere, or resets their second factor |
 | `POST /api/query` | run `{sql, db?, run_id, worksheet_id?}`; every statement in order until one fails |
 | `POST /api/cancel` | cancel `{run_id}` (the session's own runs only) |
 | `POST /api/export` | re-run `{sql, db?, format: csv\|json}` (one read-only statement) as a download |
@@ -254,7 +307,7 @@ PINKDB_AGENT_PROVIDER=zai ZAI_API_KEY=… \
 | `GET /api/access`, `POST /api/access/user` | users, roles and grants as the session may see them; create a user or set a password |
 | `POST /api/upload` | a CSV or Parquet file into a table (the body is the file) |
 | `GET /api/storage` | the store's mode, location and facts (secrets masked) |
-| `GET /api/databases`, `/api/schemas`, `/api/tables`, `/api/rows`, `/api/stats`, `GET /preview` | wave 78's browse API and no-JavaScript preview page: a session cookie or an `Authorization` header (HTTP Basic or a bearer token) |
+| `GET /api/databases`, `/api/schemas`, `/api/tables`, `/api/rows`, `/api/stats`, `GET /preview` | wave 78's browse API and no-JavaScript preview page: a session cookie or a personal access token |
 
 The request and response types are one Rust crate,
 `crates/pinkdb-server-ui-api`, shared by the server and the browser app.
@@ -283,9 +336,9 @@ refreshed. So building the server needs no wasm toolchain.
 
 | Asset | Size | Gzipped (served) |
 |---|---|---|
-| `pinkdb-console_bg.wasm` | 857 KB | 339 KB |
-| `pinkdb-console.js` (wasm-bindgen glue) | 49 KB | 9 KB |
-| `console.css` + `boot.js` | 54 KB | — |
+| `pinkdb-console_bg.wasm` | 972 KB | 383 KB |
+| `pinkdb-console.js` (wasm-bindgen glue) | 52 KB | 9 KB |
+| `console.css` + `boot.js` | 55 KB | — |
 
 ## The worker model and the async carve-out
 
@@ -315,6 +368,9 @@ HTML comes from `maud`, which escapes every interpolated value.
   anything but a single query.
 - **A transaction does not span runs.** Each run has its own connection: a
   `BEGIN` left open at the end of a run is rolled back.
+- **A user dropped and recreated through SQL within the same minute** keeps
+  the old user's tokens and second factor (the sweep had no chance to run);
+  an administrator can reset both.
 - **Sessions live in memory**: a server restart logs everyone out
   (worksheets and history are in the store and survive).
 - **Deep paging in `/preview` costs a scan** (`OFFSET` is applied after
@@ -329,8 +385,10 @@ HTML comes from `maud`, which escapes every interpolated value.
 --enable-ui                 serve the console (needs a build with `ui`)
 --ui-host HOST              the console's bind address (default 127.0.0.1)
 --ui-port PORT              the console's TCP port (default 8080; 0 = ephemeral)
---ui-auth basic             log in with the store's users (their grants apply)
---ui-token TOKEN            log in with this operator token
+--ui-auth password|none     sign in with the store's users (the default), or no
+                            sign-in for a store without users on loopback
+--ui-tls-cert PATH          serve HTTPS with this PEM certificate chain
+--ui-tls-key PATH           the certificate's PEM private key
 --ui-read-only              worksheets run only queries, for everyone
 --ui-allowed-host NAME      another Host name to answer to (repeatable)
 --ui-workers N              the runtime's worker threads (default 4)

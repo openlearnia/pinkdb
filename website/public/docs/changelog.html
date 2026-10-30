@@ -195,6 +195,14 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-30">2026-10-30<a class="anchor" href="#2026-10-30" aria-label="Permalink: 2026-10-30">#</a></h2>
+<h3>Wave 121d — sign-in for the console ✅</h3>
+<ul>
+<li>The console <strong>asks for sign-in by default</strong> with the store's users; the <code>--ui-auth basic</code> opt-in is gone. A store without users starts in <strong>first-run setup</strong>: the server prints a one-time setup code, and the account created with it becomes the administrator. <code>--ui-auth none</code> still serves a store without users with no sign-in, on loopback only.</li>
+<li><strong>Two-factor sign-in (TOTP)</strong>: enrol with a QR code on the new <strong>Account</strong> page, keep ten one-time recovery codes; sign-in then asks for the authenticator code. Administrators can reset a lost second factor.</li>
+<li><strong>Personal access tokens</strong> replace <code>--ui-token</code>: per user, named, expiring, revocable, shown once and stored hashed; scripts send <code>Authorization: Bearer pdbt_…</code> to any API route and act with the user's grants. HTTP Basic on the API is gone (it would skip the second factor).</li>
+<li><strong>Account self-service</strong>: change your password (other sessions end), see your sessions and sign out one or all others. Administrators sign a user out everywhere from Access, which also shows who uses two-factor.</li>
+</ul>
+<li><strong>HTTPS for the console</strong>: <code>--ui-tls-cert</code> / <code>--ui-tls-key</code> (rustls), with <code>Secure</code> cookies and <code>Strict-Transport-Security</code>; with a certificate the console may listen beyond localhost.</li>
 <h3>Wave 121c — the console's design system ✅</h3>
 <ul>
 <li>The warehouse console has a design system (<code>docs/console-design/README.md</code>, with a clickable mockup and a component gallery): color, type, spacing and elevation tokens in light and dark, one icon set, and specified buttons, inputs, tabs, trees, grids, tables, callouts, dialogs, toasts and empty states. Every text color meets WCAG AA contrast in both themes.</li>

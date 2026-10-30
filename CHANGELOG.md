@@ -9,6 +9,26 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 121d — sign-in for the console ✅
+
+- The console **asks for sign-in by default** with the store's users; the
+  `--ui-auth basic` opt-in is gone. A store without users starts in
+  **first-run setup**: the server prints a one-time setup code, and the
+  account created with it becomes the administrator. `--ui-auth none`
+  still serves a store without users with no sign-in, on loopback only.
+- **Two-factor sign-in (TOTP)**: enrol with a QR code on the new
+  **Account** page, keep ten one-time recovery codes; sign-in then asks for
+  the authenticator code. Administrators can reset a lost second factor.
+- **Personal access tokens** replace `--ui-token`: per user, named,
+  expiring, revocable, shown once and stored hashed; scripts send
+  `Authorization: Bearer pdbt_…` to any API route and act with the user's
+  grants. HTTP Basic on the API is gone (it would skip the second factor).
+- **Account self-service**: change your password (other sessions end), see
+  your sessions and sign out one or all others. Administrators sign a user
+  out everywhere from Access, which also shows who uses two-factor.
+- **HTTPS for the console**: `--ui-tls-cert` / `--ui-tls-key` (rustls),
+  with `Secure` cookies and `Strict-Transport-Security`; with a certificate
+  the console may listen beyond localhost.
 ### Wave 121c — the console's design system ✅
 
 - The warehouse console has a design system

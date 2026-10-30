@@ -14,6 +14,14 @@ use pinkdb::Database;
 use pinkdb_server_ui::{UiAuth, UiHandle, UiOptions, UiServer};
 use serde_json::{Value, json};
 
+/// A console without sign-in (`--ui-auth none`): the store has no users.
+fn open_options() -> UiOptions {
+    UiOptions {
+        auth: UiAuth::None,
+        ..UiOptions::default()
+    }
+}
+
 // ---------- a tiny HTTP client ----------
 
 #[derive(Debug)]
@@ -185,7 +193,7 @@ fn options() -> UiOptions {
     UiOptions {
         read_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(30),
-        ..UiOptions::default()
+        ..open_options()
     }
 }
 
@@ -215,7 +223,7 @@ fn store_with_users() -> Database {
 
 fn basic() -> UiOptions {
     UiOptions {
-        auth: UiAuth::Basic,
+        auth: UiAuth::Password,
         ..options()
     }
 }
@@ -795,29 +803,6 @@ fn the_browse_api_takes_the_session_cookie() {
     assert_eq!(bob.get("/api/databases").status, 200);
     // Bob's grants apply to the browse API too.
     assert_ne!(bob.get("/api/rows?db=main&table=t").status, 200);
-}
-
-#[test]
-fn token_mode_logs_in_with_the_token() {
-    let console = start(
-        store(),
-        UiOptions {
-            auth: UiAuth::Token("s3cret".to_string()),
-            ..options()
-        },
-    );
-    let r = request(console.addr, "GET", "/api/session", &[], None);
-    assert_eq!(r.status, 401);
-    assert_eq!(r.json()["auth"], "token");
-    assert_eq!(
-        login(console.addr, json!({ "token": "nope" }))
-            .err()
-            .unwrap()
-            .status,
-        401
-    );
-    let client = login(console.addr, json!({ "token": "s3cret" })).unwrap();
-    assert_eq!(client.query("SELECT 1")["results"][0]["rows"][0][0], "1");
 }
 
 #[test]

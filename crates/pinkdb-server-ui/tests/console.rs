@@ -15,6 +15,14 @@ use std::time::{Duration, Instant};
 use pinkdb::{Database, QueryResult};
 use pinkdb_server_ui::{UiAuth, UiHandle, UiOptions, UiServer};
 
+/// A console without sign-in (`--ui-auth none`): the store has no users.
+fn open_options() -> UiOptions {
+    UiOptions {
+        auth: UiAuth::None,
+        ..UiOptions::default()
+    }
+}
+
 // ---------- a tiny HTTP client ----------
 
 /// One HTTP response.
@@ -169,7 +177,7 @@ fn options() -> UiOptions {
         read_timeout: Duration::from_secs(2),
         request_timeout: Duration::from_secs(20),
         max_page_size: 10,
-        ..UiOptions::default()
+        ..open_options()
     }
 }
 
@@ -637,6 +645,7 @@ fn a_non_loopback_bind_is_refused() {
     let err = pinkdb_server_ui::check_bind_policy(
         "192.0.2.1".parse().expect("an address"),
         pinkdb_server_ui::ConsoleTls::Absent,
+        &UiAuth::Password,
     )
     .expect_err("must be refused");
     assert!(err.to_string().contains("loopback"));
@@ -653,97 +662,34 @@ fn a_store_with_users_refuses_to_start_unauthenticated() {
     let err = UiServer::bind("127.0.0.1:0", db.clone(), options()).expect_err("must be refused");
     let message = err.to_string();
     assert!(
-        message.contains("--ui-auth basic") || message.contains("--ui-token"),
+        message.contains("--ui-auth none"),
         "the error must name the way out: {message}"
     );
 
-    // With an explicit credential the console starts.
+    // Sign-in (the default) starts.
     let opts = UiOptions {
-        auth: UiAuth::Basic,
+        auth: UiAuth::Password,
         ..options()
     };
-    let server = UiServer::bind("127.0.0.1:0", db, opts).expect("bind with basic auth");
+    let server = UiServer::bind("127.0.0.1:0", db, opts).expect("bind with sign-in");
     let addr = server.local_addr();
     let handle = server.spawn().expect("spawn");
-    // Without credentials: refused.
+    // Without credentials: refused, and the 401 names the scheme.
     let response = get(addr, "/api/databases");
     assert_eq!(response.status, 401);
     assert_eq!(
         response.header("www-authenticate"),
-        Some("Basic realm=\"pinkdb\""),
-        "the 401 must challenge the browser"
+        Some("Bearer realm=\"pinkdb\""),
     );
-    // With the right credentials: served.
+    // A password in a header is not a credential (it would skip the second
+    // factor): only a personal access token is.
     let encoded = base64("alice:secret");
     let response = get_with(
         addr,
         "/api/databases",
         &[("Authorization", &format!("Basic {encoded}"))],
     );
-    assert_eq!(response.status, 200, "body: {}", response.body);
-    handle.shutdown();
-}
-
-#[test]
-fn basic_auth_rejects_a_wrong_password() {
-    let db = store();
-    let mut conn = db.connect();
-    conn.execute("CREATE USER alice PASSWORD 'secret'")
-        .expect("create the user");
-    conn.execute("GRANT SELECT ON TABLE main.t TO alice")
-        .expect("grant the select privilege");
-    drop(conn);
-
-    let opts = UiOptions {
-        auth: UiAuth::Basic,
-        ..options()
-    };
-    let server = UiServer::bind("127.0.0.1:0", db, opts).expect("bind");
-    let addr = server.local_addr();
-    let handle = server.spawn().expect("spawn");
-
-    let wrong = base64("alice:wrong");
-    let response = get_with(
-        addr,
-        "/api/rows?db=main&table=t",
-        &[("Authorization", &format!("Basic {wrong}"))],
-    );
     assert_eq!(response.status, 401, "body: {}", response.body);
-
-    let right = base64("alice:secret");
-    let response = get_with(
-        addr,
-        "/api/rows?db=main&table=t",
-        &[("Authorization", &format!("Basic {right}"))],
-    );
-    assert_eq!(response.status, 200, "body: {}", response.body);
-    handle.shutdown();
-}
-
-#[test]
-fn a_bearer_token_guards_the_api() {
-    let opts = UiOptions {
-        auth: UiAuth::Token("s3cret".to_string()),
-        ..options()
-    };
-    let server = UiServer::bind("127.0.0.1:0", store(), opts).expect("bind");
-    let addr = server.local_addr();
-    let handle = server.spawn().expect("spawn");
-
-    // Without the token: refused.
-    assert_eq!(get(addr, "/api/databases").status, 401);
-    // With the wrong token: refused.
-    assert_eq!(
-        get_with(addr, "/api/databases", &[("Authorization", "Bearer nope")]).status,
-        401
-    );
-    // With the token: served.
-    let response = get_with(
-        addr,
-        "/api/databases",
-        &[("Authorization", "Bearer s3cret")],
-    );
-    assert_eq!(response.status, 200, "body: {}", response.body);
     handle.shutdown();
 }
 

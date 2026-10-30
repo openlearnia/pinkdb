@@ -29,6 +29,9 @@ pub enum Section {
     History,
     Access,
     Storage,
+    /// The signed-in user's own page (wave 121d): password, two-factor,
+    /// sessions, access tokens.
+    Account,
 }
 
 impl Section {
@@ -264,7 +267,7 @@ impl App {
             }
             Section::Catalog => self.load_catalog(),
             Section::Storage => self.load_storage(),
-            Section::Query | Section::Access => {}
+            Section::Query | Section::Access | Section::Account => {}
         }
     }
 
@@ -713,6 +716,64 @@ pub fn kind_label(kind: &str) -> String {
     }
 }
 
+/// Unix seconds as a short relative time: `just now`, `4 min ago`,
+/// `3 h ago`, `2 days ago`, or the date.
+pub fn ago(secs: u64) -> String {
+    if secs == 0 {
+        return "never".to_string();
+    }
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+    let delta = now.saturating_sub(secs);
+    match delta {
+        0..60 => "just now".to_string(),
+        60..3600 => format!("{} min ago", delta / 60),
+        3600..86_400 => format!("{} h ago", delta / 3600),
+        86_400..604_800 => format!("{} days ago", delta / 86_400),
+        _ => date(secs),
+    }
+}
+
+/// Unix seconds as `2026-10-30` (UTC); 0 is "never".
+pub fn date(secs: u64) -> String {
+    if secs == 0 {
+        return "never".to_string();
+    }
+    let iso: String = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(secs as f64 * 1000.0))
+        .to_iso_string()
+        .into();
+    iso.chars().take(10).collect()
+}
+
+/// A browser's user agent in a few words (`Chrome on macOS`).
+pub fn device(user_agent: &str) -> String {
+    let browser = [
+        ("Edg/", "Edge"),
+        ("Firefox/", "Firefox"),
+        ("Chrome/", "Chrome"),
+        ("Safari/", "Safari"),
+        ("curl/", "curl"),
+    ]
+    .iter()
+    .find(|(needle, _)| user_agent.contains(needle))
+    .map_or("A browser", |(_, name)| name);
+    let system = [
+        ("iPhone", "iOS"),
+        ("iPad", "iPadOS"),
+        ("Android", "Android"),
+        ("Mac OS X", "macOS"),
+        ("Macintosh", "macOS"),
+        ("Windows", "Windows"),
+        ("Linux", "Linux"),
+    ]
+    .iter()
+    .find(|(needle, _)| user_agent.contains(needle))
+    .map(|(_, name)| *name);
+    match system {
+        Some(system) => format!("{browser} on {system}"),
+        None => browser.to_string(),
+    }
+}
+
 /// Whether a catalog kind holds rows.
 pub fn is_relation(kind: &str) -> bool {
     matches!(kind, "TABLE" | "VIEW" | "MATERIALIZED VIEW" | "LAKE TABLE")
@@ -784,5 +845,13 @@ mod tests {
         assert_eq!(kind_icon("LAKE TABLE"), "lake");
         assert!(is_relation("VIEW") && !is_relation("INDEX"));
         assert_eq!(count(1_500_000), "1,500,000");
+        assert_eq!(
+            device(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/605 Chrome/131.0 Safari/537"
+            ),
+            "Chrome on macOS"
+        );
+        assert_eq!(device("curl/8.4"), "curl");
+        assert_eq!(device(""), "A browser");
     }
 }

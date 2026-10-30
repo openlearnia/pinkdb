@@ -18,8 +18,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pinkdb::Database;
-use pinkdb_server_ui::{UiOptions, UiServer};
+use pinkdb_server_ui::{UiAuth, UiOptions, UiServer};
 use serde_json::{Value, json};
+
+/// A console without sign-in (`--ui-auth none`): the store has no users.
+fn open_options() -> UiOptions {
+    UiOptions {
+        auth: UiAuth::None,
+        ..UiOptions::default()
+    }
+}
 
 /// The key the mock provider must see and no console response may carry.
 const SENTINEL: &str = "sk-wave121-sentinel-never-in-a-response";
@@ -232,7 +240,7 @@ fn the_ask_box_streams_an_agent_run() {
         .unwrap();
     db.load_extension(library.to_str().unwrap())
         .expect("load the agent extension");
-    let server = UiServer::bind("127.0.0.1:0", db.clone(), UiOptions::default()).unwrap();
+    let server = UiServer::bind("127.0.0.1:0", db.clone(), open_options()).unwrap();
     let addr = server.local_addr();
     let handle = server.spawn().unwrap();
 

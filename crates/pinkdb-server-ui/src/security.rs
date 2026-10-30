@@ -187,6 +187,24 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
+/// Middleware: `Strict-Transport-Security` on every response of a console
+/// served over TLS (wave 121d) — a browser that saw it once never talks to
+/// the console in clear text again.
+pub async fn strict_transport(
+    State(shared): State<Arc<Shared>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    if shared.opts.tls.is_some() {
+        response.headers_mut().insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

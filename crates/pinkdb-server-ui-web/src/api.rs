@@ -227,6 +227,19 @@ pub fn download_blob(name: &str, blob: &web_sys::Blob) {
     let _ = web_sys::Url::revoke_object_url(&url);
 }
 
+/// Put text on the clipboard (a token, recovery codes); `false` when the
+/// browser refuses.
+pub fn copy_text(text: &str) -> bool {
+    let clipboard = web_sys::window().map(|w| w.navigator().clipboard());
+    match clipboard {
+        Some(clipboard) => {
+            let _ = clipboard.write_text(text);
+            true
+        }
+        None => false,
+    }
+}
+
 /// A random id for a run (not a secret: it only names the run to cancel).
 pub fn run_id() -> String {
     let a = (js_sys::Math::random() * 1e15) as u64;

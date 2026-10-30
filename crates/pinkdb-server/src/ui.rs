@@ -10,7 +10,7 @@
 //! use pinkdb_server::ui::{UiAuth, UiOptions, UiServer};
 //!
 //! let opts = UiOptions {
-//!     auth: UiAuth::Basic,
+//!     auth: UiAuth::Password,
 //!     ..UiOptions::default()
 //! };
 //! let server = UiServer::bind("127.0.0.1:8080", Database::new(), opts)?;
@@ -19,13 +19,13 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! The console is **read-only** and **feature-gated**: it exists only in a
-//! build with the `ui` cargo feature, it binds loopback by default, and it
-//! refuses to serve a store that has users without an explicit credential.
-//! See `docs/server-ui.md`.
+//! The console is **feature-gated**: it exists only in a build with the
+//! `ui` cargo feature. It asks for sign-in by default, binds loopback unless
+//! it has a certificate ([`UiTls`]), and refuses to serve a store that has
+//! users without sign-in. See `docs/server-ui.md`.
 
 pub use pinkdb_server_ui::{
-    ConsoleTls, LiveFacts, StorageInfo, UiAuth, UiError, UiHandle, UiOptions, UiServer,
+    ConsoleTls, LiveFacts, StorageInfo, UiAuth, UiError, UiHandle, UiOptions, UiServer, UiTls,
     check_auth_policy, check_bind_policy, redact,
 };
 

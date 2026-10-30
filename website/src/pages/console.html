@@ -13,11 +13,14 @@ binary — nothing comes from a CDN.</p>
 ./target/release/pinkdb-server --file warehouse.pink --enable-ui
 # pinkdb-server: warehouse console on http://127.0.0.1:8080 (worksheets)</code></pre>
 
-<p>A store without users logs the browser in by itself (and the server warns
-that every local process can run any SQL). A store with users needs
-<code>--ui-auth basic</code> — log in with a store user, whose grants then apply
-to every statement — or <code>--ui-token &lt;secret&gt;</code>.
-<code>--ui-read-only</code> limits everyone to queries.</p>
+<p>The console asks for sign-in with the store's users, whose grants then
+apply to every statement. A store without users starts in first-run setup:
+the server prints a setup code, and the account created with it becomes the
+administrator. Each user can add a TOTP second factor and create personal
+access tokens for scripts (<code>Authorization: Bearer pdbt_…</code>).
+<code>--ui-tls-cert</code> and <code>--ui-tls-key</code> serve HTTPS and allow a
+non-loopback address; <code>--ui-read-only</code> limits everyone to
+queries.</p>
 
 <h2>What you see</h2>
 

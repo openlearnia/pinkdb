@@ -4,6 +4,7 @@
 //! system it follows is `docs/console-design/README.md`.
 
 mod access;
+mod account;
 mod api;
 mod app;
 mod ask;

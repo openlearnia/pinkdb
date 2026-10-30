@@ -66,6 +66,8 @@ fn read_access(shared: &Shared, session: &UiSession) -> Result<Access, String> {
         kind: text(&r, 1).unwrap_or_default(),
         is_admin: matches!(r.get(2), Some(Value::Boolean(true))),
         roles: text(&r, 3).unwrap_or_default(),
+        two_factor: false,
+        sessions: 0,
     })
     .collect();
     let grants: Vec<GrantRow> = rows(
@@ -88,6 +90,18 @@ fn read_access(shared: &Shared, session: &UiSession) -> Result<Access, String> {
             .iter()
             .any(|p| p.kind == "USER" && p.name.eq_ignore_ascii_case(me) && p.is_admin),
     };
+    // An administrator also sees who signs in with a second factor and how
+    // many sessions each user has (wave 121d).
+    let mut principals = principals;
+    if admin {
+        crate::account::sweep(shared);
+        let totp = shared.vault.totp_users().unwrap_or_default();
+        for p in principals.iter_mut().filter(|p| p.kind == "USER") {
+            let name = p.name.to_ascii_lowercase();
+            p.two_factor = totp.contains(&name);
+            p.sessions = shared.sessions.of_user(&name).len();
+        }
+    }
     Ok(Access {
         me: session.user.clone(),
         admin,
@@ -106,7 +120,7 @@ pub(crate) fn session_is_admin(shared: &Shared, session: &UiSession) -> bool {
 
 /// `GET /api/access`
 pub async fn access(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    let session = match get_session(&shared, &headers) {
+    let session = match get_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -118,20 +132,11 @@ pub async fn access(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Re
     }
 }
 
-/// A user name the statement can carry: no quote games, no empty name.
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-}
-
 /// `POST /api/access/user`: create a user, or set a user's password, as the
 /// session user (the engine requires `ADMIN` for either, except a user
 /// changing their own password where the engine allows it).
 pub async fn user(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Body) -> Response {
-    let session = match post_session(&shared, &headers) {
+    let session = match post_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -139,14 +144,11 @@ pub async fn user(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: B
         Ok(body) => body,
         Err(response) => return response,
     };
-    if !valid_name(&body.name) {
+    if !crate::account::valid_name(&body.name) {
         return json_error(
             StatusCode::BAD_REQUEST,
             "a user name is letters, digits, `_`, `-` and `.`",
         );
-    }
-    if body.password.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "the password is empty");
     }
     if shared.opts.read_only {
         return json_error(
@@ -154,8 +156,19 @@ pub async fn user(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: B
             "the console is read-only (--ui-read-only)",
         );
     }
+    if let Some(problem) = crate::account::password_problem(&body.name, &body.password) {
+        return json_error(StatusCode::BAD_REQUEST, problem);
+    }
     let worker = Arc::clone(&shared);
+    let actor = Arc::clone(&session);
+    let target = body.name.to_ascii_lowercase();
+    let alter = body.alter;
     let outcome = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        // A new user starts with no credentials of an earlier user of the
+        // same name.
+        if !body.alter {
+            worker.vault.forget(&body.name.to_ascii_lowercase())?;
+        }
         let mut conn = session.connect(&worker.db)?;
         conn.set_exec_limits(limits(&worker));
         let verb = if body.alter { "ALTER" } else { "CREATE" };
@@ -175,7 +188,18 @@ pub async fn user(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: B
     })
     .await;
     match outcome {
-        Ok(Ok(message)) => json_ok(&json!({ "message": message })),
+        Ok(Ok(message)) => {
+            // A password set by someone else ends the user's sessions (the
+            // administrator's own, when they reset themselves, stays).
+            if alter {
+                let keep = actor
+                    .user
+                    .eq_ignore_ascii_case(&target)
+                    .then(|| crate::sessions::Sessions::id_of(&actor));
+                shared.sessions.end_user(&target, keep);
+            }
+            json_ok(&json!({ "message": message }))
+        }
         Ok(Err(message)) => {
             let lower = message.to_ascii_lowercase();
             let status = if lower.contains("permission") || lower.contains("privilege") {
@@ -191,7 +215,7 @@ pub async fn user(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: B
 
 /// `GET /api/storage`: the Storage panel.
 pub async fn storage(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    if let Err(response) = get_session(&shared, &headers) {
+    if let Err(response) = get_session(&shared, &headers).await {
         return response;
     }
     let info = &shared.opts.storage;
@@ -232,15 +256,6 @@ pub async fn storage(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn user_names_are_plain() {
-        assert!(valid_name("alice"));
-        assert!(valid_name("svc.loader-1"));
-        assert!(!valid_name(""));
-        assert!(!valid_name("a b"));
-        assert!(!valid_name("x\"; DROP"));
-    }
 
     #[test]
     fn identifiers_are_quoted_in_user_statements() {

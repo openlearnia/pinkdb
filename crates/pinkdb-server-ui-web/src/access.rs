@@ -7,7 +7,7 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use pinkdb_server_ui_api::sql::quote_ident;
-use pinkdb_server_ui_api::{Access, GrantRow, UserRequest};
+use pinkdb_server_ui_api::{Access, GrantRow, UserAction, UserRequest};
 
 use crate::api;
 use crate::icon::Icon;
@@ -83,6 +83,20 @@ fn privilege_tone(privilege: &str) -> &'static str {
     }
 }
 
+/// An administrator's action on a user's credentials (wave 121d).
+fn user_action(app: App, path: &'static str, name: String, done: &'static str) {
+    let csrf = app.csrf();
+    spawn_local(async move {
+        match api::post::<_, serde_json::Value>(path, &UserAction { name: name.clone() }, &csrf)
+            .await
+        {
+            Ok(_) => app.toast(Tone::Success, done, name),
+            Err(e) => app.toast(Tone::Danger, "That did not work", e.message),
+        }
+        app.access_epoch.update(|e| *e += 1);
+    });
+}
+
 /// Which dialog is open.
 #[derive(Clone, PartialEq)]
 enum Open {
@@ -142,6 +156,9 @@ pub fn AccessPage() -> impl IntoView {
                 let me = !role && p.name.eq_ignore_ascii_case(&a.me);
                 let name = p.name.clone();
                 let reset_name = p.name.clone();
+                let sessions_name = p.name.clone();
+                let totp_name = p.name.clone();
+                let (two_factor, sessions) = (p.two_factor, p.sessions);
                 let n = grants_of(&p.name);
                 let memberships = p
                     .roles
@@ -157,6 +174,8 @@ pub fn AccessPage() -> impl IntoView {
                                 <Icon name=if role { "users" } else { "user" } class="subtle" />
                                 <span class="mono">{p.name.clone()}</span>
                                 {me.then(|| view! { <span class="badge badge--outline">"You"</span> })}
+                                {two_factor
+                                    .then(|| view! { <span class="badge badge--success" title="Signs in with a second factor">"2FA"</span> })}
                             </span>
                         </td>
                         <td class="muted">{if role { "Role" } else { "User" }}</td>
@@ -175,6 +194,50 @@ pub fn AccessPage() -> impl IntoView {
                             }}
                         </td>
                         <td class="t-actions">
+                            {(admin && !role && sessions > 0)
+                                .then(|| {
+                                    view! {
+                                        <button
+                                            class="btn btn--ghost btn--sm"
+                                            title="End every console session of this user"
+                                            on:click=move |_| {
+                                                let who = sessions_name.clone();
+                                                app.ask_first(
+                                                    format!("Sign {who} out everywhere?"),
+                                                    format!("{who}'s {sessions} console session(s) end at once. Access tokens keep working."),
+                                                    "",
+                                                    "Sign out",
+                                                    move |_| user_action(app, "/api/access/sessions/end", who.clone(), "Signed out"),
+                                                );
+                                            }
+                                        >
+                                            <Icon name="log-out" size=14 />
+                                            {format!("Sign out ({sessions})")}
+                                        </button>
+                                    }
+                                })}
+                            {(admin && two_factor)
+                                .then(|| {
+                                    view! {
+                                        <button
+                                            class="btn btn--ghost btn--sm"
+                                            title="For a lost phone: turn the user's second factor off"
+                                            on:click=move |_| {
+                                                let who = totp_name.clone();
+                                                app.ask_first(
+                                                    format!("Reset {who}'s two-factor sign-in?"),
+                                                    format!("{who} signs in with the password alone until they set it up again. Their sessions end."),
+                                                    "",
+                                                    "Reset two-factor",
+                                                    move |_| user_action(app, "/api/access/totp/reset", who.clone(), "Two-factor reset"),
+                                                );
+                                            }
+                                        >
+                                            <Icon name="shield" size=14 />
+                                            "Reset 2FA"
+                                        </button>
+                                    }
+                                })}
                             {(admin && !role)
                                 .then(|| {
                                     view! {
@@ -473,9 +536,10 @@ fn UserDialog(name: Option<String>, close: Callback<()>) -> impl IntoView {
                             .then(|| {
                                 view! {
                                     <Callout tone=Tone::Warning title="This console runs without sign-in">
-                                        "The store has no users yet. Creating the first one ends that: restart the server with "
-                                        <span class="mono">"--ui-auth basic"</span>
-                                        " and sign in as that user."
+                                        "It was started with "
+                                        <span class="mono">"--ui-auth none"</span>
+                                        ", which only serves a store without users. Creating the first user ends it: \
+                                         restart the server without that flag and sign in as the new user."
                                     </Callout>
                                 }
                             })

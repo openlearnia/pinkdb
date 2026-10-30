@@ -53,8 +53,20 @@ getrandom = "0.2"
 # trait and its byte type (both already in the lockfile through hyper).
 http-body = "1"
 bytes = "1"
+# Wave 121d (authentication): TOTP is HMAC-SHA1 and token hashes are
+# SHA-256, both from ring (already the workspace's rustls provider); base32
+# for TOTP secrets; rustls + tokio-rustls for the console's own HTTPS; and a
+# small dependency-free QR encoder for the authenticator enrolment code.
+ring = "0.17"
+data-encoding = "2"
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
+rustls-pemfile = "2.2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+qrcodegen = "1.8"
 
 [dev-dependencies]
+# Wave 121d: a self-signed certificate for the HTTPS tests.
+rcgen = "0.14"
 # Wave 121b's import tests: the CSV source (local, http, s3) and the Parquet
 # reader/writer, registered in the test process the way the server binary
 # registers them (both already workspace members).

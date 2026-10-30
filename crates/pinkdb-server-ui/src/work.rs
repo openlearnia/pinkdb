@@ -11,19 +11,18 @@
 // only add an allocation per refusal.
 #![allow(clippy::result_large_err)]
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use pinkdb::{CancelFlag, Connection, ExecLimits, QueryProfile, QueryResult, Value};
 use pinkdb_server_ui_api::{
     CancelRequest, Catalog, CatalogColumn, CatalogObject, DeleteWorksheet, ExportRequest,
-    HistoryList, LoginRequest, Profile, QueryRequest, QueryResponse, ResultColumn, SaveWorksheet,
-    SessionInfo, StatementError, StatementResult, WorksheetList,
+    HistoryList, Profile, QueryRequest, QueryResponse, ResultColumn, SaveWorksheet, StatementError,
+    StatementResult, WorksheetList,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -34,9 +33,7 @@ use crate::auth::{AuthState, Credentials};
 use crate::book::{self, RunRecord};
 use crate::policy::UiAuth;
 use crate::preview::display_value;
-use crate::security::{
-    CSRF_HEADER, clear_session_cookie, origin_allowed, session_cookie, set_session_cookie,
-};
+use crate::security::{CSRF_HEADER, origin_allowed, session_cookie};
 use crate::server::Shared;
 use crate::sessions::{Identity, RunRefused, Sessions, UiSession};
 use crate::store::quote_ident;
@@ -87,45 +84,84 @@ pub(crate) fn cookie_session(shared: &Shared, headers: &HeaderMap) -> Option<Arc
     Some(session)
 }
 
-/// A `GET` of the worksheet API: the session cookie is the credential.
-pub(crate) fn get_session(
-    shared: &Shared,
+/// The one-request session of a personal access token
+/// (`Authorization: Bearer pdbt_…`, wave 121d): the token's owner, looked up
+/// on the blocking pool.
+pub(crate) async fn token_session(
+    shared: &Arc<Shared>,
     headers: &HeaderMap,
-) -> Result<Arc<UiSession>, Response> {
-    cookie_session(shared, headers).ok_or_else(login_required)
+) -> Option<Arc<UiSession>> {
+    if matches!(shared.auth.mode(), UiAuth::None) {
+        return None;
+    }
+    let Credentials::Token(token) = AuthState::parse(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    ) else {
+        return None;
+    };
+    if !crate::factors::looks_like_token(&token) {
+        return None;
+    }
+    let worker = Arc::clone(shared);
+    let owner = tokio::task::spawn_blocking(move || worker.vault.token_owner(&token))
+        .await
+        .ok()?
+        .ok()??;
+    Some(UiSession::transient(Identity::User(owner.clone()), owner))
 }
 
-/// A `POST`: the cookie, the CSRF token and the `Origin`.
-pub(crate) fn post_session(
-    shared: &Shared,
+/// A `GET` of the API: the session cookie, or a personal access token.
+pub(crate) async fn get_session(
+    shared: &Arc<Shared>,
     headers: &HeaderMap,
 ) -> Result<Arc<UiSession>, Response> {
-    if !origin_allowed(headers, shared.opts.secure_cookies) {
-        return Err(json_error(
-            StatusCode::FORBIDDEN,
-            "cross-origin request refused",
-        ));
+    if let Some(session) = cookie_session(shared, headers) {
+        return Ok(session);
     }
-    let session = get_session(shared, headers)?;
-    let token = headers
-        .get(CSRF_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !session.csrf_matches(token) {
-        return Err(json_error(
-            StatusCode::FORBIDDEN,
-            "missing or wrong CSRF token (X-CSRF-Token)",
-        ));
-    }
-    Ok(session)
+    token_session(shared, headers)
+        .await
+        .ok_or_else(login_required)
 }
 
-fn login_required() -> Response {
+/// A `POST`: the cookie, the CSRF token and the `Origin` — or a personal
+/// access token (no cookie, so nothing for another site to ride on: the
+/// token is the credential, and no CSRF token is needed).
+pub(crate) async fn post_session(
+    shared: &Arc<Shared>,
+    headers: &HeaderMap,
+) -> Result<Arc<UiSession>, Response> {
+    if let Some(session) = cookie_session(shared, headers) {
+        if !origin_allowed(headers, shared.opts.secure_cookies) {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "cross-origin request refused",
+            ));
+        }
+        let token = headers
+            .get(CSRF_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !session.csrf_matches(token) {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "missing or wrong CSRF token (X-CSRF-Token)",
+            ));
+        }
+        return Ok(session);
+    }
+    token_session(shared, headers)
+        .await
+        .ok_or_else(login_required)
+}
+
+pub(crate) fn login_required() -> Response {
     json_error(StatusCode::UNAUTHORIZED, "login required")
 }
 
 /// Run blocking engine work on the bounded pool.
-async fn blocking<T, F>(work: F) -> Result<T, Response>
+pub(crate) async fn blocking<T, F>(work: F) -> Result<T, Response>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -152,183 +188,6 @@ pub(crate) fn json_ok<T: Serialize>(payload: &T) -> Response {
             format!("cannot serialize the response: {err}"),
         ),
     }
-}
-
-fn auth_name(mode: &UiAuth) -> &'static str {
-    match mode {
-        UiAuth::None => "none",
-        UiAuth::Basic => "basic",
-        UiAuth::Token(_) => "token",
-    }
-}
-
-// ---------- login ----------
-
-/// The session's own answer; `admin` is read from the access catalog each
-/// time (a grant or revoke since the login counts at once).
-async fn session_info(shared: &Arc<Shared>, session: &Arc<UiSession>) -> Response {
-    let worker = Arc::clone(shared);
-    let who = Arc::clone(session);
-    let admin = tokio::task::spawn_blocking(move || crate::admin::session_is_admin(&worker, &who))
-        .await
-        .unwrap_or(false);
-    json_ok(&SessionInfo {
-        user: session.user.clone(),
-        csrf: session.csrf().to_string(),
-        auth: auth_name(shared.auth.mode()).to_string(),
-        read_only: shared.opts.read_only,
-        agent: crate::ask::agent_loaded(shared),
-        admin,
-        max_shown_rows: shared.opts.max_shown_rows,
-    })
-}
-
-/// `GET /api/session`: the cookie's session, or `401` with the login mode.
-pub async fn session(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    match cookie_session(&shared, &headers) {
-        Some(session) => session_info(&shared, &session).await,
-        None => {
-            let mut response = json_ok(&json!({
-                "error": "login required",
-                "auth": auth_name(shared.auth.mode()),
-            }));
-            *response.status_mut() = StatusCode::UNAUTHORIZED;
-            response
-        }
-    }
-}
-
-/// `POST /api/login`: verify the credential once and start a session.
-pub async fn login(
-    State(shared): State<Arc<Shared>>,
-    headers: HeaderMap,
-    peer: ConnectInfo<SocketAddr>,
-    body: Body,
-) -> Response {
-    if !origin_allowed(&headers, shared.opts.secure_cookies) {
-        return json_error(StatusCode::FORBIDDEN, "cross-origin request refused");
-    }
-    let body: LoginRequest = match read_json(&shared, body).await {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
-    let ip = peer.0.ip();
-    if let Some(wait) = shared.auth.blocked_for(ip) {
-        return json_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "too many failed logins from this address; try again in {} s",
-                wait.as_secs().max(1)
-            ),
-        );
-    }
-    let identity = match shared.auth.mode().clone() {
-        UiAuth::None => {
-            if shared.db.has_users() {
-                return json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "the store has users: this console must be restarted with authentication",
-                );
-            }
-            Identity::Operator
-        }
-        UiAuth::Token(_) => {
-            let token = body.token.unwrap_or_default();
-            if !shared.auth.token_matches(&token) {
-                shared.auth.record_failure(ip);
-                return json_error(StatusCode::UNAUTHORIZED, "authentication failed");
-            }
-            Identity::Operator
-        }
-        UiAuth::Basic => {
-            let (Some(user), Some(password)) = (body.user, body.password) else {
-                return json_error(StatusCode::BAD_REQUEST, "user and password are required");
-            };
-            let Some(permit) = shared.auth.try_verify() else {
-                return json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "too many concurrent logins; try again later",
-                );
-            };
-            let db = shared.db.clone();
-            let verified = blocking(move || {
-                let _permit = permit;
-                db.connect()
-                    .login(&user, &password)
-                    .map(|_| user.to_ascii_lowercase())
-            })
-            .await;
-            match verified {
-                Ok(Ok(user)) => Identity::User(user),
-                Ok(Err(_)) => {
-                    shared.auth.record_failure(ip);
-                    return json_error(StatusCode::UNAUTHORIZED, "authentication failed");
-                }
-                Err(response) => return response,
-            }
-        }
-    };
-    shared.auth.record_success(ip);
-    // The owner name is the engine's answer to `current_user()`.
-    let user = match &identity {
-        Identity::User(user) => user.clone(),
-        Identity::Operator => {
-            let db = shared.db.clone();
-            blocking(move || operator_name(&db))
-                .await
-                .unwrap_or_else(|_| "pinkdb".to_string())
-        }
-    };
-    let session = shared.sessions.create(identity, user);
-    let mut response = session_info(&shared, &session).await;
-    if let Ok(cookie) = HeaderValue::from_str(&set_session_cookie(
-        Sessions::id_of(&session),
-        shared.opts.secure_cookies,
-    )) {
-        response.headers_mut().insert(header::SET_COOKIE, cookie);
-    }
-    response
-}
-
-/// `current_user()` of a trusted session.
-fn operator_name(db: &pinkdb::Database) -> String {
-    let mut conn = db.connect();
-    match conn
-        .execute("SELECT current_user()")
-        .ok()
-        .and_then(|mut r| r.pop())
-    {
-        Some(QueryResult::Selected { rows, .. }) => rows
-            .first()
-            .and_then(|row| row.first())
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "pinkdb".to_string()),
-        _ => "pinkdb".to_string(),
-    }
-}
-
-/// `POST /api/logout`.
-pub async fn logout(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    let session = match post_session(&shared, &headers) {
-        Ok(session) => session,
-        Err(response) => return response,
-    };
-    shared.sessions.remove(Sessions::id_of(&session));
-    let mut response = json_ok(&json!({ "ok": true }));
-    if let Ok(cookie) = HeaderValue::from_str(&clear_session_cookie(shared.opts.secure_cookies)) {
-        response.headers_mut().insert(header::SET_COOKIE, cookie);
-    }
-    response
-}
-
-/// The legacy header credential for a request without a cookie: keeps the
-/// wave-78 API usable from scripts (`curl -u`, a bearer token).
-pub(crate) fn header_credentials(headers: &HeaderMap) -> Credentials {
-    AuthState::parse(
-        headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-    )
 }
 
 // ---------- running SQL ----------
@@ -466,7 +325,7 @@ fn worksheet_conn(
 /// `POST /api/query`: run every statement of `sql`, in order, until one
 /// fails.
 pub async fn query(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Body) -> Response {
-    let session = match post_session(&shared, &headers) {
+    let session = match post_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -647,7 +506,7 @@ fn store_hook(sql: &str) {
 
 /// `POST /api/cancel`: stop one of this session's runs.
 pub async fn cancel(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Body) -> Response {
-    let session = match post_session(&shared, &headers) {
+    let session = match post_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -663,7 +522,7 @@ pub async fn cancel(State(shared): State<Arc<Shared>>, headers: HeaderMap, body:
 /// `POST /api/export`: re-run **one read-only** statement with the export
 /// cap and answer it as a CSV or JSON download.
 pub async fn export(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Body) -> Response {
-    let session = match post_session(&shared, &headers) {
+    let session = match post_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -801,7 +660,7 @@ pub fn to_json(names: &[String], rows: &[Vec<Value>]) -> Vec<u8> {
 
 /// `GET /api/worksheets`
 pub async fn worksheets(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    let session = match get_session(&shared, &headers) {
+    let session = match get_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -819,7 +678,7 @@ pub async fn save_worksheet(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let session = match post_session(&shared, &headers) {
+    let session = match post_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -863,7 +722,7 @@ pub async fn delete_worksheet(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let session = match post_session(&shared, &headers) {
+    let session = match post_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -885,7 +744,7 @@ pub async fn delete_worksheet(
 
 /// `GET /api/history`: the session user's latest runs.
 pub async fn history(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    let session = match get_session(&shared, &headers) {
+    let session = match get_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };
@@ -914,7 +773,7 @@ pub async fn catalog(
     Query(query): Query<CatalogQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let session = match get_session(&shared, &headers) {
+    let session = match get_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };

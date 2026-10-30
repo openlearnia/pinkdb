@@ -104,7 +104,7 @@ impl CommandEvents for Collect {
 
 /// `GET /api/agent`: whether the agent is loaded, and its providers.
 pub async fn info(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
-    if let Err(response) = get_session(&shared, &headers) {
+    if let Err(response) = get_session(&shared, &headers).await {
         return response;
     }
     if !agent_loaded(&shared) {
@@ -277,7 +277,7 @@ fn memory_text(text: &str) -> String {
 
 /// `POST /api/ask`: run the agent and stream the run.
 pub async fn ask(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Body) -> Response {
-    let session = match post_session(&shared, &headers) {
+    let session = match post_session(&shared, &headers).await {
         Ok(session) => session,
         Err(response) => return response,
     };

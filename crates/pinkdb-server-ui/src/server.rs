@@ -54,6 +54,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tower_service::Service;
 
+use crate::account::{self, Challenges};
 use crate::admin;
 use crate::api;
 use crate::ask;
@@ -65,6 +66,7 @@ use crate::security;
 use crate::sessions::Sessions;
 use crate::store::Session;
 use crate::upload;
+use crate::vault::Vault;
 use crate::work;
 
 /// Maximum number of request headers (hyper's HTTP/1.1 builder).
@@ -152,6 +154,53 @@ pub struct UiOptions {
     pub max_upload_bytes: usize,
     /// What the Storage panel reports about the store (wave 121b).
     pub storage: StorageInfo,
+    /// The console's own HTTPS (wave 121d): with a certificate the console
+    /// serves TLS, marks its cookie `Secure`, sends
+    /// `Strict-Transport-Security`, and may bind beyond loopback.
+    pub tls: Option<UiTls>,
+}
+
+/// The console's certificate (PEM): the chain, leaf first, and its private
+/// key (PKCS#8, PKCS#1 or SEC1).
+#[derive(Clone)]
+pub struct UiTls {
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for UiTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UiTls")
+            .field("cert_pem", &format_args!("{} bytes", self.cert_pem.len()))
+            .field("key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+impl UiTls {
+    /// The rustls server configuration (ring provider, HTTP/1.1 only).
+    fn server_config(&self) -> Result<rustls::ServerConfig, UiError> {
+        let tls_error = |what: &str| UiError::Policy(format!("the console's TLS {what}"));
+        let certs: Vec<_> = rustls_pemfile::certs(&mut self.cert_pem.as_slice())
+            .collect::<Result<_, _>>()
+            .map_err(|e| tls_error(&format!("certificate cannot be read: {e}")))?;
+        if certs.is_empty() {
+            return Err(tls_error("certificate file holds no certificate"));
+        }
+        let key = rustls_pemfile::private_key(&mut self.key_pem.as_slice())
+            .map_err(|e| tls_error(&format!("key cannot be read: {e}")))?
+            .ok_or_else(|| tls_error("key file holds no private key"))?;
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| tls_error(&e.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| tls_error(&format!("certificate and key do not match: {e}")))?;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(config)
+    }
 }
 
 /// Storage facts read at request time (`(label, value)` pairs).
@@ -265,7 +314,7 @@ impl Default for UiOptions {
             statement_timeout: Duration::from_secs(30),
             max_result_rows: 1_000,
             max_result_bytes: 16 * 1024 * 1024,
-            auth: UiAuth::None,
+            auth: UiAuth::Password,
             read_only: false,
             query_timeout: Duration::from_secs(300),
             query_max_bytes: 512 * 1024 * 1024,
@@ -285,6 +334,7 @@ impl Default for UiOptions {
                 mode: "in-memory".to_string(),
                 ..StorageInfo::default()
             },
+            tls: None,
         }
     }
 }
@@ -339,6 +389,15 @@ pub(crate) struct Shared {
     pub sessions: Sessions,
     /// Worksheet and history storage.
     pub book: Book,
+    /// Tokens, TOTP secrets and recovery codes (wave 121d).
+    pub vault: Vault,
+    /// Password-verified sign-ins waiting for their second factor.
+    pub challenges: Challenges,
+    /// The first-run setup code (printed at start; void once the store has a
+    /// user).
+    pub setup_code: String,
+    /// Serializes first-run setups.
+    pub setup_lock: Mutex<()>,
     /// The last provider list the agent answered (it cannot answer while a
     /// run holds it).
     pub agent_providers: Mutex<Option<serde_json::Value>>,
@@ -347,11 +406,14 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    fn new(db: Database, opts: UiOptions, bind: SocketAddr) -> Self {
+    fn new(db: Database, mut opts: UiOptions, bind: SocketAddr) -> Self {
+        // A console served over TLS always marks its cookie `Secure`.
+        opts.secure_cookies |= opts.tls.is_some();
         let exec_limits = opts.exec_limits();
         let auth = AuthState::new(opts.auth.clone());
         let sessions = Sessions::new(opts.session_idle, opts.session_lifetime, opts.max_sessions);
         let book = Book::new(db.clone());
+        let vault = Vault::new(db.clone());
         Self {
             db,
             opts,
@@ -360,6 +422,10 @@ impl Shared {
             pool: Mutex::new(Vec::new()),
             sessions,
             book,
+            vault,
+            challenges: Challenges::default(),
+            setup_code: crate::factors::new_setup_code(),
+            setup_lock: Mutex::new(()),
             agent_providers: Mutex::new(None),
             bind,
         }
@@ -399,6 +465,7 @@ impl Shared {
 /// A bound, not-yet-running console.
 pub struct UiServer {
     listener: std::net::TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
     addr: SocketAddr,
     shared: Arc<Shared>,
     shutdown: watch::Sender<bool>,
@@ -433,12 +500,24 @@ impl UiServer {
         let listener = std::net::TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
-        check_bind_policy(addr.ip(), ConsoleTls::Absent)?;
+        let tls = match &opts.tls {
+            Some(tls) => Some(tokio_rustls::TlsAcceptor::from(Arc::new(
+                tls.server_config()?,
+            ))),
+            None => None,
+        };
+        let console_tls = if tls.is_some() {
+            ConsoleTls::Configured
+        } else {
+            ConsoleTls::Absent
+        };
+        check_bind_policy(addr.ip(), console_tls, &opts.auth)?;
         check_auth_policy(db.has_users(), &opts.auth)?;
         let shared = Arc::new(Shared::new(db, opts, addr));
         let (shutdown, _) = watch::channel(false);
         Ok(UiServer {
             listener,
+            tls,
             addr,
             shared,
             shutdown,
@@ -450,14 +529,29 @@ impl UiServer {
         self.addr
     }
 
+    /// The first-run setup code: needed to create the first account of a
+    /// store without users (the server prints it; embedders and tests read
+    /// it here).
+    pub fn setup_code(&self) -> &str {
+        &self.shared.setup_code
+    }
+
+    /// The console's URL (`https://` with TLS).
+    pub fn url(&self) -> String {
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        format!("{scheme}://{}", self.addr)
+    }
+
     /// Run the console on its own thread and runtime.
     ///
     /// The returned handle stops it ([`UiHandle::shutdown`]) and joins it.
     pub fn spawn(self) -> std::io::Result<UiHandle> {
         let addr = self.addr;
+        let url = self.url();
         let shared = Arc::clone(&self.shared);
         let shutdown = self.shutdown.clone();
         let listener = self.listener;
+        let tls = self.tls;
         let thread = std::thread::Builder::new()
             .name("pinkdb-server-ui".to_string())
             .stack_size(CONSOLE_STACK_SIZE)
@@ -478,11 +572,19 @@ impl UiServer {
                             return;
                         }
                     };
-                    if let Err(err) = runtime.block_on(run(shared, listener, shutdown.clone())) {
+                    if let Err(err) = runtime.block_on(run(shared, listener, tls, shutdown.clone()))
+                    {
                         eprintln!("pinkdb-server-ui: the console stopped: {err}");
                     }
                 }
             })?;
+        if *shared.auth.mode() == UiAuth::Password && !shared.db.has_users() {
+            eprintln!(
+                "pinkdb-server-ui: first-run setup: the store has no users. Open {url} and \
+                 create the administrator with the setup code {}",
+                shared.setup_code
+            );
+        }
         if matches!(shared.auth.mode(), UiAuth::None) {
             eprintln!(
                 "pinkdb-server-ui: WARNING: the console on http://{addr} is served WITHOUT \
@@ -504,12 +606,35 @@ impl UiServer {
 async fn run(
     shared: Arc<Shared>,
     listener: std::net::TcpListener,
+    tls: Option<tokio_rustls::TlsAcceptor>,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), UiError> {
     let listener = TcpListener::from_std(listener)?;
     let app = build_router(Arc::clone(&shared));
     let permits = Arc::new(Semaphore::new(shared.opts.max_connections.max(1)));
     let mut stop = shutdown.subscribe();
+    // Credentials of dropped users go at start and then every minute (see
+    // `account::sweep`), on the blocking pool.
+    tokio::spawn({
+        let shared = Arc::clone(&shared);
+        let mut stop = shutdown.subscribe();
+        async move {
+            let mut every = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = every.tick() => {
+                        let worker = Arc::clone(&shared);
+                        let _ = tokio::task::spawn_blocking(move || account::sweep(&worker)).await;
+                    }
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -539,9 +664,22 @@ async fn run(
                 };
                 let app = app.clone();
                 let opts = shared.opts.clone();
+                let tls = tls.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    serve_connection(stream, peer, app, opts).await;
+                    let _ = stream.set_nodelay(true);
+                    match tls {
+                        None => serve_connection(stream, peer, app, opts).await,
+                        Some(acceptor) => {
+                            // The handshake has the head's deadline: a client
+                            // that opens a connection and stalls is dropped.
+                            if let Ok(Ok(stream)) =
+                                tokio::time::timeout(opts.read_timeout, acceptor.accept(stream)).await
+                            {
+                                serve_connection(stream, peer, app, opts).await;
+                            }
+                        }
+                    }
                 });
             }
         }
@@ -550,13 +688,10 @@ async fn run(
 }
 
 /// Serve one connection: HTTP/1.1, one request, then close.
-async fn serve_connection(
-    stream: tokio::net::TcpStream,
-    peer: SocketAddr,
-    app: Router,
-    opts: UiOptions,
-) {
-    let _ = stream.set_nodelay(true);
+async fn serve_connection<S>(stream: S, peer: SocketAddr, app: Router, opts: UiOptions)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let service = PeerService {
         router: app,
         peer,
@@ -602,12 +737,67 @@ fn build_router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route(
             "/api/session",
-            get(work::session).fallback(method_not_allowed),
+            get(account::session).fallback(method_not_allowed),
         )
-        .route("/api/login", post(work::login).fallback(method_not_allowed))
+        .route(
+            "/api/setup",
+            post(account::setup).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/login",
+            post(account::login).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/login/verify",
+            post(account::verify).fallback(method_not_allowed),
+        )
         .route(
             "/api/logout",
-            post(work::logout).fallback(method_not_allowed),
+            post(account::logout).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/account",
+            get(account::account).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/account/password",
+            post(account::change_password).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/account/sessions/end",
+            post(account::end_sessions).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/account/tokens",
+            post(account::create_token).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/account/tokens/revoke",
+            post(account::revoke_token).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/account/totp/start",
+            post(account::totp_start).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/account/totp/confirm",
+            post(account::totp_confirm).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/account/totp/disable",
+            post(account::totp_disable).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/account/recovery",
+            post(account::new_recovery).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/access/sessions/end",
+            post(account::admin_end_sessions).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/access/totp/reset",
+            post(account::admin_reset_totp).fallback(method_not_allowed),
         )
         .route("/api/query", post(work::query).fallback(method_not_allowed))
         .route(
@@ -671,6 +861,7 @@ fn build_router(shared: Arc<Shared>) -> Router {
         .route("/history", get(api::shell).fallback(method_not_allowed))
         .route("/access", get(api::shell).fallback(method_not_allowed))
         .route("/storage", get(api::shell).fallback(method_not_allowed))
+        .route("/account", get(api::shell).fallback(method_not_allowed))
         .route("/preview", get(api::preview).fallback(method_not_allowed))
         .route("/assets/console.css", get(assets::css))
         .route("/assets/boot.js", get(assets::boot))
@@ -694,6 +885,10 @@ fn build_router(shared: Arc<Shared>) -> Router {
             security::check_host,
         ))
         .layer(middleware::from_fn(security::security_headers))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&shared),
+            security::strict_transport,
+        ))
         .with_state(shared)
 }
 

@@ -1,7 +1,7 @@
 //! The console's authentication and its login throttling.
 //!
-//! The console reuses the **engine's** password verification path: a Basic
-//! credential is checked with [`pinkdb::Connection::login`], i.e. the same
+//! The console reuses the **engine's** password verification path: a
+//! sign-in password is checked with [`pinkdb::Connection::login`], i.e. the same
 //! Argon2id verification (and the same "unknown user" dummy derivation) the
 //! wire protocol uses. A verified session then runs under that user's
 //! grants, so RBAC applies to the console exactly as it applies to a wire
@@ -28,8 +28,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-
 use crate::policy::UiAuth;
 
 /// Global cap on concurrent Argon2id verifications (mirrors the wire
@@ -50,13 +48,13 @@ pub const IP_BLOCK: Duration = Duration::from_secs(60);
 /// the map is full and nothing has expired).
 pub const IP_MAX_ENTRIES: usize = 4096;
 
-/// The credentials a request carries.
+/// The credentials a request's `Authorization` header carries. Only a
+/// bearer token counts (wave 121d): a personal access token. A password in
+/// a header (HTTP Basic) would skip the second factor, so it is ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Credentials {
-    /// No `Authorization` header.
+    /// No usable `Authorization` header.
     None,
-    /// HTTP Basic credentials.
-    Basic { user: String, password: String },
     /// A bearer token.
     Token(String),
 }
@@ -70,8 +68,6 @@ pub enum AuthFailure {
     Rejected,
     /// The client address is blocked by the failed-login limiter.
     Blocked,
-    /// Too many verifications are already running.
-    Busy,
 }
 
 /// The console's authentication state.
@@ -101,24 +97,9 @@ impl AuthState {
         let Some(value) = header else {
             return Credentials::None;
         };
-        let value = value.trim();
-        if let Some(rest) = strip_prefix_ci(value, "basic ") {
-            return match decode_basic(rest.trim()) {
-                Some((user, password)) => Credentials::Basic { user, password },
-                None => Credentials::None,
-            };
-        }
-        if let Some(rest) = strip_prefix_ci(value, "bearer ") {
-            return Credentials::Token(rest.trim().to_string());
-        }
-        Credentials::None
-    }
-
-    /// Check a bearer token in constant time.
-    pub fn token_matches(&self, token: &str) -> bool {
-        match &self.mode {
-            UiAuth::Token(expected) => constant_time_eq(expected.as_bytes(), token.as_bytes()),
-            _ => false,
+        match strip_prefix_ci(value.trim(), "bearer ") {
+            Some(rest) if !rest.trim().is_empty() => Credentials::Token(rest.trim().to_string()),
+            _ => Credentials::None,
         }
     }
 
@@ -276,18 +257,6 @@ fn strip_prefix_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-/// Decode an HTTP Basic credential (`base64(user:password)`).
-fn decode_basic(encoded: &str) -> Option<(String, String)> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(encoded.as_bytes())
-        .ok()?;
-    let text = String::from_utf8(decoded).ok()?;
-    // Only the first colon separates the user from the password (a password
-    // may contain colons).
-    let (user, password) = text.split_once(':')?;
-    Some((user.to_string(), password.to_string()))
-}
-
 /// Compare two byte strings without leaking their contents through timing.
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // Fold the length difference into the accumulator so the comparison does
@@ -305,54 +274,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_basic_credentials() {
-        let encoded = base64::engine::general_purpose::STANDARD.encode("alice:secret");
-        let header = format!("Basic {encoded}");
+    fn only_bearer_tokens_count() {
         assert_eq!(
-            AuthState::parse(Some(&header)),
-            Credentials::Basic {
-                user: "alice".to_string(),
-                password: "secret".to_string()
-            }
+            AuthState::parse(Some("Bearer pdbt_x")),
+            Credentials::Token("pdbt_x".to_string())
         );
-    }
-
-    #[test]
-    fn parses_a_password_with_a_colon() {
-        let encoded = base64::engine::general_purpose::STANDARD.encode("alice:a:b");
-        let header = format!("Basic {encoded}");
         assert_eq!(
-            AuthState::parse(Some(&header)),
-            Credentials::Basic {
-                user: "alice".to_string(),
-                password: "a:b".to_string()
-            }
+            AuthState::parse(Some("bearer  pdbt_x ")),
+            Credentials::Token("pdbt_x".to_string())
         );
-    }
-
-    #[test]
-    fn parses_bearer_tokens_and_rejects_junk() {
         assert_eq!(
-            AuthState::parse(Some("Bearer s3cret")),
-            Credentials::Token("s3cret".to_string())
+            AuthState::parse(Some("Basic YWxpY2U6c2VjcmV0")),
+            Credentials::None
         );
-        assert_eq!(AuthState::parse(Some("Basic !!!")), Credentials::None);
+        assert_eq!(AuthState::parse(Some("Bearer ")), Credentials::None);
         assert_eq!(AuthState::parse(None), Credentials::None);
         assert_eq!(AuthState::parse(Some("Digest x")), Credentials::None);
     }
 
     #[test]
-    fn tokens_are_compared_in_constant_time() {
-        let state = AuthState::new(UiAuth::Token("s3cret".to_string()));
-        assert!(state.token_matches("s3cret"));
-        assert!(!state.token_matches("s3cre"));
-        assert!(!state.token_matches("s3cretx"));
-        assert!(!state.token_matches(""));
+    fn constant_time_comparison() {
+        assert!(constant_time_eq(b"s3cret", b"s3cret"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cre"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cretx"));
+        assert!(!constant_time_eq(b"s3cret", b""));
     }
 
     #[test]
     fn the_gate_bounds_concurrent_verifications() {
-        let state = AuthState::new(UiAuth::Basic);
+        let state = AuthState::new(UiAuth::Password);
         let first = state.try_verify().expect("first permit");
         let second = state.try_verify().expect("second permit");
         let third = state.try_verify().expect("third permit");
@@ -366,7 +316,7 @@ mod tests {
 
     #[test]
     fn repeated_failures_block_the_address() {
-        let state = AuthState::new(UiAuth::Basic);
+        let state = AuthState::new(UiAuth::Password);
         let ip: IpAddr = "127.0.0.1".parse().expect("ip");
         for _ in 0..IP_MAX_FAILURES {
             state.record_failure(ip);

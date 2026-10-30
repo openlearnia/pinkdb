@@ -143,13 +143,15 @@ struct Args {
     /// `--ui-port PORT`: the console's TCP port.
     #[cfg(feature = "ui")]
     ui_port: u16,
-    /// `--ui-auth basic`: require HTTP Basic authentication against the
-    /// store's own users.
+    /// `--ui-auth none`: serve a store without users with no sign-in (the
+    /// default is sign-in with the store's users, wave 121d).
     #[cfg(feature = "ui")]
-    ui_auth_basic: bool,
-    /// `--ui-token TOKEN`: require this bearer token.
+    ui_auth_none: bool,
+    /// `--ui-tls-cert PATH` / `--ui-tls-key PATH`: the console's own HTTPS.
     #[cfg(feature = "ui")]
-    ui_token: Option<String>,
+    ui_tls_cert: Option<String>,
+    #[cfg(feature = "ui")]
+    ui_tls_key: Option<String>,
     /// `--ui-workers N`: the console's runtime threads.
     #[cfg(feature = "ui")]
     ui_workers: usize,
@@ -250,14 +252,18 @@ fn usage() -> &'static str {
      \x20                        worksheets and the ask box (waves 78, 121);\n\
      \x20                        needs a build with the `ui` feature; off by default\n\
      \x20 --ui-host HOST        the console's bind address (default 127.0.0.1; a\n\
-     \x20                        non-loopback address is refused: the console has no\n\
-     \x20                        TLS of its own)\n\
+     \x20                        non-loopback address needs --ui-tls-cert/--ui-tls-key)\n\
      \x20 --ui-port PORT        the console's TCP port (default 8080; 0 = ephemeral)\n\
-     \x20 --ui-auth basic       require HTTP Basic authentication against the store's\n\
-     \x20                        own users (the engine verifies the password, and the\n\
-     \x20                        console's statements run under that user's grants)\n\
-     \x20 --ui-token TOKEN      require this bearer token on every API request\n\
-     \x20                        (constant-time comparison; independent of the catalog)\n\
+     \x20 --ui-auth MODE        `password` (the default): sign in with the store's users\n\
+     \x20                        (their grants apply), with an optional TOTP second\n\
+     \x20                        factor and personal access tokens for scripts; a store\n\
+     \x20                        without users starts in first-run setup (the setup code\n\
+     \x20                        is printed at start). `none`: no sign-in, for a store\n\
+     \x20                        without users on loopback only\n\
+     \x20 --ui-tls-cert PATH    serve the console over HTTPS with this PEM certificate\n\
+     \x20                        chain (with --ui-tls-key); allows a non-loopback\n\
+     \x20                        --ui-host\n\
+     \x20 --ui-tls-key PATH     the certificate's PEM private key\n\
      \x20 --ui-workers N        the console's runtime threads (default 4)\n\
      \x20 --ui-max-connections N  the console's concurrent connections (default 64)\n\
      \x20 --ui-max-page-size N  the console's row-preview page-size bound (default 500)\n\
@@ -290,12 +296,13 @@ fn usage() -> &'static str {
      the transport (it identifies the server, not clients). Keep the bind\n\
      address on localhost or a trusted network until the store has users.\n\
      \n\
-     The warehouse console (--enable-ui) runs SQL worksheets as the logged-in\n\
+     The warehouse console (--enable-ui) runs SQL worksheets as the signed-in\n\
      user (their grants apply; --ui-read-only limits everyone to queries). It\n\
-     binds 127.0.0.1 by default and refuses any other address (it has no TLS\n\
-     of its own). A store with users is never served unauthenticated: start\n\
-     it with --ui-auth basic or --ui-token. Serving a store without users\n\
-     prints a loud warning."
+     asks for sign-in by default; a store without users starts in first-run\n\
+     setup, guarded by a code printed at start. It binds 127.0.0.1 unless it\n\
+     has a certificate (--ui-tls-cert/--ui-tls-key). --ui-auth none serves a\n\
+     store without users with no sign-in, on loopback only, with a loud\n\
+     warning."
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -329,9 +336,11 @@ fn parse_args() -> Result<Args, String> {
         #[cfg(feature = "ui")]
         ui_port: DEFAULT_UI_PORT,
         #[cfg(feature = "ui")]
-        ui_auth_basic: false,
+        ui_auth_none: false,
         #[cfg(feature = "ui")]
-        ui_token: None,
+        ui_tls_cert: None,
+        #[cfg(feature = "ui")]
+        ui_tls_key: None,
         #[cfg(feature = "ui")]
         ui_workers: DEFAULT_UI_WORKERS,
         #[cfg(feature = "ui")]
@@ -495,13 +504,17 @@ fn parse_args() -> Result<Args, String> {
                 let raw = value("--ui-auth")?;
                 #[cfg(feature = "ui")]
                 {
-                    if raw != "basic" {
-                        return Err(format!(
-                            "invalid --ui-auth value {raw:?}: the only mode is `basic` \
-                             (HTTP Basic against the store's users)"
-                        ));
-                    }
-                    args.ui_auth_basic = true;
+                    args.ui_auth_none = match raw.as_str() {
+                        "password" => false,
+                        "none" => true,
+                        _ => {
+                            return Err(format!(
+                                "invalid --ui-auth value {raw:?}: `password` (the default: \
+                                 sign in with the store's users) or `none` (a store without \
+                                 users, on loopback)"
+                            ));
+                        }
+                    };
                 }
                 #[cfg(not(feature = "ui"))]
                 {
@@ -510,10 +523,23 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--ui-token" => {
-                let raw = value("--ui-token")?;
+                return Err(
+                    "--ui-token is gone (wave 121d): the console asks for sign-in by default, \
+                     and scripts use personal access tokens (created on the console's Account \
+                     page, sent as `Authorization: Bearer pdbt_…`)"
+                        .to_string(),
+                );
+            }
+            "--ui-tls-cert" | "--ui-tls-key" => {
+                let which = flag.clone();
+                let raw = value(&which)?;
                 #[cfg(feature = "ui")]
                 {
-                    args.ui_token = Some(raw);
+                    if which == "--ui-tls-cert" {
+                        args.ui_tls_cert = Some(raw);
+                    } else {
+                        args.ui_tls_key = Some(raw);
+                    }
                 }
                 #[cfg(not(feature = "ui"))]
                 {
@@ -644,14 +670,11 @@ fn parse_args() -> Result<Args, String> {
                 .to_string(),
         );
     }
-    // The console's two credential modes are mutually exclusive: the
-    // operator asks for one, not two.
+    // The console's certificate and key come together.
     #[cfg(feature = "ui")]
-    if args.ui_auth_basic && args.ui_token.is_some() {
+    if args.ui_tls_cert.is_some() != args.ui_tls_key.is_some() {
         return Err(
-            "--ui-auth basic and --ui-token are mutually exclusive: pick one credential for \
-             the console"
-                .to_string(),
+            "--ui-tls-cert and --ui-tls-key must be given together (both or neither)".to_string(),
         );
     }
     // Pairing is validated before anything binds, so a half-configured TLS
@@ -1247,11 +1270,20 @@ fn start_ui(
     db: &Database,
     storage: pinkdb_server::ui::StorageInfo,
 ) -> Result<pinkdb_server::ui::UiHandle, String> {
-    use pinkdb_server::ui::{UiAuth, UiOptions, UiServer};
-    let auth = match (&args.ui_token, args.ui_auth_basic) {
-        (Some(token), _) => UiAuth::Token(token.clone()),
-        (None, true) => UiAuth::Basic,
-        (None, false) => UiAuth::None,
+    use pinkdb_server::ui::{UiAuth, UiOptions, UiServer, UiTls};
+    let auth = if args.ui_auth_none {
+        UiAuth::None
+    } else {
+        UiAuth::Password
+    };
+    let tls = match (&args.ui_tls_cert, &args.ui_tls_key) {
+        (Some(cert), Some(key)) => Some(UiTls {
+            cert_pem: std::fs::read(cert)
+                .map_err(|e| format!("cannot read --ui-tls-cert {cert}: {e}"))?,
+            key_pem: std::fs::read(key)
+                .map_err(|e| format!("cannot read --ui-tls-key {key}: {e}"))?,
+        }),
+        _ => None,
     };
     let opts = UiOptions {
         workers: args.ui_workers,
@@ -1263,16 +1295,17 @@ fn start_ui(
         agent_allow_writes: args.agent_allow_writes,
         max_upload_bytes: args.ui_max_upload_mb.saturating_mul(1024 * 1024),
         storage,
+        tls,
         ..UiOptions::default()
     };
     let server = UiServer::bind((args.ui_host.as_str(), args.ui_port), db.clone(), opts)
         .map_err(|e| format!("cannot start the warehouse console: {e}"))?;
-    let addr = server.local_addr();
+    let url = server.url();
     let handle = server
         .spawn()
         .map_err(|e| format!("cannot start the warehouse console: {e}"))?;
     println!(
-        "pinkdb-server: warehouse console on http://{addr} ({})",
+        "pinkdb-server: warehouse console on {url} ({})",
         if args.ui_read_only {
             "read-only worksheets"
         } else {

@@ -56,15 +56,16 @@
 //!
 //! - The console is **off by default**: the operator turns it on explicitly
 //!   (`--enable-ui`).
-//! - It binds **127.0.0.1** unless told otherwise, and a **non-loopback
-//!   bind is refused** (see [`check_bind_policy`]): the console is a browser
-//!   UI and cannot use the server's TLS transport, so a non-localhost
-//!   exposure needs console TLS (wave 46) *and* RBAC (wave 48) first.
-//! - When the store **has users** (wave 48's RBAC catalog), the console
-//!   refuses to serve them unauthenticated (see [`check_auth_policy`]): the
-//!   operator must ask for HTTP Basic authentication (verified through the
-//!   engine's own password path, so the console's statements run under that
-//!   user's grants) or for a bearer token.
+//! - It binds **127.0.0.1** unless told otherwise. A **non-loopback bind
+//!   needs the console's own HTTPS** (`--ui-tls-cert` / `--ui-tls-key`, wave
+//!   121d) and sign-in (see [`check_bind_policy`]).
+//! - **Sign-in is the default** (wave 121d): the store's users and
+//!   passwords (verified through the engine, so the console's statements run
+//!   under that user's grants), an optional TOTP second factor, and personal
+//!   access tokens for scripts. A store without users starts in first-run
+//!   setup, guarded by a code the server prints. `--ui-auth none` serves a
+//!   store without users with no sign-in, on loopback only (see
+//!   [`check_auth_policy`]).
 //! - Serving without authentication prints a **loud warning**.
 //!
 //! # The preview renderer
@@ -80,12 +81,14 @@
 //! addition (a per-cell width cap, which a browser table needs and a
 //! terminal box does not).
 
+mod account;
 mod admin;
 mod api;
 mod ask;
 mod assets;
 mod auth;
 mod book;
+mod factors;
 mod html;
 mod policy;
 mod preview;
@@ -94,10 +97,15 @@ mod server;
 mod sessions;
 mod store;
 mod upload;
+mod vault;
 mod work;
 
 pub use policy::{ConsoleTls, UiAuth, UiError, check_auth_policy, check_bind_policy};
-pub use server::{LiveFacts, StorageInfo, UiHandle, UiOptions, UiServer, redact};
+pub use server::{LiveFacts, StorageInfo, UiHandle, UiOptions, UiServer, UiTls, redact};
+
+/// TOTP for the tests and embedders that drive a second factor (wave 121d).
+#[doc(hidden)]
+pub use factors::{step_of, totp_at};
 
 /// The test-only reactor hook (hidden from the docs).
 #[doc(hidden)]

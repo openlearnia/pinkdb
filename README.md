@@ -1821,11 +1821,14 @@ cargo build --release -p pinkdb-server --features ui
   `--memory-distill-every SECS` (with `--memory-extension`) drains the
   agent-memory queue in the background.
 
-**Who runs the SQL.** With `--ui-auth basic` every statement runs as the
-logged-in user, under that user's grants (the password is checked once, at
-login); `--ui-token` is an operator token; a store without users may be
-served without authentication (with a loud warning). `--ui-read-only`
-limits everyone to queries.
+**Who runs the SQL.** The console asks for sign-in by default, and every
+statement runs as the signed-in user, under that user's grants (the
+password is checked once, at sign-in). Users can add a TOTP second factor,
+scripts use personal access tokens (`Authorization: Bearer pdbt_…`), and a
+store without users starts in first-run setup with a code the server prints.
+`--ui-tls-cert`/`--ui-tls-key` serve HTTPS (and allow a non-loopback bind);
+`--ui-auth none` serves a store without users with no sign-in, on loopback.
+`--ui-read-only` limits everyone to queries.
 
 **Security.** Server-side sessions (`HttpOnly`, `SameSite=Strict` cookie),
 a CSRF token plus an `Origin` check on every `POST`, a `Host` check against
