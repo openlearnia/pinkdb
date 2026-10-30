@@ -41,7 +41,10 @@ and one GB for the Parquet files.
 
 The `ci` family compares against the committed `baseline-ci.json` and fails
 on a 2× query regression (or +5 ms), a 1.1× size increase, or a wrong
-answer. Refresh it deliberately with `--only ci --update-baseline`.
+answer. Binary sizes are kept per platform (`binary_bytes.darwin`,
+`binary_bytes.linux`: Mach-O and ELF builds differ); a platform without an
+entry is not size-checked. Refresh it deliberately with
+`--only ci --update-baseline` (on each platform whose size should change).
 
 ## Flags
 

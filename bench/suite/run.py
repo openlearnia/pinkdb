@@ -985,13 +985,22 @@ class Suite:
                 got = out[key]["median_ms"]
                 if base and got and got > max(2 * base, base + 5):
                     regressions.append(f"{key}: {got:.1f}ms vs baseline {base:.1f}ms")
-            if out["binary_bytes"] > baseline.get("binary_bytes", 0) * 1.1:
+            # Binary sizes differ by platform (Mach-O vs ELF, linkers), so the
+            # baseline keeps one per sys.platform; a platform without one is
+            # not checked (record it with --update-baseline on that platform).
+            base_bytes = (baseline.get("binary_bytes") or {}).get(sys.platform)
+            if base_bytes and out["binary_bytes"] > base_bytes * 1.1:
                 regressions.append(
-                    f"binary {out['binary_bytes']} B vs baseline {baseline.get('binary_bytes')} B"
+                    f"binary {out['binary_bytes']} B vs baseline {base_bytes} B ({sys.platform})"
                 )
         out["regressions"] = regressions
         if self.args.update_baseline or not baseline:
-            baseline_path.write_text(json.dumps(out, indent=2) + "\n")
+            record = dict(out)
+            record["binary_bytes"] = {
+                **((baseline or {}).get("binary_bytes") or {}),
+                sys.platform: out["binary_bytes"],
+            }
+            baseline_path.write_text(json.dumps(record, indent=2) + "\n")
             print(f"  ci baseline written to {baseline_path}", flush=True)
         self.results["ci"] = out
         for name, _ in queries:
