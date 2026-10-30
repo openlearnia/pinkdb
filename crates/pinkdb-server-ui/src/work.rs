@@ -164,13 +164,21 @@ fn auth_name(mode: &UiAuth) -> &'static str {
 
 // ---------- login ----------
 
-fn session_info(shared: &Shared, session: &UiSession) -> Response {
+/// The session's own answer; `admin` is read from the access catalog each
+/// time (a grant or revoke since the login counts at once).
+async fn session_info(shared: &Arc<Shared>, session: &Arc<UiSession>) -> Response {
+    let worker = Arc::clone(shared);
+    let who = Arc::clone(session);
+    let admin = tokio::task::spawn_blocking(move || crate::admin::session_is_admin(&worker, &who))
+        .await
+        .unwrap_or(false);
     json_ok(&SessionInfo {
         user: session.user.clone(),
         csrf: session.csrf().to_string(),
         auth: auth_name(shared.auth.mode()).to_string(),
         read_only: shared.opts.read_only,
         agent: crate::ask::agent_loaded(shared),
+        admin,
         max_shown_rows: shared.opts.max_shown_rows,
     })
 }
@@ -178,7 +186,7 @@ fn session_info(shared: &Shared, session: &UiSession) -> Response {
 /// `GET /api/session`: the cookie's session, or `401` with the login mode.
 pub async fn session(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     match cookie_session(&shared, &headers) {
-        Some(session) => session_info(&shared, &session),
+        Some(session) => session_info(&shared, &session).await,
         None => {
             let mut response = json_ok(&json!({
                 "error": "login required",
@@ -272,7 +280,7 @@ pub async fn login(
         }
     };
     let session = shared.sessions.create(identity, user);
-    let mut response = session_info(&shared, &session);
+    let mut response = session_info(&shared, &session).await;
     if let Ok(cookie) = HeaderValue::from_str(&set_session_cookie(
         Sessions::id_of(&session),
         shared.opts.secure_cookies,
@@ -405,6 +413,17 @@ fn statement_result(
     }
 }
 
+/// What the history keeps of a run's SQL: the text, unless it may carry a
+/// password (`CREATE USER … PASSWORD …`, `ALTER USER …`), which stays out of
+/// `pinkdb_worksheets`.
+fn history_text(sql: &str) -> String {
+    if sql.to_ascii_lowercase().contains("password") {
+        "-- (a statement with a password: not recorded)".to_string()
+    } else {
+        sql.to_string()
+    }
+}
+
 /// Is a client run id acceptable (short, URL-safe)?
 fn valid_run_id(id: &str) -> bool {
     !id.is_empty()
@@ -506,7 +525,7 @@ fn run_worksheet(
         shared.book.record_run(&RunRecord {
             owner: &session.user,
             worksheet_id: &body.worksheet_id,
-            sql: &body.sql,
+            sql: &history_text(&body.sql),
             started: started_at,
             elapsed: started.elapsed(),
             status,

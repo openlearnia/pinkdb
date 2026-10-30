@@ -146,7 +146,11 @@ jobs:
               cargo test -p pinkdb-server --features async-server
               cargo test -p pinkdb-server --features ui
               cargo test -p pinkdb-server --features ui,tls
+              # Wave 121b: imports (CSV/Parquet readers) and the console over
+              # lake catalogs (.pink, SQLite) with S3 data on the mock.
+              cargo test -p pinkdb-server --features ui,parquet,httpfs,catalog-sqlite,lake-s3
               ! cargo tree -p pinkdb-server | grep -q tokio
+              ! cargo tree -p pinkdb-server -e normal | grep -qE "pinkdb-parquet|pinkdb-httpfs"
           - name: vss
             run: |
               cargo test -p pinkdb-vss
@@ -235,6 +239,9 @@ jobs:
 
       - name: CLI Postgres catalog
         run: cargo test -p pinkdb-cli --features pinklake,s3,catalog-sqlite,catalog-postgres
+
+      - name: the console over a Postgres catalog (wave 121b)
+        run: cargo test -p pinkdb-server --features ui,catalog-postgres,catalog-sqlite --test console_storage
 
       # The default build must stay lean even after the feature tests above.
       - name: default build links no SQL or Postgres client

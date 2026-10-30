@@ -151,3 +151,120 @@ fn the_catalog_relation_lists_objects_a_session_may_read() {
             .is_err()
     );
 }
+
+/// Wave 121b: a `VALUES` list longer than one chunk (2,048 rows) is a row
+/// source like any other (it failed with "vector overflow" before).
+#[test]
+fn a_values_list_spans_several_chunks() {
+    let db = Database::new();
+    let mut conn = db.connect();
+    let list: Vec<String> = (0..5_000).map(|i| format!("({i}, 'r{i}')")).collect();
+    let values = list.join(", ");
+    let out = conn
+        .execute(&format!(
+            "SELECT count(*), sum(a), max(b) FROM (VALUES {values}) AS v(a, b)"
+        ))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        rows(out),
+        vec![vec![
+            Value::Bigint(5_000),
+            Value::Bigint(12_497_500),
+            Value::Varchar("r999".into())
+        ]]
+    );
+    conn.execute(&format!(
+        "CREATE TABLE v AS SELECT a, b FROM (VALUES {values}) AS v(a, b)"
+    ))
+    .unwrap();
+    let out = conn
+        .execute("SELECT count(*) FROM v WHERE a >= 2048")
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(rows(out), vec![vec![Value::Bigint(2_952)]]);
+    // Exactly one chunk, and empty, still work.
+    let one: Vec<String> = (0..2_048).map(|i| format!("({i})")).collect();
+    let out = conn
+        .execute(&format!(
+            "SELECT count(*) FROM (VALUES {}) AS v(a)",
+            one.join(",")
+        ))
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(rows(out), vec![vec![Value::Bigint(2_048)]]);
+}
+
+/// Wave 121b: `pinkdb_users()` and `pinkdb_grants()` show an administrator
+/// (or a trusted session) everything and anyone else only themselves and
+/// their roles.
+#[test]
+fn the_access_relations_show_each_principal_what_is_theirs() {
+    let db = Database::new();
+    db.connect()
+        .execute(
+            "CREATE TABLE t (a INTEGER); CREATE USER root PASSWORD 'pw'; GRANT ADMIN TO root; \
+             CREATE USER bob PASSWORD 'pw'; CREATE USER eve PASSWORD 'pw'; \
+             CREATE ROLE readers; GRANT SELECT ON TABLE main.t TO readers; \
+             GRANT readers TO bob; GRANT INSERT ON TABLE main.t TO eve; \
+             GRANT CREATE ON DATABASE main TO eve",
+        )
+        .unwrap();
+    let list = |conn: &mut pinkdb::Connection, sql: &str| -> Vec<String> {
+        rows(conn.execute(sql).unwrap().pop().unwrap())
+            .into_iter()
+            .map(|r| r.iter().map(Value::to_string).collect::<Vec<_>>().join("|"))
+            .collect()
+    };
+    let users =
+        "SELECT \"name\", \"kind\", \"is_admin\", \"roles\" FROM pinkdb_users() ORDER BY 2, 1";
+    let grants = "SELECT \"principal\", \"privilege\", \"object_type\", \"database\", \"name\" \
+                  FROM pinkdb_grants() ORDER BY 1, 2";
+    let mut trusted = db.connect();
+    assert_eq!(
+        list(&mut trusted, users),
+        vec![
+            "readers|ROLE|false|",
+            "bob|USER|false|readers",
+            "eve|USER|false|",
+            "root|USER|true|",
+        ]
+    );
+    assert_eq!(
+        list(&mut trusted, grants),
+        vec![
+            "bob|MEMBER|ROLE|NULL|readers",
+            "eve|CREATE|DATABASE|main|NULL",
+            "eve|INSERT|TABLE|main|t",
+            "readers|SELECT|TABLE|main|t",
+            "root|ADMIN|GLOBAL|NULL|NULL",
+        ]
+    );
+    let mut root = db.connect();
+    root.impersonate("root").unwrap();
+    assert_eq!(list(&mut root, grants).len(), 5);
+    let mut bob = db.connect();
+    bob.impersonate("bob").unwrap();
+    assert_eq!(
+        list(&mut bob, users),
+        vec!["readers|ROLE|false|", "bob|USER|false|readers"]
+    );
+    assert_eq!(
+        list(&mut bob, grants),
+        vec![
+            "bob|MEMBER|ROLE|NULL|readers",
+            "readers|SELECT|TABLE|main|t"
+        ]
+    );
+    let mut eve = db.connect();
+    eve.impersonate("eve").unwrap();
+    assert_eq!(list(&mut eve, users), vec!["eve|USER|false|"]);
+    assert!(
+        db.connect()
+            .execute("SELECT * FROM pinkdb_users(1)")
+            .is_err()
+    );
+}

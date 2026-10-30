@@ -9,6 +9,25 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 121b — the console: access control, imports, storage ✅
+
+- An **Access** tab lists users, roles and grants (from the new
+  `pinkdb_users()` and `pinkdb_grants()` relations; a non-admin sees only
+  themselves and their roles) and lets administrators create users and
+  roles, change passwords, grant and revoke — each action a statement run as
+  the user, so RBAC decides. Passwords never reach the run history.
+- **Import**: CSV or Parquet from a server path, `https://` or `s3://`
+  (preview, then create, replace or append; administrators, as file reads
+  are) or uploaded from the browser (parsed by the server and written as the
+  user, with the `CREATE` / `INSERT` grants a `CREATE TABLE AS` or an
+  `INSERT` needs). New `pinkdb-server` features `httpfs` and `parquet`;
+  `--ui-max-upload-mb`.
+- **Storage**: memory, a durable `.pink` file, or a lake catalog (`.pink`,
+  SQLite, Postgres; local or S3 data) with its published version, passwords
+  masked; a Checkpoint button. The console is tested over every backend.
+- Fixed: a `VALUES` list of more than 2,048 rows as a row source failed with
+  "vector overflow".
+
 ### Wave 121 — the warehouse console: SQL worksheets, catalog, ask ✅
 
 - `pinkdb-server --enable-ui` (a build with the `ui` feature) now serves a

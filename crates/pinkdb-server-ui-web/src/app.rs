@@ -174,6 +174,10 @@ fn TopBar() -> impl IntoView {
                 }>{databases}</select>
             </label>
             {move || app.read_only().then(|| view! { <span class="badge">"read-only"</span> })}
+            {move || {
+                (!app.read_only())
+                    .then(|| view! { <button on:click=move |_| app.import_open.set(true)>"Import"</button> })
+            }}
             <span class="notice">{move || app.notice.get()}</span>
             <span class="spacer"></span>
             {move || {
@@ -332,5 +336,6 @@ fn Workspace() -> impl IntoView {
             </section>
             {move || app.ask_open.get().then(|| view! { <AskPanel /> })}
         </main>
+        {move || app.import_open.get().then(|| view! { <crate::import::ImportDialog /> })}
     }
 }

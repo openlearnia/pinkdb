@@ -169,6 +169,9 @@ struct Args {
     /// user's grants).
     #[cfg(feature = "ui")]
     agent_allow_writes: bool,
+    /// `--ui-max-upload-mb N`: the largest file an upload may send.
+    #[cfg(feature = "ui")]
+    ui_max_upload_mb: usize,
     /// `--agent-extension PATH`: load the data agent for the console's ask box.
     agent_extension: Option<String>,
     /// `--memory-extension PATH`: load the agent memory.
@@ -262,6 +265,7 @@ fn usage() -> &'static str {
      \x20                        SHOW, USE) for every user, whatever their grants\n\
      \x20 --ui-allowed-host NAME  another Host name the console answers to (a reverse\n\
      \x20                        proxy's); loopback names and the bind address always are\n\
+     \x20 --ui-max-upload-mb N  the largest file the console's Import may upload (default 64)\n\
      \x20 --agent-extension PATH  load the data agent (libpinkdb_agent) for the console's\n\
      \x20                        ask box; the provider and its key come from this\n\
      \x20                        process's environment and never reach the browser\n\
@@ -340,6 +344,8 @@ fn parse_args() -> Result<Args, String> {
         ui_allowed_hosts: Vec::new(),
         #[cfg(feature = "ui")]
         agent_allow_writes: false,
+        #[cfg(feature = "ui")]
+        ui_max_upload_mb: 64,
         agent_extension: None,
         memory_extension: None,
         memory_distill_every: None,
@@ -592,6 +598,22 @@ fn parse_args() -> Result<Args, String> {
                 }
                 #[cfg(not(feature = "ui"))]
                 {
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--ui-max-upload-mb" => {
+                let raw = value("--ui-max-upload-mb")?;
+                #[cfg(feature = "ui")]
+                {
+                    args.ui_max_upload_mb = raw
+                        .parse()
+                        .ok()
+                        .filter(|n: &usize| *n > 0)
+                        .ok_or_else(|| format!("invalid --ui-max-upload-mb value {raw:?}"))?;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    let _ = raw;
                     return Err(ui_feature_missing());
                 }
             }
@@ -905,6 +927,14 @@ fn main() -> ExitCode {
         None => None,
     };
 
+    // The import readers (wave 121b) register process-wide before any store
+    // opens, as the CLI does: a durable open may replay a statement that read
+    // a file.
+    #[cfg(feature = "parquet")]
+    pinkdb_parquet::ensure_registered();
+    #[cfg(feature = "httpfs")]
+    pinkdb_httpfs::ensure_registered();
+
     // A durable open replays the WAL, which may write to a checkpointed
     // vector graph; the owning package must be registered before that.
     #[cfg(feature = "vss")]
@@ -1056,7 +1086,18 @@ fn main() -> ExitCode {
     // would be a silent downgrade.
     #[cfg(feature = "ui")]
     let _ui_handle = if args.enable_ui {
-        match start_ui(&args, &db) {
+        #[cfg(feature = "catalog")]
+        let version = catalog_store.as_ref().map(CatalogStore::version_reader);
+        #[cfg(not(feature = "catalog"))]
+        let version = None;
+        let storage = pinkdb_server::ui::storage_info(
+            args.file.as_deref(),
+            args.catalog.as_deref(),
+            args.data.as_deref(),
+            version,
+            import_formats(),
+        );
+        match start_ui(&args, &db, storage) {
             Ok(handle) => Some(handle),
             Err(msg) => {
                 eprintln!("Error: {msg}");
@@ -1181,9 +1222,31 @@ fn main() -> ExitCode {
     }
 }
 
+/// What an import can read in this build (the Storage panel and the Import
+/// dialog show it): `upload:` formats the console parses itself, `url:`
+/// formats a statement reads from a server path, `https://` or `s3://`.
+#[cfg(feature = "ui")]
+fn import_formats() -> Vec<String> {
+    let mut formats = vec!["upload:csv".to_string()];
+    if cfg!(feature = "parquet") {
+        formats.push("upload:parquet".to_string());
+    }
+    if cfg!(feature = "httpfs") {
+        formats.push("url:csv".to_string());
+    }
+    if cfg!(feature = "parquet") {
+        formats.push("url:parquet".to_string());
+    }
+    formats
+}
+
 /// Start the warehouse console (waves 78 and 121).
 #[cfg(feature = "ui")]
-fn start_ui(args: &Args, db: &Database) -> Result<pinkdb_server::ui::UiHandle, String> {
+fn start_ui(
+    args: &Args,
+    db: &Database,
+    storage: pinkdb_server::ui::StorageInfo,
+) -> Result<pinkdb_server::ui::UiHandle, String> {
     use pinkdb_server::ui::{UiAuth, UiOptions, UiServer};
     let auth = match (&args.ui_token, args.ui_auth_basic) {
         (Some(token), _) => UiAuth::Token(token.clone()),
@@ -1198,6 +1261,8 @@ fn start_ui(args: &Args, db: &Database) -> Result<pinkdb_server::ui::UiHandle, S
         read_only: args.ui_read_only,
         allowed_hosts: args.ui_allowed_hosts.clone(),
         agent_allow_writes: args.agent_allow_writes,
+        max_upload_bytes: args.ui_max_upload_mb.saturating_mul(1024 * 1024),
+        storage,
         ..UiOptions::default()
     };
     let server = UiServer::bind((args.ui_host.as_str(), args.ui_port), db.clone(), opts)

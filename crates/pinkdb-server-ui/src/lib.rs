@@ -80,6 +80,7 @@
 //! addition (a per-cell width cap, which a browser table needs and a
 //! terminal box does not).
 
+mod admin;
 mod api;
 mod ask;
 mod assets;
@@ -92,10 +93,11 @@ mod security;
 mod server;
 mod sessions;
 mod store;
+mod upload;
 mod work;
 
 pub use policy::{ConsoleTls, UiAuth, UiError, check_auth_policy, check_bind_policy};
-pub use server::{UiHandle, UiOptions, UiServer};
+pub use server::{LiveFacts, StorageInfo, UiHandle, UiOptions, UiServer, redact};
 
 /// The test-only reactor hook (hidden from the docs).
 #[doc(hidden)]

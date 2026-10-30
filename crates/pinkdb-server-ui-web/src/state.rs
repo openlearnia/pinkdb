@@ -27,6 +27,8 @@ pub enum Side {
     Catalog,
     Worksheets,
     History,
+    Access,
+    Storage,
 }
 
 /// One open worksheet tab.
@@ -100,6 +102,10 @@ pub struct App {
     /// Text the editor should insert at its cursor (the catalog and the ask
     /// box set it; the editor takes it).
     pub insert: RwSignal<Option<String>>,
+    /// The Import dialog is open.
+    pub import_open: RwSignal<bool>,
+    /// Bumped when the access catalog changed (the Access panel reloads).
+    pub access_epoch: RwSignal<u64>,
 }
 
 impl App {
@@ -118,12 +124,45 @@ impl App {
             notice: RwSignal::new(String::new()),
             next_key: RwSignal::new(1),
             insert: RwSignal::new(None),
+            import_open: RwSignal::new(false),
+            access_epoch: RwSignal::new(0),
         }
     }
 
     pub fn csrf(&self) -> String {
         self.session
             .with_untracked(|s| s.as_ref().map(|s| s.csrf.clone()).unwrap_or_default())
+    }
+
+    pub fn admin(&self) -> bool {
+        self.session.with(|s| s.as_ref().is_some_and(|s| s.admin))
+    }
+
+    /// Run one statement outside any worksheet (an Access or Import action),
+    /// as the session user; `done` gets the outcome line or the error.
+    pub fn run_statement(&self, sql: String, done: impl FnOnce(Result<String, String>) + 'static) {
+        let request = QueryRequest {
+            sql,
+            db: Some(self.db.get_untracked()).filter(|d| !d.is_empty()),
+            run_id: api::run_id(),
+            worksheet_id: String::new(),
+        };
+        let csrf = self.csrf();
+        spawn_local(async move {
+            let outcome = match api::post::<_, QueryResponse>("/api/query", &request, &csrf).await {
+                Ok(response) => match response.error {
+                    Some(error) => Err(error.message),
+                    None => Ok(response
+                        .results
+                        .iter()
+                        .map(|r| r.message.clone())
+                        .collect::<Vec<_>>()
+                        .join("; ")),
+                },
+                Err(e) => Err(e.message),
+            };
+            done(outcome);
+        });
     }
 
     pub fn read_only(&self) -> bool {

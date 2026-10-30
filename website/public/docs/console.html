@@ -243,6 +243,34 @@ to every statement — or <code>--ui-token &lt;secret&gt;</code>.
   button, and the answer.</li>
 </ul>
 
+<h2 id="access-imports-and-storage">Access, imports and storage<a class="anchor" href="#access-imports-and-storage" aria-label="Permalink: Access, imports and storage">#</a></h2>
+
+<ul>
+  <li><strong>Access</strong> (a sidebar tab) lists users, roles and grants — an
+  administrator sees everyone, anyone else only themselves and their roles.
+  Administrators get forms: a new user (the password never reaches the run
+  history), a new role, and a grant of a table privilege, <code>CREATE</code> on a
+  database, a role membership or <code>ADMIN</code>; each grant row has a
+  <em>revoke</em> button. Every action is a statement run as you, so RBAC
+  decides.</li>
+  <li><strong>Import</strong> (the top bar, or the Storage tab) opens a dialog with
+  two tabs. <em>From a path or URL</em> takes a server path, an
+  <code>https://</code> URL or an <code>s3://</code> key, previews the first rows with
+  their types, and loads them into a table — create, replace or append.
+  <em>Upload a file</em> sends a CSV or Parquet file from your machine; the
+  server parses it and writes the rows as you.</li>
+  <li><strong>Storage</strong> shows what the server stores into: memory, a durable
+  <code>.pink</code> file, or a lake catalog (<code>.pink</code>, SQLite, Postgres) with
+  its data location (local or S3) and published version. Passwords in a
+  catalog URL are shown as <code>***</code>. A <em>Checkpoint</em> button folds the WAL
+  into the file.</li>
+</ul>
+
+<p>Imports from a path or URL need a server built with
+<code>--features ui,parquet,httpfs</code>, and an administrator (file and URL reads are
+administrator-only). An upload needs only the <code>CREATE</code> privilege on the
+database (or <code>INSERT</code> to append).</p>
+
 <h2 id="keys">Keys<a class="anchor" href="#keys" aria-label="Permalink: Keys">#</a></h2>
 
 <table>
@@ -298,6 +326,7 @@ turns go to the user's <a href="../docs/memory">agent memory</a>, and
 <ul>
   <li><a href="#start-it">Start it</a></li>
   <li><a href="#what-you-see">What you see</a></li>
+  <li><a href="#access-imports-and-storage">Access, imports and storage</a></li>
   <li><a href="#keys">Keys</a></li>
   <li><a href="#security">Security</a></li>
   <li><a href="#the-ask-box">The ask box</a></li>

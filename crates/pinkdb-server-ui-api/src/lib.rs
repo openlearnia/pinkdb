@@ -36,6 +36,10 @@ pub struct SessionInfo {
     pub read_only: bool,
     /// The agent extension is loaded.
     pub agent: bool,
+    /// The session's identity is an administrator (or the trusted operator
+    /// session): the Access and Storage panels offer admin actions.
+    #[serde(default)]
+    pub admin: bool,
     /// The rows of one result the browser gets.
     pub max_shown_rows: usize,
 }
@@ -241,6 +245,84 @@ pub struct Catalog {
     pub current: String,
     pub databases: Vec<String>,
     pub objects: Vec<CatalogObject>,
+}
+
+// ---------- access control (wave 121b) ----------
+
+/// One row of `pinkdb_users()`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Principal {
+    pub name: String,
+    /// `USER` or `ROLE`.
+    pub kind: String,
+    pub is_admin: bool,
+    /// Direct role memberships, comma-separated.
+    pub roles: String,
+}
+
+/// One row of `pinkdb_grants()`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GrantRow {
+    pub principal: String,
+    /// `SELECT`…`CREATE`, `ADMIN`, or `MEMBER` (a role membership).
+    pub privilege: String,
+    /// `TABLE`, `DATABASE`, `GLOBAL` or `ROLE`.
+    pub object_type: String,
+    pub database: Option<String>,
+    pub name: Option<String>,
+}
+
+/// `GET /api/access`: what the session may see of the access catalog.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Access {
+    pub me: String,
+    pub admin: bool,
+    pub principals: Vec<Principal>,
+    pub grants: Vec<GrantRow>,
+}
+
+/// `POST /api/access/user`: create a user, or (`alter`) set a user's
+/// password. Not a worksheet statement, so the password is never recorded
+/// in the run history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UserRequest {
+    pub name: String,
+    pub password: String,
+    #[serde(default)]
+    pub alter: bool,
+}
+
+// ---------- storage (wave 121b) ----------
+
+/// One labelled fact about the store's storage.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StorageFact {
+    pub label: String,
+    pub value: String,
+}
+
+/// `GET /api/storage`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Storage {
+    /// `in-memory`, `durable` or `lake`.
+    pub mode: String,
+    /// The store file or the lake catalog (secrets redacted).
+    pub location: String,
+    pub facts: Vec<StorageFact>,
+    /// File and URL formats an import can read in this server build.
+    pub import_formats: Vec<String>,
+}
+
+// ---------- uploads (wave 121b) ----------
+
+/// The answer to `POST /api/upload`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UploadResult {
+    pub database: String,
+    pub table: String,
+    pub rows: u64,
+    pub columns: Vec<ResultColumn>,
+    pub elapsed_ms: f64,
 }
 
 // ---------- the agent ----------

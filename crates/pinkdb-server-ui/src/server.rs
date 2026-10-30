@@ -54,6 +54,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
 use tower_service::Service;
 
+use crate::admin;
 use crate::api;
 use crate::ask;
 use crate::assets;
@@ -63,6 +64,7 @@ use crate::policy::{ConsoleTls, UiAuth, UiError, check_auth_policy, check_bind_p
 use crate::security;
 use crate::sessions::Sessions;
 use crate::store::Session;
+use crate::upload;
 use crate::work;
 
 /// Maximum number of request headers (hyper's HTTP/1.1 builder).
@@ -146,6 +148,108 @@ pub struct UiOptions {
     /// the user's grants, never the transcript database, and never with
     /// [`Self::read_only`]).
     pub agent_allow_writes: bool,
+    /// The largest file an upload may send (wave 121b).
+    pub max_upload_bytes: usize,
+    /// What the Storage panel reports about the store (wave 121b).
+    pub storage: StorageInfo,
+}
+
+/// Storage facts read at request time (`(label, value)` pairs).
+pub type LiveFacts = std::sync::Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>;
+
+/// What the server tells the console about its store (wave 121b): the
+/// Storage panel's facts. The host fills it (the server binary knows whether
+/// it serves a file, a lake catalog or memory); secrets must already be
+/// redacted (see [`redact`]).
+#[derive(Clone, Default)]
+pub struct StorageInfo {
+    /// `in-memory`, `durable` or `lake`.
+    pub mode: String,
+    /// The store file or the lake catalog.
+    pub location: String,
+    /// Fixed facts (`catalog backend`, `data`).
+    pub facts: Vec<(String, String)>,
+    /// Facts read at request time (a lake's published version).
+    pub live: Option<LiveFacts>,
+    /// The formats an import can read in this build (`csv`, `parquet`).
+    pub import_formats: Vec<String>,
+}
+
+impl std::fmt::Debug for StorageInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageInfo")
+            .field("mode", &self.mode)
+            .field("location", &self.location)
+            .field("facts", &self.facts)
+            .field("import_formats", &self.import_formats)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Redact the secrets a storage location may carry: the password of a
+/// `scheme://user:password@host` URL and `password=` / `secret=` / `token=`
+/// query or connection-string parameters.
+pub fn redact(location: &str) -> String {
+    let mut out = location.to_string();
+    if let Some(scheme) = out.find("://") {
+        let rest_start = scheme + 3;
+        let authority_end = out[rest_start..]
+            .find(['/', '?', '#'])
+            .map_or(out.len(), |i| rest_start + i);
+        if let Some(at) = out[rest_start..authority_end].rfind('@') {
+            let userinfo = &out[rest_start..rest_start + at];
+            if let Some(colon) = userinfo.find(':') {
+                let start = rest_start + colon + 1;
+                out.replace_range(start..rest_start + at, "***");
+            }
+        }
+    }
+    // `key=value` secrets, case-insensitive, up to the next separator.
+    // `to_ascii_lowercase` keeps byte offsets, so `lower` indexes `out`.
+    const KEYS: [&str; 4] = ["password=", "secret=", "token=", "sslpassword="];
+    let lower = out.to_ascii_lowercase();
+    let mut result = String::with_capacity(out.len());
+    let mut i = 0;
+    while i < out.len() {
+        let at_word = i == 0 || !lower.as_bytes()[i - 1].is_ascii_alphanumeric();
+        if at_word && let Some(key) = KEYS.iter().find(|key| lower[i..].starts_with(*key)) {
+            result.push_str(&out[i..i + key.len()]);
+            i += key.len();
+            result.push_str("***");
+            i = out[i..]
+                .find(['&', ' ', ';'])
+                .map_or(out.len(), |end| i + end);
+            continue;
+        }
+        let c = out[i..].chars().next().unwrap_or('\0');
+        result.push(c);
+        i += c.len_utf8().max(1);
+    }
+    result
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact;
+
+    #[test]
+    fn secrets_are_redacted() {
+        assert_eq!(
+            redact("postgres://pink:hunter2@db.local:5432/lake"),
+            "postgres://pink:***@db.local:5432/lake"
+        );
+        assert_eq!(
+            redact("host=db user=pink password=hunter2 dbname=lake"),
+            "host=db user=pink password=*** dbname=lake"
+        );
+        assert_eq!(
+            redact("https://x/lake?token=abc&region=eu"),
+            "https://x/lake?token=***&region=eu"
+        );
+        assert_eq!(redact("s3://bucket/prefix"), "s3://bucket/prefix");
+        assert_eq!(redact("/data/store.pink"), "/data/store.pink");
+        assert_eq!(redact("postgres://pink@db/lake"), "postgres://pink@db/lake");
+    }
 }
 
 impl Default for UiOptions {
@@ -176,6 +280,11 @@ impl Default for UiOptions {
             secure_cookies: false,
             allow_external_services: false,
             agent_allow_writes: false,
+            max_upload_bytes: 64 * 1024 * 1024,
+            storage: StorageInfo {
+                mode: "in-memory".to_string(),
+                ..StorageInfo::default()
+            },
         }
     }
 }
@@ -452,6 +561,7 @@ async fn serve_connection(
         router: app,
         peer,
         max_body_bytes: opts.max_body_bytes,
+        max_upload_bytes: opts.max_upload_bytes,
         request_timeout: opts.request_timeout,
     };
     let mut builder = http1::Builder::new();
@@ -526,6 +636,22 @@ fn build_router(shared: Arc<Shared>) -> Router {
             "/api/catalog",
             get(work::catalog).fallback(method_not_allowed),
         )
+        .route(
+            "/api/access",
+            get(admin::access).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/access/user",
+            post(admin::user).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/storage",
+            get(admin::storage).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/upload",
+            post(upload::upload).fallback(method_not_allowed),
+        )
         .route("/api/agent", get(ask::info).fallback(method_not_allowed))
         .route("/api/ask", post(ask::ask).fallback(method_not_allowed))
         .route("/", get(api::shell).fallback(method_not_allowed))
@@ -575,13 +701,17 @@ struct PeerService {
     router: Router,
     peer: SocketAddr,
     max_body_bytes: usize,
+    max_upload_bytes: usize,
     request_timeout: Duration,
 }
 
 /// The routes that may run longer than `request_timeout`: worksheet SQL, an
 /// export and an agent run (each bounded by its own statement deadlines).
 fn long_route(path: &str) -> bool {
-    matches!(path, "/api/query" | "/api/export" | "/api/ask")
+    matches!(
+        path,
+        "/api/query" | "/api/export" | "/api/ask" | "/api/upload"
+    )
 }
 
 impl Service<hyper::Request<Incoming>> for PeerService {
@@ -601,14 +731,19 @@ impl Service<hyper::Request<Incoming>> for PeerService {
         // The console reads no body at all, but a request that *declares* one
         // over the limit is refused at the edge: the body is never buffered
         // and never read.
+        // An upload may send a file; every other request a small JSON body.
+        let limit = if req.uri().path() == "/api/upload" {
+            self.max_upload_bytes
+        } else {
+            self.max_body_bytes
+        };
         if let Some(declared) = req
             .headers()
             .get(header::CONTENT_LENGTH)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<usize>().ok())
-            && declared > self.max_body_bytes
+            && declared > limit
         {
-            let limit = self.max_body_bytes;
             return Box::pin(async move {
                 Ok(api::json_error(
                     StatusCode::PAYLOAD_TOO_LARGE,

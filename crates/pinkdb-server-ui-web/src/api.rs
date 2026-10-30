@@ -136,6 +136,33 @@ pub async fn post_raw<B: Serialize>(
     }
 }
 
+/// `POST path` with a file as the body (an upload), as JSON.
+pub async fn post_file<T: DeserializeOwned>(
+    path: &str,
+    file: &web_sys::File,
+    csrf: &str,
+) -> Result<T, ApiError> {
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_credentials(RequestCredentials::SameOrigin);
+    let headers = web_sys::Headers::new().map_err(js_error)?;
+    headers
+        .set("Accept", "application/json")
+        .map_err(js_error)?;
+    headers
+        .set("Content-Type", "application/octet-stream")
+        .map_err(js_error)?;
+    headers.set("X-CSRF-Token", csrf).map_err(js_error)?;
+    init.set_headers(&headers);
+    init.set_body(file);
+    let request = Request::new_with_str_and_init(path, &init).map_err(js_error)?;
+    let window = web_sys::window().ok_or_else(|| js_error(JsValue::from_str("no window")))?;
+    let response = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(js_error)?;
+    decode(response.dyn_into::<Response>().map_err(js_error)?).await
+}
+
 /// Read a streamed body chunk by chunk; `on_text` gets each piece of text
 /// (UTF-8 sequences split across chunks are joined first).
 pub async fn read_stream(

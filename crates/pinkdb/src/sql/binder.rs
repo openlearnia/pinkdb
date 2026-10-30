@@ -12,7 +12,7 @@
 //! - Comparisons need both-numeric, both-VARCHAR, or both-BOOLEAN (equality).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -9984,6 +9984,9 @@ fn bind_table_function(
     if name.eq_ignore_ascii_case("pinkdb_catalog") {
         return bind_catalog(db, binder, args, alias);
     }
+    if name.eq_ignore_ascii_case("pinkdb_users") || name.eq_ignore_ascii_case("pinkdb_grants") {
+        return bind_access(db, binder, &name.to_ascii_lowercase(), args, alias);
+    }
     let call = TableFunctionCall::Function {
         name: name.to_string(),
         args: args.to_vec(),
@@ -10159,6 +10162,174 @@ fn bind_catalog(
         name: alias
             .clone()
             .unwrap_or_else(|| "pinkdb_catalog".to_string())
+            .to_ascii_lowercase(),
+        original: None,
+        db: None,
+        is_alias: alias.is_some(),
+        qualified_only: false,
+        columns: names.iter().cloned().zip(types.iter().copied()).collect(),
+    };
+    Ok((
+        scope,
+        LogicalPlan::Values {
+            rows,
+            names,
+            types,
+            sources: Vec::new(),
+        },
+    ))
+}
+
+/// `pinkdb_users()` and `pinkdb_grants()` (wave 121b): the store's users and
+/// roles, and every grant, for an access-control panel.
+///
+/// `pinkdb_users()`: `name`, `kind` (`USER`/`ROLE`), `is_admin` (directly or
+/// through a role), `roles` (the roles it is a direct member of).
+/// `pinkdb_grants()`: `principal`, `privilege` (`SELECT`… `CREATE`, `ADMIN`,
+/// or `MEMBER` for a role membership), `object_type` (`TABLE`, `DATABASE`,
+/// `GLOBAL`, `ROLE`), `database`, `name`.
+///
+/// A trusted session or an administrator sees every row. Anyone else sees
+/// only rows about themselves and the roles they hold: the catalog of other
+/// principals is not theirs to read. Passwords never appear (the store keeps
+/// only their hashes, and not here either).
+fn bind_access(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    which: &str,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    if !args.is_empty() {
+        return Err(PinkDbError::Type(format!("{which}() takes no arguments")));
+    }
+    let rbac = db.rbac();
+    let viewer = binder.session.principal().map(|p| p.to_ascii_lowercase());
+    let sees_all = viewer
+        .as_deref()
+        .is_none_or(|me| rbac.is_admin_resolved(me));
+    let visible: BTreeSet<String> = match viewer.as_deref() {
+        Some(me) if !sees_all => {
+            let mut set = rbac.roles_of(me);
+            set.insert(me.to_string());
+            set
+        }
+        _ => BTreeSet::new(),
+    };
+    let shown = |key: &str| sees_all || visible.contains(key);
+    let text = |v: &str| BoundExpr::Literal(Value::Varchar(v.to_string()));
+    let null = || BoundExpr::Literal(Value::Null);
+    let mut rows: Vec<Vec<BoundExpr>> = Vec::new();
+    let names: Vec<String>;
+    let types: Vec<DataType>;
+    if which == "pinkdb_users" {
+        names = ["name", "kind", "is_admin", "roles"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        types = vec![
+            DataType::Varchar,
+            DataType::Varchar,
+            DataType::Boolean,
+            DataType::Varchar,
+        ];
+        let direct_roles = |key: &str| {
+            rbac.memberships
+                .get(key)
+                .map(|roles| {
+                    roles
+                        .iter()
+                        .map(|r| rbac.display_of(r))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default()
+        };
+        for (key, user) in &rbac.users {
+            if shown(key) {
+                rows.push(vec![
+                    text(&user.name),
+                    text("USER"),
+                    BoundExpr::Literal(Value::Boolean(rbac.is_admin_resolved(key))),
+                    text(&direct_roles(key)),
+                ]);
+            }
+        }
+        for (key, display) in &rbac.roles {
+            if shown(key) {
+                rows.push(vec![
+                    text(display),
+                    text("ROLE"),
+                    BoundExpr::Literal(Value::Boolean(rbac.is_admin_resolved(key))),
+                    text(&direct_roles(key)),
+                ]);
+            }
+        }
+    } else {
+        names = ["principal", "privilege", "object_type", "database", "name"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        types = vec![DataType::Varchar; 5];
+        for key in &rbac.admins {
+            if shown(key) {
+                rows.push(vec![
+                    text(&rbac.display_of(key)),
+                    text("ADMIN"),
+                    text("GLOBAL"),
+                    null(),
+                    null(),
+                ]);
+            }
+        }
+        for (member, roles) in &rbac.memberships {
+            if shown(member) {
+                for role in roles {
+                    rows.push(vec![
+                        text(&rbac.display_of(member)),
+                        text("MEMBER"),
+                        text("ROLE"),
+                        null(),
+                        text(&rbac.display_of(role)),
+                    ]);
+                }
+            }
+        }
+        for (dbname, grants) in &rbac.database_grants {
+            for (principal, privileges) in grants {
+                if shown(principal) {
+                    for privilege in privileges {
+                        rows.push(vec![
+                            text(&rbac.display_of(principal)),
+                            text(privilege.keyword()),
+                            text("DATABASE"),
+                            text(dbname),
+                            null(),
+                        ]);
+                    }
+                }
+            }
+        }
+        for ((dbname, table), grants) in &rbac.table_grants {
+            for (principal, privileges) in grants {
+                if shown(principal) {
+                    for privilege in privileges {
+                        rows.push(vec![
+                            text(&rbac.display_of(principal)),
+                            text(privilege.keyword()),
+                            text("TABLE"),
+                            text(dbname),
+                            text(table),
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+    let scope = ScopeTable {
+        name: alias
+            .clone()
+            .unwrap_or_else(|| which.to_string())
             .to_ascii_lowercase(),
         original: None,
         db: None,

@@ -33,6 +33,7 @@ pub fn Sidebar() -> impl IntoView {
                         Side::History => app.load_history(),
                         Side::Worksheets => app.load_worksheets(false),
                         Side::Catalog => app.load_catalog(),
+                        Side::Access | Side::Storage => {}
                     }
                 }
             >
@@ -44,13 +45,17 @@ pub fn Sidebar() -> impl IntoView {
         <aside class="sidebar">
             <div class="stabs">
                 {tab("Catalog", Side::Catalog)}
-                {tab("Worksheets", Side::Worksheets)}
+                {tab("Sheets", Side::Worksheets)}
                 {tab("History", Side::History)}
+                {tab("Access", Side::Access)}
+                {tab("Storage", Side::Storage)}
             </div>
             {move || match app.side.get() {
                 Side::Catalog => view! { <CatalogTree /> }.into_any(),
                 Side::Worksheets => view! { <Worksheets /> }.into_any(),
                 Side::History => view! { <History /> }.into_any(),
+                Side::Access => view! { <crate::access::AccessPanel /> }.into_any(),
+                Side::Storage => view! { <crate::access::StoragePanel /> }.into_any(),
             }}
         </aside>
     }

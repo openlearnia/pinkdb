@@ -139,6 +139,13 @@ impl CatalogStore {
     pub fn version(&self) -> u64 {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).version
     }
+
+    /// A reader of [`CatalogStore::version`] that outlives the borrow (the
+    /// console's Storage panel reads it per request).
+    pub fn version_reader(&self) -> std::sync::Arc<dyn Fn() -> u64 + Send + Sync> {
+        let state = Arc::clone(&self.state);
+        std::sync::Arc::new(move || state.lock().unwrap_or_else(|p| p.into_inner()).version)
+    }
 }
 
 impl Drop for CatalogStore {

@@ -1802,6 +1802,17 @@ cargo build --release -p pinkdb-server --features ui
 - **Catalog**: tables, views, materialized views, indexes (hash and HNSW),
   triggers, macros and attached lake tables, with column statistics — the
   new `pinkdb_catalog()` relation plus `pinkdb_column_stats()`.
+- **Access** (121b): users, roles and grants from `pinkdb_users()` /
+  `pinkdb_grants()` (each user sees only themselves unless an admin);
+  admins create users and roles, grant and revoke — every action is a
+  statement run as the user, so RBAC decides.
+- **Import** (121b): CSV or Parquet from a server path, `https://` or `s3://`
+  (with the `httpfs` / `parquet` server features; admin-only, as file reads
+  are), or uploaded from the browser (parsed by the server and written as
+  the user with `CREATE`/`INSERT` grants).
+- **Storage** (121b): memory, a durable `.pink` file, or a lake catalog
+  (`.pink`, SQLite, Postgres; local or S3 data) with its published version —
+  credentials masked.
 - **Ask**: with `--agent-extension libpinkdb_agent…` the console runs the
   data agent as the logged-in user and streams each statement the model
   runs and its answer. Providers and keys come from the server's
@@ -1824,7 +1835,7 @@ policy of wave 78 stays: loopback-only (no console TLS yet), and a store with
 users is never served unauthenticated.
 
 The browser app is Rust — [Leptos](https://leptos.dev) compiled to
-WebAssembly, 255 KB gzipped — embedded in the binary (no CDN);
+WebAssembly, 303 KB gzipped — embedded in the binary (no CDN);
 `scripts/build-console.sh` rebuilds it. See
 [`docs/server-ui.md`](docs/server-ui.md) for the endpoints, the limits and
 a demo with a TPC-H store.

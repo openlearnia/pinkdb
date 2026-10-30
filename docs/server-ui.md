@@ -7,8 +7,9 @@ feature, so the default server binary is unchanged (the console crate is not
 even compiled without the feature).
 
 ```sh
-# build the server with the console (the `ui` feature is off by default)
-cargo build --release -p pinkdb-server --features ui
+# build the server with the console (the `ui` feature is off by default);
+# add `parquet,httpfs` for imports from paths, https:// and s3://
+cargo build --release -p pinkdb-server --features ui,parquet,httpfs
 
 # serve the console next to the protocol, on 127.0.0.1:8080
 ./target/release/pinkdb-server --file warehouse.pink --enable-ui
@@ -56,6 +57,15 @@ agent.
 - **Ask.** A question to the data agent, answered live: each statement the
   model runs appears with its reply and a "Copy SQL into worksheet" button,
   then the answer. See [the ask box](#the-ask-box).
+- **Access** (wave 121b). Users, roles and grants; administrators create
+  users and roles, change passwords, grant and revoke. See
+  [access control](#access-control).
+- **Import** (wave 121b). A CSV or Parquet file from a server path,
+  `https://` or `s3://` (preview, then create, replace or append), or
+  uploaded from the browser. See [imports](#imports).
+- **Storage** (wave 121b). What the server stores into — memory, a durable
+  `.pink` file, or a lake catalog (`.pink`, SQLite or Postgres) with local or
+  S3 data — and the lake's published version; a Checkpoint button.
 
 ## Who runs the SQL
 
@@ -115,6 +125,62 @@ it through your browser, and stored data must never become markup.
   (below). Worksheets live in `pinkdb_worksheets`; a user's own SQL reaches
   those rows only through grants (administrators), and the console serves
   each user only their own and those shared with them.
+
+## Access control
+
+The Access tab reads the engine's `pinkdb_users()` (name, kind, admin,
+roles) and `pinkdb_grants()` (principal, privilege, object) **as the session
+user**: an administrator — or the operator of a token or no-auth console —
+sees every principal and grant, anyone else only themselves and the roles
+they hold. Every change is a statement run as the session user (`CREATE ROLE`,
+`GRANT … TO`, `REVOKE … FROM`, `DROP USER`), so the engine's RBAC decides
+and a non-administrator gets its refusal. Creating a user or changing a
+password goes through `POST /api/access/user`, never a worksheet, so the
+password is not in the run history; a worksheet run whose SQL mentions a
+password is recorded as `-- (a statement with a password: not recorded)`.
+
+On a console without logins (a store with no users), creating the first user
+ends that console: the store now has users, so unauthenticated sessions stop
+and the server must be restarted with `--ui-auth basic`. The form says so.
+
+## Imports
+
+- **From a path or URL.** The dialog previews `SELECT * FROM read_csv(…)` /
+  `read_parquet(…)` and loads with `CREATE TABLE … AS SELECT …`, `DROP TABLE
+  IF EXISTS` + create, or `INSERT INTO … SELECT …` — SQL run as the session
+  user, so the engine's rule that file and URL reads are administrator-only
+  holds (a non-administrator cannot make the server fetch a URL or read its
+  files). On a durable store the dialog follows the import with `CHECKPOINT`,
+  so the table no longer depends on the source being readable at a replay.
+  Needs a server built with `httpfs` (CSV over a path, `https://`, `s3://`;
+  remote Parquet) and/or `parquet`; `s3://` reads take the server's
+  `AWS_*` environment.
+- **Upload.** `POST /api/upload?table=&db=&format=&mode=` with the file as the
+  body (up to `--ui-max-upload-mb`, default 64). The server parses it itself
+  — CSV with the engine's own parser, Parquet through a scratch in-memory
+  store — and writes the rows as the session user, in one transaction, with
+  bound values: a new or replaced table is one `CREATE TABLE … AS SELECT …
+  FROM (VALUES …)` (it needs `CREATE` on the database, exactly like a
+  `CREATE TABLE AS`; pinkdb's RBAC grants a table's creator nothing on it,
+  so a create-then-insert would need an `INSERT` grant that cannot exist
+  yet), an append is batched `INSERT`s (it needs `INSERT`). No server file is
+  read on the user's behalf, so an upload needs no `ADMIN`, and a durable
+  store's WAL holds the rows, not a reference to a temporary file.
+
+## Storage
+
+`GET /api/storage` reports the mode (`in-memory`, `durable`, `lake`), the
+location, and facts: for a lake the catalog backend (`.pink` file, `.pink` on
+S3, SQLite, Postgres) and the data location, plus the lake's published
+version, read per request. Credentials never appear: a URL's `user:password@`
+is shown as `user:***@` and `password=`/`secret=`/`token=` parameters are
+masked; S3 keys come from the environment and are never shown. The panel's
+Checkpoint button runs `CHECKPOINT` as the user (an administrator action in a
+console with logins).
+
+The console works the same over every backend — the tests run worksheets and
+uploads over a `.pink` catalog, a SQLite catalog, a Postgres catalog and S3
+data, then reopen the lake under a new server and read the rows back.
 
 ## The exposure policy (fail closed)
 
@@ -180,6 +246,9 @@ PINKDB_AGENT_PROVIDER=zai ZAI_API_KEY=… \
 | `GET /api/history` | the user's latest 200 runs |
 | `GET /api/catalog` | every object the user may read, with columns and statistics (`pinkdb_catalog()` + `pinkdb_column_stats()`) |
 | `GET /api/agent`, `POST /api/ask` | the agent's provider table; an agent run as an event stream |
+| `GET /api/access`, `POST /api/access/user` | users, roles and grants as the session may see them; create a user or set a password |
+| `POST /api/upload` | a CSV or Parquet file into a table (the body is the file) |
+| `GET /api/storage` | the store's mode, location and facts (secrets masked) |
 | `GET /api/databases`, `/api/schemas`, `/api/tables`, `/api/rows`, `/api/stats`, `GET /preview` | wave 78's browse API and no-JavaScript preview page: a session cookie or an `Authorization` header (HTTP Basic or a bearer token) |
 
 The request and response types are one Rust crate,
@@ -204,7 +273,7 @@ refreshed. So building the server needs no wasm toolchain.
 
 | Asset | Size | Gzipped (served) |
 |---|---|---|
-| `pinkdb-console_bg.wasm` | 604 KB | 255 KB |
+| `pinkdb-console_bg.wasm` | 734 KB | 303 KB |
 | `pinkdb-console.js` (wasm-bindgen glue) | 43 KB | 8 KB |
 | `console.css` + `boot.js` | 17 KB | — |
 
@@ -240,6 +309,9 @@ HTML comes from `maud`, which escapes every interpolated value.
   (worksheets and history are in the store and survive).
 - **Deep paging in `/preview` costs a scan** (`OFFSET` is applied after
   the scan).
+- **Imports read CSV and Parquet** (the readers this server can register);
+  JSON and Arrow files are not offered.
+- **An upload is held in memory** while it is parsed (up to the upload cap).
 
 ## The flags
 
@@ -254,6 +326,7 @@ HTML comes from `maud`, which escapes every interpolated value.
 --ui-workers N              the runtime's worker threads (default 4)
 --ui-max-connections N      the concurrent connections (default 64)
 --ui-max-page-size N        the /preview and /api/rows page bound (default 500)
+--ui-max-upload-mb N        the largest file an upload may send (default 64)
 --agent-extension PATH      load the data agent for the ask box
 --agent-allow-writes        let the agent write (under the user's grants)
 --memory-extension PATH     load the agent memory

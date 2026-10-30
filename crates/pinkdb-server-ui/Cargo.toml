@@ -53,3 +53,10 @@ getrandom = "0.2"
 # trait and its byte type (both already in the lockfile through hyper).
 http-body = "1"
 bytes = "1"
+
+[dev-dependencies]
+# Wave 121b's import tests: the CSV source (local, http, s3) and the Parquet
+# reader/writer, registered in the test process the way the server binary
+# registers them (both already workspace members).
+pinkdb-httpfs = { path = "../pinkdb-httpfs", features = ["s3"] }
+pinkdb-parquet = { path = "../../extensions/parquet", features = ["remote"] }

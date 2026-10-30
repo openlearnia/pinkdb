@@ -9,6 +9,13 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-30</h2>
+<h3>Wave 121b — the console: access control, imports, storage ✅</h3>
+<ul>
+<li>An <strong>Access</strong> tab lists users, roles and grants (from the new <code>pinkdb_users()</code> and <code>pinkdb_grants()</code> relations; a non-admin sees only themselves and their roles) and lets administrators create users and roles, change passwords, grant and revoke — each action a statement run as the user, so RBAC decides. Passwords never reach the run history.</li>
+<li><strong>Import</strong>: CSV or Parquet from a server path, <code>https://</code> or <code>s3://</code> (preview, then create, replace or append; administrators, as file reads are) or uploaded from the browser (parsed by the server and written as the user, with the <code>CREATE</code> / <code>INSERT</code> grants a <code>CREATE TABLE AS</code> or an <code>INSERT</code> needs). New <code>pinkdb-server</code> features <code>httpfs</code> and <code>parquet</code>; <code>--ui-max-upload-mb</code>.</li>
+<li><strong>Storage</strong>: memory, a durable <code>.pink</code> file, or a lake catalog (<code>.pink</code>, SQLite, Postgres; local or S3 data) with its published version, passwords masked; a Checkpoint button. The console is tested over every backend.</li>
+<li>Fixed: a <code>VALUES</code> list of more than 2,048 rows as a row source failed with "vector overflow".</li>
+</ul>
 <h3>Wave 121 — the warehouse console: SQL worksheets, catalog, ask ✅</h3>
 <ul>
 <li><code>pinkdb-server --enable-ui</code> (a build with the <code>ui</code> feature) now serves a <strong>worksheet console</strong>: tabs of SQL saved in the store and shareable by name, an editor with highlighting and catalog completion (<code>Ctrl/Cmd+Enter</code> runs the statement at the cursor), one result per statement in a virtual-scrolled grid with a cell viewer, the query profile, <code>EXPLAIN</code> as a tree, bar/line/scatter charts, CSV/JSON download, <strong>cancel</strong>, and a per-user run history.</li>

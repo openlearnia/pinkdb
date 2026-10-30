@@ -3741,16 +3741,25 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 columns: Vec::new(),
                 num_rows: 1,
             };
-            let mut cols: Vec<Vector> = types.iter().map(|t| Vector::new_empty(*t)).collect();
-            for row in rows {
-                for (i, expr) in row.iter().enumerate() {
-                    let v = eval_expr(expr, &scope, cx)?;
-                    cols[i].push_value(v.get(0))?;
+            // A chunk holds at most CHUNK_SIZE rows: a longer VALUES list
+            // (or a catalog relation of many rows) spans several chunks.
+            let empty = || -> Vec<Vector> { types.iter().map(|t| Vector::new_empty(*t)).collect() };
+            let mut chunks = Vec::with_capacity(rows.len().div_ceil(CHUNK_SIZE).max(1));
+            for block in rows.chunks(CHUNK_SIZE) {
+                let mut cols = empty();
+                for row in block {
+                    for (i, expr) in row.iter().enumerate() {
+                        let v = eval_expr(expr, &scope, cx)?;
+                        cols[i].push_value(v.get(0))?;
+                    }
                 }
+                chunks.push(DataChunk::new(cols)?);
             }
-            let chunk = DataChunk::new(cols)?;
+            if chunks.is_empty() {
+                chunks.push(DataChunk::new(empty())?);
+            }
             Ok(Output {
-                chunks: vec![chunk],
+                chunks,
                 names: names.clone(),
                 types: types.clone(),
             })
