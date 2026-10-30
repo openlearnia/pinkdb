@@ -1,7 +1,6 @@
 //! CLI coverage for a `.pink` lake catalog (wave 103, T1b): `.lake save
-//! <pink:path> data <dir>`, `.lake open`, `.lake attach` and the writable
-//! attach + `.lake commit`, plus two real CLI processes committing to one
-//! catalog.
+//! <pink:path> data <dir>`, `.lake open`, read-only and writable lake
+//! databases (`ATTACH`), plus two real CLI processes writing one catalog.
 
 #![cfg(feature = "pinklake")]
 
@@ -90,29 +89,28 @@ fn save_open_attach_and_commit_through_a_pink_catalog() {
         "the catalog stays at its own location, not in the data root"
     );
 
-    // Read-only attach by the catalog URL, an explicit `data` open (the moved
-    // location override), and detach by the same URL.
+    // A read-only lake database by the catalog URL, an explicit `data` open
+    // (the moved location override), and DETACH.
     let out = run(&format!(
-        ".lake attach {catalog}\n\
-         SELECT COUNT(*) FROM t;\n\
-         .lake detach {catalog}\n\
+        "ATTACH 'lake:{catalog}' AS lk (READ_ONLY);\n\
+         SELECT COUNT(*) FROM lk.t;\n\
+         DETACH lk;\n\
          .lake open {catalog} data {data}\n\
          SELECT COUNT(*) FROM t;\n\
          .quit\n"
     ));
-    assert!(out.contains("statistics-only"), "{out}");
     assert!(out.contains("│ 2        │"), "{out}");
-    assert!(out.contains(&format!("Detached {catalog}")), "{out}");
+    assert!(out.contains("Database lk dropped."), "{out}");
+    assert!(!out.contains("Error"), "{out}");
 
-    // Writable attach + commit, all keyed by the catalog URL.
+    // A writable lake database publishes each statement, keyed by the
+    // catalog URL (with an explicit data location, too).
     let out = run(&format!(
-        ".lake attach {catalog} write\n\
-         INSERT INTO t VALUES (3, 'z');\n\
-         .lake commit {catalog}\n\
+        "ATTACH 'lake:{catalog}' AS lk (DATA '{data}');\n\
+         INSERT INTO lk.t VALUES (3, 'z');\n\
          .quit\n"
     ));
-    assert!(out.contains("Committed lake version 3"), "{out}");
-    assert!(!out.contains("no writable attach"), "{out}");
+    assert!(!out.contains("Error"), "{out}");
 
     // The new version is visible from a fresh session.
     let out = run(&format!(
@@ -221,34 +219,16 @@ impl Cli {
         }
     }
 
-    /// Wait for the first line containing any of `markers`.
-    fn wait_for_any(&mut self, markers: &[&str]) -> String {
-        loop {
-            let line = match self.lines.recv_timeout(std::time::Duration::from_secs(120)) {
-                Ok(line) => line,
-                Err(error) => panic!(
-                    "no CLI output while waiting for {markers:?} ({error}); collected:\n{}",
-                    self.out
-                ),
-            };
-            self.out.push_str(&line);
-            if markers.iter().any(|marker| line.contains(marker)) {
-                return line;
-            }
-        }
-    }
-
     fn quit(mut self) {
         self.send(".quit\n");
         let _ = self.child.wait();
     }
 }
 
-/// Two real CLI processes attach writable to one `pink:` catalog and both
-/// insert. They serialize on pinkdb's write lease: the first commit lands,
-/// the second is the retryable "the stored difference cannot be applied"
-/// conflict (the writable diff's base moved), and its re-attach + retry
-/// lands. The final version count is exactly the two commits on top of the
+/// Two CLI processes on one `.pink` catalog: the second writable lake
+/// database is refused by the engine lease (one writer per lake), a
+/// read-only one is fine, and once the first process exits the second can
+/// write. The final version count is exactly the two commits on top of the
 /// create.
 #[test]
 fn two_cli_processes_commit_to_one_pink_catalog() {
@@ -264,37 +244,25 @@ fn two_cli_processes_commit_to_one_pink_catalog() {
 
     let mut a = Cli::spawn();
     let mut b = Cli::spawn();
-    for cli in [&mut a, &mut b] {
-        cli.send(&format!(".lake attach {catalog} write\n"));
-        cli.wait_for("writable");
-    }
-    a.send("INSERT INTO t VALUES (1);\n");
-    a.wait_for("Inserted 1 row");
-    b.send("INSERT INTO t VALUES (2);\n");
-    b.wait_for("Inserted 1 row");
+    a.send(&format!("ATTACH 'lake:{catalog}' AS lk;\n"));
+    a.wait_for("Database lk created.");
+    b.send(&format!("ATTACH 'lake:{catalog}' AS lk;\n"));
+    b.wait_for("already served by");
+    b.send(&format!("ATTACH 'lake:{catalog}' AS ro (READ_ONLY);\n"));
+    b.wait_for("Database ro created.");
 
-    // A lands first.
-    a.send(&format!(".lake commit {catalog}\n"));
-    a.wait_for("Committed lake version 3");
-    // B's diff is based on version 2. Either the commit loop rebases and
-    // lands v4 directly, or the table-changed conflict is reported and the
-    // documented recovery (re-attach, re-apply, commit) lands v4.
-    b.send(&format!(".lake commit {catalog}\n"));
-    let outcome = b.wait_for_any(&[
-        "Committed lake version 4",
-        "changed in the lake since this change was computed",
-    ]);
-    if outcome.contains("Error") {
-        b.send(&format!(".lake detach {catalog} force\n"));
-        b.wait_for("Detached");
-        b.send(&format!(".lake attach {catalog} write\n"));
-        b.wait_for("writable");
-        b.send("INSERT INTO t VALUES (2);\n");
-        b.wait_for("Inserted 1 row");
-        b.send(&format!(".lake commit {catalog}\n"));
-        b.wait_for("Committed lake version 4");
-    }
+    // A writes version 3.
+    a.send("INSERT INTO lk.t VALUES (1);\n");
+    a.wait_for("Inserted 1 row");
     a.quit();
+
+    // A's exit released the lease: B writes version 4.
+    b.send("DETACH ro;\n");
+    b.wait_for("Database ro dropped.");
+    b.send(&format!("ATTACH 'lake:{catalog}' AS lk;\n"));
+    b.wait_for("Database lk created.");
+    b.send("INSERT INTO lk.t VALUES (2);\n");
+    b.wait_for("Inserted 1 row");
     b.quit();
 
     let out = run(&format!(
@@ -321,10 +289,9 @@ fn maintenance_and_settings_commands_work() {
         "CREATE TABLE t (a INTEGER, b VARCHAR);\n\
          INSERT INTO t VALUES (1, 'one');\n\
          .lake save {catalog} data {data}\n\
-         .lake attach {catalog} write\n\
-         INSERT INTO t VALUES (2, 'two'), (3, 'three'), (4, 'four');\n\
-         .lake commit {catalog}\n\
-         .lake detach {catalog}\n\
+         ATTACH 'lake:{catalog}' AS lk;\n\
+         INSERT INTO lk.t VALUES (2, 'two'), (3, 'three'), (4, 'four');\n\
+         DETACH lk;\n\
          .lake flush {catalog}\n\
          .lake open {catalog}\n\
          SELECT count(*) FROM t;\n\
@@ -347,20 +314,17 @@ fn maintenance_and_settings_commands_work() {
          INSERT INTO t VALUES (1);\n\
          .lake save {maint} data {maint_data}\n\
          .lake inlining {maint} t 0\n\
-         .lake attach {maint} write\n"
+         ATTACH 'lake:{maint}' AS lk;\n"
     );
     for i in 2..6 {
-        script.push_str(&format!(
-            "INSERT INTO t VALUES ({i});\n.lake commit {maint}\n"
-        ));
+        script.push_str(&format!("INSERT INTO lk.t VALUES ({i});\n"));
     }
     script.push_str(&format!(
-        ".lake detach {maint}\n\
+        "DETACH lk;\n\
          .lake merge {maint}\n\
-         .lake attach {maint} write\n\
-         DELETE FROM t WHERE a = 1;\n\
-         .lake commit {maint}\n\
-         .lake detach {maint}\n\
+         ATTACH 'lake:{maint}' AS lk;\n\
+         DELETE FROM lk.t WHERE a = 1;\n\
+         DETACH lk;\n\
          .lake rewrite {maint} delete_threshold=0.0\n\
          .lake partition {maint} t by (a)\n\
          .lake inlining {maint} t 5\n\

@@ -9,6 +9,15 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-30</h2>
+<h3>Wave 124a — lake databases ✅</h3>
+<ul>
+<li><strong>A lake is a database.</strong> <code>CREATE DATABASE events (TYPE LAKE [, CATALOG '…'] [, DATA '…'])</code> creates a lake and <code>ATTACH 'lake:&lt;catalog&gt;' AS name [(READ_ONLY, DATA '…', VERSION n)]</code> opens an existing one; <code>DETACH name</code> forgets it (the lake keeps its data). The lake's one schema is the database (<code>main.t</code> in the lake is <code>events.t</code>); a lake with several schemas is refused. <code>CREATE DATABASE … (TYPE LAKE)</code> with no <code>CATALOG</code> puts the lake under the store's lake directory.</li>
+<li><strong>Writable lake databases publish every commit.</strong> Each committed statement or transaction on a writable lake database is one lake version — its data files plus the database's engine metadata (constraints, defaults, indexes, macros, triggers, procedures, materialized views) — and holds the lake's lease: a second writer is refused until the first detaches or its heartbeat goes stale. A read-only one answers from the lake's statistics.</li>
+<li><strong>A statement or transaction writes one storage</strong> — the local store or one lake — never both; a trigger or <code>CALL</code> that tries is undone. A local write that reads a lake records the lake version it read in the WAL, so <code>INSERT INTO local SELECT … FROM lake</code> replays exactly after the lake moved on.</li>
+<li><strong>Durable stores keep their lake databases.</strong> The checkpoint records each database's storage (<code>.pink</code> footer version 3: older files are refused as written by an older pinkdb) and the WAL the <code>ATTACH</code>/<code>DETACH</code> statements; a reopen reopens the lakes. A lake that cannot be opened is listed as <code>unavailable</code> with the reason, and the store still opens.</li>
+<li><code>SHOW DATABASES</code> gains <code>storage</code>, <code>location</code> (passwords masked), <code>read_only</code>, <code>version</code> and <code>status</code>; <code>pinkdb_catalog()</code> has one <code>DATABASE</code> row per database with the same facts. <code>pinkdb_lake_decodes()</code> reports a read-only lake's data-file decodes. A lake URL with a password is refused (use <code>PGPASSWORD</code> / <code>AWS_*</code>).</li>
+<li><strong>CLI:</strong> <code>.lake attach</code>, <code>.lake detach</code>, <code>.lake attached</code> and <code>.lake commit</code> are gone — use the SQL above (a writable lake database commits by itself). <code>PINKDB_KEY</code> is every lake's key; the maintenance commands refuse a lake a writable lake database holds.</li>
+</ul>
 <h3>Fixes from the first CI run after the console waves ✅</h3>
 <ul>
 <li><strong>An explicit transaction publishes to a lake catalog.</strong> On a server over a lake catalog (<code>--catalog</code>), work done between <code>BEGIN</code> and <code>COMMIT</code> was not published (single statements were); the console's CSV upload, which writes in one transaction, was lost on restart.</li>

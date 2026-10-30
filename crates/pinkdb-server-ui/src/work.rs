@@ -804,9 +804,10 @@ pub async fn catalog(
             .collect();
         let mut objects: Vec<CatalogObject> = select(
             // Plain views are session-local (never stored), so the catalog
-            // leaves them out; materialized views are listed.
+            // leaves them out; materialized views are listed. DATABASE rows
+            // (wave 124) describe the databases, not objects in them.
             "SELECT \"database\", \"name\", \"kind\", \"table_name\", \"detail\" FROM pinkdb_catalog() \
-             WHERE \"kind\" <> 'VIEW'",
+             WHERE \"kind\" NOT IN ('VIEW', 'DATABASE')",
         )?
         .into_iter()
         .map(|row| CatalogObject {

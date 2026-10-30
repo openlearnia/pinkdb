@@ -131,6 +131,12 @@ const DISPLAY_CAP: usize = 10_000;
 /// `pinkdb_datetime::ensure_registered()`, `pinkdb_math::ensure_registered()`,
 /// `pinkdb_arrow::ensure_registered()`).
 fn register_builtin_extensions() {
+    // Wave 124: lake databases (`ATTACH 'lake:…'`, `CREATE DATABASE … (TYPE
+    // LAKE)`) open through pink-lake; a durable reopen replays them.
+    // `PINKDB_KEY` is every lake's at-rest key too (an invalid value is
+    // reported by the startup check below).
+    #[cfg(feature = "pinklake")]
+    pink_lake::database::register_with_key(pink_lake::EncryptionKey::from_env().ok().flatten());
     #[cfg(feature = "json")]
     if let Err(e) = pinkdb_json::ensure_registered() {
         eprintln!("warning: the json extension could not be registered: {e}");
@@ -503,7 +509,6 @@ fn print_help() {
             "  .lake open {LAKE}{DATA} [v]  load the lake's latest (or \
              version v) into memory"
         );
-        println!("  .lake attach {LAKE}{DATA} [v] [read-only|write]");
         println!("                                {LAKE} is a `.pink` catalog path (or");
         println!(
             "                                `pink:<path>`); data defaults to <catalog>.files/"
@@ -517,11 +522,6 @@ fn print_help() {
             );
             println!("                                (the password is never printed)");
         }
-        println!("        read-only (default): query the lake from its statistics");
-        println!("        write: materialize its tables into the session store");
-        println!(
-            "  .lake commit {LAKE}        publish the writable attach as one incremental version"
-        );
         println!("  .lake partition {LAKE} <t> by (<key>, ...) | clear");
         println!("                                set/clear a table's partition spec (identity or");
         println!("                                bucket(N, col)); new writes split per value set");
@@ -556,8 +556,6 @@ fn print_help() {
         println!("  .lake table_info {LAKE}     per-table file/delete counts and sizes");
         println!("  .lake options {LAKE}        catalog facts (data path, format, encryption)");
         println!("  .lake settings {LAKE}       catalog_type / extension_version / data_path");
-        println!("  .lake detach {LAKE} [force]  detach one attached lake");
-        println!("  .lake attached              list attached lakes and their tables");
         println!("  .lake versions {LAKE}       list the lake's published versions");
         println!(
             "  .lake snapshots {LAKE}      per-version records: time, author, message, changes"
@@ -567,7 +565,7 @@ fn print_help() {
             "  .lake info {LAKE}           show the lake's format version, versions, and tables"
         );
         println!("  .lake format [<id>]         show or choose the data-file format for");
-        println!("                                subsequent .lake save / .lake commit writes");
+        println!("                                subsequent .lake save writes");
         println!("  .lake replicate create {LAKE} from <dir|s3://...|store:<db>> [every s] [...]");
         println!("                                table-level replication jobs (wave 89)");
         println!(
@@ -576,8 +574,13 @@ fn print_help() {
         println!(
             "                                run/inspect jobs; start keeps a session supervisor"
         );
+        println!("  Lake databases (SQL, wave 124):");
+        println!("    ATTACH 'lake:{LAKE}' AS name [(READ_ONLY, DATA '…', VERSION n)]");
+        println!("    CREATE DATABASE name (TYPE LAKE, CATALOG '{LAKE}' [, DATA '…'])");
+        println!("    DETACH name                 forget it (the lake keeps its data)");
+        println!("    SHOW DATABASES              storage, location, version, status");
         println!(
-            "  FROM t AT (VERSION => n)     query an attached lake table at a version \
+            "  FROM t AT (VERSION => n)     query a lake database table at a version \
              (or AT (TIMESTAMP => TIMESTAMP '…'))"
         );
         if !cfg!(feature = "s3") {
@@ -3304,13 +3307,13 @@ fn main() {
         for command in &opts.commands {
             for line in command.lines() {
                 if !input.feed(&mut session, line) {
-                    exit_for_script();
+                    exit_for_script(session);
                 }
             }
             // Each -c argument is complete on its own.
             input.finish(&mut session);
         }
-        exit_for_script();
+        exit_for_script(session);
     }
 
     if interactive {
@@ -3336,7 +3339,7 @@ fn main() {
             // No line editor (unusual terminal): read plain lines.
             eprintln!("rustyline init failed ({e}); reading plain stdin");
             run_plain_stdin(&mut session);
-            exit_for_script();
+            exit_for_script(session);
         }
     };
 
@@ -3374,7 +3377,7 @@ fn main() {
         }
     }
     if !interactive {
-        exit_for_script();
+        exit_for_script(session);
     }
 }
 
@@ -3399,8 +3402,10 @@ fn run_script_file(session: &mut Session, path: &str) -> bool {
 }
 
 /// Exit after a script: status 1 when anything failed (sqlite3/duckdb
-/// convention), else 0.
-fn exit_for_script() -> ! {
+/// convention), else 0. The session is dropped first, so its writable lake
+/// databases release their leases (wave 124).
+fn exit_for_script(session: Session) -> ! {
+    drop(session);
     std::process::exit(i32::from(HAD_ERROR.load(Ordering::Relaxed)));
 }
 

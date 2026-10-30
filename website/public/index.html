@@ -236,9 +236,9 @@ binary.</p>
   </li>
   <li class="card">
     <h3><a href="docs/lake">Read-only attach</a></h3>
-    <p><code>.lake attach</code> opens a published snapshot without decoding column
-    data; exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code> come from stored
-    statistics.</p>
+    <p><code>ATTACH 'lake:…' AS db (READ_ONLY)</code> opens a published snapshot
+    without decoding column data; exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code>
+    come from stored statistics.</p>
   </li>
   <li class="card">
     <h3><a href="docs/server">Network server</a></h3>

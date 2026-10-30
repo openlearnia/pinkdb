@@ -106,7 +106,7 @@ fn the_catalog_relation_lists_objects_a_session_may_read() {
         let out = conn
             .execute(
                 "SELECT \"database\", \"name\", \"kind\", \"table_name\", \"detail\" \
-                 FROM pinkdb_catalog() ORDER BY 1, 3, 2",
+                 FROM pinkdb_catalog() WHERE \"kind\" <> 'DATABASE' ORDER BY 1, 3, 2",
             )
             .unwrap()
             .pop()
@@ -121,6 +121,26 @@ fn the_catalog_relation_lists_objects_a_session_may_read() {
             })
             .collect()
     };
+    // Wave 124: one DATABASE row per database carries its storage.
+    let databases = rows(
+        admin
+            .execute(
+                "SELECT \"name\", storage, location, read_only, status FROM pinkdb_catalog() \
+                 WHERE kind = 'DATABASE'",
+            )
+            .unwrap()
+            .pop()
+            .unwrap(),
+    );
+    assert_eq!(databases.len(), 1, "{databases:?}");
+    assert_eq!(
+        databases[0]
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("|"),
+        "main|local|NULL|false|ok"
+    );
     let all = list(&mut admin);
     assert_eq!(
         all,

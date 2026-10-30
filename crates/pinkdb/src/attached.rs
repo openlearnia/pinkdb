@@ -1,7 +1,9 @@
-//! Attached read-only lakes (`.lake attach`).
+//! Attached read-only lakes.
 //!
-//! An attached lake is a *session-local*, read-only extension of the
-//! catalog the binder resolves queries against: the engine answers exact
+//! An attached lake is a read-only extension of the catalog the binder
+//! resolves queries against — the reader behind a read-only lake database
+//! (wave 124, `ATTACH … (READ_ONLY)`, see [`crate::lake_db`]) or a session
+//! attachment made through [`PinkDb::attach_lake`]: the engine answers exact
 //! `COUNT`/`MIN`/`MAX` aggregates from the lake's stored statistics when the
 //! lake layer can prove the answer, and otherwise materializes the one table
 //! a query touches through the same data-file decode `.lake open` uses.
@@ -11,10 +13,10 @@
 //! checkpoint, and every mutation statement (`INSERT`/`UPDATE`/`DELETE`,
 //! `DROP TABLE`, `CREATE TABLE` over the name) is refused with a clear
 //! read-only error. `.lake open` replaces the whole store and therefore drops
-//! every attachment with it; `.lake detach` drops one explicitly.
+//! every session attachment with it; `DETACH` drops a lake database.
 //!
 //! The lake side implements [`AttachedLake`]: [`AttachedLake::tables`]
-//! returns the descriptors `.lake attach` read from the data files' footers
+//! returns the descriptors the attach read from the data files' footers
 //! (no column data touched), and [`AttachedLake::load`] decodes one table on
 //! first use and caches it for the rest of the session.
 
@@ -295,8 +297,8 @@ impl AttachedScan {
 /// One attached lake, as the engine sees it. Implemented by `pink-lake`
 /// (the dependency direction stays engine ← lake).
 pub trait AttachedLake: fmt::Debug + Send + Sync {
-    /// The lake location as `.lake attach` was given it (for display and
-    /// `.lake detach`).
+    /// The lake location as the attach was given it (for display and
+    /// [`PinkDb::detach_lake`]).
     fn location(&self) -> &str;
 
     /// The tables this lake offers, pinned to the version attached.
@@ -463,7 +465,7 @@ impl PinkDb {
         let location = lake.location().to_string();
         if self.attached_lakes.iter().any(|l| l.location() == location) {
             return Err(PinkDbError::Catalog(format!(
-                "lake {location} is already attached to this session; .lake detach it first"
+                "lake {location} is already attached to this session; detach it first"
             )));
         }
         let tables: Vec<AttachedTable> = lake.tables().to_vec();
@@ -487,7 +489,7 @@ impl PinkDb {
             if let Some(other) = self.attached_location_in(&t.db, &t.table) {
                 return Err(PinkDbError::Catalog(format!(
                     "cannot attach lake {location}: table \"{}.{}\" is already attached from \
-                     lake {other}; .lake detach it first",
+                     lake {other}; detach it first",
                     t.db, t.table
                 )));
             }
@@ -575,7 +577,8 @@ impl PinkDb {
             Ok(t) => Ok(t.schema()),
             Err(e) => match self.attached_lookup(db, name) {
                 Some((t, _)) => Ok(t.schema.clone()),
-                None => Err(e),
+                // A lake database that could not be opened says why.
+                None => Err(self.unavailable_lake(db).unwrap_or(e)),
             },
         }
     }
@@ -596,7 +599,7 @@ impl PinkDb {
             None => match self.table_in(db, name) {
                 Ok(_) => Err(PinkDbError::Catalog(format!(
                     "table \"{db}.{name}\" has no snapshot history: AT ({at}) time travel \
-                     works on lake tables attached with .lake attach"
+                     works on tables of lake databases"
                 ))),
                 Err(e) => Err(e),
             },
@@ -606,23 +609,32 @@ impl PinkDb {
     /// The read-only refusal for a mutation targeting an attached table,
     /// if it is one.
     pub(crate) fn attached_read_only(&self, db: &str, name: &str) -> Option<PinkDbError> {
-        self.attached_location_in(db, name).map(|location| {
-            PinkDbError::Execution(format!(
-                "table \"{db}.{name}\" is attached read-only from lake {location} \
-                     (attached lake tables are read-only); use .lake open to load a \
-                     writable copy"
-            ))
+        self.attached_lookup(db, name).map(|(_, lake)| {
+            if self.is_lake_reader(lake) {
+                PinkDbError::Execution(format!(
+                    "table \"{db}.{name}\" is in database \"{db}\", a read-only lake ({}); \
+                     attach it without READ_ONLY to write",
+                    lake.location()
+                ))
+            } else {
+                PinkDbError::Execution(format!(
+                    "table \"{db}.{name}\" is attached read-only from lake {} (attached \
+                     lake tables are read-only); ATTACH the lake as a database to write",
+                    lake.location()
+                ))
+            }
         })
     }
 
-    /// Refuse a statement that is about to be WAL-logged and reads an
-    /// attached lake table.
+    /// Refuse a statement that is about to be WAL-logged and reads a table a
+    /// session attachment (the Rust [`PinkDb::attach_lake`] API) provides.
     ///
-    /// Attached tables are session-local: they are not in the store, not in a
-    /// checkpoint, and `.lake attach` is not a SQL statement, so the logged
-    /// SQL text of a mutating statement that references one could never
-    /// replay. Read-only statements are never logged and stay unaffected, and
-    /// an in-memory store has no WAL to replay.
+    /// Session attachments are not in the store, not in a checkpoint and
+    /// not a SQL statement, so the logged SQL text of a mutating statement
+    /// that references one could never replay. A lake **database** is
+    /// different: its reads are pinned in the WAL record (wave 124, see
+    /// [`crate::lake_db`]). Read-only statements are never logged and stay
+    /// unaffected, and an in-memory store has no WAL to replay.
     pub(crate) fn refuse_logged_attached_reads(
         &self,
         plan: &crate::plan::LogicalPlan,
@@ -638,12 +650,14 @@ impl PinkDb {
             reads.insert((db, table));
         }
         for (db, table) in reads {
-            if let Some(location) = self.attached_location_in(&db, &table) {
+            if let Some((_, lake)) = self.attached_lookup(&db, &table)
+                && !self.is_lake_reader(lake)
+            {
                 return Err(PinkDbError::Execution(format!(
                     "this statement is durable and reads attached lake table \"{db}.{table}\" \
-                     ({location}); attached tables are session-local and the statement could \
-                     not replay after a reopen — run the write without the lake, or with \
-                     .lake open"
+                     ({}); a session attachment could not replay after a reopen — ATTACH the \
+                     lake as a database instead",
+                    lake.location()
                 )));
             }
         }

@@ -1,6 +1,7 @@
 //! CLI coverage for the `pinklake` feature: `.lake save/open/versions/
-//! tables/info` end to end over `.pink` data files, `.lake attach` over the
-//! published statistics block, and the `s3` variant.
+//! tables/info` end to end over `.pink` data files, read-only lake databases
+//! (`ATTACH 'lake:…' (READ_ONLY)`) over the published statistics block, and
+//! the `s3` variant.
 //!
 //! `tests/lake.rs` covers the broader CLI surface; this file focuses on the
 //! statistics-only attach and the saved shapes.
@@ -155,13 +156,13 @@ fn lean_save_open_versions_tables_info() {
     cleanup(&dir);
 
     // The `--features pinklake` help describes the lake build and offers
-    // `.lake attach` (statistics-only).
+    // lake databases (statistics-only attach).
     let help = run(".help\n.quit\n");
     assert!(help.contains(".lake save"), "{help}");
     assert!(help.contains("catalog format_version 7"), "{help}");
     assert!(
-        help.contains(".lake attach "),
-        "help must offer attach in a pinklake build (statistics-only):\n{help}"
+        help.contains("ATTACH 'lake:"),
+        "help must offer ATTACH in a pinklake build (statistics-only):\n{help}"
     );
     assert!(
         !help.contains("needs the `pinklake` feature"),
@@ -169,7 +170,7 @@ fn lean_save_open_versions_tables_info() {
     );
 }
 
-/// `.lake attach` answers exact COUNT/COUNT(col)/MIN/MAX from the published
+/// A read-only lake database answers exact COUNT/COUNT(col)/MIN/MAX from the published
 /// statistics without decoding (decode counters stay at zero), and a fallback
 /// query materializes the table exactly once and caches it.
 #[test]
@@ -189,20 +190,17 @@ fn lean_attach_answers_from_statistics_without_decoding() {
     assert!(out.contains("Saved lake version 2"), "{out}");
 
     // A fresh process: attach from the statistics block, then fast paths.
+    let d = common::DECODES;
     let out = run(&format!(
-        ".lake attach {lake}\nUSE lake;\n\
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n\
          SELECT COUNT(*), COUNT(i), COUNT(g), COUNT(s) FROM t;\n\
          SELECT MIN(i), MAX(i), MIN(g), MAX(g), MIN(s), MAX(s), MIN(b), MAX(b) FROM t;\n\
-         SELECT COUNT(*), COUNT(x), MIN(x) FROM empty;\n\
-         .lake attached\n\
-         SELECT SUM(i) FROM t;\n\
-         .lake attached\n\
-         SELECT SUM(i), SUM(g) FROM t;\n\
-         .lake attached\n\
+         SELECT COUNT(*), COUNT(x), MIN(x) FROM empty;\n{d}\
+         SELECT SUM(i) FROM t;\n{d}\
+         SELECT SUM(i), SUM(g) FROM t;\n{d}\
          .quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("statistics-only"), "{out}");
     assert!(!out.contains("Error"), "{out}");
     // The stats answers.
     assert!(
@@ -211,19 +209,23 @@ fn lean_attach_answers_from_statistics_without_decoding() {
     );
     // The fast paths decoded nothing; each fallback decoded only the columns
     // it needed.
-    let zero = out.matches("decodes: 0 loads, 0 columns").count();
-    assert_eq!(zero, 1, "fast paths must not decode:\n{out}");
     // `.pink` files decode only the columns a query needs (wave 102): the
     // first fallback reads one column, the second a further one.
-    assert!(
-        out.contains("decodes: 1 load, 1 column") && out.contains("decodes: 2 loads, 2 columns"),
-        "projected decodes, one column at a time:\n{out}"
+    let decodes = common::decode_lines(&out);
+    assert_eq!(
+        decodes,
+        vec![
+            "decodes: 0 loads, 0 columns, 0 files",
+            "decodes: 1 loads, 1 columns, 1 files",
+            "decodes: 2 loads, 2 columns, 2 files",
+        ],
+        "fast paths must not decode; projected decodes, one column at a time:\n{out}"
     );
     cleanup(&dir);
 }
 
 /// The core lean equivalence gate: the same data, the same query battery,
-/// three arms — in-memory, `.lake open`, `.lake attach` — produce identical
+/// three arms — in-memory, `.lake open`, a read-only lake database — produce identical
 /// transcripts, and the attach arm really ran the statistics fast paths
 /// (zero data-file decodes for the COUNT/COUNT(col)/MIN/MAX shapes).
 #[test]
@@ -245,7 +247,7 @@ fn lean_attach_answers_equal_open_and_in_memory() {
         lake = lake.display()
     ));
     let attached = run(&format!(
-        ".lake attach {lake}\nUSE lake;\n{queries}.quit\n",
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n{queries}.quit\n",
         lake = lake.display()
     ));
 
@@ -258,32 +260,30 @@ fn lean_attach_answers_equal_open_and_in_memory() {
     assert_eq!(
         common::tail_after_marker(&attached),
         base,
-        "lean `.lake attach` diverged from the in-memory answers"
+        "the lean lake database diverged from the in-memory answers"
     );
-    assert!(attached.contains("statistics-only"), "{attached}");
 
     // The fast paths are statistics-only: after COUNT/COUNT(col)/MIN/MAX the
     // decode counters stay at zero, and the first fallback materializes once.
+    let d = common::DECODES;
     let stats_arm = run(&format!(
-        ".lake attach {lake}\nUSE lake;\n\
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n\
          SELECT COUNT(*) FROM t;\n\
-         SELECT MIN(i), MAX(i), COUNT(s), MIN(b), MAX(b) FROM t;\n\
-         .lake attached\n\
-         SELECT SUM(i) FROM t;\n\
-         .lake attached\n\
-         SELECT AVG(i) FROM t;\n\
-         .lake attached\n\
+         SELECT MIN(i), MAX(i), COUNT(s), MIN(b), MAX(b) FROM t;\n{d}\
+         SELECT SUM(i) FROM t;\n{d}\
+         SELECT AVG(i) FROM t;\n{d}\
          .quit\n",
         lake = lake.display()
     ));
-    assert!(
-        stats_arm.contains("decodes: 0 loads, 0 columns"),
-        "fast paths must not decode:\n{stats_arm}"
-    );
     assert_eq!(
-        stats_arm.matches("decodes: 1 load, 1 column").count(),
-        2,
-        "the fallback decodes only its column once (wave 102), then the cache serves it:\n{stats_arm}"
+        common::decode_lines(&stats_arm),
+        vec![
+            "decodes: 0 loads, 0 columns, 0 files",
+            "decodes: 1 loads, 1 columns, 1 files",
+            "decodes: 1 loads, 1 columns, 1 files",
+        ],
+        "fast paths must not decode; the fallback decodes only its column once \
+         (wave 102), then the cache serves it:\n{stats_arm}"
     );
     cleanup(&dir);
 }
@@ -334,29 +334,32 @@ fn lean_partition_splits_commits_and_prunes() {
          INSERT INTO t VALUES (1, 'east'), (2, 'west');\n\
          .lake save {lake}\n\
          .lake partition {lake} t by (region)\n\
-         .lake attach {lake} write\n\
+         ATTACH 'lake:{lake}' AS lk;\n\
+         USE lk;\n\
          INSERT INTO t VALUES (3, 'south'), (4, 'south'), (5, 'north');\n\
-         .lake commit {lake}\n\
          .quit\n",
             lake = lake.display()
         ),
         &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
     );
     assert!(out.contains("Partitioned main.t by (region)"), "{out}");
-    assert!(out.contains("2 files: 2 data, 0 delete"), "{out}");
+    assert!(!out.contains("Error"), "{out}");
 
     // Read-only attach: a partitioned predicate decodes only the surviving
     // files (the v2 file plus the matching partition file).
     let out = run(&format!(
-        ".lake attach {lake}\n\
-         SELECT id FROM t WHERE region = 'north';\n\
-         .lake attached\n\
+        "ATTACH 'lake:{lake}' AS lk (READ_ONLY);\nUSE lk;\n\
+         SELECT id FROM t WHERE region = 'north';\n{d}\
          .quit\n",
-        lake = lake.display()
+        lake = lake.display(),
+        d = common::DECODES,
     ));
-    assert!(out.contains("Attached"), "{out}");
     assert!(out.contains("│ 5 "), "{out}");
-    assert!(out.contains("decodes: 1 load, 2 columns, 2 files"), "{out}");
+    assert_eq!(
+        common::decode_lines(&out),
+        vec!["decodes: 1 loads, 2 columns, 2 files"],
+        "{out}"
+    );
     cleanup(&dir);
 }
 
@@ -373,10 +376,9 @@ fn lean_maintenance_merge_expire_cleanup() {
             "CREATE TABLE t (id INTEGER);\n\
          INSERT INTO t VALUES (1), (2);\n\
          .lake save {lake}\n\
-         .lake attach {lake} write\n\
-         INSERT INTO t VALUES (3);\n\
-         .lake commit {lake}\n\
-         .lake detach {lake}\n\
+         ATTACH 'lake:{lake}' AS lk;\n\
+         INSERT INTO lk.t VALUES (3);\n\
+         DETACH lk;\n\
          .quit\n",
             lake = lake.display()
         ),
@@ -441,7 +443,10 @@ fn lean_attach_refuses_stats_less_and_corrupted_lakes() {
         "UPDATE ducklake_file_column_stats SET min_value = 'not-an-int' \
          WHERE column_id = (SELECT MIN(column_id) FROM ducklake_column);",
     );
-    let out = run(&format!(".lake attach {}\n.quit\n", tampered.display()));
+    let out = run(&format!(
+        "ATTACH 'lake:{}' AS lk (READ_ONLY);\n.quit\n",
+        tampered.display()
+    ));
     assert!(out.contains("does not decode"), "{out}");
 
     // No statistics rows at all: a clear stats-less refusal.
@@ -452,7 +457,10 @@ fn lean_attach_refuses_stats_less_and_corrupted_lakes() {
         blank.display()
     ));
     catalog_sql(&blank, "DELETE FROM ducklake_file_column_stats;");
-    let out = run(&format!(".lake attach {}\n.quit\n", blank.display()));
+    let out = run(&format!(
+        "ATTACH 'lake:{}' AS lk (READ_ONLY);\n.quit\n",
+        blank.display()
+    ));
     assert!(out.contains("without a statistics block"), "{out}");
     assert!(out.contains("use .lake open"), "{out}");
 

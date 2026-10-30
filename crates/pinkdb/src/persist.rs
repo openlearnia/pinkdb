@@ -132,7 +132,15 @@ pub const ROW_GROUP_ROWS: usize = 122_880;
 pub const CHUNKS_PER_ROW_GROUP: usize = ROW_GROUP_ROWS / CHUNK_SIZE;
 
 /// The footer's own version word (bumped when the footer layout changes).
-const FOOTER_VERSION: u32 = 2;
+/// Version 3 (wave 124) adds every database's storage after its name; a
+/// version-2 file is refused as written by an older pinkdb.
+const FOOTER_VERSION: u32 = 3;
+
+/// A database's storage tag in the footer: rows in the file.
+const STORAGE_LOCAL: u8 = 0;
+/// A database's storage tag in the footer: a lake (its location follows,
+/// and the database carries no tables or catalog sections in the file).
+const STORAGE_LAKE: u8 = 1;
 
 /// Flags bit 0: every table carries the constraint section described in the
 /// module docs. Set iff at least one table has constraints.
@@ -2815,6 +2823,7 @@ struct TableDir {
 #[derive(Debug)]
 struct DbDir {
     name: String,
+    storage: crate::lake_db::DbStorage,
     tables: Vec<TableDir>,
     macros: Vec<crate::macros::MacroDef>,
     materialized_views: Vec<crate::storage::MaterializedViewDef>,
@@ -3363,7 +3372,17 @@ impl PinkDb {
         dbs.sort();
         let mut db_dirs: Vec<DbDir> = Vec::with_capacity(dbs.len());
         for dbname in &dbs {
-            let mut names = self.list_tables_in(dbname);
+            let storage = self
+                .database_storage(dbname)
+                .unwrap_or(crate::lake_db::DbStorage::Local);
+            // A lake database's tables and catalog objects live in its lake:
+            // the file records only where that is.
+            let lake = matches!(storage, crate::lake_db::DbStorage::Lake(_));
+            let mut names = if lake {
+                Vec::new()
+            } else {
+                self.list_tables_in(dbname)
+            };
             names.sort();
             let mut tables: Vec<TableDir> = Vec::with_capacity(names.len());
             for name in &names {
@@ -3403,13 +3422,14 @@ impl PinkDb {
             }
             db_dirs.push(DbDir {
                 name: dbname.clone(),
+                storage,
                 tables,
-                macros: if with_macros {
+                macros: if with_macros && !lake {
                     self.macros_in(dbname).into_iter().map(|(_, d)| d).collect()
                 } else {
                     Vec::new()
                 },
-                materialized_views: if with_mvs {
+                materialized_views: if with_mvs && !lake {
                     self.materialized_views_in(dbname)
                         .into_iter()
                         .map(|(_, d)| d)
@@ -3417,7 +3437,7 @@ impl PinkDb {
                 } else {
                     Vec::new()
                 },
-                procedures: if with_procedures {
+                procedures: if with_procedures && !lake {
                     self.procedures_in(dbname)
                         .into_iter()
                         .map(|(_, d)| d)
@@ -3427,7 +3447,7 @@ impl PinkDb {
                 },
                 // Creation order is the firing order, so the slice is written
                 // as stored — never sorted.
-                triggers: if with_triggers {
+                triggers: if with_triggers && !lake {
                     self.triggers_in(dbname).to_vec()
                 } else {
                     Vec::new()
@@ -3442,6 +3462,7 @@ impl PinkDb {
         fw.u32(db_dirs.len() as u32);
         for dbdir in &db_dirs {
             fw.str(&dbdir.name);
+            write_storage(&mut fw, &dbdir.storage);
             fw.u32(dbdir.tables.len() as u32);
             for tdir in &dbdir.tables {
                 fw.str(&tdir.name);
@@ -3737,6 +3758,9 @@ impl PinkDb {
         let mut db = PinkDb::with_databases(Vec::<String>::new());
         for dbdir in &footer.databases {
             db.create_database(&dbdir.name)?;
+            if let Some(cat) = db.databases.get_mut(&dbdir.name.to_ascii_lowercase()) {
+                cat.storage = dbdir.storage.clone();
+            }
             for tdir in &dbdir.tables {
                 db.create_table_with_constraints_in(
                     &dbdir.name,
@@ -4056,12 +4080,100 @@ pub fn footer_flags(bytes: &[u8]) -> Result<u32> {
     let footer = &bytes[start..start + len];
     let mut r = Reader::new(footer);
     let version = r.u32()?;
+    check_footer_version(version)?;
+    r.u32()
+}
+
+/// Refuse a footer this build does not write: an older one (no legacy
+/// readers) or a newer one.
+fn check_footer_version(version: u32) -> Result<()> {
+    if version < FOOTER_VERSION {
+        return Err(PinkDbError::Execution(format!(
+            "this .pink file was written by an older pinkdb (footer version {version}); \
+             this build reads footer version {FOOTER_VERSION} only"
+        )));
+    }
     if version != FOOTER_VERSION {
         return Err(PinkDbError::Execution(format!(
             "unsupported .pink footer version {version}; upgrade pinkdb"
         )));
     }
-    r.u32()
+    Ok(())
+}
+
+/// A database's storage, after its name in the footer:
+/// `u8 STORAGE_LOCAL` or `u8 STORAGE_LAKE | u8 has_catalog [str catalog] |
+/// u8 has_data [str data] | u8 read_only | u8 has_version [u64 version]`.
+fn write_storage(fw: &mut Writer, storage: &crate::lake_db::DbStorage) {
+    match storage {
+        crate::lake_db::DbStorage::Local => fw.u8(STORAGE_LOCAL),
+        crate::lake_db::DbStorage::Lake(spec) => {
+            fw.u8(STORAGE_LAKE);
+            for text in [&spec.catalog, &spec.data] {
+                match text {
+                    Some(t) => {
+                        fw.u8(1);
+                        fw.str(t);
+                    }
+                    None => fw.u8(0),
+                }
+            }
+            fw.u8(u8::from(spec.read_only));
+            match spec.version {
+                Some(v) => {
+                    fw.u8(1);
+                    fw.u64(v);
+                }
+                None => fw.u8(0),
+            }
+        }
+    }
+}
+
+fn read_storage(r: &mut Reader<'_>) -> Result<crate::lake_db::DbStorage> {
+    match r.u8()? {
+        STORAGE_LOCAL => Ok(crate::lake_db::DbStorage::Local),
+        STORAGE_LAKE => {
+            let mut text = || -> Result<Option<String>> {
+                match r.u8()? {
+                    0 => Ok(None),
+                    1 => Ok(Some(r.str()?)),
+                    t => Err(PinkDbError::Execution(format!(
+                        "corrupt file: bad lake location flag {t}"
+                    ))),
+                }
+            };
+            let catalog = text()?;
+            let data = text()?;
+            let read_only = match r.u8()? {
+                0 => false,
+                1 => true,
+                t => {
+                    return Err(PinkDbError::Execution(format!(
+                        "corrupt file: bad read-only flag {t}"
+                    )));
+                }
+            };
+            let version = match r.u8()? {
+                0 => None,
+                1 => Some(r.u64()?),
+                t => {
+                    return Err(PinkDbError::Execution(format!(
+                        "corrupt file: bad lake version flag {t}"
+                    )));
+                }
+            };
+            Ok(crate::lake_db::DbStorage::Lake(crate::lake_db::LakeSpec {
+                catalog,
+                data,
+                read_only,
+                version,
+            }))
+        }
+        t => Err(PinkDbError::Execution(format!(
+            "corrupt file: unknown database storage tag {t}"
+        ))),
+    }
 }
 
 /// The refusal for a file written by an older pinkdb.
@@ -4546,11 +4658,7 @@ fn check_magic(data: &[u8], trailer_magic: &[u8]) -> Result<()> {
 fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
     let mut r = Reader::new(footer);
     let version = r.u32()?;
-    if version != FOOTER_VERSION {
-        return Err(PinkDbError::Execution(format!(
-            "unsupported .pink footer version {version}; upgrade pinkdb"
-        )));
-    }
+    check_footer_version(version)?;
     let flags = r.u32()?;
     if flags
         & !(FLAG_CONSTRAINTS
@@ -4586,6 +4694,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
     let mut databases = Vec::with_capacity(n_dbs);
     for _ in 0..n_dbs {
         let name = r.str()?;
+        let storage = read_storage(&mut r)?;
         let n_tables = r.u32()? as usize;
         if n_tables > r.remaining() / 8 + 1 {
             return r.err("table count exceeds the remaining file");
@@ -4733,6 +4842,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
         };
         databases.push(DbDir {
             name,
+            storage,
             tables,
             macros: dmacros,
             materialized_views: dmvs,
@@ -5984,9 +6094,9 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
 /// The pinned length and footer checksum of the golden corpus's `PINKDB06`
 /// image (see `golden_pinkdb06_bytes_are_pinned`).
 #[cfg(test)]
-const GOLDEN_V6_LEN: usize = 143_712;
+const GOLDEN_V6_LEN: usize = 143_714;
 #[cfg(test)]
-const GOLDEN_V6_FOOTER_CRC: u32 = 3_066_041_510;
+const GOLDEN_V6_FOOTER_CRC: u32 = 676_117_509;
 
 #[cfg(test)]
 mod tests {
@@ -6145,6 +6255,54 @@ mod tests {
                 "version {version}"
             );
         }
+    }
+
+    /// Wave 124: footer version 3 records every database's storage. A
+    /// version-2 footer (no storage) is refused as an older pinkdb's.
+    #[test]
+    fn a_version_two_footer_is_refused_as_an_older_pinkdbs() {
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        let mut bytes = db.to_bytes().unwrap();
+        let (start, len) = footer_span_raw(&bytes).unwrap();
+        bytes[start..start + 4].copy_from_slice(&2u32.to_le_bytes());
+        let crc = crc32c(&bytes[start..start + len]);
+        let crc_at = start + len;
+        bytes[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this .pink file was written by an older pinkdb (footer version 2); this build \
+             reads footer version 3 only"
+        );
+    }
+
+    /// Wave 124: a lake database round-trips through the footer as its
+    /// location only — never its tables.
+    #[test]
+    fn a_lake_database_is_persisted_as_its_location() {
+        let mut db = PinkDb::new();
+        db.create_database("lk").unwrap();
+        db.create_table_in("lk", "t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        let spec = crate::lake_db::LakeSpec {
+            catalog: Some("sqlite:/srv/lk.sqlite".to_string()),
+            data: Some("s3://bucket/lk".to_string()),
+            read_only: true,
+            version: Some(7),
+        };
+        db.databases.get_mut("lk").unwrap().storage = crate::lake_db::DbStorage::Lake(spec.clone());
+        let back = PinkDb::load_bytes(&db.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            back.database_storage("lk"),
+            Some(crate::lake_db::DbStorage::Lake(spec))
+        );
+        assert!(back.list_tables_in("lk").is_empty());
+        assert_eq!(
+            back.database_storage("main"),
+            Some(crate::lake_db::DbStorage::Local)
+        );
     }
 
     /// A file from a *newer* pinkdb is a different error: "upgrade pinkdb".
@@ -8776,6 +8934,7 @@ mod tests {
             fw.u32(FLAG_RBAC);
             fw.u32(1); // one database
             fw.str("main");
+            fw.u8(STORAGE_LOCAL);
             fw.u32(1); // one table
             fw.str("t");
             fw.u32(1); // one column

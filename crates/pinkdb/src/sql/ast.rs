@@ -103,13 +103,28 @@ pub enum Statement {
         db: Option<String>,
         name: String,
     },
-    /// `CREATE DATABASE <name>`.
+    /// `CREATE DATABASE <name> [(TYPE LAKE [, CATALOG '…'] [, DATA '…'])]`.
     CreateDatabase {
         name: String,
         if_not_exists: bool,
+        /// The option list, when given (wave 124).
+        options: Option<DatabaseOptions>,
     },
     /// `DROP DATABASE <name>`.
     DropDatabase {
+        name: String,
+        if_exists: bool,
+    },
+    /// `ATTACH '<location>' AS <name> [(TYPE LAKE, READ_ONLY, DATA '…',
+    /// VERSION n)]` (wave 124): open an existing lake as a database.
+    Attach {
+        location: String,
+        name: String,
+        options: DatabaseOptions,
+    },
+    /// `DETACH [DATABASE] [IF EXISTS] <name>` (wave 124): forget a lake
+    /// database; the lake keeps its data.
+    Detach {
         name: String,
         if_exists: bool,
     },
@@ -1044,4 +1059,19 @@ pub enum UnaryOp {
     Not,
     Negate,
     Plus,
+}
+
+/// The option list of `CREATE DATABASE … (…)` and `ATTACH … (…)` (wave 124).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DatabaseOptions {
+    /// `TYPE LAKE`.
+    pub lake: bool,
+    /// `CATALOG '<location>'` (`CREATE DATABASE` only).
+    pub catalog: Option<String>,
+    /// `DATA '<location>'`.
+    pub data: Option<String>,
+    /// `READ_ONLY` (`ATTACH` only).
+    pub read_only: bool,
+    /// `VERSION n` (`ATTACH … READ_ONLY` only).
+    pub version: Option<u64>,
 }

@@ -1234,6 +1234,8 @@ fn read_checked(plan: &LogicalPlan) -> bool {
             | LogicalPlan::Revoke { .. }
             | LogicalPlan::CreateDatabase { .. }
             | LogicalPlan::DropDatabase { .. }
+            | LogicalPlan::Attach { .. }
+            | LogicalPlan::Detach { .. }
             | LogicalPlan::Checkpoint
             | LogicalPlan::Analyze { .. }
             | LogicalPlan::LoadExtension { .. }
@@ -1346,7 +1348,10 @@ pub(crate) fn check_statement(
         | LogicalPlan::DropRole { .. }
         | LogicalPlan::Grant { .. }
         | LogicalPlan::Revoke { .. } => return admin_only("user/role management"),
-        LogicalPlan::CreateDatabase { .. } | LogicalPlan::DropDatabase { .. } => {
+        LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Attach { .. }
+        | LogicalPlan::Detach { .. } => {
             return admin_only("database management");
         }
         LogicalPlan::Checkpoint => return admin_only("CHECKPOINT"),

@@ -257,10 +257,22 @@ pub enum LogicalPlan {
         db: Option<String>,
         name: String,
     },
-    /// `CREATE DATABASE <name>` (store-level; never inside a transaction).
+    /// `CREATE DATABASE <name> [(TYPE LAKE …)]` (store-level; never inside a
+    /// transaction). `lake` makes it a lake database (wave 124).
     CreateDatabase {
         name: String,
         if_not_exists: bool,
+        lake: Option<crate::lake_db::LakeSpec>,
+    },
+    /// `ATTACH '<location>' AS <name> (…)` (wave 124; store-level).
+    Attach {
+        name: String,
+        spec: crate::lake_db::LakeSpec,
+    },
+    /// `DETACH <name>` (wave 124; store-level).
+    Detach {
+        name: String,
+        if_exists: bool,
     },
     /// `DROP DATABASE <name>` (store-level; never inside a transaction).
     DropDatabase {
@@ -843,6 +855,8 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreateDatabase { .. }
             | LogicalPlan::DropDatabase { .. }
+            | LogicalPlan::Attach { .. }
+            | LogicalPlan::Detach { .. }
             | LogicalPlan::Use { .. }
             // `SET VARIABLE` is session state, not store state: it is
             // read-only for the store (no lock upgrade) and never logged —
@@ -903,6 +917,8 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
     Some(match plan {
         LogicalPlan::CreateDatabase { .. } => "CREATE DATABASE",
         LogicalPlan::DropDatabase { .. } => "DROP DATABASE",
+        LogicalPlan::Attach { .. } => "ATTACH",
+        LogicalPlan::Detach { .. } => "DETACH",
         LogicalPlan::LoadExtension { .. } => "LOAD EXTENSION",
         LogicalPlan::InstallExtension { .. } => "INSTALL",
         LogicalPlan::LoadInstalledExtension { .. } => "LOAD",
@@ -974,7 +990,10 @@ pub(crate) fn optimistic_eligible(plan: &LogicalPlan) -> bool {
 /// what it touches.
 pub(crate) fn plan_sets(plan: &LogicalPlan, default_db: &str, out: &mut crate::wal::FrameSets) {
     match plan {
-        LogicalPlan::CreateDatabase { name, .. } | LogicalPlan::DropDatabase { name, .. } => {
+        LogicalPlan::CreateDatabase { name, .. }
+        | LogicalPlan::DropDatabase { name, .. }
+        | LogicalPlan::Attach { name, .. }
+        | LogicalPlan::Detach { name, .. } => {
             out.add_database(name);
             return;
         }
@@ -1052,6 +1071,8 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Attach { .. }
+        | LogicalPlan::Detach { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
@@ -1510,6 +1531,8 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Attach { .. }
+        | LogicalPlan::Detach { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
@@ -1750,6 +1773,8 @@ fn walk_scan_filters(
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Attach { .. }
+        | LogicalPlan::Detach { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
@@ -2188,6 +2213,8 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Attach { .. }
+        | LogicalPlan::Detach { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
@@ -2652,6 +2679,8 @@ fn walk_scan_projections(
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Attach { .. }
+        | LogicalPlan::Detach { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }

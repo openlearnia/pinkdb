@@ -57,23 +57,24 @@ resets the session database to <code>main</code>. A bare path is a
 
 <h2>5. Attach read-only (the fast path)</h2>
 
-<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake attach mylake
-pinkdb&gt; SELECT COUNT(*), MIN(total), MAX(total) FROM sales;  -- from stored statistics
-pinkdb&gt; .tables            -- lists sales (1000000 rows, attached)
-pinkdb&gt; .lake attached
-pinkdb&gt; .lake detach mylake</code></pre>
+<pre class="code" data-lang="sql"><code>pinkdb&gt; ATTACH 'lake:mylake' AS sales_lake (READ_ONLY);
+pinkdb&gt; SELECT COUNT(*), MIN(total), MAX(total) FROM sales_lake.sales;  -- from stored statistics
+pinkdb&gt; SHOW DATABASES;    -- sales_lake: storage lake, its version
+pinkdb&gt; SELECT * FROM pinkdb_lake_decodes();   -- 0 data files decoded
+pinkdb&gt; DETACH sales_lake;</code></pre>
 
-<p>Attach decodes no column data for the statistics fast paths; anything else
-materializes the table lazily, decoding only the columns the query references.
-Attached tables are read-only and session-local.</p>
+<p>A read-only lake database decodes no column data for the statistics fast
+paths; anything else materializes the table lazily, decoding only the columns
+the query references. Without <code>READ_ONLY</code> the lake is writable: every
+committed statement publishes one incremental lake version.</p>
 
 <div class="callout warn">
   <span class="callout-title">Gotchas</span>
   <ul>
     <li>Saving again rewrites every table — plan disk and time for full snapshots,
     not appends. Old versions and their files are kept; there is no GC.</li>
-    <li><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code>
-    are refused inside a transaction.</li>
+    <li><code>.lake save</code>, <code>.lake open</code>, <code>ATTACH</code> and
+    <code>DETACH</code> are refused inside a transaction.</li>
     <li>Every build writes and reads <code>.pink</code> data files. A lake
     saved with the removed (wave 104) data format is refused with a clear
     re-save error; there is no converter.</li>

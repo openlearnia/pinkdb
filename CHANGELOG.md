@@ -9,6 +9,41 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 124a — lake databases ✅
+
+- **A lake is a database.** `CREATE DATABASE events (TYPE LAKE [, CATALOG
+  '…'] [, DATA '…'])` creates a lake and `ATTACH 'lake:<catalog>' AS name
+  [(READ_ONLY, DATA '…', VERSION n)]` opens an existing one; `DETACH name`
+  forgets it (the lake keeps its data). The lake's one schema is the
+  database (`main.t` in the lake is `events.t`); a lake with several schemas
+  is refused. `CREATE DATABASE … (TYPE LAKE)` with no `CATALOG` puts the lake
+  under the store's lake directory.
+- **Writable lake databases publish every commit.** Each committed statement
+  or transaction on a writable lake database is one lake version — its data
+  files plus the database's engine metadata (constraints, defaults, indexes,
+  macros, triggers, procedures, materialized views) — and holds the lake's
+  lease: a second writer is refused until the first detaches or its
+  heartbeat goes stale. A read-only one answers from the lake's statistics.
+- **A statement or transaction writes one storage** — the local store or
+  one lake — never both; a trigger or `CALL` that tries is undone. A local
+  write that reads a lake records the lake version it read in the WAL, so
+  `INSERT INTO local SELECT … FROM lake` replays exactly after the lake moved
+  on.
+- **Durable stores keep their lake databases.** The checkpoint records each
+  database's storage (`.pink` footer version 3: older files are refused as
+  written by an older pinkdb) and the WAL the `ATTACH`/`DETACH` statements; a
+  reopen reopens the lakes. A lake that cannot be opened is listed as
+  `unavailable` with the reason, and the store still opens.
+- `SHOW DATABASES` gains `storage`, `location` (passwords masked),
+  `read_only`, `version` and `status`; `pinkdb_catalog()` has one `DATABASE`
+  row per database with the same facts. `pinkdb_lake_decodes()` reports a
+  read-only lake's data-file decodes. A lake URL with a password is refused
+  (use `PGPASSWORD` / `AWS_*`).
+- **CLI:** `.lake attach`, `.lake detach`, `.lake attached` and `.lake
+  commit` are gone — use the SQL above (a writable lake database commits by
+  itself). `PINKDB_KEY` is every lake's key; the maintenance commands refuse
+  a lake a writable lake database holds.
+
 ### Fixes from the first CI run after the console waves ✅
 
 - **An explicit transaction publishes to a lake catalog.** On a server over

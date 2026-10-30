@@ -1530,9 +1530,25 @@ pub struct DbCatalog {
     /// Triggers (wave 100) in **creation order**: that order is the firing
     /// order, so it must survive a save/open round trip and a WAL replay.
     pub(crate) triggers: Vec<crate::trigger::TriggerDef>,
+    /// Where the database's rows live (wave 124): the store, or a lake.
+    /// Persisted in the checkpoint footer.
+    pub(crate) storage: crate::lake_db::DbStorage,
+    /// A lake database's version as this catalog reflects it (the pinned or
+    /// last published lake version); 0 for a local database. Process-local:
+    /// a reopen reads the lake's own.
+    pub(crate) lake_version: u64,
 }
 
 impl DbCatalog {
+    /// An empty database catalog.
+    pub(crate) fn empty(name: &str, storage: crate::lake_db::DbStorage) -> Self {
+        Self {
+            name: name.to_string(),
+            storage,
+            ..Self::default()
+        }
+    }
+
     /// Trigger definitions are only ever replaced by `OR REPLACE` or removed
     /// by `DROP TRIGGER`: the list is short, so a linear scan is the lookup.
     fn trigger_index(&self, name: &str) -> Option<usize> {
@@ -1656,20 +1672,6 @@ impl Session {
 /// the WAL handle (`Arc`), so transaction snapshots and multi-writer
 /// `txn.work` copies all log to the same file. In-memory databases have
 /// `wal == None` and are byte-for-byte unchanged.
-/// The host's commit hook (wave 96b): see [`PinkDb::set_commit_hook`].
-/// `Debug` prints nothing of the closure, so [`PinkDb`]'s derived `Debug`
-/// stays usable.
-pub(crate) struct CommitHook(CommitHookFn);
-
-/// The publish callback's type, named so the struct above reads plainly.
-type CommitHookFn = Box<dyn Fn(&PinkDb) -> Result<()> + Send + Sync>;
-
-impl std::fmt::Debug for CommitHook {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CommitHook")
-    }
-}
-
 #[derive(Debug)]
 pub struct PinkDb {
     /// Key = lowercased database name.
@@ -1845,17 +1847,14 @@ pub struct PinkDb {
     /// a trigger body is checked against *this* principal — invoker rights, not
     /// the definer's. `None` is a trusted embedded session.
     pub(crate) session_principal: Option<String>,
-    /// The host's commit hook (wave 96b): called after every committed unit —
-    /// one autocommit statement, or one `COMMIT` — so a host that keeps the
-    /// store's *durable* metadata elsewhere (pinkdb-server's lake catalog)
-    /// publishes it as part of the same commit. Shared by store clones and
-    /// never persisted; `None` means the store's own checkpoint/WAL is the
-    /// durable copy ([`PinkDb::set_commit_hook`]).
-    pub(crate) commit_hook: Option<std::sync::Arc<CommitHook>>,
-    /// Set when the commit hook failed (wave 96b): the durable copy is behind
-    /// the in-memory state, so no later statement may run. Shared by store
-    /// clones; `None` until a hook fails.
-    pub(crate) commit_hook_failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The store's lake databases (wave 124): the open lakes behind them, the
+    /// managed-lake directory and the host's location policy. Shared by
+    /// store clones and never persisted (the footer persists each database's
+    /// [`crate::lake_db::DbStorage`]).
+    pub(crate) lakes: crate::lake_db::LakeRuntime,
+    /// The storages the open embedded transaction wrote so far (wave 124):
+    /// a transaction writes the local store or one lake database.
+    pub(crate) txn_storages: std::collections::BTreeSet<crate::lake_db::StorageKey>,
     /// While a trigger body (or anything it calls) runs: the principal every
     /// statement it binds is checked against — invoker rights, never a
     /// definer's. `None` outside a trigger body; an empty string is a trigger
@@ -1993,8 +1992,8 @@ impl Clone for PinkDb {
             dml_cte_rows: self.dml_cte_rows.clone(),
             trigger_depth: self.trigger_depth,
             session_principal: self.session_principal.clone(),
-            commit_hook: self.commit_hook.clone(),
-            commit_hook_failure: std::sync::Arc::clone(&self.commit_hook_failure),
+            lakes: self.lakes.clone(),
+            txn_storages: self.txn_storages.clone(),
             trigger_invoker: self.trigger_invoker.clone(),
             rbac: self.rbac.clone(),
             file_formats: self.file_formats.clone(),
@@ -2087,8 +2086,8 @@ impl PinkDb {
             dml_cte_rows: None,
             trigger_depth: 0,
             session_principal: None,
-            commit_hook: None,
-            commit_hook_failure: std::sync::Arc::default(),
+            lakes: crate::lake_db::LakeRuntime::default(),
+            txn_storages: std::collections::BTreeSet::new(),
             trigger_invoker: None,
             rbac: crate::rbac::RbacCatalog::default(),
             // Process-global sinks (`filefmt::register_global_file_format`)
@@ -2109,40 +2108,6 @@ impl PinkDb {
             stream_buffered_rows: std::sync::atomic::AtomicUsize::new(0),
             stream_peak_rows: std::sync::atomic::AtomicUsize::new(0),
             stream_folded_rows: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    /// Install the host's commit hook (wave 96b). The hook runs after every
-    /// committed unit — one autocommit statement, or one `COMMIT` — while the
-    /// store lock is still held, and receives the store as it is *after* the
-    /// commit. It is the seam a host uses when the durable copy of the catalog
-    /// lives outside the store (pinkdb-server publishes its lake catalog
-    /// there). An error fails the committing statement; the host is
-    /// responsible for stopping the store, whose in-memory state is then ahead
-    /// of its durable one.
-    ///
-    /// The hook is shared by every clone of the store and never persisted.
-    pub fn set_commit_hook<F>(&mut self, hook: F)
-    where
-        F: Fn(&PinkDb) -> Result<()> + Send + Sync + 'static,
-    {
-        self.commit_hook = Some(std::sync::Arc::new(CommitHook(Box::new(hook))));
-    }
-
-    /// Run the host's commit hook, if any, after a commit was recorded.
-    pub(crate) fn run_commit_hook(&self) -> Result<()> {
-        match &self.commit_hook {
-            Some(hook) => {
-                let result = (hook.0)(self);
-                if let Err(err) = &result {
-                    *self
-                        .commit_hook_failure
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = Some(err.to_string());
-                }
-                result
-            }
-            None => Ok(()),
         }
     }
 
@@ -2279,6 +2244,14 @@ impl PinkDb {
         if !self.databases.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "database \"{name}\" not found"
+            )));
+        }
+        if matches!(
+            self.databases.get(&key).map(|c| &c.storage),
+            Some(crate::lake_db::DbStorage::Lake(_))
+        ) {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" is a lake database: DETACH it (the lake keeps its data)"
             )));
         }
         if self.databases.len() == 1 {
@@ -2740,17 +2713,6 @@ impl PinkDb {
     /// from ever being observed or saved. The database must be reopened,
     /// which recovers exactly the durable prefix.
     pub(crate) fn ensure_wal_healthy(&self) -> Result<()> {
-        if let Some(msg) = self
-            .commit_hook_failure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-        {
-            return Err(PinkDbError::Execution(format!(
-                "the store stopped after a catalog publish failure ({msg}); \
-                 reopen it to recover the durable state"
-            )));
-        }
         if let Some(wal) = self.durable_handle() {
             let guard = wal.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(msg) = guard.failure() {
@@ -2815,9 +2777,13 @@ impl PinkDb {
         // name wins (store tables shadow attached ones in resolution, exactly
         // like `visible_table_schema`). Without this, a full rebuild silently
         // orphaned every attached `db.table` name.
+        // Lake databases' readers are not session attachments: their
+        // databases come back with the reloaded catalog (or a replayed
+        // `ATTACH`), below.
         let attached_dbs: Vec<String> = self
             .attached_lakes
             .iter()
+            .filter(|l| !self.is_lake_reader(l))
             .flat_map(|l| l.tables().iter().map(|t| t.db.clone()))
             .collect();
         for name in attached_dbs {
@@ -2829,6 +2795,9 @@ impl PinkDb {
                 });
         }
         self.current_db = other.current_db;
+        // Wave 124: the reloaded checkpoint names its lake databases but holds
+        // none of their content; this process's open lakes provide it.
+        self.reinstall_lake_databases();
     }
 
     /// WAL hook for one statement that has just committed successfully
@@ -2962,7 +2931,7 @@ impl PinkDb {
     // The arguments are the record's fields, one per column of the payload.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn wal_append_session(
-        &self,
+        &mut self,
         db_before: &str,
         db_after: &str,
         stmts: &[String],
@@ -2971,7 +2940,13 @@ impl PinkDb {
         sets: Option<&crate::wal::FrameSets>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
-        self.wal_append_session_unhooked(
+        // Wave 124: a unit that changed lake databases commits there, and the
+        // storage checks guarantee it wrote nothing local — so it is not
+        // appended to the local WAL.
+        if self.route_committed_unit()? {
+            return Ok(());
+        }
+        self.wal_append_local(
             db_before,
             db_after,
             stmts,
@@ -2979,15 +2954,16 @@ impl PinkDb {
             loaded_extensions,
             sets,
             memo,
-        )?;
-        self.run_commit_hook()
+        )
     }
 
-    /// [`PinkDb::wal_append_session`] without the commit hook: a transaction
-    /// logs its record before it merges its work into the store, and runs the
-    /// hook only after the merge, so the hook sees what was committed.
+    /// [`PinkDb::wal_append_session`] without the lake routing: append the
+    /// unit to the local WAL (no-op in memory). The lake versions the unit
+    /// read ride in the record (see [`crate::lake_db`]). A transaction of a
+    /// shared store logs its record before it merges its work, and routes
+    /// after the merge.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn wal_append_session_unhooked(
+    pub(crate) fn wal_append_local(
         &self,
         db_before: &str,
         db_after: &str,
@@ -2998,6 +2974,14 @@ impl PinkDb {
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
+            let pins = self.lake_pins(sets);
+            let memo: std::borrow::Cow<'_, [crate::wal::ExtCall]> = if pins.is_empty() {
+                std::borrow::Cow::Borrowed(memo)
+            } else {
+                let mut all = memo.to_vec();
+                all.extend(pins);
+                std::borrow::Cow::Owned(all)
+            };
             let mut guard = wal.lock().map_err(|_| {
                 PinkDbError::Execution("internal lock error (poisoned)".to_string())
             })?;
@@ -3009,7 +2993,7 @@ impl PinkDb {
                 touched_extensions,
                 loaded_extensions,
                 sets,
-                memo,
+                &memo,
             )?;
         }
         Ok(())
@@ -3038,6 +3022,7 @@ impl PinkDb {
         self.wal_txn_sets = crate::wal::FrameSets::default();
         self.wal_txn_memo.clear();
         self.txn_touched = crate::wal::FrameSets::default();
+        self.txn_storages.clear();
         // A new transaction starts with no writes; ROLLBACK must not leave
         // this transaction's writes in the ON COMMIT dirty set.
         self.txn_writes.clear();
@@ -3085,7 +3070,21 @@ impl PinkDb {
                 return Err(PinkDbError::Execution(conflict.message("transaction")));
             }
         }
-        if writes {
+        // Wave 124: a transaction writes one storage. The per-statement checks
+        // already refused the plans that named two; what a `CALL` or trigger
+        // wrote is only known now. A lake transaction publishes instead of
+        // logging; a failed publish rolls it back.
+        let txn_storages = std::mem::take(&mut self.txn_storages);
+        if let Err(e) = self.refuse_mixed_storages(&txn_storages, "transaction") {
+            self.rollback()?;
+            return Err(e);
+        }
+        let lake_routed = writes && !self.dirty_lake_databases()?.is_empty();
+        if lake_routed && let Err(e) = self.route_committed_unit() {
+            self.rollback()?;
+            return Err(e);
+        }
+        if writes && !lake_routed {
             let stmts = std::mem::take(&mut self.wal_txn);
             let touched = std::mem::take(&mut self.wal_txn_ext_paths);
             let loaded = std::mem::take(&mut self.wal_txn_ext_loaded);
@@ -3096,7 +3095,7 @@ impl PinkDb {
                 .take()
                 .unwrap_or_else(|| self.current_db.clone());
             let after = self.current_db.clone();
-            if let Err(e) = self.wal_append_session(
+            if let Err(e) = self.wal_append_local(
                 &before,
                 &after,
                 &stmts,
@@ -3147,6 +3146,7 @@ impl PinkDb {
                 self.wal_txn_ext_loaded.clear();
                 self.wal_txn_sets = crate::wal::FrameSets::default();
                 self.txn_touched = crate::wal::FrameSets::default();
+                self.txn_storages.clear();
                 // A rolled-back transaction's writes never happened: drop its
                 // ON COMMIT dirty set (the snapshot restore above already
                 // reverted the pre-`BEGIN` value).

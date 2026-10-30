@@ -61,6 +61,7 @@ mod install;
 pub(crate) mod js;
 /// SQL macros (wave 77): scalar/table templates expanded at bind time.
 mod keys;
+pub mod lake_db;
 pub mod macros;
 pub(crate) mod mv;
 pub mod optimizer;
@@ -111,6 +112,10 @@ pub use exec::{CancelFlag, ExecLimits, QueryResult, STATEMENT_CANCELLED};
 pub use filefmt::FileFormat;
 pub use fsutil::{CopyToPolicy, write_atomic_private};
 pub use install::{InstalledExtension, NO_REPO_SUPPORT};
+pub use lake_db::{
+    DatabaseInfo, DatabaseOpener, DbStorage, LakeContent, LakeDatabase, LakeOpenRequest,
+    LakePolicy, LakeSpec, register_database_opener,
+};
 pub use macros::{MacroDef, MacroParamDef};
 pub use package::{ExtensionPackage, extension_package_names, register_extension_package};
 /// The extension ABI's value types, re-exported so a package that declares
@@ -279,8 +284,23 @@ impl PinkDb {
                 exec::ExecBudget::new(limits.as_ref())
                     .with_external_services(self.external_services()),
             );
+            // Wave 124: a unit writes one storage. The writes a `CALL` or a
+            // trigger performs are checked after it ran (and undone when
+            // refused); a transaction remembers what it wrote so far.
             let run_plan = |db: &mut PinkDb, plan: &plan::LogicalPlan| {
-                exec::run_with_budget(db, plan, budget.clone())
+                let prior = if db.in_transaction() {
+                    db.txn_storages.clone()
+                } else {
+                    Default::default()
+                };
+                let (result, storages) =
+                    db.run_storage_checked(plan, &session_db, &prior, |db| {
+                        exec::run_with_budget(db, plan, budget.clone())
+                    })?;
+                if db.in_transaction() {
+                    db.txn_storages = storages;
+                }
+                Ok::<_, types::PinkDbError>(result)
             };
             let bind_start = profiling.then(std::time::Instant::now);
             let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &session_db)?;
@@ -293,6 +313,14 @@ impl PinkDb {
             let optimize = optimize_start
                 .map(|start| start.elapsed())
                 .unwrap_or_default();
+            // Wave 124: refuse a write to a read-only or unavailable lake, or
+            // to a second storage, before anything runs.
+            let txn_storages = if self.in_transaction() {
+                self.txn_storages.clone()
+            } else {
+                Default::default()
+            };
+            self.check_statement_storages(&plan, &session_db, &txn_storages)?;
             // A record replay serves these results instead of calling the
             // function; only a statement that is actually WAL-logged records.
             budget.set_collect_external_calls(

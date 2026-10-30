@@ -1,6 +1,6 @@
 //! CLI coverage for the `parquetlake` feature (wave 87): `.lake format
 //! parquet` selects the provider, `.lake save` writes `.parquet` data files,
-//! `.lake open` reads them back, `.lake attach` answers from the manifest
+//! `.lake open` reads them back, a read-only lake database answers from the manifest
 //! statistics, and an unknown format id is a clean error. The on-disk checks
 //! read the published `<lake>.files/data` tree (the layout wave 102/103
 //! introduced; the JSON catalog these tests once read is gone).
@@ -137,12 +137,13 @@ fn attach_answers_from_the_parquet_lake_statistics() {
     assert!(out.contains("Saved lake version 2"), "{out}");
 
     let out = run(&format!(
-        ".lake attach {lake}\n\
+        "ATTACH 'lake:{lake}' AS lk (READ_ONLY);\nUSE lk;\n\
          SELECT COUNT(*), COUNT(s), MIN(i), MAX(i), MIN(s), MAX(s) FROM t;\n\
+         SELECT 'decodes: ' || files || ' files' AS d FROM pinkdb_lake_decodes();\n\
          .quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("statistics-only"), "{out}");
+    assert!(out.contains("decodes: 0 files"), "statistics-only: {out}");
     assert!(
         out.contains("│ 3        │ 2        │ 1       │ 3       │ x       │ z       │"),
         "{out}"

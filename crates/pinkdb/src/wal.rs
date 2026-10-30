@@ -532,6 +532,11 @@ pub struct DurableOpenOptions {
     /// The directory extension loads are confined to (`None` = no root).
     /// A recorded path outside the root is refused.
     pub extension_root: Option<PathBuf>,
+    /// Where the store's managed lakes live and relative lake paths resolve
+    /// (wave 124, see [`PinkDb::set_lake_dir`]). Needed at open: the
+    /// checkpoint's lake databases and the WAL's `ATTACH` records resolve
+    /// against it before the caller holds the store.
+    pub lake_dir: Option<PathBuf>,
 }
 
 impl Default for DurableOpenOptions {
@@ -542,6 +547,7 @@ impl Default for DurableOpenOptions {
             lock_mode: LockMode::Required,
             allow_extension_replay: false,
             extension_root: None,
+            lake_dir: None,
         }
     }
 }
@@ -4053,6 +4059,11 @@ impl PinkDb {
         // (see `PinkDb::resolve_replay_extension`), never auto-loaded.
         db.allow_extension_replay = opts.allow_extension_replay;
         db.extension_root = opts.extension_root.clone();
+        // Wave 124: open the checkpoint's lake databases before the replay
+        // (a record may read one, pinned to the version it read). A lake that
+        // cannot be opened is listed as unavailable; the open continues.
+        db.set_lake_dir(opts.lake_dir.clone());
+        db.reopen_lake_databases()?;
         // A checkpointed vector graph is inert until its provider is loaded;
         // replay of the WAL above must find it. Activate the registered
         // (linked-in) package before replaying, never a file the store names.
@@ -5080,6 +5091,11 @@ fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
     // Every `external_io` host scalar of this record is served from the
     // record's memo, never called: a replay must not reach a provider (it may
     // have no key and no network) and must reproduce the original vectors.
+    // Wave 124: a record that read lake databases replays against the lake
+    // versions it read.
+    let pins = db.apply_replay_pins(&rec.memo).map_err(|e| {
+        PinkDbError::Execution(format!("WAL replay failed at lsn {}: {e}", rec.lsn))
+    })?;
     let previous = db.set_ext_replay(Some(std::sync::Arc::new(ReplayMemo::new(&rec.memo))));
     let mut outcome = Ok(());
     for sql in &rec.stmts {
@@ -5092,6 +5108,7 @@ fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
         }
     }
     db.set_ext_replay(previous);
+    db.restore_replay_pins(pins);
     outcome
 }
 

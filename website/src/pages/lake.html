@@ -62,8 +62,8 @@ pinkdb&gt; .lake open pink:lake.pink
 pinkdb&gt; .lake versions pink:lake.pink
 pinkdb&gt; .lake tables pink:lake.pink
 pinkdb&gt; .lake info pink:lake.pink
-pinkdb&gt; .lake attach pink:lake.pink
-pinkdb&gt; SELECT COUNT(*) FROM t;      -- from the catalog, no data read</code></pre>
+pinkdb&gt; ATTACH 'lake:pink:lake.pink' AS lk (READ_ONLY);
+pinkdb&gt; SELECT COUNT(*) FROM lk.t;   -- from the catalog, no data read</code></pre>
 
 <p>A save writes immutable data files first, then one catalog transaction. A
 crash leaves the previous version or the new one, never a mix. Time travel
@@ -72,10 +72,15 @@ older <code>begin_snapshot</code> boundary.</p>
 
 <h2>Incremental commits</h2>
 
-<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake attach pink:lake.pink write
-pinkdb&gt; INSERT INTO t VALUES (…);
-pinkdb&gt; DELETE FROM t WHERE …;
-pinkdb&gt; .lake commit pink:lake.pink</code></pre>
+<pre class="code" data-lang="sql"><code>pinkdb&gt; ATTACH 'lake:pink:lake.pink' AS lk;   -- writable: holds the lake's lease
+pinkdb&gt; INSERT INTO lk.t VALUES (…);           -- one lake version
+pinkdb&gt; BEGIN; DELETE FROM lk.t WHERE …; INSERT INTO lk.t …; COMMIT;   -- one version
+pinkdb&gt; DETACH lk;</code></pre>
+
+<p>A lake is a database (wave 124): <code>CREATE DATABASE name (TYPE LAKE,
+CATALOG '…', DATA '…')</code> creates one, a writable lake database publishes
+every committed statement or transaction, and one lake has one writer at a
+time (a lease in its catalog). The lake's one schema is the database.</p>
 
 <p>Append-only commits add data files (inlined rows stay in the catalog when they
 are small). Deletes use positional delete files; merge/rewrite bake them in when

@@ -1639,6 +1639,8 @@ pub(crate) fn refused_in_body(stmt: &Statement) -> Option<&'static str> {
         Statement::LoadInstalledExtension { .. } => "LOAD",
         Statement::CreateDatabase { .. } => "CREATE DATABASE",
         Statement::DropDatabase { .. } => "DROP DATABASE",
+        Statement::Attach { .. } => "ATTACH",
+        Statement::Detach { .. } => "DETACH",
         Statement::CreateProcedure { .. } => "CREATE PROCEDURE",
         Statement::DropProcedure { .. } => "DROP PROCEDURE",
         // Wave 83: an anonymous block is a top-level statement only.

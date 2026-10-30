@@ -1997,12 +1997,28 @@ pub(crate) fn run_plain(
         LogicalPlan::CreateDatabase {
             name,
             if_not_exists,
+            lake,
         } => {
             if *if_not_exists && db.database_exists(name) {
                 return Ok(QueryResult::CreatedDatabase { name: name.clone() });
             }
-            db.create_database(name)?;
+            match lake {
+                Some(spec) => db.create_lake_database(name, spec.clone())?,
+                None => db.create_database(name)?,
+            }
             Ok(QueryResult::CreatedDatabase { name: name.clone() })
+        }
+        // Wave 124: `ATTACH` reports the database it created, `DETACH` the one
+        // it removed (so a session on it falls back like after a DROP).
+        LogicalPlan::Attach { name, spec } => {
+            db.attach_lake_database(name, spec.clone())?;
+            Ok(QueryResult::CreatedDatabase { name: name.clone() })
+        }
+        LogicalPlan::Detach { name, if_exists } => {
+            if db.detach_lake_database(name, *if_exists)? {
+                db.rbac_mut().remove_database(name);
+            }
+            Ok(QueryResult::DroppedDatabase { name: name.clone() })
         }
         LogicalPlan::DropDatabase { name, if_exists } => {
             if *if_exists && !db.database_exists(name) {
@@ -3358,6 +3374,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Attach { .. }
+        | LogicalPlan::Detach { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -3498,11 +3516,52 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             })
         }
         LogicalPlan::ShowDatabases => {
-            let names = cx.db.list_databases();
+            // Wave 124: every database with its storage facts.
+            let infos = cx.db.database_infos();
+            let n = infos.len();
+            let mut name = Vector::with_capacity(DataType::Varchar, n);
+            let mut storage = Vector::with_capacity(DataType::Varchar, n);
+            let mut location = Vector::with_capacity(DataType::Varchar, n);
+            let mut read_only = Vector::with_capacity(DataType::Boolean, n);
+            let mut version = Vector::with_capacity(DataType::Bigint, n);
+            let mut status = Vector::with_capacity(DataType::Varchar, n);
+            for info in infos {
+                name.push_valid(Value::Varchar(info.name))?;
+                storage.push_valid(Value::Varchar(info.storage))?;
+                match info.location {
+                    Some(l) => location.push_valid(Value::Varchar(l))?,
+                    None => location.push_null()?,
+                }
+                read_only.push_valid(Value::Boolean(info.read_only))?;
+                match info.version {
+                    Some(v) => version.push_valid(Value::Bigint(v as i64))?,
+                    None => version.push_null()?,
+                }
+                status.push_valid(Value::Varchar(info.status))?;
+            }
             Ok(Output {
-                chunks: vec![DataChunk::new(vec![string_vector(&names)?])?],
-                names: vec!["database_name".to_string()],
-                types: vec![DataType::Varchar],
+                chunks: vec![DataChunk::new(vec![
+                    name, storage, location, read_only, version, status,
+                ])?],
+                names: [
+                    "database_name",
+                    "storage",
+                    "location",
+                    "read_only",
+                    "version",
+                    "status",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                types: vec![
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                ],
             })
         }
         LogicalPlan::ShowMacros { db: qdb } => {
@@ -8399,6 +8458,8 @@ fn explain_into(
         LogicalPlan::DropView { db, name } => format!("DropView {}", qualify(db, name)),
         LogicalPlan::CreateDatabase { name, .. } => format!("CreateDatabase {name}"),
         LogicalPlan::DropDatabase { name, .. } => format!("DropDatabase {name}"),
+        LogicalPlan::Attach { name, .. } => format!("Attach {name}"),
+        LogicalPlan::Detach { name, .. } => format!("Detach {name}"),
         LogicalPlan::Use { name } => format!("Use {name}"),
         LogicalPlan::Sample { input, sample } => {
             children.push(input);
@@ -11761,7 +11822,10 @@ mod tests {
         db.execute("CREATE DATABASE zz;").unwrap();
         db.execute("CREATE DATABASE aa;").unwrap();
         assert_eq!(
-            select(&mut db, "SHOW DATABASES;"),
+            select(&mut db, "SHOW DATABASES;")
+                .into_iter()
+                .map(|r| vec![r[0].clone()])
+                .collect::<Vec<_>>(),
             vec![
                 vec![V::Varchar("aa".to_string())],
                 vec![V::Varchar("main".to_string())],

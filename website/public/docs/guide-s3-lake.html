@@ -231,8 +231,8 @@ pinkdb&gt; .lake info     pink:/srv/lakes/demo.pink</code></pre></div>
 </code></pre></div>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code>pinkdb&gt; .lake open   pink:/srv/lakes/demo.pink
-pinkdb&gt; .lake attach pink:/srv/lakes/demo.pink
-pinkdb&gt; <span class="tok-k">SELECT</span> COUNT(*) <span class="tok-k">FROM</span> sales;   <span class="tok-c">-- statistics fast path, 0 column decodes</span></code></pre></div>
+pinkdb&gt; <span class="tok-k">ATTACH</span> <span class="tok-s">'lake:pink:/srv/lakes/demo.pink'</span> <span class="tok-k">AS</span> demo (READ_ONLY);
+pinkdb&gt; <span class="tok-k">SELECT</span> COUNT(*) <span class="tok-k">FROM</span> demo.sales;   <span class="tok-c">-- statistics fast path, 0 column decodes</span></code></pre></div>
 
 <p>For a lake shared by several machines, put the catalog in Postgres instead:
 <code>.lake save postgres://user@host/db?schema=sales data s3://bucket/sales</code>.

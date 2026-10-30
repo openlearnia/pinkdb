@@ -351,9 +351,12 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
         | DropTrigger { db, .. }
         | CreateMacro { db, .. }
         | DropMacro { db, .. } => table(db, current_db),
+        // Attaching and detaching lakes change the store's database list and
+        // open outside storage: a store-level write (wave 124).
         CreateDatabase { name, .. } | DropDatabase { name, .. } => {
             WriteTarget::Databases(vec![name.to_ascii_lowercase()])
         }
+        Attach { .. } | Detach { .. } => WriteTarget::Global,
         // Everything else a policy can see here changes the store outside one
         // database, or runs SQL this function cannot inspect.
         LoadExtension { .. }
@@ -385,9 +388,9 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
 /// later is refused until it is reviewed here.
 ///
 /// `USE` is allowed: it only moves the session's current database, and
-/// `tables(database)` needs it. `ATTACH` and `SET` never reach this function:
-/// the engine has no such statements (attaching a lake is the CLI's
-/// `.lake attach`, and security settings are startup flags).
+/// `tables(database)` needs it. `ATTACH`/`DETACH` (wave 124) are writes and
+/// are refused; `SET` never reaches this function (security settings are
+/// startup flags).
 pub fn statement_allowed(stmt: &Statement, allow_writes: bool) -> bool {
     if allow_writes {
         return true;

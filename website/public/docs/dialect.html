@@ -220,7 +220,7 @@ is <a href="https://github.com/openlearnia/pinkdb/blob/main/docs/sql-conformance
     <tr><td><code>PREPARE</code>/<code>EXECUTE</code> (SQL)</td><td>✗</td><td>placeholders are <code>?</code> through the bind API, server protocol and FFI — no SQL-level statements</td></tr>
     <tr><td><code>SET</code></td><td>✗</td><td>configuration is build flags and <code>PINKDB_*</code>/<code>AWS_*</code> environment variables</td></tr>
     <tr><td><code>COPY</code> (files)</td><td>✗</td><td>CSV in via <code>.import</code> (local and, from wave 75, <code>https://</code> / <code>s3://</code>); remote exports are a follow-up</td></tr>
-    <tr><td><code>ATTACH</code> (SQL)</td><td>✗</td><td>lakes attach with the <code>.lake attach</code> dot-command; Iceberg <code>ATTACH</code> is planned (wave 72)</td></tr>
+    <tr><td><code>ATTACH</code> / <code>DETACH</code> (SQL)</td><td>◐</td><td>lakes only (wave 124): <code>ATTACH 'lake:&lt;catalog&gt;' AS name [(READ_ONLY, DATA '…', VERSION n)]</code> or <code>CREATE DATABASE name (TYPE LAKE …)</code>; attaching <code>.pink</code> files and Iceberg <code>ATTACH</code> are later waves</td></tr>
     <tr><td><code>TRUNCATE</code>, <code>VACUUM</code>, <code>ANALYZE</code></td><td>✗</td><td>use <code>DELETE</code>; maintenance waves cover lake compaction (wave 67)</td></tr>
     <tr><td>Table functions, <code>FROM 'file.csv'</code></td><td>✅</td><td><code>read_csv</code> (with the wave-76 options), <code>read_parquet</code>, <code>read_arrow</code> and replacement scans for local paths, <code>https://</code> and <code>s3://</code> in builds with the matching feature</td></tr>
   </tbody>

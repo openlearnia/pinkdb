@@ -243,23 +243,24 @@ resets the session database to <code>main</code>. A bare path is a
 
 <h2 id="5-attach-read-only-the-fast-path">5. Attach read-only (the fast path)<a class="anchor" href="#5-attach-read-only-the-fast-path" aria-label="Permalink: 5. Attach read-only (the fast path)">#</a></h2>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code>pinkdb&gt; .lake attach mylake
-pinkdb&gt; <span class="tok-k">SELECT</span> COUNT(*), MIN(total), MAX(total) <span class="tok-k">FROM</span> sales;  <span class="tok-c">-- from stored statistics</span>
-pinkdb&gt; .tables            <span class="tok-c">-- lists sales (1000000 rows, attached)</span>
-pinkdb&gt; .lake attached
-pinkdb&gt; .lake detach mylake</code></pre></div>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code>pinkdb&gt; <span class="tok-k">ATTACH</span> <span class="tok-s">'lake:mylake'</span> <span class="tok-k">AS</span> sales_lake (READ_ONLY);
+pinkdb&gt; <span class="tok-k">SELECT</span> COUNT(*), MIN(total), MAX(total) <span class="tok-k">FROM</span> sales_lake.sales;  <span class="tok-c">-- from stored statistics</span>
+pinkdb&gt; SHOW DATABASES;    <span class="tok-c">-- sales_lake: storage lake, its version</span>
+pinkdb&gt; <span class="tok-k">SELECT</span> * <span class="tok-k">FROM</span> pinkdb_lake_decodes();   <span class="tok-c">-- 0 data files decoded</span>
+pinkdb&gt; DETACH sales_lake;</code></pre></div>
 
-<p>Attach decodes no column data for the statistics fast paths; anything else
-materializes the table lazily, decoding only the columns the query references.
-Attached tables are read-only and session-local.</p>
+<p>A read-only lake database decodes no column data for the statistics fast
+paths; anything else materializes the table lazily, decoding only the columns
+the query references. Without <code>READ_ONLY</code> the lake is writable: every
+committed statement publishes one incremental lake version.</p>
 
 <div class="callout warn">
   <span class="callout-title">Gotchas</span>
   <ul>
     <li>Saving again rewrites every table — plan disk and time for full snapshots,
     not appends. Old versions and their files are kept; there is no GC.</li>
-    <li><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code>
-    are refused inside a transaction.</li>
+    <li><code>.lake save</code>, <code>.lake open</code>, <code>ATTACH</code> and
+    <code>DETACH</code> are refused inside a transaction.</li>
     <li>Every build writes and reads <code>.pink</code> data files. A lake
     saved with the removed (wave 104) data format is refused with a clear
     re-save error; there is no converter.</li>

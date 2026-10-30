@@ -279,7 +279,7 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
     std::fs::remove_dir_all(&scratch).ok();
 }
 
-/// `.lake attach` over the mock S3: allowed, footer-only in the decode sense
+/// A read-only lake database over the mock S3: allowed, footer-only in the decode sense
 /// (whole objects, as the note says), with working statistics fast paths and
 /// lazy materialization.
 #[test]
@@ -302,25 +302,25 @@ fn lake_s3_attach_reports_and_queries() {
     let out = run_mock(
         &mock,
         &format!(
-            ".lake attach {catalog}\n\
-             .lake attached\n\
+            "ATTACH 'lake:{catalog}' AS lk (READ_ONLY);\n\
+             USE lk;\n\
              SELECT COUNT(*), COUNT(b), MIN(a), MAX(b) FROM t;\n\
+             {decodes}\
              SELECT SUM(a) FROM t;\n\
-             .lake detach {catalog}\n\
-             .quit\n"
+             USE main;\n\
+             DETACH lk;\n\
+             .quit\n",
+            decodes = common::DECODES,
         ),
     );
     assert!(!out.contains("footer-only"), "{out}");
-    assert!(
-        out.contains("statistics-only") && out.contains("decodes: 0 loads"),
-        "{out}"
+    assert_eq!(
+        common::decode_lines(&out),
+        vec!["decodes: 0 loads, 0 columns, 0 files"],
+        "statistics-only: {out}"
     );
-    assert!(
-        !out.contains("Transport:"),
-        "attach reads the catalog, not a data object:\n{out}"
-    );
-    assert!(out.contains("main.t (2 rows)"), "{out}");
-    assert!(out.contains("Detached"), "{out}");
+    assert!(out.contains("│ 3 "), "{out}");
+    assert!(out.contains("Database lk dropped."), "{out}");
     assert!(!out.contains("Error:"), "{out}");
 }
 

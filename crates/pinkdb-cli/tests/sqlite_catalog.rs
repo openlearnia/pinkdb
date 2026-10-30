@@ -1,7 +1,7 @@
 //! CLI coverage for a SQLite lake catalog (wave 96a): `.lake save <catalog>
-//! data <dir>`, `.lake open <catalog>`, `.lake attach <catalog>` and the
-//! writable attach + `.lake commit <catalog>`, with every metadata object in
-//! SQL and the data files in a separate directory.
+//! data <dir>`, `.lake open <catalog>`, and read-only and writable lake
+//! databases (`ATTACH 'lake:<catalog>'`), with every metadata object in SQL
+//! and the data files in a separate directory.
 
 #![cfg(all(feature = "pinklake", feature = "catalog-sqlite"))]
 
@@ -80,29 +80,27 @@ fn save_open_attach_and_commit_through_a_sqlite_catalog() {
         "the catalog stays at its own location, not in the data root"
     );
 
-    // Read-only attach by the catalog URL, an explicit `data` open (the moved
-    // location override), and detach by the same URL.
+    // A read-only lake database by the catalog URL, an explicit `data` open
+    // (the moved location override), and DETACH.
     let out = run(&format!(
-        ".lake attach {catalog}\n\
-         SELECT COUNT(*) FROM t;\n\
-         .lake detach {catalog}\n\
+        "ATTACH 'lake:{catalog}' AS lk (READ_ONLY);\n\
+         SELECT COUNT(*) FROM lk.t;\n\
+         DETACH lk;\n\
          .lake open {catalog} data {data}\n\
          SELECT COUNT(*) FROM t;\n\
          .quit\n"
     ));
-    assert!(out.contains("statistics-only"), "{out}");
     assert!(out.contains("│ 2        │"), "{out}");
-    assert!(out.contains(&format!("Detached {catalog}")), "{out}");
+    assert!(out.contains("Database lk dropped."), "{out}");
+    assert!(!out.contains("Error"), "{out}");
 
-    // Writable attach + commit, all keyed by the catalog URL.
+    // A writable lake database publishes each statement.
     let out = run(&format!(
-        ".lake attach {catalog} write\n\
-         INSERT INTO t VALUES (3, 'z');\n\
-         .lake commit {catalog}\n\
+        "ATTACH 'lake:{catalog}' AS lk;\n\
+         INSERT INTO lk.t VALUES (3, 'z');\n\
          .quit\n"
     ));
-    assert!(out.contains("Committed lake version 3"), "{out}");
-    assert!(!out.contains("no writable attach"), "{out}");
+    assert!(!out.contains("Error"), "{out}");
 
     // The new version is visible from a fresh session.
     let out = run(&format!(
@@ -160,10 +158,9 @@ fn maintenance_and_settings_commands_work() {
         "CREATE TABLE t (a INTEGER, b VARCHAR);\n\
          INSERT INTO t VALUES (1, 'one');\n\
          .lake save {catalog} data {data}\n\
-         .lake attach {catalog} write\n\
-         INSERT INTO t VALUES (2, 'two'), (3, 'three'), (4, 'four');\n\
-         .lake commit {catalog}\n\
-         .lake detach {catalog}\n\
+         ATTACH 'lake:{catalog}' AS lk;\n\
+         INSERT INTO lk.t VALUES (2, 'two'), (3, 'three'), (4, 'four');\n\
+         DETACH lk;\n\
          .lake flush {catalog}\n\
          .lake open {catalog}\n\
          SELECT count(*) FROM t;\n\
@@ -186,20 +183,17 @@ fn maintenance_and_settings_commands_work() {
          INSERT INTO t VALUES (1);\n\
          .lake save {maint} data {maint_data}\n\
          .lake inlining {maint} t 0\n\
-         .lake attach {maint} write\n"
+         ATTACH 'lake:{maint}' AS lk;\n"
     );
     for i in 2..6 {
-        script.push_str(&format!(
-            "INSERT INTO t VALUES ({i});\n.lake commit {maint}\n"
-        ));
+        script.push_str(&format!("INSERT INTO lk.t VALUES ({i});\n"));
     }
     script.push_str(&format!(
-        ".lake detach {maint}\n\
+        "DETACH lk;\n\
          .lake merge {maint}\n\
-         .lake attach {maint} write\n\
-         DELETE FROM t WHERE a = 1;\n\
-         .lake commit {maint}\n\
-         .lake detach {maint}\n\
+         ATTACH 'lake:{maint}' AS lk;\n\
+         DELETE FROM lk.t WHERE a = 1;\n\
+         DETACH lk;\n\
          .lake rewrite {maint} delete_threshold=0.0\n\
          .lake partition {maint} t by (a)\n\
          .lake inlining {maint} t 5\n\

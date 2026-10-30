@@ -66,8 +66,8 @@ impl std::fmt::Display for LeaseError {
         match self {
             LeaseError::Held { owner, age_ms } => write!(
                 f,
-                "the catalog is already served by {owner} (heartbeat {:.1}s ago); \
-                 one server per catalog until phase 2's shared-catalog support",
+                "the lake is already served by {owner} (heartbeat {:.1}s ago): a lake has \
+                 one writer at a time; attach it READ_ONLY to read it",
                 *age_ms as f64 / 1000.0
             ),
             LeaseError::Lost { owner: Some(owner) } => write!(

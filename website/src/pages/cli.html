@@ -95,16 +95,13 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
       default)</td>
     </tr>
     <tr>
-      <td><code>.lake attach &lt;dir|s3://…&gt; [version] [read-only|write]</code></td>
-      <td>attach a lake for this session, from its statistics only —
-      <code>read-only</code> is the default; <code>write</code> materializes the
-      (optionally pinned) version into the store for DML and <code>.lake
-      commit</code></td>
-    </tr>
-    <tr>
-      <td><code>.lake commit &lt;dir|s3://…&gt;</code></td>
-      <td>publish a writable attachment's changes as one incremental version
-      (append-only data files + positional deletes; retry settings below)</td>
+      <td><code>ATTACH 'lake:&lt;catalog&gt;' AS name [(READ_ONLY, DATA '…', VERSION n)]</code></td>
+      <td>SQL (wave 124): attach a lake as a database — read-only from its
+      statistics, or writable (every committed statement publishes one
+      incremental version); <code>CREATE DATABASE name (TYPE LAKE, CATALOG '…')</code>
+      creates one, <code>DETACH name</code> forgets it, <code>SHOW DATABASES</code>
+      lists storage and versions. The <code>.lake attach/commit/detach/attached</code>
+      dot-commands are gone.</td>
     </tr>
     <tr>
       <td><code>.lake partition &lt;dir|s3://…&gt; &lt;table&gt; by (col, bucket(N, col), …) | clear</code></td>
@@ -132,16 +129,6 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
       <td><code>.lake files | table_info | options | settings &lt;dir|s3://…&gt;</code></td>
       <td>introspection: per-file listing, table stats, lake options and
       settings</td>
-    </tr>
-    <tr>
-      <td><code>.lake detach &lt;dir|s3://…&gt; [force]</code></td>
-      <td>detach one attached lake; a writable attachment with uncommitted changes
-      refuses unless <code>force</code> (which keeps the tables as ordinary store
-      tables)</td>
-    </tr>
-    <tr>
-      <td><code>.lake attached</code></td>
-      <td>list this session's attached lakes and their tables</td>
     </tr>
     <tr>
       <td><code>.lake versions &lt;dir|s3://…&gt;</code></td>

@@ -856,6 +856,15 @@ fn reject_nul_in_quoted_identifier(sql: &str) -> Result<()> {
     }
 }
 
+/// One option of a `CREATE DATABASE`/`ATTACH` option list (wave 124).
+enum DbOpt {
+    Lake,
+    Catalog(String),
+    Data(String),
+    ReadOnly,
+    Version(u64),
+}
+
 /// What may follow the left operand of a comparison-level expression.
 /// `apply_cmp` turns `(left, tail)` into the AST node the tail describes.
 enum CmpTail {
@@ -1389,6 +1398,7 @@ peg::parser! {
             / delete()
             / txn()
             / use_stmt()
+            / attach_stmt()
             / install()
             / load_stmt()
             / alter_stmt()
@@ -1456,6 +1466,47 @@ peg::parser! {
 
         rule use_stmt() -> Statement
             = kw(Keyword::Use) name:ident() { Statement::Use { name } }
+
+        /// `ATTACH '<location>' AS <name> [(options)]` and `DETACH [DATABASE]
+        /// [IF EXISTS] <name>` (wave 124). Words, not reserved keywords.
+        rule attach_stmt() -> Statement
+            = word("attach") kw(Keyword::Database)? location:string_lit() kw(Keyword::As)
+              name:ident() options:database_options()? {
+                  Statement::Attach { location, name, options: options.unwrap_or_default() }
+              }
+            / word("detach") kw(Keyword::Database)? ife:if_exists() name:ident() {
+                  Statement::Detach { name, if_exists: ife }
+              }
+
+        /// The option list of `CREATE DATABASE` and `ATTACH`: `TYPE LAKE`,
+        /// `CATALOG '…'`, `DATA '…'`, `READ_ONLY`, `VERSION n`, comma
+        /// separated, each at most once.
+        rule database_options() -> crate::sql::ast::DatabaseOptions
+            = lparen() opts:(database_option() ++ comma()) rparen() {?
+                  let mut out = crate::sql::ast::DatabaseOptions::default();
+                  let mut seen: Vec<&'static str> = Vec::new();
+                  for (key, opt) in opts {
+                      if seen.contains(&key) {
+                          return Err("a database option given twice");
+                      }
+                      seen.push(key);
+                      match opt {
+                          DbOpt::Lake => out.lake = true,
+                          DbOpt::Catalog(c) => out.catalog = Some(c),
+                          DbOpt::Data(d) => out.data = Some(d),
+                          DbOpt::ReadOnly => out.read_only = true,
+                          DbOpt::Version(v) => out.version = Some(v),
+                      }
+                  }
+                  Ok(out)
+              }
+
+        rule database_option() -> (&'static str, DbOpt)
+            = word("type") eq()? word("lake") { ("type", DbOpt::Lake) }
+            / word("catalog") eq()? s:string_lit() { ("catalog", DbOpt::Catalog(s)) }
+            / word("data") eq()? s:string_lit() { ("data", DbOpt::Data(s)) }
+            / word("read_only") { ("read_only", DbOpt::ReadOnly) }
+            / word("version") eq()? n:nonneg_integer() { ("version", DbOpt::Version(n as u64)) }
 
         /// `SHOW TABLES` / `SHOW DATABASES` / `SHOW MATERIALIZED VIEWS` —
         /// matched as words, not reserved keywords, so `show` and `tables`
@@ -1645,8 +1696,9 @@ peg::parser! {
             / kw(Keyword::Create) word("role") ifne:if_not_exists() name:ident() {
                   Statement::CreateRole { name, if_not_exists: ifne }
               }
-            / kw(Keyword::Create) kw(Keyword::Database) ifne:if_not_exists() name:ident() {
-                  Statement::CreateDatabase { name, if_not_exists: ifne }
+            / kw(Keyword::Create) kw(Keyword::Database) ifne:if_not_exists() name:ident()
+              options:database_options()? {
+                  Statement::CreateDatabase { name, if_not_exists: ifne, options }
               }
             / kw(Keyword::Create) kw(Keyword::Index) ifne:if_not_exists() name:ident() kw(Keyword::On) t:table_ref()
               before:index_using()? lparen() col:ident() rparen() after:index_using()? options:index_options()? {?

@@ -1335,8 +1335,11 @@ fn attached_lake_survives_a_full_rebuild() {
     // b opens before a's checkpoint and attaches the lake read-only.
     let mut b = Cli::spawn(&dir, None);
     b.open("db.pink");
-    b.send(&format!(".lake attach {}\n", lake.display()));
-    b.wait_for("Attached");
+    b.send(&format!(
+        "ATTACH 'lake:{}' AS lake (READ_ONLY);\n",
+        lake.display()
+    ));
+    b.wait_for("Database lake created.");
     b.expect_marker(
         "SELECT 'attached-3' AS m FROM lake.lt WHERE i = 3;",
         "attached-3",
@@ -1356,9 +1359,9 @@ fn attached_lake_survives_a_full_rebuild() {
         "attached-count",
     );
     b.expect_marker("SELECT 'sees-11' AS m FROM t WHERE a = 11;", "sees-11");
-    // `.lake attached` still lists it after the rebuild.
-    b.send(".lake attached\n");
-    b.wait_for("lake.lt");
+    // SHOW DATABASES still lists it after the rebuild.
+    b.send("SHOW DATABASES;\n");
+    b.wait_for("│ lake ");
     a.quit();
     b.quit();
     cleanup(&ckpt);

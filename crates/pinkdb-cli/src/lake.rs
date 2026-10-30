@@ -2,7 +2,9 @@
 //! load versions back.
 //!
 //! Built with the `pinklake` feature (`.pink` data files, catalog
-//! format_version 7, `.lake attach` over the published statistics blocks).
+//! format_version 7). Attaching a lake is SQL since wave 124 — `ATTACH
+//! 'lake:<catalog>' AS name [(READ_ONLY)]`, `CREATE DATABASE name (TYPE
+//! LAKE …)`, `DETACH name` — through the opener this build registers.
 //!
 //! The lake itself lives in the `pink-lake` crate; this module is only the
 //! REPL surface. A lake is a catalog (`pink:`, `sqlite:` or `postgres://`)
@@ -16,8 +18,8 @@
 //! file instead of the data location: `<catalog>` is then `sqlite:<path>` and
 //! `.lake save <catalog> data <dir|s3://…>` gives the data location once, at
 //! create (it is recorded in the catalog). Every later command needs only the
-//! catalog URL; an explicit `data <location>` on `.lake open`/`.lake attach`
-//! overrides the recorded one for that session (a moved directory or bucket).
+//! catalog URL; an explicit `data <location>` on `.lake open` overrides the
+//! recorded one for that session (a moved directory or bucket).
 //! Without the feature a `sqlite:` URL is the library's clear rebuild hint.
 //! The object-store layout is unchanged when no SQL catalog is used.
 //!
@@ -44,31 +46,14 @@
 //!   the catalog cannot represent (dotted database name, over-long table
 //!   name) leaves no stray empty lake behind.
 //!
-//! # Incremental writes: `.lake attach <dir> write` and `.lake commit`
+//! # Lake databases (wave 124)
 //!
-//! `.lake attach <dir> write` opens the lake *writable* (the attached-write
-//! route; the default attach stays read-only): every table of the pinned
-//! version is materialized into the session store, and ordinary
-//! `INSERT`/`UPDATE`/`DELETE` against those tables accumulate there. `.lake
-//! commit <dir>` publishes exactly the difference as one incremental lake
-//! version — appended rows become new immutable data files and removed or
-//! updated rows become positional delete files, **never a rewrite of a
-//! published file** (see the `pink-lake` incremental module). The commit
-//! retries a conflicting publish with DuckLake's settings (defaults
-//! `max_retry_count = 10`, `retry_backoff = 1.5`, `retry_wait_ms = 100`,
-//! overridable with `PINKDB_LAKE_MAX_RETRY_COUNT`,
-//! `PINKDB_LAKE_RETRY_BACKOFF`, `PINKDB_LAKE_RETRY_WAIT_MS`).
-//!
-//! Tables of the lake that already exist in the session store are *adopted*
-//! as the writable copy when their schema matches (the crash-recovery path: a
-//! durable session's WAL replay rebuilds the tables, and re-attaching
-//! continues from them); a schema mismatch is refused. Store tables outside
-//! the attachment are not committed (`.lake save` publishes them). In a
-//! durable session, `.lake attach … write` checkpoints the materialized
-//! tables (so the WAL covers every later change) and `.lake commit` flushes
-//! the WAL before publishing, which makes the commit idempotent across a
-//! crash: replaying a recovered session re-attaches and `.lake commit`
-//! publishes nothing when the change already landed.
+//! `.lake attach`, `.lake detach`, `.lake attached` and `.lake commit` are
+//! gone: a lake is a database (see `pinkdb::lake_db`). A writable lake
+//! database publishes every committed statement as one incremental lake
+//! version; a read-only one is the lazy, statistics-first attachment. The
+//! maintenance commands below refuse a lake whose engine lease a writable
+//! lake database holds.
 //!
 //! # Partitioning (wave 66)
 //!
@@ -79,14 +64,13 @@
 //! own supported set named in the message, duplicate keys are refused like
 //! DuckLake's "matches an earlier partition key", and every key column must
 //! exist in the table's schema. New writes then split into **one data file
-//! per partition value set** — a `.lake commit` of appended rows and a
+//! per partition value set** — a lake database's commit of appended rows and a
 //! `.lake save` of the table alike — and the catalog records each file's
 //! values; existing files are never rewritten (DuckLake semantics).
 //!
 //! Read-only attaches prune: a `WHERE` carrying simple comparisons (`col =
 //! literal`, ranges, `IS [NOT] NULL`) over zoned/partitioned columns decodes
-//! only the data files that can still match, and `.lake attached` shows the
-//! files decoded per lake.
+//! only the data files that can still match.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
@@ -95,7 +79,6 @@ use std::time::{Duration, Instant};
 use pink_lake::replication::{self, JobSpec, Source, Supervisor};
 use pink_lake::{
     CleanupSettings, CommitSettings, ExpireSettings, Lake, MergeSettings, RewriteSettings,
-    WritableAttachment,
 };
 use pinkdb::{PinkDb, sanitize_terminal};
 
@@ -265,13 +248,6 @@ fn set_baseline(lake: &Lake, version: u64) {
         .insert(baseline_key(lake), version);
 }
 
-/// The session's writable attachments, one per resolved lake location.
-static WRITABLES: Mutex<BTreeMap<String, WritableAttachment>> = Mutex::new(BTreeMap::new());
-
-fn writables() -> MutexGuard<'static, BTreeMap<String, WritableAttachment>> {
-    WRITABLES.lock().unwrap_or_else(|p| p.into_inner())
-}
-
 /// The session's `.lake format <id>` choice: the data-file format every
 /// subsequent full save / commit / inlined flush writes. `None` keeps the
 /// build default (`.pink`). Per session, not persisted (a lake's existing
@@ -343,7 +319,7 @@ fn apply_write_format(lake: &mut Lake) -> pink_lake::Result<()> {
     Ok(())
 }
 
-/// The commit retry settings of a `.lake commit`, from the environment with
+/// The commit retry settings of a lake commit, from the environment with
 /// DuckLake's defaults (`PINKDB_LAKE_MAX_RETRY_COUNT`,
 /// `PINKDB_LAKE_RETRY_BACKOFF`, `PINKDB_LAKE_RETRY_WAIT_MS`). An unparseable
 /// value is reported and the default is used.
@@ -389,8 +365,6 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
     match sub {
         "save" => cmd_save(db, rest),
         "open" => cmd_open(db, rest),
-        "attach" => cmd_attach(db, rest),
-        "commit" => cmd_commit(db, rest),
         "replicate" => cmd_replicate(db, rest),
         "partition" => cmd_partition(db, rest),
         "inlining" => cmd_inlining(rest),
@@ -407,16 +381,20 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "options" => cmd_options(rest),
         "settings" => cmd_settings(rest),
         "format" => cmd_format(rest),
-        "detach" => cmd_detach(db, rest),
-        "attached" => cmd_attached(db, rest),
+        // Wave 124: attaching a lake is SQL now.
+        "attach" | "detach" | "attached" | "commit" => cli_error!(
+            ".lake {sub} is gone: lakes are databases now. Use ATTACH 'lake:<catalog>' AS name \
+             [(READ_ONLY)], DETACH name, SHOW DATABASES; a writable lake database commits with \
+             every statement"
+        ),
         "versions" => cmd_versions(rest),
         "snapshots" => cmd_snapshots(rest),
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
         "" => println!(
-            "Usage: .lake <save|open|attach|commit|replicate|partition|inlining|flush|changes|\
+            "Usage: .lake <save|open|replicate|partition|inlining|flush|changes|\
              add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
-             settings|format|detach|attached|versions|snapshots|tables|info> ..."
+             settings|format|versions|snapshots|tables|info> ..."
         ),
         other => cli_error!("unknown .lake subcommand \"{other}\". Try .help"),
     }
@@ -559,25 +537,6 @@ fn cmd_save(db: &PinkDb, arg: &str) {
     match lake.write_from_store_report(db) {
         Ok(report) => {
             set_baseline(&lake, report.version);
-            // A writable attachment of this lake just had its whole change
-            // published by the save: re-pin it to the new version with the
-            // store's current content (nothing pending any more). The map is
-            // keyed by the location string the attach used (the catalog URL
-            // for a split lake, the resolved path otherwise), which for a
-            // plain lake is exactly `lake.path()`; `dir` covers the split
-            // case where `lake.path()` is the data location.
-            let key = dir.clone();
-            let mut writables = writables();
-            if let Some(wa) = writables.get_mut(&key) {
-                match wa.repin_at(report.version, db) {
-                    Ok(()) => println!(
-                        "  (writable attach at {dir_shown} re-pinned to version {})",
-                        report.version
-                    ),
-                    Err(e) => cli_error!("{e}"),
-                }
-            }
-            drop(writables);
             if db
                 .list_databases()
                 .iter()
@@ -687,28 +646,6 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
         );
         return;
     }
-    // A writable attachment's tables are store tables: replacing the store
-    // would silently discard uncommitted changes (or orphan the attachment).
-    {
-        let writables = writables();
-        if !writables.is_empty() {
-            let mut pending: Vec<String> = Vec::new();
-            for (location, wa) in writables.iter() {
-                let changed = wa.changed_tables(db).unwrap_or_default();
-                if !changed.is_empty() {
-                    pending.push(format!("{} ({} table(s))", shown(location), changed.len()));
-                }
-            }
-            if !pending.is_empty() {
-                cli_error!(
-                    ".lake open would discard the uncommitted changes of the writable \
-                     attachment(s) {}; run .lake commit (or .lake detach <dir> force) first",
-                    pending.join(", ")
-                );
-                return;
-            }
-        }
-    }
     let lake = match open_lake_with_data(&dir, data.as_deref()) {
         Ok(lake) => lake,
         Err(e) => {
@@ -737,14 +674,6 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
             // Saving after opening an older version deliberately publishes
             // on top of the latest one (a restore), so the base is current.
             set_baseline(&lake, lake.current_version());
-            // Writable attachments describe store tables that the replace
-            // just discarded: drop them (their changes were either committed
-            // or are gone with the store — the pending check above already
-            // refused the latter).
-            if !writables().is_empty() {
-                writables().clear();
-                println!("Note: .lake open discarded the session's writable attachment(s).");
-            }
             println!(
                 "Opened lake version {shown} in {:.3}s ({tables} table{}) from {dir_shown}",
                 t0.elapsed().as_secs_f64(),
@@ -766,429 +695,6 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
         }
         Err(e) => cli_error!("{e}"),
     }
-}
-
-/// `.lake attach <location> [data <dir|s3://…>] [version] [read-only|write]`:
-/// attach the lake.
-///
-/// The default (`read-only`) attach reads the published statistics only: a
-/// `.pink` file contributes its catalog statistics block (no data file is
-/// opened). No column data is decoded; the one table a query actually scans
-/// materializes lazily on first use.
-///
-/// `write` opens the lake for incremental writes (see the module docs):
-/// every table of the pinned version is materialized into the session store
-/// as a writable copy, DML accumulates there, and `.lake commit <dir>`
-/// publishes exactly the difference. A same-named store table with the
-/// matching schema is adopted as the writable copy (the recovery path); a
-/// schema mismatch is refused.
-fn cmd_attach(db: &mut PinkDb, arg: &str) {
-    const USAGE: &str = concat!(
-        "Usage: .lake attach <catalog>",
-        data_opt!(),
-        " [version] [read-only|write]"
-    );
-    let Some((dir, mut rest)) = take_token(arg) else {
-        println!("{USAGE}{HINT}");
-        return;
-    };
-    let dir = unquote(&dir);
-    let dir_shown = shown(&dir);
-    let mut version: Option<u64> = None;
-    let mut mode: Option<&str> = None;
-    let mut data: Option<String> = None;
-    loop {
-        let tail = rest.trim_start();
-        if tail.is_empty() {
-            break;
-        }
-        let Some((token, after)) = take_token(tail) else {
-            break;
-        };
-        let token_lower = token.to_ascii_lowercase();
-        match token_lower.as_str() {
-            "data" => {
-                let Some((value, after)) = take_value(after) else {
-                    println!("{USAGE}{HINT}");
-                    return;
-                };
-                data = Some(unquote(&value));
-                rest = after;
-            }
-            "read-only" | "read" | "ro" => {
-                mode = Some("read-only");
-                rest = after;
-            }
-            "write" | "read-write" | "read_write" | "rw" => {
-                mode = Some("write");
-                rest = after;
-            }
-            _ => match token.parse::<u64>() {
-                Ok(v) if version.is_none() => {
-                    version = Some(v);
-                    rest = after;
-                }
-                _ => {
-                    println!("{USAGE}{HINT}");
-                    return;
-                }
-            },
-        }
-    }
-    let write = match mode.unwrap_or("read-only") {
-        "read-only" => false,
-        "write" => true,
-        _ => unreachable!("mode is parsed from the two literals above"),
-    };
-    if write {
-        cmd_attach_write(db, &dir, data.as_deref(), version);
-        return;
-    }
-    // Attaching changes session state that a ROLLBACK cannot undo (like
-    // `.lake save`, not like `.lake open`, which replaces the store).
-    if db.in_transaction() {
-        cli_error!(".lake attach is not allowed inside a transaction; COMMIT or ROLLBACK first");
-        return;
-    }
-    let lake = match open_lake_with_data(&dir, data.as_deref()) {
-        Ok(lake) => lake,
-        Err(e) => {
-            cli_error!("{e}");
-            return;
-        }
-    };
-    let t0 = Instant::now();
-    match lake.attach(version) {
-        Ok(report) => match db.attach_lake(report.lake) {
-            Ok(tables) => {
-                println!(
-                    "Attached {dir_shown} version {} in {:.3}s ({} table{}, statistics-only)",
-                    report.version,
-                    t0.elapsed().as_secs_f64(),
-                    tables.len(),
-                    plural(tables.len())
-                );
-                warn_unavailable_tables(&lake, version, "reading it will fail");
-                if report.encrypted {
-                    println!(
-                        "Note: the lake is encrypted; attach unsealed the catalog and its \
-                         statistics blocks and read no data file."
-                    );
-                }
-                if report.requests > 0 {
-                    println!(
-                        "Transport: {} request{}, {} byte{}, {:.3}s waiting (attach only).",
-                        report.requests,
-                        plural(report.requests as usize),
-                        report.bytes,
-                        if report.bytes == 1 { "" } else { "s" },
-                        report.wait_nanos as f64 / 1e9
-                    );
-                }
-            }
-            Err(e) => cli_error!("{e}"),
-        },
-        Err(e) => cli_error!("{e}"),
-    }
-}
-
-/// `.lake attach <dir> write`: the writable (incremental) attach. Materializes
-/// the pinned version's tables into the session store and remembers the base
-/// version; `.lake commit <dir>` publishes the difference.
-/// The writable attach's default `data_inlining_row_limit`, from
-/// `PINKDB_LAKE_INLINING_ROW_LIMIT` (DuckLake's session setting
-/// `ducklake_default_data_inlining_row_limit`; 0 disables inlining so every
-/// commit writes data files). Unset keeps the handle default (10); an
-/// unparseable value is reported and the default is used. A table's persisted
-/// `.lake inlining` limit always wins.
-fn attach_inlining_limit() -> Option<u64> {
-    let raw = std::env::var("PINKDB_LAKE_INLINING_ROW_LIMIT").ok()?;
-    match raw.trim().parse::<u64>() {
-        Ok(v) => Some(v),
-        Err(_) => {
-            eprintln!(
-                "warning: PINKDB_LAKE_INLINING_ROW_LIMIT={raw:?} is not a count; using the \
-                 default"
-            );
-            None
-        }
-    }
-}
-
-fn cmd_attach_write(db: &mut PinkDb, dir: &str, data: Option<&str>, version: Option<u64>) {
-    let dir_shown = shown(dir);
-    if db.in_transaction() {
-        cli_error!(".lake attach is not allowed inside a transaction; COMMIT or ROLLBACK first");
-        return;
-    }
-    let t0 = Instant::now();
-    // The writable attachment opens through the same catalog-aware helper as
-    // every other command, then materializes; this is the plaintext/keyed
-    // open plus `WritableAttachment::attach`, so a `sqlite:` catalog with an
-    // explicit or recorded data location works exactly like a directory.
-    let lake = match open_lake_with_data(dir, data) {
-        Ok(lake) => lake,
-        Err(e) => {
-            cli_error!("{e}");
-            return;
-        }
-    };
-    let mut wa = match WritableAttachment::attach(lake, version) {
-        Ok(wa) => wa,
-        Err(e) => {
-            cli_error!("{e}");
-            return;
-        }
-    };
-    if let Err(e) = apply_write_format(wa.lake_mut()) {
-        cli_error!("{e}");
-        return;
-    }
-    warn_unavailable_tables(wa.lake(), version, "it was skipped");
-    if let Some(limit) = attach_inlining_limit() {
-        wa.set_data_inlining_row_limit(limit);
-    }
-    // Key the attachment by the location string the user gave (the catalog
-    // URL for a split lake): `.lake commit`/`.lake detach` take the same
-    // argument, while `wa.location()` is the resolved data root for a split
-    // lake and would never match them.
-    let key = dir.to_string();
-    if writables().contains_key(&key) {
-        cli_error!(
-            "{dir_shown} is already attached writable in this session; .lake commit it or \
-             .lake detach it first"
-        );
-        return;
-    }
-    let base = wa.base_version();
-    let mut created = 0usize;
-    let mut adopted = 0usize;
-    for (table_key, rows) in wa.tables() {
-        let Some((dbname, table)) = table_key.split_once('.') else {
-            cli_error!("lake table key \"{table_key}\" is not \"db.table\"");
-            return;
-        };
-        let Some(base_table) = wa.base_table(&table_key) else {
-            continue;
-        };
-        match db.table_in(dbname, table) {
-            Ok(existing) => {
-                if existing.schema() != base_table.schema() {
-                    cli_error!(
-                        "cannot attach {dir_shown} writable: table \"{table_key}\" already exists \
-                         in the session with a different shape — the lake has ({}) and the \
-                         store has ({}); drop or rename one of them",
-                        schema_text(&base_table.schema()),
-                        schema_text(&existing.schema())
-                    );
-                    return;
-                }
-                adopted += 1;
-                let _ = rows;
-            }
-            Err(_) => {
-                if !db.database_exists(dbname)
-                    && let Err(e) = db.create_database(dbname)
-                {
-                    cli_error!("{e}");
-                    return;
-                }
-                if let Err(e) = db.create_table_in(dbname, table, base_table.schema()) {
-                    cli_error!("{e}");
-                    return;
-                }
-                let dst = match db.table_mut_in(dbname, table) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        cli_error!("{e}");
-                        return;
-                    }
-                };
-                // The lake's schema record is authoritative for column
-                // defaults (wave 65): an INSERT that omits an added column
-                // writes them, exactly like the version it materializes.
-                for (col, src) in dst.columns.iter_mut().zip(&base_table.columns) {
-                    col.default = src.default.clone();
-                }
-                for c in 0..base_table.num_chunks() {
-                    let Some(chunk) = base_table.scan_chunk(c) else {
-                        continue;
-                    };
-                    if let Err(e) = dst.append_shared_chunk(&chunk.columns) {
-                        cli_error!("{e}");
-                        return;
-                    }
-                }
-                created += 1;
-            }
-        }
-    }
-    writables().insert(key.clone(), wa);
-    // A durable session's WAL must be able to replay the statements that
-    // mutate the writable tables: the tables themselves are not logged (the
-    // attach is a session action), so persist them now. Later INSERTs/UPDATEs
-    // replay onto the checkpointed tables.
-    let mut checkpointed = false;
-    if db.is_durable() {
-        match db.checkpoint() {
-            Ok(()) => checkpointed = true,
-            Err(e) => {
-                writables().remove(&key);
-                cli_error!("could not checkpoint the writable tables: {e}");
-                return;
-            }
-        }
-    }
-    println!(
-        "Attached {dir_shown} version {base} writable in {:.3}s ({created} table{} materialized, \
-         {adopted} adopted)",
-        t0.elapsed().as_secs_f64(),
-        plural(created)
-    );
-    if checkpointed {
-        println!("  (durable session: the materialized tables were checkpointed)");
-    }
-    // The commit reconciles each table to the session's content; when the
-    // session's tables already differ from the pinned version (adopted
-    // recovery tables, or edits made before re-attaching), say exactly what
-    // that means instead of letting a diff quietly drop rows.
-    if adopted > 0
-        && let Some(wa) = writables().get(&key)
-    {
-        let changed = wa.changed_tables(db).unwrap_or_default();
-        if !changed.is_empty() {
-            println!(
-                "Note: {} session table(s) differ from version {base} ({}); .lake commit \
-                     reconciles the lake to the session's content — rows the lake has and the \
-                     session lacks are deleted.",
-                changed.len(),
-                changed.join(", ")
-            );
-        }
-    }
-    println!("  publish changes with .lake commit {dir_shown}");
-}
-
-fn schema_text(schema: &[(String, pinkdb::DataType)]) -> String {
-    schema
-        .iter()
-        .map(|(n, t)| format!("{n} {t}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// `.lake commit <catalog>`: publish the writable attachment's changes as one
-/// incremental lake version (appended data files + positional delete files;
-/// no published file is rewritten). The commit retries a conflicting publish
-/// with the DuckLake-parity settings (see the module docs) and is idempotent:
-/// committing with nothing to publish is a no-op.
-fn cmd_commit(db: &mut PinkDb, arg: &str) {
-    let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake commit <catalog>{HINT}");
-        return;
-    };
-    if !rest.trim().is_empty() {
-        println!("Usage: .lake commit <catalog>{HINT}");
-        return;
-    }
-    let dir = unquote(&dir);
-    let dir_shown = shown(&dir);
-    if db.in_transaction() {
-        cli_error!(".lake commit is not allowed inside a transaction; COMMIT or ROLLBACK first");
-        return;
-    }
-    let Some(wa) = writables().remove(&dir) else {
-        cli_error!(
-            "no writable attach at {dir_shown}; run .lake attach {dir_shown} write first (read-only \
-             attaches are never written)"
-        );
-        return;
-    };
-    let mut wa = wa;
-    // A format chosen after the writable attach (`.lake format`) applies to
-    // this commit's new data files too.
-    if let Err(e) = apply_write_format(wa.lake_mut()) {
-        writables().insert(dir.clone(), wa);
-        cli_error!("{e}");
-        return;
-    }
-    // The WAL covers the changes first: every statement feeding this commit
-    // is durable before the lake publishes, so a crash can only lose the
-    // publication, never the change (re-running .lake commit after reopen is
-    // the recovery, and it is idempotent).
-    if db.is_durable()
-        && let Err(e) = db.flush_wal()
-    {
-        writables().insert(dir.clone(), wa);
-        cli_error!("could not flush the WAL before committing: {e}");
-        return;
-    }
-    let settings = commit_settings();
-    let t0 = Instant::now();
-    match wa.commit(db, &settings) {
-        Ok(report) if !report.committed => {
-            println!(
-                "Nothing to commit to {dir_shown}: no change against version {}",
-                report.version
-            );
-        }
-        Ok(report) => {
-            // The baseline map is keyed by the resolved lake path elsewhere
-            // (`.lake save`/`.lake open`), while the writable map is keyed by
-            // the user's location string. Record both: for a plain lake they
-            // are the same, and for a split lake this keeps the one-live-
-            // writer check in `.lake save` meaningful.
-            set_baseline_version_only(&dir, report.version);
-            set_baseline_version_only(&wa.location().display().to_string(), report.version);
-            println!(
-                "Committed lake version {} onto {dir_shown} in {:.3}s ({} file{}: {} data, {} \
-                 delete{};{} +{} row{}, -{} row{}; {} bytes; {} retr{})",
-                report.version,
-                t0.elapsed().as_secs_f64(),
-                report.data_files + report.delete_files,
-                plural(report.data_files + report.delete_files),
-                report.data_files,
-                report.delete_files,
-                if report.rows_inlined > 0 {
-                    format!(
-                        " ({} row{} inlined)",
-                        report.rows_inlined,
-                        plural(report.rows_inlined as usize)
-                    )
-                } else {
-                    String::new()
-                },
-                if report.schema_changes > 0 {
-                    format!(
-                        " {} schema change{};",
-                        report.schema_changes,
-                        plural(report.schema_changes)
-                    )
-                } else {
-                    String::new()
-                },
-                report.rows_added,
-                plural(report.rows_added as usize),
-                report.rows_deleted,
-                plural(report.rows_deleted as usize),
-                report.bytes_written,
-                report.retries,
-                if report.retries == 1 { "y" } else { "ies" },
-            );
-        }
-        Err(e) => {
-            cli_error!("{e}");
-            let text = e.to_string();
-            if text.contains("changed in the lake since this change was computed") {
-                println!(
-                    "hint: .lake detach {dir_shown} force + .lake attach {dir_shown} write re-materializes \
-                     the base at the current version (the session's tables are adopted, and \
-                     the next commit reconciles the lake to them)"
-                );
-            }
-        }
-    }
-    writables().insert(dir, wa);
 }
 
 /// Set the save-conflict baseline for a location that was never `.lake
@@ -1285,15 +791,9 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
     };
     // A writable attachment of the same lake would be invalidated by the
     // new version (its base changes): refuse and point at the recovery.
-    {
-        let writables = writables();
-        if writables.contains_key(&dir) {
-            cli_error!(
-                "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir_shown}) it before changing its partition specification"
-            );
-            return;
-        }
+    if let Some(refusal) = writable_refusal(&dir, "changing its partition specification") {
+        cli_error!("{refusal}");
+        return;
     }
     let mut lake = match open_lake(&dir) {
         Ok(lake) => lake,
@@ -1395,15 +895,9 @@ fn cmd_inlining(arg: &str) {
             }
         }
     };
-    {
-        let writables = writables();
-        if writables.contains_key(&dir) {
-            cli_error!(
-                "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir_shown}) it before changing its inlining setting"
-            );
-            return;
-        }
+    if let Some(refusal) = writable_refusal(&dir, "changing its inlining setting") {
+        cli_error!("{refusal}");
+        return;
     }
     let mut lake = match open_lake(&dir) {
         Ok(lake) => lake,
@@ -1462,15 +956,9 @@ fn cmd_flush(arg: &str) {
         println!("{usage}");
         return;
     };
-    {
-        let writables = writables();
-        if writables.contains_key(&dir) {
-            cli_error!(
-                "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir_shown}) it before flushing its inlined rows"
-            );
-            return;
-        }
+    if let Some(refusal) = writable_refusal(&dir, "flushing its inlined rows") {
+        cli_error!("{refusal}");
+        return;
     }
     let mut lake = match open_lake(&dir) {
         Ok(lake) => lake,
@@ -1647,15 +1135,9 @@ fn cmd_add_data_files(arg: &str) {
     let dir = unquote(&dir);
     let dir_shown = shown(&dir);
     let table = flat_table_key(&unquote(&table));
-    {
-        let writables = writables();
-        if writables.contains_key(&dir) {
-            cli_error!(
-                "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir_shown}) it before registering files"
-            );
-            return;
-        }
+    if let Some(refusal) = writable_refusal(&dir, "registering files") {
+        cli_error!("{refusal}");
+        return;
     }
     let mut lake = match open_lake(&dir) {
         Ok(lake) => lake,
@@ -1679,122 +1161,6 @@ fn cmd_add_data_files(arg: &str) {
             }
         }
         Err(e) => cli_error!("{e}"),
-    }
-}
-
-/// `.lake detach <dir> [force]`: drop one attached lake from this session. A
-/// writable attach with uncommitted changes refuses unless `force` is given
-/// (which keeps the store tables as ordinary tables and abandons the
-/// attachment's base — the changes are then not publishable through it).
-fn cmd_detach(db: &mut PinkDb, arg: &str) {
-    let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake detach <dir> [force]{HINT}");
-        return;
-    };
-    let dir = unquote(&dir);
-    let dir_shown = shown(&dir);
-    let force = match rest.trim() {
-        "" => false,
-        "force" => true,
-        _ => {
-            println!("Usage: .lake detach <dir> [force]{HINT}");
-            return;
-        }
-    };
-    let mut writable = writables().remove(&dir);
-    if let Some(wa) = &writable {
-        let changed = wa.changed_tables(db).unwrap_or_default();
-        if !changed.is_empty() && !force {
-            writables().insert(dir.clone(), writable.take().expect("writable present"));
-            cli_error!(
-                "writable attach {dir_shown} has uncommitted changes in {} table(s) ({}); \
-                 .lake commit {dir_shown} first, or detach with `force` to keep the session \
-                 tables as ordinary tables and abandon the attachment",
-                changed.len(),
-                changed.join(", ")
-            );
-            return;
-        }
-        println!(
-            "Detached writable attach {dir_shown} (the session tables stay as ordinary tables)"
-        );
-    }
-    if db.detach_lake(&dir) {
-        println!("Detached {dir_shown}");
-        return;
-    }
-    // A split lake is attached under its resolved data path (`Lake::path`),
-    // while the user names it by catalog URL. Resolve and retry so
-    // `.lake detach <catalog>` matches `.lake attach <catalog>`.
-    if let Ok(lake) = open_lake(&dir) {
-        let resolved = lake.path().display().to_string();
-        if resolved != dir && db.detach_lake(&resolved) {
-            println!("Detached {dir_shown}");
-            return;
-        }
-    }
-    if writable.is_none() {
-        cli_error!("no lake is attached at {dir_shown} (see .lake attached)");
-    }
-}
-
-/// `.lake attached`: the lakes attached to this session and their tables,
-/// plus each lake's data-file decode counters (statistics-only queries and a
-/// projected decode show up here). Writable attaches list their base version
-/// and pending tables.
-fn cmd_attached(db: &PinkDb, arg: &str) {
-    if !arg.trim().is_empty() {
-        println!("Usage: .lake attached");
-        return;
-    }
-    let lakes = db.attached_lakes();
-    if lakes.is_empty() {
-        println!("(no attached lakes)");
-    }
-    let stats = db.attached_decode_stats();
-    for ((location, tables), (_, loads, columns, files)) in lakes.into_iter().zip(stats) {
-        println!("{}", sanitize_terminal(&shown(location)));
-        for t in tables {
-            let rows = if t.rows == pink_lake::UNAVAILABLE_ROWS {
-                "unavailable: its data-file format cannot be read".to_string()
-            } else {
-                format!("{} row{}", t.rows, plural(t.rows as usize))
-            };
-            println!(
-                "  {}.{} ({rows})",
-                sanitize_terminal(&t.db),
-                sanitize_terminal(&t.table)
-            );
-        }
-        println!(
-            "  decodes: {loads} load{}, {columns} column{}, {files} file{}",
-            plural(loads as usize),
-            plural(columns as usize),
-            plural(files as usize)
-        );
-    }
-    for (location, wa) in writables().iter() {
-        let changed = wa.changed_tables(db).unwrap_or_default();
-        println!("{} (writable)", sanitize_terminal(&shown(location)));
-        for (key, rows) in wa.tables() {
-            println!(
-                "  {} ({rows} row{})",
-                sanitize_terminal(&key),
-                plural(rows as usize)
-            );
-        }
-        if changed.is_empty() {
-            println!(
-                "  base version: {} (no uncommitted changes)",
-                wa.base_version()
-            );
-        } else {
-            println!(
-                "  base version: {} (uncommitted: {})",
-                wa.base_version(),
-                changed.join(", ")
-            );
-        }
     }
 }
 
@@ -2792,17 +2158,20 @@ fn parse_versions_option(value: &str) -> Option<Vec<u64>> {
     Some(out)
 }
 
-/// The shared refuse-when-attached-writable guard for the commands that
-/// publish a version (a writable attachment's base would go stale; the
-/// session's `.lake commit` must land or be detached first).
+/// The shared refuse-when-served guard for the commands that publish a
+/// version outside a lake database's commit loop: a writable lake database
+/// (in this session or any other process) holds the lake's engine lease, and
+/// its base would go stale. Probing takes the lease for an instant when it
+/// is free.
 fn writable_refusal(dir: &str, what: &str) -> Option<String> {
-    let dir_shown = shown(dir);
-    writables().contains_key(dir).then(|| {
-        format!(
-            "{dir_shown} is attached writable in this session; .lake commit (or .lake detach \
-                 {dir_shown}) it before {what}"
-        )
-    })
+    let lake = open_lake(dir).ok()?;
+    match pink_lake::EngineLease::acquire(&lake, "pinkdb-cli-maintenance") {
+        Err(pink_lake::LeaseError::Held { owner, .. }) => Some(format!(
+            "{} is attached as a writable lake database by {owner}; DETACH it before {what}",
+            shown(dir)
+        )),
+        _ => None,
+    }
 }
 
 /// `.lake merge <dir> [table] [min_file_size=N] [max_file_size=N]
@@ -3547,44 +2916,14 @@ fn cmd_format(arg: &str) {
         return;
     }
     let Some(table) = table else {
-        // Existing writable attachments write through their own handle: apply
-        // the choice now so a following `.lake commit` uses it.
-        {
-            let mut writables = writables();
-            for (location, wa) in writables.iter_mut() {
-                if let Err(e) = wa.lake_mut().set_write_format(&id) {
-                    cli_error!(
-                        "cannot apply format \"{id}\" to the writable attach at {}: {e}",
-                        shown(location)
-                    );
-                    return;
-                }
-            }
-        }
         *WRITE_FORMAT.lock().unwrap_or_else(|p| p.into_inner()) = Some(id.clone());
         println!(
-            "Lake write format set to \"{id}\" for subsequent .lake save / .lake commit / \
+            "Lake write format set to \"{id}\" for subsequent .lake save / \
              .lake flush writes"
         );
         return;
     };
     let key = flat_table_key(&table);
-    let (db, name) = key
-        .split_once('.')
-        .expect("flat_table_key yields a db.table key");
-    {
-        let mut writables = writables();
-        for (location, wa) in writables.iter_mut() {
-            if let Err(e) = wa.lake_mut().set_table_format(db, name, &id) {
-                cli_error!(
-                    "cannot apply format \"{id}\" for table \"{key}\" to the writable attach at \
-                     {}: {e}",
-                    shown(location)
-                );
-                return;
-            }
-        }
-    }
     TABLE_FORMATS
         .lock()
         .unwrap_or_else(|p| p.into_inner())

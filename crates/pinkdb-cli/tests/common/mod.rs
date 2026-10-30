@@ -74,7 +74,26 @@ pub fn assert_script_exit(status: ExitStatus) {
     );
 }
 
-/// A deterministic corpus for the `.lake attach` equivalence tests (shared by
+/// The query that prints a read-only lake database's data-file decode
+/// counters, one `decodes: L loads, C columns, F files` line per lake (wave
+/// 124: `pinkdb_lake_decodes()` replaced `.lake attached`'s report).
+#[allow(dead_code)]
+pub const DECODES: &str = "SELECT 'decodes: ' || loads || ' loads, ' || columns || ' columns, ' \
+                           || files || ' files' AS d FROM pinkdb_lake_decodes();\n";
+
+/// The `decodes: …` lines of a transcript, in order.
+#[allow(dead_code)]
+pub fn decode_lines(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| {
+            let at = l.find("decodes: ")?;
+            Some(l[at..].trim_end_matches(['│', ' ']).to_string())
+        })
+        .filter(|l| !l.contains("||"))
+        .collect()
+}
+
+/// A deterministic corpus for the lake database equivalence tests (shared by
 /// the full `tests/lake.rs` and the lean `tests/pinklake.rs`): the SQL script
 /// is returned, two CSVs are written into `dir`. Everything the design calls
 /// out: all-NULL column, empty table, NaN/±0 payloads, negative ints and
@@ -155,7 +174,7 @@ pub fn attach_corpus(dir: &Path) -> String {
     sql
 }
 
-/// The identical query batch every `.lake attach` arm runs (both builds).
+/// The identical query batch every lake database arm runs (both builds).
 /// Mixes stats-answerable shapes (COUNT/COUNT(col)/MIN/MAX) with shapes that
 /// must fall back (SUM/AVG, filter, group by, order by, joins, expressions)
 /// so the transcripts prove both paths agree.

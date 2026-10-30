@@ -405,6 +405,7 @@ mod catalog;
 mod catalog_store;
 mod cdc;
 mod crypto;
+pub mod database;
 mod delete_file;
 pub mod engine;
 pub mod format;

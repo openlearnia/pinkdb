@@ -248,8 +248,8 @@ pinkdb&gt; .lake open pink:lake.pink
 pinkdb&gt; .lake versions pink:lake.pink
 pinkdb&gt; .lake tables pink:lake.pink
 pinkdb&gt; .lake info pink:lake.pink
-pinkdb&gt; .lake attach pink:lake.pink
-pinkdb&gt; <span class="tok-k">SELECT</span> COUNT(*) <span class="tok-k">FROM</span> t;      <span class="tok-c">-- from the catalog, no data read</span></code></pre></div>
+pinkdb&gt; <span class="tok-k">ATTACH</span> <span class="tok-s">'lake:pink:lake.pink'</span> <span class="tok-k">AS</span> lk (READ_ONLY);
+pinkdb&gt; <span class="tok-k">SELECT</span> COUNT(*) <span class="tok-k">FROM</span> lk.t;   <span class="tok-c">-- from the catalog, no data read</span></code></pre></div>
 
 <p>A save writes immutable data files first, then one catalog transaction. A
 crash leaves the previous version or the new one, never a mix. Time travel
@@ -258,10 +258,15 @@ older <code>begin_snapshot</code> boundary.</p>
 
 <h2 id="incremental-commits">Incremental commits<a class="anchor" href="#incremental-commits" aria-label="Permalink: Incremental commits">#</a></h2>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code>pinkdb&gt; .lake attach pink:lake.pink write
-pinkdb&gt; <span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> t <span class="tok-k">VALUES</span> (…);
-pinkdb&gt; <span class="tok-k">DELETE</span> <span class="tok-k">FROM</span> t <span class="tok-k">WHERE</span> …;
-pinkdb&gt; .lake commit pink:lake.pink</code></pre></div>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code>pinkdb&gt; <span class="tok-k">ATTACH</span> <span class="tok-s">'lake:pink:lake.pink'</span> <span class="tok-k">AS</span> lk;   <span class="tok-c">-- writable: holds the lake's lease</span>
+pinkdb&gt; <span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> lk.t <span class="tok-k">VALUES</span> (…);           <span class="tok-c">-- one lake version</span>
+pinkdb&gt; <span class="tok-k">BEGIN</span>; <span class="tok-k">DELETE</span> <span class="tok-k">FROM</span> lk.t <span class="tok-k">WHERE</span> …; <span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> lk.t …; <span class="tok-k">COMMIT</span>;   <span class="tok-c">-- one version</span>
+pinkdb&gt; DETACH lk;</code></pre></div>
+
+<p>A lake is a database (wave 124): <code>CREATE DATABASE name (TYPE LAKE,
+CATALOG '…', DATA '…')</code> creates one, a writable lake database publishes
+every committed statement or transaction, and one lake has one writer at a
+time (a lease in its catalog). The lake's one schema is the database.</p>
 
 <p>Append-only commits add data files (inlined rows stay in the catalog when they
 are small). Deletes use positional delete files; merge/rewrite bake them in when

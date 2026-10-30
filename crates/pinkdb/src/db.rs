@@ -152,16 +152,27 @@ impl Database {
         }
     }
 
-    /// Install the host's commit hook (wave 96b): see
-    /// [`PinkDb::set_commit_hook`]. A stateless server publishes its lake
-    /// catalog image from here, so one statement's metadata and data become
-    /// one catalog transaction. Shared by every connection, since it lives on
-    /// the store.
-    pub fn set_commit_hook<F>(&self, hook: F)
-    where
-        F: Fn(&PinkDb) -> Result<()> + Send + Sync + 'static,
-    {
-        write_lock(&self.shared).set_commit_hook(hook);
+    /// The host's check on every lake a statement creates or attaches (see
+    /// [`PinkDb::set_lake_policy`]).
+    pub fn set_lake_policy(&self, policy: Option<crate::lake_db::LakePolicy>) {
+        write_lock(&self.shared).set_lake_policy(policy);
+    }
+
+    /// Where managed lakes live (see [`PinkDb::set_lake_dir`]). A durable
+    /// store takes it from [`DurableOpenOptions::lake_dir`] at open.
+    pub fn set_lake_dir(&self, dir: Option<std::path::PathBuf>) {
+        write_lock(&self.shared).set_lake_dir(dir);
+    }
+
+    /// Close every lake the store holds (see [`PinkDb::close_lake_databases`]):
+    /// a server's shutdown releases the lakes' leases with it.
+    pub fn close_lake_databases(&self) {
+        write_lock(&self.shared).close_lake_databases();
+    }
+
+    /// Every database with its storage facts (see [`PinkDb::database_infos`]).
+    pub fn database_infos(&self) -> Vec<crate::lake_db::DatabaseInfo> {
+        read_lock(&self.shared).database_infos()
     }
 
     /// Load a native extension into the shared store (the host-bootstrap step
@@ -955,6 +966,10 @@ impl Connection {
                 // the snapshot binds and runs in this session.
                 txn.work.session = self.session.clone();
                 enforce(gate.as_deref(), &txn.work, &plan, &pre)?;
+                // Wave 124: a transaction writes one storage (what it wrote so
+                // far comes from its write set).
+                let prior = txn_storages(&txn.work, &txn.table_writes)?;
+                txn.work.check_statement_storages(&plan, &pre, &prior)?;
                 // A durable transaction logs its mutating statements: one
                 // that reads an attached lake table could never replay (the
                 // guard is a no-op for in-memory stores).
@@ -981,7 +996,9 @@ impl Connection {
                     txn.work.is_durable() && crate::plan::writes_tables(&plan),
                 );
                 let exec_start = profile.as_ref().map(|_| Instant::now());
-                let result = crate::exec::run_with_budget(&mut txn.work, &plan, budget.clone())?;
+                let (result, _) = txn.work.run_storage_checked(&plan, &pre, &prior, |work| {
+                    crate::exec::run_with_budget(work, &plan, budget.clone())
+                })?;
                 let memo = budget.take_external_calls();
                 if let Some(p) = profile.as_deref_mut() {
                     p.execute += exec_start.map(|s| s.elapsed()).unwrap_or_default();
@@ -1121,7 +1138,7 @@ impl Connection {
                     if let Some(text) = sql_text {
                         // `USE` touches no table: a known-empty set.
                         let sets = crate::wal::FrameSets::default();
-                        shared.wal_append_session(
+                        shared.wal_append_local(
                             &pre,
                             &after,
                             &[text.to_string()],
@@ -1195,6 +1212,7 @@ impl Connection {
         shared.session_principal = self.principal.clone();
         shared.session = self.session.clone();
         enforce(self.gate(), &shared, &plan, pre)?;
+        shared.check_statement_storages(&plan, pre, &Default::default())?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
@@ -1217,6 +1235,7 @@ impl Connection {
             shared.session_principal = self.principal.clone();
             shared.session = self.session.clone();
             enforce(self.gate(), &shared, &plan, pre)?;
+            shared.check_statement_storages(&plan, pre, &Default::default())?;
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
             }
@@ -1225,7 +1244,11 @@ impl Connection {
             );
             // Wave 83: an autocommit CALL may COMMIT/ROLLBACK in its body.
             shared.standalone_call = true;
-            let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone());
+            let result = shared
+                .run_storage_checked(&plan, pre, &Default::default(), |shared| {
+                    crate::exec::run_with_budget(shared, &plan, budget.clone())
+                })
+                .map(|(result, _)| result);
             shared.standalone_call = false;
             let result = result?;
             let execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
@@ -1257,7 +1280,10 @@ impl Connection {
         sets.canonicalize();
         let base = shared.capture_base()?;
         // Execute with no lease: this is the span other writers overlap.
-        let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone())?;
+        let (result, _) =
+            shared.run_storage_checked(&plan, pre, &Default::default(), |shared| {
+                crate::exec::run_with_budget(shared, &plan, budget.clone())
+            })?;
         // Past this point a failure must not leave the uncommitted effect
         // observable: without the lease it cannot be undone, so the handle
         // fail-stops (see `poison_uncommitted`).
@@ -1311,10 +1337,14 @@ impl Connection {
         let plan = crate::plan::with_mv_source(plan, sql_text);
         shared.session_principal = self.principal.clone();
         enforce(self.gate(), &shared, &plan, pre)?;
+        shared.check_statement_storages(&plan, pre, &Default::default())?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
-        let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone())?;
+        let (result, _) =
+            shared.run_storage_checked(&plan, pre, &Default::default(), |shared| {
+                crate::exec::run_with_budget(shared, &plan, budget.clone())
+            })?;
         let execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
         let log_start = profile.as_ref().map(|_| Instant::now());
         self.log_autocommit(
@@ -1556,20 +1586,28 @@ impl Connection {
                 return Err(conflict(&format!("database \"{db}\"")));
             }
         }
+        // Wave 124: a transaction writes one storage. The per-statement checks
+        // refused plans that named two; what a `CALL` or trigger wrote shows
+        // in the write set now. A transaction that changed a lake database
+        // publishes after the merge instead of logging.
+        let mut written: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (db, _) in &txn.table_writes {
+            written.insert(db.clone());
+        }
+        let storages = txn.work.write_storages(&written)?;
+        txn.work.refuse_mixed_storages(&storages, "transaction")?;
+        let lake_routed = !txn.work.dirty_lake_databases()?.is_empty();
         // Validation passed: make the transaction durable first, then merge
         // (the merge itself cannot fail). A conflict abort returns above and
         // therefore never logs.
-        if !txn.wal_stmts.is_empty() {
+        if !txn.wal_stmts.is_empty() && !lake_routed {
             let before = txn
                 .wal_db_before
                 .clone()
                 .unwrap_or_else(|| txn.wal_db_after.clone());
             let mut sets = txn.wal_sets.clone();
             sets.canonicalize();
-            // The commit hook runs after the merge below: run here, it would
-            // see the store without this transaction's work (a lake catalog
-            // would publish the state before `BEGIN`).
-            shared.wal_append_session_unhooked(
+            shared.wal_append_local(
                 &before,
                 &txn.wal_db_after,
                 &txn.wal_stmts,
@@ -1603,8 +1641,11 @@ impl Connection {
                 }
             }
         }
-        if !txn.wal_stmts.is_empty() {
-            shared.run_commit_hook()?;
+        if lake_routed {
+            // A failed publish restores the lake database's last published
+            // state: the transaction is gone either way.
+            shared.route_committed_unit()?;
+        } else if !txn.wal_stmts.is_empty() {
             shared.maybe_auto_checkpoint(lease.as_ref());
         }
         // Wave 80: the committed transaction's writes feed the ON COMMIT
@@ -1655,6 +1696,19 @@ fn conflict_error(c: &crate::wal::CommitConflict, unit: &str) -> PinkDbError {
     PinkDbError::Execution(c.message(unit))
 }
 
+/// The storages a [`Connection`] transaction wrote so far (wave 124), from
+/// its write set. Empty when the store has no lake database.
+fn txn_storages(
+    work: &PinkDb,
+    writes: &HashSet<(String, String)>,
+) -> Result<std::collections::BTreeSet<crate::lake_db::StorageKey>> {
+    if !work.has_lake_databases() {
+        return Ok(Default::default());
+    }
+    let dbs: std::collections::BTreeSet<String> = writes.iter().map(|(db, _)| db.clone()).collect();
+    work.write_storages(&dbs)
+}
+
 /// Store/process-level statements refused inside a [`Connection`] transaction
 /// (a snapshot commit cannot undo them and would silently discard them).
 /// Returns the SQL statement name for the error message; `None` = allowed.
@@ -1663,6 +1717,8 @@ fn refused_in_txn(stmt: &crate::sql::ast::Statement) -> Option<&'static str> {
     Some(match stmt {
         Statement::CreateDatabase { .. } => "CREATE DATABASE",
         Statement::DropDatabase { .. } => "DROP DATABASE",
+        Statement::Attach { .. } => "ATTACH",
+        Statement::Detach { .. } => "DETACH",
         Statement::LoadExtension { .. } => "LOAD EXTENSION",
         Statement::InstallExtension { .. } => "INSTALL",
         Statement::LoadInstalledExtension { .. } => "LOAD",
@@ -2069,9 +2125,13 @@ mod tests {
             rows_of(c.execute("SHOW TABLES;").unwrap()),
             vec![vec![Value::Varchar("u".to_string())]]
         );
-        // SHOW DATABASES lists the whole store, sorted by name.
+        // SHOW DATABASES lists the whole store, sorted by name (the first
+        // column; wave 124 added the storage facts after it).
         assert_eq!(
-            rows_of(c.execute("SHOW DATABASES;").unwrap()),
+            rows_of(c.execute("SHOW DATABASES;").unwrap())
+                .into_iter()
+                .map(|r| vec![r[0].clone()])
+                .collect::<Vec<_>>(),
             vec![
                 vec![Value::Varchar("db1".to_string())],
                 vec![Value::Varchar("db2".to_string())],

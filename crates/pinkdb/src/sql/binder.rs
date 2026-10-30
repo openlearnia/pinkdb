@@ -6965,9 +6965,23 @@ fn bind_tracked_plan(
         Statement::CreateDatabase {
             name,
             if_not_exists,
+            options,
         } => empty(LogicalPlan::CreateDatabase {
             name: name.clone(),
             if_not_exists: *if_not_exists,
+            lake: bind_create_database_options(options.as_ref())?,
+        }),
+        Statement::Attach {
+            location,
+            name,
+            options,
+        } => empty(LogicalPlan::Attach {
+            name: name.clone(),
+            spec: bind_attach_options(location, options)?,
+        }),
+        Statement::Detach { name, if_exists } => empty(LogicalPlan::Detach {
+            name: name.clone(),
+            if_exists: *if_exists,
         }),
         Statement::DropDatabase { name, if_exists } => empty(LogicalPlan::DropDatabase {
             name: name.clone(),
@@ -9824,6 +9838,8 @@ pub(crate) fn plan_schema(
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Attach { .. }
+        | LogicalPlan::Detach { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -9981,6 +9997,9 @@ fn bind_table_function(
     if name.eq_ignore_ascii_case("pinkdb_column_stats") {
         return bind_column_stats(db, binder, args, alias);
     }
+    if name.eq_ignore_ascii_case("pinkdb_lake_decodes") {
+        return bind_lake_decodes(db, args, alias);
+    }
     if name.eq_ignore_ascii_case("pinkdb_catalog") {
         return bind_catalog(db, binder, args, alias);
     }
@@ -10024,11 +10043,13 @@ fn bind_table_function(
 /// this over `duckdb_tables()`, `duckdb_views()` and `duckdb_indexes()`; one
 /// relation keeps the console to one statement.
 ///
-/// Columns: `database`, `name`, `kind` (`TABLE`, `VIEW`, `MATERIALIZED VIEW`,
-/// `INDEX`, `TRIGGER`, `MACRO`, `PROCEDURE`, `LAKE TABLE`), `table_name` (the
-/// table an index or trigger belongs to), `detail` (index column and method,
-/// trigger timing, macro parameters, procedure parameters and language, lake
-/// location). A logged-in session sees only the relations it may `SELECT`,
+/// Columns: `database`, `name`, `kind` (`DATABASE`, `TABLE`, `VIEW`,
+/// `MATERIALIZED VIEW`, `INDEX`, `TRIGGER`, `MACRO`, `PROCEDURE`, `LAKE
+/// TABLE`), `table_name` (the table an index or trigger belongs to), `detail`
+/// (index column and method, trigger timing, macro parameters, procedure
+/// parameters and language, lake location), and — on `DATABASE` rows only
+/// (wave 124) — `storage` (`local`/`lake`), `location` (redacted),
+/// `read_only`, `version` and `status` (`ok` or `unavailable: …`). A logged-in session sees only the relations it may `SELECT`,
 /// only those relations' indexes and triggers, and procedures only when it
 /// is an administrator (the one who may `CALL` them).
 fn bind_catalog(
@@ -10042,11 +10063,23 @@ fn bind_catalog(
             "pinkdb_catalog() takes no arguments".to_string(),
         ));
     }
-    let names: Vec<String> = ["database", "name", "kind", "table_name", "detail"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    let types = vec![DataType::Varchar; names.len()];
+    let names: Vec<String> = [
+        "database",
+        "name",
+        "kind",
+        "table_name",
+        "detail",
+        "storage",
+        "location",
+        "read_only",
+        "version",
+        "status",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let mut types = vec![DataType::Varchar; 7];
+    types.extend([DataType::Boolean, DataType::Bigint, DataType::Varchar]);
     let principal = binder.session.principal();
     let readable = |dbname: &str, table: &str| match &principal {
         None => true,
@@ -10065,6 +10098,24 @@ fn bind_catalog(
     let text = |v: &str| BoundExpr::Literal(Value::Varchar(v.to_string()));
     let null = || BoundExpr::Literal(Value::Null);
     let mut rows: Vec<Vec<BoundExpr>> = Vec::new();
+    // Wave 124: one DATABASE row per database carries its storage facts
+    // (the other rows leave those columns NULL).
+    for info in db.database_infos() {
+        rows.push(vec![
+            text(&info.name),
+            text(&info.name),
+            text("DATABASE"),
+            null(),
+            null(),
+            text(&info.storage),
+            info.location.as_deref().map(text).unwrap_or_else(null),
+            BoundExpr::Literal(Value::Boolean(info.read_only)),
+            info.version
+                .map(|v| BoundExpr::Literal(Value::Bigint(v as i64)))
+                .unwrap_or_else(null),
+            text(&info.status),
+        ]);
+    }
     let mut databases = db.list_databases();
     databases.sort();
     for dbname in databases {
@@ -10181,6 +10232,11 @@ fn bind_catalog(
                     text(location),
                 ]);
             }
+        }
+    }
+    for row in &mut rows {
+        while row.len() < names.len() {
+            row.push(null());
         }
     }
     let scope = ScopeTable {
@@ -11893,6 +11949,145 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         };
     }
     Ok(plan)
+}
+
+/// `CREATE DATABASE`'s option list (wave 124): only `TYPE LAKE` with an
+/// optional `CATALOG` and `DATA`.
+fn bind_create_database_options(
+    options: Option<&crate::sql::ast::DatabaseOptions>,
+) -> Result<Option<crate::lake_db::LakeSpec>> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    if !options.lake {
+        return Err(PinkDbError::Catalog(
+            "CREATE DATABASE options describe a lake: add TYPE LAKE".to_string(),
+        ));
+    }
+    if options.read_only || options.version.is_some() {
+        return Err(PinkDbError::Catalog(
+            "READ_ONLY and VERSION apply to ATTACH, not to CREATE DATABASE".to_string(),
+        ));
+    }
+    if options.data.is_some() && options.catalog.is_none() {
+        return Err(PinkDbError::Catalog(
+            "DATA needs a CATALOG: a managed lake keeps its data under the store's lake \
+             directory"
+                .to_string(),
+        ));
+    }
+    Ok(Some(crate::lake_db::LakeSpec {
+        catalog: options.catalog.clone(),
+        data: options.data.clone(),
+        read_only: false,
+        version: None,
+    }))
+}
+
+/// `ATTACH`'s location and options (wave 124): a lake, named with the
+/// `lake:` prefix or `TYPE LAKE`.
+fn bind_attach_options(
+    location: &str,
+    options: &crate::sql::ast::DatabaseOptions,
+) -> Result<crate::lake_db::LakeSpec> {
+    let catalog = match location.strip_prefix("lake:") {
+        Some(rest) => rest,
+        None if options.lake => location,
+        None => {
+            return Err(PinkDbError::Catalog(format!(
+                "ATTACH '{}' is not a lake: name a lake with the lake: prefix or TYPE LAKE \
+                 (attaching a .pink file is not supported yet)",
+                crate::lake_db::redact_location(location)
+            )));
+        }
+    };
+    if catalog.trim().is_empty() {
+        return Err(PinkDbError::Catalog(
+            "ATTACH needs a lake catalog location".to_string(),
+        ));
+    }
+    if options.catalog.is_some() {
+        return Err(PinkDbError::Catalog(
+            "ATTACH takes the catalog as its location, not as a CATALOG option".to_string(),
+        ));
+    }
+    if options.version.is_some() && !options.read_only {
+        return Err(PinkDbError::Catalog(
+            "VERSION pins a read-only attachment: add READ_ONLY".to_string(),
+        ));
+    }
+    Ok(crate::lake_db::LakeSpec {
+        catalog: Some(catalog.to_string()),
+        data: options.data.clone(),
+        read_only: options.read_only,
+        version: options.version,
+    })
+}
+
+/// `pinkdb_lake_decodes()` (wave 124): the data-file decode counters of every
+/// read-only lake database (and session attachment) — `database` (NULL for a
+/// session attachment), `location`, `loads`, `columns`, `files` — the
+/// diagnostics behind "a statistics-only query decodes nothing" and "a
+/// pruned scan decodes only the matching files" (`.lake attached` printed
+/// them before lakes became databases).
+fn bind_lake_decodes(
+    db: &PinkDb,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    if !args.is_empty() {
+        return Err(PinkDbError::Type(
+            "pinkdb_lake_decodes() takes no arguments".to_string(),
+        ));
+    }
+    let names: Vec<String> = ["database", "location", "loads", "columns", "files"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let types = vec![
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Bigint,
+        DataType::Bigint,
+        DataType::Bigint,
+    ];
+    let lit = |v: Value| BoundExpr::Literal(v);
+    let rows: Vec<Vec<BoundExpr>> = db
+        .lake_decode_stats()
+        .into_iter()
+        .map(|(database, location, loads, columns, files)| {
+            vec![
+                database
+                    .map(Value::Varchar)
+                    .map(lit)
+                    .unwrap_or(lit(Value::Null)),
+                lit(Value::Varchar(location)),
+                lit(Value::Bigint(loads as i64)),
+                lit(Value::Bigint(columns as i64)),
+                lit(Value::Bigint(files as i64)),
+            ]
+        })
+        .collect();
+    let scope = ScopeTable {
+        name: alias
+            .clone()
+            .unwrap_or_else(|| "pinkdb_lake_decodes".to_string())
+            .to_ascii_lowercase(),
+        original: None,
+        db: None,
+        is_alias: alias.is_some(),
+        qualified_only: false,
+        columns: names.iter().cloned().zip(types.iter().copied()).collect(),
+    };
+    Ok((
+        scope,
+        LogicalPlan::Values {
+            rows,
+            names,
+            types,
+            sources: Vec::new(),
+        },
+    ))
 }
 
 #[cfg(test)]
