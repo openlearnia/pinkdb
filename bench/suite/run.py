@@ -92,6 +92,10 @@ def sh(
             return x.decode("utf-8", "replace") if isinstance(x, bytes) else (x or "")
 
         return subprocess.CompletedProcess(args, 124, text(exc.stdout), text(exc.stderr))
+    except OSError as exc:
+        # A program that is not installed (sw_vers off macOS, a missing DuckDB)
+        # is a failed run like any other, exit 127 as a shell reports it.
+        return subprocess.CompletedProcess(args, 127, "", str(exc))
 
 
 def timer_values(out: str) -> list[float]:
