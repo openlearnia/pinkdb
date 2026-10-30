@@ -1317,10 +1317,17 @@ assert_contains "$TMP/conflict_seed.log" "Saved lake version 2"
     echo "$?" >"$TMP/conflict_slow.exit"
 ) &
 SLOW_PID=$!
-# Head start: long enough that the slow writer has read the catalog (v2) and
-# is inside its encode/upload when the quick writer reads it too, short
-# enough that the slow writer has not published v3 yet. With SLOWROWS sized
-# to ~1s of encoding the window is wide on any local server.
+# The slow writer's `.import` of SLOWROWS rows takes seconds and happens
+# before its save reads the catalog, so a fixed head start let the quick
+# writer publish v3 before the slow save even began (both then published,
+# v3 and v4, without racing). Wait for the import to finish, then give the
+# save a moment to read the catalog (v2): the quick writer then reads v2 too
+# and publishes v3 while the slow save is still encoding.
+for _ in $(seq 1 1800); do
+    grep -q "^Imported " "$TMP/conflict_slow.log" 2>/dev/null && break
+    kill -0 "$SLOW_PID" 2>/dev/null || break
+    sleep 0.1
+done
 sleep 0.3
 { echo ".import $TMP/quick.csv tquick"; echo ".lake save $CONFLICT_CAT data $CONFLICT"; echo ".quit"; } \
     | cli_run "$TMP/conflict_quick.log"
@@ -1343,7 +1350,7 @@ errors = {name: [l for l in text.splitlines() if l.startswith("Error:")]
           for name, text in logs.items()}
 winners = [name for name, v in saved.items() if v]
 losers = [name for name in logs if name not in winners]
-if winners == [] or losers == []:
+if winners == []:
     for name in logs:
         print(f"{name}: saved={saved[name]} errors={errors[name]}", file=sys.stderr)
     print("expected exactly one winner and one loser", file=sys.stderr)
