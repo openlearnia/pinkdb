@@ -3897,19 +3897,21 @@ impl<'a> Binder<'a> {
             // callback `is_null` with the registered type tag.
             //
             // Everything else must equal the registered argument type — ABI
-            // v1 inserts no implicit casts — with three documented widening
+            // v1 inserts no implicit casts — with four documented widening
             // rules: a **DOUBLE parameter accepts any numeric argument**
             // (INTEGER, BIGINT, DECIMAL) and the engine inserts the CAST to
             // DOUBLE that DuckDB applies implicitly, so `exp(1)`, `log(100)`
             // and an integer or DECIMAL column all work like DuckDB; a
             // **BIGINT parameter accepts an INTEGER** (lossless, DuckDB's
-            // implicit cast: `split_part(s, ',', 1)`); and a **VARCHAR
-            // parameter accepts a VARIANT**, whose text form is its JSON
-            // value, so the `json_*` functions read VARIANT directly as
-            // DuckDB's do. Every other declared type stays exact and keeps
-            // the CAST hint (`json_array(1)` and `ext_repeat('x', 1.5)` keep
-            // their documented errors): a string is not a number, and parsing
-            // one is not this ABI's job.
+            // implicit cast: `split_part(s, ',', 1)`); a **TIMESTAMP
+            // parameter accepts a DATE** (midnight, DuckDB's implicit cast:
+            // `dayofweek(DATE '2024-01-07')`); and a **VARCHAR parameter
+            // accepts a VARIANT**, whose text form is its JSON value, so the
+            // `json_*` functions read VARIANT directly as DuckDB's do. Every
+            // other declared type stays exact and keeps the CAST hint
+            // (`json_array(1)` and `ext_repeat('x', 1.5)` keep their
+            // documented errors): a string is not a number, and parsing one
+            // is not this ABI's job.
             bound.push(coerce_host_arg(&func_name, i + 1, want, b)?);
         }
         Ok(BoundExpr::DynamicScalar {
@@ -4055,8 +4057,8 @@ fn assign_host_args(
 }
 
 /// Check one host-function argument against its declared type: ABI v1's rules
-/// (exact type, numeric→DOUBLE, VARIANT→VARCHAR), with the argument's SQL
-/// position in the message.
+/// (exact type, numeric→DOUBLE, INTEGER→BIGINT, DATE→TIMESTAMP,
+/// VARIANT→VARCHAR), with the argument's SQL position in the message.
 fn coerce_host_arg(
     what: &str,
     position: usize,
@@ -4081,6 +4083,15 @@ fn coerce_host_arg(
         return Ok(BoundExpr::Cast {
             expr: Box::new(bound),
             dtype: DataType::Bigint,
+        });
+    }
+    // DATE → TIMESTAMP is the other implicit cast DuckDB applies: a date is
+    // midnight of that day, so no information is lost or reinterpreted
+    // (`dayofweek(DATE '2024-01-07')`).
+    if want == crate::ext::ExtType::Timestamp && bound.dtype() == DataType::Date {
+        return Ok(BoundExpr::Cast {
+            expr: Box::new(bound),
+            dtype: DataType::Timestamp,
         });
     }
     if want == crate::ext::ExtType::Varchar && bound.dtype() == DataType::Variant {

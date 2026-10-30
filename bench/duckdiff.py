@@ -527,9 +527,9 @@ QUERIES = [
     ("json-mutate-arity", "SELECT json_remove('{\"a\":1}', '$.a', '$.b');", False, True),
     ("json-mutate-bad-path", "SELECT json_set('{\"a\":1}', '$.', '1');", False, True),
     # ---- wave 56: the core datetime extension ----
-    # DATE arguments take `::TIMESTAMP` in pinkdb (the strict extension ABI
-    # inserts no implicit casts); DuckDB accepts the same cast, so every
-    # probe is one SQL text for both engines.
+    # DATE arguments widen into the TIMESTAMP parameters the way DuckDB casts
+    # them implicitly, so the probes below also pass bare DATE values; the
+    # older probes keep their explicit `::TIMESTAMP` spellings.
     ("dt-epoch", "SELECT epoch(TIMESTAMP '2024-01-01 12:00:00'), epoch(TIMESTAMP '1969-12-31 23:59:59.5'), epoch(DATE '1970-01-01'::TIMESTAMP), epoch(TIMESTAMP '1969-12-31 23:59:59.999999'), epoch(TIMESTAMP '1969-12-31 23:59:59.000001'), epoch(TIMESTAMP '1969-12-31 23:59:59.000000');", False, False),
     ("dt-epoch-ms", "SELECT epoch_ms(TIMESTAMP '2024-01-01 00:00:00.000001'), epoch_ms(TIMESTAMP '1969-12-31 23:59:59.999999'), epoch_ms(TIMESTAMP '1969-12-31 23:59:59.9995'), epoch_ms(TIMESTAMP '1970-01-01 00:00:00.0005'), epoch_ms(DATE '1970-01-01'::TIMESTAMP);", False, False),
     ("dt-dayofweek", "SELECT dayofweek(DATE '2024-01-07'::TIMESTAMP), dayofweek(DATE '2024-01-08'::TIMESTAMP), dayofweek(TIMESTAMP '2023-01-01 12:00:00'), dayofweek(TIMESTAMP '1969-12-31 23:59:59');", False, False),
@@ -550,6 +550,19 @@ QUERIES = [
     ("dt-null-matrix", "SELECT epoch(hired::TIMESTAMP), epoch_ms(hired::TIMESTAMP), dayofweek(hired::TIMESTAMP), dayofyear(hired::TIMESTAMP), week(hired::TIMESTAMP), last_day(hired::TIMESTAMP), strftime(hired::TIMESTAMP, '%Y'), strptime(NULL, '%Y'), strptime('2024', NULL), age(hired::TIMESTAMP, DATE '2024-01-01'::TIMESTAMP), make_date(NULL, 1, 1) FROM emp WHERE id = 5;", False, False),
     ("dt-columns", "SELECT id, dayofyear(hired::TIMESTAMP), week(hired::TIMESTAMP), last_day(hired::TIMESTAMP) FROM emp ORDER BY id;", True, False),
     ("dt-where-group", "SELECT strftime(hired::TIMESTAMP, '%Y-%m') AS m, COUNT(*) FROM emp WHERE week(hired::TIMESTAMP) >= 1 GROUP BY m ORDER BY m;", True, False),
+    # ---- wave 137: DATE arguments, dayofmonth/weekofyear and date_diff ----
+    ("dt-date-args", "SELECT dayofweek(DATE '2020-01-01'), dayofyear(DATE '2020-12-31'), week(DATE '2021-01-01'), weekofyear(DATE '2021-01-01'), dayofmonth(DATE '2020-01-15'), strftime(DATE '2020-01-01', '%Y-%m-%d'), last_day(DATE '2024-02-10'), epoch(DATE '1970-01-02');", False, False),
+    ("dt-date-args-timestamps", "SELECT dayofmonth(TIMESTAMP '2020-02-29 13:00:00'), weekofyear(TIMESTAMP '2021-01-01 23:00:00'), dayofmonth(TIMESTAMP '1969-12-31 23:59:59'), weekofyear(TIMESTAMP '2023-01-01 00:00:00');", False, False),
+    ("dt-date-args-null", "SELECT dayofmonth(CAST(NULL AS TIMESTAMP)) IS NULL, weekofyear(CAST(NULL AS TIMESTAMP)) IS NULL, date_diff(NULL, DATE '2020-01-01', DATE '2020-01-02') IS NULL, date_diff('day', CAST(NULL AS TIMESTAMP), NULL) IS NULL, date_diff('day', DATE '2020-01-01', CAST(NULL AS TIMESTAMP)) IS NULL;", False, False),
+    ("dt-date-diff-parts", "SELECT date_diff('year', DATE '2020-02-29', DATE '2021-02-28'), date_diff('quarter', DATE '2020-01-01', DATE '2020-04-01'), date_diff('month', DATE '2020-01-31', DATE '2020-02-01'), date_diff('week', DATE '2020-01-01', DATE '2020-01-08'), date_diff('day', DATE '2020-01-01', DATE '2020-01-31');", False, False),
+    ("dt-date-diff-negative", "SELECT date_diff('month', DATE '2020-02-01', DATE '2020-01-31'), date_diff('year', DATE '2021-02-28', DATE '2020-02-29'), date_diff('week', DATE '2020-01-14', DATE '2020-01-01'), date_diff('day', DATE '2020-01-31', DATE '2020-01-01'), date_diff('hour', TIMESTAMP '2020-01-01 00:00:00', TIMESTAMP '2019-12-31 22:30:00');", False, False),
+    ("dt-date-diff-subday", "SELECT date_diff('hour', TIMESTAMP '2020-01-01 00:00:00', TIMESTAMP '2020-01-01 01:59:00'), date_diff('minute', TIMESTAMP '2020-01-01 00:00:00', TIMESTAMP '2020-01-01 00:00:30'), date_diff('second', TIMESTAMP '2020-01-01 00:00:00', TIMESTAMP '2020-01-01 00:00:00.5'), date_diff('millisecond', TIMESTAMP '2020-01-01 00:00:00', TIMESTAMP '2020-01-01 00:00:00.0005'), date_diff('microsecond', TIMESTAMP '2020-01-01 00:00:00', TIMESTAMP '2020-01-01 00:00:00.000500');", False, False),
+    ("dt-date-diff-day-boundaries", "SELECT date_diff('day', TIMESTAMP '2020-01-01 23:00:00', TIMESTAMP '2020-01-02 01:00:00'), date_diff('day', TIMESTAMP '2020-01-02 00:00:00', TIMESTAMP '2020-01-01 12:00:00'), date_diff('week', TIMESTAMP '2020-01-08 01:00:00', TIMESTAMP '2020-01-01 23:00:00'), date_diff('second', TIMESTAMP '2020-01-01 00:00:00.5', TIMESTAMP '2020-01-01 00:00:02.4'), date_diff('minute', TIMESTAMP '2019-12-31 23:59:30', TIMESTAMP '2020-01-01 00:00:00');", False, False),
+    ("dt-date-diff-aliases", "SELECT date_diff('DAYS', DATE '2020-01-01', DATE '2020-01-03'), date_diff('mons', DATE '2020-01-01', DATE '2020-03-01'), date_diff('hrs', TIMESTAMP '2020-01-01 00:00:00', TIMESTAMP '2020-01-01 02:00:00'), date_diff('epoch', DATE '2020-01-01', DATE '2020-01-01'), date_diff('dow', DATE '2020-01-01', DATE '2020-01-03'), date_diff('isoyear', DATE '2021-01-01', DATE '2020-01-01');", False, False),
+    ("dt-datediff-alias", "SELECT datediff('day', DATE '2020-01-01', DATE '2020-01-02'), datediff('month', DATE '2020-01-31', DATE '2020-02-01');", False, False),
+    ("dt-date-diff-columns", "SELECT id, dayofmonth(hired::TIMESTAMP), weekofyear(hired::TIMESTAMP), date_diff('day', hired::TIMESTAMP, TIMESTAMP '2024-06-01 00:00:00') FROM emp ORDER BY id;", True, False),
+    ("dt-date-diff-unknown-part", "SELECT date_diff('bogus', DATE '2020-01-01', DATE '2020-01-02');", False, True),
+    ("dt-date-diff-qtr", "SELECT date_diff('qtr', DATE '2020-01-01', DATE '2020-04-01');", False, True),
     # error cases: both engines must refuse.
     ("dt-strftime-unsupported", "SELECT strftime(TIMESTAMP '2024-03-05 14:07:09', '%e');", False, True),
     ("dt-strftime-trailing-percent", "SELECT strftime(TIMESTAMP '2024-03-05 14:07:09', 'x%');", False, True),
@@ -611,6 +624,27 @@ STRING_EXT_QUERIES = [
     ("str-group", "SELECT left(name, CAST(1 AS BIGINT)) AS initial, COUNT(*) FROM emp GROUP BY initial ORDER BY initial;", True, False),
     ("str-compose", "SELECT upper(reverse(name)) FROM emp ORDER BY 1;", True, False),
     ("str-integer-widening", "SELECT left('hello', 2), right('hello', 2), split_part('a,b,c', ',', 3), split_part(name, 'a', 1) FROM emp ORDER BY id;", True, False),
+    # ---- wave 137: DuckDB's optional regexp arities, padding and concat_ws ----
+    ("str-regexp-extract-arity", "SELECT regexp_extract('abc', 'b'), regexp_extract('abc', 'b', 1), regexp_extract('abc-123', '([a-z]+)-([0-9]+)', 2), regexp_extract('abc', '(b)', 1, 'i'), regexp_extract('abc', 'z');", False, False),
+    ("str-regexp-matches-arity", "SELECT regexp_matches('abc', 'b'), regexp_matches('ABC', 'b'), regexp_matches('ABC', 'b', 'i'), regexp_matches('abc', 'z', 's');", False, False),
+    ("str-regexp-null-pattern-bad-option", "SELECT regexp_matches('a', NULL, 'q');", False, True),
+    ("str-regexp-replace-null-bad-option", "SELECT regexp_replace(NULL, 'b', 'c', 'q');", False, True),
+    ("str-regexp-null-input-g-option", "SELECT regexp_matches(NULL, 'a', 'g');", False, True),
+    ("str-regexp-arity-null", "SELECT regexp_extract(NULL, 'b') IS NULL, regexp_extract('abc', NULL) IS NULL, regexp_matches(NULL, 'b') IS NULL;", False, False),
+    ("str-regexp-replace", "SELECT regexp_replace('abcabc', 'b', 'x'), regexp_replace('abcabc', 'b', 'x', 'g'), regexp_replace('abcabc', '(b)', '[\\1]'), regexp_replace('abcabc', '(b)', '[\\1]', 'g'), regexp_replace('abc', 'b', '<\\0>'), regexp_replace('aBcB', 'b', 'x', 'gi'), regexp_replace('abc', '', '-', 'g');", False, False),
+    ("str-regexp-replace-null", "SELECT regexp_replace(NULL, 'b', 'x') IS NULL, regexp_replace('abc', NULL, 'x') IS NULL, regexp_replace('abc', 'b', NULL) IS NULL;", False, False),
+    ("str-regexp-replace-bad-rewrite", "SELECT regexp_replace('xyz', 'b', '\\q');", False, True),
+    ("str-regexp-replace-bad-option", "SELECT regexp_replace('abc', 'b', 'x', 'G');", False, True),
+    ("str-lpad-rpad", "SELECT lpad('a', 3, 'x'), lpad('a', 3, 'xyz'), lpad('abcdef', 3, 'x'), lpad('a', 5, 'ab'), lpad('a', 5, 'abc'), lpad('héllo', 6, 'x'), lpad('a', 0, 'x'), lpad('a', -3, 'x'), lpad('abc', 2, ''), rpad('a', 3, 'x'), rpad('a', 5, 'abc'), rpad('', 2, 'ab'), rpad('abcdef', 3, 'x');", False, False),
+    ("str-lpad-rpad-null", "SELECT lpad(NULL, 3, 'x') IS NULL, lpad('a', NULL, 'x') IS NULL, lpad('a', 3, NULL) IS NULL, rpad('a', NULL, 'x') IS NULL;", False, False),
+    ("str-lpad-empty-pad", "SELECT lpad('a', 3, '');", False, True),
+    ("str-rpad-empty-pad", "SELECT rpad('a', 3, '');", False, True),
+    ("str-lpad-arity", "SELECT lpad('a', 3);", False, True),
+    ("str-concat-ws", "SELECT concat_ws(',', 'a', NULL, 'b'), concat_ws(NULL, 'a'), concat_ws(',', NULL, NULL), concat_ws('', 'a', 'b'), concat_ws(',', 'a'), concat_ws(',', 'a', 'b', 'c');", False, False),
+    ("str-concat-ws-arity", "SELECT concat_ws(',');", False, True),
+    ("str-regexp-arity-too-few", "SELECT regexp_matches('a');", False, True),
+    ("str-regexp-arity-too-many", "SELECT regexp_replace('a', 'b', 'c', 'g', 'x');", False, True),
+    ("str-pad-concat-columns", "SELECT id, lpad(name, 6, '.'), rpad(name, 6, '.'), concat_ws('|', name, CAST(id AS VARCHAR)) FROM emp ORDER BY id;", True, False),
     # ---- wave 54: core math extension (`extensions/math`) ----
     # The CLI's default `math` feature loads the extension into every store, so
     # `exp`/`ln`/`log`/... need no LOAD; `sqrt`/`pow`/`floor`/`ceil`/`sign`/

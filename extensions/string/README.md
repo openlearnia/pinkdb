@@ -1,6 +1,6 @@
 # `string` — pinkdb's core string extension
 
-Ten deterministic string functions for pinkdb, authored with the Rust
+Fourteen deterministic string functions for pinkdb, authored with the Rust
 extension SDK (ABI v1) and pinned live against DuckDB
 `v2.0.0-alpha46057` (`duckdb` CLI). The library is
 `target/release/libstring_ext.<dylib|so>`; the extension's SQL name is
@@ -40,8 +40,11 @@ no ABI symbols (not loadable natively); the Makefile passes the feature.
 | `left(string, count)` / `right(string, count)` | first/last `count` characters; negative `count` drops that many from the other side (`left('hello', -2)` = `'hel'`); past-the-end → whole string; NULL → NULL | same |
 | `strpos(string, search)` | 1-based **character** position, `0` when absent; empty search → `1`; NULL → NULL | same |
 | `starts_with(string, search)` / `ends_with(string, search)` | `BOOLEAN`; empty search always matches; NULL → NULL | same |
-| `regexp_extract(string, pattern, group, options)` | capturing group of the first match; no match or a non-participating group → `''`; `group` is `INTEGER` 0..=9 (outside → error); NULL group → `''`; NULL input/pattern → NULL; NULL options → error | same semantics, **fixed 4-arg form only** |
-| `regexp_matches(string, pattern, options)` | `BOOLEAN`, partial match (anchor with `^`/`$`); NULL input/pattern → NULL; NULL options → error; `g` → error | same semantics, **fixed 3-arg form only** |
+| `regexp_extract(string, pattern [, group [, options]])` | capturing group of the first match; no match or a non-participating group → `''`; `group` is `INTEGER` 0..=9 (outside → error), defaults to 0, and a BIGINT needs `CAST(x AS INTEGER)` like DuckDB; NULL group → `''`; NULL input/pattern → NULL; NULL options → error | same, 2/3/4 arguments |
+| `regexp_matches(string, pattern [, options])` | `BOOLEAN`, partial match (anchor with `^`/`$`); NULL input/pattern → NULL; NULL options → error; `g` → error | same, 2/3 arguments |
+| `regexp_replace(string, pattern, replacement [, options])` | rewrites the first match, or every match with `g`; `replacement` supports `\0`…`\9` group references and `\\`; NULL input/pattern/replacement → NULL; NULL options → error; an invalid rewrite schema errors even when nothing matches | same |
+| `lpad(string, count, character)` / `rpad(…)` | pads to `count` characters by repeating `character`; a longer string is **truncated** to `count`; `count <= 0` → `''`; an empty pad errors only when padding is needed (`Insufficient padding in LPAD.`); NULL → NULL | same |
+| `concat_ws(separator, …)` | joins the non-NULL arguments with `separator`; NULL separator → NULL; empty separator concatenates; at least 2 arguments | same, but every value must be `VARCHAR` (see divergence 2) |
 | `regexp_match(string, pattern)` | **DuckDB has no such function** (`Catalog Error`; PostgreSQL's returns `TEXT[]` of capture groups) | **pinkdb-pinned**: `VARCHAR` = first match text, `''` when none; equivalent to `regexp_extract(s, p, 0, '')` |
 
 `trim`, `ltrim`, `rtrim` and `replace` are **engine built-ins** already, with
@@ -54,19 +57,21 @@ functions cannot shadow a built-in, so a re-registration here would make
 
 ## Deliberate divergences (all loud, all tested)
 
-1. **Fixed arity.** ABI v1 declares one signature per function name — there
-   are no overloads or optional arguments. Every function here is registered
-   in its full DuckDB shape, so a call that omits a trailing argument in
-   DuckDB needs an explicit `NULL`/`''` here:
-   `regexp_extract(s, p, NULL, '')` (2-arg DuckDB form),
-   `regexp_matches(s, p, '')` (2-arg DuckDB form).
-   The `regexp_match` pin is the exception: its one 2-argument form is the
-   whole surface.
+1. **One declaration per name.** ABI v1 has no overloads, but the SDK's
+   `optional(min)` modifier gives one declaration a trailing argument range,
+   so DuckDB's shorthand forms work as written: `regexp_extract(s, p)`,
+   `regexp_extract(s, p, 1)`, `regexp_matches(s, p)` and
+   `regexp_replace(s, p, r)`. `concat_ws` is `variadic(1)` (the ABI repeats
+   its one declared element type), so its "at least 2 arguments" rule is a
+   body check and its error text is the runtime one.
 2. **Strict typing: few implicit casts.** ABI v1 widens an INTEGER into a
-   `BIGINT` parameter (`left(name, 2)`, like DuckDB) and any number into a
+   `BIGINT` parameter (`left(name, 2)`, like DuckDB), a DATE into a
+   TIMESTAMP one (`strftime(DATE '2020-01-01', '%Y')`), and any number into a
    `DOUBLE` one, and inserts no other cast: `left(name, '2')` is an error
    naming the fix (*argument 2 must be BIGINT, got VARCHAR (use CAST)*),
-   where DuckDB would parse the string.
+   where DuckDB would parse the string. For the same reason every
+   `concat_ws` value must be `VARCHAR` (DuckDB casts numbers and booleans to
+   text): `concat_ws(',', 1, 2)` needs `CAST(1 AS VARCHAR)`.
 3. **No list type.** `regexp_matches` in *PostgreSQL* (and the roadmap's
    `regexp_match` sketch) returns an array of capture groups / matches.
    pinkdb's ABI v1 value model is `BOOLEAN | INTEGER | BIGINT | DOUBLE |
@@ -99,26 +104,30 @@ live:
 | `l` | literal pattern (no regex tokens) | same (`regex::escape`) |
 | `m`, `n`, `p` | newline-sensitive: `.` does not match `\n` (the default) | same |
 | `s` | non-newline-sensitive: `.` matches `\n` | same |
-| `g` | global replace, only valid for `regexp_replace` | refused, same as DuckDB outside `regexp_replace` |
+| `g` | global replace, only valid for `regexp_replace` | same: `regexp_replace` accepts it (first match otherwise); every other `regexp_*` refuses it |
 | anything else | error | error (`unrecognized regex option …`) |
 
 `regexp_extract`'s NULL handling is pinned exactly: options are checked
-first (NULL → error), then the group range, then the pattern (NULL → NULL,
+first (NULL → error, and an unknown letter or `g` errors even when the
+pattern is NULL), then the group range, then the pattern (NULL → NULL,
 invalid → error), then the input (NULL → NULL); a NULL group with a non-NULL
-input yields `''`. Inline flags (`(?s)a.b`) work as in DuckDB.
+input yields `''`. DuckDB also has a `regexp_extract(s, p, options)` overload
+whose third argument is a VARCHAR; one ABI declaration cannot carry both, so
+spell it `regexp_extract(s, p, 0, options)` here. Inline flags (`(?s)a.b`)
+work as in DuckDB.
 
 ## Building and testing
 
 ```sh
-cargo test -p pinkdb-ext-string     # 11 unit + 7 engine tests
+cargo test -p pinkdb-ext-string     # 14 unit + 10 engine tests
 make -C extensions/string           # release library -> build/
 ./extensions/string/smoke.sh        # CLI session (native LOAD EXTENSION path)
 python3 bench/duckdiff.py           # adds the string probe set, extension-loaded
 ```
 
 - **Unit tests** (`src/lib.rs`) call the declared functions directly: unicode,
-  empty strings, NULL policies, boundary indexes, every regexp option and
-  error path.
+  empty strings, NULL policies, boundary indexes, every regexp option,
+  rewrite schema, padding/truncation and error path.
 - **Engine tests** (`tests/engine.rs`) go through a real store via the linked
   registration: `LOAD EXTENSION 'string'`, WHERE/GROUP BY/ORDER BY
   composition, prepared statements (with the strict-typing error pinned), and

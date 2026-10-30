@@ -404,3 +404,182 @@ fn deterministic_functions_wal_log_and_replay_identically() {
     let after = rows(&mut db, "SELECT v FROM t ORDER BY v;");
     assert_eq!(after, before, "WAL replay diverged");
 }
+
+// ---------- DuckDB's optional arities, padding and concat_ws ----------
+
+#[test]
+fn regexp_arities_and_replace_match_duckdb() {
+    let mut db = test_db();
+    // DuckDB's optional trailing arguments: matches 2/3, extract 2/3/4.
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT regexp_matches('abc', 'b'), regexp_matches('ABC', 'b'), \
+             regexp_matches('ABC', 'b', 'i'), regexp_extract('abc', 'b'), \
+             regexp_extract('abc', 'b', 1), \
+             regexp_extract('abc-123', '([a-z]+)-([0-9]+)', 2), \
+             regexp_extract('abc', '(b)', 1, 'i');"
+        ),
+        vec![vec![
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            text("b"),
+            text(""),
+            text("123"),
+            text("b"),
+        ]]
+    );
+    // regexp_replace rewrites the first match unless the `g` option is given,
+    // and `\1`/`\0` are group references.
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT regexp_replace('abcabc', 'b', 'x'), \
+             regexp_replace('abcabc', 'b', 'x', 'g'), \
+             regexp_replace('abcabc', '(b)', '[\\1]'), \
+             regexp_replace('abcabc', '(b)', '[\\1]', 'g'), \
+             regexp_replace('abc', 'b', '<\\0>'), \
+             regexp_replace('aBcB', 'b', 'x', 'gi'), \
+             regexp_replace('abc', '', '-', 'g');"
+        ),
+        vec![vec![
+            text("axcabc"),
+            text("axcaxc"),
+            text("a[b]cabc"),
+            text("a[b]ca[b]c"),
+            text("a<b>c"),
+            text("axcx"),
+            text("-a-b-c-"),
+        ]]
+    );
+    // NULL input/pattern/replacement are NULL; a NULL options field is not.
+    for sql in [
+        "SELECT regexp_replace(NULL, 'b', 'x') IS NULL;",
+        "SELECT regexp_replace('abc', NULL, 'x') IS NULL;",
+        "SELECT regexp_replace('abc', 'b', NULL) IS NULL;",
+    ] {
+        assert_eq!(
+            rows(&mut db, sql),
+            vec![vec![Value::Boolean(true)]],
+            "{sql}"
+        );
+    }
+    let err = error(&mut db, "SELECT regexp_replace('abc', 'b', 'x', NULL);");
+    assert!(err.contains("regex options must not be NULL"), "{err}");
+    // A bad rewrite schema fails even when the pattern never matches, like
+    // DuckDB validating the schema up front.
+    let err = error(&mut db, "SELECT regexp_replace('xyz', 'b', '\\q');");
+    assert!(err.contains("must be followed by a digit"), "{err}");
+    let err = error(&mut db, "SELECT regexp_replace('abc', 'b', 'x', 'G');");
+    assert!(err.contains("unrecognized regex option G"), "{err}");
+    // DuckDB validates the options before it looks at NULL inputs.
+    for (sql, needle) in [
+        (
+            "SELECT regexp_matches('a', NULL, 'q');",
+            "unrecognized regex option q",
+        ),
+        (
+            "SELECT regexp_replace(NULL, 'b', 'c', 'q');",
+            "unrecognized regex option q",
+        ),
+        ("SELECT regexp_matches(NULL, 'a', 'g');", "regexp_replace"),
+    ] {
+        let err = error(&mut db, sql);
+        assert!(err.contains(needle), "{sql}: {err}");
+    }
+    // Arity errors name the DuckDB range.
+    for (sql, needle) in [
+        (
+            "SELECT regexp_matches('a');",
+            "takes between 2 and 3 argument(s)",
+        ),
+        (
+            "SELECT regexp_extract('a');",
+            "takes between 2 and 4 argument(s)",
+        ),
+        (
+            "SELECT regexp_replace('a', 'b');",
+            "takes between 3 and 4 argument(s)",
+        ),
+        (
+            "SELECT regexp_replace('a', 'b', 'c', 'g', 'x');",
+            "takes at most 4 argument(s)",
+        ),
+    ] {
+        let err = error(&mut db, sql);
+        assert!(err.contains(needle), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn padding_and_concat_ws_match_duckdb() {
+    let mut db = test_db();
+    // Padding repeats the pad string (character-wise), and truncation wins
+    // over an empty pad.
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT lpad('a', 3, 'x'), lpad('a', 3, 'xyz'), lpad('abcdef', 3, 'x'), \
+             lpad('a', 5, 'ab'), lpad('a', 5, 'abc'), lpad('héllo', 6, 'x'), \
+             lpad('a', 0, 'x'), lpad('a', -3, 'x'), lpad('abc', 2, ''), \
+             rpad('a', 3, 'x'), rpad('a', 5, 'abc'), rpad('', 2, 'ab'), \
+             rpad('abcdef', 3, 'x');"
+        ),
+        vec![vec![
+            text("xxa"),
+            text("xya"),
+            text("abc"),
+            text("ababa"),
+            text("abcaa"),
+            text("xhéllo"),
+            text(""),
+            text(""),
+            text("ab"),
+            text("axx"),
+            text("aabca"),
+            text("ab"),
+            text("abc"),
+        ]]
+    );
+    let err = error(&mut db, "SELECT lpad('a', 3, '');");
+    assert!(err.contains("Insufficient padding in LPAD"), "{err}");
+    let err = error(&mut db, "SELECT rpad('a', 3, '');");
+    assert!(err.contains("Insufficient padding in RPAD"), "{err}");
+    for sql in [
+        "SELECT lpad(NULL, 3, 'x') IS NULL;",
+        "SELECT lpad('a', NULL, 'x') IS NULL;",
+        "SELECT lpad('a', 3, NULL) IS NULL;",
+        "SELECT rpad('a', NULL, 'x') IS NULL;",
+    ] {
+        assert_eq!(
+            rows(&mut db, sql),
+            vec![vec![Value::Boolean(true)]],
+            "{sql}"
+        );
+    }
+    // concat_ws skips NULL arguments; a NULL separator poisons the row.
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT concat_ws(',', 'a', NULL, 'b'), concat_ws(',', NULL, NULL), \
+             concat_ws('', 'a', 'b'), concat_ws(',', 'a'), concat_ws(',', 'a', 'b', 'c');"
+        ),
+        vec![vec![
+            text("a,b"),
+            text(""),
+            text("ab"),
+            text("a"),
+            text("a,b,c"),
+        ]]
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT concat_ws(NULL, 'a') IS NULL;"),
+        vec![vec![Value::Boolean(true)]]
+    );
+    // DuckDB's arity rules: lpad needs 3 arguments, concat_ws at least 2.
+    let err = error(&mut db, "SELECT lpad('a', CAST(2 AS BIGINT));");
+    assert!(err.contains("takes 3 argument(s)"), "{err}");
+    let err = error(&mut db, "SELECT concat_ws(',');");
+    assert!(err.contains("at least 2 argument(s)"), "{err}");
+}

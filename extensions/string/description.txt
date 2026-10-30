@@ -1,1 +1,1 @@
-String functions: split_part, reverse, left/right, strpos, starts_with/ends_with, regexp_extract/regexp_matches
+String functions: split_part, reverse, left/right, strpos, starts_with/ends_with, lpad/rpad, concat_ws, regexp_extract/regexp_matches/regexp_replace

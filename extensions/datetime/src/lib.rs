@@ -1,4 +1,4 @@
-//! pinkdb's core **datetime** extension (wave 56): ten DuckDB date/time
+//! pinkdb's core **datetime** extension (wave 56): fourteen DuckDB date/time
 //! functions over naive `DATE`/`TIMESTAMP` values, authored with the Rust
 //! extension SDK.
 //!
@@ -9,8 +9,10 @@
 //! | `epoch(ts)` | TIMESTAMP | DOUBLE |
 //! | `epoch_ms(ts)` | TIMESTAMP | BIGINT |
 //! | `dayofweek(ts)` | TIMESTAMP | BIGINT (0 = Sunday) |
+//! | `dayofmonth(ts)` | TIMESTAMP | BIGINT (1-based) |
 //! | `dayofyear(ts)` | TIMESTAMP | BIGINT (1-based) |
-//! | `week(ts)` | TIMESTAMP | BIGINT (ISO-8601, 1..=53) |
+//! | `week(ts)` / `weekofyear(ts)` | TIMESTAMP | BIGINT (ISO-8601, 1..=53) |
+//! | `date_diff(part, start, end)` / `datediff(…)` | VARCHAR, TIMESTAMP, TIMESTAMP | BIGINT |
 //! | `last_day(ts)` | TIMESTAMP | DATE |
 //! | `age(end, start)` | TIMESTAMP, TIMESTAMP | INTERVAL |
 //! | `make_date(y, m, d)` | INTEGER ×3 | DATE |
@@ -27,10 +29,20 @@
 //!   build's shape. **`epoch_ms`** returns the millisecond count *rounded to
 //!   nearest, ties away from zero* (`-1 µs` → `0`, `-500 µs` → `-1`,
 //!   `-999999 µs` → `-1000`), exactly the pinned build.
-//! * **`dayofweek`** is 0 = Sunday … 6 = Saturday; **`dayofyear`** is
-//!   1-based; **`week`** is the ISO-8601 week (weeks start Monday, week 1
-//!   contains the first Thursday): 2021-01-01 is 2020-W53, 2023-01-01 is
-//!   2022-W52.
+//! * **`dayofweek`** is 0 = Sunday … 6 = Saturday; **`dayofmonth`** is
+//!   1..=31; **`dayofyear`** is 1-based; **`week`**/**`weekofyear`** is the
+//!   ISO-8601 week (weeks start Monday, week 1 contains the first Thursday):
+//!   2021-01-01 is 2020-W53, 2023-01-01 is 2022-W52.
+//! * **`date_diff(part, start, end)`** (and DuckDB's alias `datediff`)
+//!   counts the **boundaries crossed**, not whole units: year, quarter and
+//!   month from the calendar fields (`date_diff('month', DATE '2020-01-31',
+//!   DATE '2020-02-01')` is 1), week from whole-day differences divided by 7,
+//!   day from calendar-day differences, and hour/minute/second/millisecond
+//!   from the absolute unit boundaries each timestamp falls in
+//!   (`date_diff('hour', TIMESTAMP '2020-01-01 00:30:00', TIMESTAMP
+//!   '2020-01-01 00:59:00')` is 0). Part
+//!   names are DuckDB's, case-insensitively and with its abbreviations; an
+//!   unknown part is an error.
 //! * **`last_day`** returns the last day of the input's month as a DATE
 //!   (2024-02-01 → 2024-02-29), for DATE and TIMESTAMP inputs alike in
 //!   DuckDB; here the input is a TIMESTAMP, so wrap a DATE in `::TIMESTAMP`.
@@ -54,17 +66,17 @@
 //! * **`make_date`** validates month/day against the calendar (leap days
 //!   included) and the `i32` day range, erroring like the pinned build
 //!   ("date out of range: 2023-2-29"); any NULL argument is NULL.
-//! * NULL in → NULL out for every function; all ten are deterministic.
+//! * NULL in → NULL out for every function; all fourteen are deterministic.
 //!
 //! # Divergences from DuckDB (documented, by design)
 //!
 //! * **Naive timestamps only**: no time zone types, no `TIMESTAMPTZ`, no
 //!   `%z`/`%Z`, and no DST-aware arithmetic. UTC semantics in DuckDB's
 //!   timezone-naive mode are identical to these functions' results.
-//! * **Strict argument types** (the extension ABI inserts no implicit
-//!   casts): every date/time argument is declared TIMESTAMP, so a DATE goes
-//!   through `::TIMESTAMP` (`dayofweek(DATE '2024-01-07'::TIMESTAMP)`) where
-//!   DuckDB casts implicitly; the value is unchanged (midnight).
+//! * **Some argument types are exact**: the engine widens an INTEGER into a
+//!   BIGINT parameter and a DATE into a TIMESTAMP one (so
+//!   `dayofweek(DATE '2024-01-07')` works like DuckDB); nothing else is
+//!   coerced, so a VARCHAR timestamp needs an explicit CAST.
 //! * **`make_date` takes INTEGER**: `make_date(2024, 2, 29)` binds directly
 //!   (DuckDB's signature is BIGINT with an implicit INTEGER→BIGINT cast); a
 //!   BIGINT argument needs `CAST(x AS INTEGER)`.
@@ -77,6 +89,12 @@
 //! * **BC dates**: `make_date(-1, 1, 1)` and `strptime` with a negative `%Y`
 //!   work, but the engine renders year 0 and earlier without DuckDB's
 //!   "`(BC)`" suffix (the engine's existing DATE display).
+//! * **`date_diff` part set**: the calendar and sub-day parts above are
+//!   pinned; DuckDB's `decade`/`century`/`millennium` are refused here (it
+//!   accepts them) and its `timezone` part is refused there too.
+//! * **Bare `NULL` binds to any parameter**, so `dayofmonth(NULL)` is NULL
+//!   here; DuckDB's binder needs a typed NULL for these (`dayofmonth(CAST(NULL
+//!   AS TIMESTAMP))`), which works on both sides.
 //!
 //! # Activation
 //!
@@ -93,7 +111,7 @@
 //! # }
 //! ```
 //!
-//! The CLI's default `datetime` feature does both at startup, so the ten
+//! The CLI's default `datetime` feature does both at startup, so the fourteen
 //! functions work out of the box; `--no-default-features` and the other
 //! core extensions' features leave them out. The crate links no dependencies
 //! beyond the SDK (calendar math and the format engine are hand rolled).
@@ -107,7 +125,7 @@ use pinkdb_ext_sdk::{Date, ExtError, Interval, Timestamp, pinkdb_extension};
 /// The registry name: `LOAD EXTENSION 'datetime'`.
 pub const EXTENSION_NAME: &str = "datetime";
 
-// ---------- the ten pure functions (pure, unit-testable) ----------
+// ---------- the pure functions (pure, unit-testable) ----------
 //
 // Each takes `Option` arguments and returns `Option`/`Result<Option<_>>` —
 // NULL in, NULL out — and contains no ambient state. The `pinkdb_extension!`
@@ -136,6 +154,13 @@ pub fn dayofweek_of(ts: i64) -> i64 {
     civil::weekday(days) as i64
 }
 
+/// `dayofmonth(ts)`: day of the month, 1..=31.
+pub fn dayofmonth_of(ts: i64) -> i64 {
+    let (days, _) = civil::split_timestamp(ts);
+    let (_, _, day) = civil::civil_from_days(days);
+    i64::from(day)
+}
+
 /// `dayofyear(ts)`: 1-based day of year (366 in a leap year's last day).
 pub fn dayofyear_of(ts: i64) -> i64 {
     let (days, _) = civil::split_timestamp(ts);
@@ -146,6 +171,61 @@ pub fn dayofyear_of(ts: i64) -> i64 {
 pub fn week_of(ts: i64) -> i64 {
     let (days, _) = civil::split_timestamp(ts);
     civil::iso_week(days).1 as i64
+}
+
+/// `date_diff(part, start, end)`: the number of `part` boundaries crossed
+/// between two timestamps (DuckDB counts boundaries, not whole units).
+///
+/// `start`/`end` are naive microseconds since the epoch. Year, quarter and
+/// month differences come from the calendar fields; week and day from whole
+/// calendar days (`week` divides that difference by 7, truncating toward
+/// zero); the sub-day parts from the absolute unit boundaries each timestamp
+/// falls in. The
+/// part name is case-insensitive and accepts DuckDB's abbreviations; anything
+/// else is an error, like DuckDB's `extract specifier … not recognized`.
+pub fn date_diff_of(part: &str, start: i64, end: i64) -> Result<i64, String> {
+    let (start_days, _) = civil::split_timestamp(start);
+    let (end_days, _) = civil::split_timestamp(end);
+    let (start_year, start_month, _) = civil::civil_from_days(start_days);
+    let (end_year, end_month, _) = civil::civil_from_days(end_days);
+    // DuckDB's sub-day parts count the absolute unit boundaries each stamp
+    // falls in (`00:30 → 00:59` is 0 hours, `00:00 → 22:30` the day before is
+    // -2), which is the floor division of each side.
+    let boundaries = |us: i64, per: i64| us.div_euclid(per);
+    let part = part.to_ascii_lowercase();
+    let diff = match part.as_str() {
+        "year" | "years" | "y" | "yr" | "yrs" => i64::from(end_year - start_year),
+        "isoyear" => i64::from(civil::iso_week(end_days).0 - civil::iso_week(start_days).0),
+        "quarter" | "quarters" => {
+            let quarters = |year: i32, month: u32| i64::from(year) * 4 + i64::from(month - 1) / 3;
+            quarters(end_year, end_month) - quarters(start_year, start_month)
+        }
+        "month" | "months" | "mon" | "mons" => {
+            let months = |year: i32, month: u32| i64::from(year) * 12 + i64::from(month - 1);
+            months(end_year, end_month) - months(start_year, start_month)
+        }
+        "week" | "weeks" | "w" => (end_days - start_days) / 7,
+        "day" | "days" | "d" | "dow" | "isodow" | "doy" | "weekday" => end_days - start_days,
+        "hour" | "hours" | "h" | "hr" | "hrs" => {
+            boundaries(end, 3_600_000_000) - boundaries(start, 3_600_000_000)
+        }
+        "minute" | "minutes" | "min" | "mins" | "m" => {
+            boundaries(end, 60_000_000) - boundaries(start, 60_000_000)
+        }
+        "second" | "seconds" | "s" | "sec" | "secs" | "epoch" => {
+            boundaries(end, 1_000_000) - boundaries(start, 1_000_000)
+        }
+        "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" => {
+            boundaries(end, 1_000) - boundaries(start, 1_000)
+        }
+        "microsecond" | "microseconds" | "us" | "usec" | "usecs" => {
+            // `i128` so two extreme timestamps cannot overflow the subtraction.
+            i64::try_from(i128::from(end) - i128::from(start))
+                .map_err(|_| "date_diff: difference out of range".to_string())?
+        }
+        other => return Err(format!("extract specifier \"{other}\" not recognized")),
+    };
+    Ok(diff)
 }
 
 /// `last_day(ts)`: the last day of the timestamp's month as a DATE (days
@@ -237,12 +317,20 @@ pinkdb_extension! {
         fn dayofweek(ts: Option<Timestamp>) -> Option<i64> {
             ts.map(|t| dayofweek_of(t.0))
         },
+        /// `dayofmonth(ts)` → BIGINT, day of month (1..=31).
+        fn dayofmonth(ts: Option<Timestamp>) -> Option<i64> {
+            ts.map(|t| dayofmonth_of(t.0))
+        },
         /// `dayofyear(ts)` → BIGINT, 1-based.
         fn dayofyear(ts: Option<Timestamp>) -> Option<i64> {
             ts.map(|t| dayofyear_of(t.0))
         },
         /// `week(ts)` → BIGINT, ISO-8601 week (1..=53).
         fn week(ts: Option<Timestamp>) -> Option<i64> {
+            ts.map(|t| week_of(t.0))
+        },
+        /// `weekofyear(ts)` → BIGINT, DuckDB's name for the ISO-8601 week.
+        fn weekofyear(ts: Option<Timestamp>) -> Option<i64> {
             ts.map(|t| week_of(t.0))
         },
         /// `last_day(ts)` → DATE, the last day of the timestamp's month.
@@ -276,6 +364,26 @@ pinkdb_extension! {
                 (Some(y), Some(m), Some(d)) => make_date_of(y, m, d).map(|days| Some(Date(days))),
                 _ => Ok(None),
             }
+        },
+        /// `date_diff(part, start, end)` → BIGINT, the number of `part`
+        /// boundaries crossed between `start` and `end`.
+        fn date_diff(
+            part: Option<&str>,
+            start: Option<Timestamp>,
+            end: Option<Timestamp>,
+        ) -> Result<Option<i64>, String> {
+            match (part, start, end) {
+                (Some(part), Some(start), Some(end)) => date_diff_of(part, start.0, end.0).map(Some),
+                _ => Ok(None),
+            }
+        },
+        /// `datediff(part, start, end)`: DuckDB's spelling of `date_diff`.
+        fn datediff(
+            part: Option<&str>,
+            start: Option<Timestamp>,
+            end: Option<Timestamp>,
+        ) -> Result<Option<i64>, String> {
+            date_diff(part, start, end)
         },
     ],
 }
@@ -396,6 +504,158 @@ mod tests {
         assert_eq!(last_day_of(d(2024, 12, 1)), 20_088); // 2024-12-31
         assert_eq!(last_day_of(ts(2024, 2, 1, 13, 14, 15, 0)), 19_782);
         assert_eq!(last_day_of(d(2000, 2, 15)), 11_016); // 2000-02-29
+    }
+
+    // ---------- dayofmonth / weekofyear ----------
+
+    #[test]
+    fn dayofmonth_and_weekofyear_match_duckdb() {
+        assert_eq!(dayofmonth_of(ts(2020, 1, 15, 0, 0, 0, 0)), 15);
+        assert_eq!(dayofmonth_of(ts(2020, 2, 29, 13, 0, 0, 0)), 29);
+        assert_eq!(dayofmonth_of(ts(2020, 12, 31, 23, 59, 59, 999_999)), 31);
+        assert_eq!(dayofmonth_of(ts(1970, 1, 1, 0, 0, 0, 0)), 1);
+        // `weekofyear` is `week` under DuckDB's other name.
+        for (stamp, want) in [
+            (ts(2021, 1, 1, 0, 0, 0, 0), 53),
+            (ts(2023, 1, 1, 0, 0, 0, 0), 52),
+            (ts(2020, 12, 31, 12, 0, 0, 0), 53),
+            (ts(2024, 6, 15, 0, 0, 0, 0), 24),
+            (ts(2024, 1, 4, 0, 0, 0, 0), 1),
+        ] {
+            assert_eq!(week_of(stamp), want);
+            assert_eq!(weekofyear(Some(Timestamp(stamp))), Some(want));
+        }
+    }
+
+    // ---------- date_diff ----------
+
+    #[test]
+    fn date_diff_counts_boundaries_and_truncates_like_duckdb() {
+        let d = |y, m, day| ts(y, m, day, 0, 0, 0, 0);
+        // Calendar parts count boundaries crossed, not whole units.
+        assert_eq!(date_diff_of("month", d(2020, 1, 31), d(2020, 2, 1)), Ok(1));
+        assert_eq!(date_diff_of("month", d(2020, 1, 31), d(2020, 1, 1)), Ok(0));
+        assert_eq!(
+            date_diff_of("month", d(2020, 1, 1), d(2019, 12, 31)),
+            Ok(-1)
+        );
+        assert_eq!(date_diff_of("year", d(2020, 2, 29), d(2021, 2, 28)), Ok(1));
+        assert_eq!(date_diff_of("year", d(2021, 3, 1), d(2020, 3, 1)), Ok(-1));
+        assert_eq!(date_diff_of("quarter", d(2020, 1, 1), d(2020, 4, 1)), Ok(1));
+        assert_eq!(
+            date_diff_of("quarter", d(2020, 1, 1), d(2020, 3, 31)),
+            Ok(0)
+        );
+        assert_eq!(
+            date_diff_of("quarter", d(2020, 1, 1), d(2019, 10, 1)),
+            Ok(-1)
+        );
+        // Week and day use whole calendar days; weeks truncate toward zero.
+        assert_eq!(date_diff_of("day", d(2020, 1, 1), d(2020, 1, 8)), Ok(7));
+        assert_eq!(date_diff_of("day", d(2020, 1, 2), d(2020, 1, 1)), Ok(-1));
+        assert_eq!(
+            date_diff_of(
+                "day",
+                ts(2020, 1, 1, 23, 0, 0, 0),
+                ts(2020, 1, 2, 1, 0, 0, 0)
+            ),
+            Ok(1)
+        );
+        assert_eq!(date_diff_of("week", d(2020, 1, 1), d(2020, 1, 8)), Ok(1));
+        assert_eq!(date_diff_of("week", d(2020, 1, 7), d(2020, 1, 1)), Ok(0));
+        assert_eq!(date_diff_of("week", d(2020, 1, 14), d(2020, 1, 1)), Ok(-1));
+        assert_eq!(
+            date_diff_of(
+                "week",
+                ts(2020, 1, 8, 1, 0, 0, 0),
+                ts(2020, 1, 1, 23, 0, 0, 0)
+            ),
+            Ok(-1)
+        );
+        // Sub-day parts subtract the absolute unit boundaries, so a span that
+        // crosses midnight backwards can lose an extra unit.
+        assert_eq!(
+            date_diff_of("hour", ts(2020, 1, 1, 0, 59, 0, 0), d(2020, 1, 1)),
+            Ok(0)
+        );
+        assert_eq!(
+            date_diff_of("hour", d(2020, 1, 1), ts(2020, 1, 1, 1, 59, 0, 0)),
+            Ok(1)
+        );
+        assert_eq!(
+            date_diff_of("hour", d(2020, 1, 1), ts(2019, 12, 31, 22, 30, 0, 0)),
+            Ok(-2)
+        );
+        assert_eq!(
+            date_diff_of(
+                "hour",
+                ts(2020, 1, 1, 0, 30, 0, 0),
+                ts(2020, 1, 1, 0, 59, 0, 0)
+            ),
+            Ok(0)
+        );
+        assert_eq!(
+            date_diff_of("minute", d(2020, 1, 1), ts(2020, 1, 1, 0, 0, 30, 0)),
+            Ok(0)
+        );
+        assert_eq!(
+            date_diff_of("second", d(2020, 1, 1), ts(2020, 1, 1, 0, 0, 0, 500_000)),
+            Ok(0)
+        );
+        assert_eq!(
+            date_diff_of("millisecond", d(2020, 1, 1), ts(2020, 1, 1, 0, 0, 0, 500)),
+            Ok(0)
+        );
+        assert_eq!(
+            date_diff_of(
+                "second",
+                ts(2020, 1, 1, 0, 0, 0, 500_000),
+                ts(2020, 1, 1, 0, 0, 2, 400_000)
+            ),
+            Ok(2)
+        );
+        assert_eq!(
+            date_diff_of("minute", ts(2019, 12, 31, 23, 59, 30, 0), d(2020, 1, 1)),
+            Ok(1)
+        );
+        assert_eq!(
+            date_diff_of(
+                "millisecond",
+                ts(2019, 12, 31, 23, 59, 59, 999_500),
+                d(2020, 1, 1)
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            date_diff_of("microsecond", d(2020, 1, 1), ts(2020, 1, 1, 0, 0, 0, 500)),
+            Ok(500)
+        );
+        // DuckDB's abbreviations, case-insensitively; `m` is minutes.
+        assert_eq!(date_diff_of("DAYS", d(2020, 1, 1), d(2020, 1, 3)), Ok(2));
+        assert_eq!(
+            date_diff_of("m", d(2020, 1, 1), ts(2020, 1, 1, 0, 1, 0, 0)),
+            Ok(1)
+        );
+        assert_eq!(date_diff_of("mons", d(2020, 1, 1), d(2020, 3, 1)), Ok(2));
+        assert_eq!(
+            date_diff_of("hrs", d(2020, 1, 1), ts(2020, 1, 1, 2, 0, 0, 0)),
+            Ok(2)
+        );
+        assert_eq!(
+            date_diff_of("epoch", d(2020, 1, 1), ts(2020, 1, 1, 0, 0, 2, 0)),
+            Ok(2)
+        );
+        assert_eq!(date_diff_of("dow", d(2020, 1, 1), d(2020, 1, 3)), Ok(2));
+        // ISO week years: 2021-01-01 belongs to 2020-W53.
+        assert_eq!(date_diff_of("isoyear", d(2021, 1, 1), d(2020, 1, 1)), Ok(0));
+        assert_eq!(date_diff_of("isoyear", d(2020, 1, 1), d(2022, 1, 1)), Ok(1));
+        // Unknown parts error like DuckDB.
+        assert!(
+            date_diff_of("bogus", 0, 0)
+                .unwrap_err()
+                .contains("not recognized")
+        );
+        assert!(date_diff_of("qtr", 0, 0).is_err());
     }
 
     // ---------- make_date ----------
@@ -825,13 +1085,17 @@ mod tests {
                 "epoch",
                 "epoch_ms",
                 "dayofweek",
+                "dayofmonth",
                 "dayofyear",
                 "week",
+                "weekofyear",
                 "last_day",
                 "strftime",
                 "strptime",
                 "age",
-                "make_date"
+                "make_date",
+                "date_diff",
+                "datediff"
             ]
         );
         for f in ext.functions() {
@@ -862,6 +1126,26 @@ mod tests {
                 pinkdb_ext_sdk::ExtType::Varchar
             ]
         );
+        // The calendar-field functions DuckDB spells differently but returns
+        // as BIGINT, and the boundary-counting `date_diff` pair.
+        for name in ["dayofmonth", "weekofyear"] {
+            assert_eq!(linked(name).ret_type(), pinkdb_ext_sdk::ExtType::Bigint);
+            assert_eq!(
+                linked(name).arg_types(),
+                &[pinkdb_ext_sdk::ExtType::Timestamp]
+            );
+        }
+        for name in ["date_diff", "datediff"] {
+            assert_eq!(linked(name).ret_type(), pinkdb_ext_sdk::ExtType::Bigint);
+            assert_eq!(
+                linked(name).arg_types(),
+                &[
+                    pinkdb_ext_sdk::ExtType::Varchar,
+                    pinkdb_ext_sdk::ExtType::Timestamp,
+                    pinkdb_ext_sdk::ExtType::Timestamp
+                ]
+            );
+        }
         assert_eq!(
             linked("make_date").arg_types(),
             &[

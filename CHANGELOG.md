@@ -39,7 +39,12 @@ are their own wave.
 - **The `string` extension** (`split_part`, `regexp_*`, `starts_with`, …)
   is linked into the CLI by default, and the server now links json,
   datetime, math and string too. An INTEGER argument widens into an
-  extension's BIGINT parameter, so `split_part(s, ',', 1)` works.
+  extension's BIGINT parameter (`split_part(s, ',', 1)`) and a DATE into a
+  TIMESTAMP one (`dayofweek(d)`).
+- **QuackLab's DSL functions:** `regexp_matches(s, p)` and
+  `regexp_extract(s, p [, group])` take DuckDB's short forms;
+  `regexp_replace`, `lpad`, `rpad`, `concat_ws`, `dayofmonth`, `weekofyear`
+  and `date_diff` / `datediff` are new.
 
 ### Wave 124c — databases and lakes in the console ✅
 

@@ -88,9 +88,9 @@ fn error(db: &mut PinkDb, sql: &str) -> String {
 // ---------- registration ----------
 
 #[test]
-fn load_extension_by_name_registers_the_ten_functions() {
+fn load_extension_by_name_registers_the_pinned_surface() {
     let mut db = db_with_datetime();
-    // All ten are reachable and case-insensitive like every function name.
+    // All fourteen are reachable and case-insensitive like every function name.
     assert_eq!(
         bigint(&mut db, "SELECT DAYOFWEEK(DATE '2024-01-07'::TIMESTAMP);"),
         Some(0)
@@ -650,4 +650,134 @@ fn durable_records_touching_datetime_replay() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- wave 137: DATE arguments, calendar fields and date_diff ----------
+
+#[test]
+fn date_arguments_widen_into_the_timestamp_parameters() {
+    let mut db = db_with_datetime();
+    // DuckDB casts a DATE into the TIMESTAMP parameter implicitly; the
+    // binder's widening makes the same calls work without `::TIMESTAMP`.
+    assert_eq!(
+        bigint(&mut db, "SELECT dayofweek(DATE '2020-01-01');"),
+        Some(3)
+    );
+    assert_eq!(
+        bigint(&mut db, "SELECT dayofyear(DATE '2020-12-31');"),
+        Some(366)
+    );
+    assert_eq!(
+        one(&mut db, "SELECT epoch(DATE '1970-01-02');"),
+        Value::Double(86_400.0)
+    );
+    assert_eq!(
+        text(&mut db, "SELECT strftime(DATE '2020-01-01', '%Y-%m-%d');").as_deref(),
+        Some("2020-01-01")
+    );
+    assert_eq!(
+        date(&mut db, "SELECT last_day(DATE '2024-02-10');"),
+        Some(19_782)
+    );
+    assert_eq!(
+        interval(&mut db, "SELECT age(DATE '2024-03-01', DATE '2024-01-01');"),
+        Some((2, 0, 0))
+    );
+    // Only DATE widens: a VARCHAR timestamp still needs an explicit CAST.
+    let err = error(&mut db, "SELECT dayofweek('2020-01-01');");
+    assert!(
+        err.contains("must be TIMESTAMP, got VARCHAR (use CAST)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn date_diff_counts_boundaries_through_sql() {
+    let mut db = db_with_datetime();
+    for (sql, want) in [
+        (
+            "SELECT date_diff('month', DATE '2020-01-31', DATE '2020-02-01');",
+            1,
+        ),
+        (
+            "SELECT date_diff('year', DATE '2020-02-29', DATE '2021-02-28');",
+            1,
+        ),
+        (
+            "SELECT datediff('day', DATE '2020-01-01', DATE '2020-01-31');",
+            30,
+        ),
+        (
+            "SELECT date_diff('day', DATE '2020-01-31', DATE '2020-01-01');",
+            -30,
+        ),
+        (
+            "SELECT date_diff('week', DATE '2020-01-14', DATE '2020-01-01');",
+            -1,
+        ),
+        (
+            "SELECT date_diff('quarter', DATE '2020-01-01', DATE '2020-04-01');",
+            1,
+        ),
+        (
+            "SELECT date_diff('hour', TIMESTAMP '2020-01-01 00:00:00', \
+             TIMESTAMP '2020-01-01 01:59:00');",
+            1,
+        ),
+        (
+            "SELECT date_diff('day', TIMESTAMP '2020-01-01 23:00:00', \
+             TIMESTAMP '2020-01-02 01:00:00');",
+            1,
+        ),
+        (
+            "SELECT date_diff('microsecond', \
+             strptime('2020-01-01 00:00:00', '%Y-%m-%d %H:%M:%S'), \
+             strptime('2020-01-01 00:00:00.000500', '%Y-%m-%d %H:%M:%S.%f'));",
+            500,
+        ),
+        (
+            "SELECT date_diff('isoyear', DATE '2021-01-01', DATE '2020-01-01');",
+            0,
+        ),
+    ] {
+        assert_eq!(bigint(&mut db, sql), Some(want), "{sql}");
+    }
+    // The calendar-field functions from the same wave.
+    assert_eq!(
+        bigint(&mut db, "SELECT dayofmonth(DATE '2020-01-15');"),
+        Some(15)
+    );
+    assert_eq!(
+        bigint(
+            &mut db,
+            "SELECT dayofmonth(TIMESTAMP '2020-02-29 13:00:00');"
+        ),
+        Some(29)
+    );
+    assert_eq!(
+        bigint(&mut db, "SELECT weekofyear(DATE '2021-01-01');"),
+        Some(53)
+    );
+    // NULL part/start/end are NULL …
+    for sql in [
+        "SELECT date_diff(NULL, DATE '2020-01-01', DATE '2020-01-02') IS NULL;",
+        "SELECT date_diff('day', NULL, DATE '2020-01-02') IS NULL;",
+        "SELECT date_diff('day', DATE '2020-01-01', NULL) IS NULL;",
+        "SELECT datediff(NULL, NULL, NULL) IS NULL;",
+    ] {
+        assert_eq!(
+            rows(&mut db, sql),
+            vec![vec![Value::Boolean(true)]],
+            "{sql}"
+        );
+    }
+    // … and an unknown part is DuckDB's error.
+    let err = error(
+        &mut db,
+        "SELECT date_diff('bogus', DATE '2020-01-01', DATE '2020-01-02');",
+    );
+    assert!(
+        err.contains("extract specifier \"bogus\" not recognized"),
+        "{err}"
+    );
 }
