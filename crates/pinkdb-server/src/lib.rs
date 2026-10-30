@@ -106,9 +106,9 @@
 //! sign-in (wave 121d). It owns its own tokio runtime on its
 //! own thread, so it works with either transport, and every synchronous
 //! engine call runs on a bounded blocking pool. See `docs/server-ui.md`.
-#[cfg(feature = "catalog")]
-pub mod catalog;
 pub mod client;
+/// The server's data directory and lake location policy (wave 124).
+pub mod data_dir;
 /// The agent-memory distillation worker (wave 121): drains wave 109's queue
 /// on an interval when the server runs with `--memory-distill-every`.
 pub mod memory_worker;
@@ -127,9 +127,8 @@ pub mod ui;
 #[cfg(feature = "async-server")]
 pub mod async_server;
 
-#[cfg(feature = "catalog")]
-pub use catalog::CatalogStore;
 pub use client::{Client, ClientError};
+pub use data_dir::{DEFAULT_DATA_DIR, DataDir, lake_policy};
 pub use protocol::{
     DoneKind, MAX_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ROWS_PER_FRAME, Request, Response,
     decode_request, decode_response, encode_request, encode_response, read_request, read_response,

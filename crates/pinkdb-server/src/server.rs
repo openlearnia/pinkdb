@@ -680,6 +680,12 @@ impl Server {
         self.local_addr
     }
 
+    /// The flag that stops [`Server::run`] (wave 124: the binary sets it from
+    /// SIGINT/SIGTERM for a graceful shutdown).
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown)
+    }
+
     /// Accept connections until [`ServerHandle::shutdown`] (or the
     /// corresponding flag) is set; blocks the calling thread.
     ///

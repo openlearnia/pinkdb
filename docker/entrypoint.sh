@@ -66,13 +66,14 @@ if [ -n "${PINKDB_COPY_ROOT:-}" ]; then
     set -- --copy-root "$PINKDB_COPY_ROOT" "$@"
 fi
 
-# Container defaults: all interfaces, the documented port, and a durable
-# database on the /data volume. PINKDB_HOST/PORT/FILE override them (and the
+# Container defaults: all interfaces, the documented port, and the server's
+# data directory on the /data volume (wave 124: pinkdb.pink, state.pink,
+# lakes/, tmp/). PINKDB_HOST/PORT/DATA_DIR override them (and the
 # HEALTHCHECK reads the same variables).
 set -- \
     --host "${PINKDB_HOST:-0.0.0.0}" \
     --port "${PINKDB_PORT:-5433}" \
-    --file "${PINKDB_FILE:-/data/pinkdb.pink}" \
+    --data-dir "${PINKDB_DATA_DIR:-/data}" \
     "$@"
 
 exec pinkdb-server "$@"

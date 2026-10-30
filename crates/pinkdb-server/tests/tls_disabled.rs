@@ -7,10 +7,10 @@
 
 #![cfg(not(feature = "tls"))]
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    in_memory_server()
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -35,4 +35,12 @@ fn half_configured_tls_is_refused_without_the_tls_feature() {
         text.contains("--tls-cert and --tls-key must be given together"),
         "{text}"
     );
+}
+
+/// The server binary, in memory (wave 124: without `--in-memory` it would
+/// keep its data in `./pinkdb-data` under the test's working directory).
+fn in_memory_server() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    command.arg("--in-memory");
+    command
 }

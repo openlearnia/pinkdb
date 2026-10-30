@@ -3,11 +3,11 @@
 //! authentication". These tests drive the real binary.
 
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[test]
 fn help_text_describes_the_real_authentication_policy() {
-    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let out = in_memory_server()
         .arg("--help")
         .output()
         .expect("run pinkdb-server --help");
@@ -33,7 +33,7 @@ fn help_text_describes_the_real_authentication_policy() {
 
 #[test]
 fn help_text_says_tls_is_sync_only() {
-    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let out = in_memory_server()
         .arg("--help")
         .output()
         .expect("run pinkdb-server --help");
@@ -53,7 +53,7 @@ fn help_text_says_tls_is_sync_only() {
 
 #[test]
 fn startup_banner_does_not_claim_there_is_no_authentication() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let mut child = in_memory_server()
         .args(["--host", "127.0.0.1", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -89,7 +89,7 @@ fn startup_banner_does_not_claim_there_is_no_authentication() {
 
 #[test]
 fn help_text_documents_the_copy_opt_in() {
-    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let out = in_memory_server()
         .arg("--help")
         .output()
         .expect("run pinkdb-server --help");
@@ -109,7 +109,7 @@ fn help_text_documents_the_copy_opt_in() {
 #[test]
 fn copy_flags_reject_unsafe_configurations_at_startup() {
     // Opting in without a root is refused (exit 2), with an actionable error.
-    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let out = in_memory_server()
         .args(["--allow-copy-to", "--port", "0"])
         .output()
         .expect("run pinkdb-server");
@@ -126,7 +126,7 @@ fn copy_flags_reject_unsafe_configurations_at_startup() {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&missing);
-    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let out = in_memory_server()
         .args([
             "--allow-copy-to",
             "--copy-root",
@@ -139,4 +139,12 @@ fn copy_flags_reject_unsafe_configurations_at_startup() {
     assert_eq!(out.status.code(), Some(2));
     let text = String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("is not a directory"), "{text}");
+}
+
+/// The server binary, in memory (wave 124: without `--in-memory` it would
+/// keep its data in `./pinkdb-data` under the test's working directory).
+fn in_memory_server() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    command.arg("--in-memory");
+    command
 }

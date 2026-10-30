@@ -301,6 +301,12 @@ impl AsyncServer {
             .build()
     }
 
+    /// The flag that stops the accept loop (wave 124: the binary sets it from
+    /// SIGINT/SIGTERM for a graceful shutdown).
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown)
+    }
+
     /// Accept connections until `AsyncServerHandle::shutdown` is
     /// requested; runs on the caller's tokio runtime.
     ///

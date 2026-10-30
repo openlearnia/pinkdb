@@ -1,7 +1,8 @@
 //! `pinkdb-server` — run a pinkdb database over TCP.
 //!
 //! ```text
-//! pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]
+//! pinkdb-server [--host HOST] [--port PORT] [--data-dir DIR | --in-memory]
+//!               [--lake-root DIR]...
 //!               [--max-connections N] [--idle-timeout SECS]
 //!               [--statement-timeout-ms N] [--max-result-rows N]
 //!               [--max-result-bytes N] [--max-concurrent-logins N]
@@ -14,9 +15,15 @@
 //! pinkdb-server --health-check [HOST:PORT]
 //! ```
 //!
-//! Without `--file` the database is in-memory; with it, the server opens the
-//! durable checkpoint + WAL path (wave 22): rows acked to a client survive a
-//! server crash and are replayed on the next start. Authentication is opt-in
+//! The server owns a data directory (wave 124; `--data-dir`, default
+//! `./pinkdb-data`, created on first start): `pinkdb.pink` holds the local
+//! databases, the users and grants and the list of lake databases (durable
+//! checkpoint + WAL: rows acked to a client survive a crash and replay on the
+//! next start), `state.pink` the console's and the agent's own state,
+//! `lakes/` the lakes `CREATE DATABASE … (TYPE LAKE)` creates, and `tmp/`
+//! upload staging. `--in-memory` keeps everything in memory instead (nothing
+//! is saved). SIGINT/SIGTERM stop accepting, checkpoint both stores and
+//! release the lakes' leases. Authentication is opt-in
 //! per store: while the store has no users every connection is trusted, and
 //! once a user exists every statement request must log in first. Bind
 //! localhost until the store has users.
@@ -50,14 +57,15 @@
 use std::process::ExitCode;
 
 use pinkdb::{Database, DurableOpenOptions};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-#[cfg(feature = "catalog")]
-use pinkdb_server::CatalogStore;
 use pinkdb_server::{
     Client, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONCURRENT_LOGINS, DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS, DEFAULT_STATEMENT_TIMEOUT_MS, Server,
 };
+use pinkdb_server::{DEFAULT_DATA_DIR, DataDir};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5433;
@@ -93,14 +101,14 @@ enum Transport {
 struct Args {
     host: String,
     port: u16,
-    file: Option<String>,
-    /// `--catalog CATALOG`: keep the store in a pink-lake lake (wave 96b) —
-    /// the engine metadata in the catalog database, rows in `--data`.
-    /// Mutually exclusive with `--file`.
-    catalog: Option<String>,
-    /// `--data DIR|s3://BUCKET/PREFIX`: the lake's data location; required
-    /// with `--catalog`.
-    data: Option<String>,
+    /// `--data-dir DIR` (wave 124): the server's data directory; default
+    /// `./pinkdb-data`.
+    data_dir: Option<String>,
+    /// `--in-memory`: keep everything in memory (nothing is saved).
+    in_memory: bool,
+    /// `--lake-root DIR` (repeatable): another directory local lakes may
+    /// live in, besides `<data-dir>/lakes`.
+    lake_roots: Vec<String>,
     max_connections: usize,
     idle_timeout_secs: u64,
     /// Per-statement engine deadline (milliseconds); always positive.
@@ -176,10 +184,6 @@ struct Args {
     ui_max_upload_mb: usize,
     /// `--agent-extension PATH`: load the data agent for the console's ask box.
     agent_extension: Option<String>,
-    /// `--state PATH`: the state store (wave 121e) — the console's worksheets
-    /// and credentials, the agent's transcript and the memory layers, kept
-    /// out of the served store.
-    state: Option<String>,
     /// `--memory-extension PATH`: load the agent memory.
     memory_extension: Option<String>,
     /// `--memory-distill-every SECS`: drain the memory queue on an interval.
@@ -187,8 +191,8 @@ struct Args {
 }
 
 fn usage() -> &'static str {
-    "Usage: pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]\n\
-     \x20       pinkdb-server [--host HOST] [--port PORT] --catalog CATALOG --data DIR\n\
+    "Usage: pinkdb-server [--host HOST] [--port PORT] [--data-dir DIR | --in-memory]\n\
+     \x20                    [--lake-root DIR]...\n\
      \x20                    [--max-connections N] [--idle-timeout SECS]\n\
      \x20                    [--statement-timeout-ms N] [--max-result-rows N]\n\
      \x20                    [--max-result-bytes N] [--max-concurrent-logins N]\n\
@@ -201,12 +205,19 @@ fn usage() -> &'static str {
      \n\
      \x20 --host HOST            bind address (default 127.0.0.1)\n\
      \x20 --port PORT            TCP port; 0 picks an ephemeral port (default 5433)\n\
-     \x20 --file PATH            durable database (checkpoint + WAL); in-memory when omitted\n\
-     \x20 --catalog CATALOG      keep the store in a pink-lake lake (wave 96b): engine\n\
-     \x20                        metadata in the catalog database, rows in --data\n\
-     \x20                        (pink:PATH, sqlite:PATH, or a postgres: URL; the\n\
-     \x20                        backends are build features)\n\
-     \x20 --data DIR|s3://…      the lake's data location; required with --catalog\n\
+     \x20 --data-dir DIR         the server's data directory (default ./pinkdb-data,\n\
+     \x20                        created on first start): pinkdb.pink (databases, users,\n\
+     \x20                        grants, the lake databases' locations; checkpoint +\n\
+     \x20                        WAL), state.pink (console/agent state), lakes/ (lakes\n\
+     \x20                        CREATE DATABASE … (TYPE LAKE) makes) and tmp/\n\
+     \x20 --in-memory            keep everything in memory: nothing is saved\n\
+     \x20 --lake-root DIR        another directory local lakes may live in (repeatable);\n\
+     \x20                        lakes are databases: CREATE DATABASE n (TYPE LAKE\n\
+     \x20                        [, CATALOG '…', DATA '…']), ATTACH 'lake:…' AS n\n\
+     \x20                        [(READ_ONLY)], DETACH n (ADMIN only); a local lake\n\
+     \x20                        path must be inside <data-dir>/lakes or a --lake-root,\n\
+     \x20                        remote catalogs are postgres:// (credentials from\n\
+     \x20                        PGPASSWORD, never in the URL) and data s3:// (AWS_*)\n\
      \x20 --max-connections N    concurrent clients served (default 128)\n\
      \x20 --idle-timeout SECS    disconnect clients idle this long; 0 = never (default 300)\n\
      \x20 --statement-timeout-ms N  per-statement execution deadline in ms (default 30000);\n\
@@ -282,12 +293,6 @@ fn usage() -> &'static str {
      \x20 --agent-allow-writes  let the console's agent write (under the user's grants;\n\
      \x20                        never with --ui-read-only)\n\
      \x20 --memory-extension PATH  load the agent memory (libpinkdb_memory)\n\
-     \x20 --state PATH          where the console, the agent and memory keep their own\n\
-     \x20                        state (worksheets, credentials, transcripts, memory),\n\
-     \x20                        apart from the served store; default: next to --file\n\
-     \x20                        (warehouse.pink -> warehouse.state.pink) or a local lake\n\
-     \x20                        catalog, in memory for an in-memory store; required for\n\
-     \x20                        a remote lake catalog\n\
      \x20 --memory-distill-every SECS  drain the memory distillation queue on this\n\
      \x20                        interval, as each owner (off by default)\n\
      \n\
@@ -298,7 +303,7 @@ fn usage() -> &'static str {
      \x20                        PINKDB_HEALTHCHECK_TIMEOUT_MS bounds it (default 2000)\n\
      \n\
      At-rest encryption is not wired into the server: PINKDB_KEY is ignored and\n\
-     --file must be a plaintext database (an encrypted one is refused at startup).\n\
+     the data directory's stores are plaintext (an encrypted one is refused).\n\
      \n\
      Security: authentication is opt-in per store — while the store has no\n\
      users every connection is trusted and can run any SQL; once a user\n\
@@ -319,9 +324,9 @@ fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         host: DEFAULT_HOST.to_string(),
         port: DEFAULT_PORT,
-        file: None,
-        catalog: None,
-        data: None,
+        data_dir: None,
+        in_memory: false,
+        lake_roots: Vec::new(),
         max_connections: DEFAULT_MAX_CONNECTIONS,
         idle_timeout_secs: DEFAULT_IDLE_TIMEOUT.as_secs(),
         statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
@@ -366,7 +371,6 @@ fn parse_args() -> Result<Args, String> {
         #[cfg(feature = "ui")]
         ui_max_upload_mb: 64,
         agent_extension: None,
-        state: None,
         memory_extension: None,
         memory_distill_every: None,
     };
@@ -394,9 +398,9 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("invalid --port value {raw:?}"))?;
             }
-            "--file" => args.file = Some(value("--file")?),
-            "--catalog" => args.catalog = Some(value("--catalog")?),
-            "--data" => args.data = Some(value("--data")?),
+            "--data-dir" => args.data_dir = Some(value("--data-dir")?),
+            "--in-memory" => args.in_memory = true,
+            "--lake-root" => args.lake_roots.push(value("--lake-root")?),
             "--max-connections" => {
                 let raw = value("--max-connections")?;
                 args.max_connections = raw
@@ -655,7 +659,6 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--agent-extension" => args.agent_extension = Some(value("--agent-extension")?),
-            "--state" => args.state = Some(value("--state")?),
             "--memory-extension" => args.memory_extension = Some(value("--memory-extension")?),
             "--memory-distill-every" => {
                 let raw = value("--memory-distill-every")?;
@@ -706,27 +709,11 @@ fn parse_args() -> Result<Args, String> {
                 .to_string(),
         );
     }
-    // Wave 96b: `--catalog` and `--file` are two durable stores, and `--data`
-    // is the catalog mode's data location. Refuse the ambiguous combinations
-    // before anything opens.
-    if args.catalog.is_some() && args.file.is_some() {
+    // Wave 124: a server keeps its data in one directory, or in memory.
+    if args.in_memory && args.data_dir.is_some() {
         return Err(
-            "--catalog and --file are mutually exclusive: a --catalog store keeps \
-                    its metadata in the lake catalog, a --file store in the file"
-                .to_string(),
-        );
-    }
-    if args.catalog.is_some() && args.data.is_none() {
-        return Err(
-            "--catalog requires --data DIR|s3://BUCKET/PREFIX (the lake's data \
-                    location)"
-                .to_string(),
-        );
-    }
-    if args.catalog.is_none() && args.data.is_some() {
-        return Err(
-            "--data needs --catalog CATALOG (it names a --catalog store's data \
-                    location)"
+            "--in-memory and --data-dir are mutually exclusive: an in-memory server saves \
+             nothing"
                 .to_string(),
         );
     }
@@ -977,12 +964,37 @@ fn main() -> ExitCode {
         eprintln!("warning: the vss extension could not be registered: {e}");
     }
 
-    // Kept alive for the whole process: dropping it stops the lease heartbeat
-    // and releases the catalog lease.
-    #[cfg(feature = "catalog")]
-    let mut catalog_store: Option<CatalogStore> = None;
-    let db = match (&args.file, &args.catalog) {
-        (Some(path), _) => {
+    // Wave 124: lake databases open through pink-lake. The opener registers
+    // before the store opens: the checkpoint names lake databases and the
+    // WAL may replay an ATTACH.
+    pink_lake::database::register();
+
+    // The data directory: created on first start, unless --in-memory.
+    let data_dir = if args.in_memory {
+        None
+    } else {
+        let path = args.data_dir.as_deref().unwrap_or(DEFAULT_DATA_DIR);
+        match DataDir::prepare(path) {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                eprintln!("Error: cannot use the data directory {path:?}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let mut lake_roots: Vec<std::path::PathBuf> = Vec::new();
+    for root in &args.lake_roots {
+        match std::path::Path::new(root).canonicalize() {
+            Ok(root) if root.is_dir() => lake_roots.push(root),
+            _ => {
+                eprintln!("Error: --lake-root {root:?} is not a directory");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let db = match &data_dir {
+        Some(dir) => {
             // The durable open carries the extension policy: a WAL that
             // records an extension is only replayed into a load when the
             // operator opted in *and* the library is inside the extension
@@ -991,9 +1003,11 @@ fn main() -> ExitCode {
             let opts = DurableOpenOptions {
                 allow_extension_replay: args.allow_load_extension,
                 extension_root: extension_root.clone(),
+                lake_dir: Some(dir.lakes()),
                 ..DurableOpenOptions::default()
             };
-            match Database::open_with_options(path, opts) {
+            let path = dir.store().to_string_lossy().into_owned();
+            match Database::open_with_options(&path, opts) {
                 Ok(db) => db,
                 Err(e) => {
                     eprintln!("Error: cannot open durable database {path:?}: {e}");
@@ -1001,38 +1015,25 @@ fn main() -> ExitCode {
                 }
             }
         }
-        #[cfg(not(feature = "catalog"))]
-        (None, Some(_)) => {
-            eprintln!(
-                "Error: --catalog needs a pinkdb-server built with the `catalog` feature \
-                 (cargo build -p pinkdb-server --features catalog, plus catalog-sqlite, \
-                 catalog-postgres or lake-s3 for those backends)"
-            );
-            return ExitCode::FAILURE;
-        }
-        #[cfg(feature = "catalog")]
-        (None, Some(catalog)) => {
-            let data = args.data.as_deref().unwrap_or_default();
-            let owner = format!("{}:{} pid {}", args.host, args.port, std::process::id());
-            match CatalogStore::open(catalog, data, &owner) {
-                Ok(store) => {
-                    let db = store.database();
-                    db.set_extension_root(extension_root.clone());
-                    catalog_store = Some(store);
-                    db
-                }
-                Err(e) => {
-                    eprintln!("Error: cannot open the lake catalog {catalog:?}: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-        (None, None) => {
+        None => {
             let db = Database::new();
             db.set_extension_root(extension_root.clone());
             db
         }
     };
+    db.set_lake_policy(Some(pinkdb_server::lake_policy(
+        data_dir.as_ref().map(DataDir::lakes),
+        lake_roots.clone(),
+    )));
+    for info in db.database_infos() {
+        if info.status != "ok" {
+            eprintln!(
+                "warning: lake database {:?} is {} (its queries fail until it is reachable \
+                 again; DETACH forgets it)",
+                info.name, info.status
+            );
+        }
+    }
 
     // Built-in linked extensions, published before any store exists and
     // loaded into the store this server serves. A durable store whose log
@@ -1069,17 +1070,9 @@ fn main() -> ExitCode {
         }
     }
 
-    let mode = match (&args.file, &args.catalog) {
-        (Some(path), _) => format!("durable: {path}"),
-        #[cfg(feature = "catalog")]
-        (None, Some(catalog)) => format!(
-            "catalog: {catalog} (data {}, lake version {})",
-            args.data.as_deref().unwrap_or_default(),
-            catalog_store.as_ref().map_or(0, CatalogStore::version)
-        ),
-        #[cfg(not(feature = "catalog"))]
-        (None, Some(_)) => unreachable!("--catalog is refused above without the feature"),
-        (None, None) => "in-memory".to_string(),
+    let mode = match &data_dir {
+        Some(dir) => format!("durable: {}", dir.root().display()),
+        None => "in-memory: nothing is saved".to_string(),
     };
 
     // The agent and its memory (wave 121): loaded into the served store for
@@ -1098,52 +1091,34 @@ fn main() -> ExitCode {
     }
     // The state store (wave 121e): the console's, the agent's and memory's
     // own bookkeeping, apart from the served store, where no statement can
-    // list, read or drop it. Only a server that runs one of them needs it.
-    #[cfg(feature = "ui")]
-    let uses_state =
-        args.enable_ui || args.agent_extension.is_some() || args.memory_extension.is_some();
-    #[cfg(not(feature = "ui"))]
-    let uses_state = args.agent_extension.is_some() || args.memory_extension.is_some();
-    if uses_state {
-        let path = match state_path(
-            args.state.as_deref(),
-            args.file.as_deref(),
-            args.catalog.as_deref(),
-        ) {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!("Error: {e}");
-                return ExitCode::from(2);
-            }
-        };
-        let state = match &path {
-            Some(path) => match Database::open(path) {
+    // list, read or drop it. Wave 124: always `<data-dir>/state.pink` (in
+    // memory for an in-memory server).
+    let state = match &data_dir {
+        Some(dir) => {
+            let path = dir.state().to_string_lossy().into_owned();
+            match Database::open(&path) {
                 Ok(state) => state,
                 Err(e) => {
                     eprintln!("Error: cannot open the state store {path:?}: {e}");
                     return ExitCode::FAILURE;
                 }
-            },
-            None => Database::new(),
-        };
-        // Memory's vector search calls `embed()` on its own channel, which
-        // now runs on the state store.
-        #[cfg(feature = "embeddings")]
-        if !state.is_extension_loaded(pinkdb_embeddings::EXTENSION_NAME)
-            && let Err(e) = state.load_extension(pinkdb_embeddings::EXTENSION_NAME)
-        {
-            eprintln!(
-                "warning: the embeddings extension could not be loaded into the state store: {e}"
-            );
+            }
         }
-        if let Err(e) = db.attach_state_store(state) {
-            eprintln!("Error: cannot attach the state store: {e}");
-            return ExitCode::FAILURE;
-        }
+        None => Database::new(),
+    };
+    // Memory's vector search calls `embed()` on its own channel, which runs
+    // on the state store.
+    #[cfg(feature = "embeddings")]
+    if !state.is_extension_loaded(pinkdb_embeddings::EXTENSION_NAME)
+        && let Err(e) = state.load_extension(pinkdb_embeddings::EXTENSION_NAME)
+    {
         eprintln!(
-            "pinkdb-server: state store: {}",
-            path.as_deref().unwrap_or("in memory (lost on exit)")
+            "warning: the embeddings extension could not be loaded into the state store: {e}"
         );
+    }
+    if let Err(e) = db.attach_state_store(state.clone()) {
+        eprintln!("Error: cannot attach the state store: {e}");
+        return ExitCode::FAILURE;
     }
     let _memory_worker = match args.memory_distill_every {
         Some(secs) => {
@@ -1170,18 +1145,9 @@ fn main() -> ExitCode {
     // would be a silent downgrade.
     #[cfg(feature = "ui")]
     let _ui_handle = if args.enable_ui {
-        #[cfg(feature = "catalog")]
-        let version = catalog_store.as_ref().map(CatalogStore::version_reader);
-        #[cfg(not(feature = "catalog"))]
-        let version = None;
-        let storage = pinkdb_server::ui::storage_info(
-            args.file.as_deref(),
-            args.catalog.as_deref(),
-            args.data.as_deref(),
-            version,
-            import_formats(),
-        );
-        match start_ui(&args, &db, storage) {
+        let storage =
+            pinkdb_server::ui::storage_info(data_dir.as_ref(), &lake_roots, import_formats());
+        match start_ui(&args, &db, storage, data_dir.as_ref().map(DataDir::tmp)) {
             Ok(handle) => Some(handle),
             Err(msg) => {
                 eprintln!("Error: {msg}");
@@ -1213,7 +1179,11 @@ fn main() -> ExitCode {
         }
     }
 
-    match args.transport {
+    // Graceful shutdown (wave 124): SIGINT/SIGTERM stop the accept loop; the
+    // stores are checkpointed and the lakes' leases released below.
+    install_signal_handlers();
+    let served = db.clone();
+    let exit = match args.transport {
         Transport::Sync => {
             let bound = match (&args.tls_cert, &args.tls_key) {
                 (Some(cert), Some(key)) => {
@@ -1264,6 +1234,7 @@ fn main() -> ExitCode {
                     "plaintext"
                 },
             );
+            stop_on_signal(server.shutdown_flag());
             match server.run() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -1295,6 +1266,7 @@ fn main() -> ExitCode {
                 }
             };
             announce(server.local_addr(), &mode, "async");
+            stop_on_signal(server.shutdown_flag());
             match server.run_blocking() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -1303,7 +1275,57 @@ fn main() -> ExitCode {
                 }
             }
         }
+    };
+    shut_down(&served, &state, data_dir.is_some());
+    exit
+}
+
+/// Set by SIGINT/SIGTERM (wave 124).
+static SIGNALED: AtomicBool = AtomicBool::new(false);
+
+/// Route SIGINT and SIGTERM to [`SIGNALED`] instead of killing the process.
+#[cfg(unix)]
+fn install_signal_handlers() {
+    extern "C" fn on_signal(_: libc::c_int) {
+        SIGNALED.store(true, Ordering::SeqCst);
     }
+    let handler = on_signal as extern "C" fn(libc::c_int) as *const () as libc::sighandler_t;
+    // SAFETY: the handler only stores to a static atomic, which is
+    // async-signal-safe; `signal` installs it for the two signals.
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
+
+/// Stop the accept loop behind `flag` once a signal arrived.
+fn stop_on_signal(flag: Arc<AtomicBool>) {
+    let _ = std::thread::Builder::new()
+        .name("pinkdb-signals".to_string())
+        .spawn(move || {
+            while !SIGNALED.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            flag.store(true, Ordering::SeqCst);
+        });
+}
+
+/// After the accept loop stopped: checkpoint both stores (each waits for the
+/// statements running on it) and release the lake databases' leases.
+fn shut_down(db: &Database, state: &Database, durable: bool) {
+    eprintln!("pinkdb-server: shutting down");
+    if durable {
+        for (what, store) in [("store", db), ("state store", state)] {
+            if let Err(e) = store.checkpoint() {
+                eprintln!("warning: cannot checkpoint the {what}: {e}");
+            }
+        }
+    }
+    db.close_lake_databases();
+    eprintln!("pinkdb-server: stopped");
 }
 
 /// What an import can read in this build (the Storage panel and the Import
@@ -1324,56 +1346,13 @@ fn import_formats() -> Vec<String> {
     formats
 }
 
-/// Where the state store lives (wave 121e): `--state`, else next to the
-/// store file or a local lake catalog, else in memory for an in-memory store.
-/// A remote lake catalog has no place for it: `--state` is required there,
-/// because in-memory state would drop sign-in factors and tokens on restart.
-fn state_path(
-    state: Option<&str>,
-    file: Option<&str>,
-    catalog: Option<&str>,
-) -> Result<Option<String>, String> {
-    if let Some(path) = state {
-        return Ok(Some(path.to_string()));
-    }
-    let next_to = |path: &str| -> String {
-        let path = path.trim_end_matches('/');
-        match path.strip_suffix(".pink") {
-            Some(stem) => format!("{stem}.state.pink"),
-            None => format!("{path}.state.pink"),
-        }
-    };
-    if let Some(file) = file {
-        return Ok(Some(next_to(file)));
-    }
-    if let Some(catalog) = catalog {
-        let lower = catalog.to_ascii_lowercase();
-        let local = if let Some(path) = catalog.strip_prefix("pink:") {
-            (!lower.starts_with("pink+")).then_some(path)
-        } else if let Some(path) = catalog.strip_prefix("sqlite:") {
-            Some(path)
-        } else if lower.contains("://") {
-            None
-        } else {
-            Some(catalog)
-        };
-        return match local {
-            Some(path) => Ok(Some(next_to(path))),
-            None => Err(format!(
-                "the lake catalog {catalog:?} is remote, so the console's and the agent's own \
-                 state has no file to live next to: name one with --state PATH"
-            )),
-        };
-    }
-    Ok(None)
-}
-
 /// Start the warehouse console (waves 78 and 121).
 #[cfg(feature = "ui")]
 fn start_ui(
     args: &Args,
     db: &Database,
     storage: pinkdb_server::ui::StorageInfo,
+    scratch_dir: Option<std::path::PathBuf>,
 ) -> Result<pinkdb_server::ui::UiHandle, String> {
     use pinkdb_server::ui::{UiAuth, UiOptions, UiServer, UiTls};
     let auth = if args.ui_auth_none {
@@ -1399,6 +1378,7 @@ fn start_ui(
         allowed_hosts: args.ui_allowed_hosts.clone(),
         agent_allow_writes: args.agent_allow_writes,
         max_upload_bytes: args.ui_max_upload_mb.saturating_mul(1024 * 1024),
+        scratch_dir,
         storage,
         tls,
         ..UiOptions::default()
@@ -1443,49 +1423,6 @@ fn announce(addr: std::net::SocketAddr, mode: &str, transport: &str) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_state_store_lives_next_to_the_store() {
-        use super::state_path;
-        let at = |state, file, catalog| state_path(state, file, catalog);
-        assert_eq!(
-            at(Some("/s.pink"), Some("/w.pink"), None)
-                .unwrap()
-                .as_deref(),
-            Some("/s.pink")
-        );
-        assert_eq!(
-            at(None, Some("/d/warehouse.pink"), None)
-                .unwrap()
-                .as_deref(),
-            Some("/d/warehouse.state.pink")
-        );
-        assert_eq!(
-            at(None, Some("demo.db"), None).unwrap().as_deref(),
-            Some("demo.db.state.pink")
-        );
-        assert_eq!(
-            at(None, None, Some("pink:/l/cat.pink")).unwrap().as_deref(),
-            Some("/l/cat.state.pink")
-        );
-        assert_eq!(
-            at(None, None, Some("sqlite:/l/cat.db")).unwrap().as_deref(),
-            Some("/l/cat.db.state.pink")
-        );
-        assert_eq!(
-            at(None, None, Some("/l/lake/")).unwrap().as_deref(),
-            Some("/l/lake.state.pink")
-        );
-        assert!(at(None, None, Some("postgres://u@h/lake")).is_err());
-        assert!(at(None, None, Some("pink+s3://b/cat.pink")).is_err());
-        assert_eq!(
-            at(Some("/s.pink"), None, Some("postgres://u@h/lake"))
-                .unwrap()
-                .as_deref(),
-            Some("/s.pink")
-        );
-        assert_eq!(at(None, None, None).unwrap(), None);
-    }
-
     use super::*;
 
     fn args(values: &[&str]) -> Vec<String> {

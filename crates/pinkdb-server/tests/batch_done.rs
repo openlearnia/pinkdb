@@ -6,14 +6,14 @@
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 
 use pinkdb_server::protocol::{self, PROTOCOL_VERSION, Request, Response};
 
 /// Spawn the real binary, wait for the readiness line and return the child
 /// plus its address.
 fn start_server() -> (Child, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    let mut cmd = in_memory_server();
     cmd.args(["--host", "127.0.0.1", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -97,4 +97,12 @@ fn statement_counts_match_executed_statements() {
     drop(writer);
     child.kill().expect("kill pinkdb-server");
     child.wait().expect("reap pinkdb-server");
+}
+
+/// The server binary, in memory (wave 124: without `--in-memory` it would
+/// keep its data in `./pinkdb-data` under the test's working directory).
+fn in_memory_server() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    command.arg("--in-memory");
+    command
 }

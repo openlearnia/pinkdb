@@ -4,7 +4,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinkdb_server::Client;
@@ -26,7 +26,7 @@ fn scratch(tag: &str) -> PathBuf {
 /// Spawn the real binary on an ephemeral port and wait for the readiness
 /// ("listening") line; returns the child and the address it printed.
 fn start_server(args: &[&str]) -> (Child, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    let mut cmd = in_memory_server();
     cmd.args(["--host", "127.0.0.1", "--port", "0"])
         .args(args)
         .stdin(Stdio::null())
@@ -107,7 +107,7 @@ fn a_root_that_is_not_a_directory_is_refused_at_startup() {
     let dir = scratch("bad_root");
     let file = dir.join("a-file");
     std::fs::write(&file, b"x").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let out = in_memory_server()
         .args([
             "--host",
             "127.0.0.1",
@@ -145,7 +145,7 @@ fn stderr_text(out: &std::process::Output) -> String {
 #[test]
 fn a_bad_pin_is_refused_at_startup() {
     for pin in ["nonsense", "/tmp/lib.dylib=xyz"] {
-        let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+        let out = in_memory_server()
             .args(["--host", "127.0.0.1", "--port", "0", "--extension-pin", pin])
             .stdin(Stdio::null())
             .output()
@@ -209,4 +209,12 @@ fn a_library_whose_hash_differs_from_its_pin_is_refused() {
 
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The server binary, in memory (wave 124: without `--in-memory` it would
+/// keep its data in `./pinkdb-data` under the test's working directory).
+fn in_memory_server() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    command.arg("--in-memory");
+    command
 }

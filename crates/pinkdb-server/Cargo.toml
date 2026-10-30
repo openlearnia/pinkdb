@@ -19,15 +19,14 @@ async-server = ["dep:tokio"]
 # key configuration. Off by default: the default build has no TLS code and no
 # TLS dependencies.
 tls = ["dep:rustls", "dep:rustls-pemfile"]
-# `--catalog` mode (wave 96b): the store lives in a pink-lake lake. Off by
-# default, so the default binary links no lake code at all; `catalog` alone
-# serves `pink:` catalogs over a local data directory, and the backend and
-# data-store features forward to `pink-lake` (and imply `catalog`).
-catalog = ["dep:pink-lake"]
-catalog-sqlite = ["catalog", "pink-lake/catalog-sqlite"]
-catalog-postgres = ["catalog", "pink-lake/catalog-postgres"]
-lake-s3 = ["catalog", "pink-lake/s3"]
-catalog-s3 = ["catalog", "lake-s3", "pink-lake/catalog-s3"]
+# Lake databases (wave 124) are part of every build: `CREATE DATABASE …
+# (TYPE LAKE)` and `ATTACH` open `pink:` catalogs over local data. These
+# features add the other catalog backends and S3 data, forwarding to
+# `pink-lake`.
+catalog-sqlite = ["pink-lake/catalog-sqlite"]
+catalog-postgres = ["pink-lake/catalog-postgres"]
+lake-s3 = ["pink-lake/s3"]
+catalog-s3 = ["lake-s3", "pink-lake/catalog-s3"]
 # Opt-in warehouse browsing UI (wave 78): the read-only web console the
 # server serves next to its binary protocol. Off by default: the default
 # build does not even compile the console crate, so the lean server binary is
@@ -72,9 +71,9 @@ pinkdb-vss = { path = "../../extensions/vss", optional = true }
 # Import readers (wave 121b; `parquet` / `httpfs` features only).
 pinkdb-parquet = { path = "../../extensions/parquet", optional = true }
 pinkdb-httpfs = { path = "../pinkdb-httpfs", optional = true }
-# `--catalog` mode (wave 96b): the lake catalog and data store, only with the
-# `catalog` feature (see above).
-pink-lake = { path = "../pink-lake", optional = true }
+# Lake databases (wave 124): pink-lake's opener, registered before the store
+# opens so its replay can open the lakes it names.
+pink-lake = { path = "../pink-lake" }
 # The optional SHA-256 pin allowlist (`--extension-pin`): a workspace crate the
 # engine already links, so this adds no dependency to the binary beyond the API
 # the flag needs.
@@ -99,9 +98,14 @@ rustls-pemfile = { version = "2.2", optional = true }
 # default build pulls neither the console nor its async runtime.
 pinkdb-server-ui = { path = "../pinkdb-server-ui", optional = true }
 
+# Graceful shutdown (wave 124): SIGINT/SIGTERM set a flag the accept loop
+# polls (already in the dependency tree through the engine's crates).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
-# The `--catalog` tests (built with the `catalog` feature) need SQLite and a
-# mock S3 data store; the features are unified for test builds only.
+# The lake database tests need SQLite and a mock S3 data store; the features
+# are unified for test builds only.
 pink-lake = { path = "../pink-lake", features = ["catalog-sqlite", "s3"] }
 # Test-only self-signed certificate generation (the `tls` tests); `ring` is
 # already in the workspace's crypto stack.

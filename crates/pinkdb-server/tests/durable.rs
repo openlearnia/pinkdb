@@ -30,15 +30,17 @@ fn scratch(tag: &str) -> PathBuf {
 
 /// Spawn the real binary on an ephemeral port and wait for the readiness
 /// ("listening") line; returns the child and the address it printed.
-fn start_server(file: Option<&Path>) -> (Child, String) {
+/// `data_dir` is the server's `--data-dir`; `None` serves in memory.
+fn start_server(data_dir: Option<&Path>) -> (Child, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
     cmd.args(["--host", "127.0.0.1", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    if let Some(path) = file {
-        cmd.arg("--file").arg(path);
-    }
+    match data_dir {
+        Some(dir) => cmd.arg("--data-dir").arg(dir),
+        None => cmd.arg("--in-memory"),
+    };
     let mut child = cmd.spawn().expect("spawn pinkdb-server");
     let stdout = child.stdout.take().expect("child stdout");
     let mut reader = BufReader::new(stdout);
@@ -85,7 +87,7 @@ fn varchar(s: &str) -> Value {
 #[test]
 fn durable_rows_survive_kill_and_restart() {
     let dir = scratch("durable");
-    let file = dir.join("x.pink");
+    let file = dir.join("data");
 
     // First run: create + insert (acked), then SIGKILL.
     let (mut child, addr) = start_server(Some(&file));
@@ -146,7 +148,7 @@ fn in_memory_server_serves_sql() {
 #[test]
 fn concurrent_clients_survive_kill_with_exactly_once_replay() {
     let dir = scratch("concurrent");
-    let file = dir.join("x.pink");
+    let file = dir.join("data");
 
     let (mut child, addr) = start_server(Some(&file));
     let mut setup = Client::connect(&addr).expect("connect");
@@ -216,7 +218,7 @@ fn concurrent_clients_survive_kill_with_exactly_once_replay() {
 #[test]
 fn unknown_flag_is_rejected_with_usage() {
     let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
-        .arg("--bogus")
+        .args(["--in-memory", "--bogus"])
         .stdin(Stdio::null())
         .output()
         .expect("run pinkdb-server");
@@ -236,7 +238,7 @@ fn security_limit_flags_reject_zero_and_invalid_values() {
     ] {
         for value in ["0", "not-a-number"] {
             let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
-                .args([flag, value])
+                .args(["--in-memory", flag, value])
                 .stdin(Stdio::null())
                 .output()
                 .expect("run pinkdb-server");

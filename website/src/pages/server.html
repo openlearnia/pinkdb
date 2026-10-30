@@ -6,78 +6,72 @@ protocol. One thread per connection, zero async, no external dependencies.</p>
 
 <h2>Build and run</h2>
 
-<pre class="code" data-lang="sh"><code># in-memory server on 127.0.0.1:5433
+<pre class="code" data-lang="sh"><code># a durable server on 127.0.0.1:5433, its data in ./pinkdb-data
 cargo run --release -p pinkdb-server
 
-# durable server: same checkpoint + WAL guarantees as the embedded path
-cargo run --release -p pinkdb-server -- --file sales.pink
+# elsewhere, or nothing saved at all
+cargo run --release -p pinkdb-server -- --data-dir /srv/pinkdb
+cargo run --release -p pinkdb-server -- --in-memory
 
 # explicit bind address and port (0 picks an ephemeral port)
 cargo run --release -p pinkdb-server -- --host 127.0.0.1 --port 5433</code></pre>
 
-<p>The full flag list:</p>
+<p>The main flags (<code>pinkdb-server --help</code> lists them all):</p>
 
-<pre class="code" data-lang="text"><code>Usage: pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]
-        pinkdb-server [--host HOST] [--port PORT] --catalog CATALOG --data DIR
-                     [--max-connections N] [--idle-timeout SECS]
+<pre class="code" data-lang="text"><code>Usage: pinkdb-server [--host HOST] [--port PORT] [--data-dir DIR | --in-memory]
+                     [--lake-root DIR]... [--max-connections N] [--idle-timeout SECS]
                      [--allow-load-extension]
 
   --host HOST            bind address (default 127.0.0.1)
   --port PORT            TCP port; 0 picks an ephemeral port (default 5433)
-  --file PATH            durable database (checkpoint + WAL); in-memory when omitted
-  --catalog CATALOG      keep the store in a pink-lake lake (wave 96b): engine
-                         metadata in the catalog database, rows in --data
-                         (pink:PATH, sqlite:PATH, or a postgres: URL; the
-                         backends are build features)
-  --data DIR|s3://…      the lake's data location; required with --catalog
+  --data-dir DIR         the server's data directory (default ./pinkdb-data)
+  --in-memory            keep everything in memory: nothing is saved
+  --lake-root DIR        another directory local lakes may live in (repeatable)
   --max-connections N    concurrent clients served (default 128)
   --idle-timeout SECS    disconnect clients idle this long; 0 = never (default 300)
   --allow-load-extension let clients run LOAD EXTENSION (loads native code on
                          the server host; off by default)</code></pre>
 
-<p>On startup the server prints its listening address and runs until terminated.
-Both durable modes share the embedded durability path: with <code>--file</code>,
-committed transactions are replayed from the WAL on the next start, and rows
-acknowledged to a client survive a server crash. <code>--file</code> and
-<code>--catalog</code> are mutually exclusive; <code>--data</code> requires
-<code>--catalog</code>; without either the server is in memory.</p>
+<p>On startup the server prints its listening address. It runs until SIGINT or
+SIGTERM, which stop accepting connections, checkpoint its stores and release
+its lakes' leases. Committed transactions are replayed from the WAL on the next
+start, and rows acknowledged to a client survive a server crash.</p>
 
-<h2>Stateless mode: metadata in the catalog, rows in a lake</h2>
+<h2>The data directory and lake databases</h2>
 
-<p>With <code>--catalog</code> the server holds no durable state of its own: the
-engine catalog — databases, table definitions with constraints and defaults,
-views, macros, materialized views, procedures, triggers, users/roles/grants,
-loaded extension sources — goes into the lake catalog database, and the rows go
-into the lake data files. Restart the server (or start it on another machine)
-on the same catalog and data URL and you get the identical store.</p>
+<p>The server owns one directory (wave 124): <code>pinkdb.pink</code> (+ WAL)
+holds the local databases, the users, roles and grants, and the list of lake
+databases; <code>state.pink</code> the console's and the agent's own state;
+<code>lakes/</code> the lakes it creates; <code>tmp/</code> upload staging.</p>
 
-<pre class="code" data-lang="sh"><code># metadata in the catalog database, rows in ./warehouse
-cargo run --release -p pinkdb-server -- \
-    --catalog sqlite:./warehouse.catalog --data ./warehouse
+<p>Every database has a storage: <code>local</code>, or a <strong>lake</strong> —
+rows and table metadata in a pink-lake lake (a <code>.pink</code>, SQLite or
+Postgres catalog; local or S3 data) with its own lease and version history. The
+lake's one schema is the database.</p>
 
-# S3 data, and a Postgres or SQLite catalog with the matching features
-cargo run --release -p pinkdb-server --features lake-s3 -- \
-    --catalog sqlite:./warehouse.catalog --data s3://bucket/warehouse</code></pre>
+<pre class="code" data-lang="sql"><code>CREATE DATABASE sales;                                   -- local
+CREATE DATABASE scratch (TYPE LAKE);                     -- &lt;data-dir&gt;/lakes/scratch/
+CREATE DATABASE events (TYPE LAKE, CATALOG 'postgres://h/db', DATA 's3://b/events');
+ATTACH 'lake:sqlite:/srv/archive.sqlite' AS archive (READ_ONLY);
+DETACH archive;                                          -- forgets it; never deletes data
+SHOW DATABASES;                                          -- storage, location, version, status</code></pre>
 
-<p>The <code>ducklake_*</code> tables stay exactly what DuckDB expects; the
-engine catalog is one row of <code>pinkdb_engine_catalog</code> beside them, an
-image of the engine's own catalog with the row pages omitted. Every committed
-statement publishes at most one catalog transaction — data files, lake delta
-and metadata image together — and a metadata-only statement
-(<code>CREATE VIEW</code>, <code>GRANT</code>, <code>LOAD EXTENSION</code>)
-publishes the image without minting a lake version. Passwords are still stored
-only as Argon2id hashes.</p>
+<p>A writable lake publishes every committed statement (or <code>COMMIT</code>)
+as one lake version — data files plus the database's engine metadata in one
+catalog transaction — and holds the lake's lease: a second writer is refused
+with <code>the lake is already served by …</code> until the first stops or its
+2 s heartbeat goes stale (6 s). A statement or transaction writes the local
+store or one lake, never both; a local write that reads a lake records the
+version it read in the WAL, so it replays exactly. A lake that cannot be opened
+is listed as unavailable; the server still starts.</p>
 
-<p>Phase 1 serves one server per catalog: a lease row with a 2 s heartbeat makes
-a second server fail with <code>already served by …</code> until the first stops
-or its heartbeat goes stale (6 s), which is how a crashed server is taken over.
-Shared catalogs need fencing tokens and cache invalidation, scoped as phase 2 in
-<a href="https://github.com/openlearnia/pinkdb/blob/main/docs/wave-96b-plan.md" rel="noopener"><code>docs/wave-96b-plan.md</code></a>.</p>
-
-<p>The mode needs the <code>catalog</code> feature; the default build links no
-lake, SQLite, Postgres or S3 code. A backend the build lacks is refused with
-the feature to rebuild with (<code>catalog</code>, <code>catalog-sqlite</code>,
-<code>catalog-postgres</code>, <code>catalog-s3</code>, <code>lake-s3</code>).</p>
+<p><code>ATTACH</code>, <code>DETACH</code> and <code>CREATE DATABASE</code> are
+administrator statements. Local lake paths must be inside
+<code>&lt;data-dir&gt;/lakes/</code> or a <code>--lake-root</code>; a catalog URL
+with a password is refused (use <code>PGPASSWORD</code> and the
+<code>AWS_*</code> environment). Every build opens <code>pink:</code> catalogs over
+local data; <code>catalog-sqlite</code>, <code>catalog-postgres</code>,
+<code>lake-s3</code> and <code>catalog-s3</code> add the other backends.</p>
 
 <h2>Remote CLI mode</h2>
 
@@ -181,8 +175,8 @@ like local ones. Each connection gets its own <code>Connection</code>, so
   process load and run a native library from its own filesystem, which without
   authentication would be remote code execution. WAL replay at startup still
   re-loads extensions a durable database recorded.</li>
-  <li><code>pinkdb-server</code> has no encryption-key option: its
-  <code>--file</code> must be a plaintext database (an encrypted one is refused at
+  <li><code>pinkdb-server</code> has no encryption-key option: its data
+  directory's stores must be plaintext (an encrypted one is refused at
   startup), and <code>PINKDB_KEY</code> is ignored by the server.</li>
   <li>In remote CLI mode, <code>PINKDB_KEY</code> is reported as inert instead of
   being silently ignored.</li>

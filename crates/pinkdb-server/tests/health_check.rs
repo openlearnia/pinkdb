@@ -5,12 +5,12 @@
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 /// Start the real server on an ephemeral port and read its readiness line.
 fn spawn_server() -> (Child, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let mut child = in_memory_server()
         .args(["--host", "127.0.0.1", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -38,7 +38,7 @@ fn stop(mut child: Child) {
 }
 
 fn health_check(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    in_memory_server()
         .args(args)
         .env_remove("PINKDB_HEALTHCHECK_ADDR")
         .env_remove("PINKDB_HEALTHCHECK_TIMEOUT_MS")
@@ -78,7 +78,7 @@ fn health_check_without_an_address_uses_the_container_environment() {
     let (child, addr) = spawn_server();
     let (host, port) = addr.rsplit_once(':').expect("host:port");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let out = in_memory_server()
         .arg("--health-check")
         .env("PINKDB_HOST", host)
         .env("PINKDB_PORT", port)
@@ -109,7 +109,7 @@ fn health_check_fails_fast_against_a_silent_peer() {
     });
 
     let start = Instant::now();
-    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let out = in_memory_server()
         .args(["--health-check", &addr])
         .env("PINKDB_HEALTHCHECK_TIMEOUT_MS", "200")
         .env_remove("PINKDB_HEALTHCHECK_ADDR")
@@ -140,7 +140,7 @@ fn health_check_with_tls_configured_checks_tcp_accept() {
         let _ = listener.accept();
     });
     let probe = |target: &str| {
-        Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+        in_memory_server()
             .args(["--health-check", target])
             .env("PINKDB_TLS_CERT", "/certs/server.pem")
             .env("PINKDB_HEALTHCHECK_TIMEOUT_MS", "500")
@@ -165,4 +165,12 @@ fn health_check_with_tls_configured_checks_tcp_accept() {
     let dead = closed.local_addr().unwrap().to_string();
     drop(closed);
     assert_eq!(probe(&dead).status.code(), Some(1));
+}
+
+/// The server binary, in memory (wave 124: without `--in-memory` it would
+/// keep its data in `./pinkdb-data` under the test's working directory).
+fn in_memory_server() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    command.arg("--in-memory");
+    command
 }

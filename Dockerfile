@@ -186,7 +186,7 @@ LABEL org.opencontainers.image.title="pinkdb" \
 # and explicit arguments still win (`docker run … --port 6000`).
 ENV PINKDB_HOST=0.0.0.0 \
     PINKDB_PORT=5433 \
-    PINKDB_FILE=/data/pinkdb.pink
+    PINKDB_DATA_DIR=/data
 
 WORKDIR /data
 VOLUME ["/data"]

@@ -236,14 +236,13 @@ fn tool(port: u16, id: u64, name: &str, arguments: Value) -> (bool, String) {
 #[test]
 fn a_store_with_users_refuses_an_unauthenticated_bridge() {
     let dir = scratch("users");
-    let store = dir.join("store.pink");
-    let path = store.display().to_string();
+    let store = dir.join("pinkdb.pink");
     seed(&store, &["CREATE USER agent PASSWORD 'secret'"]);
 
     let mut server = spawn(
         &[
-            "--file",
-            &path,
+            "--data-dir",
+            dir.to_str().expect("a UTF-8 path"),
             "--port",
             "0",
             "--mcp-extension",
@@ -279,8 +278,7 @@ fn a_store_with_users_refuses_an_unauthenticated_bridge() {
 #[test]
 fn the_bridge_serves_the_servers_store_read_only() {
     let dir = scratch("readonly");
-    let store = dir.join("store.pink");
-    let path = store.display().to_string();
+    let store = dir.join("pinkdb.pink");
     seed(
         &store,
         &[
@@ -291,8 +289,8 @@ fn the_bridge_serves_the_servers_store_read_only() {
 
     let mut server = spawn(
         &[
-            "--file",
-            &path,
+            "--data-dir",
+            dir.to_str().expect("a UTF-8 path"),
             "--port",
             "0",
             "--mcp-extension",
@@ -332,8 +330,7 @@ fn the_bridge_serves_the_servers_store_read_only() {
 #[test]
 fn a_logged_in_bridge_serves_the_store() {
     let dir = scratch("login");
-    let store = dir.join("store.pink");
-    let path = store.display().to_string();
+    let store = dir.join("pinkdb.pink");
     seed(
         &store,
         &[
@@ -345,8 +342,8 @@ fn a_logged_in_bridge_serves_the_store() {
 
     let mut server = spawn(
         &[
-            "--file",
-            &path,
+            "--data-dir",
+            dir.to_str().expect("a UTF-8 path"),
             "--port",
             "0",
             "--mcp-extension",

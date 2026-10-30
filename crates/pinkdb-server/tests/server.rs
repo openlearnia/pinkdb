@@ -1016,7 +1016,7 @@ fn accept_errors_from_fd_exhaustion_do_not_kill_the_server() {
     fn start_with_low_fd_limit() -> (Child, String) {
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg("ulimit -n 48; exec \"$0\" --host 127.0.0.1 --port 0")
+            .arg("ulimit -n 48; exec \"$0\" --in-memory --host 127.0.0.1 --port 0")
             .arg(env!("CARGO_BIN_EXE_pinkdb-server"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

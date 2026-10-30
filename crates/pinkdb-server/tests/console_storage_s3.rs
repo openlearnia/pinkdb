@@ -1,7 +1,7 @@
 //! Wave 121b: the console over a lake whose data lives in (mock) S3. Its own
 //! binary: the S3 client reads its endpoint and credentials from the process
 //! environment, which this one test sets before any store exists.
-#![cfg(all(feature = "ui", feature = "catalog", feature = "lake-s3"))]
+#![cfg(all(feature = "ui", feature = "catalog-sqlite", feature = "lake-s3"))]
 
 #[path = "common/console.rs"]
 mod console;
@@ -32,7 +32,7 @@ fn the_console_over_s3_data() {
     console::lake_round_trip(
         &format!("sqlite:{}", dir.join("catalog.sqlite").display()),
         &data,
-        "SQLite",
+        "sqlite:",
     );
     // The rows above the inlining limit reached the bucket.
     assert!(

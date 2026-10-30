@@ -9,6 +9,27 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 124b — the server owns its data ✅
+
+- **A data directory.** `pinkdb-server` keeps everything in `--data-dir`
+  (default `./pinkdb-data`, created on first start): `pinkdb.pink` (local
+  databases, users, grants, the lake databases' locations), `state.pink`
+  (console worksheets, credentials, agent, memory), `lakes/` (lakes `CREATE
+  DATABASE … (TYPE LAKE)` makes) and `tmp/` (upload staging). `--in-memory`
+  saves nothing. `--file`, `--catalog`, `--data` and `--state` are gone: a
+  lake is a database now (see 124a), and the server serves many of them.
+- **Lake location policy.** A local lake path must be inside
+  `<data-dir>/lakes/` or a `--lake-root DIR` (repeatable; `..` and symlink
+  escapes are refused); remote catalogs are `postgres://`/`pink+s3://`,
+  remote data `s3://`; creating, attaching and detaching lakes needs ADMIN.
+  Every server build opens `pink:` lakes; the catalog-backend features add
+  SQLite, Postgres and S3.
+- **Graceful shutdown.** SIGINT/SIGTERM stop accepting connections,
+  checkpoint both stores and release the lakes' leases; a killed server's
+  lakes reopen once their lease goes stale.
+- Docker: `PINKDB_DATA_DIR` (default `/data`) replaces `PINKDB_FILE`;
+  `make console` keeps its data directory in `.dev/data`.
+
 ### Wave 124a — lake databases ✅
 
 - **A lake is a database.** `CREATE DATABASE events (TYPE LAKE [, CATALOG

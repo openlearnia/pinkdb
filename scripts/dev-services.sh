@@ -1,21 +1,23 @@
 #!/bin/sh
 # Local pinkdb services for development (`make console`, `make stop`, …):
 # the server with its warehouse console, run in the background from this
-# checkout's debug build. Its store, pid file and log live under .dev/.
+# checkout's debug build. Its data directory, pid file and log live under
+# .dev/.
 #
 #   scripts/dev-services.sh start|stop|restart|status|logs
 #
-# Settings (environment): STORE (.dev/warehouse.pink), PORT (5491),
-# UI_PORT (8091), UI_AUTH (password | none), AGENT=1 (the data agent behind
-# the ask box), MEMORY=1 (agent memory).
+# Settings (environment): DATA_DIR (.dev/data), PORT (5491), UI_PORT (8091),
+# UI_AUTH (password | none), AGENT=1 (the data agent behind the ask box),
+# MEMORY=1 (agent memory).
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEV="$ROOT/.dev"
-STORE=${STORE:-$DEV/warehouse.pink}
-# A relative store is relative to the checkout, wherever make runs from.
-case $STORE in
+DATA_DIR=${DATA_DIR:-$DEV/data}
+# A relative data directory is relative to the checkout, wherever make runs
+# from.
+case $DATA_DIR in
 /*) ;;
-*) STORE="$ROOT/$STORE" ;;
+*) DATA_DIR="$ROOT/$DATA_DIR" ;;
 esac
 PORT=${PORT:-5491}
 UI_PORT=${UI_PORT:-8091}
@@ -60,14 +62,14 @@ start() {
         fi
     done
     (cd "$ROOT" && cargo build -q -p pinkdb-server --features ui)
-    set -- --file "$STORE" --port "$PORT" --enable-ui --ui-port "$UI_PORT" --ui-auth "$UI_AUTH"
+    set -- --data-dir "$DATA_DIR" --port "$PORT" --enable-ui --ui-port "$UI_PORT" --ui-auth "$UI_AUTH"
     if [ -n "$AGENT" ]; then
         set -- "$@" --agent-extension "$(extension agent)"
     fi
     if [ -n "$MEMORY" ]; then
         set -- "$@" --memory-extension "$(extension memory)"
     fi
-    mkdir -p "$(dirname "$STORE")" "$DEV"
+    mkdir -p "$DEV"
     nohup "$BIN" "$@" >"$LOG" 2>&1 &
     echo $! >"$PID"
     # Wait for the console to listen, or for the server to fail.

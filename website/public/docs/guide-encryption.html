@@ -270,7 +270,7 @@ db.save_with_key(<span class="tok-s">"x.pink"</span>, &amp;key)?;               
   <li><strong>Not exposed everywhere yet:</strong> the C ABI takes only a path, so
   the Python/Go bindings and C embedders open plaintext databases; use the Rust API
   or the CLI for encrypted stores. <code>pinkdb-server</code> has no key option —
-  its <code>--file</code> must be plaintext.</li>
+  its data directory's stores must be plaintext.</li>
   <li><strong>Lakes are not encrypted.</strong> <code>PINKDB_KEY</code> applies to
   <code>.pink</code> databases and their WAL, not to lake data files or objects.</li>
 </ul>

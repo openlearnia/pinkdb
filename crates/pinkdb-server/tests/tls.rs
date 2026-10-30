@@ -547,7 +547,7 @@ fn bad_certificate_and_key_files_refuse_startup_with_precise_messages() {
 
 /// Spawn the real server binary; the caller reads its readiness line.
 fn spawn_server(args: &[&str]) -> (Child, BufReader<ChildStdout>) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    let mut cmd = in_memory_server();
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -563,7 +563,7 @@ fn binary_refuses_a_half_configured_tls_pair() {
         ["--tls-cert", "/nonexistent/cert.pem"].as_slice(),
         ["--tls-key", "/nonexistent/key.pem"].as_slice(),
     ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+        let out = in_memory_server()
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -583,7 +583,7 @@ fn binary_refuses_a_bad_certificate_before_listening() {
     let pair = valid_pair();
     let (_cert, key) = identity(&scratch, "server", &pair);
     let garbage = scratch.write("garbage.crt", "not a certificate\n");
-    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let out = in_memory_server()
         .args(["--host", "127.0.0.1", "--port", "0"])
         .arg("--tls-cert")
         .arg(&garbage)
@@ -639,4 +639,12 @@ fn binary_serves_tls_end_to_end() {
 
     child.kill().expect("kill server");
     let _ = child.wait();
+}
+
+/// The server binary, in memory (wave 124: without `--in-memory` it would
+/// keep its data in `./pinkdb-data` under the test's working directory).
+fn in_memory_server() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    command.arg("--in-memory");
+    command
 }

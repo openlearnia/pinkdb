@@ -249,7 +249,7 @@ the image defaults:</p>
   <tbody>
     <tr><td><code>PINKDB_HOST</code></td><td><code>0.0.0.0</code></td><td><code>--host</code></td></tr>
     <tr><td><code>PINKDB_PORT</code></td><td><code>5433</code></td><td><code>--port</code></td></tr>
-    <tr><td><code>PINKDB_FILE</code></td><td><code>/data/pinkdb.pink</code></td><td><code>--file</code></td></tr>
+    <tr><td><code>PINKDB_DATA_DIR</code></td><td><code>/data</code></td><td><code>--data-dir</code></td></tr>
     <tr><td><code>PINKDB_TRANSPORT</code></td><td><code>sync</code></td><td><code>--transport</code></td></tr>
     <tr><td><code>PINKDB_TLS_CERT</code> / <code>PINKDB_TLS_KEY</code></td><td>—</td><td><code>--tls-cert</code> / <code>--tls-key</code></td></tr>
     <tr><td><code>PINKDB_MAX_CONNECTIONS</code></td><td><code>128</code></td><td><code>--max-connections</code></td></tr>
@@ -267,7 +267,7 @@ the image defaults:</p>
 </div>
 
 <p>Values of <code>1</code>, <code>true</code>, <code>TRUE</code> or
-<code>yes</code> turn the two opt-ins on. <code>PINKDB_FILE</code> must stay
+<code>yes</code> turn the two opt-ins on. <code>PINKDB_DATA_DIR</code> must stay
 inside the writable <code>/data</code> volume unless you mount another path.</p>
 
 <h2 id="health-check">Health check<a class="anchor" href="#health-check" aria-label="Permalink: Health check">#</a></h2>

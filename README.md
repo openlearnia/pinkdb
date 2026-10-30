@@ -95,8 +95,8 @@ docker run -p 6000:6000 -v pinkdb-data:/data ghcr.io/openlearnia/pinkdb \
 ```
 
 The entrypoint maps the common settings from the environment:
-`PINKDB_HOST` (default `0.0.0.0`), `PINKDB_PORT` (`5433`), `PINKDB_FILE`
-(`/data/pinkdb.pink`), `PINKDB_TRANSPORT` (`sync`; the image has both
+`PINKDB_HOST` (default `0.0.0.0`), `PINKDB_PORT` (`5433`), `PINKDB_DATA_DIR`
+(`/data`), `PINKDB_TRANSPORT` (`sync`; the image has both
 transports), `PINKDB_TLS_CERT`/`PINKDB_TLS_KEY`, the limit flags
 (`PINKDB_MAX_CONNECTIONS`, `PINKDB_IDLE_TIMEOUT`,
 `PINKDB_STATEMENT_TIMEOUT_MS`, `PINKDB_MAX_RESULT_ROWS`,
@@ -1348,7 +1348,7 @@ containers (see "Lakes" below). The value must be valid UTF-8: a
 set-but-non-UTF-8 variable is a hard error (exit 2) instead of a silent
 fallback to plaintext, and remote mode (`--host`) warns that the variable is
 inert (the server's own configuration applies; `pinkdb-server` has no key
-option, so its `--file` must be a plaintext database). A wrong key (or a
+option, so its data directory's stores must be plaintext). A wrong key (or a
 tampered header) fails the key-check block with a clear `wrong key` error,
 never "corrupt file". A tampered payload byte fails AEAD authentication: for a
 `.pink` checkpoint that is a hard error (loads are all-or-nothing), and for the
@@ -1504,11 +1504,12 @@ default build for RBAC password hashing — about +0.23 MB per binary (the
 passphrase KDF there).
 
 ```sh
-# in-memory server on 127.0.0.1:5433
+# a durable server on 127.0.0.1:5433, its data in ./pinkdb-data (wave 124)
 cargo run --release -p pinkdb-server
 
-# durable server: same checkpoint + WAL guarantees as the embedded path
-cargo run --release -p pinkdb-server -- --file sales.pink
+# elsewhere, or nothing saved at all
+cargo run --release -p pinkdb-server -- --data-dir /srv/pinkdb
+cargo run --release -p pinkdb-server -- --in-memory
 
 # remote REPL: build the CLI with the optional `client` feature, then
 cargo build --release -p pinkdb-cli --features client
@@ -1516,9 +1517,9 @@ cargo build --release -p pinkdb-cli --features client
 ```
 
 `pinkdb-server --help` lists the flags: `--host` (default `127.0.0.1`),
-`--port` (default `5433`; `0` picks an ephemeral port), `--file` (durable
-`.pink`: the checkpoint loads and the sidecar WAL replays on restart;
-in-memory when omitted), `--max-connections N` (default 128),
+`--port` (default `5433`; `0` picks an ephemeral port), `--data-dir DIR`
+(default `./pinkdb-data`: the checkpoint loads and the sidecar WAL replays on
+restart), `--in-memory`, `--lake-root DIR`, `--max-connections N` (default 128),
 `--idle-timeout SECS` (default 300; `0` = never),
 `--statement-timeout-ms N` (per-statement engine deadline, default 30000;
 checked at chunk boundaries), `--max-result-rows N` (materialized rows per
@@ -1539,79 +1540,63 @@ explicitly. TLS is available only with the default `sync` transport:
 `--transport async` combined with
 `--tls-cert`/`--tls-key` is refused at startup (exit code 2) rather than
 silently serving plaintext. The server
-prints its listening address on startup and runs until terminated.
+prints its listening address on startup and runs until SIGINT/SIGTERM,
+which stop accepting connections, checkpoint the data directory's stores and
+release the lake databases' leases.
 `pinkdb-server --health-check [HOST:PORT]` is a one-shot liveness probe:
 connect, send the protocol `Ping`, and exit 0 (healthy) or 1 (unhealthy)
 within `PINKDB_HEALTHCHECK_TIMEOUT_MS` (default 2000 ms); without an address it
 reads `PINKDB_HEALTHCHECK_ADDR`, then `PINKDB_HOST`/`PINKDB_PORT`, then
 `127.0.0.1:5433`. It is what the Docker image's `HEALTHCHECK` uses.
 
-### Stateless mode: metadata in the catalog, rows in a lake (wave 96b)
+### The data directory and lake databases (wave 124)
 
-A `--file` server keeps its whole store — catalog metadata *and* rows — in one
-local `.pink` file plus WAL. `--catalog` puts the metadata in a lake catalog
-database and the rows in lake data files, so the server holds no local state
-and can be restarted, or moved to another machine, from the catalog and data
-alone:
+A server owns one data directory (`--data-dir`, default `./pinkdb-data`,
+created on first start): `pinkdb.pink` (+ WAL) holds the local databases,
+the users, roles and grants, and the list of lake databases; `state.pink`
+the console's and the agent's own state; `lakes/` the lakes it creates;
+`tmp/` upload staging. `--in-memory` keeps everything in memory instead.
 
-```sh
-# metadata in the catalog database, rows in ./warehouse
-cargo run --release -p pinkdb-server -- \
-    --catalog sqlite:./warehouse.catalog --data ./warehouse
+Every database has a **storage**: `local`, or a **lake** — rows and table
+metadata in a pink-lake lake (a `.pink`, SQLite or Postgres catalog; local or
+S3 data), with its own lease and version history. The lake's one schema is
+the database:
 
-# S3 data (build with `--features lake-s3`)
-cargo run --release -p pinkdb-server --features lake-s3 -- \
-    --catalog sqlite:./warehouse.catalog --data s3://bucket/warehouse
+```sql
+CREATE DATABASE sales;                                   -- local
+CREATE DATABASE scratch (TYPE LAKE);                     -- <data-dir>/lakes/scratch/
+CREATE DATABASE events (TYPE LAKE, CATALOG 'postgres://h/db', DATA 's3://b/events');
+ATTACH 'lake:sqlite:/srv/archive.sqlite' AS archive (READ_ONLY);
+DETACH archive;                                          -- forgets it; never deletes data
+SHOW DATABASES;                                          -- storage, location, version, status
 ```
 
-`--catalog` needs a server built with the `catalog` feature (the default
-binary links no lake code). It takes the same locations a lake catalog does:
-`pink:<path>`, `sqlite:<path>`, or a Postgres catalog URL (with the
-`catalog-sqlite`, `catalog-postgres` or `catalog-s3` features, which imply
-`catalog`). `--data` takes a
-directory or `s3://bucket/prefix` (feature `lake-s3`). `--catalog` and
-`--file` are mutually exclusive, and `--data` requires `--catalog`; without
-either flag the server is in-memory, exactly as before.
+- A writable lake database publishes every committed statement (or
+  `COMMIT`) as one lake version: the data files plus the database's engine
+  metadata (constraints, defaults, indexes, macros, triggers, procedures,
+  materialized views) in one catalog transaction. It is never in the local
+  WAL or checkpoint, which record only its location.
+- A read-only one (`READ_ONLY`, optionally `VERSION n`) answers from the
+  lake's statistics and decodes only what a query needs.
+- **One writer per lake.** A writable lake holds the catalog's lease
+  (`engine/lease`, heartbeat every 2 s); a second writer is refused with
+  `the lake is already served by …` until the first stops or its heartbeat
+  goes stale (6 s), so a crashed server's lake reopens on restart.
+- **One storage per unit.** A statement or transaction writes the local
+  store or one lake database, never both (a trigger or `CALL` that tries is
+  undone). A local write that *reads* a lake records the lake version it read
+  in its WAL record, so it replays exactly after the lake moved on.
+- **Unavailable lakes** (unreachable, removed) are listed with the reason;
+  the server starts, and only statements on them fail.
+- **Location policy.** `ATTACH`/`DETACH`/`CREATE DATABASE` are ADMIN-only.
+  Local lake paths must be inside `<data-dir>/lakes/` or a `--lake-root DIR`
+  (repeatable); a catalog URL with a password is refused — use `PGPASSWORD`
+  and the `AWS_*` environment.
 
-What lives where:
-
-- **The catalog** holds the lake's own `ducklake_*` tables (fixed by DuckDB
-  interop) plus one row of `pinkdb_engine_catalog`, the engine catalog image:
-  databases, table definitions with their constraints, defaults and indexes,
-  views (with their `CREATE VIEW` text), macros, materialized views,
-  procedures, triggers, users/roles/grants, and the loaded extension sources.
-  A password appears only as its Argon2id hash. The lake's own settings
-  (inlining limit, partition specs, write format) stay in its `ducklake_*`
-  rows, where they already live.
-- **The data location** holds the table rows, as ordinary `.pink` data files.
-- **The server process** holds nothing durable: there is no local WAL, no
-  checkpoint and no replay. The in-memory MVCC rules are unchanged.
-
-Every committed statement publishes at most one catalog transaction: the data
-files, the lake delta and the metadata image together. A statement that only
-changes metadata (`CREATE VIEW`, `GRANT`, `CREATE ROLE`, `LOAD EXTENSION`)
-publishes the image without minting a lake version; a statement inside
-`BEGIN … COMMIT` publishes once, at the commit; a rollback publishes nothing;
-a crash before the transaction commits publishes nothing, and one after it
-publishes everything.
-
-Views and other engine metadata survive a restart in this mode (they are part
-of the engine catalog), which `--file` still does not persist — `--file`
-behaviour is unchanged.
-
-**One server per catalog (phase 1).** The catalog carries a lease row
-(`pinkdb_object` / `engine/lease`) with a heartbeat every 2 s. A second server
-on the same catalog refuses to start with
-`the catalog is already served by <host:pid> (heartbeat <n>s ago)` until the
-first one stops or its heartbeat goes stale (6 s), so a crashed server is
-taken over on restart. Several servers on one catalog need fencing tokens and
-cache invalidation; that is phase 2 and is scoped in
-[`docs/wave-96b-plan.md`](docs/wave-96b-plan.md).
-
-The default `pinkdb-server` build has no SQLite, Postgres or S3 dependency: a
-catalog backend the build lacks is refused with the feature name to rebuild
-with, and `--data s3://…` without `lake-s3` says the build has no S3 data
-support.
+Every build links pink-lake for `pink:` catalogs over local data; the
+`catalog-sqlite`, `catalog-postgres`, `lake-s3` and `catalog-s3` features add
+the other backends. The CLI speaks the same SQL (with `--features pinklake`);
+its `.lake attach`/`detach`/`attached`/`commit` dot-commands are gone.
 
 Server robustness, in one place:
 
@@ -1789,12 +1774,12 @@ feature, so the default server binary is unchanged:
 
 ```sh
 cargo build --release -p pinkdb-server --features ui
-./target/release/pinkdb-server --file warehouse.pink --enable-ui   # http://127.0.0.1:8080
+./target/release/pinkdb-server --enable-ui   # http://127.0.0.1:8080, data in ./pinkdb-data
 ```
 
 In a checkout, `make console` builds the debug server and starts it with
-the console in the background (http://127.0.0.1:8091, store and log in
-`.dev/`; `UI_AUTH=none`, `AGENT=1`, `MEMORY=1`, `STORE=…`, `PORT=…` and
+the console in the background (http://127.0.0.1:8091, data directory and
+log in `.dev/`; `UI_AUTH=none`, `AGENT=1`, `MEMORY=1`, `DATA_DIR=…`, `PORT=…` and
 `UI_PORT=…` adjust it), `make status` shows what is running, `make logs`
 follows the log and `make stop` stops every running `pinkdb-server`.
 
@@ -2019,8 +2004,9 @@ through a second, internal channel that is confined to the `pinkdb_agent`
 database, so it cannot touch user data either.
 
 **Sessions are tables.** A session lives in the `pinkdb_agent` database of
-the state store next to the store it ran against (`warehouse.pink` →
-`warehouse.state.pink`, or `--state PATH`; never in the store itself):
+the state store next to the store it ran against (the CLI's `warehouse.pink`
+→ `warehouse.state.pink`; a server's `<data-dir>/state.pink`; never in the
+store itself):
 `sessions`, `messages`, `tool_calls`,
 `checkpoints`, `usage`. Every step (transport, any calls, the tool results,
 the next checkpoint) commits, so `kill -9` costs at most one step:

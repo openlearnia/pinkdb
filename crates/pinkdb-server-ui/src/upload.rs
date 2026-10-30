@@ -80,7 +80,7 @@ fn format_of(query: &UploadQuery) -> Result<&'static str, String> {
 }
 
 /// Parse an upload in a scratch store that is not the served one.
-fn parse(format: &str, bytes: &[u8]) -> Result<Parsed, String> {
+fn parse(format: &str, bytes: &[u8], staging: Option<&std::path::Path>) -> Result<Parsed, String> {
     let mut scratch = PinkDb::new();
     let result = match format {
         "csv" => {
@@ -93,7 +93,8 @@ fn parse(format: &str, bytes: &[u8]) -> Result<Parsed, String> {
         _ => {
             // The Parquet reader reads files: a private temporary one, removed
             // whatever happens.
-            let path = std::env::temp_dir().join(format!(
+            let dir = staging.map_or_else(std::env::temp_dir, std::path::Path::to_path_buf);
+            let path = dir.join(format!(
                 "pinkdb-upload-{}.parquet",
                 &crate::security::random_token()[..16]
             ));
@@ -275,7 +276,7 @@ pub async fn upload(
     let worker = Arc::clone(&shared);
     let outcome = tokio::task::spawn_blocking(move || -> Result<UploadResult, String> {
         let started = Instant::now();
-        let parsed = parse(format, &bytes)?;
+        let parsed = parse(format, &bytes, worker.opts.scratch_dir.as_deref())?;
         let mut conn = session.connect(&worker.db)?;
         conn.set_exec_limits(pinkdb::ExecLimits {
             statement_timeout: Some(worker.opts.query_timeout),
@@ -358,11 +359,11 @@ mod tests {
 
     #[test]
     fn a_csv_upload_is_parsed_with_types() {
-        let parsed = parse("csv", b"id,name,price\n1,a,1.5\n2,\"b, c\",2\n").unwrap();
+        let parsed = parse("csv", b"id,name,price\n1,a,1.5\n2,\"b, c\",2\n", None).unwrap();
         assert_eq!(parsed.names, vec!["id", "name", "price"]);
         assert_eq!(parsed.types[0], DataType::Integer);
         assert_eq!(parsed.rows.len(), 2);
         assert_eq!(parsed.rows[1][1], Value::Varchar("b, c".into()));
-        assert!(parse("csv", &[0xff, 0xfe]).is_err());
+        assert!(parse("csv", &[0xff, 0xfe], None).is_err());
     }
 }

@@ -196,7 +196,7 @@ binary — nothing comes from a CDN.</p>
 <h2 id="start-it">Start it<a class="anchor" href="#start-it" aria-label="Permalink: Start it">#</a></h2>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-server <span class="tok-f">--features</span> ui
-./target/release/pinkdb-server <span class="tok-f">--file</span> warehouse.pink <span class="tok-f">--enable-ui</span>
+./target/release/pinkdb-server <span class="tok-f">--enable-ui</span>        <span class="tok-c"># data in ./pinkdb-data</span>
 <span class="tok-c"># pinkdb-server: warehouse console on http://127.0.0.1:8080 (worksheets)</span></code></pre></div>
 
 <p>The console asks for sign-in with the store's users, whose grants then
@@ -302,7 +302,7 @@ database (or <code>INSERT</code> to append).</p>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-agent
 <span class="tok-v">PINKDB_AGENT_PROVIDER</span>=zai <span class="tok-v">ZAI_API_KEY</span>=… ./target/release/pinkdb-server \
-  <span class="tok-f">--file</span> warehouse.pink <span class="tok-f">--enable-ui</span> \
+  <span class="tok-f">--enable-ui</span> \
   <span class="tok-f">--agent-extension</span> ./target/release/libpinkdb_agent.dylib</code></pre></div>
 
 <p>The agent runs as the logged-in user, read-only unless the server was started

@@ -11,8 +11,9 @@ even compiled without the feature).
 # add `parquet,httpfs` for imports from paths, https:// and s3://
 cargo build --release -p pinkdb-server --features ui,parquet,httpfs
 
-# serve the console next to the protocol, on 127.0.0.1:8080
-./target/release/pinkdb-server --file warehouse.pink --enable-ui
+# serve the console next to the protocol, on 127.0.0.1:8080; the server
+# keeps its data in ./pinkdb-data (--data-dir DIR, or --in-memory)
+./target/release/pinkdb-server --enable-ui
 # pinkdb-server: warehouse console on http://127.0.0.1:8080 (worksheets)
 ```
 
@@ -70,9 +71,11 @@ agent.
 - **Import** (wave 121b). A CSV or Parquet file from a server path,
   `https://` or `s3://` (preview, then create, replace or append), or
   uploaded from the browser. See [imports](#imports).
-- **Storage** (wave 121b). What the server stores into — memory, a durable
-  `.pink` file, or a lake catalog (`.pink`, SQLite or Postgres) with local or
-  S3 data — and the lake's published version; a Checkpoint button.
+- **Storage** (waves 121b, 124). The server's data directory (or memory),
+  every database with its storage — local, or a lake (`.pink`, SQLite or
+  Postgres catalog; local or S3 data) with its version and status — and, for
+  administrators, **New database** (local or lake), **Attach lake** and
+  **Detach**; a Checkpoint button. See [storage](#storage).
 
 ## Who runs the SQL
 
@@ -173,6 +176,14 @@ it through your browser, and stored data must never become markup.
   (below). Worksheets, history and credentials live in the state store,
   which no statement reaches — not even an administrator's — and the console
   serves each user only their own worksheets and those shared with them.
+- **Lakes** (wave 124). Creating, attaching and detaching a lake database is
+  an administrator statement (RBAC). The server confines lake locations: a
+  local catalog or data path must resolve inside `<data-dir>/lakes/` or a
+  `--lake-root` (no `..`; symlinks are resolved before the check), a remote
+  catalog is `postgres://` or `pink+s3://` and remote data `s3://`, and a URL
+  with a password is refused outright (it would land in the WAL and the
+  checkpoint): Postgres takes `PGPASSWORD`, S3 the server's `AWS_*`
+  environment. A lake's location is shown with any password masked.
 
 ## The state store (wave 121e)
 
@@ -185,15 +196,12 @@ channel runs on the state store, as the caller — `current_user()` and
 `current_roles()` there answer the warehouse's user, so memory stays per
 user — while the model's statements run on the warehouse.
 
-| Served store | State store |
+| Server | State store |
 |---|---|
-| `--state PATH` | that file |
-| `--file warehouse.pink` | `warehouse.state.pink` next to it |
-| a local lake catalog (`pink:`, `sqlite:`, a directory) | next to the catalog (`cat.pink` → `cat.state.pink`) |
-| a remote lake catalog (Postgres, S3) | **`--state` is required** (in memory, second factors and tokens would be lost on restart) |
-| in memory | in memory |
+| `--data-dir DIR` (default `./pinkdb-data`) | `DIR/state.pink` |
+| `--in-memory` | in memory |
 
-A server opens it only when it runs the console, the agent or memory; the
+A server always opens it (wave 124); the
 CLI opens it on the first `.agent` or `.memory`, encrypted under the store's
 key when the store is encrypted. Back it up with the warehouse. Existing
 `pinkdb_worksheets`, `pinkdb_agent` and `pinkdb_memory` databases inside a
@@ -243,18 +251,57 @@ the server must be restarted without that flag. The form says so.
 
 ## Storage
 
-`GET /api/storage` reports the mode (`in-memory`, `durable`, `lake`), the
-location, and facts: for a lake the catalog backend (`.pink` file, `.pink` on
-S3, SQLite, Postgres) and the data location, plus the lake's published
-version, read per request. Credentials never appear: a URL's `user:password@`
-is shown as `user:***@` and `password=`/`secret=`/`token=` parameters are
+Wave 124: the server owns its data. `--data-dir DIR` (default
+`./pinkdb-data`, created on first start) holds:
+
+```
+pinkdb-data/
+  pinkdb.pink (+ .wal, .lock)   local databases, users/roles/grants, and the
+                                list of lake databases (checkpoint + WAL)
+  state.pink  (+ sidecars)      console worksheets, credentials, agent, memory
+  lakes/<name>/                 lakes created with no explicit location
+  tmp/                          upload staging
+```
+
+`--in-memory` keeps everything in memory instead (the Storage page says
+nothing is saved). SIGINT/SIGTERM stop accepting connections, checkpoint
+both stores (waiting for the statements running on them) and release the
+lakes' leases.
+
+Every database has a **storage**: `local` (rows in `pinkdb.pink`) or a
+**lake** (rows and table metadata in a pink-lake lake, with its own lease and
+version history; the lake's one schema is the database). SQL creates and
+attaches them, and the console's Storage page runs the same statements:
+
+```sql
+CREATE DATABASE sales;                                  -- local
+CREATE DATABASE scratch (TYPE LAKE);                    -- <data-dir>/lakes/scratch/
+CREATE DATABASE events (TYPE LAKE, CATALOG 'postgres://h/db', DATA 's3://b/events');
+ATTACH 'lake:sqlite:/srv/archive.sqlite' AS archive (READ_ONLY);
+DETACH archive;                                         -- forgets it; never deletes data
+```
+
+A writable lake publishes every committed statement or transaction as one
+lake version, and holds the lake's lease (a second server's writable attach
+is refused; read-only attachments are always allowed). A statement or
+transaction writes one storage: the local store or one lake. A local write
+that reads a lake records the lake version it read in the WAL, so it replays
+exactly. A lake that cannot be opened at startup is listed as
+`unavailable` with the reason; the rest of the server works.
+
+`GET /api/storage` reports the mode (`in-memory`, `durable`), the data
+directory and facts (the managed-lake directory, the lake roots).
+`/api/catalog` lists each database's storage, location, read-only flag,
+version and status. Credentials never appear: a URL's `user:password@` is
+shown as `user:***@` and `password=`/`secret=`/`token=` parameters are
 masked; S3 keys come from the environment and are never shown. The panel's
 Checkpoint button runs `CHECKPOINT` as the user (an administrator action in a
 console with logins).
 
 The console works the same over every backend — the tests run worksheets and
-uploads over a `.pink` catalog, a SQLite catalog, a Postgres catalog and S3
-data, then reopen the lake under a new server and read the rows back.
+uploads into lake databases over a `.pink` catalog, a SQLite catalog, a
+Postgres catalog and S3 data, then reopen the data directory and read the
+rows back.
 
 ## The exposure policy (fail closed)
 
@@ -276,7 +323,7 @@ Start the server with the agent extension:
 ```sh
 cargo build --release -p pinkdb-agent
 PINKDB_AGENT_PROVIDER=zai ZAI_API_KEY=… \
-  ./target/release/pinkdb-server --file warehouse.pink --enable-ui \
+  ./target/release/pinkdb-server --data-dir warehouse --enable-ui \
   --agent-extension ./target/release/libpinkdb_agent.dylib
 ```
 
@@ -411,7 +458,9 @@ HTML comes from `maud`, which escapes every interpolated value.
 ## The flags
 
 ```
---state PATH                the state store (default: next to --file; see above)
+--data-dir DIR              the server's data directory (default ./pinkdb-data)
+--in-memory                 keep everything in memory; nothing is saved
+--lake-root DIR             another directory local lakes may live in (repeatable)
 --enable-ui                 serve the console (needs a build with `ui`)
 --ui-host HOST              the console's bind address (default 127.0.0.1)
 --ui-port PORT              the console's TCP port (default 8080; 0 = ephemeral)
@@ -434,10 +483,12 @@ HTML comes from `maud`, which escapes every interpolated value.
 ## A demo
 
 ```sh
-# a TPC-H SF 0.01 store (bench/suite generates one; any .pink file works)
+# a TPC-H SF 0.01 store (bench/suite generates one; any .pink file works),
+# copied in as the data directory's store
 python3 bench/suite/run.py --only tpch --scale 0.01 --runs 1 --warmup 0
 cargo build --release -p pinkdb-server --features ui -p pinkdb-agent
-./target/release/pinkdb-server --file <work-dir>/tpch_sf0.01/store.pink \
+mkdir -p demo-data && cp <work-dir>/tpch_sf0.01/store.pink demo-data/pinkdb.pink
+./target/release/pinkdb-server --data-dir demo-data \
   --enable-ui --agent-extension ./target/release/libpinkdb_agent.dylib
 # open http://127.0.0.1:8080/
 ```

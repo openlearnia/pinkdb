@@ -10,7 +10,7 @@ binary — nothing comes from a CDN.</p>
 <h2>Start it</h2>
 
 <pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-server --features ui
-./target/release/pinkdb-server --file warehouse.pink --enable-ui
+./target/release/pinkdb-server --enable-ui        # data in ./pinkdb-data
 # pinkdb-server: warehouse console on http://127.0.0.1:8080 (worksheets)</code></pre>
 
 <p>The console asks for sign-in with the store's users, whose grants then
@@ -116,7 +116,7 @@ database (or <code>INSERT</code> to append).</p>
 
 <pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-agent
 PINKDB_AGENT_PROVIDER=zai ZAI_API_KEY=… ./target/release/pinkdb-server \
-  --file warehouse.pink --enable-ui \
+  --enable-ui \
   --agent-extension ./target/release/libpinkdb_agent.dylib</code></pre>
 
 <p>The agent runs as the logged-in user, read-only unless the server was started

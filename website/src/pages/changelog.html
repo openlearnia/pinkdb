@@ -9,6 +9,13 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-30</h2>
+<h3>Wave 124b — the server owns its data ✅</h3>
+<ul>
+<li><strong>A data directory.</strong> <code>pinkdb-server</code> keeps everything in <code>--data-dir</code> (default <code>./pinkdb-data</code>, created on first start): <code>pinkdb.pink</code> (local databases, users, grants, the lake databases' locations), <code>state.pink</code> (console worksheets, credentials, agent, memory), <code>lakes/</code> (lakes <code>CREATE DATABASE … (TYPE LAKE)</code> makes) and <code>tmp/</code> (upload staging). <code>--in-memory</code> saves nothing. <code>--file</code>, <code>--catalog</code>, <code>--data</code> and <code>--state</code> are gone: a lake is a database now (see 124a), and the server serves many of them.</li>
+<li><strong>Lake location policy.</strong> A local lake path must be inside <code>&lt;data-dir&gt;/lakes/</code> or a <code>--lake-root DIR</code> (repeatable; <code>..</code> and symlink escapes are refused); remote catalogs are <code>postgres://</code>/<code>pink+s3://</code>, remote data <code>s3://</code>; creating, attaching and detaching lakes needs ADMIN. Every server build opens <code>pink:</code> lakes; the catalog-backend features add SQLite, Postgres and S3.</li>
+<li><strong>Graceful shutdown.</strong> SIGINT/SIGTERM stop accepting connections, checkpoint both stores and release the lakes' leases; a killed server's lakes reopen once their lease goes stale.</li>
+<li>Docker: <code>PINKDB_DATA_DIR</code> (default <code>/data</code>) replaces <code>PINKDB_FILE</code>; <code>make console</code> keeps its data directory in <code>.dev/data</code>.</li>
+</ul>
 <h3>Wave 124a — lake databases ✅</h3>
 <ul>
 <li><strong>A lake is a database.</strong> <code>CREATE DATABASE events (TYPE LAKE [, CATALOG '…'] [, DATA '…'])</code> creates a lake and <code>ATTACH 'lake:&lt;catalog&gt;' AS name [(READ_ONLY, DATA '…', VERSION n)]</code> opens an existing one; <code>DETACH name</code> forgets it (the lake keeps its data). The lake's one schema is the database (<code>main.t</code> in the lake is <code>events.t</code>); a lake with several schemas is refused. <code>CREATE DATABASE … (TYPE LAKE)</code> with no <code>CATALOG</code> puts the lake under the store's lake directory.</li>

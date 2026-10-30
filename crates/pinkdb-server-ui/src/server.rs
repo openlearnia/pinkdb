@@ -152,6 +152,9 @@ pub struct UiOptions {
     pub agent_allow_writes: bool,
     /// The largest file an upload may send (wave 121b).
     pub max_upload_bytes: usize,
+    /// Where an upload is staged while it is parsed (wave 124: the server's
+    /// `<data-dir>/tmp`); `None` = the system temporary directory.
+    pub scratch_dir: Option<std::path::PathBuf>,
     /// What the Storage panel reports about the store (wave 121b).
     pub storage: StorageInfo,
     /// The console's own HTTPS (wave 121d): with a certificate the console
@@ -330,6 +333,7 @@ impl Default for UiOptions {
             allow_external_services: false,
             agent_allow_writes: false,
             max_upload_bytes: 64 * 1024 * 1024,
+            scratch_dir: None,
             storage: StorageInfo {
                 mode: "in-memory".to_string(),
                 ..StorageInfo::default()

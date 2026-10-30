@@ -1,6 +1,6 @@
 # Local pinkdb services for development (scripts/dev-services.sh): the
 # server with its warehouse console, run in the background from the debug
-# build. The store, pid file and log live under .dev/.
+# build. The server's data directory, pid file and log live under .dev/.
 #
 #   make console               build and start the server and its console
 #   make console UI_AUTH=none  ... without sign-in (a store without users)
@@ -12,16 +12,16 @@
 #   make logs                  follow the server's log
 #   make console-app           rebuild the console's browser app (web-dist)
 #
-# Settings: STORE (.dev/warehouse.pink), PORT (5491), UI_PORT (8091),
-# UI_AUTH (password), AGENT, MEMORY.
+# Settings: DATA_DIR (.dev/data: pinkdb.pink, state.pink, lakes/, tmp/),
+# PORT (5491), UI_PORT (8091), UI_AUTH (password), AGENT, MEMORY.
 
-STORE ?= .dev/warehouse.pink
+DATA_DIR ?= .dev/data
 PORT ?= 5491
 UI_PORT ?= 8091
 UI_AUTH ?= password
 AGENT ?=
 MEMORY ?=
-export STORE PORT UI_PORT UI_AUTH AGENT MEMORY
+export DATA_DIR PORT UI_PORT UI_AUTH AGENT MEMORY
 
 SERVICES := scripts/dev-services.sh
 

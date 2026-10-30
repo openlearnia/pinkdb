@@ -29,71 +29,49 @@ pub use pinkdb_server_ui::{
     check_auth_policy, check_bind_policy, redact,
 };
 
-/// The catalog backend a lake catalog location names (pink-lake's location
-/// rules: `postgres://`, `sqlite:`, `pink:`, `pink+s3://`, else a local
-/// directory).
-pub fn catalog_backend(catalog: &str) -> &'static str {
-    let lower = catalog.to_ascii_lowercase();
-    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
-        "Postgres"
-    } else if lower.starts_with("sqlite:") {
-        "SQLite"
-    } else if lower.starts_with("pink+s3://") {
-        "pinkdb (.pink on S3)"
-    } else if lower.starts_with("pink:") {
-        "pinkdb (.pink file)"
-    } else {
-        "directory"
-    }
-}
-
-/// What the Storage panel shows for a server that serves `file` (durable),
-/// a lake `catalog` over `data`, or memory. Secrets in the locations are
-/// redacted here; `version` reads a lake's published version per request.
+/// What the Storage panel shows for a server that keeps its data in
+/// `data_dir` (durable) or in memory (wave 124). Every database's own
+/// storage — local or a lake — comes from the catalog, per request.
 pub fn storage_info(
-    file: Option<&str>,
-    catalog: Option<&str>,
-    data: Option<&str>,
-    version: Option<std::sync::Arc<dyn Fn() -> u64 + Send + Sync>>,
+    data_dir: Option<&crate::DataDir>,
+    lake_roots: &[std::path::PathBuf],
     import_formats: Vec<String>,
 ) -> StorageInfo {
-    match (file, catalog) {
-        (Some(path), _) => StorageInfo {
-            mode: "durable".to_string(),
-            location: path.to_string(),
-            facts: vec![("format".to_string(), ".pink file + WAL".to_string())],
-            live: None,
-            import_formats,
-        },
-        (None, Some(catalog)) => {
-            let data = data.unwrap_or_default();
+    let roots = || {
+        lake_roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match data_dir {
+        Some(dir) => {
+            let mut facts = vec![
+                ("store".to_string(), "pinkdb.pink + WAL".to_string()),
+                (
+                    "managed lakes".to_string(),
+                    dir.lakes().display().to_string(),
+                ),
+            ];
+            if !lake_roots.is_empty() {
+                facts.push(("lake roots".to_string(), roots()));
+            }
             StorageInfo {
-                mode: "lake".to_string(),
-                location: redact(catalog),
-                facts: vec![
-                    ("catalog".to_string(), catalog_backend(catalog).to_string()),
-                    (
-                        "data".to_string(),
-                        if data.starts_with("s3://") {
-                            format!("{} (S3)", redact(data))
-                        } else {
-                            redact(data)
-                        },
-                    ),
-                ],
-                live: version.map(|version| {
-                    std::sync::Arc::new(move || {
-                        vec![("lake version".to_string(), version().to_string())]
-                    })
-                        as std::sync::Arc<dyn Fn() -> Vec<(String, String)> + Send + Sync>
-                }),
+                mode: "durable".to_string(),
+                location: dir.root().display().to_string(),
+                facts,
+                live: None,
                 import_formats,
             }
         }
-        (None, None) => StorageInfo {
+        None => StorageInfo {
             mode: "in-memory".to_string(),
-            location: "(memory)".to_string(),
-            facts: Vec::new(),
+            location: "(memory: nothing is saved)".to_string(),
+            facts: if lake_roots.is_empty() {
+                Vec::new()
+            } else {
+                vec![("lake roots".to_string(), roots())]
+            },
             live: None,
             import_formats,
         },
@@ -105,24 +83,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lake_locations_name_their_backend_without_secrets() {
-        assert_eq!(catalog_backend("postgres://u:p@h/db"), "Postgres");
-        assert_eq!(catalog_backend("sqlite:/x/cat.db"), "SQLite");
-        assert_eq!(catalog_backend("pink:/x/cat.pink"), "pinkdb (.pink file)");
-        let info = storage_info(
-            None,
-            Some("postgres://pink:hunter2@db/lake"),
-            Some("s3://bucket/lake"),
-            Some(std::sync::Arc::new(|| 7)),
-            vec![],
-        );
-        assert_eq!(info.mode, "lake");
-        assert!(!info.location.contains("hunter2"), "{}", info.location);
-        assert_eq!(info.facts[1].1, "s3://bucket/lake (S3)");
-        assert_eq!((info.live.unwrap())()[0].1, "7");
-        assert_eq!(
-            storage_info(None, None, None, None, vec![]).mode,
-            "in-memory"
-        );
+    fn storage_names_the_data_directory_or_memory() {
+        let base = std::env::temp_dir().join(format!("pinkdb_ui_storage_{}", std::process::id()));
+        let dir = crate::DataDir::prepare(&base).unwrap();
+        let info = storage_info(Some(&dir), &[], vec![]);
+        assert_eq!(info.mode, "durable");
+        assert_eq!(info.location, dir.root().display().to_string());
+        assert!(info.facts.iter().any(|(k, _)| k == "managed lakes"));
+        let info = storage_info(None, &[std::path::PathBuf::from("/srv/lakes")], vec![]);
+        assert_eq!(info.mode, "in-memory");
+        assert_eq!(info.facts[0].1, "/srv/lakes");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

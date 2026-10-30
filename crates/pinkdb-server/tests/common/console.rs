@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pinkdb_server::CatalogStore;
 use pinkdb_server::ui::{UiAuth, UiOptions, UiServer, storage_info};
+use pinkdb_server::{DataDir, lake_policy};
 use serde_json::{Value, json};
 
 /// A fresh directory under the system temp dir.
@@ -125,8 +125,13 @@ impl Session {
 
     /// Upload a CSV file into `table`.
     pub fn upload_csv(&self, table: &str, csv: &str) -> Value {
+        self.upload_csv_into("main", table, csv)
+    }
+
+    /// Upload a CSV file into `db.table`.
+    pub fn upload_csv_into(&self, db: &str, table: &str, csv: &str) -> Value {
         let (status, body) = self.post(
-            &format!("/api/upload?table={table}&name={table}.csv"),
+            &format!("/api/upload?db={db}&table={table}&name={table}.csv"),
             "application/octet-stream",
             csv.as_bytes(),
         );
@@ -135,27 +140,37 @@ impl Session {
     }
 }
 
-/// The console over a lake catalog: worksheet DDL/DML and an upload publish
-/// to the catalog; a reopen under a new lease sees them; the Storage panel
-/// names the backend and hides secrets.
+/// The console over a lake database (wave 124): worksheet DDL/DML and an
+/// upload into a lake database publish to its lake; a reopen of the data
+/// directory sees them; the catalog names the storage and hides secrets.
 pub fn lake_round_trip(catalog: &str, data: &str, backend: &str) {
-    let store = CatalogStore::open(catalog, data, "w121b console first")
-        .unwrap_or_else(|e| panic!("open {catalog}: {e}"));
-    let storage = storage_info(
-        None,
-        Some(catalog),
-        Some(data),
-        Some(store.version_reader()),
-        vec!["upload:csv".to_string()],
-    );
+    pink_lake::database::register();
+    let base = tempdir("console-data");
+    let dir = DataDir::prepare(&base).unwrap();
+    let open = || {
+        let opts = pinkdb::DurableOpenOptions {
+            lake_dir: Some(dir.lakes()),
+            ..pinkdb::DurableOpenOptions::default()
+        };
+        let db = pinkdb::Database::open_with_options(&dir.store().to_string_lossy(), opts)
+            .unwrap_or_else(|e| panic!("open the data directory: {e}"));
+        // The test's catalogs live in its own temporary directories.
+        db.set_lake_policy(Some(lake_policy(
+            Some(dir.lakes()),
+            vec![std::env::temp_dir().canonicalize().unwrap()],
+        )));
+        db
+    };
+    let db = open();
     let server = UiServer::bind(
         "127.0.0.1:0",
-        store.database(),
+        db.clone(),
         // These are storage tests: no sign-in (the default since wave 121d
         // asks for one).
         UiOptions {
-            storage,
+            storage: storage_info(Some(&dir), &[], vec!["upload:csv".to_string()]),
             auth: UiAuth::None,
+            scratch_dir: Some(dir.tmp()),
             ..UiOptions::default()
         },
     )
@@ -164,67 +179,60 @@ pub fn lake_round_trip(catalog: &str, data: &str, backend: &str) {
     let handle = server.spawn().unwrap();
     let session = Session::open(addr);
 
-    let before: u64 = session.get("/api/storage")["facts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|f| f["label"] == "lake version")
-        .and_then(|f| f["value"].as_str()?.parse().ok())
-        .unwrap_or(0);
+    session.scalar(&format!(
+        "CREATE DATABASE lk (TYPE LAKE, CATALOG '{catalog}', DATA '{data}'); SELECT 1"
+    ));
+    let version = |session: &Session| -> i64 {
+        session
+            .scalar("SELECT version FROM pinkdb_catalog() WHERE kind = 'DATABASE' AND name = 'lk'")
+            .parse()
+            .unwrap()
+    };
+    let before = version(&session);
     let rows: Vec<String> = (1..=40).map(|i| format!("({i}, 'row-{i}')")).collect();
     session.scalar(&format!(
-        "CREATE TABLE items (id INTEGER, name VARCHAR); \
-         INSERT INTO items VALUES {}; \
-         CREATE VIEW late AS SELECT id FROM items WHERE id > 35; SELECT 1",
+        "CREATE TABLE lk.items (id INTEGER, name VARCHAR); \
+         INSERT INTO lk.items VALUES {}; SELECT 1",
         rows.join(", ")
     ));
-    let upload = session.upload_csv("sales", "region,total\nnorth,10\nsouth,7.5\n");
+    let upload = session.upload_csv_into("lk", "sales", "region,total\nnorth,10\nsouth,7.5\n");
     assert_eq!(upload["rows"], 2);
-    assert_eq!(session.scalar("SELECT count(*) FROM items"), "40");
-
+    assert_eq!(session.scalar("SELECT count(*) FROM lk.items"), "40");
+    assert!(version(&session) > before, "the writes published");
+    assert_eq!(
+        session.scalar(
+            "SELECT storage || ' ' || status FROM pinkdb_catalog() \
+             WHERE kind = 'DATABASE' AND name = 'lk'"
+        ),
+        "lake ok"
+    );
+    let location = session
+        .scalar("SELECT location FROM pinkdb_catalog() WHERE kind = 'DATABASE' AND name = 'lk'");
+    assert!(
+        location.contains(backend) || backend.is_empty(),
+        "{location}"
+    );
+    assert!(!location.contains("password"), "{location}");
     let storage = session.get("/api/storage");
-    assert_eq!(storage["mode"], "lake", "{storage}");
-    let facts = storage["facts"].to_string();
-    assert!(facts.contains(backend), "{facts}");
-    let after: u64 = storage["facts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|f| f["label"] == "lake version")
-        .and_then(|f| f["value"].as_str()?.parse().ok())
-        .unwrap();
-    assert!(after > before, "the writes published: {before} → {after}");
-    // No password of the catalog location reaches the browser: a URL's
-    // `user:password@` shows as `user:***@`.
-    if let Some((scheme, rest)) = catalog.split_once("://")
-        && let Some((userinfo, host)) = rest.split_once('@')
-        && let Some((user, password)) = userinfo.split_once(':')
-        && !password.is_empty()
-    {
-        let location = storage["location"].as_str().unwrap();
-        assert!(
-            location.starts_with(&format!(
-                "{scheme}://{user}:***@{}",
-                host.split('/').next().unwrap()
-            )),
-            "{location}"
-        );
-        assert!(!location.contains(&format!(":{password}@")), "{location}");
-    }
+    assert_eq!(storage["mode"], "durable", "{storage}");
+    // Nothing the console staged stays behind.
+    assert_eq!(std::fs::read_dir(dir.tmp()).unwrap().count(), 0);
 
     handle.join();
-    drop(store);
+    db.close_lake_databases();
+    drop(db);
 
-    // A new server on the same catalog sees everything the console wrote.
-    let reopened = CatalogStore::open(catalog, data, "w121b console second")
-        .unwrap_or_else(|e| panic!("reopen {catalog}: {e}"));
-    let mut conn = reopened.database().connect();
+    // The data directory reopened: the lake database comes back with it.
+    let reopened = open();
+    let mut conn = reopened.connect();
     let out = conn
-        .execute("SELECT (SELECT count(*) FROM items), (SELECT count(*) FROM late), (SELECT sum(total) FROM sales)")
+        .execute("SELECT (SELECT count(*) FROM lk.items), (SELECT sum(total) FROM lk.sales)")
         .unwrap();
     let text = format!("{out:?}");
     assert!(
-        text.contains("Bigint(40)") && text.contains("Bigint(5)") && text.contains("17.5"),
+        text.contains("Bigint(40)") && text.contains("17.5"),
         "{text}"
     );
+    reopened.close_lake_databases();
+    let _ = std::fs::remove_dir_all(&base);
 }

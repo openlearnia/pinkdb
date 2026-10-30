@@ -83,7 +83,7 @@ fn free_port() -> u16 {
 }
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    in_memory_server()
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -141,7 +141,7 @@ fn async_transport_refuses_each_tls_flag_alone() {
 
 #[test]
 fn async_transport_without_tls_starts_and_serves() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+    let mut child = in_memory_server()
         .args(["--host", "127.0.0.1", "--port", "0", "--transport", "async"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -179,4 +179,12 @@ fn async_transport_without_tls_starts_and_serves() {
 
     child.kill().expect("kill server");
     let _ = child.wait();
+}
+
+/// The server binary, in memory (wave 124: without `--in-memory` it would
+/// keep its data in `./pinkdb-data` under the test's working directory).
+fn in_memory_server() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pinkdb-server"));
+    command.arg("--in-memory");
+    command
 }
