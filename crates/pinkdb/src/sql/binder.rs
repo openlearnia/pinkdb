@@ -10020,15 +10020,17 @@ fn bind_table_function(
 
 /// `pinkdb_catalog()`: one row per catalog object of the store (wave 121) —
 /// tables, views, materialized views, hash and vector indexes, triggers,
-/// macros and attached lake tables — for a catalog browser. DuckDB splits
+/// macros, procedures and attached lake tables — for a catalog browser. DuckDB splits
 /// this over `duckdb_tables()`, `duckdb_views()` and `duckdb_indexes()`; one
 /// relation keeps the console to one statement.
 ///
 /// Columns: `database`, `name`, `kind` (`TABLE`, `VIEW`, `MATERIALIZED VIEW`,
-/// `INDEX`, `TRIGGER`, `MACRO`, `LAKE TABLE`), `table_name` (the table an
-/// index or trigger belongs to), `detail` (index column and method, trigger
-/// timing, macro parameters, lake location). A logged-in session sees only the
-/// relations it may `SELECT`, and only those relations' indexes and triggers.
+/// `INDEX`, `TRIGGER`, `MACRO`, `PROCEDURE`, `LAKE TABLE`), `table_name` (the
+/// table an index or trigger belongs to), `detail` (index column and method,
+/// trigger timing, macro parameters, procedure parameters and language, lake
+/// location). A logged-in session sees only the relations it may `SELECT`,
+/// only those relations' indexes and triggers, and procedures only when it
+/// is an administrator (the one who may `CALL` them).
 fn bind_catalog(
     db: &PinkDb,
     binder: &Binder<'_>,
@@ -10057,6 +10059,9 @@ fn bind_catalog(
             crate::rbac::Privilege::Select,
         ),
     };
+    let may_call = principal
+        .as_deref()
+        .is_none_or(|p| db.rbac().is_admin_resolved(p));
     let text = |v: &str| BoundExpr::Literal(Value::Varchar(v.to_string()));
     let null = || BoundExpr::Literal(Value::Null);
     let mut rows: Vec<Vec<BoundExpr>> = Vec::new();
@@ -10143,6 +10148,26 @@ fn bind_catalog(
                 null(),
                 text(&def.parameter_names()),
             ]);
+        }
+        // Only a session that may `CALL` a procedure (an administrator) sees
+        // it: its body reaches anything the definer can.
+        if may_call {
+            for (_, def) in db.procedures_in(&dbname) {
+                let params: Vec<String> =
+                    def.params.iter().map(|(n, t)| format!("{n} {t}")).collect();
+                let detail = if params.is_empty() {
+                    def.language.name().to_string()
+                } else {
+                    format!("{} · {}", params.join(", "), def.language.name())
+                };
+                rows.push(vec![
+                    text(&dbname),
+                    text(&def.name),
+                    text("PROCEDURE"),
+                    null(),
+                    text(&detail),
+                ]);
+            }
         }
     }
     for (location, tables) in db.attached_lakes() {

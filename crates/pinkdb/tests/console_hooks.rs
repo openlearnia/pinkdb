@@ -98,6 +98,7 @@ fn the_catalog_relation_lists_objects_a_session_may_read() {
             "CREATE TABLE open (y INTEGER); CREATE VIEW open_v AS SELECT y FROM open; \
              CREATE INDEX big_x ON big(x); CREATE INDEX open_y ON open(y); \
              CREATE MACRO plus1(a) AS a + 1; \
+             CREATE PROCEDURE add_y(v INTEGER) AS $$ BEGIN INSERT INTO open VALUES (v); END $$; \
              CREATE USER bob PASSWORD 'pw'; GRANT SELECT ON TABLE main.open TO bob",
         )
         .unwrap();
@@ -127,6 +128,7 @@ fn the_catalog_relation_lists_objects_a_session_may_read() {
             "main|big_x|INDEX|big|x (hash)",
             "main|open_y|INDEX|open|y (hash)",
             "main|plus1|MACRO|NULL|a",
+            "main|add_y|PROCEDURE|NULL|v INTEGER · SQL",
             "main|big|TABLE|NULL|NULL",
             "main|open|TABLE|NULL|NULL",
             "main|open_v|VIEW|NULL|NULL",
@@ -145,6 +147,8 @@ fn the_catalog_relation_lists_objects_a_session_may_read() {
         "{seen:?}"
     );
     assert!(!seen.iter().any(|r| r.contains("big")), "{seen:?}");
+    // Only an administrator may CALL a procedure, so only one sees it.
+    assert!(!seen.iter().any(|r| r.contains("PROCEDURE")), "{seen:?}");
     assert!(
         db.connect()
             .execute("SELECT * FROM pinkdb_catalog('x')")

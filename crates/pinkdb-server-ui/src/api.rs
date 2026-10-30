@@ -28,7 +28,7 @@ use crate::store::Session;
 
 /// The schema name pinkdb's implicit schema carries (`pinkdb` has no schema
 /// layer: every database holds its relations in `main`).
-pub const DEFAULT_SCHEMA: &str = "main";
+pub const DEFAULT_SCHEMA: &str = pinkdb_server_ui_api::DEFAULT_SCHEMA;
 
 /// The default page size (bounded by [`crate::UiOptions::max_page_size`]).
 pub const DEFAULT_PAGE_SIZE: usize = 50;

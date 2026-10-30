@@ -2,6 +2,7 @@
 //! they ran. Every field is a signal (all `Copy`), so components take the
 //! whole [`App`] from context and read what they need.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use leptos::prelude::*;
@@ -212,6 +213,9 @@ pub struct App {
     pub import_open: RwSignal<bool>,
     /// Bumped when the access catalog changed (the Access panel reloads).
     pub access_epoch: RwSignal<u64>,
+    /// The catalog tree's nodes the user opened or closed, by node key: the
+    /// tree is rebuilt whenever the catalog reloads, and keeps them.
+    pub tree_open: StoredValue<HashMap<String, bool>>,
 }
 
 impl App {
@@ -245,7 +249,21 @@ impl App {
             insert: RwSignal::new(None),
             import_open: RwSignal::new(false),
             access_epoch: RwSignal::new(0),
+            tree_open: StoredValue::new(HashMap::new()),
         }
+    }
+
+    /// Is a catalog tree node open: as the user left it, else `default`.
+    pub fn tree_is_open(&self, key: &str, default: bool) -> bool {
+        self.tree_open
+            .with_value(|open| open.get(key).copied())
+            .unwrap_or(default)
+    }
+
+    /// Remember that the user opened or closed a catalog tree node.
+    pub fn remember_open(&self, key: &str, open: bool) {
+        self.tree_open
+            .update_value(|nodes| _ = nodes.insert(key.to_string(), open));
     }
 
     pub fn csrf(&self) -> String {
@@ -719,7 +737,17 @@ pub fn kind_icon(kind: &str) -> &'static str {
         "INDEX" => "index",
         "TRIGGER" => "bolt",
         "MACRO" => "function",
+        "PROCEDURE" => "code",
         _ => "table",
+    }
+}
+
+/// `n` and its noun, singular for one (`1 procedure`, `2 procedures`).
+pub fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
     }
 }
 
@@ -853,6 +881,8 @@ mod tests {
 
     #[test]
     fn counts_and_kinds_read_well() {
+        assert_eq!(plural(1, "procedure"), "1 procedure");
+        assert_eq!(plural(0, "macro"), "0 macros");
         assert_eq!(compact(25), "25");
         assert_eq!(compact(1_204), "1.2K");
         assert_eq!(compact(150_000), "150K");

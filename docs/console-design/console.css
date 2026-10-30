@@ -441,7 +441,8 @@ textarea.input { height: auto; min-height: 72px; padding: var(--sp-1_5) var(--sp
 .tree__row.is-selected .tree__kind { color: var(--accent-text); }
 .tree__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree__name--mono { font-family: var(--font-mono); font-size: var(--text-sm); }
-.tree__detail { color: var(--text-subtle); font-size: var(--text-xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tree__detail { color: var(--text-subtle); font-size: var(--text-xs); font-variant-numeric: tabular-nums; white-space: nowrap;
+  max-width: 50%; overflow: hidden; text-overflow: ellipsis; }
 .tree__actions { display: none; gap: 0; }
 .tree__row:hover .tree__actions, .tree__row:focus-within .tree__actions { display: inline-flex; }
 .tree__row:hover .tree__detail { display: none; }

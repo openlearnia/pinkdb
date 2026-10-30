@@ -9,6 +9,21 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 121f — the catalog tree by schema and kind ✅
+
+- The console's catalog reads like a warehouse's: **database → schema →
+  Tables, Views, Indexes, Triggers, Procedures, Macros… → objects →
+  columns**. Each folder shows its count; Tables, Views, Triggers and
+  Procedures are always there (empty ones say so), the rest appear once a
+  schema holds one. pinkdb has one schema per database, `main`.
+- The tree remembers what you opened and closed across refreshes; a filter
+  opens the path down to every match.
+- **Stored procedures are in the catalog**: `pinkdb_catalog()` lists them
+  (kind `PROCEDURE`, detail = parameters and language) to administrators,
+  the only users who may `CALL` one. A procedure or macro has its own page
+  (database, schema, signature, how to use it), and an object's breadcrumb
+  names its schema.
+
 ### Wave 121e — internal state in its own store ✅
 
 - The console's worksheets, run history and credentials, the agent's

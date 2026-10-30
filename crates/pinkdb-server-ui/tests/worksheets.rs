@@ -776,7 +776,13 @@ fn a_query_exports_as_csv_or_json() {
 
 #[test]
 fn the_catalog_lists_views_indexes_and_column_stats() {
-    let console = start(store(), options());
+    let db = store();
+    db.connect()
+        .execute(
+            "CREATE PROCEDURE add_t(v INTEGER) AS $$ BEGIN INSERT INTO t VALUES (v, 'p'); END $$",
+        )
+        .unwrap();
+    let console = start(db, options());
     let client = login(console.addr, json!({})).unwrap();
     let catalog = client.get("/api/catalog").json();
     let objects = catalog["objects"].as_array().unwrap();
@@ -792,6 +798,12 @@ fn the_catalog_lists_views_indexes_and_column_stats() {
     assert_eq!(index["kind"], "INDEX");
     assert_eq!(index["table_name"], "t");
     assert_eq!(catalog["current"], "main");
+    // Every object names its schema (one per database), and procedures are
+    // listed with their signature.
+    assert!(objects.iter().all(|o| o["schema"] == "main"), "{objects:?}");
+    let procedure = find("add_t");
+    assert_eq!(procedure["kind"], "PROCEDURE");
+    assert_eq!(procedure["detail"], "v INTEGER · SQL");
 }
 
 #[test]

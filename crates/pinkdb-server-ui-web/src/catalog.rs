@@ -8,7 +8,9 @@ use pinkdb_server_ui_api::{CatalogObject, QueryRequest, QueryResponse, Statement
 use crate::api;
 use crate::explorer::{GROUPS, lake_sql, preview, preview_sql};
 use crate::icon::Icon;
-use crate::state::{App, Section, Tone, count, is_relation, kind_icon, kind_label, numeric};
+use crate::state::{
+    App, Section, Tone, count, is_relation, kind_icon, kind_label, numeric, plural,
+};
 use crate::ui::{Callout, Empty};
 
 #[component]
@@ -144,7 +146,7 @@ fn DatabasePage() -> impl IntoView {
                         <div class="card metric">
                             <span class="overline">"Tables"</span>
                             <span class="metric__value">{of("TABLE")}</span>
-                            <span class="metric__caption">{format!("{} lake tables", of("LAKE TABLE"))}</span>
+                            <span class="metric__caption">{plural(of("LAKE TABLE"), "lake table")}</span>
                         </div>
                         <div class="card metric">
                             <span class="overline">"Views"</span>
@@ -159,7 +161,9 @@ fn DatabasePage() -> impl IntoView {
                         <div class="card metric">
                             <span class="overline">"Indexes and triggers"</span>
                             <span class="metric__value">{of("INDEX") + of("TRIGGER")}</span>
-                            <span class="metric__caption">{format!("{} macros", of("MACRO"))}</span>
+                            <span class="metric__caption">
+                                {format!("{} · {}", plural(of("PROCEDURE"), "procedure"), plural(of("MACRO"), "macro"))}
+                            </span>
                         </div>
                     </div>
                     <div class="card card--flush">{table}</div>
@@ -180,6 +184,8 @@ enum Tab {
 fn ObjectPage(object: CatalogObject) -> impl IntoView {
     let app = expect_context::<App>();
     let relation = is_relation(&object.kind);
+    // A procedure or macro stands alone: no columns, no dependents.
+    let routine = object.table_name.is_none() && !relation;
     let tab = RwSignal::new(if relation {
         Tab::Columns
     } else {
@@ -352,6 +358,9 @@ fn ObjectPage(object: CatalogObject) -> impl IntoView {
                         {object.database.clone()}
                     </button>
                     <span class="crumbs__sep">"›"</span>
+                    <Icon name="schema" size=14 />
+                    {object.schema.clone()}
+                    <span class="crumbs__sep">"›"</span>
                     {group}
                     <span class="crumbs__sep">"›"</span>
                     <span class="mono">{object.name.clone()}</span>
@@ -391,14 +400,42 @@ fn ObjectPage(object: CatalogObject) -> impl IntoView {
                             </div>
                         }
                     })}
-                <div class="card card--flush">
-                    <div class="tabs" role="tablist">
-                        {relation.then(|| tab_button("Columns".to_string(), Tab::Columns))}
-                        {relation.then(|| tab_button("Preview".to_string(), Tab::Preview))}
-                        {tab_button(format!("Indexes and triggers · {n_deps}"), Tab::Dependents)}
-                    </div>
-                    {body}
-                </div>
+                {if routine {
+                    let (what, usage) = if object.kind == "PROCEDURE" {
+                        ("Parameters and language", "Run it with CALL (administrators).")
+                    } else {
+                        ("Parameters", "Use it like a function in any query.")
+                    };
+                    view! {
+                        <div class="card">
+                            <div class="card__body card__body--kv">
+                            <dl class="kv">
+                                <dt>"Database"</dt>
+                                <dd class="mono">{object.database.clone()}</dd>
+                                <dt>"Schema"</dt>
+                                <dd class="mono">{object.schema.clone()}</dd>
+                                <dt>{what}</dt>
+                                <dd class="mono">{object.detail.clone().filter(|d| !d.is_empty()).unwrap_or_else(|| "—".to_string())}</dd>
+                                <dt>"Usage"</dt>
+                                <dd>{usage}</dd>
+                            </dl>
+                            </div>
+                        </div>
+                    }
+                        .into_any()
+                } else {
+                    view! {
+                        <div class="card card--flush">
+                            <div class="tabs" role="tablist">
+                                {relation.then(|| tab_button("Columns".to_string(), Tab::Columns))}
+                                {relation.then(|| tab_button("Preview".to_string(), Tab::Preview))}
+                                {tab_button(format!("Indexes and triggers · {n_deps}"), Tab::Dependents)}
+                            </div>
+                            {body}
+                        </div>
+                    }
+                        .into_any()
+                }}
             </div>
         </div>
     }

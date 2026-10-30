@@ -808,6 +808,7 @@ pub async fn catalog(
         .into_iter()
         .map(|row| CatalogObject {
             database: text(&row, 0).unwrap_or_default(),
+            schema: crate::api::DEFAULT_SCHEMA.to_string(),
             name: text(&row, 1).unwrap_or_default(),
             kind: text(&row, 2).unwrap_or_default(),
             table_name: text(&row, 3),

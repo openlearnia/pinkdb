@@ -51,10 +51,12 @@ agent.
 - **Cancel.** A running query stops at its next chunk boundary (the same
   checkpoints as the statement timeout), so a cancelled statement fails
   before any write-back.
-- **Catalog.** Databases with their tables, views, materialized views,
-  indexes (hash and HNSW), triggers, macros and attached lake tables, each
-  table's columns with types and statistics (NULLs, distinct estimate,
-  min … max). Click a name to insert it; ▶ previews 100 rows; ⏱ on a lake
+- **Catalog.** A tree of databases → schemas (one per database, `main`) →
+  folders per kind (tables, views, materialized views, lake tables, indexes
+  (hash and HNSW), triggers, procedures — administrators only — and macros)
+  → objects → each table's columns with types and statistics (NULLs,
+  distinct estimate, min … max). The tree keeps what you opened across
+  refreshes. Click a name to insert it; ▶ previews 100 rows; ⏱ on a lake
   table opens time travel (`AT (VERSION => n)`) and `lake_changes(…)`.
 - **History.** Every run, newest first (status, timing, row count); click
   one to reopen its SQL.

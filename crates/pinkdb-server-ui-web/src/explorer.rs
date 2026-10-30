@@ -1,9 +1,11 @@
 //! The explorer beside the Query and Catalog workspaces: the catalog tree
-//! (databases → kinds → objects → columns) and the saved worksheets.
+//! (databases → schemas → kinds → objects → columns) and the saved
+//! worksheets.
 
 use leptos::prelude::*;
 use pinkdb_server_ui_api::sql::{quote_ident, quote_string};
-use pinkdb_server_ui_api::{CatalogObject, DeleteWorksheet, Worksheet};
+use pinkdb_server_ui_api::{CatalogObject, DEFAULT_SCHEMA, DeleteWorksheet, Worksheet};
+use wasm_bindgen::JsCast;
 
 use crate::api;
 use crate::app::Drag;
@@ -19,8 +21,49 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("LAKE TABLE", "Lake tables"),
     ("INDEX", "Indexes"),
     ("TRIGGER", "Triggers"),
+    ("PROCEDURE", "Procedures"),
     ("MACRO", "Macros"),
 ];
+
+/// The kinds a schema always shows a folder for, even empty; the others
+/// appear once the schema holds one.
+pub const ALWAYS: &[&str] = &["TABLE", "VIEW", "TRIGGER", "PROCEDURE"];
+
+/// The key a catalog tree node remembers its open state under.
+pub fn node_key(path: &[&str]) -> String {
+    path.iter()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+}
+
+/// The schemas the tree shows for a database, in order: those its objects
+/// name, or the default one for a database with none.
+pub fn schemas_of<'a>(objects: impl Iterator<Item = &'a CatalogObject>) -> Vec<String> {
+    let mut schemas: Vec<String> = objects.map(|o| o.schema.clone()).collect();
+    schemas.sort_by_key(|s| s.to_ascii_lowercase());
+    schemas.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    if schemas.is_empty() {
+        schemas.push(DEFAULT_SCHEMA.to_string());
+    }
+    schemas
+}
+
+/// Remember a node the user opened or closed (not while a filter forces the
+/// tree open).
+fn remember(app: App, key: String, filter: RwSignal<String>) -> impl Fn(web_sys::Event) + 'static {
+    move |ev: web_sys::Event| {
+        if !filter.get_untracked().is_empty() {
+            return;
+        }
+        if let Some(details) = ev
+            .current_target()
+            .and_then(|t| t.dyn_into::<web_sys::HtmlDetailsElement>().ok())
+        {
+            app.remember_open(&key, details.open());
+        }
+    }
+}
 
 /// The SQL that previews a relation.
 pub fn preview_sql(object: &CatalogObject) -> String {
@@ -197,6 +240,7 @@ fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
     let app = expect_context::<App>();
     move || {
         let needle = filter.get().to_ascii_lowercase();
+        let filtering = !needle.is_empty();
         let catalog = app.catalog.get();
         let current = app.db.get();
         if catalog.databases.is_empty() {
@@ -221,35 +265,80 @@ fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
                     })
                     .cloned()
                     .collect();
-                if !needle.is_empty() && objects.is_empty() {
+                if filtering && objects.is_empty() {
                     return ().into_any();
                 }
                 any = true;
                 let is_current = db.eq_ignore_ascii_case(&current);
-                let open = is_current || !needle.is_empty();
-                let groups = GROUPS
-                    .iter()
-                    .filter_map(|(kind, label)| {
-                        let members: Vec<CatalogObject> =
-                            objects.iter().filter(|o| o.kind == *kind).cloned().collect();
-                        (!members.is_empty()).then(|| {
-                            let n = members.len();
-                            let items = members
-                                .into_iter()
-                                .map(|object| view! { <ObjectItem object filter=needle.clone() /> })
-                                .collect_view();
-                            view! {
-                                <li class="tree__group overline depth-1">{format!("{label} · {n}")}</li>
-                                {items}
-                            }
-                        })
+                let schemas = schemas_of(objects.iter())
+                    .into_iter()
+                    .map(|schema| {
+                        let in_schema: Vec<&CatalogObject> = objects
+                            .iter()
+                            .filter(|o| o.schema.eq_ignore_ascii_case(&schema))
+                            .collect();
+                        let n_objects = in_schema.len();
+                        let folders = GROUPS
+                            .iter()
+                            .filter_map(|(kind, label)| {
+                                let members: Vec<CatalogObject> = in_schema
+                                    .iter()
+                                    .filter(|o| o.kind == *kind)
+                                    .map(|o| (*o).clone())
+                                    .collect();
+                                if members.is_empty() && (filtering || !ALWAYS.contains(kind)) {
+                                    return None;
+                                }
+                                let n = members.len();
+                                let key = node_key(&[db, &schema, kind]);
+                                let open = filtering || app.tree_is_open(&key, is_current && *kind == "TABLE");
+                                let items = if members.is_empty() {
+                                    view! { <li class="tree__empty depth-3">"None"</li> }.into_any()
+                                } else {
+                                    members
+                                        .into_iter()
+                                        .map(|object| view! { <ObjectItem object filter /> })
+                                        .collect_view()
+                                        .into_any()
+                                };
+                                Some(view! {
+                                    <li>
+                                        <details open=open on:toggle=remember(app, key, filter)>
+                                            <summary class="tree__row depth-2" title=format!("{label} in {db}.{schema}")>
+                                                <Icon name="chevron-right" class="tree__chev" />
+                                                <Icon name=kind_icon(kind) class="tree__kind" />
+                                                <span class="tree__name">{*label}</span>
+                                                <span class="tree__detail">{n}</span>
+                                            </summary>
+                                            <ul>{items}</ul>
+                                        </details>
+                                    </li>
+                                })
+                            })
+                            .collect_view();
+                        let key = node_key(&[db, &schema]);
+                        let open = filtering || app.tree_is_open(&key, is_current);
+                        view! {
+                            <li>
+                                <details open=open on:toggle=remember(app, key, filter)>
+                                    <summary class="tree__row depth-1" title=format!("Schema {db}.{schema}")>
+                                        <Icon name="chevron-right" class="tree__chev" />
+                                        <Icon name="schema" class="tree__kind" />
+                                        <span class="tree__name">{schema.clone()}</span>
+                                        <span class="tree__detail">{n_objects}</span>
+                                    </summary>
+                                    <ul>{folders}</ul>
+                                </details>
+                            </li>
+                        }
                     })
                     .collect_view();
                 let db_name = db.clone();
-                let empty = objects.is_empty();
+                let key = node_key(&[db]);
+                let open = filtering || app.tree_is_open(&key, is_current);
                 view! {
                     <li>
-                        <details open=open>
+                        <details open=open on:toggle=remember(app, key, filter)>
                             <summary class="tree__row" title=format!("Database {db}")>
                                 <Icon name="chevron-right" class="tree__chev" />
                                 <Icon name="database" class="tree__kind" />
@@ -275,10 +364,7 @@ fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
                                         .into_any()
                                 }}
                             </summary>
-                            <ul>
-                                {groups}
-                                {empty.then(|| view! { <li class="tree__empty depth-1">"No objects yet"</li> })}
-                            </ul>
+                            <ul>{schemas}</ul>
                         </details>
                     </li>
                 }
@@ -294,8 +380,9 @@ fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
 }
 
 #[component]
-fn ObjectItem(object: CatalogObject, filter: String) -> impl IntoView {
+fn ObjectItem(object: CatalogObject, filter: RwSignal<String>) -> impl IntoView {
     let app = expect_context::<App>();
+    let needle = filter.get_untracked().to_ascii_lowercase();
     let relation = is_relation(&object.kind);
     let name = object.name.clone();
     let detail = match (&object.table_name, &object.detail) {
@@ -323,7 +410,7 @@ fn ObjectItem(object: CatalogObject, filter: String) -> impl IntoView {
         return view! {
             <li>
                 <div
-                    class="tree__row depth-1"
+                    class="tree__row depth-3"
                     class:is-selected=selected
                     title=title
                     tabindex="0"
@@ -368,7 +455,7 @@ fn ObjectItem(object: CatalogObject, filter: String) -> impl IntoView {
             view! {
                 <li>
                     <div
-                        class="tree__row depth-2"
+                        class="tree__row depth-4"
                         title=stats.join(" · ")
                         on:click=move |_| app.insert.set(Some(column.clone()))
                     >
@@ -381,17 +468,22 @@ fn ObjectItem(object: CatalogObject, filter: String) -> impl IntoView {
             }
         })
         .collect_view();
-    // A filter that matched a column opens the table to show it.
-    let open = !filter.is_empty()
-        && !object.name.to_ascii_lowercase().contains(&filter)
-        && object
-            .columns
-            .iter()
-            .any(|c| c.name.to_ascii_lowercase().contains(&filter));
+    // A filter that matched a column opens the table to show it; otherwise
+    // the table is as the user left it.
+    let key = node_key(&[&object.database, &object.schema, &object.kind, &object.name]);
+    let open = if needle.is_empty() {
+        app.tree_is_open(&key, false)
+    } else {
+        !object.name.to_ascii_lowercase().contains(&needle)
+            && object
+                .columns
+                .iter()
+                .any(|c| c.name.to_ascii_lowercase().contains(&needle))
+    };
     view! {
         <li>
-            <details open=open>
-                <summary class="tree__row depth-1" title=title>
+            <details open=open on:toggle=remember(app, key, filter)>
+                <summary class="tree__row depth-3" title=title>
                     <Icon name="chevron-right" class="tree__chev" />
                     <Icon name=icon class="tree__kind" />
                     <span class="tree__name tree__name--mono">{name}</span>
@@ -619,5 +711,48 @@ fn WorksheetList(filter: RwSignal<String>) -> impl IntoView {
                 })}
         }
         .into_any()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(schema: &str, name: &str) -> CatalogObject {
+        CatalogObject {
+            database: "main".to_string(),
+            schema: schema.to_string(),
+            name: name.to_string(),
+            kind: "TABLE".to_string(),
+            table_name: None,
+            detail: None,
+            rows: None,
+            columns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn node_keys_ignore_case_and_keep_parts_apart() {
+        assert_eq!(node_key(&["Sales", "MAIN"]), node_key(&["sales", "main"]));
+        assert_ne!(node_key(&["a", "bc"]), node_key(&["ab", "c"]));
+    }
+
+    #[test]
+    fn a_database_shows_its_schemas_or_the_default_one() {
+        assert_eq!(schemas_of(std::iter::empty()), vec![DEFAULT_SCHEMA]);
+        let objects = [
+            object("main", "t"),
+            object("MAIN", "u"),
+            object("audit", "v"),
+        ];
+        assert_eq!(schemas_of(objects.iter()), vec!["audit", "main"]);
+    }
+
+    #[test]
+    fn every_kind_has_a_folder() {
+        for kind in ALWAYS {
+            assert!(GROUPS.iter().any(|(k, _)| k == kind), "{kind}");
+        }
+        assert!(GROUPS.iter().any(|(k, _)| *k == "PROCEDURE"));
     }
 }
