@@ -1,0 +1,15 @@
+[package]
+name = "pinkdb-server-ui-api"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "The warehouse console's wire types and SQL helpers, shared by the server and the browser app (wave 121)"
+license = "MIT"
+
+[dependencies]
+# Serde only: this crate is compiled for the server and for wasm32 (the
+# console's Leptos app), so it carries nothing either side does not need.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

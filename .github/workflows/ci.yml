@@ -311,6 +311,16 @@ jobs:
           bash website/tools/build-wasm.sh
           node website/tools/wasm-smoke.mjs
 
+      # The console's browser app (wave 121) is outside the workspace and
+      # embedded prebuilt (crates/pinkdb-server-ui/web-dist); the workspace
+      # tests check that build is fresh. Here: it still compiles, lints clean
+      # and its unit tests (and the shared API crate's) pass.
+      - name: console app (Leptos, wasm32) — clippy + tests
+        working-directory: crates/pinkdb-server-ui-web
+        run: |
+          cargo clippy --target wasm32-unknown-unknown -- -D warnings
+          cargo test
+
   # The release CLI the duckdiff job consumes. It runs in parallel with the
   # test/clippy jobs instead of at the end of a serial mega-job.
   release-cli:

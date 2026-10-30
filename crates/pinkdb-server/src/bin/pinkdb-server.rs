@@ -159,6 +159,22 @@ struct Args {
     /// `--ui-max-page-size N`: the console's page-size bound.
     #[cfg(feature = "ui")]
     ui_max_page_size: usize,
+    /// `--ui-read-only`: worksheets run only queries, whatever the grants.
+    #[cfg(feature = "ui")]
+    ui_read_only: bool,
+    /// `--ui-allowed-host NAME` (repeatable): extra `Host` names.
+    #[cfg(feature = "ui")]
+    ui_allowed_hosts: Vec<String>,
+    /// `--agent-allow-writes`: the console's agent may write (under the
+    /// user's grants).
+    #[cfg(feature = "ui")]
+    agent_allow_writes: bool,
+    /// `--agent-extension PATH`: load the data agent for the console's ask box.
+    agent_extension: Option<String>,
+    /// `--memory-extension PATH`: load the agent memory.
+    memory_extension: Option<String>,
+    /// `--memory-distill-every SECS`: drain the memory queue on an interval.
+    memory_distill_every: Option<u64>,
 }
 
 fn usage() -> &'static str {
@@ -227,7 +243,8 @@ fn usage() -> &'static str {
      \x20                        defined this is required, and PINKDB_MCP_PASSWORD\n\
      \x20                        holds its password (an unauthenticated bridge would\n\
      \x20                        bypass the store's authentication)\n\
-     \x20 --enable-ui           serve the read-only warehouse browsing console (wave 78);\n\
+     \x20 --enable-ui           serve the warehouse console: catalog browser, SQL\n\
+     \x20                        worksheets and the ask box (waves 78, 121);\n\
      \x20                        needs a build with the `ui` feature; off by default\n\
      \x20 --ui-host HOST        the console's bind address (default 127.0.0.1; a\n\
      \x20                        non-loopback address is refused: the console has no\n\
@@ -241,6 +258,18 @@ fn usage() -> &'static str {
      \x20 --ui-workers N        the console's runtime threads (default 4)\n\
      \x20 --ui-max-connections N  the console's concurrent connections (default 64)\n\
      \x20 --ui-max-page-size N  the console's row-preview page-size bound (default 500)\n\
+     \x20 --ui-read-only        worksheets run only queries (SELECT, EXPLAIN, DESCRIBE,\n\
+     \x20                        SHOW, USE) for every user, whatever their grants\n\
+     \x20 --ui-allowed-host NAME  another Host name the console answers to (a reverse\n\
+     \x20                        proxy's); loopback names and the bind address always are\n\
+     \x20 --agent-extension PATH  load the data agent (libpinkdb_agent) for the console's\n\
+     \x20                        ask box; the provider and its key come from this\n\
+     \x20                        process's environment and never reach the browser\n\
+     \x20 --agent-allow-writes  let the console's agent write (under the user's grants;\n\
+     \x20                        never with --ui-read-only)\n\
+     \x20 --memory-extension PATH  load the agent memory (libpinkdb_memory)\n\
+     \x20 --memory-distill-every SECS  drain the memory distillation queue on this\n\
+     \x20                        interval, as each owner (off by default)\n\
      \n\
      \x20 --health-check [HOST:PORT]  one-shot liveness probe: connect, send Ping, and\n\
      \x20                        exit 0 (healthy) or 1 (unhealthy). Without an address it\n\
@@ -257,11 +286,12 @@ fn usage() -> &'static str {
      the transport (it identifies the server, not clients). Keep the bind\n\
      address on localhost or a trusted network until the store has users.\n\
      \n\
-     The warehouse console (--enable-ui) is read-only: it has no DML and no\n\
-     DDL endpoint. It binds 127.0.0.1 by default and refuses any other\n\
-     address (it has no TLS of its own). A store with users is never served\n\
-     unauthenticated: start it with --ui-auth basic or --ui-token. Serving a\n\
-     store without users prints a loud warning."
+     The warehouse console (--enable-ui) runs SQL worksheets as the logged-in\n\
+     user (their grants apply; --ui-read-only limits everyone to queries). It\n\
+     binds 127.0.0.1 by default and refuses any other address (it has no TLS\n\
+     of its own). A store with users is never served unauthenticated: start\n\
+     it with --ui-auth basic or --ui-token. Serving a store without users\n\
+     prints a loud warning."
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -304,6 +334,15 @@ fn parse_args() -> Result<Args, String> {
         ui_max_connections: DEFAULT_UI_MAX_CONNECTIONS,
         #[cfg(feature = "ui")]
         ui_max_page_size: DEFAULT_UI_MAX_PAGE_SIZE,
+        #[cfg(feature = "ui")]
+        ui_read_only: false,
+        #[cfg(feature = "ui")]
+        ui_allowed_hosts: Vec::new(),
+        #[cfg(feature = "ui")]
+        agent_allow_writes: false,
+        agent_extension: None,
+        memory_extension: None,
+        memory_distill_every: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -523,6 +562,49 @@ fn parse_args() -> Result<Args, String> {
                     let _ = raw;
                     return Err(ui_feature_missing());
                 }
+            }
+            "--ui-read-only" => {
+                #[cfg(feature = "ui")]
+                {
+                    args.ui_read_only = true;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--ui-allowed-host" => {
+                let raw = value("--ui-allowed-host")?;
+                #[cfg(feature = "ui")]
+                {
+                    args.ui_allowed_hosts.push(raw);
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    let _ = raw;
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--agent-allow-writes" => {
+                #[cfg(feature = "ui")]
+                {
+                    args.agent_allow_writes = true;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--agent-extension" => args.agent_extension = Some(value("--agent-extension")?),
+            "--memory-extension" => args.memory_extension = Some(value("--memory-extension")?),
+            "--memory-distill-every" => {
+                let raw = value("--memory-distill-every")?;
+                args.memory_distill_every = Some(
+                    raw.parse()
+                        .ok()
+                        .filter(|n: &u64| *n > 0)
+                        .ok_or_else(|| format!("invalid --memory-distill-every value {raw:?}"))?,
+                );
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -935,8 +1017,41 @@ fn main() -> ExitCode {
         (None, None) => "in-memory".to_string(),
     };
 
-    // The warehouse browsing console (wave 78): opt-in, read-only, loopback
-    // by default. A configuration the exposure policy refuses stops the
+    // The agent and its memory (wave 121): loaded into the served store for
+    // the console's ask box and the distillation worker. A library that does
+    // not load stops the server: the operator asked for it.
+    for (flag, path) in [
+        ("--agent-extension", &args.agent_extension),
+        ("--memory-extension", &args.memory_extension),
+    ] {
+        if let Some(path) = path
+            && let Err(e) = db.load_extension(path)
+        {
+            eprintln!("Error: {flag} {path:?} could not be loaded: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let _memory_worker = match args.memory_distill_every {
+        Some(secs) => {
+            if args.memory_extension.is_none() {
+                eprintln!("Error: --memory-distill-every needs --memory-extension");
+                return ExitCode::from(2);
+            }
+            match pinkdb_server::memory_worker::MemoryWorker::spawn(
+                db.clone(),
+                Duration::from_secs(secs),
+            ) {
+                Ok(worker) => Some(worker),
+                Err(e) => {
+                    eprintln!("Error: cannot start the memory worker: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+
+    // The warehouse console (waves 78, 121): opt-in, loopback by default. A configuration the exposure policy refuses stops the
     // server: the operator asked for the console, so running without it
     // would be a silent downgrade.
     #[cfg(feature = "ui")]
@@ -1066,7 +1181,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Start the read-only warehouse browsing console (wave 78).
+/// Start the warehouse console (waves 78 and 121).
 #[cfg(feature = "ui")]
 fn start_ui(args: &Args, db: &Database) -> Result<pinkdb_server::ui::UiHandle, String> {
     use pinkdb_server::ui::{UiAuth, UiOptions, UiServer};
@@ -1080,6 +1195,9 @@ fn start_ui(args: &Args, db: &Database) -> Result<pinkdb_server::ui::UiHandle, S
         max_connections: args.ui_max_connections,
         max_page_size: args.ui_max_page_size,
         auth,
+        read_only: args.ui_read_only,
+        allowed_hosts: args.ui_allowed_hosts.clone(),
+        agent_allow_writes: args.agent_allow_writes,
         ..UiOptions::default()
     };
     let server = UiServer::bind((args.ui_host.as_str(), args.ui_port), db.clone(), opts)
@@ -1088,7 +1206,14 @@ fn start_ui(args: &Args, db: &Database) -> Result<pinkdb_server::ui::UiHandle, S
     let handle = server
         .spawn()
         .map_err(|e| format!("cannot start the warehouse console: {e}"))?;
-    println!("pinkdb-server: warehouse console on http://{addr} (read-only)");
+    println!(
+        "pinkdb-server: warehouse console on http://{addr} ({})",
+        if args.ui_read_only {
+            "read-only worksheets"
+        } else {
+            "worksheets"
+        }
+    );
     Ok(handle)
 }
 

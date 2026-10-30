@@ -41,8 +41,9 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{ConnectInfo, DefaultBodyLimit};
 use axum::http::{StatusCode, header};
+use axum::middleware;
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -54,10 +55,15 @@ use tokio::sync::{Semaphore, watch};
 use tower_service::Service;
 
 use crate::api;
+use crate::ask;
 use crate::assets;
 use crate::auth::AuthState;
+use crate::book::Book;
 use crate::policy::{ConsoleTls, UiAuth, UiError, check_auth_policy, check_bind_policy};
+use crate::security;
+use crate::sessions::Sessions;
 use crate::store::Session;
+use crate::work;
 
 /// Maximum number of request headers (hyper's HTTP/1.1 builder).
 pub const MAX_HEADERS: usize = 64;
@@ -101,6 +107,45 @@ pub struct UiOptions {
     pub max_result_bytes: usize,
     /// How the console authenticates its requests.
     pub auth: UiAuth,
+    /// `--ui-read-only`: worksheets run only queries (`SELECT`, `EXPLAIN`,
+    /// `DESCRIBE`, `SHOW`, `USE`) for everyone, whatever their grants, and
+    /// the agent never writes.
+    pub read_only: bool,
+    /// The per-statement deadline of a worksheet statement.
+    pub query_timeout: Duration,
+    /// The bytes a worksheet statement may materialize (the engine's cap; a
+    /// worksheet has no row cap, the grid shows [`Self::max_shown_rows`]).
+    pub query_max_bytes: usize,
+    /// The rows of one result the browser gets; the rest is counted, and
+    /// [`Self::max_export_rows`] bounds a download.
+    pub max_shown_rows: usize,
+    /// The rows an export (CSV/JSON download) may hold.
+    pub max_export_rows: usize,
+    /// Worksheet runs one session may have running at once.
+    pub session_queries: usize,
+    /// A session ends after this long without a request.
+    pub session_idle: Duration,
+    /// A session ends this long after its login in any case.
+    pub session_lifetime: Duration,
+    /// The most live sessions; the least recently used one makes room.
+    pub max_sessions: usize,
+    /// The deadline of a connection that runs worksheet SQL or an agent run
+    /// (the whole connection: request, work, response). Every other
+    /// connection has [`Self::request_timeout`].
+    pub long_request_timeout: Duration,
+    /// Extra `Host` names the console answers to (a reverse proxy's name).
+    /// Loopback names and the bind address are always allowed.
+    pub allowed_hosts: Vec<String>,
+    /// Mark the session cookie `Secure` (set when the console is served
+    /// over TLS).
+    pub secure_cookies: bool,
+    /// Let worksheet statements call host scalars that reach an external
+    /// service (wave 107c's `embed()`). Off by default.
+    pub allow_external_services: bool,
+    /// `--agent-allow-writes`: the agent's statements may write (still under
+    /// the user's grants, never the transcript database, and never with
+    /// [`Self::read_only`]).
+    pub agent_allow_writes: bool,
 }
 
 impl Default for UiOptions {
@@ -111,12 +156,26 @@ impl Default for UiOptions {
             max_connections: 64,
             read_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),
-            max_body_bytes: 64 * 1024,
+            max_body_bytes: 1024 * 1024,
             max_page_size: 500,
             statement_timeout: Duration::from_secs(30),
             max_result_rows: 1_000,
             max_result_bytes: 16 * 1024 * 1024,
             auth: UiAuth::None,
+            read_only: false,
+            query_timeout: Duration::from_secs(300),
+            query_max_bytes: 512 * 1024 * 1024,
+            max_shown_rows: 10_000,
+            max_export_rows: 1_000_000,
+            session_queries: 2,
+            session_idle: Duration::from_secs(30 * 60),
+            session_lifetime: Duration::from_secs(12 * 60 * 60),
+            max_sessions: 256,
+            long_request_timeout: Duration::from_secs(15 * 60),
+            allowed_hosts: Vec::new(),
+            secure_cookies: false,
+            allow_external_services: false,
+            agent_allow_writes: false,
         }
     }
 }
@@ -164,27 +223,48 @@ pub(crate) struct Shared {
     pub auth: AuthState,
     /// The engine limits.
     exec_limits: ExecLimits,
-    /// The pooled sessions (each remembers the database it browses).
-    sessions: Mutex<Vec<Session>>,
+    /// The pooled browsing connections (each remembers the database it
+    /// browses).
+    pool: Mutex<Vec<Session>>,
+    /// The login sessions (wave 121).
+    pub sessions: Sessions,
+    /// Worksheet and history storage.
+    pub book: Book,
+    /// The last provider list the agent answered (it cannot answer while a
+    /// run holds it).
+    pub agent_providers: Mutex<Option<serde_json::Value>>,
+    /// The address the console is bound to (the `Host` check allows it).
+    bind: SocketAddr,
 }
 
 impl Shared {
-    fn new(db: Database, opts: UiOptions) -> Self {
+    fn new(db: Database, opts: UiOptions, bind: SocketAddr) -> Self {
         let exec_limits = opts.exec_limits();
         let auth = AuthState::new(opts.auth.clone());
+        let sessions = Sessions::new(opts.session_idle, opts.session_lifetime, opts.max_sessions);
+        let book = Book::new(db.clone());
         Self {
             db,
             opts,
             auth,
             exec_limits,
-            sessions: Mutex::new(Vec::new()),
+            pool: Mutex::new(Vec::new()),
+            sessions,
+            book,
+            agent_providers: Mutex::new(None),
+            bind,
         }
+    }
+
+    /// The IP address the console is bound to.
+    pub(crate) fn bind_ip(&self) -> std::net::IpAddr {
+        self.bind.ip()
     }
 
     /// Take a session from the pool (or open a new one).
     pub(crate) fn take_session(&self) -> Session {
         let mut pool = self
-            .sessions
+            .pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.pop()
@@ -198,7 +278,7 @@ impl Shared {
     pub(crate) fn put_session(&self, mut session: Session) {
         session.logout();
         let mut pool = self
-            .sessions
+            .pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if pool.len() < self.opts.max_blocking_threads {
@@ -246,7 +326,7 @@ impl UiServer {
         let addr = listener.local_addr()?;
         check_bind_policy(addr.ip(), ConsoleTls::Absent)?;
         check_auth_policy(db.has_users(), &opts.auth)?;
-        let shared = Arc::new(Shared::new(db, opts));
+        let shared = Arc::new(Shared::new(db, opts, addr));
         let (shutdown, _) = watch::channel(false);
         Ok(UiServer {
             listener,
@@ -372,6 +452,7 @@ async fn serve_connection(
         router: app,
         peer,
         max_body_bytes: opts.max_body_bytes,
+        request_timeout: opts.request_timeout,
     };
     let mut builder = http1::Builder::new();
     builder.timer(TokioTimer::new());
@@ -382,9 +463,11 @@ async fn serve_connection(
     builder.keep_alive(false);
     let svc = TowerToHyperService::new(service);
     // The whole request (head, body, response) is bounded: a slow client
-    // cannot pin the connection.
+    // cannot pin the connection. A connection that runs worksheet SQL or an
+    // agent run gets the long deadline; [`PeerService`] holds every other
+    // request to `request_timeout` itself.
     let _ = tokio::time::timeout(
-        opts.request_timeout,
+        opts.request_timeout.max(opts.long_request_timeout),
         builder.serve_connection(TokioIo::new(stream), svc),
     )
     .await;
@@ -399,14 +482,58 @@ async fn refuse(mut stream: tokio::net::TcpStream) {
 
 /// Build the console's router.
 ///
-/// Every route is `GET` (and, through axum, `HEAD`): **there is no mutating
-/// route at all**. Anything else is a `405`.
+/// The wave-78 browsing routes are `GET` (and, through axum, `HEAD`). The
+/// worksheet routes (wave 121) that change anything — log in, run SQL, save a
+/// worksheet, ask the agent — are `POST`s that need the session cookie, the
+/// CSRF token and a same-origin `Origin` (see [`crate::security`]). Every
+/// request's `Host` is checked and every response carries the security
+/// headers. A method a path does not implement is a `405`.
 fn build_router(shared: Arc<Shared>) -> Router {
     Router::new()
+        .route(
+            "/api/session",
+            get(work::session).fallback(method_not_allowed),
+        )
+        .route("/api/login", post(work::login).fallback(method_not_allowed))
+        .route(
+            "/api/logout",
+            post(work::logout).fallback(method_not_allowed),
+        )
+        .route("/api/query", post(work::query).fallback(method_not_allowed))
+        .route(
+            "/api/cancel",
+            post(work::cancel).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/export",
+            post(work::export).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/worksheets",
+            get(work::worksheets)
+                .post(work::save_worksheet)
+                .fallback(method_not_allowed),
+        )
+        .route(
+            "/api/worksheets/delete",
+            post(work::delete_worksheet).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/history",
+            get(work::history).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/catalog",
+            get(work::catalog).fallback(method_not_allowed),
+        )
+        .route("/api/agent", get(ask::info).fallback(method_not_allowed))
+        .route("/api/ask", post(ask::ask).fallback(method_not_allowed))
         .route("/", get(api::shell).fallback(method_not_allowed))
         .route("/preview", get(api::preview).fallback(method_not_allowed))
         .route("/assets/console.css", get(assets::css))
-        .route("/assets/console.js", get(assets::script))
+        .route("/assets/boot.js", get(assets::boot))
+        .route("/assets/pinkdb-console.js", get(assets::app_js))
+        .route("/assets/pinkdb-console_bg.wasm", get(assets::app_wasm))
         .route(
             "/api/databases",
             get(api::databases).fallback(method_not_allowed),
@@ -420,19 +547,20 @@ fn build_router(shared: Arc<Shared>) -> Router {
         .route("/api/stats", get(api::stats).fallback(method_not_allowed))
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(shared.opts.max_body_bytes))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&shared),
+            security::check_host,
+        ))
+        .layer(middleware::from_fn(security::security_headers))
         .with_state(shared)
 }
 
 /// The response for a method the console does not implement.
 async fn method_not_allowed() -> Response {
-    let mut response = api::json_error(
+    api::json_error(
         StatusCode::METHOD_NOT_ALLOWED,
-        "the console is read-only: only GET and HEAD are implemented",
-    );
-    response
-        .headers_mut()
-        .insert(header::ALLOW, header::HeaderValue::from_static("GET, HEAD"));
-    response
+        "method not allowed on this path (state-changing requests are POSTs to /api/…)",
+    )
 }
 
 /// The response for an unknown path.
@@ -447,6 +575,13 @@ struct PeerService {
     router: Router,
     peer: SocketAddr,
     max_body_bytes: usize,
+    request_timeout: Duration,
+}
+
+/// The routes that may run longer than `request_timeout`: worksheet SQL, an
+/// export and an agent run (each bounded by its own statement deadlines).
+fn long_route(path: &str) -> bool {
+    matches!(path, "/api/query" | "/api/export" | "/api/ask")
 }
 
 impl Service<hyper::Request<Incoming>> for PeerService {
@@ -482,7 +617,20 @@ impl Service<hyper::Request<Incoming>> for PeerService {
             });
         }
         let mut router = self.router.clone();
-        Box::pin(async move { router.call(req).await })
+        if long_route(req.uri().path()) {
+            return Box::pin(async move { router.call(req).await });
+        }
+        // Everything else answers within `request_timeout`, as in wave 78.
+        let deadline = self.request_timeout;
+        Box::pin(async move {
+            match tokio::time::timeout(deadline, router.call(req)).await {
+                Ok(response) => response,
+                Err(_) => Ok(api::json_error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "the request took longer than the console's request timeout",
+                )),
+            }
+        })
     }
 }
 

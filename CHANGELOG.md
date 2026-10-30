@@ -9,6 +9,37 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 121 — the warehouse console: SQL worksheets, catalog, ask ✅
+
+- `pinkdb-server --enable-ui` (a build with the `ui` feature) now serves a
+  **worksheet console**: tabs of SQL saved in the store and shareable by
+  name, an editor with highlighting and catalog completion
+  (`Ctrl/Cmd+Enter` runs the statement at the cursor), one result per
+  statement in a virtual-scrolled grid with a cell viewer, the query
+  profile, `EXPLAIN` as a tree, bar/line/scatter charts, CSV/JSON download,
+  **cancel**, and a per-user run history.
+- The catalog browser lists tables, views, materialized views, indexes
+  (hash and HNSW), triggers, macros and attached lake tables with their
+  column statistics; the new `pinkdb_catalog()` relation is what it reads,
+  and it shows each user only what they may `SELECT`.
+- **Ask**: with `--agent-extension` the console runs the data agent as the
+  logged-in user and streams every statement it runs and its answer.
+  Providers and keys stay in the server's environment (no default
+  provider; no key ever reaches the browser); the agent is read-only unless
+  `--agent-allow-writes`. `--memory-distill-every SECS` drains the agent
+  memory queue in the background.
+- SQL runs **as the logged-in user** under their grants; `--ui-read-only`
+  limits everyone to queries. Server-side sessions (`HttpOnly`,
+  `SameSite=Strict`), CSRF tokens and `Origin`/`Host` checks, a strict
+  Content-Security-Policy and request and per-session limits; the console
+  still binds loopback only and never serves a store with users without a
+  login.
+- The browser app is Rust — Leptos compiled to WebAssembly (255 KB
+  gzipped), embedded in the binary. See `docs/server-ui.md`.
+- Fixed in the CLI too: an agent answer recorded to memory could set a
+  memory flag (for example `--visibility team`) if its text contained one;
+  the text is now passed as a single quoted argument.
+
 ### Wave 125f — EXISTS reads a filtered subquery side through its selection ✅
 
 - `EXISTS` / `NOT EXISTS` over a filtered table (TPC-H Q4's

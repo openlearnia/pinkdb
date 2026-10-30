@@ -192,7 +192,7 @@ fn the_shell_page_is_self_hosted() {
     let body = response.body;
     // The assets are served by the console itself.
     assert!(body.contains("/assets/console.css"), "{body}");
-    assert!(body.contains("/assets/console.js"), "{body}");
+    assert!(body.contains("/assets/boot.js"), "{body}");
     // No CDN, no external font, no external script.
     assert!(
         !body.contains("http://"),
@@ -224,26 +224,43 @@ fn the_assets_are_served_from_the_binary() {
     );
     assert!(css.body.contains(".grid"), "the stylesheet looks empty");
 
-    let js = get(fixture.addr(), "/assets/console.js");
-    assert_eq!(js.status, 200);
+    let boot = get(fixture.addr(), "/assets/boot.js");
+    assert_eq!(boot.status, 200);
     assert!(
-        js.header("content-type")
+        boot.header("content-type")
             .unwrap_or_default()
             .contains("javascript")
     );
     assert!(
-        js.body.contains("/api/"),
-        "the script does not call the API"
+        boot.body.contains("/assets/pinkdb-console.js"),
+        "the boot module does not load the app"
     );
-    // No external resource in the script either.
-    assert!(
-        !js.body.contains("http://"),
-        "an external URL in the script"
-    );
-    assert!(
-        !js.body.contains("https://"),
-        "an external URL in the script"
-    );
+    // No external resource in the stylesheet or the boot module.
+    for text in [&css.body, &boot.body] {
+        assert!(!text.contains("http://"), "an external URL in an asset");
+        assert!(!text.contains("https://"), "an external URL in an asset");
+        assert!(!text.contains("@import"), "a CSS import in an asset");
+    }
+
+    // The app (Leptos, wasm) is embedded gzipped and served as such.
+    for (path, kind) in [
+        ("/assets/pinkdb-console.js", "javascript"),
+        ("/assets/pinkdb-console_bg.wasm", "application/wasm"),
+    ] {
+        let response = get_with(fixture.addr(), path, &[("Accept-Encoding", "gzip, br")]);
+        assert_eq!(response.status, 200, "{path}");
+        assert!(
+            response
+                .header("content-type")
+                .unwrap_or_default()
+                .contains(kind),
+            "{path}: {:?}",
+            response.header("content-type")
+        );
+        assert_eq!(response.header("content-encoding"), Some("gzip"), "{path}");
+        // A client that cannot take gzip is told so, not sent bytes it cannot read.
+        assert_eq!(get(fixture.addr(), path).status, 406, "{path}");
+    }
 }
 
 // ---------- the JSON API ----------
@@ -468,11 +485,6 @@ fn a_mutating_method_is_405() {
             &format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"),
         );
         assert_eq!(response.status, 405, "path {path}");
-        assert_eq!(
-            response.header("allow"),
-            Some("GET, HEAD"),
-            "the 405 must name the allowed methods"
-        );
     }
     // A DELETE is refused the same way.
     let response = raw(

@@ -134,6 +134,15 @@ impl Session {
             .map_err(|err| err.to_string())
     }
 
+    /// Adopt a user verified at login (a console session): later statements
+    /// run under that user's grants.
+    pub fn impersonate(&mut self, user: &str) -> Result<(), String> {
+        self.conn
+            .impersonate(user)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
     /// Forget the session's principal.
     ///
     /// The console calls this before a pooled session is handed to another

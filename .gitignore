@@ -33,3 +33,6 @@ __pycache__/
 # In-repo extension build outputs (copied into build/ by extensions/*/Makefile
 # for the publish workflow; the canonical libraries live in target/)
 /extensions/*/build/
+
+# The console browser app (wave 121) is outside the workspace: its own build dir.
+crates/pinkdb-server-ui-web/target/

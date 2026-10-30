@@ -81,13 +81,18 @@
 //! terminal box does not).
 
 mod api;
+mod ask;
 mod assets;
 mod auth;
+mod book;
 mod html;
 mod policy;
 mod preview;
+mod security;
 mod server;
+mod sessions;
 mod store;
+mod work;
 
 pub use policy::{ConsoleTls, UiAuth, UiError, check_auth_policy, check_bind_policy};
 pub use server::{UiHandle, UiOptions, UiServer};

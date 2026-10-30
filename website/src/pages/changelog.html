@@ -9,6 +9,15 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-30</h2>
+<h3>Wave 121 — the warehouse console: SQL worksheets, catalog, ask ✅</h3>
+<ul>
+<li><code>pinkdb-server --enable-ui</code> (a build with the <code>ui</code> feature) now serves a <strong>worksheet console</strong>: tabs of SQL saved in the store and shareable by name, an editor with highlighting and catalog completion (<code>Ctrl/Cmd+Enter</code> runs the statement at the cursor), one result per statement in a virtual-scrolled grid with a cell viewer, the query profile, <code>EXPLAIN</code> as a tree, bar/line/scatter charts, CSV/JSON download, <strong>cancel</strong>, and a per-user run history.</li>
+<li>The catalog browser lists tables, views, materialized views, indexes (hash and HNSW), triggers, macros and attached lake tables with their column statistics; the new <code>pinkdb_catalog()</code> relation is what it reads, and it shows each user only what they may <code>SELECT</code>.</li>
+<li><strong>Ask</strong>: with <code>--agent-extension</code> the console runs the data agent as the logged-in user and streams every statement it runs and its answer. Providers and keys stay in the server's environment (no default provider; no key ever reaches the browser); the agent is read-only unless <code>--agent-allow-writes</code>. <code>--memory-distill-every SECS</code> drains the agent memory queue in the background.</li>
+<li>SQL runs <strong>as the logged-in user</strong> under their grants; <code>--ui-read-only</code> limits everyone to queries. Server-side sessions (<code>HttpOnly</code>, <code>SameSite=Strict</code>), CSRF tokens and <code>Origin</code>/<code>Host</code> checks, a strict Content-Security-Policy and request and per-session limits; the console still binds loopback only and never serves a store with users without a login.</li>
+<li>The browser app is Rust — Leptos compiled to WebAssembly (255 KB gzipped), embedded in the binary. See <code>docs/server-ui.md</code>.</li>
+<li>Fixed in the CLI too: an agent answer recorded to memory could set a memory flag (for example <code>--visibility team</code>) if its text contained one; the text is now passed as a single quoted argument.</li>
+</ul>
 <h3>Wave 125f — EXISTS reads a filtered subquery side through its selection ✅</h3>
 <ul>
 <li><code>EXISTS</code> / <code>NOT EXISTS</code> over a filtered table (TPC-H Q4's <code>l_commitdate &lt; l_receiptdate</code>) now reads the kept rows of the filtered side in place instead of copying them first. TPC-H SF 1: Q4 −18 %.</li>

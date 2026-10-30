@@ -1,0 +1,55 @@
+[package]
+name = "pinkdb-server-ui-web"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "The warehouse console's browser app (wave 121): Leptos, compiled to wasm and embedded in pinkdb-server-ui"
+license = "MIT"
+publish = false
+
+# Not a member of the pinkdb workspace: the workspace never compiles Leptos.
+# `scripts/build-console.sh` builds this crate for wasm32 with trunk and
+# copies the result into `crates/pinkdb-server-ui/web-dist/`, which the server
+# embeds. This crate has its own lockfile.
+[workspace]
+
+[[bin]]
+name = "pinkdb-console"
+path = "src/main.rs"
+
+[dependencies]
+pinkdb-server-ui-api = { path = "../pinkdb-server-ui-api" }
+leptos = { version = "0.8", features = ["csr"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "AbortController",
+    "AbortSignal",
+    "Blob",
+    "BlobPropertyBag",
+    "CssStyleDeclaration",
+    "Document",
+    "Element",
+    "HtmlAnchorElement",
+    "HtmlElement",
+    "HtmlTextAreaElement",
+    "KeyboardEvent",
+    "Headers",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "Request",
+    "RequestCredentials",
+    "RequestInit",
+    "Response",
+    "Url",
+    "Window",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

@@ -62,6 +62,41 @@ pub struct ExecLimits {
     pub max_result_bytes: Option<usize>,
 }
 
+/// A statement cancellation switch (wave 121): set it from any thread and the
+/// statement running on the connection that holds it stops at its next chunk
+/// boundary, the same checkpoints the deadline uses — so, like a timeout, a
+/// cancelled statement fails before its write-back begins.
+///
+/// One flag stays set until [`CancelFlag::reset`]: a front-end that cancels a
+/// multi-statement run wants every later statement of it refused too.
+#[derive(Clone, Debug, Default)]
+pub struct CancelFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelFlag {
+    /// A flag that is not set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the statement to stop.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`CancelFlag::cancel`] was called (and not reset since).
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clear the flag for the next run.
+    pub fn reset(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The error a cancelled statement fails with.
+pub const STATEMENT_CANCELLED: &str = "statement cancelled";
+
 impl ExecLimits {
     /// No limits (the embedded default).
     pub const fn none() -> Self {
@@ -103,6 +138,8 @@ pub(crate) struct ExecBudget {
     /// leaves the process, whatever statement shape reaches it (a macro,
     /// view, trigger or procedure body included).
     external_services: std::sync::atomic::AtomicBool,
+    /// The connection's cancellation switch, when a front-end installed one.
+    cancel: Option<CancelFlag>,
 }
 
 /// [`ExecBudget`]'s recorded `external_io` results, in call order, and the
@@ -128,7 +165,14 @@ impl ExecBudget {
             collect_external_calls: std::sync::atomic::AtomicBool::new(false),
             external_calls: std::sync::Mutex::new(ExternalCalls::default()),
             external_services: std::sync::atomic::AtomicBool::new(true),
+            cancel: None,
         }
+    }
+
+    /// Stop this statement when `cancel` is set (wave 121).
+    pub(crate) fn with_cancel(mut self, cancel: Option<CancelFlag>) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     /// A statement that a durable store WAL-logs must carry the results of
@@ -210,6 +254,11 @@ impl ExecBudget {
     }
 
     pub(crate) fn check_deadline(&self) -> Result<()> {
+        if let Some(cancel) = &self.cancel
+            && cancel.is_cancelled()
+        {
+            return Err(PinkDbError::Execution(STATEMENT_CANCELLED.to_string()));
+        }
         if let (Some(timeout), Some(started)) = (self.timeout, self.started)
             && started.elapsed() >= timeout
         {

@@ -10,7 +10,6 @@ use axum::response::IntoResponse;
 use maud::{DOCTYPE, Markup, html};
 
 use crate::api::ColumnInfo;
-use crate::policy::UiAuth;
 use crate::server::Shared;
 
 /// One previewed cell: its text, whether it is NULL, and whether it was
@@ -37,9 +36,9 @@ pub struct PreviewPage {
     pub rows: Vec<Vec<Cell>>,
 }
 
-/// The console shell (the interactive page).
-pub fn shell(shared: &Shared) -> Markup {
-    let token_mode = matches!(shared.auth.mode(), UiAuth::Token(_));
+/// The console shell: the stylesheet and the app's boot module. The page
+/// carries no data; the app (wave 121) logs in and fetches everything.
+pub fn shell(_shared: &Shared) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -48,35 +47,17 @@ pub fn shell(shared: &Shared) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "pinkdb console" }
                 link rel="stylesheet" href="/assets/console.css";
+                script type="module" src="/assets/boot.js" {}
             }
             body {
-                header class="topbar" {
-                    h1 { "pinkdb console" }
-                    span class="badge" { "read-only" }
-                    @if token_mode {
-                        label class="token" {
-                            span { "token" }
-                            input id="token" type="password" autocomplete="off"
-                                placeholder="bearer token";
-                        }
+                noscript {
+                    p class="noscript" {
+                        "The console needs JavaScript and WebAssembly. A server-rendered, \
+                         read-only row preview is at "
+                        code { "/preview?db=<database>&table=<table>" }
+                        "."
                     }
                 }
-                main class="layout" {
-                    aside class="sidebar" {
-                        h2 { "Databases" }
-                        ul id="databases" class="list" {}
-                        h2 { "Relations" }
-                        ul id="tables" class="list" {}
-                    }
-                    section class="content" {
-                        div id="status" class="status" { "loading…" }
-                        h2 id="title" { "—" }
-                        div id="stats" class="stats" {}
-                        div id="preview" class="preview" {}
-                        div id="pager" class="pager" {}
-                    }
-                }
-                script src="/assets/console.js" {}
             }
         }
     }

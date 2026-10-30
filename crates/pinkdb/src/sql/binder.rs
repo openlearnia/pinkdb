@@ -9981,6 +9981,9 @@ fn bind_table_function(
     if name.eq_ignore_ascii_case("pinkdb_column_stats") {
         return bind_column_stats(db, binder, args, alias);
     }
+    if name.eq_ignore_ascii_case("pinkdb_catalog") {
+        return bind_catalog(db, binder, args, alias);
+    }
     let call = TableFunctionCall::Function {
         name: name.to_string(),
         args: args.to_vec(),
@@ -10010,6 +10013,168 @@ fn bind_table_function(
         "unknown table function \"{name}\": {}",
         no_file_source_hint(db)
     )))
+}
+
+/// `pinkdb_catalog()`: one row per catalog object of the store (wave 121) —
+/// tables, views, materialized views, hash and vector indexes, triggers,
+/// macros and attached lake tables — for a catalog browser. DuckDB splits
+/// this over `duckdb_tables()`, `duckdb_views()` and `duckdb_indexes()`; one
+/// relation keeps the console to one statement.
+///
+/// Columns: `database`, `name`, `kind` (`TABLE`, `VIEW`, `MATERIALIZED VIEW`,
+/// `INDEX`, `TRIGGER`, `MACRO`, `LAKE TABLE`), `table_name` (the table an
+/// index or trigger belongs to), `detail` (index column and method, trigger
+/// timing, macro parameters, lake location). A logged-in session sees only the
+/// relations it may `SELECT`, and only those relations' indexes and triggers.
+fn bind_catalog(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    if !args.is_empty() {
+        return Err(PinkDbError::Type(
+            "pinkdb_catalog() takes no arguments".to_string(),
+        ));
+    }
+    let names: Vec<String> = ["database", "name", "kind", "table_name", "detail"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let types = vec![DataType::Varchar; names.len()];
+    let principal = binder.session.principal();
+    let readable = |dbname: &str, table: &str| match &principal {
+        None => true,
+        Some(principal) => db.rbac().allowed(
+            principal,
+            &crate::rbac::GrantObject::Table {
+                db: dbname.to_string(),
+                table: table.to_string(),
+            },
+            crate::rbac::Privilege::Select,
+        ),
+    };
+    let text = |v: &str| BoundExpr::Literal(Value::Varchar(v.to_string()));
+    let null = || BoundExpr::Literal(Value::Null);
+    let mut rows: Vec<Vec<BoundExpr>> = Vec::new();
+    let mut databases = db.list_databases();
+    databases.sort();
+    for dbname in databases {
+        let mvs: Vec<String> = db
+            .materialized_view_status_in(&dbname, crate::mv::now_ms())
+            .into_iter()
+            .map(|status| status.name)
+            .collect();
+        let mut tables = db.list_tables_in(&dbname);
+        tables.sort();
+        for tname in &tables {
+            if !readable(&dbname, tname) {
+                continue;
+            }
+            let kind = if mvs.iter().any(|mv| mv.eq_ignore_ascii_case(tname)) {
+                "MATERIALIZED VIEW"
+            } else {
+                "TABLE"
+            };
+            rows.push(vec![text(&dbname), text(tname), text(kind), null(), null()]);
+            let t = db.table_in(&dbname, tname)?;
+            let schema = t.schema();
+            let column = |i: usize| schema.get(i).map(|(c, _)| c.as_str()).unwrap_or("?");
+            for index in &t.indexes {
+                rows.push(vec![
+                    text(&dbname),
+                    text(&index.name),
+                    text("INDEX"),
+                    text(tname),
+                    text(&format!("{} (hash)", column(index.column))),
+                ]);
+            }
+            for index in &t.vector_indexes {
+                rows.push(vec![
+                    text(&dbname),
+                    text(&index.name),
+                    text("INDEX"),
+                    text(tname),
+                    text(&format!("{} ({})", column(index.column), index.provider)),
+                ]);
+            }
+        }
+        let mut views = db.list_views_in(&dbname);
+        views.sort();
+        for view in views {
+            if readable(&dbname, &view) {
+                rows.push(vec![
+                    text(&dbname),
+                    text(&view),
+                    text("VIEW"),
+                    null(),
+                    null(),
+                ]);
+            }
+        }
+        for trigger in db.triggers_in(&dbname) {
+            if readable(&dbname, &trigger.table) {
+                rows.push(vec![
+                    text(&dbname),
+                    text(&trigger.name),
+                    text("TRIGGER"),
+                    text(&trigger.table),
+                    text(&format!(
+                        "{} {}",
+                        trigger.timing.as_str(),
+                        trigger
+                            .events
+                            .iter()
+                            .map(|e| e.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" OR ")
+                    )),
+                ]);
+            }
+        }
+        for (_, def) in db.macros_in(&dbname) {
+            rows.push(vec![
+                text(&dbname),
+                text(&def.name),
+                text("MACRO"),
+                null(),
+                text(&def.parameter_names()),
+            ]);
+        }
+    }
+    for (location, tables) in db.attached_lakes() {
+        for table in tables {
+            if readable(&table.db, &table.table) {
+                rows.push(vec![
+                    text(&table.db),
+                    text(&table.table),
+                    text("LAKE TABLE"),
+                    null(),
+                    text(location),
+                ]);
+            }
+        }
+    }
+    let scope = ScopeTable {
+        name: alias
+            .clone()
+            .unwrap_or_else(|| "pinkdb_catalog".to_string())
+            .to_ascii_lowercase(),
+        original: None,
+        db: None,
+        is_alias: alias.is_some(),
+        qualified_only: false,
+        columns: names.iter().cloned().zip(types.iter().copied()).collect(),
+    };
+    Ok((
+        scope,
+        LogicalPlan::Values {
+            rows,
+            names,
+            types,
+            sources: Vec::new(),
+        },
+    ))
 }
 
 /// `pinkdb_column_stats(['table'])`: one row per column of every table in

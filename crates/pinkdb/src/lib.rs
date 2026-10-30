@@ -107,7 +107,7 @@ pub use attached::{
 };
 pub use crypto::EncryptionKey;
 pub use db::{AUTHENTICATION_REQUIRED, Connection, Database};
-pub use exec::{ExecLimits, QueryResult};
+pub use exec::{CancelFlag, ExecLimits, QueryResult, STATEMENT_CANCELLED};
 pub use filefmt::FileFormat;
 pub use fsutil::{CopyToPolicy, write_atomic_private};
 pub use install::{InstalledExtension, NO_REPO_SUPPORT};

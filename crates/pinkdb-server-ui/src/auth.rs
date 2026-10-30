@@ -289,7 +289,7 @@ fn decode_basic(encoded: &str) -> Option<(String, String)> {
 }
 
 /// Compare two byte strings without leaking their contents through timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // Fold the length difference into the accumulator so the comparison does
     // not return early on a length mismatch.
     let mut diff = (a.len() ^ b.len()) as u32;

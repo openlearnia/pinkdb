@@ -1,182 +1,245 @@
-# The warehouse browsing UI (wave 78)
+# The warehouse console (waves 78 and 121)
 
-`pinkdb-server` can serve a **read-only web console** next to its binary
-protocol: a small browser UI that shows the store's databases, relations,
-row previews and statistics.
-
-The console is **opt-in**, **feature-gated** and **local-only by default**.
-It is a browsing tool, not a query console: there is no endpoint that runs
-a statement the operator did not write, and no endpoint that mutates
-anything.
+`pinkdb-server` can serve a **web console** next to its binary protocol:
+SQL worksheets, a catalog browser, the run history, and an ask box that runs
+the data agent. It is **off by default** and lives behind the `ui` cargo
+feature, so the default server binary is unchanged (the console crate is not
+even compiled without the feature).
 
 ```sh
 # build the server with the console (the `ui` feature is off by default)
 cargo build --release -p pinkdb-server --features ui
 
 # serve the console next to the protocol, on 127.0.0.1:8080
-./target/release/pinkdb-server --enable-ui
-# pinkdb-server: warehouse console on http://127.0.0.1:8080 (read-only)
+./target/release/pinkdb-server --file warehouse.pink --enable-ui
+# pinkdb-server: warehouse console on http://127.0.0.1:8080 (worksheets)
 ```
 
-Open <http://127.0.0.1:8080> in a browser.
+Open the address in a browser. A store without users logs you in by itself;
+a store with users asks for a user and password (`--ui-auth basic`) or the
+console token (`--ui-token`).
+
+Wave 78 shipped a read-only catalog browser. Wave 121 turned it into a
+worksheet console: the browser app is now Rust (Leptos) compiled to
+WebAssembly, the console runs the logged-in user's SQL, and it hosts the
+agent.
+
+## What the console does
+
+- **Worksheets.** Tabs of SQL, saved in the store as you type (in the
+  `pinkdb_worksheets` database), private to their owner unless shared with
+  named users (`share with: bob, carol`, or `*` for everyone; a shared
+  worksheet is read-only for the others, who can duplicate it).
+- **The editor.** Highlighting, completion of keywords, functions,
+  databases, tables and columns from the catalog (`Ctrl+Space`, or as you
+  type; `alias.` completes that table's columns), `Ctrl/Cmd+Enter` runs the
+  statement at the cursor or the selection, `Shift+Ctrl/Cmd+Enter` runs
+  everything, `Esc` cancels a running query, `Ctrl/Cmd+S` saves.
+- **Results.** Every statement of a run gets its own result tab; a run stops
+  at the first failing statement and shows it. The grid is virtual-scrolled
+  (only the visible rows are in the page), NULLs are marked, numbers are
+  right-aligned, and clicking a cell opens it whole — JSON, `STRUCT`, lists
+  and `VARIANT` values pretty-printed. Each result shows its row count and
+  timing; **Profile** shows wave 84's per-phase profile; an `EXPLAIN` result
+  shows as a plan tree; **Chart** draws a bar, line or scatter chart of any
+  x and numeric y column (SVG); **CSV** and **JSON** download the result.
+- **Cancel.** A running query stops at its next chunk boundary (the same
+  checkpoints as the statement timeout), so a cancelled statement fails
+  before any write-back.
+- **Catalog.** Databases with their tables, views, materialized views,
+  indexes (hash and HNSW), triggers, macros and attached lake tables, each
+  table's columns with types and statistics (NULLs, distinct estimate,
+  min … max). Click a name to insert it; ▶ previews 100 rows; ⏱ on a lake
+  table opens time travel (`AT (VERSION => n)`) and `lake_changes(…)`.
+- **History.** Every run, newest first (status, timing, row count); click
+  one to reopen its SQL.
+- **Ask.** A question to the data agent, answered live: each statement the
+  model runs appears with its reply and a "Copy SQL into worksheet" button,
+  then the answer. See [the ask box](#the-ask-box).
+
+## Who runs the SQL
+
+| Console mode | Statements run as |
+|---|---|
+| `--ui-auth basic` | the logged-in user: every statement is checked against that user's grants (wave 48), exactly like a protocol client |
+| `--ui-token TOKEN` | the operator (the token is the operator's own secret, as in wave 78) |
+| no authentication (a store without users only) | the implicit session of a store without users |
+
+The password is verified once, at login, through the engine's own Argon2id
+path; the console keeps a server-side session and never the password. Later
+statements adopt the user with `Connection::impersonate`, so a dropped user's
+session ends with them.
+
+Every worksheet statement runs under the console's limits: a 5-minute
+statement deadline, a 512 MiB materialization cap, at most 10,000 rows sent
+to the browser per result (the full count is still reported; a CSV/JSON
+export re-runs a single read-only statement with a 1,000,000-row cap), and
+at most two queries running per session at once.
+
+`--ui-read-only` limits **everyone** to queries (`SELECT`, `EXPLAIN`,
+`DESCRIBE`, `SHOW`, `USE`), whatever their grants; a run with any other
+statement is refused before its first statement runs.
+
+## Security
+
+The console runs SQL, so a page on another site must not be able to drive
+it through your browser, and stored data must never become markup.
+
+- **Sessions.** `POST /api/login` sets `pinkdb_session` — 256 random bits,
+  `HttpOnly`, `SameSite=Strict`, `Path=/`, and `Secure` when the console is
+  served over TLS. Sessions end after 30 minutes idle, 12 hours in any case,
+  on logout, or when the oldest is evicted to make room (256 at most).
+  Failed logins are throttled as in wave 78 (four verifications at once; 20
+  failures in 60 s block the address for 60 s).
+- **CSRF.** Every state-changing request is a `POST` that needs the cookie,
+  the session's CSRF token in `X-CSRF-Token` (a separate 256-bit value,
+  compared in constant time), and an `Origin`, when the browser sends one,
+  equal to the console's own.
+- **DNS rebinding.** Every request's `Host` must be a loopback name, the
+  bind address, or a name given with `--ui-allowed-host`; anything else is
+  `421`.
+- **Output.** Every response carries `Content-Security-Policy: default-src
+  'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src
+  'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self';
+  frame-ancestors 'none'` (no inline script, no `eval`; `wasm-unsafe-eval`
+  only lets the page compile its own WebAssembly), plus `nosniff`,
+  `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. The API
+  answers JSON only, and the app renders every value and identifier as a
+  text node.
+- **Requests.** Header count and size caps, a 10 s header and body read
+  timeout, a 1 MiB body cap (a larger declared body is refused before it is
+  read), a connection cap, and a deadline per request (30 s; 15 minutes for
+  worksheet SQL, exports and agent runs).
+- **Secrets.** The agent's provider key never reaches the browser, and the
+  agent's and memory's own databases follow their wave 106b/109 policies
+  (below). Worksheets live in `pinkdb_worksheets`; a user's own SQL reaches
+  those rows only through grants (administrators), and the console serves
+  each user only their own and those shared with them.
 
 ## The exposure policy (fail closed)
-
-The console refuses to run in a configuration it cannot protect:
 
 | Situation | What happens |
 |---|---|
 | The console was not asked for | It is not started at all (the default). |
-| `--ui-host` names a non-loopback address | **Refused** (exit 2): the console is a browser UI and cannot use the server's TLS transport, so a non-localhost exposure needs console TLS (wave 46) *and* RBAC (wave 48) first. |
-| The store has users (the wave-48 RBAC catalog) and no credential was configured | **Refused** (exit 2): start it with `--ui-auth basic` or `--ui-token <secret>`. |
+| `--ui-host` names a non-loopback address | **Refused** (exit 2): the console has no TLS of its own, so a non-localhost exposure needs console TLS and RBAC first. |
+| The store has users and no credential was configured | **Refused** (exit 2): start it with `--ui-auth basic` or `--ui-token <secret>`. |
 | `--ui-auth basic` and the store has no users | **Refused** (exit 2): there is nothing to authenticate against. |
-| The store has no users and no credential was configured | The console starts and prints a **loud warning**: every request can read the whole store. |
-| The store gains a user while the console runs | The console refuses to serve it (the empty-catalog policy is re-checked per request). |
+| The store has no users and no credential was configured | The console starts and prints a **loud warning**: every local process can run any SQL. |
+| The store gains a user while the console runs | Its unauthenticated sessions end and new logins are refused. |
 
-`--ui-auth basic` verifies the password through the **engine's own path**
-(`pinkdb::Connection::login`, the same Argon2id verification the wire
-protocol uses) and then runs the console's statements **under that user's
-grants**: RBAC applies to the console exactly as it applies to a wire
-client (a user without the `SELECT` privilege can list the catalog but gets
-`permission denied` on a row preview).
+## The ask box
 
-`--ui-token TOKEN` is an operator-level credential: every API request must
-carry `Authorization: Bearer <token>` (compared in constant time). The token
-is independent of the store's catalog, so the console's statements run with
-the engine's trusted-session semantics — a token holder sees everything the
-store holds. The two modes are mutually exclusive.
+Start the server with the agent extension:
 
-The console's login throttling mirrors the pass-5 policy of the wire
-server: at most four password verifications run at once (a fifth gets
-`too many concurrent logins`), and a client address that accumulates 20
-failures inside 60 seconds is blocked for 60 seconds — **before** any
-hashing happens.
+```sh
+cargo build --release -p pinkdb-agent
+PINKDB_AGENT_PROVIDER=zai ZAI_API_KEY=… \
+  ./target/release/pinkdb-server --file warehouse.pink --enable-ui \
+  --agent-extension ./target/release/libpinkdb_agent.dylib
+```
+
+- **Providers come from the server's environment**, exactly as for the CLI
+  (wave 106b). There is **no default provider**: unless the server sets
+  `PINKDB_AGENT_PROVIDER`, the user picks one; with none configured the
+  panel says which variables to set. The browser sees provider names and
+  whether each is configured — never a key, a key prefix or a base URL.
+- **The run is the user's.** The console runs `.agent ask` through the
+  extension's command entry point on a connection logged in as the session
+  user (`Connection::run_command`), so each statement the model runs is
+  checked by the user's grants **and** by the agent policy: read-only unless
+  the server was started with `--agent-allow-writes` (and never with
+  `--ui-read-only`), never a write to the transcript database
+  (`pinkdb_agent`), never a file or an external service. The store lock is
+  taken per statement, so a model call between statements blocks nobody.
+- **Live.** The run streams as server-sent events over the `POST` response
+  (`progress`, `tool`, `answer`, `done`, `error`). Stopping the run (or
+  closing the page) cancels it: the next statement is refused and a running
+  one stops at its next chunk.
+- **Memory.** With `--memory-extension libpinkdb_memory…` the question and
+  the answer are added to the user's agent memory (wave 109), as the CLI
+  does. `--memory-distill-every SECS` starts a worker that drains the
+  distillation queue on that interval, running `.memory distill` as each
+  owner with pending turns (off by default; it needs a provider in the
+  environment and reports a missing one once).
+- One agent run at a time per server (the extension loader runs one
+  host-driven call per library); a second ask gets an error to retry.
 
 ## The endpoints
 
-Every route is `GET` (and, through the HTTP layer, `HEAD`). Anything else is
-`405` with an `Allow: GET, HEAD` header; an unknown path is `404`.
-
-| Route | What it returns |
+| Method and path | What |
 |---|---|
-| `GET /` | The console shell (server-rendered HTML; the assets are self-hosted). |
-| `GET /preview?db=&table=&page=&page_size=` | A server-rendered row preview (the no-JavaScript fallback). |
-| `GET /assets/console.css` | The stylesheet (embedded in the binary). |
-| `GET /assets/console.js` | The script (embedded in the binary). |
-| `GET /api/databases` | `{"current": "main", "databases": [{"name": "main", "current": true}]}` |
-| `GET /api/schemas?db=` | `{"db": "main", "schemas": [{"name": "main", "relations": 3}]}` — pinkdb has no schema layer, so every database holds its relations in the implicit schema `main`. |
-| `GET /api/tables?db=&schema=` | `{"db": …, "schema": "main", "tables": [{"name": …, "columns": [{"name": …, "type": "INTEGER", "nullable": true}]}]}` |
-| `GET /api/rows?db=&table=&page=&page_size=` | `{"db": …, "table": …, "page": 1, "page_size": 50, "total_rows": 1234, "total_pages": 25, "columns": [...], "rows": [[{"text": "1", "null": false, "truncated": false}]]}` |
-| `GET /api/stats?db=` | `{"db": …, "tables": [{"name": …, "rows": 1234, "estimated_bytes": 24680, "columns": 3}]}` |
+| `GET /` | the shell: the stylesheet and the app's boot module, no data |
+| `GET /assets/console.css`, `/assets/boot.js` | the stylesheet and the boot module |
+| `GET /assets/pinkdb-console.js`, `/assets/pinkdb-console_bg.wasm` | the app, served gzip-encoded (`406` to a client that refuses gzip) |
+| `GET /api/session` | the session (user, CSRF token, mode), or `401` with the login mode |
+| `POST /api/login`, `/api/logout` | start or end a session |
+| `POST /api/query` | run `{sql, db?, run_id, worksheet_id?}`; every statement in order until one fails |
+| `POST /api/cancel` | cancel `{run_id}` (the session's own runs only) |
+| `POST /api/export` | re-run `{sql, db?, format: csv\|json}` (one read-only statement) as a download |
+| `GET /api/worksheets`, `POST /api/worksheets`, `POST /api/worksheets/delete` | list, create/update, delete worksheets |
+| `GET /api/history` | the user's latest 200 runs |
+| `GET /api/catalog` | every object the user may read, with columns and statistics (`pinkdb_catalog()` + `pinkdb_column_stats()`) |
+| `GET /api/agent`, `POST /api/ask` | the agent's provider table; an agent run as an event stream |
+| `GET /api/databases`, `/api/schemas`, `/api/tables`, `/api/rows`, `/api/stats`, `GET /preview` | wave 78's browse API and no-JavaScript preview page: a session cookie or an `Authorization` header (HTTP Basic or a bearer token) |
 
-Paging is bounded: `page` is 1-based (`page=0` is a `400`) and `page_size`
-is clamped to the console's maximum (`--ui-max-page-size`, default 500).
-`total_rows` is the **exact** row count (`SELECT COUNT(*)`), and it is the
-same on every page.
+The request and response types are one Rust crate,
+`crates/pinkdb-server-ui-api`, shared by the server and the browser app.
 
-## Read-only by construction
+## The browser app
 
-The console's store access runs exactly these statements:
+`crates/pinkdb-server-ui-web` is a Leptos (client-side rendering) app
+compiled to wasm32: the editor (a `<textarea>` over a highlighted layer, so
+the browser's own editing, selection and undo work), the virtual grid, the
+SVG charts and the ask panel. The SQL tokenizer, statement splitter and
+completion context are plain Rust in the shared API crate, unit-tested
+natively. Nothing is fetched from a CDN: the app, its stylesheet (system
+fonts only) and its boot module are embedded in the server binary.
 
-```sql
-SHOW DATABASES
-SHOW TABLES
-DESCRIBE "db"."table"
-SELECT COUNT(*) FROM "db"."table"
-SELECT * FROM "db"."table" LIMIT n OFFSET m
-```
+The app is **not** a workspace member (the workspace never compiles
+Leptos). `scripts/build-console.sh` builds it with
+[trunk](https://trunkrs.dev) and commits its gzipped output to
+`crates/pinkdb-server-ui/web-dist/` with a hash of its sources; a test in
+`pinkdb-server-ui` fails when the sources changed and the build was not
+refreshed. So building the server needs no wasm toolchain.
 
-There is no DML and no DDL, and the router has no `POST`/`PUT`/`DELETE`
-route at all. The one session statement the console uses is `USE` (to
-browse a database other than the session's current one): it changes no
-table, no row and no catalog entry — on a durable store the engine appends
-a *session record* to the WAL so a replay reproduces the same session. The
-console pools its sessions, so the switch happens once per pooled session
-and database, not once per request.
+| Asset | Size | Gzipped (served) |
+|---|---|---|
+| `pinkdb-console_bg.wasm` | 604 KB | 255 KB |
+| `pinkdb-console.js` (wasm-bindgen glue) | 43 KB | 8 KB |
+| `console.css` + `boot.js` | 17 KB | — |
 
-Every store read runs under the engine's own limits (the pass-5 ones): a
-30 s statement deadline, a 1 000-row materialized-result cap and a 16 MiB
-materialized-byte cap. The store lock is **released** before any HTTP work
-happens: the engine call returns materialized rows, and the JSON/HTML
-rendering runs afterwards, outside the lock.
+## The worker model and the async carve-out
+
+The console owns a **tokio runtime on its own thread** (it works with either
+server transport), and every engine call runs through `spawn_blocking` on a
+**bounded blocking pool** (`--ui-workers` runtime threads, default 4; a
+blocking pool of 8): the async runtime never executes engine code. The
+workspace's rule is zero async; the console is the documented carve-out
+scoped to the I/O boundary, and the default server build does not compile
+it (`cargo tree -p pinkdb-server` shows no tokio without `ui`).
 
 ## The preview renderer
 
-The console **mirrors** the repository's box renderer (the CLI's
-`format_select`/`display_value`/`sanitize_cell`):
+Wave 78's `/preview` page and the result cells mirror the CLI's box
+renderer: `NULL` is `NULL`, a `DOUBLE` prints `1.0`, and the preview page's
+HTML comes from `maud`, which escapes every interpolated value.
 
-- a `NULL` cell renders as the text `NULL`;
-- a `DOUBLE` renders DuckDB-style (`1.0`, not `1`);
-- a `VARCHAR` cell never carries a raw control character (a newline becomes
-  a space, every other control character is shown as `\u{..}`).
+## Known limits
 
-The renderer lives in the CLI's *binary* crate, so wave 78 mirrors the
-rules and pins them with tests instead of moving the CLI's renderer into a
-shared crate. The one addition: a per-cell character cap (512), because the
-terminal box sizes a column to its widest cell and a browser table cannot.
-A truncated cell is marked (`"truncated": true`).
-
-Untrusted cell content is **never** rendered as markup: the HTML is
-generated by `maud`, which escapes every interpolated value, and the
-script inserts cell values with `textContent`, never `innerHTML`. A cell
-containing `<script>` is shown as text.
-
-## The worker model and the limits
-
-The console owns a **tokio runtime on its own thread**: it does not care
-whether the server next to it runs the blocking (`sync`) transport or the
-tokio transport (`async-server`, wave 47).
-
-- The runtime's worker threads and its **blocking-pool size are set
-  explicitly** (`--ui-workers`, default 4; the blocking pool, default 8).
-  The engine is synchronous, so every store read runs through
-  `spawn_blocking` on that bounded pool: the async runtime never executes
-  engine code, and a slow scan cannot stall the reactor.
-- The accept loop caps the concurrent connections (`--ui-max-connections`,
-  default 64): over the cap the connection is refused with a `503`.
-- hyper caps the request headers (64 headers, 16 KiB each) and enforces
-  the header read timeout (10 s), so a slow client cannot hold a
-  connection open.
-- Every request has a deadline (30 s) that covers the head, the body and
-  the response.
-- A request that declares a body over the limit (64 KiB) is refused with a
-  `413` at the edge — the console never reads a body at all.
-
-## The async carve-out
-
-The workspace's design rule is **zero async**: the engine, the planner, the
-storage and the default server are synchronous. The console is the second
-documented carve-out (after wave 47's `async-server` transport), scoped to
-the I/O boundary only:
-
-1. The console owns its own runtime, on its own thread. The default build
-   of `pinkdb-server` does not even compile the console crate, so the
-   lean server binary is unchanged (`cargo tree -p pinkdb-server` shows no
-   tokio without the `ui` feature).
-2. The engine stays synchronous: every store read is a `spawn_blocking`
-   call on the bounded blocking pool.
-3. No protocol change, no engine change, no async storage: the console is
-   an HTTP surface around the existing synchronous engine.
-
-## Known limits (this wave)
-
-- **No query console.** The console browses; it cannot run SQL. That is
-  the explicit follow-up of this wave, and it needs its own authorization
-  story (a query console is an arbitrary-statement surface, not a
-  read-only one).
-- **The sizes are estimates.** The engine keeps no byte-size accounting (a
-  table knows its row count and its chunks, not its bytes), so
-  `estimated_bytes` is the row count times the sum of the columns' type
-  widths (an average inline string is counted as 16 bytes).
-- **Views and tables are listed together.** pinkdb's `SHOW TABLES` merges
-  them and the console uses that statement, so a view appears in the
-  relation list like a table (its rows are previewed through the view).
-- **A token cannot open the server-rendered preview page.** A browser
-  cannot add a bearer header to a top-level navigation; the interactive
-  console asks for the token once and sends it with every API call, and
-  `curl -H "Authorization: Bearer …" /preview?…` works for scripts.
-- **Deep paging costs a scan.** The engine applies `OFFSET` after the scan,
-  so a far page of a large table reads the table's chunks.
+- **Lake attachments are session-local** and made from the CLI (`.lake
+  attach`); a server shows attached lake tables when its store has them,
+  and time travel and the change feed are SQL (`AT (VERSION => n)`,
+  `lake_changes`), not a version browser.
+- **One agent run per server at a time** (above).
+- **The browser holds at most 10,000 rows of a result**; the CSV/JSON
+  buttons export the rest by re-running the statement, so they refuse
+  anything but a single query.
+- **A transaction does not span runs.** Each run has its own connection: a
+  `BEGIN` left open at the end of a run is rolled back.
+- **Sessions live in memory**: a server restart logs everyone out
+  (worksheets and history are in the store and survive).
+- **Deep paging in `/preview` costs a scan** (`OFFSET` is applied after
+  the scan).
 
 ## The flags
 
@@ -184,9 +247,26 @@ the I/O boundary only:
 --enable-ui                 serve the console (needs a build with `ui`)
 --ui-host HOST              the console's bind address (default 127.0.0.1)
 --ui-port PORT              the console's TCP port (default 8080; 0 = ephemeral)
---ui-auth basic             HTTP Basic against the store's users
---ui-token TOKEN            a bearer token for the API
+--ui-auth basic             log in with the store's users (their grants apply)
+--ui-token TOKEN            log in with this operator token
+--ui-read-only              worksheets run only queries, for everyone
+--ui-allowed-host NAME      another Host name to answer to (repeatable)
 --ui-workers N              the runtime's worker threads (default 4)
 --ui-max-connections N      the concurrent connections (default 64)
---ui-max-page-size N        the row-preview page-size bound (default 500)
+--ui-max-page-size N        the /preview and /api/rows page bound (default 500)
+--agent-extension PATH      load the data agent for the ask box
+--agent-allow-writes        let the agent write (under the user's grants)
+--memory-extension PATH     load the agent memory
+--memory-distill-every SECS drain the memory queue on this interval
+```
+
+## A demo
+
+```sh
+# a TPC-H SF 0.01 store (bench/suite generates one; any .pink file works)
+python3 bench/suite/run.py --only tpch --scale 0.01 --runs 1 --warmup 0
+cargo build --release -p pinkdb-server --features ui -p pinkdb-agent
+./target/release/pinkdb-server --file <work-dir>/tpch_sf0.01/store.pink \
+  --enable-ui --agent-extension ./target/release/libpinkdb_agent.dylib
+# open http://127.0.0.1:8080/
 ```

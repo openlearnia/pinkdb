@@ -24,7 +24,7 @@ const USAGE: &str = "\
 .agent sessions
 .agent show <session>
 .agent fork <session> <step> [provider <name>] [model <name>] [\"<new question>\"]
-.agent providers
+.agent providers [json]
 .agent rows|cols|cell|budget|timeout|hint [N]   (wave 99: agent output settings)
 ";
 
@@ -76,6 +76,7 @@ fn dispatch(session: &mut dyn Host, args: &str) -> Result<(), String> {
             show(session, id)
         }
         "fork" => fork(session, &words[1..]),
+        "providers" if words.get(1).is_some_and(|w| w == "json") => providers_json(session),
         "providers" => providers(session),
         other => Err(format!(
             "unknown .agent command {other:?}: try .agent ask, resume, sessions, show, fork or \
@@ -192,6 +193,43 @@ fn providers(session: &mut dyn Host) -> Result<(), String> {
         session,
         "there is no default provider: name one with `provider <name>` on the run or \
          PINKDB_AGENT_PROVIDER\n",
+    );
+    Ok(())
+}
+
+/// `.agent providers json`: the provider table for a program (the warehouse
+/// console). Whether a key and a base URL are set — never the key, never the
+/// URL, which may carry a private host — and which provider the environment
+/// names by default, if any.
+fn providers_json(session: &mut dyn Host) -> Result<(), String> {
+    let providers: Vec<Value> = registry::PROVIDERS
+        .iter()
+        .map(|entry| {
+            let key_set = entry
+                .key_variables
+                .iter()
+                .any(|name| registry::env(name).is_some());
+            let base_url_set = entry.base_url_with(&registry::env).is_some();
+            json!({
+                "name": entry.name,
+                "protocol": entry.protocol.name(),
+                "default_model": entry.default_model,
+                "key_set": key_set,
+                "key_required": entry.key_required,
+                "base_url_set": base_url_set,
+                "ready": base_url_set && (key_set || !entry.key_required),
+                "key_variables": entry.key_variables,
+                "base_url_variable": entry.base_url_variable,
+            })
+        })
+        .collect();
+    let selected = registry::env(registry::PROVIDER_VARIABLE);
+    emit(
+        session,
+        &format!(
+            "{}\n",
+            json!({ "providers": providers, "default": selected })
+        ),
     );
     Ok(())
 }

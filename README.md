@@ -1780,60 +1780,54 @@ scans (`read_parquet`, `read_arrow`, `FROM 'file.parquet'`) likewise require
 `ADMIN` in an authenticated session; the embedded API stays trusted. See
 [`docs/security-remediation-pass6.md`](docs/security-remediation-pass6.md).
 
-### Warehouse browsing UI (wave 78)
+### Warehouse console (waves 78, 121)
 
-`pinkdb-server` can serve a **read-only web console** next to its binary
-protocol: a browser UI with the store's databases, relations, paged row
-previews and statistics. It is **off by default** and lives behind the
-`ui` cargo feature, so the default server binary is unchanged (the console
-crate is not even compiled without the feature):
+`pinkdb-server` can serve a **web console** next to its binary protocol:
+SQL worksheets, a catalog browser, the run history and an ask box for the
+data agent. It is **off by default** and lives behind the `ui` cargo
+feature, so the default server binary is unchanged:
 
 ```sh
 cargo build --release -p pinkdb-server --features ui
-./target/release/pinkdb-server --enable-ui     # console on 127.0.0.1:8080
+./target/release/pinkdb-server --file warehouse.pink --enable-ui   # http://127.0.0.1:8080
 ```
 
-The console is **read-only by construction**: its store access can only run
-`SHOW DATABASES`, `SHOW TABLES`, `DESCRIBE`, `SELECT COUNT(*)` and
-`SELECT … LIMIT … OFFSET …`. There is no DML and no DDL endpoint, and the
-router has no `POST`/`PUT`/`DELETE` route at all. Every read runs under the
-engine's own pass-5 limits (a 30 s statement deadline, a 1 000-row
-materialized-result cap, a 16 MiB byte cap) and releases the store lock
-before any HTTP work happens.
+- **Worksheets**: tabs of SQL saved in the store (`pinkdb_worksheets`),
+  private to their owner unless shared by name; an editor with
+  highlighting and catalog completion (`Ctrl/Cmd+Enter` runs the statement
+  at the cursor); one result tab per statement with a virtual-scrolled
+  grid, a cell viewer that pretty-prints JSON/`STRUCT`/`VARIANT`, the
+  wave-84 profile, `EXPLAIN` as a tree, SVG charts and CSV/JSON download;
+  **cancel** stops a running query at its next chunk; a per-user history.
+- **Catalog**: tables, views, materialized views, indexes (hash and HNSW),
+  triggers, macros and attached lake tables, with column statistics — the
+  new `pinkdb_catalog()` relation plus `pinkdb_column_stats()`.
+- **Ask**: with `--agent-extension libpinkdb_agent…` the console runs the
+  data agent as the logged-in user and streams each statement the model
+  runs and its answer. Providers and keys come from the server's
+  environment (no default provider; no key ever reaches the browser), and
+  the agent is read-only unless `--agent-allow-writes`.
+  `--memory-distill-every SECS` (with `--memory-extension`) drains the
+  agent-memory queue in the background.
 
-**Exposure policy (fail closed).** The console binds `127.0.0.1` by default
-and a **non-loopback bind is refused** (exit 2): the console is a browser UI
-and cannot use the server's TLS transport, so a non-localhost exposure needs
-console TLS (wave 46) *and* RBAC (wave 48) first. A store that **has users**
-is never served unauthenticated: the server refuses to start unless
-`--ui-auth basic` (HTTP Basic, verified through the engine's own Argon2id
-path — the console's statements then run under that user's grants) or
-`--ui-token <secret>` (a constant-time bearer token) is given. Serving a
-store *without* users prints a loud warning: every request can read the
-whole store.
+**Who runs the SQL.** With `--ui-auth basic` every statement runs as the
+logged-in user, under that user's grants (the password is checked once, at
+login); `--ui-token` is an operator token; a store without users may be
+served without authentication (with a loud warning). `--ui-read-only`
+limits everyone to queries.
 
-**Endpoints** (all `GET`/`HEAD`; anything else is `405`, an unknown path is
-`404`): `/` (the console shell), `/preview?db=&table=&page=` (a
-server-rendered row preview — the no-JavaScript fallback), `/assets/console.css`
-and `/assets/console.js` (embedded in the binary — no CDN, no external font
-or script), and the JSON API `/api/databases`, `/api/schemas?db=`,
-`/api/tables?db=&schema=`, `/api/rows?db=&table=&page=&page_size=` and
-`/api/stats?db=` (per-table row counts and size estimates). Paging is
-bounded (`--ui-max-page-size`, default 500) and `total_rows` is exact.
+**Security.** Server-side sessions (`HttpOnly`, `SameSite=Strict` cookie),
+a CSRF token plus an `Origin` check on every `POST`, a `Host` check against
+DNS rebinding, a strict Content-Security-Policy (no inline script), JSON-only
+answers rendered as text, request and per-session query limits. The exposure
+policy of wave 78 stays: loopback-only (no console TLS yet), and a store with
+users is never served unauthenticated.
 
-The preview text **mirrors the CLI's box renderer** (`NULL` renders as
-`NULL`, a `DOUBLE` prints `1.0`, a `VARCHAR` never carries a raw control
-character) and untrusted cell content is never rendered as markup: the HTML
-is generated by `maud` (which escapes every interpolated value) and the
-script inserts cells with `textContent`.
-
-The console is the workspace's **second async carve-out** (after wave 47's
-`async-server` transport), scoped to the I/O boundary: it owns a tokio
-runtime on its own thread (so it works with either transport), and every
-synchronous engine call runs through `spawn_blocking` on a **bounded blocking
-pool** — the async runtime never executes engine code. See
-[`docs/server-ui.md`](docs/server-ui.md) for the full policy, the endpoint
-list and the known limits (no query console yet).
+The browser app is Rust — [Leptos](https://leptos.dev) compiled to
+WebAssembly, 255 KB gzipped — embedded in the binary (no CDN);
+`scripts/build-console.sh` rebuilds it. See
+[`docs/server-ui.md`](docs/server-ui.md) for the endpoints, the limits and
+a demo with a TPC-H store.
 
 ## Agents and MCP (wave 105)
 

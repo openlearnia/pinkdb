@@ -2728,11 +2728,11 @@ fn agent_flags(args: &str) -> (bool, bool) {
 /// database, which stays off-limits even with allow-writes so a prompt
 /// injection cannot rewrite the transcript a run resumes from.
 fn agent_tool_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::ServePolicy {
-    pinkdb::serve::ServePolicy {
-        deny_write_databases: vec![pinkdb::serve::AGENT_DATABASE.to_string()],
+    pinkdb::serve::agent_policies(&pinkdb::serve::ServePolicy {
         limits: agent_limits(),
         ..mcp_policy(allow_writes, allow_files)
-    }
+    })
+    .0
 }
 
 /// What the extension's own bookkeeping may do: write its database, read its
@@ -2740,19 +2740,18 @@ fn agent_tool_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::Se
 /// read list — not the extension's quoting — is what keeps a mistyped
 /// identifier inside the transcript.
 fn agent_internal_policy() -> pinkdb::serve::ServePolicy {
-    pinkdb::serve::ServePolicy {
-        write_database: Some(pinkdb::serve::AGENT_DATABASE.to_string()),
-        read_databases: Some(vec![pinkdb::serve::AGENT_DATABASE.to_string()]),
+    pinkdb::serve::agent_policies(&pinkdb::serve::ServePolicy {
         limits: agent_limits(),
         ..mcp_policy(true, false)
-    }
+    })
+    .1
 }
 
-/// The agent memory's database. The engine does not name it: the extension
-/// owns the shape, and these policies are what keep every other statement out
-/// of it. A cell can only be trusted to the extension because the extension is
+/// The agent memory's database. The extension owns the shape; the policies in
+/// `pinkdb::serve::memory_policies` are what keep every other statement out of
+/// it. A cell can only be trusted to the extension because the extension is
 /// what filters rows by their visibility.
-const MEMORY_DATABASE: &str = "pinkdb_memory";
+const MEMORY_DATABASE: &str = pinkdb::serve::MEMORY_DATABASE;
 
 /// The memory library file name of this platform: what `.memory` tells the
 /// user to load.
@@ -2840,12 +2839,11 @@ fn memory_command(db: &mut PinkDb, args: &str) -> i32 {
 /// internal channel; a tool that plans a statement against the memory tables is
 /// a bug, not a grant, so the public channel cannot read or write them.
 fn memory_tool_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::ServePolicy {
-    pinkdb::serve::ServePolicy {
-        deny_read_databases: vec![MEMORY_DATABASE.to_string()],
-        deny_write_databases: vec![MEMORY_DATABASE.to_string()],
+    pinkdb::serve::memory_policies(&pinkdb::serve::ServePolicy {
         limits: agent_limits(),
         ..mcp_policy(allow_writes, allow_files)
-    }
+    })
+    .0
 }
 
 /// What the extension's own bookkeeping may do: read and write memory, reach
@@ -2853,13 +2851,11 @@ fn memory_tool_policy(allow_writes: bool, allow_files: bool) -> pinkdb::serve::S
 /// RBAC gate, so the read list is the defense: a slip in a generated predicate
 /// reads `pinkdb_memory` or fails, never a user's table or a file.
 fn memory_internal_policy() -> pinkdb::serve::ServePolicy {
-    pinkdb::serve::ServePolicy {
-        write_database: Some(MEMORY_DATABASE.to_string()),
-        read_databases: Some(vec![MEMORY_DATABASE.to_string()]),
-        allow_external_services: true,
+    pinkdb::serve::memory_policies(&pinkdb::serve::ServePolicy {
         limits: agent_limits(),
         ..mcp_policy(true, false)
-    }
+    })
+    .1
 }
 
 /// What a served memory session may do: the MCP policy, memory masked off the
@@ -3050,16 +3046,25 @@ fn agent_memory_record(db: &mut PinkDb, question: &str, answer: &str) {
     }
 }
 
-/// One line the memory command grammar can take whole: no quotes, no
-/// backslashes, and a cap that keeps a long answer from becoming a huge cell.
+/// One quoted argument the memory command grammar takes whole: no quotes, no
+/// backslashes, a cap that keeps a long answer from becoming a huge cell, and
+/// no leading `-`. The grammar reads `--name value` anywhere in its words, so
+/// an answer passed as loose words could set a flag (`--visibility team`).
 fn sanitize(text: &str) -> String {
-    text.split_whitespace()
+    let text: String = text
+        .split_whitespace()
         .map(|word| word.replace(['"', '\\'], ""))
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
         .take(4000)
-        .collect()
+        .collect();
+    let text = text.trim_start_matches('-').trim_start();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("\"{text}\"")
+    }
 }
 
 /// Escape one word for the `.agent` command line's quoting rules.

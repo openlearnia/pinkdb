@@ -107,6 +107,7 @@ NAV = [
             {"key": "lake", "label": "Lake", "out": "docs/lake.html"},
             {"key": "iceberg", "label": "Iceberg", "out": "docs/iceberg.html"},
             {"key": "server", "label": "Server", "out": "docs/server.html"},
+            {"key": "console", "label": "Warehouse console", "out": "docs/console.html"},
             {"key": "agents", "label": "Agents and MCP", "out": "docs/agents.html"},
             {"key": "agent", "label": "pinkdb agent", "out": "docs/agent.html"},
             {"key": "memory", "label": "Agent memory", "out": "docs/memory.html"},
@@ -265,6 +266,16 @@ PAGES = {
         "description": (
             "Run pinkdb-server over TCP: flags, durable mode, the framed "
             "binary protocol, remote CLI mode, and the security posture."
+        ),
+    },
+    "console.html": {
+        "out": "docs/console.html",
+        "nav": "console",
+        "title": "Warehouse console — pinkdb",
+        "description": (
+            "pinkdb-server's web console: SQL worksheets with completion, "
+            "results, charts and cancel, the catalog browser, the run history, "
+            "the ask box for the data agent, and its security model."
         ),
     },
     "agents.html": {

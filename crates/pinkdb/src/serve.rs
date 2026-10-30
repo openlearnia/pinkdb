@@ -94,6 +94,62 @@ pub struct ServePolicy {
 /// `pinkdb_ext_sdk::AGENT_DATABASE` is the same name on the extension side.
 pub const AGENT_DATABASE: &str = "pinkdb_agent";
 
+/// The database the agent-memory extension (wave 109) keeps its layers in.
+/// The engine does not create it: the extension owns the shape, and
+/// [`memory_policies`] are what keep every other statement out of it.
+pub const MEMORY_DATABASE: &str = "pinkdb_memory";
+
+/// The two policies an agent command (`.agent …`) runs under, built from the
+/// host's base policy (its write/file switches, budgets and display):
+///
+/// * the **tool** channel — the model's statements — gets the base policy and
+///   may never write [`AGENT_DATABASE`], so a prompt injection cannot rewrite
+///   the transcript a run resumes from;
+/// * the **internal** channel — the extension's bookkeeping — may write and
+///   read only [`AGENT_DATABASE`], and reaches no file and no service. It runs
+///   without the RBAC gate, so this read list, not the extension's quoting, is
+///   what keeps a mistyped identifier inside the transcript.
+pub fn agent_policies(base: &ServePolicy) -> (ServePolicy, ServePolicy) {
+    let tool = ServePolicy {
+        deny_write_databases: vec![AGENT_DATABASE.to_string()],
+        internal: None,
+        ..base.clone()
+    };
+    let internal = ServePolicy {
+        allow_writes: true,
+        allow_files: false,
+        allow_external_services: false,
+        write_database: Some(AGENT_DATABASE.to_string()),
+        read_databases: Some(vec![AGENT_DATABASE.to_string()]),
+        internal: None,
+        ..base.clone()
+    };
+    (tool, internal)
+}
+
+/// The two policies a memory command (`.memory …`) runs under: the tool
+/// channel cannot read or write [`MEMORY_DATABASE`] (its rows are filtered per
+/// caller by the extension, never served raw), and the internal channel may
+/// read and write only that database and reach the embeddings provider.
+pub fn memory_policies(base: &ServePolicy) -> (ServePolicy, ServePolicy) {
+    let tool = ServePolicy {
+        deny_read_databases: vec![MEMORY_DATABASE.to_string()],
+        deny_write_databases: vec![MEMORY_DATABASE.to_string()],
+        internal: None,
+        ..base.clone()
+    };
+    let internal = ServePolicy {
+        allow_writes: true,
+        allow_files: false,
+        allow_external_services: true,
+        write_database: Some(MEMORY_DATABASE.to_string()),
+        read_databases: Some(vec![MEMORY_DATABASE.to_string()]),
+        internal: None,
+        ..base.clone()
+    };
+    (tool, internal)
+}
+
 /// A host command handler: text starting with `.`, the store, and whether the
 /// session is read-only.
 pub type CommandHook = fn(&mut PinkDb, &str, bool) -> std::result::Result<String, String>;
@@ -910,7 +966,10 @@ pub fn render_results(results: &[QueryResult], display: AgentDisplay) -> String 
 
 /// One line for a statement that returned no rows. Only reachable with
 /// `allow_writes`, so a read-only client never sees these.
-fn outcome_line(result: &QueryResult) -> String {
+/// One line describing a statement's outcome (`Inserted 3 rows`, `Created view
+/// v`), with names sanitized for a terminal. A `SELECT` answers its row count;
+/// hosts render its rows themselves.
+pub fn outcome_line(result: &QueryResult) -> String {
     /// Names are user data: a table or role name may carry a terminal escape
     /// sequence, and the client renders this text.
     fn name(name: &str) -> String {
@@ -918,7 +977,9 @@ fn outcome_line(result: &QueryResult) -> String {
     }
     let rows = |count: usize| agent::format_count(count as u64);
     match result {
-        QueryResult::Selected { .. } => unreachable!("selected results are rendered as a table"),
+        QueryResult::Selected { rows: selected, .. } => {
+            format!("Selected {} rows", rows(selected.len()))
+        }
         QueryResult::Created => "Created".to_string(),
         QueryResult::Inserted { count } => format!("Inserted {} rows", rows(*count)),
         QueryResult::Updated { count } => format!("Updated {} rows", rows(*count)),
@@ -1135,6 +1196,98 @@ impl pinkdb_ext_loader::CommandHost for CommandSession<'_> {
 
     fn emit(&mut self, channel: i32, text: &str) {
         (self.sink)(channel, text);
+    }
+}
+
+/// What a command run on a [`crate::db::Connection`] reports back to its
+/// host ([`crate::db::Connection::run_command`], wave 121).
+pub trait CommandEvents {
+    /// Text from the extension: channel `0` is the answer, `1` a diagnostic.
+    fn emit(&mut self, channel: i32, text: &str);
+
+    /// One statement the extension ran on the public (tool) channel, with its
+    /// reply: `(0, markdown)` or `(1, error_json)`. A console shows these as
+    /// the run's tool calls.
+    fn statement(&mut self, _sql: &str, _code: i32, _reply: &str) {}
+
+    /// Whether the host wants the run stopped: every later statement of the
+    /// run, on either channel, is refused with [`crate::STATEMENT_CANCELLED`].
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// The host half of a command run on a connection: each statement takes the
+/// store lock for its own duration, so a long run (a model call between
+/// statements) never blocks the store's other sessions.
+struct ConnectionCommand<'a> {
+    conn: &'a mut crate::db::Connection,
+    policy: &'a ServePolicy,
+    internal: &'a ServePolicy,
+    events: &'a mut dyn CommandEvents,
+}
+
+impl pinkdb_ext_loader::CommandHost for ConnectionCommand<'_> {
+    fn execute_statement(&mut self, sql: &str) -> (i32, String) {
+        let (code, reply) = if self.events.cancelled() {
+            (
+                1,
+                agent::error_json(crate::exec::STATEMENT_CANCELLED, "execution", None),
+            )
+        } else if sql.trim_start().starts_with('.') {
+            (1, agent::error_json(NO_COMMANDS_HINT, "permission", None))
+        } else {
+            execute_on(self.conn, self.policy, sql)
+        };
+        self.events.statement(sql, code, &reply);
+        (code, reply)
+    }
+
+    fn execute_internal(&mut self, sql: &str) -> (i32, String) {
+        if self.events.cancelled() {
+            return (
+                1,
+                agent::error_json(crate::exec::STATEMENT_CANCELLED, "execution", None),
+            );
+        }
+        internal_on(self.conn, self.internal, sql)
+    }
+
+    fn emit(&mut self, channel: i32, text: &str) {
+        self.events.emit(channel, text);
+    }
+}
+
+impl crate::db::Connection {
+    /// Run one of `name`'s commands (`pinkdb_ext_command`) on this connection,
+    /// blocking until it returns (wave 121). The connection's login applies:
+    /// the tool channel runs under `policy` *and* the principal's grants; the
+    /// extension's bookkeeping runs under `internal` (no privilege gate, as
+    /// [`crate::db::Connection::execute_as_extension`] documents).
+    ///
+    /// Unlike [`PinkDb::run_command`], the store lock is taken per statement.
+    pub fn run_command(
+        &mut self,
+        name: &str,
+        args: &str,
+        policy: &ServePolicy,
+        internal: &ServePolicy,
+        events: &mut dyn CommandEvents,
+    ) -> Result<()> {
+        let ext = self.database().dynamic_extension(name)?;
+        if ext.command_fn().is_none() {
+            return Err(PinkDbError::Execution(format!(
+                "extension \"{name}\" exports no pinkdb_ext_command (it has no commands)"
+            )));
+        }
+        let mut host = ConnectionCommand {
+            conn: self,
+            policy,
+            internal,
+            events,
+        };
+        pinkdb_ext_loader::command::run_command(&ext, args, &mut host)
+            .map_err(|e| PinkDbError::Execution(e.to_string()))
     }
 }
 

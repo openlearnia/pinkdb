@@ -109,13 +109,17 @@
 #[cfg(feature = "catalog")]
 pub mod catalog;
 pub mod client;
+/// The agent-memory distillation worker (wave 121): drains wave 109's queue
+/// on an interval when the server runs with `--memory-distill-every`.
+pub mod memory_worker;
 pub mod protocol;
 pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
 
-/// The warehouse browsing UI (wave 78): the read-only web console the
-/// server can serve next to its binary protocol. Only in a build with the
+/// The warehouse console (waves 78 and 121): the web console — catalog
+/// browser, SQL worksheets and the data agent — the server can serve next to
+/// its binary protocol. Only in a build with the
 /// `ui` cargo feature (off by default); see `docs/server-ui.md`.
 #[cfg(feature = "ui")]
 pub mod ui;

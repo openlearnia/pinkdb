@@ -7,6 +7,12 @@ members = [
     # A sibling of `pinkdb-server`, pulled in by that crate's optional `ui`
     # feature, so the default server binary stays exactly as it was.
     "crates/pinkdb-server-ui",
+    # Wave 121: the console's wire types and editor SQL helpers, shared by the
+    # server and the browser app. The browser app itself
+    # (`crates/pinkdb-server-ui-web`, Leptos compiled to wasm) is *not* a
+    # member: it has its own lockfile and is built by
+    # `scripts/build-console.sh`, so the workspace never compiles Leptos.
+    "crates/pinkdb-server-ui-api",
     "crates/pinkdb-ffi",
     "crates/pinkdb-ext-loader",
     "crates/pinkdb-js",

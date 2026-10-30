@@ -1,8 +1,10 @@
-//! The console's JSON API and its server-rendered pages.
+//! The console's browsing API (wave 78) and its server-rendered pages.
 //!
-//! Every handler is **read-only**: the router has no mutating route, and the
-//! store access layer ([`crate::store`]) can only run catalog reads, counts
-//! and `SELECT`s.
+//! Every handler here is **read-only**: the store access layer
+//! ([`crate::store`]) can only run catalog reads, counts and `SELECT`s. The
+//! worksheet API, which runs a user's SQL, is [`crate::work`]. A request is
+//! authenticated by its session cookie or, for scripts, by an
+//! `Authorization` header (HTTP Basic or a bearer token).
 //!
 //! The engine work runs on the console's **bounded blocking pool**
 //! ([`tokio::task::spawn_blocking`]): pinkdb's API is synchronous, so the
@@ -275,6 +277,8 @@ fn auth_failure_response(failure: AuthFailure, mode: &UiAuth) -> Response {
 
 /// What a request proved about itself.
 enum AuthPlan {
+    /// A login session (the session cookie, wave 121).
+    Session(Arc<crate::sessions::UiSession>),
     /// No credential is needed (the store has no users).
     Anonymous,
     /// A bearer token was verified.
@@ -297,12 +301,11 @@ fn plan_auth(
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
 ) -> Result<AuthPlan, ApiError> {
+    if let Some(session) = crate::work::cookie_session(shared, headers) {
+        return Ok(AuthPlan::Session(session));
+    }
     let mode = shared.auth.mode().clone();
-    let credentials = crate::auth::AuthState::parse(
-        headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-    );
+    let credentials = crate::work::header_credentials(headers);
     match mode {
         UiAuth::None => Ok(AuthPlan::Anonymous),
         UiAuth::Token(_) => match credentials {
@@ -534,21 +537,10 @@ pub async fn shell(
     headers: HeaderMap,
     _peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    // The shell is a static page: in token mode it carries no data, so it
-    // is served without a credential (the browser cannot send a bearer
-    // token on a top-level navigation). In Basic mode the browser must
-    // present credentials — the page carries no data, so the credential is
-    // not verified here (every API call verifies it through the engine).
-    if matches!(shared.auth.mode(), UiAuth::Basic) {
-        let credentials = crate::auth::AuthState::parse(
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-        );
-        if !matches!(credentials, Credentials::Basic { .. }) {
-            return auth_failure_response(AuthFailure::Missing, shared.auth.mode());
-        }
-    }
+    // The shell is a static page that carries no data: it is served without
+    // a credential and shows its own login form (wave 121) when the browser
+    // has no session. Every API call is authenticated.
+    let _ = headers;
     html::shell_response(&shared)
 }
 
@@ -655,6 +647,13 @@ where
         // have gained a user since the console started, and an
         // unauthenticated console must stop serving it.
         if matches!(plan, AuthPlan::Anonymous) && worker.db.has_users() {
+            worker.put_session(session);
+            return Err(ApiError::Auth(AuthFailure::Rejected));
+        }
+        if let AuthPlan::Session(ui) = &plan
+            && let crate::sessions::Identity::User(user) = &ui.identity
+            && session.impersonate(user).is_err()
+        {
             worker.put_session(session);
             return Err(ApiError::Auth(AuthFailure::Rejected));
         }

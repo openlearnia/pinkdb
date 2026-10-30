@@ -186,6 +186,13 @@ impl Database {
         read_lock(&self.shared).dynamic_extension(name)
     }
 
+    /// The loaded extensions that export `pinkdb_ext_command` (see
+    /// [`PinkDb::command_extensions`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn command_extensions(&self) -> Vec<String> {
+        read_lock(&self.shared).command_extensions()
+    }
+
     pub fn connect(&self) -> Connection {
         // Start on the store's current database (fresh stores: `main`).
         let current_db = read_lock(&self.shared).current_db().to_string();
@@ -202,6 +209,7 @@ impl Database {
             session: crate::storage::Session::new(),
             external_services: true,
             trusted: false,
+            cancel: None,
         }
     }
 
@@ -460,6 +468,9 @@ pub struct Connection {
     /// `principal` stays set, so `current_user()` and a trigger's invoker
     /// rights still see the logged-in user.
     trusted: bool,
+    /// The front-end's cancellation switch (wave 121), checked by every
+    /// statement of this connection at its chunk boundaries.
+    cancel: Option<crate::exec::CancelFlag>,
 }
 
 impl Connection {
@@ -616,6 +627,44 @@ impl Connection {
         self.principal = Some(user.to_ascii_lowercase());
         self.session.set_principal(self.principal.clone());
         Ok(name)
+    }
+
+    /// Adopt an existing user as this session's principal **without** a
+    /// password (wave 121).
+    ///
+    /// For a front-end that authenticated the user itself — the warehouse
+    /// console checks the password once at login and then keeps a session
+    /// cookie, never the password. Every later statement runs under the
+    /// user's grants, exactly as after [`Connection::login`]. This widens
+    /// nothing: the caller already holds a [`Database`], whose plain
+    /// [`Database::connect`] is a trusted session with every privilege; this
+    /// only narrows such a session to one user. Fails when the user does not
+    /// exist (a dropped user's console session ends with it).
+    pub fn impersonate(&mut self, user: &str) -> Result<String> {
+        self.db.refresh()?;
+        let record = {
+            let store = read_lock(&self.db.shared);
+            store.login_record(user)
+        };
+        let Some((name, _)) = record else {
+            return Err(crate::rbac::auth_failed());
+        };
+        self.principal = Some(user.to_ascii_lowercase());
+        self.session.set_principal(self.principal.clone());
+        Ok(name)
+    }
+
+    /// Install (or remove) a cancellation switch: setting it stops the
+    /// statement this connection is running at its next chunk boundary, with
+    /// [`crate::STATEMENT_CANCELLED`].
+    pub fn set_cancel_flag(&mut self, cancel: Option<crate::exec::CancelFlag>) {
+        self.cancel = cancel;
+    }
+
+    /// The database this connection runs on.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn database(&self) -> &Database {
+        &self.db
     }
 
     /// The authenticated principal of this session, if any (lowercased).
@@ -781,7 +830,8 @@ impl Connection {
         // limits (the embedded default) is a zero-cost `None` budget.
         let budget = Arc::new(
             crate::exec::ExecBudget::new(self.exec_limits.as_ref())
-                .with_external_services(self.external_services),
+                .with_external_services(self.external_services)
+                .with_cancel(self.cancel.clone()),
         );
         // Transaction control never touches table data: handle first. The
         // whole transition (including COMMIT's WAL append) is execution time.
