@@ -9,6 +9,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-30</h2>
+<h3>Fixes from the first CI run after the console waves ✅</h3>
+<ul>
+<li><strong>An explicit transaction publishes to a lake catalog.</strong> On a server over a lake catalog (<code>--catalog</code>), work done between <code>BEGIN</code> and <code>COMMIT</code> was not published (single statements were); the console's CSV upload, which writes in one transaction, was lost on restart.</li>
+<li><strong>Postgres lake catalogs work with a password.</strong> Every catalog write reconnected with the redacted URL (<code>user:***@</code>) and failed on a server that checks passwords.</li>
+<li>Arrow and Parquet move to 60.1 for <code>zstd</code> 0.14 (security advisories in <code>zstd</code>/<code>zstd-safe</code> 0.13/7); the Docker image builds again (its fetch stage now copies every crate manifest).</li>
+</ul>
 <h3>Wave 121g — plain views out of the console's catalog ✅</h3>
 <ul>
 <li>The console no longer lists plain views (<code>CREATE VIEW</code>): they are session-local and never stored with the warehouse, so a listed one disappeared on restart. Materialized views, which are stored, keep their folder; the database page counts them on their own.</li>

@@ -9,6 +9,19 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Fixes from the first CI run after the console waves ✅
+
+- **An explicit transaction publishes to a lake catalog.** On a server over
+  a lake catalog (`--catalog`), work done between `BEGIN` and `COMMIT` was
+  not published (single statements were); the console's CSV upload, which
+  writes in one transaction, was lost on restart.
+- **Postgres lake catalogs work with a password.** Every catalog write
+  reconnected with the redacted URL (`user:***@`) and failed on a server
+  that checks passwords.
+- Arrow and Parquet move to 60.1 for `zstd` 0.14 (security advisories in
+  `zstd`/`zstd-safe` 0.13/7); the Docker image builds again (its fetch
+  stage now copies every crate manifest).
+
 ### Wave 121g — plain views out of the console's catalog ✅
 
 - The console no longer lists plain views (`CREATE VIEW`): they are
