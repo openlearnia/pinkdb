@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pinkdb_server::CatalogStore;
-use pinkdb_server::ui::{UiOptions, UiServer, storage_info};
+use pinkdb_server::ui::{UiAuth, UiOptions, UiServer, storage_info};
 use serde_json::{Value, json};
 
 /// A fresh directory under the system temp dir.
@@ -151,8 +151,11 @@ pub fn lake_round_trip(catalog: &str, data: &str, backend: &str) {
     let server = UiServer::bind(
         "127.0.0.1:0",
         store.database(),
+        // These are storage tests: no sign-in (the default since wave 121d
+        // asks for one).
         UiOptions {
             storage,
+            auth: UiAuth::None,
             ..UiOptions::default()
         },
     )
