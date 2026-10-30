@@ -251,6 +251,8 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
                 }
             }
         }
+        // Threads finish in any order: compare the versions sorted.
+        winners.sort_unstable();
         let mut unique = winners.clone();
         unique.dedup();
         assert_eq!(
