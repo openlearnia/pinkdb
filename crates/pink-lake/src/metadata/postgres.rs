@@ -55,6 +55,7 @@ static INSTALL_PROVIDER: Once = Once::new();
 
 /// The URL in its safe-to-keep forms plus the passwords that must never
 /// appear in an error string.
+#[derive(Clone)]
 struct UrlInfo {
     raw: String,
     redacted: String,
@@ -144,7 +145,8 @@ pub(crate) fn open(url: &str, create: bool) -> Result<SqlMetadataStore> {
         let store = Arc::new(Mutex::new(client));
         Ok(Box::new(PostgresConnection {
             client: store,
-            url: info.redacted.clone(),
+            url: url.to_string(),
+            info,
             in_transaction: false,
             total: AtomicU64::new(0),
         }))
@@ -156,7 +158,10 @@ pub(crate) fn open(url: &str, create: bool) -> Result<SqlMetadataStore> {
 /// stays usable by readers.
 pub(crate) struct PostgresConnection {
     client: Arc<Mutex<Client>>,
+    /// The URL as given, password included: each transaction connects with
+    /// it. Never shown; errors and `Debug` use `info.redacted`.
     url: String,
+    info: UrlInfo,
     in_transaction: bool,
     total: AtomicU64,
 }
@@ -164,7 +169,7 @@ pub(crate) struct PostgresConnection {
 impl fmt::Debug for PostgresConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PostgresConnection")
-            .field("url", &self.url)
+            .field("url", &self.info.redacted)
             .field("in_transaction", &self.in_transaction)
             .finish()
     }
@@ -178,11 +183,7 @@ impl PostgresConnection {
     }
 
     fn info(&self) -> UrlInfo {
-        UrlInfo {
-            raw: self.url.clone(),
-            redacted: self.url.clone(),
-            passwords: Vec::new(),
-        }
+        self.info.clone()
     }
 }
 
@@ -227,7 +228,7 @@ impl SqlConnection for PostgresConnection {
             });
         }
         let parsed = PostgresUrl::parse(&self.url).map_err(|message| LakeError::BadLocation {
-            location: self.url.clone(),
+            location: self.info.redacted.clone(),
             message,
         })?;
         let info = UrlInfo::new(&parsed);
@@ -240,6 +241,7 @@ impl SqlConnection for PostgresConnection {
         Ok(Box::new(PostgresConnection {
             client: Arc::new(Mutex::new(client)),
             url: self.url.clone(),
+            info,
             in_transaction: true,
             total: AtomicU64::new(0),
         }))
