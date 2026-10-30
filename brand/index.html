@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>pinkdb brand</title>
+<link rel="icon" href="icon/favicon.svg" type="image/svg+xml">
+<style>
+  @font-face { font-family: "Bricolage Grotesque"; src: url("../website/src/assets/fonts/bricolage-grotesque.woff2") format("woff2"); font-weight: 400 800; }
+  @font-face { font-family: "Public Sans"; src: url("../website/src/assets/fonts/public-sans.woff2") format("woff2"); font-weight: 100 900; }
+  @font-face { font-family: "JetBrains Mono"; src: url("../website/src/assets/fonts/jetbrains-mono.woff2") format("woff2"); font-weight: 400 700; }
+  :root { --ink: #241F1C; --paper: #F7F1E8; --pink: #D6336C; --line: #DDCFBA; --ink-3: #6E6156; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.55 "Public Sans", system-ui, sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; padding: 56px 32px 80px; }
+  h1, h2 { font-family: "Bricolage Grotesque", system-ui, sans-serif; letter-spacing: -0.01em; }
+  h1 { font-size: 15px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); margin: 0 0 24px; }
+  h2 { font-size: 26px; font-weight: 700; margin: 64px 0 8px; }
+  p.lede { color: var(--ink-3); margin: 0 0 24px; max-width: 62ch; }
+  .hero { display: grid; place-items: center; padding: 72px 0; border: 1px solid var(--line); border-radius: 18px; background: #FCF8F1; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .tile { border: 1px solid var(--line); border-radius: 14px; padding: 28px; display: grid; place-items: center; min-height: 190px; position: relative; }
+  .tile.dark { background: var(--ink); border-color: var(--ink); }
+  .tile.pinkbg { background: var(--pink); border-color: var(--pink); }
+  .tile { overflow: hidden; }
+  .tile img { max-width: 100%; height: auto; }
+  .grid.wide { grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); }
+  .tile .cap { position: absolute; left: 14px; bottom: 10px; font: 12px "JetBrains Mono", monospace; color: var(--ink-3); }
+  .tile.dark .cap { color: #A89A88; }
+  .swatch { border-radius: 14px; padding: 18px; min-height: 150px; display: flex; flex-direction: column; justify-content: flex-end; font: 13px "JetBrains Mono", monospace; border: 1px solid var(--line); }
+  .swatch b { font: 700 20px "Bricolage Grotesque", sans-serif; }
+  .sizes { display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; }
+  .type div { padding: 14px 0; border-top: 1px solid var(--line); display: grid; grid-template-columns: 180px 1fr; align-items: baseline; }
+  .type span { font: 12px "JetBrains Mono", monospace; color: var(--ink-3); }
+  .dont { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  .dont .tile { min-height: 150px; }
+  .dont .tile::after { content: "✕"; position: absolute; top: 8px; right: 12px; color: #C92A2A; font-weight: 700; }
+  code { font: 13px "JetBrains Mono", monospace; }
+</style>
+</head>
+<body>
+<main>
+  <h1>pinkdb · brand sheet</h1>
+  <div class="hero"><img src="logo/pinkdb-lockup.svg" width="520" alt="pinkdb"></div>
+
+  <h2>The mark</h2>
+  <p class="lede">A lowercase p. The stem is a column cut into row groups, and the bowl is the pink dot: the value a query returns. The pink dot is the brand's only accent, and the same dot is the tittle of the wordmark's i.</p>
+  <div class="grid">
+    <div class="tile"><img src="logo/pinkdb-mark.svg" width="120" alt=""><span class="cap">pinkdb-mark</span></div>
+    <div class="tile dark"><img src="logo/pinkdb-mark-reverse.svg" width="120" alt=""><span class="cap">pinkdb-mark-reverse</span></div>
+    <div class="tile"><img src="logo/pinkdb-lockup-stacked.svg" width="150" alt=""><span class="cap">pinkdb-lockup-stacked</span></div>
+    <div class="tile dark"><img src="logo/pinkdb-lockup-stacked-reverse.svg" width="150" alt=""><span class="cap">pinkdb-lockup-stacked-reverse</span></div>
+  </div>
+
+  <h2>Lockups</h2>
+  <div class="grid wide">
+    <div class="tile"><img src="logo/pinkdb-lockup.svg" width="300" alt=""><span class="cap">pinkdb-lockup</span></div>
+    <div class="tile dark"><img src="logo/pinkdb-lockup-reverse.svg" width="300" alt=""><span class="cap">pinkdb-lockup-reverse</span></div>
+    <div class="tile"><img src="logo/pinkdb-wordmark.svg" width="240" alt=""><span class="cap">pinkdb-wordmark</span></div>
+    <div class="tile dark"><img src="logo/pinkdb-wordmark-reverse.svg" width="240" alt=""><span class="cap">pinkdb-wordmark-reverse</span></div>
+  </div>
+
+  <h2>App icon and favicon</h2>
+  <p class="lede">Below 24 px the stem cuts close up, so the favicon uses a solid stem.</p>
+  <div class="sizes">
+    <img src="icon/app-icon.svg" width="160" alt="">
+    <img src="icon/app-icon-light.svg" width="160" alt="">
+    <img src="icon/app-icon-pink.svg" width="160" alt="">
+    <img src="icon/app-icon.svg" width="64" alt="">
+    <img src="icon/favicon.svg" width="32" alt="">
+    <img src="icon/favicon.svg" width="16" alt="">
+  </div>
+
+  <h2>Color</h2>
+  <div class="grid">
+    <div class="swatch" style="background:#D6336C;color:#fff;border-color:#D6336C"><b>Pink</b>#D6336C · 214 51 108</div>
+    <div class="swatch" style="background:#241F1C;color:#F7F1E8;border-color:#241F1C"><b>Ink</b>#241F1C · 36 31 28</div>
+    <div class="swatch" style="background:#F7F1E8"><b>Paper</b>#F7F1E8 · 247 241 232</div>
+  </div>
+
+  <h2>Type</h2>
+  <div class="type">
+    <div><span>Display · Bricolage Grotesque</span><b style="font:700 34px 'Bricolage Grotesque'">Analytics, embedded.</b></div>
+    <div><span>Text · Public Sans</span><span style="font:16px 'Public Sans';color:var(--ink)">A small, fast analytical SQL database that runs in your process.</span></div>
+    <div><span>Code · JetBrains Mono</span><code style="font-size:15px;color:var(--ink)">SELECT region, avg(total) FROM sales GROUP BY 1;</code></div>
+  </div>
+
+  <h2>Don't</h2>
+  <div class="dont">
+    <div class="tile"><img src="logo/pinkdb-lockup.svg" width="130" style="transform:scaleX(1.5)" alt=""><span class="cap">stretch</span></div>
+    <div class="tile dark"><img src="logo/pinkdb-lockup.svg" width="200" alt=""><span class="cap">ink logo on dark</span></div>
+    <div class="tile"><img src="logo/pinkdb-mark.svg" width="90" style="filter:hue-rotate(160deg)" alt=""><span class="cap">recolor the dot</span></div>
+    <div class="tile"><span style="font:800 38px 'Bricolage Grotesque'">Pink<span style="color:var(--pink)">DB</span></span><span class="cap">retype the name</span></div>
+  </div>
+</main>
+</body>
+</html>

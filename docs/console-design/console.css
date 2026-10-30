@@ -462,8 +462,12 @@ textarea.input { height: auto; min-height: 72px; padding: var(--sp-1_5) var(--sp
   background: var(--bg-surface); border-bottom: 1px solid var(--border);
 }
 .brand { width: var(--rail-w); height: 100%; display: flex; align-items: center; justify-content: center; flex: none; }
-.brand__mark { width: 24px; height: 24px; border-radius: 6px; background: var(--accent); color: #fff;
-  display: grid; place-items: center; font: 700 13px/1 var(--font-sans); letter-spacing: -0.02em; }
+/* The pinkdb mark (brand/README.md) at 24 px: a solid stem and the pink dot.
+   Drawn in CSS, so the markup's "p" stays as the text fallback. */
+.brand__mark { position: relative; flex: none; width: 23px; height: 24px; font-size: 0; color: transparent; }
+.brand__mark::before, .brand__mark::after { content: ""; position: absolute; top: 0; }
+.brand__mark::before { left: 0; width: 6px; height: 24px; border-radius: 3px; background: var(--text); }
+.brand__mark::after { right: 0; width: 15.5px; height: 15.5px; border-radius: 50%; background: var(--accent); }
 .brand__name { font-weight: 600; font-size: var(--text-lg); margin-right: var(--sp-2); letter-spacing: -0.01em; }
 .brand__sub { color: var(--text-subtle); font-weight: 500; }
 .topbar__sep { width: 1px; height: 20px; background: var(--border); margin: 0 var(--sp-1); }

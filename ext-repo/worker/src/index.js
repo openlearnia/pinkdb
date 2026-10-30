@@ -98,7 +98,7 @@ function infoPage() {
 <meta property="og:title" content="pinkdb extension repository">
 <meta property="og:description" content="Format v1 machine endpoints: /index.json (CORS *) and immutable artifact bytes under /artifacts/.">
 <meta property="og:url" content="https://pinkdb-ext-repo.defaultcms.workers.dev/">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23F7F1E8'/%3E%3Cpath d='M7.5 10.5h11M7.5 15.5h7.5' stroke='%23241F1C' stroke-width='2.6' stroke-linecap='round'/%3E%3Ccircle cx='21.4' cy='21.4' r='5.9' fill='%23C9557A' stroke='%23241F1C' stroke-width='2.4'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23241F1C'/%3E%3Cg transform='scale(0.5)'%3E%3Cpath fill='%23F7F1E8' d='M9 14a6 6 0 0 1 12 0v36a6 6 0 0 1-12 0z'/%3E%3Ccircle cx='39.5' cy='23.5' r='15.5' fill='%23D6336C'/%3E%3C/g%3E%3C/svg%3E">
 <style>
 :root {
   color-scheme: light;
@@ -110,9 +110,9 @@ function infoPage() {
   --ink-2: #52483f;
   --ink-3: #6e6156;
   --line-strong: #b9a88f;
-  --pink: #c9557a;
-  --pink-deep: #a63a5e;
-  --pink-soft: #f4dbe2;
+  --pink: #d6336c;
+  --pink-deep: #a61e4d;
+  --pink-soft: #f8dde6;
   --blue: #2c4a66;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;

@@ -9,6 +9,22 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Brand — pinkdb's logo and identity ✅
+
+- pinkdb has a logo: a lowercase **p** whose stem is a column cut into row
+  groups and whose bowl is the pink dot, with a drawn geometric wordmark
+  (the dot is its *i*). The brand kit in `brand/` has the mark, wordmark,
+  lockups (light, dark and one-color), app icons, a favicon, PNG renders,
+  a brand sheet and guidelines (`brand/README.md`: naming, construction,
+  clear space, color, type, voice). `brand/make-brand.py` generates all of it.
+- One brand pink, `#D6336C`, across the docs site, the extension
+  repository's info page and the console (its existing accent). The docs
+  site's header shows the logo, and it has a new favicon, an Apple touch
+  icon and a new social card; the night edition's pink is lifted to
+  `#F06595` so text on it keeps 5.5:1 contrast.
+- The console's top bar and login show the mark, and its pages carry a
+  favicon (inline, so the shell still loads nothing from outside).
+
 ### Wave 121c — the console's design system ✅
 
 - The warehouse console has a design system
