@@ -31,8 +31,8 @@ agent.
 
 ## What the console does
 
-- **Worksheets.** Tabs of SQL, saved in the store as you type (in the
-  `pinkdb_worksheets` database), private to their owner unless shared with
+- **Worksheets.** Tabs of SQL, saved as you type in the console's state
+  store (below), private to their owner unless shared with
   named users (`share with: bob, carol`, or `*` for everyone; a shared
   worksheet is read-only for the others, who can duplicate it).
 - **The editor.** Highlighting, completion of keywords, functions,
@@ -125,8 +125,8 @@ statement is refused before its first statement runs.
   administrator signs a user out everywhere from the Access page, which
   also shows who uses two-factor.
 - **Where the credentials live.** Token hashes, TOTP secrets and recovery
-  code hashes are in `pinkdb_worksheets.access_tokens`, `.totp` and
-  `.recovery_codes`, written on trusted connections with bound parameters.
+  code hashes are in the state store (below), written on trusted connections
+  with bound parameters.
   A dropped user's rows go at the next sweep (at start, every minute, and
   whenever an administrator opens Access), so a later user of the same name
   starts clean.
@@ -167,9 +167,35 @@ it through your browser, and stored data must never become markup.
   worksheet SQL, exports and agent runs).
 - **Secrets.** The agent's provider key never reaches the browser, and the
   agent's and memory's own databases follow their wave 106b/109 policies
-  (below). Worksheets live in `pinkdb_worksheets`; a user's own SQL reaches
-  those rows only through grants (administrators), and the console serves
-  each user only their own and those shared with them.
+  (below). Worksheets, history and credentials live in the state store,
+  which no statement reaches — not even an administrator's — and the console
+  serves each user only their own worksheets and those shared with them.
+
+## The state store (wave 121e)
+
+The console's worksheets, run history and credentials, the agent's
+transcript (`pinkdb_agent`) and memory's layers (`pinkdb_memory`) live in a
+**separate store**, never in the warehouse: `SHOW DATABASES`, the catalog and
+completion do not list them, and no statement on the warehouse can read,
+write or drop them. The extensions are unchanged: their own (internal)
+channel runs on the state store, as the caller — `current_user()` and
+`current_roles()` there answer the warehouse's user, so memory stays per
+user — while the model's statements run on the warehouse.
+
+| Served store | State store |
+|---|---|
+| `--state PATH` | that file |
+| `--file warehouse.pink` | `warehouse.state.pink` next to it |
+| a local lake catalog (`pink:`, `sqlite:`, a directory) | next to the catalog (`cat.pink` → `cat.state.pink`) |
+| a remote lake catalog (Postgres, S3) | **`--state` is required** (in memory, second factors and tokens would be lost on restart) |
+| in memory | in memory |
+
+A server opens it only when it runs the console, the agent or memory; the
+CLI opens it on the first `.agent` or `.memory`, encrypted under the store's
+key when the store is encrypted. Back it up with the warehouse. Existing
+`pinkdb_worksheets`, `pinkdb_agent` and `pinkdb_memory` databases inside a
+warehouse are not migrated: they become ordinary databases an administrator
+may drop.
 
 ## Access control
 
@@ -382,6 +408,7 @@ HTML comes from `maud`, which escapes every interpolated value.
 ## The flags
 
 ```
+--state PATH                the state store (default: next to --file; see above)
 --enable-ui                 serve the console (needs a build with `ui`)
 --ui-host HOST              the console's bind address (default 127.0.0.1)
 --ui-port PORT              the console's TCP port (default 8080; 0 = ephemeral)

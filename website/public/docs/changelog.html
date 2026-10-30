@@ -195,6 +195,13 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-30">2026-10-30<a class="anchor" href="#2026-10-30" aria-label="Permalink: 2026-10-30">#</a></h2>
+<h3>Wave 121e — internal state in its own store ✅</h3>
+<ul>
+<li>The console's worksheets, run history and credentials, the agent's transcript and memory's layers no longer live inside the warehouse. They are in a <strong>state store</strong> next to it (<code>warehouse.pink</code> → <code>warehouse.state.pink</code>, or <code>--state PATH</code>), which <code>SHOW DATABASES</code>, the console's catalog and completion never list and no statement can read, write or drop — not even an administrator's.</li>
+<li>The agent and memory extensions are unchanged: their own channel runs on the state store <strong>as the caller</strong> (<code>current_user()</code> / <code>current_roles()</code> there answer the warehouse user, so memory stays per user); the model's queries still run on the warehouse.</li>
+<li>An in-memory store keeps its state in memory; a local lake catalog gets it next to the catalog; a remote one (Postgres, S3) needs <code>--state</code>. The CLI opens it on the first <code>.agent</code> / <code>.memory</code>, under the store's key when the store is encrypted. Old <code>pinkdb_*</code> databases are not migrated.</li>
+<li>The console falls back to an existing database when the one it was using is dropped (the catalog no longer fails on a database the browser still names).</li>
+</ul>
 <h3>Wave 121d — sign-in for the console ✅</h3>
 <ul>
 <li>The console <strong>asks for sign-in by default</strong> with the store's users; the <code>--ui-auth basic</code> opt-in is gone. A store without users starts in <strong>first-run setup</strong>: the server prints a one-time setup code, and the account created with it becomes the administrator. <code>--ui-auth none</code> still serves a store without users with no sign-in, on loopback only.</li>

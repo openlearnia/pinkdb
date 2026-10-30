@@ -9,6 +9,26 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 121e — internal state in its own store ✅
+
+- The console's worksheets, run history and credentials, the agent's
+  transcript and memory's layers no longer live inside the warehouse. They
+  are in a **state store** next to it (`warehouse.pink` →
+  `warehouse.state.pink`, or `--state PATH`), which `SHOW DATABASES`, the
+  console's catalog and completion never list and no statement can read,
+  write or drop — not even an administrator's.
+- The agent and memory extensions are unchanged: their own channel runs on
+  the state store **as the caller** (`current_user()` / `current_roles()`
+  there answer the warehouse user, so memory stays per user); the model's
+  queries still run on the warehouse.
+- An in-memory store keeps its state in memory; a local lake catalog gets
+  it next to the catalog; a remote one (Postgres, S3) needs `--state`. The
+  CLI opens it on the first `.agent` / `.memory`, under the store's key when
+  the store is encrypted. Old `pinkdb_*` databases are not migrated.
+- The console falls back to an existing database when the one it was using
+  is dropped (the catalog no longer fails on a database the browser still
+  names).
+
 ### Wave 121d — sign-in for the console ✅
 
 - The console **asks for sign-in by default** with the store's users; the

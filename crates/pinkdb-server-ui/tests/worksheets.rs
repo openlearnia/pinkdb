@@ -686,9 +686,12 @@ fn worksheets_are_private_until_shared() {
     assert_eq!(r.status, 404);
     let r = bob.post("/api/worksheets/delete", &json!({ "id": id }));
     assert_eq!(r.status, 404);
-    // Bob cannot read the worksheet table through SQL either (no grant).
+    // Nobody reaches the worksheet table through SQL: it is in the state
+    // store, not the warehouse (wave 121e).
     let out = bob.query("SELECT * FROM pinkdb_worksheets.worksheets");
     assert!(out["error"].is_object(), "{out}");
+    let out = alice.query("SELECT * FROM pinkdb_worksheets.worksheets");
+    assert!(out["error"].is_object(), "not even an administrator: {out}");
 
     // Shared with bob: he sees it, read-only.
     let r = alice.post(
@@ -849,4 +852,61 @@ fn a_slow_request_body_is_cut_off() {
     assert!(started.elapsed() < Duration::from_secs(5));
     let text = String::from_utf8_lossy(&buf);
     assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+}
+
+// ---------- wave 121e: the console's state is not in the warehouse ----------
+
+#[test]
+fn the_consoles_state_stays_out_of_the_warehouse() {
+    let dir = std::env::temp_dir().join(format!("pinkdb-121e-{}", rand_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state_path = dir.join("warehouse.state.pink");
+    let warehouse = store();
+    let state = Database::open(state_path.to_str().unwrap()).unwrap();
+    warehouse.attach_state_store(state).unwrap();
+    {
+        let console = start(warehouse.clone(), options());
+        let client = login(console.addr, json!({})).unwrap();
+        let r = client.post(
+            "/api/worksheets",
+            &json!({ "title": "kept", "sql": "SELECT 1" }),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        client.query("SELECT 1");
+        // Neither the catalog nor SQL on the warehouse shows it.
+        let catalog = client.get("/api/catalog").json();
+        let names = catalog["databases"].to_string();
+        assert!(!names.contains("pinkdb_"), "{names}");
+        let listed = client.query("SHOW DATABASES").to_string();
+        assert!(!listed.contains("pinkdb_worksheets"), "{listed}");
+    }
+    // A new warehouse handle, the same state file: the worksheet is there.
+    let state = Database::open(state_path.to_str().unwrap()).unwrap();
+    let again = store();
+    again.attach_state_store(state).unwrap();
+    let console = start(again, options());
+    let client = login(console.addr, json!({})).unwrap();
+    let list = client.get("/api/worksheets").json();
+    assert!(list.to_string().contains("\"kept\""), "{list}");
+    drop(console);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_catalog_answers_after_its_database_is_dropped() {
+    let console = start(store(), options());
+    let client = login(console.addr, json!({})).unwrap();
+    client.query("CREATE DATABASE sales; CREATE TABLE sales.orders (id INTEGER)");
+    assert_eq!(client.get("/api/catalog?db=sales").status, 200);
+    client.query("DROP DATABASE sales");
+    // The browser still names it: the catalog answers from the default, so
+    // the app can choose an existing database.
+    let r = client.get("/api/catalog?db=sales");
+    assert_eq!(r.status, 200, "{}", r.body);
+    let catalog = r.json();
+    assert!(
+        !catalog["databases"].to_string().contains("sales"),
+        "{catalog}"
+    );
+    assert_eq!(catalog["current"], "main");
 }

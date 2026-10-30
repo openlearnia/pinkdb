@@ -1065,6 +1065,30 @@ impl PinkDb {
         &mut self.rbac
     }
 
+    /// The display names of `principal`'s roles, as `current_roles()`
+    /// answers them (none for the trusted session).
+    pub(crate) fn display_roles_of(&self, principal: Option<&str>) -> Vec<String> {
+        let rbac = self.rbac();
+        principal
+            .iter()
+            .flat_map(|principal| rbac.roles_of(principal))
+            .map(|role| rbac.display_of(&role))
+            .collect()
+    }
+
+    /// The host's state store (wave 121e), if one is attached: see
+    /// [`crate::Database::attach_state_store`].
+    pub fn state_store(&self) -> Option<crate::db::Database> {
+        self.state_store.clone()
+    }
+
+    /// Attach the host's state store (wave 121e). An extension's internal
+    /// channel and the host's own bookkeeping run there from now on; no
+    /// statement on this store can reach it.
+    pub fn attach_state_store(&mut self, state: crate::db::Database) {
+        self.state_store = Some(state);
+    }
+
     /// Is any user defined? A store with no users is the documented
     /// empty-catalog state: the network server lets every connection in
     /// **trusted** (embedded semantics) until the first user exists.

@@ -207,7 +207,9 @@ client.</p>
 </tbody>
 </table>
 
-<p>Everything lives in one database, <code>pinkdb_memory</code>, and every row
+<p>Everything lives in one database, <code>pinkdb_memory</code>, in the state
+store next to the store (<code>warehouse.state.pink</code>, or <code>--state
+PATH</code>), never in the store a user's SQL reaches; every row
 carries the same identity columns: <code>owner</code>, <code>team</code>,
 <code>visibility</code>, an ACL of users, roles and agents, and
 <code>agent</code>. Nothing is hard-deleted. <code>forget</code> sets

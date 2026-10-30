@@ -74,4 +74,42 @@ fn the_worker_drains_as_each_owner_and_needs_a_provider() {
         .execute("SELECT owner FROM pinkdb_memory.l0_turns WHERE distilled = false")
         .unwrap();
     assert!(format!("{pending:?}").contains("dana"), "{pending:?}");
+
+    // Wave 121e: with a state store, memory keeps its layers there — the
+    // warehouse never lists them — and each owner is still the caller.
+    let warehouse = Database::new();
+    let state = Database::new();
+    warehouse.attach_state_store(state.clone()).unwrap();
+    warehouse
+        .load_extension(library().to_str().unwrap())
+        .unwrap();
+    warehouse
+        .connect()
+        .execute("CREATE USER dana PASSWORD 'pw'; CREATE USER eli PASSWORD 'pw'")
+        .unwrap();
+    for (user, text) in [("dana", "dana likes tea"), ("eli", "eli likes coffee")] {
+        let mut conn = warehouse.connect();
+        conn.impersonate(user).unwrap();
+        conn.run_command(
+            "memory",
+            &format!("add --speaker user --conversation c1 {text}"),
+            &tool,
+            &internal,
+            &mut Quiet,
+        )
+        .expect("memory add");
+    }
+    let listed = warehouse.connect().execute("SHOW DATABASES").unwrap();
+    assert!(
+        !format!("{listed:?}").contains("pinkdb_memory"),
+        "{listed:?}"
+    );
+    let turns = state
+        .connect()
+        .execute("SELECT owner, count(*) FROM pinkdb_memory.l0_turns GROUP BY 1 ORDER BY 1")
+        .unwrap();
+    let turns = format!("{turns:?}");
+    assert!(turns.contains("dana") && turns.contains("eli"), "{turns}");
+    let err = drain_once(&warehouse).unwrap_err();
+    assert!(err.to_lowercase().contains("provider"), "{err}");
 }

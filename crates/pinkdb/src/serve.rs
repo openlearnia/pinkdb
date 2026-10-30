@@ -437,6 +437,11 @@ pub fn execute(db: &mut PinkDb, policy: &ServePolicy, sql: &str) -> (i32, String
 /// tool channel goes through [`execute`] with [`ServePolicy::
 /// deny_write_databases`] instead.
 pub fn execute_internal(db: &mut PinkDb, policy: &ServePolicy, sql: &str) -> (i32, String) {
+    // A host with a state store keeps the extension's bookkeeping there
+    // (wave 121e), never in the store the model's statements see.
+    if let Some(route) = Session::state_route(db) {
+        return internal_on(&mut route.connect(), policy, sql);
+    }
     let text = sql.trim();
     if text.starts_with('.') {
         return (1, agent::error_json(NO_COMMANDS_HINT, "execution", None));
@@ -559,6 +564,30 @@ pub trait Session {
     fn run_internal(&mut self, sql: &str, limits: ExecLimits) -> Result<Vec<QueryResult>> {
         self.run_statement(sql, limits)
     }
+
+    /// Where this session's internal channel runs instead (wave 121e): the
+    /// host's state store and the caller's identity, when one is attached.
+    fn state_route(&self) -> Option<StateRoute> {
+        None
+    }
+}
+
+/// An internal channel moved to the host's state store: the store, and who
+/// the caller is on the warehouse (`current_user()` / `current_roles()` on
+/// the state store answer this).
+pub struct StateRoute {
+    pub store: crate::db::Database,
+    pub user: String,
+    pub roles: Vec<String>,
+}
+
+impl StateRoute {
+    /// A connection to the state store that answers as the caller.
+    fn connect(&self) -> crate::db::Connection {
+        let mut conn = self.store.connect();
+        conn.adopt_identity(&self.user, self.roles.clone());
+        conn
+    }
 }
 
 impl Session for PinkDb {
@@ -576,6 +605,16 @@ impl Session for PinkDb {
 
     fn set_external_services(&mut self, allowed: bool) {
         PinkDb::set_external_services(self, allowed);
+    }
+
+    fn state_route(&self) -> Option<StateRoute> {
+        let store = self.state_store()?;
+        let principal = self.session.principal();
+        Some(StateRoute {
+            store,
+            roles: self.display_roles_of(principal.as_deref()),
+            user: principal.unwrap_or_else(|| crate::rbac::IMPLICIT_PRINCIPAL.to_string()),
+        })
     }
 }
 
@@ -600,6 +639,12 @@ impl Session for crate::db::Connection {
     fn run_internal(&mut self, sql: &str, limits: ExecLimits) -> Result<Vec<QueryResult>> {
         self.set_exec_limits(limits);
         self.execute_as_extension(sql)
+    }
+
+    fn state_route(&self) -> Option<StateRoute> {
+        let store = self.database().state_store()?;
+        let (user, roles) = self.identity();
+        Some(StateRoute { store, user, roles })
     }
 }
 
@@ -644,6 +689,11 @@ fn internal_on<R: Session + ?Sized>(
     policy: &ServePolicy,
     sql: &str,
 ) -> (i32, String) {
+    // See `execute_internal`: the state store, as the caller. A state store
+    // has no state store of its own, so this recurses once at most.
+    if let Some(route) = session.state_route() {
+        return internal_on(&mut route.connect(), policy, sql);
+    }
     if sql.trim().starts_with('.') {
         return (1, agent::error_json(NO_COMMANDS_HINT, "execution", None));
     }

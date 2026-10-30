@@ -412,8 +412,17 @@ impl Shared {
         let exec_limits = opts.exec_limits();
         let auth = AuthState::new(opts.auth.clone());
         let sessions = Sessions::new(opts.session_idle, opts.session_lifetime, opts.max_sessions);
-        let book = Book::new(db.clone());
-        let vault = Vault::new(db.clone());
+        // The console's worksheets and credentials live in the host's state
+        // store (wave 121e), never in the warehouse a user's SQL reaches. A
+        // host that attached none gets an in-memory one here, which the
+        // agent's and memory's bookkeeping then use as well.
+        let state = db.state_store().unwrap_or_else(|| {
+            let state = Database::new();
+            let _ = db.attach_state_store(state.clone());
+            state
+        });
+        let book = Book::new(state.clone());
+        let vault = Vault::new(state);
         Self {
             db,
             opts,

@@ -176,6 +176,10 @@ struct Args {
     ui_max_upload_mb: usize,
     /// `--agent-extension PATH`: load the data agent for the console's ask box.
     agent_extension: Option<String>,
+    /// `--state PATH`: the state store (wave 121e) — the console's worksheets
+    /// and credentials, the agent's transcript and the memory layers, kept
+    /// out of the served store.
+    state: Option<String>,
     /// `--memory-extension PATH`: load the agent memory.
     memory_extension: Option<String>,
     /// `--memory-distill-every SECS`: drain the memory queue on an interval.
@@ -278,6 +282,12 @@ fn usage() -> &'static str {
      \x20 --agent-allow-writes  let the console's agent write (under the user's grants;\n\
      \x20                        never with --ui-read-only)\n\
      \x20 --memory-extension PATH  load the agent memory (libpinkdb_memory)\n\
+     \x20 --state PATH          where the console, the agent and memory keep their own\n\
+     \x20                        state (worksheets, credentials, transcripts, memory),\n\
+     \x20                        apart from the served store; default: next to --file\n\
+     \x20                        (warehouse.pink -> warehouse.state.pink) or a local lake\n\
+     \x20                        catalog, in memory for an in-memory store; required for\n\
+     \x20                        a remote lake catalog\n\
      \x20 --memory-distill-every SECS  drain the memory distillation queue on this\n\
      \x20                        interval, as each owner (off by default)\n\
      \n\
@@ -356,6 +366,7 @@ fn parse_args() -> Result<Args, String> {
         #[cfg(feature = "ui")]
         ui_max_upload_mb: 64,
         agent_extension: None,
+        state: None,
         memory_extension: None,
         memory_distill_every: None,
     };
@@ -644,6 +655,7 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--agent-extension" => args.agent_extension = Some(value("--agent-extension")?),
+            "--state" => args.state = Some(value("--state")?),
             "--memory-extension" => args.memory_extension = Some(value("--memory-extension")?),
             "--memory-distill-every" => {
                 let raw = value("--memory-distill-every")?;
@@ -1084,6 +1096,55 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    // The state store (wave 121e): the console's, the agent's and memory's
+    // own bookkeeping, apart from the served store, where no statement can
+    // list, read or drop it. Only a server that runs one of them needs it.
+    #[cfg(feature = "ui")]
+    let uses_state =
+        args.enable_ui || args.agent_extension.is_some() || args.memory_extension.is_some();
+    #[cfg(not(feature = "ui"))]
+    let uses_state = args.agent_extension.is_some() || args.memory_extension.is_some();
+    if uses_state {
+        let path = match state_path(
+            args.state.as_deref(),
+            args.file.as_deref(),
+            args.catalog.as_deref(),
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let state = match &path {
+            Some(path) => match Database::open(path) {
+                Ok(state) => state,
+                Err(e) => {
+                    eprintln!("Error: cannot open the state store {path:?}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            None => Database::new(),
+        };
+        // Memory's vector search calls `embed()` on its own channel, which
+        // now runs on the state store.
+        #[cfg(feature = "embeddings")]
+        if !state.is_extension_loaded(pinkdb_embeddings::EXTENSION_NAME)
+            && let Err(e) = state.load_extension(pinkdb_embeddings::EXTENSION_NAME)
+        {
+            eprintln!(
+                "warning: the embeddings extension could not be loaded into the state store: {e}"
+            );
+        }
+        if let Err(e) = db.attach_state_store(state) {
+            eprintln!("Error: cannot attach the state store: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!(
+            "pinkdb-server: state store: {}",
+            path.as_deref().unwrap_or("in memory (lost on exit)")
+        );
+    }
     let _memory_worker = match args.memory_distill_every {
         Some(secs) => {
             if args.memory_extension.is_none() {
@@ -1263,6 +1324,50 @@ fn import_formats() -> Vec<String> {
     formats
 }
 
+/// Where the state store lives (wave 121e): `--state`, else next to the
+/// store file or a local lake catalog, else in memory for an in-memory store.
+/// A remote lake catalog has no place for it: `--state` is required there,
+/// because in-memory state would drop sign-in factors and tokens on restart.
+fn state_path(
+    state: Option<&str>,
+    file: Option<&str>,
+    catalog: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(path) = state {
+        return Ok(Some(path.to_string()));
+    }
+    let next_to = |path: &str| -> String {
+        let path = path.trim_end_matches('/');
+        match path.strip_suffix(".pink") {
+            Some(stem) => format!("{stem}.state.pink"),
+            None => format!("{path}.state.pink"),
+        }
+    };
+    if let Some(file) = file {
+        return Ok(Some(next_to(file)));
+    }
+    if let Some(catalog) = catalog {
+        let lower = catalog.to_ascii_lowercase();
+        let local = if let Some(path) = catalog.strip_prefix("pink:") {
+            (!lower.starts_with("pink+")).then_some(path)
+        } else if let Some(path) = catalog.strip_prefix("sqlite:") {
+            Some(path)
+        } else if lower.contains("://") {
+            None
+        } else {
+            Some(catalog)
+        };
+        return match local {
+            Some(path) => Ok(Some(next_to(path))),
+            None => Err(format!(
+                "the lake catalog {catalog:?} is remote, so the console's and the agent's own \
+                 state has no file to live next to: name one with --state PATH"
+            )),
+        };
+    }
+    Ok(None)
+}
+
 /// Start the warehouse console (waves 78 and 121).
 #[cfg(feature = "ui")]
 fn start_ui(
@@ -1338,6 +1443,49 @@ fn announce(addr: std::net::SocketAddr, mode: &str, transport: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_state_store_lives_next_to_the_store() {
+        use super::state_path;
+        let at = |state, file, catalog| state_path(state, file, catalog);
+        assert_eq!(
+            at(Some("/s.pink"), Some("/w.pink"), None)
+                .unwrap()
+                .as_deref(),
+            Some("/s.pink")
+        );
+        assert_eq!(
+            at(None, Some("/d/warehouse.pink"), None)
+                .unwrap()
+                .as_deref(),
+            Some("/d/warehouse.state.pink")
+        );
+        assert_eq!(
+            at(None, Some("demo.db"), None).unwrap().as_deref(),
+            Some("demo.db.state.pink")
+        );
+        assert_eq!(
+            at(None, None, Some("pink:/l/cat.pink")).unwrap().as_deref(),
+            Some("/l/cat.state.pink")
+        );
+        assert_eq!(
+            at(None, None, Some("sqlite:/l/cat.db")).unwrap().as_deref(),
+            Some("/l/cat.db.state.pink")
+        );
+        assert_eq!(
+            at(None, None, Some("/l/lake/")).unwrap().as_deref(),
+            Some("/l/lake.state.pink")
+        );
+        assert!(at(None, None, Some("postgres://u@h/lake")).is_err());
+        assert!(at(None, None, Some("pink+s3://b/cat.pink")).is_err());
+        assert_eq!(
+            at(Some("/s.pink"), None, Some("postgres://u@h/lake"))
+                .unwrap()
+                .as_deref(),
+            Some("/s.pink")
+        );
+        assert_eq!(at(None, None, None).unwrap(), None);
+    }
+
     use super::*;
 
     fn args(values: &[&str]) -> Vec<String> {

@@ -220,6 +220,28 @@ impl Database {
         read_lock(&self.shared).has_users()
     }
 
+    /// Attach the host's **state store** (wave 121e): a separate store for the
+    /// host's own bookkeeping — an extension's internal channel (the agent's
+    /// transcript, the memory layers) and a front-end's state (the console's
+    /// worksheets and credentials). From now on every extension command and
+    /// serve call on this store runs its internal channel on `state`, with
+    /// the caller's identity; no statement on this store can list, read or
+    /// write it. Refused for the store itself.
+    pub fn attach_state_store(&self, state: Database) -> Result<()> {
+        if Arc::ptr_eq(&self.shared, &state.shared) {
+            return Err(PinkDbError::Execution(
+                "a store cannot be its own state store".to_string(),
+            ));
+        }
+        write_lock(&self.shared).attach_state_store(state);
+        Ok(())
+    }
+
+    /// The attached state store, if any (see [`Database::attach_state_store`]).
+    pub fn state_store(&self) -> Option<Database> {
+        read_lock(&self.shared).state_store()
+    }
+
     /// True when this database logs commits to a WAL.
     pub fn is_durable(&self) -> bool {
         read_lock(&self.shared).is_durable()
@@ -627,6 +649,29 @@ impl Connection {
         self.principal = Some(user.to_ascii_lowercase());
         self.session.set_principal(self.principal.clone());
         Ok(name)
+    }
+
+    /// Answer `current_user()` and `current_roles()` as `user` with `roles`
+    /// (wave 121e), **without** taking that user's privileges: the connection
+    /// stays as trusted as it was. For a host's state store, which has no
+    /// users of its own — the internal channel of an extension that keeps
+    /// per-user state (the memory layers) asks who the caller is, and must
+    /// hear the warehouse's answer.
+    pub fn adopt_identity(&mut self, user: &str, roles: Vec<String>) {
+        self.session.set_principal(Some(user.to_ascii_lowercase()));
+        self.session.set_roles(Some(roles));
+    }
+
+    /// Who this connection is, as `current_user()` / `current_roles()`
+    /// would answer: the logged-in user (or the implicit principal of a
+    /// trusted session) and the display names of their roles.
+    pub fn identity(&self) -> (String, Vec<String>) {
+        let user = self
+            .principal
+            .clone()
+            .unwrap_or_else(|| crate::rbac::IMPLICIT_PRINCIPAL.to_string());
+        let roles = read_lock(&self.db.shared).display_roles_of(self.principal.as_deref());
+        (user, roles)
     }
 
     /// Adopt an existing user as this session's principal **without** a

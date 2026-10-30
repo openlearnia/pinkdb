@@ -1792,7 +1792,7 @@ cargo build --release -p pinkdb-server --features ui
 ./target/release/pinkdb-server --file warehouse.pink --enable-ui   # http://127.0.0.1:8080
 ```
 
-- **Worksheets**: tabs of SQL saved in the store (`pinkdb_worksheets`),
+- **Worksheets**: tabs of SQL saved in the console's state store,
   private to their owner unless shared by name; an editor with
   highlighting and catalog completion (`Ctrl/Cmd+Enter` runs the statement
   at the cursor); one result tab per statement with a virtual-scrolled
@@ -2013,7 +2013,9 @@ through a second, internal channel that is confined to the `pinkdb_agent`
 database, so it cannot touch user data either.
 
 **Sessions are tables.** A session lives in the `pinkdb_agent` database of
-the store it ran against: `sessions`, `messages`, `tool_calls`,
+the state store next to the store it ran against (`warehouse.pink` →
+`warehouse.state.pink`, or `--state PATH`; never in the store itself):
+`sessions`, `messages`, `tool_calls`,
 `checkpoints`, `usage`. Every step (transport, any calls, the tool results,
 the next checkpoint) commits, so `kill -9` costs at most one step:
 `.agent resume` re-requests an interrupted stream, reuses every recorded tool
@@ -2054,7 +2056,8 @@ runs the z.ai one with `ZAI_API_KEY` and the Anthropic one with
 ## Agent memory (wave 109)
 
 `pinkdb-memory` gives an agent long-term memory in four layers, stored in one
-database (`pinkdb_memory`), distilled by a model and read back layered and
+database (`pinkdb_memory`) of the state store next to the store (never in the
+store itself), distilled by a model and read back layered and
 budgeted. The design is a Rust reimplementation of
 [TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory)
 (no code copied); what pinkdb adds is the enforcement — every row is filed under

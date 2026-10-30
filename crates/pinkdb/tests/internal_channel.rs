@@ -237,3 +237,130 @@ fn the_agent_channel_is_confined_the_same_way() {
         assert!(text.contains(AGENT), "{sql} must name its database: {text}");
     }
 }
+
+// ---------- wave 121e: the host's state store ----------
+
+/// A warehouse with users and a role, and a separate state store holding the
+/// extension's database.
+fn warehouse_and_state() -> (Database, Database) {
+    let warehouse = Database::new();
+    warehouse
+        .connect()
+        .execute(
+            "CREATE TABLE t (x INTEGER); CREATE USER alice PASSWORD 'pw'; \
+             CREATE ROLE analyst; GRANT analyst TO alice; CREATE USER bob PASSWORD 'pw'",
+        )
+        .unwrap();
+    let state = Database::new();
+    state
+        .connect()
+        .execute(
+            "CREATE DATABASE pinkdb_memory; \
+             CREATE TABLE pinkdb_memory.atoms (owner VARCHAR, text VARCHAR)",
+        )
+        .unwrap();
+    warehouse.attach_state_store(state.clone()).unwrap();
+    (warehouse, state)
+}
+
+fn run_as(db: &Database, user: &str, policy: &ServePolicy, sql: &str) -> (i32, String) {
+    let mut conn = db.connect();
+    conn.login(user, "pw").unwrap();
+    SessionHost::new(&mut conn, policy).execute_internal(sql)
+}
+
+#[test]
+fn the_internal_channel_runs_on_the_state_store() {
+    let (warehouse, state) = warehouse_and_state();
+    let policy = memory_channel(false);
+    // The extension's database is not in the warehouse at all.
+    let listed = warehouse.connect().execute("SHOW DATABASES").unwrap();
+    assert!(!format!("{listed:?}").contains(MEMORY), "{listed:?}");
+    // Its writes land in the state store.
+    let (code, text) = run_as(
+        &warehouse,
+        "alice",
+        &policy,
+        "INSERT INTO pinkdb_memory.atoms VALUES ('alice', 'likes tea')",
+    );
+    assert_eq!(code, 0, "{text}");
+    let rows = state
+        .connect()
+        .execute("SELECT owner, text FROM pinkdb_memory.atoms")
+        .unwrap();
+    assert!(format!("{rows:?}").contains("alice"), "{rows:?}");
+    // The model's channel, on the warehouse, cannot see them.
+    let mut alice = warehouse.connect();
+    alice.login("alice", "pw").unwrap();
+    assert!(alice.execute("SELECT * FROM pinkdb_memory.atoms").is_err());
+    // The store cannot be its own state store.
+    assert!(warehouse.attach_state_store(warehouse.clone()).is_err());
+}
+
+#[test]
+fn the_state_store_answers_as_the_caller() {
+    let (warehouse, _state) = warehouse_and_state();
+    let policy = memory_channel(false);
+    let who = |user: &str| {
+        let (code, text) = run_as(
+            &warehouse,
+            user,
+            &policy,
+            "SELECT current_user(), current_roles()",
+        );
+        assert_eq!(code, 0, "{text}");
+        text
+    };
+    // The state store has no users; its connection carries the warehouse's
+    // answer, so per-user state stays per user.
+    let alice = who("alice");
+    assert!(
+        alice.contains("\"alice\"") && alice.contains("analyst"),
+        "{alice}"
+    );
+    let bob = who("bob");
+    assert!(bob.contains("\"bob\"") && !bob.contains("analyst"), "{bob}");
+    // And it gains no privilege: the policy still confines the channel.
+    let text = run_as(&warehouse, "alice", &policy, "SELECT * FROM main.t").1;
+    assert!(
+        text.contains("error") || text.contains("not found"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_embedded_store_routes_through_its_state_store_too() {
+    let mut store = pinkdb::PinkDb::new();
+    let state = Database::new();
+    state
+        .connect()
+        .execute("CREATE DATABASE pinkdb_agent; CREATE TABLE pinkdb_agent.sessions (id VARCHAR)")
+        .unwrap();
+    store.attach_state_store(state.clone());
+    let policy = agent_channel();
+    let (code, text) = pinkdb::serve::execute_internal(
+        &mut store,
+        policy.internal.as_deref().unwrap(),
+        "INSERT INTO pinkdb_agent.sessions VALUES ('s1')",
+    );
+    assert_eq!(code, 0, "{text}");
+    let rows = state
+        .connect()
+        .execute("SELECT id FROM pinkdb_agent.sessions")
+        .unwrap();
+    assert!(format!("{rows:?}").contains("s1"), "{rows:?}");
+    // The embedded store's caller is the implicit principal.
+    let (_, who) = pinkdb::serve::execute_internal(
+        &mut store,
+        policy.internal.as_deref().unwrap(),
+        "SELECT current_user()",
+    );
+    assert!(who.contains("\"pinkdb\""), "{who}");
+    assert!(
+        store
+            .execute("SHOW DATABASES")
+            .map(|r| format!("{r:?}"))
+            .unwrap()
+            .contains("main")
+    );
+}

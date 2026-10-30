@@ -1,6 +1,8 @@
-//! Worksheet and history storage (wave 121), in the store itself.
+//! Worksheet and history storage (wave 121), in the host's state store.
 //!
-//! The console keeps its own state in the `pinkdb_worksheets` database:
+//! The console keeps its own state in the `pinkdb_worksheets` database of
+//! the **state store** (wave 121e), a store separate from the warehouse: no
+//! statement a user runs can list, read or drop it.
 //!
 //! ```sql
 //! worksheets(id, owner, title, sql, created_at, updated_at, shared_with)
@@ -11,8 +13,7 @@
 //! connection, with every value bound as a parameter (never spliced into the
 //! text), and the console — not RBAC — decides whose rows a request sees: a
 //! worksheet is visible to its owner and to the users its `shared_with`
-//! names (`*` for everyone), and only its owner may change or delete it. A
-//! user's own SQL reaches these tables only through grants (administrators).
+//! names (`*` for everyone), and only its owner may change or delete it.
 //! Timestamps are bound values too, so a WAL replay of the bookkeeping
 //! reproduces the same rows.
 

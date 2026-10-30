@@ -274,7 +274,7 @@ fn statement_result(
 
 /// What the history keeps of a run's SQL: the text, unless it may carry a
 /// password (`CREATE USER … PASSWORD …`, `ALTER USER …`), which stays out of
-/// `pinkdb_worksheets`.
+/// the console's state store.
 fn history_text(sql: &str) -> String {
     if sql.to_ascii_lowercase().contains("password") {
         "-- (a statement with a password: not recorded)".to_string()
@@ -784,7 +784,13 @@ pub async fn catalog(
             max_result_rows: Some(1_000_000),
             max_result_bytes: Some(worker.opts.max_result_bytes.max(64 * 1024 * 1024)),
         };
-        let mut conn = worksheet_conn(&worker, &session, query.db.as_deref(), limits, None)?;
+        // A database the browser still names may have been dropped: the
+        // catalog then answers from the session's default, so the app can
+        // pick an existing one.
+        let mut conn = match worksheet_conn(&worker, &session, query.db.as_deref(), limits, None) {
+            Ok(conn) => conn,
+            Err(_) => worksheet_conn(&worker, &session, None, limits, None)?,
+        };
         let mut select = |sql: &str| -> Result<Vec<Vec<Value>>, String> {
             store_hook(sql);
             match conn.execute(sql).map_err(|e| e.to_string())?.pop() {

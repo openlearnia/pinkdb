@@ -1571,6 +1571,11 @@ pub struct Session {
     /// `None` is the trusted embedded session, whose implicit principal is
     /// [`IMPLICIT_PRINCIPAL`].
     principal: Arc<Mutex<Option<String>>>,
+    /// The roles `current_roles()` answers when the identity was adopted
+    /// from another store (wave 121e): a host's state store has no users, so
+    /// its connection carries the caller's roles from the warehouse instead
+    /// of resolving them in its own (empty) user catalog.
+    roles: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -1594,6 +1599,17 @@ impl Session {
     /// Adopt `principal` as this session's user (`None` = trusted embedded).
     pub(crate) fn set_principal(&self, principal: Option<String>) {
         *self.principal.lock().unwrap_or_else(|e| e.into_inner()) = principal;
+    }
+
+    /// Adopt the role display names `current_roles()` answers (`None` =
+    /// resolve them in this store's user catalog).
+    pub(crate) fn set_roles(&self, roles: Option<Vec<String>>) {
+        *self.roles.lock().unwrap_or_else(|e| e.into_inner()) = roles;
+    }
+
+    /// The adopted roles, if the identity came from another store.
+    pub(crate) fn adopted_roles(&self) -> Option<Vec<String>> {
+        self.roles.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The session's user, `None` on a trusted embedded session.
@@ -1762,6 +1778,12 @@ pub struct PinkDb {
     /// the visible catalog for reads only — never part of the store's own
     /// tables and never touched by `.save`, `.lake save`, or the WAL.
     pub(crate) attached_lakes: Vec<Arc<dyn crate::attached::AttachedLake>>,
+    /// The host's state store (wave 121e): a separate store for the host's own
+    /// bookkeeping — an extension's internal channel (the agent's transcript,
+    /// the memory layers) and the console's worksheets and credentials. Never
+    /// listed, read or written by a statement on this store. Process-level
+    /// like attached lakes: never persisted.
+    pub(crate) state_store: Option<crate::db::Database>,
     /// Host-registered table sources (wave 70; unified with the arrow
     /// extension's reads in wave 71): every file read surface — `read_parquet`
     /// / `read_arrow` / `FROM 'file.<ext>'`. Process-level like extensions and
@@ -1952,6 +1974,7 @@ impl Clone for PinkDb {
             wal_txn_memo: self.wal_txn_memo.clone(),
             external_services: self.external_services,
             attached_lakes: self.attached_lakes.clone(),
+            state_store: self.state_store.clone(),
             table_sources: self.table_sources.clone(),
             mv_pending: self.mv_pending.clone(),
             txn_writes: HashSet::new(),
@@ -2048,6 +2071,7 @@ impl PinkDb {
             wal_txn_memo: Vec::new(),
             external_services: true,
             attached_lakes: Vec::new(),
+            state_store: None,
             // Process-global table sources (`table_source::
             // register_global_table_source`) seed every store constructed
             // after the registration; the store then owns its list (durable

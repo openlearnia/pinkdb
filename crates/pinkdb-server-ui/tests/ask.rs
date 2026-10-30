@@ -323,9 +323,15 @@ fn the_ask_box_streams_an_agent_run() {
     assert_eq!(tool.1["ok"], false, "{body}");
     let count = db.connect().execute("SELECT count(*) FROM t").unwrap();
     assert!(format!("{count:?}").contains("Bigint(3)"), "{count:?}");
-    // The runs are recorded in the agent's own database.
-    let databases = format!("{:?}", db.connect().execute("SHOW DATABASES").unwrap());
+    // The runs are recorded in the agent's own database, in the state store,
+    // which the warehouse does not list.
+    let state = db
+        .state_store()
+        .expect("the console attached a state store");
+    let databases = format!("{:?}", state.connect().execute("SHOW DATABASES").unwrap());
     assert!(databases.contains("pinkdb_agent"), "{databases}");
+    let databases = format!("{:?}", db.connect().execute("SHOW DATABASES").unwrap());
+    assert!(!databases.contains("pinkdb_agent"), "{databases}");
 
     // No provider named, none in the environment: the run says so.
     let ask = json!({ "question": "Anything?" }).to_string();

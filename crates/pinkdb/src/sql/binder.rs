@@ -3304,12 +3304,12 @@ impl<'a> Binder<'a> {
         } else {
             // Display names, the spelling `CREATE ROLE` took: a statement's
             // text must keep working after a role is renamed in another case.
-            let rbac = self.db.rbac();
-            let roles: Vec<String> = principal
-                .iter()
-                .flat_map(|principal| rbac.roles_of(principal))
-                .map(|role| rbac.display_of(&role))
-                .collect();
+            // A connection to a host's state store carries the caller's roles
+            // from the warehouse (wave 121e): its own catalog has no users.
+            let roles = self
+                .session
+                .adopted_roles()
+                .unwrap_or_else(|| self.db.display_roles_of(principal.as_deref()));
             Value::Varchar(roles.join(","))
         };
         Ok(BoundExpr::Literal(value))

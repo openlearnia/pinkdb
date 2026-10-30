@@ -29,6 +29,10 @@ static ALLOW_LOAD_EXTENSION: AtomicBool = AtomicBool::new(false);
 /// The directory every extension load is confined to (`--extension-root`).
 static EXTENSION_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
+/// `--state PATH` (wave 121e): where the agent and memory keep their own
+/// tables. `None` = next to the open store file, or in memory.
+static STATE_PATH: Mutex<Option<String>> = Mutex::new(None);
+
 /// Agent mode (wave 99): on for a detected agent session or `-agent`, off
 /// otherwise. Read by the renderer and the error path.
 static AGENT: AtomicBool = AtomicBool::new(false);
@@ -448,9 +452,10 @@ fn print_help() {
         agent_library_name()
     );
     println!(
-        "                         {} database, tools read-only unless allow-writes",
+        "                         {} database of the state store (--state), tools",
         pinkdb::serve::AGENT_DATABASE
     );
+    println!("                         read-only unless allow-writes");
     println!("  .memory add|search|update|forget|distill|persona|show|serve");
     println!("                         the agent memory (`.memory help`; needs LOAD EXTENSION");
     println!(
@@ -2009,7 +2014,7 @@ fn print_usage() {
         agent_library_name()
     );
     println!(
-        "                     in the {} database of FILE; read-only)",
+        "                     in the {} database of FILE's state store; read-only)",
         pinkdb::serve::AGENT_DATABASE
     );
     println!("  --agent-allow-writes, --agent-allow-files");
@@ -2027,6 +2032,10 @@ fn print_usage() {
     println!("  --file-cache DIR   keep remote byte ranges on disk between queries");
     println!("                     (off by default; PINKDB_EXTERNAL_FILE_CACHE=1 with");
     println!("                     PINKDB_EXTERNAL_FILE_CACHE_DIR/_BYTES does the same)");
+    println!("  --state PATH       where the agent and memory keep their own tables (sessions,");
+    println!("                     memory), apart from the store; default: next to the store");
+    println!("                     file (warehouse.pink -> warehouse.state.pink), in memory");
+    println!("                     for an in-memory store; opened on the first .agent/.memory");
     println!("  --extension-root PATH");
     println!("                     confine every extension load to this directory (a path");
     println!("                     outside it, a bare library name, a `..` component and a");
@@ -2116,6 +2125,14 @@ fn parse_args() -> Result<Opts, String> {
             "--extension-root" => {
                 let value = args.next().ok_or("--extension-root requires a path")?;
                 opts.extension_root = Some(value);
+            }
+            "--state" => {
+                let value = args.next().ok_or("--state requires a path")?;
+                *STATE_PATH.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+            }
+            other if other.starts_with("--state=") => {
+                *STATE_PATH.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(other["--state=".len()..].to_string());
             }
             other if other.starts_with("--extension-root=") => {
                 opts.extension_root = Some(other["--extension-root=".len()..].to_string());
@@ -2650,9 +2667,10 @@ fn agent_usage() {
     println!("  .agent providers          the built-in providers and whose key is set");
     println!("  .agent [rows N | cols N | cell N | budget N | timeout MS | hint N]");
     println!(
-        "Sessions live in the {} database of the open store. There is no default",
+        "Sessions live in the {} database of the state store (next to the open store,",
         pinkdb::serve::AGENT_DATABASE
     );
+    println!("or --state), never in the store itself. There is no default");
     println!("provider: name one with `provider <name>` or PINKDB_AGENT_PROVIDER, and export");
     println!("that provider's own key variable (`.agent providers` lists them). The tools");
     println!("run read-only unless allow-writes; the agent's own tables stay read-only");
@@ -2660,7 +2678,51 @@ fn agent_usage() {
 }
 
 /// Run one `.agent` command in the loaded extension and report its exit code.
+/// The state store path next to a store file (`warehouse.pink` ->
+/// `warehouse.state.pink`), as the server names it.
+fn state_path_next_to(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    match text.strip_suffix(".pink") {
+        Some(stem) => format!("{stem}.state.pink"),
+        None => format!("{text}.state.pink"),
+    }
+}
+
+/// Attach the state store (wave 121e) before the agent or memory runs: their
+/// own tables live there, never in the open store. Opened on first use, so a
+/// session that runs neither creates no file; an encrypted store's state is
+/// encrypted under the same key.
+fn ensure_state_store(db: &mut PinkDb) -> Result<(), String> {
+    if db.state_store().is_some() {
+        return Ok(());
+    }
+    let path = STATE_PATH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .or_else(|| db.durable_path().map(|p| state_path_next_to(&p)));
+    let state = match &path {
+        Some(path) => match db.encryption_key() {
+            Some(key) => pinkdb::Database::open_with_key(path, key),
+            None => pinkdb::Database::open(path),
+        }
+        .map_err(|e| format!("cannot open the state store {path}: {e}"))?,
+        None => pinkdb::Database::new(),
+    };
+    // Memory's vector search calls `embed()` on its own channel.
+    #[cfg(feature = "embeddings")]
+    if !state.is_extension_loaded(pinkdb_embeddings::EXTENSION_NAME) {
+        let _ = state.load_extension(pinkdb_embeddings::EXTENSION_NAME);
+    }
+    db.attach_state_store(state);
+    Ok(())
+}
+
 fn agent_command(db: &mut PinkDb, args: &str) -> i32 {
+    if let Err(e) = ensure_state_store(db) {
+        cli_error!("{e}");
+        return 1;
+    }
     if !db
         .command_extensions()
         .iter()
@@ -2784,19 +2846,23 @@ fn memory_usage() {
     println!("  .memory serve [stdio | http <port>] [allow-memory] [allow-writes] [allow-files]");
     println!("  .memory help                   this help");
     println!(
-        "Memory lives in the {} database of the open store: raw turns (L0), atoms",
+        "Memory lives in the {} database of the state store (next to the open store,",
         MEMORY_DATABASE
     );
-    println!("distilled from them (L1), scenarios grouping atoms (L2) and one persona (L3).");
-    println!("Every row carries its owner, team and visibility, and only this extension reads");
-    println!("past them, so the tables are granted to nobody — an administrator can still read");
-    println!("them directly. Distillation needs a provider: name one with `provider <name>` or");
+    println!("or --state): raw turns (L0), atoms distilled from them (L1), scenarios grouping");
+    println!("atoms (L2) and one persona (L3). Every row carries its owner, team and visibility,");
+    println!("and only this extension reads past them; no statement on the store reaches them.");
+    println!("Distillation needs a provider: name one with `provider <name>` or");
     println!("PINKDB_AGENT_PROVIDER and export that provider's key; add and search work without");
     println!("one. A served session's write tools need `allow-memory`.");
 }
 
 /// Run one `.memory` command in the loaded extension and report its exit code.
 fn memory_command(db: &mut PinkDb, args: &str) -> i32 {
+    if let Err(e) = ensure_state_store(db) {
+        cli_error!("{e}");
+        return 1;
+    }
     if args.split_whitespace().next() == Some("serve") {
         return memory_serve(db, args);
     }

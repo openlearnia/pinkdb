@@ -212,3 +212,31 @@ fn a_store_without_the_extension_names_the_library_to_load() {
     assert!(out.contains("the memory extension is not loaded"), "{out}");
     assert!(out.contains(library_name()), "{out}");
 }
+
+/// Wave 121e: memory keeps its layers in the state store next to the store
+/// file, never in the store a user's SQL reaches.
+#[test]
+fn memory_lives_in_the_state_store_next_to_the_file() {
+    let store = Store::new("state");
+    let script = store.script(&[".memory add the warehouse runs on pinkdb"]);
+    let (out, status) = run_merged(store.command(), &script);
+    assert!(status.success(), "{out}");
+    let state = store.dir.join("store.state.pink");
+    let state_wal = store.dir.join("store.state.pink.wal");
+    assert!(
+        state.exists() || state_wal.exists(),
+        "no state store next to the file: {out}"
+    );
+    let path = store.path.display();
+    let (listed, status) = run_merged(store.command(), &format!(".open {path}\n.databases\n"));
+    assert!(status.success(), "{listed}");
+    assert!(!listed.contains("pinkdb_memory"), "{listed}");
+    let (atoms, _) = run_merged(
+        store.command(),
+        &format!(
+            ".open {}\nSELECT count(*) FROM pinkdb_memory.l0_turns;\n",
+            state.display()
+        ),
+    );
+    assert!(atoms.contains('1'), "{atoms}");
+}

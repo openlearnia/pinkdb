@@ -331,8 +331,10 @@ directions are tested.</p>
 
 <h2 id="sessions">Sessions<a class="anchor" href="#sessions" aria-label="Permalink: Sessions">#</a></h2>
 
-<p>A session lives in the <code>pinkdb_agent</code> database of the store it
-ran against: <code>sessions</code>, <code>messages</code>,
+<p>A session lives in the <code>pinkdb_agent</code> database of the state store
+next to the store it ran against (<code>warehouse.pink</code> →
+<code>warehouse.state.pink</code>, or <code>--state PATH</code>), never in the
+store itself: <code>sessions</code>, <code>messages</code>,
 <code>tool_calls</code>, <code>checkpoints</code> and <code>usage</code>. Every
 step — the model turn, its tool calls, their results and the next checkpoint —
 commits together, so a <code>kill -9</code> costs at most the step in flight.

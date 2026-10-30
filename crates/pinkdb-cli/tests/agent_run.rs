@@ -514,14 +514,21 @@ impl Store {
         script
     }
 
-    /// Replay the WAL and checkpoint it into the snapshot.
+    /// Replay the WALs and checkpoint them into the snapshots: the store's
+    /// and the state store's (wave 121e).
     fn fold(&self) {
-        let path = self.path.display();
-        let (out, status) = run_merged(
-            self.plain_command(),
-            &format!(".open {path}\n.save {path}\n"),
-        );
-        assert!(status.success(), "fold failed:\n{out}");
+        for path in [self.path.clone(), self.state_path()] {
+            if !path.exists() && !std::path::Path::new(&format!("{}.wal", path.display())).exists()
+            {
+                continue;
+            }
+            let path = path.display();
+            let (out, status) = run_merged(
+                self.plain_command(),
+                &format!(".open {path}\n.save {path}\n"),
+            );
+            assert!(status.success(), "fold failed:\n{out}");
+        }
     }
 
     fn run(&self, mock: &Mock, lines: &[String]) -> (String, i32) {
@@ -537,13 +544,32 @@ impl Store {
         out
     }
 
-    /// One read-only SQL session: rows as the CLI prints them.
+    /// The state store next to the store (wave 121e): the agent's transcript.
+    fn state_path(&self) -> std::path::PathBuf {
+        self.path.with_file_name(format!(
+            "{}.state.pink",
+            self.path.file_stem().unwrap().to_string_lossy()
+        ))
+    }
+
+    /// One read-only SQL session: rows as the CLI prints them. The agent's
+    /// own tables are in the state store, not the store (wave 121e).
     fn query(&self, sql: &str) -> String {
-        let path = self.path.display();
+        let path = if sql.contains("pinkdb_agent") {
+            self.state_path()
+        } else {
+            self.path.clone()
+        };
+        let path = path.display();
         let script = format!(".open {path}\n{sql}\n");
         let (out, status) = run_merged(self.plain_command(), &script);
         assert!(status.success(), "query {sql} failed:\n{out}");
-        out
+        // How much of the log the open replayed depends on when it was last
+        // checkpointed, not on the rows.
+        out.lines()
+            .filter(|line| !line.starts_with("Replayed "))
+            .map(|line| format!("{line}\n"))
+            .collect()
     }
 
     /// The first data cell of `sql`'s Markdown table.
@@ -551,10 +577,14 @@ impl Store {
         cells(&self.query(sql))
     }
 
+    /// Everything on disk: the store, the state store and their logs.
     fn bytes(&self) -> Vec<u8> {
-        let mut bytes = std::fs::read(&self.path).unwrap_or_default();
-        if let Ok(wal) = std::fs::read(format!("{}.wal", self.path.display())) {
-            bytes.extend(wal);
+        let mut bytes = Vec::new();
+        for path in [self.path.clone(), self.state_path()] {
+            bytes.extend(std::fs::read(&path).unwrap_or_default());
+            if let Ok(wal) = std::fs::read(format!("{}.wal", path.display())) {
+                bytes.extend(wal);
+            }
         }
         bytes
     }

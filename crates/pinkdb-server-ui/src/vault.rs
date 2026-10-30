@@ -1,5 +1,5 @@
 //! The console's credential store (wave 121d), next to the worksheets in
-//! the `pinkdb_worksheets` database:
+//! the `pinkdb_worksheets` database of the host's state store (wave 121e):
 //!
 //! ```sql
 //! access_tokens(id, owner, name, token_hash, hint, created_at, expires_at, last_used_at)
@@ -9,9 +9,9 @@
 //!
 //! Times are Unix seconds (`expires_at` 0 = never, `used_at` 0 = unused).
 //! Tokens and recovery codes are kept as their SHA-256 only; a TOTP secret
-//! must be readable to check a code, so it is kept as is — non-admins have
-//! no grant on this database, and an administrator can already reset any
-//! credential. Like the worksheet store, every statement runs on a trusted
+//! must be readable to check a code, so it is kept as is — in the state
+//! store, which no statement on the warehouse can reach (not even an
+//! administrator's). Like the worksheet store, every statement runs on a trusted
 //! connection with bound parameters, and the console decides whose rows a
 //! request touches. The checks that must hold once — a TOTP step, a
 //! recovery code — are single `UPDATE`s whose row count says whether this

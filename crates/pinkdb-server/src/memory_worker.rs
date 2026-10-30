@@ -97,9 +97,10 @@ impl CommandEvents for Collect {
     }
 }
 
-/// The owners with work waiting.
+/// The owners with work waiting. Memory's layers live in the host's state
+/// store when one is attached (wave 121e), else in the store itself.
 fn owners(db: &Database) -> Result<Vec<String>, String> {
-    let mut conn = db.connect();
+    let mut conn = db.state_store().unwrap_or_else(|| db.clone()).connect();
     let sql = format!(
         "SELECT DISTINCT owner FROM {m}.distill_queue WHERE state = 'pending' \
          UNION SELECT DISTINCT owner FROM {m}.l0_turns WHERE distilled = false",
