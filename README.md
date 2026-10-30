@@ -1792,6 +1792,12 @@ cargo build --release -p pinkdb-server --features ui
 ./target/release/pinkdb-server --file warehouse.pink --enable-ui   # http://127.0.0.1:8080
 ```
 
+In a checkout, `make console` builds the debug server and starts it with
+the console in the background (http://127.0.0.1:8091, store and log in
+`.dev/`; `UI_AUTH=none`, `AGENT=1`, `MEMORY=1`, `STORE=…`, `PORT=…` and
+`UI_PORT=…` adjust it), `make status` shows what is running, `make logs`
+follows the log and `make stop` stops every running `pinkdb-server`.
+
 - **Worksheets**: tabs of SQL saved in the console's state store,
   private to their owner unless shared by name; an editor with
   highlighting and catalog completion (`Ctrl/Cmd+Enter` runs the statement

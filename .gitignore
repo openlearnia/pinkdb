@@ -3,6 +3,8 @@
 # extension staging (scripts/release/build-extensions.sh).
 /dist/
 /ext-dist/
+# Local dev services (`make console`): store, pid file and log.
+/.dev/
 *.pink
 !crates/pinkdb/tests/fixtures/*.pink
 # Lake fixture data files (their catalog/snapshot JSONs are tracked normally).
