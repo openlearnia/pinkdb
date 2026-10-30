@@ -440,7 +440,7 @@ jobs:
         working-directory: bindings/node
         run: |
           npm run build
-          node --test test
+          node --test "test/*.test.js"
           npm pack --dry-run
 
       - name: install Go
