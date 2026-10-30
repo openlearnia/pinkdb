@@ -15,12 +15,17 @@ fn run(args: &[&str], env: &[(&str, &str)], stdin: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn pinkdb");
-    child
+    // A startup error (a bad pin) ends the CLI before it reads its script:
+    // the write may then meet a closed pipe, which is not a test failure.
+    if let Err(e) = child
         .stdin
         .take()
         .expect("child stdin")
         .write_all(stdin.as_bytes())
-        .expect("write the script");
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        panic!("write the script: {e}");
+    }
     child.wait_with_output().expect("wait for pinkdb")
 }
 
