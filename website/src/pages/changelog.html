@@ -9,6 +9,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-30</h2>
+<h3>Extension libraries load on macOS 27 ✅</h3>
+<ul>
+<li>On macOS 27 the release builds of the agent and memory extensions failed <code>LOAD EXTENSION</code> / <code>--agent-extension</code> with "mis-aligned LINKEDIT string pool": the new loader wants the symbol string table 8-byte aligned, and both Apple's ld and LLD leave it 4-byte aligned when a library imports an odd number of functions (which libraries hit it changes with the code). <code>scripts/macos-align-linkedit.py &lt;library&gt;</code> moves the table and re-signs the file (a no-op on an aligned library), and the loader's error now names the script.</li>
+</ul>
 <h3>Wave 121b — the console: access control, imports, storage ✅</h3>
 <ul>
 <li>An <strong>Access</strong> tab lists users, roles and grants (from the new <code>pinkdb_users()</code> and <code>pinkdb_grants()</code> relations; a non-admin sees only themselves and their roles) and lets administrators create users and roles, change passwords, grant and revoke — each action a statement run as the user, so RBAC decides. Passwords never reach the run history.</li>

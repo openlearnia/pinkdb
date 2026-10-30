@@ -1917,6 +1917,13 @@ set -a; . ./.env; set +a                 # the key is exported, never read by pi
     --agent-provider zai
 ```
 
+On macOS 27, if `--agent` or `LOAD EXTENSION` fails with "mis-aligned
+LINKEDIT string pool", the linker left the library's string table 4-byte
+aligned and the new loader wants 8; run
+`python3 scripts/macos-align-linkedit.py target/release/libpinkdb_agent.dylib`
+(it moves the table and re-signs the file, and does nothing to an aligned
+library). The same applies to `libpinkdb_memory.dylib`.
+
 **Providers (wave 106b).** There is **no default provider**: every run names
 one, with `provider <name>` on the run, `--agent-provider` on the command
 line, or `PINKDB_AGENT_PROVIDER`. A run that names none fails with

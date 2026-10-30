@@ -46,6 +46,17 @@ pinkdb&gt; .memory distill --provider zai
 pinkdb&gt; .memory search how big is my warehouse
 pinkdb&gt; .memory show                        # counts per layer, persona, recent rows</code></pre>
 
+<div class="callout">
+  <span class="callout-title">macOS 27: "mis-aligned LINKEDIT string pool"</span>
+  <p>macOS 27's loader refuses a library whose symbol string table is not 8-byte
+  aligned, and the linkers (Apple's ld and LLD) can write one; whether a build hits
+  it changes with the code. The library is otherwise fine: run
+  <code>python3 scripts/macos-align-linkedit.py target/release/libpinkdb_memory.dylib</code> once
+  after building (it does nothing to a library that is already aligned), and
+  <code>LOAD EXTENSION</code> names the script when it sees the error.</p>
+</div>
+
+
 <p><strong>There is no default provider</strong>, exactly as with
 <code>.agent</code>: a distill without one fails with
 <code>no provider: …</code> while <code>add</code> and

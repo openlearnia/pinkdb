@@ -229,6 +229,10 @@ PINKDB_AGENT_PROVIDER=zai ZAI_API_KEY=… \
   environment and reports a missing one once).
 - One agent run at a time per server (the extension loader runs one
   host-driven call per library); a second ask gets an error to retry.
+- On macOS 27 a release build of the agent or memory library can fail to
+  load with "mis-aligned LINKEDIT string pool" (the linker writes a string
+  table the new loader rejects); `python3 scripts/macos-align-linkedit.py
+  <library>` fixes the file.
 
 ## The endpoints
 

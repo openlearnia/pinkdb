@@ -882,7 +882,7 @@ fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, Ext
     // this path. The handle is kept alive by the returned functions.
     let library = unsafe { libloading::Library::new(canonical) }.map_err(|e| ExtError::Load {
         path: path.clone(),
-        message: e.to_string(),
+        message: with_load_hint(e.to_string()),
     })?;
     let library = Arc::new(library);
 
@@ -1019,6 +1019,24 @@ fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, Ext
     })
 }
 
+/// Add what to do to a loader error that has a known local fix.
+///
+/// macOS 27's dyld refuses a library whose symbol string table is not 8-byte
+/// aligned, and both Apple's ld and LLD can write one (an odd number of
+/// indirect symbols leaves the table 4-byte aligned). The library itself is
+/// fine; `scripts/macos-align-linkedit.py` aligns the table and re-signs it.
+fn with_load_hint(message: String) -> String {
+    if message.contains("mis-aligned LINKEDIT string pool") {
+        format!(
+            "{message} (a macOS 27 loader check this build of the library fails; fix \
+             the file with `python3 scripts/macos-align-linkedit.py <library>` from the \
+             pinkdb repository, then load it again)"
+        )
+    } else {
+        message
+    }
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
@@ -1042,6 +1060,20 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_misaligned_string_pool_names_the_fix() {
+        let hinted = with_load_hint(
+            "dlopen(x.dylib): tried: 'x.dylib' (mis-aligned LINKEDIT string pool, \
+             fileOffset=0x0020BBDC)"
+                .to_string(),
+        );
+        assert!(
+            hinted.contains("scripts/macos-align-linkedit.py"),
+            "{hinted}"
+        );
+        assert_eq!(with_load_hint("no such file".to_string()), "no such file");
     }
 
     #[test]

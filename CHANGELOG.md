@@ -9,6 +9,17 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Extension libraries load on macOS 27 ✅
+
+- On macOS 27 the release builds of the agent and memory extensions failed
+  `LOAD EXTENSION` / `--agent-extension` with "mis-aligned LINKEDIT string
+  pool": the new loader wants the symbol string table 8-byte aligned, and
+  both Apple's ld and LLD leave it 4-byte aligned when a library imports an
+  odd number of functions (which libraries hit it changes with the code).
+  `scripts/macos-align-linkedit.py <library>` moves the table and re-signs
+  the file (a no-op on an aligned library), and the loader's error now names
+  the script.
+
 ### Wave 121b — the console: access control, imports, storage ✅
 
 - An **Access** tab lists users, roles and grants (from the new
