@@ -642,15 +642,17 @@ mod tests {
             "https://host/a/b.csv?token=x",
             "s3://bucket/a/b.csv",
             "s3://bucket/a/b.csv#frag",
+            // Gzip CSV, DuckDB's replacement scan too (read decompressed).
+            "x.csv.gz",
+            "https://host/a/b.csv.gz",
         ] {
             assert!(claims_path(claimed), "{claimed}");
         }
         for unclaimed in [
             "x.parquet",
-            "x.csv.gz",
+            "x.gz",
             "https://host/a/b.parquet",
             "s3://bucket/a/b.parquet",
-            "https://host/a/b.csv.gz",
             "http://host/a/b.csv",
             "ftp://host/a/b.csv",
             "read_csv.csv.bak",

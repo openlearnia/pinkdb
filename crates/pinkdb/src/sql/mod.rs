@@ -754,7 +754,7 @@ fn take_statement_children(
                 if let ast::TableItem::Column(col) = item
                     && let Some(e) = col.default.take()
                 {
-                    exprs.push(e);
+                    exprs.push(*e);
                 }
             }
         }

@@ -201,7 +201,7 @@ fn three_part_references_work_in_every_clause_position() {
             "SELECT db1.u.c, db1.t.* FROM db1.t JOIN db1.u ON db1.t.a = db1.u.a \
              ORDER BY db1.t.a;"
         ),
-        vec!["db1.u.c", "a", "b"]
+        vec!["c", "a", "b"]
     );
     // `db.table.*` where every column is explicitly qualified.
     assert_eq!(
@@ -551,18 +551,19 @@ fn every_three_part_error_names_the_full_reference() {
 #[test]
 fn three_part_references_render_faithfully() {
     let mut db = seeded();
-    // Default output names keep the written reference (the expression text).
+    // A column reference is named by its column, however it is qualified
+    // (DuckDB's rule), so a view over it exposes `a`.
     assert_eq!(
         names(&mut db, "SELECT db1.t.a, db1.t.* FROM db1.t;"),
-        vec!["db1.t.a", "a", "b"]
+        vec!["a", "a", "b"]
     );
     // EXPLAIN renders the bound plan without losing the reference's
     // resolution (the column is the same as the two-part form's).
     let text = explain(&mut db, "SELECT db1.t.a FROM db1.t WHERE db1.t.a = 1");
     assert!(!text.is_empty(), "EXPLAIN produced no text");
-    assert!(text.contains("db1.t.a"), "{text}");
+    assert!(text.contains("Scan db1.t"), "{text}");
     let two = explain(&mut db, "SELECT t.a FROM db1.t WHERE t.a = 1");
-    assert!(two.contains("t.a"), "{two}");
+    assert_eq!(two, text, "the two-part form binds the same plan");
     // DESCRIBE and SHOW are unaffected.
     assert!(!rows(&mut db, "DESCRIBE db1.t;").is_empty());
 }
@@ -680,7 +681,7 @@ fn prepared_statements_bind_three_part_references() {
     assert_eq!(stmt.parameter_count(), 1);
     match db.execute_prepared(&stmt, &[Value::Integer(2)]).unwrap() {
         QueryResult::Selected { names, rows, .. } => {
-            assert_eq!(names, vec!["db1.t.a".to_string()]);
+            assert_eq!(names, vec!["a".to_string()]);
             assert_eq!(rows, vec![vec![Value::Integer(2)]]);
         }
         other => panic!("{other:?}"),

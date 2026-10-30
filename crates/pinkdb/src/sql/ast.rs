@@ -458,7 +458,7 @@ pub struct ColumnDef {
     /// `DEFAULT <expr>` in `CREATE TABLE` (a constant, evaluated once when
     /// the table is created). `ALTER TABLE … ADD COLUMN` carries its default
     /// on the operation instead.
-    pub default: Option<Expr>,
+    pub default: Option<Box<Expr>>,
 }
 
 /// `CONSTRAINT name <constraint>` (the name is optional).

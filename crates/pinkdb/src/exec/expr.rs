@@ -2636,7 +2636,7 @@ fn random_uuids(n: usize) -> Result<Vector> {
     getrandom::getrandom(&mut bytes)
         .map_err(|e| PinkDbError::Execution(format!("cannot obtain randomness for uuid(): {e}")))?;
     let mut out = Vector::new_empty(DataType::Varchar);
-    for raw in bytes.chunks_exact_mut(16) {
+    for raw in bytes.as_chunks_mut::<16>().0 {
         raw[6] = (raw[6] & 0x0f) | 0x40;
         raw[8] = (raw[8] & 0x3f) | 0x80;
         let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();

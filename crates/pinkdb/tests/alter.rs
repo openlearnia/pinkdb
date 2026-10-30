@@ -460,12 +460,10 @@ fn adding_a_column_with_a_typed_default_coerces_and_rejects_bad_values() {
         rows(&mut db, "SELECT big FROM t WHERE i = 1;"),
         vec![vec![Value::Bigint(5)]]
     );
-    // A string literal into INTEGER is a clean type error.
+    // A string that is not a number is a clean conversion error (DuckDB's
+    // assignment cast parses it; `'7'` would be accepted).
     let msg = err(&mut db, "ALTER TABLE t ADD COLUMN bad INTEGER DEFAULT 'x';");
-    assert!(
-        msg.contains("cannot coerce") || msg.contains("type"),
-        "{msg}"
-    );
+    assert!(msg.contains("cannot CAST \"x\" AS INTEGER"), "{msg}");
     // A constant expression is folded.
     db.execute("ALTER TABLE t ADD COLUMN sum INTEGER DEFAULT 1 + 2;")
         .unwrap();

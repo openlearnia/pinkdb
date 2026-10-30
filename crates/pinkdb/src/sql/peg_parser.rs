@@ -997,6 +997,12 @@ fn values_select(rows: Vec<Vec<Expr>>, tail: QueryTail) -> Select {
     }
 }
 
+/// One item after a `CREATE TABLE` column's type.
+enum ColumnPart {
+    Constraint(ColumnConstraint),
+    Default(Box<Expr>),
+}
+
 /// The marker function a parsed `PIVOT` carries as its only projection:
 /// `pivot(on, in_list(v…), using(agg, alias, …))`. Keeping the clauses as
 /// ordinary expressions lets every AST walker (parameters, macros, views) see
@@ -2067,17 +2073,17 @@ peg::parser! {
                   let mut default = None;
                   for part in parts {
                       match part {
-                          Ok(c) => constraints.push(c),
-                          Err(e) if default.is_none() => default = Some(e),
-                          Err(_) => return Err("only one DEFAULT clause"),
+                          ColumnPart::Constraint(c) => constraints.push(c),
+                          ColumnPart::Default(e) if default.is_none() => default = Some(e),
+                          ColumnPart::Default(_) => return Err("only one DEFAULT clause"),
                       }
                   }
                   Ok(ColumnDef { name, dtype: ty, constraints, default })
               }
 
-        rule column_part() -> std::result::Result<ColumnConstraint, Expr>
-            = c:column_constraint() { Ok(c) }
-            / e:alter_default() { Err(e) }
+        rule column_part() -> ColumnPart
+            = c:column_constraint() { ColumnPart::Constraint(c) }
+            / e:alter_default() { ColumnPart::Default(Box::new(e)) }
 
         rule column_constraints() -> Vec<ColumnConstraint>
             = c:(column_constraint()*) { c }

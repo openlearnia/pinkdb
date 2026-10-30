@@ -8340,6 +8340,7 @@ pub(crate) fn bind_constant_expr_tracked(
 /// Bind CREATE VIEW: validate the query now (errors surface at creation),
 /// store the AST for per-use rebinding. The view lives in the qualified
 /// database (or the session's), and its body resolves unqualified names there.
+#[allow(clippy::too_many_arguments)]
 fn bind_create_view(
     db: &PinkDb,
     default_db: &str,
