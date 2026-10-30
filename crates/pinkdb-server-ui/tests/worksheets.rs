@@ -535,10 +535,7 @@ fn worksheets_run_under_the_users_grants() {
         .iter()
         .map(|o| o["name"].as_str().unwrap())
         .collect();
-    assert!(
-        names.contains(&"t") && names.contains(&"v") && names.contains(&"t_id"),
-        "{names:?}"
-    );
+    assert!(names.contains(&"t") && names.contains(&"t_id"), "{names:?}");
 
     // A dropped user's session ends with them.
     db.connect().execute("DROP USER bob").unwrap();
@@ -775,7 +772,7 @@ fn a_query_exports_as_csv_or_json() {
 }
 
 #[test]
-fn the_catalog_lists_views_indexes_and_column_stats() {
+fn the_catalog_lists_indexes_and_column_stats_but_not_plain_views() {
     let db = store();
     db.connect()
         .execute(
@@ -792,8 +789,8 @@ fn the_catalog_lists_views_indexes_and_column_stats() {
     assert_eq!(t["rows"], 3);
     assert_eq!(t["columns"][1]["name"], "name");
     assert_eq!(t["columns"][1]["null_count"], 1);
-    assert_eq!(find("v")["kind"], "VIEW");
-    assert_eq!(find("v")["columns"][0]["name"], "id");
+    // A plain view is session-local (never stored): the catalog leaves it out.
+    assert!(!objects.iter().any(|o| o["name"] == "v"), "{objects:?}");
     let index = find("t_id");
     assert_eq!(index["kind"], "INDEX");
     assert_eq!(index["table_name"], "t");

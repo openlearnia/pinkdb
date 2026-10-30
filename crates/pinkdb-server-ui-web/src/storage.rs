@@ -98,7 +98,7 @@ pub fn StoragePage() -> impl IntoView {
                 <div class="card metric">
                     <span class="overline">"Databases"</span>
                     <span class="metric__value">{dbs}</span>
-                    <span class="metric__caption">{format!("{objects} tables and views")}</span>
+                    <span class="metric__caption">{format!("{objects} tables and materialized views")}</span>
                 </div>
                 <div class="card metric">
                     <span class="overline">"Rows"</span>

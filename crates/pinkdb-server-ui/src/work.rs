@@ -803,7 +803,10 @@ pub async fn catalog(
             .filter_map(|row| row.into_iter().next().map(|v| v.to_string()))
             .collect();
         let mut objects: Vec<CatalogObject> = select(
-            "SELECT \"database\", \"name\", \"kind\", \"table_name\", \"detail\" FROM pinkdb_catalog()",
+            // Plain views are session-local (never stored), so the catalog
+            // leaves them out; materialized views are listed.
+            "SELECT \"database\", \"name\", \"kind\", \"table_name\", \"detail\" FROM pinkdb_catalog() \
+             WHERE \"kind\" <> 'VIEW'",
         )?
         .into_iter()
         .map(|row| CatalogObject {
@@ -836,27 +839,6 @@ pub async fn catalog(
                     min: text(&row, 7),
                     max: text(&row, 8),
                 });
-            }
-        }
-        // Views carry no statistics: their columns come from DESCRIBE.
-        for object in objects.iter_mut().filter(|o| o.kind == "VIEW") {
-            let sql = format!(
-                "DESCRIBE {}.{}",
-                quote_ident(&object.database),
-                quote_ident(&object.name)
-            );
-            if let Ok(rows) = select(&sql) {
-                object.columns = rows
-                    .into_iter()
-                    .map(|row| CatalogColumn {
-                        name: text(&row, 0).unwrap_or_default(),
-                        dtype: text(&row, 1).unwrap_or_default(),
-                        null_count: None,
-                        distinct_count: None,
-                        min: None,
-                        max: None,
-                    })
-                    .collect();
             }
         }
         Ok(Catalog {

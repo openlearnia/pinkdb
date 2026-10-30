@@ -767,7 +767,7 @@ fn Search() -> impl IntoView {
                     id="console-search"
                     class="input"
                     node_ref=input
-                    placeholder="Search tables, views, worksheets…"
+                    placeholder="Search tables, worksheets…"
                     autocomplete="off"
                     aria-label="Search"
                     prop:value=move || query.get()

@@ -16,7 +16,6 @@ use crate::ui::Empty;
 /// The groups the catalog shows, in order.
 pub const GROUPS: &[(&str, &str)] = &[
     ("TABLE", "Tables"),
-    ("VIEW", "Views"),
     ("MATERIALIZED VIEW", "Materialized views"),
     ("LAKE TABLE", "Lake tables"),
     ("INDEX", "Indexes"),
@@ -27,7 +26,7 @@ pub const GROUPS: &[(&str, &str)] = &[
 
 /// The kinds a schema always shows a folder for, even empty; the others
 /// appear once the schema holds one.
-pub const ALWAYS: &[&str] = &["TABLE", "VIEW", "TRIGGER", "PROCEDURE"];
+pub const ALWAYS: &[&str] = &["TABLE", "TRIGGER", "PROCEDURE"];
 
 /// The key a catalog tree node remembers its open state under.
 pub fn node_key(path: &[&str]) -> String {
@@ -372,7 +371,7 @@ fn CatalogTree(filter: RwSignal<String>) -> impl IntoView {
             })
             .collect_view();
         if !any {
-            return view! { <Empty icon="search" title="No matches" body="No table, view or column has that name." /> }
+            return view! { <Empty icon="search" title="No matches" body="No table or column has that name." /> }
                 .into_any();
         }
         view! { <ul class="tree">{dbs}</ul> }.into_any()
@@ -754,5 +753,7 @@ mod tests {
             assert!(GROUPS.iter().any(|(k, _)| k == kind), "{kind}");
         }
         assert!(GROUPS.iter().any(|(k, _)| *k == "PROCEDURE"));
+        // Plain views are session-local and have no folder.
+        assert!(!GROUPS.iter().any(|(k, _)| *k == "VIEW"));
     }
 }

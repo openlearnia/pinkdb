@@ -149,9 +149,9 @@ fn DatabasePage() -> impl IntoView {
                             <span class="metric__caption">{plural(of("LAKE TABLE"), "lake table")}</span>
                         </div>
                         <div class="card metric">
-                            <span class="overline">"Views"</span>
-                            <span class="metric__value">{of("VIEW") + of("MATERIALIZED VIEW")}</span>
-                            <span class="metric__caption">{format!("{} materialized", of("MATERIALIZED VIEW"))}</span>
+                            <span class="overline">"Materialized views"</span>
+                            <span class="metric__value">{of("MATERIALIZED VIEW")}</span>
+                            <span class="metric__caption">"stored query results"</span>
                         </div>
                         <div class="card metric">
                             <span class="overline">"Rows"</span>

@@ -52,11 +52,12 @@ agent.
   checkpoints as the statement timeout), so a cancelled statement fails
   before any write-back.
 - **Catalog.** A tree of databases → schemas (one per database, `main`) →
-  folders per kind (tables, views, materialized views, lake tables, indexes
+  folders per kind (tables, materialized views, lake tables, indexes
   (hash and HNSW), triggers, procedures — administrators only — and macros)
   → objects → each table's columns with types and statistics (NULLs,
   distinct estimate, min … max). The tree keeps what you opened across
-  refreshes. Click a name to insert it; ▶ previews 100 rows; ⏱ on a lake
+  refreshes. Plain views are not listed: they are session-local (never
+  stored with the warehouse), so the console leaves them out. Click a name to insert it; ▶ previews 100 rows; ⏱ on a lake
   table opens time travel (`AT (VERSION => n)`) and `lake_changes(…)`.
 - **History.** Every run, newest first (status, timing, row count); click
   one to reopen its SQL.

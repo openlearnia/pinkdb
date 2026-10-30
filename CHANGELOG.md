@@ -9,6 +9,13 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-30
+### Wave 121g — plain views out of the console's catalog ✅
+
+- The console no longer lists plain views (`CREATE VIEW`): they are
+  session-local and never stored with the warehouse, so a listed one
+  disappeared on restart. Materialized views, which are stored, keep their
+  folder; the database page counts them on their own.
+
 ### Wave 121f — the catalog tree by schema and kind ✅
 
 - The console's catalog reads like a warehouse's: **database → schema →
