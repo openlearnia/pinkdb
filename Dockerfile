@@ -20,52 +20,40 @@ ARG RUST_VERSION=1.97
 ARG RUNTIME=musl
 ARG VARIANT=default
 
+# ---------------------------------------------------------------- manifests
+# Every Cargo.toml in the build context as is, and every .rs file as an empty
+# stub at its path (cargo finds bins, benches and examples from the files that
+# exist). A hand-written COPY list fell behind the workspace once (wave 107c's
+# embeddings extension broke `cargo fetch`), so nothing here names a crate.
+FROM rust:${RUST_VERSION}-slim-bookworm AS manifests
+
+WORKDIR /src
+COPY . .
+RUN set -eux; \
+    mkdir /manifests; \
+    cp Cargo.lock /manifests/; \
+    find . -name target -prune -o -name Cargo.toml -print | while read -r f; do \
+        mkdir -p "/manifests/${f%/*}"; \
+        cp "$f" "/manifests/$f"; \
+    done; \
+    find . -name target -prune -o -name '*.rs' -print | while read -r f; do \
+        mkdir -p "/manifests/${f%/*}"; \
+        : >"/manifests/$f"; \
+    done
+
 # ---------------------------------------------------------------- fetch
-# Manifests only (plus stub sources): `cargo fetch` is reused as long as
-# Cargo.toml/Cargo.lock stay unchanged, so editing a .rs file only invalidates
-# the source layer and the build below. The registry is arch independent, so
-# both builders reuse the same fetched crates.
+# Manifests and stubs only: the copy below is cached by content, so `cargo
+# fetch` reruns only when a manifest changes or a Rust file is added or
+# removed; editing a .rs file only invalidates the builders. The registry is
+# arch independent, so both builders reuse the same fetched crates.
 FROM rust:${RUST_VERSION}-slim-bookworm AS fetch
 
 ENV CARGO_INCREMENTAL=0 \
     CARGO_TERM_COLOR=always
 
 WORKDIR /fetch
-
-# Cache-friendly layer order: manifests + a throwaway source tree first, then
-# `cargo fetch`. The fetched registry is copied into both builders below, so
-# editing a .rs file does not invalidate this layer or re-download crates.
-COPY Cargo.toml Cargo.lock ./
-COPY crates/pinkdb/Cargo.toml crates/pinkdb/Cargo.toml
-COPY crates/pinkdb-cli/Cargo.toml crates/pinkdb-cli/Cargo.toml
-COPY crates/pinkdb-server/Cargo.toml crates/pinkdb-server/Cargo.toml
-COPY crates/pinkdb-server-ui/Cargo.toml crates/pinkdb-server-ui/Cargo.toml
-COPY crates/pinkdb-ffi/Cargo.toml crates/pinkdb-ffi/Cargo.toml
-COPY crates/pinkdb-ext-loader/Cargo.toml crates/pinkdb-ext-loader/Cargo.toml
-COPY crates/pinkdb-js/Cargo.toml crates/pinkdb-js/Cargo.toml
-COPY crates/pinkdb-httpfs/Cargo.toml crates/pinkdb-httpfs/Cargo.toml
-COPY crates/pinkdb-wasm/Cargo.toml crates/pinkdb-wasm/Cargo.toml
-COPY crates/pink-lake/Cargo.toml crates/pink-lake/Cargo.toml
-COPY crates/pink-lake-parquet/Cargo.toml crates/pink-lake-parquet/Cargo.toml
-COPY ext-sdk/rust/Cargo.toml ext-sdk/rust/Cargo.toml
-COPY ext-sdk/rust/example/string_ext/Cargo.toml ext-sdk/rust/example/string_ext/Cargo.toml
-COPY extensions/json/Cargo.toml extensions/json/Cargo.toml
-COPY extensions/string/Cargo.toml extensions/string/Cargo.toml
-COPY extensions/datetime/Cargo.toml extensions/datetime/Cargo.toml
-COPY extensions/math/Cargo.toml extensions/math/Cargo.toml
-COPY extensions/arrow/Cargo.toml extensions/arrow/Cargo.toml
-COPY extensions/parquet/Cargo.toml extensions/parquet/Cargo.toml
+COPY --from=manifests /manifests/ ./
 RUN set -eux; \
-    for manifest in $(find . -mindepth 2 -name Cargo.toml); do \
-        dir=${manifest%/Cargo.toml}; \
-        mkdir -p "$dir/src"; \
-        [ -f "$dir/src/lib.rs" ] || : >"$dir/src/lib.rs"; \
-        [ -f "$dir/src/main.rs" ] || : >"$dir/src/main.rs"; \
-    done; \
-    mkdir -p crates/pinkdb-server/src/bin; \
-    : >crates/pinkdb-server/src/bin/pinkdb-server.rs; \
-    mkdir -p crates/pinkdb/benches; \
-    : >crates/pinkdb/benches/durable.rs; \
     mkdir -p /usr/local/cargo/git; \
     cargo fetch --locked
 
