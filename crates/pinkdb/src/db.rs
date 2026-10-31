@@ -2257,7 +2257,8 @@ mod tests {
         // USE to a missing database or schema is a clear bind-time error.
         let err = b.execute("USE nope;").unwrap_err();
         assert!(
-            err.to_string().contains("schema \"nope\" not found"),
+            err.to_string()
+                .contains("no database or schema named \"nope\""),
             "{err}"
         );
 

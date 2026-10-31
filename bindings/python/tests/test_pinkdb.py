@@ -245,7 +245,7 @@ class StatementKindTests(unittest.TestCase):
         self.assertEqual(results[3].affected, 1)
         self.assertEqual(
             [results[i].name for i in (4, 5, 6, 7, 8, 13, 14)],
-            ["v", "v", "t", "db1", "db1", "main", "db1"],
+            ["v", "v", "t", "db1", "db1.main", "main.main", "db1"],
         )
         # Non-SELECT results expose empty column/row surface, SELECT their own.
         for result in results[:-1]:

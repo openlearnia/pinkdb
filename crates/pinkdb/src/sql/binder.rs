@@ -7676,7 +7676,11 @@ fn bind_tracked_plan(
                     } else {
                         let ns = SchemaPath::new(default_ns.db(), x);
                         if !db.schema_exists(&ns) {
-                            return Err(schema_error(db, &ns));
+                            // Either reading could have been meant (DuckDB:
+                            // "No catalog + schema named …").
+                            return Err(PinkDbError::Catalog(format!(
+                                "no database or schema named \"{x}\""
+                            )));
                         }
                         ns
                     }
@@ -14580,7 +14584,8 @@ mod tests {
         ));
         let err = bind_one(&db, "USE nope;").unwrap_err();
         assert!(
-            err.to_string().contains("schema \"nope\" not found"),
+            err.to_string()
+                .contains("no database or schema named \"nope\""),
             "{err}"
         );
         assert!(matches!(

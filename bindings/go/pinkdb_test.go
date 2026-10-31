@@ -571,7 +571,7 @@ func TestMultiStatementKindsAndMetadata(t *testing.T) {
 			t.Fatalf("results[%d].Affected = %d, want %d", i, got, want)
 		}
 	}
-	wantNames := map[int]string{4: "v", 5: "v", 6: "t", 7: "db1", 8: "db1", 13: "main", 14: "db1"}
+	wantNames := map[int]string{4: "v", 5: "v", 6: "t", 7: "db1", 8: "db1.main", 13: "main.main", 14: "db1"}
 	for i, want := range wantNames {
 		if got := results[i].Name; got != want {
 			t.Fatalf("results[%d].Name = %q, want %q", i, got, want)
@@ -845,7 +845,7 @@ func TestNativeErrorMessagesExact(t *testing.T) {
 	}{
 		{"missing table", "", "SELECT * FROM nope;", `table "nope" not found`},
 		{"drop missing table", "", "DROP TABLE nope;", `table "nope" not found`},
-		{"missing database", "", "USE nope;", `database "nope" not found`},
+		{"missing database", "", "USE nope;", `no database or schema named "nope"`},
 		{"duplicate table", "CREATE TABLE dup (a INTEGER);", "CREATE TABLE dup (a INTEGER);", `table "dup" already exists`},
 		{"missing column", "CREATE TABLE t (a INTEGER);", "SELECT nosuchcol FROM t;", `no column "nosuchcol"`},
 		{"nested transaction", "", "BEGIN; BEGIN;", "already in a transaction"},
