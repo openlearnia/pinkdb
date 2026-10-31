@@ -530,7 +530,7 @@ pub fn expire_and_cleanup_on_a_split_lake(suite: &mut dyn Suite) {
     cleanup(&dir);
 }
 
-/// CDC reads the commit deltas from the catalog rows.
+/// CDC reads the change facts from the catalog rows.
 pub fn cdc_reports_the_committed_rows(suite: &mut dyn Suite) {
     let dir = scratch("cdc");
     let (_catalog, _, mut lake) = saved_catalog(suite, &dir, &store(3));

@@ -1960,9 +1960,11 @@ fn watermark_high(
 }
 
 /// Apply one snapshot CDC range: per version in order, deduplicated inserts
-/// by full-row match, then deletes by full-row match. A delete whose row is
-/// value-identical to an insert in the same version is a no-op update and is
-/// skipped (the change data does not pair update pre/post images).
+/// by full-row match, then deletes by full-row match. An update appears as a
+/// delete preimage and an insert postimage in one version; the postimage is
+/// inserted first and the preimage then removes the old row, so the version's
+/// net effect is the update. A delete whose row is value-identical to an
+/// insert in the same version is a no-op update and is skipped.
 fn apply_snapshot_changes(rows: &mut Vec<Vec<Value>>, changes: &[crate::cdc::ChangeRow]) {
     // Rows are matched bit-exactly (`exact_key`): replication must keep
     // `-0.0` and NaN payloads, so the engine's `-0.0 = 0.0` equality is the
@@ -1988,7 +1990,7 @@ fn apply_snapshot_changes(rows: &mut Vec<Vec<Value>>, changes: &[crate::cdc::Cha
         let batch = &changes[start..end];
         let mut inserted: HashSet<Vec<u8>> = HashSet::new();
         for change in batch {
-            if change.change_type == crate::cdc::ChangeKind::Insert {
+            if change.change_type.is_insertion() {
                 let columns: Vec<usize> = (0..change.values.len()).collect();
                 let key = exact_key(&change.values, &columns);
                 let slot = positions.entry(key.clone()).or_default();
@@ -2001,7 +2003,7 @@ fn apply_snapshot_changes(rows: &mut Vec<Vec<Value>>, changes: &[crate::cdc::Cha
             }
         }
         for change in batch {
-            if change.change_type != crate::cdc::ChangeKind::Delete {
+            if !change.change_type.is_deletion() {
                 continue;
             }
             let columns: Vec<usize> = (0..change.values.len()).collect();

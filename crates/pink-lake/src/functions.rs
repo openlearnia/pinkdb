@@ -42,12 +42,15 @@
 //!   size: pinkdb's catalog keeps a delete file's path and row count but not
 //!   its footer, and the storage facade does not hand out per-file keys. Those
 //!   three columns are `NULL`.
-//! - `ducklake_table_changes` has no `update_preimage`/`update_postimage` pair:
-//!   a pinkdb commit records an `UPDATE` as a delete plus an insert (see
-//!   [`crate::ChangeKind`]), so it reports `delete` and `insert` rows. It also
-//!   needs a commit of pinkdb's own to read, so the three row-level functions
-//!   answer only for a lake pinkdb wrote; DuckDB derives the same rows from
-//!   the file and inlined-table state a catalog of any writer carries.
+//! - `ducklake_table_changes` reports `update_preimage`/`update_postimage` for
+//!   an `UPDATE` exactly when DuckDB does: an insertion and a deletion with the
+//!   same `(snapshot_id, rowid)`. The three row-level functions read the
+//!   catalog (see [`crate::cdc`]), not a commit of pinkdb's own, so they answer
+//!   for any DuckLake, including one only DuckDB wrote.
+//! - A row whose file carries no recorded row-id range reads `rowid = NULL`,
+//!   where DuckDB's is `row_id_start + position`; a NULL row id never pairs
+//!   (DuckDB's join on `rowid` behaves the same), so such a range reports
+//!   plain `insert`/`delete`.
 //! - `ducklake_options` reports the catalog's own `ducklake_metadata` rows,
 //!   exactly as DuckDB does, so a pinkdb-written lake shows pinkdb's option set
 //!   (`data_format`, `current_version`, …) and a DuckDB-written lake shows
@@ -55,8 +58,11 @@
 //!   description, as in DuckDB.
 //! - A flush keeps the flushed rows in the inlined table, closing them with an
 //!   end snapshot instead of deleting them, which is what lets a later snapshot
-//!   still read them at an older version. DuckDB's own
-//!   `ducklake_flush_inlined_data` would therefore flush them a second time, so
+//!   still read them at an older version. The row-level change functions read
+//!   that closing as a deletion of each flushed row plus an insertion of the
+//!   file that carries it — what DuckDB computes from the same catalog, where
+//!   its own flush instead deletes the inlined rows. DuckDB's own
+//!   `ducklake_flush_inlined_data` would flush floating rows a second time, so
 //!   a lake pinkdb flushed is flushed by pinkdb (a lake DuckDB flushed reads
 //!   the same either way — the rows are gone from the inlined table).
 //! - `ducklake_options` on a pinkdb-written lake shows no
@@ -749,15 +755,15 @@ fn table_changes(lake: &Lake, bound: &Bound<'_>) -> Result<DataTable> {
     let rows = lake.table_changes(&read.key, read.start, Some(read.end))?;
     let with_change = bound.spec.name == "ducklake_table_changes";
     let wanted = if bound.spec.name == "ducklake_table_insertions" {
-        Some(crate::ChangeKind::Insert)
+        Some(true)
     } else if bound.spec.name == "ducklake_table_deletions" {
-        Some(crate::ChangeKind::Delete)
+        Some(false)
     } else {
         None
     };
     let mut out = table_for(lake, bound)?;
     for row in rows {
-        if wanted.is_some_and(|wanted| wanted != row.change_type) {
+        if wanted.is_some_and(|insertions| insertions != row.change_type.is_insertion()) {
             continue;
         }
         let mut values = Vec::new();

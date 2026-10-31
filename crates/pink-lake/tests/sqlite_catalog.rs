@@ -315,7 +315,7 @@ fn three_hundred_single_row_commits_write_only_the_delta() {
         .collect();
     assert!(
         !pink_tables.iter().any(|name| name == "pinkdb_commit"),
-        "the commit manifest is derived from DuckLake rows, so pinkdb_commit is gone"
+        "row-level changes come from the DuckLake rows, so pinkdb_commit is gone"
     );
     assert!(
         !pink_tables.iter().any(|name| name == "pinkdb_inlined"),

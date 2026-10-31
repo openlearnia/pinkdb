@@ -310,9 +310,20 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// version.
     fn commit(&self, base_version: u64, change: CatalogChange) -> Result<u64>;
 
-    /// The stored commit-delta manifest's logical content, if the store keeps
-    /// one. Used by change-data reads.
-    fn commit_manifest(&self, version: u64) -> Result<Option<Vec<u8>>>;
+    /// The catalog facts DuckLake's change queries read for one table over the
+    /// inclusive version range `[start, end]`: files whose rows begin in it,
+    /// files dropped whole in it, the delete files listed at `end`, and the
+    /// inlined insertions, deletions and positional deletes dated in it.
+    /// `None` when the table does not exist at `end`.
+    ///
+    /// The facts are catalog state, not pinkdb's commit history, so a lake any
+    /// DuckLake writer produced answers them (see [`crate::cdc`]).
+    fn change_facts(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<crate::cdc::ChangeFacts>>;
 
     /// Store/read an opaque catalog-side object (replication state, the
     /// engine lease, …). The catalog's own tables are the source of truth;

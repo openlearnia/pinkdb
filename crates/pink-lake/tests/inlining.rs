@@ -526,20 +526,43 @@ fn flush_materializes_inlined_rows_and_keeps_the_history() {
     assert_eq!(report.version, 3);
     assert!(report.tables.is_empty());
 
-    // Deleting a flushed row is a normal positional delete on the new file;
-    // change data reports the deletion at the delete's version and never the
-    // flush as one.
+    // Change data reads the catalog, and the flush closes each flushed inlined
+    // row with an end snapshot: DuckDB reading this catalog reports the
+    // flushed rows as deletions at the flush's version plus insertions of the
+    // file that carries them. Deleting one of those file rows is then an
+    // ordinary positional delete at the later version.
     let files = file_paths(&lake_dir, "main.t");
     let mut commit = Commit::new();
     commit.delete_positions("main.t", &files[0], &[0]);
     let report = lake.commit(&commit).unwrap();
     assert_eq!(report.rows_deleted, 1);
     let deletions = lake.table_deletions("main.t", 1, None).unwrap();
-    assert_eq!(deletions.len(), 1, "{deletions:?}");
-    assert_eq!(deletions[0].version, 4, "the flush is not a deletion");
+    assert_eq!(
+        deletions
+            .iter()
+            .map(|r| (r.version, r.row_id))
+            .collect::<Vec<_>>(),
+        vec![(3, Some(0)), (3, Some(1)), (3, Some(2)), (4, Some(3))],
+        "{deletions:?}"
+    );
     assert_eq!(deletions[0].values[0], Value::Integer(1));
+    assert_eq!(deletions[3].values[0], Value::Integer(1));
     let insertions = lake.table_insertions("main.t", 1, None).unwrap();
-    assert_eq!(insertions.len(), 3, "{insertions:?}");
+    assert_eq!(
+        insertions
+            .iter()
+            .map(|r| (r.version, r.row_id))
+            .collect::<Vec<_>>(),
+        vec![
+            (2, Some(0)),
+            (2, Some(1)),
+            (2, Some(2)),
+            (3, Some(3)),
+            (3, Some(4)),
+            (3, Some(5)),
+        ],
+        "{insertions:?}"
+    );
 
     cleanup(&dir);
 }
@@ -623,10 +646,11 @@ fn change_data_renders_insertions_deletions_and_changes() {
     assert_eq!(head, 6);
 
     // Insertions: the 12 file rows at v2 (row ids 0..12), the two inlined at
-    // v3 (ids 12, 13), the updated row's new version at v5 (id 13), and the
-    // flushed file's rows are NOT re-reported.
+    // v3 (ids 12, 13), the updated row's new version at v5 (id 14), and at v6
+    // the flush's file row (id 15), which re-keys the inlined row 14 it
+    // carries.
     let insertions = lake.table_insertions("main.t", 1, None).unwrap();
-    assert_eq!(insertions.len(), 15, "{insertions:?}");
+    assert_eq!(insertions.len(), 16, "{insertions:?}");
     assert!(
         insertions
             .iter()
@@ -659,18 +683,22 @@ fn change_data_renders_insertions_deletions_and_changes() {
         vec![(Some(14), 2)],
         "the update's postimage gets a fresh row id (no preimage pairing)"
     );
-    assert!(at(6).is_empty(), "the flush adds no insertions");
+    assert_eq!(
+        at(6),
+        vec![(Some(15), 2)],
+        "the flush writes row 14 into a file, with a fresh row id"
+    );
 
     // Deletions: v4's inlined row 12, v5's file position (row id 0) and the
-    // inlined row 13's old version; nothing at v6.
+    // inlined row 13's old version, then v6 closes the flushed inlined row 14.
     let deletions = lake.table_deletions("main.t", 1, None).unwrap();
-    assert_eq!(deletions.len(), 3, "{deletions:?}");
+    assert_eq!(deletions.len(), 4, "{deletions:?}");
     assert_eq!(
         deletions
             .iter()
             .map(|r| (r.version, r.row_id))
             .collect::<Vec<_>>(),
-        vec![(4, Some(12)), (5, Some(0)), (5, Some(13))]
+        vec![(4, Some(12)), (5, Some(0)), (5, Some(13)), (6, Some(14))]
     );
     assert_eq!(deletions[1].values[0], Value::Integer(100), "{deletions:?}");
 
@@ -713,21 +741,29 @@ fn change_data_renders_insertions_deletions_and_changes() {
         .to_string();
     assert!(err.contains("start must not exceed end"), "{err}");
 
-    // A full save in the range is refused by name: CDC cannot render it.
-    // (The save publishes through its own handle; reopen to see the head.)
+    // A range that excludes the save works, even across the flush.
+    assert_eq!(lake.table_changes("main.t", 6, Some(6)).unwrap().len(), 2);
+    // A full save replaces every file; a catalog-derived read reports it the
+    // way DuckDB reports a rewritten table — whole-file deletions plus the new
+    // files' insertions — so a range may span it. This save also re-keys
+    // every row, so nothing pairs into an update.
     open_lake(&lake_dir)
         .unwrap()
         .write_from_store(&lake.load(None).unwrap())
         .unwrap();
     let lake = open_lake(&lake_dir).unwrap();
-    let err = lake
-        .table_changes("main.t", 1, None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("replaced table \"main.t\" wholesale"), "{err}");
-    assert!(err.contains("full"), "{err}");
-    // A range that excludes the save still works, even across the flush.
-    assert_eq!(lake.table_changes("main.t", 6, Some(6)).unwrap().len(), 0);
+    let save = lake.current_version();
+    let changes = lake.table_changes("main.t", save, Some(save)).unwrap();
+    assert_eq!(changes.len(), 24, "{changes:?}");
+    assert_eq!(
+        changes
+            .iter()
+            .filter(|r| r.change_type == ChangeKind::Insert)
+            .count(),
+        12,
+        "the save writes every live row into new files"
+    );
+    assert!(changes.iter().all(|r| r.version == save));
 
     cleanup(&dir);
 }

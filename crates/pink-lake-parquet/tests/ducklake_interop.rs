@@ -14,6 +14,7 @@
 
 #![cfg(feature = "catalog-sqlite")]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -1355,6 +1356,15 @@ struct TestPostgres {
     dir: PathBuf,
 }
 
+/// One throwaway server at a time: the tests that start one share port 55433.
+#[cfg(feature = "catalog-postgres")]
+static POSTGRES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "catalog-postgres")]
+fn postgres_guard() -> std::sync::MutexGuard<'static, ()> {
+    POSTGRES.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 #[cfg(feature = "catalog-postgres")]
 impl TestPostgres {
     /// A throwaway local server: initdb under `$TMPDIR`, port 55433, trust on
@@ -1441,6 +1451,7 @@ fn binary_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(feature = "catalog-postgres")]
 #[test]
 fn a_duckdb_postgres_conninfo_lake_matches_pinkdb_at_every_snapshot() {
+    let _postgres = postgres_guard();
     let Some(binary) = duckdb_binary() else {
         return;
     };
@@ -1564,28 +1575,148 @@ fn text(value: &str) -> FnArg {
     FnArg::Text(value.to_string())
 }
 
-/// The lake every read function is compared on: inlined rows, two Parquet
-/// files, a DELETE, an UPDATE, an added column, a second table and a commit
+/// The three row-level change functions over every snapshot range, compared
+/// value by value with DuckDB on the same lake. Ranges start at the first
+/// snapshot that holds the table: a change read needs it at `end`. The table's
+/// columns can change with the schema, so ranges are grouped by the output
+/// columns pinkdb reports and each group is one DuckDB query.
+fn check_change_functions(lake: &Lake, binary: &Path, attach: &str, data: &Path, table: &str) {
+    let prefix = attach_script(attach, data);
+    let versions = lake.versions().unwrap();
+    let first = versions
+        .iter()
+        .copied()
+        .find(|version| {
+            lake.load(Some(*version))
+                .is_ok_and(|mut db| db.execute(&format!("SELECT count(*) FROM {table}")).is_ok())
+        })
+        .unwrap_or(versions[0]);
+    let ids: Vec<i64> = versions
+        .iter()
+        .filter(|version| **version >= first)
+        .map(|version| *version as i64 - 1)
+        .collect();
+    for name in [
+        "ducklake_table_changes",
+        "ducklake_table_insertions",
+        "ducklake_table_deletions",
+    ] {
+        // One output column set: our rows and the DuckDB selects for it.
+        type Group = (Vec<Vec<String>>, Vec<String>);
+        let mut groups: BTreeMap<Vec<String>, Group> = BTreeMap::new();
+        for (index, start) in ids.iter().enumerate() {
+            for end in ids[index..].iter() {
+                let rows = call_read(
+                    lake,
+                    &call(
+                        name,
+                        vec![
+                            text("l"),
+                            text("main"),
+                            text(table),
+                            FnArg::Int(*start),
+                            FnArg::Int(*end),
+                        ],
+                    ),
+                )
+                .unwrap_or_else(|error| panic!("{name} over {start}..={end}: {error}"));
+                let columns: Vec<String> = rows
+                    .schema()
+                    .iter()
+                    .map(|(column, _)| column.to_string())
+                    .collect();
+                let group = groups.entry(columns).or_default();
+                for mut row in pinkdb_rows(&rows) {
+                    row.insert(0, end.to_string());
+                    row.insert(0, start.to_string());
+                    group.0.push(row);
+                }
+                let casts = rows
+                    .schema()
+                    .iter()
+                    .map(|(column, _)| format!("CAST({column} AS VARCHAR) AS {column}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // A table function's arguments must be constants, so every
+                // range is spelled out; the inner SELECT keeps an alias from
+                // colliding with a column of the same name.
+                group.1.push(format!(
+                    "SELECT {start} AS start_snapshot, {end} AS end_snapshot, {casts} \
+                     FROM (SELECT * FROM {name}('l', 'main', '{table}', {start}, {end}))"
+                ));
+            }
+        }
+        for (columns, (mut ours, selects)) in groups {
+            ours.sort();
+            let mut names = vec!["start_snapshot".to_string(), "end_snapshot".to_string()];
+            names.extend(columns);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let mut theirs = duckdb_json_rows(
+                binary,
+                &format!("{prefix}{}", selects.join("\nUNION ALL\n")),
+                &names,
+            );
+            theirs.sort();
+            assert_eq!(
+                ours, theirs,
+                "{name}: every snapshot range of main.{table} over {names:?}"
+            );
+        }
+    }
+}
+
+/// The lake every function is compared on: inlined rows, two flushed Parquet
+/// files, a DELETE, UPDATEs, an added column, a second table and a commit
 /// message with extra info.
-fn write_duckdb_function_lake(binary: &Path, attach: &str, data: &Path) -> bool {
-    let statements = [
-        "CALL ducklake_set_commit_message('l', 'duckdb-author', 'first commit');",
-        "CREATE TABLE l.t (i INTEGER, s VARCHAR);",
-        "INSERT INTO l.t VALUES (1, 'a'), (2, 'b');",
-        "CALL ducklake_flush_inlined_data('l');",
-        "INSERT INTO l.t VALUES (3, 'c'), (4, 'd');",
-        "CALL ducklake_flush_inlined_data('l');",
-        "DELETE FROM l.t WHERE i = 2;",
-        "UPDATE l.t SET s = 'u' WHERE i = 3;",
-        "ALTER TABLE l.t ADD COLUMN c INTEGER;",
-        "UPDATE l.t SET c = i * 10;",
-        "CREATE TABLE l.t2 (x BIGINT);",
-        "INSERT INTO l.t2 VALUES (7), (8);",
-        "INSERT INTO l.t VALUES (5, 'e', 50);",
-        "CALL ducklake_set_commit_message('l', 'duckdb-author', 'last commit', extra_info := 'extra');",
-        "INSERT INTO l.t VALUES (6, 'f', 60);",
-    ];
-    let script = format!("{}{}", attach_script(attach, data), statements.join("\n"));
+const FUNCTION_STATEMENTS: &[&str] = &[
+    "CALL ducklake_set_commit_message('l', 'duckdb-author', 'first commit');",
+    "CREATE TABLE l.t (i INTEGER, s VARCHAR);",
+    "INSERT INTO l.t VALUES (1, 'a'), (2, 'b');",
+    "CALL ducklake_flush_inlined_data('l');",
+    "INSERT INTO l.t VALUES (3, 'c'), (4, 'd');",
+    "CALL ducklake_flush_inlined_data('l');",
+    "DELETE FROM l.t WHERE i = 2;",
+    "UPDATE l.t SET s = 'u' WHERE i = 3;",
+    "ALTER TABLE l.t ADD COLUMN c INTEGER;",
+    "UPDATE l.t SET c = i * 10;",
+    "CREATE TABLE l.t2 (x BIGINT);",
+    "INSERT INTO l.t2 VALUES (7), (8);",
+    "INSERT INTO l.t VALUES (5, 'e', 50);",
+    "CALL ducklake_set_commit_message('l', 'duckdb-author', 'last commit', extra_info := 'extra');",
+    "INSERT INTO l.t VALUES (6, 'f', 60);",
+];
+
+/// A lake whose flushes merge rows of several snapshots: an inlined `UPDATE`
+/// ends one inlined row and inserts another at a later snapshot, so the flush
+/// writes a data file whose rows span two snapshots (`partial_max`) and a
+/// delete file whose positions each carry their own snapshot id. DuckLake's
+/// change queries then attribute every row and every position to its own
+/// snapshot instead of the file's.
+const PARTIAL_STATEMENTS: &[&str] = &[
+    "CREATE TABLE l.t (i INTEGER, s VARCHAR);",
+    "INSERT INTO l.t VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+    "UPDATE l.t SET s = 'B' WHERE i = 2;",
+    "CALL ducklake_flush_inlined_data('l');",
+    "UPDATE l.t SET s = 'C' WHERE i = 3;",
+    "DELETE FROM l.t WHERE i = 1;",
+    "INSERT INTO l.t VALUES (4, 'd');",
+    "CALL ducklake_flush_inlined_data('l');",
+];
+
+fn write_duckdb_partial_lake(binary: &Path, prefix: &str) -> bool {
+    let script = format!("{prefix}{}", PARTIAL_STATEMENTS.join("\n"));
+    match run_duckdb(binary, &script) {
+        Ok(_) => true,
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            eprintln!("skipping: DuckDB has no ducklake extension: {message}");
+            false
+        }
+        Err(message) => panic!("writing the partial-file lake: {message}"),
+    }
+}
+
+fn write_duckdb_function_lake(binary: &Path, prefix: &str) -> bool {
+    let script = format!("{prefix}{}", FUNCTION_STATEMENTS.join("\n"));
     match run_duckdb(binary, &script) {
         Ok(_) => true,
         Err(message) if message.contains("extension") || message.contains("Extension") => {
@@ -1728,7 +1859,7 @@ fn ducklake_functions_match_duckdb_on_a_duckdb_lake() {
     let data = dir.join("data");
     std::fs::create_dir_all(&data).unwrap();
     let attach = format!("ducklake:sqlite:{}", catalog_path.display());
-    if !write_duckdb_function_lake(&binary, &attach, &data) {
+    if !write_duckdb_function_lake(&binary, &attach_script(&attach, &data)) {
         cleanup(&dir);
         return;
     }
@@ -1738,6 +1869,66 @@ fn ducklake_functions_match_duckdb_on_a_duckdb_lake() {
     )
     .unwrap();
     check_read_functions(&lake, &binary, &attach, &data);
+    check_change_functions(&lake, &binary, &attach, &data, "t");
+    drop(lake);
+    cleanup(&dir);
+}
+
+/// A DuckDB-written lake whose flushed files carry per-row snapshot ids: the
+/// change functions must report each row and each delete position at the
+/// snapshot DuckDB does, over every range.
+#[test]
+fn ducklake_change_functions_match_duckdb_on_a_partial_file_lake() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("partial-lake");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let attach = format!("ducklake:sqlite:{}", dir.join("catalog.db").display());
+    if !write_duckdb_partial_lake(&binary, &attach_script(&attach, &data)) {
+        cleanup(&dir);
+        return;
+    }
+    let lake = Lake::open_with_catalog(
+        &format!("sqlite:{}", dir.join("catalog.db").display()),
+        Some(data.to_str().unwrap()),
+    )
+    .unwrap();
+    check_change_functions(&lake, &binary, &attach, &data, "t");
+    drop(lake);
+    cleanup(&dir);
+}
+
+/// The same function lake on a throwaway Postgres catalog: DuckDB's change
+/// functions and pinkdb's must agree there too, flush snapshots included.
+#[cfg(feature = "catalog-postgres")]
+#[test]
+fn ducklake_functions_match_duckdb_on_a_duckdb_postgres_lake() {
+    let _postgres = postgres_guard();
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    let Some(server) = TestPostgres::start() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("functions-duckdb-postgres");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let attach = format!("ducklake:postgres:{}", server.conninfo());
+    if !write_duckdb_function_lake(&binary, &attach_script(&attach, &data)) {
+        cleanup(&dir);
+        return;
+    }
+    let lake = Lake::open_with_catalog(
+        &format!("postgres:{}", server.conninfo()),
+        Some(data.to_str().unwrap()),
+    )
+    .unwrap();
+    check_read_functions(&lake, &binary, &attach, &data);
+    check_change_functions(&lake, &binary, &attach, &data, "t");
     drop(lake);
     cleanup(&dir);
 }
@@ -1813,62 +2004,26 @@ fn ducklake_functions_match_duckdb_on_a_pinkdb_lake() {
         return;
     };
     register().unwrap();
+    // Unflushed: the rows sit in the inlined table, so the change functions
+    // read them there on both sides.
     let dir = scratch("functions-pinkdb-lake");
+    let lake = write_pinkdb_function_lake(&dir, false);
+    let data = dir.join("data");
+    let attach = format!("ducklake:sqlite:{}", dir.join("catalog.db").display());
+    check_read_functions(&lake, &binary, &attach, &data);
+    check_change_functions(&lake, &binary, &attach, &data, "t");
+    drop(lake);
+    cleanup(&dir);
+
+    // Flushed: pinkdb closes the inlined rows with an end snapshot and writes
+    // them into a Parquet file. DuckDB reads that catalog as deletions of the
+    // inlined rows plus insertions of the file's rows, and pinkdb must agree.
+    let dir = scratch("functions-pinkdb-flushed");
     let lake = write_pinkdb_function_lake(&dir, true);
     let data = dir.join("data");
     let attach = format!("ducklake:sqlite:{}", dir.join("catalog.db").display());
     check_read_functions(&lake, &binary, &attach, &data);
-
-    // The row-level functions: pinkdb reconstructs them from its own commit
-    // deltas, so only a pinkdb-written lake can answer them, and only one that
-    // never flushed: DuckDB derives changes from file and inlined-table state,
-    // so it shows a flush as a delete of the inlined row plus an insert into
-    // the new file, which pinkdb's deltas do not model.
-    drop(lake);
-    cleanup(&dir);
-    let dir = scratch("functions-pinkdb-changes");
-    let lake = write_pinkdb_function_lake(&dir, false);
-    let attach = format!("ducklake:sqlite:{}", dir.join("catalog.db").display());
-    let prefix = attach_script(&attach, &dir.join("data"));
-    let head = lake
-        .snapshots()
-        .unwrap()
-        .iter()
-        .map(|info| info.version)
-        .max()
-        .unwrap() as i64
-        - 1;
-    for (name, extra) in [
-        ("ducklake_table_changes", true),
-        ("ducklake_table_insertions", false),
-        ("ducklake_table_deletions", false),
-    ] {
-        let selection = if extra {
-            format!(
-                "SELECT CAST(snapshot_id AS VARCHAR) AS snapshot_id, CAST(rowid AS VARCHAR) AS rowid, \
-                 change_type, CAST(i AS VARCHAR) AS i, s FROM {name}('l', 'main', 't', 0, {head})"
-            )
-        } else {
-            format!("SELECT CAST(i AS VARCHAR) AS i, s FROM {name}('l', 'main', 't', 0, {head})")
-        };
-        check_function(
-            &lake,
-            &binary,
-            &format!("{prefix}{selection}"),
-            call(
-                name,
-                vec![
-                    text("l"),
-                    text("main"),
-                    text("t"),
-                    FnArg::Int(0),
-                    FnArg::Int(head),
-                ],
-            ),
-            true,
-        );
-    }
-
+    check_change_functions(&lake, &binary, &attach, &data, "t");
     drop(lake);
     cleanup(&dir);
 }

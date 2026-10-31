@@ -34,16 +34,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pinkdb::DataType;
 
-use super::conn::{SqlConnection, SqlConnectionExt, SqlValue, encode_hex, params, query_one};
+use super::conn::{
+    SqlConnection, SqlConnectionExt, SqlRow, SqlValue, encode_hex, params, query_one,
+};
 use super::dialect::{DUCKLAKE_VERSION, Dialect};
 use super::{
     CatalogChange, MetadataOptionRow, MetadataStore, SnapshotChanges, TableIdentity, pink_version,
     snapshot_id,
 };
 use crate::catalog::{
-    Catalog, ColumnEntry, CommitManifest, DeleteRef, DeltaKind, FileFormat, FileRef, InlinedRow,
-    PartitionKey, RenameEntry, TableDelta, TableEntry, TableMeta, TableRuntime,
+    Catalog, ColumnEntry, DeleteRef, DeltaKind, FileFormat, FileRef, InlinedRow, PartitionKey,
+    RenameEntry, TableDelta, TableEntry, TableMeta,
 };
+use crate::cdc::{ChangeDeleteFile, ChangeFacts, ChangeFile, ChangeInlinedDeletes};
 use crate::replication::{Job, JobStatus, ReplicationState, Source, Strategy, TableState};
 use crate::stats::{self, StatsBlock};
 use crate::{LakeError, Result};
@@ -376,21 +379,16 @@ impl SqlMetadataStore {
         })
     }
 
-    /// The commit-delta manifest for `version`, reconstructed from the rows:
-    /// files that begin/end at the snapshot, inlined rows that begin/end
-    /// there, and DuckLake's own snapshot-change row. There is no stored
-    /// manifest blob.
-    pub(crate) fn commit_manifest(&self, version: u64) -> Result<Option<Vec<u8>>> {
-        self.with_conn(|conn| {
-            let Some(manifest) = manifest_from_rows(conn, version)? else {
-                return Ok(None);
-            };
-            serde_json::to_vec(&manifest)
-                .map(Some)
-                .map_err(|e| LakeError::Internal {
-                    message: format!("serializing a derived commit manifest: {e}"),
-                })
-        })
+    /// The catalog facts DuckLake's change queries read for `key` over the
+    /// inclusive version range `[start, end]`.
+    pub(crate) fn change_facts(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<crate::cdc::ChangeFacts>> {
+        let sid = snapshot_id(end)?;
+        self.with_conn(|conn| change_facts_conn(conn, key, start, end, sid))
     }
 
     /// Whether a snapshot row exists for this pinkdb version.
@@ -1028,6 +1026,15 @@ impl MetadataStore for SqlMetadataStore {
         SqlMetadataStore::table_layout(self, key, version)
     }
 
+    fn change_facts(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<crate::cdc::ChangeFacts>> {
+        SqlMetadataStore::change_facts(self, key, start, end)
+    }
+
     fn table_stub(&self, key: &str, version: Option<u64>) -> Result<Option<TableEntry>> {
         SqlMetadataStore::table_stub(self, key, version)
     }
@@ -1125,10 +1132,6 @@ impl MetadataStore for SqlMetadataStore {
             }
             (Err(e), None) => Err(e),
         }
-    }
-
-    fn commit_manifest(&self, version: u64) -> Result<Option<Vec<u8>>> {
-        SqlMetadataStore::commit_manifest(self, version)
     }
 
     fn put_object(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
@@ -2015,370 +2018,6 @@ fn find_table(conn: &dyn SqlConnection, key: &str, sid: i64) -> Result<Option<Ta
     .map_err(|e| sql_error("reading a table", e))
 }
 
-fn find_table_by_id(conn: &dyn SqlConnection, table_id: i64) -> Result<Option<TableRow>> {
-    conn.query_row(
-        "SELECT t.table_id, s.schema_name, s.path, s.path_is_relative,
-                t.table_name, t.path, t.path_is_relative,
-                CAST(t.table_uuid AS VARCHAR)
-         FROM ducklake_table t
-         JOIN ducklake_schema s ON s.schema_id = t.schema_id
-         WHERE t.table_id = ?1
-         ORDER BY t.begin_snapshot DESC, s.begin_snapshot DESC LIMIT 1",
-        params![table_id],
-        |row| {
-            Ok(TableRow {
-                table_id: row.get(0)?,
-                // DuckLake treats a NULL path as "use the parent path";
-                // an empty relative part joins to exactly that.
-                schema_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                schema_path_is_relative: row.get::<_, Option<bool>>(3)?.unwrap_or(true),
-                table_path: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                table_path_is_relative: row.get::<_, Option<bool>>(6)?.unwrap_or(true),
-                table_uuid: row.get(7)?,
-                table_key: format!("{}.{}", row.get::<_, String>(1)?, row.get::<_, String>(4)?),
-            })
-        },
-    )
-    .map_err(|e| sql_error("reading a table by id", e))
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct ChangeRow {
-    kind: i64,
-    partition_changed: bool,
-    inlining_changed: bool,
-    inlined_limit: Option<u64>,
-}
-
-/// Reconstruct one commit's audit manifest from the DuckLake rows. Files,
-/// delete files and inlined row versions are selected by their begin/end
-/// snapshot; the audit-only facts (kind, partition/inlining changes) come from
-/// `pinkdb_table_change`, and author/message/changes_made from DuckLake's own
-/// snapshot-change row.
-fn manifest_from_rows(conn: &dyn SqlConnection, version: u64) -> Result<Option<CommitManifest>> {
-    if version <= 1 {
-        return Ok(None);
-    }
-    let sid = snapshot_id(version)?;
-    let Some(state) = snapshot_state(conn, sid)? else {
-        return Ok(None);
-    };
-    let root = data_root_conn(conn)?;
-    let (updated, format_version): (Option<String>, Option<i64>) = conn
-        .query_row(
-            "SELECT updated, format_version FROM pinkdb_snapshot WHERE snapshot_id = ?1",
-            params![sid],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| sql_error("reading a snapshot's side row", e))?
-        .unwrap_or((None, None));
-    let updated = match updated {
-        Some(updated) => updated,
-        None => conn
-            .query_row(
-                "SELECT snapshot_time FROM ducklake_snapshot WHERE snapshot_id = ?1",
-                params![sid],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .map_err(|e| sql_error("reading a snapshot's time", e))?
-            .flatten()
-            .unwrap_or_default(),
-    };
-    let mut ids: Vec<i64> = Vec::new();
-    {
-        let stmt = conn
-            .prepare(
-                "SELECT table_id FROM ducklake_table
-                 WHERE begin_snapshot = ?1 OR end_snapshot = ?1
-                 UNION SELECT table_id FROM ducklake_data_file
-                 WHERE begin_snapshot = ?1 OR end_snapshot = ?1
-                 UNION SELECT table_id FROM ducklake_delete_file
-                 WHERE begin_snapshot = ?1 OR end_snapshot = ?1",
-            )
-            .map_err(|e| sql_error("listing a commit's tables", e))?;
-        let rows = stmt
-            .query_map(params![sid], |row| row.get::<_, i64>(0))
-            .map_err(|e| sql_error("listing a commit's tables", e))?;
-        for row in rows {
-            ids.push(row.map_err(|e| sql_error("listing a commit's tables", e))?);
-        }
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    // An inline-only change touches no DuckLake file or table row, so the
-    // union above cannot see it. Ask every table that has typed inlined
-    // storage whether this snapshot begins or ends one of its rows.
-    for (table_id,) in {
-        let stmt = conn
-            .prepare("SELECT DISTINCT table_id FROM ducklake_inlined_data_tables")
-            .map_err(|e| sql_error("listing inlined tables", e))?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?,)))
-            .map_err(|e| sql_error("listing inlined tables", e))?;
-        rows.into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| sql_error("listing inlined tables", e))?
-    } {
-        if ids.binary_search(&table_id).is_ok() {
-            continue;
-        }
-        let (begin, end) = inlined_change_counts(conn, table_id, sid)?;
-        if begin > 0 || end > 0 {
-            ids.push(table_id);
-        }
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    let mut tables = std::collections::BTreeMap::new();
-    for table_id in ids {
-        let Some(table) = find_table_by_id(conn, table_id)? else {
-            continue;
-        };
-        let change = conn
-            .query_row(
-                "SELECT kind, partition_changed, inlining_changed, inlined_limit
-                 FROM pinkdb_table_change WHERE snapshot_id = ?1 AND table_id = ?2",
-                params![sid, table_id],
-                |row| {
-                    Ok(ChangeRow {
-                        kind: row.get(0)?,
-                        partition_changed: row.get::<_, i64>(1)? != 0,
-                        inlining_changed: row.get::<_, i64>(2)? != 0,
-                        inlined_limit: row.get::<_, Option<i64>>(3)?.map(i64_to_u64),
-                    })
-                },
-            )
-            .map_err(|e| sql_error("reading a table change", e))?
-            .unwrap_or_default();
-        let added_files = load_data_files_added(conn, &table, sid)?;
-        let mut compacted_files = Vec::new();
-        if change.kind != 1 {
-            let stmt = conn
-                .prepare(
-                    "SELECT path, path_is_relative FROM ducklake_data_file
-                     WHERE table_id = ?1 AND end_snapshot = ?2 ORDER BY data_file_id",
-                )
-                .map_err(|e| sql_error("reading ended data files", e))?;
-            let rows = stmt
-                .query_map(params![table_id, sid], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
-                })
-                .map_err(|e| sql_error("reading ended data files", e))?;
-            for row in rows {
-                let (path, path_is_relative) =
-                    row.map_err(|e| sql_error("reading ended data files", e))?;
-                compacted_files.push(compose_path(&root, &table, &path, path_is_relative)?);
-            }
-        }
-        let added_deletes = load_delete_files_added(conn, &table, sid)?;
-        let mut removed_delete_files = Vec::new();
-        {
-            let stmt = conn
-                .prepare(
-                    "SELECT path, path_is_relative FROM ducklake_delete_file
-                     WHERE table_id = ?1 AND end_snapshot = ?2 ORDER BY delete_file_id",
-                )
-                .map_err(|e| sql_error("reading ended delete files", e))?;
-            let rows = stmt
-                .query_map(params![table_id, sid], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
-                })
-                .map_err(|e| sql_error("reading ended delete files", e))?;
-            for row in rows {
-                let (path, path_is_relative) =
-                    row.map_err(|e| sql_error("reading ended delete files", e))?;
-                removed_delete_files.push(compose_path(&root, &table, &path, path_is_relative)?);
-            }
-        }
-        let (inlined_begin, inlined_end) = inlined_change_counts(conn, table_id, sid)?;
-        let mut inlined_flushed = 0u64;
-        if change.kind == 3 {
-            // A flush commit ends live rows because it materialized them into
-            // a data file; DuckLake records the same end, but not why.
-            inlined_flushed = inlined_end;
-        }
-        let added_records: u64 = added_files.iter().filter_map(|f| f.rows()).sum();
-        let added_delete_rows: u64 = added_deletes.iter().map(|d| d.count).sum();
-        let (rows_added, rows_deleted, rows_inlined, inlined_ended, inlined_flushed) =
-            match change.kind {
-                1 => (added_records + inlined_begin, 0, 0, 0, 0),
-                2 => (0, 0, 0, 0, 0),
-                3 => (0, 0, 0, 0, inlined_flushed),
-                _ => (
-                    added_records + inlined_begin,
-                    added_delete_rows + inlined_end,
-                    inlined_begin,
-                    inlined_end,
-                    0,
-                ),
-            };
-        let partition_by = if change.partition_changed {
-            load_partition_keys(conn, table_id, sid)?
-        } else {
-            None
-        };
-        tables.insert(
-            table.table_key,
-            TableDelta {
-                runtime: TableRuntime::default(),
-                data_files: added_files,
-                delete_files: added_deletes,
-                rows_added,
-                rows_deleted,
-                replaced: change.kind == 1,
-                partition_changed: change.partition_changed,
-                partition_by,
-                compacted_files,
-                removed_delete_files,
-                rows_inlined,
-                inlined_ended,
-                inlined_flushed,
-                inlined_limit: if change.inlining_changed {
-                    change.inlined_limit
-                } else {
-                    None
-                },
-                inlining_changed: change.inlining_changed,
-            },
-        );
-    }
-    let _ = state;
-    Ok(Some(CommitManifest {
-        format_version: format_version
-            .map(|v| u32::try_from(v).unwrap_or(crate::FORMAT_VERSION))
-            .unwrap_or(crate::FORMAT_VERSION),
-        version,
-        base_version: version - 1,
-        updated,
-        tables,
-    }))
-}
-
-fn load_data_files_added(
-    conn: &dyn SqlConnection,
-    table: &TableRow,
-    sid: i64,
-) -> Result<Vec<FileRef>> {
-    let root = data_root_conn(conn)?;
-    let stmt = conn
-        .prepare(
-            "SELECT f.data_file_id, f.path, f.record_count,
-                    p.schema_version, p.footer_offset, p.footer_len, p.footer_crc32,
-                    f.row_id_start, f.path_is_relative
-             FROM ducklake_data_file f
-             LEFT JOIN pinkdb_data_file p ON p.data_file_id = f.data_file_id
-             WHERE f.table_id = ?1 AND f.begin_snapshot = ?2
-             ORDER BY f.data_file_id",
-        )
-        .map_err(|e| sql_error("reading added data files", e))?;
-    let rows = stmt
-        .query_map(params![table.table_id, sid], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, bool>(8)?,
-            ))
-        })
-        .map_err(|e| sql_error("reading added data files", e))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (
-            file_id,
-            path,
-            records,
-            schema_version,
-            footer_offset,
-            footer_len,
-            footer_crc,
-            start,
-            path_is_relative,
-        ) = row.map_err(|e| sql_error("reading added data files", e))?;
-        let composed = compose_path(&root, table, &path, path_is_relative)?;
-        let stats = load_file_stats(
-            conn,
-            file_id,
-            table.table_id,
-            &table.table_key,
-            &composed,
-            records,
-        )?;
-        let stats_sealed = stats.is_some();
-        out.push(FileRef::Entry {
-            path: composed,
-            rows: records.map(i64_to_u64).unwrap_or(0),
-            schema_version: schema_version.map(i64_to_u64),
-            stats,
-            partition: load_partition_values(conn, file_id, table, sid)?,
-            row_id_start: start.map(i64_to_u64),
-            footer_offset: footer_offset.map(i64_to_u64),
-            footer_len: footer_len.map(i64_to_u64),
-            footer_crc32c: footer_crc.map(|v| v as u32),
-            stats_sealed,
-        });
-    }
-    Ok(out)
-}
-
-fn load_delete_files_added(
-    conn: &dyn SqlConnection,
-    table: &TableRow,
-    sid: i64,
-) -> Result<Vec<DeleteRef>> {
-    let root = data_root_conn(conn)?;
-    let stmt = conn
-        .prepare(
-            "SELECT d.data_file_id, d.path, d.delete_count, d.format, d.path_is_relative
-             FROM ducklake_delete_file d
-             WHERE d.table_id = ?1 AND d.begin_snapshot = ?2
-             ORDER BY d.delete_file_id",
-        )
-        .map_err(|e| sql_error("reading added delete files", e))?;
-    let rows = stmt
-        .query_map(params![table.table_id, sid], |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, bool>(4)?,
-            ))
-        })
-        .map_err(|e| sql_error("reading added delete files", e))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (data_file_id, path, count, format, path_is_relative) =
-            row.map_err(|e| sql_error("reading added delete files", e))?;
-        let file = match data_file_id {
-            Some(id) => match conn
-                .query_row(
-                    "SELECT path, path_is_relative FROM ducklake_data_file WHERE data_file_id = ?1",
-                    params![id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
-                )
-                .map_err(|e| sql_error("reading a delete file's data file", e))?
-            {
-                Some((p, rel)) => compose_path(&root, table, &p, rel)?,
-                None => String::new(),
-            },
-            None => String::new(),
-        };
-        out.push(DeleteRef {
-            positions: None,
-            path: compose_path(&root, table, &path, path_is_relative)?,
-            file,
-            count: count.map(i64_to_u64).unwrap_or(0),
-            format: format.unwrap_or_else(|| "pink".to_string()),
-        });
-    }
-    Ok(out)
-}
-
 fn visible_tables(conn: &dyn SqlConnection, sid: i64) -> Result<Vec<TableRow>> {
     let stmt = conn
         .prepare(
@@ -2866,6 +2505,339 @@ fn load_schema_versions(conn: &dyn SqlConnection, table_id: i64) -> Result<Vec<(
     Ok(out)
 }
 
+/// One `ducklake_data_file` row as the change queries read it:
+/// `(path, path_is_relative, record_count, row_id_start, begin_snapshot,
+/// snapshot, partial_max, pinkdb_data_file.schema_version)`.
+type ChangeFileRow = (
+    String,
+    bool,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// One data file's inlined file deletes: the target, the target's end snapshot
+/// (a snapshot id) and the deleted positions with their snapshot ids.
+type InlinedDeleteGroup = (ChangeFile, Option<i64>, Vec<(u64, u64)>);
+
+fn change_file(
+    root: &str,
+    table: &TableRow,
+    row: ChangeFileRow,
+    schema_versions: &[(i64, u64)],
+) -> Result<ChangeFile> {
+    let (
+        path,
+        path_is_relative,
+        record_count,
+        row_id_start,
+        begin_snapshot,
+        snapshot,
+        partial,
+        schema_version,
+    ) = row;
+    if record_count.is_some_and(|rows| rows < 0) {
+        return Err(LakeError::Corrupt {
+            path: PathBuf::from(&table.table_key),
+            message: format!(
+                "data file \"{path}\" has a negative record_count ({})",
+                record_count.unwrap_or_default()
+            ),
+        });
+    }
+    Ok(ChangeFile {
+        rel: compose_path(root, table, &path, path_is_relative)?,
+        rows: record_count.map(i64_to_u64).unwrap_or(0),
+        row_id_start: row_id_start.map(i64_to_u64),
+        // A DuckDB-written catalog has no pinkdb_data_file side row, so the
+        // file's schema epoch comes from ducklake_schema_versions (the rule
+        // `load_files` uses).
+        schema_version: schema_version.map(i64_to_u64).or_else(|| {
+            schema_versions
+                .iter()
+                .rev()
+                .find(|(begin, _)| *begin <= begin_snapshot)
+                .map(|(_, version)| *version)
+        }),
+        partial: partial.map(i64_to_u64),
+        // Change rows are reported by pinkdb version, not DuckLake snapshot id.
+        snapshot: pink_version(snapshot),
+    })
+}
+
+/// DuckLake's change queries for one table over the inclusive version range
+/// `[start, end]`: `GetTableInsertions` and `GetTableDeletions` in
+/// `ducklake_metadata_manager.cpp`, plus the inlined-row queries their scans
+/// read (`ReadInlinedDataInsertions` / `ReadInlinedDataDeletions`). The SQL
+/// filters are the reference's; `crate::cdc` applies the range to each row's
+/// own snapshot, which is what DuckLake's scan-side filters do.
+fn change_facts_conn(
+    conn: &dyn SqlConnection,
+    key: &str,
+    start: u64,
+    end: u64,
+    sid: i64,
+) -> Result<Option<ChangeFacts>> {
+    let Some(table) = find_table(conn, key, sid)? else {
+        return Ok(None);
+    };
+    let root = data_root_conn(conn)?;
+    let start_sid = snapshot_id(start)?;
+    let end_sid = snapshot_id(end)?;
+    let schema_versions = load_schema_versions(conn, table.table_id)?;
+    let mut facts = ChangeFacts::default();
+
+    // Insertions: files that start in the range. `partial_max` places a file
+    // that merged rows of several snapshots in the range even when it started
+    // earlier; `crate::cdc` then filters its rows by their own snapshot id.
+    let stmt = conn
+        .prepare(
+            "SELECT f.path, f.path_is_relative, f.record_count, f.row_id_start,
+                    f.begin_snapshot, f.begin_snapshot, f.partial_max, p.schema_version
+             FROM ducklake_data_file f
+             LEFT JOIN pinkdb_data_file p ON p.data_file_id = f.data_file_id
+             WHERE f.table_id = ?1
+               AND f.begin_snapshot <= ?2
+               AND (f.begin_snapshot >= ?3
+                    OR (f.partial_max IS NOT NULL AND f.partial_max >= ?3))
+             ORDER BY f.data_file_id",
+        )
+        .map_err(|e| sql_error("reading inserted data files", e))?;
+    for row in stmt
+        .query_map(params![table.table_id, end_sid, start_sid], change_file_row)
+        .map_err(|e| sql_error("reading inserted data files", e))?
+    {
+        let row = row.map_err(|e| sql_error("reading inserted data files", e))?;
+        facts
+            .inserted_files
+            .push(change_file(&root, &table, row, &schema_versions)?);
+    }
+
+    // Whole-file deletes: the file's rows end at `end_snapshot`.
+    let stmt = conn
+        .prepare(
+            "SELECT f.path, f.path_is_relative, f.record_count, f.row_id_start,
+                    f.begin_snapshot, f.end_snapshot, f.partial_max, p.schema_version
+             FROM ducklake_data_file f
+             LEFT JOIN pinkdb_data_file p ON p.data_file_id = f.data_file_id
+             WHERE f.table_id = ?1
+               AND f.end_snapshot IS NOT NULL
+               AND f.end_snapshot >= ?2
+               AND f.end_snapshot <= ?3
+             ORDER BY f.data_file_id",
+        )
+        .map_err(|e| sql_error("reading dropped data files", e))?;
+    for row in stmt
+        .query_map(params![table.table_id, start_sid, end_sid], change_file_row)
+        .map_err(|e| sql_error("reading dropped data files", e))?
+    {
+        let row = row.map_err(|e| sql_error("reading dropped data files", e))?;
+        facts
+            .dropped_files
+            .push(change_file(&root, &table, row, &schema_versions)?);
+    }
+
+    // Every delete file listed at `end`, including files written before the
+    // range and files a later delete superseded: the first carry positions
+    // the range must not report (each position records its own snapshot), the
+    // second name positions a cumulative file repeats.
+    let stmt = conn
+        .prepare(
+            "SELECT d.path, d.format, d.begin_snapshot, d.partial_max, d.delete_count,
+                    d.path_is_relative,
+                    f.path, f.path_is_relative, f.record_count, f.row_id_start,
+                    f.begin_snapshot, f.begin_snapshot, f.partial_max, p.schema_version
+             FROM ducklake_delete_file d
+             JOIN ducklake_data_file f ON f.data_file_id = d.data_file_id
+             LEFT JOIN pinkdb_data_file p ON p.data_file_id = f.data_file_id
+             WHERE d.table_id = ?1 AND d.begin_snapshot <= ?2
+             ORDER BY d.delete_file_id",
+        )
+        .map_err(|e| sql_error("reading change delete files", e))?;
+    let rows = stmt
+        .query_map(params![table.table_id, end_sid], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, bool>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, bool>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+            ))
+        })
+        .map_err(|e| sql_error("reading change delete files", e))?;
+    for row in rows {
+        let (
+            path,
+            format,
+            begin_snapshot,
+            partial,
+            count,
+            path_is_relative,
+            target_path,
+            target_relative,
+            target_rows,
+            target_row_id_start,
+            target_begin,
+            target_snapshot,
+            target_partial,
+            target_schema_version,
+        ) = row.map_err(|e| sql_error("reading change delete files", e))?;
+        facts.delete_files.push(ChangeDeleteFile {
+            path: compose_path(&root, &table, &path, path_is_relative)?,
+            format: format.unwrap_or_else(|| "pink".to_string()),
+            snapshot: pink_version(begin_snapshot),
+            partial: partial.map(i64_to_u64),
+            count: count.map(i64_to_u64).unwrap_or(0),
+            target: change_file(
+                &root,
+                &table,
+                (
+                    target_path,
+                    target_relative,
+                    target_rows,
+                    target_row_id_start,
+                    target_begin,
+                    target_snapshot,
+                    target_partial,
+                    target_schema_version,
+                ),
+                &schema_versions,
+            )?,
+        });
+    }
+
+    // Inlined file deletes: DuckLake keeps small deletes in
+    // `ducklake_inlined_delete_<table_id>` instead of writing a delete file.
+    // The reference applies a group only to a file with no delete file and
+    // whose lifetime lies outside the range, and only to positions dated in
+    // it.
+    let delete_table = inlined_delete_table(table.table_id);
+    if table_exists(conn, &delete_table)? {
+        let sql = format!(
+            "SELECT d.file_id, f.path, f.path_is_relative, f.record_count, f.row_id_start,
+                    f.begin_snapshot, f.begin_snapshot, f.end_snapshot, f.partial_max,
+                    p.schema_version, d.row_id, d.begin_snapshot
+             FROM {delete_table} d
+             JOIN ducklake_data_file f ON f.data_file_id = d.file_id
+             LEFT JOIN pinkdb_data_file p ON p.data_file_id = f.data_file_id
+             WHERE d.begin_snapshot >= ?1 AND d.begin_snapshot <= ?2
+             ORDER BY d.file_id, d.row_id"
+        );
+        let stmt = conn
+            .prepare(&sql)
+            .map_err(|e| sql_error("reading inlined file deletes", e))?;
+        let rows = stmt
+            .query_map(params![start_sid, end_sid], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            })
+            .map_err(|e| sql_error("reading inlined file deletes", e))?;
+        let mut groups: BTreeMap<i64, InlinedDeleteGroup> = BTreeMap::new();
+        for row in rows {
+            let (
+                file_id,
+                target_path,
+                target_relative,
+                target_rows,
+                target_row_id_start,
+                target_begin,
+                target_snapshot,
+                target_end,
+                target_partial,
+                target_schema_version,
+                position,
+                snapshot,
+            ) = row.map_err(|e| sql_error("reading inlined file deletes", e))?;
+            let target = change_file(
+                &root,
+                &table,
+                (
+                    target_path,
+                    target_relative,
+                    target_rows,
+                    target_row_id_start,
+                    target_begin,
+                    target_snapshot,
+                    target_partial,
+                    target_schema_version,
+                ),
+                &schema_versions,
+            )?;
+            let group = groups
+                .entry(file_id)
+                .or_insert_with(|| (target, target_end, Vec::new()));
+            group.2.push((i64_to_u64(position), pink_version(snapshot)));
+        }
+        for (_file_id, (target, target_end, positions)) in groups {
+            if facts
+                .delete_files
+                .iter()
+                .any(|delete| delete.target.rel == target.rel)
+            {
+                continue;
+            }
+            if target_end.is_some_and(|end| end >= start_sid && end <= end_sid) {
+                continue;
+            }
+            facts
+                .inlined_deletes
+                .push(ChangeInlinedDeletes { target, positions });
+        }
+    }
+
+    // Inlined rows: insertions by begin snapshot, deletions by end snapshot.
+    let lake_schema_version = snapshot_state(conn, sid)?
+        .map(|state| state.schema_version)
+        .unwrap_or(0);
+    for row in load_inlined(conn, &table, sid, lake_schema_version, false, true)? {
+        if row.begin >= start && row.begin <= end {
+            facts.inserted_rows.push(row.clone());
+        }
+        if row.end.is_some_and(|at| at >= start && at <= end) {
+            facts.deleted_rows.push(row);
+        }
+    }
+    Ok(Some(facts))
+}
+
+/// One `change_facts_conn` file row: column order matches [`ChangeFileRow`].
+fn change_file_row(row: &SqlRow) -> Result<ChangeFileRow> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, bool>(1)?,
+        row.get::<_, Option<i64>>(2)?,
+        row.get::<_, Option<i64>>(3)?,
+        row.get::<_, i64>(4)?,
+        row.get::<_, Option<i64>>(5)?.unwrap_or_default(),
+        row.get::<_, Option<i64>>(6)?,
+        row.get::<_, Option<i64>>(7)?,
+    ))
+}
+
 fn load_files(
     conn: &dyn SqlConnection,
     table: &TableRow,
@@ -3221,109 +3193,6 @@ fn build_stats_block(
     Ok(Some(block))
 }
 
-fn load_file_stats(
-    conn: &dyn SqlConnection,
-    file_id: i64,
-    table_id: i64,
-    table_key: &str,
-    composed: &str,
-    record_count: Option<i64>,
-) -> Result<Option<StatsBlock>> {
-    let stmt = conn
-        .prepare(
-            // `c.column_type` is the coarse DuckLake name; the side row
-            // carries the type the engine wrote (see `load_stats_blocks`).
-            "SELECT c.column_name, c.column_type, s.null_count, s.min_value, s.max_value,
-                    s.contains_nan, p.dtype
-             FROM ducklake_file_column_stats s
-             JOIN ducklake_data_file f
-               ON f.data_file_id = s.data_file_id
-             JOIN ducklake_column c
-               ON c.table_id = s.table_id AND c.column_id = s.column_id
-              AND c.begin_snapshot <= f.begin_snapshot
-              AND (c.end_snapshot IS NULL OR c.end_snapshot > f.begin_snapshot)
-             LEFT JOIN pinkdb_column p
-               ON p.table_id = c.table_id
-              AND p.column_id = c.column_id
-              AND p.begin_snapshot = c.begin_snapshot
-             WHERE s.data_file_id = ?1 AND s.table_id = ?2
-             ORDER BY c.column_order",
-        )
-        .map_err(|e| sql_error("reading file statistics", e))?;
-    let mapped = stmt
-        .query_map(params![file_id, table_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-            ))
-        })
-        .map_err(|e| sql_error("reading file statistics", e))?;
-    let mut rows = Vec::new();
-    for row in mapped {
-        rows.push(row.map_err(|e| sql_error("reading file statistics", e))?);
-    }
-    let mut rows: Vec<StatRow> = rows
-        .into_iter()
-        .map(|(name, ty, nulls, min, max, nan, side_dtype)| {
-            let dtype = side_dtype
-                .and_then(|text| crate::catalog::parse_dtype_name(&text))
-                .unwrap_or_else(|| pink_dtype(&ty));
-            (name, dtype, nulls, min, max, nan, Vec::new())
-        })
-        .collect();
-    // Path statistics live in DuckLake's own table, joined to the column name
-    // the file was written under.
-    let stmt = conn
-        .prepare(
-            "SELECT v.variant_path, v.shredded_type, v.null_count, v.min_value, v.max_value,
-                    c.column_name
-             FROM ducklake_file_variant_stats v
-             JOIN ducklake_data_file f
-               ON f.data_file_id = v.data_file_id
-             JOIN ducklake_column c
-               ON c.table_id = v.table_id AND c.column_id = v.column_id
-              AND c.begin_snapshot <= f.begin_snapshot
-              AND (c.end_snapshot IS NULL OR c.end_snapshot > f.begin_snapshot)
-             WHERE v.data_file_id = ?1 AND v.table_id = ?2
-             ORDER BY c.column_order, v.variant_path",
-        )
-        .map_err(|e| sql_error("reading file variant statistics", e))?;
-    let mapped = stmt
-        .query_map(params![file_id, table_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })
-        .map_err(|e| sql_error("reading file variant statistics", e))?;
-    for row in mapped {
-        let (path, dtype, nulls, min, max, column) =
-            row.map_err(|e| sql_error("reading file variant statistics", e))?;
-        let Some(stat) = rows.iter_mut().find(|stat| stat.0 == column) else {
-            continue;
-        };
-        stat.6.push(stats::StatsPath {
-            path,
-            dtype,
-            nulls: nulls.map(i64_to_u64).unwrap_or(0),
-            min,
-            max,
-        });
-    }
-    // Re-seal the reconstructed block exactly as the writer did, so `.pink`
-    // attach can still verify it. The CRC covers the table key and path.
-    build_stats_block(table_key, composed, record_count, rows)
-}
-
 fn load_partition_values(
     conn: &dyn SqlConnection,
     file_id: i64,
@@ -3646,28 +3515,6 @@ fn flush_snapshots(
     rows.into_iter()
         .collect::<std::result::Result<std::collections::BTreeSet<_>, _>>()
         .map_err(|e| sql_error("reading flush snapshots", e))
-}
-
-/// Count the inlined row versions this table begins and ends at `sid`, across
-/// every typed inlined table.
-fn inlined_change_counts(conn: &dyn SqlConnection, table_id: i64, sid: i64) -> Result<(u64, u64)> {
-    let mut begin = 0u64;
-    let mut end = 0u64;
-    for (table_name, _) in inlined_tables(conn, table_id)? {
-        let sql = format!(
-            "SELECT CAST(COALESCE(SUM(CASE WHEN _ducklake_begin_snapshot = ?1 THEN 1 ELSE 0 END), 0) AS BIGINT),
-                    CAST(COALESCE(SUM(CASE WHEN _ducklake_end_snapshot = ?1 THEN 1 ELSE 0 END), 0) AS BIGINT)
-             FROM {}",
-            quote_ident(&table_name)
-        );
-        let (b, e): (i64, i64) = query_one(conn, &sql, params![sid], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .map_err(|e| sql_error("counting a commit's inlined rows", e))?;
-        begin = begin.saturating_add(i64_to_u64(b));
-        end = end.saturating_add(i64_to_u64(e));
-    }
-    Ok((begin, end))
 }
 
 /// The pink type of every column this table has ever had, latest definition
