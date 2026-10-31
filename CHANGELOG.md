@@ -101,6 +101,21 @@ works everywhere a table is named, and QuackLab's SQL runs as written —
   probe chunk instead of once per join.
 - **Fixed:** the console's Preview of a table never finished (the new tab
   lost its state when the explorer refreshed).
+### Wave 130 — the QuackLab benchmark ✅
+
+`bench/quacklab/run.py` measures QuackLab's own workload on pinkdb and DuckDB
+on the same machine: the NYC-taxi model compiled by QuackLab's compiler, its
+ETL plan per batch, a full refresh of its 55 materialized views, and 12
+dashboard widgets at 1, 4 and 16 concurrent clients, plus cold start and peak
+memory, on local storage and on a lake (Postgres catalog, S3 data).
+
+- pinkdb runs QuackLab's statements as emitted first and records what blocks
+  them (schemas: wave 131; DuckLake `ATTACH`: wave 132), then a labelled
+  workaround. Dialect gaps it works around are probed and listed with
+  pinkdb's error, and stop being shimmed once pinkdb accepts them.
+- Results agree between the engines (table counts, widget rows).
+- `crates/pinkdb-server/examples/chart_load.rs`: a concurrent chart-query
+  load client for pinkdb-server.
 
 ## 2026-10-30
 ### Wave 129 — QuackLab's DuckDB dialect ✅
