@@ -111,18 +111,70 @@ Goal: QuackLab's ETL around 3 s on the small batch, results unchanged.
 
 ## Measurements
 
-Synthetic repro (`pinkdb-wt/bench-c/scratch`, release CLI, in-memory,
-1.92M-row fact, 9 columns for the MERGE, 18 for CTAS), before:
+Synthetic repros (`pinkdb-wt/bench-c/scratch`, release CLI, in-memory,
+1.92M-row fact), before (236c4f2) and after (525e1e6):
 
 | statement | before | after |
 |---|---|---|
-| `NOT EXISTS` over a `UNION` of 265 + 100 keys | 4.99 s | |
-| `MERGE`, 1 source row, 7-key `ON` | 8.78 s | |
-| CTAS `SELECT *` (18 columns) | 3.66 s | |
-| `INSERT … SELECT *` (18 columns) | 3.96 s | |
+| `NOT EXISTS` over a `UNION` of 265 + 100 keys (140a) | 4.99 s | 0.007 s |
+| `MERGE`, 1 source row, 7-key `ON`, 9 columns (140b) | 6.64 s | 0.09 s |
+| `MERGE`, 960k matched source rows (140b) | 45.2 s | 0.67 s |
+| `MERGE` of 1.92M rows into an empty table, all inserts (140d) | 1.05 s after 140b | 0.24 s |
+| CTAS `SELECT *`, 18 columns (140c) | 1.45 s | 0.06 s |
+| `INSERT … SELECT *`, 18 columns (140c) | 1.51 s | 0.06 s |
 
-QuackLab benchmark (`bench/quacklab/run.py --size small --storage local`)
-and TPC-H SF1: recorded below when measured.
+QuackLab benchmark (`bench/quacklab/run.py --size small --storage local
+--clients 1 --rounds 1`, stream B's harness at ae486e1 with this branch's
+binaries; load average 4–8 from the other streams, so DuckDB's own numbers
+move between runs). Results in `pinkdb-wt/bench-c/results/`.
+
+| phase | before (236c4f2) | after (525e1e6) | DuckDB (same run) |
+|---|---|---|---|
+| ETL 2024-07 (1.87M rows) | 68.3 s | **1.81 s** | 2.20 s |
+| ETL 2024-08-12 | 43.3 s | **1.49 s** | 0.34 s |
+| ETL one-row correction | 14.8 s | **1.35 s** | 0.09 s |
+| mart refresh 2024-07 | 23.5 s | 9.1 s | 2.5 s |
+| mart refresh 2024-08-12 | 17.2 s | 8.7 s | 2.4 s |
+| peak RSS, ETL 2024-07 | 4.45 GB | 2.11 GB | 0.78 GB |
+
+Table counts and widget rows agree with DuckDB before and after. What is
+left of the ETL is mostly process overhead (open the store, `.save`:
+0.6–1.1 s against DuckDB's 0.04–0.28 s, wave 136's lazy storage), the
+correction batch's `MERGE` (0.20 s; its keys are VARCHAR/DATE columns whose
+zones do not prune the unsorted fact table) and the staging `DELETE`
+(0.15 s).
+
+TPC-H SF 1, interleaved A/B of 236c4f2 against 140c (5 rounds, load ~10,
+`pinkdb-wt/tools/tpch-ab.py`): geometric mean 0.97; the two outliers were
+noise (a 9-round rerun: Q2 1.00, Q20 1.03). TPC-H's correlated bodies are
+plain scan and join trees, so their plans do not change. 22/22 match DuckDB
+at SF 0.01 and SF 1.
+
+## Landed
+
+- **140a** (c2171dd) decision 1; the review's differential run caught a
+  correlated `HAVING` that the first lift broke and a missing guard for
+  projections that read the enclosing row, both now refused (per-row path).
+- **140b** (d6b7363) decision 2; the review caught joined batches that could
+  pass `CHUNK_SIZE` (a "vector overflow" error), now split.
+- **140c** (7dc6e79) decision 3, plus the pre-existing `RETURNING` /
+  data-modifying CTE / transition-table failure past 2048 rows.
+- **140d** (525e1e6): `MERGE`'s `NOT MATCHED` inserts take 140c's chunk path
+  under the same conditions, with one `NOT MATCHED` clause (several keep
+  their clause-major order on the row path).
+
+## Follow-ups (not in this wave)
+
+- `trigger::predicted_id` and `storage.rs` `extend_key_index` predict a new
+  row's id as `num_rows() / CHUNK_SIZE`, wrong once a delete has left an
+  interior chunk short (keyed tables). 140b's `MERGE` derives it from the
+  tail chunk instead.
+- `DELETE … RETURNING` (any capture) deletes one row per call in
+  `trigger::delete_rows`: 1.92M rows take 34 s against 0.016 s without
+  `RETURNING`.
+- Store open and `.save` per process (0.6–1.1 s on QuackLab's store): wave
+  136's lazy storage.
+- Mart refresh is 3.7–4× DuckDB: wave 135's pipelines.
 
 ## Tests
 
