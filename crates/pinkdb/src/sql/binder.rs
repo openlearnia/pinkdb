@@ -7584,19 +7584,34 @@ fn bind_tracked_plan(
             name,
             if_not_exists,
             options,
-        } => empty(LogicalPlan::CreateDatabase {
-            name: name.clone(),
-            if_not_exists: *if_not_exists,
-            lake: bind_create_database_options(options.as_ref())?,
-        }),
+        } => {
+            if name.eq_ignore_ascii_case("system") {
+                return Err(PinkDbError::Catalog(
+                    "database name \"system\" is reserved".to_string(),
+                ));
+            }
+            empty(LogicalPlan::CreateDatabase {
+                name: name.clone(),
+                if_not_exists: *if_not_exists,
+                lake: bind_create_database_options(options.as_ref())?,
+            })
+        }
         Statement::Attach {
             location,
             name,
             options,
-        } => empty(LogicalPlan::Attach {
-            name: name.clone(),
-            spec: bind_attach_options(location, options)?,
-        }),
+        } => {
+            if name.eq_ignore_ascii_case("system") {
+                return Err(PinkDbError::Catalog(
+                    "Attached database name \"system\" cannot be used because it is a reserved name"
+                        .to_string(),
+                ));
+            }
+            empty(LogicalPlan::Attach {
+                name: name.clone(),
+                spec: bind_attach_options(location, options)?,
+            })
+        }
         Statement::Detach { name, if_exists } => empty(LogicalPlan::Detach {
             name: name.clone(),
             if_exists: *if_exists,
@@ -7608,6 +7623,10 @@ fn bind_tracked_plan(
         Statement::ShowTables => empty(LogicalPlan::ShowTables {
             ns: default_ns.clone(),
         }),
+        Statement::ShowAllTables => {
+            let binder = Binder::new(db, default_ns).with_session(session.clone());
+            empty(bind_show_all_tables(db, &binder)?)
+        }
         Statement::ShowDatabases => empty(LogicalPlan::ShowDatabases),
         Statement::Describe { qual: qdb, name } => bind_describe(db, default_ns, qdb, name),
         Statement::Explain(inner) => {
@@ -10478,6 +10497,30 @@ fn bind_describe(
     qdb: &Qualifier,
     name: &str,
 ) -> Result<(LogicalPlan, Vec<String>)> {
+    if let Some(schema) = qdb
+        .schema
+        .as_deref()
+        .filter(|schema| is_builtin_schema(schema))
+    {
+        let dbname = qdb
+            .catalog
+            .clone()
+            .unwrap_or_else(|| default_ns.db().to_string());
+        let binder = Binder::new(db, default_ns);
+        let (scope, _) = bind_builtin_view(db, &binder, &dbname, schema, name, &None)?;
+        let columns = scope
+            .columns
+            .into_iter()
+            .map(|(name, dtype)| crate::plan::DescribeColumn {
+                name,
+                dtype,
+                not_null: false,
+                key: None,
+                default: None,
+            })
+            .collect();
+        return Ok((LogicalPlan::Describe { columns }, Vec::new()));
+    }
     let lookup = Binder::new(db, default_ns).resolve_ns(qdb)?;
     if let Ok(t) = db.table_in(&lookup, name) {
         let mut columns = Vec::with_capacity(t.columns.len());
@@ -11075,6 +11118,13 @@ fn bind_table_function(
     if name.eq_ignore_ascii_case("pinkdb_catalog") {
         return bind_catalog(db, binder, args, alias);
     }
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "duckdb_databases" | "duckdb_schemas" | "duckdb_tables" | "duckdb_views" | "duckdb_columns"
+    ) {
+        return bind_duckdb_meta(db, binder, &lower, args, alias);
+    }
     if name.eq_ignore_ascii_case("pinkdb_users") || name.eq_ignore_ascii_case("pinkdb_grants") {
         return bind_access(db, binder, &name.to_ascii_lowercase(), args, alias);
     }
@@ -11111,20 +11161,23 @@ fn bind_table_function(
 }
 
 /// `pinkdb_catalog()`: one row per catalog object of the store (wave 121) —
-/// tables, views, materialized views, hash and vector indexes, triggers,
-/// macros, procedures and attached lake tables — for a catalog browser. DuckDB splits
-/// this over `duckdb_tables()`, `duckdb_views()` and `duckdb_indexes()`; one
-/// relation keeps the console to one statement.
+/// databases, schemas, tables, views, materialized views, hash and vector
+/// indexes, triggers, macros, procedures and attached lake tables — for a
+/// catalog browser. DuckDB splits this over `duckdb_tables()`,
+/// `duckdb_views()` and `duckdb_indexes()`; one relation keeps the console to
+/// one statement.
 ///
-/// Columns: `database`, `name`, `kind` (`DATABASE`, `TABLE`, `VIEW`,
-/// `MATERIALIZED VIEW`, `INDEX`, `TRIGGER`, `MACRO`, `PROCEDURE`, `LAKE
-/// TABLE`), `table_name` (the table an index or trigger belongs to), `detail`
-/// (index column and method, trigger timing, macro parameters, procedure
-/// parameters and language, lake location), and — on `DATABASE` rows only
-/// (wave 124) — `storage` (`local`/`lake`), `location` (redacted),
-/// `read_only`, `version` and `status` (`ok` or `unavailable: …`). A logged-in session sees only the relations it may `SELECT`,
-/// only those relations' indexes and triggers, and procedures only when it
-/// is an administrator (the one who may `CALL` them).
+/// Columns: `database`, `schema`, `name`, `kind` (`DATABASE`, `SCHEMA`,
+/// `TABLE`, `VIEW`, `MATERIALIZED VIEW`, `INDEX`, `TRIGGER`, `MACRO`,
+/// `PROCEDURE`, `LAKE TABLE`), `table_name` (the table an index or trigger
+/// belongs to), `detail` (index column and method, trigger timing, macro
+/// parameters, procedure parameters and language, lake location), and — on
+/// `DATABASE` rows only (wave 124) — `storage` (`local`/`lake`), `location`
+/// (redacted), `read_only`, `version` and `status` (`ok` or
+/// `unavailable: …`). `schema` is NULL on `DATABASE` rows. A logged-in
+/// session sees only the relations it may `SELECT`, only those relations'
+/// indexes and triggers, and procedures only when it is an administrator
+/// (the one who may `CALL` them).
 fn bind_catalog(
     db: &PinkDb,
     binder: &Binder<'_>,
@@ -11138,6 +11191,7 @@ fn bind_catalog(
     }
     let names: Vec<String> = [
         "database",
+        "schema",
         "name",
         "kind",
         "table_name",
@@ -11151,16 +11205,16 @@ fn bind_catalog(
     .into_iter()
     .map(str::to_string)
     .collect();
-    let mut types = vec![DataType::Varchar; 7];
+    let mut types = vec![DataType::Varchar; 8];
     types.extend([DataType::Boolean, DataType::Bigint, DataType::Varchar]);
     let principal = binder.session.principal();
-    let readable = |dbname: &str, table: &str| match &principal {
+    let readable = |dbname: &str, schema: &str, table: &str| match &principal {
         None => true,
         Some(principal) => db.rbac().allowed(
             principal,
             &crate::rbac::GrantObject::Table {
                 db: dbname.to_string(),
-                schema: "main".to_string(),
+                schema: schema.to_string(),
                 table: table.to_string(),
             },
             crate::rbac::Privilege::Select,
@@ -11173,10 +11227,12 @@ fn bind_catalog(
     let null = || BoundExpr::Literal(Value::Null);
     let mut rows: Vec<Vec<BoundExpr>> = Vec::new();
     // Wave 124: one DATABASE row per database carries its storage facts
-    // (the other rows leave those columns NULL).
+    // (the other rows leave those columns NULL). Wave 131c adds one SCHEMA
+    // row per schema, and object rows now name their schema.
     for info in db.database_infos() {
         rows.push(vec![
             text(&info.name),
+            null(),
             text(&info.name),
             text("DATABASE"),
             null(),
@@ -11193,113 +11249,147 @@ fn bind_catalog(
     let mut databases = db.list_databases();
     databases.sort();
     for dbname in databases {
-        let mvs: Vec<String> = db
-            .materialized_view_status_in(&dbname, crate::mv::now_ms())
-            .into_iter()
-            .map(|status| status.name)
-            .collect();
-        let mut tables = db.list_tables_in(&dbname);
-        tables.sort();
-        for tname in &tables {
-            if !readable(&dbname, tname) {
+        let mut schemas = db.list_schemas(&dbname);
+        schemas.sort();
+        for schema in schemas {
+            let ns = SchemaPath::new(&dbname, &schema);
+            let mvs: Vec<String> = db
+                .materialized_view_status_in(ns.clone(), crate::mv::now_ms())
+                .into_iter()
+                .map(|status| status.name)
+                .collect();
+            let mut tables = db.list_tables_in(ns.clone());
+            tables.sort();
+            let mut views = db.list_views_in(ns.clone());
+            views.sort();
+            let visible = principal.is_none()
+                || may_call
+                || tables.iter().any(|t| readable(&dbname, &schema, t))
+                || views.iter().any(|v| readable(&dbname, &schema, v));
+            if !visible {
                 continue;
             }
-            let kind = if mvs.iter().any(|mv| mv.eq_ignore_ascii_case(tname)) {
-                "MATERIALIZED VIEW"
-            } else {
-                "TABLE"
-            };
-            rows.push(vec![text(&dbname), text(tname), text(kind), null(), null()]);
-            let t = db.table_in(&dbname, tname)?;
-            let schema = t.schema();
-            let column = |i: usize| schema.get(i).map(|(c, _)| c.as_str()).unwrap_or("?");
-            for index in &t.indexes {
-                rows.push(vec![
-                    text(&dbname),
-                    text(&index.name),
-                    text("INDEX"),
-                    text(tname),
-                    text(&format!("{} (hash)", column(index.column))),
-                ]);
-            }
-            for index in &t.vector_indexes {
-                rows.push(vec![
-                    text(&dbname),
-                    text(&index.name),
-                    text("INDEX"),
-                    text(tname),
-                    text(&format!("{} ({})", column(index.column), index.provider)),
-                ]);
-            }
-        }
-        let mut views = db.list_views_in(&dbname);
-        views.sort();
-        for view in views {
-            if readable(&dbname, &view) {
-                rows.push(vec![
-                    text(&dbname),
-                    text(&view),
-                    text("VIEW"),
-                    null(),
-                    null(),
-                ]);
-            }
-        }
-        for trigger in db.triggers_in(&dbname) {
-            if readable(&dbname, &trigger.table) {
-                rows.push(vec![
-                    text(&dbname),
-                    text(&trigger.name),
-                    text("TRIGGER"),
-                    text(&trigger.table),
-                    text(&format!(
-                        "{} {}",
-                        trigger.timing.as_str(),
-                        trigger
-                            .events
-                            .iter()
-                            .map(|e| e.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" OR ")
-                    )),
-                ]);
-            }
-        }
-        for (_, def) in db.macros_in(&dbname) {
             rows.push(vec![
                 text(&dbname),
-                text(&def.name),
-                text("MACRO"),
+                text(&schema),
+                text(&schema),
+                text("SCHEMA"),
                 null(),
-                text(&def.parameter_names()),
+                null(),
             ]);
-        }
-        // Only a session that may `CALL` a procedure (an administrator) sees
-        // it: its body reaches anything the definer can.
-        if may_call {
-            for (_, def) in db.procedures_in(&dbname) {
-                let params: Vec<String> =
-                    def.params.iter().map(|(n, t)| format!("{n} {t}")).collect();
-                let detail = if params.is_empty() {
-                    def.language.name().to_string()
+            for tname in &tables {
+                if !readable(&dbname, &schema, tname) {
+                    continue;
+                }
+                let kind = if mvs.iter().any(|mv| mv.eq_ignore_ascii_case(tname)) {
+                    "MATERIALIZED VIEW"
                 } else {
-                    format!("{} · {}", params.join(", "), def.language.name())
+                    "TABLE"
                 };
                 rows.push(vec![
                     text(&dbname),
-                    text(&def.name),
-                    text("PROCEDURE"),
+                    text(&schema),
+                    text(tname),
+                    text(kind),
                     null(),
-                    text(&detail),
+                    null(),
                 ]);
+                let t = db.table_in(ns.clone(), tname)?;
+                let table_schema = t.schema();
+                let column = |i: usize| table_schema.get(i).map(|(c, _)| c.as_str()).unwrap_or("?");
+                for index in &t.indexes {
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&index.name),
+                        text("INDEX"),
+                        text(tname),
+                        text(&format!("{} (hash)", column(index.column))),
+                    ]);
+                }
+                for index in &t.vector_indexes {
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&index.name),
+                        text("INDEX"),
+                        text(tname),
+                        text(&format!("{} ({})", column(index.column), index.provider)),
+                    ]);
+                }
+            }
+            for view in views {
+                if readable(&dbname, &schema, &view) {
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&view),
+                        text("VIEW"),
+                        null(),
+                        null(),
+                    ]);
+                }
+            }
+            for trigger in db.triggers_in(ns.clone()) {
+                if readable(&dbname, &schema, &trigger.table) {
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&trigger.name),
+                        text("TRIGGER"),
+                        text(&trigger.table),
+                        text(&format!(
+                            "{} {}",
+                            trigger.timing.as_str(),
+                            trigger
+                                .events
+                                .iter()
+                                .map(|e| e.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" OR ")
+                        )),
+                    ]);
+                }
+            }
+            for (_, def) in db.macros_in(ns.clone()) {
+                rows.push(vec![
+                    text(&dbname),
+                    text(&schema),
+                    text(&def.name),
+                    text("MACRO"),
+                    null(),
+                    text(&def.parameter_names()),
+                ]);
+            }
+            // Only a session that may `CALL` a procedure (an administrator)
+            // sees it: its body reaches anything the definer can.
+            if may_call {
+                for (_, def) in db.procedures_in(ns.clone()) {
+                    let params: Vec<String> =
+                        def.params.iter().map(|(n, t)| format!("{n} {t}")).collect();
+                    let detail = if params.is_empty() {
+                        def.language.name().to_string()
+                    } else {
+                        format!("{} · {}", params.join(", "), def.language.name())
+                    };
+                    rows.push(vec![
+                        text(&dbname),
+                        text(&schema),
+                        text(&def.name),
+                        text("PROCEDURE"),
+                        null(),
+                        text(&detail),
+                    ]);
+                }
             }
         }
     }
     for (location, tables) in db.attached_lakes() {
         for table in tables {
-            if readable(&table.db, &table.table) {
+            if readable(&table.db, "main", &table.table) {
                 rows.push(vec![
                     text(&table.db),
+                    text("main"),
                     text(&table.table),
                     text("LAKE TABLE"),
                     null(),
@@ -11333,6 +11423,984 @@ fn bind_catalog(
             sources: Vec::new(),
         },
     ))
+}
+
+// ---------- DuckDB-compatible catalog metadata (wave 131c) ----------
+
+#[derive(Clone)]
+struct CatalogDatabase {
+    name: String,
+    oid: i64,
+    info: crate::lake_db::DatabaseInfo,
+    path: Option<String>,
+    encrypted: bool,
+    internal: bool,
+}
+
+struct CatalogSchema {
+    db: String,
+    name: String,
+    oid: i64,
+    /// `information_schema` / `pg_catalog`: built-in views, never
+    /// enumerated as tables of their own.
+    builtin: bool,
+    /// What `duckdb_schemas().internal` reports: the built-in schemas and
+    /// every database's `main`, as DuckDB marks them.
+    internal: bool,
+}
+
+struct CatalogColumn {
+    name: String,
+    dtype: DataType,
+    default: Option<Value>,
+    not_null: bool,
+}
+
+struct CatalogTable {
+    db: String,
+    schema: String,
+    schema_oid: i64,
+    name: String,
+    oid: i64,
+    sql: Option<String>,
+    columns: Vec<CatalogColumn>,
+    row_count: i64,
+    index_count: i64,
+    has_primary_key: bool,
+}
+
+struct CatalogView {
+    db: String,
+    schema: String,
+    schema_oid: i64,
+    name: String,
+    oid: i64,
+    sql: Option<String>,
+    columns: Option<Vec<CatalogColumn>>,
+}
+
+struct CatalogSnapshot {
+    databases: Vec<CatalogDatabase>,
+    schemas: Vec<CatalogSchema>,
+    tables: Vec<CatalogTable>,
+    views: Vec<CatalogView>,
+}
+
+/// The catalog as one statement sees it. OIDs are assigned in sorted
+/// enumeration order (databases, then schemas, then tables and views) so the
+/// functions join with each other; they are not stable across DDL.
+///
+/// DuckDB keeps `information_schema` and `pg_catalog` under a separate
+/// `system` database; pinkdb exposes the same virtual database (it is not in
+/// the store and cannot be created or attached).
+fn catalog_snapshot(db: &PinkDb, binder: &Binder<'_>) -> Result<CatalogSnapshot> {
+    let principal = binder.session.principal();
+    let restricted = principal
+        .as_deref()
+        .is_some_and(|p| !db.rbac().is_admin_resolved(p));
+    let readable = |dbname: &str, schema: &str, table: &str| match &principal {
+        None => true,
+        Some(principal) => db.rbac().allowed(
+            principal,
+            &crate::rbac::GrantObject::Table {
+                db: dbname.to_string(),
+                schema: schema.to_string(),
+                table: table.to_string(),
+            },
+            crate::rbac::Privilege::Select,
+        ),
+    };
+    let mut databases = Vec::new();
+    for (i, info) in db.database_infos().into_iter().enumerate() {
+        let path = if info.storage == "local" {
+            db.store_path()
+        } else {
+            info.location.clone()
+        };
+        let encrypted = info.storage == "local" && db.encryption_key().is_some();
+        let name = info.name.clone();
+        databases.push(CatalogDatabase {
+            name,
+            oid: (i + 1) as i64,
+            info,
+            path,
+            encrypted,
+            internal: false,
+        });
+    }
+    databases.push(CatalogDatabase {
+        name: "system".to_string(),
+        oid: (databases.len() + 1) as i64,
+        info: crate::lake_db::DatabaseInfo {
+            name: "system".to_string(),
+            storage: "local".to_string(),
+            location: None,
+            read_only: false,
+            version: None,
+            status: "ok".to_string(),
+        },
+        path: None,
+        encrypted: false,
+        internal: true,
+    });
+    let mut schemas = Vec::new();
+    for database in &databases {
+        let mut names = db.list_schemas(&database.name);
+        names.sort();
+        for name in names {
+            let builtin = false;
+            let internal = name.eq_ignore_ascii_case("main");
+            if !builtin && restricted {
+                let ns = SchemaPath::new(&database.name, &name);
+                let has_table = db
+                    .list_tables_in(ns.clone())
+                    .iter()
+                    .any(|t| readable(&database.name, &name, t));
+                let has_view = db
+                    .list_views_in(ns)
+                    .iter()
+                    .any(|v| readable(&database.name, &name, v));
+                if !has_table && !has_view {
+                    continue;
+                }
+            }
+            schemas.push(CatalogSchema {
+                db: database.name.clone(),
+                name,
+                oid: 0,
+                builtin,
+                internal,
+            });
+        }
+    }
+    let mut system_schemas = vec![
+        ("information_schema".to_string(), true),
+        ("main".to_string(), false),
+        ("pg_catalog".to_string(), true),
+    ];
+    system_schemas.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, builtin) in system_schemas {
+        schemas.push(CatalogSchema {
+            db: "system".to_string(),
+            name,
+            oid: 0,
+            builtin,
+            internal: true,
+        });
+    }
+    for (i, schema) in schemas.iter_mut().enumerate() {
+        schema.oid = (i + 1) as i64;
+    }
+    let mut tables = Vec::new();
+    let mut views = Vec::new();
+    let mut next_oid = 1i64;
+    for schema in &schemas {
+        if schema.builtin {
+            continue;
+        }
+        let ns = SchemaPath::new(&schema.db, &schema.name);
+        let mvs: Vec<String> = db
+            .materialized_view_status_in(ns.clone(), crate::mv::now_ms())
+            .into_iter()
+            .map(|status| status.name)
+            .collect();
+        for name in db.list_tables_in(ns.clone()) {
+            if !readable(&schema.db, &schema.name, &name) {
+                continue;
+            }
+            let table = db.table_in(ns.clone(), &name)?;
+            let sql = if mvs.iter().any(|mv| mv.eq_ignore_ascii_case(&name)) {
+                Some(
+                    db.materialized_view_in(ns.clone(), &name)?
+                        .query_sql
+                        .clone(),
+                )
+            } else {
+                Some(catalog_table_sql(db, &ns, table)?)
+            };
+            let columns = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, column)| CatalogColumn {
+                    name: column.name.clone(),
+                    dtype: column.dtype,
+                    default: column.default.clone(),
+                    not_null: table.constraints.is_not_null(i),
+                })
+                .collect();
+            tables.push(CatalogTable {
+                db: schema.db.clone(),
+                schema: schema.name.clone(),
+                schema_oid: schema.oid,
+                name,
+                oid: next_oid,
+                sql,
+                columns,
+                row_count: table.num_rows as i64,
+                index_count: (table.indexes.len() + table.vector_indexes.len()) as i64,
+                has_primary_key: table.constraints.primary_key().is_some(),
+            });
+            next_oid += 1;
+        }
+        for name in db.list_views_in(ns.clone()) {
+            if !readable(&schema.db, &schema.name, &name) {
+                continue;
+            }
+            let view = db.view_in(ns.clone(), &name)?;
+            let sql = (!view.sql.is_empty()).then(|| view.sql.clone());
+            let columns = catalog_view_columns(db, binder, &ns, view);
+            views.push(CatalogView {
+                db: schema.db.clone(),
+                schema: schema.name.clone(),
+                schema_oid: schema.oid,
+                name,
+                oid: next_oid,
+                sql,
+                columns,
+            });
+            next_oid += 1;
+        }
+    }
+    Ok(CatalogSnapshot {
+        databases,
+        schemas,
+        tables,
+        views,
+    })
+}
+
+fn catalog_table_sql(db: &PinkDb, ns: &SchemaPath, table: &DataTable) -> Result<String> {
+    let mut items = Vec::new();
+    let mut names = Vec::new();
+    for (i, column) in table.columns.iter().enumerate() {
+        let name = crate::rbac::quote_ident(&column.name);
+        names.push(name.clone());
+        let mut item = format!("{name} {}", column.dtype.name());
+        if let Some(default) = &column.default {
+            item.push_str(&format!(
+                " DEFAULT({})",
+                crate::prepared::value_literal(default)?
+            ));
+        }
+        // DuckDB repeats only explicitly written NOT NULL; a PRIMARY KEY
+        // column is implicitly NOT NULL and stays bare in `sql`.
+        if table.constraints.not_null.contains(&i) {
+            item.push_str(" NOT NULL");
+        }
+        items.push(item);
+    }
+    for key in &table.constraints.keys {
+        let keyword = match key.kind {
+            KeyKind::Primary => "PRIMARY KEY",
+            KeyKind::Unique => "UNIQUE",
+        };
+        let columns: Vec<String> = key
+            .columns
+            .iter()
+            .map(|&i| names.get(i).cloned().unwrap_or_else(|| "?".to_string()))
+            .collect();
+        items.push(format!("{keyword}({})", columns.join(", ")));
+    }
+    for foreign_key in &table.constraints.foreign_keys {
+        let columns: Vec<String> = foreign_key
+            .columns
+            .iter()
+            .map(|&i| names.get(i).cloned().unwrap_or_else(|| "?".to_string()))
+            .collect();
+        let referenced = db.table_in(ns.clone(), &foreign_key.ref_table)?;
+        let referenced_columns: Vec<String> = foreign_key
+            .ref_columns
+            .iter()
+            .map(|&i| {
+                referenced
+                    .columns
+                    .get(i)
+                    .map(|column| crate::rbac::quote_ident(&column.name))
+                    .unwrap_or_else(|| "?".to_string())
+            })
+            .collect();
+        items.push(format!(
+            "FOREIGN KEY ({}) REFERENCES {}({})",
+            columns.join(", "),
+            crate::rbac::quote_ident(&referenced.name),
+            referenced_columns.join(", ")
+        ));
+    }
+    // DuckDB's generated SQL names the schema only when it is not the
+    // default one; the database never appears.
+    let table_name = if ns.schema().eq_ignore_ascii_case("main") {
+        crate::rbac::quote_ident(&table.name)
+    } else {
+        format!(
+            "{}.{}",
+            crate::rbac::quote_ident(ns.schema()),
+            crate::rbac::quote_ident(&table.name)
+        )
+    };
+    Ok(format!("CREATE TABLE {table_name}({});", items.join(", ")))
+}
+
+fn catalog_view_columns(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    ns: &SchemaPath,
+    view: &crate::storage::ViewDef,
+) -> Option<Vec<CatalogColumn>> {
+    let view = view.clone();
+    let key = format!("{ns}.{}", view.name).to_ascii_lowercase();
+    if binder.views_expanding.borrow().contains(&key) {
+        return None;
+    }
+    binder.views_expanding.borrow_mut().push(key);
+    let result = (|| -> Result<Vec<CatalogColumn>> {
+        let mut child = binder.child();
+        child.default_ns = ns.clone();
+        child.ctes.clear();
+        let sub = bind_select_in(db, &mut child, &view.query)?;
+        let mut schema = plan_schema(db, &child.default_ns, &child.ctes, &sub)?;
+        if let Some(cols) = &view.cols {
+            for (s, c) in schema.iter_mut().zip(cols.iter()) {
+                s.0 = c.clone();
+            }
+        }
+        Ok(schema
+            .into_iter()
+            .map(|(name, dtype)| CatalogColumn {
+                name,
+                dtype,
+                default: None,
+                not_null: false,
+            })
+            .collect())
+    })();
+    binder.views_expanding.borrow_mut().pop();
+    result.ok()
+}
+
+fn duckdb_data_type_id(dtype: DataType) -> i64 {
+    match dtype {
+        DataType::Boolean => 10,
+        DataType::Integer => 13,
+        DataType::Bigint => 14,
+        DataType::Date => 15,
+        DataType::Timestamp => 19,
+        DataType::Decimal { .. } => 21,
+        DataType::Double => 23,
+        DataType::Varchar => 25,
+        DataType::Interval => 27,
+        // Pinkdb arrays always carry a length, so they are DuckDB's fixed
+        // ARRAY type (id 108), not a variable LIST (101).
+        DataType::Array { .. } => 108,
+        DataType::Variant => 109,
+    }
+}
+
+fn duckdb_numeric_meta(dtype: DataType) -> (Option<i32>, Option<i32>, Option<i32>) {
+    match dtype {
+        DataType::Integer => (Some(32), Some(2), Some(0)),
+        DataType::Bigint => (Some(64), Some(2), Some(0)),
+        DataType::Double => (Some(53), Some(2), Some(0)),
+        DataType::Decimal { precision, scale } => {
+            (Some(precision as i32), Some(10), Some(scale as i32))
+        }
+        _ => (None, None, None),
+    }
+}
+
+fn duckdb_list_text(items: impl IntoIterator<Item = String>) -> String {
+    let mut out = String::from("[");
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        if item.is_empty()
+            || item.starts_with(char::is_whitespace)
+            || item.ends_with(char::is_whitespace)
+            || item.contains([',', '\'', '"', '(', ')', '[', ']', '{', '}', ':', '='])
+        {
+            out.push('\'');
+            out.push_str(&item.replace('\'', "\\'"));
+            out.push('\'');
+        } else {
+            out.push_str(&item);
+        }
+    }
+    out.push(']');
+    out
+}
+
+fn bind_duckdb_meta(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    which: &str,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    if !args.is_empty() {
+        return Err(PinkDbError::Type(format!("{which}() takes no arguments")));
+    }
+    let snapshot = catalog_snapshot(db, binder)?;
+    let text = |v: &str| BoundExpr::Literal(Value::Varchar(v.to_string()));
+    let text_opt = |v: Option<&str>| {
+        v.map(|v| BoundExpr::Literal(Value::Varchar(v.to_string())))
+            .unwrap_or(BoundExpr::Literal(Value::Null))
+    };
+    let bigint = |v: i64| BoundExpr::Literal(Value::Bigint(v));
+    let integer = |v: i32| BoundExpr::Literal(Value::Integer(v));
+    let boolean = |v: bool| BoundExpr::Literal(Value::Boolean(v));
+    let null = || BoundExpr::Literal(Value::Null);
+    let make = |names: &[&str], types: Vec<DataType>, rows: Vec<Vec<BoundExpr>>| {
+        let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        let scope = ScopeTable {
+            name: alias
+                .clone()
+                .unwrap_or_else(|| which.to_string())
+                .to_ascii_lowercase(),
+            original: None,
+            ns: None,
+            is_alias: alias.is_some(),
+            qualified_only: false,
+            columns: names.iter().cloned().zip(types.iter().copied()).collect(),
+        };
+        (
+            scope,
+            LogicalPlan::Values {
+                rows,
+                names,
+                types,
+                sources: Vec::new(),
+            },
+        )
+    };
+    match which {
+        "duckdb_databases" => {
+            let mut rows = Vec::new();
+            for database in &snapshot.databases {
+                rows.push(vec![
+                    text(&database.name),
+                    bigint(database.oid),
+                    text_opt(database.path.as_deref()),
+                    null(),
+                    boolean(database.internal),
+                    text(if database.info.storage == "local" {
+                        "pinkdb"
+                    } else {
+                        "ducklake"
+                    }),
+                    boolean(database.info.read_only),
+                    boolean(database.encrypted),
+                    null(),
+                ]);
+            }
+            Ok(make(
+                &[
+                    "database_name",
+                    "database_oid",
+                    "path",
+                    "comment",
+                    "internal",
+                    "type",
+                    "readonly",
+                    "encrypted",
+                    "cipher",
+                ],
+                vec![
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                ],
+                rows,
+            ))
+        }
+        "duckdb_schemas" => {
+            let mut rows = Vec::new();
+            for schema in &snapshot.schemas {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&schema.db))
+                    .expect("snapshot schema belongs to a database");
+                rows.push(vec![
+                    bigint(schema.oid),
+                    text(&schema.db),
+                    bigint(database.oid),
+                    text(&schema.name),
+                    null(),
+                    boolean(schema.internal),
+                    null(),
+                    null(),
+                    null(),
+                ]);
+            }
+            Ok(make(
+                &[
+                    "oid",
+                    "database_name",
+                    "database_oid",
+                    "schema_name",
+                    "comment",
+                    "internal",
+                    "sql",
+                    "parent_schema",
+                    "parent_schema_oid",
+                ],
+                vec![
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                ],
+                rows,
+            ))
+        }
+        "duckdb_tables" => {
+            let mut rows = Vec::new();
+            for table in &snapshot.tables {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&table.db))
+                    .expect("snapshot table belongs to a database");
+                rows.push(vec![
+                    text(&table.db),
+                    bigint(database.oid),
+                    text(&table.schema),
+                    bigint(table.schema_oid),
+                    text(&table.name),
+                    bigint(table.oid),
+                    null(),
+                    boolean(false),
+                    boolean(false),
+                    boolean(table.has_primary_key),
+                    bigint(table.row_count),
+                    bigint(table.columns.len() as i64),
+                    bigint(table.index_count),
+                    bigint(0),
+                    text_opt(table.sql.as_deref()),
+                ]);
+            }
+            Ok(make(
+                &[
+                    "database_name",
+                    "database_oid",
+                    "schema_name",
+                    "schema_oid",
+                    "table_name",
+                    "table_oid",
+                    "comment",
+                    "internal",
+                    "temporary",
+                    "has_primary_key",
+                    "estimated_size",
+                    "column_count",
+                    "index_count",
+                    "check_constraint_count",
+                    "sql",
+                ],
+                vec![
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Boolean,
+                    DataType::Boolean,
+                    DataType::Bigint,
+                    DataType::Bigint,
+                    DataType::Bigint,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                ],
+                rows,
+            ))
+        }
+        "duckdb_views" => {
+            let mut rows = Vec::new();
+            for view in &snapshot.views {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&view.db))
+                    .expect("snapshot view belongs to a database");
+                rows.push(vec![
+                    text(&view.db),
+                    bigint(database.oid),
+                    text(&view.schema),
+                    bigint(view.schema_oid),
+                    text(&view.name),
+                    bigint(view.oid),
+                    null(),
+                    boolean(false),
+                    boolean(false),
+                    bigint(view.columns.as_ref().map_or(0, |columns| columns.len()) as i64),
+                    text_opt(view.sql.as_deref()),
+                    boolean(view.columns.is_some()),
+                ]);
+            }
+            Ok(make(
+                &[
+                    "database_name",
+                    "database_oid",
+                    "schema_name",
+                    "schema_oid",
+                    "view_name",
+                    "view_oid",
+                    "comment",
+                    "internal",
+                    "temporary",
+                    "column_count",
+                    "sql",
+                    "is_bound",
+                ],
+                vec![
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Boolean,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                ],
+                rows,
+            ))
+        }
+        "duckdb_columns" => {
+            let mut rows = Vec::new();
+            for table in &snapshot.tables {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&table.db))
+                    .expect("snapshot table belongs to a database");
+                for (i, column) in table.columns.iter().enumerate() {
+                    let (precision, radix, scale) = duckdb_numeric_meta(column.dtype);
+                    let default = column
+                        .default
+                        .as_ref()
+                        .map(crate::prepared::value_literal)
+                        .transpose()?;
+                    rows.push(vec![
+                        text(&table.db),
+                        bigint(database.oid),
+                        text(&table.schema),
+                        bigint(table.schema_oid),
+                        text(&table.name),
+                        bigint(table.oid),
+                        text(&column.name),
+                        integer((i + 1) as i32),
+                        null(),
+                        boolean(false),
+                        text_opt(default.as_deref()),
+                        boolean(!column.not_null),
+                        text(&column.dtype.name()),
+                        bigint(duckdb_data_type_id(column.dtype)),
+                        null(),
+                        precision.map(integer).unwrap_or_else(null),
+                        radix.map(integer).unwrap_or_else(null),
+                        scale.map(integer).unwrap_or_else(null),
+                        boolean(false),
+                        null(),
+                    ]);
+                }
+            }
+            for view in &snapshot.views {
+                let database = snapshot
+                    .databases
+                    .iter()
+                    .find(|database| database.name.eq_ignore_ascii_case(&view.db))
+                    .expect("snapshot view belongs to a database");
+                if let Some(columns) = &view.columns {
+                    for (i, column) in columns.iter().enumerate() {
+                        let (precision, radix, scale) = duckdb_numeric_meta(column.dtype);
+                        rows.push(vec![
+                            text(&view.db),
+                            bigint(database.oid),
+                            text(&view.schema),
+                            bigint(view.schema_oid),
+                            text(&view.name),
+                            bigint(view.oid),
+                            text(&column.name),
+                            integer((i + 1) as i32),
+                            null(),
+                            boolean(false),
+                            null(),
+                            boolean(true),
+                            text(&column.dtype.name()),
+                            bigint(duckdb_data_type_id(column.dtype)),
+                            null(),
+                            precision.map(integer).unwrap_or_else(null),
+                            radix.map(integer).unwrap_or_else(null),
+                            scale.map(integer).unwrap_or_else(null),
+                            boolean(false),
+                            null(),
+                        ]);
+                    }
+                }
+            }
+            Ok(make(
+                &[
+                    "database_name",
+                    "database_oid",
+                    "schema_name",
+                    "schema_oid",
+                    "table_name",
+                    "table_oid",
+                    "column_name",
+                    "column_index",
+                    "comment",
+                    "internal",
+                    "column_default",
+                    "is_nullable",
+                    "data_type",
+                    "data_type_id",
+                    "character_maximum_length",
+                    "numeric_precision",
+                    "numeric_precision_radix",
+                    "numeric_scale",
+                    "is_generated",
+                    "generation_expression",
+                ],
+                vec![
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Varchar,
+                    DataType::Integer,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Integer,
+                    DataType::Integer,
+                    DataType::Integer,
+                    DataType::Integer,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                ],
+                rows,
+            ))
+        }
+        _ => unreachable!("bind_duckdb_meta called for {which}"),
+    }
+}
+
+/// DuckDB's `information_schema` views, kept as SQL over the catalog
+/// functions above (design and definitions adapted from DuckDB's
+/// `default_views.cpp`, used under the MIT licence).
+const INFORMATION_SCHEMA_VIEWS: &[(&str, &str)] = &[
+    (
+        "schemata",
+        r#"SELECT database_name AS catalog_name, schema_name, 'duckdb' AS schema_owner, CAST(NULL AS VARCHAR) AS default_character_set_catalog, CAST(NULL AS VARCHAR) AS default_character_set_schema, CAST(NULL AS VARCHAR) AS default_character_set_name, "sql" AS sql_path FROM duckdb_schemas();"#,
+    ),
+    (
+        "tables",
+        r#"SELECT database_name AS table_catalog, schema_name AS table_schema, table_name, CASE WHEN ("temporary") THEN ('LOCAL TEMPORARY') ELSE 'BASE TABLE' END AS table_type, CAST(NULL AS VARCHAR) AS self_referencing_column_name, CAST(NULL AS VARCHAR) AS reference_generation, CAST(NULL AS VARCHAR) AS user_defined_type_catalog, CAST(NULL AS VARCHAR) AS user_defined_type_schema, CAST(NULL AS VARCHAR) AS user_defined_type_name, 'YES' AS is_insertable_into, 'NO' AS is_typed, CASE WHEN ("temporary") THEN ('PRESERVE') ELSE CAST(NULL AS VARCHAR) END AS commit_action, "comment" AS TABLE_COMMENT FROM duckdb_tables() UNION ALL SELECT database_name AS table_catalog, schema_name AS table_schema, view_name AS table_name, 'VIEW' AS table_type, CAST(NULL AS VARCHAR) AS self_referencing_column_name, CAST(NULL AS VARCHAR) AS reference_generation, CAST(NULL AS VARCHAR) AS user_defined_type_catalog, CAST(NULL AS VARCHAR) AS user_defined_type_schema, CAST(NULL AS VARCHAR) AS user_defined_type_name, 'NO' AS is_insertable_into, 'NO' AS is_typed, CAST(NULL AS VARCHAR) AS commit_action, "comment" AS TABLE_COMMENT FROM duckdb_views();"#,
+    ),
+    (
+        "columns",
+        r#"SELECT database_name AS table_catalog, schema_name AS table_schema, table_name, column_name, column_index AS ordinal_position, column_default, CASE WHEN (is_nullable) THEN ('YES') ELSE 'NO' END AS is_nullable, data_type, character_maximum_length, CAST(NULL AS INTEGER) AS character_octet_length, numeric_precision, numeric_precision_radix, numeric_scale, CAST(NULL AS INTEGER) AS datetime_precision, CAST(NULL AS VARCHAR) AS interval_type, CAST(NULL AS INTEGER) AS interval_precision, CAST(NULL AS VARCHAR) AS character_set_catalog, CAST(NULL AS VARCHAR) AS character_set_schema, CAST(NULL AS VARCHAR) AS character_set_name, CAST(NULL AS VARCHAR) AS collation_catalog, CAST(NULL AS VARCHAR) AS collation_schema, CAST(NULL AS VARCHAR) AS collation_name, CAST(NULL AS VARCHAR) AS domain_catalog, CAST(NULL AS VARCHAR) AS domain_schema, CAST(NULL AS VARCHAR) AS domain_name, CAST(NULL AS VARCHAR) AS udt_catalog, CAST(NULL AS VARCHAR) AS udt_schema, CAST(NULL AS VARCHAR) AS udt_name, CAST(NULL AS VARCHAR) AS scope_catalog, CAST(NULL AS VARCHAR) AS scope_schema, CAST(NULL AS VARCHAR) AS scope_name, CAST(NULL AS BIGINT) AS maximum_cardinality, CAST(NULL AS VARCHAR) AS dtd_identifier, CAST(NULL AS BOOL) AS is_self_referencing, CAST(NULL AS BOOL) AS is_identity, CAST(NULL AS VARCHAR) AS identity_generation, CAST(NULL AS VARCHAR) AS identity_start, CAST(NULL AS VARCHAR) AS identity_increment, CAST(NULL AS VARCHAR) AS identity_maximum, CAST(NULL AS VARCHAR) AS identity_minimum, CAST(NULL AS BOOL) AS identity_cycle, CASE WHEN (is_generated) THEN ('ALWAYS') ELSE 'NEVER' END AS is_generated, generation_expression, CAST(NULL AS BOOL) AS is_updatable, "comment" AS COLUMN_COMMENT FROM duckdb_columns();"#,
+    ),
+    (
+        "views",
+        r#"SELECT database_name AS table_catalog, schema_name AS table_schema, view_name AS table_name, "sql" AS view_definition, 'NONE' AS check_option, 'NO' AS is_updatable, 'NO' AS is_insertable_into, 'NO' AS is_trigger_updatable, 'NO' AS is_trigger_deletable, 'NO' AS is_trigger_insertable_into FROM duckdb_views();"#,
+    ),
+];
+
+/// The `pg_catalog` subset DuckDB defines in one short view over the same
+/// functions. Everything else in `pg_catalog` needs constructors pinkdb has
+/// no equivalent for yet.
+const PG_CATALOG_VIEWS: &[(&str, &str)] = &[
+    (
+        "pg_namespace",
+        r#"SELECT oid, schema_name AS nspname, 0 AS nspowner, CAST(NULL AS VARCHAR) AS nspacl FROM duckdb_schemas() WHERE database_name = current_database();"#,
+    ),
+    (
+        "pg_tables",
+        r#"SELECT schema_name AS schemaname, table_name AS tablename, 'duckdb' AS tableowner, CAST(NULL AS VARCHAR) AS "tablespace", (index_count > 0) AS hasindexes, false AS hasrules, false AS hastriggers FROM duckdb_tables();"#,
+    ),
+    (
+        "pg_views",
+        r#"SELECT schema_name AS schemaname, view_name AS viewname, 'duckdb' AS viewowner, "sql" AS definition FROM duckdb_views();"#,
+    ),
+];
+
+fn is_builtin_schema(schema: &str) -> bool {
+    schema.eq_ignore_ascii_case("information_schema") || schema.eq_ignore_ascii_case("pg_catalog")
+}
+
+fn builtin_view_sql(schema: &str, name: &str) -> Option<&'static str> {
+    let views = if schema.eq_ignore_ascii_case("information_schema") {
+        INFORMATION_SCHEMA_VIEWS
+    } else if schema.eq_ignore_ascii_case("pg_catalog") {
+        PG_CATALOG_VIEWS
+    } else {
+        return None;
+    };
+    views
+        .iter()
+        .find(|(view, _)| view.eq_ignore_ascii_case(name))
+        .map(|(_, sql)| *sql)
+}
+
+/// Bind a built-in view as a derived table. The view's SQL is parsed and
+/// bound in its own database, like a stored view body.
+fn bind_builtin_view(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    dbname: &str,
+    schema: &str,
+    name: &str,
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    if !dbname.eq_ignore_ascii_case("system")
+        && !db
+            .list_databases()
+            .iter()
+            .any(|database| database.eq_ignore_ascii_case(dbname))
+    {
+        return Err(PinkDbError::Catalog(format!(
+            "database \"{dbname}\" not found"
+        )));
+    }
+    let sql = builtin_view_sql(schema, name)
+        .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))?;
+    let statement = super::parse_statements(sql)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))?;
+    let Statement::Select(select) = statement else {
+        return Err(PinkDbError::Catalog(format!(
+            "built-in view \"{name}\" is not a SELECT"
+        )));
+    };
+    let ns = SchemaPath::new(dbname, schema);
+    let key = format!("{ns}.{name}").to_ascii_lowercase();
+    if binder.views_expanding.borrow().contains(&key) {
+        return Err(PinkDbError::Catalog(format!(
+            "view \"{name}\" is recursive: its definition reads itself through a macro or another view"
+        )));
+    }
+    binder.views_expanding.borrow_mut().push(key);
+    let result = (|| -> Result<(ScopeTable, LogicalPlan)> {
+        let mut child = binder.child();
+        child.default_ns = ns.clone();
+        child.ctes.clear();
+        let plan = bind_select_in(db, &mut child, &select)?;
+        let columns = plan_schema(db, &child.default_ns, &child.ctes, &plan)?;
+        let effective = alias.clone().unwrap_or_else(|| name.to_string());
+        Ok((
+            ScopeTable {
+                name: effective.to_ascii_lowercase(),
+                original: Some(name.to_ascii_lowercase()),
+                ns: Some(ns.clone()),
+                is_alias: alias.is_some(),
+                qualified_only: false,
+                columns,
+            },
+            plan,
+        ))
+    })();
+    binder.views_expanding.borrow_mut().pop();
+    result
+}
+
+struct ShowTableRow {
+    database: String,
+    schema: String,
+    name: String,
+    columns: Vec<String>,
+    types: Vec<String>,
+}
+
+fn bind_show_all_tables(db: &PinkDb, binder: &Binder<'_>) -> Result<LogicalPlan> {
+    let snapshot = catalog_snapshot(db, binder)?;
+    let mut objects = Vec::new();
+    for table in &snapshot.tables {
+        objects.push(ShowTableRow {
+            database: table.db.clone(),
+            schema: table.schema.clone(),
+            name: table.name.clone(),
+            columns: table.columns.iter().map(|c| c.name.clone()).collect(),
+            types: table.columns.iter().map(|c| c.dtype.name()).collect(),
+        });
+    }
+    for view in &snapshot.views {
+        let columns = view.columns.as_deref().unwrap_or(&[]);
+        objects.push(ShowTableRow {
+            database: view.db.clone(),
+            schema: view.schema.clone(),
+            name: view.name.clone(),
+            columns: columns.iter().map(|c| c.name.clone()).collect(),
+            types: columns.iter().map(|c| c.dtype.name()).collect(),
+        });
+    }
+    objects.sort_by(|a, b| {
+        a.database
+            .cmp(&b.database)
+            .then_with(|| a.schema.cmp(&b.schema))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let text = |v: &str| BoundExpr::Literal(Value::Varchar(v.to_string()));
+    let names = [
+        "database",
+        "schema",
+        "name",
+        "column_names",
+        "column_types",
+        "temporary",
+    ];
+    let types = [
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Boolean,
+    ];
+    let rows = objects
+        .into_iter()
+        .map(|row| {
+            vec![
+                text(&row.database),
+                text(&row.schema),
+                text(&row.name),
+                text(&duckdb_list_text(row.columns)),
+                text(&duckdb_list_text(row.types)),
+                BoundExpr::Literal(Value::Boolean(false)),
+            ]
+        })
+        .collect();
+    Ok(LogicalPlan::Values {
+        rows,
+        names: names.iter().map(|name| name.to_string()).collect(),
+        types: types.to_vec(),
+        sources: Vec::new(),
+    })
 }
 
 /// `pinkdb_users()` and `pinkdb_grants()` (wave 121b): the store's users and
@@ -11866,6 +12934,22 @@ fn bind_source_raw(
             ))
         }
         FromSource::Table { qual: qdb, name } => {
+            if let Some(schema) = qdb
+                .schema
+                .as_deref()
+                .filter(|schema| is_builtin_schema(schema))
+            {
+                if at.is_some() {
+                    return Err(PinkDbError::Catalog(format!(
+                        "time travel is not available on the built-in view \"{name}\""
+                    )));
+                }
+                let dbname = qdb
+                    .catalog
+                    .clone()
+                    .unwrap_or_else(|| binder.default_ns.db().to_string());
+                return bind_builtin_view(db, binder, &dbname, schema, name, alias);
+            }
             // CTEs shadow everything — but only unqualified names.
             if qdb.is_empty()
                 && let Some((_, schema)) = binder

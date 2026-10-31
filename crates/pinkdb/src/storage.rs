@@ -3085,6 +3085,15 @@ impl PinkDb {
         self.wal.is_some()
     }
 
+    /// The checkpoint file behind a durable store, or `None` in memory.
+    /// `duckdb_databases().path` reports it for local databases.
+    pub fn store_path(&self) -> Option<String> {
+        self.wal.as_ref().map(|wal| {
+            let wal = wal.lock().unwrap_or_else(|e| e.into_inner());
+            wal.checkpoint_path().display().to_string()
+        })
+    }
+
     /// Install (or clear) the replay memo of the WAL record being replayed,
     /// returning the previous one so the caller can restore it. While set,
     /// every `external_io` host scalar must be served from it.

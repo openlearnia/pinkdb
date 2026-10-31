@@ -1635,7 +1635,8 @@ peg::parser! {
         /// matched as words, not reserved keywords, so `show` and `tables`
         /// stay usable as names.
         rule show_stmt() -> Statement
-            = word("show") word("tables") { Statement::ShowTables }
+            = word("show") word("all") word("tables") { Statement::ShowAllTables }
+            / word("show") word("tables") { Statement::ShowTables }
             / word("show") word("databases") { Statement::ShowDatabases }
             / word("show") word("materialized") word("views") { Statement::ShowMaterializedViews }
             / word("show") word("macros") { Statement::ShowMacros }

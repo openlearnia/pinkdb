@@ -816,18 +816,19 @@ pub async fn catalog(
         let mut objects: Vec<CatalogObject> = select(
             // Plain views are session-local (never stored), so the catalog
             // leaves them out; materialized views are listed. DATABASE rows
-            // (wave 124) describe the databases, not objects in them.
-            "SELECT \"database\", \"name\", \"kind\", \"table_name\", \"detail\" FROM pinkdb_catalog() \
-             WHERE \"kind\" NOT IN ('VIEW', 'DATABASE')",
+            // (wave 124) describe the databases, not objects in them, and
+            // SCHEMA rows wait for the 131e tree.
+            "SELECT \"database\", \"schema\", \"name\", \"kind\", \"table_name\", \"detail\" \
+             FROM pinkdb_catalog() WHERE \"kind\" NOT IN ('VIEW', 'DATABASE', 'SCHEMA')",
         )?
         .into_iter()
         .map(|row| CatalogObject {
             database: text(&row, 0).unwrap_or_default(),
-            schema: crate::api::DEFAULT_SCHEMA.to_string(),
-            name: text(&row, 1).unwrap_or_default(),
-            kind: text(&row, 2).unwrap_or_default(),
-            table_name: text(&row, 3),
-            detail: text(&row, 4),
+            schema: text(&row, 1).unwrap_or_default(),
+            name: text(&row, 2).unwrap_or_default(),
+            kind: text(&row, 3).unwrap_or_default(),
+            table_name: text(&row, 4),
+            detail: text(&row, 5),
             rows: None,
             columns: Vec::new(),
         })
@@ -836,7 +837,10 @@ pub async fn catalog(
             "SELECT \"database\", \"table_name\", \"column_name\", \"data_type\", \"row_count\", \
              \"null_count\", \"distinct_count\", \"min\", \"max\" FROM pinkdb_column_stats()",
         )? {
-            let (db, table) = (text(&row, 0).unwrap_or_default(), text(&row, 1).unwrap_or_default());
+            let (db, table) = (
+                text(&row, 0).unwrap_or_default(),
+                text(&row, 1).unwrap_or_default(),
+            );
             if let Some(object) = objects.iter_mut().find(|o| {
                 o.table_name.is_none()
                     && o.database.eq_ignore_ascii_case(&db)

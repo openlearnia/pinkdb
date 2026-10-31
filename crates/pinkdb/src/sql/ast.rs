@@ -238,6 +238,8 @@ pub enum Statement {
     },
     /// `SHOW TABLES`: the current database's tables, sorted by name.
     ShowTables,
+    /// `SHOW ALL TABLES`: every database's tables and views, one row each.
+    ShowAllTables,
     /// `SHOW DATABASES`: every database in the store, sorted by name.
     ShowDatabases,
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [REFRESH <policy>] AS

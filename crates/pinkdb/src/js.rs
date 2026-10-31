@@ -201,6 +201,7 @@ fn returns_rows(stmt: &crate::sql::ast::Statement) -> bool {
         stmt,
         S::Select { .. }
             | S::ShowTables
+            | S::ShowAllTables
             | S::ShowDatabases
             | S::ShowMaterializedViews
             | S::ShowMacros

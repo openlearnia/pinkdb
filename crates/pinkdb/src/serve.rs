@@ -309,6 +309,7 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
         Describe { .. }
         | DescribeMacro { .. }
         | ShowTables
+        | ShowAllTables
         | ShowDatabases
         | ShowMaterializedViews
         | ShowMacros
@@ -420,6 +421,7 @@ pub fn statement_allowed(stmt: &Statement, allow_writes: bool) -> bool {
         Statement::Describe { .. }
             | Statement::DescribeMacro { .. }
             | Statement::ShowTables
+            | Statement::ShowAllTables
             | Statement::ShowDatabases
             | Statement::ShowMaterializedViews
             | Statement::ShowMacros
@@ -1573,7 +1575,7 @@ mod tests {
     fn only_queries_pass_the_read_only_policy() {
         // One statement of every kind the parser can produce; a new kind
         // must be added here (and to the allowlist) on purpose.
-        let sql = "SELECT 1; EXPLAIN SELECT 1; DESCRIBE t; SHOW TABLES; SHOW DATABASES; \
+        let sql = "SELECT 1; EXPLAIN SELECT 1; DESCRIBE t; SHOW TABLES; SHOW ALL TABLES; SHOW DATABASES; \
                    SHOW MATERIALIZED VIEWS; SHOW MACROS; USE main; \
                    INSERT INTO t VALUES (1, 'x'); UPDATE t SET a = 1; DELETE FROM t; \
                    INSERT INTO t VALUES (1, 'x') ON CONFLICT DO NOTHING; \
@@ -1603,6 +1605,7 @@ mod tests {
             "Describe",
             "DescribeMacro",
             "ShowTables",
+            "ShowAllTables",
             "ShowDatabases",
             "ShowMaterializedViews",
             "ShowMacros",

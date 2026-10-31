@@ -753,6 +753,7 @@ def run_small():
         run_case(label, sql, ordered, expect_error, SETUP + "\n" + NAN_SETUP,
                  SETUP + "\n" + NAN_SETUP)
     run_three_part()
+    run_catalog()
     run_arrow()
     run_parquet()
 
@@ -953,6 +954,161 @@ INSERT INTO db2.t VALUES (2, 'deux'), (3, 'trois'), (4, 'quatre');
 CREATE TABLE db1.u (a INTEGER, c VARCHAR);
 INSERT INTO db1.u VALUES (1, 'x'), (3, 'z');
 """
+
+# ---- wave 131c: DuckDB-compatible catalog functions and information_schema ----
+#
+# The same two-database catalog on both sides. DuckDB spells a database as an
+# attached catalog; pinkdb as `CREATE DATABASE`. The probes read only user
+# objects in c1/c2: internal schemas and the engines' default databases are
+# excluded because pinkdb has no `system` database and DuckDB's default is
+# called `memory`. OIDs, `sql`, `estimated_size`, `path` and `type` are
+# excluded because they deliberately differ (OIDs are per-statement here;
+# `sql` is engine-generated; pinkdb counts storage differently; there is no
+# store path in memory; `type` names the engine). `index_count` is excluded
+# because DuckDB includes primary/unique constraint indexes while pinkdb's
+# column counts only explicit hash/vector indexes, as the 131c brief asks.
+CATALOG_PINK_SETUP = """
+CREATE DATABASE c1;
+CREATE DATABASE c2;
+CREATE SCHEMA c1.s;
+CREATE TABLE c1.main.m (x INTEGER PRIMARY KEY, y VARCHAR);
+CREATE TABLE c1.s.t (a INTEGER PRIMARY KEY, b VARCHAR NOT NULL DEFAULT 'z', c DECIMAL(18,3));
+CREATE INDEX t_b ON c1.s.t(b);
+CREATE VIEW c1.s.v AS SELECT a, b FROM c1.s.t;
+CREATE MACRO c1.s.plus1(a) AS a + 1;
+CREATE SCHEMA c2.s;
+CREATE TABLE c2.s.u (id BIGINT, ts TIMESTAMP);
+"""
+
+CATALOG_DUCK_SETUP = """
+ATTACH ':memory:' AS c1;
+ATTACH ':memory:' AS c2;
+CREATE SCHEMA c1.s;
+CREATE TABLE c1.main.m (x INTEGER PRIMARY KEY, y VARCHAR);
+CREATE TABLE c1.s.t (a INTEGER PRIMARY KEY, b VARCHAR NOT NULL DEFAULT 'z', c DECIMAL(18,3));
+CREATE INDEX t_b ON c1.s.t(b);
+CREATE VIEW c1.s.v AS SELECT a, b FROM c1.s.t;
+CREATE MACRO c1.s.plus1(a) AS a + 1;
+CREATE SCHEMA c2.s;
+CREATE TABLE c2.s.u (id BIGINT, ts TIMESTAMP);
+"""
+
+CATALOG_PROBES = [
+    ("catalog-duckdb-databases",
+     "SELECT database_name, comment, readonly, encrypted, cipher FROM duckdb_databases() "
+     "WHERE database_name IN ('c1', 'c2') ORDER BY 1;",
+     "SELECT database_name, comment, readonly, encrypted, cipher FROM duckdb_databases() "
+     "WHERE database_name IN ('c1', 'c2') ORDER BY 1;"),
+    ("catalog-duckdb-schemas",
+     # `main` is internal in both engines; the built-in schemas live under the
+     # virtual `system` database in both. `temp` is DuckDB-only (wave 139).
+     "SELECT database_name, schema_name, internal FROM duckdb_schemas() "
+     "WHERE database_name IN ('c1', 'c2', 'system') "
+     "AND schema_name IN ('information_schema', 'pg_catalog', 'main', 's') "
+     "ORDER BY 1, 2;",
+     "SELECT database_name, schema_name, internal FROM duckdb_schemas() "
+     "WHERE database_name IN ('c1', 'c2', 'system') "
+     "AND schema_name IN ('information_schema', 'pg_catalog', 'main', 's') "
+     "ORDER BY 1, 2;"),
+    ("catalog-duckdb-tables",
+     "SELECT database_name, schema_name, table_name, internal, temporary, has_primary_key, "
+     "column_count, check_constraint_count FROM duckdb_tables() "
+     "WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3;",
+     "SELECT database_name, schema_name, table_name, internal, temporary, has_primary_key, "
+     "column_count, check_constraint_count FROM duckdb_tables() "
+     "WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3;"),
+    ("catalog-duckdb-views",
+     "SELECT database_name, schema_name, view_name, internal, temporary, column_count, is_bound "
+     "FROM duckdb_views() WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3;",
+     "SELECT database_name, schema_name, view_name, internal, temporary, column_count, is_bound "
+     "FROM duckdb_views() WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3;"),
+    ("catalog-duckdb-columns",
+     "SELECT database_name, schema_name, table_name, column_name, column_index, column_default, "
+     "is_nullable, data_type, data_type_id, character_maximum_length, numeric_precision, "
+     "numeric_precision_radix, numeric_scale, is_generated, generation_expression "
+     "FROM duckdb_columns() WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3, 5;",
+     "SELECT database_name, schema_name, table_name, column_name, column_index, column_default, "
+     "is_nullable, data_type, data_type_id, character_maximum_length, numeric_precision, "
+     "numeric_precision_radix, numeric_scale, is_generated, generation_expression "
+     "FROM duckdb_columns() WHERE database_name IN ('c1', 'c2') ORDER BY 1, 2, 3, 5;"),
+    ("catalog-information-schema-schemata",
+     "SELECT catalog_name, schema_name, schema_owner, sql_path FROM information_schema.schemata "
+     "WHERE catalog_name IN ('c1', 'c2') "
+     "AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1, 2;",
+     "SELECT catalog_name, schema_name, schema_owner, sql_path FROM information_schema.schemata "
+     "WHERE catalog_name IN ('c1', 'c2') "
+     "AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1, 2;"),
+    ("catalog-information-schema-tables",
+     "SELECT table_catalog, table_schema, table_name, table_type, is_insertable_into, is_typed, "
+     "commit_action FROM information_schema.tables "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3;",
+     "SELECT table_catalog, table_schema, table_name, table_type, is_insertable_into, is_typed, "
+     "commit_action FROM information_schema.tables "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3;"),
+    ("catalog-information-schema-columns",
+     "SELECT table_catalog, table_schema, table_name, column_name, ordinal_position, "
+     "column_default, is_nullable, data_type, character_maximum_length, numeric_precision, "
+     "numeric_precision_radix, numeric_scale FROM information_schema.columns "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3, 5;",
+     "SELECT table_catalog, table_schema, table_name, column_name, ordinal_position, "
+     "column_default, is_nullable, data_type, character_maximum_length, numeric_precision, "
+     "numeric_precision_radix, numeric_scale FROM information_schema.columns "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3, 5;"),
+    ("catalog-information-schema-views",
+     "SELECT table_catalog, table_schema, table_name, check_option, is_updatable, "
+     "is_insertable_into FROM information_schema.views "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3;",
+     "SELECT table_catalog, table_schema, table_name, check_option, is_updatable, "
+     "is_insertable_into FROM information_schema.views "
+     "WHERE table_catalog IN ('c1', 'c2') ORDER BY 1, 2, 3;"),
+    ("catalog-show-all-tables",
+     "SHOW ALL TABLES;",
+     "SHOW ALL TABLES;"),
+]
+
+
+def duck_list_text(values):
+    """DuckDB prints LIST values as `[a, 'b, c']`; `-json` hands them over as
+    arrays, so flatten the two SHOW ALL TABLES list columns the same way."""
+    parts = []
+    for value in values:
+        text = str(value)
+        if (
+            not text
+            or text[0].isspace()
+            or text[-1].isspace()
+            or any(ch in text for ch in ", '\"()[]{}:=")
+        ):
+            text = "'" + text.replace("'", "\\'") + "'"
+        parts.append(text)
+    return "[" + ", ".join(parts) + "]"
+
+
+def run_catalog():
+    print("== catalog functions battery (wave 131c) ==")
+    for label, psql, dsql in CATALOG_PROBES:
+        got = pink_query(CATALOG_PINK_SETUP, psql)
+        if got[0] == "error":
+            check(label, False, f"pinkdb error: {got[1]}")
+            continue
+        _, types, prows = got
+        if label == "catalog-show-all-tables":
+            prows = [r for r in prows if r[0] in ("c1", "c2")]
+        d = duck_query(CATALOG_DUCK_SETUP, dsql)
+        if d[0] == "error":
+            check(label, False, f"duckdb error: {d[1]}")
+            continue
+        drows = d[1]
+        if label == "catalog-show-all-tables":
+            drows = [r for r in drows if r[0] in ("c1", "c2")]
+            drows = [
+                [duck_list_text(c) if isinstance(c, list) else c for c in row]
+                for row in drows
+            ]
+        prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+        ok = rows_equal(prows_n, drows, True)
+        check(label, ok, "" if ok else f"\npink={prows_n}\nduck={drows}")
+
 
 # (label, pinkdb sql, duckdb sql, ordered). DuckDB's parser rejects a
 # database qualifier on a star (`db1.t.*` — "more than one column in front of

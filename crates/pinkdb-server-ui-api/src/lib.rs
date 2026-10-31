@@ -260,15 +260,14 @@ pub struct CatalogColumn {
     pub max: Option<String>,
 }
 
-/// The schema every database holds its objects in (pinkdb has one schema per
-/// database, named like DuckDB's default).
+/// DuckDB's default schema name; pinkdb also calls its first schema `main`.
 pub const DEFAULT_SCHEMA: &str = "main";
 
 /// One row of `pinkdb_catalog()`, with columns for tables and views.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CatalogObject {
     pub database: String,
-    /// The schema in the database (one per database today: `main`).
+    /// The schema the object lives in.
     pub schema: String,
     pub name: String,
     /// `TABLE`, `VIEW`, `MATERIALIZED VIEW`, `INDEX`, `TRIGGER`, `MACRO`,
