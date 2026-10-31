@@ -1088,6 +1088,16 @@ DIALECT_QUERIES = [
     ("dialect-pivot-default-group", "CREATE TABLE pv AS SELECT * FROM (VALUES ('x','a',1),('x','b',2),('y','a',3),('y','a',4)) v(g,c,n); SELECT * FROM (PIVOT pv ON c) p ORDER BY g, n;", True, False),
     ("dialect-pivot-multi-agg", "CREATE TABLE pv AS SELECT * FROM (VALUES ('x','a',1),('x','b',2),('y','a',3),('y','a',4)) v(g,c,n); SELECT * FROM (PIVOT pv ON c USING sum(n) AS s, max(n) AS m GROUP BY g) p ORDER BY g;", True, False),
     ("dialect-split-part", "SELECT split_part('a,b,c', ',', 2), starts_with('abc', 'a'), ends_with('abc', 'bc'), reverse('abc');", False, False),
+    # Correlated subqueries over derived tables and UNIONs (wave 140): the
+    # staging foreign-key checks, which must not run the body per outer row.
+    ("dialect-fk-exists-union", "SELECT c.id FROM emp c WHERE EXISTS (SELECT 1 FROM (SELECT did FROM dept UNION SELECT k FROM pn) p WHERE p.did = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-not-exists-union", "SELECT c.id FROM emp c WHERE c.did IS NOT NULL AND NOT EXISTS (SELECT 1 FROM (SELECT did FROM dept UNION SELECT k FROM pn) p WHERE p.did = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-in-union", "SELECT c.id FROM emp c WHERE c.did IN (SELECT did FROM (SELECT did FROM dept UNION SELECT k FROM pn) p WHERE p.did = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-scalar-count-union-all", "SELECT c.id, (SELECT count(*) FROM (SELECT did FROM dept UNION ALL SELECT k FROM pn) p WHERE p.did = c.did) FROM emp c ORDER BY c.id;", True, False),
+    ("dialect-fk-derived-computed", "SELECT c.id FROM emp c WHERE EXISTS (SELECT 1 FROM (SELECT did AS d, did + 10 AS d10 FROM emp) z WHERE z.d10 = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-grouped-derived", "SELECT c.did, (SELECT sum(s) FROM (SELECT k * 10 AS d, sum(v) AS s FROM pn GROUP BY k) g WHERE g.d = c.did) FROM emp c WHERE c.did IS NOT NULL ORDER BY c.did;", True, False),
+    ("dialect-fk-null-keys", "SELECT c.id FROM emp c WHERE NOT EXISTS (SELECT 1 FROM (SELECT x FROM nn UNION SELECT did FROM dept) p WHERE p.x = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-correlation-under-limit", "SELECT c.id FROM emp c WHERE EXISTS (SELECT 1 FROM dept d WHERE d.did = c.did LIMIT 1) ORDER BY c.id;", True, False),
 ]
 
 
