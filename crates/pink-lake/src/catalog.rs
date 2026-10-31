@@ -752,10 +752,14 @@ pub(crate) struct DeleteRef {
     /// Number of positions in the delete file (its exact row count), checked
     /// against the file's contents when it is read.
     pub(crate) count: u64,
-    /// The DuckLake delete-file format (`"pink"` or `"parquet"`). Old JSON
-    /// manifests omit it; they always held pink's container.
+    /// The DuckLake delete-file format (`"pink"`, `"parquet"` or `"inlined"`).
+    /// Old JSON manifests omit it; they always held pink's container.
     #[serde(default = "pink_delete_format")]
     pub(crate) format: String,
+    /// Positions when the catalog stores them inline (DuckLake's
+    /// `ducklake_inlined_delete_<table_id>` rows) instead of in `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) positions: Option<Vec<u64>>,
 }
 
 fn pink_delete_format() -> String {

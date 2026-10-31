@@ -812,7 +812,7 @@ fn add_data_files_registers_existing_files() {
 }
 
 /// Registrations that cannot be validated are refused cleanly, before
-/// anything is published: a missing path, a path outside `data/`, a file of
+/// anything is published: a missing path, a path that escapes the lake, a file of
 /// another table, a file whose schema does not match (here: the wrong table
 /// shape), and a plaintext file in an encrypted lake.
 #[test]
@@ -830,10 +830,10 @@ fn add_data_files_refuses_unverifiable_files() {
     assert!(err.contains("no files found that match"), "{err}");
 
     let err = lake
-        .add_data_files("main.t", &["elsewhere/x.pink".to_string()])
+        .add_data_files("main.t", &["../escape.pink".to_string()])
         .unwrap_err()
         .to_string();
-    assert!(err.contains("is not a lake-relative"), "{err}");
+    assert!(err.contains("must be relative"), "{err}");
 
     let err = lake
         .add_data_files("main.other", &["data/main.t/x.pink".to_string()])

@@ -11,8 +11,17 @@
 //! (`ducklake_inlined_data_<table_id>_<schema_version>`), and that name is
 //! derived from two integers the store allocated, never from user input.
 
-/// The DuckLake metadata format this build writes and reads.
-pub(crate) const DUCKLAKE_VERSION: &str = "1.1";
+/// The DuckLake metadata format this build writes. Stock DuckDB 2.x reports
+/// `1.1-dev1` for its own catalogs, so writing the same string lets DuckDB
+/// attach a pinkdb-written lake without a version override.
+pub(crate) const DUCKLAKE_VERSION: &str = "1.1-dev1";
+
+/// The DuckLake versions this build reads. They share the v1.1 table shape;
+/// later versions only add tables pinkdb does not use.
+pub(crate) const SUPPORTED_DUCKLAKE_VERSIONS: &[&str] = &["1.1-dev1", "1.1", "1.2", "1.3"];
+
+/// The supported range, for the refusal message.
+pub(crate) const SUPPORTED_DUCKLAKE_RANGE: &str = "1.1-dev1 through 1.3";
 
 /// A SQL dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -343,11 +343,15 @@ impl Lake {
             .find(|f| f.path() == delete.file)
             .and_then(|f| f.row_id_start());
         let path = self.storage.abs(&delete.path);
-        let bytes = self
-            .storage
-            .read(&delete.path, &format!("reading {}", path.display()))?;
-        let positions =
-            crate::delete_file::read_positions(&bytes, &delete.format, &delete.file, &path)?;
+        let positions = match &delete.positions {
+            Some(positions) => positions.clone(),
+            None => {
+                let bytes = self
+                    .storage
+                    .read(&delete.path, &format!("reading {}", path.display()))?;
+                crate::delete_file::read_positions(&bytes, &delete.format, &delete.file, &path)?
+            }
+        };
         if positions.len() as u64 != delete.count {
             return Err(LakeError::Corrupt {
                 path,
@@ -585,8 +589,7 @@ mod tests {
         for hostile in ["../escape", "/etc/x", "data/../../escape"] {
             let err = validate_commit_paths(&manifest_with_data_file(hostile)).unwrap_err();
             assert!(
-                err.to_string()
-                    .contains("data file path must be relative and under data/"),
+                err.to_string().contains("data file path must be relative"),
                 "{hostile}: {err}"
             );
         }
@@ -599,6 +602,7 @@ mod tests {
             "main.t".to_string(),
             TableDelta {
                 delete_files: vec![DeleteRef {
+                    positions: None,
                     path: "data/main.t/x.pinkdel".to_string(),
                     file: "../escape".to_string(),
                     count: 1,
@@ -617,8 +621,7 @@ mod tests {
         };
         let err = validate_commit_paths(&manifest).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("data file path must be relative and under data/"),
+            err.to_string().contains("data file path must be relative"),
             "{err}"
         );
     }

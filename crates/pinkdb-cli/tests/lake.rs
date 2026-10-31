@@ -1899,7 +1899,7 @@ fn inlining_flush_changes_and_inlining_limit_round_trip() {
 
 /// Wave 68: `.lake add_data_files` registers an existing in-lake data file as
 /// rows of a table, `.lake files` names it, and the rows read back; a path
-/// outside `data/` is refused with the documented message.
+/// that escapes the lake is refused with the documented message.
 #[test]
 fn add_data_files_registers_through_the_cli() {
     let dir = scratch("register");
@@ -1911,14 +1911,14 @@ fn add_data_files_registers_through_the_cli() {
          .lake save {lake}\n\
          .lake files {lake}\n\
          .lake add_data_files {lake} main.t data/main.t/nope.pink\n\
-         .lake add_data_files {lake} main.t elsewhere/x.pink\n\
+         .lake add_data_files {lake} main.t ../escape.pink\n\
          .quit\n",
         values.join(", "),
         lake = lake.display()
     ));
     assert!(out.contains("Saved lake version 2"), "{out}");
     assert!(out.contains("no files found that match"), "{out}");
-    assert!(out.contains("is not a lake-relative"), "{out}");
+    assert!(out.contains("must be relative"), "{out}");
 
     // Register the saved file itself (its rows appear a second time).
     let files_line = out

@@ -520,6 +520,19 @@ pub enum LakeError {
     Corrupt { path: PathBuf, message: String },
     /// The metadata is well-formed but a newer/incompatible format.
     Unsupported { path: PathBuf, found: u32 },
+    /// The DuckLake catalog records a `ducklake_metadata.version` this build
+    /// does not read.
+    UnsupportedDuckLakeVersion {
+        path: PathBuf,
+        found: String,
+        supported: &'static str,
+    },
+    /// A delete file recorded in a format this build cannot read (DuckLake's
+    /// Puffin deletion vectors).
+    UnsupportedDeleteFile { path: PathBuf, format: String },
+    /// A catalog row names an absolute path outside the lake's data path.
+    /// Pinkdb never reads bytes from outside the lake it was opened on.
+    OutsideDataRoot { path: String, data_root: String },
     /// The requested snapshot version does not exist.
     VersionNotFound { path: PathBuf, version: u64 },
     /// The store's shape cannot be represented in the flat lake catalog.
@@ -633,6 +646,27 @@ impl fmt::Display for LakeError {
                     )
                 }
             }
+            LakeError::UnsupportedDuckLakeVersion {
+                path,
+                found,
+                supported,
+            } => write!(
+                f,
+                "unsupported DuckLake version {found} at {} (this build reads DuckLake \
+                 {supported})",
+                path.display()
+            ),
+            LakeError::UnsupportedDeleteFile { path, format } => write!(
+                f,
+                "unsupported delete file format {format:?} at {}: DuckLake deletion vectors are \
+                 Puffin files this build does not read (positional Parquet deletes are read)",
+                path.display()
+            ),
+            LakeError::OutsideDataRoot { path, data_root } => write!(
+                f,
+                "catalog path {path} is outside the lake's data path {data_root}; pinkdb reads \
+                 only files under the lake's data path"
+            ),
             LakeError::VersionNotFound { path, version } => write!(
                 f,
                 "lake {} has no snapshot version {version}",
@@ -2132,6 +2166,7 @@ impl Lake {
         self.storage.put(&rel, &bytes)?;
         Ok((
             DeleteRef {
+                positions: None,
                 path: rel,
                 file: file.to_string(),
                 count: positions.len() as u64,
@@ -3019,10 +3054,10 @@ fn split_key<'a>(key: &'a str, path: &Path) -> Result<(&'a str, &'a str)> {
 fn validate_rel_path(rel: &str) -> Result<()> {
     let path = Path::new(rel);
     let plain = path.components().all(|c| matches!(c, Component::Normal(_)));
-    if path.is_absolute() || !plain || !rel.starts_with("data/") {
+    if rel.is_empty() || path.is_absolute() || !plain {
         return Err(LakeError::Corrupt {
             path: PathBuf::from(rel),
-            message: "data file path must be relative and under data/".to_string(),
+            message: "data file path must be relative".to_string(),
         });
     }
     Ok(())
@@ -3434,10 +3469,12 @@ mod tests {
     fn relative_path_validation_is_fail_closed() {
         assert!(validate_rel_path("data/main.t/x.pink").is_ok());
         assert!(validate_rel_path("data/x.pink").is_ok());
+        assert!(validate_rel_path("main/t/x.parquet").is_ok());
+        assert!(validate_rel_path("x.parquet").is_ok());
         assert!(validate_rel_path("../evil.pink").is_err());
         assert!(validate_rel_path("data/../../evil.pink").is_err());
         assert!(validate_rel_path("/etc/passwd").is_err());
-        assert!(validate_rel_path("data").is_err());
+        assert!(validate_rel_path("").is_err());
         assert!(validate_rel_path("./data/x.pink").is_err());
     }
 }

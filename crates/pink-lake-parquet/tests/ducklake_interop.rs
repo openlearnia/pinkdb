@@ -5,7 +5,7 @@
 //! 1. A pinkdb Parquet lake whose catalog is SQLite attaches in DuckDB (the
 //!    `ducklake` extension): `count(*)`, a filtered query and `AT VERSION`.
 //!    Skipped, with a printed note, when the reference DuckDB binary is not
-//!    present (`DUCKDB_BIN` overrides `/tmp/duckdb-2.0.0/duckdb`).
+//!    present (`DUCKDB_BIN` overrides `~/.local/bin/duckdb`).
 //! 2. A DuckDB-written DuckLake catalog (the checked-in fixture) opens in
 //!    pinkdb with an explicit data location. Older versions read `t`
 //!    (inlined) and `f` (Parquet); the latest `f` carries a DuckLake Parquet
@@ -72,7 +72,9 @@ fn count(db: &mut PinkDb, sql: &str) -> i64 {
 fn duckdb_binary() -> Option<PathBuf> {
     let path = std::env::var_os("DUCKDB_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/duckdb-2.0.0/duckdb"));
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/bin/duckdb")
+        });
     if path.is_file() {
         Some(path)
     } else {
@@ -593,7 +595,11 @@ fn pinkdb_parquet_deletes_apply_in_duckdb() {
         "LOAD ducklake;\n\
          ATTACH 'ducklake:sqlite:{}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n\
          SELECT count(*) FROM l.t;\n\
-         SELECT i, s FROM l.t ORDER BY i;\n",
+         SELECT i, s FROM l.t ORDER BY i;\n\
+         SELECT count(*) FROM l.t AT (VERSION => 1);\n\
+         SELECT i, s FROM l.t AT (VERSION => 1) ORDER BY i;\n\
+         SELECT count(*) FROM l.t AT (VERSION => 2);\n\
+         SELECT i, s FROM l.t AT (VERSION => 2) ORDER BY i;\n",
         catalog_path.display(),
         data.display()
     );
@@ -612,8 +618,15 @@ fn pinkdb_parquet_deletes_apply_in_duckdb() {
             "2".to_string(),
             "0,row-0".to_string(),
             "2,row-2".to_string(),
+            "3".to_string(),
+            "0,row-0".to_string(),
+            "1,row-1".to_string(),
+            "2,row-2".to_string(),
+            "2".to_string(),
+            "0,row-0".to_string(),
+            "2,row-2".to_string(),
         ],
-        "DuckDB must apply pinkdb's Parquet delete file"
+        "DuckDB must read both pinkdb snapshots and apply the delete in the later one"
     );
 
     cleanup(&dir);
@@ -709,9 +722,8 @@ fn a_duckdb_catalog_with_parquet_deletes_opens() {
     copy_tree(&fixture, &copied);
     let catalog = format!("sqlite:{}", copied.join("ref.db").display());
     // DuckDB records `main/` as the schema path and `<copied>/data` as the
-    // data path. Pink composes schema+table+file under `data/`, so the lake
-    // root is the fixture directory itself.
-    let data = &copied;
+    // data path, so the lake root is the data directory itself.
+    let data = copied.join("data");
 
     let lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
     // Pink version 5 is DuckLake snapshot 4: `t`'s two inlined rows and `f`'s
@@ -1053,5 +1065,401 @@ fn a_duckdb_list_column_is_refused_with_the_followup_wave() {
         "the refusal must name the follow-up wave: {text}"
     );
 
+    cleanup(&dir);
+}
+
+// ===================== wave 132: DuckDB writes, pinkdb reads =================
+
+/// The lake the reviewer's repro writes, plus a second table, a MERGE, an
+/// added column with a default and later inserts. Each statement is one
+/// snapshot, so the snapshot ids are 0..=13.
+const INTEROP_STATEMENTS: &str = "\
+CREATE TABLE l.t (a INTEGER, b VARCHAR);
+INSERT INTO l.t VALUES (1, 'x'), (2, 'y');
+INSERT INTO l.t SELECT CAST(range AS INTEGER), 'r' || range FROM range(10, 1010);
+INSERT INTO l.t SELECT CAST(range AS INTEGER), 'r' || range FROM range(1010, 2010);
+INSERT INTO l.t SELECT CAST(range AS INTEGER), 'r' || range FROM range(2010, 3010);
+DELETE FROM l.t WHERE a % 100 = 0;
+UPDATE l.t SET b = 'upd' WHERE a = 11;
+CREATE TABLE l.u (id INTEGER, v VARCHAR);
+INSERT INTO l.u VALUES (1, 'a'), (2, 'b');
+MERGE INTO l.u USING (VALUES (2, 'b2'), (4, 'd')) AS s(id, v) ON l.u.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+ALTER TABLE l.t ADD COLUMN c INTEGER DEFAULT 7;
+INSERT INTO l.t (a, b) SELECT CAST(range AS INTEGER), 'r' || range FROM range(3010, 3210);
+INSERT INTO l.u VALUES (5, 'e');
+";
+
+/// (table, summed column, dumped columns, row order, snapshot it appears in)
+const SNAPSHOT_TABLES: &[(&str, &str, &str, &str, i64)] =
+    &[("t", "a", "a, b, c", "a", 1), ("u", "id", "id, v", "id", 8)];
+
+fn write_interop_lake(binary: &Path, attach: &str, data: &Path) -> bool {
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH '{attach}' AS l (DATA_PATH '{}');\n\
+         {INTEROP_STATEMENTS}",
+        data.display()
+    );
+    match run_duckdb(binary, &script) {
+        Ok(_) => true,
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip DuckDB interop test: {message}");
+            false
+        }
+        Err(message) => panic!("{message}"),
+    }
+}
+
+/// DuckDB's own answers at one snapshot, one `count,<n>,<sum>` line per table
+/// followed by one `row,…` line per dumped row.
+fn duckdb_snapshot_lines(
+    binary: &Path,
+    attach: &str,
+    data: &Path,
+    snapshot: i64,
+    tables: &[(&str, &str, &str, &str, i64)],
+) -> Vec<String> {
+    let mut selects = String::new();
+    for (table, sum, columns, order, _) in tables {
+        selects.push_str(&format!(
+            "SELECT 'count', count(*), COALESCE(sum({sum}), 0) FROM l.{table} \
+             AT (VERSION => {snapshot});\n\
+             SELECT 'row', {columns} FROM l.{table} AT (VERSION => {snapshot}) \
+             ORDER BY {order};\n"
+        ));
+    }
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH '{attach}' AS l (DATA_PATH '{}');\n\
+         {selects}",
+        data.display()
+    );
+    run_duckdb(binary, &script)
+        .unwrap_or_else(|message| panic!("DuckDB at snapshot {snapshot}: {message}"))
+}
+
+fn pink_snapshot_lines(
+    lake: &Lake,
+    version: u64,
+    tables: &[(&str, &str, &str, &str, i64)],
+) -> Vec<String> {
+    let mut db = lake
+        .load(Some(version))
+        .unwrap_or_else(|e| panic!("pink load of version {version}: {e}"));
+    let mut out = Vec::new();
+    for (table, sum, columns, order, _) in tables {
+        let totals = query(
+            &mut db,
+            &format!("SELECT count(*), COALESCE(sum({sum}), 0) FROM {table}"),
+        );
+        out.push(format!(
+            "count,{},{}",
+            csv_cell(&totals[0][0]),
+            csv_cell(&totals[0][1])
+        ));
+        for row in query(
+            &mut db,
+            &format!("SELECT {columns} FROM {table} ORDER BY {order}"),
+        ) {
+            out.push(format!(
+                "row,{}",
+                row.iter().map(csv_cell).collect::<Vec<_>>().join(",")
+            ));
+        }
+    }
+    out
+}
+
+fn csv_cell(value: &Value) -> String {
+    value.to_string()
+}
+
+/// Every DuckLake snapshot must agree with pinkdb: the row count, the sum of
+/// one numeric column and the full ordered dump (which also covers inlined
+/// rows, deletes, the UPDATE's re-inserted row and the added default column).
+fn check_every_snapshot(binary: &Path, attach: &str, data: &Path, lake: &Lake) {
+    let versions = lake.versions().unwrap();
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH '{attach}' AS l (DATA_PATH '{}');\n\
+         SELECT snapshot_id FROM ducklake_snapshots('l') ORDER BY 1;\n",
+        data.display()
+    );
+    let ids: Vec<i64> = match run_duckdb(binary, &script) {
+        Ok(lines) => lines.iter().map(|line| line.parse().unwrap()).collect(),
+        Err(message) => {
+            if message.contains("extension") || message.contains("Extension") {
+                println!("skip DuckDB interop test: {message}");
+                return;
+            }
+            panic!("{message}");
+        }
+    };
+    assert_eq!(ids.len(), 14, "the script makes snapshots 0..=13: {ids:?}");
+    assert_eq!(
+        ids.len(),
+        versions.len(),
+        "pink versions {versions:?} vs DuckLake snapshots {ids:?}"
+    );
+    for (snapshot, version) in ids.iter().zip(&versions) {
+        assert_eq!(
+            *version,
+            u64::try_from(*snapshot).unwrap() + 1,
+            "pink version = snapshot_id + 1"
+        );
+        let active: Vec<_> = SNAPSHOT_TABLES
+            .iter()
+            .filter(|table| *snapshot >= table.4)
+            // `c` only exists after the ALTER TABLE at snapshot 11.
+            .map(|table| {
+                if table.0 == "t" && *snapshot < 11 {
+                    (table.0, table.1, "a, b", table.3, table.4)
+                } else {
+                    *table
+                }
+            })
+            .collect();
+        let expected = duckdb_snapshot_lines(binary, attach, data, *snapshot, &active);
+        let actual = pink_snapshot_lines(lake, *version, &active);
+        if expected != actual {
+            let first = expected
+                .iter()
+                .zip(&actual)
+                .position(|(a, b)| a != b)
+                .unwrap_or(expected.len().min(actual.len()));
+            panic!(
+                "snapshot {snapshot} (pink version {version}): first difference at line {first}\n\
+                 duckdb: {:?}\n\
+                 pinkdb: {:?}\n\
+                 lines: duckdb {}, pinkdb {}",
+                expected.get(first),
+                actual.get(first),
+                expected.len(),
+                actual.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_duckdb_sqlite_lake_matches_pinkdb_at_every_snapshot() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("duckdb-sqlite-snapshots");
+    let catalog_path = dir.join("cat.sqlite");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let attach = format!("ducklake:sqlite:{}", catalog_path.display());
+    if !write_interop_lake(&binary, &attach, &data) {
+        cleanup(&dir);
+        return;
+    }
+
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    let lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
+    check_every_snapshot(&binary, &attach, &data, &lake);
+    drop(lake);
+    cleanup(&dir);
+}
+
+/// DuckDB records absolute file paths when its data path does not prefix-match
+/// the normalized file path, as with a `//` in `DATA_PATH`. Those paths must
+/// still resolve under the lake's data root.
+#[test]
+fn a_duckdb_lake_with_a_double_slash_data_path_reads_every_snapshot() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("duckdb-double-slash");
+    let catalog_path = dir.join("cat.sqlite");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data_arg = PathBuf::from(format!("{}//data/", dir.display()));
+    let attach = format!("ducklake:sqlite:{}", catalog_path.display());
+    if !write_interop_lake(&binary, &attach, &data_arg) {
+        cleanup(&dir);
+        return;
+    }
+
+    let catalog = format!("sqlite:{}", catalog_path.display());
+    // No explicit DATA: the catalog's `//` data path is used as recorded.
+    let lake = Lake::open_with_catalog(&catalog, None).unwrap();
+    check_every_snapshot(&binary, &attach, &data_arg, &lake);
+    drop(lake);
+    cleanup(&dir);
+}
+
+#[test]
+fn an_absolute_catalog_path_outside_the_data_root_is_refused() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    let Some(sqlite3) = binary_on_path("sqlite3") else {
+        println!("skip outside-root test: sqlite3 is not on PATH");
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("duckdb-outside-root");
+    let catalog_path = dir.join("cat.sqlite");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let attach = format!("ducklake:sqlite:{}", catalog_path.display());
+    if !write_interop_lake(&binary, &attach, &data) {
+        cleanup(&dir);
+        return;
+    }
+
+    let edited = dir.join("outside.sqlite");
+    std::fs::copy(&catalog_path, &edited).unwrap();
+    let outside = dir.join("elsewhere").join("x.parquet");
+    let update = format!(
+        "UPDATE ducklake_data_file SET path = '{}', path_is_relative = 0 \
+         WHERE data_file_id = (SELECT min(data_file_id) FROM ducklake_data_file);",
+        outside.display()
+    );
+    let status = Command::new(sqlite3)
+        .arg(&edited)
+        .arg(update)
+        .status()
+        .unwrap();
+    assert!(status.success(), "sqlite3 could not edit the catalog copy");
+
+    let catalog = format!("sqlite:{}", edited.display());
+    let lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
+    let error = lake.load(None).expect_err("an outside path must fail");
+    let text = error.to_string();
+    assert!(
+        text.contains("outside the lake's data path"),
+        "the refusal must name the fence: {text}"
+    );
+    assert!(
+        text.contains(&outside.display().to_string()),
+        "the refusal must name the path: {text}"
+    );
+    assert!(
+        text.contains(&data.display().to_string()),
+        "the refusal must name the data root: {text}"
+    );
+    drop(lake);
+    cleanup(&dir);
+}
+
+#[cfg(feature = "catalog-postgres")]
+struct TestPostgres {
+    dir: PathBuf,
+}
+
+#[cfg(feature = "catalog-postgres")]
+impl TestPostgres {
+    /// A throwaway local server: initdb under `$TMPDIR`, port 55433, trust on
+    /// 127.0.0.1. Stopped and deleted by `Drop`.
+    fn start() -> Option<Self> {
+        let Some(initdb) = binary_on_path("initdb") else {
+            println!("skip Postgres interop test: initdb is not on PATH");
+            return None;
+        };
+        let dir = scratch("postgres-server");
+        let output = Command::new(&initdb)
+            .arg("-D")
+            .arg(&dir)
+            .args(["-U", "postgres", "--auth=trust", "--no-sync"])
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "initdb failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pg_ctl = binary_on_path("pg_ctl").expect("pg_ctl is next to initdb");
+        let log = dir.join("server.log");
+        let output = Command::new(&pg_ctl)
+            .arg("-D")
+            .arg(&dir)
+            .args(["-o", "-p 55433 -h 127.0.0.1", "-l"])
+            .arg(&log)
+            .args(["-w", "start"])
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            let log = std::fs::read_to_string(&log).unwrap_or_default();
+            cleanup(&dir);
+            panic!(
+                "pg_ctl start on port 55433 failed: {}\n{log}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let createdb = binary_on_path("createdb").expect("createdb is next to initdb");
+        let output = Command::new(createdb)
+            .args(["-h", "127.0.0.1", "-p", "55433", "-U", "postgres", "duck"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "createdb failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(Self { dir })
+    }
+
+    fn conninfo(&self) -> &'static str {
+        "host=127.0.0.1 port=55433 user=postgres dbname=duck"
+    }
+}
+
+#[cfg(feature = "catalog-postgres")]
+impl Drop for TestPostgres {
+    fn drop(&mut self) {
+        if let Some(pg_ctl) = binary_on_path("pg_ctl") {
+            let _ = Command::new(pg_ctl)
+                .arg("-D")
+                .arg(&self.dir)
+                .args(["-m", "immediate", "stop"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        cleanup(&self.dir);
+    }
+}
+
+fn binary_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+    })
+}
+
+#[cfg(feature = "catalog-postgres")]
+#[test]
+fn a_duckdb_postgres_conninfo_lake_matches_pinkdb_at_every_snapshot() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    let Some(server) = TestPostgres::start() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("duckdb-postgres-snapshots");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let attach = format!("ducklake:postgres:{}", server.conninfo());
+    if !write_interop_lake(&binary, &attach, &data) {
+        cleanup(&dir);
+        return;
+    }
+
+    // The catalog location is the libpq conninfo form, not a URL.
+    let catalog = format!("postgres:{}", server.conninfo());
+    let lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
+    check_every_snapshot(&binary, &attach, &data, &lake);
+    drop(lake);
     cleanup(&dir);
 }

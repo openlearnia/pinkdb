@@ -49,12 +49,19 @@ impl PostgresUrl {
     /// Parse `postgres://` or `postgresql://`. The error string never contains
     /// the raw URL (a caller may attach it to a `BadLocation` message).
     pub(crate) fn parse(raw: &str) -> std::result::Result<Self, String> {
+        // libpq conninfo form: `postgres:host=… dbname=…` (DuckDB's
+        // `ducklake:postgres:` prefix is stripped by the caller).
+        if let Some(rest) = raw.strip_prefix("postgres:")
+            && !rest.starts_with("//")
+        {
+            return Self::parse_conninfo(rest);
+        }
         let (scheme, rest) = if let Some(rest) = raw.strip_prefix("postgres://") {
             ("postgres", rest)
         } else if let Some(rest) = raw.strip_prefix("postgresql://") {
             ("postgresql", rest)
         } else {
-            return Err("expected a postgres:// or postgresql:// catalog URL".to_string());
+            return Err("expected a postgres:// URL or postgres: conninfo".to_string());
         };
         // A fragment is not meaningful for a catalog URL, but `abs()` renders
         // one; tolerate and drop it here.
@@ -107,6 +114,83 @@ impl PostgresUrl {
             host_port: host_port.to_string(),
             port,
             db: db.to_string(),
+            params,
+            schema,
+        })
+    }
+
+    /// Parse libpq's `key=value` conninfo form (the text after `postgres:`).
+    /// Values may be single-quoted, with `\'` and `\\` escapes; whitespace
+    /// around `=` is ignored. Password keys are refused so a secret never
+    /// lands in a printed location.
+    fn parse_conninfo(raw: &str) -> std::result::Result<Self, String> {
+        let mut host = None;
+        let mut hostaddr = None;
+        let mut port = None;
+        let mut db = String::new();
+        let mut user = None;
+        let mut params = Vec::new();
+        let mut schema = "public".to_string();
+        for (key, value) in conninfo_fields(raw)? {
+            match key.as_str() {
+                "host" => host = Some(value),
+                "hostaddr" => hostaddr = Some(value),
+                "port" => port = Some(parse_port(&value)?),
+                "dbname" => db = value,
+                "user" => user = Some(value),
+                "sslmode" => params.push((key, percent_encode(&value))),
+                "options" => params.push((key, percent_encode(&value))),
+                "schema" => schema = value,
+                "password" => {
+                    return Err("a `password` in a catalog conninfo is not accepted; set \
+                                PGPASSWORD instead"
+                        .to_string());
+                }
+                other => {
+                    return Err(format!(
+                        "unknown conninfo key `{other}` (supported: host, hostaddr, port, \
+                         dbname, user, sslmode, options, schema)"
+                    ));
+                }
+            }
+        }
+        if !valid_schema(&schema) {
+            return Err(format!(
+                "the `schema` parameter {schema:?} is not a valid Postgres identifier \
+                 (letters, digits and underscores, not starting with a digit)"
+            ));
+        }
+        let host = match (host, hostaddr) {
+            (Some(host), Some(addr)) => {
+                params.insert(0, ("hostaddr".to_string(), percent_encode(&addr)));
+                host
+            }
+            (Some(host), None) => host,
+            (None, Some(addr)) => addr,
+            (None, None) => return Err("the conninfo has no host (set host=…)".to_string()),
+        };
+        if host.is_empty() {
+            return Err("the conninfo host is empty".to_string());
+        }
+        let authority = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
+        let host_port = match port {
+            Some(port) => format!("{authority}:{port}"),
+            None => authority,
+        };
+        Ok(Self {
+            scheme: "postgres".to_string(),
+            userinfo: user.as_deref().map(percent_encode),
+            user,
+            password: None,
+            password_plain: None,
+            host,
+            host_port,
+            port,
+            db: percent_encode(&db),
             params,
             schema,
         })
@@ -242,12 +326,103 @@ impl PostgresUrl {
 /// Non-Postgres locations (directories, `s3://`, `sqlite:`) are returned
 /// unchanged: they have no credentials.
 pub(crate) fn redact_location(location: &str) -> String {
-    if location.starts_with("postgres://") || location.starts_with("postgresql://") {
+    if location.starts_with("postgres:") || location.starts_with("postgresql://") {
+        let conninfo = location
+            .strip_prefix("postgres:")
+            .is_some_and(|rest| !rest.starts_with("//"));
+        if conninfo {
+            // A conninfo that failed to parse may still hold a password.
+            return PostgresUrl::parse(location)
+                .map_or_else(|_| "postgres:<conninfo>".to_string(), |url| url.redacted());
+        }
         PostgresUrl::parse(location)
             .map_or_else(|_| redact_best_effort(location), |url| url.redacted())
     } else {
         location.to_string()
     }
+}
+
+/// Split libpq conninfo text into `(key, value)` pairs.
+fn conninfo_fields(raw: &str) -> std::result::Result<Vec<(String, String)>, String> {
+    let bytes = raw.as_bytes();
+    let mut fields = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == bytes.len() {
+            break;
+        }
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key = &raw[key_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == bytes.len() || bytes[i] != b'=' {
+            return Err(format!("conninfo key `{key}` has no `=`"));
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut value = String::new();
+        if i < bytes.len() && bytes[i] == b'\'' {
+            i += 1;
+            loop {
+                if i == bytes.len() {
+                    return Err(format!(
+                        "unterminated quoted value for conninfo key `{key}`"
+                    ));
+                }
+                match bytes[i] {
+                    b'\\' if i + 1 < bytes.len() => {
+                        let ch = raw[i + 1..].chars().next().expect("a char follows");
+                        value.push(ch);
+                        i += 1 + ch.len_utf8();
+                    }
+                    b'\'' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => {
+                        let ch = raw[i..].chars().next().expect("i is a char boundary");
+                        value.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+            }
+            if i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                return Err(format!(
+                    "unexpected text after the quoted value for conninfo key `{key}`"
+                ));
+            }
+        } else {
+            let value_start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            value.push_str(&raw[value_start..i]);
+        }
+        fields.push((key.to_string(), value));
+    }
+    Ok(fields)
+}
+
+/// Percent-encode a conninfo value for the URL the Postgres client parses.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Best-effort redaction for a URL too malformed to parse: anything after the
@@ -400,5 +575,65 @@ mod tests {
             let err = PostgresUrl::parse(&raw).unwrap_err();
             assert!(!err.contains(":p@"), "{err}");
         }
+    }
+
+    #[test]
+    fn conninfo_parses_like_the_url_form() {
+        let url =
+            PostgresUrl::parse("postgres:dbname=duck host=127.0.0.1 port=55433 user=postgres")
+                .unwrap();
+        assert_eq!(url.host(), "127.0.0.1");
+        assert_eq!(url.port(), Some(55433));
+        assert!(url.is_local());
+        assert_eq!(url.schema(), "public");
+        assert_eq!(
+            url.connection_url(),
+            "postgres://postgres@127.0.0.1:55433/duck"
+        );
+
+        let spaced = PostgresUrl::parse(
+            "postgres:dbname = lake host = localhost user = postgres schema = w132 \
+             sslmode = disable",
+        )
+        .unwrap();
+        assert_eq!(spaced.schema(), "w132");
+        assert_eq!(spaced.sslmode(), Some("disable"));
+        assert_eq!(
+            spaced.connection_url(),
+            "postgres://postgres@localhost/lake"
+        );
+
+        let quoted = PostgresUrl::parse(
+            "postgres:host=localhost dbname='my lake' user='a\\'b\\\\c' \
+             options='-c search_path=lake'",
+        )
+        .unwrap();
+        assert_eq!(
+            quoted.connection_url(),
+            "postgres://a%27b%5Cc@localhost/my%20lake?options=-c%20search_path%3Dlake"
+        );
+
+        let both =
+            PostgresUrl::parse("postgres:host=db.example.com hostaddr=10.0.0.7 dbname=l").unwrap();
+        assert_eq!(both.host(), "db.example.com");
+        assert_eq!(
+            both.connection_url(),
+            "postgres://db.example.com/l?hostaddr=10.0.0.7"
+        );
+    }
+
+    #[test]
+    fn conninfo_refuses_passwords_and_unknown_keys() {
+        let err = PostgresUrl::parse("postgres:host=localhost password=hunter2").unwrap_err();
+        assert!(err.contains("password"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+        assert_eq!(
+            redact_location("postgres:host=localhost password=hunter2"),
+            "postgres:<conninfo>"
+        );
+
+        let err = PostgresUrl::parse("postgres:host=localhost frobnicate=x").unwrap_err();
+        assert!(err.contains("frobnicate"), "{err}");
+        assert!(!err.contains("=x"), "{err}");
     }
 }

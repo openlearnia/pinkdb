@@ -1311,8 +1311,13 @@ pub(crate) fn entry_layout(
                 ),
             })?;
         let path = storage.abs(&d.path);
-        let bytes = storage.read(&d.path, &format!("reading {}", path.display()))?;
-        let positions = delete_file::read_positions(&bytes, &d.format, &d.file, &path)?;
+        let positions = match &d.positions {
+            Some(positions) => positions.clone(),
+            None => {
+                let bytes = storage.read(&d.path, &format!("reading {}", path.display()))?;
+                delete_file::read_positions(&bytes, &d.format, &d.file, &path)?
+            }
+        };
         if positions.len() as u64 != d.count {
             return Err(LakeError::Corrupt {
                 path,
@@ -2869,18 +2874,23 @@ impl Lake {
                 // would double-drop rows (and break the row-count invariant):
                 // refuse, never publish a manifest that lies about its rows.
                 for existing in entry.deletes.iter().filter(|d| d.file == dref.file) {
-                    let epath = self.storage.abs(&existing.path);
-                    let bytes = self
-                        .storage
-                        .read(&existing.path, &format!("reading {}", epath.display()))
-                        .map_err(PublishFailure::Fatal)?;
-                    let epos = delete_file::read_positions(
-                        &bytes,
-                        &existing.format,
-                        &existing.file,
-                        &epath,
-                    )
-                    .map_err(PublishFailure::Fatal)?;
+                    let epos = match &existing.positions {
+                        Some(positions) => positions.clone(),
+                        None => {
+                            let epath = self.storage.abs(&existing.path);
+                            let bytes = self
+                                .storage
+                                .read(&existing.path, &format!("reading {}", epath.display()))
+                                .map_err(PublishFailure::Fatal)?;
+                            delete_file::read_positions(
+                                &bytes,
+                                &existing.format,
+                                &existing.file,
+                                &epath,
+                            )
+                            .map_err(PublishFailure::Fatal)?
+                        }
+                    };
                     let overlap: Vec<u64> = pos
                         .iter()
                         .copied()
