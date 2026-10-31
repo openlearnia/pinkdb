@@ -1091,3 +1091,363 @@ fn explain_names_the_dml_cte_forms() {
         "{err}"
     );
 }
+
+// ----------------------------------- wave 140b: MERGE at chunk scale (140b)
+
+/// A nine-column target the size of QuackLab's `f` (seven key columns), over
+/// several chunks.
+const MERGE_TARGET: &str = "CREATE TABLE f AS SELECT \
+     CAST(i % 300 AS VARCHAR) AS zone_id, \
+     CAST(i % 263 AS VARCHAR) AS do_zone_id, \
+     DATE '2024-07-01' + CAST(i % 31 AS INTEGER) AS day_id, \
+     CAST(i % 24 AS BIGINT) AS hour_id, \
+     CAST(i % 5 AS BIGINT) AS payment_type_id, \
+     CAST(i % 3 AS BIGINT) AS vendor_id, \
+     CAST(i % 7 AS VARCHAR) AS rate_code_id, \
+     CAST(i AS BIGINT) AS trips, \
+     CAST(i AS DOUBLE) * 1.5 AS fare \
+     FROM range(0, 7000) t(i)";
+
+/// The seven-key `ON` and both actions, shared by the chunk-scale cases.
+const MERGE_BODY: &str = "ON (target.zone_id = source.zone_id \
+     AND target.do_zone_id = source.do_zone_id AND target.day_id = source.day_id \
+     AND target.hour_id = source.hour_id \
+     AND target.payment_type_id = source.payment_type_id \
+     AND target.vendor_id = source.vendor_id \
+     AND target.rate_code_id = source.rate_code_id) \
+     WHEN MATCHED THEN UPDATE SET trips = source.trips + 42 \
+     WHEN NOT MATCHED THEN INSERT (zone_id, do_zone_id, day_id, hour_id, \
+       payment_type_id, vendor_id, rate_code_id, trips, fare) \
+     VALUES (source.zone_id, source.do_zone_id, source.day_id, source.hour_id, \
+       source.payment_type_id, source.vendor_id, source.rate_code_id, \
+       source.trips, source.fare)";
+
+/// One matching source row (in the third chunk) and one that matches nothing,
+/// against the same changes computed by `UPDATE`/`INSERT` on a copy.
+#[test]
+fn merge_matches_a_multi_chunk_target_by_hash() {
+    let mut db = PinkDb::new();
+    db.execute(MERGE_TARGET).unwrap();
+    db.execute("CREATE TABLE want AS SELECT * FROM f").unwrap();
+    db.execute(
+        "CREATE TABLE s AS SELECT * FROM f WHERE trips = 5000 \
+         UNION ALL SELECT 'zzz', 'zzz', DATE '2024-07-01', CAST(0 AS BIGINT), \
+           CAST(0 AS BIGINT), CAST(0 AS BIGINT), '0', CAST(9000 AS BIGINT), \
+           CAST(1.25 AS DOUBLE)",
+    )
+    .unwrap();
+    db.execute("UPDATE want SET trips = trips + 42 WHERE trips = 5000")
+        .unwrap();
+    db.execute(
+        "INSERT INTO want VALUES ('zzz', 'zzz', DATE '2024-07-01', 0, 0, 0, '0', 9000, 1.25)",
+    )
+    .unwrap();
+    db.execute(&format!(
+        "MERGE INTO f AS target USING s AS source {MERGE_BODY}"
+    ))
+    .unwrap();
+    let got = tabs(&mut db, "SELECT * FROM f ORDER BY trips");
+    assert_eq!(got, tabs(&mut db, "SELECT * FROM want ORDER BY trips"));
+    assert_eq!(tabs(&mut db, "SELECT count(*) FROM f"), vec!["7001"]);
+    assert_eq!(
+        tabs(
+            &mut db,
+            "SELECT trips, fare FROM f WHERE fare IN (7500.0, 1.25) ORDER BY trips"
+        ),
+        vec!["5042\t7500", "9000\t1.25"]
+    );
+}
+
+/// The full batch: every other target row matches, so each chunk has work and
+/// no chunk is skipped.
+#[test]
+fn merge_full_batch_matches_update_and_insert() {
+    let mut db = PinkDb::new();
+    db.execute(MERGE_TARGET).unwrap();
+    db.execute("CREATE TABLE want AS SELECT * FROM f").unwrap();
+    db.execute("CREATE TABLE s AS SELECT * FROM f WHERE trips % 2 = 0")
+        .unwrap();
+    db.execute("UPDATE want SET trips = trips + 42 WHERE trips % 2 = 0")
+        .unwrap();
+    db.execute(&format!(
+        "MERGE INTO f AS target USING s AS source {MERGE_BODY}"
+    ))
+    .unwrap();
+    assert_eq!(
+        tabs(&mut db, "SELECT * FROM f ORDER BY trips"),
+        tabs(&mut db, "SELECT * FROM want ORDER BY trips")
+    );
+}
+
+/// Every clause kind, with conditions that differ per row, plus DuckDB's
+/// re-measurement of the pin.
+#[test]
+fn merge_clause_conditions_run_per_row() {
+    let script = "CREATE TABLE t (a INT PRIMARY KEY, b INT); \
+         INSERT INTO t VALUES (1,1),(2,2),(3,3),(4,4),(7,1); \
+         CREATE TABLE s (a INT, b INT); \
+         INSERT INTO s VALUES (1,10),(2,20),(5,5),(6,6); \
+         MERGE INTO t AS target USING s AS source ON target.a = source.a \
+           WHEN MATCHED AND source.b > 15 THEN DELETE \
+           WHEN MATCHED AND source.b > 5 THEN UPDATE SET b = source.b \
+           WHEN MATCHED THEN UPDATE SET b = target.b + 100 \
+           WHEN NOT MATCHED BY SOURCE AND target.b < 3 THEN DELETE \
+           WHEN NOT MATCHED THEN INSERT (a, b) VALUES (source.a, source.b); \
+         SELECT a, b FROM t ORDER BY a";
+    let want = ["1\t10", "3\t3", "4\t4", "5\t5", "6\t6"];
+    let mut db = PinkDb::new();
+    let got: Vec<String> = script_rows(&mut db, script);
+    assert_eq!(got, want);
+    if let Some(measured) = duck_script(script) {
+        assert_eq!(measured, want, "duckdb drifted from the pin");
+    }
+}
+
+/// A target row matched twice is an error, even when the pair surfaces after
+/// thousands of rows already matched; nothing is written.
+#[test]
+fn merge_duplicate_match_in_a_later_batch_leaves_the_table_untouched() {
+    let mut db = PinkDb::new();
+    db.execute(
+        "CREATE TABLE t AS SELECT CAST(i AS INT) AS a, CAST(i * 10 AS INT) AS b \
+         FROM range(0, 3000) t(i)",
+    )
+    .unwrap();
+    db.execute("CREATE TABLE s AS SELECT a, b + 1 AS b FROM t")
+        .unwrap();
+    db.execute("INSERT INTO s SELECT a, b FROM s WHERE a = 2999")
+        .unwrap();
+    let before = tabs(&mut db, "SELECT count(*), sum(b) FROM t");
+    let err = db
+        .execute("MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN UPDATE SET b = s.b")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot affect the same target row more than once"),
+        "{err}"
+    );
+    assert_eq!(tabs(&mut db, "SELECT count(*), sum(b) FROM t"), before);
+}
+
+/// A keyed target refuses an update that collides with another live key, and
+/// an insert that duplicates one; either way the table is unchanged.
+#[test]
+fn merge_key_violations_are_errors() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE k (a INT PRIMARY KEY, b INT)")
+        .unwrap();
+    db.execute("INSERT INTO k VALUES (1, 10), (2, 20)").unwrap();
+    db.execute("CREATE TABLE s (a INT, b INT)").unwrap();
+    db.execute("INSERT INTO s VALUES (1, 2), (2, 3)").unwrap();
+    let before = tabs(&mut db, "SELECT a, b FROM k ORDER BY a");
+    let err = db
+        .execute("MERGE INTO k USING s ON k.a = s.a WHEN MATCHED THEN UPDATE SET a = s.b")
+        .unwrap_err();
+    assert!(err.to_string().contains("constraint"), "{err}");
+    assert_eq!(tabs(&mut db, "SELECT a, b FROM k ORDER BY a"), before);
+    db.execute("DELETE FROM s").unwrap();
+    db.execute("INSERT INTO s VALUES (1, 99)").unwrap();
+    // The source row matches nothing, and its insert duplicates a live key.
+    let err = db
+        .execute(
+            "MERGE INTO k USING s ON k.a = s.a + 100 \
+             WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b)",
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("constraint"), "{err}");
+    assert_eq!(tabs(&mut db, "SELECT a, b FROM k ORDER BY a"), before);
+}
+
+/// A row trigger rewrites `NEW`, and `RETURNING` reports what it wrote.
+#[test]
+fn merge_fires_row_triggers_and_returns_final_rows() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    db.execute("CREATE TABLE s (a INT, b INT)").unwrap();
+    db.execute("INSERT INTO s VALUES (2, 5), (3, 30)").unwrap();
+    db.execute(
+        "CREATE TRIGGER t_before BEFORE UPDATE ON t FOR EACH ROW \
+         EXECUTE DO $$ BEGIN SET NEW.b = NEW.b * 10; END; $$",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TRIGGER t_insert BEFORE INSERT ON t FOR EACH ROW \
+         EXECUTE DO $$ BEGIN SET NEW.b = NEW.b + 1; END; $$",
+    )
+    .unwrap();
+    let got = tabs(
+        &mut db,
+        "MERGE INTO t USING s ON t.a = s.a \
+         WHEN MATCHED THEN UPDATE SET b = s.b \
+         WHEN NOT MATCHED THEN INSERT VALUES (s.a, s.b) RETURNING a, b",
+    );
+    assert_eq!(got, vec!["2\t50".to_string(), "3\t31".to_string()]);
+    assert_eq!(
+        tabs(&mut db, "SELECT a, b FROM t ORDER BY a"),
+        vec![
+            "1\t10".to_string(),
+            "2\t50".to_string(),
+            "3\t31".to_string()
+        ]
+    );
+}
+
+/// `WHEN NOT MATCHED BY SOURCE` sees every target chunk, including those the
+/// source's keys cannot reach (zone skipping must be off for it).
+#[test]
+fn merge_by_source_sees_every_chunk() {
+    let mut db = PinkDb::new();
+    db.execute(
+        "CREATE TABLE t AS SELECT CAST(i AS INT) AS a, CAST(i % 4 AS INT) AS b \
+         FROM range(0, 3000) t(i)",
+    )
+    .unwrap();
+    db.execute("CREATE TABLE want AS SELECT * FROM t").unwrap();
+    db.execute("CREATE TABLE s AS SELECT a, b FROM t WHERE a = 2999")
+        .unwrap();
+    db.execute("UPDATE want SET b = 99 WHERE a = 2999").unwrap();
+    db.execute("DELETE FROM want WHERE b < 2").unwrap();
+    db.execute(
+        "MERGE INTO t USING s ON t.a = s.a \
+         WHEN MATCHED THEN UPDATE SET b = 99 \
+         WHEN NOT MATCHED BY SOURCE AND t.b < 2 THEN DELETE",
+    )
+    .unwrap();
+    assert_eq!(
+        tabs(&mut db, "SELECT * FROM t ORDER BY a"),
+        tabs(&mut db, "SELECT * FROM want ORDER BY a")
+    );
+}
+
+/// An `ON` with no source=target equality keeps the nested-loop path, and the
+/// duplicate match still refuses the statement.
+#[test]
+fn merge_without_an_equality_still_matches() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    db.execute("CREATE TABLE s (a INT, b INT)").unwrap();
+    db.execute("INSERT INTO s VALUES (2, 5)").unwrap();
+    let got = tabs(
+        &mut db,
+        "MERGE INTO t USING s ON t.a < s.a \
+         WHEN MATCHED THEN UPDATE SET b = s.b RETURNING a, b",
+    );
+    assert_eq!(got, vec!["1\t5".to_string()]);
+    db.execute("INSERT INTO s VALUES (4, 8)").unwrap();
+    let before = tabs(&mut db, "SELECT a, b FROM t ORDER BY a");
+    let err = db
+        .execute("MERGE INTO t USING s ON t.a < s.a WHEN MATCHED THEN UPDATE SET b = s.b")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot affect the same target row more than once"),
+        "{err}"
+    );
+    assert_eq!(tabs(&mut db, "SELECT a, b FROM t ORDER BY a"), before);
+}
+
+/// A batch is one joined chunk, so one target row's candidates have to split
+/// across batches once they fill it; the nested-loop path gives every target
+/// row one candidate per source row.
+#[test]
+fn merge_candidate_batches_never_exceed_one_chunk() {
+    for rows in [682usize, 683, 7000] {
+        let mut db = PinkDb::new();
+        db.execute(&format!(
+            "CREATE TABLE t AS SELECT CAST(i AS INTEGER) AS k, 'a' AS s \
+             FROM range(0, {rows}) r(i)"
+        ))
+        .unwrap();
+        db.execute("CREATE TABLE src AS SELECT CAST(i * 3 AS BIGINT) AS k FROM range(0, 3) r(i)")
+            .unwrap();
+        db.execute(
+            "MERGE INTO t USING src ON t.k < src.k AND t.k > src.k - 2 \
+             WHEN MATCHED THEN UPDATE SET s = 'ne'",
+        )
+        .unwrap();
+        assert_eq!(
+            tabs(&mut db, "SELECT count(*), sum(k) FROM t WHERE s = 'ne'"),
+            vec!["2\t7"],
+            "{rows} target rows"
+        );
+    }
+}
+
+/// More candidates for one target row than a chunk holds, without an equality
+/// in `ON`: the clause condition keeps exactly one, so the row is updated once.
+#[test]
+fn merge_one_row_many_candidates_without_equality() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (k INT, s VARCHAR)").unwrap();
+    db.execute("INSERT INTO t VALUES (0, 'a')").unwrap();
+    db.execute("CREATE TABLE src AS SELECT CAST(i AS INT) AS k FROM range(0, 3000) r(i)")
+        .unwrap();
+    db.execute(
+        "MERGE INTO t USING src ON t.k <= src.k AND src.k < 3000 \
+         WHEN MATCHED AND src.k = 2999 THEN UPDATE SET s = 'b' \
+         WHEN MATCHED THEN DELETE",
+    )
+    .unwrap();
+    assert_eq!(tabs(&mut db, "SELECT k, s FROM t"), vec!["0\tb"]);
+}
+
+/// The same shape through the hash path: 3000 source rows share the target's
+/// key. One clause condition keeps one; without it the row is matched twice.
+#[test]
+fn merge_one_row_many_candidates_by_hash() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (k INT, s VARCHAR)").unwrap();
+    db.execute("INSERT INTO t VALUES (0, 'a')").unwrap();
+    db.execute("CREATE TABLE src AS SELECT 0 AS k, CAST(i AS INT) AS i FROM range(0, 3000) r(i)")
+        .unwrap();
+    db.execute(
+        "MERGE INTO t USING src ON t.k = src.k \
+         WHEN MATCHED AND src.i = 2999 THEN UPDATE SET s = 'b' \
+         WHEN MATCHED THEN DELETE",
+    )
+    .unwrap();
+    assert_eq!(tabs(&mut db, "SELECT k, s FROM t"), vec!["0\tb"]);
+    let before = tabs(&mut db, "SELECT k, s FROM t");
+    let err = db
+        .execute("MERGE INTO t USING src ON t.k = src.k WHEN MATCHED THEN DELETE")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot affect the same target row more than once"),
+        "{err}"
+    );
+    assert_eq!(tabs(&mut db, "SELECT k, s FROM t"), before);
+}
+
+/// `UPDATE … FROM` and `DELETE … USING` over a multi-chunk target agree with
+/// the same changes made directly on a copy.
+#[test]
+fn update_from_and_delete_using_probe_by_chunk() {
+    let mut db = PinkDb::new();
+    db.execute(
+        "CREATE TABLE t AS SELECT CAST(i AS INT) AS a, CAST(i AS INT) AS b \
+         FROM range(0, 3000) t(i)",
+    )
+    .unwrap();
+    db.execute("CREATE TABLE want AS SELECT * FROM t").unwrap();
+    db.execute("CREATE TABLE s AS SELECT a FROM t WHERE a % 500 = 0")
+        .unwrap();
+    db.execute("UPDATE want SET b = -1 WHERE a % 500 = 0")
+        .unwrap();
+    db.execute("UPDATE t SET b = -1 FROM s WHERE t.a = s.a")
+        .unwrap();
+    assert_eq!(
+        tabs(&mut db, "SELECT count(*), sum(b) FROM t"),
+        tabs(&mut db, "SELECT count(*), sum(b) FROM want")
+    );
+    db.execute("DELETE FROM want WHERE a % 500 = 0").unwrap();
+    db.execute("DELETE FROM t USING s WHERE t.a = s.a").unwrap();
+    assert_eq!(
+        tabs(&mut db, "SELECT count(*), sum(b) FROM t"),
+        tabs(&mut db, "SELECT count(*), sum(b) FROM want")
+    );
+    assert_eq!(tabs(&mut db, "SELECT count(*) FROM t"), vec!["2994"]);
+}

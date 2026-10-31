@@ -5218,11 +5218,14 @@ fn residual_selection(
 /// results are exactly the nested loop's.
 ///
 /// Key expressions live in the joined `[source…, target…]` column space the
-/// DML executor builds its one-row chunks in: source keys evaluate against a
-/// source chunk as-is, target keys are shifted into target space.
+/// DML executor builds its chunks in: source keys evaluate against a source
+/// chunk as-is, target keys are shifted into target space. A target chunk's
+/// keys are evaluated once ([`DmlIndex::probe_keys`]); probing a row is then a
+/// lookup, not an evaluation over the whole chunk.
 pub(crate) struct DmlIndex {
     table: MatchTable,
     keys: Vec<BoundExpr>,
+    src_keys: Vec<BoundExpr>,
     commons: Vec<Option<DataType>>,
     ints: bool,
 }
@@ -5276,40 +5279,114 @@ impl DmlIndex {
         Ok(Some(DmlIndex {
             table,
             keys,
+            src_keys,
             commons,
             ints,
         }))
     }
 
-    /// The source `(chunk, row)` candidates for one target row, in source input
-    /// order. A NULL key matches nothing (`=` is never true for NULL).
-    pub(crate) fn probe(
+    /// Evaluate the target-side key expressions once for a whole target chunk.
+    pub(crate) fn probe_keys(&self, cx: &Cx, chunk: &DataChunk) -> Result<ProbeKeys> {
+        let kvs = self
+            .table
+            .probe_keys(cx, &self.keys, chunk, &self.commons, self.ints)?;
+        let rows = chunk.num_rows();
+        let mut null = vec![false; rows];
+        for kv in &kvs {
+            for (row, null) in null.iter_mut().enumerate() {
+                *null |= kv.is_null(row);
+            }
+        }
+        // Encoded once per row, the layout `MatchTable`'s byte keys use.
+        let mut bytes = Vec::new();
+        let mut ends = Vec::with_capacity(rows);
+        if !self.ints {
+            for (row, is_null) in null.iter().enumerate() {
+                if !is_null {
+                    for kv in &kvs {
+                        kv.encode_into(&mut bytes, row);
+                    }
+                }
+                ends.push(bytes.len() as u32);
+            }
+        }
+        Ok(ProbeKeys {
+            kvs,
+            bytes,
+            ends,
+            null,
+        })
+    }
+
+    /// The source `(chunk, row)` candidates for `row` of the chunk its
+    /// [`ProbeKeys`] were evaluated over, in source input order. A NULL key
+    /// matches nothing (`=` is never true for NULL).
+    pub(crate) fn matches<'k>(
+        &'k self,
+        keys: &'k ProbeKeys,
+        row: usize,
+    ) -> impl Iterator<Item = (u32, u32)> + 'k {
+        let hit = (!keys.null[row]).then(|| {
+            if self.ints {
+                self.table.matches_int(int_key_at(&keys.kvs[0], row))
+            } else {
+                let end = keys.ends[row] as usize;
+                let start = if row == 0 {
+                    0
+                } else {
+                    keys.ends[row - 1] as usize
+                };
+                self.table.matches_bytes(&keys.bytes[start..end])
+            }
+        });
+        hit.into_iter().flatten().map(|row| self.table.loc(row))
+    }
+
+    /// Zone of each hash key's *source* side, for keys whose target side is a
+    /// plain column (returned as that column's index in the target). A target
+    /// chunk whose own zone cannot overlap has no match, the same min/max
+    /// bound a hash join derives in [`derive_join_filters`]. Types the key
+    /// encoding does not normalize (anything but a numeric pair or one type on
+    /// both sides) order no better than by shape, so they are left out.
+    pub(crate) fn target_zones(
         &self,
         cx: &Cx,
-        chunk: &DataChunk,
-        row: usize,
-        buf: &mut Vec<u8>,
-    ) -> Result<Vec<(u32, u32)>> {
-        let kvs: Vec<Vector> = self
-            .keys
-            .iter()
-            .zip(self.commons.iter())
-            .map(|(k, c)| eval_join_key(cx, k, chunk, *c, self.ints))
-            .collect::<Result<_>>()?;
-        if kvs.iter().any(|kv| kv.is_null(row)) {
-            return Ok(Vec::new());
-        }
-        let matches = if self.ints {
-            self.table.matches_int(int_key_at(&kvs[0], row))
-        } else {
-            buf.clear();
-            for kv in &kvs {
-                kv.encode_into(buf, row);
+        source: &[DataChunk],
+        src_cols: usize,
+        schema: &[(String, DataType)],
+    ) -> Result<Vec<(usize, crate::stats::Zone)>> {
+        let mut out = Vec::new();
+        for (i, key) in self.keys.iter().enumerate() {
+            let BoundExpr::Column { index, .. } = key else {
+                continue;
+            };
+            if *index < src_cols {
+                continue;
             }
-            self.table.matches_bytes(buf)
-        };
-        Ok(matches.map(|r| self.table.loc(r)).collect())
+            let src_dtype = self.src_keys[i].dtype();
+            let target_dtype = schema[*index - src_cols].1;
+            if src_dtype != target_dtype && common_numeric(src_dtype, target_dtype).is_err() {
+                continue;
+            }
+            let mut zone = crate::stats::Zone::empty();
+            for chunk in source {
+                let kv = eval_join_key(cx, &self.src_keys[i], chunk, self.commons[i], self.ints)?;
+                zone.merge(&crate::stats::Zone::of_vector(&kv));
+            }
+            out.push((*index - src_cols, zone));
+        }
+        Ok(out)
     }
+}
+
+/// One target chunk's keys under a [`DmlIndex`].
+pub(crate) struct ProbeKeys {
+    kvs: Vec<Vector>,
+    /// Each non-NULL-keyed row's encoded key, row by row; `ends[row]` is where
+    /// row `row`'s encoding stops (unchanged for a NULL-keyed row).
+    bytes: Vec<u8>,
+    ends: Vec<u32>,
+    null: Vec<bool>,
 }
 
 /// Flatten `a AND b AND …` into its conjuncts.

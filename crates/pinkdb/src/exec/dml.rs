@@ -12,16 +12,20 @@
 //!   ([`PinkDb::trigger_capture`]), so a `BEFORE` trigger's rewrite of `NEW` is
 //!   what `RETURNING` sees.
 //!
-//! The joins here are nested loops: `UPDATE … FROM` and `DELETE … USING`
-//! evaluate their predicate once per (target row, source row) pair and `MERGE`
-//! once per pair for its `ON`. That is O(n·m); a hash join is the upgrade path
-//! when these forms see large inputs. Plain DML never enters this module.
+//! The joins here are hash probes where the predicate equates a source
+//! expression with a target one ([`DmlIndex`]), so a target chunk's keys are
+//! evaluated once instead of once per row. `MERGE` gathers its candidate pairs
+//! into `[source…, target…]` batches and evaluates `ON`, the clause conditions
+//! and its `SET`s a vector at a time. A predicate with no such equality falls
+//! back to pairs. Plain DML never enters this module.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::selection::all_rows;
 use super::{Cx, DmlIndex, ExecBudget, Output, QueryResult, eval, eval_expr};
-use crate::keys::{KeySpace, RowId};
+use crate::attached::PruneOp;
+use crate::keys::RowId;
 use crate::plan::{
     ConflictActionPlan, ConflictPlan, LogicalPlan, MergeActionPlan, MergeClausePlan, Returning,
 };
@@ -29,7 +33,7 @@ use crate::sql::ast::MergeMatch;
 use crate::sql::binder::BoundExpr;
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
-use crate::vector::{CHUNK_SIZE, DataChunk, Vector};
+use crate::vector::{CHUNK_SIZE, DataChunk, GATHER_NULL, Vector};
 
 type RowImages = Vec<(Vec<Value>, Vec<Value>)>;
 
@@ -227,12 +231,15 @@ pub(crate) fn update_from(
             Some(p) => DmlIndex::build(&cx, &src_chunks, src_types.len(), p)?,
             None => None,
         };
-        let mut buf = Vec::new();
+        let mut probe_keys = None;
         for (ci, writes) in per_chunk.iter_mut().enumerate() {
             cx.check_deadline()?;
             let chunk = t.scan_chunk(ci).ok_or_else(|| {
                 PinkDbError::Execution("storage changed during UPDATE".to_string())
             })?;
+            if let Some(index) = &index {
+                probe_keys = Some(index.probe_keys(&cx, &chunk)?);
+            }
             for row in 0..chunk.num_rows() {
                 let mut chosen: Option<DataChunk> = None;
                 // One candidate pair: the predicate decides whether it wins.
@@ -250,13 +257,13 @@ pub(crate) fn update_from(
                         }
                         Ok(())
                     };
-                match &index {
-                    Some(index) => {
-                        for (sc, srow) in index.probe(&cx, &chunk, row, &mut buf)? {
+                match (&index, &probe_keys) {
+                    (Some(index), Some(keys)) => {
+                        for (sc, srow) in index.matches(keys, row) {
                             visit(sc as usize, srow as usize, &mut chosen)?;
                         }
                     }
-                    None => {
+                    _ => {
                         for (sc, source_chunk) in src_chunks.iter().enumerate() {
                             for srow in 0..source_chunk.num_rows() {
                                 visit(sc, srow, &mut chosen)?;
@@ -304,12 +311,15 @@ pub(crate) fn delete_using(
             Some(p) => DmlIndex::build(&cx, &src_chunks, src_types.len(), p)?,
             None => None,
         };
-        let mut buf = Vec::new();
+        let mut probe_keys = None;
         for ci in 0..t.num_chunks() {
             cx.check_deadline()?;
             let chunk = t.scan_chunk(ci).ok_or_else(|| {
                 PinkDbError::Execution("storage changed during DELETE".to_string())
             })?;
+            if let Some(index) = &index {
+                probe_keys = Some(index.probe_keys(&cx, &chunk)?);
+            }
             let mut dropped = Vec::new();
             for row in 0..chunk.num_rows() {
                 let hit = |sc: usize, srow: usize| -> Result<bool> {
@@ -321,10 +331,10 @@ pub(crate) fn delete_using(
                         None => true,
                     })
                 };
-                let matched = match &index {
-                    Some(index) => {
+                let matched = match (&index, &probe_keys) {
+                    (Some(index), Some(keys)) => {
                         let mut found = false;
-                        for (sc, srow) in index.probe(&cx, &chunk, row, &mut buf)? {
+                        for (sc, srow) in index.matches(keys, row) {
                             if hit(sc as usize, srow as usize)? {
                                 found = true;
                                 break;
@@ -332,7 +342,7 @@ pub(crate) fn delete_using(
                         }
                         found
                     }
-                    None => {
+                    _ => {
                         let mut found = false;
                         'candidates: for (sc, source_chunk) in src_chunks.iter().enumerate() {
                             for srow in 0..source_chunk.num_rows() {
@@ -356,10 +366,20 @@ pub(crate) fn delete_using(
 }
 
 /// `MERGE INTO … USING … ON … WHEN …`: the source is materialized, then every
-/// target row is matched against it.
+/// target row is matched against it by a hash probe over the `ON`'s equality
+/// conjuncts ([`DmlIndex`]).
+///
+/// The candidates of one target chunk are gathered into `[source…, target…]`
+/// batches of at most [`CHUNK_SIZE`] rows, so the `ON`, the clause conditions
+/// and the `SET`/`VALUES` expressions each evaluate a vector at a time, and the
+/// writes of one statement go out as one call per kind. DuckDB's `MERGE` has
+/// the same shape — a join of source and target whose joined chunks are routed
+/// to per-action sinks (`duckdb/src/planner/binder/statement/bind_merge_into.cpp`,
+/// `duckdb/src/execution/operator/persistent/physical_merge_into.cpp`).
 ///
 /// A target row may be affected by at most one source row; more is an error
-/// (DuckDB's rule, which never silently picks one). Returns
+/// (DuckDB's rule, which never silently picks one). Every row is resolved
+/// before the first write, so an error leaves the table untouched. Returns
 /// `(inserted, updated, deleted)`.
 pub(crate) fn merge(
     db: &mut PinkDb,
@@ -380,182 +400,542 @@ pub(crate) fn merge(
         .enumerate()
         .flat_map(|(c, ch)| (0..ch.num_rows()).map(move |r| (c, r)))
         .collect();
-    let t = db.table_in(target_db, table)?;
-    let schema = t.schema();
-    let defaults: Vec<Value> = t
-        .columns
-        .iter()
-        .map(|c| c.default.clone().unwrap_or(Value::Null))
+    // Global index of each source chunk's first row: a probe yields
+    // chunk-local coordinates, `source_matched` is indexed globally.
+    let mut src_starts = Vec::with_capacity(src_chunks.len());
+    let mut acc = 0usize;
+    for source_chunk in &src_chunks {
+        src_starts.push(acc);
+        acc += source_chunk.num_rows();
+    }
+    // The source column by column, chunk by chunk: the batched gathers.
+    let src_cols: Vec<Vec<&Vector>> = (0..src_types.len())
+        .map(|i| src_chunks.iter().map(|c| c.column(i)).collect())
         .collect();
-    let mut images = snapshot(t);
-    let mut keys = KeySpace::build(t);
-    let mut updates: Vec<(RowId, Vec<Value>)> = Vec::new();
-    let mut drops: Vec<Vec<usize>> = vec![Vec::new(); t.num_chunks()];
-    let mut inserts: Vec<Vec<Value>> = Vec::new();
     let mut source_matched = vec![false; src_rows.len()];
-    {
-        let cx = Cx::with_budget(db, budget.clone());
-        let index = DmlIndex::build(&cx, &src_chunks, src_types.len(), on)?;
-        // Global source-row index per chunk: `hits` and `source_matched` are
-        // indexed by it, and a probe yields chunk-local coordinates.
-        let mut src_starts = Vec::with_capacity(src_chunks.len());
-        let mut acc = 0usize;
-        for source_chunk in &src_chunks {
-            src_starts.push(acc);
-            acc += source_chunk.num_rows();
+    // Constraints are checked against a copy of the table's cached key map: the
+    // write funnels take and maintain the canonical one themselves, so it goes
+    // back pristine. A keyless table stages nothing.
+    let mut keys = match crate::keys::take_or_build(db, target_db, table)? {
+        Some(space) => {
+            let staged = space.clone();
+            crate::keys::store(db, target_db, table, Some(space));
+            Some(staged)
         }
-        let mut buf = Vec::new();
-        for ci in 0..t.num_chunks() {
+        None => None,
+    };
+    let matched: Vec<usize> = clauses
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.matched == MergeMatch::Matched)
+        .map(|(i, _)| i)
+        .collect();
+    // `WHEN NOT MATCHED BY SOURCE` sees every target row, even one no source
+    // row can reach: no chunk may be skipped for it.
+    let by_source = clauses
+        .iter()
+        .any(|c| c.matched == MergeMatch::NotMatchedBySource);
+    let (per_chunk, drops, inserts, updated) = {
+        let cx = Cx::with_budget(db, budget.clone());
+        let t = db.table_in(target_db, table)?;
+        let schema = t.schema();
+        let defaults: Vec<Value> = t
+            .columns
+            .iter()
+            .map(|c| c.default.clone().unwrap_or(Value::Null))
+            .collect();
+        let num_chunks = t.num_chunks();
+        let mut per_chunk: Vec<Vec<(usize, usize, Value)>> = vec![Vec::new(); num_chunks];
+        let mut drops: Vec<Vec<usize>> = vec![Vec::new(); num_chunks];
+        let mut inserts: Vec<Vec<Value>> = Vec::new();
+        // `append_row` fills the tail chunk before opening a new one, and a
+        // delete can leave a chunk short, so the next row's id is
+        // `(tail chunk, its length)`, not `num_rows() / CHUNK_SIZE`.
+        let mut next_id = append_id(t);
+        let mut updated = 0usize;
+        let index = DmlIndex::build(&cx, &src_chunks, src_types.len(), on)?;
+        // The source side's reach, per plain-column key: a target chunk whose
+        // zone cannot overlap it has no match (a hash join skips its probe
+        // chunks the same way, through `JoinFilter`).
+        let zones = match &index {
+            Some(index) if !by_source => {
+                index.target_zones(&cx, &src_chunks, src_types.len(), &schema)?
+            }
+            _ => Vec::new(),
+        };
+        let ctx = MergeCtx {
+            cx: &cx,
+            on,
+            clauses,
+            matched: &matched,
+            src_cols: &src_cols,
+            src_types: &src_types,
+            schema: &schema,
+        };
+        let mut hits: Vec<RowHit> = Vec::new();
+        for ci in 0..num_chunks {
             cx.check_deadline()?;
             let chunk = t.scan_chunk(ci).ok_or_else(|| {
                 PinkDbError::Execution("storage changed during MERGE".to_string())
             })?;
-            for row in 0..chunk.num_rows() {
+            let rows = chunk.num_rows();
+            let reachable = zones.is_empty()
+                || zones.iter().all(|(col, zone)| {
+                    let own = t.zone(*col, ci);
+                    own.may_match(rows as u64, PruneOp::GtEq, zone.min.as_ref())
+                        && own.may_match(rows as u64, PruneOp::LtEq, zone.max.as_ref())
+                });
+            if !reachable {
+                continue;
+            }
+            hits.clear();
+            hits.extend((0..rows).map(|_| RowHit::default()));
+            let probe_keys = match &index {
+                Some(index) => Some(index.probe_keys(&cx, &chunk)?),
+                None => None,
+            };
+            let mut batch: Vec<(u32, u32, u32)> = Vec::with_capacity(CHUNK_SIZE);
+            // A batch is one joined chunk, so it is full at `CHUNK_SIZE`: a
+            // target row with more candidates than that splits across batches,
+            // its `hits` carrying the earlier batches' matches.
+            let flush = |batch: &mut Vec<(u32, u32, u32)>,
+                         hits: &mut [RowHit],
+                         source_matched: &mut [bool]|
+             -> Result<()> {
                 budget.check_deadline()?;
-                // Every source row whose ON holds for this target row.
-                let mut hits: Vec<usize> = Vec::new();
-                match &index {
-                    Some(index) => {
-                        for (sc, sr) in index.probe(&cx, &chunk, row, &mut buf)? {
-                            let si = src_starts[sc as usize] + sr as usize;
-                            let joined = join_chunk(
-                                &src_chunks[sc as usize],
-                                sr as usize,
-                                &chunk,
-                                row,
-                                &src_types,
-                                &schema,
-                            )?;
-                            if is_true(&eval_expr(on, &joined, &cx)?, 0)? {
-                                hits.push(si);
-                                source_matched[si] = true;
+                ctx.match_batch(&chunk, batch, hits, source_matched, &src_starts)?;
+                batch.clear();
+                Ok(())
+            };
+            for row in 0..rows {
+                budget.check_deadline()?;
+                match (&index, &probe_keys) {
+                    (Some(index), Some(probe_keys)) => {
+                        for (sc, sr) in index.matches(probe_keys, row) {
+                            batch.push((row as u32, sc, sr));
+                            if batch.len() == CHUNK_SIZE {
+                                flush(&mut batch, &mut hits, &mut source_matched)?;
                             }
                         }
                     }
-                    None => {
-                        for (si, &(sc, sr)) in src_rows.iter().enumerate() {
-                            let joined =
-                                join_chunk(&src_chunks[sc], sr, &chunk, row, &src_types, &schema)?;
-                            if is_true(&eval_expr(on, &joined, &cx)?, 0)? {
-                                hits.push(si);
-                                source_matched[si] = true;
+                    // No equality between the source and the target: every pair
+                    // is a candidate.
+                    _ => {
+                        for &(sc, sr) in &src_rows {
+                            batch.push((row as u32, sc as u32, sr as u32));
+                            if batch.len() == CHUNK_SIZE {
+                                flush(&mut batch, &mut hits, &mut source_matched)?;
                             }
                         }
                     }
                 }
-                if hits.is_empty() {
-                    let joined = join_chunk_null_source(&chunk, row, &src_types, &schema)?;
-                    let Some(clause) =
-                        first_clause(clauses, MergeMatch::NotMatchedBySource, &cx, &joined)?
-                    else {
-                        continue;
-                    };
-                    match &clause.action {
-                        MergeActionPlan::Delete => drops[ci].push(row),
-                        MergeActionPlan::Update { sets } => {
-                            let old = images[ci][row].clone();
-                            let new = eval_sets(&cx, sets, &joined, src_types.len())?;
-                            stage_update(
-                                t,
-                                &mut keys,
-                                &mut images,
-                                &mut updates,
-                                ci,
-                                row,
-                                old,
-                                new,
-                            )?;
-                        }
-                        MergeActionPlan::Insert { .. } => {
-                            return Err(PinkDbError::Execution(
-                                "MERGE: WHEN NOT MATCHED BY SOURCE cannot INSERT".to_string(),
-                            ));
-                        }
-                    }
+            }
+            if !batch.is_empty() {
+                flush(&mut batch, &mut hits, &mut source_matched)?;
+            }
+            // Every row of the chunk resolved before any of it is staged.
+            for action in ctx.resolve_chunk(&chunk, &hits)? {
+                let row = action.row;
+                if matches!(clauses[action.clause].action, MergeActionPlan::Delete) {
+                    drops[ci].push(row);
                     continue;
                 }
-                // First clause (in written order) that any matching source row
-                // satisfies; two source rows for the same target row is an
-                // error, as in DuckDB.
-                let mut applied = None;
-                for clause in clauses.iter().filter(|c| c.matched == MergeMatch::Matched) {
-                    for &si in &hits {
-                        let (sc, sr) = src_rows[si];
-                        let joined =
-                            join_chunk(&src_chunks[sc], sr, &chunk, row, &src_types, &schema)?;
-                        if clause_holds(clause, &cx, &joined)? {
-                            if applied.is_some() {
-                                return Err(duplicate_match());
-                            }
-                            applied = Some((clause, joined));
-                        }
-                    }
-                    if applied.is_some() {
-                        break;
-                    }
+                // An update: its new key must not collide with another row, and
+                // only the columns whose value changed are written (a same-value
+                // first column when none did, so the row still counts and fires
+                // triggers, as `apply` stages it).
+                let old = row_values(&chunk, row);
+                let new = action.image.expect("a resolved update carries its image");
+                if let Some(keys) = &mut keys {
+                    let id = RowId::new(ci, row);
+                    keys.release(&old);
+                    keys.check(&new, t, Some(id))?;
+                    keys.reserve(&new, id);
                 }
-                let Some((clause, joined)) = applied else {
-                    continue;
-                };
-                match &clause.action {
-                    MergeActionPlan::Delete => drops[ci].push(row),
-                    MergeActionPlan::Update { sets } => {
-                        let old = images[ci][row].clone();
-                        let new = eval_sets(&cx, sets, &joined, src_types.len())?;
-                        stage_update(t, &mut keys, &mut images, &mut updates, ci, row, old, new)?;
-                    }
-                    MergeActionPlan::Insert { .. } => {
+                let mut writes: Vec<(usize, usize, Value)> = old
+                    .iter()
+                    .zip(new.iter())
+                    .enumerate()
+                    .filter(|(_, (o, n))| o != n)
+                    .map(|(col, (_, n))| (col, row, n.clone()))
+                    .collect();
+                if writes.is_empty() {
+                    writes.push((0, row, new[0].clone()));
+                }
+                per_chunk[ci].extend(writes);
+                updated += 1;
+            }
+        }
+        // Source rows no target row matched: `WHEN NOT MATCHED` inserts them,
+        // their values evaluated a batch at a time against NULL target columns.
+        let mut open: Vec<u32> = (0..src_rows.len() as u32)
+            .filter(|i| !source_matched[*i as usize])
+            .collect();
+        for clause in clauses
+            .iter()
+            .filter(|c| c.matched == MergeMatch::NotMatched)
+        {
+            if open.is_empty() {
+                break;
+            }
+            let mut kept: Vec<u32> = Vec::new();
+            for batch in open.chunks(CHUNK_SIZE) {
+                cx.check_deadline()?;
+                let picks: Vec<(u32, u32)> = batch
+                    .iter()
+                    .map(|&i| {
+                        let (sc, sr) = src_rows[i as usize];
+                        (sc as u32, sr as u32)
+                    })
+                    .collect();
+                let joined = ctx.joined(&picks, None)?;
+                let mut sel = all_rows(batch.len());
+                if let Some(condition) = &clause.condition {
+                    select_rows(condition, &joined, &cx, &mut sel)?;
+                }
+                if !sel.is_empty() {
+                    let MergeActionPlan::Insert { columns, values } = &clause.action else {
                         return Err(PinkDbError::Execution(
-                            "MERGE: WHEN MATCHED cannot INSERT".to_string(),
+                            "MERGE: WHEN NOT MATCHED must INSERT".to_string(),
                         ));
+                    };
+                    // One evaluation per value expression for the batch.
+                    let taken = joined.take(&sel);
+                    let mut evaluated: Vec<Vector> = Vec::with_capacity(values.len());
+                    for value in values {
+                        evaluated.push(eval_expr(value, &taken, &cx)?);
+                    }
+                    for row in 0..taken.num_rows() {
+                        let mut image = defaults.clone();
+                        for (col, value) in columns.iter().zip(&evaluated) {
+                            image[*col] = DataTable::coerce(value.get(row), schema[*col].1)?;
+                        }
+                        if let Some(keys) = &mut keys {
+                            keys.check(&image, t, None)?;
+                            keys.reserve(&image, next_id);
+                            advance_id(&mut next_id);
+                        }
+                        inserts.push(image);
                     }
                 }
+                if sel.len() < batch.len() {
+                    let mut taken = vec![false; batch.len()];
+                    for &k in &sel {
+                        taken[k as usize] = true;
+                    }
+                    kept.extend(
+                        batch
+                            .iter()
+                            .zip(taken)
+                            .filter(|(_, taken)| !taken)
+                            .map(|(&i, _)| i),
+                    );
+                }
             }
+            open = kept;
         }
-        // Source rows no target row matched: WHEN NOT MATCHED inserts them.
-        let null_target = vec![Value::Null; schema.len()];
-        for (si, &(sc, sr)) in src_rows.iter().enumerate() {
-            if source_matched[si] {
-                continue;
-            }
-            let src_row = row_values(&src_chunks[sc], sr);
-            let joined = pair_chunk(&src_row, &null_target, &src_types, &schema)?;
-            let Some(clause) = first_clause(clauses, MergeMatch::NotMatched, &cx, &joined)? else {
-                continue;
-            };
-            let MergeActionPlan::Insert { columns, values } = &clause.action else {
-                return Err(PinkDbError::Execution(
-                    "MERGE: WHEN NOT MATCHED must INSERT".to_string(),
-                ));
-            };
-            let mut image = defaults.clone();
-            for (col, value) in columns.iter().zip(values.iter()) {
-                image[*col] =
-                    DataTable::coerce(eval_expr(value, &joined, &cx)?.get(0), schema[*col].1)?;
-            }
-            keys.check(&image, t, None)?;
-            let id = append_id(&images);
-            keys.reserve(&image, id);
-            push_image(&mut images, image.clone());
-            inserts.push(image);
-        }
-    }
-    // Apply updates in place, then deletes (highest row first within each
-    // chunk, so the staged ids stay valid), then appends.
-    let updated = updates.len();
+        (per_chunk, drops, inserts, updated)
+    };
+    // Updates in place, then appends, then deletes (highest row first within
+    // each chunk, so the staged ids stay valid).
     let inserted = inserts.len();
-    let mut ops: Vec<Op> = updates
-        .into_iter()
-        .map(|(id, new)| Op::Update(id, new))
-        .collect();
-    ops.extend((0..inserts.len()).map(Op::Insert));
-    apply(db, target_db, table, ops, &inserts, budget)?;
+    if per_chunk.iter().any(|writes| !writes.is_empty()) {
+        crate::trigger::update_rows(db, target_db, table, per_chunk, budget)?;
+    }
+    if !inserts.is_empty() {
+        crate::trigger::insert_rows(db, target_db, table, inserts, budget)?;
+    }
     let deleted = if drops.iter().all(|d| d.is_empty()) {
         0
     } else {
         crate::trigger::delete_rows(db, target_db, table, drops, budget)?
     };
     Ok((inserted, updated, deleted))
+}
+
+/// What every batch of one `MERGE` is evaluated against.
+struct MergeCtx<'a, 'db> {
+    cx: &'a Cx<'db>,
+    on: &'a BoundExpr,
+    clauses: &'a [MergeClausePlan],
+    /// Indices of the `WHEN MATCHED` clauses, in written order.
+    matched: &'a [usize],
+    /// Source columns by column, then by source chunk, for the gathers.
+    src_cols: &'a [Vec<&'a Vector>],
+    src_types: &'a [DataType],
+    schema: &'a [(String, DataType)],
+}
+
+impl MergeCtx<'_, '_> {
+    /// `[source…, target…]` over `picks` (`(source chunk, source row)` pairs)
+    /// and `target`'s rows (`(chunk, rows)`); `None` leaves the target side all
+    /// NULL, as `WHEN NOT MATCHED` sees it. A [`GATHER_NULL`] pick is a NULL
+    /// source row, as `WHEN NOT MATCHED BY SOURCE` sees it.
+    fn joined(
+        &self,
+        picks: &[(u32, u32)],
+        target: Option<(&DataChunk, &[u32])>,
+    ) -> Result<DataChunk> {
+        let rows = picks.len();
+        let mut cols: Vec<Vector> = self
+            .src_cols
+            .iter()
+            .zip(self.src_types)
+            .map(|(sources, dtype)| Vector::gather_located(*dtype, sources, picks))
+            .collect();
+        match target {
+            Some((chunk, target_rows)) => {
+                for col in 0..self.schema.len() {
+                    cols.push(chunk.column(col).take(target_rows));
+                }
+            }
+            None => {
+                for (_, dtype) in self.schema {
+                    let mut col = Vector::with_capacity(*dtype, rows);
+                    for _ in 0..rows {
+                        col.push_null()?;
+                    }
+                    cols.push(col);
+                }
+            }
+        }
+        DataChunk::new(cols)
+    }
+
+    /// Match one batch of `(target row, source chunk, source row)` candidates:
+    /// the `ON` over the whole batch, then the `WHEN MATCHED` conditions over
+    /// the rows still without a clause. Each target row keeps the earliest
+    /// clause (written order) one of its candidates satisfied.
+    fn match_batch(
+        &self,
+        chunk: &DataChunk,
+        batch: &[(u32, u32, u32)],
+        hits: &mut [RowHit],
+        source_matched: &mut [bool],
+        src_starts: &[usize],
+    ) -> Result<()> {
+        let picks: Vec<(u32, u32)> = batch.iter().map(|&(_, sc, sr)| (sc, sr)).collect();
+        let target_rows: Vec<u32> = batch.iter().map(|&(row, _, _)| row).collect();
+        let joined = self.joined(&picks, Some((chunk, &target_rows)))?;
+        let mut sel = all_rows(batch.len());
+        select_rows(self.on, &joined, self.cx, &mut sel)?;
+        for &k in &sel {
+            let (row, sc, sr) = batch[k as usize];
+            hits[row as usize].on = true;
+            source_matched[src_starts[sc as usize] + sr as usize] = true;
+        }
+        // A row an earlier clause resolved does not look at a later one: its
+        // condition stays unevaluated for that row, as in a per-row pass.
+        let mut resolved = vec![false; batch.len()];
+        for &clause in self.matched {
+            let mut taken: Vec<u32> = sel
+                .iter()
+                .copied()
+                .filter(|k| !resolved[*k as usize])
+                .collect();
+            if taken.is_empty() {
+                break;
+            }
+            if let Some(condition) = &self.clauses[clause].condition {
+                select_rows(condition, &joined, self.cx, &mut taken)?;
+            }
+            for &k in &taken {
+                resolved[k as usize] = true;
+                let (row, sc, sr) = batch[k as usize];
+                let hit = &mut hits[row as usize];
+                match hit.clause {
+                    Some(earlier) if earlier < clause => {}
+                    Some(earlier) if earlier == clause => hit.count += 1,
+                    _ => {
+                        hit.clause = Some(clause);
+                        hit.count = 1;
+                        hit.cand = (sc, sr);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve one target chunk's rows into the actions to stage: the duplicate
+    /// match, the earliest satisfied clause per row, and every `SET` image,
+    /// evaluated a clause at a time over batched joined chunks.
+    fn resolve_chunk(&self, chunk: &DataChunk, hits: &[RowHit]) -> Result<Vec<Action>> {
+        let rows = chunk.num_rows();
+        for hit in hits {
+            if hit.count > 1 {
+                return Err(duplicate_match());
+            }
+            if let Some(clause) = hit.clause
+                && matches!(self.clauses[clause].action, MergeActionPlan::Insert { .. })
+            {
+                return Err(PinkDbError::Execution(
+                    "MERGE: WHEN MATCHED cannot INSERT".to_string(),
+                ));
+            }
+        }
+        let mut images: Vec<Option<Vec<Value>>> = vec![None; rows];
+        for &clause in self.matched {
+            let MergeActionPlan::Update { sets } = &self.clauses[clause].action else {
+                continue;
+            };
+            let rows_of: Vec<u32> = (0..rows)
+                .filter(|row| hits[*row].clause == Some(clause))
+                .map(|row| row as u32)
+                .collect();
+            for batch in rows_of.chunks(CHUNK_SIZE) {
+                let picks: Vec<(u32, u32)> = batch.iter().map(|&r| hits[r as usize].cand).collect();
+                let joined = self.joined(&picks, Some((chunk, batch)))?;
+                let new = eval_sets_batch(self.cx, sets, &joined, self.src_types.len())?;
+                for (&row, image) in batch.iter().zip(new) {
+                    images[row as usize] = Some(image);
+                }
+            }
+        }
+        let mut actions: Vec<Action> = (0..rows)
+            .filter_map(|row| {
+                hits[row].clause.map(|clause| Action {
+                    row,
+                    clause,
+                    image: images[row].take(),
+                })
+            })
+            .collect();
+        // `WHEN NOT MATCHED BY SOURCE`: the rows no `ON` matched, clause by
+        // clause, over NULL source columns.
+        let by_source: Vec<usize> = self
+            .clauses
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.matched == MergeMatch::NotMatchedBySource)
+            .map(|(i, _)| i)
+            .collect();
+        let mut open: Vec<u32> = (0..rows as u32)
+            .filter(|row| !hits[*row as usize].on)
+            .collect();
+        for &clause in &by_source {
+            if open.is_empty() {
+                break;
+            }
+            let mut kept: Vec<u32> = Vec::new();
+            for batch in open.chunks(CHUNK_SIZE) {
+                let null_picks = vec![(GATHER_NULL, 0u32); batch.len()];
+                let joined = self.joined(&null_picks, Some((chunk, batch)))?;
+                let mut sel = all_rows(batch.len());
+                if let Some(condition) = &self.clauses[clause].condition {
+                    select_rows(condition, &joined, self.cx, &mut sel)?;
+                }
+                match &self.clauses[clause].action {
+                    MergeActionPlan::Delete => {
+                        for &k in &sel {
+                            let row = batch[k as usize] as usize;
+                            actions.push(Action {
+                                row,
+                                clause,
+                                image: None,
+                            });
+                        }
+                    }
+                    MergeActionPlan::Update { sets } => {
+                        if !sel.is_empty() {
+                            let picked = joined.take(&sel);
+                            let new =
+                                eval_sets_batch(self.cx, sets, &picked, self.src_types.len())?;
+                            for (&k, image) in sel.iter().zip(new) {
+                                actions.push(Action {
+                                    row: batch[k as usize] as usize,
+                                    clause,
+                                    image: Some(image),
+                                });
+                            }
+                        }
+                    }
+                    MergeActionPlan::Insert { .. } => {
+                        if !sel.is_empty() {
+                            return Err(PinkDbError::Execution(
+                                "MERGE: WHEN NOT MATCHED BY SOURCE cannot INSERT".to_string(),
+                            ));
+                        }
+                    }
+                }
+                if sel.len() < batch.len() {
+                    let mut taken = vec![false; batch.len()];
+                    for &k in &sel {
+                        taken[k as usize] = true;
+                    }
+                    kept.extend(
+                        batch
+                            .iter()
+                            .zip(taken)
+                            .filter(|(_, taken)| !taken)
+                            .map(|(&row, _)| row),
+                    );
+                }
+            }
+            open = kept;
+        }
+        // Row order, so staging follows the same order a per-row pass did.
+        actions.sort_by_key(|action| action.row);
+        Ok(actions)
+    }
+}
+
+/// One target row's resolved `MERGE` action.
+struct Action {
+    row: usize,
+    clause: usize,
+    /// The staged image of an update: the row with its `SET` values applied.
+    image: Option<Vec<Value>>,
+}
+
+/// One target row's match state while its chunk's candidates are probed.
+#[derive(Default)]
+struct RowHit {
+    /// Some candidate's `ON` held: the row is not a `WHEN NOT MATCHED BY
+    /// SOURCE` candidate.
+    on: bool,
+    /// The earliest clause (written order) one of its candidates satisfied.
+    clause: Option<usize>,
+    /// How many candidates satisfied `clause`: two is the duplicate match.
+    count: usize,
+    /// `(source chunk, source row)` of the first such candidate.
+    cand: (u32, u32),
+}
+
+/// Narrow `sel` to the rows of `chunk` where `expr` is TRUE, keeping the DML
+/// wording for a condition that is not `BOOLEAN`.
+fn select_rows(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx, sel: &mut Vec<u32>) -> Result<()> {
+    if expr.dtype() != DataType::Boolean {
+        return Err(PinkDbError::Type(
+            "DML condition needs a BOOLEAN expression".to_string(),
+        ));
+    }
+    super::expr::select_predicate(expr, chunk, cx, sel)
+}
+
+/// Evaluate `SET` expressions over every row of `joined` and return the new
+/// target images, which start at column `base` (the source width for `MERGE`).
+fn eval_sets_batch(
+    cx: &Cx,
+    sets: &[(usize, BoundExpr)],
+    joined: &DataChunk,
+    base: usize,
+) -> Result<Vec<Vec<Value>>> {
+    let width = joined.num_cols() - base;
+    let mut out: Vec<Vec<Value>> = (0..joined.num_rows())
+        .map(|row| {
+            (0..width)
+                .map(|i| joined.columns[base + i].get(row))
+                .collect()
+        })
+        .collect();
+    for (col, expr) in sets {
+        let values = eval_expr(expr, joined, cx)?;
+        for (row, image) in out.iter_mut().enumerate() {
+            image[*col] = values.get(row);
+        }
+    }
+    Ok(out)
 }
 
 fn duplicate_match() -> PinkDbError {
@@ -623,48 +1003,6 @@ fn apply(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn stage_update(
-    t: &DataTable,
-    keys: &mut KeySpace,
-    images: &mut [Vec<Vec<Value>>],
-    updates: &mut Vec<(RowId, Vec<Value>)>,
-    chunk: usize,
-    row: usize,
-    old: Vec<Value>,
-    new: Vec<Value>,
-) -> Result<()> {
-    let id = RowId::new(chunk, row);
-    keys.release(&old);
-    keys.check(&new, t, Some(id))?;
-    keys.reserve(&new, id);
-    images[chunk][row] = new.clone();
-    updates.push((id, new));
-    Ok(())
-}
-
-/// The first clause of `kind` whose `AND` condition holds for `joined`.
-fn first_clause<'a>(
-    clauses: &'a [MergeClausePlan],
-    kind: MergeMatch,
-    cx: &Cx,
-    joined: &DataChunk,
-) -> Result<Option<&'a MergeClausePlan>> {
-    for clause in clauses.iter().filter(|c| c.matched == kind) {
-        if clause_holds(clause, cx, joined)? {
-            return Ok(Some(clause));
-        }
-    }
-    Ok(None)
-}
-
-fn clause_holds(clause: &MergeClausePlan, cx: &Cx, joined: &DataChunk) -> Result<bool> {
-    match &clause.condition {
-        Some(c) => is_true(&eval_expr(c, joined, cx)?, 0),
-        None => Ok(true),
-    }
-}
-
 /// Evaluate `SET` expressions over `joined` and return the new target image,
 /// which starts at column `base` (`0` for ON CONFLICT's
 /// `[existing, excluded]`, the source width for MERGE's `[source, target]`).
@@ -688,36 +1026,27 @@ fn schema_types(t: &DataTable) -> Vec<DataType> {
     t.schema().into_iter().map(|(_, ty)| ty).collect()
 }
 
-fn snapshot(t: &DataTable) -> Vec<Vec<Vec<Value>>> {
-    let mut out = Vec::with_capacity(t.num_chunks());
-    for ci in 0..t.num_chunks() {
-        let Some(chunk) = t.scan_chunk(ci) else {
-            continue;
-        };
-        out.push(
-            (0..chunk.num_rows())
-                .map(|r| chunk.columns.iter().map(|c| c.get(r)).collect())
-                .collect(),
-        );
-    }
-    out
-}
-
-fn append_id(images: &[Vec<Vec<Value>>]) -> RowId {
-    let Some(last) = images.last() else {
+/// The id `append_row` gives the next row: the last chunk while it has room,
+/// otherwise a new one.
+fn append_id(t: &DataTable) -> RowId {
+    let chunks = t.num_chunks();
+    if chunks == 0 {
         return RowId::new(0, 0);
-    };
-    if last.len() >= CHUNK_SIZE {
-        RowId::new(images.len(), 0)
+    }
+    let tail = chunks - 1;
+    let len = t.scan_chunk(tail).map(|c| c.num_rows()).unwrap_or(0);
+    if len >= CHUNK_SIZE {
+        RowId::new(tail + 1, 0)
     } else {
-        RowId::new(images.len() - 1, last.len())
+        RowId::new(tail, len)
     }
 }
 
-fn push_image(images: &mut Vec<Vec<Vec<Value>>>, values: Vec<Value>) {
-    match images.last_mut() {
-        Some(last) if last.len() < CHUNK_SIZE => last.push(values),
-        _ => images.push(vec![values]),
+fn advance_id(id: &mut RowId) {
+    id.row += 1;
+    if id.row == CHUNK_SIZE {
+        id.row = 0;
+        id.chunk += 1;
     }
 }
 
@@ -746,24 +1075,6 @@ fn join_chunk(
     let mut cols = Vec::with_capacity(src.columns.len() + target.columns.len());
     for (v, t) in src.columns.iter().zip(src_types.iter()) {
         cols.push(single(*t, v.get(src_row))?);
-    }
-    for (v, (_, t)) in target.columns.iter().zip(target_types.iter()) {
-        cols.push(single(*t, v.get(target_row))?);
-    }
-    DataChunk::new(cols)
-}
-
-fn join_chunk_null_source(
-    target: &DataChunk,
-    target_row: usize,
-    src_types: &[DataType],
-    target_types: &[(String, DataType)],
-) -> Result<DataChunk> {
-    let mut cols = Vec::with_capacity(src_types.len() + target_types.len());
-    for t in src_types {
-        let mut col = Vector::with_capacity(*t, 1);
-        col.push_null()?;
-        cols.push(col);
     }
     for (v, (_, t)) in target.columns.iter().zip(target_types.iter()) {
         cols.push(single(*t, v.get(target_row))?);
