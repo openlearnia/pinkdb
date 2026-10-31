@@ -1628,8 +1628,8 @@ func TestStmtRBACKinds(t *testing.T) {
 	}{
 		{"CREATE USER alice PASSWORD 'secret'", "created_user", "alice"},
 		{"CREATE ROLE analyst", "created_role", "analyst"},
-		{"GRANT SELECT ON TABLE t TO alice", "granted", "SELECT ON TABLE main.t TO alice"},
-		{"REVOKE SELECT ON TABLE t FROM alice", "revoked", "SELECT ON TABLE main.t TO alice"},
+		{"GRANT SELECT ON TABLE t TO alice", "granted", "SELECT ON TABLE main.main.t TO alice"},
+		{"REVOKE SELECT ON TABLE t FROM alice", "revoked", "SELECT ON TABLE main.main.t TO alice"},
 		{"ALTER USER alice PASSWORD 'rotated'", "altered_user", "alice"},
 		{"DROP ROLE analyst", "dropped_role", "analyst"},
 		{"DROP USER alice", "dropped_user", "alice"},

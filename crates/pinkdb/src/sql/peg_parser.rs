@@ -1018,6 +1018,7 @@ fn pivot_select(
     tail: QueryTail,
 ) -> Select {
     let call = |name: &str, args: Vec<Expr>| Expr::Function {
+        qual: Box::new(Qualifier::none()),
         name: name.to_string(),
         args,
         distinct: false,
@@ -1055,10 +1056,10 @@ fn pivot_select(
 }
 
 /// `TABLE t` — `SELECT * FROM t` with the same trailing clauses.
-fn table_select(db: Option<String>, name: String, tail: QueryTail) -> Select {
+fn table_select(qual: crate::sql::ast::Qualifier, name: String, tail: QueryTail) -> Select {
     Select {
         from: Some(FromClause {
-            source: FromSource::Table { db, name },
+            source: FromSource::Table { qual, name },
             alias: None,
             col_aliases: None,
             at: None,
@@ -1139,6 +1140,7 @@ fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
             Some(escape) => negate_if(
                 negated,
                 Expr::Function {
+                    qual: Box::new(Qualifier::none()),
                     name: "like_escape".to_string(),
                     args: vec![left, right, escape],
                     distinct: false,
@@ -1149,6 +1151,7 @@ fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
         CmpTail::SimilarTo { negated, right } => negate_if(
             negated,
             Expr::Function {
+                qual: Box::new(Qualifier::none()),
                 name: "similar_to".to_string(),
                 args: vec![left, right],
                 distinct: false,
@@ -1214,6 +1217,7 @@ fn array_of(
 
 fn row_ctor(args: Vec<Expr>) -> Expr {
     Expr::Function {
+        qual: Box::new(Qualifier::none()),
         name: "row".to_string(),
         args,
         distinct: false,
@@ -1576,8 +1580,15 @@ peg::parser! {
               }
             / { crate::types::RefreshPolicy::Manual }
 
+        /// `USE x` or `USE x.y`: one part names a database first, then a
+        /// schema of the current database (DuckDB's order, resolved at bind).
         rule use_stmt() -> Statement
-            = kw(Keyword::Use) name:ident() { Statement::Use { name } }
+            = kw(Keyword::Use) a:ident() dot() b:ident() {
+                  Statement::Use { qual: crate::sql::ast::Qualifier::both(&a, &b) }
+              }
+            / kw(Keyword::Use) name:ident() {
+                  Statement::Use { qual: crate::sql::ast::Qualifier::part(&name) }
+              }
 
         /// `ATTACH '<location>' AS <name> [(options)]` and `DETACH [DATABASE]
         /// [IF EXISTS] <name>` (wave 124). Words, not reserved keywords.
@@ -1630,7 +1641,7 @@ peg::parser! {
             / word("show") word("macros") { Statement::ShowMacros }
             / word("show") word("triggers") t:trigger_on_table()? {
                   Statement::ShowTriggers {
-                      db: t.as_ref().and_then(|t| t.0.clone()),
+                      qual: t.as_ref().map(|t| t.0.clone()).unwrap_or_default(),
                       table: t.map(|t| t.1),
                   }
               }
@@ -1639,9 +1650,9 @@ peg::parser! {
         /// <name>` (wave 77) reports one macro's function metadata.
         rule describe_stmt() -> Statement
             = word("describe") word("macro") t:table_ref() {
-                  Statement::DescribeMacro { db: t.0, name: t.1 }
+                  Statement::DescribeMacro { qual: t.0, name: t.1 }
               }
-            / word("describe") t:table_ref() { Statement::Describe { db: t.0, name: t.1 } }
+            / word("describe") t:table_ref() { Statement::Describe { qual: t.0, name: t.1 } }
 
         /// `EXPLAIN <query>` — the plain (optimized) plan text.
         /// `EXPLAIN <query | DML>`: what may appear inside is checked at
@@ -1666,12 +1677,12 @@ peg::parser! {
               /// `analyze` stays usable as a name.
               rule analyze_stmt() -> Statement
                   = word("analyze") word("table") t:table_ref() {
-                        Statement::Analyze { db: t.0, table: Some(t.1) }
+                        Statement::Analyze { qual: t.0, table: Some(t.1) }
                     }
                   / word("analyze") t:table_ref() {
-                        Statement::Analyze { db: t.0, table: Some(t.1) }
+                        Statement::Analyze { qual: t.0, table: Some(t.1) }
                     }
-                  / word("analyze") { Statement::Analyze { db: None, table: None } }
+                  / word("analyze") { Statement::Analyze { qual: crate::sql::ast::Qualifier::none(), table: None } }
 
               /// `REFRESH MATERIALIZED VIEWS` (wave 80: every view of the
               /// session database, all-or-nothing), `REFRESH MATERIALIZED
@@ -1679,10 +1690,10 @@ peg::parser! {
               rule refresh_stmt() -> Statement
               = word("refresh") word("materialized") word("views") { Statement::RefreshMaterializedViews }
               / word("refresh") word("materialized") kw(Keyword::View) t:table_ref() {
-                 Statement::RefreshMaterializedView { db: t.0, name: t.1 }
+                 Statement::RefreshMaterializedView { qual: t.0, name: t.1 }
               }
               / word("refresh") t:table_ref() {
-                 Statement::RefreshMaterializedView { db: t.0, name: t.1 }
+                 Statement::RefreshMaterializedView { qual: t.0, name: t.1 }
               }
 
         /// `LOAD EXTENSION '<path>'` — the path must be a string literal —
@@ -1727,7 +1738,13 @@ peg::parser! {
             / word("grant") privs:grant_priv_list() kw(Keyword::On) word("table") t:table_ref()
               word("to") principal:ident() {
                   Statement::Grant { target: crate::rbac::GrantTarget::Table {
-                      privs, db: t.0, table: t.1, principal,
+                      privs, qual: t.0, table: t.1, principal,
+                  } }
+              }
+            / word("grant") privs:grant_priv_list() kw(Keyword::On) word("schema") t:schema_ref()
+              word("to") principal:ident() {
+                  Statement::Grant { target: crate::rbac::GrantTarget::Schema {
+                      privs, qual: t.0, name: t.1, principal,
                   } }
               }
             / word("grant") privs:grant_priv_list() kw(Keyword::On) word("database") db:ident()
@@ -1748,7 +1765,13 @@ peg::parser! {
             / word("revoke") privs:grant_priv_list() kw(Keyword::On) word("table") t:table_ref()
               word("from") principal:ident() {
                   Statement::Revoke { target: crate::rbac::GrantTarget::Table {
-                      privs, db: t.0, table: t.1, principal,
+                      privs, qual: t.0, table: t.1, principal,
+                  } }
+              }
+            / word("revoke") privs:grant_priv_list() kw(Keyword::On) word("schema") t:schema_ref()
+              word("from") principal:ident() {
+                  Statement::Revoke { target: crate::rbac::GrantTarget::Schema {
+                      privs, qual: t.0, name: t.1, principal,
                   } }
               }
             / word("revoke") privs:grant_priv_list() kw(Keyword::On) word("database") db:ident()
@@ -1786,19 +1809,35 @@ peg::parser! {
             = word("password_hash") h:string_lit() { crate::rbac::PasswordSource::prehashed(h) }
             / word("password") p:string_lit() { crate::rbac::PasswordSource::plaintext(p) }
 
-        /// `name` or `db.name` — a table reference. Three-part names are
-        /// rejected as soon as the second dot appears, with a clear error
-        /// saying a *table* has at most two parts (this alternative reaches
-        /// furthest and wins, whatever follows the dot: `.col`, `.*`, or
-        /// nothing at all). Column references are a separate grammar rule and
-        /// accept three parts (wave 94).
-        rule table_ref() -> (Option<String>, String)
-            = _db:ident() dot() _t:ident() dot() {?
-                  Err("a table reference has at most two parts (database.table); \
-                       column references may be database.table.column")
+        /// `name`, `schema.name` or `catalog.schema.name` — a table reference.
+        /// A two-part name is ambiguous until bind: `x.t` may name a schema of
+        /// the session database or a database (`x.main.t`). Four parts is a
+        /// clear error (this alternative reaches furthest and wins, whatever
+        /// follows the dot: `.col`, `.*`, or nothing at all). Column
+        /// references are a separate rule and accept four parts.
+        rule table_ref() -> (crate::sql::ast::Qualifier, String)
+            = _a:ident() dot() _b:ident() dot() _c:ident() dot() {?
+                  Err("a table reference has at most three parts \
+                       (catalog.schema.table); column references may have \
+                       catalog.schema.table.column")
               }
-            / db:ident() dot() name:ident() { (Some(db), name) }
-            / name:ident() { (None, name) }
+            / c:ident() dot() s:ident() dot() name:ident() {
+                  (crate::sql::ast::Qualifier::both(&c, &s), name)
+              }
+            / s:ident() dot() name:ident() {
+                  (crate::sql::ast::Qualifier::part(&s), name)
+              }
+            / name:ident() { (crate::sql::ast::Qualifier::none(), name) }
+
+        /// `[db.]schema` for `CREATE/DROP SCHEMA` and `GRANT … ON SCHEMA`:
+        /// one part is a schema of the session database, two name its
+        /// database. The database rides in `catalog` so the binder does not
+        /// have to re-decide what the second part meant.
+        rule schema_ref() -> (crate::sql::ast::Qualifier, String)
+            = db:ident() dot() name:ident() {
+                  (crate::sql::ast::Qualifier::both(&db, &name), name)
+              }
+            / name:ident() { (crate::sql::ast::Qualifier::none(), name) }
 
         rule create() -> Statement
             = kw(Keyword::Create) word("user") ifne:if_not_exists() name:ident()
@@ -1807,6 +1846,9 @@ peg::parser! {
               }
             / kw(Keyword::Create) word("role") ifne:if_not_exists() name:ident() {
                   Statement::CreateRole { name, if_not_exists: ifne }
+              }
+            / kw(Keyword::Create) word("schema") ifne:if_not_exists() t:schema_ref() {
+                  Statement::CreateSchema { qual: t.0, name: t.1, if_not_exists: ifne }
               }
             / kw(Keyword::Create) kw(Keyword::Database) ifne:if_not_exists() name:ident()
               options:database_options()? {
@@ -1818,7 +1860,7 @@ peg::parser! {
                       return Err("USING is given twice");
                   }
                   Ok(Statement::CreateIndex {
-                      db: t.0,
+                      qual: t.0,
                       name,
                       table: t.1,
                       column: col,
@@ -1828,12 +1870,12 @@ peg::parser! {
                   })
               }
             / kw(Keyword::Create) word("materialized") kw(Keyword::View) ifne:if_not_exists() t:table_ref() policy:refresh_policy() kw(Keyword::As) query:select() {
-                  Statement::CreateMaterializedView { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne, policy }
+                  Statement::CreateMaterializedView { qual: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne, policy }
               }
             / kw(Keyword::Create) orr:or_replace() word("macro") ifne:if_not_exists() t:table_ref()
               params:macro_params() kw(Keyword::As) body:macro_body() {
                   Statement::CreateMacro {
-                      db: t.0,
+                      qual: t.0,
                       name: t.1,
                       params,
                       body,
@@ -1842,7 +1884,7 @@ peg::parser! {
                   }
               }
             / kw(Keyword::Create) orr:or_replace() kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
-                  Statement::CreateView { db: t.0, name: t.1, cols, query: Box::new(query), or_replace: orr }
+                  Statement::CreateView { qual: t.0, name: t.1, cols, query: Box::new(query), or_replace: orr }
               }
             / kw(Keyword::Create) or_replace() (word("temp") / word("temporary")) {?
                   Err("CREATE TEMP is not supported: pinkdb has no session-local temporary \
@@ -1852,7 +1894,7 @@ peg::parser! {
                   if orr && ifne {
                       return Err("OR REPLACE and IF NOT EXISTS cannot both be used");
                   }
-                  Ok(Statement::CreateTableAs { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne, or_replace: orr })
+                  Ok(Statement::CreateTableAs { qual: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne, or_replace: orr })
               }
             / kw(Keyword::Create) orr:or_replace() kw(Keyword::Table) ifne:if_not_exists() t:table_ref() lparen() first:table_item()
               rest:(comma() i:table_item() { i })* rparen() {?
@@ -1861,13 +1903,13 @@ peg::parser! {
                   }
                   let mut items = vec![first];
                   items.extend(rest);
-                  Ok(Statement::CreateTable { db: t.0, name: t.1, items, if_not_exists: ifne, or_replace: orr })
+                  Ok(Statement::CreateTable { qual: t.0, name: t.1, items, if_not_exists: ifne, or_replace: orr })
               }
             / kw(Keyword::Create) orr:or_replace() word("procedure") t:table_ref() params:proc_params()
               lang:procedure_language()? kw(Keyword::As) body:string_lit() lang2:procedure_language()? {
                   let language = lang.or(lang2).unwrap_or(crate::procedure::ProcLanguage::Sql);
                   Statement::CreateProcedure {
-                      db: t.0,
+                      qual: t.0,
                       name: t.1,
                       params,
                       language,
@@ -1883,7 +1925,7 @@ peg::parser! {
                   let (events, update_columns) = events;
                   let (old_table, new_table) = refer.unwrap_or((None, None));
                   Statement::CreateTrigger {
-                      db: t.0,
+                      qual: t.0,
                       name,
                       table: t.1,
                       timing,
@@ -1977,12 +2019,12 @@ peg::parser! {
         /// single statement the trigger runs directly.
         rule trigger_action() -> Statement
             = word("procedure") t:table_ref() args:call_args() {
-                  Statement::Call { db: t.0, name: t.1, args }
+                  Statement::Call { qual: t.0, name: t.1, args }
               }
             / s:statement() { s }
 
         /// The `ON <table>` of `DROP TRIGGER` / `SHOW TRIGGERS`.
-        rule trigger_on_table() -> (Option<String>, String)
+        rule trigger_on_table() -> (crate::sql::ast::Qualifier, String)
             = word("on") t:table_ref() { t }
 
         /// A macro's parameter list (wave 77): `(a, b := 10)` or `()`.
@@ -2039,7 +2081,7 @@ peg::parser! {
         /// table/column name.
         rule call_stmt() -> Statement
             = word("call") t:table_ref() args:call_args() {
-                  Statement::Call { db: t.0, name: t.1, args }
+                  Statement::Call { qual: t.0, name: t.1, args }
               }
 
         /// `DO '<body>'` / `DO $$ <body> $$` (wave 83): an anonymous procedural
@@ -2107,7 +2149,7 @@ peg::parser! {
             / kw(Keyword::Not) kw(Keyword::Null) { ColumnConstraintKind::NotNull }
             / word("references") t:table_ref() cols:col_name_list()? {
                   ColumnConstraintKind::References {
-                      ref_table: RefTable { db: t.0, name: t.1 },
+                      ref_table: RefTable { qual: t.0, name: t.1 },
                       ref_columns: cols,
                   }
               }
@@ -2150,7 +2192,7 @@ peg::parser! {
                   TableConstraint::ForeignKey {
                       name: None,
                       columns: cols,
-                      ref_table: RefTable { db: t.0, name: t.1 },
+                      ref_table: RefTable { qual: t.0, name: t.1 },
                       ref_columns: rcols,
                   }
               }
@@ -2204,13 +2246,13 @@ peg::parser! {
             = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? source:insert_source()
               oc:on_conflict()? ret:returning_clause() {
                   Statement::Insert {
-                      db: t.0, table: t.1, columns, source, on_conflict: oc, returning: ret,
+                      qual: t.0, table: t.1, columns, source, on_conflict: oc, returning: ret,
                   }
               }
             / kw(Keyword::Insert) word("or") mode:insert_or() kw(Keyword::Into) t:table_ref()
               columns:col_name_list()? source:insert_source() ret:returning_clause() {
                   Statement::Insert {
-                      db: t.0, table: t.1, columns, source,
+                      qual: t.0, table: t.1, columns, source,
                       on_conflict: Some(OnConflict { columns: None, action: mode }),
                       returning: ret,
                   }
@@ -2273,7 +2315,7 @@ peg::parser! {
                   let mut sets = vec![first];
                   sets.extend(rest);
                   Statement::Update {
-                      db: t.0, table: t.1, sets, where_clause: where_,
+                      qual: t.0, table: t.1, sets, where_clause: where_,
                       from: from.map(Box::new), returning: ret,
                   }
               }
@@ -2281,21 +2323,32 @@ peg::parser! {
         /// One `SET` target: `column`, `table.column` or `db.table.column`
         /// (wave 94); the binder checks a qualifier against the UPDATE target.
         rule set_item() -> (crate::sql::ast::SetTarget, Expr)
-            = db:ident() dot() t:ident() dot() c:ident() eq() e:expr() {
-                  (crate::sql::ast::SetTarget { db: Some(db), table: Some(t), column: c }, e)
+            = c:ident() dot() s:ident() dot() t:ident() dot() col:ident() eq() e:expr() {
+                  (crate::sql::ast::SetTarget {
+                      qual: crate::sql::ast::Qualifier::both(&c, &s), table: Some(t), column: col,
+                  }, e)
+              }
+            / s:ident() dot() t:ident() dot() c:ident() eq() e:expr() {
+                  (crate::sql::ast::SetTarget {
+                      qual: crate::sql::ast::Qualifier::part(&s), table: Some(t), column: c,
+                  }, e)
               }
             / t:ident() dot() c:ident() eq() e:expr() {
-                  (crate::sql::ast::SetTarget { db: None, table: Some(t), column: c }, e)
+                  (crate::sql::ast::SetTarget {
+                      qual: crate::sql::ast::Qualifier::none(), table: Some(t), column: c,
+                  }, e)
               }
             / c:ident() eq() e:expr() {
-                  (crate::sql::ast::SetTarget { db: None, table: None, column: c }, e)
+                  (crate::sql::ast::SetTarget {
+                      qual: crate::sql::ast::Qualifier::none(), table: None, column: c,
+                  }, e)
               }
 
         rule delete() -> Statement
             = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() alias:delete_alias()?
               using:delete_using()? where_:where_clause()? ret:returning_clause() {
                   Statement::Delete {
-                      db: t.0, table: t.1, alias, where_clause: where_,
+                      qual: t.0, table: t.1, alias, where_clause: where_,
                       using: using.map(Box::new), returning: ret,
                   }
               }
@@ -2324,7 +2377,7 @@ peg::parser! {
               using:merge_using() kw(Keyword::On) on:expr() clauses:merge_clause()+
               ret:returning_clause() {
                   Statement::Merge {
-                      db: t.0, table: t.1, alias, using, on, clauses, returning: ret,
+                      qual: t.0, table: t.1, alias, using, on, clauses, returning: ret,
                   }
               }
 
@@ -2393,7 +2446,7 @@ peg::parser! {
         /// time, DuckDB's rule.
         rule copy_stmt() -> Statement
             = word("copy") t:table_ref() word("to") p:string_lit() fmt:copy_format() {
-                  Statement::CopyTo { db: t.0, table: t.1, path: p, format: fmt }
+                  Statement::CopyTo { qual: t.0, table: t.1, path: p, format: fmt }
               }
 
         rule copy_format() -> Option<String>
@@ -2408,7 +2461,16 @@ peg::parser! {
             = s:ident_raw() ws() { s.to_ascii_lowercase() }
 
         rule drop() -> Statement
-            = kw(Keyword::Drop) kw(Keyword::Database) ife:if_exists() name:ident() {
+            = kw(Keyword::Drop) word("schema") ife:if_exists() t:schema_ref()
+              cascade:(word("cascade") { true } / word("restrict") { false })? {
+                  Statement::DropSchema {
+                      qual: t.0,
+                      name: t.1,
+                      if_exists: ife,
+                      cascade: cascade.unwrap_or(false),
+                  }
+              }
+            / kw(Keyword::Drop) kw(Keyword::Database) ife:if_exists() name:ident() {
                   Statement::DropDatabase { name, if_exists: ife }
               }
             / kw(Keyword::Drop) word("user") ife:if_exists() name:ident() {
@@ -2418,16 +2480,16 @@ peg::parser! {
                   Statement::DropRole { name, if_exists: ife }
               }
             / kw(Keyword::Drop) kw(Keyword::Table) ife:if_exists() t:table_ref() {
-                  Statement::DropTable { db: t.0, name: t.1, if_exists: ife }
+                  Statement::DropTable { qual: t.0, name: t.1, if_exists: ife }
               }
-            / kw(Keyword::Drop) kw(Keyword::Index) ife:if_exists() t:table_ref() { Statement::DropIndex { db: t.0, name: t.1, if_exists: ife } }
-            / kw(Keyword::Drop) word("materialized") kw(Keyword::View) ife:if_exists() t:table_ref() { Statement::DropMaterializedView { db: t.0, name: t.1, if_exists: ife } }
-            / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { db: t.0, name: t.1 } }
-            / kw(Keyword::Drop) word("procedure") ife:if_exists() t:table_ref() { Statement::DropProcedure { db: t.0, name: t.1, if_exists: ife } }
-            / kw(Keyword::Drop) word("macro") ife:if_exists() t:table_ref() { Statement::DropMacro { db: t.0, name: t.1, if_exists: ife } }
+            / kw(Keyword::Drop) kw(Keyword::Index) ife:if_exists() t:table_ref() { Statement::DropIndex { qual: t.0, name: t.1, if_exists: ife } }
+            / kw(Keyword::Drop) word("materialized") kw(Keyword::View) ife:if_exists() t:table_ref() { Statement::DropMaterializedView { qual: t.0, name: t.1, if_exists: ife } }
+            / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { qual: t.0, name: t.1 } }
+            / kw(Keyword::Drop) word("procedure") ife:if_exists() t:table_ref() { Statement::DropProcedure { qual: t.0, name: t.1, if_exists: ife } }
+            / kw(Keyword::Drop) word("macro") ife:if_exists() t:table_ref() { Statement::DropMacro { qual: t.0, name: t.1, if_exists: ife } }
             / kw(Keyword::Drop) word("trigger") ife:if_exists() name:ident() t:trigger_on_table()? {
                   Statement::DropTrigger {
-                      db: t.as_ref().and_then(|t| t.0.clone()),
+                      qual: t.as_ref().map(|t| t.0.clone()).unwrap_or_default(),
                       name,
                       table: t.map(|t| t.1),
                       if_exists: ife,
@@ -2441,7 +2503,7 @@ peg::parser! {
                   Statement::AlterUser { name, password: p }
               }
             / word("alter") kw(Keyword::Table) t:table_ref() op:alter_op() {
-                  Statement::AlterTable { db: t.0, name: t.1, op }
+                  Statement::AlterTable { qual: t.0, name: t.1, op }
               }
 
         rule alter_op() -> AlterTableOp
@@ -2620,11 +2682,20 @@ peg::parser! {
         /// expression (and refused below), not a star projection.
         rule projection() -> Projection
             = star() exclude:star_exclude() &star_end() { Projection::Star { exclude } }
-            / db:ident() dot() t:ident() dot() star() exclude:star_exclude() &star_end() {
-                  Projection::QualifiedStar { db: Some(db), table: t, exclude }
+            / c:ident() dot() s:ident() dot() t:ident() dot() star() exclude:star_exclude() &star_end() {
+                  Projection::QualifiedStar {
+                      qual: crate::sql::ast::Qualifier::both(&c, &s), table: t, exclude,
+                  }
+              }
+            / s:ident() dot() t:ident() dot() star() exclude:star_exclude() &star_end() {
+                  Projection::QualifiedStar {
+                      qual: crate::sql::ast::Qualifier::part(&s), table: t, exclude,
+                  }
               }
             / t:ident() dot() star() exclude:star_exclude() &star_end() {
-                  Projection::QualifiedStar { db: None, table: t, exclude }
+                  Projection::QualifiedStar {
+                      qual: crate::sql::ast::Qualifier::none(), table: t, exclude,
+                  }
               }
             / e:expr() alias:alias()? {?
                   if matches!(&e, Expr::Star | Expr::QualifiedStar { .. }) {
@@ -2714,15 +2785,18 @@ peg::parser! {
                   Err("a LATERAL table function is not supported: only LATERAL subqueries are")
               }
             / lparen() q:query() rparen() { (FromSource::Derived(Box::new(q)), false) }
+            / q:call_qualifier() name:ident() lparen() args:table_function_args() rparen() {
+                  (FromSource::Function { qual: q, name, args }, false)
+              }
             / name:ident() lparen() args:table_function_args() rparen() {
-                  (FromSource::Function { name, args }, false)
+                  (FromSource::Function { qual: Qualifier::none(), name, args }, false)
               }
             // `RANGE` is a keyword (window frames) and a table function.
             / kw(Keyword::Range) lparen() args:table_function_args() rparen() {
-                  (FromSource::Function { name: "range".to_string(), args }, false)
+                  (FromSource::Function { qual: Qualifier::none(), name: "range".to_string(), args }, false)
               }
             / s:string_lit() { (FromSource::Path(s), false) }
-            / t:table_ref() { (FromSource::Table { db: t.0, name: t.1 }, false) }
+            / t:table_ref() { (FromSource::Table { qual: t.0, name: t.1 }, false) }
 
         /// `TABLESAMPLE …` / `USING SAMPLE …` after a FROM/join source. Both
         /// spellings take the same body; `REPEATABLE (seed)` makes the sample
@@ -3113,6 +3187,7 @@ peg::parser! {
                       // scalar, DuckDB's desugaring (its column titles show
                       // `timezone('UTC', …)` too).
                       PostfixOp::AtTimeZone(zone) => Expr::Function {
+                          qual: Box::new(Qualifier::none()),
                           name: "timezone".to_string(),
                           args: vec![zone, expr],
                           distinct: false,
@@ -3180,7 +3255,7 @@ peg::parser! {
             = s:ident_raw() ws() !lparen() {?
                   let lower = s.to_ascii_lowercase();
                   if matches!(lower.as_str(), "current_timestamp" | "current_date" | "current_time") {
-                      Ok(Expr::Function { name: lower, args: Vec::new(), distinct: false, filter: None })
+                      Ok(Expr::Function { qual: Box::new(Qualifier::none()), name: lower, args: Vec::new(), distinct: false, filter: None })
                   } else {
                       Err("CURRENT_TIMESTAMP")
                   }
@@ -3197,6 +3272,7 @@ peg::parser! {
         rule dollar_name() -> Expr
             = "$" ws() name:ident_raw() ws() {
                   Expr::Function {
+                      qual: Box::new(Qualifier::none()),
                       name: format!("${name}"),
                       args: Vec::new(),
                       distinct: false,
@@ -3233,6 +3309,7 @@ peg::parser! {
         rule extract_call() -> Expr
             = extract_name() lparen() part:extract_part() kw(Keyword::From) e:expr() rparen() {
                   Expr::Function {
+                      qual: Box::new(Qualifier::none()),
                       name: "extract".to_string(),
                       args: vec![Expr::Literal(Value::Varchar(part)), e],
                       distinct: false,
@@ -3250,10 +3327,11 @@ peg::parser! {
               len:(word("for") l:expr() { l })? rparen() {
                   let mut args = vec![e, start];
                   args.extend(len);
-                  Expr::Function { name: "substring".to_string(), args, distinct: false, filter: None }
+                  Expr::Function { qual: Box::new(Qualifier::none()), name: "substring".to_string(), args, distinct: false, filter: None }
               }
             / word("substring") lparen() e:expr() word("for") l:expr() rparen() {
                   Expr::Function {
+                      qual: Box::new(Qualifier::none()),
                       name: "substring".to_string(),
                       args: vec![e, Expr::Literal(Value::Integer(1)), l],
                       distinct: false,
@@ -3347,32 +3425,64 @@ peg::parser! {
         rule ident_expr() -> Expr
             = coalesce_call()
             / fn_call()
-            / four_part_column()
-            / db:ident() dot() t:ident() dot() c:ident() {
-                  Expr::Column { db: Some(db), table: Some(t), name: c }
+            / qualified_fn_call()
+            / five_part_column()
+            / c:ident() dot() s:ident() dot() t:ident() dot() col:ident() {
+                  Expr::Column {
+                      qual: crate::sql::ast::Qualifier::both(&c, &s),
+                      table: Some(t),
+                      name: col,
+                  }
               }
-            / db:ident() dot() t:ident() dot() star() {
-                  Expr::QualifiedStar { db: Some(db), table: t }
+            / c:ident() dot() s:ident() dot() t:ident() dot() star() {
+                  Expr::QualifiedStar {
+                      qual: crate::sql::ast::Qualifier::both(&c, &s), table: t,
+                  }
+              }
+            / s:ident() dot() t:ident() dot() col:ident() {
+                  Expr::Column {
+                      qual: crate::sql::ast::Qualifier::part(&s),
+                      table: Some(t),
+                      name: col,
+                  }
+              }
+            / s:ident() dot() t:ident() dot() star() {
+                  Expr::QualifiedStar {
+                      qual: crate::sql::ast::Qualifier::part(&s), table: t,
+                  }
               }
             / name:ident() dot() col:ident() {
-                  Expr::Column { db: None, table: Some(name), name: col }
+                  Expr::Column {
+                      qual: crate::sql::ast::Qualifier::none(),
+                      table: Some(name),
+                      name: col,
+                  }
               }
             / name:ident() dot() star() {
-                  Expr::QualifiedStar { db: None, table: name }
+                  Expr::QualifiedStar {
+                      qual: crate::sql::ast::Qualifier::none(), table: name,
+                  }
               }
-            / name:ident() { Expr::Column { db: None, table: None, name } }
-
-        /// Four or more parts (`a.b.c.d`, `a.b.c.d.e`, …) are refused. The
-        /// grammar cannot carry a dynamic PEG error (the error type is
-        /// `&'static str`), so it produces a marked column node carrying the
-        /// written reference; [`super::check_ast_depth`] walks the tree and
-        /// turns the marker into a parse error that names it. This rule is
-        /// tried before the valid three-part form so its longer match wins.
-        rule four_part_column() -> Expr
-            = text:$(_a:ident() dot() _b:ident() dot() _c:ident() dot() _d:ident()
-                       (dot() _r:ident())*) {
+            / name:ident() {
                   Expr::Column {
-                      db: Some(crate::sql::FOUR_PART_MARKER.to_string()),
+                      qual: crate::sql::ast::Qualifier::none(), table: None, name,
+                  }
+              }
+
+        /// Five or more parts (`a.b.c.d.e`, …) are refused. The grammar
+        /// cannot carry a dynamic PEG error (the error type is `&'static str`),
+        /// so it produces a marked column node carrying the written reference;
+        /// [`super::check_ast_depth`] walks the tree and turns the marker into
+        /// a parse error that names it. This rule is tried before the valid
+        /// four-part form so its longer match wins.
+        rule five_part_column() -> Expr
+            = text:$(_a:ident() dot() _b:ident() dot() _c:ident() dot() _d:ident()
+                       dot() _e:ident() (dot() _r:ident())*) {
+                  Expr::Column {
+                      qual: crate::sql::ast::Qualifier {
+                          catalog: Some(crate::sql::FOUR_PART_MARKER.to_string()),
+                          schema: None,
+                      },
                       table: None,
                       // Identifiers consume trailing whitespace; name the
                       // reference as written, without it.
@@ -3427,10 +3537,35 @@ peg::parser! {
                       None => (name, args),
                   };
                   Ok(match over {
-                      Some(over) => Expr::Window { name, args, over, distinct, filter: filter.map(Box::new) },
-                      None => Expr::Function { name, args, distinct, filter: filter.map(Box::new) },
+                      Some(over) => Expr::Window { qual: Box::new(Qualifier::none()), name, args, over: Box::new(over), distinct, filter: filter.map(Box::new) },
+                      None => Expr::Function { qual: Box::new(Qualifier::none()), name, args, distinct, filter: filter.map(Box::new) },
                   })
               }
+
+        /// `s.f(...)` / `c.s.f(...)`: only a stored macro may be qualified,
+        /// resolved like a table name by the binder (DuckDB binds qualified
+        /// macro calls the same way). Kept after the bare call so ordinary
+        /// functions keep their fast path.
+        rule qualified_fn_call() -> Expr
+            = q:call_qualifier() name:non_coalesce_name() lparen() distinct:distinct_flag() args:fn_args() rparen()
+              filter:filter_clause()? within:within_group_clause()? after:filter_clause()? over:over_clause()? {?
+                  let filter = match (filter, after) {
+                      (Some(_), Some(_)) => return Err("write FILTER once"),
+                      (before, later) => before.or(later),
+                  };
+                  let (name, args) = match within {
+                      Some(items) => ordered_set_args(name, args, items)?,
+                      None => (name, args),
+                  };
+                  Ok(match over {
+                      Some(over) => Expr::Window { qual: Box::new(q), name, args, over: Box::new(over), distinct, filter: filter.map(Box::new) },
+                      None => Expr::Function { qual: Box::new(q), name, args, distinct, filter: filter.map(Box::new) },
+                  })
+              }
+
+        rule call_qualifier() -> Qualifier
+            = c:ident() dot() s:ident() dot() { Qualifier::both(&c, &s) }
+            / s:ident() dot() { Qualifier::part(&s) }
 
         /// `FILTER (WHERE cond)` after an aggregate call.
         rule filter_clause() -> Expr = word("filter") lparen() kw(Keyword::Where) e:expr() rparen() { e }
@@ -4580,12 +4715,8 @@ mod tests {
         "UPDATE db1.;",
         "DELETE FROM db1.;",
         "SELECT * FROM db1.;",
-        "SELECT * FROM db1.t.col;",
         "SELECT * FROM db1.t.*;",
         "SELECT a FROM db1.t.;",
-        "CREATE TABLE db1.t.col (a INTEGER);",
-        "CREATE VIEW db1.t.col AS SELECT 1;",
-        "SELECT a.b.c.d FROM a;",
         "DROP TABLE db1.;",
         "CREATE VIEW db1.;",
         "SELECT * FROM db1.t JOIN db2.u;",
@@ -5107,7 +5238,7 @@ mod tests {
                 ref_table,
                 ref_columns,
             } => {
-                assert_eq!(ref_table.db, None);
+                assert!(ref_table.qual.is_empty());
                 assert_eq!(ref_table.name, "u");
                 assert_eq!(ref_columns.as_deref(), Some(["x".to_string()].as_slice()));
             }
@@ -5296,7 +5427,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(name, "rank");
-                let OverSpec::Inline(over) = over else {
+                let OverSpec::Inline(over) = over.as_ref() else {
                     panic!("expected an inline window spec")
                 };
                 assert_eq!(over.partition.len(), 1);
@@ -5325,7 +5456,7 @@ mod tests {
                 expr: Expr::Window { over, .. },
                 ..
             } => {
-                let OverSpec::Inline(over) = over else {
+                let OverSpec::Inline(over) = over.as_ref() else {
                     panic!("expected an inline window spec")
                 };
                 let frame = over.frame.as_ref().expect("frame parsed");
@@ -5343,7 +5474,7 @@ mod tests {
                 expr: Expr::Window { over, .. },
                 ..
             } => {
-                let OverSpec::Inline(over) = over else {
+                let OverSpec::Inline(over) = over.as_ref() else {
                     panic!("expected an inline window spec")
                 };
                 let frame = over.frame.as_ref().expect("frame parsed");
@@ -5389,13 +5520,13 @@ mod tests {
     fn update_delete_shapes() {
         match parse_one("UPDATE t SET a = 1, b = a + 2 WHERE a > 0;") {
             Statement::Update {
-                db,
+                qual,
                 table,
                 sets,
                 where_clause,
                 ..
             } => {
-                assert_eq!(db, None);
+                assert!(qual.is_empty());
                 assert_eq!(table, "t");
                 assert_eq!(sets.len(), 2);
                 assert!(where_clause.is_some());
@@ -5403,20 +5534,20 @@ mod tests {
             _ => panic!(),
         }
         match parse_one("UPDATE db1.t SET a = 1;") {
-            Statement::Update { db, table, .. } => {
-                assert_eq!(db, Some("db1".to_string()));
+            Statement::Update { qual, table, .. } => {
+                assert_eq!(qual, Qualifier::part("db1"));
                 assert_eq!(table, "t");
             }
             _ => panic!(),
         }
         match parse_one("DELETE FROM t;") {
             Statement::Delete {
-                db,
+                qual,
                 table,
                 where_clause,
                 ..
             } => {
-                assert_eq!(db, None);
+                assert!(qual.is_empty());
                 assert_eq!(table, "t");
                 assert!(where_clause.is_none());
             }
@@ -5438,40 +5569,40 @@ mod tests {
         ));
         assert!(matches!(
             parse_one("USE analytics;"),
-            Statement::Use { name } if name == "analytics"
+            Statement::Use { qual } if qual.schema.as_deref() == Some("analytics")
         ));
         // Qualified DDL/DML.
         match parse_one("CREATE TABLE db1.t (a INTEGER);") {
-            Statement::CreateTable { db, name, .. } => {
-                assert_eq!(db, Some("db1".to_string()));
+            Statement::CreateTable { qual, name, .. } => {
+                assert_eq!(qual, Qualifier::part("db1"));
                 assert_eq!(name, "t");
             }
             _ => panic!(),
         }
         match parse_one("INSERT INTO db1.t VALUES (1);") {
-            Statement::Insert { db, table, .. } => {
-                assert_eq!(db, Some("db1".to_string()));
+            Statement::Insert { qual, table, .. } => {
+                assert_eq!(qual, Qualifier::part("db1"));
                 assert_eq!(table, "t");
             }
             _ => panic!(),
         }
         match parse_one("CREATE VIEW db1.v AS SELECT 1;") {
-            Statement::CreateView { db, name, .. } => {
-                assert_eq!(db, Some("db1".to_string()));
+            Statement::CreateView { qual, name, .. } => {
+                assert_eq!(qual, Qualifier::part("db1"));
                 assert_eq!(name, "v");
             }
             _ => panic!(),
         }
         match parse_one("DROP TABLE db1.t;") {
-            Statement::DropTable { db, name, .. } => {
-                assert_eq!(db, Some("db1".to_string()));
+            Statement::DropTable { qual, name, .. } => {
+                assert_eq!(qual, Qualifier::part("db1"));
                 assert_eq!(name, "t");
             }
             _ => panic!(),
         }
         match parse_one("DROP VIEW db1.v;") {
-            Statement::DropView { db, name } => {
-                assert_eq!(db, Some("db1".to_string()));
+            Statement::DropView { qual, name } => {
+                assert_eq!(qual, Qualifier::part("db1"));
                 assert_eq!(name, "v");
             }
             _ => panic!(),
@@ -5481,8 +5612,8 @@ mod tests {
             panic!()
         };
         match sel.from.unwrap().source {
-            FromSource::Table { db, name } => {
-                assert_eq!(db, Some("db1".to_string()));
+            FromSource::Table { qual, name } => {
+                assert_eq!(qual, Qualifier::part("db1"));
                 assert_eq!(name, "t");
             }
             other => panic!("{other:?}"),
@@ -5496,22 +5627,28 @@ mod tests {
             Projection::Expr {
                 expr:
                     Expr::Column {
-                        db: Some(db),
+                        qual,
                         table: Some(table),
                         name,
                     },
                 ..
             } => {
                 assert_eq!(
-                    (db.as_str(), table.as_str(), name.as_str()),
-                    ("db1", "t", "a")
+                    (
+                        qual.catalog.as_deref(),
+                        qual.schema.as_deref(),
+                        table.as_str(),
+                        name.as_str(),
+                    ),
+                    (None, Some("db1"), "t", "a")
                 );
             }
             other => panic!("{other:?}"),
         }
         assert!(matches!(
             &sel.projections[1],
-            Projection::QualifiedStar { db: Some(db), table, .. } if db == "db1" && table == "t"
+            Projection::QualifiedStar { qual, table, .. }
+                if qual.schema.as_deref() == Some("db1") && table == "t"
         ));
         let Statement::Select(sel) =
             parse_one("SELECT \"My Db\".\"t 1\".\"a b\" FROM \"My Db\".\"t 1\";")
@@ -5521,15 +5658,17 @@ mod tests {
         assert!(matches!(
             &sel.projections[0],
             Projection::Expr {
-                expr: Expr::Column { db: Some(db), table: Some(t), name },
+                expr: Expr::Column { qual, table: Some(t), name },
                 ..
-            } if db == "My Db" && t == "t 1" && name == "a b"
+            } if qual.schema.as_deref() == Some("My Db") && t == "t 1" && name == "a b"
         ));
-        // Four or more parts are refused with a clear message naming the
-        // written reference.
-        let e = parse("SELECT a.b.c.d FROM a;").unwrap_err().to_string();
-        assert!(e.contains("at most three parts"), "{e}");
-        assert!(e.contains("a.b.c.d"), "{e}");
+        // Four-part column references are `catalog.schema.table.column`.
+        assert!(matches!(
+            projection_expr(parse_one("SELECT a.b.c.d FROM a;")),
+            Expr::Column { qual, table: Some(t), name }
+                if qual == Qualifier::both("a", "b") && t == "c" && name == "d"
+        ));
+        // Five parts are refused with a clear message naming the reference.
         let e = parse("SELECT a.b.c.d.e FROM a;").unwrap_err().to_string();
         assert!(e.contains("a.b.c.d.e"), "{e}");
     }
@@ -5706,33 +5845,208 @@ mod tests {
             .collect();
         assert_eq!(names, ["select", "", "we\"ird"]);
         match sel.from.unwrap().source {
-            FromSource::Table { db: None, name } => assert_eq!(name, "tab le"),
+            FromSource::Table { qual, name } => {
+                assert!(qual.is_empty());
+                assert_eq!(name, "tab le");
+            }
             other => panic!("{other:?}"),
         }
         // A NUL inside a string literal is value data, not a name: accepted.
         assert_eq!(lit("SELECT 'a\0b';"), Value::Varchar("a\0b".to_string()));
     }
 
-    /// Three-part *table* names still fail with a clear message that no
-    /// longer claims column references are unsupported (wave 94).
+    /// Four-part table names fail with a clear message; three parts are
+    /// a catalog, schema and table (wave 131).
     #[test]
-    fn three_part_table_names_are_refused_clearly() {
+    fn four_part_table_names_are_refused_clearly() {
         let cases = [
-            "SELECT * FROM db1.t.*;",
-            "SELECT a FROM db1.t.;",
-            "CREATE TABLE db1.t.col (a INTEGER);",
-            "CREATE VIEW db1.t.col AS SELECT 1;",
+            "SELECT * FROM c.s.t.*;",
+            "SELECT a FROM c.s.t.;",
+            "CREATE TABLE c.s.t.col (a INTEGER);",
+            "CREATE VIEW c.s.t.col AS SELECT 1;",
         ];
         for sql in cases {
             let e = parse(sql).unwrap_err().to_string();
             assert!(
-                e.contains("a table reference has at most two parts (database.table)"),
+                e.contains("a table reference has at most three parts (catalog.schema.table)"),
                 "{sql}: {e}"
             );
-            assert!(
-                !e.contains("column references are not supported"),
-                "{sql}: {e}"
-            );
+        }
+        let Statement::Select(sel) = parse_one("SELECT * FROM c.s.t;") else {
+            panic!()
+        };
+        let FromSource::Table { qual, name } = sel.from.unwrap().source else {
+            panic!()
+        };
+        assert_eq!(qual, Qualifier::both("c", "s"));
+        assert_eq!(name, "t");
+    }
+
+    #[test]
+    fn qualified_function_calls_parse() {
+        for (sql, qual, name) in [
+            ("SELECT s.f(1);", Qualifier::part("s"), "f"),
+            ("SELECT c.s.f(1);", Qualifier::both("c", "s"), "f"),
+            (
+                "SELECT \"Odd db\".\"x\"\"y\".m(1);",
+                Qualifier::both("Odd db", "x\"y"),
+                "m",
+            ),
+        ] {
+            let Statement::Select(sel) = parse_one(sql) else {
+                panic!("{sql}")
+            };
+            let Projection::Expr {
+                expr:
+                    Expr::Function {
+                        qual: got,
+                        name: got_name,
+                        ..
+                    },
+                ..
+            } = &sel.projections[0]
+            else {
+                panic!("{sql}")
+            };
+            assert_eq!((got.as_ref(), got_name.as_str()), (&qual, name), "{sql}");
+        }
+        for (sql, qual, name) in [
+            ("SELECT * FROM s.f();", Qualifier::part("s"), "f"),
+            ("SELECT * FROM c.s.f();", Qualifier::both("c", "s"), "f"),
+        ] {
+            let Statement::Select(sel) = parse_one(sql) else {
+                panic!("{sql}")
+            };
+            let FromSource::Function {
+                qual: got,
+                name: got_name,
+                ..
+            } = sel.from.unwrap().source
+            else {
+                panic!("{sql}")
+            };
+            assert_eq!((&got, got_name.as_str()), (&qual, name), "{sql}");
+        }
+    }
+
+    /// Wave 131b: one, two and three-part table references, four-part
+    /// columns, and the schema DDL/session/`GRANT` shapes around them.
+    #[test]
+    fn schema_names_parse_in_every_shape() {
+        for (sql, qual, name) in [
+            ("SELECT * FROM t;", Qualifier::none(), "t"),
+            ("SELECT * FROM x.t;", Qualifier::part("x"), "t"),
+            ("SELECT * FROM c.s.t;", Qualifier::both("c", "s"), "t"),
+            (
+                "SELECT * FROM \"a b\".\"x\"\"y\";",
+                Qualifier::part("a b"),
+                "x\"y",
+            ),
+        ] {
+            let Statement::Select(sel) = parse_one(sql) else {
+                panic!("{sql}")
+            };
+            let FromSource::Table {
+                qual: got,
+                name: got_name,
+            } = sel.from.unwrap().source
+            else {
+                panic!("{sql}")
+            };
+            assert_eq!((&got, got_name.as_str()), (&qual, name), "{sql}");
+        }
+
+        let Statement::Select(sel) = parse_one("SELECT t.c, s.t.c, c.s.t.c FROM c.s.t;") else {
+            panic!()
+        };
+        let column = |p: &Projection| match p {
+            Projection::Expr {
+                expr: Expr::Column { qual, table, name },
+                ..
+            } => (qual.clone(), table.clone(), name.clone()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            column(&sel.projections[0]),
+            (Qualifier::none(), Some("t".to_string()), "c".to_string())
+        );
+        assert_eq!(
+            column(&sel.projections[1]),
+            (Qualifier::part("s"), Some("t".to_string()), "c".to_string())
+        );
+        assert_eq!(
+            column(&sel.projections[2]),
+            (
+                Qualifier::both("c", "s"),
+                Some("t".to_string()),
+                "c".to_string()
+            )
+        );
+
+        assert_eq!(
+            parse_one("CREATE SCHEMA s;"),
+            Statement::CreateSchema {
+                qual: Qualifier::none(),
+                name: "s".to_string(),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            parse_one("CREATE SCHEMA IF NOT EXISTS db.\"Master\";"),
+            Statement::CreateSchema {
+                qual: Qualifier::both("db", "Master"),
+                name: "Master".to_string(),
+                if_not_exists: true,
+            }
+        );
+        assert_eq!(
+            parse_one("DROP SCHEMA IF EXISTS db.s CASCADE;"),
+            Statement::DropSchema {
+                qual: Qualifier::both("db", "s"),
+                name: "s".to_string(),
+                if_exists: true,
+                cascade: true,
+            }
+        );
+        assert_eq!(
+            parse_one("DROP SCHEMA s RESTRICT;"),
+            Statement::DropSchema {
+                qual: Qualifier::none(),
+                name: "s".to_string(),
+                if_exists: false,
+                cascade: false,
+            }
+        );
+        assert_eq!(
+            parse_one("USE db;"),
+            Statement::Use {
+                qual: Qualifier::part("db")
+            }
+        );
+        assert_eq!(
+            parse_one("USE db.s;"),
+            Statement::Use {
+                qual: Qualifier::both("db", "s")
+            }
+        );
+
+        match parse_one("GRANT SELECT ON SCHEMA db.s TO alice;") {
+            Statement::Grant {
+                target: crate::rbac::GrantTarget::Schema { qual, name, .. },
+            } => {
+                assert_eq!(qual, Qualifier::both("db", "s"));
+                assert_eq!(name, "s");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_one("GRANT SELECT ON TABLE c.s.t TO alice;") {
+            Statement::Grant {
+                target: crate::rbac::GrantTarget::Table { qual, table, .. },
+            } => {
+                assert_eq!(qual, Qualifier::both("c", "s"));
+                assert_eq!(table, "t");
+            }
+            other => panic!("{other:?}"),
         }
     }
 

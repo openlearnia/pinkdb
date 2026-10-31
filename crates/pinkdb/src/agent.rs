@@ -316,9 +316,8 @@ pub fn error_json_for(err: &PinkDbError, sql: &str) -> String {
 /// prints a hint for a statement that is about to fail anyway.
 pub fn estimate_scan(db: &PinkDb, sql: &str) -> Option<ScanEstimate> {
     let stmt = crate::sql::parse_statements(sql).ok()?.into_iter().next()?;
-    let session_db = db.current_db().to_string();
-    let session = crate::storage::SchemaPath::main(&session_db);
-    let (plan, _) = crate::sql::bind_tracked(db, &stmt, &session_db).ok()?;
+    let session = db.current_ns().clone();
+    let (plan, _) = crate::sql::bind_tracked(db, &stmt, &session).ok()?;
     let plan = crate::optimizer::optimize(db, plan);
     let mut tables = std::collections::HashSet::new();
     crate::plan::collect_tables_read(&plan, &session, &mut tables);

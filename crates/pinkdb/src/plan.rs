@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::attached::AtSpec;
 use crate::sql::ast::{JoinKind, MergeMatch, Select, SetOp, SortSpec};
 use crate::sql::binder::{BoundAgg, BoundExpr, BoundWindow};
+use crate::storage::SchemaPath;
 use crate::types::{DataType, Value};
 
 /// The rows a DML statement returns (`RETURNING`, wave 95b): the final row
@@ -65,8 +66,8 @@ pub enum MergeActionPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
     CreateTable {
-        /// Target database (binder-resolved; `None` = session default).
-        db: Option<String>,
+        /// Target namespace (binder-resolved; `None` = session default).
+        ns: Option<SchemaPath>,
         name: String,
         schema: Vec<(String, DataType)>,
         /// Declarative constraints (PRIMARY KEY / UNIQUE / FOREIGN KEY / NOT
@@ -83,7 +84,7 @@ pub enum LogicalPlan {
     },
     /// `CREATE TABLE t AS SELECT ...`: schema from the query's output.
     CreateTableAs {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         query: Box<LogicalPlan>,
         if_not_exists: bool,
@@ -94,13 +95,13 @@ pub enum LogicalPlan {
     /// table. The `ADD COLUMN` default is a bound constant expression the
     /// executor evaluates once (and stores as the column's default).
     AlterTable {
-        /// Target database (binder-resolved; `None` = session default).
-        db: Option<String>,
+        /// Target namespace (binder-resolved; `None` = session default).
+        ns: Option<SchemaPath>,
         name: String,
         op: AlterTablePlan,
     },
     Insert {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: String,
         /// One bound expr per table column per row (constants; missing
         /// columns are NULL). Evaluated against an empty single-row chunk.
@@ -111,7 +112,7 @@ pub enum LogicalPlan {
     },
     /// `INSERT INTO t [(cols)] SELECT ...`.
     InsertSelect {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: String,
         /// Target column indices in written order (`None` = every column).
         columns: Option<Vec<usize>>,
@@ -120,7 +121,7 @@ pub enum LogicalPlan {
         returning: Option<Returning>,
     },
     Update {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: String,
         /// `(column index, value expression)` — expressions address table
         /// columns and evaluate simultaneously per row (pre-update values).
@@ -132,7 +133,7 @@ pub enum LogicalPlan {
         returning: Option<Returning>,
     },
     Delete {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: String,
         predicate: Option<BoundExpr>,
         /// `DELETE … USING` (wave 95b): extra rows appended after the
@@ -142,7 +143,7 @@ pub enum LogicalPlan {
     },
     /// `MERGE INTO target USING source ON cond WHEN … THEN …` (wave 95b).
     Merge {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: String,
         source: Box<LogicalPlan>,
         /// The ON condition over `[target columns, source columns]`.
@@ -157,7 +158,7 @@ pub enum LogicalPlan {
     /// the store and the WAL are untouched, so the statement is never logged
     /// and needs no lease; the result is DuckDB's `Count` shape.
     CopyTo {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: String,
         format: String,
         path: String,
@@ -166,7 +167,7 @@ pub enum LogicalPlan {
     Commit,
     Rollback,
     CreateView {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         cols: Option<Vec<String>>,
         query: Box<Select>,
@@ -178,7 +179,7 @@ pub enum LogicalPlan {
         or_replace: bool,
     },
     CreateMaterializedView {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         query: Box<LogicalPlan>,
         if_not_exists: bool,
@@ -191,30 +192,30 @@ pub enum LogicalPlan {
         source: String,
     },
     RefreshMaterializedView {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
     },
     /// `REFRESH MATERIALIZED VIEWS`: every view of `db`, all-or-nothing.
     RefreshMaterializedViews {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
     },
     DropMaterializedView {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         if_exists: bool,
     },
     /// `SHOW MATERIALIZED VIEWS` of `db` (wave 80).
     ShowMaterializedViews {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
     },
     DropTable {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         /// `IF EXISTS`: a missing table makes this a no-op.
         if_exists: bool,
     },
     CreateIndex {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         table: String,
         /// Resolved column ordinal in `table.columns`.
@@ -231,7 +232,7 @@ pub enum LogicalPlan {
         options: Vec<(String, String)>,
     },
     DropIndex {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         /// The table owning the index, resolved by the binder so the plan's
         /// touched set covers the catalog object a durable replay rebuilds.
@@ -240,7 +241,7 @@ pub enum LogicalPlan {
         if_exists: bool,
     },
     IndexScan {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: String,
         index: String,
         value: BoundExpr,
@@ -249,7 +250,7 @@ pub enum LogicalPlan {
     /// vector index (wave 107b). Produces the table's full rows in ascending
     /// distance order, at most `k` of them.
     VectorTopK {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: String,
         /// Column ordinal of the indexed `FLOAT[N]`/`DOUBLE[N]` column.
         column: usize,
@@ -263,7 +264,7 @@ pub enum LogicalPlan {
         k: usize,
     },
     DropView {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
     },
     /// `CREATE DATABASE <name> [(TYPE LAKE …)]` (store-level; never inside a
@@ -288,9 +289,23 @@ pub enum LogicalPlan {
         name: String,
         if_exists: bool,
     },
-    /// `USE <name>`: the session layer applies the returned database.
-    Use {
+    /// `CREATE SCHEMA`: the binder resolved the database (the schema name is
+    /// `ns.schema()`). Store-level DDL, never inside a transaction.
+    CreateSchema {
+        ns: SchemaPath,
+        /// The written schema name, preserving quoted case for display.
         name: String,
+        if_not_exists: bool,
+    },
+    /// `DROP SCHEMA`: `cascade` also drops its objects.
+    DropSchema {
+        ns: SchemaPath,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// `USE <schema>`: the session layer applies the resolved namespace.
+    Use {
+        ns: SchemaPath,
     },
     /// `SET VARIABLE <name> = <expr>`: bind a session variable. The value is
     /// evaluated once, at execution, and spliced into later statements as a
@@ -330,12 +345,12 @@ pub enum LogicalPlan {
     /// checkpoint persists it) and refused inside a transaction, where a
     /// rollback would leave statistics for rows that no longer exist.
     Analyze {
-        db: String,
+        ns: SchemaPath,
         table: Option<String>,
     },
     /// `SHOW TABLES`: the given database's tables, sorted by name.
     ShowTables {
-        db: String,
+        ns: SchemaPath,
     },
     /// `SHOW DATABASES`: every database, sorted by name.
     ShowDatabases,
@@ -351,7 +366,7 @@ pub enum LogicalPlan {
     /// definition in the target database's catalog. A name that already names
     /// a table, view or materialized view is refused at execution.
     CreateProcedure {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         def: crate::procedure::ProcedureDef,
         /// `OR REPLACE`: an existing procedure of that name is replaced.
@@ -359,7 +374,7 @@ pub enum LogicalPlan {
     },
     /// `DROP PROCEDURE [IF EXISTS] name`.
     DropProcedure {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         if_exists: bool,
     },
@@ -368,7 +383,7 @@ pub enum LogicalPlan {
     /// `CREATE TRIGGER` source text (persisted in `.pink`, like a macro's);
     /// the executor refuses an empty one.
     CreateTrigger {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         /// Boxed: a whole statement (`TriggerDef::action`) makes the
         /// definition much larger than the other variants' payloads.
         def: Box<crate::trigger::TriggerDef>,
@@ -376,14 +391,14 @@ pub enum LogicalPlan {
     },
     /// `DROP TRIGGER [IF EXISTS] [db.]name [ON table]`.
     DropTrigger {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         table: Option<String>,
         if_exists: bool,
     },
     /// `SHOW TRIGGERS [ON table]`.
     ShowTriggers {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: Option<String>,
     },
     /// `CALL name(args...)` (wave 44): run the stored procedure. The
@@ -397,7 +412,7 @@ pub enum LogicalPlan {
     /// [`crate::storage::PinkDb::proc_frame`] and the logging paths take the
     /// frame's payload from there.
     Call {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         args: Vec<BoundExpr>,
         /// `DO` (wave 83): the anonymous block's definition, run instead of
@@ -409,7 +424,7 @@ pub enum LogicalPlan {
     /// runner attached (persisted in `.pink`, like a materialized view's
     /// defining SQL); the executor refuses an empty one.
     CreateMacro {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         def: crate::macros::MacroDef,
         or_replace: bool,
@@ -418,17 +433,17 @@ pub enum LogicalPlan {
     },
     /// `DROP MACRO [IF EXISTS] name`.
     DropMacro {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         name: String,
         if_exists: bool,
     },
     /// `SHOW MACROS`: the database's macros, sorted by name.
     ShowMacros {
-        db: String,
+        ns: SchemaPath,
     },
     /// `DESCRIBE MACRO name`: one macro's DuckDB-shaped function metadata.
     DescribeMacro {
-        db: String,
+        ns: SchemaPath,
         name: String,
     },
     /// `CREATE USER [IF NOT EXISTS] name PASSWORD '<plaintext>'` (wave 48).
@@ -483,12 +498,12 @@ pub enum LogicalPlan {
         right: Box<LogicalPlan>,
         types: Vec<DataType>,
     },
-    /// Full scan of a table. `db: None` names a CTE (binder-resolved);
-    /// `Some(db)` is a catalog table in that database. `at: Some(spec)` is a
+    /// Full scan of a table. `ns: None` names a CTE (binder-resolved);
+    /// `Some(ns)` is a catalog table in that namespace. `at: Some(spec)` is a
     /// time-travel scan: exactly the attached lake table's contents as of
     /// that version/timestamp (`AT (VERSION => n)` / `AT (TIMESTAMP => ts)`).
     Scan {
-        db: Option<String>,
+        ns: Option<SchemaPath>,
         table: String,
         at: Option<AtSpec>,
     },
@@ -756,14 +771,14 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
 pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> LogicalPlan {
     match plan {
         LogicalPlan::CreateMaterializedView {
-            db,
+            ns,
             name,
             query,
             if_not_exists,
             policy,
             ..
         } => LogicalPlan::CreateMaterializedView {
-            db,
+            ns,
             name,
             query,
             if_not_exists,
@@ -774,14 +789,14 @@ pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> Logical
         // text (a bound template cannot be rendered back to SQL), so the
         // runner's per-statement source rides along exactly like an MV's.
         LogicalPlan::CreateMacro {
-            db,
+            ns,
             name,
             def,
             or_replace,
             if_not_exists,
             ..
         } => LogicalPlan::CreateMacro {
-            db,
+            ns,
             name,
             def,
             or_replace,
@@ -792,14 +807,14 @@ pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> Logical
         // image (the `.pink` footer still omits it, keeping `--file` views
         // session-local).
         LogicalPlan::CreateView {
-            db,
+            ns,
             name,
             cols,
             query,
             or_replace,
             ..
         } => LogicalPlan::CreateView {
-            db,
+            ns,
             name,
             cols,
             query,
@@ -809,13 +824,13 @@ pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> Logical
         // Wave 100: a trigger definition is persisted as its `CREATE TRIGGER`
         // text, for the same reason a macro's definition is.
         LogicalPlan::CreateTrigger {
-            db,
+            ns,
             mut def,
             or_replace,
         } => {
             def.source = source.unwrap_or_default().to_string();
             LogicalPlan::CreateTrigger {
-                db,
+                ns,
                 def,
                 or_replace,
             }
@@ -865,6 +880,8 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
             | LogicalPlan::DropDatabase { .. }
             | LogicalPlan::Attach { .. }
             | LogicalPlan::Detach { .. }
@@ -927,7 +944,9 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
 pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str> {
     Some(match plan {
         LogicalPlan::CreateDatabase { .. } => "CREATE DATABASE",
+        LogicalPlan::CreateSchema { .. } => "CREATE SCHEMA",
         LogicalPlan::DropDatabase { .. } => "DROP DATABASE",
+        LogicalPlan::DropSchema { .. } => "DROP SCHEMA",
         LogicalPlan::Attach { .. } => "ATTACH",
         LogicalPlan::Detach { .. } => "DETACH",
         LogicalPlan::LoadExtension { .. } => "LOAD EXTENSION",
@@ -1005,6 +1024,10 @@ pub(crate) fn plan_sets(
     out: &mut crate::wal::FrameSets,
 ) {
     match plan {
+        LogicalPlan::CreateSchema { ns, .. } | LogicalPlan::DropSchema { ns, .. } => {
+            out.add_schema(ns);
+            return;
+        }
         LogicalPlan::CreateDatabase { name, .. }
         | LogicalPlan::DropDatabase { name, .. }
         | LogicalPlan::Attach { name, .. }
@@ -1062,29 +1085,25 @@ pub(crate) fn collect_tables_read(
     default_ns: &crate::storage::SchemaPath,
     out: &mut std::collections::HashSet<crate::storage::TableRef>,
 ) {
-    // An unqualified name resolves in the statement's schema; 131a has no
-    // schema syntax yet, so a `db` qualifier always means that database's
-    // `main` schema (131b carries the schema in the plan).
-    let key = |db: &Option<String>, table: &str| {
-        let ns = match db {
-            Some(db) => crate::storage::SchemaPath::main(db),
-            None => default_ns.clone(),
-        };
-        (ns, table.to_ascii_lowercase())
+    let key = |qns: &Option<crate::storage::SchemaPath>, table: &str| {
+        (
+            qns.clone().unwrap_or_else(|| default_ns.clone()),
+            table.to_ascii_lowercase(),
+        )
     };
     match plan {
         LogicalPlan::Scan {
-            db: Some(db),
+            ns: Some(db),
             table,
             ..
         } => {
             out.insert(key(&Some(db.clone()), table));
         }
         // A file source reads no store table; `COPY` reads its source table.
-        LogicalPlan::CopyTo { db, table, .. } => {
-            out.insert(key(db, table));
+        LogicalPlan::CopyTo { ns, table, .. } => {
+            out.insert(key(ns, table));
         }
-        LogicalPlan::Scan { db: None, .. }
+        LogicalPlan::Scan { ns: None, .. }
         | LogicalPlan::SingleRow
         | LogicalPlan::Begin
         | LogicalPlan::Commit
@@ -1094,6 +1113,8 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
@@ -1126,7 +1147,7 @@ pub(crate) fn collect_tables_read(
         // pointing at a vanished table.
         LogicalPlan::CreateTrigger { def, .. } => {
             out.insert((
-                crate::storage::SchemaPath::main(&def.db),
+                crate::storage::SchemaPath::new(&def.db, &def.schema),
                 def.table.to_ascii_lowercase(),
             ));
         }
@@ -1148,8 +1169,8 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::DropUser { .. }
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::DropRole { .. } => {}
-        LogicalPlan::IndexScan { db, table, .. } | LogicalPlan::VectorTopK { db, table, .. } => {
-            out.insert(key(db, table));
+        LogicalPlan::IndexScan { ns, table, .. } | LogicalPlan::VectorTopK { ns, table, .. } => {
+            out.insert(key(ns, table));
         }
         // A table-function scan (wave 70) reads external state, not a catalog
         // table: the multi-writer touched set stays empty (a logged statement
@@ -1179,7 +1200,10 @@ pub(crate) fn collect_tables_read(
         LogicalPlan::CreateTableAs { query, .. } => collect_tables_read(query, default_ns, out),
         LogicalPlan::Values { rows, sources, .. } => {
             for (database, table) in sources {
-                out.insert(key(&Some(database.clone()), table));
+                out.insert(key(
+                    &Some(crate::storage::SchemaPath::main(database)),
+                    table,
+                ));
             }
             for e in rows.iter().flatten() {
                 expr_tables_read(e, default_ns, out);
@@ -1196,10 +1220,10 @@ pub(crate) fn collect_tables_read(
         }
         // The target is both read (scanned for the affected rows) and
         // written; the conflict/RETURNING payloads may read more.
-        LogicalPlan::Update { db, table, .. }
-        | LogicalPlan::Delete { db, table, .. }
-        | LogicalPlan::Merge { db, table, .. } => {
-            out.insert(key(db, table));
+        LogicalPlan::Update { ns, table, .. }
+        | LogicalPlan::Delete { ns, table, .. }
+        | LogicalPlan::Merge { ns, table, .. } => {
+            out.insert(key(ns, table));
             let (exprs, plans) = dml_payload(plan);
             for p in plans {
                 collect_tables_read(p, default_ns, out);
@@ -1566,6 +1590,8 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
@@ -1808,6 +1834,8 @@ fn walk_scan_filters(
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
@@ -2248,6 +2276,8 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
@@ -2467,7 +2497,7 @@ fn walk_scan_projections(
     out: &mut HashMap<usize, Vec<usize>>,
 ) {
     match plan {
-        LogicalPlan::Scan { db: Some(_), .. } | LogicalPlan::TableFunction { .. } => {
+        LogicalPlan::Scan { ns: Some(_), .. } | LogicalPlan::TableFunction { .. } => {
             if let Needed::Cols(set) = needed {
                 out.insert(
                     node_addr(plan),
@@ -2481,7 +2511,7 @@ fn walk_scan_projections(
         }
         // Unqualified scans name CTE outputs (binder-resolved), not tables;
         // the CTE's own query is walked through `LogicalPlan::Cte`.
-        LogicalPlan::Scan { db: None, .. } | LogicalPlan::SingleRow => {}
+        LogicalPlan::Scan { ns: None, .. } | LogicalPlan::SingleRow => {}
         // Constant rows hold no scan: their expressions are the whole input.
         LogicalPlan::Values { rows, .. } => {
             for e in rows.iter().flatten() {
@@ -2714,6 +2744,8 @@ fn walk_scan_projections(
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::CreateSchema { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
@@ -3185,7 +3217,7 @@ mod scan_filter_tests {
 
     fn scan(table: &str) -> LogicalPlan {
         LogicalPlan::Scan {
-            db: Some("main".to_string()),
+            ns: Some(crate::storage::SchemaPath::main("main")),
             table: table.to_string(),
             at: None,
         }

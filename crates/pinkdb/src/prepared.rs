@@ -124,8 +124,13 @@ impl PreparedStatement {
     /// against the current catalog, so every bind-time error (unknown column,
     /// incompatible value, untypable `NULL`) surfaces here, before anything
     /// executes. Does not mutate `db`.
-    pub fn bind(&self, db: &PinkDb, default_db: &str, params: &[Value]) -> Result<BoundStatement> {
-        self.bind_in(db, default_db, params, &db.session)
+    pub fn bind(
+        &self,
+        db: &PinkDb,
+        default_ns: &crate::storage::SchemaPath,
+        params: &[Value],
+    ) -> Result<BoundStatement> {
+        self.bind_in(db, default_ns, params, &db.session)
     }
 
     /// Bind against an explicit session: a network connection's variables are
@@ -133,7 +138,7 @@ impl PreparedStatement {
     pub(crate) fn bind_in(
         &self,
         db: &PinkDb,
-        default_db: &str,
+        default_ns: &crate::storage::SchemaPath,
         params: &[Value],
         session: &crate::storage::Session,
     ) -> Result<BoundStatement> {
@@ -142,7 +147,7 @@ impl PreparedStatement {
         // Dry bind: inference, conversion, and every bind-time check happen
         // here; the plan itself is discarded (execution re-binds the
         // substituted text through the statement's normal path).
-        bind_tracked_with(db, &self.ast, default_db, Some(slots.clone()), session)?;
+        bind_tracked_with(db, &self.ast, default_ns, Some(slots.clone()), session)?;
         let mut values = Vec::with_capacity(params.len());
         let mut types = Vec::with_capacity(params.len());
         for i in 0..params.len() {
@@ -208,7 +213,7 @@ impl PinkDb {
         stmt: &PreparedStatement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        let bound = stmt.bind(self, self.current_db(), params)?;
+        let bound = stmt.bind(self, self.current_ns(), params)?;
         self.execute_bound(&bound)
     }
 

@@ -1873,6 +1873,9 @@ pub struct PinkDb {
     pub(crate) loaded_extensions: HashMap<String, ExtHandle>,
     /// Lowercased name of the embedded session's current database.
     pub(crate) current_db: String,
+    /// The embedded session's current schema (wave 131b). `current_db` above
+    /// is kept as the database part so the pre-schema call sites stay cheap.
+    pub(crate) current_ns: SchemaPath,
     /// The embedded handle's session (see [`Session`]): `SET VARIABLE` state
     /// for this client only. A network [`crate::Connection`] overrides it with
     /// its own session for every statement it runs.
@@ -1900,7 +1903,7 @@ pub struct PinkDb {
     wal_txn: Vec<String>,
     /// Session database before the first statement of the open transaction's
     /// WAL record (the record replays in that session).
-    wal_txn_db: Option<String>,
+    wal_txn_db: Option<SchemaPath>,
     /// Extension paths touched by the buffered statements (dynamic functions
     /// they call), deduped, in first-use order. A record whose replay needs an
     /// extension the current WAL generation has not loaded is prefixed with
@@ -2127,6 +2130,7 @@ impl Clone for PinkDb {
             dynamic_functions: self.dynamic_functions.clone(),
             loaded_extensions: self.loaded_extensions.clone(),
             current_db: self.current_db.clone(),
+            current_ns: self.current_ns.clone(),
             // Clones share the session: a transaction's private snapshot runs
             // in the session that opened it.
             session: self.session.clone(),
@@ -2232,6 +2236,7 @@ impl PinkDb {
             dynamic_functions: HashMap::new(),
             loaded_extensions: HashMap::new(),
             current_db: "main".to_string(),
+            current_ns: SchemaPath::main("main"),
             session: Session::default(),
             txn_snapshot: None,
             wal: None,
@@ -2370,7 +2375,12 @@ impl PinkDb {
 
     /// The embedded session's current database (lowercased).
     pub fn current_db(&self) -> &str {
-        &self.current_db
+        self.current_ns.db()
+    }
+
+    /// The embedded session's current schema (database and schema).
+    pub fn current_ns(&self) -> &SchemaPath {
+        &self.current_ns
     }
 
     /// Set the embedded session's current database without validation
@@ -2378,6 +2388,14 @@ impl PinkDb {
     /// the session layer after `USE`/`DROP DATABASE`).
     pub(crate) fn set_current_db(&mut self, name: &str) {
         self.current_db = name.to_string();
+        self.current_ns = SchemaPath::main(name);
+    }
+
+    /// Set the embedded session's current schema without validation (the
+    /// session layer has already checked it, or a dropped schema fell back).
+    pub(crate) fn set_current_ns(&mut self, ns: SchemaPath) {
+        self.current_db = ns.db().to_string();
+        self.current_ns = ns;
     }
 
     /// Sorted display names of every database.
@@ -2465,7 +2483,36 @@ impl PinkDb {
             )));
         }
         self.current_db = Self::db_key(name);
+        self.current_ns = SchemaPath::main(&self.current_db);
         Ok(())
+    }
+
+    /// Switch the embedded session to `ns` (validated; wave 131b).
+    pub fn use_schema(&mut self, ns: &SchemaPath) -> Result<()> {
+        if !self.database_exists(ns.db()) {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{}\" not found",
+                ns.db()
+            )));
+        }
+        if !self.schema_exists(ns) {
+            return Err(PinkDbError::Catalog(format!(
+                "schema \"{}\" not found",
+                ns.schema()
+            )));
+        }
+        self.set_current_ns(ns.clone());
+        Ok(())
+    }
+
+    /// The schema a session should fall back to after dropping its current
+    /// schema: `main` of the current database (or the fallback database when
+    /// that one is gone too).
+    pub fn fallback_ns(&self) -> SchemaPath {
+        if self.database_exists(self.current_ns.db()) {
+            return SchemaPath::main(self.current_ns.db());
+        }
+        SchemaPath::main(&self.fallback_db())
     }
 
     /// The database a session should fall back to after dropping its current
@@ -2581,8 +2628,8 @@ impl PinkDb {
                 ns.schema()
             )));
         }
-        // No SQL names a schema yet (131b adds the grammar), so the display
-        // name is the lowercased path part.
+        // The SQL layer sets the written spelling after this call; the
+        // catalog key and this fallback display name are lowercased.
         cat.schemas
             .insert(ns.schema().to_string(), SchemaCatalog::empty(ns.schema()));
         Ok(())
@@ -2992,9 +3039,11 @@ impl PinkDb {
     /// session's current database is live, like `rollback`'s.
     pub(crate) fn proc_snapshot_restore(&mut self, snap: Box<PinkDb>) {
         let current = self.current_db.clone();
+        let current_ns = self.current_ns.clone();
         let base = self.txn_base.take();
         *self = *snap;
         self.current_db = current;
+        self.current_ns = current_ns;
         self.txn_base = base;
     }
 
@@ -3166,6 +3215,7 @@ impl PinkDb {
                 });
         }
         self.current_db = other.current_db;
+        self.current_ns = other.current_ns;
         // Wave 124: the reloaded checkpoint names its lake databases but holds
         // none of their content; this process's open lakes provide it.
         self.reinstall_lake_databases();
@@ -3243,13 +3293,13 @@ impl PinkDb {
         let sets = match sets {
             Some(s) => s.clone(),
             None => {
-                let ns = SchemaPath::main(&self.current_db);
+                let ns = self.current_ns().clone();
                 self.plan_sets_store(plan, &ns)
             }
         };
         if self.in_transaction() {
             if self.wal_txn_db.is_none() {
-                self.wal_txn_db = Some(self.current_db.clone());
+                self.wal_txn_db = Some(self.current_ns().clone());
             }
             self.wal_txn.push(sql.to_string());
             self.wal_txn_sets.extend(&sets);
@@ -3268,20 +3318,20 @@ impl PinkDb {
         }
         // `USE` is self-contained: replaying it lands in the target session
         // from anywhere, so no prefix is needed (and none would help).
-        if let crate::plan::LogicalPlan::Use { name } = plan {
+        if let crate::plan::LogicalPlan::Use { ns } = plan {
             if let Some(wal) = self.durable_handle() {
                 let mut guard = wal.lock().map_err(|_| {
                     PinkDbError::Execution("internal lock error (poisoned)".to_string())
                 })?;
                 guard.append(&[sql.to_string()], Some(&sets), memo)?;
-                guard.set_session_db(&name.to_ascii_lowercase());
+                guard.set_session_db(ns);
             }
             return Ok(());
         }
-        let db = self.current_db.clone();
+        let ns = self.current_ns().clone();
         self.wal_append_session(
-            &db,
-            &db,
+            &ns,
+            &ns,
             &[sql.to_string()],
             &touched,
             &loaded,
@@ -3316,8 +3366,8 @@ impl PinkDb {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn wal_append_session(
         &mut self,
-        db_before: &str,
-        db_after: &str,
+        db_before: &SchemaPath,
+        db_after: &SchemaPath,
         stmts: &[String],
         touched_extensions: &[String],
         loaded_extensions: &[String],
@@ -3349,8 +3399,8 @@ impl PinkDb {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn wal_append_local(
         &self,
-        db_before: &str,
-        db_after: &str,
+        db_before: &SchemaPath,
+        db_after: &SchemaPath,
         stmts: &[String],
         touched_extensions: &[String],
         loaded_extensions: &[String],
@@ -3369,7 +3419,7 @@ impl PinkDb {
             let mut guard = wal.lock().map_err(|_| {
                 PinkDbError::Execution("internal lock error (poisoned)".to_string())
             })?;
-            let before = self.database_exists(db_before).then_some(db_before);
+            let before = self.schema_exists(db_before).then_some(db_before);
             guard.append_in_session(
                 before,
                 db_after,
@@ -3477,8 +3527,8 @@ impl PinkDb {
             let before = self
                 .wal_txn_db
                 .take()
-                .unwrap_or_else(|| self.current_db.clone());
-            let after = self.current_db.clone();
+                .unwrap_or_else(|| self.current_ns().clone());
+            let after = self.current_ns().clone();
             if let Err(e) = self.wal_append_local(
                 &before,
                 &after,
@@ -3522,8 +3572,10 @@ impl PinkDb {
         match self.txn_snapshot.take() {
             Some(snap) => {
                 let current = self.current_db.clone();
+                let current_ns = self.current_ns.clone();
                 *self = *snap;
                 self.current_db = current;
+                self.current_ns = current_ns;
                 self.wal_txn.clear();
                 self.wal_txn_db = None;
                 self.wal_txn_ext_paths.clear();

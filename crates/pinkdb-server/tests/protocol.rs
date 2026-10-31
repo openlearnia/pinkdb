@@ -88,8 +88,8 @@ fn requests_round_trip() {
 /// value (tag 11) and dtype (tag 10) tags (v13).
 /// A change here is a protocol change and must bump [`PROTOCOL_VERSION`].
 #[test]
-fn protocol_v13_pins_the_variant_tags_and_keeps_the_v10_surface() {
-    assert_eq!(PROTOCOL_VERSION, 13);
+fn protocol_v14_pins_the_schema_done_kinds_and_keeps_the_v13_surface() {
+    assert_eq!(PROTOCOL_VERSION, 14);
     assert_eq!(msg_type::LOGIN, 6);
     assert_eq!(msg_type::LOGGED_IN, 18);
     assert_eq!(msg_type::SET_PROFILING, 7);
@@ -111,6 +111,8 @@ fn protocol_v13_pins_the_variant_tags_and_keeps_the_v10_surface() {
         (DoneKind::Granted, 24),
         (DoneKind::Revoked, 25),
         (DoneKind::SetVariable, 26),
+        (DoneKind::CreatedSchema, 27),
+        (DoneKind::DroppedSchema, 28),
     ] {
         let frame = encode_response(&Response::Done {
             kind,
@@ -130,10 +132,10 @@ fn protocol_v13_pins_the_variant_tags_and_keeps_the_v10_surface() {
         );
     }
     // A tag past the current surface is still rejected.
-    let bytes = frame(msg_type::DONE, &[27, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let bytes = frame(msg_type::DONE, &[29, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     assert!(matches!(
         decode_response(&bytes),
-        Err(ProtocolError::Malformed(msg)) if msg.contains("unknown Done kind 27")
+        Err(ProtocolError::Malformed(msg)) if msg.contains("unknown Done kind 29")
     ));
 }
 

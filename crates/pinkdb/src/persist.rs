@@ -4902,7 +4902,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
                 Vec::new()
             };
             let dtriggers = if triggers {
-                read_trigger_defs(&mut r, &name)?
+                read_trigger_defs(&mut r, &name, &sname)?
             } else {
                 Vec::new()
             };
@@ -5569,7 +5569,11 @@ fn write_trigger_defs(w: &mut Writer, defs: &[crate::trigger::TriggerDef]) {
 /// Decode one database's trigger section, re-parsing each `CREATE TRIGGER`
 /// text. A body that no longer parses is a corrupt file (it parsed when the
 /// trigger was created).
-fn read_trigger_defs(r: &mut Reader, dbname: &str) -> Result<Vec<crate::trigger::TriggerDef>> {
+fn read_trigger_defs(
+    r: &mut Reader,
+    dbname: &str,
+    schema: &str,
+) -> Result<Vec<crate::trigger::TriggerDef>> {
     let n = r.u32()? as usize;
     // Each trigger costs at least 8 bytes (two empty strings' length prefixes).
     if n > r.remaining() / 8 + 1 {
@@ -5592,7 +5596,11 @@ fn read_trigger_defs(r: &mut Reader, dbname: &str) -> Result<Vec<crate::trigger:
                 )));
             }
         };
-        let mut def = crate::trigger::def_from_statement(dbname, &stmt).map_err(|e| {
+        let mut def = crate::trigger::def_from_statement(
+            &crate::storage::SchemaPath::new(dbname, schema),
+            &stmt,
+        )
+        .map_err(|e| {
             PinkDbError::Execution(format!(
                 "corrupt file: trigger \"{name}\" does not parse: {e}"
             ))

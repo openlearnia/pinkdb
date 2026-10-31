@@ -81,9 +81,12 @@ bind_create.cpp`): ported and credited, not pasted.
    - Column references take one to four parts (`col`, `t.col`, `s.t.col`,
      `c.s.t.col`); a qualifier matches a FROM item whose own path ends
      with it.
-   - A view, macro, materialized view, procedure or trigger binds its body
-     with **its own schema** as the default (DuckDB binds view bodies
-     against the view's schema). A trigger and its table share a schema.
+   - A view, materialized view, procedure or trigger binds its body with
+     **its own schema** as the default (DuckDB binds view bodies against
+     the view's schema). A trigger and its table share a schema. A macro is
+     spliced into the calling query, so its body resolves against the
+     **caller's** schema, as DuckDB's macros do. Macros are called
+     unqualified (current schema) or as `s.m()` / `c.s.m()`.
    - Foreign keys must stay in one schema (DuckDB: "Creating foreign keys
      across different schemas or catalogs is not supported").
 5. **Session position.** A session (embedded handle, `Connection`) holds

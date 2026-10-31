@@ -211,7 +211,7 @@ impl Session {
         let sql = format!("USE {}", quote_ident(db));
         let results = self.run(&sql)?;
         match results.into_iter().next() {
-            Some(QueryResult::Used { db }) => {
+            Some(QueryResult::Used { db, .. }) => {
                 self.db = db;
                 Ok(())
             }

@@ -85,7 +85,9 @@ use pinkdb::{DataType, Value};
 /// rides as `u32 byte length | encoded cell` (the same cell encoding a `.pink`
 /// page stores, so an ARRAY crosses the wire without a per-element tag); the
 /// dtype carries an element byte and a `u32` length.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// v14: `CREATE/DROP SCHEMA` `Done` kinds (tags 27–28); `Used`'s `name` is
+/// `db\0schema` (wave 131b).
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -484,7 +486,7 @@ pub enum DoneKind {
     DroppedView = 10,
     CreatedDatabase = 11,
     DroppedDatabase = 12,
-    /// `USE <db>`; `name` is the database.
+    /// `USE <db>[.<schema>]`; `name` is `db\0schema`.
     Used = 13,
     /// Reserved for statement outcomes a future protocol version may add;
     /// this version's server never emits it and the client rejects it.
@@ -517,12 +519,16 @@ pub enum DoneKind {
     /// `DROP ROLE` (v9); `name` is the role.
     DroppedRole = 23,
     /// `GRANT …` (v9); `name` is the human-readable grant
-    /// (`SELECT ON TABLE main.t TO alice`).
+    /// (`SELECT ON TABLE main.main.t TO alice`).
     Granted = 24,
     /// `REVOKE …` (v9); `name` names the grant that was removed.
     Revoked = 25,
     /// `SET VARIABLE x = …` (v12, wave 95c); `name` is the variable.
     SetVariable = 26,
+    /// `CREATE SCHEMA` (v14, wave 131b); `name` is the schema.
+    CreatedSchema = 27,
+    /// `DROP SCHEMA` (v14); `name` is the schema.
+    DroppedSchema = 28,
 }
 
 impl DoneKind {
@@ -555,6 +561,8 @@ impl DoneKind {
             24 => DoneKind::Granted,
             25 => DoneKind::Revoked,
             26 => DoneKind::SetVariable,
+            27 => DoneKind::CreatedSchema,
+            28 => DoneKind::DroppedSchema,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown Done kind {other}"

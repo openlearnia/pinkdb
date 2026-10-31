@@ -396,12 +396,19 @@ pub enum QueryResult {
     CreatedDatabase {
         name: String,
     },
+    CreatedSchema {
+        name: String,
+    },
     DroppedDatabase {
         name: String,
     },
-    /// `USE <db>`: the session layer applies this to its current database.
+    DroppedSchema {
+        name: String,
+    },
+    /// `USE`: the session layer applies this to its current schema.
     Used {
         db: String,
+        schema: String,
     },
     /// `SET VARIABLE <name> = <value>`: the session variable now holds the
     /// value. Variables are session-scoped, so a durable store logs the
@@ -479,7 +486,7 @@ pub enum QueryResult {
         name: String,
     },
     /// `GRANT …` (wave 48): `description` is the human-readable grant
-    /// (`SELECT ON TABLE main.t TO alice`).
+    /// (`SELECT ON TABLE main.main.t TO alice`).
     Granted {
         description: String,
     },
@@ -674,7 +681,7 @@ fn join_nodes<'p>(plan: &'p LogicalPlan, out: &mut Vec<&'p LogicalPlan>) {
 fn reads_cte(plan: &LogicalPlan) -> bool {
     use LogicalPlan as P;
     match plan {
-        P::Scan { db: None, .. } => true,
+        P::Scan { ns: None, .. } => true,
         P::Join { left, right, .. }
         | P::NestedLoopJoin { left, right, .. }
         | P::SetOp { left, right, .. } => reads_cte(left) || reads_cte(right),
@@ -1040,8 +1047,8 @@ impl<'a> Cx<'a> {
 /// the new one is created. Its grants stay: replacing is how a pipeline
 /// rebuilds the same table, and losing access on every rebuild would be a
 /// surprise (a plain `DROP TABLE` does remove them).
-fn replace_table(db: &mut PinkDb, target: &str, name: &str) -> Result<()> {
-    if let Some(err) = db.attached_read_only(&crate::storage::SchemaPath::main(target), name) {
+fn replace_table(db: &mut PinkDb, target: &crate::storage::SchemaPath, name: &str) -> Result<()> {
+    if let Some(err) = db.attached_read_only(target, name) {
         return Err(err);
     }
     if db.table_in(target, name).is_ok() {
@@ -1050,8 +1057,8 @@ fn replace_table(db: &mut PinkDb, target: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_db(db: &PinkDb, qdb: &Option<String>) -> String {
-    qdb.clone().unwrap_or_else(|| db.current_db().to_string())
+fn resolve_ns(db: &PinkDb, qdb: &Option<crate::storage::SchemaPath>) -> crate::storage::SchemaPath {
+    qdb.clone().unwrap_or_else(|| db.current_ns().clone())
 }
 
 /// `SET VARIABLE`: evaluate the value (a constant expression, like a `CALL`
@@ -1078,14 +1085,17 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
 /// `dbname` when `table` is `None` (wave 122). Statistics are advisory: this
 /// touches no rows, writes no WAL record, and the next checkpoint persists
 /// the result.
-fn analyze_tables(db: &mut PinkDb, dbname: &str, table: Option<&str>) -> Result<usize> {
-    // `ANALYZE` names no schema (the grammar arrives with wave 131b), so a
-    // named table is the database's `main` one; the all-tables form means
+fn analyze_tables(
+    db: &mut PinkDb,
+    ns: &crate::storage::SchemaPath,
+    table: Option<&str>,
+) -> Result<usize> {
+    // A named table is the binder-resolved one; the all-tables form means
     // every table of the database, in every schema.
     let targets: Vec<(crate::storage::SchemaPath, String)> = match table {
-        Some(name) => vec![(crate::storage::SchemaPath::main(dbname), name.to_string())],
+        Some(name) => vec![(ns.clone(), name.to_string())],
         None => db
-            .all_tables_of(dbname)
+            .all_tables_of(ns.db())
             .into_iter()
             .map(|(ns, name, _)| (ns, name))
             .collect(),
@@ -1114,14 +1124,22 @@ fn sql_load_gate(db: &PinkDb, statement: &str, source: &str) -> Result<()> {
 /// `USE` validation + result. Bind already checks existence; re-checking here
 /// closes the window for the multi-writer `Connection` path (bind and run are
 /// separate lock acquisitions) and keeps `run` self-contained.
-fn use_result(db: &PinkDb, name: &str) -> Result<QueryResult> {
-    if !db.database_exists(name) {
+fn use_result(db: &PinkDb, ns: &crate::storage::SchemaPath) -> Result<QueryResult> {
+    if !db.database_exists(ns.db()) {
         return Err(PinkDbError::Catalog(format!(
-            "database \"{name}\" not found"
+            "database \"{}\" not found",
+            ns.db()
+        )));
+    }
+    if !db.schema_exists(ns) {
+        return Err(PinkDbError::Catalog(format!(
+            "schema \"{}\" not found",
+            ns.schema()
         )));
     }
     Ok(QueryResult::Used {
-        db: name.to_ascii_lowercase(),
+        db: ns.db().to_string(),
+        schema: ns.schema().to_string(),
     })
 }
 
@@ -1248,7 +1266,7 @@ fn run_with_budget_inner(
     // A `CALL` recurses through this function; dispatch it before the
     // statement match so one nesting level does not hold `run_plain`'s frame.
     if let LogicalPlan::Call {
-        db: qdb,
+        ns: qdb,
         name,
         args,
         inline,
@@ -1256,7 +1274,7 @@ fn run_with_budget_inner(
     {
         return run_call_plan(db, qdb, name, args, inline, &budget);
     }
-    if let Some((target, table, event)) = crate::trigger::plan_dml(plan, db.current_db())
+    if let Some((target, table, event)) = crate::trigger::plan_dml(plan, db.current_ns())
         && crate::trigger::has_triggers(db, &target, &table)
     {
         return crate::trigger::run_with_triggers(db, plan, &budget, &target, &table, event);
@@ -1270,13 +1288,13 @@ fn run_with_budget_inner(
 /// keeps the documented 32-level call depth inside a default thread stack.
 fn run_call_plan(
     db: &mut PinkDb,
-    qdb: &Option<String>,
+    qdb: &Option<crate::storage::SchemaPath>,
     name: &str,
     args: &[crate::sql::binder::BoundExpr],
     inline: &Option<Box<crate::procedure::ProcedureDef>>,
     budget: &std::sync::Arc<ExecBudget>,
 ) -> Result<QueryResult> {
-    let target = resolve_db(db, qdb);
+    let target = resolve_ns(db, qdb);
     // The arguments are constant expressions: evaluate them against an empty
     // single-row chunk, exactly like an ALTER default.
     let single = DataChunk {
@@ -1321,7 +1339,7 @@ fn run_call_plan(
 /// the deleted row instead.
 fn finish_dml(
     db: &mut PinkDb,
-    target: &str,
+    target: &crate::storage::SchemaPath,
     table: &str,
     run: impl FnOnce(&mut PinkDb) -> Result<usize>,
     returning: Option<&crate::plan::Returning>,
@@ -1355,7 +1373,7 @@ pub(crate) fn run_plain(
     budget.check_deadline()?;
     match plan {
         LogicalPlan::CreateTable {
-            db: qdb,
+            ns: qdb,
             name,
             schema,
             constraints,
@@ -1363,7 +1381,7 @@ pub(crate) fn run_plain(
             or_replace,
             defaults,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // `IF NOT EXISTS`: an existing table makes the statement a no-op
             // (DuckDB semantics). A same-named view still conflicts, like
             // the plain CREATE.
@@ -1410,13 +1428,13 @@ pub(crate) fn run_plain(
             Ok(QueryResult::Created)
         }
         LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query,
             if_not_exists,
             or_replace,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if *if_not_exists && db.table_in(&target, name).is_ok() {
                 return Ok(QueryResult::Created);
             }
@@ -1455,13 +1473,13 @@ pub(crate) fn run_plain(
             Ok(QueryResult::Created)
         }
         LogicalPlan::Insert {
-            db: qdb,
+            ns: qdb,
             table,
             rows,
             conflict,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // Evaluate constant cells against an empty single-row chunk, then
             // append (storage coerces INTEGER → BIGINT → DOUBLE).
             let single = DataChunk {
@@ -1522,14 +1540,14 @@ pub(crate) fn run_plain(
             )
         }
         LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
             query,
             conflict,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let out = {
                 let cx = Cx::with_budget(db, budget.clone()).with_projections(plan);
                 eval(&cx, query)?
@@ -1582,14 +1600,14 @@ pub(crate) fn run_plain(
             )
         }
         LogicalPlan::Update {
-            db: qdb,
+            ns: qdb,
             table,
             sets,
             predicate,
             from,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let run = |db: &mut PinkDb| -> Result<usize> {
                 // `UPDATE … FROM`: the source row precedes the target row in
                 // every expression's input.
@@ -1647,13 +1665,13 @@ pub(crate) fn run_plain(
             )
         }
         LogicalPlan::Delete {
-            db: qdb,
+            ns: qdb,
             table,
             predicate,
             using,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let run = |db: &mut PinkDb| -> Result<usize> {
                 if let Some(source) = using {
                     return dml::delete_using(
@@ -1692,14 +1710,14 @@ pub(crate) fn run_plain(
             })
         }
         LogicalPlan::Merge {
-            db: qdb,
+            ns: qdb,
             table,
             source,
             on,
             clauses,
             returning,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let run = |db: &mut PinkDb| -> Result<usize> {
                 let (inserted, updated, deleted) =
                     dml::merge(db, &target, table, source, on, clauses, &budget)?;
@@ -1728,14 +1746,14 @@ pub(crate) fn run_plain(
             Ok(QueryResult::RolledBack)
         }
         LogicalPlan::CreateView {
-            db: qdb,
+            ns: qdb,
             name,
             cols,
             query,
             source,
             or_replace,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if *or_replace && db.view_in(&target, name).is_ok() {
                 db.drop_view_in(&target, name)?;
             }
@@ -1746,12 +1764,12 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedView { name: name.clone() })
         }
         LogicalPlan::DropTable {
-            db: qdb,
+            ns: qdb,
             name,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
-            let ns = crate::storage::SchemaPath::main(&target);
+            let target = resolve_ns(db, qdb);
+            let ns = target.clone();
             // An attached (read-only) name is refused before the existence
             // probe: DROP TABLE must never look like a missing-table no-op.
             if let Some(err) = db.attached_read_only(&ns, name) {
@@ -1771,7 +1789,7 @@ pub(crate) fn run_plain(
             Ok(QueryResult::DroppedTable { name: name.clone() })
         }
         LogicalPlan::CreateIndex {
-            db: qdb,
+            ns: qdb,
             name,
             table,
             column,
@@ -1780,7 +1798,7 @@ pub(crate) fn run_plain(
             options,
             ..
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if db.table_in(&target, table).is_err() {
                 if *if_not_exists {
                     return Ok(QueryResult::CreatedIndex { name: name.clone() });
@@ -1810,12 +1828,12 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedIndex { name: name.clone() })
         }
         LogicalPlan::DropIndex {
-            db: qdb,
+            ns: qdb,
             name,
             table,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // The binder resolved the owning table (and the touched set a
             // durable frame records). Use it, so execution drops the same
             // object the plan named.
@@ -1835,9 +1853,9 @@ pub(crate) fn run_plain(
             }
             Ok(QueryResult::DroppedIndex { name: name.clone() })
         }
-        LogicalPlan::AlterTable { db: qdb, name, op } => {
-            let target = resolve_db(db, qdb);
-            let ns = crate::storage::SchemaPath::main(&target);
+        LogicalPlan::AlterTable { ns: qdb, name, op } => {
+            let target = resolve_ns(db, qdb);
+            let ns = target.clone();
             // An attached (read-only) name is refused before anything runs:
             // ALTER must never look like a no-op on a lake table.
             if let Some(err) = db.attached_read_only(&ns, name) {
@@ -1970,20 +1988,20 @@ pub(crate) fn run_plain(
                 }
             }
         }
-        LogicalPlan::DropView { db: qdb, name } => {
-            let target = resolve_db(db, qdb);
+        LogicalPlan::DropView { ns: qdb, name } => {
+            let target = resolve_ns(db, qdb);
             db.drop_view_in(&target, name)?;
             Ok(QueryResult::DroppedView { name: name.clone() })
         }
         LogicalPlan::CreateMaterializedView {
-            db: qdb,
+            ns: qdb,
             name,
             query,
             if_not_exists,
             policy,
             source,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if *if_not_exists
                 && (db.materialized_view_in(&target, name).is_ok()
                     || db.table_in(&target, name).is_ok())
@@ -2001,7 +2019,7 @@ pub(crate) fn run_plain(
             if db.table_in(&target, name).is_ok() {
                 db.drop_table_in(&target, name)?;
             }
-            store_materialized_view(db, &crate::storage::SchemaPath::main(&target), name, &out)?;
+            store_materialized_view(db, &target, name, &out)?;
             // Store the definition: the bound query, the defining SQL text
             // (persisted, and the rebuild source when the plan cannot be
             // rebound), the policy, and the initial refresh stamp — creation
@@ -2024,13 +2042,13 @@ pub(crate) fn run_plain(
             )?;
             Ok(QueryResult::CreatedMaterializedView { name: name.clone() })
         }
-        LogicalPlan::RefreshMaterializedView { db: qdb, name } => {
-            let target = crate::storage::SchemaPath::main(&resolve_db(db, qdb));
+        LogicalPlan::RefreshMaterializedView { ns: qdb, name } => {
+            let target = resolve_ns(db, qdb);
             refresh_materialized_view(db, &target, name)?;
             Ok(QueryResult::RefreshedMaterializedView { name: name.clone() })
         }
-        LogicalPlan::RefreshMaterializedViews { db: qdb } => {
-            let target = crate::storage::SchemaPath::main(&resolve_db(db, qdb));
+        LogicalPlan::RefreshMaterializedViews { ns: qdb } => {
+            let target = resolve_ns(db, qdb);
             let names = db.materialized_view_names_in(&target);
             // All-or-nothing: every defining query is evaluated before any
             // backing table is touched, so one broken view cannot leave the
@@ -2049,11 +2067,11 @@ pub(crate) fn run_plain(
             Ok(QueryResult::RefreshedMaterializedViews { names })
         }
         LogicalPlan::DropMaterializedView {
-            db: qdb,
+            ns: qdb,
             name,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if db.materialized_view_in(&target, name).is_err() {
                 if *if_exists {
                     return Ok(QueryResult::DroppedMaterializedView { name: name.clone() });
@@ -2070,6 +2088,62 @@ pub(crate) fn run_plain(
             }
             db.materialized_views_remove_in(&target, &name.to_ascii_lowercase());
             Ok(QueryResult::DroppedMaterializedView { name: name.clone() })
+        }
+        LogicalPlan::CreateSchema {
+            ns,
+            name,
+            if_not_exists,
+        } => {
+            if db.lake_slot(ns.db()).is_some() {
+                return Err(PinkDbError::Execution(
+                    "CREATE SCHEMA is not supported yet in a lake database".to_string(),
+                ));
+            }
+            if !db.database_exists(ns.db()) {
+                return Err(PinkDbError::Catalog(format!(
+                    "database \"{}\" not found",
+                    ns.db()
+                )));
+            }
+            if !*if_not_exists && db.schema_exists(ns) {
+                return Err(PinkDbError::Catalog(format!(
+                    "schema \"{}\" already exists",
+                    ns.schema()
+                )));
+            }
+            let existed = db.schema_exists(ns);
+            db.create_schema(ns, *if_not_exists)?;
+            if !existed {
+                db.set_schema_display(ns, name)?;
+            }
+            Ok(QueryResult::CreatedSchema { name: name.clone() })
+        }
+        LogicalPlan::DropSchema {
+            ns,
+            if_exists,
+            cascade,
+        } => {
+            if db.lake_slot(ns.db()).is_some() {
+                return Err(PinkDbError::Execution(
+                    "DROP SCHEMA is not supported yet in a lake database".to_string(),
+                ));
+            }
+            if !*if_exists && !db.schema_exists(ns) {
+                return Err(PinkDbError::Catalog(format!(
+                    "schema \"{}\" not found",
+                    ns.schema()
+                )));
+            }
+            if db.schema_exists(ns) {
+                db.drop_schema(ns, *if_exists, *cascade)?;
+                if db.current_ns() == ns {
+                    let fallback = db.fallback_ns();
+                    db.set_current_ns(fallback);
+                }
+            }
+            Ok(QueryResult::DroppedSchema {
+                name: ns.schema().to_string(),
+            })
         }
         LogicalPlan::CreateDatabase {
             name,
@@ -2107,7 +2181,7 @@ pub(crate) fn run_plain(
             db.rbac_mut().remove_database(name);
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
         }
-        LogicalPlan::Use { name } => use_result(db, name),
+        LogicalPlan::Use { ns } => use_result(db, ns),
         LogicalPlan::SetVariable { name, value } => {
             let cx = Cx::with_budget(db, budget.clone());
             set_variable(&cx, name, value)
@@ -2118,7 +2192,7 @@ pub(crate) fn run_plain(
             }
             Ok(QueryResult::Checkpointed)
         }
-        LogicalPlan::Analyze { db: adb, table } => {
+        LogicalPlan::Analyze { ns: adb, table } => {
             analyze_tables(db, adb, table.as_deref())?;
             // DuckDB-shaped outcome: one BOOLEAN row.
             Ok(QueryResult::Selected {
@@ -2174,12 +2248,12 @@ pub(crate) fn run_plain(
             Ok(QueryResult::LoadedExtension { name })
         }
         LogicalPlan::CreateProcedure {
-            db: qdb,
+            ns: qdb,
             name,
             def,
             or_replace,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // The procedure shares the table/view/materialized-view name
             // space at creation: a callable named like a table would make
             // `CALL` and queries silently disagree. A materialized view is
@@ -2210,11 +2284,11 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedProcedure { name: name.clone() })
         }
         LogicalPlan::DropProcedure {
-            db: qdb,
+            ns: qdb,
             name,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if db.procedure_in(&target, name).is_err() {
                 if *if_exists {
                     return Ok(QueryResult::DroppedProcedure { name: name.clone() });
@@ -2227,13 +2301,14 @@ pub(crate) fn run_plain(
             Ok(QueryResult::DroppedProcedure { name: name.clone() })
         }
         LogicalPlan::CreateTrigger {
-            db: qdb,
+            ns: qdb,
             def,
             or_replace,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let mut def = (**def).clone();
-            def.db = target.clone();
+            def.db = target.db().to_string();
+            def.schema = target.schema().to_string();
             // A trigger shares the callable/catalog name space with nothing —
             // it is looked up per table — but two triggers of one table with
             // the same name would make `DROP TRIGGER` ambiguous.
@@ -2250,12 +2325,12 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedTrigger { name })
         }
         LogicalPlan::DropTrigger {
-            db: qdb,
+            ns: qdb,
             name,
             table,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             let existing = db.trigger_in(&target, name).ok().cloned();
             let Some(existing) = existing else {
                 if *if_exists {
@@ -2391,20 +2466,20 @@ pub(crate) fn run_plain(
             })
         }
         LogicalPlan::Call {
-            db: qdb,
+            ns: qdb,
             name,
             args,
             inline,
         } => run_call_plan(db, qdb, name, args, inline, &budget),
         LogicalPlan::CreateMacro {
-            db: qdb,
+            ns: qdb,
             name,
             def,
             or_replace,
             if_not_exists,
             source,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             // The definition is persisted as its statement text; a plan that
             // reached the executor without one (a host calling the raw
             // bind/run API) could never be saved, so refuse loudly instead of
@@ -2433,11 +2508,11 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedMacro { name: name.clone() })
         }
         LogicalPlan::DropMacro {
-            db: qdb,
+            ns: qdb,
             name,
             if_exists,
         } => {
-            let target = resolve_db(db, qdb);
+            let target = resolve_ns(db, qdb);
             if db.macro_in(&target, name).is_err() {
                 if *if_exists {
                     return Ok(QueryResult::DroppedMacro { name: name.clone() });
@@ -2488,8 +2563,8 @@ pub(crate) fn run_read_with_budget(
 fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
     // `USE` is read-only for locking but is not a row-producing plan: it
     // returns the target database for the session layer to apply.
-    if let LogicalPlan::Use { name } = plan {
-        return use_result(cx.db, name);
+    if let LogicalPlan::Use { ns } = plan {
+        return use_result(cx.db, ns);
     }
     // `SET VARIABLE` writes session state only: it is read-only for the store
     // (no lock upgrade, nothing logged) but must still run on the read path.
@@ -2546,7 +2621,7 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
 /// `BIGINT` column naming the rows written.
 fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
     let LogicalPlan::CopyTo {
-        db: qdb,
+        ns: qdb,
         table,
         format,
         path,
@@ -2554,7 +2629,7 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
     else {
         unreachable!("execute_copy_to needs a CopyTo node");
     };
-    let target = resolve_db(db, qdb);
+    let target = resolve_ns(db, qdb);
     // M-3: the destination policy is enforced in the engine, not at bind
     // time, so a policy changed after prepare still applies. A disabled
     // server refuses even an ADMIN; the opt-in form confines the parent.
@@ -2665,7 +2740,7 @@ fn scan_candidates(
 /// every column decoded. A time-travel scan (`at`) reads the attached lake at
 /// the target version instead of the pinned one.
 fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
-    let LogicalPlan::Scan { db: qdb, table, at } = plan else {
+    let LogicalPlan::Scan { ns: qdb, table, at } = plan else {
         unreachable!("scan_output needs a Scan node");
     };
     if qdb.is_none()
@@ -2673,11 +2748,16 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     {
         return Ok(out.clone());
     }
-    let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
+    let lookup = qdb
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| cx.db.current_ns().clone());
     let projected = cx.projections.for_scan(plan);
     // Join filters a completed build side registered for this scan (wave 122).
     let dynamic = cx.dynamic.for_scan(plan);
-    if let Some((_, lake)) = cx.db.attached_lookup(lookup, table) {
+    if lookup.schema() == "main"
+        && let Some((_, lake)) = cx.db.attached_lookup(lookup.db(), table)
+    {
         // The simple `WHERE` conjuncts this scan may be pruned by (analyzed
         // with the projections). The lake decodes only the files whose zone
         // maps leave the predicate satisfiable.
@@ -2693,8 +2773,8 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             }
         }
         let scan = match at {
-            None => lake.load_filtered(lookup, table, projected, &prunes)?,
-            Some(at) => lake.load_filtered_at(lookup, table, *at, projected, &prunes)?,
+            None => lake.load_filtered(lookup.db(), table, projected, &prunes)?,
+            Some(at) => lake.load_filtered_at(lookup.db(), table, *at, projected, &prunes)?,
         };
         let (names, types) = scan.table.schema().into_iter().unzip();
         return Ok(Output {
@@ -2703,7 +2783,7 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             types,
         });
     }
-    let t = cx.db.table_in(lookup, table)?;
+    let t = cx.db.table_in(&lookup, table)?;
     let (names, types) = t.schema().into_iter().unzip();
     let keep = scan_candidates(t, cx.prunes.for_scan(plan), &dynamic);
     let chunks = match projected {
@@ -2839,7 +2919,7 @@ impl PartialOrd for ExactHit {
 #[allow(clippy::too_many_arguments)]
 fn exact_topk_rows(
     cx: &Cx,
-    db: &str,
+    db: &crate::storage::SchemaPath,
     table: &str,
     column: usize,
     dim: usize,
@@ -2912,7 +2992,7 @@ fn exact_topk_rows(
 /// interior chunk shorter than [`CHUNK_SIZE`].
 fn index_scan_output(
     cx: &Cx,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     table: &str,
     _col: usize,
     row_indices: &[usize],
@@ -3078,13 +3158,18 @@ fn attached_stats_aggregate(
     // a CTE); the attached lookup decides whether it is an attached lake
     // table at all.
     let LogicalPlan::Scan {
-        db: Some(db),
+        ns: Some(ns),
         table,
         at,
     } = input
     else {
         return Ok(None);
     };
+    // Attached lakes are database-level: only their `main` schema exists.
+    if ns.schema() != "main" {
+        return Ok(None);
+    }
+    let db = ns.db();
     let Some((pinned, lake)) = cx.db.attached_lookup(db, table) else {
         return Ok(None);
     };
@@ -3450,7 +3535,9 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::CreateSchema { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::DropSchema { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
         | LogicalPlan::LoadExtension { .. }
@@ -3497,13 +3584,13 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             "COPY does not produce rows".to_string(),
         )),
         LogicalPlan::IndexScan {
-            db,
+            ns: db,
             table,
             index,
             value,
         } => {
             // Use the index to get matching row indices, then gather columns.
-            let target = resolve_db(cx.db, db);
+            let target = resolve_ns(cx.db, db);
             let t = cx.db.table_in(&target, table)?;
             let idx = t
                 .indexes
@@ -3536,7 +3623,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             index_scan_output(cx, &target, table, idx.column, &row_indices)
         }
         LogicalPlan::VectorTopK {
-            db,
+            ns: db,
             table,
             column,
             index,
@@ -3546,7 +3633,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             k,
             ..
         } => {
-            let target = resolve_db(cx.db, db);
+            let target = resolve_ns(cx.db, db);
             let t = cx.db.table_in(&target, table)?;
             let def = t
                 .vector_indexes
@@ -3577,10 +3664,10 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             };
             index_scan_output(cx, &target, table, *column, &rows)
         }
-        LogicalPlan::ShowTables { db } => {
+        LogicalPlan::ShowTables { ns } => {
             // DuckDB lists tables and views together, sorted by name.
-            let mut names = cx.db.list_tables_in(db);
-            for v in cx.db.list_views_in(db) {
+            let mut names = cx.db.list_tables_in(ns);
+            for v in cx.db.list_views_in(ns) {
                 if !names.iter().any(|n| n.eq_ignore_ascii_case(&v)) {
                     names.push(v);
                 }
@@ -3641,8 +3728,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 ],
             })
         }
-        LogicalPlan::ShowMacros { db: qdb } => {
-            let target = resolve_db(cx.db, &Some(qdb.clone()));
+        LogicalPlan::ShowMacros { ns: qdb } => {
+            let target = qdb.clone();
             let defs = cx.db.macros_in(&target);
             let mut name = Vector::with_capacity(DataType::Varchar, defs.len());
             let mut kind = Vector::with_capacity(DataType::Varchar, defs.len());
@@ -3662,8 +3749,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types: vec![DataType::Varchar, DataType::Varchar, DataType::Varchar],
             })
         }
-        LogicalPlan::ShowTriggers { db: qdb, table } => {
-            let target = resolve_db(cx.db, qdb);
+        LogicalPlan::ShowTriggers { ns: qdb, table } => {
+            let target = resolve_ns(cx.db, qdb);
             let defs: Vec<&crate::trigger::TriggerDef> = cx
                 .db
                 .triggers_in(&target)
@@ -3706,7 +3793,7 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 ],
             })
         }
-        LogicalPlan::DescribeMacro { db: qdb, name } => {
+        LogicalPlan::DescribeMacro { ns: qdb, name } => {
             let def = cx.db.macro_in(qdb, name)?.clone();
             // DuckDB-shaped macro metadata (`duckdb_functions()`' columns for
             // a `function_type = 'macro'` row). `return_type` is NULL for an
@@ -3741,8 +3828,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 ],
             })
         }
-        LogicalPlan::ShowMaterializedViews { db: qdb } => {
-            let target = resolve_db(cx.db, qdb);
+        LogicalPlan::ShowMaterializedViews { ns: qdb } => {
+            let target = resolve_ns(cx.db, qdb);
             let rows = cx
                 .db
                 .materialized_view_status_in(&target, crate::mv::now_ms());
@@ -5156,6 +5243,44 @@ fn candidate_pairs(
     pairs
 }
 
+/// A join residual rewritten into the dense column space
+/// [`residual_selection`] gathers: the joined-row columns it reads (sorted) and
+/// the predicate over them.
+///
+/// Built **once per join**, before the probe chunks fan out, and primed there:
+/// an uncorrelated subquery's memo is keyed by its plan node's address, so a
+/// predicate rebuilt per chunk would miss the memo on every chunk and run the
+/// subquery again on a worker — the contention wave 111ab's priming exists to
+/// prevent (`tests/subquery_parallel.rs`).
+struct GatheredResidual {
+    cols: Vec<usize>,
+    pred: BoundExpr,
+}
+
+impl GatheredResidual {
+    fn new(cx: &Cx, residual: &BoundExpr) -> Result<Self> {
+        let mut cols = Vec::new();
+        columns_in(residual, &mut cols);
+        cols.sort_unstable();
+        cols.dedup();
+        if cols.contains(&usize::MAX) {
+            return Err(PinkDbError::Execution(
+                "internal: join residual reads an aggregate or window column".to_string(),
+            ));
+        }
+        let pred = if cols.is_empty() {
+            residual.clone()
+        } else {
+            crate::plan::map_columns(residual.clone(), &|i| {
+                cols.binary_search(&i)
+                    .expect("residual column was gathered")
+            })
+        };
+        expr::prime(cx, [&pred])?;
+        Ok(Self { cols, pred })
+    }
+}
+
 /// The candidate pairs that satisfy `residual`, as indices into `pairs`. The
 /// predicate reads the joined row in `preserved ++ build` space; only the
 /// columns it mentions are gathered into a dense chunk, so it evaluates once
@@ -5167,7 +5292,7 @@ fn candidate_pairs(
 /// src/execution/operator/join/physical_hash_join.cpp) gather the same way.
 fn residual_selection(
     cx: &Cx,
-    residual: &BoundExpr,
+    residual: &GatheredResidual,
     pairs: &[MatchPair],
     preserved: &DataChunk,
     preserved_cols: usize,
@@ -5176,30 +5301,18 @@ fn residual_selection(
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
-    let mut cols = Vec::new();
-    columns_in(residual, &mut cols);
-    cols.sort_unstable();
-    cols.dedup();
-    if cols.contains(&usize::MAX) {
-        return Err(PinkDbError::Execution(
-            "internal: join residual reads an aggregate or window column".to_string(),
-        ));
-    }
+    let GatheredResidual { cols, pred } = residual;
     if cols.is_empty() {
         // A residual folded to a constant reads no column, so the column space
         // is irrelevant: one evaluation answers for every pair.
         let mut sel = selection::all_rows(preserved.num_rows());
-        expr::select_predicate(residual, preserved, cx, &mut sel)?;
+        expr::select_predicate(pred, preserved, cx, &mut sel)?;
         return Ok(if sel.is_empty() {
             Vec::new()
         } else {
             (0..pairs.len() as u32).collect()
         });
     }
-    let pred = crate::plan::map_columns(residual.clone(), &|i| {
-        cols.binary_search(&i)
-            .expect("residual column was gathered")
-    });
     // A chunk is at most `CHUNK_SIZE` rows, and a probe chunk can have many
     // more candidate pairs than that (several matches per row), so the pairs
     // are gathered and tested a chunk's worth at a time.
@@ -5225,7 +5338,7 @@ fn residual_selection(
             .collect();
         let chunk = DataChunk::new(dense)?;
         let mut sel = selection::all_rows(chunk.num_rows());
-        expr::select_predicate(&pred, &chunk, cx, &mut sel)?;
+        expr::select_predicate(pred, &chunk, cx, &mut sel)?;
         let base = (batch * CHUNK_SIZE) as u32;
         out.extend(sel.into_iter().map(|k| base + k));
     }
@@ -5394,20 +5507,25 @@ struct JoinSide<'a> {
 /// default.
 fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
     match plan {
-        LogicalPlan::Scan { db: qdb, table, at } => {
+        LogicalPlan::Scan { ns: qdb, table, at } => {
             if qdb.is_none()
                 && let Some(out) = cx.ctes.get(&table.to_ascii_lowercase())
             {
                 return Some(out.chunks.iter().map(|c| c.num_rows() as u64).sum());
             }
-            let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
-            if let Some((attached, lake)) = cx.db.attached_lookup(lookup, table) {
+            let lookup = qdb
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cx.db.current_ns().clone());
+            if lookup.schema() == "main"
+                && let Some((attached, lake)) = cx.db.attached_lookup(lookup.db(), table)
+            {
                 // A time-travel target's own row count is exact too; a target
                 // this lake cannot resolve keeps the unknown-size default
                 // (the query itself will surface the error).
                 return match at {
                     None => Some(attached.rows),
-                    Some(at) => lake.table_at(lookup, table, *at).ok().map(|t| t.rows),
+                    Some(at) => lake.table_at(lookup.db(), table, *at).ok().map(|t| t.rows),
                 };
             }
             cx.db
@@ -5570,6 +5688,10 @@ fn semi_by_marking_left(
     let residual = how
         .residual
         .map(|r| swap_join_space(r, left.types.len(), right.types.len()));
+    let residual = residual
+        .as_ref()
+        .map(|r| GatheredResidual::new(cx, r))
+        .transpose()?;
     let (table, ints) = join_table(cx, left.chunks, left_keys, right_keys, commons, ints, true)?;
     let marks: Vec<Vec<AtomicBool>> = left
         .chunks
@@ -5791,6 +5913,7 @@ fn hash_mark_join(
         }
     }
 
+    let residual = residual.map(|r| GatheredResidual::new(cx, r)).transpose()?;
     let mut dtypes: Vec<DataType> = left.types.to_vec();
     if mark {
         dtypes.push(DataType::Boolean);
@@ -5807,7 +5930,7 @@ fn hash_mark_join(
             // row answers exactly as if that right row did not exist.
             // A residual can only arrive on a semi/anti join (see the guard above), so
             // a row "passes" when at least one candidate pair survives it.
-            let row_pass: Option<Vec<bool>> = match residual {
+            let row_pass: Option<Vec<bool>> = match &residual {
                 None => None,
                 Some(residual) => {
                     let pairs = candidate_pairs(chunk, &kvs, &table, ints, filters, &mut buf);
@@ -6223,6 +6346,7 @@ fn hash_join_probe(
     let mut dtypes: Vec<DataType> = left_types.to_vec();
     dtypes.extend(right_types.iter().copied());
     let n_left = left_types.len();
+    let residual = residual.map(|r| GatheredResidual::new(cx, r)).transpose()?;
     let build_cols = JoinAssembler::build_columns(build.chunks, build.types.len());
     let partitions: Vec<Vec<DataChunk>> = preserved
         .chunks
@@ -6234,7 +6358,7 @@ fn hash_join_probe(
             // residual tests gathered pairs, so it gets a compacted chunk.
             let sel = preserved.sels.map(|s| s[ci].as_slice());
             let compacted;
-            let (chunk, sel) = match (sel, residual) {
+            let (chunk, sel) = match (sel, &residual) {
                 (Some(sel), Some(_)) => {
                     compacted = chunk.take(sel);
                     (&compacted, None)
@@ -6255,7 +6379,7 @@ fn hash_join_probe(
                 present,
                 &build_cols,
             );
-            if let Some(residual) = residual {
+            if let Some(residual) = &residual {
                 // Two passes: the residual decides which candidate pairs are
                 // matches before any of them is assembled.
                 let pairs = candidate_pairs(chunk, &kvs, &table, ints, filters, &mut buf);
@@ -7212,11 +7336,13 @@ fn fused_scan_aggregate(
             .is_some_and(|src| src.streams_scan(call)),
         // A time-travel scan has no streaming loader.
         LogicalPlan::Scan { at: Some(_), .. } => return Ok(None),
-        LogicalPlan::Scan { db, table, .. } => {
-            let lookup = db.as_deref().unwrap_or_else(|| cx.db.current_db());
-            cx.db
-                .attached_lookup(lookup, table)
-                .is_some_and(|(_, lake)| lake.streams_scan(lookup, table))
+        LogicalPlan::Scan { ns, table, .. } => {
+            let lookup = ns.as_ref().unwrap_or(cx.db.current_ns());
+            lookup.schema() == "main"
+                && cx
+                    .db
+                    .attached_lookup(lookup.db(), table)
+                    .is_some_and(|(_, lake)| lake.streams_scan(lookup.db(), table))
         }
         _ => return Ok(None),
     };
@@ -7272,9 +7398,15 @@ fn stream_leaf_chunks(
             src.scan_stream(call, projection, prunes, &mut push)?;
             cx.check_deadline()
         }
-        LogicalPlan::Scan { db, table, .. } => {
-            let lookup = db.as_deref().unwrap_or_else(|| cx.db.current_db());
-            let Some((_, lake)) = cx.db.attached_lookup(lookup, table) else {
+        LogicalPlan::Scan { ns, table, .. } => {
+            let lookup = ns
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cx.db.current_ns().clone());
+            let Some((_, lake)) = (lookup.schema() == "main")
+                .then(|| cx.db.attached_lookup(lookup.db(), table))
+                .flatten()
+            else {
                 return Err(PinkDbError::Execution(format!(
                     "the attached table \"{lookup}.{table}\" is no longer loaded in this session; \
                      run the statement again"
@@ -7282,7 +7414,7 @@ fn stream_leaf_chunks(
             };
             let projected = cx.projections.for_scan(plan);
             let prunes = cx.prunes.for_scan(plan);
-            lake.scan_streamed(lookup, table, projected, prunes, sink)?;
+            lake.scan_streamed(lookup.db(), table, projected, prunes, sink)?;
             cx.check_deadline()
         }
         _ => unreachable!("stream_leaf_chunks needs a leaf the fusion accepted"),
@@ -8275,7 +8407,7 @@ fn explain_into(
     let mut children: Vec<&LogicalPlan> = Vec::new();
     let head = match plan {
         LogicalPlan::CopyTo {
-            db,
+            ns: db,
             table,
             format,
             path,
@@ -8283,7 +8415,7 @@ fn explain_into(
             format!("CopyTo {} ({format}) -> '{path}'", qualify(db, table))
         }
         LogicalPlan::CreateTable {
-            db,
+            ns: db,
             name,
             if_not_exists,
             ..
@@ -8292,7 +8424,7 @@ fn explain_into(
             format!("CreateTable{ine} {}", qualify(db, name))
         }
         LogicalPlan::CreateTableAs {
-            db,
+            ns: db,
             name,
             query,
             if_not_exists,
@@ -8303,7 +8435,10 @@ fn explain_into(
             format!("CreateTableAs{ine} {}", qualify(db, name))
         }
         LogicalPlan::Insert {
-            db, table, rows, ..
+            ns: db,
+            table,
+            rows,
+            ..
         } => {
             let mut text = format!("Insert {} ({} rows)", qualify(db, table), rows.len());
             if let Some(c) = conflict_text(plan) {
@@ -8311,7 +8446,7 @@ fn explain_into(
             }
             text
         }
-        LogicalPlan::AlterTable { db, name, op } => {
+        LogicalPlan::AlterTable { ns, name, op } => {
             let what = match op {
                 AlterTablePlan::AddColumn { column, .. } => format!("AddColumn {column}"),
                 AlterTablePlan::DropColumn { column, .. } => format!("DropColumn {column}"),
@@ -8320,10 +8455,10 @@ fn explain_into(
                 }
                 AlterTablePlan::RenameTable { to } => format!("RenameTable ->{to}"),
             };
-            format!("AlterTable {} ({what})", qualify(db, name))
+            format!("AlterTable {} ({what})", qualify(ns, name))
         }
         LogicalPlan::InsertSelect {
-            db,
+            ns: db,
             table,
             query,
             columns,
@@ -8340,7 +8475,7 @@ fn explain_into(
             )
         }
         LogicalPlan::Update {
-            db,
+            ns: db,
             table,
             sets,
             predicate,
@@ -8357,10 +8492,13 @@ fn explain_into(
             s
         }
         LogicalPlan::Merge {
-            db, table, clauses, ..
+            ns: db,
+            table,
+            clauses,
+            ..
         } => format!("Merge {} ({} clauses)", qualify(db, table), clauses.len()),
         LogicalPlan::Delete {
-            db,
+            ns: db,
             table,
             predicate,
             using,
@@ -8378,10 +8516,10 @@ fn explain_into(
         LogicalPlan::Begin => "Begin".to_string(),
         LogicalPlan::Commit => "Commit".to_string(),
         LogicalPlan::Rollback => "Rollback".to_string(),
-        LogicalPlan::CreateView { db, name, .. } => format!("CreateView {}", qualify(db, name)),
-        LogicalPlan::DropTable { db, name, .. } => format!("DropTable {}", qualify(db, name)),
+        LogicalPlan::CreateView { ns: db, name, .. } => format!("CreateView {}", qualify(db, name)),
+        LogicalPlan::DropTable { ns: db, name, .. } => format!("DropTable {}", qualify(db, name)),
         LogicalPlan::CreateIndex {
-            db,
+            ns: db,
             name,
             table,
             using,
@@ -8412,30 +8550,33 @@ fn explain_into(
             }
             None => format!("CreateIndex {} ON {}", name, qualify(db, table)),
         },
-        LogicalPlan::DropIndex { db, name, .. } => format!("DropIndex {}", qualify(db, name)),
-        LogicalPlan::CreateMaterializedView { db, name, .. } => {
+        LogicalPlan::DropIndex { ns: db, name, .. } => format!("DropIndex {}", qualify(db, name)),
+        LogicalPlan::CreateMaterializedView { ns: db, name, .. } => {
             format!("CreateMaterializedView {}", qualify(db, name))
         }
-        LogicalPlan::RefreshMaterializedView { db, name } => {
+        LogicalPlan::RefreshMaterializedView { ns: db, name } => {
             format!("RefreshMaterializedView {}", qualify(db, name))
         }
         LogicalPlan::CreateProcedure { name, .. } => format!("CreateProcedure {name}"),
         LogicalPlan::DropProcedure { name, .. } => format!("DropProcedure {name}"),
-        LogicalPlan::CreateTrigger { db, def, .. } => {
+        LogicalPlan::CreateTrigger { ns: db, def, .. } => {
             format!("CreateTrigger {}", qualify(db, &def.name))
         }
-        LogicalPlan::DropTrigger { db, name, .. } => {
+        LogicalPlan::DropTrigger { ns: db, name, .. } => {
             format!("DropTrigger {}", qualify(db, name))
         }
-        LogicalPlan::ShowTriggers { db, .. } => {
-            format!("ShowTriggers {}", db.as_deref().unwrap_or(""))
+        LogicalPlan::ShowTriggers { ns, .. } => {
+            format!(
+                "ShowTriggers {}",
+                ns.as_ref().map(|n| n.to_string()).unwrap_or_default()
+            )
         }
-        LogicalPlan::CreateMacro { db, name, .. } => {
+        LogicalPlan::CreateMacro { ns: db, name, .. } => {
             format!("CreateMacro {}", qualify(db, name))
         }
-        LogicalPlan::DropMacro { db, name, .. } => format!("DropMacro {}", qualify(db, name)),
-        LogicalPlan::ShowMacros { db } => format!("ShowMacros {db}"),
-        LogicalPlan::DescribeMacro { db, name } => {
+        LogicalPlan::DropMacro { ns: db, name, .. } => format!("DropMacro {}", qualify(db, name)),
+        LogicalPlan::ShowMacros { ns } => format!("ShowMacros {ns}"),
+        LogicalPlan::DescribeMacro { ns: db, name } => {
             format!("DescribeMacro {}", qualify(&Some(db.clone()), name))
         }
         LogicalPlan::Call { name, .. } => format!("Call {name}"),
@@ -8446,21 +8587,29 @@ fn explain_into(
         LogicalPlan::DropRole { name, .. } => format!("DropRole {name}"),
         LogicalPlan::Grant { spec } => format!("Grant {}", spec.description),
         LogicalPlan::Revoke { spec } => format!("Revoke {}", spec.description),
-        LogicalPlan::RefreshMaterializedViews { db } => format!(
-            "RefreshMaterializedViews {}",
-            db.clone().unwrap_or_default()
-        ),
-        LogicalPlan::DropMaterializedView { db, name, .. } => {
+        LogicalPlan::RefreshMaterializedViews { ns } => {
+            format!(
+                "RefreshMaterializedViews {}",
+                ns.as_ref().map(|n| n.to_string()).unwrap_or_default()
+            )
+        }
+        LogicalPlan::DropMaterializedView { ns: db, name, .. } => {
             format!("DropMaterializedView {}", qualify(db, name))
         }
-        LogicalPlan::ShowMaterializedViews { db } => {
-            format!("ShowMaterializedViews {}", db.clone().unwrap_or_default())
+        LogicalPlan::ShowMaterializedViews { ns } => {
+            format!(
+                "ShowMaterializedViews {}",
+                ns.as_ref().map(|n| n.to_string()).unwrap_or_default()
+            )
         }
         LogicalPlan::IndexScan {
-            db, table, index, ..
+            ns: db,
+            table,
+            index,
+            ..
         } => format!("IndexScan {} using {}", qualify(db, table), index),
         LogicalPlan::VectorTopK {
-            db,
+            ns: db,
             table,
             index,
             metric,
@@ -8530,12 +8679,14 @@ fn explain_into(
             }
             line
         }
-        LogicalPlan::DropView { db, name } => format!("DropView {}", qualify(db, name)),
+        LogicalPlan::DropView { ns: db, name } => format!("DropView {}", qualify(db, name)),
         LogicalPlan::CreateDatabase { name, .. } => format!("CreateDatabase {name}"),
+        LogicalPlan::CreateSchema { ns, .. } => format!("CreateSchema {ns}"),
+        LogicalPlan::DropSchema { ns, .. } => format!("DropSchema {ns}"),
         LogicalPlan::DropDatabase { name, .. } => format!("DropDatabase {name}"),
         LogicalPlan::Attach { name, .. } => format!("Attach {name}"),
         LogicalPlan::Detach { name, .. } => format!("Detach {name}"),
-        LogicalPlan::Use { name } => format!("Use {name}"),
+        LogicalPlan::Use { ns } => format!("Use {ns}"),
         LogicalPlan::Sample { input, sample } => {
             children.push(input);
             let size = match sample.size {
@@ -8568,11 +8719,11 @@ fn explain_into(
             format!("LoadInstalledExtension {name}")
         }
         LogicalPlan::Checkpoint => "Checkpoint".to_string(),
-        LogicalPlan::Analyze { db, table } => match table {
-            Some(t) => format!("Analyze {}.{t}", db),
-            None => format!("Analyze {db}"),
+        LogicalPlan::Analyze { ns, table } => match table {
+            Some(t) => format!("Analyze {ns}.{t}"),
+            None => format!("Analyze {ns}"),
         },
-        LogicalPlan::ShowTables { db } => format!("ShowTables {db}"),
+        LogicalPlan::ShowTables { ns } => format!("ShowTables {ns}"),
         LogicalPlan::ShowDatabases => "ShowDatabases".to_string(),
         LogicalPlan::Describe { columns } => format!("Describe ({} cols)", columns.len()),
         LogicalPlan::Explain { plan } => {
@@ -8597,7 +8748,7 @@ fn explain_into(
             };
             format!("{name} ({} cols)", types.len())
         }
-        LogicalPlan::Scan { db, table, at } => {
+        LogicalPlan::Scan { ns: db, table, at } => {
             let text = if db.is_none() {
                 format!("Scan CTE {table}")
             } else {
@@ -8755,7 +8906,7 @@ fn join_name(kind: JoinKind) -> &'static str {
     }
 }
 
-fn qualify(db: &Option<String>, table: &str) -> String {
+fn qualify(db: &Option<crate::storage::SchemaPath>, table: &str) -> String {
     match db {
         Some(d) => format!("{d}.{table}"),
         None => table.to_string(),
@@ -9120,7 +9271,7 @@ fn plan_schema_of(cx: &Cx, plan: &LogicalPlan) -> Result<(Vec<String>, Vec<DataT
             )
         })
         .collect();
-    let schema = crate::sql::binder::plan_schema(cx.db, cx.db.current_db(), &ctes, plan)?;
+    let schema = crate::sql::binder::plan_schema(cx.db, cx.db.current_ns(), &ctes, plan)?;
     Ok(schema.into_iter().unzip())
 }
 
@@ -11864,7 +12015,7 @@ mod tests {
                 "  Sort [#0]".to_string(),
                 "    Project [x]".to_string(),
                 "      Filter (#0 > 1)".to_string(),
-                "        Scan main.wj".to_string(),
+                "        Scan main.main.wj".to_string(),
             ]
         );
         // EXPLAIN binds but never executes: a query against a missing table
@@ -11878,7 +12029,7 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert!(explained.contains("Insert main.wj"), "{explained}");
+        assert!(explained.contains("Insert main.main.wj"), "{explained}");
         assert!(
             db.execute("EXPLAIN CREATE TABLE nope (a INTEGER);")
                 .expect_err("EXPLAIN of DDL")
@@ -13893,7 +14044,7 @@ mod tests {
         let stmts = crate::sql::parse_statements(sql).unwrap();
         crate::optimizer::optimize(
             db,
-            crate::sql::bind(db, &stmts[0], db.current_db()).unwrap(),
+            crate::sql::bind(db, &stmts[0], db.current_ns()).unwrap(),
         )
     }
 
@@ -15028,13 +15179,15 @@ mod tests {
         assert_eq!(
             results[0],
             QueryResult::Used {
-                db: "db1".to_string()
+                db: "db1".to_string(),
+                schema: "main".to_string(),
             }
         );
         assert_eq!(
             results[2],
             QueryResult::Used {
-                db: "main".to_string()
+                db: "main".to_string(),
+                schema: "main".to_string(),
             }
         );
         assert_eq!(
@@ -15342,7 +15495,7 @@ mod tests {
         let cx = Cx::new(&db);
         let rows = db.table("w").unwrap().num_rows() as u64;
         let scan = LogicalPlan::Scan {
-            db: Some(db.current_db().to_string()),
+            ns: Some(db.current_ns().clone()),
             table: "w".to_string(),
             at: None,
         };
@@ -15407,7 +15560,7 @@ mod tests {
             estimate_rows(
                 &cx,
                 &LogicalPlan::Scan {
-                    db: Some("main".to_string()),
+                    ns: Some(crate::storage::SchemaPath::main("main")),
                     table: "nope".to_string(),
                     at: None,
                 }
@@ -15622,7 +15775,9 @@ mod tests {
             ("LOAD math_ext", true),
         ] {
             let stmt = crate::sql::parse_statements(sql).unwrap().remove(0);
-            let plan = crate::sql::binder::bind(&db, &stmt, "main").unwrap();
+            let plan =
+                crate::sql::binder::bind(&db, &stmt, &crate::storage::SchemaPath::main("main"))
+                    .unwrap();
             assert_eq!(crate::plan::writes_tables(&plan), logged, "{sql}");
         }
     }
@@ -15866,7 +16021,10 @@ mod tests {
             !lines.iter().any(|l| l.contains("Join")),
             "the parent join must be eliminated: {lines:?}"
         );
-        assert!(lines.iter().any(|l| l.contains("Scan main.c")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("Scan main.main.c")),
+            "{lines:?}"
+        );
         // Results agree with the declaration satisfied (and with the join
         // written out).
         let with_join = select(
@@ -16033,32 +16191,21 @@ mod tests {
         assert_eq!(got, vec![vec![V::Integer(1)], vec![V::Integer(2)]]);
     }
 
-    /// Declared foreign keys work across databases (`REFERENCES db.table`)
-    /// and eliminate the cross-database join the same way.
+    /// A foreign key cannot leave its table's schema (wave 131: DuckDB's
+    /// rule), so the old cross-database spelling is refused.
     #[test]
     fn wave41_cross_database_fk() {
         let mut db = PinkDb::new();
         db.execute("CREATE DATABASE d2;").unwrap();
         db.execute("CREATE TABLE d2.p (id INTEGER PRIMARY KEY, v INTEGER);")
             .unwrap();
-        db.execute("INSERT INTO d2.p VALUES (1, 10);").unwrap();
-        db.execute("CREATE TABLE c (cid INTEGER, pid INTEGER NOT NULL REFERENCES d2.p(id));")
-            .unwrap();
-        db.execute("INSERT INTO c VALUES (7, 1);").unwrap();
-        let fk = &db.table("c").unwrap().constraints.foreign_keys[0];
-        assert_eq!(fk.ref_db, "d2");
-        assert_eq!(fk.ref_table, "p");
-        let lines = explain_lines(
-            &mut db,
-            "SELECT c.cid FROM c JOIN d2.p AS x ON c.pid = x.id",
-        );
-        assert!(!lines.iter().any(|l| l.contains("Join")), "{lines:?}");
-        assert_eq!(
-            select(
-                &mut db,
-                "SELECT c.cid FROM c JOIN d2.p AS x ON c.pid = x.id;"
-            ),
-            vec![vec![V::Integer(7)]]
+        let err = db
+            .execute("CREATE TABLE c (cid INTEGER, pid INTEGER NOT NULL REFERENCES d2.p(id));")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("foreign keys across different schemas or catalogs is not supported"),
+            "{err}"
         );
     }
 

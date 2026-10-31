@@ -171,7 +171,7 @@ fn grant_and_revoke_are_idempotent_and_scope_checked() {
         assert_eq!(
             r,
             QueryResult::Granted {
-                description: "SELECT ON TABLE main.t TO alice".to_string()
+                description: "SELECT ON TABLE main.main.t TO alice".to_string()
             }
         );
     }
@@ -181,7 +181,7 @@ fn grant_and_revoke_are_idempotent_and_scope_checked() {
         assert_eq!(
             r,
             QueryResult::Revoked {
-                description: "INSERT ON TABLE main.t TO alice".to_string()
+                description: "INSERT ON TABLE main.main.t TO alice".to_string()
             }
         );
     }
@@ -190,7 +190,8 @@ fn grant_and_revoke_are_idempotent_and_scope_checked() {
     assert_eq!(
         r,
         QueryResult::Granted {
-            description: "SELECT, INSERT, UPDATE, DELETE ON TABLE main.t TO analyst".to_string()
+            description: "SELECT, INSERT, UPDATE, DELETE ON TABLE main.main.t TO analyst"
+                .to_string()
         }
     );
     let r = exec(&mut db, "GRANT ALL ON DATABASE main TO analyst;");
@@ -448,7 +449,10 @@ fn authenticated_sessions_are_checked_per_statement() {
         "{e}"
     );
     let e = execute(&mut alice, "CREATE TABLE bob_table (a INTEGER);");
-    assert!(e.contains("CREATE privilege on database \"main\""), "{e}");
+    assert!(
+        e.contains("CREATE privilege on schema \"main.main\""),
+        "{e}"
+    );
     let e = execute(&mut alice, "SELECT * FROM other.o;");
     assert!(
         e.contains("SELECT privilege on table \"other.main.o\""),

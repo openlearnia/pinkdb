@@ -1730,7 +1730,7 @@ pub(crate) struct ProcFrame {
     /// logs these statements (the final segment, executed in the named
     /// database) instead of the `CALL` text — re-running a call that
     /// committed part of its work would apply that part twice.
-    segment_log: Option<(String, Vec<String>)>,
+    segment_log: Option<(crate::storage::SchemaPath, Vec<String>)>,
 }
 
 impl ProcFrame {
@@ -1759,7 +1759,7 @@ impl ProcFrame {
     /// The final segment to log instead of the `CALL` statement (wave 83),
     /// as `(database, statements)`; `None` for a call without transaction
     /// control (it logs its own text, as before).
-    pub(crate) fn segment_log(&self) -> Option<&(String, Vec<String>)> {
+    pub(crate) fn segment_log(&self) -> Option<&(crate::storage::SchemaPath, Vec<String>)> {
         self.segment_log.as_ref()
     }
 
@@ -1811,7 +1811,7 @@ struct Var {
 /// Per-call execution state.
 struct Frame<'a> {
     name: &'a str,
-    db_name: String,
+    db_name: crate::storage::SchemaPath,
     scopes: Vec<Vec<Var>>,
     /// Body statements executed so far (reported by `QueryResult::Called`).
     statements: usize,
@@ -1900,7 +1900,7 @@ impl<'a> Frame<'a> {
 /// call's result. See the module docs for the transaction/atomicity rule.
 pub(crate) fn execute_call(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     args: Vec<Value>,
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
@@ -1913,7 +1913,7 @@ pub(crate) fn execute_call(
 /// transaction control.
 pub(crate) fn execute_do(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<QueryResult> {
@@ -1922,7 +1922,7 @@ pub(crate) fn execute_do(
 
 fn execute_call_kind(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     args: Vec<Value>,
     kind: CallKind,
@@ -1943,7 +1943,7 @@ fn execute_call_kind(
 
 fn execute_call_inner(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     args: Vec<Value>,
     kind: CallKind,
@@ -2011,7 +2011,7 @@ fn execute_call_inner(
 /// call-start snapshot, or the state at the body's last `COMMIT`/`ROLLBACK`.
 fn run_sql_body(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     scope: Vec<Var>,
     kind: CallKind,
@@ -2037,7 +2037,7 @@ fn run_sql_body(
         .then(Vec::new);
     let mut frame = Frame {
         name: &def.name,
-        db_name: db_name.to_string(),
+        db_name: db_name.clone(),
         scopes: vec![scope],
         statements: 0,
         last: None,
@@ -2078,7 +2078,7 @@ fn run_sql_body(
 #[cfg(feature = "js")]
 fn run_js_body(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     scope: Vec<Var>,
 ) -> Result<QueryResult> {
@@ -2089,7 +2089,7 @@ fn run_js_body(
 #[cfg(not(feature = "js"))]
 fn run_js_body(
     _db: &mut PinkDb,
-    _db_name: &str,
+    _db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     _scope: Vec<Var>,
 ) -> Result<QueryResult> {
@@ -2457,7 +2457,7 @@ fn exec_sql(
 /// language-specific "this statement cannot be part of a logged call" error.
 pub(crate) fn run_call_statement(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     slots: crate::sql::binder::ParamSlots,
     sql: &Statement,
     budget: Option<&std::sync::Arc<crate::exec::ExecBudget>>,
@@ -2515,9 +2515,8 @@ pub(crate) fn run_call_statement(
     // The call's actual touched set (the WAL frame's payload and the
     // transaction's conflict set): collected here because loop conditions are
     // data-dependent and cannot be approximated before execution.
-    let ns = crate::storage::SchemaPath::main(db_name);
-    let sets = db.plan_sets_store(&plan, &ns);
-    let writes = db.plan_writes_of(&plan, &ns);
+    let sets = db.plan_sets_store(&plan, db_name);
+    let writes = db.plan_writes_of(&plan, db_name);
     db.proc_frame.add_sets(&sets);
     db.proc_frame.add_writes(&writes);
     let wrote = crate::plan::writes_tables(&plan);

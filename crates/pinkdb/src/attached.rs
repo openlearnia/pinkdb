@@ -572,13 +572,20 @@ impl PinkDb {
     /// The schema of a table visible to queries: a store table first, else an
     /// attached lake table. Anything else keeps the store's "not found"
     /// error unchanged.
-    pub fn visible_table_schema(&self, db: &str, name: &str) -> Result<Vec<(String, DataType)>> {
-        match self.table_in(db, name) {
+    pub fn visible_table_schema(
+        &self,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+    ) -> Result<Vec<(String, DataType)>> {
+        match self.table_in(ns, name) {
             Ok(t) => Ok(t.schema()),
-            Err(e) => match self.attached_lookup(db, name) {
+            // Attachments are database-level in wave 131a: only `main` names
+            // an attached table.
+            Err(e) if ns.schema() != "main" => Err(e),
+            Err(e) => match self.attached_lookup(ns.db(), name) {
                 Some((t, _)) => Ok(t.schema.clone()),
                 // A lake database that could not be opened says why.
-                None => Err(self.unavailable_lake(db).unwrap_or(e)),
+                None => Err(self.unavailable_lake(ns.db()).unwrap_or(e)),
             },
         }
     }
@@ -590,15 +597,19 @@ impl PinkDb {
     /// in. An unknown table keeps the store's normal "not found" error.
     pub fn visible_table_schema_at(
         &self,
-        db: &str,
+        ns: &crate::storage::SchemaPath,
         name: &str,
         at: AtSpec,
     ) -> Result<Vec<(String, DataType)>> {
-        match self.attached_lookup(db, name) {
+        let db = ns.db();
+        match self
+            .attached_lookup(db, name)
+            .filter(|_| ns.schema() == "main")
+        {
             Some((_, lake)) => Ok(lake.table_at(db, name, at)?.schema),
-            None => match self.table_in(db, name) {
+            None => match self.table_in(ns, name) {
                 Ok(_) => Err(PinkDbError::Catalog(format!(
-                    "table \"{db}.{name}\" has no snapshot history: AT ({at}) time travel \
+                    "table \"{ns}.{name}\" has no snapshot history: AT ({at}) time travel \
                      works on tables of lake databases"
                 ))),
                 Err(e) => Err(e),
@@ -651,7 +662,7 @@ impl PinkDb {
         if !self.is_durable() || self.attached_lakes.is_empty() {
             return Ok(());
         }
-        let session = crate::storage::SchemaPath::main(self.current_db());
+        let session = self.current_ns().clone();
         let mut reads = std::collections::HashSet::new();
         crate::plan::collect_tables_read(plan, &session, &mut reads);
         // A materialized-view refresh re-evaluates its defining query: the
@@ -2148,7 +2159,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Scan main.t AT (VERSION => 2)"), "{text}");
+        assert!(
+            text.contains("Scan main.main.t AT (VERSION => 2)"),
+            "{text}"
+        );
         let rows = query(
             &mut db,
             "EXPLAIN SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '1970-01-01 00:00:02.5');",

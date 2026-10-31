@@ -229,8 +229,8 @@ fn a_chain_under_nested_decorrelated_joins_starts_from_its_filtered_table() {
                AND EXISTS (SELECT 1 FROM item b WHERE b.o = a.o AND b.s <> a.s) \
                AND NOT EXISTS (SELECT 1 FROM item c WHERE c.o = a.o AND c.s <> a.s AND c.late)";
     let plan = explain(&mut db, sql);
-    let nat_at = plan.find("Scan main.nat").expect("nat scan");
-    let item_at = plan.find("Scan main.item").expect("item scan");
+    let nat_at = plan.find("Scan main.main.nat").expect("nat scan");
+    let item_at = plan.find("Scan main.main.item").expect("item scan");
     assert!(
         nat_at < item_at,
         "the filtered table should join first:\n{plan}"

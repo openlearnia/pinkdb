@@ -60,7 +60,7 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
         LogicalPlan::Filter { input, predicate } => {
             let input = apply_indexes(db, *input);
             // Try to match input: Scan + predicate: col = literal.
-            if let LogicalPlan::Scan { db: qdb, table, .. } = &input
+            if let LogicalPlan::Scan { ns: qdb, table, .. } = &input
                 && let BoundExpr::Binary {
                     op: crate::sql::ast::BinaryOp::Eq,
                     left,
@@ -83,7 +83,7 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
                         };
                     }
                 };
-                let lookup = qdb.clone().unwrap_or_else(|| db.current_db().to_string());
+                let lookup = qdb.clone().unwrap_or_else(|| db.current_ns().clone());
                 let candidate = match db.table_in(&lookup, table) {
                     Ok(t) if !t.indexes_stale => t
                         .indexes
@@ -107,7 +107,7 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
                     };
                     return LogicalPlan::Filter {
                         input: Box::new(LogicalPlan::IndexScan {
-                            db: qdb.clone(),
+                            ns: qdb.clone(),
                             table: table.clone(),
                             index: index_name,
                             value: BoundExpr::Literal(canonical),
@@ -696,13 +696,13 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             offset,
         },
         LogicalPlan::Insert {
-            db,
+            ns,
             table,
             rows,
             conflict,
             returning,
         } => LogicalPlan::Insert {
-            db,
+            ns,
             table,
             rows: rows
                 .into_iter()
@@ -712,14 +712,14 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             returning,
         },
         LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
             query,
             conflict,
             returning,
         } => LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
             query: Box::new(fold_plan(db, *query)),
@@ -741,13 +741,13 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             plan: Box::new(fold_plan(db, *plan)),
         },
         LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query,
             if_not_exists,
             or_replace,
         } => LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query: Box::new(fold_plan(db, *query)),
             if_not_exists,
@@ -1426,7 +1426,7 @@ fn comma_join_leaves(
     }
     // A join records its left input's width, so the last leaf's width has to
     // come from its own schema.
-    let last = crate::sql::binder::plan_schema(db, db.current_db(), &[], leaves.last()?)
+    let last = crate::sql::binder::plan_schema(db, db.current_ns(), &[], leaves.last()?)
         .ok()?
         .len();
     widths.push(last);
@@ -1468,12 +1468,14 @@ const REORDER_GAIN: f64 = 0.9;
 fn leaf_base_rows(db: &crate::storage::PinkDb, leaf: &LogicalPlan) -> Option<f64> {
     match leaf {
         LogicalPlan::Scan {
-            db: qdb,
+            ns: qdb,
             table,
             at: None,
         } => {
-            let name = qdb.clone().unwrap_or_else(|| db.current_db().to_string());
-            if let Some((attached, _)) = db.attached_lookup(&name, table) {
+            let name = qdb.clone().unwrap_or_else(|| db.current_ns().clone());
+            if name.schema() == "main"
+                && let Some((attached, _)) = db.attached_lookup(name.db(), table)
+            {
                 return Some(attached.rows as f64);
             }
             db.table_in(&name, table).ok().map(|t| t.num_rows() as f64)
@@ -1497,11 +1499,11 @@ pub(crate) fn leaf_stats<'a>(
 ) -> Option<&'a crate::stats::TableStats> {
     match leaf {
         LogicalPlan::Scan {
-            db: qdb,
+            ns: qdb,
             table,
             at: None,
         } => {
-            let name = qdb.clone().unwrap_or_else(|| db.current_db().to_string());
+            let name = qdb.clone().unwrap_or_else(|| db.current_ns().clone());
             db.table_in(&name, table).ok().map(|t| t.stats())
         }
         LogicalPlan::Filter { input, .. }
@@ -2357,7 +2359,7 @@ fn reorder_comma_join(
     let above = and_all(outside);
     // The parent still addresses the chain's original column order, so put a
     // transparent projection on top. Its width is the chain's width.
-    let schema = crate::sql::binder::plan_schema(db, db.current_db(), &[], plan).ok()?;
+    let schema = crate::sql::binder::plan_schema(db, db.current_ns(), &[], plan).ok()?;
     let mut exprs = Vec::with_capacity(schema.len());
     let mut names = Vec::with_capacity(schema.len());
     for (g, (name, dtype)) in schema.iter().enumerate() {
@@ -3331,14 +3333,14 @@ fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> Lo
             types,
         },
         LogicalPlan::InsertSelect {
-            db,
+            ns,
             table,
             columns,
             query,
             conflict,
             returning,
         } => LogicalPlan::InsertSelect {
-            db,
+            ns,
             table,
             columns,
             query: Box::new(pushdown_inner(*query, pdb)),
@@ -3346,13 +3348,13 @@ fn pushdown_inner(plan: LogicalPlan, pdb: Option<&crate::storage::PinkDb>) -> Lo
             returning,
         },
         LogicalPlan::CreateTableAs {
-            db,
+            ns,
             name,
             query,
             if_not_exists,
             or_replace,
         } => LogicalPlan::CreateTableAs {
-            db,
+            ns,
             name,
             query: Box::new(pushdown_inner(*query, pdb)),
             if_not_exists,
@@ -3460,7 +3462,7 @@ impl Live {
 fn plan_width(db: &crate::storage::PinkDb, plan: &LogicalPlan) -> Option<usize> {
     match plan {
         LogicalPlan::Scan {
-            db: Some(dbname),
+            ns: Some(dbname),
             table,
             ..
         } => db.table_in(dbname, table).ok().map(|t| t.num_cols()),
@@ -3497,14 +3499,14 @@ fn column_origin(
 ) -> Option<(String, String, usize, bool)> {
     match plan {
         LogicalPlan::Scan {
-            db: Some(dbname),
+            ns: Some(dbname),
             table,
             ..
         } => {
             let t = db.table_in(dbname, table).ok()?;
             (index < t.num_cols()).then(|| {
                 (
-                    dbname.to_ascii_lowercase(),
+                    dbname.db().to_ascii_lowercase(),
                     table.to_ascii_lowercase(),
                     index,
                     false,
@@ -3590,7 +3592,7 @@ fn fk_join_eliminable(
     right_keys: &[BoundExpr],
 ) -> bool {
     let LogicalPlan::Scan {
-        db: Some(ref_db),
+        ns: Some(ref_db),
         table: ref_table,
         ..
     } = right
@@ -3639,7 +3641,8 @@ fn fk_join_eliminable(
     }) else {
         return false;
     };
-    if !fk.ref_db.eq_ignore_ascii_case(ref_db) || !fk.ref_table.eq_ignore_ascii_case(ref_table) {
+    if !fk.ref_db.eq_ignore_ascii_case(ref_db.db()) || !fk.ref_table.eq_ignore_ascii_case(ref_table)
+    {
         return false;
     }
     // Every FK column must be NOT NULL by declaration (see the rule above).
@@ -3953,14 +3956,14 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
             recursive: recursive.map(|r| Box::new(r.map(&|p| elim(db, p, &Live::All)))),
         },
         LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
             query,
             conflict,
             returning,
         } => LogicalPlan::InsertSelect {
-            db: qdb,
+            ns: qdb,
             table,
             columns,
             query: Box::new(elim(db, *query, &Live::All)),
@@ -3968,13 +3971,13 @@ fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalP
             returning,
         },
         LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query,
             if_not_exists,
             or_replace,
         } => LogicalPlan::CreateTableAs {
-            db: qdb,
+            ns: qdb,
             name,
             query: Box::new(elim(db, *query, &Live::All)),
             if_not_exists,
@@ -4067,7 +4070,7 @@ fn rewrite_sort(
         return None;
     };
     let LogicalPlan::Scan {
-        db: qdb,
+        ns: qdb,
         table,
         at: None,
     } = *scan
@@ -4097,8 +4100,11 @@ fn rewrite_sort(
         (BoundExpr::Literal(v), BoundExpr::Column { index, .. }) => (*index, v),
         _ => return None,
     };
-    let lookup = qdb.as_deref().unwrap_or_else(|| db.current_db());
-    let t = db.table_in(lookup, &table).ok()?;
+    let lookup = qdb
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| db.current_ns().clone());
+    let t = db.table_in(&lookup, &table).ok()?;
     let col = t.columns.get(col_idx)?;
     let dtype @ crate::types::DataType::Array { len, .. } = col.dtype else {
         return None;
@@ -4136,7 +4142,7 @@ fn rewrite_sort(
     }
     Some(LogicalPlan::Project {
         input: Box::new(LogicalPlan::VectorTopK {
-            db: qdb,
+            ns: qdb,
             table: table.clone(),
             column: col_idx,
             column_name: col.name.clone(),

@@ -98,6 +98,16 @@ impl Privilege {
     /// Every database privilege (`GRANT ALL ON DATABASE`).
     pub const DATABASE: [Privilege; 1] = [Privilege::Create];
 
+    /// Every schema privilege (`GRANT ALL ON SCHEMA`): table rights over every
+    /// table in the schema, plus `CREATE` for objects in it.
+    pub const SCHEMA: [Privilege; 5] = [
+        Privilege::Select,
+        Privilege::Insert,
+        Privilege::Update,
+        Privilege::Delete,
+        Privilege::Create,
+    ];
+
     /// The SQL word the privilege is written with.
     pub fn keyword(self) -> &'static str {
         match self {
@@ -213,11 +223,18 @@ pub enum GrantTarget {
     /// `GRANT <role> TO <principal>` / `REVOKE <role> FROM <principal>`:
     /// role membership.
     Role { role: String, principal: String },
-    /// `GRANT <priv>[, …] ON TABLE [db.]t TO <principal>`.
+    /// `GRANT <priv>[, …] ON TABLE [db.[schema.]]t TO <principal>`.
     Table {
         privs: GrantPrivs,
-        db: Option<String>,
+        qual: crate::sql::ast::Qualifier,
         table: String,
+        principal: String,
+    },
+    /// `GRANT <priv>[, …] ON SCHEMA [db.]s TO <principal>`.
+    Schema {
+        privs: GrantPrivs,
+        qual: crate::sql::ast::Qualifier,
+        name: String,
         principal: String,
     },
     /// `GRANT <priv>[, …] ON DATABASE db TO <principal>`.
@@ -271,6 +288,15 @@ impl GrantPrivs {
             self.privs.clone()
         }
     }
+
+    /// Expand for a schema grant: `ALL` means every schema privilege.
+    pub fn expand_schema(&self) -> Vec<Privilege> {
+        if self.all {
+            Privilege::SCHEMA.to_vec()
+        } else {
+            self.privs.clone()
+        }
+    }
 }
 
 /// A bound `GRANT`/`REVOKE`: canonical keys plus the display form the result
@@ -289,7 +315,7 @@ pub struct GrantSpec {
     pub object: GrantObject,
     /// The receiving principal, in canonical key form.
     pub principal: String,
-    /// `SELECT ON TABLE main.t TO alice` — the human-readable form of the
+    /// `SELECT ON TABLE main.main.t TO alice` — the human-readable form of the
     /// grant, built at bind time from the as-written names, reported in the
     /// statement's result.
     pub description: String,
@@ -821,7 +847,8 @@ impl RbacCatalog {
         // privileges (a database's `CREATE` is not a right on the table).
         let scope: &[Privilege] = match object {
             GrantObject::Table { .. } => &Privilege::TABLE,
-            GrantObject::Schema { .. } | GrantObject::Database { .. } => &Privilege::DATABASE,
+            GrantObject::Schema { .. } => &Privilege::SCHEMA,
+            GrantObject::Database { .. } => &Privilege::DATABASE,
             GrantObject::Admin | GrantObject::Role { .. } => &[],
         };
         out.retain(|p| scope.contains(p));
@@ -1405,13 +1432,10 @@ fn denied(principal: &str, what: &str, hint: &str) -> PinkDbError {
 
 /// The database a (possibly unqualified) plan target resolves to.
 fn target_ns(
-    qdb: &Option<String>,
+    qns: &Option<crate::storage::SchemaPath>,
     default_ns: &crate::storage::SchemaPath,
 ) -> crate::storage::SchemaPath {
-    match qdb {
-        Some(db) => crate::storage::SchemaPath::main(db),
-        None => default_ns.clone(),
-    }
+    qns.clone().unwrap_or_else(|| default_ns.clone())
 }
 
 /// The statement kinds `check_statement` applies the read pass to: every
@@ -1485,13 +1509,13 @@ pub(crate) fn check_statement(
     store: &PinkDb,
     principal: &str,
     plan: &LogicalPlan,
-    default_db: &str,
+    default_ns: &crate::storage::SchemaPath,
 ) -> Result<()> {
     let rbac = store.rbac();
     if rbac.is_admin_resolved(principal) {
         return Ok(());
     }
-    let default_ns = crate::storage::SchemaPath::main(default_db);
+    let default_ns = default_ns.clone();
     // M-4: a table-function scan (`read_parquet`, `read_arrow`, the
     // replacement scan `FROM 'file.parquet'`) reads external files with a
     // client-controlled path. It has no catalog object to grant on, so it is
@@ -1528,6 +1552,31 @@ pub(crate) fn check_statement(
             &format!("the CREATE privilege on database \"{db}\""),
             &format!(
                 "GRANT CREATE ON DATABASE {db} TO {}",
+                rbac.display_of(principal)
+            ),
+        ))
+    };
+    let create_on_ns = |ns: &crate::storage::SchemaPath| -> Result<()> {
+        let object = GrantObject::Schema {
+            db: ns.db().to_string(),
+            schema: ns.schema().to_string(),
+        };
+        if rbac.allowed(principal, &object, Privilege::Create)
+            || rbac.allowed(
+                principal,
+                &GrantObject::Database {
+                    db: ns.db().to_string(),
+                },
+                Privilege::Create,
+            )
+        {
+            return Ok(());
+        }
+        Err(denied(
+            principal,
+            &format!("the CREATE privilege on schema \"{ns}\" or its database"),
+            &format!(
+                "GRANT CREATE ON SCHEMA {ns} TO {}",
                 rbac.display_of(principal)
             ),
         ))
@@ -1574,37 +1623,40 @@ pub(crate) fn check_statement(
         // or write anything the definer can reach), so running one requires
         // ADMIN. Defining one only needs CREATE on the database.
         LogicalPlan::Call { .. } => return admin_only("CALL"),
-        LogicalPlan::CreateTable { db, .. }
-        | LogicalPlan::AlterTable { db, .. }
-        | LogicalPlan::DropTable { db, .. }
-        | LogicalPlan::CreateView { db, .. }
-        | LogicalPlan::DropView { db, .. }
-        | LogicalPlan::CreateIndex { db, .. }
-        | LogicalPlan::DropIndex { db, .. }
-        | LogicalPlan::CreateProcedure { db, .. }
-        | LogicalPlan::DropProcedure { db, .. }
+        LogicalPlan::CreateTable { ns, .. }
+        | LogicalPlan::AlterTable { ns, .. }
+        | LogicalPlan::DropTable { ns, .. }
+        | LogicalPlan::CreateView { ns, .. }
+        | LogicalPlan::DropView { ns, .. }
+        | LogicalPlan::CreateIndex { ns, .. }
+        | LogicalPlan::DropIndex { ns, .. }
+        | LogicalPlan::CreateProcedure { ns, .. }
+        | LogicalPlan::DropProcedure { ns, .. }
         // Wave 77: a macro is database metadata like a procedure: defining or
         // dropping one needs CREATE on the database. Invoking one needs no
         // macro privilege — its expansion runs under the invoker's ordinary
         // table privileges (see `check_statement`'s read pass).
-        | LogicalPlan::CreateMacro { db, .. }
-        | LogicalPlan::DropMacro { db, .. }
+        | LogicalPlan::CreateMacro { ns, .. }
+        | LogicalPlan::DropMacro { ns, .. }
         // Wave 100: defining or dropping a trigger is table DDL: it needs the
         // same CREATE on the database `ALTER TABLE` and index DDL need. The
         // body runs with the *invoker's* table privileges, not the definer's
         // (`procedure::run_call_statement` re-checks every body statement).
-        | LogicalPlan::CreateTrigger { db, .. }
-        | LogicalPlan::DropTrigger { db, .. }
-        | LogicalPlan::CreateTableAs { db, .. }
-        | LogicalPlan::CreateMaterializedView { db, .. }
-        | LogicalPlan::RefreshMaterializedView { db, .. }
-        | LogicalPlan::DropMaterializedView { db, .. } => {
-            let ns = target_ns(db, &default_ns);
+        | LogicalPlan::CreateTrigger { ns, .. }
+        | LogicalPlan::DropTrigger { ns, .. }
+        | LogicalPlan::CreateTableAs { ns, .. }
+        | LogicalPlan::CreateMaterializedView { ns, .. }
+        | LogicalPlan::RefreshMaterializedView { ns, .. }
+        | LogicalPlan::DropMaterializedView { ns, .. } => {
+            let ns = ns.clone().unwrap_or_else(|| default_ns.clone());
+            create_on_ns(&ns)?;
+        }
+        LogicalPlan::CreateSchema { ns, .. } | LogicalPlan::DropSchema { ns, .. } => {
             create_on_db(ns.db().to_string())?;
         }
-        LogicalPlan::RefreshMaterializedViews { db } => {
-            let ns = target_ns(db, &default_ns);
-            create_on_db(ns.db().to_string())?;
+        LogicalPlan::RefreshMaterializedViews { ns } => {
+            let ns = ns.clone().unwrap_or_else(|| default_ns.clone());
+            create_on_ns(&ns)?;
         }
         _ => {}
     }
@@ -1635,29 +1687,29 @@ fn check_writes(
     default_ns: &crate::storage::SchemaPath,
 ) -> Result<()> {
     match plan {
-        LogicalPlan::Insert { db, table, .. } | LogicalPlan::InsertSelect { db, table, .. } => {
+        LogicalPlan::Insert { ns, table, .. } | LogicalPlan::InsertSelect { ns, table, .. } => {
             check_table(
                 store,
                 principal,
-                &target_ns(db, default_ns),
+                &target_ns(ns, default_ns),
                 table,
                 Privilege::Insert,
             )?;
         }
-        LogicalPlan::Update { db, table, .. } => {
+        LogicalPlan::Update { ns, table, .. } => {
             check_table(
                 store,
                 principal,
-                &target_ns(db, default_ns),
+                &target_ns(ns, default_ns),
                 table,
                 Privilege::Update,
             )?;
         }
-        LogicalPlan::Delete { db, table, .. } => {
+        LogicalPlan::Delete { ns, table, .. } => {
             check_table(
                 store,
                 principal,
-                &target_ns(db, default_ns),
+                &target_ns(ns, default_ns),
                 table,
                 Privilege::Delete,
             )?;
@@ -1665,7 +1717,7 @@ fn check_writes(
         // A MERGE executes the actions its clauses spell out, so it needs
         // exactly the privileges of those actions on its target.
         LogicalPlan::Merge {
-            db, table, clauses, ..
+            ns, table, clauses, ..
         } => {
             let (mut update, mut delete, mut insert) = (false, false, false);
             for clause in clauses {
@@ -1675,7 +1727,7 @@ fn check_writes(
                             check_table(
                                 store,
                                 principal,
-                                &target_ns(db, default_ns),
+                                &target_ns(ns, default_ns),
                                 table,
                                 Privilege::Update,
                             )?;
@@ -1687,7 +1739,7 @@ fn check_writes(
                             check_table(
                                 store,
                                 principal,
-                                &target_ns(db, default_ns),
+                                &target_ns(ns, default_ns),
                                 table,
                                 Privilege::Delete,
                             )?;
@@ -1699,7 +1751,7 @@ fn check_writes(
                             check_table(
                                 store,
                                 principal,
-                                &target_ns(db, default_ns),
+                                &target_ns(ns, default_ns),
                                 table,
                                 Privilege::Insert,
                             )?;
@@ -1790,7 +1842,7 @@ pub(crate) fn wal_statement_text(plan: &LogicalPlan, sql: &str) -> String {
             password_hash
         ),
         LogicalPlan::CreateIndex {
-            db,
+            ns,
             name,
             table,
             column_name,
@@ -1803,7 +1855,7 @@ pub(crate) fn wal_statement_text(plan: &LogicalPlan, sql: &str) -> String {
                 "CREATE INDEX {}{} ON {}({})",
                 if *if_not_exists { "IF NOT EXISTS " } else { "" },
                 quote_ident(name),
-                qualified_ident(db, table),
+                qualified_ident(ns, table),
                 quote_ident(column_name)
             );
             if let Some(provider) = using {
@@ -1819,22 +1871,22 @@ pub(crate) fn wal_statement_text(plan: &LogicalPlan, sql: &str) -> String {
             out
         }
         LogicalPlan::DropIndex {
-            db,
+            ns,
             name,
             if_exists,
             ..
         } => format!(
             "DROP INDEX {}{}",
             if *if_exists { "IF EXISTS " } else { "" },
-            qualified_ident(db, name)
+            qualified_ident(ns, name)
         ),
         _ => sql.to_string(),
     }
 }
 
-fn qualified_ident(db: &Option<String>, name: &str) -> String {
-    match db {
-        Some(db) => format!("{}.{}", quote_ident(db), quote_ident(name)),
+fn qualified_ident(ns: &Option<crate::storage::SchemaPath>, name: &str) -> String {
+    match ns {
+        Some(ns) => format!("{}.{}", ns, quote_ident(name)),
         None => quote_ident(name),
     }
 }
@@ -2037,7 +2089,7 @@ mod tests {
         // qualified and every identifier is quoted exactly: keywords, spaces,
         // unicode and an embedded quote included.
         let create = LogicalPlan::CreateIndex {
-            db: Some("d ä".to_string()),
+            ns: Some(crate::storage::SchemaPath::new("d ä", "main")),
             name: "select".to_string(),
             table: "t x".to_string(),
             column: 0,
@@ -2048,17 +2100,17 @@ mod tests {
         };
         assert_eq!(
             wal_statement_text(&create, "CREATE INDEX IF NOT EXISTS select ON t(a);"),
-            "CREATE INDEX IF NOT EXISTS \"select\" ON \"d ä\".\"t x\"(\"a\"\"b\")"
+            "CREATE INDEX IF NOT EXISTS \"select\" ON \"d ä\".main.\"t x\"(\"a\"\"b\")"
         );
         let drop = LogicalPlan::DropIndex {
-            db: Some("d ä".to_string()),
+            ns: Some(crate::storage::SchemaPath::new("d ä", "main")),
             name: "ix".to_string(),
             table: Some("t x".to_string()),
             if_exists: true,
         };
         assert_eq!(
             wal_statement_text(&drop, "DROP INDEX ix;"),
-            "DROP INDEX IF EXISTS \"d ä\".ix"
+            "DROP INDEX IF EXISTS \"d ä\".main.ix"
         );
     }
 
@@ -2070,8 +2122,13 @@ mod tests {
         // privileged statement is denied instead of silently promoted.
         let db = PinkDb::new();
         assert!(!db.has_users());
-        let e = check_statement(&db, "alice", &LogicalPlan::Checkpoint, "main")
-            .expect_err("an authenticated principal keeps being checked");
+        let e = check_statement(
+            &db,
+            "alice",
+            &LogicalPlan::Checkpoint,
+            &crate::storage::SchemaPath::main("main"),
+        )
+        .expect_err("an authenticated principal keeps being checked");
         assert!(e.to_string().contains("ADMIN privilege"), "{e}");
     }
 
@@ -2086,10 +2143,26 @@ mod tests {
         assert!(db.principal_is_admin("alice"));
         // The same plan that is admin-only is accepted only because of the
         // role-held ADMIN: `check_statement` uses the resolved check.
-        assert!(check_statement(&db, "alice", &LogicalPlan::Checkpoint, "main").is_ok());
+        assert!(
+            check_statement(
+                &db,
+                "alice",
+                &LogicalPlan::Checkpoint,
+                &crate::storage::SchemaPath::main("main")
+            )
+            .is_ok()
+        );
         db.execute("REVOKE ADMIN FROM ops;").unwrap();
         assert!(!db.principal_is_admin("alice"));
-        assert!(check_statement(&db, "alice", &LogicalPlan::Checkpoint, "main").is_err());
+        assert!(
+            check_statement(
+                &db,
+                "alice",
+                &LogicalPlan::Checkpoint,
+                &crate::storage::SchemaPath::main("main")
+            )
+            .is_err()
+        );
     }
 
     /// Wave 131a: a schema grant covers every table of that schema, and a

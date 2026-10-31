@@ -206,11 +206,15 @@ impl Database {
 
     pub fn connect(&self) -> Connection {
         // Start on the store's current database (fresh stores: `main`).
-        let current_db = read_lock(&self.shared).current_db().to_string();
+        let store = read_lock(&self.shared);
+        let current_db = store.current_db().to_string();
+        let current_schema = store.current_ns().schema().to_string();
+        drop(store);
         Connection {
             db: self.clone(),
             txn: None,
             current_db,
+            current_schema,
             // A plain connect is trusted (see `Connection::principal`).
             // Network front-ends authenticate with `Connection::login` and
             // arm the per-statement gate with `Connection::require_login`.
@@ -447,13 +451,13 @@ struct Txn {
     wal_ext_loaded: Vec<String>,
     /// Session database before the first buffered statement, and after the
     /// last (the record is `USE`-prefixed when replay's session differs).
-    wal_db_before: Option<String>,
-    wal_db_after: String,
+    wal_db_before: Option<crate::storage::SchemaPath>,
+    wal_db_after: crate::storage::SchemaPath,
     /// Every database the WAL record's replay may switch into: the session of
     /// each buffered statement (the implicit `USE` prefix) plus every `USE`
     /// target. A database dropped since BEGIN makes the record unreplayable,
     /// so COMMIT conflicts on it.
-    wal_dbs: Vec<String>,
+    wal_dbs: Vec<crate::storage::SchemaPath>,
     /// The optimistic base captured at BEGIN (wave 45o): COMMIT validates
     /// every frame committed after it. No lease is held while the transaction
     /// is open — another process's writes run in parallel and are detected as
@@ -468,6 +472,8 @@ pub struct Connection {
     txn: Option<Txn>,
     /// This connection's current database (lowercased).
     current_db: String,
+    /// This connection's current schema inside `current_db` (lowercased).
+    current_schema: String,
     /// The authenticated principal of this session (wave 48), set by
     /// [`Connection::login`]: `Some(lowercased user name)` makes every
     /// statement of this connection run under that user's privileges.
@@ -828,9 +834,9 @@ impl Connection {
         stmt: &crate::prepared::PreparedStatement,
         params: &[crate::types::Value],
     ) -> Result<crate::prepared::BoundStatement> {
-        let default_db = self.current_db.clone();
+        let default_ns = crate::storage::SchemaPath::new(&self.current_db, &self.current_schema);
         let session = &self.session;
-        self.with_bind_store(|db| stmt.bind_in(db, &default_db, params, session))
+        self.with_bind_store(|db| stmt.bind_in(db, &default_ns, params, session))
     }
 
     /// Execute a prepared statement like any other statement of this
@@ -950,10 +956,10 @@ impl Connection {
                     )));
                 }
                 let pre = self.current_db.clone();
-                let pre_ns = crate::storage::SchemaPath::main(&pre);
+                let pre_ns = crate::storage::SchemaPath::new(&pre, &self.current_schema);
                 let bind_start = profile.as_ref().map(|_| Instant::now());
                 let (plan, dynamic_functions_used) =
-                    crate::sql::bind_tracked_in(&txn.work, stmt, &pre, &self.session)?;
+                    crate::sql::bind_tracked_in(&txn.work, stmt, &pre_ns, &self.session)?;
                 budget.check_deadline()?;
                 let plan = crate::plan::with_mv_source(plan, sql_text);
                 if let Some(p) = profile.as_deref_mut() {
@@ -966,7 +972,7 @@ impl Connection {
                 // `SET VARIABLE` state is the connection's, not the store's:
                 // the snapshot binds and runs in this session.
                 txn.work.session = self.session.clone();
-                enforce(gate.as_deref(), &txn.work, &plan, &pre)?;
+                enforce(gate.as_deref(), &txn.work, &plan, &pre_ns)?;
                 // Wave 124: a transaction writes one storage (what it wrote so
                 // far comes from its write set).
                 let prior = txn_storages(&txn.work, &txn.table_writes)?;
@@ -1016,14 +1022,14 @@ impl Connection {
                         txn.table_writes.insert(w);
                     }
                 }
-                let after = session_after(&result, &pre, &txn.work);
+                let after = session_after(&result, &pre, &self.current_schema, &txn.work);
                 // Buffer the committed statement for the transaction's single
                 // WAL record (flushed by txn_commit; never by ROLLBACK).
                 if let Some(text) = sql_text
                     && crate::plan::writes_tables(&plan)
                 {
                     if txn.wal_db_before.is_none() {
-                        txn.wal_db_before = Some(pre.clone());
+                        txn.wal_db_before = Some(pre_ns.clone());
                     }
                     txn.wal_stmts
                         .push(crate::rbac::wal_statement_text(&plan, text));
@@ -1031,8 +1037,8 @@ impl Connection {
                     // The record's replay starts in `pre` (possibly via a
                     // `USE` prefix) and may switch to `after` (a `USE`):
                     // both must still exist at COMMIT.
-                    for db in [&pre, &after] {
-                        if !txn.wal_dbs.iter().any(|d| d.eq_ignore_ascii_case(db)) {
+                    for db in [&pre_ns, &after] {
+                        if !txn.wal_dbs.iter().any(|d| d == db) {
                             txn.wal_dbs.push(db.clone());
                         }
                     }
@@ -1063,11 +1069,13 @@ impl Connection {
                         }
                     }
                 }
-                self.current_db = after;
+                self.current_db = after.db().to_string();
+                self.current_schema = after.schema().to_string();
                 Ok(result)
             }
             None => {
                 let pre = self.current_db.clone();
+                let pre_ns = crate::storage::SchemaPath::new(&pre, &self.current_schema);
                 // Statement-boundary freshness: a stale view refreshes under
                 // the write lease before binding (statement-start snapshot;
                 // reads never hold a lease while executing).
@@ -1079,7 +1087,7 @@ impl Connection {
                 // under the exclusive lock.
                 let shared = read_lock(&self.db.shared);
                 let bind_start = profile.as_ref().map(|_| Instant::now());
-                let (plan, _) = crate::sql::bind_tracked_in(&shared, stmt, &pre, &self.session)?;
+                let (plan, _) = crate::sql::bind_tracked_in(&shared, stmt, &pre_ns, &self.session)?;
                 budget.check_deadline()?;
                 if let Some(p) = profile.as_deref_mut() {
                     p.bind += bind_start.map(|s| s.elapsed()).unwrap_or_default();
@@ -1087,7 +1095,7 @@ impl Connection {
                 // Wave 48: the privilege check runs on the bound plan under
                 // the same lock the bind took, so no statement can slip
                 // between the check and its execution.
-                enforce(self.gate(), &shared, &plan, &pre)?;
+                enforce(self.gate(), &shared, &plan, &pre_ns)?;
                 let result = if is_read_only(&plan) {
                     let exec_start = profile.as_ref().map(|_| Instant::now());
                     let result = crate::exec::run_read_with_budget(
@@ -1130,8 +1138,8 @@ impl Connection {
                         shared.refresh_under_lease(g)?;
                     }
                     let shared = read_lock(&self.db.shared);
-                    let after = session_after(&result, &pre, &shared);
-                    if !shared.database_exists(&after) {
+                    let after = session_after(&result, &pre, &self.current_schema, &shared);
+                    if !shared.schema_exists(&after) {
                         return Err(PinkDbError::Catalog(format!(
                             "database \"{after}\" not found"
                         )));
@@ -1140,7 +1148,7 @@ impl Connection {
                         // `USE` touches no table: a known-empty set.
                         let sets = crate::wal::FrameSets::default();
                         shared.wal_append_local(
-                            &pre,
+                            &pre_ns,
                             &after,
                             &[text.to_string()],
                             &[],
@@ -1156,13 +1164,14 @@ impl Connection {
                     drop(lease);
                 }
                 // Apply the session transition.
-                self.current_db = match &result {
-                    QueryResult::Used { db } => db.clone(),
-                    QueryResult::DroppedDatabase { name } if name.eq_ignore_ascii_case(&pre) => {
-                        read_lock(&self.db.shared).fallback_db()
-                    }
-                    _ => pre,
-                };
+                let after = session_after(
+                    &result,
+                    &pre,
+                    &self.current_schema,
+                    &read_lock(&self.db.shared),
+                );
+                self.current_db = after.db().to_string();
+                self.current_schema = after.schema().to_string();
                 Ok(result)
             }
         }
@@ -1197,6 +1206,7 @@ impl Connection {
         mut profile: Option<&mut ProfileDraft>,
     ) -> Result<QueryResult> {
         let mut shared = write_lock(&self.db.shared);
+        let pre_ns = crate::storage::SchemaPath::new(pre, &self.current_schema);
         // Wave 44: the procedure frame is statement-scoped.
         shared.proc_frame_reset();
         // Rebind under the exclusive lock: a concurrent local commit could
@@ -1204,7 +1214,7 @@ impl Connection {
         // this lock.
         let bind_start = profile.as_ref().map(|_| Instant::now());
         let (plan, dynamic_functions_used) =
-            crate::sql::bind_tracked_in(&shared, stmt, pre, &self.session)?;
+            crate::sql::bind_tracked_in(&shared, stmt, &pre_ns, &self.session)?;
         budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
         if let Some(p) = profile.as_deref_mut() {
@@ -1212,8 +1222,8 @@ impl Connection {
         }
         shared.session_principal = self.principal.clone();
         shared.session = self.session.clone();
-        enforce(self.gate(), &shared, &plan, pre)?;
-        shared.check_statement_storages(&plan, pre, &Default::default())?;
+        enforce(self.gate(), &shared, &plan, &pre_ns)?;
+        shared.check_statement_storages(&plan, pre_ns.db(), &Default::default())?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
@@ -1230,13 +1240,13 @@ impl Connection {
             // The refresh/rebind under the lease is execution time: it is the
             // span the caller waits on, not a second bind phase.
             let (plan, dynamic_functions_used) =
-                crate::sql::bind_tracked_in(&shared, stmt, pre, &self.session)?;
+                crate::sql::bind_tracked_in(&shared, stmt, &pre_ns, &self.session)?;
             budget.check_deadline()?;
             let plan = crate::plan::with_mv_source(plan, sql_text);
             shared.session_principal = self.principal.clone();
             shared.session = self.session.clone();
-            enforce(self.gate(), &shared, &plan, pre)?;
-            shared.check_statement_storages(&plan, pre, &Default::default())?;
+            enforce(self.gate(), &shared, &plan, &pre_ns)?;
+            shared.check_statement_storages(&plan, pre_ns.db(), &Default::default())?;
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
             }
@@ -1277,7 +1287,11 @@ impl Connection {
         // Optimistic fast path.
         let exec_start = profile.as_ref().map(|_| Instant::now());
         let mut sets = crate::wal::FrameSets::default();
-        crate::plan::plan_sets(&plan, &crate::storage::SchemaPath::main(pre), &mut sets);
+        crate::plan::plan_sets(
+            &plan,
+            &crate::storage::SchemaPath::new(&self.current_db, &self.current_schema),
+            &mut sets,
+        );
         sets.canonicalize();
         let base = shared.capture_base()?;
         // Execute with no lease: this is the span other writers overlap.
@@ -1333,12 +1347,12 @@ impl Connection {
             shared.rebuild_under_lease(g)?;
         }
         shared.note_optimistic_fallback_for_test();
-        let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+        let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, &pre_ns)?;
         budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
         shared.session_principal = self.principal.clone();
-        enforce(self.gate(), &shared, &plan, pre)?;
-        shared.check_statement_storages(&plan, pre, &Default::default())?;
+        enforce(self.gate(), &shared, &plan, &pre_ns)?;
+        shared.check_statement_storages(&plan, pre_ns.db(), &Default::default())?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
@@ -1386,6 +1400,7 @@ impl Connection {
         sets: Option<&crate::wal::FrameSets>,
         budget: &Arc<crate::exec::ExecBudget>,
     ) -> Result<()> {
+        let pre_ns = crate::storage::SchemaPath::new(pre, &self.current_schema);
         // The statement's recorded external-call results travel in its record:
         // a replay serves them and never calls the provider (wave 107c).
         let memo = budget.take_external_calls();
@@ -1410,7 +1425,7 @@ impl Connection {
         if let Some(text) = sql_text
             && crate::plan::writes_tables(plan)
         {
-            let after = session_after(result, pre, shared);
+            let after = session_after(result, pre, &self.current_schema, shared);
             let touched = shared.dynamic_function_paths(dynamic_functions_used);
             let loaded = crate::storage::loaded_extension_path(plan);
             // The optimistic path already computed (and canonicalized)
@@ -1418,10 +1433,10 @@ impl Connection {
             // walking the plan again.
             let sets = match sets {
                 Some(s) => s.clone(),
-                None => shared.plan_sets_store(plan, &crate::storage::SchemaPath::main(pre)),
+                None => shared.plan_sets_store(plan, &pre_ns),
             };
             shared.wal_append_session(
-                pre,
+                &pre_ns,
                 &after,
                 &[text.to_string()],
                 &touched,
@@ -1472,7 +1487,7 @@ impl Connection {
             wal_ext_paths: Vec::new(),
             wal_ext_loaded: Vec::new(),
             wal_db_before: None,
-            wal_db_after: self.current_db.clone(),
+            wal_db_after: crate::storage::SchemaPath::new(&self.current_db, &self.current_schema),
             wal_dbs: Vec::new(),
             base,
         };
@@ -1574,9 +1589,9 @@ impl Connection {
         }
         // Every session the record's replay switches into (implicit `USE`
         // prefixes and `USE` targets) must still exist.
-        for db in &txn.wal_dbs {
-            if !shared.database_exists(db) {
-                return Err(conflict(&format!("database \"{db}\"")));
+        for ns in &txn.wal_dbs {
+            if !shared.schema_exists(ns) {
+                return Err(conflict(&format!("schema \"{ns}\"")));
             }
         }
         // Wave 124: a transaction writes one storage. The per-statement checks
@@ -1668,11 +1683,11 @@ fn enforce(
     principal: Option<&str>,
     store: &PinkDb,
     plan: &LogicalPlan,
-    default_db: &str,
+    default_ns: &crate::storage::SchemaPath,
 ) -> Result<()> {
     match principal {
         None => Ok(()),
-        Some(principal) => crate::rbac::check_statement(store, principal, plan, default_db),
+        Some(principal) => crate::rbac::check_statement(store, principal, plan, default_ns),
     }
 }
 
@@ -1751,13 +1766,23 @@ fn refused_in_txn(stmt: &crate::sql::ast::Statement) -> Option<&'static str> {
 /// The session database after `result` ran from `before`: `USE` switches to
 /// its target; dropping the session's current database falls back to `main`
 /// (or the first remaining database); everything else leaves it unchanged.
-fn session_after(result: &QueryResult, before: &str, store: &PinkDb) -> String {
+fn session_after(
+    result: &QueryResult,
+    before_db: &str,
+    before_schema: &str,
+    store: &PinkDb,
+) -> crate::storage::SchemaPath {
     match result {
-        QueryResult::Used { db } => db.clone(),
-        QueryResult::DroppedDatabase { name } if name.eq_ignore_ascii_case(before) => {
-            store.fallback_db()
+        QueryResult::Used { db, schema } => crate::storage::SchemaPath::new(db, schema),
+        QueryResult::DroppedDatabase { name } if name.eq_ignore_ascii_case(before_db) => {
+            crate::storage::SchemaPath::main(&store.fallback_db())
         }
-        _ => before.to_string(),
+        QueryResult::DroppedSchema { name }
+            if name.eq_ignore_ascii_case(before_schema) && store.database_exists(before_db) =>
+        {
+            crate::storage::SchemaPath::main(before_db)
+        }
+        _ => crate::storage::SchemaPath::new(before_db, before_schema),
     }
 }
 
@@ -1768,22 +1793,19 @@ pub(crate) fn record_writes(
     tables: &mut HashSet<crate::storage::TableRef>,
     views: &mut HashSet<crate::storage::TableRef>,
 ) {
-    // 131a has no schema syntax: a `db` qualifier still addresses that
-    // database's `main` schema (131b carries the schema in the plan).
-    let key = |qdb: &Option<String>, name: &str| {
-        let ns = match qdb {
-            Some(db) => crate::storage::SchemaPath::main(db),
-            None => default_ns.clone(),
-        };
-        (ns, name.to_ascii_lowercase())
+    let key = |qns: &Option<crate::storage::SchemaPath>, name: &str| {
+        (
+            qns.clone().unwrap_or_else(|| default_ns.clone()),
+            name.to_ascii_lowercase(),
+        )
     };
     match plan {
-        LogicalPlan::Insert { db, table, .. }
-        | LogicalPlan::InsertSelect { db, table, .. }
-        | LogicalPlan::Update { db, table, .. }
-        | LogicalPlan::Delete { db, table, .. }
-        | LogicalPlan::Merge { db, table, .. } => {
-            tables.insert(key(db, table));
+        LogicalPlan::Insert { ns, table, .. }
+        | LogicalPlan::InsertSelect { ns, table, .. }
+        | LogicalPlan::Update { ns, table, .. }
+        | LogicalPlan::Delete { ns, table, .. }
+        | LogicalPlan::Merge { ns, table, .. } => {
+            tables.insert(key(ns, table));
         }
         // A data-modifying CTE writes through the statement that wraps it,
         // and the frame must cover that table's write (wave 95b).
@@ -1791,47 +1813,47 @@ pub(crate) fn record_writes(
             record_writes(query, default_ns, tables, views);
             record_writes(body, default_ns, tables, views);
         }
-        LogicalPlan::CreateTable { db, name, .. }
-        | LogicalPlan::CreateTableAs { db, name, .. }
-        | LogicalPlan::DropTable { db, name, .. } => {
-            tables.insert(key(db, name));
+        LogicalPlan::CreateTable { ns, name, .. }
+        | LogicalPlan::CreateTableAs { ns, name, .. }
+        | LogicalPlan::DropTable { ns, name, .. } => {
+            tables.insert(key(ns, name));
         }
         // Wave 79 (durability half): an index definition is catalog state of
         // its table (rebuilt by re-executing the logged statement). Recording
         // the pair makes the commit merge carry the table, the frame's
         // touched set cover it, and a concurrent writer of that table
         // conflict instead of silently losing/keeping the index.
-        LogicalPlan::CreateIndex { db, table, .. } => {
-            tables.insert(key(db, table));
+        LogicalPlan::CreateIndex { ns, table, .. } => {
+            tables.insert(key(ns, table));
         }
         LogicalPlan::DropIndex {
-            db,
+            ns,
             table: Some(table),
             ..
         } => {
-            tables.insert(key(db, table));
+            tables.insert(key(ns, table));
         }
         LogicalPlan::DropIndex { table: None, .. } => {}
         // A materialized-view statement writes its backing table; the
         // definition itself rides along in the same WAL record (wave 80).
         // `REFRESH MATERIALIZED VIEWS` names the whole database instead — the
         // store-side helper `PinkDb::plan_writes_of` resolves its views.
-        LogicalPlan::CreateMaterializedView { db, name, .. }
-        | LogicalPlan::RefreshMaterializedView { db, name }
-        | LogicalPlan::DropMaterializedView { db, name, .. } => {
-            tables.insert(key(db, name));
+        LogicalPlan::CreateMaterializedView { ns, name, .. }
+        | LogicalPlan::RefreshMaterializedView { ns, name }
+        | LogicalPlan::DropMaterializedView { ns, name, .. } => {
+            tables.insert(key(ns, name));
         }
-        LogicalPlan::AlterTable { db, name, op } => {
+        LogicalPlan::AlterTable { ns, name, op } => {
             // A rename touches the old and the new key: the WAL frame's set
             // must cover both, so a concurrent writer of either name
             // conflicts instead of replaying onto the wrong table.
-            tables.insert(key(db, name));
+            tables.insert(key(ns, name));
             if let crate::plan::AlterTablePlan::RenameTable { to } = op {
-                tables.insert(key(db, to));
+                tables.insert(key(ns, to));
             }
         }
-        LogicalPlan::CreateView { db, name, .. } | LogicalPlan::DropView { db, name } => {
-            views.insert(key(db, name));
+        LogicalPlan::CreateView { ns, name, .. } | LogicalPlan::DropView { ns, name } => {
+            views.insert(key(ns, name));
         }
         _ => {}
     }
@@ -2212,7 +2234,8 @@ mod tests {
         assert_eq!(
             results,
             vec![QueryResult::Used {
-                db: "db1".to_string()
+                db: "db1".to_string(),
+                schema: "main".to_string(),
             }]
         );
         assert_eq!(a.current_db(), "db1");
@@ -2231,16 +2254,16 @@ mod tests {
         // The store's embedded session is not mutated by a connection's USE.
         assert_eq!(db.shared.read().unwrap().current_db(), "main");
 
-        // USE to a missing database is a clear bind-time error.
+        // USE to a missing database or schema is a clear bind-time error.
         let err = b.execute("USE nope;").unwrap_err();
         assert!(
-            err.to_string().contains("database \"nope\" not found"),
+            err.to_string().contains("schema \"nope\" not found"),
             "{err}"
         );
 
         // Qualified names resolve regardless of the session.
         assert_eq!(
-            rows_of(a.execute("SELECT tag FROM main.t;").unwrap()),
+            rows_of(a.execute("SELECT tag FROM main.main.t;").unwrap()),
             vec![vec![Value::Varchar("main".to_string())]]
         );
         assert_eq!(
@@ -2501,23 +2524,33 @@ mod tests {
     /// and the connection keeps working either way.
     #[test]
     fn ast_depth_cap_boundary_through_the_engine() {
-        let db = Database::new();
-        let mut c = db.connect();
-        let at_cap = chain_sql(crate::sql::MAX_AST_DEPTH - 3);
-        assert_eq!(
-            rows_of(c.execute(&at_cap).unwrap()),
-            vec![vec![Value::Integer((crate::sql::MAX_AST_DEPTH - 3) as i32)]]
-        );
-        let over_cap = chain_sql(crate::sql::MAX_AST_DEPTH - 2);
-        let err = c.execute(&over_cap).unwrap_err();
-        assert!(
-            err.to_string().contains("expression too deep"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(
-            rows_of(c.execute("SELECT 2;").unwrap()),
-            vec![vec![Value::Integer(2)]]
-        );
+        // The AST node grew with `Qualifier` (wave 131b), so the maximal
+        // legal chain needs the same 16 MiB stack a server connection uses;
+        // the default 2 MiB test thread is no longer enough.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let db = Database::new();
+                let mut c = db.connect();
+                let at_cap = chain_sql(crate::sql::MAX_AST_DEPTH - 3);
+                assert_eq!(
+                    rows_of(c.execute(&at_cap).unwrap()),
+                    vec![vec![Value::Integer((crate::sql::MAX_AST_DEPTH - 3) as i32)]]
+                );
+                let over_cap = chain_sql(crate::sql::MAX_AST_DEPTH - 2);
+                let err = c.execute(&over_cap).unwrap_err();
+                assert!(
+                    err.to_string().contains("expression too deep"),
+                    "unexpected error: {err}"
+                );
+                assert_eq!(
+                    rows_of(c.execute("SELECT 2;").unwrap()),
+                    vec![vec![Value::Integer(2)]]
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// A ~10k-term chain (far past the recursive-drop crash point on this

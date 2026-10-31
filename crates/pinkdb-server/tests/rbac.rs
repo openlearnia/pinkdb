@@ -369,7 +369,10 @@ fn privileges_are_enforced_per_statement_through_the_server() {
         let e = err_of(alice.execute("INSERT INTO t VALUES (3);"));
         assert!(e.contains("INSERT privilege"), "{e}");
         let e = err_of(alice.execute("CREATE TABLE other (a INTEGER);"));
-        assert!(e.contains("CREATE privilege on database \"main\""), "{e}");
+        assert!(
+            e.contains("CREATE privilege on schema \"main.main\""),
+            "{e}"
+        );
         // Metadata stays available.
         assert!(alice.execute("SHOW TABLES;").is_ok());
         assert!(alice.execute("DESCRIBE t;").is_ok());
@@ -468,7 +471,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';",
                     description: "ROLE analyst TO alice".to_string()
                 },
                 QueryResult::Granted {
-                    description: "SELECT, INSERT ON TABLE main.t TO analyst".to_string()
+                    description: "SELECT, INSERT ON TABLE main.main.t TO analyst".to_string()
                 },
                 QueryResult::Granted {
                     description: "ADMIN TO alice".to_string()

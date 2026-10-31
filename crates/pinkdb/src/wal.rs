@@ -1142,11 +1142,11 @@ pub struct Wal {
     /// Set after a write/sync failure: appends are refused so a retry can
     /// never append a duplicate record after a partially durable write.
     poisoned: Option<String>,
-    /// The replay session's database after the records appended so far
-    /// (`None` = unknown, so the next append prefixes unconditionally).
+    /// The replay session's `(database, schema)` after the records appended
+    /// so far (`None` = unknown, so the next append prefixes unconditionally).
     /// Multi-connection appends emit a `USE` prefix whenever their session
-    /// differs, so every record replays in the database it was executed in.
-    session_db: Option<String>,
+    /// differs, so every record replays where it was executed.
+    session_db: Option<crate::storage::SchemaPath>,
     /// Extension paths whose `LOAD EXTENSION` the CURRENT WAL generation
     /// already covers: a record touching such an extension is not prefixed
     /// again. Seeded after recovery from the extensions replay loaded (the
@@ -1983,8 +1983,8 @@ impl Wal {
     /// Record the replay-session database after the records appended so far.
     /// Called after recovery (the replay leaves the session wherever the last
     /// record did) and by the embedded path (whose session is the store's).
-    pub(crate) fn set_session_db(&mut self, db: &str) {
-        self.session_db = Some(db.to_string());
+    pub(crate) fn set_session_db(&mut self, ns: &crate::storage::SchemaPath) {
+        self.session_db = Some(ns.clone());
     }
 
     /// Mark extension paths as already covered by the current WAL generation.
@@ -2027,8 +2027,8 @@ impl Wal {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_in_session(
         &mut self,
-        db_before: Option<&str>,
-        db_after: &str,
+        db_before: Option<&crate::storage::SchemaPath>,
+        db_after: &crate::storage::SchemaPath,
         stmts: &[String],
         touched_extensions: &[String],
         loaded_extensions: &[String],
@@ -2037,15 +2037,15 @@ impl Wal {
     ) -> Result<()> {
         let mut rec: Vec<String> = Vec::with_capacity(stmts.len() + touched_extensions.len() + 1);
         if let Some(before) = db_before
-            && !self
-                .session_db
-                .as_deref()
-                .is_some_and(|s| s.eq_ignore_ascii_case(before))
+            && self.session_db.as_ref() != Some(before)
         {
-            // Quote the name: databases may hold spaces/keywords when
-            // created with a quoted identifier (`CREATE DATABASE
-            // "My Db"`).
-            rec.push(format!("USE \"{}\"", before.replace('"', "\"\"")));
+            // Quote both parts: databases and schemas may hold spaces,
+            // dots or keywords when created with a quoted identifier.
+            rec.push(format!(
+                "USE \"{}\".\"{}\"",
+                before.db().replace('"', "\"\""),
+                before.schema().replace('"', "\"\"")
+            ));
         }
         let mut prefixed: HashSet<&str> = HashSet::new();
         for path in touched_extensions {
@@ -2066,7 +2066,7 @@ impl Wal {
         self.tracked_extensions
             .extend(loaded_extensions.iter().cloned());
         match db_before {
-            Some(_) => self.session_db = Some(db_after.to_string()),
+            Some(_) => self.session_db = Some(db_after.clone()),
             None => self.session_db = None,
         }
         Ok(())
@@ -4192,7 +4192,7 @@ impl PinkDb {
         }
         // Replay leaves the session wherever the last record did (a logged
         // `USE` or the start at `main`): later appends must know that.
-        handle.set_session_db(db.current_db());
+        handle.set_session_db(db.current_ns());
         // Every extension replay loaded is covered by the current WAL
         // generation (the live WAL is exactly what was just replayed): a
         // later record touching it must not emit a redundant prefix.
@@ -4312,7 +4312,7 @@ impl PinkDb {
         let wal_path = wal.path.clone();
         let ckpt = wal.checkpoint_path.clone();
         let tmp = tmp_path(&ckpt);
-        let local_session = self.current_db.clone();
+        let local_session = self.current_ns().clone();
         let mut mutated = false;
 
         // 1. Recovery state machine (idempotent under the lease): finish an
@@ -4395,13 +4395,13 @@ impl PinkDb {
             for rec in &records {
                 wal.journal_push(rec.lsn, rec.sets.clone());
             }
-        } else if self.database_exists(&local_session) {
+        } else if self.schema_exists(&local_session) {
             // No new frames: the local session is still valid (a full
             // rebuild adopted the checkpoint's default session).
-            self.set_current_db(&local_session);
+            self.set_current_ns(local_session);
         } else {
-            let fallback = self.fallback_db();
-            self.set_current_db(&fallback);
+            let fallback = crate::storage::SchemaPath::main(&self.fallback_db());
+            self.set_current_ns(fallback);
         }
 
         // 5. Bookkeeping: the applied position and the epoch cache.
@@ -4665,7 +4665,7 @@ impl PinkDb {
             }
         }
         if !records.is_empty() {
-            let local_session = self.current_db.clone();
+            let local_session = self.current_ns().clone();
             self.replay_frames(&mut wal, &records, &local_session)?;
             for rec in &records {
                 wal.journal_push(rec.lsn, rec.sets.clone());
@@ -4734,7 +4734,7 @@ impl PinkDb {
         &mut self,
         wal: &mut Wal,
         records: &[Record],
-        local_session: &str,
+        local_session: &crate::storage::SchemaPath,
     ) -> Result<()> {
         // Two callers: the refresh (never inside an embedded transaction) and
         // the optimistic commit check, where an open transaction's changes
@@ -4746,10 +4746,10 @@ impl PinkDb {
         // lineage database falls back (the record then cannot name it either
         // — it was appended bare precisely because the database vanished).
         let start = match wal.session_db.clone() {
-            Some(s) if self.database_exists(&s) => s,
-            _ => self.fallback_db(),
+            Some(ns) if self.schema_exists(&ns) => ns,
+            _ => self.fallback_ns(),
         };
-        self.set_current_db(&start);
+        self.set_current_ns(start);
         // H5: a replayed `LOAD EXTENSION` is never auto-loaded. The record
         // may name an extension this process already has mapped (the
         // registry is process-local and never persisted, so a registry
@@ -4785,15 +4785,15 @@ impl PinkDb {
                 .collect();
             wal.seed_tracked_extensions(newly_loaded);
             // The replay session after the last record is the new lineage.
-            wal.set_session_db(self.current_db());
+            wal.set_session_db(self.current_ns());
         }
         // H2c: never let another process's `USE` jump this process's local
         // session; if it vanished under the refresh, fall back.
-        if self.database_exists(local_session) {
-            self.set_current_db(local_session);
+        if self.schema_exists(local_session) {
+            self.set_current_ns(local_session.clone());
         } else {
-            let fallback = self.fallback_db();
-            self.set_current_db(&fallback);
+            let fallback = crate::storage::SchemaPath::main(&self.fallback_db());
+            self.set_current_ns(fallback);
         }
         self.wal = stashed_wal;
         result
@@ -4915,7 +4915,7 @@ impl PinkDb {
         // A fresh WAL generation replays from the checkpoint's session
         // default (the checkpoint does not store a session): reset the
         // tracked replay session so later appends `USE`-prefix correctly.
-        let fallback = self.fallback_db();
+        let fallback = crate::storage::SchemaPath::main(&self.fallback_db());
         guard_wal.set_session_db(&fallback);
         // Index definitions and their maps ride in the published `.pink`
         // itself (flags bit 3, wave 79), atomically with the data, so the
@@ -4956,7 +4956,7 @@ impl PinkDb {
             .iter()
             .map(|(lsn, bytes)| decode_portable_record(bytes, *lsn))
             .collect::<Result<Vec<_>>>()?;
-        let local_session = self.current_db.clone();
+        let local_session = self.current_ns().clone();
         let stashed_wal = self.wal.take();
         self.replaying = true;
         let result = decoded
@@ -4964,11 +4964,11 @@ impl PinkDb {
             .try_for_each(|record| replay_record(self, record));
         self.replaying = false;
         self.wal = stashed_wal;
-        if self.database_exists(&local_session) {
-            self.set_current_db(&local_session);
+        if self.schema_exists(&local_session) {
+            self.set_current_ns(local_session);
         } else {
-            let fallback = self.fallback_db();
-            self.set_current_db(&fallback);
+            let fallback = crate::storage::SchemaPath::main(&self.fallback_db());
+            self.set_current_ns(fallback);
         }
         result
     }
@@ -9560,7 +9560,10 @@ mod tests {
             .into_iter()
             .find(|r| r.stmts.iter().any(|s| s.contains("CREATE INDEX")))
             .expect("create-index record");
-        assert_eq!(rec.stmts, vec!["CREATE INDEX \"i x\" ON main.t(\"b b\")"]);
+        assert_eq!(
+            rec.stmts,
+            vec!["CREATE INDEX \"i x\" ON main.main.t(\"b b\")"]
+        );
         assert_eq!(
             rec.sets.as_ref().expect("known touched set").table_refs(),
             &[("main".to_string(), "main".to_string(), "t".to_string())]
@@ -9571,7 +9574,7 @@ mod tests {
             .into_iter()
             .find(|r| r.stmts.iter().any(|s| s.contains("DROP INDEX")))
             .expect("drop-index record");
-        assert_eq!(rec.stmts, vec!["DROP INDEX main.\"i x\""]);
+        assert_eq!(rec.stmts, vec!["DROP INDEX main.main.\"i x\""]);
         assert_eq!(
             rec.sets.as_ref().expect("known touched set").table_refs(),
             &[("main".to_string(), "main".to_string(), "t".to_string())]

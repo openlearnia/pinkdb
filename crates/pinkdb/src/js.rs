@@ -34,7 +34,7 @@ pub(crate) fn check_definition(name: &str, source: &str, params: &[String]) -> R
 /// (`procedure::execute_call`).
 pub(crate) fn call(
     db: &mut PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     def: &ProcedureDef,
     args: &[Value],
 ) -> Result<QueryResult> {
@@ -91,7 +91,7 @@ fn seed_of(def: &ProcedureDef) -> u64 {
 
 struct SqlHost<'a> {
     db: &'a mut PinkDb,
-    db_name: &'a str,
+    db_name: &'a crate::storage::SchemaPath,
     statements: usize,
     output: Vec<String>,
 }

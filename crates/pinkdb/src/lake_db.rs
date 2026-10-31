@@ -939,15 +939,19 @@ impl PinkDb {
             .into_iter()
             .map(|(ns, _)| ns.db().to_string())
             .collect();
-        let db_of = |db: &Option<String>| db.as_deref().unwrap_or(default_db).to_ascii_lowercase();
+        let db_of = |ns: &Option<crate::storage::SchemaPath>| {
+            ns.as_ref()
+                .map(|n| n.db().to_string())
+                .unwrap_or_else(|| default_db.to_string())
+        };
         match plan {
-            P::CreateMacro { db, .. }
-            | P::DropMacro { db, .. }
-            | P::CreateProcedure { db, .. }
-            | P::DropProcedure { db, .. }
-            | P::CreateTrigger { db, .. }
-            | P::DropTrigger { db, .. } => {
-                out.insert(db_of(db));
+            P::CreateMacro { ns, .. }
+            | P::DropMacro { ns, .. }
+            | P::CreateProcedure { ns, .. }
+            | P::DropProcedure { ns, .. }
+            | P::CreateTrigger { ns, .. }
+            | P::DropTrigger { ns, .. } => {
+                out.insert(db_of(ns));
             }
             _ => {}
         }

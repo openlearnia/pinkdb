@@ -293,8 +293,13 @@ impl WriteTarget {
 pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
     use Statement::*;
     /// A catalog write that names its database, or inherits the session's.
-    fn table(db: &Option<String>, current_db: Option<&str>) -> WriteTarget {
-        match db.as_deref().or(current_db) {
+    fn table(qual: &crate::sql::ast::Qualifier, current_db: Option<&str>) -> WriteTarget {
+        let db = qual
+            .catalog
+            .as_deref()
+            .or(qual.schema.as_deref())
+            .or(current_db);
+        match db {
             Some(db) => WriteTarget::Databases(vec![db.to_ascii_lowercase()]),
             None => WriteTarget::Unknown,
         }
@@ -309,6 +314,8 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
         | ShowMacros
         | ShowTriggers { .. }
         | Use { .. }
+        | CreateSchema { .. }
+        | DropSchema { .. }
         | Analyze { .. }
         // Transaction control and session variables change no table by
         // themselves; every statement inside the transaction is checked.
@@ -328,29 +335,29 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
         Explain(inner) => write_target(inner, current_db),
         // A trigger writes wherever its action does each time it fires, not
         // only the database of the table it is attached to.
-        CreateTrigger { db, action, .. } => {
-            table(db, current_db).merge(write_target(action, current_db))
+        CreateTrigger { qual, action, .. } => {
+            table(qual, current_db).merge(write_target(action, current_db))
         }
-        CreateTable { db, .. }
-        | CreateTableAs { db, .. }
-        | Insert { db, .. }
-        | Update { db, .. }
-        | Delete { db, .. }
-        | Merge { db, .. }
-        | CreateView { db, .. }
-        | DropTable { db, .. }
-        | AlterTable { db, .. }
-        | DropView { db, .. }
-        | CreateMaterializedView { db, .. }
-        | RefreshMaterializedView { db, .. }
-        | DropMaterializedView { db, .. }
-        | CreateIndex { db, .. }
-        | DropIndex { db, .. }
-        | CreateProcedure { db, .. }
-        | DropProcedure { db, .. }
-        | DropTrigger { db, .. }
-        | CreateMacro { db, .. }
-        | DropMacro { db, .. } => table(db, current_db),
+        CreateTable { qual, .. }
+        | CreateTableAs { qual, .. }
+        | Insert { qual, .. }
+        | Update { qual, .. }
+        | Delete { qual, .. }
+        | Merge { qual, .. }
+        | CreateView { qual, .. }
+        | DropTable { qual, .. }
+        | AlterTable { qual, .. }
+        | DropView { qual, .. }
+        | CreateMaterializedView { qual, .. }
+        | RefreshMaterializedView { qual, .. }
+        | DropMaterializedView { qual, .. }
+        | CreateIndex { qual, .. }
+        | DropIndex { qual, .. }
+        | CreateProcedure { qual, .. }
+        | DropProcedure { qual, .. }
+        | DropTrigger { qual, .. }
+        | CreateMacro { qual, .. }
+        | DropMacro { qual, .. } => table(qual, current_db),
         // Attaching and detaching lakes change the store's database list and
         // open outside storage: a store-level write (wave 124).
         CreateDatabase { name, .. } | DropDatabase { name, .. } => {
@@ -847,8 +854,8 @@ fn statement_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) ->
 /// own error.
 fn read_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Option<String> {
     let allowed = policy.read_databases.as_deref();
-    let session_db = db.current_db().to_string();
-    let Ok((plan, _)) = crate::sql::bind_tracked(db, statement, &session_db) else {
+    let session_ns = db.current_ns().clone();
+    let Ok((plan, _)) = crate::sql::bind_tracked(db, statement, &session_ns) else {
         // Nothing to check: the statement fails at bind time with its own
         // error. A file source whose function is not installed is the
         // exception — it must be refused for reading a file, not for an
@@ -861,11 +868,7 @@ fn read_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Opti
         return None;
     };
     let mut reads = std::collections::HashSet::new();
-    crate::plan::collect_tables_read(
-        &plan,
-        &crate::storage::SchemaPath::main(&session_db),
-        &mut reads,
-    );
+    crate::plan::collect_tables_read(&plan, &session_ns, &mut reads);
     if let Some(allowed) = allowed {
         // A view over a table function binds to a scan the syntax check cannot
         // see, so the plan is asked too.
@@ -913,8 +916,8 @@ fn external_reason(
     if policy.allow_files && policy.allow_external_services {
         return None;
     }
-    let session_db = db.current_db().to_string();
-    let Ok((plan, dynamic)) = crate::sql::bind_tracked(db, statement, &session_db) else {
+    let session_ns = db.current_ns().clone();
+    let Ok((plan, dynamic)) = crate::sql::bind_tracked(db, statement, &session_ns) else {
         // The bound plan is the sharper test; the syntax alone is all there is
         // when a source's function is not installed, and reading files is
         // still the reason to refuse it.
@@ -1063,8 +1066,16 @@ pub fn outcome_line(result: &QueryResult) -> String {
             format!("Dropped materialized view {}", name(view))
         }
         QueryResult::CreatedDatabase { name: db } => format!("Created database {}", name(db)),
+        QueryResult::CreatedSchema { name: schema } => {
+            format!("Created schema {}", name(schema))
+        }
         QueryResult::DroppedDatabase { name: db } => format!("Dropped database {}", name(db)),
-        QueryResult::Used { db } => format!("Using database {}", name(db)),
+        QueryResult::DroppedSchema { name: schema } => {
+            format!("Dropped schema {}", name(schema))
+        }
+        QueryResult::Used { db, schema } => {
+            format!("Using {}.{}", name(db), name(schema))
+        }
         QueryResult::SetVariable { name: variable } => {
             format!("Set variable {}", name(variable))
         }

@@ -225,10 +225,10 @@ pub(crate) fn substitute_expr(
     tick(used, 1)?;
     Ok(match expr {
         Expr::Column {
-            db: None,
+            qual,
             table: None,
             name,
-        } => {
+        } if qual.is_empty() => {
             if let Some(replacement) = args.get(&name.to_ascii_lowercase()) {
                 count_expr(replacement, used)?;
                 replacement.clone()
@@ -261,11 +261,13 @@ pub(crate) fn substitute_expr(
             negated: *negated,
         },
         Expr::Function {
+            qual,
             name,
             args: call_args,
             distinct,
             filter,
         } => Expr::Function {
+            qual: qual.clone(),
             name: name.clone(),
             args: call_args
                 .iter()
@@ -278,18 +280,20 @@ pub(crate) fn substitute_expr(
             },
         },
         Expr::Window {
+            qual,
             name,
             args: call_args,
             over,
             distinct,
             filter,
         } => Expr::Window {
+            qual: qual.clone(),
             name: name.clone(),
             args: call_args
                 .iter()
                 .map(|a| substitute_expr(a, args, used))
                 .collect::<Result<_>>()?,
-            over: match over {
+            over: Box::new(match over.as_ref() {
                 crate::sql::ast::OverSpec::Named(n) => crate::sql::ast::OverSpec::Named(n.clone()),
                 crate::sql::ast::OverSpec::Inline(over) => {
                     crate::sql::ast::OverSpec::Inline(crate::sql::ast::OverClause {
@@ -313,7 +317,7 @@ pub(crate) fn substitute_expr(
                         frame: over.frame.clone(),
                     })
                 }
-            },
+            }),
             distinct: *distinct,
             filter: match filter {
                 Some(f) => Some(Box::new(substitute_expr(f, args, used)?)),
@@ -576,9 +580,11 @@ fn substitute_source(
             query, args, used,
         )?))),
         FromSource::Function {
+            qual,
             name,
             args: call_args,
         } => Ok(FromSource::Function {
+            qual: qual.clone(),
             name: name.clone(),
             args: call_args
                 .iter()
@@ -673,7 +679,7 @@ fn count_expr(expr: &Expr, used: &std::cell::Cell<usize>) -> Result<()> {
             for a in args {
                 count_expr(a, used)?;
             }
-            if let crate::sql::ast::OverSpec::Inline(over) = over {
+            if let crate::sql::ast::OverSpec::Inline(over) = over.as_ref() {
                 for e in &over.partition {
                     count_expr(e, used)?;
                 }
@@ -769,6 +775,14 @@ fn count_source(source: &FromSource, used: &std::cell::Cell<usize>) -> Result<()
 
 /// Every macro name a body calls (scalar `f(...)` and table `FROM f(...)`),
 /// lowercased and deduped. Used for the `CREATE`-time recursion check.
+fn qualified_name(qual: &crate::sql::ast::Qualifier, name: &str) -> String {
+    match (&qual.catalog, &qual.schema) {
+        (Some(catalog), Some(schema)) => format!("{catalog}.{schema}.{name}").to_ascii_lowercase(),
+        (None, Some(schema)) => format!("{schema}.{name}").to_ascii_lowercase(),
+        _ => name.to_ascii_lowercase(),
+    }
+}
+
 pub(crate) fn body_calls(body: &MacroBody) -> Vec<String> {
     let mut out = HashSet::new();
     match body {
@@ -782,8 +796,10 @@ pub(crate) fn body_calls(body: &MacroBody) -> Vec<String> {
 
 fn collect_expr_calls(expr: &Expr, out: &mut HashSet<String>) {
     match expr {
-        Expr::Function { name, args, .. } => {
-            out.insert(name.to_ascii_lowercase());
+        Expr::Function {
+            qual, name, args, ..
+        } => {
+            out.insert(qualified_name(qual, name));
             for a in args {
                 collect_expr_calls(a, out);
             }
@@ -822,11 +838,18 @@ fn collect_expr_calls(expr: &Expr, out: &mut HashSet<String>) {
             collect_expr_calls(low, out);
             collect_expr_calls(high, out);
         }
-        Expr::Window { args, over, .. } => {
+        Expr::Window {
+            qual,
+            name,
+            args,
+            over,
+            ..
+        } => {
+            out.insert(qualified_name(qual, name));
             for a in args {
                 collect_expr_calls(a, out);
             }
-            if let crate::sql::ast::OverSpec::Inline(over) = over {
+            if let crate::sql::ast::OverSpec::Inline(over) = over.as_ref() {
                 for e in &over.partition {
                     collect_expr_calls(e, out);
                 }
@@ -904,8 +927,12 @@ fn collect_select_calls(select: &Select, out: &mut HashSet<String>) {
 fn collect_source_calls(source: &FromSource, out: &mut HashSet<String>) {
     match source {
         FromSource::Derived(query) => collect_select_calls(query, out),
-        FromSource::Function { name, args } => {
-            out.insert(name.to_ascii_lowercase());
+        FromSource::Function { qual, name, args } => {
+            if !qual.is_empty() {
+                out.insert(qualified_name(qual, name));
+            } else {
+                out.insert(name.to_ascii_lowercase());
+            }
             for a in args {
                 collect_expr_calls(&a.expr, out);
             }
@@ -925,7 +952,7 @@ fn collect_source_calls(source: &FromSource, out: &mut HashSet<String>) {
 /// stored macro definitions?
 pub(crate) fn body_reaches(
     db: &crate::storage::PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     body: &MacroBody,
     target: &str,
 ) -> bool {
@@ -939,7 +966,7 @@ pub(crate) fn body_reaches(
 /// Does the definition of `start` (transitively) call `target`?
 pub(crate) fn reaches(
     db: &crate::storage::PinkDb,
-    db_name: &str,
+    db_name: &crate::storage::SchemaPath,
     start: &str,
     target: &str,
     seen: &mut HashSet<String>,
@@ -951,7 +978,7 @@ pub(crate) fn reaches(
     if !seen.insert(key.clone()) {
         return false;
     }
-    let Ok(def) = db.macro_in(db_name, &key) else {
+    let Ok(def) = db.macro_in(db_name.clone(), &key) else {
         return false;
     };
     body_calls(&def.body)
@@ -1042,7 +1069,7 @@ mod tests {
             Some(Expr::Binary {
                 op: crate::sql::ast::BinaryOp::Eq,
                 left: Box::new(Expr::Column {
-                    db: None,
+                    qual: crate::sql::ast::Qualifier::none(),
                     table: None,
                     name: "b".to_string()
                 }),

@@ -228,10 +228,11 @@ fn unqualified_from_belongs_to_the_current_database() {
         ints(&mut db, "SELECT db1.t.a FROM t ORDER BY 1;"),
         vec![1, 2, 3]
     );
-    let e = err(&mut db, "SELECT main.t.a FROM t;");
-    assert!(
-        e.contains("no table \"main.t\" in this query's FROM clause"),
-        "{e}"
+    // `main` is also the current database's only schema, so this is the
+    // same table.
+    assert_eq!(
+        ints(&mut db, "SELECT main.t.a FROM t ORDER BY 1;"),
+        vec![1, 2, 3]
     );
     db.execute("USE main;").unwrap();
 }
@@ -249,7 +250,7 @@ fn aliases_hide_the_original_name_and_the_workaround_still_works() {
     // `db.table.*` follows the same rule.
     let e = err(&mut db, "SELECT db1.t.* FROM db1.t AS x;");
     assert!(
-        e.contains("table \"db1.t\" is aliased as \"x\"")
+        e.contains("table \"db1.t.*\" is aliased as \"x\"")
             && e.contains("refer to its columns as x.*"),
         "{e}"
     );
@@ -301,7 +302,7 @@ fn same_table_name_in_two_databases_is_disambiguated_by_three_parts() {
         "SELECT t.a FROM db1.t JOIN db2.t ON db1.t.a = db2.t.a;",
     );
     assert!(e.contains("ambiguous"), "{e}");
-    assert!(e.contains("db1.t") && e.contains("db2.t"), "{e}");
+    assert!(e.contains("db1.main.t") && e.contains("db2.main.t"), "{e}");
     assert!(e.contains("db.t.a") || e.contains("three-part"), "{e}");
     // Neither can `t.*`.
     let e = err(
@@ -454,10 +455,10 @@ fn update_set_targets_accept_all_three_qualified_forms() {
 
     // A mismatched database names both sides.
     let e = err(&mut db, "UPDATE db1.t SET db2.t.b = 'x';");
-    assert!(e.contains("db2.t.b") && e.contains("db1.t"), "{e}");
+    assert!(e.contains("db2.t.b") && e.contains("db1.main.t"), "{e}");
     // A mismatched table names both sides.
     let e = err(&mut db, "UPDATE db1.t SET u.b = 'x';");
-    assert!(e.contains("u.b") && e.contains("db1.t"), "{e}");
+    assert!(e.contains("u.b") && e.contains("db1.main.t"), "{e}");
     let e = err(&mut db, "UPDATE db1.t SET db1.t.nope = 1;");
     assert!(e.contains("no column \"nope\""), "{e}");
     // The plain form is unchanged.
@@ -510,13 +511,18 @@ fn quoted_multi_word_and_case_insensitive_parts_work() {
     db.execute("INSERT INTO MyDb.T VALUES (8);").unwrap();
     assert_eq!(ints(&mut db, "SELECT mydb.t.a FROM mydb.t;"), vec![8]);
     assert_eq!(ints(&mut db, "SELECT MYDB.T.A FROM MYDB.T;"), vec![8]);
-    // Four or more parts are refused clearly.
+    // Four parts name catalog.schema.table.column.
+    assert_eq!(
+        ints(&mut db, "SELECT mydb.main.t.a FROM mydb.main.t;"),
+        vec![8]
+    );
+    // Five or more are refused clearly.
     let e = db
-        .execute("SELECT a.b.c.d FROM a;")
-        .expect_err("four parts")
+        .execute("SELECT a.b.c.d.e FROM a;")
+        .expect_err("five parts")
         .to_string();
-    assert!(e.contains("at most three parts"), "{e}");
-    assert!(e.contains("got \"a.b.c.d\""), "{e}");
+    assert!(e.contains("at most four parts"), "{e}");
+    assert!(e.contains("got \"a.b.c.d.e\""), "{e}");
 }
 
 // ---------- full-reference errors (rule 5) ----------
@@ -524,8 +530,8 @@ fn quoted_multi_word_and_case_insensitive_parts_work() {
 #[test]
 fn every_three_part_error_names_the_full_reference() {
     let mut db = seeded();
-    let e = err(&mut db, "SELECT nope.t.a FROM db1.t;");
-    assert!(e.contains("database \"nope\" not found"), "{e}");
+    let e = err(&mut db, "SELECT t.a FROM nope.t;");
+    assert!(e.contains("schema \"nope\" not found"), "{e}");
     let e = err(&mut db, "SELECT db1.nope.a FROM db1.t;");
     assert!(
         e.contains("no table \"db1.nope\" in this query's FROM clause"),
@@ -541,7 +547,7 @@ fn every_three_part_error_names_the_full_reference() {
     );
     let e = err(&mut db, "SELECT db1.nope.* FROM db1.t;");
     assert!(
-        e.contains("no table \"db1.nope\" in this query's FROM clause"),
+        e.contains("table \"db1.nope.*\" is not in the FROM clause"),
         "{e}"
     );
 }
@@ -561,7 +567,7 @@ fn three_part_references_render_faithfully() {
     // resolution (the column is the same as the two-part form's).
     let text = explain(&mut db, "SELECT db1.t.a FROM db1.t WHERE db1.t.a = 1");
     assert!(!text.is_empty(), "EXPLAIN produced no text");
-    assert!(text.contains("Scan db1.t"), "{text}");
+    assert!(text.contains("Scan db1.main.t"), "{text}");
     let two = explain(&mut db, "SELECT t.a FROM db1.t WHERE t.a = 1");
     assert_eq!(two, text, "the two-part form binds the same plan");
     // DESCRIBE and SHOW are unaffected.

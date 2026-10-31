@@ -131,6 +131,8 @@ pub struct TriggerDef {
     pub name: String,
     /// The database the trigger — and its table — belongs to.
     pub db: String,
+    /// The schema the trigger's table and body resolve in.
+    pub schema: String,
     pub table: String,
     pub timing: TriggerTiming,
     /// The events it fires for, in written order.
@@ -191,7 +193,10 @@ pub(crate) struct TriggerScope {
 /// Build a definition from the parsed `CREATE TRIGGER` statement. Shared by
 /// the binder (first creation) and the `.pink` reader (reopen), so both agree
 /// on exactly what a definition means.
-pub(crate) fn def_from_statement(db: &str, stmt: &Statement) -> Result<TriggerDef> {
+pub(crate) fn def_from_statement(
+    ns: &crate::storage::SchemaPath,
+    stmt: &Statement,
+) -> Result<TriggerDef> {
     let Statement::CreateTrigger {
         name,
         table,
@@ -212,7 +217,8 @@ pub(crate) fn def_from_statement(db: &str, stmt: &Statement) -> Result<TriggerDe
     };
     Ok(TriggerDef {
         name: name.clone(),
-        db: db.to_string(),
+        db: ns.db().to_string(),
+        schema: ns.schema().to_string(),
         table: table.clone(),
         timing: *timing,
         events: events.clone(),
@@ -231,21 +237,21 @@ pub(crate) fn def_from_statement(db: &str, stmt: &Statement) -> Result<TriggerDe
 /// cheap pre-check that keeps trigger-free tables on the plain path.
 pub(crate) fn plan_dml(
     plan: &LogicalPlan,
-    default_db: &str,
-) -> Option<(String, String, TriggerEvent)> {
-    let (qdb, table, event) = match plan {
-        LogicalPlan::Insert { db, table, .. } | LogicalPlan::InsertSelect { db, table, .. } => {
-            (db, table, TriggerEvent::Insert)
+    default_ns: &crate::storage::SchemaPath,
+) -> Option<(crate::storage::SchemaPath, String, TriggerEvent)> {
+    let (qns, table, event) = match plan {
+        LogicalPlan::Insert { ns, table, .. } | LogicalPlan::InsertSelect { ns, table, .. } => {
+            (ns, table, TriggerEvent::Insert)
         }
-        LogicalPlan::Update { db, table, .. } => (db, table, TriggerEvent::Update),
-        LogicalPlan::Delete { db, table, .. } => (db, table, TriggerEvent::Delete),
+        LogicalPlan::Update { ns, table, .. } => (ns, table, TriggerEvent::Update),
+        LogicalPlan::Delete { ns, table, .. } => (ns, table, TriggerEvent::Delete),
         // MERGE fires INSERT/UPDATE/DELETE row triggers through the write
         // funnels; its one statement-level event is UPDATE.
-        LogicalPlan::Merge { db, table, .. } => (db, table, TriggerEvent::Update),
+        LogicalPlan::Merge { ns, table, .. } => (ns, table, TriggerEvent::Update),
         _ => return None,
     };
-    let db = qdb.clone().unwrap_or_else(|| default_db.to_string());
-    Some((db, table.clone(), event))
+    let ns = qns.clone().unwrap_or_else(|| default_ns.clone());
+    Some((ns, table.clone(), event))
 }
 
 /// The columns an `UPDATE` statement writes, by name — the input to
@@ -253,13 +259,13 @@ pub(crate) fn plan_dml(
 fn updated_columns(
     db: &PinkDb,
     plan: &LogicalPlan,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
 ) -> Option<std::collections::HashSet<String>> {
     let LogicalPlan::Update { sets, .. } = plan else {
         return None;
     };
-    let schema = db.table_in(target_db, table).ok()?.schema();
+    let schema = db.table_in(target_ns, table).ok()?.schema();
     Some(
         sets.iter()
             .filter_map(|(col, _)| schema.get(*col).map(|(n, _)| n.to_ascii_lowercase()))
@@ -270,12 +276,12 @@ fn updated_columns(
 /// Every trigger of `event` on the table, in creation order.
 fn triggers_for(
     db: &PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     event: TriggerEvent,
     changed: Option<&std::collections::HashSet<String>>,
 ) -> Vec<TriggerDef> {
-    db.triggers_in(target_db)
+    db.triggers_in(target_ns)
         .iter()
         .filter(|t| t.table.eq_ignore_ascii_case(table) && t.fires_on(event, changed))
         .cloned()
@@ -286,13 +292,13 @@ fn triggers_for(
 /// (and heap-free) on a table with no triggers: the write path's only cost.
 pub(crate) fn row_defs(
     db: &PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     event: TriggerEvent,
     changed: Option<&std::collections::HashSet<String>>,
 ) -> Vec<TriggerDef> {
     let mut out: Vec<TriggerDef> = Vec::new();
-    for def in db.triggers_in(target_db) {
+    for def in db.triggers_in(target_ns) {
         if def.level == TriggerLevel::Row
             && def.table.eq_ignore_ascii_case(table)
             && def.fires_on(event, changed)
@@ -305,8 +311,12 @@ pub(crate) fn row_defs(
 
 /// True when the table has any trigger at all: the only lookup a writing
 /// statement pays when nothing is defined.
-pub(crate) fn has_triggers(db: &PinkDb, target_db: &str, table: &str) -> bool {
-    db.triggers_in(target_db)
+pub(crate) fn has_triggers(
+    db: &PinkDb,
+    target_ns: &crate::storage::SchemaPath,
+    table: &str,
+) -> bool {
+    db.triggers_in(target_ns)
         .iter()
         .any(|t| t.table.eq_ignore_ascii_case(table))
 }
@@ -317,12 +327,12 @@ pub(crate) fn run_with_triggers(
     db: &mut PinkDb,
     plan: &LogicalPlan,
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     event: TriggerEvent,
 ) -> Result<QueryResult> {
-    let changed = updated_columns(db, plan, target_db, table);
-    let defs = triggers_for(db, target_db, table, event, changed.as_ref());
+    let changed = updated_columns(db, plan, target_ns, table);
+    let defs = triggers_for(db, target_ns, table, event, changed.as_ref());
     guarded(db, |db| {
         for def in defs
             .iter()
@@ -345,7 +355,7 @@ pub(crate) fn run_with_triggers(
         let result = result?;
         if !after.is_empty() {
             let schema: Vec<(String, DataType)> = db
-                .table_in(target_db, table)?
+                .table_in(target_ns, table)?
                 .schema()
                 .into_iter()
                 .map(|(n, t)| (n.to_ascii_lowercase(), t))
@@ -434,22 +444,22 @@ fn predicted_id(t: &DataTable, offset: usize) -> crate::keys::RowId {
 /// runs the unchanged batch path — the trigger machinery costs it nothing.
 pub(crate) fn insert_rows(
     db: &mut PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     rows: Vec<Vec<Value>>,
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<()> {
-    let defs = row_defs(db, target_db, table, TriggerEvent::Insert, None);
+    let defs = row_defs(db, target_ns, table, TriggerEvent::Insert, None);
     // Primary/unique keys are enforced here, the funnel every SQL INSERT
     // (VALUES, SELECT, CTAS row source, procedures, WAL replay) uses. The
     // occupancy map is cached on the table, so a statement pays O(rows
     // written) instead of an O(table) scan.
-    let mut keys = crate::keys::take_or_build(db, target_db, table)?;
+    let mut keys = crate::keys::take_or_build(db, target_ns, table)?;
     if defs.is_empty() {
         // No row triggers: validate every image before the first append, so a
         // duplicate key leaves the table untouched (a statement is atomic).
         if let Some(keys) = &mut keys {
-            let t = db.table_in(target_db, table)?;
+            let t = db.table_in(target_ns, table)?;
             // Every row is reserved before the first append, so the ids are
             // predicted from the row count (`next_row_id` would return the
             // same position for all of them).
@@ -459,16 +469,16 @@ pub(crate) fn insert_rows(
             }
         }
         if db.trigger_capture.is_none() {
-            let t = db.table_mut_in(target_db, table)?;
+            let t = db.table_mut_in(target_ns, table)?;
             for values in rows {
                 t.append_row(values)?;
             }
-            crate::keys::store(db, target_db, table, keys);
+            crate::keys::store(db, target_ns, table, keys);
             return Ok(());
         }
         let mut appended = Vec::with_capacity(rows.len());
         {
-            let t = db.table_mut_in(target_db, table)?;
+            let t = db.table_mut_in(target_ns, table)?;
             for values in rows {
                 t.append_row(values.clone())?;
                 appended.push(values);
@@ -479,7 +489,7 @@ pub(crate) fn insert_rows(
             .as_mut()
             .expect("checked above that a capture is installed");
         capture.extend(appended.into_iter().map(|v| (Vec::new(), v)));
-        crate::keys::store(db, target_db, table, keys);
+        crate::keys::store(db, target_ns, table, keys);
         return Ok(());
     }
     let mut capture = db.trigger_capture.take();
@@ -502,12 +512,12 @@ pub(crate) fn insert_rows(
                 .unwrap_or(values)
             };
             if let Some(keys) = &mut keys {
-                let t = db.table_in(target_db, table)?;
+                let t = db.table_in(target_ns, table)?;
                 keys.check(&new, t, None)?;
                 let (chunk, row) = next_row_id(t);
                 keys.reserve(&new, crate::keys::RowId::new(chunk, row));
             }
-            db.table_mut_in(target_db, table)?.append_row(new.clone())?;
+            db.table_mut_in(target_ns, table)?.append_row(new.clone())?;
             if let Some(c) = &mut capture {
                 c.push((Vec::new(), new.clone()));
             }
@@ -519,7 +529,7 @@ pub(crate) fn insert_rows(
     })();
     db.trigger_capture = capture;
     if out.is_ok() {
-        crate::keys::store(db, target_db, table, keys);
+        crate::keys::store(db, target_ns, table, keys);
     }
     out
 }
@@ -529,7 +539,7 @@ pub(crate) fn insert_rows(
 /// writes for each chunk, evaluated against the pre-mutation rows.
 pub(crate) fn update_rows(
     db: &mut PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     per_chunk: Vec<Vec<(usize, usize, Value)>>,
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
@@ -541,7 +551,7 @@ pub(crate) fn update_rows(
     // other columns keeps the plain path. (A BEFORE trigger can still rewrite
     // a key, which is why the fast path also requires that there is none.)
     let keyed = {
-        let t = db.table_in(target_db, table)?;
+        let t = db.table_in(target_ns, table)?;
         let key_cols: Vec<usize> = t
             .constraints
             .keys
@@ -553,14 +563,14 @@ pub(crate) fn update_rows(
             .flatten()
             .any(|(col, _, _)| key_cols.contains(col))
     };
-    if !keyed && db.trigger_capture.is_none() && !has_triggers(db, target_db, table) {
-        let t = db.table_mut_in(target_db, table)?;
+    if !keyed && db.trigger_capture.is_none() && !has_triggers(db, target_ns, table) {
+        let t = db.table_mut_in(target_ns, table)?;
         for (ci, writes) in per_chunk.iter().enumerate() {
             t.update_rows(ci, writes)?;
         }
         return Ok(());
     }
-    let schema = db.table_in(target_db, table)?.schema();
+    let schema = db.table_in(target_ns, table)?.schema();
     // `UPDATE OF col` narrowing sees the written columns, not the predicate.
     // Deduplicate by index: a bulk UPDATE carries one entry per row.
     let mut seen = vec![false; schema.len()];
@@ -577,10 +587,10 @@ pub(crate) fn update_rows(
             }
         }
     }
-    let defs = row_defs(db, target_db, table, TriggerEvent::Update, Some(&changed));
+    let defs = row_defs(db, target_ns, table, TriggerEvent::Update, Some(&changed));
     // A BEFORE trigger can rewrite a key column, so a keyed table always needs
     // the occupancy map here (cheap: it is cached on the table).
-    let mut keys = crate::keys::take_or_build(db, target_db, table)?;
+    let mut keys = crate::keys::take_or_build(db, target_ns, table)?;
     let mut capture = db.trigger_capture.take();
     let out = (|| -> Result<()> {
         for (ci, writes) in per_chunk.iter().enumerate() {
@@ -598,7 +608,7 @@ pub(crate) fn update_rows(
             }
             let images: Vec<Vec<Value>> = {
                 let chunk = db
-                    .table_in(target_db, table)?
+                    .table_in(target_ns, table)?
                     .scan_chunk(ci)
                     .ok_or_else(|| {
                         PinkDbError::Execution("storage changed during UPDATE".to_string())
@@ -637,7 +647,7 @@ pub(crate) fn update_rows(
                     .map(|(col, (_, n))| (col, row, n.clone()))
                     .collect();
                 if let Some(keys) = &mut keys {
-                    let t = db.table_in(target_db, table)?;
+                    let t = db.table_in(target_ns, table)?;
                     let id = crate::keys::RowId::new(ci, row);
                     keys.release(&old);
                     if let Err(e) = keys.check(&new, t, Some(id)) {
@@ -648,7 +658,7 @@ pub(crate) fn update_rows(
                     keys.reserve(&new, id);
                 }
                 if !writes.is_empty() {
-                    db.table_mut_in(target_db, table)?
+                    db.table_mut_in(target_ns, table)?
                         .update_rows(ci, &writes)?;
                 }
                 if let Some(c) = &mut capture {
@@ -670,7 +680,7 @@ pub(crate) fn update_rows(
     })();
     db.trigger_capture = capture;
     if out.is_ok() {
-        crate::keys::store(db, target_db, table, keys);
+        crate::keys::store(db, target_ns, table, keys);
     }
     out
 }
@@ -680,20 +690,20 @@ pub(crate) fn update_rows(
 /// valid, as the plain path does per chunk.
 pub(crate) fn delete_rows(
     db: &mut PinkDb,
-    target_db: &str,
+    target_ns: &crate::storage::SchemaPath,
     table: &str,
     drops: Vec<Vec<usize>>,
     budget: &std::sync::Arc<crate::exec::ExecBudget>,
 ) -> Result<usize> {
-    let defs = row_defs(db, target_db, table, TriggerEvent::Delete, None);
+    let defs = row_defs(db, target_ns, table, TriggerEvent::Delete, None);
     if defs.is_empty() && db.trigger_capture.is_none() {
         let mut count = 0;
-        let t = db.table_mut_in(target_db, table)?;
+        let t = db.table_mut_in(target_ns, table)?;
         for ci in (0..drops.len()).rev() {
             count += t.delete_from_chunk(ci, &drops[ci])?;
         }
         // Deletes shift row indices, so the cached key map cannot be patched.
-        crate::keys::invalidate(db, target_db, table);
+        crate::keys::invalidate(db, target_ns, table);
         return Ok(count);
     }
     let mut count = 0;
@@ -708,7 +718,7 @@ pub(crate) fn delete_rows(
                 budget.check_deadline()?;
                 let old: Vec<Value> = {
                     let chunk = db
-                        .table_in(target_db, table)?
+                        .table_in(target_ns, table)?
                         .scan_chunk(ci)
                         .ok_or_else(|| {
                             PinkDbError::Execution("storage changed during DELETE".to_string())
@@ -721,7 +731,7 @@ pub(crate) fn delete_rows(
                     fire_row_triggers(db, &defs, TriggerTiming::Before, Some(&old), None, budget)?;
                 }
                 count += db
-                    .table_mut_in(target_db, table)?
+                    .table_mut_in(target_ns, table)?
                     .delete_from_chunk(ci, &[row])?;
                 if let Some(c) = &mut capture {
                     c.push((old.clone(), Vec::new()));
@@ -735,7 +745,7 @@ pub(crate) fn delete_rows(
     })();
     db.trigger_capture = capture;
     if out.is_ok() {
-        crate::keys::invalidate(db, target_db, table);
+        crate::keys::invalidate(db, target_ns, table);
     }
     out
 }
@@ -747,7 +757,7 @@ fn row_scope(
     old: Option<&[Value]>,
     new: Option<&[Value]>,
 ) -> Result<TriggerScope> {
-    let schema = db.table_in(&def.db, &def.table)?.schema();
+    let schema = db.table_in(def_ns(def), &def.table)?.schema();
     let mut scope = TriggerScope::default();
     for (alias, image) in [("old", old), ("new", new)] {
         let Some(image) = image else { continue };
@@ -784,9 +794,13 @@ fn run_trigger(
             crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(trigger_variables(db))
         };
         if let Some(when) = &def.when {
-            let (bound, dynamic) =
-                crate::sql::binder::bind_constant_expr_tracked(db, &def.db, when, Some(slots()))
-                    .map_err(|e| err(def, format!("WHEN: {e}")))?;
+            let (bound, dynamic) = crate::sql::binder::bind_constant_expr_tracked(
+                db,
+                &def_ns(def),
+                when,
+                Some(slots()),
+            )
+            .map_err(|e| err(def, format!("WHEN: {e}")))?;
             if let Some(function) = db.first_volatile_dynamic_function(&dynamic) {
                 return Err(err(
                     def,
@@ -826,7 +840,7 @@ fn run_trigger(
         }
         crate::procedure::run_call_statement(
             db,
-            &def.db,
+            &def_ns(def),
             slots(),
             &def.action,
             Some(budget),
@@ -919,6 +933,11 @@ fn guarded<R>(db: &mut PinkDb, f: impl FnOnce(&mut PinkDb) -> Result<R>) -> Resu
     out
 }
 
+/// The schema a trigger definition lives in (wave 131b).
+fn def_ns(def: &TriggerDef) -> crate::storage::SchemaPath {
+    crate::storage::SchemaPath::new(&def.db, &def.schema)
+}
+
 /// A trigger's error, tagged with the definition it comes from.
 fn err(def: &TriggerDef, msg: impl std::fmt::Display) -> PinkDbError {
     PinkDbError::Execution(format!(
@@ -970,19 +989,19 @@ pub(crate) fn validate(db: &PinkDb, def: &TriggerDef) -> Result<()> {
     }
     // A trigger definition names its table by database; the schema
     // qualifier arrives with the grammar (wave 131b), so it means `main`.
-    if let Some(e) = db.attached_read_only(&crate::storage::SchemaPath::main(&def.db), &def.table) {
+    if let Some(e) = db.attached_read_only(&def_ns(def), &def.table) {
         return Err(err(
             def,
             format!("triggers are not supported on attached lake tables: {e}"),
         ));
     }
-    if db.view_in(&def.db, &def.table).is_ok() {
+    if db.view_in(def_ns(def), &def.table).is_ok() {
         return Err(err(
             def,
             "triggers are not supported on views; name a table",
         ));
     }
-    let schema = db.table_in(&def.db, &def.table)?.schema();
+    let schema = db.table_in(def_ns(def), &def.table)?.schema();
     for column in &def.columns {
         if !schema.iter().any(|(n, _)| n.eq_ignore_ascii_case(column)) {
             return Err(err(
@@ -1029,13 +1048,18 @@ pub(crate) fn validate(db: &PinkDb, def: &TriggerDef) -> Result<()> {
     let slots =
         crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(trigger_variables(&probe));
     if let Some(when) = &def.when {
-        crate::sql::binder::bind_constant_expr_tracked(&probe, &def.db, when, Some(slots.clone()))
-            .map_err(|e| err(def, format!("WHEN: {e}")))?;
+        crate::sql::binder::bind_constant_expr_tracked(
+            &probe,
+            &def_ns(def),
+            when,
+            Some(slots.clone()),
+        )
+        .map_err(|e| err(def, format!("WHEN: {e}")))?;
     }
     crate::sql::binder::bind_tracked_with(
         &probe,
         &def.action,
-        &def.db,
+        &def_ns(def),
         Some(slots),
         &probe.session,
     )
@@ -1050,18 +1074,22 @@ mod tests {
     #[test]
     fn plan_dml_only_matches_writes() {
         let plan = LogicalPlan::Delete {
-            db: Some("db".to_string()),
+            ns: Some(crate::storage::SchemaPath::new("db", "main")),
             table: "t".to_string(),
             predicate: None,
             using: None,
             returning: None,
         };
         assert_eq!(
-            plan_dml(&plan, "cur"),
-            Some(("db".to_string(), "t".to_string(), TriggerEvent::Delete))
+            plan_dml(&plan, &crate::storage::SchemaPath::main("cur")),
+            Some((
+                crate::storage::SchemaPath::new("db", "main"),
+                "t".to_string(),
+                TriggerEvent::Delete
+            ))
         );
         let plan = LogicalPlan::Update {
-            db: None,
+            ns: None,
             table: "T".to_string(),
             sets: Vec::new(),
             predicate: None,
@@ -1069,9 +1097,19 @@ mod tests {
             returning: None,
         };
         assert_eq!(
-            plan_dml(&plan, "cur"),
-            Some(("cur".to_string(), "T".to_string(), TriggerEvent::Update))
+            plan_dml(&plan, &crate::storage::SchemaPath::main("cur")),
+            Some((
+                crate::storage::SchemaPath::main("cur"),
+                "T".to_string(),
+                TriggerEvent::Update
+            ))
         );
-        assert_eq!(plan_dml(&LogicalPlan::SingleRow, "cur"), None);
+        assert_eq!(
+            plan_dml(
+                &LogicalPlan::SingleRow,
+                &crate::storage::SchemaPath::main("cur")
+            ),
+            None
+        );
     }
 }

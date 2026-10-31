@@ -1724,8 +1724,14 @@ fn render_results_into(out: &mut String, results: &[QueryResult]) {
             QueryResult::DroppedDatabase { name } => {
                 let _ = writeln!(out, "Database {} dropped.", clean(name));
             }
-            QueryResult::Used { db } => {
-                let _ = writeln!(out, "Using database {}.", clean(db));
+            QueryResult::CreatedSchema { name } => {
+                let _ = writeln!(out, "Schema {} created.", clean(name));
+            }
+            QueryResult::DroppedSchema { name } => {
+                let _ = writeln!(out, "Schema {} dropped.", clean(name));
+            }
+            QueryResult::Used { db, schema } => {
+                let _ = writeln!(out, "Using {}.{}.", clean(db), clean(schema));
             }
             // DuckDB prints nothing for `SET VARIABLE`.
             QueryResult::SetVariable { .. } => {}
@@ -3628,7 +3634,12 @@ mod tests {
             QueryResult::DroppedView { name: n() },
             QueryResult::CreatedDatabase { name: n() },
             QueryResult::DroppedDatabase { name: n() },
-            QueryResult::Used { db: n() },
+            QueryResult::CreatedSchema { name: n() },
+            QueryResult::DroppedSchema { name: n() },
+            QueryResult::Used {
+                db: n(),
+                schema: n(),
+            },
             QueryResult::LoadedExtension { name: n() },
             QueryResult::Checkpointed,
             QueryResult::AlteredTable { name: n() },

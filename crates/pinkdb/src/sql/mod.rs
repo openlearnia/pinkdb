@@ -236,15 +236,15 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
         // error type cannot carry the written text), and this walk reports it
         // with the reference named (wave 94).
         if let NodeRef::Expr(ast::Expr::Column {
-            db: Some(marker),
+            qual,
             table: None,
             name,
         }) = node
-            && marker == FOUR_PART_MARKER
+            && qual.catalog.as_deref() == Some(FOUR_PART_MARKER)
         {
             return Err(PinkDbError::Parse(format!(
-                "column references have at most three parts (database.table.column), \
-                 got \"{name}\""
+                "column references have at most four parts \
+                 (catalog.schema.table.column), got \"{name}\""
             )));
         }
         max = max.max(depth);
@@ -808,7 +808,7 @@ fn take_projection(projection: &mut ast::Projection, exprs: &mut Vec<ast::Expr>)
 fn empty_from() -> ast::FromClause {
     ast::FromClause {
         source: ast::FromSource::Table {
-            db: None,
+            qual: ast::Qualifier::none(),
             name: String::new(),
         },
         alias: None,
