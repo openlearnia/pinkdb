@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::selection::all_rows;
-use super::{Cx, DmlIndex, ExecBudget, Output, QueryResult, eval, eval_expr};
+use super::{Cx, DmlIndex, ExecBudget, Output, QueryResult, eval, eval_expr, stage_batch};
 use crate::attached::PruneOp;
 use crate::keys::RowId;
 use crate::plan::{
@@ -385,6 +385,11 @@ pub(crate) fn delete_using(
 /// (DuckDB's rule, which never silently picks one). Every row is resolved
 /// before the first write, so an error leaves the table untouched. Returns
 /// `(inserted, updated, deleted)`.
+///
+/// A target that needs no per-row work — no capture, no `INSERT` row trigger,
+/// no declared key, one `WHEN NOT MATCHED` clause — appends its inserts as
+/// whole staged batches instead of one `append_row` per row, as an
+/// `INSERT … SELECT` does.
 pub(crate) fn merge(
     db: &mut PinkDb,
     target_db: &str,
@@ -439,7 +444,25 @@ pub(crate) fn merge(
     let by_source = clauses
         .iter()
         .any(|c| c.matched == MergeMatch::NotMatchedBySource);
-    let (per_chunk, drops, inserts, updated) = {
+    // The inserts append whole staged batches when a row-at-a-time write adds
+    // nothing: no capture (`RETURNING`, an `AFTER … REFERENCING` transition
+    // table), no `INSERT` row trigger, no declared key — the `INSERT … SELECT`
+    // condition — and at most one `WHEN NOT MATCHED` clause, so the batches
+    // land in the order the row path stages them (see below).
+    let bulk = db.trigger_capture.is_none()
+        && db.table_in(target_db, table)?.constraints.keys.is_empty()
+        && clauses
+            .iter()
+            .filter(|c| c.matched == MergeMatch::NotMatched)
+            .count()
+            <= 1
+        && !crate::trigger::has_row_triggers(
+            db,
+            target_db,
+            table,
+            crate::trigger::TriggerEvent::Insert,
+        );
+    let (per_chunk, drops, inserts, batches, updated) = {
         let cx = Cx::with_budget(db, budget.clone());
         let t = db.table_in(target_db, table)?;
         let schema = t.schema();
@@ -452,6 +475,8 @@ pub(crate) fn merge(
         let mut per_chunk: Vec<Vec<(usize, usize, Value)>> = vec![Vec::new(); num_chunks];
         let mut drops: Vec<Vec<usize>> = vec![Vec::new(); num_chunks];
         let mut inserts: Vec<Vec<Value>> = Vec::new();
+        // The bulk path's staged append batches, in source order.
+        let mut batches: Vec<Vec<Arc<Vector>>> = Vec::new();
         // `append_row` fills the tail chunk before opening a new one, and a
         // delete can leave a chunk short, so the next row's id is
         // `(tail chunk, its length)`, not `num_rows() / CHUNK_SIZE`.
@@ -609,17 +634,29 @@ pub(crate) fn merge(
                     for value in values {
                         evaluated.push(eval_expr(value, &taken, &cx)?);
                     }
-                    for row in 0..taken.num_rows() {
-                        let mut image = defaults.clone();
-                        for (col, value) in columns.iter().zip(&evaluated) {
-                            image[*col] = DataTable::coerce(value.get(row), schema[*col].1)?;
+                    if bulk {
+                        // `taken` is already the selected rows: one batch built
+                        // the way an `INSERT … SELECT` batch is.
+                        batches.push(stage_insert_batch(
+                            taken.num_rows(),
+                            evaluated,
+                            columns,
+                            &schema,
+                            &defaults,
+                        )?);
+                    } else {
+                        for row in 0..taken.num_rows() {
+                            let mut image = defaults.clone();
+                            for (col, value) in columns.iter().zip(&evaluated) {
+                                image[*col] = DataTable::coerce(value.get(row), schema[*col].1)?;
+                            }
+                            if let Some(keys) = &mut keys {
+                                keys.check(&image, t, None)?;
+                                keys.reserve(&image, next_id);
+                                advance_id(&mut next_id);
+                            }
+                            inserts.push(image);
                         }
-                        if let Some(keys) = &mut keys {
-                            keys.check(&image, t, None)?;
-                            keys.reserve(&image, next_id);
-                            advance_id(&mut next_id);
-                        }
-                        inserts.push(image);
                     }
                 }
                 if sel.len() < batch.len() {
@@ -638,16 +675,26 @@ pub(crate) fn merge(
             }
             open = kept;
         }
-        (per_chunk, drops, inserts, updated)
+        (per_chunk, drops, inserts, batches, updated)
     };
     // Updates in place, then appends, then deletes (highest row first within
     // each chunk, so the staged ids stay valid).
-    let inserted = inserts.len();
+    let inserted = inserts.len()
+        + batches
+            .iter()
+            .map(|batch| batch.first().map_or(0, |column| column.len()))
+            .sum::<usize>();
     if per_chunk.iter().any(|writes| !writes.is_empty()) {
         crate::trigger::update_rows(db, target_db, table, per_chunk, budget)?;
     }
     if !inserts.is_empty() {
         crate::trigger::insert_rows(db, target_db, table, inserts, budget)?;
+    }
+    if !batches.is_empty() {
+        let t = db.table_mut_in(target_db, table)?;
+        for batch in &batches {
+            t.append_shared_chunk(batch)?;
+        }
     }
     let deleted = if drops.iter().all(|d| d.is_empty()) {
         0
@@ -940,6 +987,28 @@ fn eval_sets_batch(
         }
     }
     Ok(out)
+}
+
+/// One `WHEN NOT MATCHED` batch as a staged append batch: `evaluated` holds
+/// the clause's `values` for `rows` source rows, `columns` the target column
+/// of each, and every other target column takes its default.
+///
+/// The batch is a `DataChunk` over those vectors, so [`stage_batch`] stages it
+/// exactly as it stages an `INSERT … SELECT` batch: a column already in the
+/// target's type is shared, another is coerced cell by cell.
+fn stage_insert_batch(
+    rows: usize,
+    evaluated: Vec<Vector>,
+    columns: &[usize],
+    schema: &[(String, DataType)],
+    defaults: &[Value],
+) -> Result<Vec<Arc<Vector>>> {
+    let mut sources = vec![None; schema.len()];
+    for (src, &column) in columns.iter().enumerate() {
+        sources[column] = Some(src);
+    }
+    let chunk = DataChunk::new(evaluated)?;
+    stage_batch(&chunk, 0..rows, &sources, schema, defaults)
 }
 
 fn duplicate_match() -> PinkDbError {

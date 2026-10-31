@@ -625,3 +625,280 @@ fn durable_store_replays_ctas_and_bulk_insert() {
     assert_eq!(stats(&mut db, "ct"), expected);
     assert_stats_exact(&mut db, "ct");
 }
+
+// Wave 140d: MERGE's `WHEN NOT MATCHED` inserts append whole batches.
+
+/// QuackLab's ETL shape: 7000 rows (four chunks) over VARCHAR, DATE and BIGINT
+/// key columns, so the `ON` probes by key and the insert list is wide.
+const MERGE_SOURCE: &str = "CREATE TABLE f AS SELECT \
+     CAST(i % 300 AS VARCHAR) AS zone_id, \
+     CAST(i % 263 AS VARCHAR) AS do_zone_id, \
+     DATE '2024-07-01' + CAST(i % 31 AS INTEGER) AS day_id, \
+     CAST(i % 24 AS BIGINT) AS hour_id, \
+     CAST(i % 5 AS BIGINT) AS payment_type_id, \
+     CAST(i % 3 AS BIGINT) AS vendor_id, \
+     CAST(i % 7 AS VARCHAR) AS rate_code_id, \
+     CAST(i AS BIGINT) AS trips, \
+     CAST(i AS DOUBLE) * 1.5 AS fare \
+     FROM range(0, 7000) t(i)";
+
+/// The repro's insert column list, for `f` as source and `target` as target.
+const MERGE_INSERT: &str = "INSERT (zone_id, do_zone_id, day_id, hour_id, \
+     payment_type_id, vendor_id, rate_code_id, trips, fare) \
+     VALUES (source.zone_id, source.do_zone_id, source.day_id, source.hour_id, \
+       source.payment_type_id, source.vendor_id, source.rate_code_id, \
+       source.trips, source.fare)";
+
+/// The repro's target, keyed on `trips` so every insert goes through
+/// `insert_rows`/`append_row`: the same rows by the row path.
+fn keyed_merge_target(db: &mut PinkDb, name: &str) {
+    ok(
+        db,
+        &format!(
+            "CREATE TABLE {name} (zone_id VARCHAR, do_zone_id VARCHAR, day_id DATE, \
+             hour_id BIGINT, payment_type_id BIGINT, vendor_id BIGINT, \
+             rate_code_id VARCHAR, trips BIGINT PRIMARY KEY, fare DOUBLE);"
+        ),
+    );
+}
+
+#[test]
+fn merge_inserts_append_whole_batches() {
+    let mut db = PinkDb::new();
+    ok(&mut db, MERGE_SOURCE);
+    ok(&mut db, "CREATE TABLE bulk AS SELECT * FROM f LIMIT 0;");
+    keyed_merge_target(&mut db, "rw");
+    // Every source row is unmatched, so the whole statement is inserts.
+    let all = format!(
+        "MERGE INTO {{t}} AS target USING f AS source \
+         ON (target.zone_id = source.zone_id \
+             AND target.do_zone_id = source.do_zone_id \
+             AND target.day_id = source.day_id AND target.hour_id = source.hour_id \
+             AND target.payment_type_id = source.payment_type_id \
+             AND target.vendor_id = source.vendor_id \
+             AND target.rate_code_id = source.rate_code_id) \
+         WHEN NOT MATCHED THEN {MERGE_INSERT};"
+    );
+    ok(&mut db, &all.replace("{t}", "bulk"));
+    ok(&mut db, &all.replace("{t}", "rw"));
+    assert_eq!(int(&one(&mut db, "SELECT count(*) FROM bulk")[0]), 7000);
+    // The same rows in the same positions: both append in source order.
+    assert_eq!(
+        rows(&mut db, "SELECT * FROM bulk"),
+        rows(&mut db, "SELECT * FROM rw")
+    );
+    assert_eq!(stats(&mut db, "bulk"), stats(&mut db, "rw"));
+    assert_stats_exact(&mut db, "bulk");
+
+    // Half filled: the even `trips` match and update, the odd ones append
+    // behind three chunks, so the first batch straddles a chunk seam. The `ON`
+    // is unique here, since the repro's seven keys are not.
+    ok(
+        &mut db,
+        "CREATE TABLE half AS SELECT * FROM f WHERE trips % 2 = 0;",
+    );
+    keyed_merge_target(&mut db, "half_rw");
+    ok(
+        &mut db,
+        "INSERT INTO half_rw SELECT * FROM f WHERE trips % 2 = 0;",
+    );
+    let mixed = format!(
+        "MERGE INTO {{t}} AS target USING f AS source \
+         ON (target.trips = source.trips) \
+         WHEN MATCHED THEN UPDATE SET fare = source.fare + 1 \
+         WHEN NOT MATCHED THEN {MERGE_INSERT};"
+    );
+    ok(&mut db, &mixed.replace("{t}", "half"));
+    ok(&mut db, &mixed.replace("{t}", "half_rw"));
+    assert_eq!(int(&one(&mut db, "SELECT count(*) FROM half")[0]), 7000);
+    assert_eq!(
+        rows(&mut db, "SELECT * FROM half"),
+        rows(&mut db, "SELECT * FROM half_rw")
+    );
+    // The updates above leave the sketches upper bounds; rebuilding them from
+    // the rows makes the comparison exact for the appended batches too.
+    ok(&mut db, "ANALYZE half; ANALYZE half_rw;");
+    assert_eq!(stats(&mut db, "half"), stats(&mut db, "half_rw"));
+    assert_stats_exact(&mut db, "half");
+
+    // The appends share `f`'s vectors; a later write to either table must not
+    // reach the other.
+    let source = one(&mut db, "SELECT sum(trips), sum(fare), count(*) FROM f");
+    ok(&mut db, "UPDATE half SET fare = -2.5 WHERE trips < 10;");
+    ok(&mut db, "DELETE FROM bulk WHERE trips >= 6990;");
+    assert_eq!(
+        one(&mut db, "SELECT sum(trips), sum(fare), count(*) FROM f"),
+        source
+    );
+}
+
+/// Several `WHEN NOT MATCHED` clauses keep the row path and stage clause by
+/// clause: the first clause's rows land before the second's.
+#[test]
+fn several_not_matched_clauses_keep_the_row_path_and_source_order() {
+    let mut db = PinkDb::new();
+    ok(&mut db, "CREATE TABLE t (a INTEGER, b INTEGER);");
+    ok(&mut db, "CREATE TABLE s (a INTEGER, b INTEGER);");
+    ok(
+        &mut db,
+        "INSERT INTO s VALUES (1, 10), (2, 20), (3, 30), (4, 40);",
+    );
+    ok(
+        &mut db,
+        "MERGE INTO t AS target USING s AS source ON target.a = source.a \
+         WHEN NOT MATCHED AND source.b > 25 THEN INSERT (a, b) VALUES (source.a, source.b) \
+         WHEN NOT MATCHED THEN INSERT (a, b) VALUES (source.a, source.b + 1000);",
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT a, b FROM t"),
+        vec![
+            vec![Value::Integer(3), Value::Integer(30)],
+            vec![Value::Integer(4), Value::Integer(40)],
+            vec![Value::Integer(1), Value::Integer(1010)],
+            vec![Value::Integer(2), Value::Integer(1020)],
+        ]
+    );
+}
+
+/// The batch path takes the unlisted columns' defaults and widens a value that
+/// does not match its column, exactly as the row path does.
+#[test]
+fn merge_inserts_take_defaults_and_widen_columns() {
+    let mut db = PinkDb::new();
+    ok(&mut db, "CREATE TABLE s (a INTEGER, b VARCHAR);");
+    ok(
+        &mut db,
+        "INSERT INTO s SELECT CAST(i AS INTEGER), 'v' || CAST(i % 5 AS VARCHAR) \
+         FROM range(0, 7000) t(i);",
+    );
+    // `a` widens INTEGER into BIGINT; `tag` and `n` are unlisted defaults.
+    ok(
+        &mut db,
+        "CREATE TABLE bulk (a BIGINT, b VARCHAR, tag VARCHAR DEFAULT 'dflt', \
+         n INTEGER DEFAULT 7);",
+    );
+    ok(
+        &mut db,
+        "CREATE TABLE rw (a BIGINT PRIMARY KEY, b VARCHAR, tag VARCHAR DEFAULT 'dflt', \
+         n INTEGER DEFAULT 7);",
+    );
+    let merge = "MERGE INTO {t} AS target USING s AS source ON target.a = source.a \
+                 WHEN NOT MATCHED THEN INSERT (a, b) VALUES (source.a, source.b);";
+    ok(&mut db, &merge.replace("{t}", "bulk"));
+    ok(&mut db, &merge.replace("{t}", "rw"));
+    assert_eq!(
+        one(
+            &mut db,
+            "SELECT count(*), count(DISTINCT a), min(a), max(a), count(DISTINCT tag), \
+             min(n), max(n) FROM bulk"
+        ),
+        vec![
+            Value::Bigint(7000),
+            Value::Bigint(7000),
+            Value::Bigint(0),
+            Value::Bigint(6999),
+            Value::Bigint(1),
+            Value::Integer(7),
+            Value::Integer(7),
+        ]
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT * FROM bulk"),
+        rows(&mut db, "SELECT * FROM rw")
+    );
+    assert_eq!(stats(&mut db, "bulk"), stats(&mut db, "rw"));
+    assert_stats_exact(&mut db, "bulk");
+}
+
+/// A value the target column cannot take fails the statement after every
+/// source row was staged, so nothing is appended — including the rows before
+/// the bad one, which sit in earlier batches.
+#[test]
+fn merge_insert_coercion_failure_leaves_the_table_untouched() {
+    let mut db = PinkDb::new();
+    ok(&mut db, "CREATE TABLE t (a INTEGER, d DATE);");
+    ok(&mut db, "INSERT INTO t VALUES (1, DATE '2024-01-01');");
+    ok(&mut db, "CREATE TABLE s (a INTEGER, v VARCHAR);");
+    ok(
+        &mut db,
+        "INSERT INTO s SELECT CAST(i AS INTEGER), \
+           CASE WHEN i = 2999 THEN 'zzz' \
+                ELSE CAST(DATE '2024-01-01' + CAST(i % 400 AS INTEGER) AS VARCHAR) END \
+         FROM range(0, 3000) t(i);",
+    );
+    let before = stats(&mut db, "t");
+    let err = fail(
+        &mut db,
+        "MERGE INTO t AS target USING s AS source ON target.a = source.a \
+         WHEN NOT MATCHED THEN INSERT (a, d) VALUES (source.a, source.v);",
+    );
+    assert_eq!(err, "cannot CAST \"zzz\" AS DATE");
+    assert_eq!(int(&one(&mut db, "SELECT count(*) FROM t")[0]), 1);
+    assert_eq!(stats(&mut db, "t"), before);
+}
+
+/// A keyed target, a row trigger and `RETURNING` each keep the row path, over
+/// more rows than one chunk holds.
+#[test]
+fn merge_keys_triggers_and_returning_keep_the_row_path() {
+    let mut db = PinkDb::new();
+    ok(&mut db, "CREATE TABLE s (id INTEGER, v VARCHAR);");
+    ok(
+        &mut db,
+        "INSERT INTO s SELECT CAST(i AS INTEGER), 'v' || CAST(i AS VARCHAR) \
+         FROM range(0, 3000) t(i);",
+    );
+
+    // A row trigger fires once per inserted row and rewrites it.
+    ok(&mut db, "CREATE TABLE t (id INTEGER, v VARCHAR);");
+    ok(
+        &mut db,
+        "CREATE TRIGGER t_before BEFORE INSERT ON t FOR EACH ROW \
+         EXECUTE DO $$ BEGIN SET NEW.v = NEW.v || '!'; END; $$",
+    );
+    ok(
+        &mut db,
+        "MERGE INTO t AS target USING s AS source ON target.id = source.id \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (source.id, source.v);",
+    );
+    assert_eq!(int(&one(&mut db, "SELECT count(*) FROM t")[0]), 3000);
+    assert_eq!(
+        rows(&mut db, "SELECT v FROM t WHERE id = 2999"),
+        vec![vec![Value::Varchar("v2999!".to_string())]]
+    );
+
+    // `RETURNING` reports every inserted row.
+    ok(&mut db, "CREATE TABLE r (id INTEGER, v VARCHAR);");
+    let (_, _, got) = selected(
+        &mut db,
+        "MERGE INTO r AS target USING s AS source ON target.id = source.id \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (source.id, source.v) \
+         RETURNING id, v",
+    );
+    assert_eq!(got.len(), 3000);
+    assert_eq!(
+        got[2999],
+        vec![Value::Integer(2999), Value::Varchar("v2999".to_string())]
+    );
+
+    // A declared key is enforced, so a colliding insert is refused and the
+    // table is unchanged.
+    ok(
+        &mut db,
+        "CREATE TABLE k (id INTEGER PRIMARY KEY, v VARCHAR);",
+    );
+    ok(
+        &mut db,
+        "MERGE INTO k AS target USING s AS source ON target.id = source.id \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (source.id, source.v);",
+    );
+    assert_eq!(int(&one(&mut db, "SELECT count(*) FROM k")[0]), 3000);
+    let before = stats(&mut db, "k");
+    let err = fail(
+        &mut db,
+        "MERGE INTO k AS target USING s AS source ON target.id = source.id + 100000 \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (source.id, source.v);",
+    );
+    assert!(err.contains("duplicate key"), "{err}");
+    assert_eq!(stats(&mut db, "k"), before);
+}
