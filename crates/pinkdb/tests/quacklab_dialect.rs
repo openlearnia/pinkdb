@@ -106,7 +106,7 @@ fn uuid_is_refused_in_a_logged_statement_and_fine_in_a_read() {
 }
 
 #[test]
-fn a_column_default_is_a_constant_and_a_clock_default_is_refused() {
+fn column_defaults_are_expressions_and_a_clock_default_uses_the_statement() {
     let scratch = Scratch::new("default");
     {
         let mut db = open(&scratch);
@@ -134,11 +134,26 @@ fn a_column_default_is_a_constant_and_a_clock_default_is_refused() {
             ])
             .collect::<Vec<_>>()
     );
-    let err = db
-        .execute("CREATE TABLE e (t TIMESTAMP DEFAULT now());")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("reads the clock"), "{err}");
+    // A clock default is an expression: CREATE succeeds, and every row that
+    // takes the default reads the INSERT statement's one clock instant.
+    run(&mut db, "CREATE TABLE e (t TIMESTAMP DEFAULT now());");
+    run(&mut db, "INSERT INTO e DEFAULT VALUES;");
+    let first = match rows(&mut db, "SELECT t FROM e;")[0][0] {
+        Value::Timestamp(v) => v,
+        ref other => panic!("expected TIMESTAMP, got {other:?}"),
+    };
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    run(&mut db, "INSERT INTO e DEFAULT VALUES;");
+    let all = rows(&mut db, "SELECT t FROM e ORDER BY t;");
+    assert_eq!(all.len(), 2);
+    let second = match all[1][0] {
+        Value::Timestamp(v) => v,
+        ref other => panic!("expected TIMESTAMP, got {other:?}"),
+    };
+    assert!(
+        second > first,
+        "clock default did not advance: {first} -> {second}"
+    );
 }
 
 #[test]

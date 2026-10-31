@@ -225,7 +225,10 @@ pub(crate) fn materialize_live(
         columns.push(pinkdb::storage::Column {
             name: col.name.clone(),
             dtype: col.dtype,
-            default: col.default.clone(),
+            default: col
+                .default
+                .clone()
+                .map(pinkdb::plan::ColumnDefault::constant),
             chunks: vec![Arc::new(vector)],
         });
         present.push(wanted[i]);

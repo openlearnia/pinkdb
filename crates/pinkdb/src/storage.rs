@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use pinkdb_ext_loader::{ExtFunction, ExtHandle};
 
 use crate::crypto::EncryptionKey;
+use crate::plan::ColumnDefault;
 use crate::sql::ast::Select;
 use crate::stats::{ColStats, Hll, TableStats, Zone};
 use crate::types::{DataType, PinkDbError, Result, Value};
@@ -45,13 +46,12 @@ pub(crate) fn reset_index_rebuild_count() {
 pub struct Column {
     pub name: String,
     pub dtype: DataType,
-    /// The column's DEFAULT (wave 65): the value a later `INSERT` that omits
-    /// the column writes, and the value `ALTER TABLE … ADD COLUMN … DEFAULT`
-    /// materialized into the rows that existed before it. `None` = no default
-    /// (an omitted `INSERT` column writes NULL). Persisted in `.pink` v5 under
-    /// the defaults flag; lake v5 manifests carry it in the table entry's
-    /// `columns` record.
-    pub default: Option<Value>,
+    /// The column's DEFAULT (wave 65): the expression a later `INSERT` that
+    /// omits the column evaluates, and the expression `ALTER TABLE … ADD
+    /// COLUMN … DEFAULT` evaluated for every existing row. `None` = no
+    /// default (an omitted `INSERT` column writes NULL). The `.pink` footer
+    /// stores its text under the defaults flag and rebinds it at load.
+    pub default: Option<ColumnDefault>,
     /// Reference-counted chunks: scans share storage instead of cloning
     /// megabytes per query. Mutations use copy-on-write (`Arc::make_mut`),
     /// which never actually clones — the executor never holds chunks
@@ -633,16 +633,17 @@ impl DataTable {
     }
 
     /// `ALTER TABLE … ADD COLUMN` (wave 65): append a column at the end,
-    /// filled with `default` for every existing row. The value is
-    /// materialized into the chunks (the engine's in-memory style; the lake's
-    /// schema record is what keeps the operation metadata-only for old *data
-    /// files*). `default` stays recorded on the [`Column`] so later `INSERT`s
-    /// that omit the column write it too.
+    /// filled with the per-row `values` evaluated from `default`. The values
+    /// are materialized into the chunks (the engine's in-memory style; the
+    /// lake's schema record is what keeps the operation metadata-only for old
+    /// *data files*). `default` stays recorded on the [`Column`] so later
+    /// `INSERT`s that omit the column evaluate it too.
     pub(crate) fn add_column(
         &mut self,
         name: String,
         dtype: DataType,
-        default: Option<Value>,
+        default: Option<ColumnDefault>,
+        values: &[Value],
     ) -> Result<()> {
         if self
             .columns
@@ -664,10 +665,12 @@ impl DataTable {
             .first()
             .map(|c| c.chunks.iter().map(|v| v.len()).collect())
             .unwrap_or_default();
+        debug_assert_eq!(values.len(), lens.iter().sum::<usize>());
+        let mut values = values.iter();
         for len in lens {
             let mut v = Vector::with_capacity(dtype, len);
             for _ in 0..len {
-                match &default {
+                match values.next() {
                     Some(d) if !d.is_null() => v.push_valid(d.clone())?,
                     _ => v.push_null()?,
                 }

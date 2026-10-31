@@ -1388,28 +1388,9 @@ pub(crate) fn run_plain(
             if *if_not_exists && db.table_in(&target, name).is_ok() {
                 return Ok(QueryResult::Created);
             }
-            // Evaluate every DEFAULT once, against an empty single-row chunk
-            // (like an INSERT cell), before anything changes.
-            let mut values = Vec::with_capacity(defaults.len());
-            for (default, (_, dtype)) in defaults.iter().zip(schema) {
-                values.push(match default {
-                    None => None,
-                    Some(expr) => {
-                        let single = DataChunk {
-                            columns: Vec::new(),
-                            num_rows: 1,
-                        };
-                        let cx = Cx::with_budget(db, budget.clone());
-                        let v = eval_expr(expr, &single, &cx)?;
-                        if v.len() != 1 {
-                            return Err(PinkDbError::Execution(
-                                "a column DEFAULT did not evaluate to one value".to_string(),
-                            ));
-                        }
-                        Some(DataTable::coerce(v.get(0), *dtype)?)
-                    }
-                });
-            }
+            // Defaults are stored as written and evaluated per row that takes
+            // them; CREATE itself never runs the expression (a failing cast
+            // fails at INSERT, like DuckDB).
             if *or_replace {
                 replace_table(db, &target, name)?;
             }
@@ -1419,11 +1400,9 @@ pub(crate) fn run_plain(
                 schema.clone(),
                 constraints.clone(),
             )?;
-            if values.iter().any(Option::is_some) {
-                let t = db.table_mut_in(&target, name)?;
-                for (column, value) in t.columns.iter_mut().zip(values) {
-                    column.default = value;
-                }
+            let t = db.table_mut_in(&target, name)?;
+            for (column, default) in t.columns.iter_mut().zip(defaults.iter()) {
+                column.default = default.clone();
             }
             Ok(QueryResult::Created)
         }
@@ -1543,6 +1522,7 @@ pub(crate) fn run_plain(
             ns: qdb,
             table,
             columns,
+            defaults: default_exprs,
             query,
             conflict,
             returning,
@@ -1556,11 +1536,6 @@ pub(crate) fn run_plain(
             // resolves one entry per source column).
             let t0 = db.table_in(&target, table)?;
             let schema = t0.schema();
-            let defaults: Vec<Value> = t0
-                .columns
-                .iter()
-                .map(|c| c.default.clone().unwrap_or(Value::Null))
-                .collect();
             let order: Vec<usize> = columns
                 .clone()
                 .unwrap_or_else(|| (0..schema.len()).collect());
@@ -1570,11 +1545,31 @@ pub(crate) fn run_plain(
             for chunk in &out.chunks {
                 budget.check_deadline()?;
                 for i in 0..chunk.num_rows() {
-                    // Unlisted columns take their DEFAULT (wave 65).
-                    let mut values = defaults.clone();
+                    let mut values = vec![Value::Null; schema.len()];
                     for (src, &target_idx) in order.iter().enumerate() {
                         values[target_idx] =
                             DataTable::coerce(chunk.columns[src].get(i), schema[target_idx].1)?;
+                    }
+                    // Unlisted columns take their DEFAULT per row (a clock
+                    // default is the statement's instant, a UUID default is
+                    // fresh per row).
+                    let single = DataChunk {
+                        columns: Vec::new(),
+                        num_rows: 1,
+                    };
+                    for (idx, default) in default_exprs.iter().enumerate() {
+                        if order.contains(&idx) {
+                            continue;
+                        }
+                        let Some(expr) = default else { continue };
+                        let cx = Cx::with_budget(db, budget.clone());
+                        let v = eval_expr(expr, &single, &cx)?;
+                        if v.len() != 1 {
+                            return Err(PinkDbError::Execution(
+                                "a column DEFAULT did not evaluate to one value".to_string(),
+                            ));
+                        }
+                        values[idx] = DataTable::coerce(v.get(0), schema[idx].1)?;
                     }
                     staged.push(values);
                 }
@@ -1869,7 +1864,7 @@ pub(crate) fn run_plain(
                     not_null,
                     if_not_exists,
                 } => {
-                    {
+                    let rows = {
                         let t = db.table_in(&target, name)?;
                         if t.columns
                             .iter()
@@ -1882,37 +1877,40 @@ pub(crate) fn run_plain(
                                 "Column with name \"{column}\" already exists!"
                             )));
                         }
-                    }
-                    // Evaluate the DEFAULT once, against an empty single-row
-                    // chunk (like an INSERT cell), then coerce to the column.
-                    let value = match default {
-                        None => None,
-                        Some(expr) => {
+                        t.num_rows
+                    };
+                    // Every existing row evaluates the default for itself.
+                    let values = match default {
+                        None => vec![Value::Null; rows],
+                        Some(default) => {
                             let single = DataChunk {
                                 columns: Vec::new(),
                                 num_rows: 1,
                             };
-                            let cx = Cx::with_budget(db, budget.clone());
-                            let v = eval_expr(expr, &single, &cx)?;
-                            if v.len() != 1 {
-                                return Err(PinkDbError::Execution(
-                                    "the ADD COLUMN default did not evaluate to one value"
-                                        .to_string(),
-                                ));
+                            let mut values = Vec::with_capacity(rows);
+                            for _ in 0..rows {
+                                let cx = Cx::with_budget(db, budget.clone());
+                                let v = eval_expr(&default.expr, &single, &cx)?;
+                                if v.len() != 1 {
+                                    return Err(PinkDbError::Execution(
+                                        "the ADD COLUMN default did not evaluate to one value"
+                                            .to_string(),
+                                    ));
+                                }
+                                values.push(DataTable::coerce(v.get(0), *dtype)?);
                             }
-                            Some(DataTable::coerce(v.get(0), *dtype)?)
+                            values
                         }
                     };
                     let table = db.table_mut_in(&target, name)?;
                     // DuckDB's rule: `ADD COLUMN … NOT NULL` needs a non-NULL
                     // default once the table has rows (an empty one is fine).
-                    if *not_null && table.num_rows > 0 && value.as_ref().is_none_or(|v| v.is_null())
-                    {
+                    if *not_null && values.iter().any(Value::is_null) {
                         return Err(PinkDbError::Execution(format!(
                             "NOT NULL constraint failed: {name}.{column}"
                         )));
                     }
-                    table.add_column(column.clone(), *dtype, value)?;
+                    table.add_column(column.clone(), *dtype, default.clone(), &values)?;
                     if *not_null {
                         let idx = table.columns.len() - 1;
                         table.constraints.not_null.push(idx);

@@ -400,7 +400,8 @@ pub(crate) fn substitute_expr(
         | Expr::Parameter(_)
         | Expr::Star
         | Expr::QualifiedStar { .. }
-        | Expr::Column { .. } => expr.clone(),
+        | Expr::Column { .. }
+        | Expr::Default => expr.clone(),
     })
 }
 
@@ -708,7 +709,8 @@ fn count_expr(expr: &Expr, used: &std::cell::Cell<usize>) -> Result<()> {
         | Expr::Parameter(_)
         | Expr::Star
         | Expr::QualifiedStar { .. }
-        | Expr::Column { .. } => Ok(()),
+        | Expr::Column { .. }
+        | Expr::Default => Ok(()),
     }
 }
 
@@ -883,7 +885,8 @@ fn collect_expr_calls(expr: &Expr, out: &mut HashSet<String>) {
         | Expr::Parameter(_)
         | Expr::Star
         | Expr::QualifiedStar { .. }
-        | Expr::Column { .. } => {}
+        | Expr::Column { .. }
+        | Expr::Default => {}
     }
 }
 

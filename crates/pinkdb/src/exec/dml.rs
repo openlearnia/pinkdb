@@ -382,11 +382,6 @@ pub(crate) fn merge(
         .collect();
     let t = db.table_in(target_ns, table)?;
     let schema = t.schema();
-    let defaults: Vec<Value> = t
-        .columns
-        .iter()
-        .map(|c| c.default.clone().unwrap_or(Value::Null))
-        .collect();
     let mut images = snapshot(t);
     let mut keys = KeySpace::build(t);
     let mut updates: Vec<(RowId, Vec<Value>)> = Vec::new();
@@ -528,7 +523,9 @@ pub(crate) fn merge(
                     "MERGE: WHEN NOT MATCHED must INSERT".to_string(),
                 ));
             };
-            let mut image = defaults.clone();
+            // The binder covers every target column: the written cells plus a
+            // rebound expression for each column that takes its DEFAULT.
+            let mut image = vec![Value::Null; schema.len()];
             for (col, value) in columns.iter().zip(values.iter()) {
                 image[*col] =
                     DataTable::coerce(eval_expr(value, &joined, &cx)?.get(0), schema[*col].1)?;

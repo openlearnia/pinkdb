@@ -18,6 +18,38 @@ pub struct Returning {
     pub names: Vec<String>,
 }
 
+/// A column's `DEFAULT`, as written and as bound at `CREATE`/`ADD COLUMN`.
+///
+/// Execution rebinds `text` for every statement that takes the default: the
+/// binder splices a clock reading into the bound expression, so the bound
+/// expression kept from DDL would freeze `now()` at DDL time. `constant` is
+/// the folded value only for expression that do not depend on the statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDefault {
+    /// The expression exactly as written in the statement, trimmed.
+    pub text: String,
+    /// Bound in an empty scope, typed to the column. May read the statement
+    /// clock, so it is only valid for the statement that bound it.
+    pub expr: BoundExpr,
+    /// The folded value when the default is statement-independent. Lake
+    /// schema evolution stores defaults as constants, so it uses this; a
+    /// clock or volatile default has no constant.
+    pub constant: Option<Value>,
+}
+
+impl ColumnDefault {
+    /// Rebuild a constant default for a lake column, whose catalog only
+    /// carries values rather than expression text.
+    pub fn constant(value: Value) -> Self {
+        let text = crate::prepared::value_literal(&value).unwrap_or_else(|_| "NULL".to_string());
+        Self {
+            expr: BoundExpr::Literal(value.clone()),
+            text,
+            constant: Some(value),
+        }
+    }
+}
+
 /// `ON CONFLICT` (wave 95b). A conflict is a duplicate of a declared
 /// `PRIMARY KEY`/`UNIQUE` key; the executor enforces those on every write.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,9 +110,9 @@ pub enum LogicalPlan {
         if_not_exists: bool,
         /// `OR REPLACE`: an existing table is dropped first.
         or_replace: bool,
-        /// Each column's bound `DEFAULT` (a constant expression the executor
-        /// evaluates once and stores as the column's default).
-        defaults: Vec<Option<BoundExpr>>,
+        /// Each column's `DEFAULT`: stored as written and evaluated per row
+        /// that takes it, never at CREATE.
+        defaults: Vec<Option<ColumnDefault>>,
     },
     /// `CREATE TABLE t AS SELECT ...`: schema from the query's output.
     CreateTableAs {
@@ -116,6 +148,10 @@ pub enum LogicalPlan {
         table: String,
         /// Target column indices in written order (`None` = every column).
         columns: Option<Vec<usize>>,
+        /// Default expressions for target columns the column list omits
+        /// (`None` = no default, insert NULL). Bound for this statement so a
+        /// clock default uses the statement's instant.
+        defaults: Vec<Option<BoundExpr>>,
         query: Box<LogicalPlan>,
         conflict: Option<ConflictPlan>,
         returning: Option<Returning>,
@@ -672,16 +708,16 @@ pub const MAX_RECURSIVE_ITERATIONS: usize = 100_000;
 /// Result-row cap for `WITH RECURSIVE`.
 pub const MAX_RECURSIVE_ROWS: usize = 10_000_000;
 
-/// One bound `ALTER TABLE` operation (wave 65). `ADD COLUMN`'s default is a
-/// bound constant expression (evaluated once at execution).
+/// One bound `ALTER TABLE` operation (wave 65). `ADD COLUMN`'s default is
+/// evaluated for every existing row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTablePlan {
     AddColumn {
         column: String,
         dtype: DataType,
-        /// `DEFAULT <expr>`: a constant expression (empty scope). `None` =
-        /// the DEFAULT of a nullable column (NULL).
-        default: Option<BoundExpr>,
+        /// `DEFAULT <expr>`: bound in an empty scope for this statement.
+        /// `None` = no default (existing rows get NULL).
+        default: Option<ColumnDefault>,
         /// `NOT NULL` was declared. A non-empty table needs a non-NULL
         /// default; the engine records the flag (constraints are declarative
         /// metadata, never enforced on writes — wave 41).
@@ -1416,11 +1452,13 @@ fn dml_payload(plan: &LogicalPlan) -> (Vec<&BoundExpr>, Vec<&LogicalPlan>) {
             returning_exprs(r, &mut exprs);
         }
         LogicalPlan::InsertSelect {
+            defaults,
             query,
             conflict: c,
             returning: r,
             ..
         } => {
+            exprs.extend(defaults.iter().flatten());
             plans.push(query);
             conflict_exprs(c, &mut exprs);
             returning_exprs(r, &mut exprs);
@@ -1567,9 +1605,9 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
                 || plans.iter().any(|p| contains_table_function(p))
         }
         LogicalPlan::AlterTable { op, .. } => match op {
-            AlterTablePlan::AddColumn { default, .. } => {
-                default.as_ref().is_some_and(expr_contains_table_function)
-            }
+            AlterTablePlan::AddColumn { default, .. } => default
+                .as_ref()
+                .is_some_and(|d| expr_contains_table_function(&d.expr)),
             AlterTablePlan::DropColumn { .. }
             | AlterTablePlan::RenameColumn { .. }
             | AlterTablePlan::RenameTable { .. } => false,
@@ -2329,10 +2367,11 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
         }
         LogicalPlan::AlterTable { op, .. } => {
             if let AlterTablePlan::AddColumn {
-                default: Some(e), ..
+                default: Some(default),
+                ..
             } = op
             {
-                exprs.push(e);
+                exprs.push(&default.expr);
             }
         }
         LogicalPlan::Insert { .. }

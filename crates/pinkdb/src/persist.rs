@@ -12,7 +12,7 @@
 //!       column chunk = page index + pages
 //!
 //! footer: store metadata (databases, their schemas, tables, column
-//!   defaults, constraints, index definitions + statistics, materialized
+//!   defaults as SQL text, constraints, index definitions + statistics, materialized
 //!   views, procedures, macros, RBAC) and, per table, the row count and the
 //!   row-group directory:
 //!     row groups [ { rows,
@@ -134,11 +134,10 @@ pub const CHUNKS_PER_ROW_GROUP: usize = ROW_GROUP_ROWS / CHUNK_SIZE;
 
 /// The footer's own version word (bumped when the footer layout changes).
 /// Version 4 (wave 131a) puts every database's catalog sections under its
-/// schemas: a database's name and storage are followed by a schema count and,
-/// per schema (sorted by key), the display name and the per-database sections
-/// version 3 wrote. The data region is database, schema, table order. A
-/// version ≤ 3 file is refused as written by an older pinkdb.
-const FOOTER_VERSION: u32 = 4;
+/// schemas. Version 5 (wave 139a) stores a column DEFAULT as its SQL text
+/// instead of an encoded constant value; the text is rebound at load. Files
+/// written by older builds are refused.
+const FOOTER_VERSION: u32 = 5;
 
 /// A database's storage tag in the footer: rows in the file.
 const STORAGE_LOCAL: u8 = 0;
@@ -200,24 +199,9 @@ const FLAG_MACROS: u32 = 0x40;
 /// is duplicated between the catalog and the file.
 const FLAG_TRIGGERS: u32 = 0x80;
 
-/// Column-default value tags (one byte per non-NULL default).
-const VD_BOOL: u8 = 0;
-const VD_I32: u8 = 1;
-const VD_I64: u8 = 2;
-const VD_F64_BITS: u8 = 3;
-const VD_VARCHAR: u8 = 4;
-const VD_DATE: u8 = 5;
-const VD_TIMESTAMP: u8 = 6;
-const VD_DECIMAL: u8 = 7;
-const VD_INTERVAL: u8 = 8;
-const VD_VARIANT: u8 = 9;
-/// ARRAY rides [`crate::array::encode_cell`]'s self-describing bytes
-/// (`u32 length | element kind | elements`).
-const VD_ARRAY: u8 = 10;
-
-/// Statistics value tags in the footer's per-chunk statistics block: the
-/// same shapes as the default-value tags, plus an explicit "no value" tag
-/// (an empty or all-NULL column has neither a min nor a max).
+/// Statistics value tags in the footer's per-chunk statistics block, plus an
+/// explicit "no value" tag (an empty or all-NULL column has neither a min nor
+/// a max).
 const SV_NONE: u8 = 0;
 const SV_BOOL: u8 = 1;
 const SV_I32: u8 = 2;
@@ -2813,7 +2797,7 @@ struct TableDir {
     name: String,
     schema: Vec<(String, DataType)>,
     constraints: TableConstraints,
-    defaults: Vec<Option<Value>>,
+    defaults: Vec<Option<String>>,
     indexes: Vec<IndexDef>,
     vector_indexes: Vec<VectorIndexFile>,
     row_count: u64,
@@ -3403,7 +3387,11 @@ impl PinkDb {
                                 name: name.clone(),
                                 schema: t.schema(),
                                 constraints: t.constraints.clone(),
-                                defaults: t.columns.iter().map(|c| c.default.clone()).collect(),
+                                defaults: t
+                                    .columns
+                                    .iter()
+                                    .map(|c| c.default.as_ref().map(|d| d.text.clone()))
+                                    .collect(),
                                 indexes: index_defs_without_rows(t),
                                 // A rows-free catalog image cannot carry a
                                 // graph whose nodes are row ids; vector
@@ -3795,9 +3783,23 @@ impl PinkDb {
                         tdir.schema.clone(),
                         tdir.constraints.clone(),
                     )?;
+                    // Defaults are stored as SQL text; rebind them against
+                    // the restored schema so a clock default is ready to
+                    // evaluate on later inserts.
+                    let rebound: Vec<Option<crate::plan::ColumnDefault>> = tdir
+                        .defaults
+                        .iter()
+                        .zip(tdir.schema.iter())
+                        .map(|(text, (_, dtype))| match text {
+                            Some(text) => Ok(Some(crate::sql::binder::bind_stored_default(
+                                &db, &ns, text, *dtype,
+                            )?)),
+                            None => Ok(None),
+                        })
+                        .collect::<Result<_>>()?;
                     let t = db.table_mut_in(&ns, &tdir.name)?;
-                    for (col, d) in t.columns.iter_mut().zip(tdir.defaults.iter()) {
-                        col.default = d.clone();
+                    for (col, d) in t.columns.iter_mut().zip(rebound) {
+                        col.default = d;
                     }
                 }
             }
@@ -4068,7 +4070,11 @@ fn write_table(
         name: name.to_string(),
         schema,
         constraints: t.constraints.clone(),
-        defaults: t.columns.iter().map(|c| c.default.clone()).collect(),
+        defaults: t
+            .columns
+            .iter()
+            .map(|c| c.default.as_ref().map(|d| d.text.clone()))
+            .collect(),
         indexes: index_defs(t),
         vector_indexes: vector_index_defs(t)?,
         row_count: t.num_rows() as u64,
@@ -4813,17 +4819,7 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
                     TableConstraints::default()
                 };
                 let tdefaults = if defaults {
-                    let decoded = read_defaults(&mut r, n_cols)?;
-                    for ((name, dtype), d) in schema.iter().zip(decoded.iter()) {
-                        if let Some(v) = d
-                            && !default_matches(v, *dtype)
-                        {
-                            return r.err(&format!(
-                                "default value of column \"{name}\" does not match its type"
-                            ));
-                        }
-                    }
-                    decoded
+                    read_defaults(&mut r, n_cols)?
                 } else {
                     vec![None; n_cols]
                 };
@@ -5211,167 +5207,28 @@ fn read_constraints(r: &mut Reader, n_cols: usize) -> Result<TableConstraints> {
     Ok(out)
 }
 
-/// Encode every column's DEFAULT (wave 65): one presence byte per column,
-/// then the value bytes of the ones that have a default (a NULL default is
-/// simply absent — it means the same on read).
-fn write_defaults(w: &mut Writer, defaults: &[Option<Value>]) {
+/// Encode every column's DEFAULT: one presence byte per column, then the
+/// expression text of the ones that have a default. A NULL default is absent.
+fn write_defaults(w: &mut Writer, defaults: &[Option<String>]) {
     for d in defaults {
         match d {
-            Some(v) if !v.is_null() => {
+            Some(text) => {
                 w.u8(1);
-                write_default_value(w, v);
+                w.str(text);
             }
-            _ => w.u8(0),
+            None => w.u8(0),
         }
     }
 }
 
-/// One default value's bytes: a tag byte plus its payload.
-fn write_default_value(w: &mut Writer, v: &Value) {
-    match v {
-        // Unreachable: `write_defaults` treats a NULL default as absent. A
-        // total match keeps the encoder honest.
-        Value::Null => w.u8(VD_BOOL),
-        Value::Boolean(b) => {
-            w.u8(VD_BOOL);
-            w.u8(*b as u8);
-        }
-        Value::Integer(i) => {
-            w.u8(VD_I32);
-            w.u32(*i as u32);
-        }
-        Value::Bigint(i) => {
-            w.u8(VD_I64);
-            w.u64(*i as u64);
-        }
-        Value::Double(x) => {
-            w.u8(VD_F64_BITS);
-            w.u64(x.to_bits());
-        }
-        Value::Varchar(s) => {
-            w.u8(VD_VARCHAR);
-            w.str(s);
-        }
-        Value::Date(d) => {
-            w.u8(VD_DATE);
-            w.u32(*d as u32);
-        }
-        Value::Timestamp(t) => {
-            w.u8(VD_TIMESTAMP);
-            w.u64(*t as u64);
-        }
-        Value::Decimal(x, scale) => {
-            w.u8(VD_DECIMAL);
-            w.bytes(&x.to_le_bytes());
-            w.u8(*scale);
-        }
-        Value::Interval {
-            months,
-            days,
-            micros,
-        } => {
-            w.u8(VD_INTERVAL);
-            w.u32(*months as u32);
-            w.u32(*days as u32);
-            w.u64(*micros as u64);
-        }
-        Value::Variant(v) => {
-            let mut bytes = Vec::new();
-            crate::variant::encode(v, &mut bytes);
-            w.u8(VD_VARIANT);
-            w.u32(bytes.len() as u32);
-            w.bytes(&bytes);
-        }
-        Value::Array(a) => {
-            let bytes = crate::array::encode_cell(a);
-            w.u8(VD_ARRAY);
-            w.u32(bytes.len() as u32);
-            w.bytes(&bytes);
-        }
-    }
-}
-
-/// Decode the per-column default section. Every tag is validated; an unknown
-/// tag or a truncated payload is a corrupt-file error.
-fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<Value>>> {
+/// Decode the per-column default section; the text is rebound to a typed
+/// expression when the table is loaded.
+fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<String>>> {
     let mut out = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
-        if r.u8()? == 0 {
-            out.push(None);
-            continue;
-        }
-        let tag = r.u8()?;
-        let v = match tag {
-            VD_BOOL => Value::Boolean(match r.u8()? {
-                0 => false,
-                1 => true,
-                _ => return r.err("bad BOOLEAN default byte"),
-            }),
-            VD_I32 => Value::Integer(r.i32()?),
-            VD_I64 => Value::Bigint(r.i64()?),
-            VD_F64_BITS => Value::Double(f64::from_bits(r.u64()?)),
-            VD_VARCHAR => Value::Varchar(r.str()?),
-            VD_DATE => Value::Date(r.i32()?),
-            VD_TIMESTAMP => Value::Timestamp(r.i64()?),
-            VD_DECIMAL => {
-                let b = r.take(16)?;
-                let mut arr = [0u8; 16];
-                arr.copy_from_slice(b);
-                let x = i128::from_le_bytes(arr);
-                let scale = r.u8()?;
-                if scale > 38 {
-                    return r.err("bad DECIMAL default scale");
-                }
-                Value::Decimal(x, scale)
-            }
-            VD_INTERVAL => Value::Interval {
-                months: r.i32()?,
-                days: r.i32()?,
-                micros: r.i64()?,
-            },
-            VD_VARIANT => {
-                let n = r.u32()? as usize;
-                let bytes = r.take(n)?;
-                match crate::variant::decode(bytes) {
-                    Ok(v) => Value::Variant(Arc::new(v)),
-                    Err(_) => return r.err("bad VARIANT default"),
-                }
-            }
-            VD_ARRAY => {
-                let n = r.u32()? as usize;
-                let bytes = r.take(n)?;
-                match crate::array::decode_cell(bytes) {
-                    Ok(v) => Value::Array(Arc::new(v)),
-                    Err(_) => return r.err("bad ARRAY default"),
-                }
-            }
-            other => {
-                return Err(PinkDbError::Execution(format!(
-                    "corrupt file: unknown default value tag {other}"
-                )));
-            }
-        };
-        out.push(Some(v));
+        out.push(if r.u8()? == 0 { None } else { Some(r.str()?) });
     }
     Ok(out)
-}
-
-/// Whether a decoded default value has exactly its column's type (a tampered
-/// file cannot smuggle a mistyped default into later INSERTs).
-fn default_matches(v: &Value, dtype: DataType) -> bool {
-    match (v, dtype) {
-        (Value::Boolean(_), DataType::Boolean)
-        | (Value::Integer(_), DataType::Integer)
-        | (Value::Bigint(_), DataType::Bigint)
-        | (Value::Double(_), DataType::Double)
-        | (Value::Varchar(_), DataType::Varchar)
-        | (Value::Date(_), DataType::Date)
-        | (Value::Timestamp(_), DataType::Timestamp)
-        | (Value::Interval { .. }, DataType::Interval) => true,
-        (Value::Decimal(_, s), DataType::Decimal { scale, .. }) => *s == scale,
-        (Value::Variant(_), DataType::Variant) => true,
-        _ => false,
-    }
 }
 
 /// Policy tags in a materialized-view section (wave 80).
@@ -6223,7 +6080,7 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
 #[cfg(test)]
 const GOLDEN_V6_LEN: usize = 143_738;
 #[cfg(test)]
-const GOLDEN_V6_FOOTER_CRC: u32 = 89_012_093;
+const GOLDEN_V6_FOOTER_CRC: u32 = 2_513_587_345;
 
 #[cfg(test)]
 mod tests {
@@ -6393,8 +6250,9 @@ mod tests {
     }
 
     /// Wave 124: footer version 3 records every database's storage. A
-    /// version-2 footer (no storage) is refused as an older pinkdb's; wave
-    /// 131a bumped the footer to 4 (schemas), so it refuses 3 the same way.
+    /// version-2 footer (no storage) is refused as an older pinkdb's; later
+    /// waves bumped the footer for schemas (4) and default expressions (5),
+    /// so it refuses 2 the same way.
     #[test]
     fn a_version_two_footer_is_refused_as_an_older_pinkdbs() {
         let mut db = PinkDb::new();
@@ -6405,13 +6263,15 @@ mod tests {
         let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
         assert_eq!(
             err,
-            "this .pink file was written by an older pinkdb (footer version 2); this build \
-             reads footer version 4 only"
+            format!(
+                "this .pink file was written by an older pinkdb (footer version 2); this build \
+                 reads footer version {FOOTER_VERSION} only"
+            )
         );
     }
 
     /// Wave 131a: a version-3 footer (no schema level) is refused, never read
-    /// as a version-4 layout.
+    /// as a version-4 layout. Version 4 predates default expressions.
     #[test]
     fn a_version_three_footer_is_refused_as_an_older_pinkdbs() {
         let mut db = PinkDb::new();
@@ -6422,8 +6282,10 @@ mod tests {
         let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
         assert_eq!(
             err,
-            "this .pink file was written by an older pinkdb (footer version 3); this build \
-             reads footer version 4 only"
+            format!(
+                "this .pink file was written by an older pinkdb (footer version 3); this build \
+                 reads footer version {FOOTER_VERSION} only"
+            )
         );
     }
 
@@ -8595,7 +8457,7 @@ mod tests {
         // The column default.
         assert_eq!(
             back.table("c").unwrap().columns[3].default,
-            Some(Value::Integer(42))
+            Some(crate::plan::ColumnDefault::constant(Value::Integer(42)))
         );
         // The index definition (the map is rebuilt from the rows).
         let t = back.table("c").unwrap();

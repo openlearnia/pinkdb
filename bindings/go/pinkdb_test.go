@@ -845,7 +845,7 @@ func TestNativeErrorMessagesExact(t *testing.T) {
 	}{
 		{"missing table", "", "SELECT * FROM nope;", `table "nope" not found`},
 		{"drop missing table", "", "DROP TABLE nope;", `table "nope" not found`},
-		{"missing database", "", "USE nope;", `no database or schema named "nope"`},
+		{"missing database", "", "USE nope;", `database or schema "nope" not found`},
 		{"duplicate table", "CREATE TABLE dup (a INTEGER);", "CREATE TABLE dup (a INTEGER);", `table "dup" already exists`},
 		{"missing column", "CREATE TABLE t (a INTEGER);", "SELECT nosuchcol FROM t;", `no column "nosuchcol"`},
 		{"nested transaction", "", "BEGIN; BEGIN;", "already in a transaction"},

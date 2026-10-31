@@ -2258,7 +2258,7 @@ mod tests {
         let err = b.execute("USE nope;").unwrap_err();
         assert!(
             err.to_string()
-                .contains("no database or schema named \"nope\""),
+                .contains("database or schema \"nope\" not found"),
             "{err}"
         );
 

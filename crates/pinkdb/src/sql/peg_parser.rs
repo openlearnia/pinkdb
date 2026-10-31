@@ -35,6 +35,12 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
 ///
 /// Placeholders in positions the engine cannot bind at execute time are
 /// rejected here (see [`reject_parameter_positions`]).
+/// Parse a single expression (used to rebind a persisted column default).
+pub(crate) fn parse_expr(sql: &str) -> Result<Expr> {
+    super::check_nesting_depth(sql)?;
+    peg_sql::expr_text(sql).map_err(|e| PinkDbError::Parse(format!("parse error: {e}")))
+}
+
 pub(crate) fn parse_prepared(sql: &str) -> Result<(Vec<Statement>, Vec<usize>)> {
     super::check_nesting_depth(sql)?;
     reject_nul_in_quoted_identifier(sql)?;
@@ -137,6 +143,7 @@ fn reject_parameter_positions(stmts: &[Statement]) -> Result<()> {
                     }
                 }
                 InsertSource::Select(query) => check_select_positions(query)?,
+                InsertSource::DefaultValues => {}
             },
             Statement::Update {
                 sets, where_clause, ..
@@ -252,7 +259,11 @@ fn check_source_positions(source: &FromSource) -> Result<()> {
 /// per-select rules.
 fn check_expr_positions(expr: &Expr) -> Result<()> {
     match expr {
-        Expr::Parameter(_) | Expr::Literal(_) | Expr::Star | Expr::QualifiedStar { .. } => Ok(()),
+        Expr::Parameter(_)
+        | Expr::Literal(_)
+        | Expr::Star
+        | Expr::QualifiedStar { .. }
+        | Expr::Default => Ok(()),
         Expr::Column { .. } => Ok(()),
         Expr::Binary { left, right, .. } => {
             check_expr_positions(left)?;
@@ -338,10 +349,14 @@ fn check_expr_positions(expr: &Expr) -> Result<()> {
 }
 
 /// Whether `expr` (or any nested subquery) holds a `?`.
-fn expr_contains_parameter(expr: &Expr) -> bool {
+pub(crate) fn expr_contains_parameter(expr: &Expr) -> bool {
     match expr {
         Expr::Parameter(_) => true,
-        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar { .. } | Expr::Column { .. } => false,
+        Expr::Literal(_)
+        | Expr::Star
+        | Expr::QualifiedStar { .. }
+        | Expr::Column { .. }
+        | Expr::Default => false,
         Expr::Binary { left, right, .. } => {
             expr_contains_parameter(left) || expr_contains_parameter(right)
         }
@@ -454,6 +469,7 @@ fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
                 }
             }
             InsertSource::Select(query) => collect_select_offsets(query, out),
+            InsertSource::DefaultValues => {}
         },
         Statement::Update {
             sets, where_clause, ..
@@ -493,14 +509,14 @@ fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
                 default: Some(e), ..
             },
             ..
-        } => collect_expr_offsets(e, out),
+        } => collect_expr_offsets(&e.expr, out),
         Statement::CreateTable { items, .. } => {
             for item in items {
                 if let TableItem::Column(ColumnDef {
                     default: Some(e), ..
                 }) = item
                 {
-                    collect_expr_offsets(e, out);
+                    collect_expr_offsets(&e.expr, out);
                 }
             }
         }
@@ -567,7 +583,11 @@ fn collect_source_offsets(source: &FromSource, out: &mut Vec<usize>) {
 fn collect_expr_offsets(expr: &Expr, out: &mut Vec<usize>) {
     match expr {
         Expr::Parameter(off) => out.push(*off),
-        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar { .. } | Expr::Column { .. } => {}
+        Expr::Literal(_)
+        | Expr::Star
+        | Expr::QualifiedStar { .. }
+        | Expr::Column { .. }
+        | Expr::Default => {}
         Expr::Binary { left, right, .. } => {
             collect_expr_offsets(left, out);
             collect_expr_offsets(right, out);
@@ -662,6 +682,7 @@ fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
                 }
             }
             InsertSource::Select(query) => apply_select_ranks(query, offsets),
+            InsertSource::DefaultValues => {}
         },
         Statement::Update {
             sets, where_clause, ..
@@ -699,14 +720,14 @@ fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
                 default: Some(e), ..
             },
             ..
-        } => apply_expr_ranks(e, offsets),
+        } => apply_expr_ranks(&mut e.expr, offsets),
         Statement::CreateTable { items, .. } => {
             for item in items.iter_mut() {
                 if let TableItem::Column(ColumnDef {
                     default: Some(e), ..
                 }) = item
                 {
-                    apply_expr_ranks(e, offsets);
+                    apply_expr_ranks(&mut e.expr, offsets);
                 }
             }
         }
@@ -776,7 +797,11 @@ fn apply_expr_ranks(expr: &mut Expr, offsets: &[usize]) {
             debug_assert!(offsets.binary_search(off).is_ok());
             *off = offsets.binary_search(off).unwrap_or(0);
         }
-        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar { .. } | Expr::Column { .. } => {}
+        Expr::Literal(_)
+        | Expr::Star
+        | Expr::QualifiedStar { .. }
+        | Expr::Column { .. }
+        | Expr::Default => {}
         Expr::Binary { left, right, .. } => {
             apply_expr_ranks(left, offsets);
             apply_expr_ranks(right, offsets);
@@ -1000,7 +1025,7 @@ fn values_select(rows: Vec<Vec<Expr>>, tail: QueryTail) -> Select {
 /// One item after a `CREATE TABLE` column's type.
 enum ColumnPart {
     Constraint(ColumnConstraint),
-    Default(Box<Expr>),
+    Default(DefaultExpr),
 }
 
 /// The marker function a parsed `PIVOT` carries as its only projection:
@@ -1332,6 +1357,11 @@ peg::parser! {
     grammar peg_sql() for str {
         use super::{apply_cmp, desugar_case, int_value, CmpTail};
 
+        // Source text between two positions. `DEFAULT` keeps the expression
+        // as written for introspection and persistence; the bound expression
+        // is what execution uses.
+        inject span_text(input, lpos, rpos) -> &'input str { &input[lpos..rpos] }
+
         // ---------- trivia (mirrors the lexer's skip rules) ----------
         // `ws` runs after every token, so the cursor is always at a non-trivia
         // character when a rule is entered (or at EOF).
@@ -1462,6 +1492,10 @@ peg::parser! {
             = n:int_text() ws() {? n.parse::<i64>().map(|v| v as usize).or(Err("integer")) }
 
         // ---------- statements ----------
+
+        /// A single expression, used to rebind a stored column default.
+        pub rule expr_text() -> Expr
+            = ws() e:expr() { e }
 
         pub rule statements() -> Vec<Statement>
             = ws() semi()* first:statement()? rest:(semi()+ s:statement() { s })* semi()* {
@@ -2126,7 +2160,7 @@ peg::parser! {
 
         rule column_part() -> ColumnPart
             = c:column_constraint() { ColumnPart::Constraint(c) }
-            / e:alter_default() { ColumnPart::Default(Box::new(e)) }
+            / e:alter_default() { ColumnPart::Default(e) }
 
         rule column_constraints() -> Vec<ColumnConstraint>
             = c:(column_constraint()*) { c }
@@ -2245,18 +2279,26 @@ peg::parser! {
 
         rule insert() -> Statement
             = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? source:insert_source()
-              oc:on_conflict()? ret:returning_clause() {
-                  Statement::Insert {
-                      qual: t.0, table: t.1, columns, source, on_conflict: oc, returning: ret,
+              oc:on_conflict()? ret:returning_clause() {?
+                  if columns.is_some() && matches!(source, InsertSource::DefaultValues) {
+                      return Err("You can not provide both a column list and DEFAULT VALUES, \
+                                 please remove one of the two");
                   }
+                  Ok(Statement::Insert {
+                      qual: t.0, table: t.1, columns, source, on_conflict: oc, returning: ret,
+                  })
               }
             / kw(Keyword::Insert) word("or") mode:insert_or() kw(Keyword::Into) t:table_ref()
-              columns:col_name_list()? source:insert_source() ret:returning_clause() {
-                  Statement::Insert {
+              columns:col_name_list()? source:insert_source() ret:returning_clause() {?
+                  if columns.is_some() && matches!(source, InsertSource::DefaultValues) {
+                      return Err("You can not provide both a column list and DEFAULT VALUES, \
+                                 please remove one of the two");
+                  }
+                  Ok(Statement::Insert {
                       qual: t.0, table: t.1, columns, source,
                       on_conflict: Some(OnConflict { columns: None, action: mode }),
                       returning: ret,
-                  }
+                  })
               }
             / word("replace") kw(Keyword::Into) {?
                   Err("REPLACE INTO is not supported (DuckDB has no REPLACE INTO): spell it INSERT OR REPLACE")
@@ -2297,7 +2339,8 @@ peg::parser! {
             / { None }
 
         rule insert_source() -> InsertSource
-            = kw(Keyword::Values) rows:insert_rows() { InsertSource::Values(rows) }
+            = word("default") word("values") { InsertSource::DefaultValues }
+            / kw(Keyword::Values) rows:insert_rows() { InsertSource::Values(rows) }
             / q:select() { InsertSource::Select(Box::new(q)) }
 
         rule insert_rows() -> Vec<Vec<Expr>>
@@ -2308,7 +2351,12 @@ peg::parser! {
               }
 
         rule insert_row() -> Vec<Expr>
-            = lparen() items:expr_list()? rparen() { items.unwrap_or_default() }
+            = lparen() items:(insert_value() ** comma())? rparen() { items.unwrap_or_default() }
+
+        /// A `VALUES` cell: an expression or the `DEFAULT` keyword.
+        rule insert_value() -> Expr
+            = word("default") { Expr::Default }
+            / expr()
 
         rule update() -> Statement
             = kw(Keyword::Update) t:table_ref() kw(Keyword::Set) first:set_item() rest:(comma() s:set_item() { s })*
@@ -2324,26 +2372,31 @@ peg::parser! {
         /// One `SET` target: `column`, `table.column` or `db.table.column`
         /// (wave 94); the binder checks a qualifier against the UPDATE target.
         rule set_item() -> (crate::sql::ast::SetTarget, Expr)
-            = c:ident() dot() s:ident() dot() t:ident() dot() col:ident() eq() e:expr() {
+            = c:ident() dot() s:ident() dot() t:ident() dot() col:ident() eq() e:set_value() {
                   (crate::sql::ast::SetTarget {
                       qual: crate::sql::ast::Qualifier::both(&c, &s), table: Some(t), column: col,
                   }, e)
               }
-            / s:ident() dot() t:ident() dot() c:ident() eq() e:expr() {
+            / s:ident() dot() t:ident() dot() c:ident() eq() e:set_value() {
                   (crate::sql::ast::SetTarget {
                       qual: crate::sql::ast::Qualifier::part(&s), table: Some(t), column: c,
                   }, e)
               }
-            / t:ident() dot() c:ident() eq() e:expr() {
+            / t:ident() dot() c:ident() eq() e:set_value() {
                   (crate::sql::ast::SetTarget {
                       qual: crate::sql::ast::Qualifier::none(), table: Some(t), column: c,
                   }, e)
               }
-            / c:ident() eq() e:expr() {
+            / c:ident() eq() e:set_value() {
                   (crate::sql::ast::SetTarget {
                       qual: crate::sql::ast::Qualifier::none(), table: None, column: c,
                   }, e)
               }
+
+        /// An `UPDATE SET` value: an expression or `DEFAULT`.
+        rule set_value() -> Expr
+            = word("default") { Expr::Default }
+            / expr()
 
         rule delete() -> Statement
             = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() alias:delete_alias()?
@@ -2546,8 +2599,12 @@ peg::parser! {
         rule index_option() -> (String, Expr)
             = key:ident() eq() value:expr() { (key, value) }
 
-        rule alter_default() -> Expr
-            = word("default") e:expr() { e }
+        rule alter_default() -> DefaultExpr
+            = word("default") e:expr() {
+                  // `span_text` is the whole rule match; strip the 7-byte
+                  // keyword to keep the expression as written.
+                  DefaultExpr { text: span_text[7..].trim().to_string(), expr: Box::new(e) }
+              }
 
         rule txn() -> Statement
             = kw(Keyword::Begin) kw(Keyword::Transaction)? { Statement::Begin }

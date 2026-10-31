@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use super::ast::*;
 use crate::attached::AtSpec;
-use crate::plan::{AlterTablePlan, LogicalPlan, RecursiveStep};
+use crate::plan::{AlterTablePlan, ColumnDefault, LogicalPlan, RecursiveStep};
 use crate::storage::{
     DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, SchemaPath, Session,
     TableConstraints,
@@ -2221,6 +2221,10 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundExpr> {
         match expr {
             Expr::Literal(v) => Ok(BoundExpr::Literal(v.clone())),
+            Expr::Default => Err(PinkDbError::Parse(
+                "DEFAULT is only allowed in an INSERT values row or an UPDATE SET value"
+                    .to_string(),
+            )),
             Expr::ArrayLiteral(items) => self.bind_array_literal(items, aggs, allow_agg),
             Expr::Parameter(index) => self.bind_parameter(*index),
             Expr::Star => Err(PinkDbError::Parse(
@@ -5101,6 +5105,7 @@ fn qual_text(qual: &Qualifier) -> String {
 fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Literal(v) => v.to_string(),
+        Expr::Default => "DEFAULT".to_string(),
         Expr::ArrayLiteral(items) => format!(
             "[{}]",
             items
@@ -7280,6 +7285,20 @@ fn bind_tracked_plan(
                 table,
                 columns,
                 rows,
+                false,
+                on_conflict.as_ref(),
+                returning.as_deref(),
+                params.clone(),
+                session,
+            ),
+            InsertSource::DefaultValues => bind_insert(
+                db,
+                default_ns,
+                qdb,
+                table,
+                columns,
+                &[],
+                true,
                 on_conflict.as_ref(),
                 returning.as_deref(),
                 params.clone(),
@@ -7679,7 +7698,7 @@ fn bind_tracked_plan(
                             // Either reading could have been meant (DuckDB:
                             // "No catalog + schema named …").
                             return Err(PinkDbError::Catalog(format!(
-                                "no database or schema named \"{x}\""
+                                "database or schema \"{x}\" not found"
                             )));
                         }
                         ns
@@ -8180,9 +8199,195 @@ fn expr_has_subquery(expr: &Expr) -> bool {
         Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::Star
+        | Expr::Default
         | Expr::QualifiedStar { .. }
         | Expr::Column { .. } => false,
     }
+}
+
+/// Whether a `DEFAULT` expression contains a column reference or a window
+/// function. Subqueries are checked separately so the refusals keep DuckDB's
+/// precedence (subquery, then column, then window, then aggregate).
+fn default_expr_uses_column_or_window(expr: &Expr, column: &mut bool, window: &mut bool) {
+    match expr {
+        Expr::Column { .. } => *column = true,
+        Expr::Window {
+            args, over, filter, ..
+        } => {
+            *window = true;
+            for arg in args {
+                default_expr_uses_column_or_window(arg, column, window);
+            }
+            if let Some(filter) = filter {
+                default_expr_uses_column_or_window(filter, column, window);
+            }
+            for e in over.partition() {
+                default_expr_uses_column_or_window(e, column, window);
+            }
+            for item in over.order() {
+                default_expr_uses_column_or_window(&item.expr, column, window);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            default_expr_uses_column_or_window(left, column, window);
+            default_expr_uses_column_or_window(right, column, window);
+        }
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::TryCast { expr, .. }
+        | Expr::NamedArg { expr, .. } => default_expr_uses_column_or_window(expr, column, window),
+        Expr::Subscript { base, index } => {
+            default_expr_uses_column_or_window(base, column, window);
+            default_expr_uses_column_or_window(index, column, window);
+        }
+        Expr::ArrayLiteral(items) | Expr::Coalesce(items) => {
+            for item in items {
+                default_expr_uses_column_or_window(item, column, window);
+            }
+        }
+        Expr::Slice { base, from, to } => {
+            default_expr_uses_column_or_window(base, column, window);
+            if let Some(from) = from {
+                default_expr_uses_column_or_window(from, column, window);
+            }
+            if let Some(to) = to {
+                default_expr_uses_column_or_window(to, column, window);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            default_expr_uses_column_or_window(expr, column, window);
+            default_expr_uses_column_or_window(low, column, window);
+            default_expr_uses_column_or_window(high, column, window);
+        }
+        Expr::Function { args, filter, .. } => {
+            for arg in args {
+                default_expr_uses_column_or_window(arg, column, window);
+            }
+            if let Some(filter) = filter {
+                default_expr_uses_column_or_window(filter, column, window);
+            }
+        }
+        Expr::Case { branches, else_ } => {
+            for (when, then) in branches {
+                default_expr_uses_column_or_window(when, column, window);
+                default_expr_uses_column_or_window(then, column, window);
+            }
+            if let Some(else_) = else_ {
+                default_expr_uses_column_or_window(else_, column, window);
+            }
+        }
+        // A subquery is refused first, so its contents cannot change the
+        // message. `DEFAULT` itself is only a whole VALUES/SET item.
+        Expr::ScalarSubquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Star
+        | Expr::Default
+        | Expr::QualifiedStar { .. } => {}
+    }
+}
+
+/// Bind one column `DEFAULT` in an empty scope and check DuckDB's refusals.
+/// Cast and conversion errors are deferred: binding only types the
+/// expression, so `DEFAULT 'now()'` on TIMESTAMP is accepted here and fails
+/// when a row takes it.
+#[allow(clippy::too_many_arguments)]
+fn bind_column_default(
+    db: &PinkDb,
+    ns: &SchemaPath,
+    text: &str,
+    expr: &Expr,
+    dtype: DataType,
+    params: Option<ParamSlots>,
+    session: &Session,
+    dynamic: &mut Vec<String>,
+) -> Result<ColumnDefault> {
+    if expr_has_subquery(expr) {
+        return Err(PinkDbError::Type(
+            "DEFAULT value cannot contain subqueries".to_string(),
+        ));
+    }
+    let (mut column, mut window) = (false, false);
+    default_expr_uses_column_or_window(expr, &mut column, &mut window);
+    if column {
+        return Err(PinkDbError::Type(
+            "DEFAULT value cannot contain column names".to_string(),
+        ));
+    }
+    if window {
+        return Err(PinkDbError::Type(
+            "DEFAULT value cannot contain window functions!".to_string(),
+        ));
+    }
+    let mut binder = Binder::new(db, ns)
+        .with_session(session.clone())
+        .with_params(params);
+    binder.allow_win = false;
+    binder.pin_parameter(expr, dtype)?;
+    let mut aggs = Vec::new();
+    let mut bound = binder.bind_expr(expr, &mut aggs, true)?;
+    if !aggs.is_empty() {
+        return Err(PinkDbError::Type(
+            "DEFAULT value cannot contain aggregates!".to_string(),
+        ));
+    }
+    if bound.dtype() != dtype {
+        bound = BoundExpr::Cast {
+            expr: Box::new(bound),
+            dtype,
+        };
+    }
+    let used = binder.dynamic_functions_used();
+    // Only a statement-independent default can be recorded as a constant for
+    // lake schema evolution. A clock or volatile default is rebound per
+    // statement instead.
+    let constant = if used.is_empty() {
+        const_value(&bound).and_then(|v| crate::exec::expr::cast_value(v.clone(), dtype).ok())
+    } else {
+        None
+    };
+    for name in used {
+        if !dynamic.iter().any(|n| n == &name) {
+            dynamic.push(name);
+        }
+    }
+    // A prepared DDL default holds a bound literal but its text is `?`, which
+    // could never be rebound from the footer: store the literal instead.
+    // shortcut: `DEFAULT ? + 1` has no folded constant and keeps its `?` text,
+    // so saving such a table fails to reload; upgrade when prepared DDL
+    // defaults matter.
+    let text = if crate::sql::peg_parser::expr_contains_parameter(expr) {
+        match &constant {
+            Some(v) => crate::prepared::value_literal(v)?,
+            None => text.to_string(),
+        }
+    } else {
+        text.to_string()
+    };
+    Ok(ColumnDefault {
+        text,
+        expr: bound,
+        constant,
+    })
+}
+
+/// Rebind a default persisted as SQL text (footer v5). The statement clock is
+/// read fresh; `now()` defaults therefore take the loading statement's instant
+/// only until the next INSERT rebinds them.
+pub(crate) fn bind_stored_default(
+    db: &PinkDb,
+    ns: &SchemaPath,
+    text: &str,
+    dtype: DataType,
+) -> Result<ColumnDefault> {
+    let expr = crate::sql::parse_expr(text)?;
+    let mut dynamic = Vec::new();
+    bind_column_default(db, ns, text, &expr, dtype, None, &db.session, &mut dynamic)
 }
 
 /// Bind `CALL name(args...)`: resolve the procedure, check arity, and bind
@@ -8805,21 +9010,43 @@ fn bind_update(
         columns: t.schema(),
     });
     let mut bound_sets = Vec::with_capacity(sets.len());
+    let mut default_dynamic = Vec::new();
     for (set_target, expr) in sets {
         let col = &set_target.column;
         let idx = t
             .column_index(col)
             .map_err(|_| PinkDbError::Catalog(format!("no column \"{col}\"")))?;
         let (_, target) = t.schema()[idx].clone();
-        // `UPDATE t SET col = ?`: the parameter takes the column's type.
-        binder.pin_parameter(expr, target)?;
-        let mut aggs = Vec::new();
-        let bound = binder.bind_expr(expr, &mut aggs, false)?;
-        if !aggs.is_empty() {
-            return Err(PinkDbError::Execution(
-                "aggregates are not allowed in UPDATE SET".to_string(),
-            ));
-        }
+        let bound = if matches!(expr, Expr::Default) {
+            match &t.columns[idx].default {
+                Some(default) => {
+                    let ast = crate::sql::parse_expr(&default.text)?;
+                    bind_column_default(
+                        db,
+                        &table_db,
+                        &default.text,
+                        &ast,
+                        target,
+                        params.clone(),
+                        session,
+                        &mut default_dynamic,
+                    )?
+                    .expr
+                }
+                None => BoundExpr::Literal(Value::Null),
+            }
+        } else {
+            // `UPDATE t SET col = ?`: the parameter takes the column's type.
+            binder.pin_parameter(expr, target)?;
+            let mut aggs = Vec::new();
+            let bound = binder.bind_expr(expr, &mut aggs, false)?;
+            if !aggs.is_empty() {
+                return Err(PinkDbError::Execution(
+                    "aggregates are not allowed in UPDATE SET".to_string(),
+                ));
+            }
+            bound
+        };
         // Subqueries are fine (uncorrelated; evaluated pre-mutation).
         if !can_assign(bound.dtype(), target) && !matches!(bound, BoundExpr::Literal(Value::Null)) {
             return Err(PinkDbError::Type(format!(
@@ -8844,6 +9071,11 @@ fn bind_update(
     }
     reject_view_dependency(db, &binder.views_used())?;
     let mut dynamic_functions = binder.dynamic_functions_used();
+    for name in default_dynamic {
+        if !dynamic_functions.iter().any(|n| n == &name) {
+            dynamic_functions.push(name);
+        }
+    }
     // A RETURNING expression may itself call an extension function.
     let (returning, returning_dynamic) =
         bind_returning(db, session, &table_db, t, returning, params)?;
@@ -9602,6 +9834,7 @@ fn bind_merge(
         ));
     }
     let mut bound_clauses = Vec::with_capacity(clauses.len());
+    let mut merge_default_dynamic = Vec::new();
     for clause in clauses {
         let condition = clause
             .condition
@@ -9621,7 +9854,7 @@ fn bind_merge(
             },
             MergeAction::Delete => crate::plan::MergeActionPlan::Delete,
             MergeAction::Insert { columns, values } => {
-                let cols: Vec<usize> = match columns {
+                let written: Vec<usize> = match columns {
                     Some(cols) => {
                         let mut seen = std::collections::HashSet::new();
                         cols.iter()
@@ -9638,15 +9871,24 @@ fn bind_merge(
                     }
                     None => (0..t.schema().len()).collect(),
                 };
-                if values.len() != cols.len() {
+                if values.len() != written.len() {
                     return Err(PinkDbError::Execution(format!(
                         "MERGE INSERT has {} values for {} columns",
                         values.len(),
-                        cols.len()
+                        written.len()
                     )));
                 }
-                let mut bound = Vec::with_capacity(values.len());
-                for (expr, &col) in values.iter().zip(cols.iter()) {
+                // A written column whose value is DEFAULT, and every column
+                // the list omits, takes its DEFAULT for each inserted row.
+                let mut takes_default: Vec<bool> = (0..t.schema().len())
+                    .map(|col| !written.contains(&col))
+                    .collect();
+                let mut bound: Vec<(usize, BoundExpr)> = Vec::with_capacity(written.len());
+                for (expr, &col) in values.iter().zip(written.iter()) {
+                    if matches!(expr, Expr::Default) {
+                        takes_default[col] = true;
+                        continue;
+                    }
                     let (_, want) = t.schema()[col].clone();
                     binder.pin_parameter(expr, want)?;
                     let mut aggs = Vec::new();
@@ -9665,11 +9907,36 @@ fn bind_merge(
                             t.schema()[col].0
                         )));
                     }
-                    bound.push(e);
+                    bound.push((col, e));
                 }
+                for (col, take) in takes_default.iter().enumerate() {
+                    if !take {
+                        continue;
+                    }
+                    let (_, want) = t.schema()[col].clone();
+                    let e = match &t.columns[col].default {
+                        Some(default) => {
+                            let ast = crate::sql::parse_expr(&default.text)?;
+                            bind_column_default(
+                                db,
+                                &table_db,
+                                &default.text,
+                                &ast,
+                                want,
+                                params.clone(),
+                                session,
+                                &mut merge_default_dynamic,
+                            )?
+                            .expr
+                        }
+                        None => BoundExpr::Literal(Value::Null),
+                    };
+                    bound.push((col, e));
+                }
+                let (cols, values) = bound.into_iter().unzip();
                 crate::plan::MergeActionPlan::Insert {
                     columns: cols,
-                    values: bound,
+                    values,
                 }
             }
         };
@@ -9681,6 +9948,11 @@ fn bind_merge(
     }
     reject_view_dependency(db, &binder.views_used())?;
     let mut dynamic_functions = binder.dynamic_functions_used();
+    for name in merge_default_dynamic {
+        if !dynamic_functions.iter().any(|n| n == &name) {
+            dynamic_functions.push(name);
+        }
+    }
     let (returning, returning_dynamic) =
         bind_returning(db, session, &table_db, t, returning, params)?;
     for name in returning_dynamic {
@@ -9709,6 +9981,7 @@ fn bind_insert(
     table: &str,
     columns: &Option<Vec<String>>,
     rows: &[Vec<Expr>],
+    default_values: bool,
     on_conflict: Option<&OnConflict>,
     returning: Option<&[Projection]>,
     params: Option<ParamSlots>,
@@ -9722,7 +9995,7 @@ fn bind_insert(
     }
     let t = db.table_in(&table_db, table)?;
     let schema = t.schema();
-    let order: Vec<usize> = match columns {
+    let mut order: Vec<usize> = match columns {
         Some(cols) => cols
             .iter()
             .map(|c| {
@@ -9731,6 +10004,15 @@ fn bind_insert(
             })
             .collect::<Result<_>>()?,
         None => (0..schema.len()).collect(),
+    };
+    // `DEFAULT VALUES` is one row with the DEFAULT keyword in every cell.
+    let default_values_row;
+    let rows: &[Vec<Expr>] = if default_values {
+        order = (0..schema.len()).collect();
+        default_values_row = vec![vec![Expr::Default; schema.len()]];
+        &default_values_row
+    } else {
+        rows
     };
     if let Some(cols) = columns {
         let mut seen = std::collections::HashSet::new();
@@ -9744,9 +10026,45 @@ fn bind_insert(
     }
     // Cells bind in an empty scope: only constants (literals, constant scalar
     // expressions) are accepted; column refs and aggregates fail here.
+    //
+    // A column takes its DEFAULT when the column list omits it or its cell is
+    // the DEFAULT keyword. Bind each such default once for this statement
+    // (the clock is spliced at bind time), then clone it per row.
+    let mut provided = vec![false; schema.len()];
+    for &i in &order {
+        provided[i] = true;
+    }
+    for row in rows {
+        for (pos, cell) in row.iter().enumerate() {
+            if matches!(cell, Expr::Default) {
+                provided[order[pos]] = false;
+            }
+        }
+    }
+    let mut default_exprs: Vec<Option<BoundExpr>> = vec![None; schema.len()];
+    let mut dynamic_functions: Vec<String> = Vec::new();
+    for (i, slot) in default_exprs.iter_mut().enumerate() {
+        if provided[i] {
+            continue;
+        }
+        let Some(default) = &t.columns[i].default else {
+            continue;
+        };
+        let expr = crate::sql::parse_expr(&default.text)?;
+        let rebound = bind_column_default(
+            db,
+            &table_db,
+            &default.text,
+            &expr,
+            schema[i].1,
+            params.clone(),
+            session,
+            &mut dynamic_functions,
+        )?;
+        *slot = Some(rebound.expr);
+    }
     let mut bound_rows = Vec::with_capacity(rows.len());
     let mut views_used: Vec<String> = Vec::new();
-    let mut dynamic_functions: Vec<String> = Vec::new();
     for row in rows {
         if row.len() != order.len() {
             return Err(PinkDbError::Execution(format!(
@@ -9755,18 +10073,14 @@ fn bind_insert(
                 order.len()
             )));
         }
-        let mut bound = vec![BoundExpr::Literal(Value::Null); schema.len()];
-        // Fill unspecified columns with NULL — or the column's DEFAULT when it
-        // has one (`ALTER TABLE … ADD COLUMN … DEFAULT`, wave 65); only when a
-        // column list is given.
-        for (i, cell) in bound.iter_mut().enumerate() {
-            if !order.contains(&i)
-                && let Some(d) = &t.columns[i].default
-            {
-                *cell = BoundExpr::Literal(d.clone());
-            }
-        }
+        let mut bound: Vec<BoundExpr> = default_exprs
+            .iter()
+            .map(|e| e.clone().unwrap_or(BoundExpr::Literal(Value::Null)))
+            .collect();
         for (pos, cell) in row.iter().enumerate() {
+            if matches!(cell, Expr::Default) {
+                continue;
+            }
             let mut binder = Binder::new(db, &table_db)
                 .with_session(session.clone())
                 .with_params(params.clone());
@@ -9885,6 +10199,29 @@ fn bind_insert_select(
     }
     reject_view_dependency(db, &binder.views_used())?;
     let mut dynamic = binder.dynamic_functions_used();
+    // Omitted target columns take their DEFAULT per source row, rebound for
+    // this statement so a clock default uses its instant.
+    let mut defaults: Vec<Option<BoundExpr>> = vec![None; schema.len()];
+    for (i, slot) in defaults.iter_mut().enumerate() {
+        if order.contains(&i) {
+            continue;
+        }
+        let Some(default) = &t.columns[i].default else {
+            continue;
+        };
+        let expr = crate::sql::parse_expr(&default.text)?;
+        let rebound = bind_column_default(
+            db,
+            &table_db,
+            &default.text,
+            &expr,
+            schema[i].1,
+            params.clone(),
+            session,
+            &mut dynamic,
+        )?;
+        *slot = Some(rebound.expr);
+    }
     let (conflict, conflict_dynamic) = bind_conflict(
         db,
         session,
@@ -9906,6 +10243,7 @@ fn bind_insert_select(
             ns: Some(table_db),
             table: t.name.clone(),
             columns: Some(order),
+            defaults,
             query: Box::new(query_plan),
             conflict,
             returning,
@@ -9940,8 +10278,8 @@ fn bind_create_table(
         .with_session(session.clone())
         .resolve_ns(qdb)?;
     let mut schema: Vec<(String, DataType)> = Vec::new();
-    let mut defaults: Vec<Option<BoundExpr>> = Vec::new();
-    let mut dynamic: Vec<String> = Vec::new();
+    let mut defaults: Vec<Option<ColumnDefault>> = Vec::new();
+    let dynamic: Vec<String> = Vec::new();
     let mut constraints = TableConstraints::default();
     // Named constraints are echoes of the DDL; only the declaration matters.
     for item in items {
@@ -9961,40 +10299,24 @@ fn bind_create_table(
                 for c in &col.constraints {
                     bind_column_constraint(db, &target, name, &schema, idx, c, &mut constraints)?;
                 }
-                // A DEFAULT binds in an empty scope (constants only), like
-                // `ALTER TABLE … ADD COLUMN … DEFAULT`, and is evaluated once
-                // when the table is created.
+                // A DEFAULT binds in an empty scope and is never evaluated
+                // here: a statement-time or conversion failure surfaces when
+                // a row takes it. Its dependencies are therefore not the
+                // statement's (a `uuid()` default is refused by the INSERT
+                // that evaluates it, not by CREATE).
+                let mut unused_dynamic = Vec::new();
                 defaults.push(match &col.default {
                     None => None,
-                    Some(expr) => {
-                        let mut binder = Binder::new(db, &target)
-                            .with_session(session.clone())
-                            .with_params(params.clone());
-                        binder.allow_win = false;
-                        binder.pin_parameter(expr, col.dtype)?;
-                        let mut aggs = Vec::new();
-                        let bound = binder.bind_expr(expr, &mut aggs, false)?;
-                        if !aggs.is_empty() {
-                            return Err(PinkDbError::Execution(
-                                "an aggregate is not allowed in a column DEFAULT".to_string(),
-                            ));
-                        }
-                        let used = binder.dynamic_functions_used();
-                        if used.iter().any(|d| clock_reading(d).is_some()) {
-                            return Err(PinkDbError::Execution(format!(
-                                "the DEFAULT of column \"{}\" reads the clock: pinkdb stores a \
-                                 constant default (evaluated once at CREATE TABLE), so a \
-                                 per-row now()/CURRENT_TIMESTAMP default is not supported yet",
-                                col.name
-                            )));
-                        }
-                        for d in used {
-                            if !dynamic.contains(&d) {
-                                dynamic.push(d);
-                            }
-                        }
-                        Some(bound)
-                    }
+                    Some(default) => Some(bind_column_default(
+                        db,
+                        &target,
+                        &default.text,
+                        &default.expr,
+                        col.dtype,
+                        params.clone(),
+                        session,
+                        &mut unused_dynamic,
+                    )?),
                 });
             }
             TableItem::Constraint(tc) => {
@@ -10047,6 +10369,7 @@ fn bind_alter_table(
     let t = db.table_in(&target, name)?;
     let schema: Vec<(String, DataType)> = t.schema();
     let table_display = t.name.clone();
+    let mut dynamic = Vec::new();
     let plan_op = match op {
         AlterTableOp::AddColumn {
             column,
@@ -10085,18 +10408,20 @@ fn bind_alter_table(
                     }
                 }
             }
-            // A default expression binds in an empty scope (constants only).
+            // Bound for this statement: every existing row evaluates it, so
+            // a clock default reads this statement's instant.
             let bound_default = match default {
                 None => None,
-                Some(expr) => {
-                    let mut binder = Binder::new(db, &target)
-                        .with_session(session.clone())
-                        .with_params(params.clone());
-                    binder.allow_win = false;
-                    binder.pin_parameter(expr, column.dtype)?;
-                    let mut aggs = Vec::new();
-                    Some(binder.bind_expr(expr, &mut aggs, false)?)
-                }
+                Some(default) => Some(bind_column_default(
+                    db,
+                    &target,
+                    &default.text,
+                    &default.expr,
+                    column.dtype,
+                    params.clone(),
+                    session,
+                    &mut dynamic,
+                )?),
             };
             AlterTablePlan::AddColumn {
                 column: column.name.clone(),
@@ -10209,7 +10534,7 @@ fn bind_alter_table(
             name: table_display,
             op: plan_op,
         },
-        Vec::new(),
+        dynamic,
     ))
 }
 
@@ -10534,11 +10859,7 @@ fn bind_describe(
                 dtype: c.dtype,
                 not_null: t.constraints.is_not_null(i),
                 key: t.constraints.column_key_kind(i),
-                default: c
-                    .default
-                    .as_ref()
-                    .map(crate::prepared::value_literal)
-                    .transpose()?,
+                default: c.default.as_ref().map(|d| d.text.clone()),
             });
         }
         return Ok((LogicalPlan::Describe { columns }, Vec::new()));
@@ -11456,7 +11777,7 @@ struct CatalogSchema {
 struct CatalogColumn {
     name: String,
     dtype: DataType,
-    default: Option<Value>,
+    default: Option<String>,
     not_null: bool,
 }
 
@@ -11629,7 +11950,7 @@ fn catalog_snapshot(db: &PinkDb, binder: &Binder<'_>) -> Result<CatalogSnapshot>
                 .map(|(i, column)| CatalogColumn {
                     name: column.name.clone(),
                     dtype: column.dtype,
-                    default: column.default.clone(),
+                    default: column.default.as_ref().map(|d| d.text.clone()),
                     not_null: table.constraints.is_not_null(i),
                 })
                 .collect();
@@ -11716,10 +12037,9 @@ fn catalog_table_sql(db: &PinkDb, ns: &SchemaPath, table: &DataTable) -> Result<
         names.push(name.clone());
         let mut item = format!("{name} {}", column.dtype.name());
         if let Some(default) = &column.default {
-            item.push_str(&format!(
-                " DEFAULT({})",
-                crate::prepared::value_literal(default)?
-            ));
+            // DuckDB normalizes its own rendering (`(1+2)` becomes
+            // `(1 + 2)`); we print the written text, so simple defaults match.
+            item.push_str(&format!(" DEFAULT({})", default.text));
         }
         // DuckDB repeats only explicitly written NOT NULL; a PRIMARY KEY
         // column is implicitly NOT NULL and stays bare in `sql`.
@@ -12132,11 +12452,7 @@ fn bind_duckdb_meta(
                     .expect("snapshot table belongs to a database");
                 for (i, column) in table.columns.iter().enumerate() {
                     let (precision, radix, scale) = duckdb_numeric_meta(column.dtype);
-                    let default = column
-                        .default
-                        .as_ref()
-                        .map(crate::prepared::value_literal)
-                        .transpose()?;
+                    let default = column.default.clone();
                     rows.push(vec![
                         text(&table.db),
                         bigint(database.oid),
@@ -14585,7 +14901,7 @@ mod tests {
         let err = bind_one(&db, "USE nope;").unwrap_err();
         assert!(
             err.to_string()
-                .contains("no database or schema named \"nope\""),
+                .contains("database or schema \"nope\" not found"),
             "{err}"
         );
         assert!(matches!(

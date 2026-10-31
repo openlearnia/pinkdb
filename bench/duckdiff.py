@@ -754,6 +754,7 @@ def run_small():
                  SETUP + "\n" + NAN_SETUP)
     run_three_part()
     run_catalog()
+    run_defaults()
     run_arrow()
     run_parquet()
 
@@ -1108,6 +1109,68 @@ def run_catalog():
         prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
         ok = rows_equal(prows_n, drows, True)
         check(label, ok, "" if ok else f"\npink={prows_n}\nduck={drows}")
+
+
+# ---- wave 139a: column DEFAULTs are expressions ----
+#
+# A deterministic default is evaluated once per statement and broadcast, so
+# values and the written text both match DuckDB. A clock default is covered by
+# the Rust tests (the two engines cannot share one instant).
+DEFAULTS_SETUP = """
+CREATE TABLE d0 (a INTEGER DEFAULT 0, b VARCHAR DEFAULT 'x''y', c DECIMAL(10,2) DEFAULT 1.5);
+INSERT INTO d0 DEFAULT VALUES;
+CREATE TABLE d1 (a INTEGER DEFAULT 5, b INTEGER);
+INSERT INTO d1 VALUES (1, DEFAULT), (DEFAULT, 2);
+INSERT INTO d1 (b) VALUES (DEFAULT);
+CREATE TABLE d2 (a INTEGER DEFAULT 5, b INTEGER);
+INSERT INTO d2 (a) VALUES (1);
+UPDATE d2 SET a = DEFAULT;
+"""
+
+DEFAULTS_PROBES = [
+    ("default-values-insert", "SELECT a, b, c FROM d0;", False),
+    ("default-keyword-in-values", "SELECT a, b FROM d1 ORDER BY a, b;", True),
+    ("update-set-default", "SELECT a, b FROM d2;", False),
+    ("default-duckdb-columns-text",
+     "SELECT column_name, column_default FROM duckdb_columns() "
+     "WHERE table_name = 'd0' ORDER BY column_name;", True),
+    ("default-information-schema-text",
+     "SELECT column_name, column_default FROM information_schema.columns "
+     "WHERE table_name = 'd0' ORDER BY column_name;", True),
+]
+
+# DuckDB refuses these at CREATE; pinkdb must print the same message after
+# DuckDB's `Binder Error: ` class prefix.
+DEFAULTS_REFUSALS = [
+    ("CREATE TABLE x (a INTEGER DEFAULT (SELECT 1));",
+     "DEFAULT value cannot contain subqueries"),
+    ("CREATE TABLE x (a INTEGER, b INTEGER DEFAULT a);",
+     "DEFAULT value cannot contain column names"),
+    ("CREATE TABLE x (a INTEGER DEFAULT sum(1));",
+     "DEFAULT value cannot contain aggregates!"),
+    ("CREATE TABLE x (a INTEGER DEFAULT row_number() OVER ());",
+     "DEFAULT value cannot contain window functions!"),
+]
+
+
+def run_defaults():
+    print("== column defaults battery (wave 139a) ==")
+    for label, sql, ordered in DEFAULTS_PROBES:
+        run_case(label, sql, ordered, False, DEFAULTS_SETUP, DEFAULTS_SETUP)
+    for sql, want in DEFAULTS_REFUSALS:
+        # A refused CREATE prints no result table, so read the CLI's stderr
+        # `Error:` line directly instead of going through pink_query.
+        pink_msg = next(
+            (t[1] for t in pink_tables("", sql) if t[0] == "error"), None
+        )
+        d = duck_query("", sql)
+        if d[0] != "error":
+            check(f"default-refusal {want}", False, f"duck={d[0]}")
+            continue
+        duck_msg = d[1].split(": ", 1)[-1]
+        pink_msg = pink_msg.split(": ", 1)[-1] if pink_msg else None
+        check(f"default-refusal {want}", pink_msg == want and duck_msg == want,
+              f"\npink={pink_msg!r}\nduck={duck_msg!r}")
 
 
 # (label, pinkdb sql, duckdb sql, ordered). DuckDB's parser rejects a

@@ -442,20 +442,30 @@ pub enum Statement {
     Select(Select),
 }
 
+/// A `DEFAULT` expression as written: its source text (trimmed) and AST.
+///
+/// The text is what `DESCRIBE` and the catalog print; the binder keeps the
+/// bound expression next to it so `INSERT`/`UPDATE`/`ALTER` can evaluate it
+/// for every row that takes the default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefaultExpr {
+    pub text: String,
+    pub expr: Box<Expr>,
+}
+
 /// One `ALTER TABLE` operation (wave 65).
 ///
 /// `ADD COLUMN` carries the column definition (type + inline constraints; the
 /// binder accepts only `NOT NULL`, which needs a non-NULL `DEFAULT` on a
 /// non-empty table — DuckDB's rule) plus the optional `DEFAULT` expression.
-/// The default is bound as a constant expression and evaluated once when the
-/// statement runs; every existing row (and every later `INSERT` that omits
-/// the column) reads that value.
+/// The default text is kept and its expression is evaluated for every existing
+/// row; later `INSERT`s that omit the column evaluate it again.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterTableOp {
     AddColumn {
         column: ColumnDef,
-        /// `DEFAULT <expr>`: bound in an empty scope (constants only).
-        default: Option<Expr>,
+        /// `DEFAULT <expr>`: bound in an empty scope (no column references).
+        default: Option<DefaultExpr>,
         /// `IF NOT EXISTS`: an existing column makes the statement a no-op.
         if_not_exists: bool,
     },
@@ -492,6 +502,8 @@ pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
     /// `SELECT ...` (or WITH ... SELECT).
     Select(Box<Select>),
+    /// `DEFAULT VALUES`: one row, every column takes its default.
+    DefaultValues,
 }
 
 /// One `CREATE TABLE` item list entry: a column definition or a table-level
@@ -511,10 +523,10 @@ pub struct ColumnDef {
     pub name: String,
     pub dtype: crate::types::DataType,
     pub constraints: Vec<ColumnConstraint>,
-    /// `DEFAULT <expr>` in `CREATE TABLE` (a constant, evaluated once when
-    /// the table is created). `ALTER TABLE … ADD COLUMN` carries its default
-    /// on the operation instead.
-    pub default: Option<Box<Expr>>,
+    /// `DEFAULT <expr>` in `CREATE TABLE`: stored as written and evaluated
+    /// for every row that takes it. `ALTER TABLE … ADD COLUMN` carries its
+    /// default on the operation instead.
+    pub default: Option<DefaultExpr>,
 }
 
 /// `CONSTRAINT name <constraint>` (the name is optional).
@@ -997,6 +1009,8 @@ pub enum Expr {
     Parameter(usize),
     /// Bare `*` (only valid as a function arg for `COUNT(*)`).
     Star,
+    /// The `DEFAULT` keyword in a `VALUES` cell or an `UPDATE SET` value.
+    Default,
     /// `column`, `table.column` or `db.table.column` (wave 94). A database
     /// qualifier implies a table qualifier.
     Column {

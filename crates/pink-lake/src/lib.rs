@@ -1698,7 +1698,12 @@ impl Lake {
                     .columns
                     .iter()
                     .map(|c| {
-                        crate::catalog::ColumnEntry::new(&c.name, c.dtype, c.default.as_ref(), 1)
+                        crate::catalog::ColumnEntry::new(
+                            &c.name,
+                            c.dtype,
+                            c.default.as_ref().and_then(|d| d.constant.as_ref()),
+                            1,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()?;
                 deltas.insert(
@@ -2232,7 +2237,10 @@ impl Lake {
                         source: e,
                     })?;
                 for (col, record) in t.columns.iter_mut().zip(&record.columns) {
-                    col.default = record.default.clone();
+                    col.default = record
+                        .default
+                        .clone()
+                        .map(pinkdb::plan::ColumnDefault::constant);
                 }
                 created = true;
             }
@@ -2293,7 +2301,10 @@ impl Lake {
                                 source: e,
                             })?;
                         for (col, record) in t.columns.iter_mut().zip(&s.columns) {
-                            col.default = record.default.clone();
+                            col.default = record
+                                .default
+                                .clone()
+                                .map(pinkdb::plan::ColumnDefault::constant);
                         }
                     }
                     created = true;

@@ -2070,7 +2070,7 @@ fn extended_base(base: &DataTable, source: &DataTable) -> Result<DataTable> {
         columns.push(crate::schema::constant_column(
             &column.name,
             column.dtype,
-            column.default.as_ref(),
+            column.default.as_ref().and_then(|d| d.constant.as_ref()),
             base,
         )?);
     }

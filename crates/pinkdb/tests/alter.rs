@@ -352,10 +352,7 @@ fn defaults_survive_pink_save_and_load() {
     // DESCRIBE still reports them.
     let described = rows(&mut db, "DESCRIBE t;");
     assert_eq!(described[2][4], Value::Varchar("42".into()));
-    assert_eq!(
-        described[3][4],
-        Value::Varchar("CAST('1.25' AS DECIMAL(38,2))".into())
-    );
+    assert_eq!(described[3][4], Value::Varchar("1.25".into()));
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -509,9 +506,6 @@ fn alter_result_maps_to_protocol_and_ffi_kinds() {
         Value::Varchar("DECIMAL(4,1)".into()),
         "{described:?}"
     );
-    assert_eq!(
-        described[2][4],
-        Value::Varchar("CAST('2.5' AS DECIMAL(38,1))".into())
-    );
+    assert_eq!(described[2][4], Value::Varchar("2.5".into()));
     let _ = DataType::Integer;
 }
