@@ -85,6 +85,12 @@ pub(crate) struct CatalogChange {
     /// engine's metadata and its table data must become visible together, so
     /// the image rides the commit's transaction instead of a second one.
     pub(crate) engine_catalog: Option<std::sync::Arc<Vec<u8>>>,
+    /// The database's schemas when the engine published it: a writable lake
+    /// database keeps one `ducklake_schema` row per engine schema, empty ones
+    /// included, so schema rows are created and ended to match (the
+    /// incremental commit path applies the list). `None` leaves the catalog's
+    /// schemas alone (maintenance and saves).
+    pub(crate) schemas: Option<Vec<String>>,
 }
 
 /// The typed metadata surface every catalog database implements.
@@ -171,6 +177,9 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// `[begin_snapshot, end_snapshot)`) and schedule their files for
     /// deletion. One transaction.
     fn expire_snapshots(&self, versions: &[u64]) -> Result<()>;
+
+    /// Every live schema name at `version` (`None` = head), ordered by id.
+    fn schemas(&self, version: Option<u64>) -> Result<Vec<String>>;
 
     /// Files in `ducklake_files_scheduled_for_deletion`, as
     /// `(id, catalog-relative path)`.

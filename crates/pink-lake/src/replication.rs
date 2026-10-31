@@ -2114,7 +2114,13 @@ fn commit_content(
         None => Vec::new(),
     };
     let current = vec![(key.to_string(), Arc::new(content.clone()))];
-    dest.commit_from_tables(base_version, &base, &current, &CommitSettings::default())
+    dest.commit_from_tables(
+        base_version,
+        &base,
+        &current,
+        None,
+        &CommitSettings::default(),
+    )
 }
 
 /// Drop one destination table through an ordinary commit. A table that is

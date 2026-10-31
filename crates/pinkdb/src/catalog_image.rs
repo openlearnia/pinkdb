@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use crate::lake_db::DbStorage;
 use crate::persist::crc32c;
-use crate::storage::{DataTable, DbCatalog, PinkDb};
+use crate::storage::{DataTable, DbCatalog, PinkDb, SchemaPath};
 use crate::{PinkDbError, Result};
 
 /// `PINKDBI1`, the image magic (a `.pink` file ends with `PINKDB06`).
@@ -74,8 +74,8 @@ impl PinkDb {
     /// Append a lake table's materialized rows to its (empty) image table.
     /// The hash indexes and the primary-key cache are marked stale: rows
     /// arrived behind their back, exactly like a bulk load.
-    fn attach_rows_in(&mut self, dbname: &str, name: &str, rows: &DataTable) -> Result<()> {
-        let table = self.table_mut_in(dbname, name)?;
+    fn attach_rows_in(&mut self, ns: &SchemaPath, name: &str, rows: &DataTable) -> Result<()> {
+        let table = self.table_mut_in(ns.clone(), name)?;
         for chunk_idx in 0..rows.num_chunks() {
             let chunk = rows.scan_chunk(chunk_idx).ok_or_else(|| {
                 PinkDbError::Execution("lake table changed while it was being loaded".to_string())
@@ -97,7 +97,7 @@ pub(crate) fn load_database_image(
     name: &str,
     storage: DbStorage,
     image: Option<&[u8]>,
-    tables: &[(String, Arc<DataTable>)],
+    tables: &[(String, String, Arc<DataTable>)],
 ) -> Result<DbCatalog> {
     let mut scratch = match image {
         Some(image) => PinkDb::from_pink_bytes(decode(image)?)?,
@@ -120,26 +120,40 @@ pub(crate) fn load_database_image(
             name.to_string()
         }
     };
-    let image_tables = scratch.list_tables_in(&db);
-    // Image tables the lake no longer has are gone.
-    for t in &image_tables {
-        if !tables.iter().any(|(n, _)| n.eq_ignore_ascii_case(t)) {
-            scratch.drop_table_in(&db, t)?;
+    // Image tables the lake no longer has are gone. Image schemas stay: an
+    // empty schema is an engine object the lake cannot describe, so the
+    // image is the only place `CREATE SCHEMA` survives.
+    let image_tables: Vec<(SchemaPath, String)> = scratch
+        .all_tables_of(&db)
+        .into_iter()
+        .map(|(ns, _, t)| (ns, t.name.clone()))
+        .collect();
+    for (ns, tname) in image_tables {
+        let kept = tables.iter().any(|(schema, name, _)| {
+            ns.schema().eq_ignore_ascii_case(schema) && name.eq_ignore_ascii_case(&tname)
+        });
+        if !kept {
+            scratch.drop_table_in(ns, &tname)?;
         }
     }
-    for (tname, rows) in tables {
+    for (schema, tname, rows) in tables {
+        let ns = SchemaPath::new(&db, schema);
+        if !scratch.schema_exists(&ns) {
+            scratch.create_schema(&ns, true)?;
+            scratch.set_schema_display(&ns, schema)?;
+        }
         let described = scratch
-            .table_in(&db, tname)
+            .table_in(&ns, tname)
             .is_ok_and(|t| t.schema() == rows.schema());
         if described {
-            scratch.attach_rows_in(&db, tname, rows)?;
+            scratch.attach_rows_in(&ns, tname, rows)?;
         } else {
-            if scratch.table_in(&db, tname).is_ok() {
-                scratch.drop_table_in(&db, tname)?;
+            if scratch.table_in(&ns, tname).is_ok() {
+                scratch.drop_table_in(&ns, tname)?;
             }
             let mut table = (**rows).clone();
             table.name = tname.clone();
-            scratch.tables_insert_in(&db, tname.to_ascii_lowercase(), table)?;
+            scratch.tables_insert_in(&ns, tname.to_ascii_lowercase(), table)?;
         }
     }
     let mut cat = scratch

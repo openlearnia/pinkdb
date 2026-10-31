@@ -13,10 +13,13 @@
 //!   database's engine image — one lake version per commit, exactly what the
 //!   stateless server of wave 96b did for its whole store, now per database.
 //!
-//! A lake exposes one schema: its tables must all live in one (`main` for a
-//! lake this module creates). More than one is refused.
+//! A lake schema is a database schema: DuckLake's `s` becomes `database.s`,
+//! in its own spelling, and lookups are case-insensitive like every catalog
+//! name. A lake this module creates starts with `main` only. The engine's
+//! schema list rides every commit (`LakeContent`/`publish`/`tables_at` key
+//! tables by `(schema, table)`), so an empty `CREATE SCHEMA` is a
+//! `ducklake_schema` row and a `DROP SCHEMA` ends it.
 
-use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -28,9 +31,6 @@ use pinkdb::{
 };
 
 use crate::{CommitSettings, EngineLease, Lake, LakeError, LeaseError, WritableAttachment};
-
-/// The schema a lake this module creates keeps its tables in.
-const SCHEMA: &str = "main";
 
 /// How often a writable lake's lease heartbeat is refreshed.
 const HEARTBEAT: Duration = Duration::from_millis(1000);
@@ -104,38 +104,21 @@ fn open_lake(
     .map_err(lake_error)
 }
 
-/// The one schema of a lake's catalog keys (`schema.table`), refusing more.
-fn one_schema<'a>(
-    location: &str,
-    keys: impl Iterator<Item = &'a String>,
-) -> pinkdb::Result<String> {
-    let mut schemas: BTreeSet<String> = BTreeSet::new();
-    for key in keys {
-        if let Some((schema, _)) = key.split_once('.') {
-            schemas.insert(schema.to_string());
-        }
+/// Whether a `schema.table` catalog key names `(schema, table)`.
+fn key_matches(key: &str, schema: &str, table: &str) -> bool {
+    match key.split_once('.') {
+        Some((s, t)) => s.eq_ignore_ascii_case(schema) && t.eq_ignore_ascii_case(table),
+        None => false,
     }
-    if schemas.len() > 1 {
-        return Err(pinkdb::lake_db::multi_schema_error(
-            location,
-            &schemas.into_iter().collect::<Vec<_>>(),
-        ));
-    }
-    Ok(schemas.pop_first().unwrap_or_else(|| SCHEMA.to_string()))
 }
 
-/// The table name of a `schema.table` key.
-fn table_of(key: &str) -> &str {
-    key.split_once('.').map(|(_, t)| t).unwrap_or(key)
-}
-
-/// Every table of the lake at `version`, materialized, by table name.
-fn tables_at(lake: &Lake, version: u64) -> pinkdb::Result<Vec<(String, Arc<DataTable>)>> {
+/// Every table of the lake at `version`, materialized, by schema and table.
+fn tables_at(lake: &Lake, version: u64) -> pinkdb::Result<Vec<(String, String, Arc<DataTable>)>> {
     let report = lake.attach(Some(version)).map_err(lake_error)?;
     let reader = report.lake;
     let mut out = Vec::new();
     for t in reader.tables() {
-        out.push((t.table.clone(), reader.load(&t.db, &t.table)?));
+        out.push((t.db.clone(), t.table.clone(), reader.load(&t.db, &t.table)?));
     }
     Ok(out)
 }
@@ -146,16 +129,11 @@ impl DatabaseOpener for LakeOpener {
         let location = crate::redact_location(&request.catalog);
         if request.read_only {
             let report = lake.attach(request.version).map_err(lake_error)?;
-            let keys: Vec<String> = report
-                .lake
-                .tables()
-                .iter()
-                .map(|t| format!("{}.{}", t.db, t.table))
-                .collect();
-            one_schema(&location, keys.iter())?;
+            let schemas = lake.schemas().map_err(lake_error)?;
             return Ok(Arc::new(ReadOnlyLake {
                 location,
                 version: report.version,
+                schemas,
                 reader: report.lake,
                 lake: Mutex::new(lake),
             }));
@@ -166,9 +144,8 @@ impl DatabaseOpener for LakeOpener {
             attachment.set_data_inlining_row_limit(limit);
         }
         let (lake, version, base) = attachment.into_parts();
-        let schema = one_schema(&location, base.iter().map(|(k, _)| k))?;
         let image = lake.engine_catalog().map_err(lake_error)?.map(|(_, i)| i);
-        WritableLake::start(location, lake, version, base, image, schema, lease)
+        WritableLake::start(location, lake, version, base, image, lease)
     }
 }
 
@@ -221,6 +198,7 @@ fn lease_owner() -> String {
 struct ReadOnlyLake {
     location: String,
     version: u64,
+    schemas: Vec<String>,
     reader: Arc<dyn AttachedLake>,
     /// The handle, for older versions (a WAL record's pinned read).
     lake: Mutex<Lake>,
@@ -236,6 +214,9 @@ impl LakeDatabase for ReadOnlyLake {
     fn version(&self) -> u64 {
         self.version
     }
+    fn schemas(&self) -> pinkdb::Result<Vec<String>> {
+        Ok(self.schemas.clone())
+    }
     fn reader(&self) -> pinkdb::Result<Arc<dyn AttachedLake>> {
         Ok(Arc::clone(&self.reader))
     }
@@ -245,13 +226,18 @@ impl LakeDatabase for ReadOnlyLake {
             self.location
         )))
     }
-    fn publish(&self, _image: &[u8], _tables: &[(String, Arc<DataTable>)]) -> pinkdb::Result<u64> {
+    fn publish(
+        &self,
+        _image: &[u8],
+        _schemas: &[String],
+        _tables: &[(String, String, Arc<DataTable>)],
+    ) -> pinkdb::Result<u64> {
         Err(PinkDbError::Execution(format!(
             "lake {} is attached read-only",
             self.location
         )))
     }
-    fn tables_at(&self, version: u64) -> pinkdb::Result<Vec<(String, Arc<DataTable>)>> {
+    fn tables_at(&self, version: u64) -> pinkdb::Result<Vec<(String, String, Arc<DataTable>)>> {
         tables_at(
             &self.lake.lock().unwrap_or_else(|p| p.into_inner()),
             version,
@@ -263,7 +249,6 @@ impl LakeDatabase for ReadOnlyLake {
 /// commit diffs against.
 struct WritableLake {
     location: String,
-    schema: String,
     state: Arc<Mutex<WritableState>>,
     /// The image the lake carried when it was opened (taken by `content`).
     image: Mutex<Option<Vec<u8>>>,
@@ -284,7 +269,6 @@ impl std::fmt::Debug for WritableLake {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WritableLake")
             .field("location", &self.location)
-            .field("schema", &self.schema)
             .finish()
     }
 }
@@ -296,7 +280,6 @@ impl WritableLake {
         version: u64,
         base: Vec<(String, Arc<DataTable>)>,
         image: Option<Vec<u8>>,
-        schema: String,
         lease: Arc<EngineLease>,
     ) -> pinkdb::Result<Arc<dyn LakeDatabase>> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -327,7 +310,6 @@ impl WritableLake {
         };
         Ok(Arc::new(WritableLake {
             location,
-            schema,
             state: Arc::new(Mutex::new(WritableState {
                 lake,
                 version,
@@ -366,6 +348,10 @@ impl LakeDatabase for WritableLake {
     fn version(&self) -> u64 {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).version
     }
+    fn schemas(&self) -> pinkdb::Result<Vec<String>> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.lake.schemas().map_err(lake_error)
+    }
     fn reader(&self) -> pinkdb::Result<Arc<dyn AttachedLake>> {
         Err(PinkDbError::Execution(format!(
             "lake {} is writable: its tables live in the store",
@@ -379,11 +365,21 @@ impl LakeDatabase for WritableLake {
             tables: state
                 .base
                 .iter()
-                .map(|(key, table)| (table_of(key).to_string(), Arc::clone(table)))
+                .map(|(key, table)| match key.split_once('.') {
+                    Some((schema, name)) => {
+                        (schema.to_string(), name.to_string(), Arc::clone(table))
+                    }
+                    None => ("main".to_string(), key.clone(), Arc::clone(table)),
+                })
                 .collect(),
         })
     }
-    fn publish(&self, image: &[u8], tables: &[(String, Arc<DataTable>)]) -> pinkdb::Result<u64> {
+    fn publish(
+        &self,
+        image: &[u8],
+        schemas: &[String],
+        tables: &[(String, String, Arc<DataTable>)],
+    ) -> pinkdb::Result<u64> {
         // A server whose lease was taken over must not publish at all.
         self.lease.verify().map_err(lease_error)?;
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -392,17 +388,24 @@ impl LakeDatabase for WritableLake {
         // re-created.
         let current: Vec<(String, Arc<DataTable>)> = tables
             .iter()
-            .map(|(name, table)| {
+            .map(|(schema, name, table)| {
                 let key = state
                     .base
                     .iter()
                     .map(|(key, _)| key)
-                    .find(|key| table_of(key).eq_ignore_ascii_case(name))
+                    .find(|key| key_matches(key, schema, name))
                     .cloned()
-                    .unwrap_or_else(|| format!("{}.{name}", self.schema));
+                    .unwrap_or_else(|| format!("{schema}.{name}"));
                 (key, Arc::clone(table))
             })
             .collect();
+        // Only a schema list that differs from the lake's is worth a catalog
+        // write; the comparison is case-insensitive, like the lookups.
+        let live = state.lake.schemas().map_err(lake_error)?;
+        let same_schemas = live.len() == schemas.len()
+            && schemas
+                .iter()
+                .all(|s| live.iter().any(|l| l.eq_ignore_ascii_case(s)));
         let WritableState {
             lake,
             version,
@@ -410,7 +413,13 @@ impl LakeDatabase for WritableLake {
         } = &mut *state;
         lake.set_engine_catalog(image.to_vec());
         let report = lake
-            .commit_from_tables(*version, base, &current, &CommitSettings::default())
+            .commit_from_tables(
+                *version,
+                base,
+                &current,
+                (!same_schemas).then_some(schemas),
+                &CommitSettings::default(),
+            )
             .map_err(lake_error)?;
         if report.committed {
             *version = report.version;
@@ -423,7 +432,7 @@ impl LakeDatabase for WritableLake {
         *base = current;
         Ok(*version)
     }
-    fn tables_at(&self, version: u64) -> pinkdb::Result<Vec<(String, Arc<DataTable>)>> {
+    fn tables_at(&self, version: u64) -> pinkdb::Result<Vec<(String, String, Arc<DataTable>)>> {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         tables_at(&state.lake, version)
     }

@@ -192,7 +192,7 @@ fn lean_attach_answers_from_statistics_without_decoding() {
     // A fresh process: attach from the statistics block, then fast paths.
     let d = common::DECODES;
     let out = run(&format!(
-        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n\
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n\
          SELECT COUNT(*), COUNT(i), COUNT(g), COUNT(s) FROM t;\n\
          SELECT MIN(i), MAX(i), MIN(g), MAX(g), MIN(s), MAX(s), MIN(b), MAX(b) FROM t;\n\
          SELECT COUNT(*), COUNT(x), MIN(x) FROM empty;\n{d}\
@@ -247,7 +247,7 @@ fn lean_attach_answers_equal_open_and_in_memory() {
         lake = lake.display()
     ));
     let attached = run(&format!(
-        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n{queries}.quit\n",
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n{queries}.quit\n",
         lake = lake.display()
     ));
 
@@ -267,7 +267,7 @@ fn lean_attach_answers_equal_open_and_in_memory() {
     // decode counters stay at zero, and the first fallback materializes once.
     let d = common::DECODES;
     let stats_arm = run(&format!(
-        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n\
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n\
          SELECT COUNT(*) FROM t;\n\
          SELECT MIN(i), MAX(i), COUNT(s), MIN(b), MAX(b) FROM t;\n{d}\
          SELECT SUM(i) FROM t;\n{d}\

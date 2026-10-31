@@ -1725,19 +1725,6 @@ impl DbCatalog {
             lake_version: 0,
         }
     }
-
-    /// The always-present `main` schema. Lake publishing and the paths that
-    /// still speak plain database names (wave 131a) work against it.
-    pub(crate) fn main(&self) -> &SchemaCatalog {
-        &self.schemas["main"]
-    }
-
-    /// [`DbCatalog::main`], mutably.
-    pub(crate) fn main_mut(&mut self) -> &mut SchemaCatalog {
-        self.schemas
-            .get_mut("main")
-            .expect("every database has main")
-    }
 }
 
 /// A store of databases.

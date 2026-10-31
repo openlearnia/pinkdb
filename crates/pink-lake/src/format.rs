@@ -624,6 +624,8 @@ impl LakeFormat for PinkFormat {
                 context: format!("saving table \"{db}.{table}\""),
                 source: e,
             })?;
+        // A single-table store names the database by the lake schema and
+        // keeps one schema, `main`; the footer's own names are the same.
         let stats = saved
             .into_iter()
             .find(|s| s.db == db && s.schema == "main" && s.table == table)

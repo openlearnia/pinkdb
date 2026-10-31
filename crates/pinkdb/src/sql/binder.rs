@@ -11386,10 +11386,10 @@ fn bind_catalog(
     }
     for (location, tables) in db.attached_lakes() {
         for table in tables {
-            if readable(&table.db, "main", &table.table) {
+            if readable(&table.db, &table.schema_name, &table.table) {
                 rows.push(vec![
                     text(&table.db),
-                    text("main"),
+                    text(&table.schema_name),
                     text(&table.table),
                     text("LAKE TABLE"),
                     null(),
@@ -11640,6 +11640,40 @@ fn catalog_snapshot(db: &PinkDb, binder: &Binder<'_>) -> Result<CatalogSnapshot>
                 row_count: table.num_rows as i64,
                 index_count: (table.indexes.len() + table.vector_indexes.len()) as i64,
                 has_primary_key: table.constraints.primary_key().is_some(),
+            });
+            next_oid += 1;
+        }
+        // A read-only lake database keeps its tables in the lake, not in the
+        // engine catalog: list them from the attached reader.
+        for attached in db.attached_tables() {
+            if !attached.db.eq_ignore_ascii_case(&schema.db)
+                || !attached.schema_name.eq_ignore_ascii_case(&schema.name)
+                || db.table_in(ns.clone(), &attached.table).is_ok()
+                || !readable(&schema.db, &schema.name, &attached.table)
+            {
+                continue;
+            }
+            let columns = attached
+                .schema
+                .iter()
+                .map(|(name, dtype)| CatalogColumn {
+                    name: name.clone(),
+                    dtype: *dtype,
+                    default: None,
+                    not_null: true,
+                })
+                .collect();
+            tables.push(CatalogTable {
+                db: schema.db.clone(),
+                schema: schema.name.clone(),
+                schema_oid: schema.oid,
+                name: attached.table.clone(),
+                oid: next_oid,
+                sql: None,
+                columns,
+                row_count: attached.rows as i64,
+                index_count: 0,
+                has_primary_key: false,
             });
             next_oid += 1;
         }

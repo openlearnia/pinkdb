@@ -1626,6 +1626,7 @@ pub(crate) fn build_from(
                 );
                 tables.push(AttachedTable {
                     db: dbname.to_string(),
+                    schema_name: "main".to_string(),
                     table: table.to_string(),
                     rows: crate::UNAVAILABLE_ROWS,
                     stats: vec![ColumnStats::unknown(); schema.len()],
@@ -1894,6 +1895,7 @@ pub(crate) fn build_from(
         };
         let attached = AttachedTable {
             db: dbname.to_string(),
+            schema_name: "main".to_string(),
             table: table.to_string(),
             rows: entry.rows,
             schema: schema.clone(),

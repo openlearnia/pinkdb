@@ -16,9 +16,12 @@
 //!
 //! # Reads and writes
 //!
+//! - Lake schemas are the database's schemas: a lake schema `s` of database
+//!   `d` is schema `d.s`, spelled as the lake spells it and matched
+//!   case-insensitively. A lake this engine creates starts with `main`.
 //! - A **read-only** lake is served by the lake's lazy, statistics-first
-//!   [`AttachedLake`] behind an alias that renames the lake's one schema to
-//!   the database's name, so `main.t` in the lake is `<name>.t` here.
+//!   [`AttachedLake`], aliased once per lake schema, so `s.t` in the lake is
+//!   `<name>.s.t` here.
 //! - A **writable** lake is materialized into the store when it is opened.
 //!   Statements change those tables like any others; after every committed
 //!   unit the engine publishes each lake database whose tables or image
@@ -46,14 +49,14 @@
 //! as `unavailable`, every statement that touches it errors, and every other
 //! database works.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::attached::{AtSpec, AttachedLake, AttachedScan, AttachedTable, PrunePredicate};
 use crate::catalog_image::load_database_image;
-use crate::storage::{DataTable, DbCatalog, PinkDb};
+use crate::storage::{DataTable, DbCatalog, PinkDb, SchemaCatalog};
 use crate::types::{PinkDbError, Result, Value};
 use crate::vector::DataChunk;
 
@@ -128,8 +131,8 @@ pub struct LakeContent {
     /// The database image ([`PinkDb::to_database_image`]) the lake carries,
     /// if any (a lake written by another tool has none).
     pub image: Option<Vec<u8>>,
-    /// The lake's tables, by name (the lake's one schema stripped).
-    pub tables: Vec<(String, Arc<DataTable>)>,
+    /// The lake's tables, by schema and table name.
+    pub tables: Vec<(String, String, Arc<DataTable>)>,
 }
 
 /// One open lake database, as the engine sees it. Implemented by pink-lake.
@@ -141,17 +144,25 @@ pub trait LakeDatabase: fmt::Debug + Send + Sync {
     /// The version the database currently reflects: the pinned version of
     /// a read-only lake, the last published one of a writable lake.
     fn version(&self) -> u64;
+    /// Every schema the lake offers, in the lake's spelling. Empty schemas
+    /// are included: the engine keeps one database schema per name.
+    fn schemas(&self) -> Result<Vec<String>>;
     /// A read-only lake's lazy reader, its tables keyed by the lake's own
-    /// schema (the engine aliases it to the database).
+    /// schema (the engine aliases each one to the database).
     fn reader(&self) -> Result<Arc<dyn AttachedLake>>;
     /// A writable lake's image and tables at [`LakeDatabase::version`].
     fn content(&self) -> Result<LakeContent>;
-    /// Publish one commit of a writable lake: `tables` are the database's
-    /// tables after the commit and `image` its metadata, written as one lake
+    /// Publish one commit of a writable lake: `schemas` are the database's
+    /// schemas and `tables` its tables after the commit, written as one lake
     /// version. Returns the new version.
-    fn publish(&self, image: &[u8], tables: &[(String, Arc<DataTable>)]) -> Result<u64>;
+    fn publish(
+        &self,
+        image: &[u8],
+        schemas: &[String],
+        tables: &[(String, String, Arc<DataTable>)],
+    ) -> Result<u64>;
     /// The lake's tables at an older version (a WAL record's pinned read).
-    fn tables_at(&self, version: u64) -> Result<Vec<(String, Arc<DataTable>)>>;
+    fn tables_at(&self, version: u64) -> Result<Vec<(String, String, Arc<DataTable>)>>;
 }
 
 /// Opens lakes for the engine. Registered once per process by the host.
@@ -230,8 +241,12 @@ pub(crate) struct LakeSlot {
     spec: LakeSpec,
     /// The open lake, or why it could not be opened.
     state: std::result::Result<Arc<dyn LakeDatabase>, String>,
-    /// A read-only lake's aliased reader, as registered with the store.
-    reader: Option<Arc<dyn AttachedLake>>,
+    /// A read-only lake's aliased readers, one per schema, as registered
+    /// with the store.
+    readers: Vec<Arc<dyn AttachedLake>>,
+    /// Every schema the lake offers, in the lake's spelling (empty schemas
+    /// included): a lake database's catalog holds one schema per name.
+    schemas: Vec<String>,
     /// A writable lake's last published state: the dirty check compares
     /// against it, and a failed publish restores it.
     published: Mutex<Option<Published>>,
@@ -317,59 +332,47 @@ fn resolve_path(base: Option<&Path>, path: &str) -> String {
     }
 }
 
-/// An aliased read-only lake: the lake's one schema is the database's name.
+/// An aliased read-only lake schema: the lake schema `s` of database `d` is
+/// the database's schema `s`, so `d.s.t` reads the lake's `s.t`.
 #[derive(Debug)]
 struct AliasedLake {
     inner: Arc<dyn AttachedLake>,
-    /// The lake's own schema name, as its tables carry it.
+    /// The database the lake was attached as.
+    alias: String,
+    /// The lake schema this reader serves, in the lake's spelling.
     schema: String,
     tables: Vec<AttachedTable>,
 }
 
 impl AliasedLake {
-    fn new(inner: Arc<dyn AttachedLake>, alias: &str) -> Result<Self> {
-        let mut schemas: Vec<String> = Vec::new();
+    /// The reader for one lake schema of a read-only lake database.
+    fn new(inner: Arc<dyn AttachedLake>, alias: &str, schema: &str) -> Self {
+        let mut display = schema.to_string();
+        let mut tables = Vec::new();
         for t in inner.tables() {
-            if !schemas.iter().any(|s| s.eq_ignore_ascii_case(&t.db)) {
-                schemas.push(t.db.clone());
+            if !t.db.eq_ignore_ascii_case(schema) {
+                continue;
             }
-        }
-        if schemas.len() > 1 {
-            return Err(multi_schema_error(inner.location(), &schemas));
-        }
-        let schema = schemas.pop().unwrap_or_else(|| "main".to_string());
-        let tables = inner
-            .tables()
-            .iter()
-            .map(|t| AttachedTable {
+            display = t.db.clone();
+            tables.push(AttachedTable {
                 db: alias.to_string(),
+                schema_name: t.db.clone(),
                 ..t.clone()
-            })
-            .collect();
-        Ok(Self {
+            });
+        }
+        Self {
             inner,
-            schema,
+            alias: alias.to_string(),
+            schema: display,
             tables,
-        })
+        }
     }
 
     fn rename(&self, mut t: AttachedTable) -> AttachedTable {
-        if let Some(first) = self.tables.first() {
-            t.db = first.db.clone();
-        }
+        t.db = self.alias.clone();
+        t.schema_name = self.schema.clone();
         t
     }
-}
-
-/// The refusal for a lake whose tables live in more than one schema.
-pub fn multi_schema_error(location: &str, schemas: &[String]) -> PinkDbError {
-    PinkDbError::Catalog(format!(
-        "lake {} has tables in {} schemas ({}); a lake database exposes one schema in this \
-         version",
-        redact_location(location),
-        schemas.len(),
-        schemas.join(", ")
-    ))
 }
 
 impl AttachedLake for AliasedLake {
@@ -448,7 +451,7 @@ impl AttachedLake for AliasedLake {
 
 /// Saved tables of the lake databases a replayed record pinned to an older
 /// version, restored once the record ran.
-pub(crate) type PinBackup = Vec<(String, HashMap<String, DataTable>, u64)>;
+pub(crate) type PinBackup = Vec<(String, BTreeMap<String, HashMap<String, DataTable>>, u64)>;
 
 impl PinkDb {
     /// The directory managed lakes live in (`CREATE DATABASE n (TYPE LAKE)`
@@ -644,23 +647,56 @@ impl PinkDb {
             }
             let handle = database_opener()?.open(&request)?;
             let storage = DbStorage::Lake(spec.clone());
+            let mut schemas = handle.schemas()?;
+            if schemas.is_empty() {
+                schemas.push("main".to_string());
+            }
             if handle.read_only() {
-                let reader: Arc<dyn AttachedLake> =
-                    Arc::new(AliasedLake::new(handle.reader()?, name)?);
-                return Ok::<_, PinkDbError>((handle, Some(reader), None));
+                let reader = handle.reader()?;
+                // A pinned version can hold a schema the head no longer has:
+                // its tables need a reader too.
+                for t in reader.tables() {
+                    if !schemas.iter().any(|s| s.eq_ignore_ascii_case(&t.db)) {
+                        schemas.push(t.db.clone());
+                    }
+                }
+                let readers = schemas
+                    .iter()
+                    .map(|schema| {
+                        Arc::new(AliasedLake::new(Arc::clone(&reader), name, schema))
+                            as Arc<dyn AttachedLake>
+                    })
+                    .collect();
+                return Ok::<_, PinkDbError>((handle, readers, schemas, None));
             }
             let content = handle.content()?;
             let mut catalog =
                 load_database_image(name, storage, content.image.as_deref(), &content.tables)?;
             catalog.lake_version = handle.version();
+            // The lake's schema list is the truth: an image older than a
+            // schema the lake gained (or one written by another tool) still
+            // gets that schema.
+            for schema in &schemas {
+                catalog
+                    .schemas
+                    .entry(schema.to_ascii_lowercase())
+                    .or_insert_with(|| SchemaCatalog::empty(schema));
+            }
+            schemas = catalog.schemas.values().map(|s| s.name.clone()).collect();
             let image = self.catalog_image_of(&catalog)?;
-            Ok((handle, None, Some(Published { catalog, image })))
+            Ok((
+                handle,
+                Vec::new(),
+                schemas,
+                Some(Published { catalog, image }),
+            ))
         })();
         match opened {
-            Ok((handle, reader, published)) => Ok(Arc::new(LakeSlot {
+            Ok((handle, readers, schemas, published)) => Ok(Arc::new(LakeSlot {
                 spec: spec.clone(),
                 state: Ok(handle),
-                reader,
+                readers,
+                schemas,
                 published: Mutex::new(published),
             })),
             Err(e) if startup => Ok(unavailable_slot(spec, e.to_string())),
@@ -688,14 +724,19 @@ impl PinkDb {
             (Ok(handle), None) => {
                 let mut cat = DbCatalog::empty(name, storage);
                 cat.lake_version = handle.version();
+                for schema in &slot.schemas {
+                    cat.schemas
+                        .entry(schema.to_ascii_lowercase())
+                        .or_insert_with(|| SchemaCatalog::empty(schema));
+                }
                 cat
             }
             (Err(_), _) => DbCatalog::empty(name, storage),
         };
-        if let Some(reader) = &slot.reader
-            && !self.attached_lakes.iter().any(|l| Arc::ptr_eq(l, reader))
-        {
-            self.attached_lakes.push(Arc::clone(reader));
+        for reader in &slot.readers {
+            if !self.attached_lakes.iter().any(|l| Arc::ptr_eq(l, reader)) {
+                self.attached_lakes.push(Arc::clone(reader));
+            }
         }
         self.databases.insert(key.clone(), catalog);
         self.lakes
@@ -790,8 +831,10 @@ impl PinkDb {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&key);
-        if let Some(reader) = slot.as_ref().and_then(|s| s.reader.as_ref()) {
-            self.attached_lakes.retain(|l| !Arc::ptr_eq(l, reader));
+        if let Some(slot) = slot.as_ref() {
+            for reader in &slot.readers {
+                self.attached_lakes.retain(|l| !Arc::ptr_eq(l, reader));
+            }
         }
         self.databases.remove(&key);
         Ok(true)
@@ -811,7 +854,7 @@ impl PinkDb {
             .map(|(_, slot)| slot)
             .collect();
         for slot in &slots {
-            if let Some(reader) = &slot.reader {
+            for reader in &slot.readers {
                 self.attached_lakes.retain(|l| !Arc::ptr_eq(l, reader));
             }
         }
@@ -868,7 +911,7 @@ impl PinkDb {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
-            .any(|s| s.reader.as_ref().is_some_and(|r| Arc::ptr_eq(r, lake)))
+            .any(|s| s.readers.iter().any(|r| Arc::ptr_eq(r, lake)))
     }
 
     /// The storage a write to database `db` lands in.
@@ -907,6 +950,15 @@ impl PinkDb {
             out.insert(key);
         }
         Ok(out)
+    }
+
+    /// Refuse a catalog write (a schema create or drop) in a read-only or
+    /// unavailable lake database; a local database passes.
+    pub(crate) fn refuse_lake_write(&self, db: &str) -> Result<()> {
+        if let StorageKey::Lake(name) = self.storage_key(db) {
+            self.write_storages(std::iter::once(&name))?;
+        }
+        Ok(())
     }
 
     /// Refuse a unit that writes more than one storage.
@@ -1078,15 +1130,14 @@ impl PinkDb {
             let Some(published) = published.as_ref() else {
                 continue;
             };
-            let same_tables = cat.main().tables.len() == published.catalog.main().tables.len()
-                && cat.main().tables.iter().all(|(name, t)| {
-                    published
-                        .catalog
-                        .main()
-                        .tables
-                        .get(name)
-                        .is_some_and(|p| p.version == t.version)
-                });
+            let same_tables = cat.schemas.iter().all(|(schema, sc)| {
+                published.catalog.schemas.get(schema).is_some_and(|p| {
+                    sc.tables.len() == p.tables.len()
+                        && sc.tables.iter().all(|(name, t)| {
+                            p.tables.get(name).is_some_and(|p| p.version == t.version)
+                        })
+                })
+            }) && cat.schemas.len() == published.catalog.schemas.len();
             if !same_tables || self.catalog_image_of(cat)? != published.image {
                 out.push(key);
             }
@@ -1109,13 +1160,17 @@ impl PinkDb {
                 continue;
             };
             let image = self.catalog_image_of(cat)?;
-            let tables: Vec<(String, Arc<DataTable>)> = cat
-                .main()
-                .tables
+            let schemas: Vec<String> = cat.schemas.values().map(|s| s.name.clone()).collect();
+            let tables: Vec<(String, String, Arc<DataTable>)> = cat
+                .schemas
                 .values()
-                .map(|t| (t.name.clone(), Arc::new(t.clone())))
+                .flat_map(|sc| {
+                    sc.tables
+                        .values()
+                        .map(|t| (sc.name.clone(), t.name.clone(), Arc::new(t.clone())))
+                })
                 .collect();
-            match handle.publish(&image, &tables) {
+            match handle.publish(&image, &schemas, &tables) {
                 Ok(version) => {
                     if let Some(cat) = self.databases.get_mut(key) {
                         cat.lake_version = version;
@@ -1227,13 +1282,20 @@ impl PinkDb {
                 ))
             })?;
             let cat = self.databases.get_mut(db).expect("checked above");
-            let mut pinned = HashMap::new();
-            for (name, table) in tables {
+            let mut pinned: BTreeMap<String, HashMap<String, DataTable>> = BTreeMap::new();
+            for (schema, name, table) in tables {
                 let mut table = (*table).clone();
                 table.name = name.clone();
-                pinned.insert(name.to_ascii_lowercase(), table);
+                pinned
+                    .entry(schema.to_ascii_lowercase())
+                    .or_default()
+                    .insert(name.to_ascii_lowercase(), table);
             }
-            let saved = std::mem::replace(&mut cat.main_mut().tables, pinned);
+            let mut saved = BTreeMap::new();
+            for (key, schema) in &mut cat.schemas {
+                let tables = pinned.get(key).cloned().unwrap_or_default();
+                saved.insert(key.clone(), std::mem::replace(&mut schema.tables, tables));
+            }
             let saved_version = std::mem::replace(&mut cat.lake_version, version);
             backup.push((db.clone(), saved, saved_version));
         }
@@ -1243,9 +1305,13 @@ impl PinkDb {
     /// After a replayed record ran: put back what [`PinkDb::apply_replay_pins`]
     /// swapped out.
     pub(crate) fn restore_replay_pins(&mut self, backup: PinBackup) {
-        for (db, tables, version) in backup {
+        for (db, schemas, version) in backup {
             if let Some(cat) = self.databases.get_mut(&db) {
-                cat.main_mut().tables = tables;
+                for (key, tables) in schemas {
+                    if let Some(schema) = cat.schemas.get_mut(&key) {
+                        schema.tables = tables;
+                    }
+                }
                 cat.lake_version = version;
             }
         }
@@ -1256,16 +1322,24 @@ impl PinkDb {
     /// counters `(loads, columns, files)`, sorted by database.
     pub fn lake_decode_stats(&self) -> Vec<(Option<String>, String, u64, u64, u64)> {
         let slots = self.lakes.slots.lock().unwrap_or_else(|p| p.into_inner());
+        // A lake database has one reader per lake schema, all sharing the
+        // lake's counters: report the lake once, from its first schema.
         let mut out: Vec<(Option<String>, String, u64, u64, u64)> = self
             .attached_lakes
             .iter()
-            .map(|lake| {
+            .filter_map(|lake| {
                 let database = slots
                     .iter()
-                    .find(|(_, s)| s.reader.as_ref().is_some_and(|r| Arc::ptr_eq(r, lake)))
+                    .find(|(_, s)| s.readers.first().is_some_and(|r| Arc::ptr_eq(r, lake)))
                     .map(|(key, _)| self.database_display_name(key));
+                let in_slot = slots
+                    .iter()
+                    .any(|(_, s)| s.readers.iter().any(|r| Arc::ptr_eq(r, lake)));
+                if in_slot && database.is_none() {
+                    return None;
+                }
                 let (loads, columns, files) = lake.decode_stats();
-                (database, lake.location().to_string(), loads, columns, files)
+                Some((database, lake.location().to_string(), loads, columns, files))
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1292,7 +1366,8 @@ fn unavailable_slot(spec: &LakeSpec, reason: String) -> Arc<LakeSlot> {
     Arc::new(LakeSlot {
         spec: spec.clone(),
         state: Err(reason),
-        reader: None,
+        readers: Vec::new(),
+        schemas: Vec::new(),
         published: Mutex::new(None),
     })
 }

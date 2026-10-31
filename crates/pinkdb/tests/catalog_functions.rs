@@ -2,9 +2,13 @@
 //! views and `SHOW ALL TABLES` over pinkdb's schemas.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pinkdb::{Connection, Database, PinkDb, QueryResult, SyncPolicy, Value};
+use pinkdb::{
+    AttachedLake, Connection, DataTable, DataType, Database, DatabaseOpener, LakeContent,
+    LakeDatabase, LakeOpenRequest, PinkDb, QueryResult, SyncPolicy, Value,
+};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -716,5 +720,134 @@ fn system_database_is_reserved_and_virtual() {
             "SELECT database_name FROM duckdb_databases() ORDER BY 1"
         ),
         vec!["main", "system"]
+    );
+}
+
+/// A writable lake database with `master.fact` and an empty `staging`, served
+/// by a fake opener: pinkdb has no lake implementation of its own, and this
+/// file is where the catalog functions over one belong.
+#[derive(Debug)]
+struct FakeLake {
+    location: String,
+}
+
+impl LakeDatabase for FakeLake {
+    fn location(&self) -> String {
+        self.location.clone()
+    }
+    fn read_only(&self) -> bool {
+        false
+    }
+    fn version(&self) -> u64 {
+        1
+    }
+    fn schemas(&self) -> pinkdb::Result<Vec<String>> {
+        Ok(vec![
+            "main".to_string(),
+            "master".to_string(),
+            "staging".to_string(),
+        ])
+    }
+    fn reader(&self) -> pinkdb::Result<Arc<dyn AttachedLake>> {
+        Err(pinkdb::PinkDbError::Execution(
+            "the fake lake is writable".to_string(),
+        ))
+    }
+    fn content(&self) -> pinkdb::Result<LakeContent> {
+        let mut fact = DataTable::new(
+            "fact".to_string(),
+            vec![("id".to_string(), DataType::Integer)],
+        )
+        .expect("the fake table's schema");
+        fact.append_row(vec![Value::Integer(1)])
+            .expect("the fake table's row");
+        Ok(LakeContent {
+            image: None,
+            tables: vec![("master".to_string(), "fact".to_string(), Arc::new(fact))],
+        })
+    }
+    fn publish(
+        &self,
+        _image: &[u8],
+        _schemas: &[String],
+        _tables: &[(String, String, Arc<DataTable>)],
+    ) -> pinkdb::Result<u64> {
+        Ok(1)
+    }
+    fn tables_at(&self, _version: u64) -> pinkdb::Result<Vec<(String, String, Arc<DataTable>)>> {
+        Ok(Vec::new())
+    }
+}
+
+struct FakeOpener;
+
+impl DatabaseOpener for FakeOpener {
+    fn open(&self, request: &LakeOpenRequest) -> pinkdb::Result<Arc<dyn LakeDatabase>> {
+        Ok(Arc::new(FakeLake {
+            location: request.catalog.clone(),
+        }))
+    }
+}
+
+#[test]
+fn catalog_functions_list_a_lake_databases_schemas_and_tables() {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| pinkdb::register_database_opener(Arc::new(FakeOpener)));
+    let mut db = PinkDb::new();
+    run(
+        &mut db,
+        "CREATE DATABASE lake (TYPE LAKE, CATALOG 'fake:lake');",
+    );
+    assert_eq!(
+        strings(
+            &mut db,
+            "SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'lake' ORDER BY 1"
+        ),
+        vec!["main", "master", "staging"]
+    );
+    assert_eq!(
+        strings(
+            &mut db,
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 'master'"
+        ),
+        vec!["fact"]
+    );
+    let listed = rows(
+        &mut db,
+        "SELECT table_catalog, table_schema, table_name FROM information_schema.tables \
+         WHERE table_catalog = 'lake'",
+    );
+    assert_eq!(
+        listed,
+        vec![vec![
+            Value::Varchar("lake".to_string()),
+            Value::Varchar("master".to_string()),
+            Value::Varchar("fact".to_string()),
+        ]]
+    );
+    // The empty schema survived the engine image round trip: only the schema
+    // list carries it.
+    assert!(
+        strings(
+            &mut db,
+            "SELECT schema_name FROM information_schema.schemata WHERE catalog_name = 'lake'"
+        )
+        .contains(&"staging".to_string())
+    );
+    assert_eq!(
+        strings(
+            &mut db,
+            "SELECT name FROM pinkdb_catalog() \
+             WHERE \"database\" = 'lake' AND \"schema\" = 'master' AND kind = 'TABLE'"
+        ),
+        vec!["fact"]
+    );
+    assert_eq!(
+        strings(
+            &mut db,
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_catalog = 'lake' AND table_schema = 'master'"
+        ),
+        vec!["id"]
     );
 }

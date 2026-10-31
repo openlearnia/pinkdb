@@ -993,7 +993,7 @@ fn attach_answers_equal_open_and_in_memory() {
     // Arm 3: a read-only lake database (statistics first + lazy
     // materialization), under the lake schema's own name.
     let attached = run(&format!(
-        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake;\n{queries}.quit\n",
+        "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\nUSE lake.lake;\n{queries}.quit\n",
         lake = lake.display()
     ));
 
@@ -1358,7 +1358,7 @@ fn time_travel_queries_and_errors_on_an_attached_lake() {
 
     let (stdout, stderr, code) = run_captured(&format!(
         "ATTACH 'lake:{lake}' AS lake (READ_ONLY);\n\
-         USE lake;\n\
+         USE lake.lake;\n\
          SELECT 'at-v2' AS m, COUNT(*) AS v FROM t AT (VERSION => 2);\n\
          SELECT 'at-v3-1' AS m, x AS v FROM t AT (VERSION => 3) WHERE x = 1;\n\
          SELECT 'at-v3-3' AS m, x AS v FROM t AT (VERSION => 3) WHERE x = 3;\n\
@@ -1367,8 +1367,8 @@ fn time_travel_queries_and_errors_on_an_attached_lake() {
          SELECT 'current' AS m, COUNT(*) AS v FROM t;\n\
          SELECT * FROM t AT (VERSION => 1);\n\
          SELECT * FROM t AT (VERSION => 99);\n\
-         CREATE TABLE main.plain (x INTEGER);\n\
-         SELECT * FROM main.plain AT (VERSION => 2);\n\
+         CREATE TABLE main.main.plain (x INTEGER);\n\
+         SELECT * FROM main.main.plain AT (VERSION => 2);\n\
          SELECT * FROM t AT (VERSION 2);\n\
          SELECT 'still-alive' AS m, COUNT(*) AS v FROM t;\n\
          .quit\n",

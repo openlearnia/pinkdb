@@ -2094,11 +2094,7 @@ pub(crate) fn run_plain(
             name,
             if_not_exists,
         } => {
-            if db.lake_slot(ns.db()).is_some() {
-                return Err(PinkDbError::Execution(
-                    "CREATE SCHEMA is not supported yet in a lake database".to_string(),
-                ));
-            }
+            db.refuse_lake_write(ns.db())?;
             if !db.database_exists(ns.db()) {
                 return Err(PinkDbError::Catalog(format!(
                     "database \"{}\" not found",
@@ -2123,11 +2119,7 @@ pub(crate) fn run_plain(
             if_exists,
             cascade,
         } => {
-            if db.lake_slot(ns.db()).is_some() {
-                return Err(PinkDbError::Execution(
-                    "DROP SCHEMA is not supported yet in a lake database".to_string(),
-                ));
-            }
+            db.refuse_lake_write(ns.db())?;
             if !*if_exists && !db.schema_exists(ns) {
                 return Err(PinkDbError::Catalog(format!(
                     "schema \"{}\" not found",
@@ -2755,9 +2747,7 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     let projected = cx.projections.for_scan(plan);
     // Join filters a completed build side registered for this scan (wave 122).
     let dynamic = cx.dynamic.for_scan(plan);
-    if lookup.schema() == "main"
-        && let Some((_, lake)) = cx.db.attached_lookup(lookup.db(), table)
-    {
+    if let Some((_, lake)) = cx.db.attached_lookup(lookup.db(), lookup.schema(), table) {
         // The simple `WHERE` conjuncts this scan may be pruned by (analyzed
         // with the projections). The lake decodes only the files whose zone
         // maps leave the predicate satisfiable.
@@ -3165,12 +3155,9 @@ fn attached_stats_aggregate(
     else {
         return Ok(None);
     };
-    // Attached lakes are database-level: only their `main` schema exists.
-    if ns.schema() != "main" {
-        return Ok(None);
-    }
+    // Attached lakes (and lake databases) resolve in their own schema.
     let db = ns.db();
-    let Some((pinned, lake)) = cx.db.attached_lookup(db, table) else {
+    let Some((pinned, lake)) = cx.db.attached_lookup(db, ns.schema(), table) else {
         return Ok(None);
     };
     // `AT` asks about another version: the exact statistics of *that*
@@ -5517,8 +5504,8 @@ fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| cx.db.current_ns().clone());
-            if lookup.schema() == "main"
-                && let Some((attached, lake)) = cx.db.attached_lookup(lookup.db(), table)
+            if let Some((attached, lake)) =
+                cx.db.attached_lookup(lookup.db(), lookup.schema(), table)
             {
                 // A time-travel target's own row count is exact too; a target
                 // this lake cannot resolve keeps the unknown-size default
@@ -7338,11 +7325,9 @@ fn fused_scan_aggregate(
         LogicalPlan::Scan { at: Some(_), .. } => return Ok(None),
         LogicalPlan::Scan { ns, table, .. } => {
             let lookup = ns.as_ref().unwrap_or(cx.db.current_ns());
-            lookup.schema() == "main"
-                && cx
-                    .db
-                    .attached_lookup(lookup.db(), table)
-                    .is_some_and(|(_, lake)| lake.streams_scan(lookup.db(), table))
+            cx.db
+                .attached_lookup(lookup.db(), lookup.schema(), table)
+                .is_some_and(|(_, lake)| lake.streams_scan(lookup.db(), table))
         }
         _ => return Ok(None),
     };
@@ -7403,10 +7388,7 @@ fn stream_leaf_chunks(
                 .as_ref()
                 .cloned()
                 .unwrap_or_else(|| cx.db.current_ns().clone());
-            let Some((_, lake)) = (lookup.schema() == "main")
-                .then(|| cx.db.attached_lookup(lookup.db(), table))
-                .flatten()
-            else {
+            let Some((_, lake)) = cx.db.attached_lookup(lookup.db(), lookup.schema(), table) else {
                 return Err(PinkDbError::Execution(format!(
                     "the attached table \"{lookup}.{table}\" is no longer loaded in this session; \
                      run the statement again"

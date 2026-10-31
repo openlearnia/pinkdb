@@ -230,7 +230,7 @@ impl LakeFormat for ParquetLakeFormat {
         )?;
         Ok(EncodedFile {
             bytes,
-            stats: pinkdb::persist::table_stats(db, table, src),
+            stats: pinkdb::persist::table_stats(db, "main", table, src),
             footer: None,
         })
     }
@@ -277,7 +277,7 @@ impl LakeFormat for ParquetLakeFormat {
             context: format!("writing the data file of \"{db}.{table}\""),
             source: e,
         })?;
-        Ok((pinkdb::persist::table_stats(db, table, src), None))
+        Ok((pinkdb::persist::table_stats(db, "main", table, src), None))
     }
 
     fn read(&self, file: &DataFile<'_>) -> Result<PinkDb> {

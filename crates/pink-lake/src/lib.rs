@@ -1321,6 +1321,12 @@ impl Lake {
         self.pending_engine_catalog = Some(Arc::new(image));
     }
 
+    /// Every schema the lake has at the head version, in the catalog's
+    /// spelling (DuckLake keeps an empty schema as a `ducklake_schema` row).
+    pub fn schemas(&self) -> Result<Vec<String>> {
+        self.store.schemas(None)
+    }
+
     /// The engine catalog image at the head version, if the catalog carries
     /// one (`None` for a lake written by a `--file` server or the CLI).
     pub fn engine_catalog(&self) -> Result<Option<(u64, Vec<u8>)>> {
@@ -1841,6 +1847,7 @@ impl Lake {
             author: manifest.author.clone(),
             commit_message: manifest.commit_message.clone(),
             engine_catalog: self.pending_engine_catalog.clone(),
+            schemas: None,
         };
         self.publish_sql_commit(change)?;
         self.pending_commit = None;

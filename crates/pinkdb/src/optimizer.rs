@@ -1473,9 +1473,7 @@ fn leaf_base_rows(db: &crate::storage::PinkDb, leaf: &LogicalPlan) -> Option<f64
             at: None,
         } => {
             let name = qdb.clone().unwrap_or_else(|| db.current_ns().clone());
-            if name.schema() == "main"
-                && let Some((attached, _)) = db.attached_lookup(name.db(), table)
-            {
+            if let Some((attached, _)) = db.attached_lookup(name.db(), name.schema(), table) {
                 return Some(attached.rows as f64);
             }
             db.table_in(&name, table).ok().map(|t| t.num_rows() as f64)

@@ -443,6 +443,14 @@ impl SqlMetadataStore {
         self.with_conn(scheduled_files_conn)
     }
 
+    /// Every live schema name at `version` (`None` = head).
+    pub(crate) fn schemas(&self, version: Option<u64>) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let sid = resolve_sid(conn, version, self.label())?;
+            schemas_conn(conn, sid)
+        })
+    }
+
     /// The `field_id`s a data file of `key` must record, in column order.
     ///
     /// A DuckLake reader matches a nested column's children by id, so the
@@ -875,6 +883,10 @@ impl MetadataStore for SqlMetadataStore {
         SqlMetadataStore::scheduled_files(self)
     }
 
+    fn schemas(&self, version: Option<u64>) -> Result<Vec<String>> {
+        SqlMetadataStore::schemas(self, version)
+    }
+
     fn field_ids(
         &self,
         key: &str,
@@ -1240,6 +1252,24 @@ fn schedule_file(conn: &dyn SqlConnection, id: i64, path: &str, now: &str) -> Re
         params![id, path, now],
     )?;
     Ok(())
+}
+
+fn schemas_conn(conn: &dyn SqlConnection, sid: i64) -> Result<Vec<String>> {
+    let stmt = conn
+        .prepare(
+            "SELECT schema_name FROM ducklake_schema
+             WHERE begin_snapshot <= ?1 AND (end_snapshot IS NULL OR end_snapshot > ?1)
+             ORDER BY schema_id",
+        )
+        .map_err(|e| sql_error("listing schemas", e))?;
+    let rows = stmt
+        .query_map(params![sid], |row| row.get::<_, String>(0))
+        .map_err(|e| sql_error("listing schemas", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| sql_error("listing schemas", e))?);
+    }
+    Ok(out)
 }
 
 fn scheduled_files_conn(conn: &dyn SqlConnection) -> Result<Vec<(i64, String)>> {
@@ -3535,6 +3565,9 @@ fn commit_delta_in_conn(
     let mut next_catalog_id = state.next_catalog_id.max(1);
     let mut next_file_id = state.next_file_id.max(0);
     let mut changes: Vec<String> = Vec::new();
+    if let Some(wanted) = change.schemas.as_deref() {
+        reconcile_schemas(conn, wanted, sid, &mut next_catalog_id, &mut changes)?;
+    }
 
     // Tables whose columns began or ended at this snapshot: exactly these get
     // a `ducklake_schema_versions` row, as DuckLake writes.
@@ -4258,6 +4291,51 @@ fn ensure_schema(
     )
     .map_err(|e| sql_error("creating a schema", e))?;
     Ok(schema_id)
+}
+
+/// Make the catalog's live schemas match the engine's list: end the ones it no
+/// longer has, create the ones it gained (a lone `CREATE SCHEMA` must show up
+/// in DuckLake's catalog even while the schema is empty).
+fn reconcile_schemas(
+    conn: &dyn SqlConnection,
+    wanted: &[String],
+    sid: i64,
+    next_catalog_id: &mut i64,
+    changes: &mut Vec<String>,
+) -> Result<()> {
+    let live = schemas_conn(conn, sid)?;
+    for name in &live {
+        if wanted.iter().any(|w| w.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        // DuckLake records a dropped schema by id (`dropped_schema:<id>`, see
+        // ducklake_transaction_state.cpp) and a created one by quoted name.
+        let Some(schema_id) = conn
+            .query_row(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ?1 AND end_snapshot IS NULL AND begin_snapshot < ?2",
+                params![name, sid],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| sql_error("reading a schema", e))?
+        else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE ducklake_schema SET end_snapshot = ?1 WHERE schema_id = ?2",
+            params![sid, schema_id],
+        )
+        .map_err(|e| sql_error("ending a schema", e))?;
+        changes.push(format!("dropped_schema:{schema_id}"));
+    }
+    for name in wanted {
+        if live.iter().any(|l| l.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        ensure_schema(conn, name, sid, next_catalog_id)?;
+        changes.push(format!("created_schema:{}", quote_ident(name)));
+    }
+    Ok(())
 }
 
 /// Write a table's columns, files, deletes and partition values as one delta.

@@ -5893,7 +5893,7 @@ fn read_principal_grants(
 /// are ungated (`nan_count` and zero doubles are kept); `pink-lake` applies
 /// the one exactness gate shared with its footer path, so the two cannot
 /// drift apart.
-pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
+pub fn table_stats(db: &str, schema_name: &str, table: &str, src: &DataTable) -> SavedTableStats {
     let schema = src.schema();
     let mut accs: Vec<ChunkColumnStats> =
         schema.iter().map(|_| ChunkColumnStats::empty()).collect();
@@ -5906,9 +5906,7 @@ pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
     }
     let mut saved = SavedTableStats {
         db: db.to_string(),
-        // Lake statistics are per database today; a lake schema arrives with
-        // wave 131d.
-        schema: "main".to_string(),
+        schema: schema_name.to_string(),
         table: table.to_string(),
         rows: src.num_rows() as u64,
         columns: schema
@@ -8798,7 +8796,7 @@ mod tests {
         )
         .unwrap();
         let t = db.table_in("main", "t").unwrap();
-        let stats = table_stats("main", "t", t);
+        let stats = table_stats("main", "main", "t", t);
         let col = &stats.columns[0];
         assert_eq!(col.min, Some(Value::Boolean(true)), "{col:?}");
         assert_eq!(col.max, Some(Value::Boolean(true)), "{col:?}");
@@ -8806,7 +8804,7 @@ mod tests {
         db.execute("CREATE TABLE f (b BOOLEAN); INSERT INTO f VALUES (false), (false);")
             .unwrap();
         let f = db.table_in("main", "f").unwrap();
-        let stats = table_stats("main", "f", f);
+        let stats = table_stats("main", "main", "f", f);
         let col = &stats.columns[0];
         assert_eq!(col.min, Some(Value::Boolean(false)), "{col:?}");
         assert_eq!(col.max, Some(Value::Boolean(false)), "{col:?}");
@@ -8814,7 +8812,7 @@ mod tests {
         db.execute("CREATE TABLE n (b BOOLEAN); INSERT INTO n VALUES (NULL);")
             .unwrap();
         let n = db.table_in("main", "n").unwrap();
-        let stats = table_stats("main", "n", n);
+        let stats = table_stats("main", "main", "n", n);
         let col = &stats.columns[0];
         assert_eq!(col.min, None, "{col:?}");
         assert_eq!(col.max, None, "{col:?}");

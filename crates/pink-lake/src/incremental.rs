@@ -158,6 +158,11 @@ pub struct Commit {
     /// Set by [`Lake::commit_from_tables`]; a hand-built commit leaves it
     /// empty (no schema change).
     schemas: BTreeMap<String, crate::schema::TableSchema>,
+    /// The engine's schema list (wave 131d), set by
+    /// [`Lake::commit_from_tables`]: the catalog's `ducklake_schema` rows are
+    /// made to match it, so an empty schema survives a reopen and a dropped
+    /// one ends. A hand-built commit leaves the catalog's schemas alone.
+    catalog_schemas: Option<Vec<String>>,
     /// Table entries a row-level diff was computed against (`None` = the
     /// table must not exist), set by [`Lake::commit_from_tables`]. When one
     /// of these tables changed in the lake before the publish lands, the
@@ -312,6 +317,7 @@ impl Commit {
             && self.partition_changes.is_empty()
             && self.inlining_changes.is_empty()
             && self.schemas.is_empty()
+            && self.catalog_schemas.is_none()
     }
 
     /// Require `key`'s entry in the head to still equal `entry` (`None`: the
@@ -319,6 +325,17 @@ impl Commit {
     /// by [`Lake::commit_from_tables`]; see the `expect` field docs).
     pub(crate) fn expect_table(&mut self, key: &str, entry: Option<TableEntry>) {
         self.expect.insert(key.to_string(), entry);
+    }
+
+    /// Carry the engine's schema list into the next publish (crate-internal:
+    /// set by [`Lake::commit_from_tables`]).
+    pub(crate) fn set_catalog_schemas(&mut self, schemas: Vec<String>) {
+        self.catalog_schemas = Some(schemas);
+    }
+
+    /// The engine's schema list this commit carries, if any.
+    pub(crate) fn catalog_schemas(&self) -> Option<&[String]> {
+        self.catalog_schemas.as_deref()
     }
 
     /// Publish `key`'s new schema record with this commit (crate-internal:
@@ -1434,15 +1451,21 @@ impl Lake {
     /// row count (a mismatch is [`LakeError::Corrupt`], never a silently
     /// wrong delta). Tables in `current` but not in `base` are created;
     /// tables in `base` but not in `current` are dropped. An empty
-    /// difference publishes nothing.
+    /// difference publishes nothing. `schemas` (the engine's schema list)
+    /// makes the catalog's `ducklake_schema` rows match it, so an empty schema
+    /// and a `DROP SCHEMA` survive a reopen; `None` leaves them alone.
     pub fn commit_from_tables(
         &mut self,
         base_version: u64,
         base: &[(String, Arc<DataTable>)],
         current: &[(String, Arc<DataTable>)],
+        schemas: Option<&[String]>,
         settings: &CommitSettings,
     ) -> Result<CommitReport> {
-        let (commit, _after) = self.plan_tables_commit(base_version, base, current)?;
+        let (mut commit, _after) = self.plan_tables_commit(base_version, base, current)?;
+        if let Some(schemas) = schemas {
+            commit.set_catalog_schemas(schemas.to_vec());
+        }
         self.commit_with_settings(&commit, settings)
     }
 
@@ -2174,7 +2197,7 @@ impl Lake {
                         message: format!("table \"{table}\": row ids overflow u64"),
                     });
                 };
-                let saved = pinkdb::persist::table_stats(dbname, table_name, file_table);
+                let saved = pinkdb::persist::table_stats(dbname, "main", table_name, file_table);
                 let stats = crate::stats::StatsBlock::from_saved(table, rel, &saved)?;
                 let file = FileRef::Entry {
                     path: rel.to_string(),
@@ -3036,6 +3059,7 @@ impl Lake {
             author: new_catalog.author.clone(),
             commit_message: new_catalog.commit_message.clone(),
             engine_catalog: self.pending_engine_catalog.clone(),
+            schemas: commit.catalog_schemas().map(|s| s.to_vec()),
         };
         self.publish_sql_commit(change)
             .map_err(|error| match error {
@@ -3089,6 +3113,7 @@ impl Lake {
             author: catalog.author.clone(),
             commit_message: catalog.commit_message.clone(),
             engine_catalog: None,
+            schemas: None,
         };
         self.publish_sql_commit(change)
     }

@@ -326,7 +326,10 @@ pub fn estimate_scan(db: &PinkDb, sql: &str) -> Option<ScanEstimate> {
     for (ns, table) in tables {
         if let Ok(table) = db.table_in(&ns, &table) {
             rows += table.num_rows() as u64;
-        } else if let Some(attached) = db.attached_table_in(ns.db(), &table) {
+        } else if let Some(attached) = db
+            .attached_lookup(ns.db(), ns.schema(), &table)
+            .map(|(t, _)| t.clone())
+        {
             rows += attached.rows;
             remote = true;
         }
