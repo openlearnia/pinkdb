@@ -101,6 +101,9 @@ pub struct QueryRequest {
     pub sql: String,
     #[serde(default)]
     pub db: Option<String>,
+    /// Run in this schema of `db` (default: `db`'s `main`).
+    #[serde(default)]
+    pub schema: Option<String>,
     /// The client's id for this run (1–64 URL-safe characters): what
     /// `POST /api/cancel` names.
     pub run_id: String,
@@ -180,6 +183,8 @@ pub struct ExportRequest {
     pub sql: String,
     #[serde(default)]
     pub db: Option<String>,
+    #[serde(default)]
+    pub schema: Option<String>,
     /// `csv` or `json`.
     pub format: String,
 }
@@ -259,9 +264,6 @@ pub struct CatalogColumn {
     pub min: Option<String>,
     pub max: Option<String>,
 }
-
-/// DuckDB's default schema name; pinkdb also calls its first schema `main`.
-pub const DEFAULT_SCHEMA: &str = "main";
 
 /// One row of `pinkdb_catalog()`, with columns for tables and views.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -370,9 +372,11 @@ pub struct GrantRow {
     pub principal: String,
     /// `SELECT`…`CREATE`, `ADMIN`, or `MEMBER` (a role membership).
     pub privilege: String,
-    /// `TABLE`, `DATABASE`, `GLOBAL` or `ROLE`.
+    /// `TABLE`, `SCHEMA`, `DATABASE`, `GLOBAL` or `ROLE`.
     pub object_type: String,
     pub database: Option<String>,
+    /// The schema of a `TABLE` or `SCHEMA` grant.
+    pub schema: Option<String>,
     pub name: Option<String>,
 }
 

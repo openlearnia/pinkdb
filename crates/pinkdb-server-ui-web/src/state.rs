@@ -146,6 +146,14 @@ pub struct Sheet {
 }
 
 impl Sheet {
+    /// Create a tab in `owner`, never in the row that opened it: a catalog
+    /// refresh disposes that row while the tab is still open.
+    fn new_in(owner: &Owner, key: u64) -> Self {
+        owner.with(|| Sheet::new(key))
+    }
+}
+
+impl Sheet {
     fn new(key: u64) -> Self {
         Sheet {
             key,
@@ -177,6 +185,8 @@ pub struct App {
     pub catalog: RwSignal<Catalog>,
     /// The database statements run in.
     pub db: RwSignal<String>,
+    /// The schema statements run in (`main` until the catalog names one).
+    pub schema: RwSignal<String>,
     pub sheets: RwSignal<Vec<Sheet>>,
     pub active: RwSignal<u64>,
     pub saved: RwSignal<Vec<Worksheet>>,
@@ -185,8 +195,8 @@ pub struct App {
     pub explorer_tab: RwSignal<ExplorerTab>,
     pub explorer_open: RwSignal<bool>,
     pub explorer_width: RwSignal<f64>,
-    /// The catalog object the Catalog section shows `(database, name)`.
-    pub selected: RwSignal<Option<(String, String)>>,
+    /// The catalog object the Catalog section shows `(database, schema, name)`.
+    pub selected: RwSignal<Option<(String, String, String)>>,
     pub ask_open: RwSignal<bool>,
     /// A one-line notice in the status bar (load and network errors).
     pub notice: RwSignal<String>,
@@ -216,6 +226,8 @@ pub struct App {
     /// The catalog tree's nodes the user opened or closed, by node key: the
     /// tree is rebuilt whenever the catalog reloads, and keeps them.
     pub tree_open: StoredValue<HashMap<String, bool>>,
+    /// The owner of worksheet signals: tabs outlive the rows that open them.
+    root: StoredValue<Owner, LocalStorage>,
 }
 
 impl App {
@@ -225,6 +237,7 @@ impl App {
             login_mode: RwSignal::new(None),
             catalog: RwSignal::new(Catalog::default()),
             db: RwSignal::new(String::new()),
+            schema: RwSignal::new(String::new()),
             sheets: RwSignal::new(Vec::new()),
             active: RwSignal::new(0),
             saved: RwSignal::new(Vec::new()),
@@ -250,6 +263,7 @@ impl App {
             import_open: RwSignal::new(false),
             access_epoch: RwSignal::new(0),
             tree_open: StoredValue::new(HashMap::new()),
+            root: StoredValue::new_local(Owner::new()),
         }
     }
 
@@ -291,9 +305,19 @@ impl App {
 
     /// Show a catalog object's page.
     pub fn show_object(&self, object: &CatalogObject) {
-        self.selected
-            .set(Some((object.database.clone(), object.name.clone())));
+        self.selected.set(Some((
+            object.database.clone(),
+            object.schema.clone(),
+            object.name.clone(),
+        )));
         self.go(Section::Catalog);
+    }
+
+    /// Make `db` the database statements run in, re-picking its schema.
+    pub fn use_database(&self, db: String) {
+        self.db.set(db);
+        self.schema.set(String::new());
+        self.load_catalog();
     }
 
     /// Show a toast; it goes away after a few seconds unless it is an error.
@@ -371,12 +395,16 @@ impl App {
         });
     }
 
-    /// The catalog object `(database, name)`, if it exists.
-    pub fn object(&self, database: &str, name: &str) -> Option<CatalogObject> {
+    /// The catalog object `(database, schema, name)`, if it exists.
+    pub fn object(&self, database: &str, schema: &str, name: &str) -> Option<CatalogObject> {
         self.catalog.with(|c| {
             c.objects
                 .iter()
-                .find(|o| o.database.eq_ignore_ascii_case(database) && o.name == name)
+                .find(|o| {
+                    o.database.eq_ignore_ascii_case(database)
+                        && o.schema.eq_ignore_ascii_case(schema)
+                        && o.name == name
+                })
                 .cloned()
         })
     }
@@ -387,6 +415,7 @@ impl App {
         let request = QueryRequest {
             sql,
             db: Some(self.db.get_untracked()).filter(|d| !d.is_empty()),
+            schema: Some(self.schema.get_untracked()).filter(|s| !s.is_empty()),
             run_id: api::run_id(),
             worksheet_id: String::new(),
         };
@@ -424,7 +453,7 @@ impl App {
     pub fn open(&self, title: &str, sql: &str) -> Sheet {
         let key = self.next_key.get_untracked();
         self.next_key.set(key + 1);
-        let sheet = Sheet::new(key);
+        let sheet = self.root.with_value(|root| Sheet::new_in(root, key));
         sheet.title.set(title.to_string());
         sheet.sql.set(sql.to_string());
         self.sheets.update(|s| s.push(sheet));
@@ -535,9 +564,9 @@ impl App {
                     // one (or none chosen yet) falls back to the server's
                     // current database, else the first there is.
                     let exists = |name: &str| catalog.has_database(name);
-                    let chosen = app.db.get_untracked();
+                    let mut chosen = app.db.get_untracked();
                     if chosen.is_empty() || !exists(&chosen) {
-                        let fallback = if exists(&catalog.current) {
+                        chosen = if exists(&catalog.current) {
                             catalog.current.clone()
                         } else {
                             catalog
@@ -546,9 +575,22 @@ impl App {
                                 .map(|d| d.name.clone())
                                 .unwrap_or_default()
                         };
-                        if fallback != chosen {
-                            app.db.set(fallback);
-                        }
+                        app.db.set(chosen.clone());
+                    }
+                    // The schema statements run in must be one of the
+                    // database's: a dropped one (or a new database) falls
+                    // back to the first the catalog names.
+                    let schemas = crate::explorer::schemas_of(
+                        catalog
+                            .objects
+                            .iter()
+                            .filter(|o| o.database.eq_ignore_ascii_case(&chosen)),
+                    );
+                    if !schemas
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&app.schema.get_untracked()))
+                    {
+                        app.schema.set(schemas.first().cloned().unwrap_or_default());
                     }
                     app.catalog.set(catalog);
                 }
@@ -614,6 +656,7 @@ impl App {
         let request = QueryRequest {
             sql,
             db: Some(self.db.get_untracked()).filter(|d| !d.is_empty()),
+            schema: Some(self.schema.get_untracked()).filter(|s| !s.is_empty()),
             run_id,
             worksheet_id: sheet.id.get_untracked().unwrap_or_default(),
         };
@@ -624,9 +667,11 @@ impl App {
             sheet.running.set(None);
             match answer {
                 Ok(response) => {
-                    let changes_catalog = response.results.iter().any(|r| r.kind == "ok");
+                    let mut changes_catalog = response.results.iter().any(|r| r.kind == "ok");
                     if !response.db.is_empty() && response.db != app.db.get_untracked() {
                         app.db.set(response.db.clone());
+                        // The new database's schemas decide the selector.
+                        changes_catalog = true;
                     }
                     let shown = if response.error.is_some() {
                         response.results.len()
@@ -673,6 +718,9 @@ const THEME_KEY: &str = "pinkdb-console-theme";
 
 /// The theme this browser picked last.
 fn stored_theme() -> String {
+    #[cfg(not(target_family = "wasm"))]
+    return String::new();
+    #[cfg(target_family = "wasm")]
     leptos::prelude::window()
         .local_storage()
         .ok()
@@ -877,6 +925,21 @@ pub fn millis(ms: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sheet_outlives_the_row_that_opened_it() {
+        let root = Owner::new();
+        let app = root.with(App::new);
+        let row = root.with(Owner::new);
+        // A row's click handler runs under the row's owner; the tab it opens
+        // must not: the catalog refresh after the run disposes the row.
+        let sheet = row.with(|| app.open("t", "SELECT 1"));
+        drop(row);
+        sheet.result.set(None);
+        sheet.running.set(None);
+        assert_eq!(app.sheets.with(|sheets| sheets.len()), 1);
+        assert_eq!(sheet.title.get(), "t");
+    }
 
     #[test]
     fn counts_and_kinds_read_well() {

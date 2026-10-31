@@ -22,36 +22,64 @@ pub fn grant_sql(revoke: bool, g: &GrantRow) -> String {
         ("GRANT", "TO")
     };
     let to = quote_ident(&g.principal);
+    let db = quote_ident(g.database.as_deref().unwrap_or_default());
+    let schema = quote_ident(g.schema.as_deref().unwrap_or_default());
     match g.object_type.as_str() {
         "GLOBAL" => format!("{verb} ADMIN {prep} {to}"),
         "ROLE" => format!(
             "{verb} {} {prep} {to}",
             quote_ident(g.name.as_deref().unwrap_or_default())
         ),
-        "DATABASE" => format!(
-            "{verb} {} ON DATABASE {} {prep} {to}",
-            g.privilege,
-            quote_ident(g.database.as_deref().unwrap_or_default())
-        ),
+        "DATABASE" => format!("{verb} {} ON DATABASE {db} {prep} {to}", g.privilege),
+        "SCHEMA" => format!("{verb} {} ON SCHEMA {db}.{schema} {prep} {to}", g.privilege),
         _ => format!(
-            "{verb} {} ON TABLE {}.{} {prep} {to}",
+            "{verb} {} ON TABLE {db}.{schema}.{} {prep} {to}",
             g.privilege,
-            quote_ident(g.database.as_deref().unwrap_or_default()),
             quote_ident(g.name.as_deref().unwrap_or_default())
         ),
     }
 }
 
-/// Split `db.table` (or `table`, in `current`) for a grant form.
-fn split_object(text: &str, current: &str) -> (String, String) {
+/// Split `db.schema.table`, `schema.table` (in `current_db`) or `table` (in
+/// `current_schema`) for a grant form.
+fn split_object(text: &str, current_db: &str, current_schema: &str) -> (String, String, String) {
+    let parts: Vec<&str> = text.trim().split('.').map(str::trim).collect();
+    match parts.as_slice() {
+        [db, schema, table] => (db.to_string(), schema.to_string(), table.to_string()),
+        [schema, table] => (
+            current_db.to_string(),
+            schema.to_string(),
+            table.to_string(),
+        ),
+        [table] => (
+            current_db.to_string(),
+            current_schema.to_string(),
+            table.to_string(),
+        ),
+        _ => (
+            current_db.to_string(),
+            current_schema.to_string(),
+            text.trim().to_string(),
+        ),
+    }
+}
+
+/// Split `db.schema` (or `schema`, in `current_db`) for a schema grant.
+fn split_schema(text: &str, current_db: &str) -> (String, String) {
     match text.trim().split_once('.') {
-        Some((db, table)) => (db.trim().to_string(), table.trim().to_string()),
-        None => (current.to_string(), text.trim().to_string()),
+        Some((db, schema)) => (db.trim().to_string(), schema.trim().to_string()),
+        None => (current_db.to_string(), text.trim().to_string()),
     }
 }
 
 /// The `GRANT` statement the grant form builds.
-pub fn grant_form_sql(privilege: &str, target: &str, grantee: &str, current: &str) -> String {
+pub fn grant_form_sql(
+    privilege: &str,
+    target: &str,
+    grantee: &str,
+    current_db: &str,
+    current_schema: &str,
+) -> String {
     let to = quote_ident(grantee.trim());
     let target = target.trim();
     match privilege {
@@ -59,13 +87,36 @@ pub fn grant_form_sql(privilege: &str, target: &str, grantee: &str, current: &st
         "ROLE" => format!("GRANT {} TO {to}", quote_ident(target)),
         "CREATE" => format!(
             "GRANT CREATE ON DATABASE {} TO {to}",
-            quote_ident(if target.is_empty() { current } else { target })
+            quote_ident(if target.is_empty() {
+                current_db
+            } else {
+                target
+            })
         ),
-        privilege => {
-            let (db, table) = split_object(target, current);
+        "SCHEMA" | "CREATE_SCHEMA" => {
+            let target = if target.is_empty() {
+                current_schema
+            } else {
+                target
+            };
+            let (db, schema) = split_schema(target, current_db);
+            let privilege = if privilege == "SCHEMA" {
+                "ALL"
+            } else {
+                "CREATE"
+            };
             format!(
-                "GRANT {privilege} ON TABLE {}.{} TO {to}",
+                "GRANT {privilege} ON SCHEMA {}.{} TO {to}",
                 quote_ident(&db),
+                quote_ident(&schema)
+            )
+        }
+        privilege => {
+            let (db, schema, table) = split_object(target, current_db, current_schema);
+            format!(
+                "GRANT {privilege} ON TABLE {}.{}.{} TO {to}",
+                quote_ident(&db),
+                quote_ident(&schema),
                 quote_ident(&table)
             )
         }
@@ -337,9 +388,22 @@ pub fn AccessPage() -> impl IntoView {
                     "GLOBAL" => (String::new(), "Everything".to_string()),
                     "ROLE" => ("Role".to_string(), g.name.clone().unwrap_or_default()),
                     "DATABASE" => ("Database".to_string(), g.database.clone().unwrap_or_default()),
+                    "SCHEMA" => (
+                        "Schema".to_string(),
+                        format!(
+                            "{}.{}",
+                            g.database.clone().unwrap_or_default(),
+                            g.schema.clone().unwrap_or_default()
+                        ),
+                    ),
                     _ => (
                         "Table".to_string(),
-                        format!("{}.{}", g.database.clone().unwrap_or_default(), g.name.clone().unwrap_or_default()),
+                        format!(
+                            "{}.{}.{}",
+                            g.database.clone().unwrap_or_default(),
+                            g.schema.clone().unwrap_or_default(),
+                            g.name.clone().unwrap_or_default()
+                        ),
                     ),
                 };
                 let revoke = grant_sql(true, g);
@@ -636,6 +700,7 @@ fn GrantDialog(
             &target.get(),
             &grantee.get(),
             &app.db.get(),
+            &app.schema.get(),
         )
     };
     let submit = move |ev: leptos::ev::SubmitEvent| {
@@ -649,6 +714,7 @@ fn GrantDialog(
     let target_label = move || match privilege.get().as_str() {
         "ROLE" => "Role",
         "CREATE" => "Database",
+        "SCHEMA" | "CREATE_SCHEMA" => "Schema",
         "ADMIN" => "",
         _ => "Table",
     };
@@ -664,7 +730,9 @@ fn GrantDialog(
                             <option value="UPDATE">"UPDATE on a table"</option>
                             <option value="DELETE">"DELETE on a table"</option>
                             <option value="ALL">"ALL on a table"</option>
+                            <option value="SCHEMA">"ALL on a schema"</option>
                             <option value="CREATE">"CREATE on a database"</option>
+                            <option value="CREATE_SCHEMA">"CREATE on a schema"</option>
                             <option value="ROLE">"Membership of a role"</option>
                             <option value="ADMIN">"ADMIN (everything)"</option>
                         </select>
@@ -682,7 +750,11 @@ fn GrantDialog(
                                                 placeholder=move || match privilege.get().as_str() {
                                                     "ROLE" => "analyst".to_string(),
                                                     "CREATE" => app.db.get(),
-                                                    _ => "db.table or table".to_string(),
+                                                    "SCHEMA" | "CREATE_SCHEMA" => {
+                                                        "schema or db.schema".to_string()
+                                                    }
+                                                    _ => "db.schema.table, schema.table or table"
+                                                        .to_string(),
                                                 }
                                                 prop:value=move || target.get()
                                                 on:input=move |ev| target.set(event_target_value(&ev))
@@ -718,12 +790,19 @@ fn GrantDialog(
 mod tests {
     use super::*;
 
-    fn grant(object_type: &str, privilege: &str, db: Option<&str>, name: Option<&str>) -> GrantRow {
+    fn grant(
+        object_type: &str,
+        privilege: &str,
+        db: Option<&str>,
+        schema: Option<&str>,
+        name: Option<&str>,
+    ) -> GrantRow {
         GrantRow {
             principal: "Bob".into(),
             privilege: privilege.into(),
             object_type: object_type.into(),
             database: db.map(str::to_string),
+            schema: schema.map(str::to_string),
             name: name.map(str::to_string),
         }
     }
@@ -731,39 +810,68 @@ mod tests {
     #[test]
     fn grant_rows_invert_to_statements() {
         assert_eq!(
-            grant_sql(true, &grant("TABLE", "SELECT", Some("main"), Some("t"))),
-            "REVOKE SELECT ON TABLE main.t FROM \"Bob\""
+            grant_sql(
+                true,
+                &grant("TABLE", "SELECT", Some("sales"), Some("audit"), Some("t"))
+            ),
+            "REVOKE SELECT ON TABLE sales.audit.t FROM \"Bob\""
         );
         assert_eq!(
-            grant_sql(false, &grant("DATABASE", "CREATE", Some("main"), None)),
+            grant_sql(
+                true,
+                &grant("SCHEMA", "ALL", Some("sales"), Some("audit"), None)
+            ),
+            "REVOKE ALL ON SCHEMA sales.audit FROM \"Bob\""
+        );
+        assert_eq!(
+            grant_sql(
+                false,
+                &grant("DATABASE", "CREATE", Some("main"), None, None)
+            ),
             "GRANT CREATE ON DATABASE main TO \"Bob\""
         );
         assert_eq!(
-            grant_sql(true, &grant("GLOBAL", "ADMIN", None, None)),
+            grant_sql(true, &grant("GLOBAL", "ADMIN", None, None, None)),
             "REVOKE ADMIN FROM \"Bob\""
         );
         assert_eq!(
-            grant_sql(true, &grant("ROLE", "MEMBER", None, Some("analyst"))),
+            grant_sql(true, &grant("ROLE", "MEMBER", None, None, Some("analyst"))),
             "REVOKE analyst FROM \"Bob\""
         );
         assert_eq!(
-            split_object("sales.orders", "main"),
-            ("sales".into(), "orders".into())
+            split_object("sales.audit.orders", "main", "main"),
+            ("sales".into(), "audit".into(), "orders".into())
         );
         assert_eq!(
-            split_object("orders", "main"),
-            ("main".into(), "orders".into())
+            split_object("audit.orders", "main", "main"),
+            ("main".into(), "audit".into(), "orders".into())
         );
         assert_eq!(
-            grant_form_sql("SELECT", "sales.orders", "Ana", "main"),
-            "GRANT SELECT ON TABLE sales.orders TO \"Ana\""
+            split_object("orders", "main", "audit"),
+            ("main".into(), "audit".into(), "orders".into())
         );
         assert_eq!(
-            grant_form_sql("CREATE", "", "bob", "main"),
+            grant_form_sql("SELECT", "sales.audit.orders", "Ana", "main", "main"),
+            "GRANT SELECT ON TABLE sales.audit.orders TO \"Ana\""
+        );
+        assert_eq!(
+            grant_form_sql("SELECT", "orders", "Ana", "main", "audit"),
+            "GRANT SELECT ON TABLE main.audit.orders TO \"Ana\""
+        );
+        assert_eq!(
+            grant_form_sql("SCHEMA", "", "Ana", "main", "audit"),
+            "GRANT ALL ON SCHEMA main.audit TO \"Ana\""
+        );
+        assert_eq!(
+            grant_form_sql("CREATE_SCHEMA", "sales.audit", "Ana", "main", "main"),
+            "GRANT CREATE ON SCHEMA sales.audit TO \"Ana\""
+        );
+        assert_eq!(
+            grant_form_sql("CREATE", "", "bob", "main", "main"),
             "GRANT CREATE ON DATABASE main TO bob"
         );
         assert_eq!(
-            grant_form_sql("ADMIN", "x", "bob", "main"),
+            grant_form_sql("ADMIN", "x", "bob", "main", "main"),
             "GRANT ADMIN TO bob"
         );
     }

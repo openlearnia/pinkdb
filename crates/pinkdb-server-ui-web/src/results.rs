@@ -136,6 +136,7 @@ fn download(app: App, result: StatementResult, format: &'static str) {
     let request = ExportRequest {
         sql: result.statement.clone(),
         db: Some(app.db.get_untracked()),
+        schema: Some(app.schema.get_untracked()),
         format: format.to_string(),
     };
     let csrf = app.csrf();

@@ -12,10 +12,11 @@
 //! | Purpose            | Statement                                  |
 //! |--------------------|--------------------------------------------|
 //! | list databases     | `SHOW DATABASES`                           |
-//! | list relations     | `SHOW TABLES` (session database)           |
-//! | relation columns   | `DESCRIBE "db"."table"`                    |
-//! | row count          | `SELECT COUNT(*) FROM "db"."table"`        |
-//! | a page of rows     | `SELECT * FROM "db"."table" LIMIT n OFFSET m` |
+//! | list schemas       | `SELECT … FROM pinkdb_catalog()` (SCHEMA rows) |
+//! | list relations     | `SHOW TABLES` (session schema)              |
+//! | relation columns   | `DESCRIBE "db"."schema"."table"`          |
+//! | row count          | `SELECT COUNT(*) FROM "db"."schema"."table"` |
+//! | a page of rows     | `SELECT * FROM "db"."schema"."table" LIMIT n OFFSET m` |
 //!
 //! There is no DML and no DDL here. The one session statement the console
 //! uses is `USE` (to browse a database other than the session's current
@@ -52,6 +53,15 @@ pub struct RelationInfo {
     pub name: String,
     /// The relation's columns.
     pub columns: Vec<ColumnInfo>,
+}
+
+/// One schema of a database and its relation count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaInfo {
+    /// The schema name.
+    pub name: String,
+    /// How many tables and views it holds.
+    pub relations: usize,
 }
 
 /// One page of rows.
@@ -107,6 +117,7 @@ pub fn quote_ident(name: &str) -> String {
 pub struct Session {
     conn: Connection,
     db: String,
+    schema: String,
 }
 
 impl Session {
@@ -115,7 +126,11 @@ impl Session {
         let mut conn = db.connect();
         conn.set_exec_limits(limits);
         let current = conn.current_db().to_string();
-        Self { conn, db: current }
+        Self {
+            conn,
+            db: current,
+            schema: "main".to_string(),
+        }
     }
 
     /// The database this session currently browses.
@@ -150,23 +165,55 @@ impl Session {
             .collect())
     }
 
-    /// The relations (tables and views) of `db`, with their columns.
-    pub fn relations(&mut self, db: &str) -> Result<Vec<RelationInfo>, String> {
+    /// Every schema of `db`, with how many relations each holds.
+    pub fn schemas(&mut self, db: &str) -> Result<Vec<SchemaInfo>, String> {
+        // Switches the session, and fails for a database that is gone.
         self.ensure_db(db)?;
+        let sql = "SELECT \"database\", \"schema\", \"kind\" FROM pinkdb_catalog() \
+                   WHERE \"kind\" IN ('SCHEMA', 'TABLE', 'VIEW', 'MATERIALIZED VIEW')";
+        let selected = selected(self.run(sql)?)?;
+        let mut out: Vec<SchemaInfo> = Vec::new();
+        for row in selected.rows {
+            let database = row.first().map(text_of).unwrap_or_default();
+            if !database.eq_ignore_ascii_case(db) {
+                continue;
+            }
+            let schema = row.get(1).map(text_of).unwrap_or_default();
+            let kind = row.get(2).map(text_of).unwrap_or_default();
+            let relation = usize::from(!kind.eq_ignore_ascii_case("SCHEMA"));
+            match out
+                .iter_mut()
+                .find(|s| s.name.eq_ignore_ascii_case(&schema))
+            {
+                Some(found) => found.relations += relation,
+                None => out.push(SchemaInfo {
+                    name: schema,
+                    relations: relation,
+                }),
+            }
+        }
+        out.sort_by_cached_key(|schema| schema.name.to_lowercase());
+        Ok(out)
+    }
+
+    /// The relations (tables and views) of `db`.`schema`, with their columns.
+    pub fn relations(&mut self, db: &str, schema: &str) -> Result<Vec<RelationInfo>, String> {
+        self.ensure_ns(db, schema)?;
         let names = self.show_tables()?;
         let mut out = Vec::with_capacity(names.len());
         for name in names {
-            let columns = self.describe(db, &name)?;
+            let columns = self.describe(db, schema, &name)?;
             out.push(RelationInfo { name, columns });
         }
         Ok(out)
     }
 
-    /// The exact number of rows of `db`.`table`.
-    pub fn row_count(&mut self, db: &str, table: &str) -> Result<u64, String> {
+    /// The exact number of rows of `db`.`schema`.`table`.
+    pub fn row_count(&mut self, db: &str, schema: &str, table: &str) -> Result<u64, String> {
         let sql = format!(
-            "SELECT COUNT(*) FROM {}.{}",
+            "SELECT COUNT(*) FROM {}.{}.{}",
             quote_ident(db),
+            quote_ident(schema),
             quote_ident(table)
         );
         let selected = selected(self.run(&sql)?)?;
@@ -182,18 +229,20 @@ impl Session {
             .unwrap_or(0))
     }
 
-    /// One page of rows of `db`.`table` (`limit` rows, skipping `offset`).
+    /// One page of rows of `db`.`schema`.`table` (`limit` rows, skipping `offset`).
     pub fn rows(
         &mut self,
         db: &str,
+        schema: &str,
         table: &str,
         limit: usize,
         offset: usize,
     ) -> Result<Page, String> {
-        let columns = self.describe(db, table)?;
+        let columns = self.describe(db, schema, table)?;
         let sql = format!(
-            "SELECT * FROM {}.{} LIMIT {limit} OFFSET {offset}",
+            "SELECT * FROM {}.{}.{} LIMIT {limit} OFFSET {offset}",
             quote_ident(db),
+            quote_ident(schema),
             quote_ident(table)
         );
         let selected = selected(self.run(&sql)?)?;
@@ -209,17 +258,30 @@ impl Session {
             return Ok(());
         }
         let sql = format!("USE {}", quote_ident(db));
-        let results = self.run(&sql)?;
-        match results.into_iter().next() {
-            Some(QueryResult::Used { db, .. }) => {
-                self.db = db;
+        self.use_sql(db, &sql)
+    }
+
+    /// Switch the session to `db`.`schema` (a session statement).
+    fn ensure_ns(&mut self, db: &str, schema: &str) -> Result<(), String> {
+        if self.db.eq_ignore_ascii_case(db) && self.schema.eq_ignore_ascii_case(schema) {
+            return Ok(());
+        }
+        let sql = format!("USE {}.{}", quote_ident(db), quote_ident(schema));
+        self.use_sql(db, &sql)
+    }
+
+    fn use_sql(&mut self, db: &str, sql: &str) -> Result<(), String> {
+        match self.run(sql)?.into_iter().next() {
+            Some(QueryResult::Used { db: used, schema }) => {
+                self.db = used;
+                self.schema = schema;
                 Ok(())
             }
             _ => Err(format!("cannot switch to database {db:?}")),
         }
     }
 
-    /// The relations of the session's current database.
+    /// The relations of the session's current schema.
     fn show_tables(&mut self) -> Result<Vec<String>, String> {
         let selected = selected(self.run("SHOW TABLES")?)?;
         Ok(selected
@@ -229,9 +291,14 @@ impl Session {
             .collect())
     }
 
-    /// The columns of `db`.`table` (`DESCRIBE`).
-    fn describe(&mut self, db: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
-        let sql = format!("DESCRIBE {}.{}", quote_ident(db), quote_ident(table));
+    /// The columns of `db`.`schema`.`table` (`DESCRIBE`).
+    fn describe(&mut self, db: &str, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+        let sql = format!(
+            "DESCRIBE {}.{}.{}",
+            quote_ident(db),
+            quote_ident(schema),
+            quote_ident(table)
+        );
         let selected = selected(self.run(&sql)?)?;
         let mut out = Vec::with_capacity(selected.rows.len());
         for row in selected.rows {

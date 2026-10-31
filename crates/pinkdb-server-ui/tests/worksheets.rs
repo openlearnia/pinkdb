@@ -815,6 +815,59 @@ fn the_catalog_lists_indexes_and_column_stats_but_not_plain_views() {
 }
 
 #[test]
+fn a_run_can_name_its_schema() {
+    let db = store();
+    {
+        let mut conn = db.connect();
+        conn.execute("CREATE SCHEMA audit").unwrap();
+        conn.execute("CREATE TABLE audit.log (n INTEGER)").unwrap();
+        conn.execute("INSERT INTO audit.log VALUES (1), (2)")
+            .unwrap();
+    }
+    let console = start(db, options());
+    let client = login(console.addr, json!({})).unwrap();
+    let out = client
+        .post(
+            "/api/query",
+            &json!({
+                "sql": "SELECT count(*) AS n FROM log",
+                "db": "main",
+                "schema": "audit",
+                "run_id": "r-audit"
+            }),
+        )
+        .json();
+    assert!(out["error"].is_null(), "{out}");
+    assert_eq!(out["results"][0]["rows"][0][0], "2", "{out}");
+    assert_eq!(out["db"], "main");
+}
+
+#[test]
+fn the_catalog_names_each_object_s_schema() {
+    let db = store();
+    let mut conn = db.connect();
+    conn.execute("CREATE SCHEMA audit").unwrap();
+    conn.execute("CREATE TABLE audit.log (n INTEGER)").unwrap();
+    conn.execute("CREATE SCHEMA empty").unwrap();
+    let console = start(db, options());
+    let client = login(console.addr, json!({})).unwrap();
+    let catalog = client.get("/api/catalog").json();
+    let objects = catalog["objects"].as_array().expect("an array of objects");
+    let log = objects
+        .iter()
+        .find(|o| o["name"] == "log")
+        .expect("the audit table");
+    assert_eq!(log["database"], "main");
+    assert_eq!(log["schema"], "audit");
+    assert_eq!(log["kind"], "TABLE");
+    let empty = objects
+        .iter()
+        .find(|o| o["name"] == "empty" && o["kind"] == "SCHEMA")
+        .expect("the empty schema's row");
+    assert_eq!(empty["schema"], "empty");
+}
+
+#[test]
 fn the_browse_api_takes_the_session_cookie() {
     let console = start(store_with_users(), basic());
     // Without a credential the wave-78 API is closed.

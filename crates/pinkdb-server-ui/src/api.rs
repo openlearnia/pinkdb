@@ -26,10 +26,6 @@ use crate::preview::{preview_cell, type_width_bytes};
 use crate::server::Shared;
 use crate::store::Session;
 
-/// The schema name pinkdb's implicit schema carries (`pinkdb` has no schema
-/// layer: every database holds its relations in `main`).
-pub const DEFAULT_SCHEMA: &str = pinkdb_server_ui_api::DEFAULT_SCHEMA;
-
 /// The default page size (bounded by [`crate::UiOptions::max_page_size`]).
 pub const DEFAULT_PAGE_SIZE: usize = 50;
 
@@ -58,7 +54,7 @@ pub struct DatabaseInfo {
 pub struct SchemasResponse {
     /// The database the schemas belong to.
     pub db: String,
-    /// The schemas (pinkdb has exactly one: `main`).
+    /// The schemas of the database.
     pub schemas: Vec<SchemaInfo>,
 }
 
@@ -108,6 +104,8 @@ pub struct ColumnInfo {
 pub struct RowsResponse {
     /// The database the rows come from.
     pub db: String,
+    /// The schema the rows come from.
+    pub schema: String,
     /// The relation the rows come from.
     pub table: String,
     /// The 1-based page number.
@@ -140,6 +138,8 @@ pub struct CellInfo {
 pub struct StatsResponse {
     /// The database the statistics belong to.
     pub db: String,
+    /// The schema the statistics belong to.
+    pub schema: String,
     /// One entry per relation.
     pub tables: Vec<TableStats>,
 }
@@ -178,7 +178,7 @@ pub struct DbQuery {
 pub struct TablesQuery {
     /// The database to browse (defaults to the session's database).
     pub db: Option<String>,
-    /// The schema to browse (pinkdb has exactly one: `main`).
+    /// The schema to browse (defaults to the database's `main`).
     pub schema: Option<String>,
 }
 
@@ -187,6 +187,8 @@ pub struct TablesQuery {
 pub struct RowsQuery {
     /// The database to browse (defaults to the session's database).
     pub db: Option<String>,
+    /// The schema to browse (defaults to the database's `main`).
+    pub schema: Option<String>,
     /// The relation to preview.
     pub table: Option<String>,
     /// The 1-based page number.
@@ -195,14 +197,21 @@ pub struct RowsQuery {
     pub page_size: Option<usize>,
 }
 
+/// The `db`/`schema` parameters of the statistics.
+#[derive(Deserialize)]
+pub struct StatsQuery {
+    /// The database to browse (defaults to the session's database).
+    pub db: Option<String>,
+    /// The schema to browse (defaults to the database's `main`).
+    pub schema: Option<String>,
+}
+
 // ---------- errors ----------
 
 /// Why a request failed.
 pub enum ApiError {
     /// The request was malformed.
     BadRequest(String),
-    /// The addressed object does not exist.
-    NotFound(String),
     /// The request was not authenticated.
     Auth(AuthFailure),
     /// The engine refused the statement.
@@ -214,7 +223,6 @@ impl ApiError {
     pub fn into_response(self, mode: &UiAuth) -> Response {
         match self {
             ApiError::BadRequest(msg) => json_error(StatusCode::BAD_REQUEST, msg),
-            ApiError::NotFound(msg) => json_error(StatusCode::NOT_FOUND, msg),
             ApiError::Auth(failure) => auth_failure_response(failure, mode),
             ApiError::Engine(msg) => {
                 // The engine's "not found" errors are the client's fault.
@@ -355,13 +363,16 @@ pub async fn schemas(
         peer,
         move |session, _shared| {
             let db = resolve_db(session, query.db.as_deref())?;
-            let relations = session.relations(&db)?;
+            let schemas = session.schemas(&db)?;
             Ok(SchemasResponse {
                 db,
-                schemas: vec![SchemaInfo {
-                    name: DEFAULT_SCHEMA.to_string(),
-                    relations: relations.len(),
-                }],
+                schemas: schemas
+                    .into_iter()
+                    .map(|schema| SchemaInfo {
+                        name: schema.name,
+                        relations: schema.relations,
+                    })
+                    .collect(),
             })
         },
         json_response,
@@ -376,28 +387,28 @@ pub async fn tables(
     headers: HeaderMap,
     peer: ConnectInfo<SocketAddr>,
 ) -> Response {
-    handle(shared, headers, peer, move |session, _shared| {
-        let db = resolve_db(session, query.db.as_deref())?;
-        if let Some(schema) = query.schema.as_deref()
-            && !schema.eq_ignore_ascii_case(DEFAULT_SCHEMA)
-        {
-            return Err(ApiError::NotFound(format!(
-                "schema {schema:?} not found: this store has one schema per database ({DEFAULT_SCHEMA})"
-            )));
-        }
-        let relations = session.relations(&db)?;
-        Ok(TablesResponse {
-            db,
-            schema: DEFAULT_SCHEMA.to_string(),
-            tables: relations
-                .into_iter()
-                .map(|relation| TableInfo {
-                    name: relation.name,
-                    columns: relation.columns.into_iter().map(column_info).collect(),
-                })
-                .collect(),
-        })
-    }, json_response)
+    handle(
+        shared,
+        headers,
+        peer,
+        move |session, _shared| {
+            let db = resolve_db(session, query.db.as_deref())?;
+            let schema = resolve_schema(query.schema.as_deref()).to_string();
+            let relations = session.relations(&db, &schema)?;
+            Ok(TablesResponse {
+                db,
+                schema,
+                tables: relations
+                    .into_iter()
+                    .map(|relation| TableInfo {
+                        name: relation.name,
+                        columns: relation.columns.into_iter().map(column_info).collect(),
+                    })
+                    .collect(),
+            })
+        },
+        json_response,
+    )
     .await
 }
 
@@ -414,6 +425,7 @@ pub async fn rows(
         peer,
         move |session, shared| {
             let db = resolve_db(session, query.db.as_deref())?;
+            let schema = resolve_schema(query.schema.as_deref()).to_string();
             let table = query
                 .table
                 .as_deref()
@@ -431,15 +443,16 @@ pub async fn rows(
                 .clamp(1, shared.opts.max_page_size);
             let offset = page.saturating_sub(1).saturating_mul(page_size as u64);
             let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-            let total_rows = session.row_count(&db, &table)?;
+            let total_rows = session.row_count(&db, &schema, &table)?;
             let total_pages = if total_rows == 0 {
                 0
             } else {
                 total_rows.div_ceil(page_size as u64)
             };
-            let page = session.rows(&db, &table, page_size, offset)?;
+            let page = session.rows(&db, &schema, &table, page_size, offset)?;
             Ok(RowsResponse {
                 db,
+                schema,
                 table,
                 page: query.page.unwrap_or(1),
                 page_size,
@@ -472,7 +485,7 @@ pub async fn rows(
 /// `GET /api/stats`
 pub async fn stats(
     State(shared): State<Arc<Shared>>,
-    Query(query): Query<DbQuery>,
+    Query(query): Query<StatsQuery>,
     headers: HeaderMap,
     peer: ConnectInfo<SocketAddr>,
 ) -> Response {
@@ -482,10 +495,11 @@ pub async fn stats(
         peer,
         move |session, _shared| {
             let db = resolve_db(session, query.db.as_deref())?;
-            let relations = session.relations(&db)?;
+            let schema = resolve_schema(query.schema.as_deref()).to_string();
+            let relations = session.relations(&db, &schema)?;
             let mut tables = Vec::with_capacity(relations.len());
             for relation in relations {
-                let rows = session.row_count(&db, &relation.name)?;
+                let rows = session.row_count(&db, &schema, &relation.name)?;
                 let width: u64 = relation
                     .columns
                     .iter()
@@ -498,7 +512,7 @@ pub async fn stats(
                     columns: relation.columns.len(),
                 });
             }
-            Ok(StatsResponse { db, tables })
+            Ok(StatsResponse { db, schema, tables })
         },
         json_response,
     )
@@ -531,6 +545,7 @@ pub async fn preview(
         peer,
         move |session, shared| {
             let db = resolve_db(session, query.db.as_deref())?;
+            let schema = resolve_schema(query.schema.as_deref()).to_string();
             let table = query
                 .table
                 .as_deref()
@@ -543,15 +558,16 @@ pub async fn preview(
                 .clamp(1, shared.opts.max_page_size);
             let offset = page.saturating_sub(1).saturating_mul(page_size as u64);
             let offset = usize::try_from(offset).unwrap_or(usize::MAX);
-            let total_rows = session.row_count(&db, &table)?;
+            let total_rows = session.row_count(&db, &schema, &table)?;
             let total_pages = if total_rows == 0 {
                 0
             } else {
                 total_rows.div_ceil(page_size as u64)
             };
-            let rows = session.rows(&db, &table, page_size, offset)?;
+            let rows = session.rows(&db, &schema, &table, page_size, offset)?;
             Ok(html::PreviewPage {
                 db,
+                schema,
                 table,
                 page,
                 page_size,
@@ -582,6 +598,14 @@ fn resolve_db(session: &Session, requested: Option<&str>) -> Result<String, ApiE
     match requested {
         Some(name) if !name.is_empty() => Ok(name.to_string()),
         _ => Ok(session.current_db().to_string()),
+    }
+}
+
+/// The schema a request addresses (the database's `main` by default).
+fn resolve_schema(requested: Option<&str>) -> &str {
+    match requested {
+        Some(name) if !name.is_empty() => name,
+        _ => "main",
     }
 }
 
