@@ -653,6 +653,7 @@ mod tests {
     fn saved(dtype: DataType, min: Option<Value>, max: Option<Value>) -> SavedTableStats {
         SavedTableStats {
             db: "main".to_string(),
+            schema: "main".to_string(),
             table: "t".to_string(),
             rows: min.iter().chain(max.iter()).count() as u64,
             columns: vec![pinkdb::persist::SavedColumnStats {

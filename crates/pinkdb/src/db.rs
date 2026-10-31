@@ -414,10 +414,10 @@ struct Txn {
     /// Private working copy (snapshot at BEGIN + own writes).
     work: PinkDb,
     /// `(database, table)` versions and view definitions frozen at BEGIN.
-    base_tables: HashMap<(String, String), u64>,
-    base_views: HashMap<(String, String), ViewDef>,
+    base_tables: HashMap<crate::storage::TableRef, u64>,
+    base_views: HashMap<crate::storage::TableRef, ViewDef>,
     /// Tables / views created, dropped, or written, keyed `(database, name)`.
-    table_writes: HashSet<(String, String)>,
+    table_writes: HashSet<crate::storage::TableRef>,
     /// The buffered (mutating) statements' touched-object set (wave 45o):
     /// the transaction's one WAL frame records exactly which tables/databases
     /// its replay depends on, so writers validate optimistic commits against
@@ -428,8 +428,8 @@ struct Txn {
     /// them unchanged at COMMIT: its WAL record replays its SQL text *after*
     /// every earlier commit, so a read of state another commit changed would
     /// replay to different data than this session saw.
-    table_reads: HashSet<(String, String)>,
-    view_writes: HashSet<(String, String)>,
+    table_reads: HashSet<crate::storage::TableRef>,
+    view_writes: HashSet<crate::storage::TableRef>,
     /// SQL text of this transaction's mutating statements: one WAL record at
     /// COMMIT (empty for read-only transactions, which log nothing).
     wal_stmts: Vec<String>,
@@ -950,6 +950,7 @@ impl Connection {
                     )));
                 }
                 let pre = self.current_db.clone();
+                let pre_ns = crate::storage::SchemaPath::main(&pre);
                 let bind_start = profile.as_ref().map(|_| Instant::now());
                 let (plan, dynamic_functions_used) =
                     crate::sql::bind_tracked_in(&txn.work, stmt, &pre, &self.session)?;
@@ -976,20 +977,20 @@ impl Connection {
                 if crate::plan::writes_tables(&plan) {
                     txn.work.refuse_logged_attached_reads(&plan)?;
                 }
-                record_writes(&plan, &pre, &mut txn.table_writes, &mut txn.view_writes);
-                crate::plan::collect_tables_read(&plan, &pre, &mut txn.table_reads);
+                record_writes(&plan, &pre_ns, &mut txn.table_writes, &mut txn.view_writes);
+                crate::plan::collect_tables_read(&plan, &pre_ns, &mut txn.table_reads);
                 // A materialized-view statement reads objects the plan cannot
                 // name (its defining query's base tables). MV statements are
                 // refused inside transactions today; keep the read set honest
                 // if that refusal is ever relaxed.
-                for (db, table) in txn.work.mv_reads_of(&plan, &pre) {
-                    txn.table_reads.insert((db, table));
+                for dep in txn.work.mv_reads_of(&plan, &pre_ns) {
+                    txn.table_reads.insert(dep);
                 }
                 if crate::plan::writes_tables(&plan) {
                     // The frame's set: only statements that get buffered into
                     // the WAL record contribute (a read-only statement's text
                     // never replays).
-                    let stmt_sets = txn.work.plan_sets_store(&plan, &pre);
+                    let stmt_sets = txn.work.plan_sets_store(&plan, &pre_ns);
                     txn.wal_sets.extend(&stmt_sets);
                 }
                 budget.set_collect_external_calls(
@@ -1276,7 +1277,7 @@ impl Connection {
         // Optimistic fast path.
         let exec_start = profile.as_ref().map(|_| Instant::now());
         let mut sets = crate::wal::FrameSets::default();
-        crate::plan::plan_sets(&plan, pre, &mut sets);
+        crate::plan::plan_sets(&plan, &crate::storage::SchemaPath::main(pre), &mut sets);
         sets.canonicalize();
         let base = shared.capture_base()?;
         // Execute with no lease: this is the span other writers overlap.
@@ -1391,7 +1392,7 @@ impl Connection {
         if crate::plan::writes_tables(plan) {
             // Wave 80: the committed unit's writes feed the ON COMMIT trigger
             // for the next statement boundary (a no-op for MV-free stores).
-            let writes = shared.plan_writes_of(plan, pre);
+            let writes = shared.plan_writes_of(plan, &crate::storage::SchemaPath::main(pre));
             shared.mark_mv_writes(&writes);
         }
         // Wave 83: a CALL that used COMMIT/ROLLBACK logs its final segment
@@ -1417,7 +1418,7 @@ impl Connection {
             // walking the plan again.
             let sets = match sets {
                 Some(s) => s.clone(),
-                None => shared.plan_sets_store(plan, pre),
+                None => shared.plan_sets_store(plan, &crate::storage::SchemaPath::main(pre)),
             };
             shared.wal_append_session(
                 pre,
@@ -1449,21 +1450,13 @@ impl Connection {
         // snapshot is past the base and therefore validated.
         let base = shared.capture_base()?;
         let mut base_tables = HashMap::new();
-        for dbname in shared.list_databases() {
-            for name in shared.list_tables_in(&dbname) {
-                base_tables.insert(
-                    (dbname.to_ascii_lowercase(), name.to_ascii_lowercase()),
-                    shared.table_version_in(&dbname, &name)?,
-                );
-            }
-        }
         let mut base_views = HashMap::new();
         for dbname in shared.list_databases() {
-            for name in shared.list_views_in(&dbname) {
-                base_views.insert(
-                    (dbname.to_ascii_lowercase(), name.to_ascii_lowercase()),
-                    shared.view_in(&dbname, &name)?.clone(),
-                );
+            for (ns, name, table) in shared.all_tables_of(&dbname) {
+                base_tables.insert((ns, name), table.version);
+            }
+            for (ns, name, view) in shared.all_views_of(&dbname) {
+                base_views.insert((ns, name), view.clone());
             }
         }
         let txn = Txn {
@@ -1518,8 +1511,8 @@ impl Connection {
             && let (Some(g), Some(base)) = (lease.as_ref(), txn.base.as_ref())
         {
             let mut ours = crate::wal::FrameSets::default();
-            for (db, name) in txn.table_reads.iter().chain(txn.table_writes.iter()) {
-                ours.add_table(db, name);
+            for (ns, name) in txn.table_reads.iter().chain(txn.table_writes.iter()) {
+                ours.add_table(ns, name);
             }
             // Database-level conflicts come only from `CREATE`/`DROP
             // DATABASE` (tracked in `txn.wal_sets`), never from a
@@ -1539,17 +1532,17 @@ impl Connection {
         // A database dropped since BEGIN makes the transaction's WAL record
         // unreplayable (its statements or `USE` targets name it): conflict
         // instead of logging a dead record or silently no-op'ing the merge.
-        for (db, name) in &txn.table_writes {
-            if !shared.database_exists(db) {
-                return Err(conflict(&format!("database \"{db}\"")));
+        for (ns, name) in &txn.table_writes {
+            if !shared.database_exists(ns.db()) {
+                return Err(conflict(&format!("database \"{}\"", ns.db())));
             }
             // Validate tables: our writes must apply onto unchanged state.
             // (Versions equal base ⇒ nobody touched them; created tables must
             // still be absent; dropped ones still present-but-unchanged.)
-            let base = txn.base_tables.get(&(db.clone(), name.clone())).copied();
-            let now = shared.table_version_in(db, name).ok();
+            let base = txn.base_tables.get(&(ns.clone(), name.clone())).copied();
+            let now = shared.table_version_in(ns, name).ok();
             if base != now {
-                return Err(conflict(&format!("table \"{db}.{name}\"")));
+                return Err(conflict(&format!("table \"{ns}.{name}\"")));
             }
         }
         // Serializable reads: a writing transaction's reads must be unchanged
@@ -1557,26 +1550,26 @@ impl Connection {
         // Read-only transactions log nothing and never conflict.
         let writes = !txn.table_writes.is_empty() || !txn.view_writes.is_empty();
         if writes {
-            for (db, name) in &txn.table_reads {
-                if txn.table_writes.contains(&(db.clone(), name.clone())) {
+            for (ns, name) in &txn.table_reads {
+                if txn.table_writes.contains(&(ns.clone(), name.clone())) {
                     continue;
                 }
-                let base = txn.base_tables.get(&(db.clone(), name.clone())).copied();
-                let now = shared.table_version_in(db, name).ok();
+                let base = txn.base_tables.get(&(ns.clone(), name.clone())).copied();
+                let now = shared.table_version_in(ns, name).ok();
                 if base != now {
-                    return Err(conflict(&format!("table \"{db}.{name}\" (read)")));
+                    return Err(conflict(&format!("table \"{ns}.{name}\" (read)")));
                 }
             }
         }
         // Validate views by definition (no version counter on views).
         for (db, name) in &txn.view_writes {
-            if !shared.database_exists(db) {
-                return Err(conflict(&format!("database \"{db}\"")));
+            if !shared.database_exists(db.db()) {
+                return Err(conflict(&format!("database \"{}\"", db.db())));
             }
             let base = txn.base_views.get(&(db.clone(), name.clone()));
             let now = shared.view_in(db, name).ok();
             if now != base {
-                return Err(conflict(&format!("view \"{db}.{name}\"")));
+                return Err(conflict(&format!("view \"{}.{name}\"", db.db())));
             }
         }
         // Every session the record's replay switches into (implicit `USE`
@@ -1591,8 +1584,8 @@ impl Connection {
         // in the write set now. A transaction that changed a lake database
         // publishes after the merge instead of logging.
         let mut written: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (db, _) in &txn.table_writes {
-            written.insert(db.clone());
+        for (ns, _) in &txn.table_writes {
+            written.insert(ns.db().to_string());
         }
         let storages = txn.work.write_storages(&written)?;
         txn.work.refuse_mixed_storages(&storages, "transaction")?;
@@ -1620,24 +1613,26 @@ impl Connection {
         // Merge: swap written tables (carrying bumped versions) and views.
         // The catalog is proven present by the validation above, so a missing
         // catalog here is a hard error, never a silent no-op.
-        for (db, name) in &txn.table_writes {
-            match txn.work.tables_remove_in(db, name) {
-                Some(t) => shared.tables_insert_in(db, name.clone(), t)?,
+        for (ns, name) in &txn.table_writes {
+            match txn.work.tables_remove_in(ns, name) {
+                Some(t) => shared.tables_insert_in(ns, name.clone(), t)?,
                 None => {
-                    shared.tables_remove_in(db, name);
+                    shared.tables_remove_in(ns, name);
                 }
             }
             // Wave 48: grants follow their table through the same merge — a
             // transaction's `DROP TABLE`/`RENAME` also decided the table's
             // grant entry, which lives outside the table itself.
             let snapshot = txn.work.rbac();
-            shared.rbac_mut().sync_table_grants(snapshot, db, name);
+            shared
+                .rbac_mut()
+                .sync_table_grants(snapshot, ns.db(), ns.schema(), name);
         }
-        for (db, name) in &txn.view_writes {
-            match txn.work.views_remove_in(db, name) {
-                Some(v) => shared.views_insert_in(db, name.clone(), v)?,
+        for (ns, name) in &txn.view_writes {
+            match txn.work.views_remove_in(ns, name) {
+                Some(v) => shared.views_insert_in(ns, name.clone(), v)?,
                 None => {
-                    shared.views_remove_in(db, name);
+                    shared.views_remove_in(ns, name);
                 }
             }
         }
@@ -1700,12 +1695,13 @@ fn conflict_error(c: &crate::wal::CommitConflict, unit: &str) -> PinkDbError {
 /// its write set. Empty when the store has no lake database.
 fn txn_storages(
     work: &PinkDb,
-    writes: &HashSet<(String, String)>,
+    writes: &HashSet<crate::storage::TableRef>,
 ) -> Result<std::collections::BTreeSet<crate::lake_db::StorageKey>> {
     if !work.has_lake_databases() {
         return Ok(Default::default());
     }
-    let dbs: std::collections::BTreeSet<String> = writes.iter().map(|(db, _)| db.clone()).collect();
+    let dbs: std::collections::BTreeSet<String> =
+        writes.iter().map(|(ns, _)| ns.db().to_string()).collect();
     work.write_storages(&dbs)
 }
 
@@ -1768,17 +1764,18 @@ fn session_after(result: &QueryResult, before: &str, store: &PinkDb) -> String {
 /// Record which `(database, table|view)` pairs a bound plan will mutate.
 pub(crate) fn record_writes(
     plan: &LogicalPlan,
-    default_db: &str,
-    tables: &mut HashSet<(String, String)>,
-    views: &mut HashSet<(String, String)>,
+    default_ns: &crate::storage::SchemaPath,
+    tables: &mut HashSet<crate::storage::TableRef>,
+    views: &mut HashSet<crate::storage::TableRef>,
 ) {
+    // 131a has no schema syntax: a `db` qualifier still addresses that
+    // database's `main` schema (131b carries the schema in the plan).
     let key = |qdb: &Option<String>, name: &str| {
-        (
-            qdb.clone()
-                .unwrap_or_else(|| default_db.to_string())
-                .to_ascii_lowercase(),
-            name.to_ascii_lowercase(),
-        )
+        let ns = match qdb {
+            Some(db) => crate::storage::SchemaPath::main(db),
+            None => default_ns.clone(),
+        };
+        (ns, name.to_ascii_lowercase())
     };
     match plan {
         LogicalPlan::Insert { db, table, .. }
@@ -1791,8 +1788,8 @@ pub(crate) fn record_writes(
         // A data-modifying CTE writes through the statement that wraps it,
         // and the frame must cover that table's write (wave 95b).
         LogicalPlan::Cte { query, body, .. } => {
-            record_writes(query, default_db, tables, views);
-            record_writes(body, default_db, tables, views);
+            record_writes(query, default_ns, tables, views);
+            record_writes(body, default_ns, tables, views);
         }
         LogicalPlan::CreateTable { db, name, .. }
         | LogicalPlan::CreateTableAs { db, name, .. }

@@ -8229,6 +8229,10 @@ fn bind_grant(
                 privs: expanded.clone(),
                 object: GrantObject::Table {
                     db: target_db,
+                    // The grant SQL is parser-level in this step: `ON TABLE
+                    // db.t` names schema `main` (wave 131b adds the
+                    // three-part form).
+                    schema: "main".to_string(),
                     table: table_key,
                 },
                 description: format!(
@@ -8410,7 +8414,7 @@ fn bind_update(
     let table_db = Binder::new(db, default_db)
         .with_session(session.clone())
         .resolve_db(qdb)?;
-    if let Some(err) = db.attached_read_only(&table_db, table) {
+    if let Some(err) = db.attached_read_only(&crate::storage::SchemaPath::main(&table_db), table) {
         return Err(err);
     }
     let t = db.table_in(&table_db, table)?;
@@ -8552,7 +8556,7 @@ fn bind_delete(
     let table_db = Binder::new(db, default_db)
         .with_session(session.clone())
         .resolve_db(qdb)?;
-    if let Some(err) = db.attached_read_only(&table_db, table) {
+    if let Some(err) = db.attached_read_only(&crate::storage::SchemaPath::main(&table_db), table) {
         return Err(err);
     }
     let t = db.table_in(&table_db, table)?;
@@ -9231,7 +9235,7 @@ fn bind_merge(
     let table_db = Binder::new(db, default_db)
         .with_session(session.clone())
         .resolve_db(qdb)?;
-    if let Some(err) = db.attached_read_only(&table_db, table) {
+    if let Some(err) = db.attached_read_only(&crate::storage::SchemaPath::main(&table_db), table) {
         return Err(err);
     }
     let t = db.table_in(&table_db, table)?;
@@ -9380,7 +9384,7 @@ fn bind_insert(
     let table_db = Binder::new(db, default_db)
         .with_session(session.clone())
         .resolve_db(qdb)?;
-    if let Some(err) = db.attached_read_only(&table_db, table) {
+    if let Some(err) = db.attached_read_only(&crate::storage::SchemaPath::main(&table_db), table) {
         return Err(err);
     }
     let t = db.table_in(&table_db, table)?;
@@ -9501,7 +9505,7 @@ fn bind_insert_select(
     let table_db = Binder::new(db, default_db)
         .with_session(session.clone())
         .resolve_db(qdb)?;
-    if let Some(err) = db.attached_read_only(&table_db, table) {
+    if let Some(err) = db.attached_read_only(&crate::storage::SchemaPath::main(&table_db), table) {
         return Err(err);
     }
     let t = db.table_in(&table_db, table)?;
@@ -9704,7 +9708,7 @@ fn bind_alter_table(
     let target = Binder::new(db, default_db)
         .with_session(session.clone())
         .resolve_db(&qdb.map(str::to_string))?;
-    if let Some(err) = db.attached_read_only(&target, name) {
+    if let Some(err) = db.attached_read_only(&crate::storage::SchemaPath::main(&target), name) {
         return Err(err);
     }
     let t = db.table_in(&target, name)?;
@@ -9860,7 +9864,8 @@ fn bind_alter_table(
                     table_display
                 )));
             }
-            if let Some(err) = db.attached_read_only(&target, to) {
+            if let Some(err) = db.attached_read_only(&crate::storage::SchemaPath::main(&target), to)
+            {
                 return Err(err);
             }
             AlterTablePlan::RenameTable { to: to.clone() }
@@ -10823,6 +10828,7 @@ fn bind_catalog(
             principal,
             &crate::rbac::GrantObject::Table {
                 db: dbname.to_string(),
+                schema: "main".to_string(),
                 table: table.to_string(),
             },
             crate::rbac::Privilege::Select,
@@ -11083,17 +11089,25 @@ fn bind_access(
             }
         }
     } else {
-        names = ["principal", "privilege", "object_type", "database", "name"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        types = vec![DataType::Varchar; 5];
+        names = [
+            "principal",
+            "privilege",
+            "object_type",
+            "database",
+            "schema",
+            "name",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        types = vec![DataType::Varchar; 6];
         for key in &rbac.admins {
             if shown(key) {
                 rows.push(vec![
                     text(&rbac.display_of(key)),
                     text("ADMIN"),
                     text("GLOBAL"),
+                    null(),
                     null(),
                     null(),
                 ]);
@@ -11106,6 +11120,7 @@ fn bind_access(
                         text(&rbac.display_of(member)),
                         text("MEMBER"),
                         text("ROLE"),
+                        null(),
                         null(),
                         text(&rbac.display_of(role)),
                     ]);
@@ -11122,12 +11137,29 @@ fn bind_access(
                             text("DATABASE"),
                             text(dbname),
                             null(),
+                            null(),
                         ]);
                     }
                 }
             }
         }
-        for ((dbname, table), grants) in &rbac.table_grants {
+        for ((dbname, schema), grants) in &rbac.schema_grants {
+            for (principal, privileges) in grants {
+                if shown(principal) {
+                    for privilege in privileges {
+                        rows.push(vec![
+                            text(&rbac.display_of(principal)),
+                            text(privilege.keyword()),
+                            text("SCHEMA"),
+                            text(dbname),
+                            text(schema),
+                            null(),
+                        ]);
+                    }
+                }
+            }
+        }
+        for ((dbname, schema, table), grants) in &rbac.table_grants {
             for (principal, privileges) in grants {
                 if shown(principal) {
                     for privilege in privileges {
@@ -11136,6 +11168,7 @@ fn bind_access(
                             text(privilege.keyword()),
                             text("TABLE"),
                             text(dbname),
+                            text(schema),
                             text(table),
                         ]);
                     }
@@ -11246,6 +11279,7 @@ fn bind_column_stats(
             if let Some(principal) = &principal {
                 let object = crate::rbac::GrantObject::Table {
                     db: dbname.clone(),
+                    schema: "main".to_string(),
                     table: tname.clone(),
                 };
                 if !db

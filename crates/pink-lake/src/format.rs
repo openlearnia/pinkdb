@@ -626,7 +626,7 @@ impl LakeFormat for PinkFormat {
             })?;
         let stats = saved
             .into_iter()
-            .find(|s| s.db == db && s.table == table)
+            .find(|s| s.db == db && s.schema == "main" && s.table == table)
             .ok_or_else(|| LakeError::Internal {
                 message: format!(
                     "the single-table encoder for \"{db}.{table}\" returned no statistics"

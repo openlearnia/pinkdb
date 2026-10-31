@@ -935,9 +935,9 @@ impl PinkDb {
     ) -> BTreeSet<String> {
         use crate::plan::LogicalPlan as P;
         let mut out: BTreeSet<String> = self
-            .plan_writes_of(plan, default_db)
+            .plan_writes_of(plan, &crate::storage::SchemaPath::main(default_db))
             .into_iter()
-            .map(|(db, _)| db)
+            .map(|(ns, _)| ns.db().to_string())
             .collect();
         let db_of = |db: &Option<String>| db.as_deref().unwrap_or(default_db).to_ascii_lowercase();
         match plan {
@@ -1002,8 +1002,8 @@ impl PinkDb {
             return Ok(BTreeSet::new());
         }
         let mut dbs = self.plan_written_dbs(plan, default_db);
-        for (db, _) in self.proc_frame.writes() {
-            dbs.insert(db);
+        for (ns, _) in self.proc_frame.writes() {
+            dbs.insert(ns.db().to_string());
         }
         let mut storages = self.write_storages(&dbs)?;
         storages.extend(txn_storages.iter().cloned());
@@ -1074,10 +1074,11 @@ impl PinkDb {
             let Some(published) = published.as_ref() else {
                 continue;
             };
-            let same_tables = cat.tables.len() == published.catalog.tables.len()
-                && cat.tables.iter().all(|(name, t)| {
+            let same_tables = cat.main().tables.len() == published.catalog.main().tables.len()
+                && cat.main().tables.iter().all(|(name, t)| {
                     published
                         .catalog
+                        .main()
                         .tables
                         .get(name)
                         .is_some_and(|p| p.version == t.version)
@@ -1105,6 +1106,7 @@ impl PinkDb {
             };
             let image = self.catalog_image_of(cat)?;
             let tables: Vec<(String, Arc<DataTable>)> = cat
+                .main()
                 .tables
                 .values()
                 .map(|t| (t.name.clone(), Arc::new(t.clone())))
@@ -1170,7 +1172,7 @@ impl PinkDb {
             return Vec::new();
         }
         let mut dbs: BTreeSet<&str> = BTreeSet::new();
-        for (db, _) in sets.table_pairs() {
+        for (db, _, _) in sets.table_refs() {
             dbs.insert(db.as_str());
         }
         dbs.into_iter()
@@ -1227,7 +1229,7 @@ impl PinkDb {
                 table.name = name.clone();
                 pinned.insert(name.to_ascii_lowercase(), table);
             }
-            let saved = std::mem::replace(&mut cat.tables, pinned);
+            let saved = std::mem::replace(&mut cat.main_mut().tables, pinned);
             let saved_version = std::mem::replace(&mut cat.lake_version, version);
             backup.push((db.clone(), saved, saved_version));
         }
@@ -1239,7 +1241,7 @@ impl PinkDb {
     pub(crate) fn restore_replay_pins(&mut self, backup: PinBackup) {
         for (db, tables, version) in backup {
             if let Some(cat) = self.databases.get_mut(&db) {
-                cat.tables = tables;
+                cat.main_mut().tables = tables;
                 cat.lake_version = version;
             }
         }

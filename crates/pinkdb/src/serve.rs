@@ -861,7 +861,11 @@ fn read_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Opti
         return None;
     };
     let mut reads = std::collections::HashSet::new();
-    crate::plan::collect_tables_read(&plan, &session_db, &mut reads);
+    crate::plan::collect_tables_read(
+        &plan,
+        &crate::storage::SchemaPath::main(&session_db),
+        &mut reads,
+    );
     if let Some(allowed) = allowed {
         // A view over a table function binds to a scan the syntax check cannot
         // see, so the plan is asked too.
@@ -870,14 +874,14 @@ fn read_reason(db: &PinkDb, policy: &ServePolicy, statement: &Statement) -> Opti
         }
         if reads
             .iter()
-            .any(|(database, _)| !allowed.iter().any(|a| a.eq_ignore_ascii_case(database)))
+            .any(|(ns, _)| !allowed.iter().any(|a| a.eq_ignore_ascii_case(ns.db())))
         {
             return Some(confined_read_hint(allowed));
         }
     }
-    let mut denied: Vec<&String> = reads
+    let mut denied: Vec<&str> = reads
         .iter()
-        .map(|(db, _)| db)
+        .map(|(ns, _)| ns.db())
         .filter(|db| {
             policy
                 .deny_read_databases

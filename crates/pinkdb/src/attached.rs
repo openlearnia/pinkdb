@@ -607,8 +607,17 @@ impl PinkDb {
     }
 
     /// The read-only refusal for a mutation targeting an attached table,
-    /// if it is one.
-    pub(crate) fn attached_read_only(&self, db: &str, name: &str) -> Option<PinkDbError> {
+    /// if it is one. Attachments are database-level in wave 131a, so only
+    /// `main` can name one.
+    pub(crate) fn attached_read_only(
+        &self,
+        ns: &crate::storage::SchemaPath,
+        name: &str,
+    ) -> Option<PinkDbError> {
+        if ns.schema() != "main" {
+            return None;
+        }
+        let db = ns.db();
         self.attached_lookup(db, name).map(|(_, lake)| {
             if self.is_lake_reader(lake) {
                 PinkDbError::Execution(format!(
@@ -642,15 +651,17 @@ impl PinkDb {
         if !self.is_durable() || self.attached_lakes.is_empty() {
             return Ok(());
         }
+        let session = crate::storage::SchemaPath::main(self.current_db());
         let mut reads = std::collections::HashSet::new();
-        crate::plan::collect_tables_read(plan, self.current_db(), &mut reads);
+        crate::plan::collect_tables_read(plan, &session, &mut reads);
         // A materialized-view refresh re-evaluates its defining query: the
         // base tables are reads the plan itself cannot name (wave 80).
-        for (db, table) in self.mv_reads_of(plan, self.current_db()) {
-            reads.insert((db, table));
+        for (ns, table) in self.mv_reads_of(plan, &session) {
+            reads.insert((ns, table));
         }
-        for (db, table) in reads {
-            if let Some((_, lake)) = self.attached_lookup(&db, &table)
+        for (ns, table) in reads {
+            let db = ns.db();
+            if let Some((_, lake)) = self.attached_lookup(db, &table)
                 && !self.is_lake_reader(lake)
             {
                 return Err(PinkDbError::Execution(format!(

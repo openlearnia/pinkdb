@@ -2256,11 +2256,12 @@ fn record_len_guard(len: usize) -> Result<u32> {
 }
 
 /// The catalog objects one committed unit touches: every table any of its
-/// statements reads or writes, plus the databases its `CREATE/DROP DATABASE`
-/// statements name. Wave 45o stores this in every WAL frame (payload v4), so
-/// commit validation can compare a transaction's read∪write set with the
-/// frames another writer published **without** re-binding their SQL against a
-/// store that may hold uncommitted state.
+/// statements reads or writes, plus the schemas and databases its
+/// `CREATE/DROP SCHEMA` / `CREATE/DROP DATABASE` statements name. Wave 45o
+/// stores this in every WAL frame (payload v4), so commit validation can
+/// compare a transaction's read∪write set with the frames another writer
+/// published **without** re-binding their SQL against a store that may hold
+/// uncommitted state.
 ///
 /// Granularity is table-level, exactly like the in-process commit check
 /// (`db.rs`), and the frame's *read* half is included: a transaction that
@@ -2269,18 +2270,32 @@ fn record_len_guard(len: usize) -> Result<u32> {
 /// lowercased) keeps the encoded bytes deterministic.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FrameSets {
-    /// `(database, table)`, lowercased.
-    tables: Vec<(String, String)>,
+    /// `(database, schema, table)`, lowercased.
+    tables: Vec<(String, String, String)>,
+    /// Schemas created or dropped by the frame, lowercased `(db, schema)`
+    /// pairs.
+    schemas: Vec<(String, String)>,
     /// Databases created or dropped by the frame, lowercased.
     dbs: Vec<String>,
 }
 
 impl FrameSets {
-    /// Record a `(database, table)` dependency (called for both reads and
-    /// writes; duplicates are removed by [`FrameSets::canonicalize`]).
-    pub(crate) fn add_table(&mut self, db: &str, table: &str) {
-        self.tables
-            .push((db.to_ascii_lowercase(), table.to_ascii_lowercase()));
+    /// Record a `(database, schema, table)` dependency (called for both reads
+    /// and writes; duplicates are removed by [`FrameSets::canonicalize`]).
+    pub(crate) fn add_table(&mut self, ns: &crate::storage::SchemaPath, table: &str) {
+        self.tables.push((
+            ns.db().to_ascii_lowercase(),
+            ns.schema().to_ascii_lowercase(),
+            table.to_ascii_lowercase(),
+        ));
+    }
+
+    /// Record a schema-level mutation (`CREATE/DROP SCHEMA`).
+    pub(crate) fn add_schema(&mut self, ns: &crate::storage::SchemaPath) {
+        self.schemas.push((
+            ns.db().to_ascii_lowercase(),
+            ns.schema().to_ascii_lowercase(),
+        ));
     }
 
     /// Record a database-level mutation (`CREATE/DROP DATABASE`).
@@ -2288,22 +2303,24 @@ impl FrameSets {
         self.dbs.push(db.to_ascii_lowercase());
     }
 
-    /// The `(database, table)` pairs (canonical after
+    /// The `(database, schema, table)` triples (canonical after
     /// [`FrameSets::canonicalize`]).
-    pub(crate) fn table_pairs(&self) -> &[(String, String)] {
+    pub(crate) fn table_refs(&self) -> &[(String, String, String)] {
         &self.tables
     }
 
     /// Record a whole other touched-set (transaction accumulation).
     pub(crate) fn extend(&mut self, other: &FrameSets) {
         self.tables.extend_from_slice(&other.tables);
+        self.schemas.extend_from_slice(&other.schemas);
         self.dbs.extend_from_slice(&other.dbs);
     }
 
-    /// Record only `other`'s database-level mutations. Used by COMMIT's
-    /// conflict set, which takes its tables from the transaction's own
-    /// read/write sets rather than its buffered statements' touched set.
+    /// Record only `other`'s schema- and database-level mutations. Used by
+    /// COMMIT's conflict set, which takes its tables from the transaction's
+    /// own read/write sets rather than its buffered statements' touched set.
     pub(crate) fn extend_databases(&mut self, other: &FrameSets) {
+        self.schemas.extend_from_slice(&other.schemas);
         self.dbs.extend_from_slice(&other.dbs);
     }
 
@@ -2311,6 +2328,8 @@ impl FrameSets {
     pub(crate) fn canonicalize(&mut self) {
         self.tables.sort();
         self.tables.dedup();
+        self.schemas.sort();
+        self.schemas.dedup();
         self.dbs.sort();
         self.dbs.dedup();
     }
@@ -2319,25 +2338,70 @@ impl FrameSets {
     /// the first conflicting object, or `None` when the two are disjoint.
     /// Both sides must be canonicalized.
     pub(crate) fn conflict_with(&self, ours: &FrameSets) -> Option<String> {
-        for db in &self.dbs {
-            if ours.dbs.contains(db) {
-                return Some(format!("database \"{db}\""));
-            }
+        // A conflict always pairs one side's *mutation* with the *other*
+        // side's object: a frame that creates a database and a table in it
+        // touched nothing that an unrelated frame's table could invalidate.
+        //
+        // A database mutation conflicts with the other side's schemas and
+        // tables of that database (conservative for `CREATE DATABASE`).
+        let db = self.dbs.iter().find(|db| {
+            both(&self.dbs, &ours.dbs, db)
+                || ours.schemas.iter().any(|(sdb, _)| sdb == *db)
+                || ours.tables.iter().any(|(tdb, _, _)| tdb == *db)
+        });
+        if let Some(db) = db {
+            return Some(format!("database \"{db}\""));
         }
-        for (db, table) in &self.tables {
-            if ours.tables.contains(&(db.clone(), table.clone())) || ours.dbs.contains(db) {
-                return Some(format!("table \"{db}.{table}\""));
-            }
+        let db = ours.dbs.iter().find(|db| {
+            self.schemas.iter().any(|(sdb, _)| sdb == *db)
+                || self.tables.iter().any(|(tdb, _, _)| tdb == *db)
+        });
+        if let Some(db) = db {
+            return Some(format!("database \"{db}\""));
         }
-        // Our database-level `DROP DATABASE` conflicts with a frame whose
-        // tables live in that database (conservative for `CREATE DATABASE`).
-        for db in &ours.dbs {
-            if self.tables.iter().any(|(tdb, _)| tdb == db) {
-                return Some(format!("database \"{db}\""));
+        // A schema mutation conflicts with the other side's same schema or any
+        // table of it.
+        let schema = self.schemas.iter().find(|(db, schema)| {
+            both(&self.schemas, &ours.schemas, &(db.clone(), schema.clone()))
+                || ours
+                    .tables
+                    .iter()
+                    .any(|(tdb, ts, _)| tdb == db && ts == schema)
+        });
+        if let Some((db, schema)) = schema {
+            return Some(format!("schema \"{db}.{schema}\""));
+        }
+        let schema = ours.schemas.iter().find(|(db, schema)| {
+            self.tables
+                .iter()
+                .any(|(tdb, ts, _)| tdb == db && ts == schema)
+        });
+        if let Some((db, schema)) = schema {
+            return Some(format!("schema \"{db}.{schema}\""));
+        }
+        for (db, schema, table) in &self.tables {
+            if both(
+                &self.tables,
+                &ours.tables,
+                &(db.clone(), schema.clone(), table.clone()),
+            ) {
+                // A `main`-schema table keeps the `db.table` wording (the
+                // schema level is invisible to SQL until wave 131b).
+                return Some(if schema == "main" {
+                    format!("table \"{db}.{table}\"")
+                } else {
+                    format!("table \"{db}.{schema}.{table}\"")
+                });
             }
         }
         None
     }
+}
+
+/// Is `item` in both sets? (The conflict checks are symmetric, and one side
+/// is always `self`.)
+fn both<T: PartialEq>(a: &[T], b: &[T], item: &T) -> bool {
+    a.iter().any(|x| x == item) && b.iter().any(|x| x == item)
 }
 
 /// `sets_len` value marking a frame whose touched set is unknown (a record
@@ -2346,19 +2410,32 @@ impl FrameSets {
 /// reach a validation window it is treated as conflicting (conservative).
 const SETS_UNKNOWN: u32 = u32::MAX;
 
-/// Encode the frame's touched set (payload v4, format 1):
-/// `u8 ver(=1) | u32 n_tables | n*(u16 db_len | db | u16 t_len | t) |
+/// Encode the frame's touched set (payload v4, format 2):
+/// `u8 ver(=2) | u32 n_tables | n*(u16 db_len | db | u16 s_len | s |
+///  u16 t_len | t) | u32 n_schemas | n*(u16 db_len | db | u16 s_len | s) |
 ///  u32 n_dbs | n*(u16 db_len | db)`.
 fn encode_sets(sets: &FrameSets) -> Result<Vec<u8>> {
     let mut sets = sets.clone();
     sets.canonicalize();
     let mut out = Vec::with_capacity(1 + 4 + sets.dbs.len() * 10);
-    out.push(1u8);
+    out.push(2u8);
     let n = u32::try_from(sets.tables.len())
         .map_err(|_| PinkDbError::Execution("too many tables in one WAL record".to_string()))?;
     out.extend_from_slice(&n.to_le_bytes());
-    for (db, table) in &sets.tables {
-        for name in [db.as_str(), table.as_str()] {
+    for (db, schema, table) in &sets.tables {
+        for name in [db.as_str(), schema.as_str(), table.as_str()] {
+            let l = u16::try_from(name.len()).map_err(|_| {
+                PinkDbError::Execution("name too long for a WAL record".to_string())
+            })?;
+            out.extend_from_slice(&l.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
+    let n = u32::try_from(sets.schemas.len())
+        .map_err(|_| PinkDbError::Execution("too many schemas in one WAL record".to_string()))?;
+    out.extend_from_slice(&n.to_le_bytes());
+    for (db, schema) in &sets.schemas {
+        for name in [db.as_str(), schema.as_str()] {
             let l = u16::try_from(name.len()).map_err(|_| {
                 PinkDbError::Execution("name too long for a WAL record".to_string())
             })?;
@@ -2378,7 +2455,7 @@ fn encode_sets(sets: &FrameSets) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decode the sets section written by [`encode_sets`] (payload format 1).
+/// Decode the sets section written by [`encode_sets`] (payload format 2).
 fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
     let mut pos = 0usize;
     let need = |pos: usize, n: usize| -> std::result::Result<(), String> {
@@ -2389,8 +2466,11 @@ fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
         }
     };
     need(pos, 1)?;
-    if bytes[pos] != 1 {
-        return Err(format!("unsupported frame-sets format {}", bytes[pos]));
+    if bytes[pos] != 2 {
+        return Err(format!(
+            "unsupported frame-sets format {} (this build writes format 2)",
+            bytes[pos]
+        ));
     }
     pos += 1;
     let u32_at = |pos: &mut usize| -> std::result::Result<u32, String> {
@@ -2411,14 +2491,24 @@ fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
         Ok(s)
     };
     let nt = u32_at(&mut pos)? as usize;
-    if nt > bytes.len() / 4 {
+    if nt > bytes.len() / 6 {
         return Err(format!("implausible frame-sets table count {nt}"));
     }
     let mut sets = FrameSets::default();
     for _ in 0..nt {
         let db = str_at(&mut pos)?;
+        let schema = str_at(&mut pos)?;
         let table = str_at(&mut pos)?;
-        sets.tables.push((db, table));
+        sets.tables.push((db, schema, table));
+    }
+    let ns = u32_at(&mut pos)? as usize;
+    if ns > bytes.len() / 4 {
+        return Err(format!("implausible frame-sets schema count {ns}"));
+    }
+    for _ in 0..ns {
+        let db = str_at(&mut pos)?;
+        let schema = str_at(&mut pos)?;
+        sets.schemas.push((db, schema));
     }
     let nd = u32_at(&mut pos)? as usize;
     if nd > bytes.len() / 2 {
@@ -9007,7 +9097,27 @@ mod tests {
     fn sets_of(tables: &[(&str, &str)], dbs: &[&str]) -> FrameSets {
         let mut s = FrameSets::default();
         for (db, t) in tables {
-            s.add_table(db, t);
+            s.add_table(&crate::storage::SchemaPath::new(db, "main"), t);
+        }
+        for d in dbs {
+            s.add_database(d);
+        }
+        s.canonicalize();
+        s
+    }
+
+    /// [`sets_of`] with explicit schemas.
+    fn sets_of_ns(
+        tables: &[(&str, &str, &str)],
+        schemas: &[(&str, &str)],
+        dbs: &[&str],
+    ) -> FrameSets {
+        let mut s = FrameSets::default();
+        for (db, schema, t) in tables {
+            s.add_table(&crate::storage::SchemaPath::new(db, schema), t);
+        }
+        for (db, schema) in schemas {
+            s.add_schema(&crate::storage::SchemaPath::new(db, schema));
         }
         for d in dbs {
             s.add_database(d);
@@ -9038,6 +9148,40 @@ mod tests {
         let mut back = durable(&p);
         assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
         assert_eq!(ints(&mut back, "SELECT a FROM u;"), vec![2]);
+        cleanup(&p);
+    }
+
+    /// Review fix: a foreign frame that created a database and a table in it
+    /// carries both in one touched set. A writer touching an unrelated table
+    /// must still commit — otherwise every frame with a database mutation
+    /// would conflict with every other writer.
+    #[test]
+    fn optimistic_frame_with_its_own_database_objects_does_not_conflict() {
+        let p = tmp_ckpt("optownobjects");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut b = durable(&p);
+        b.execute("BEGIN; INSERT INTO t VALUES (2);").unwrap();
+        // A second writer's frame: `CREATE DATABASE x` plus a table in it, so
+        // its set names the database, the schema and the table.
+        {
+            let wal = b.durable_handle().expect("durable");
+            let mut guard = wal.lock().unwrap();
+            guard
+                .append(
+                    &["CREATE DATABASE x;".to_string()],
+                    Some(&sets_of_ns(&[("x", "main", "u")], &[], &["x"])),
+                    &[],
+                )
+                .unwrap();
+        }
+        b.execute("COMMIT;").unwrap();
+        assert_eq!(ints(&mut b, "SELECT a FROM t ORDER BY a;"), vec![2]);
+        drop(a);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![2]);
+        assert!(back.list_databases().iter().any(|d| d == "x"));
         cleanup(&p);
     }
 
@@ -9418,8 +9562,8 @@ mod tests {
             .expect("create-index record");
         assert_eq!(rec.stmts, vec!["CREATE INDEX \"i x\" ON main.t(\"b b\")"]);
         assert_eq!(
-            rec.sets.as_ref().expect("known touched set").table_pairs(),
-            &[("main".to_string(), "t".to_string())]
+            rec.sets.as_ref().expect("known touched set").table_refs(),
+            &[("main".to_string(), "main".to_string(), "t".to_string())]
         );
 
         db.execute("DROP INDEX \"i x\";").unwrap();
@@ -9429,8 +9573,8 @@ mod tests {
             .expect("drop-index record");
         assert_eq!(rec.stmts, vec!["DROP INDEX main.\"i x\""]);
         assert_eq!(
-            rec.sets.as_ref().expect("known touched set").table_pairs(),
-            &[("main".to_string(), "t".to_string())]
+            rec.sets.as_ref().expect("known touched set").table_refs(),
+            &[("main".to_string(), "main".to_string(), "t".to_string())]
         );
 
         // A checkpoint publishes the definitions (and maps) inside `.pink`
@@ -9560,5 +9704,92 @@ mod tests {
         assert_eq!(db.table_in("main", "t").unwrap().indexes.len(), 0);
         assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
         cleanup(&p);
+    }
+
+    /// Wave 131a: the frame sets carry `(db, schema, table)` triples and
+    /// `(db, schema)` pairs; the encoding round-trips both, and the older
+    /// format is refused instead of decoded.
+    #[test]
+    fn frame_sets_round_trip_triples_and_schema_pairs() {
+        let sets = sets_of_ns(
+            &[("db", "s", "t"), ("db2", "main", "u")],
+            &[("db", "s"), ("db2", "main")],
+            &["db", "db2"],
+        );
+        let back = decode_sets(&encode_sets(&sets).unwrap()).unwrap();
+        assert_eq!(back.table_refs(), sets.table_refs());
+        assert_eq!(back.schemas, sets.schemas);
+        assert_eq!(back.dbs, sets.dbs);
+        // Format 1 carried `(db, table)` pairs: a stale payload must not be
+        // silently read as triples.
+        let err = decode_sets(&[1u8]).unwrap_err();
+        assert!(err.contains("frame-sets format 1"), "{err}");
+    }
+
+    /// Review fix: a conflict pairs one side's mutation with the *other*
+    /// side's objects. A frame that creates a database and a table in it (its
+    /// own `dbs` and `tables` both name `x`) therefore does not conflict with
+    /// an unrelated frame, and neither does one that creates a schema
+    /// alongside a table in that schema.
+    #[test]
+    fn a_frames_own_objects_do_not_conflict() {
+        let unrelated = sets_of(&[("main", "u")], &[]);
+        let created_db = sets_of_ns(&[("x", "main", "t")], &[], &["x"]);
+        let created_schema = sets_of_ns(&[("db", "s", "t")], &[("db", "s")], &[]);
+        for own in [&created_db, &created_schema] {
+            assert_eq!(own.conflict_with(&unrelated), None);
+            assert_eq!(unrelated.conflict_with(own), None);
+        }
+    }
+
+    /// Review fix: every cross pairing still conflicts, in both directions.
+    #[test]
+    fn a_database_or_schema_mutation_conflicts_with_the_other_side() {
+        let other_schema = sets_of_ns(&[], &[("db", "s")], &[]);
+        let other_table = sets_of_ns(&[("db", "main", "t")], &[], &[]);
+        let drop_db = sets_of(&[], &["db"]);
+        for other in [&other_schema, &other_table] {
+            assert_eq!(
+                drop_db.conflict_with(other).as_deref(),
+                Some("database \"db\""),
+                "a database mutation conflicts with the other side's objects"
+            );
+            assert_eq!(
+                other.conflict_with(&drop_db).as_deref(),
+                Some("database \"db\""),
+                "the pairing is symmetric"
+            );
+        }
+        let drop_schema = sets_of_ns(&[], &[("db", "s")], &[]);
+        let table = sets_of_ns(&[("db", "s", "t")], &[], &[]);
+        assert_eq!(
+            drop_schema.conflict_with(&table).as_deref(),
+            Some("schema \"db.s\"")
+        );
+        assert_eq!(
+            table.conflict_with(&drop_schema).as_deref(),
+            Some("schema \"db.s\"")
+        );
+    }
+
+    /// Wave 131a: a schema mutation conflicts with any table of that schema
+    /// (and nothing outside it).
+    #[test]
+    fn a_schema_mutation_conflicts_with_a_table_of_that_schema() {
+        let drop = sets_of_ns(&[], &[("db", "s")], &[]);
+        let write = sets_of_ns(&[("db", "s", "t")], &[], &[]);
+        assert_eq!(
+            drop.conflict_with(&write).as_deref(),
+            Some("schema \"db.s\"")
+        );
+        // A table of another schema or database is disjoint.
+        assert_eq!(
+            drop.conflict_with(&sets_of_ns(&[("db", "other", "t")], &[], &[])),
+            None
+        );
+        assert_eq!(
+            drop.conflict_with(&sets_of_ns(&[("db2", "s", "t")], &[], &[])),
+            None
+        );
     }
 }

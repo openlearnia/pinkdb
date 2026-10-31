@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! "PINKDBI1"                       magic
-//! u32                              format version (1)
+//! u32                              format version (2)
 //! u64, u8[len]                     .pink metadata image
 //! u32                              CRC32C of every preceding byte
 //! ```
@@ -37,8 +37,10 @@ use crate::{PinkDbError, Result};
 
 /// `PINKDBI1`, the image magic (a `.pink` file ends with `PINKDB06`).
 const MAGIC: &[u8; 8] = b"PINKDBI1";
-/// The image format this build writes and reads.
-const FORMAT: u32 = 1;
+/// The image format this build writes and reads. Format 2 (wave 131a) carries
+/// the database's schemas: the image embeds a footer whose per-database
+/// sections are now per-schema.
+const FORMAT: u32 = 2;
 
 impl PinkDb {
     /// The image of database `db`: its catalog objects with each table's
@@ -146,11 +148,13 @@ pub(crate) fn load_database_image(
         .expect("the database was found above");
     if !cat.name.eq_ignore_ascii_case(name) {
         // Attached under another name: the definitions follow the database.
-        for trigger in &mut cat.triggers {
-            trigger.db = name.to_string();
-        }
-        for mv in cat.materialized_views.values_mut() {
-            mv.query = None;
+        for schema in cat.schemas.values_mut() {
+            for trigger in &mut schema.triggers {
+                trigger.db = name.to_string();
+            }
+            for mv in schema.materialized_views.values_mut() {
+                mv.query = None;
+            }
         }
     }
     cat.name = name.to_string();
@@ -247,5 +251,31 @@ impl<'a> Reader<'a> {
 
     fn rest(&self) -> &'a [u8] {
         &self.bytes[self.pos..]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::DataType;
+
+    /// Wave 131a: format 2 carries the database's schemas. A format-1 image
+    /// (one flat table list) is refused instead of misread.
+    #[test]
+    fn a_format_one_image_is_refused() {
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        let mut bytes = db.to_database_image("main").unwrap();
+        // The format word follows the 8-byte magic.
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let n = bytes.len();
+        let crc = crc32c(&bytes[..n - 4]);
+        bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        let err = decode(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("database image format 1 is not supported"),
+            "{err}"
+        );
     }
 }

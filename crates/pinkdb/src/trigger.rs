@@ -968,7 +968,9 @@ pub(crate) fn validate(db: &PinkDb, def: &TriggerDef) -> Result<()> {
     if def.events.is_empty() {
         return Err(err(def, "a trigger needs at least one event"));
     }
-    if let Some(e) = db.attached_read_only(&def.db, &def.table) {
+    // A trigger definition names its table by database; the schema
+    // qualifier arrives with the grammar (wave 131b), so it means `main`.
+    if let Some(e) = db.attached_read_only(&crate::storage::SchemaPath::main(&def.db), &def.table) {
         return Err(err(
             def,
             format!("triggers are not supported on attached lake tables: {e}"),

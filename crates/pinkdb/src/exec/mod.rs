@@ -1041,7 +1041,7 @@ impl<'a> Cx<'a> {
 /// rebuilds the same table, and losing access on every rebuild would be a
 /// surprise (a plain `DROP TABLE` does remove them).
 fn replace_table(db: &mut PinkDb, target: &str, name: &str) -> Result<()> {
-    if let Some(err) = db.attached_read_only(target, name) {
+    if let Some(err) = db.attached_read_only(&crate::storage::SchemaPath::main(target), name) {
         return Err(err);
     }
     if db.table_in(target, name).is_ok() {
@@ -1079,14 +1079,21 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
 /// touches no rows, writes no WAL record, and the next checkpoint persists
 /// the result.
 fn analyze_tables(db: &mut PinkDb, dbname: &str, table: Option<&str>) -> Result<usize> {
-    let names = match table {
-        Some(name) => vec![name.to_string()],
-        None => db.list_tables_in(dbname),
+    // `ANALYZE` names no schema (the grammar arrives with wave 131b), so a
+    // named table is the database's `main` one; the all-tables form means
+    // every table of the database, in every schema.
+    let targets: Vec<(crate::storage::SchemaPath, String)> = match table {
+        Some(name) => vec![(crate::storage::SchemaPath::main(dbname), name.to_string())],
+        None => db
+            .all_tables_of(dbname)
+            .into_iter()
+            .map(|(ns, name, _)| (ns, name))
+            .collect(),
     };
-    for name in &names {
-        db.table_mut_in(dbname, name)?.analyze();
+    for (ns, name) in &targets {
+        db.table_mut_in(ns, name)?.analyze();
     }
-    Ok(names.len())
+    Ok(targets.len())
 }
 
 /// The shared gate for the statements that load native code (`LOAD EXTENSION`,
@@ -1122,7 +1129,11 @@ fn use_result(db: &PinkDb, name: &str) -> Result<QueryResult> {
 /// store**: the schema/rows a refresh would write. Rebinds the definition from
 /// its persisted SQL when the catalog has no bound plan (a file whose base
 /// objects were missing at load), caching the rebound plan.
-fn evaluate_materialized_view(db: &mut PinkDb, target: &str, name: &str) -> Result<Output> {
+fn evaluate_materialized_view(
+    db: &mut PinkDb,
+    target: &crate::storage::SchemaPath,
+    name: &str,
+) -> Result<Output> {
     let query = match db.materialized_view_in(target, name)?.query.clone() {
         Some(q) => q,
         None => {
@@ -1145,7 +1156,12 @@ fn evaluate_materialized_view(db: &mut PinkDb, target: &str, name: &str) -> Resu
 /// recreating the table when the output schema changed. Shared by `CREATE
 /// MATERIALIZED VIEW` and every refresh: evaluation happens first, so a
 /// failing query can neither clear good data nor leave a half-written table.
-fn store_materialized_view(db: &mut PinkDb, target: &str, name: &str, out: &Output) -> Result<()> {
+fn store_materialized_view(
+    db: &mut PinkDb,
+    target: &crate::storage::SchemaPath,
+    name: &str,
+    out: &Output,
+) -> Result<()> {
     let schema: Vec<(String, DataType)> = out
         .names
         .iter()
@@ -1187,7 +1203,11 @@ fn store_materialized_view(db: &mut PinkDb, target: &str, name: &str, out: &Outp
 /// Shared by the manual statement and the boundary pass (wave 80). Errors
 /// propagate to the caller: the manual statement reports them, the automatic
 /// pass records them in the definition.
-pub(crate) fn refresh_materialized_view(db: &mut PinkDb, target: &str, name: &str) -> Result<()> {
+pub(crate) fn refresh_materialized_view(
+    db: &mut PinkDb,
+    target: &crate::storage::SchemaPath,
+    name: &str,
+) -> Result<()> {
     let out = evaluate_materialized_view(db, target, name)?;
     store_materialized_view(db, target, name, &out)?;
     db.mark_refreshed(target, name, crate::mv::now_ms())
@@ -1731,9 +1751,10 @@ pub(crate) fn run_plain(
             if_exists,
         } => {
             let target = resolve_db(db, qdb);
+            let ns = crate::storage::SchemaPath::main(&target);
             // An attached (read-only) name is refused before the existence
             // probe: DROP TABLE must never look like a missing-table no-op.
-            if let Some(err) = db.attached_read_only(&target, name) {
+            if let Some(err) = db.attached_read_only(&ns, name) {
                 return Err(err);
             }
             if db.table_in(&target, name).is_err() {
@@ -1746,7 +1767,7 @@ pub(crate) fn run_plain(
             // Wave 48: a table's grants go with the table — leaving them
             // behind would silently hand them to a future table of the same
             // name.
-            db.rbac_mut().remove_table(&target, name);
+            db.rbac_mut().remove_table(ns.db(), ns.schema(), name);
             Ok(QueryResult::DroppedTable { name: name.clone() })
         }
         LogicalPlan::CreateIndex {
@@ -1816,9 +1837,10 @@ pub(crate) fn run_plain(
         }
         LogicalPlan::AlterTable { db: qdb, name, op } => {
             let target = resolve_db(db, qdb);
+            let ns = crate::storage::SchemaPath::main(&target);
             // An attached (read-only) name is refused before anything runs:
             // ALTER must never look like a no-op on a lake table.
-            if let Some(err) = db.attached_read_only(&target, name) {
+            if let Some(err) = db.attached_read_only(&ns, name) {
                 return Err(err);
             }
             match op {
@@ -1943,7 +1965,7 @@ pub(crate) fn run_plain(
                 AlterTablePlan::RenameTable { to } => {
                     db.rename_table_in(&target, name, to)?;
                     // Wave 48: privileges follow the table to its new name.
-                    db.rbac_mut().rename_table(&target, name, to);
+                    db.rbac_mut().rename_table(ns.db(), ns.schema(), name, to);
                     Ok(QueryResult::AlteredTable { name: to.clone() })
                 }
             }
@@ -1979,7 +2001,7 @@ pub(crate) fn run_plain(
             if db.table_in(&target, name).is_ok() {
                 db.drop_table_in(&target, name)?;
             }
-            store_materialized_view(db, &target, name, &out)?;
+            store_materialized_view(db, &crate::storage::SchemaPath::main(&target), name, &out)?;
             // Store the definition: the bound query, the defining SQL text
             // (persisted, and the rebuild source when the plan cannot be
             // rebound), the policy, and the initial refresh stamp — creation
@@ -2003,12 +2025,12 @@ pub(crate) fn run_plain(
             Ok(QueryResult::CreatedMaterializedView { name: name.clone() })
         }
         LogicalPlan::RefreshMaterializedView { db: qdb, name } => {
-            let target = resolve_db(db, qdb);
+            let target = crate::storage::SchemaPath::main(&resolve_db(db, qdb));
             refresh_materialized_view(db, &target, name)?;
             Ok(QueryResult::RefreshedMaterializedView { name: name.clone() })
         }
         LogicalPlan::RefreshMaterializedViews { db: qdb } => {
-            let target = resolve_db(db, qdb);
+            let target = crate::storage::SchemaPath::main(&resolve_db(db, qdb));
             let names = db.materialized_view_names_in(&target);
             // All-or-nothing: every defining query is evaluated before any
             // backing table is touched, so one broken view cannot leave the

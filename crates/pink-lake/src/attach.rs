@@ -2201,6 +2201,7 @@ mod tests {
 
         let saved = pinkdb::persist::SavedTableStats {
             db: "main".to_string(),
+            schema: "main".to_string(),
             table: "t".to_string(),
             rows: 3,
             columns: vec![pinkdb::persist::SavedColumnStats {

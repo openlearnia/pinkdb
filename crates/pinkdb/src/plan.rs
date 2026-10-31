@@ -999,7 +999,11 @@ pub(crate) fn optimistic_eligible(plan: &LogicalPlan) -> bool {
 /// transaction wrote could not be replayed honestly on top of it. The
 /// matches are exhaustive on purpose — a new plan variant must decide here
 /// what it touches.
-pub(crate) fn plan_sets(plan: &LogicalPlan, default_db: &str, out: &mut crate::wal::FrameSets) {
+pub(crate) fn plan_sets(
+    plan: &LogicalPlan,
+    default_ns: &crate::storage::SchemaPath,
+    out: &mut crate::wal::FrameSets,
+) {
     match plan {
         LogicalPlan::CreateDatabase { name, .. }
         | LogicalPlan::DropDatabase { name, .. }
@@ -1017,7 +1021,12 @@ pub(crate) fn plan_sets(plan: &LogicalPlan, default_db: &str, out: &mut crate::w
         // wave 44).
         LogicalPlan::Grant { spec } | LogicalPlan::Revoke { spec } => {
             match &spec.object {
-                crate::rbac::GrantObject::Table { db, table } => out.add_table(db, table),
+                crate::rbac::GrantObject::Table { db, schema, table } => {
+                    out.add_table(&crate::storage::SchemaPath::new(db, schema), table);
+                }
+                crate::rbac::GrantObject::Schema { db, schema } => {
+                    out.add_schema(&crate::storage::SchemaPath::new(db, schema));
+                }
                 crate::rbac::GrantObject::Database { db } => out.add_database(db),
                 // A role membership names no object either.
                 crate::rbac::GrantObject::Admin | crate::rbac::GrantObject::Role { .. } => {}
@@ -1027,18 +1036,18 @@ pub(crate) fn plan_sets(plan: &LogicalPlan, default_db: &str, out: &mut crate::w
         _ => {}
     }
     let mut reads = std::collections::HashSet::new();
-    collect_tables_read(plan, default_db, &mut reads);
-    for (db, table) in reads {
-        out.add_table(&db, &table);
+    collect_tables_read(plan, default_ns, &mut reads);
+    for (ns, table) in reads {
+        out.add_table(&ns, &table);
     }
     // Writes: the same `(database, table)` pairs `record_writes` records
     // (view DDL is session-local and never logged; a frame never contains
     // it).
     let mut writes = std::collections::HashSet::new();
     let mut views = std::collections::HashSet::new();
-    crate::db::record_writes(plan, default_db, &mut writes, &mut views);
-    for (db, table) in writes {
-        out.add_table(&db, &table);
+    crate::db::record_writes(plan, default_ns, &mut writes, &mut views);
+    for (ns, table) in writes {
+        out.add_table(&ns, &table);
     }
 }
 
@@ -1050,14 +1059,18 @@ pub(crate) fn plan_sets(plan: &LogicalPlan, default_db: &str, out: &mut crate::w
 /// expression variant must decide here whether it reads tables.
 pub(crate) fn collect_tables_read(
     plan: &LogicalPlan,
-    default_db: &str,
-    out: &mut std::collections::HashSet<(String, String)>,
+    default_ns: &crate::storage::SchemaPath,
+    out: &mut std::collections::HashSet<crate::storage::TableRef>,
 ) {
+    // An unqualified name resolves in the statement's schema; 131a has no
+    // schema syntax yet, so a `db` qualifier always means that database's
+    // `main` schema (131b carries the schema in the plan).
     let key = |db: &Option<String>, table: &str| {
-        (
-            db.as_deref().unwrap_or(default_db).to_ascii_lowercase(),
-            table.to_ascii_lowercase(),
-        )
+        let ns = match db {
+            Some(db) => crate::storage::SchemaPath::main(db),
+            None => default_ns.clone(),
+        };
+        (ns, table.to_ascii_lowercase())
     };
     match plan {
         LogicalPlan::Scan {
@@ -1065,7 +1078,7 @@ pub(crate) fn collect_tables_read(
             table,
             ..
         } => {
-            out.insert((db.to_ascii_lowercase(), table.to_ascii_lowercase()));
+            out.insert(key(&Some(db.clone()), table));
         }
         // A file source reads no store table; `COPY` reads its source table.
         LogicalPlan::CopyTo { db, table, .. } => {
@@ -1112,18 +1125,21 @@ pub(crate) fn collect_tables_read(
         // concurrent DROP TABLE then conflicts instead of leaving a trigger
         // pointing at a vanished table.
         LogicalPlan::CreateTrigger { def, .. } => {
-            out.insert((def.db.to_ascii_lowercase(), def.table.to_ascii_lowercase()));
+            out.insert((
+                crate::storage::SchemaPath::main(&def.db),
+                def.table.to_ascii_lowercase(),
+            ));
         }
         // A materialized view's defining query is part of the statement: the
         // backing table is computed from exactly these reads.
         LogicalPlan::CreateMaterializedView { query, .. } => {
-            collect_tables_read(query, default_db, out);
+            collect_tables_read(query, default_ns, out);
         }
         // Wave 48: a grant's object must exist, so the statement reads it
         // (the frame's set records the dependency).
         LogicalPlan::Grant { spec } | LogicalPlan::Revoke { spec } => {
-            if let crate::rbac::GrantObject::Table { db, table } = &spec.object {
-                out.insert((db.clone(), table.clone()));
+            if let crate::rbac::GrantObject::Table { db, schema, table } = &spec.object {
+                out.insert((crate::storage::SchemaPath::new(db, schema), table.clone()));
             }
         }
         // RBAC user/role statements name no table.
@@ -1144,7 +1160,7 @@ pub(crate) fn collect_tables_read(
         // execution and are reported through `PinkDb::proc_frame`.
         LogicalPlan::Call { args, .. } => {
             for e in args {
-                expr_tables_read(e, default_db, out);
+                expr_tables_read(e, default_ns, out);
             }
         }
         // `CREATE TABLE` reads the declared foreign-key targets: the binder
@@ -1153,26 +1169,29 @@ pub(crate) fn collect_tables_read(
         // conflict for the write-set validation).
         LogicalPlan::CreateTable { constraints, .. } => {
             for fk in &constraints.foreign_keys {
-                out.insert((fk.ref_db.clone(), fk.ref_table.clone()));
+                out.insert((
+                    crate::storage::SchemaPath::main(&fk.ref_db),
+                    fk.ref_table.clone(),
+                ));
             }
         }
-        LogicalPlan::Explain { plan } => collect_tables_read(plan, default_db, out),
-        LogicalPlan::CreateTableAs { query, .. } => collect_tables_read(query, default_db, out),
+        LogicalPlan::Explain { plan } => collect_tables_read(plan, default_ns, out),
+        LogicalPlan::CreateTableAs { query, .. } => collect_tables_read(query, default_ns, out),
         LogicalPlan::Values { rows, sources, .. } => {
             for (database, table) in sources {
-                out.insert((database.to_ascii_lowercase(), table.to_ascii_lowercase()));
+                out.insert(key(&Some(database.clone()), table));
             }
             for e in rows.iter().flatten() {
-                expr_tables_read(e, default_db, out);
+                expr_tables_read(e, default_ns, out);
             }
         }
         LogicalPlan::Insert { .. } | LogicalPlan::InsertSelect { .. } => {
             let (exprs, plans) = dml_payload(plan);
             for p in plans {
-                collect_tables_read(p, default_db, out);
+                collect_tables_read(p, default_ns, out);
             }
             for e in exprs {
-                expr_tables_read(e, default_db, out);
+                expr_tables_read(e, default_ns, out);
             }
         }
         // The target is both read (scanned for the affected rows) and
@@ -1183,26 +1202,26 @@ pub(crate) fn collect_tables_read(
             out.insert(key(db, table));
             let (exprs, plans) = dml_payload(plan);
             for p in plans {
-                collect_tables_read(p, default_db, out);
+                collect_tables_read(p, default_ns, out);
             }
             for e in exprs {
-                expr_tables_read(e, default_db, out);
+                expr_tables_read(e, default_ns, out);
             }
         }
         LogicalPlan::SetOp { left, right, .. } => {
-            collect_tables_read(left, default_db, out);
-            collect_tables_read(right, default_db, out);
+            collect_tables_read(left, default_ns, out);
+            collect_tables_read(right, default_ns, out);
         }
         LogicalPlan::Filter { input, predicate } => {
-            collect_tables_read(input, default_db, out);
-            expr_tables_read(predicate, default_db, out);
+            collect_tables_read(input, default_ns, out);
+            expr_tables_read(predicate, default_ns, out);
         }
         LogicalPlan::Cte { query, body, .. } => {
-            collect_tables_read(query, default_db, out);
-            collect_tables_read(body, default_db, out);
+            collect_tables_read(query, default_ns, out);
+            collect_tables_read(body, default_ns, out);
         }
         LogicalPlan::Window { input, windows, .. } => {
-            collect_tables_read(input, default_db, out);
+            collect_tables_read(input, default_ns, out);
             for w in windows {
                 let exprs = w
                     .arg
@@ -1211,7 +1230,7 @@ pub(crate) fn collect_tables_read(
                     .chain(w.partition.iter())
                     .chain(w.order.iter().map(|(e, _)| e));
                 for e in exprs {
-                    expr_tables_read(e, default_db, out);
+                    expr_tables_read(e, default_ns, out);
                 }
             }
         }
@@ -1223,63 +1242,63 @@ pub(crate) fn collect_tables_read(
             residual,
             ..
         } => {
-            collect_tables_read(left, default_db, out);
-            collect_tables_read(right, default_db, out);
+            collect_tables_read(left, default_ns, out);
+            collect_tables_read(right, default_ns, out);
             for k in left_keys {
-                expr_tables_read(k, default_db, out);
+                expr_tables_read(k, default_ns, out);
             }
             for k in right_keys {
-                expr_tables_read(k, default_db, out);
+                expr_tables_read(k, default_ns, out);
             }
             if let Some(residual) = residual {
-                expr_tables_read(residual, default_db, out);
+                expr_tables_read(residual, default_ns, out);
             }
         }
         LogicalPlan::NestedLoopJoin {
             left, right, on, ..
         } => {
-            collect_tables_read(left, default_db, out);
-            collect_tables_read(right, default_db, out);
+            collect_tables_read(left, default_ns, out);
+            collect_tables_read(right, default_ns, out);
             if let Some(on) = on {
-                expr_tables_read(on, default_db, out);
+                expr_tables_read(on, default_ns, out);
             }
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
-            collect_tables_read(input, default_db, out);
+            collect_tables_read(input, default_ns, out);
             for e in keys.iter().chain(
                 aggs.iter()
                     .flat_map(|a| a.arg.iter().chain(a.filter.iter())),
             ) {
-                expr_tables_read(e, default_db, out);
+                expr_tables_read(e, default_ns, out);
             }
         }
         LogicalPlan::Project { input, exprs, .. } => {
-            collect_tables_read(input, default_db, out);
+            collect_tables_read(input, default_ns, out);
             for e in exprs {
-                expr_tables_read(e, default_db, out);
+                expr_tables_read(e, default_ns, out);
             }
         }
         LogicalPlan::Sort { input, keys } => {
-            collect_tables_read(input, default_db, out);
+            collect_tables_read(input, default_ns, out);
             for (e, _) in keys {
-                expr_tables_read(e, default_db, out);
+                expr_tables_read(e, default_ns, out);
             }
         }
         LogicalPlan::Distinct { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Sample { input, .. } => {
-            collect_tables_read(input, default_db, out);
+            collect_tables_read(input, default_ns, out);
         }
         LogicalPlan::Offset { input, .. } => {
-            collect_tables_read(input, default_db, out);
+            collect_tables_read(input, default_ns, out);
         }
     }
 }
 
 fn expr_tables_read(
     expr: &BoundExpr,
-    default_db: &str,
-    out: &mut std::collections::HashSet<(String, String)>,
+    default_ns: &crate::storage::SchemaPath,
+    out: &mut std::collections::HashSet<crate::storage::TableRef>,
 ) {
     match expr {
         BoundExpr::Literal(_)
@@ -1288,16 +1307,16 @@ fn expr_tables_read(
         | BoundExpr::AggRef { .. }
         | BoundExpr::WindowRef { .. } => {}
         BoundExpr::Binary { left, right, .. } => {
-            expr_tables_read(left, default_db, out);
-            expr_tables_read(right, default_db, out);
+            expr_tables_read(left, default_ns, out);
+            expr_tables_read(right, default_ns, out);
         }
         BoundExpr::Not(e)
         | BoundExpr::Negate { expr: e, .. }
         | BoundExpr::IsNull { expr: e, .. }
-        | BoundExpr::Cast { expr: e, .. } => expr_tables_read(e, default_db, out),
+        | BoundExpr::Cast { expr: e, .. } => expr_tables_read(e, default_ns, out),
         BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
             for a in args {
-                expr_tables_read(a, default_db, out);
+                expr_tables_read(a, default_ns, out);
             }
         }
         BoundExpr::DynamicScalar { args, reads, .. } => {
@@ -1305,29 +1324,32 @@ fn expr_tables_read(
             // the index, and its base table) records them here: RBAC's read
             // pass and the WAL's frame sets then see them like a `Scan`.
             for (db, table) in reads.iter() {
-                out.insert((db.clone(), table.clone()));
+                out.insert((
+                    crate::storage::SchemaPath::main(db),
+                    table.to_ascii_lowercase(),
+                ));
             }
             for a in args.iter() {
-                expr_tables_read(a, default_db, out);
+                expr_tables_read(a, default_ns, out);
             }
         }
         BoundExpr::Case {
             branches, else_, ..
         } => {
             for (c, v) in branches {
-                expr_tables_read(c, default_db, out);
-                expr_tables_read(v, default_db, out);
+                expr_tables_read(c, default_ns, out);
+                expr_tables_read(v, default_ns, out);
             }
             if let Some(e) = else_ {
-                expr_tables_read(e, default_db, out);
+                expr_tables_read(e, default_ns, out);
             }
         }
         BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
-            collect_tables_read(query, default_db, out);
+            collect_tables_read(query, default_ns, out);
         }
         BoundExpr::InSubquery { expr, query, .. } => {
-            expr_tables_read(expr, default_db, out);
-            collect_tables_read(query, default_db, out);
+            expr_tables_read(expr, default_ns, out);
+            collect_tables_read(query, default_ns, out);
         }
     }
 }

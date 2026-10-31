@@ -176,20 +176,29 @@ pub enum GrantObject {
     Admin,
     /// Membership in a role (a `GRANT role TO principal`).
     Role { role: String },
-    /// A table in one database.
-    Table { db: String, table: String },
-    /// A whole database (the `CREATE` privilege).
+    /// A table in one schema.
+    Table {
+        db: String,
+        schema: String,
+        table: String,
+    },
+    /// A whole schema: `CREATE` allows creating objects in it, the table
+    /// privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) cover every table
+    /// in it.
+    Schema { db: String, schema: String },
+    /// A whole database (the `CREATE` privilege covers every schema).
     Database { db: String },
 }
 
 impl GrantObject {
-    /// `ADMIN` / `ROLE analyst` / `TABLE main.t` / `DATABASE main`: the
-    /// label the grant descriptions use.
+    /// `ADMIN` / `ROLE analyst` / `TABLE main.main.t` / `SCHEMA main.s` /
+    /// `DATABASE main`: the label the grant descriptions use.
     pub fn label(&self) -> String {
         match self {
             GrantObject::Admin => "ADMIN".to_string(),
             GrantObject::Role { role } => format!("ROLE {role}"),
-            GrantObject::Table { db, table } => format!("TABLE {db}.{table}"),
+            GrantObject::Table { db, schema, table } => format!("TABLE {db}.{schema}.{table}"),
+            GrantObject::Schema { db, schema } => format!("SCHEMA {db}.{schema}"),
             GrantObject::Database { db } => format!("DATABASE {db}"),
         }
     }
@@ -593,9 +602,9 @@ pub struct UserDef {
 /// The store's user/role/grant catalog. One per store (users and roles are
 /// store-global: a table privilege names its database).
 ///
-/// Keys are lowercased principal names and lowercased `(database, table)`
-/// pairs; [`RbacCatalog::display_of`] recovers the as-created spelling for
-/// diagnostics.
+/// Keys are lowercased principal names and lowercased `(database, schema,
+/// table)` triples or `(database, schema)` pairs; [`RbacCatalog::display_of`]
+/// recovers the as-created spelling for diagnostics.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RbacCatalog {
     /// Users by lowercased name.
@@ -605,8 +614,11 @@ pub(crate) struct RbacCatalog {
     /// Role membership: member (a user or role, lowercased) → the roles it
     /// is a direct member of (lowercased).
     pub(crate) memberships: BTreeMap<String, BTreeSet<String>>,
-    /// Table grants: `(db, table)` → principal → privileges.
-    pub(crate) table_grants: BTreeMap<(String, String), BTreeMap<String, BTreeSet<Privilege>>>,
+    /// Table grants: `(db, schema, table)` → principal → privileges.
+    pub(crate) table_grants:
+        BTreeMap<(String, String, String), BTreeMap<String, BTreeSet<Privilege>>>,
+    /// Schema grants: `(db, schema)` → principal → privileges.
+    pub(crate) schema_grants: BTreeMap<(String, String), BTreeMap<String, BTreeSet<Privilege>>>,
     /// Database grants: `db` → principal → privileges.
     pub(crate) database_grants: BTreeMap<String, BTreeMap<String, BTreeSet<Privilege>>>,
     /// Principals (users and roles) holding the global `ADMIN` privilege.
@@ -665,30 +677,55 @@ impl RbacCatalog {
             // `ADMIN` is not a privilege variant; membership is never a
             // privilege check target.
             GrantObject::Admin | GrantObject::Role { .. } => false,
-            GrantObject::Table { db, table } => {
-                let Some(by_principal) = self
-                    .table_grants
-                    .get(&(db.to_ascii_lowercase(), table.to_ascii_lowercase()))
-                else {
-                    return false;
-                };
-                holders.iter().any(|p| {
-                    by_principal
-                        .get(p)
-                        .is_some_and(|set| set.contains(&privilege))
-                })
+            // A table privilege is covered by a grant on the table itself, on
+            // its schema, or on the database — the PostgreSQL shape: a
+            // schema-level privilege applies to every table in the schema, a
+            // database-level one to every schema in the database.
+            GrantObject::Table { db, schema, table } => {
+                let db = db.to_ascii_lowercase();
+                let schema = schema.to_ascii_lowercase();
+                let table = table.to_ascii_lowercase();
+                self.holds(
+                    &self.table_grants.get(&(db.clone(), schema.clone(), table)),
+                    &holders,
+                    privilege,
+                ) || self.holds(
+                    &self.schema_grants.get(&(db.clone(), schema)),
+                    &holders,
+                    privilege,
+                ) || self.holds(&self.database_grants.get(&db), &holders, privilege)
             }
-            GrantObject::Database { db } => {
-                let Some(by_principal) = self.database_grants.get(&db.to_ascii_lowercase()) else {
-                    return false;
-                };
-                holders.iter().any(|p| {
-                    by_principal
-                        .get(p)
-                        .is_some_and(|set| set.contains(&privilege))
-                })
+            GrantObject::Schema { db, schema } => {
+                let db = db.to_ascii_lowercase();
+                let schema = schema.to_ascii_lowercase();
+                self.holds(
+                    &self.schema_grants.get(&(db.clone(), schema)),
+                    &holders,
+                    privilege,
+                ) || self.holds(&self.database_grants.get(&db), &holders, privilege)
             }
+            GrantObject::Database { db } => self.holds(
+                &self.database_grants.get(&db.to_ascii_lowercase()),
+                &holders,
+                privilege,
+            ),
         }
+    }
+
+    /// Does any holder's grant set in one object's map contain `privilege`?
+    fn holds(
+        &self,
+        grants: &Option<&BTreeMap<String, BTreeSet<Privilege>>>,
+        holders: &[String],
+        privilege: Privilege,
+    ) -> bool {
+        grants.is_some_and(|by_principal| {
+            holders.iter().any(|p| {
+                by_principal
+                    .get(p)
+                    .is_some_and(|set| set.contains(&privilege))
+            })
+        })
     }
 
     /// Is `principal` a global admin?
@@ -724,10 +761,46 @@ impl RbacCatalog {
         for holder in holders {
             match object {
                 GrantObject::Admin | GrantObject::Role { .. } => {}
-                GrantObject::Table { db, table } => {
+                GrantObject::Table { db, schema, table } => {
+                    let key = (
+                        db.to_ascii_lowercase(),
+                        schema.to_ascii_lowercase(),
+                        table.to_ascii_lowercase(),
+                    );
                     if let Some(set) = self
                         .table_grants
-                        .get(&(db.to_ascii_lowercase(), table.to_ascii_lowercase()))
+                        .get(&key)
+                        .and_then(|by_principal| by_principal.get(&holder))
+                    {
+                        out.extend(set.iter().copied());
+                    }
+                    if let Some(set) = self
+                        .schema_grants
+                        .get(&(key.0.clone(), key.1.clone()))
+                        .and_then(|by_principal| by_principal.get(&holder))
+                    {
+                        out.extend(set.iter().copied());
+                    }
+                    if let Some(set) = self
+                        .database_grants
+                        .get(&key.0)
+                        .and_then(|by_principal| by_principal.get(&holder))
+                    {
+                        out.extend(set.iter().copied());
+                    }
+                }
+                GrantObject::Schema { db, schema } => {
+                    let db = db.to_ascii_lowercase();
+                    if let Some(set) = self
+                        .schema_grants
+                        .get(&(db.clone(), schema.to_ascii_lowercase()))
+                        .and_then(|by_principal| by_principal.get(&holder))
+                    {
+                        out.extend(set.iter().copied());
+                    }
+                    if let Some(set) = self
+                        .database_grants
+                        .get(&db)
                         .and_then(|by_principal| by_principal.get(&holder))
                     {
                         out.extend(set.iter().copied());
@@ -744,6 +817,14 @@ impl RbacCatalog {
                 }
             }
         }
+        // Effective rights are scoped: a table reports only table
+        // privileges (a database's `CREATE` is not a right on the table).
+        let scope: &[Privilege] = match object {
+            GrantObject::Table { .. } => &Privilege::TABLE,
+            GrantObject::Schema { .. } | GrantObject::Database { .. } => &Privilege::DATABASE,
+            GrantObject::Admin | GrantObject::Role { .. } => &[],
+        };
+        out.retain(|p| scope.contains(p));
         out.into_iter().collect()
     }
 
@@ -760,6 +841,11 @@ impl RbacCatalog {
             by_principal.remove(&key);
         }
         self.table_grants
+            .retain(|_, by_principal| !by_principal.is_empty());
+        for by_principal in self.schema_grants.values_mut() {
+            by_principal.remove(&key);
+        }
+        self.schema_grants
             .retain(|_, by_principal| !by_principal.is_empty());
         for by_principal in self.database_grants.values_mut() {
             by_principal.remove(&key);
@@ -782,10 +868,30 @@ impl RbacCatalog {
             // a privilege grant never targets a role.
             GrantObject::Role { .. } => false,
             GrantObject::Admin => self.admins.insert(principal),
-            GrantObject::Table { db, table } => {
+            GrantObject::Table { db, schema, table } => {
                 let set = self
                     .table_grants
-                    .entry((db.to_ascii_lowercase(), table.to_ascii_lowercase()))
+                    .entry((
+                        db.to_ascii_lowercase(),
+                        schema.to_ascii_lowercase(),
+                        table.to_ascii_lowercase(),
+                    ))
+                    .or_default()
+                    .entry(principal)
+                    .or_default();
+                // A plain loop on purpose: every privilege must be
+                // inserted even after the first success (`any`/`find` would
+                // short-circuit the side effects away).
+                let mut changed = false;
+                for p in privs {
+                    changed |= set.insert(*p);
+                }
+                changed
+            }
+            GrantObject::Schema { db, schema } => {
+                let set = self
+                    .schema_grants
+                    .entry((db.to_ascii_lowercase(), schema.to_ascii_lowercase()))
                     .or_default()
                     .entry(principal)
                     .or_default();
@@ -830,8 +936,12 @@ impl RbacCatalog {
         match object {
             GrantObject::Role { .. } => false,
             GrantObject::Admin => self.admins.remove(&principal),
-            GrantObject::Table { db, table } => {
-                let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+            GrantObject::Table { db, schema, table } => {
+                let key = (
+                    db.to_ascii_lowercase(),
+                    schema.to_ascii_lowercase(),
+                    table.to_ascii_lowercase(),
+                );
                 let Some(by_principal) = self.table_grants.get_mut(&key) else {
                     return false;
                 };
@@ -852,6 +962,31 @@ impl RbacCatalog {
                 }
                 if self.table_grants.get(&key).is_some_and(BTreeMap::is_empty) {
                     self.table_grants.remove(&key);
+                }
+                changed
+            }
+            GrantObject::Schema { db, schema } => {
+                let key = (db.to_ascii_lowercase(), schema.to_ascii_lowercase());
+                let Some(by_principal) = self.schema_grants.get_mut(&key) else {
+                    return false;
+                };
+                let changed = match by_principal.get_mut(&principal) {
+                    Some(set) => {
+                        // Every privilege must be removed even after the
+                        // first success (see `grant`).
+                        let mut changed = false;
+                        for p in privs {
+                            changed |= set.remove(p);
+                        }
+                        changed
+                    }
+                    None => false,
+                };
+                if by_principal.get(&principal).is_some_and(BTreeSet::is_empty) {
+                    by_principal.remove(&principal);
+                }
+                if self.schema_grants.get(&key).is_some_and(BTreeMap::is_empty) {
+                    self.schema_grants.remove(&key);
                 }
                 changed
             }
@@ -924,18 +1059,32 @@ impl RbacCatalog {
 
     /// Drop every grant on one table (a `DROP TABLE` must not leave
     /// privileges behind for a future table of the same name).
-    pub(crate) fn remove_table(&mut self, db: &str, table: &str) {
+    pub(crate) fn remove_table(&mut self, db: &str, schema: &str, table: &str) {
+        self.table_grants.remove(&(
+            db.to_ascii_lowercase(),
+            schema.to_ascii_lowercase(),
+            table.to_ascii_lowercase(),
+        ));
+    }
+
+    /// Drop every grant on one schema, its tables included (a `DROP SCHEMA
+    /// … CASCADE` removes the whole schema).
+    pub(crate) fn remove_schema(&mut self, db: &str, schema: &str) {
+        let db = db.to_ascii_lowercase();
+        let schema = schema.to_ascii_lowercase();
+        self.schema_grants.remove(&(db.clone(), schema.clone()));
         self.table_grants
-            .remove(&(db.to_ascii_lowercase(), table.to_ascii_lowercase()));
+            .retain(|(gdb, gschema, _), _| *gdb != db || *gschema != schema);
     }
 
     /// Move one table's grants to a new name (`ALTER TABLE … RENAME TO` keeps
     /// a table's privileges with the table). A collision with an existing
     /// entry merges the two (the rename cannot create one: names are unique).
-    pub(crate) fn rename_table(&mut self, db: &str, from: &str, to: &str) {
+    pub(crate) fn rename_table(&mut self, db: &str, schema: &str, from: &str, to: &str) {
         let db = db.to_ascii_lowercase();
-        let from = (db.clone(), from.to_ascii_lowercase());
-        let to = (db, to.to_ascii_lowercase());
+        let schema = schema.to_ascii_lowercase();
+        let from = (db.clone(), schema.clone(), from.to_ascii_lowercase());
+        let to = (db, schema, to.to_ascii_lowercase());
         if from == to {
             return;
         }
@@ -953,7 +1102,8 @@ impl RbacCatalog {
     pub(crate) fn remove_database(&mut self, db: &str) {
         let db = db.to_ascii_lowercase();
         self.database_grants.remove(&db);
-        self.table_grants.retain(|(gdb, _), _| *gdb != db);
+        self.schema_grants.retain(|(gdb, _), _| *gdb != db);
+        self.table_grants.retain(|(gdb, _, _), _| *gdb != db);
     }
 
     /// Make the shared store's grants for one table equal to `snapshot`'s: a
@@ -961,14 +1111,35 @@ impl RbacCatalog {
     /// private snapshot, and COMMIT merges tables — the grants must follow
     /// the same way, or a rolled-forward drop would leave privileges behind
     /// for a future table of the same name.
-    pub(crate) fn sync_table_grants(&mut self, snapshot: &RbacCatalog, db: &str, table: &str) {
-        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+    pub(crate) fn sync_table_grants(
+        &mut self,
+        snapshot: &RbacCatalog,
+        db: &str,
+        schema: &str,
+        table: &str,
+    ) {
+        let schema_key = (db.to_ascii_lowercase(), schema.to_ascii_lowercase());
+        let key = (
+            schema_key.0.clone(),
+            schema_key.1.clone(),
+            table.to_ascii_lowercase(),
+        );
         match snapshot.table_grants.get(&key) {
             Some(grants) => {
                 self.table_grants.insert(key, grants.clone());
             }
             None => {
                 self.table_grants.remove(&key);
+            }
+        }
+        // A transaction's `DROP SCHEMA`/`CREATE SCHEMA` moves the schema's
+        // grants the same way.
+        match snapshot.schema_grants.get(&schema_key) {
+            Some(grants) => {
+                self.schema_grants.insert(schema_key, grants.clone());
+            }
+            None => {
+                self.schema_grants.remove(&schema_key);
             }
         }
     }
@@ -1016,11 +1187,18 @@ pub(crate) fn apply_grant(store: &mut PinkDb, spec: &GrantSpec, revoke: bool) ->
                 }
             }
         }
-        GrantObject::Table { db, table } => {
-            if store.table_in(db, table).is_err() {
+        GrantObject::Table { db, schema, table } => {
+            let ns = crate::storage::SchemaPath::new(db, schema);
+            if store.table_in(&ns, table).is_err() {
                 return Err(PinkDbError::Catalog(format!(
-                    "table \"{table}\" not found in database \"{db}\""
+                    "table \"{table}\" not found in schema \"{ns}\""
                 )));
+            }
+        }
+        GrantObject::Schema { db, schema } => {
+            let ns = crate::storage::SchemaPath::new(db, schema);
+            if !store.schema_exists(&ns) {
+                return Err(PinkDbError::Catalog(format!("schema \"{ns}\" not found")));
             }
         }
         GrantObject::Database { db } => {
@@ -1118,14 +1296,33 @@ impl PinkDb {
     pub fn effective_table_privileges(
         &self,
         principal: &str,
-        db: &str,
+        ns: impl Into<crate::storage::SchemaPath>,
         table: &str,
     ) -> Vec<Privilege> {
+        let ns = ns.into();
         self.rbac.effective_privileges(
             principal,
             &GrantObject::Table {
-                db: db.to_ascii_lowercase(),
+                db: ns.db().to_string(),
+                schema: ns.schema().to_string(),
                 table: table.to_ascii_lowercase(),
+            },
+        )
+    }
+
+    /// The privileges `principal` effectively holds on one schema (see
+    /// [`PinkDb::effective_table_privileges`]).
+    pub fn effective_schema_privileges(
+        &self,
+        principal: &str,
+        ns: impl Into<crate::storage::SchemaPath>,
+    ) -> Vec<Privilege> {
+        let ns = ns.into();
+        self.rbac.effective_privileges(
+            principal,
+            &GrantObject::Schema {
+                db: ns.db().to_string(),
+                schema: ns.schema().to_string(),
             },
         )
     }
@@ -1207,10 +1404,14 @@ fn denied(principal: &str, what: &str, hint: &str) -> PinkDbError {
 }
 
 /// The database a (possibly unqualified) plan target resolves to.
-fn target_db(qdb: &Option<String>, default_db: &str) -> String {
-    qdb.clone()
-        .unwrap_or_else(|| default_db.to_string())
-        .to_ascii_lowercase()
+fn target_ns(
+    qdb: &Option<String>,
+    default_ns: &crate::storage::SchemaPath,
+) -> crate::storage::SchemaPath {
+    match qdb {
+        Some(db) => crate::storage::SchemaPath::main(db),
+        None => default_ns.clone(),
+    }
 }
 
 /// The statement kinds `check_statement` applies the read pass to: every
@@ -1290,6 +1491,7 @@ pub(crate) fn check_statement(
     if rbac.is_admin_resolved(principal) {
         return Ok(());
     }
+    let default_ns = crate::storage::SchemaPath::main(default_db);
     // M-4: a table-function scan (`read_parquet`, `read_arrow`, the
     // replacement scan `FROM 'file.parquet'`) reads external files with a
     // client-controlled path. It has no catalog object to grant on, so it is
@@ -1397,33 +1599,28 @@ pub(crate) fn check_statement(
         | LogicalPlan::CreateMaterializedView { db, .. }
         | LogicalPlan::RefreshMaterializedView { db, .. }
         | LogicalPlan::DropMaterializedView { db, .. } => {
-            create_on_db(target_db(db, default_db))?;
+            let ns = target_ns(db, &default_ns);
+            create_on_db(ns.db().to_string())?;
         }
         LogicalPlan::RefreshMaterializedViews { db } => {
-            create_on_db(target_db(db, default_db))?;
+            let ns = target_ns(db, &default_ns);
+            create_on_db(ns.db().to_string())?;
         }
         _ => {}
     }
     // 2. Table-level privileges (writes). A data-modifying CTE writes
     //    inside the query it wraps, so the pass recurses into `WITH` bodies.
-    check_writes(store, principal, plan, default_db)?;
+    check_writes(store, principal, plan, &default_ns)?;
     // 3. Read pass: every table the statement reads needs SELECT. Includes
     //    the target of UPDATE/DELETE (both read what they write) and the
     //    source of INSERT..SELECT / CREATE TABLE AS.
     if read_checked(plan) {
         let mut reads = std::collections::HashSet::new();
-        crate::plan::collect_tables_read(plan, default_db, &mut reads);
+        crate::plan::collect_tables_read(plan, &default_ns, &mut reads);
         let mut reads: Vec<_> = reads.into_iter().collect();
         reads.sort();
-        for (db, table) in reads {
-            check_table(
-                store,
-                principal,
-                &Some(db),
-                &table,
-                default_db,
-                Privilege::Select,
-            )?;
+        for (ns, table) in reads {
+            check_table(store, principal, &ns, &table, Privilege::Select)?;
         }
     }
     Ok(())
@@ -1435,17 +1632,35 @@ fn check_writes(
     store: &PinkDb,
     principal: &str,
     plan: &LogicalPlan,
-    default_db: &str,
+    default_ns: &crate::storage::SchemaPath,
 ) -> Result<()> {
     match plan {
         LogicalPlan::Insert { db, table, .. } | LogicalPlan::InsertSelect { db, table, .. } => {
-            check_table(store, principal, db, table, default_db, Privilege::Insert)?;
+            check_table(
+                store,
+                principal,
+                &target_ns(db, default_ns),
+                table,
+                Privilege::Insert,
+            )?;
         }
         LogicalPlan::Update { db, table, .. } => {
-            check_table(store, principal, db, table, default_db, Privilege::Update)?;
+            check_table(
+                store,
+                principal,
+                &target_ns(db, default_ns),
+                table,
+                Privilege::Update,
+            )?;
         }
         LogicalPlan::Delete { db, table, .. } => {
-            check_table(store, principal, db, table, default_db, Privilege::Delete)?;
+            check_table(
+                store,
+                principal,
+                &target_ns(db, default_ns),
+                table,
+                Privilege::Delete,
+            )?;
         }
         // A MERGE executes the actions its clauses spell out, so it needs
         // exactly the privileges of those actions on its target.
@@ -1460,9 +1675,8 @@ fn check_writes(
                             check_table(
                                 store,
                                 principal,
-                                db,
+                                &target_ns(db, default_ns),
                                 table,
-                                default_db,
                                 Privilege::Update,
                             )?;
                             update = true;
@@ -1473,9 +1687,8 @@ fn check_writes(
                             check_table(
                                 store,
                                 principal,
-                                db,
+                                &target_ns(db, default_ns),
                                 table,
-                                default_db,
                                 Privilege::Delete,
                             )?;
                             delete = true;
@@ -1486,9 +1699,8 @@ fn check_writes(
                             check_table(
                                 store,
                                 principal,
-                                db,
+                                &target_ns(db, default_ns),
                                 table,
-                                default_db,
                                 Privilege::Insert,
                             )?;
                             insert = true;
@@ -1498,8 +1710,8 @@ fn check_writes(
             }
         }
         LogicalPlan::Cte { query, body, .. } => {
-            check_writes(store, principal, query, default_db)?;
-            check_writes(store, principal, body, default_db)?;
+            check_writes(store, principal, query, default_ns)?;
+            check_writes(store, principal, body, default_ns)?;
         }
         _ => {}
     }
@@ -1510,14 +1722,13 @@ fn check_writes(
 fn check_table(
     store: &PinkDb,
     principal: &str,
-    qdb: &Option<String>,
+    ns: &crate::storage::SchemaPath,
     table: &str,
-    default_db: &str,
     privilege: Privilege,
 ) -> Result<()> {
-    let db = target_db(qdb, default_db);
     let object = GrantObject::Table {
-        db: db.clone(),
+        db: ns.db().to_string(),
+        schema: ns.schema().to_string(),
         table: table.to_ascii_lowercase(),
     };
     if store.rbac().allowed(principal, &object, privilege) {
@@ -1526,12 +1737,13 @@ fn check_table(
     Err(denied(
         principal,
         &format!(
-            "the {} privilege on table \"{db}.{table}\"",
+            "the {} privilege on table \"{ns}.{table}\"",
             privilege.keyword()
         ),
         &format!(
-            "GRANT {} ON TABLE {db}.{table} TO {}",
+            "GRANT {} ON TABLE {ns}.{} TO {}",
             privilege.keyword(),
+            table.to_ascii_lowercase(),
             store.rbac().display_of(principal)
         ),
     ))
@@ -1541,8 +1753,13 @@ fn check_table(
 /// contents or statistics into a plan at bind time refuses through this, so it
 /// fails exactly as a scan of that table would.
 pub(crate) fn check_select(store: &PinkDb, principal: &str, db: &str, table: &str) -> Result<()> {
-    let qdb = Some(db.to_string());
-    check_table(store, principal, &qdb, table, db, Privilege::Select)
+    check_table(
+        store,
+        principal,
+        &crate::storage::SchemaPath::main(db),
+        table,
+        Privilege::Select,
+    )
 }
 
 /// The statement text a committed statement is logged with. `CREATE/ALTER
@@ -1873,5 +2090,85 @@ mod tests {
         db.execute("REVOKE ADMIN FROM ops;").unwrap();
         assert!(!db.principal_is_admin("alice"));
         assert!(check_statement(&db, "alice", &LogicalPlan::Checkpoint, "main").is_err());
+    }
+
+    /// Wave 131a: a schema grant covers every table of that schema, and a
+    /// database `CREATE` covers every schema of it.
+    #[test]
+    fn a_schema_grant_covers_its_tables_only() {
+        let mut rbac = RbacCatalog::default();
+        let s = GrantObject::Schema {
+            db: "db".into(),
+            schema: "s".into(),
+        };
+        assert!(rbac.grant(&s, "alice", &[Privilege::Select]));
+        let in_s = GrantObject::Table {
+            db: "db".into(),
+            schema: "s".into(),
+            table: "t".into(),
+        };
+        assert!(rbac.allowed("alice", &in_s, Privilege::Select));
+        let elsewhere = GrantObject::Table {
+            db: "db".into(),
+            schema: "other".into(),
+            table: "t".into(),
+        };
+        assert!(!rbac.allowed("alice", &elsewhere, Privilege::Select));
+        // A table grant stays narrower than the schema.
+        assert!(!rbac.allowed(
+            "alice",
+            &GrantObject::Schema {
+                db: "db".into(),
+                schema: "other".into()
+            },
+            Privilege::Create
+        ));
+        // `CREATE` on the database covers every schema, not the other way.
+        assert!(rbac.grant(
+            &GrantObject::Database { db: "db".into() },
+            "bob",
+            &[Privilege::Create]
+        ));
+        assert!(rbac.allowed(
+            "bob",
+            &GrantObject::Schema {
+                db: "db".into(),
+                schema: "other".into()
+            },
+            Privilege::Create
+        ));
+        assert!(!rbac.allowed(
+            "bob",
+            &GrantObject::Schema {
+                db: "db2".into(),
+                schema: "s".into()
+            },
+            Privilege::Create
+        ));
+        // Dropping the schema drops its grants with it.
+        rbac.remove_schema("db", "s");
+        assert!(!rbac.allowed("alice", &in_s, Privilege::Select));
+    }
+
+    /// Wave 131a: grant labels name the schema level.
+    #[test]
+    fn grant_labels_name_the_schema() {
+        assert_eq!(
+            GrantObject::Table {
+                db: "db".into(),
+                schema: "s".into(),
+                table: "t".into()
+            }
+            .label(),
+            "TABLE db.s.t"
+        );
+        assert_eq!(
+            GrantObject::Schema {
+                db: "db".into(),
+                schema: "s".into()
+            }
+            .label(),
+            "SCHEMA db.s"
+        );
     }
 }

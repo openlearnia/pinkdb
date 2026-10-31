@@ -1545,11 +1545,16 @@ pub struct MaterializedViewDef {
     pub last_error: Option<String>,
 }
 
-/// One database's catalog: its tables, its session-local views, and (wave 44)
-/// its stored procedures.
+/// One schema's catalog: the tables, views and other objects it holds.
+///
+/// Wave 131 added the level DuckDB calls a schema (`catalog.schema.object`):
+/// two schemas of one database may each hold a table of the same name. The
+/// design follows DuckDB's `SchemaCatalogEntry`
+/// (`src/catalog/catalog_entry/duck_schema_entry.cpp`).
 #[derive(Debug, Default, Clone)]
-pub struct DbCatalog {
-    /// Display name as created (the map key is the lowercased name).
+pub struct SchemaCatalog {
+    /// Display name as created (the owning `DbCatalog::schemas` key is the
+    /// lowercased name).
     pub(crate) name: String,
     pub(crate) tables: HashMap<String, DataTable>,
     pub(crate) views: HashMap<String, ViewDef>,
@@ -1562,22 +1567,15 @@ pub struct DbCatalog {
     pub(crate) macros: HashMap<String, crate::macros::MacroDef>,
     /// Triggers (wave 100) in **creation order**: that order is the firing
     /// order, so it must survive a save/open round trip and a WAL replay.
+    /// The order is per schema, like every other object.
     pub(crate) triggers: Vec<crate::trigger::TriggerDef>,
-    /// Where the database's rows live (wave 124): the store, or a lake.
-    /// Persisted in the checkpoint footer.
-    pub(crate) storage: crate::lake_db::DbStorage,
-    /// A lake database's version as this catalog reflects it (the pinned or
-    /// last published lake version); 0 for a local database. Process-local:
-    /// a reopen reads the lake's own.
-    pub(crate) lake_version: u64,
 }
 
-impl DbCatalog {
-    /// An empty database catalog.
-    pub(crate) fn empty(name: &str, storage: crate::lake_db::DbStorage) -> Self {
+impl SchemaCatalog {
+    /// An empty schema catalog.
+    pub(crate) fn empty(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            storage,
             ..Self::default()
         }
     }
@@ -1588,6 +1586,157 @@ impl DbCatalog {
         self.triggers
             .iter()
             .position(|t| t.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Does the schema hold any object at all? (`DROP SCHEMA` without
+    /// `CASCADE` refuses a non-empty schema.)
+    fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+            && self.views.is_empty()
+            && self.materialized_views.is_empty()
+            && self.procedures.is_empty()
+            && self.macros.is_empty()
+            && self.triggers.is_empty()
+    }
+}
+
+/// A namespace's fully qualified name: `database.schema`, the first two of
+/// DuckDB's three name parts (wave 131).
+///
+/// Both parts are stored lowercased: catalog names are case-insensitive and
+/// the store's keys are lowercased. A bare database name means that database's
+/// `main` schema, which is where every object of a version-3 store lives.
+///
+/// The struct is `Ord`/`Hash` so it can key maps and order checkpoints. Use
+/// its `Display` for a message: identifiers are quoted only when they would
+/// not re-parse as written (the `rbac::quote_ident` rule).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SchemaPath {
+    db: String,
+    schema: String,
+}
+
+impl SchemaPath {
+    /// The namespace `db.schema` (both parts lowercased).
+    pub fn new(db: &str, schema: &str) -> Self {
+        Self {
+            db: db.to_ascii_lowercase(),
+            schema: schema.to_ascii_lowercase(),
+        }
+    }
+
+    /// The database's default schema, `db.main`.
+    pub fn main(db: &str) -> Self {
+        Self::new(db, "main")
+    }
+
+    /// The lowercased database name.
+    pub fn db(&self) -> &str {
+        &self.db
+    }
+
+    /// The lowercased schema name.
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+}
+
+impl std::fmt::Display for SchemaPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}.{}",
+            crate::rbac::quote_ident(&self.db),
+            crate::rbac::quote_ident(&self.schema)
+        )
+    }
+}
+
+impl From<&str> for SchemaPath {
+    fn from(db: &str) -> Self {
+        Self::main(db)
+    }
+}
+
+impl From<&String> for SchemaPath {
+    fn from(db: &String) -> Self {
+        Self::main(db)
+    }
+}
+
+impl From<String> for SchemaPath {
+    fn from(db: String) -> Self {
+        Self::main(&db)
+    }
+}
+
+impl From<&SchemaPath> for SchemaPath {
+    fn from(ns: &SchemaPath) -> Self {
+        ns.clone()
+    }
+}
+
+/// A table or view addressed by its namespace and its lowercased name: the
+/// form the plan's read/write sets, the materialized-view dirty set and the
+/// in-process commit check carry.
+pub(crate) type TableRef = (SchemaPath, String);
+
+/// One database's catalog: its schemas, and where its rows live.
+#[derive(Debug, Clone)]
+pub struct DbCatalog {
+    /// Display name as created (the map key is the lowercased name).
+    pub(crate) name: String,
+    /// The database's schemas, keyed by lowercased name. A database always
+    /// holds `main`: [`DbCatalog::empty`] creates it and `drop_schema`
+    /// refuses to remove it.
+    pub(crate) schemas: BTreeMap<String, SchemaCatalog>,
+    /// Where the database's rows live (wave 124): the store, or a lake.
+    /// Persisted in the checkpoint footer.
+    pub(crate) storage: crate::lake_db::DbStorage,
+    /// A lake database's version as this catalog reflects it (the pinned or
+    /// last published lake version); 0 for a local database. Process-local:
+    /// a reopen reads the lake's own.
+    pub(crate) lake_version: u64,
+}
+
+/// A database always holds schema `main`, so even the `..Default::default()`
+/// construction paths (`create_database`, a reload into an existing store)
+/// establish it.
+impl Default for DbCatalog {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            schemas: BTreeMap::from([("main".to_string(), SchemaCatalog::empty("main"))]),
+            storage: crate::lake_db::DbStorage::Local,
+            lake_version: 0,
+        }
+    }
+}
+
+impl DbCatalog {
+    /// An empty database catalog: no objects, one schema `main`.
+    pub(crate) fn empty(name: &str, storage: crate::lake_db::DbStorage) -> Self {
+        let mut schemas = BTreeMap::new();
+        schemas.insert("main".to_string(), SchemaCatalog::empty("main"));
+        Self {
+            name: name.to_string(),
+            schemas,
+            storage,
+            lake_version: 0,
+        }
+    }
+
+    /// The always-present `main` schema. Lake publishing and the paths that
+    /// still speak plain database names (wave 131a) work against it.
+    pub(crate) fn main(&self) -> &SchemaCatalog {
+        &self.schemas["main"]
+    }
+
+    /// [`DbCatalog::main`], mutably.
+    pub(crate) fn main_mut(&mut self) -> &mut SchemaCatalog {
+        self.schemas
+            .get_mut("main")
+            .expect("every database has main")
     }
 }
 
@@ -1831,11 +1980,11 @@ pub struct PinkDb {
     /// statements and COMMITs) since the last statement-boundary refresh pass
     /// (wave 80): the ON COMMIT trigger's dirty set. Process-local, never
     /// persisted, cleared by the pass — see `crate::mv`.
-    pub(crate) mv_pending: std::collections::HashSet<(String, String)>,
+    pub(crate) mv_pending: std::collections::HashSet<TableRef>,
     /// `(database, table)` pairs written by the open embedded transaction:
     /// moved into `mv_pending` at COMMIT, discarded at ROLLBACK (a rolled-back
     /// write must not trigger an ON COMMIT refresh).
-    pub(crate) txn_writes: std::collections::HashSet<(String, String)>,
+    pub(crate) txn_writes: std::collections::HashSet<TableRef>,
     /// The `CALL` nesting depth of the statement currently executing (wave
     /// 44): 0 outside a call. Bounds recursion ([`crate::procedure::
     /// MAX_CALL_DEPTH`]) and decides where a call's statement-scoped frame
@@ -2349,6 +2498,138 @@ impl PinkDb {
             .ok_or_else(|| PinkDbError::Catalog(format!("database \"{db}\" not found")))
     }
 
+    /// The schema `ns` names. A missing database and a missing schema are
+    /// different errors: `ns` may be fully qualified, so a typo in either part
+    /// has to be reported as the part that is wrong.
+    pub(crate) fn schema(&self, ns: &SchemaPath) -> Result<&SchemaCatalog> {
+        self.catalog(ns.db())?
+            .schemas
+            .get(ns.schema())
+            .ok_or_else(|| PinkDbError::Catalog(format!("schema \"{}\" not found", ns.schema())))
+    }
+
+    pub(crate) fn schema_mut(&mut self, ns: &SchemaPath) -> Result<&mut SchemaCatalog> {
+        self.catalog_mut(ns.db())?
+            .schemas
+            .get_mut(ns.schema())
+            .ok_or_else(|| PinkDbError::Catalog(format!("schema \"{}\" not found", ns.schema())))
+    }
+
+    /// Does `ns` name an existing schema?
+    pub fn schema_exists(&self, ns: &SchemaPath) -> bool {
+        self.databases
+            .get(ns.db())
+            .is_some_and(|c| c.schemas.contains_key(ns.schema()))
+    }
+
+    /// The display names of `db`'s schemas, sorted. Empty for an unknown
+    /// database (like the other `list_*_in` helpers).
+    pub fn list_schemas(&self, db: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .databases
+            .get(&Self::db_key(db))
+            .map(|c| c.schemas.values().map(|s| s.name.clone()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Every table of `db`, in schema-key then table-key order, as
+    /// `(namespace, lowercased key, table)`: the shape the optimistic base and
+    /// the "every table of every database" walks (statistics, index rebuilds,
+    /// vector hydration, checkpointing) need.
+    pub(crate) fn all_tables_of(&self, db: &str) -> Vec<(SchemaPath, String, &DataTable)> {
+        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+            return Vec::new();
+        };
+        cat.schemas
+            .iter()
+            .flat_map(|(schema, s)| {
+                s.tables
+                    .iter()
+                    .map(move |(name, t)| (SchemaPath::new(db, schema), name.clone(), t))
+            })
+            .collect()
+    }
+
+    /// Every view of `db`, in schema-key then view-key order (see
+    /// [`PinkDb::all_tables_of`]).
+    pub(crate) fn all_views_of(&self, db: &str) -> Vec<(SchemaPath, String, &ViewDef)> {
+        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+            return Vec::new();
+        };
+        cat.schemas
+            .iter()
+            .flat_map(|(schema, s)| {
+                s.views
+                    .iter()
+                    .map(move |(name, v)| (SchemaPath::new(db, schema), name.clone(), v))
+            })
+            .collect()
+    }
+
+    /// Create schema `ns.schema`. `if_not_exists` makes an existing schema a
+    /// no-op instead of an error (SQL `CREATE SCHEMA IF NOT EXISTS`).
+    pub fn create_schema(&mut self, ns: &SchemaPath, if_not_exists: bool) -> Result<()> {
+        let cat = self.catalog_mut(ns.db())?;
+        if cat.schemas.contains_key(ns.schema()) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(PinkDbError::Catalog(format!(
+                "schema \"{}\" already exists",
+                ns.schema()
+            )));
+        }
+        // No SQL names a schema yet (131b adds the grammar), so the display
+        // name is the lowercased path part.
+        cat.schemas
+            .insert(ns.schema().to_string(), SchemaCatalog::empty(ns.schema()));
+        Ok(())
+    }
+
+    /// Set a schema's display name (the checkpoint restores the spelling it
+    /// recorded; the catalog key stays the lowercased name).
+    pub(crate) fn set_schema_display(&mut self, ns: &SchemaPath, name: &str) -> Result<()> {
+        self.schema_mut(ns)?.name = name.to_string();
+        Ok(())
+    }
+
+    /// Drop schema `ns.schema`. `main` can never be dropped (every database
+    /// has it), and without `cascade` a non-empty schema is refused with
+    /// DuckDB's wording. With `cascade` every object in the schema goes.
+    pub fn drop_schema(&mut self, ns: &SchemaPath, if_exists: bool, cascade: bool) -> Result<()> {
+        let cat = self.catalog_mut(ns.db())?;
+        if !cat.schemas.contains_key(ns.schema()) {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(PinkDbError::Catalog(format!(
+                "schema \"{}\" not found",
+                ns.schema()
+            )));
+        }
+        if ns.schema() == "main" {
+            return Err(PinkDbError::Catalog(
+                "cannot drop schema \"main\": it is the database's default schema".to_string(),
+            ));
+        }
+        if !cascade && cat.schemas.get(ns.schema()).is_some_and(|s| !s.is_empty()) {
+            return Err(PinkDbError::Catalog(format!(
+                "schema \"{}\" is not empty: use DROP SCHEMA ... CASCADE",
+                ns.schema()
+            )));
+        }
+        cat.schemas.remove(ns.schema());
+        // Every grant on the schema and its tables goes with it, cascade or
+        // not: a later schema of the same name must not inherit them. Inside
+        // a transaction this edits the transaction's catalog copy, so a
+        // rollback restores the grants exactly as it restores a dropped table
+        // (see `sync_table_grants` in db.rs for the commit merge).
+        self.rbac_mut().remove_schema(ns.db(), ns.schema());
+        Ok(())
+    }
+
     /// Current version of one table (for conflict detection).
     pub fn table_version(&self, name: &str) -> Result<u64> {
         let db = self.current_db.clone();
@@ -2362,99 +2643,113 @@ impl PinkDb {
         self.store_id
     }
 
-    pub fn table_version_in(&self, db: &str, name: &str) -> Result<u64> {
-        Ok(self.table_in(db, name)?.version)
+    pub fn table_version_in(&self, ns: impl Into<SchemaPath>, name: &str) -> Result<u64> {
+        Ok(self.table_in(ns, name)?.version)
     }
 
-    pub(crate) fn tables_remove_in(&mut self, db: &str, key: &str) -> Option<DataTable> {
-        self.databases
-            .get_mut(&Self::db_key(db))?
-            .tables
-            .remove(key)
+    pub(crate) fn tables_remove_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        key: &str,
+    ) -> Option<DataTable> {
+        self.schema_mut(&ns.into()).ok()?.tables.remove(key)
     }
 
     pub(crate) fn tables_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: String,
         table: DataTable,
     ) -> Result<()> {
-        self.catalog_mut(db)?.tables.insert(key, table);
+        self.schema_mut(&ns.into())?.tables.insert(key, table);
         Ok(())
     }
 
-    pub(crate) fn views_remove_in(&mut self, db: &str, key: &str) -> Option<ViewDef> {
-        self.databases.get_mut(&Self::db_key(db))?.views.remove(key)
+    pub(crate) fn views_remove_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        key: &str,
+    ) -> Option<ViewDef> {
+        self.schema_mut(&ns.into()).ok()?.views.remove(key)
     }
 
-    pub(crate) fn views_insert_in(&mut self, db: &str, key: String, view: ViewDef) -> Result<()> {
-        self.catalog_mut(db)?.views.insert(key, view);
+    pub(crate) fn views_insert_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        key: String,
+        view: ViewDef,
+    ) -> Result<()> {
+        self.schema_mut(&ns.into())?.views.insert(key, view);
         Ok(())
     }
 
     pub(crate) fn materialized_views_remove_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: &str,
     ) -> Option<MaterializedViewDef> {
-        self.databases
-            .get_mut(&Self::db_key(db))?
+        self.schema_mut(&ns.into())
+            .ok()?
             .materialized_views
             .remove(key)
     }
 
     pub(crate) fn materialized_views_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: String,
         view: MaterializedViewDef,
     ) -> Result<()> {
-        self.catalog_mut(db)?.materialized_views.insert(key, view);
+        self.schema_mut(&ns.into())
+            .map(|s| s.materialized_views.insert(key, view))?;
         Ok(())
     }
 
-    /// A stored procedure of `db` by name (case-insensitive).
-    pub fn procedure_in(&self, db: &str, name: &str) -> Result<&crate::procedure::ProcedureDef> {
-        self.catalog(db)?
+    /// A stored procedure of `ns` by name (case-insensitive).
+    pub fn procedure_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&crate::procedure::ProcedureDef> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .procedures
             .get(&name.to_ascii_lowercase())
             .ok_or_else(|| {
-                PinkDbError::Catalog(format!(
-                    "procedure \"{name}\" not found in database \"{db}\""
-                ))
+                PinkDbError::Catalog(format!("procedure \"{name}\" not found in schema {ns}"))
             })
     }
 
     /// Install (or replace) one procedure definition.
     pub(crate) fn procedures_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: String,
         def: crate::procedure::ProcedureDef,
     ) -> Result<()> {
-        self.catalog_mut(db)?.procedures.insert(key, def);
+        self.schema_mut(&ns.into())?.procedures.insert(key, def);
         Ok(())
     }
 
     /// Remove one procedure (the caller checks existence for `IF EXISTS`).
     pub(crate) fn procedures_remove_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: &str,
     ) -> Option<crate::procedure::ProcedureDef> {
-        self.databases
-            .get_mut(&Self::db_key(db))?
-            .procedures
-            .remove(key)
+        self.schema_mut(&ns.into()).ok()?.procedures.remove(key)
     }
 
-    /// Every procedure of `db`, as `(lowercased key, definition)` pairs
+    /// Every procedure of `ns`, as `(lowercased key, definition)` pairs
     /// sorted by key — the deterministic order `.pink` writes them in.
-    pub(crate) fn procedures_in(&self, db: &str) -> Vec<(String, crate::procedure::ProcedureDef)> {
-        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+    pub(crate) fn procedures_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+    ) -> Vec<(String, crate::procedure::ProcedureDef)> {
+        let Ok(schema) = self.schema(&ns.into()) else {
             return Vec::new();
         };
-        let mut out: Vec<(String, crate::procedure::ProcedureDef)> = cat
+        let mut out: Vec<(String, crate::procedure::ProcedureDef)> = schema
             .procedures
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -2463,30 +2758,37 @@ impl PinkDb {
         out
     }
 
-    /// Does any database hold a procedure? (Cheap gate for the `.pink`
-    /// flags word.)
+    /// Does any schema of any database hold a procedure? (Cheap gate for the
+    /// `.pink` flags word.)
     pub(crate) fn has_procedures(&self) -> bool {
-        self.databases.values().any(|c| !c.procedures.is_empty())
+        self.databases
+            .values()
+            .any(|c| c.schemas.values().any(|s| !s.procedures.is_empty()))
     }
 
-    /// Every trigger of `db`, in creation order. A borrowed slice so the
+    /// Every trigger of `ns`, in creation order. A borrowed slice so the
     /// trigger-free write path pays no allocation at all.
-    pub(crate) fn triggers_in(&self, db: &str) -> &[crate::trigger::TriggerDef] {
+    pub(crate) fn triggers_in(&self, ns: impl Into<SchemaPath>) -> &[crate::trigger::TriggerDef] {
         static EMPTY: &[crate::trigger::TriggerDef] = &[];
-        match self.databases.get(&Self::db_key(db)) {
-            Some(cat) => &cat.triggers,
-            None => EMPTY,
+        match self.schema(&ns.into()) {
+            Ok(schema) => &schema.triggers,
+            Err(_) => EMPTY,
         }
     }
 
-    /// A stored trigger of `db` by name (case-insensitive).
-    pub(crate) fn trigger_in(&self, db: &str, name: &str) -> Result<&crate::trigger::TriggerDef> {
-        self.catalog(db)?
+    /// A stored trigger of `ns` by name (case-insensitive).
+    pub(crate) fn trigger_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&crate::trigger::TriggerDef> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .triggers
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| {
-                PinkDbError::Catalog(format!("trigger \"{name}\" not found in database \"{db}\""))
+                PinkDbError::Catalog(format!("trigger \"{name}\" not found in schema {ns}"))
             })
     }
 
@@ -2494,13 +2796,13 @@ impl PinkDb {
     /// overwrites in place, so a replaced trigger keeps its firing position.
     pub(crate) fn triggers_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         def: crate::trigger::TriggerDef,
     ) -> Result<()> {
-        let cat = self.catalog_mut(db)?;
-        match cat.trigger_index(&def.name) {
-            Some(i) => cat.triggers[i] = def,
-            None => cat.triggers.push(def),
+        let schema = self.schema_mut(&ns.into())?;
+        match schema.trigger_index(&def.name) {
+            Some(i) => schema.triggers[i] = def,
+            None => schema.triggers.push(def),
         }
         Ok(())
     }
@@ -2508,60 +2810,67 @@ impl PinkDb {
     /// Remove one trigger (the caller checks existence for `IF EXISTS`).
     pub(crate) fn triggers_remove_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
     ) -> Option<crate::trigger::TriggerDef> {
-        let cat = self.databases.get_mut(&Self::db_key(db))?;
-        let i = cat.trigger_index(name)?;
-        Some(cat.triggers.remove(i))
+        let schema = self.schema_mut(&ns.into()).ok()?;
+        let i = schema.trigger_index(name)?;
+        Some(schema.triggers.remove(i))
     }
 
-    /// Does any database hold a trigger? (Cheap gate for the `.pink` flags
-    /// word.)
+    /// Does any schema of any database hold a trigger? (Cheap gate for the
+    /// `.pink` flags word.)
     pub(crate) fn has_triggers(&self) -> bool {
-        self.databases.values().any(|c| !c.triggers.is_empty())
+        self.databases
+            .values()
+            .any(|c| c.schemas.values().any(|s| !s.triggers.is_empty()))
     }
 
-    /// A stored macro of `db` by name (case-insensitive).
-    pub fn macro_in(&self, db: &str, name: &str) -> Result<&crate::macros::MacroDef> {
-        self.catalog(db)?
+    /// A stored macro of `ns` by name (case-insensitive).
+    pub fn macro_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&crate::macros::MacroDef> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .macros
             .get(&name.to_ascii_lowercase())
             .ok_or_else(|| {
-                PinkDbError::Catalog(format!("macro \"{name}\" not found in database \"{db}\""))
+                PinkDbError::Catalog(format!("macro \"{name}\" not found in schema {ns}"))
             })
     }
 
     /// Install (or replace) one macro definition.
     pub(crate) fn macros_insert_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: String,
         def: crate::macros::MacroDef,
     ) -> Result<()> {
-        self.catalog_mut(db)?.macros.insert(key, def);
+        self.schema_mut(&ns.into())?.macros.insert(key, def);
         Ok(())
     }
 
     /// Remove one macro (the caller checks existence for `IF EXISTS`).
     pub(crate) fn macros_remove_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         key: &str,
     ) -> Option<crate::macros::MacroDef> {
-        self.databases
-            .get_mut(&Self::db_key(db))?
-            .macros
-            .remove(key)
+        self.schema_mut(&ns.into()).ok()?.macros.remove(key)
     }
 
-    /// Every macro of `db`, as `(lowercased key, definition)` pairs sorted by
+    /// Every macro of `ns`, as `(lowercased key, definition)` pairs sorted by
     /// key — the deterministic order `.pink` writes them in.
-    pub(crate) fn macros_in(&self, db: &str) -> Vec<(String, crate::macros::MacroDef)> {
-        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+    pub(crate) fn macros_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+    ) -> Vec<(String, crate::macros::MacroDef)> {
+        let Ok(schema) = self.schema(&ns.into()) else {
             return Vec::new();
         };
-        let mut out: Vec<(String, crate::macros::MacroDef)> = cat
+        let mut out: Vec<(String, crate::macros::MacroDef)> = schema
             .macros
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -2570,10 +2879,12 @@ impl PinkDb {
         out
     }
 
-    /// Does any database hold a macro? (Cheap gate for the `.pink` flags
-    /// word.)
+    /// Does any schema of any database hold a macro? (Cheap gate for the
+    /// `.pink` flags word.)
     pub(crate) fn has_macros(&self) -> bool {
-        self.databases.values().any(|c| !c.macros.is_empty())
+        self.databases
+            .values()
+            .any(|c| c.schemas.values().any(|s| !s.macros.is_empty()))
     }
 
     /// Does the store hold any RBAC data (a user, a role, a membership, a
@@ -2583,6 +2894,7 @@ impl PinkDb {
             || !self.rbac.roles.is_empty()
             || !self.rbac.memberships.is_empty()
             || !self.rbac.table_grants.is_empty()
+            || !self.rbac.schema_grants.is_empty()
             || !self.rbac.database_grants.is_empty()
             || !self.rbac.admins.is_empty()
     }
@@ -2593,8 +2905,13 @@ impl PinkDb {
         self.proc_frame.clear();
     }
 
-    pub fn materialized_view_in(&self, db: &str, name: &str) -> Result<&MaterializedViewDef> {
-        self.catalog(db)?
+    pub fn materialized_view_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&MaterializedViewDef> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .materialized_views
             .get(&name.to_ascii_lowercase())
             .ok_or_else(|| PinkDbError::Catalog(format!("materialized view \"{name}\" not found")))
@@ -2603,24 +2920,28 @@ impl PinkDb {
     /// Mutable access to one materialized view's definition.
     pub(crate) fn materialized_view_mut_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
     ) -> Result<&mut MaterializedViewDef> {
+        let ns = ns.into();
         let key = name.to_ascii_lowercase();
-        self.catalog_mut(db)?
+        self.schema_mut(&ns)?
             .materialized_views
             .get_mut(&key)
             .ok_or_else(|| PinkDbError::Catalog(format!("materialized view \"{name}\" not found")))
     }
 
-    /// Every materialized view of `db`, as `(lowercased key, definition)`
+    /// Every materialized view of `ns`, as `(lowercased key, definition)`
     /// pairs sorted by key (deterministic order for `SHOW MATERIALIZED VIEWS`,
     /// `REFRESH MATERIALIZED VIEWS`, and the boundary refresh pass).
-    pub(crate) fn materialized_views_in(&self, db: &str) -> Vec<(String, MaterializedViewDef)> {
-        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+    pub(crate) fn materialized_views_in(
+        &self,
+        ns: impl Into<SchemaPath>,
+    ) -> Vec<(String, MaterializedViewDef)> {
+        let Ok(schema) = self.schema(&ns.into()) else {
             return Vec::new();
         };
-        let mut out: Vec<(String, MaterializedViewDef)> = cat
+        let mut out: Vec<(String, MaterializedViewDef)> = schema
             .materialized_views
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -2629,13 +2950,12 @@ impl PinkDb {
         out
     }
 
-    /// Names of every materialized view of `db`, sorted (display names).
-    pub(crate) fn materialized_view_names_in(&self, db: &str) -> Vec<String> {
+    /// Names of every materialized view of `ns`, sorted (display names).
+    pub(crate) fn materialized_view_names_in(&self, ns: impl Into<SchemaPath>) -> Vec<String> {
         let mut out: Vec<String> = self
-            .databases
-            .get(&Self::db_key(db))
-            .map(|c| {
-                c.materialized_views
+            .schema(&ns.into())
+            .map(|s| {
+                s.materialized_views
                     .values()
                     .map(|v| v.name.clone())
                     .collect()
@@ -2645,16 +2965,21 @@ impl PinkDb {
         out
     }
 
-    /// The `(lowercased db, lowercased table)` pairs the refresh of the MV
-    /// `(db, name)` reads: its defining query's base tables. Empty for an
-    /// unknown view or one whose query could not be rebound.
-    pub(crate) fn materialized_view_deps(&self, db: &str, name: &str) -> HashSet<(String, String)> {
+    /// The base tables the refresh of the MV `(ns, name)` reads, as
+    /// namespace-plus-name references. Empty for an unknown view or one whose
+    /// query could not be rebound.
+    pub(crate) fn materialized_view_deps(
+        &self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> HashSet<TableRef> {
+        let ns = ns.into();
         let mut out = HashSet::new();
-        let Ok(mv) = self.materialized_view_in(db, name) else {
+        let Ok(mv) = self.materialized_view_in(&ns, name) else {
             return out;
         };
         if let Some(q) = &mv.query {
-            crate::plan::collect_tables_read(q, db, &mut out);
+            crate::plan::collect_tables_read(q, &ns, &mut out);
         }
         out
     }
@@ -2793,11 +3118,15 @@ impl PinkDb {
         // Session-local views survive the swap; a replayed object colliding
         // with one is then a hard replay error (hazard H4), exactly like a
         // reopen.
-        let local_views: Vec<(String, HashMap<String, ViewDef>)> = self
+        let local_views: Vec<(SchemaPath, HashMap<String, ViewDef>)> = self
             .databases
             .iter()
-            .filter(|(_, cat)| !cat.views.is_empty())
-            .map(|(key, cat)| (key.clone(), cat.views.clone()))
+            .flat_map(|(db, cat)| {
+                cat.schemas
+                    .iter()
+                    .map(move |(schema, s)| (SchemaPath::new(db, schema), s.views.clone()))
+            })
+            .filter(|(_, views)| !views.is_empty())
             .collect();
         self.databases = other.databases;
         // The RBAC catalog is store-global metadata outside `databases`: a
@@ -2805,10 +3134,10 @@ impl PinkDb {
         // exactly like it is for tables, so the swap carries users, roles and
         // grants too.
         self.rbac = other.rbac;
-        for (key, views) in local_views {
-            if let Some(cat) = self.databases.get_mut(&key) {
+        for (ns, views) in local_views {
+            if let Ok(schema) = self.schema_mut(&ns) {
                 for (name, view) in views {
-                    cat.views.entry(name).or_insert(view);
+                    schema.views.entry(name).or_insert(view);
                 }
             }
         }
@@ -2913,7 +3242,10 @@ impl PinkDb {
         // other writers can validate optimistic commits against this frame.
         let sets = match sets {
             Some(s) => s.clone(),
-            None => self.plan_sets_store(plan, &self.current_db.clone()),
+            None => {
+                let ns = SchemaPath::main(&self.current_db);
+                self.plan_sets_store(plan, &ns)
+            }
         };
         if self.in_transaction() {
             if self.wal_txn_db.is_none() {
@@ -3220,16 +3552,16 @@ impl PinkDb {
 
     pub fn create_table(&mut self, name: &str, schema: Vec<(String, DataType)>) -> Result<()> {
         let db = self.current_db.clone();
-        self.create_table_in(&db, name, schema)
+        self.create_table_in(SchemaPath::main(&db), name, schema)
     }
 
     pub fn create_table_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
         schema: Vec<(String, DataType)>,
     ) -> Result<()> {
-        self.create_table_with_constraints_in(db, name, schema, TableConstraints::default())
+        self.create_table_with_constraints_in(ns, name, schema, TableConstraints::default())
     }
 
     /// [`PinkDb::create_table_in`] with declarative constraints (metadata
@@ -3237,16 +3569,17 @@ impl PinkDb {
     /// (foreign keys against the referenced table's keys).
     pub fn create_table_with_constraints_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
         schema: Vec<(String, DataType)>,
         constraints: TableConstraints,
     ) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, name) {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, name) {
             return Err(err);
         }
         let key = Self::key(name);
-        let cat = self.catalog_mut(db)?;
+        let cat = self.schema_mut(&ns)?;
         if cat.tables.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "table \"{name}\" already exists"
@@ -3266,14 +3599,15 @@ impl PinkDb {
 
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         let db = self.current_db.clone();
-        self.drop_table_in(&db, name)
+        self.drop_table_in(SchemaPath::main(&db), name)
     }
 
-    pub fn drop_table_in(&mut self, db: &str, name: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, name) {
+    pub fn drop_table_in(&mut self, ns: impl Into<SchemaPath>, name: &str) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, name) {
             return Err(err);
         }
-        self.catalog_mut(db)?
+        self.schema_mut(&ns)?
             .tables
             .remove(&Self::key(name))
             .map(|_| ())
@@ -3283,15 +3617,16 @@ impl PinkDb {
     /// Build a hash index on `table.column` (by index) and store it.
     pub fn create_index_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         table: &str,
         name: &str,
         column: usize,
     ) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
-        let t = self.table_mut_in(db, table)?;
+        let t = self.table_mut_in(&ns, table)?;
         let Some(col) = t.columns.get(column) else {
             return Err(PinkDbError::Catalog(format!(
                 "column {column} out of range for table \"{table}\""
@@ -3318,14 +3653,15 @@ impl PinkDb {
     /// or has a NULL element is not a vector and is skipped.
     pub fn create_vector_index_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         table: &str,
         name: &str,
         column: usize,
         provider_name: &str,
         options: &[(String, String)],
     ) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
         let provider = self
@@ -3340,7 +3676,7 @@ impl PinkDb {
                 ))
             })?;
         let dim = {
-            let t = self.table_in(db, table)?;
+            let t = self.table_in(&ns, table)?;
             if t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(name))
                 || t.vector_indexes
                     .iter()
@@ -3380,7 +3716,7 @@ impl PinkDb {
         // One bulk call per chunk (wave 107d): the provider parallelises
         // the build, and chunk-sized calls bound the copied vectors.
         {
-            let t = self.table_in(db, table)?;
+            let t = self.table_in(&ns, table)?;
             let col = &t.columns[column];
             let mut offset = 0usize;
             for chunk in &col.chunks {
@@ -3398,7 +3734,7 @@ impl PinkDb {
                 offset += chunk.len();
             }
         }
-        let t = self.table_mut_in(db, table)?;
+        let t = self.table_mut_in(&ns, table)?;
         t.vector_indexes.push(VectorIndexDef {
             name: name.to_string(),
             column,
@@ -3411,11 +3747,17 @@ impl PinkDb {
     }
 
     /// Drop tombstones from a vector index (`ALTER INDEX … COMPACT`).
-    pub fn compact_vector_index_in(&mut self, db: &str, table: &str, name: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+    pub fn compact_vector_index_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        table: &str,
+        name: &str,
+    ) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
-        let t = self.table_mut_in(db, table)?;
+        let t = self.table_mut_in(&ns, table)?;
         let table_name = t.name.clone();
         let def = t
             .vector_indexes
@@ -3432,11 +3774,11 @@ impl PinkDb {
     /// Live/tombstone counts of a vector index (tests and diagnostics).
     pub fn vector_index_stats_in(
         &self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         table: &str,
         name: &str,
     ) -> Result<crate::vector_index::VectorIndexStats> {
-        let t = self.table_in(db, table)?;
+        let t = self.table_in(ns, table)?;
         let def = t
             .vector_indexes
             .iter()
@@ -3478,7 +3820,8 @@ impl PinkDb {
             let pending = self
                 .databases
                 .values()
-                .flat_map(|c| c.tables.values())
+                .flat_map(|c| c.schemas.values())
+                .flat_map(|s| s.tables.values())
                 .flat_map(|t| t.vector_indexes.iter())
                 .filter(|d| d.index.is_none() && d.blob.is_some())
                 .map(|d| d.provider.clone())
@@ -3504,18 +3847,20 @@ impl PinkDb {
     ) -> Result<Vec<crate::vector_index::HydratedVectorIndex>> {
         let mut ready = Vec::new();
         for (db_key, cat) in &self.databases {
-            for (table_key, t) in &cat.tables {
-                for (i, def) in t.vector_indexes.iter().enumerate() {
-                    if def.index.is_none()
-                        && def.provider.eq_ignore_ascii_case(provider.name())
-                        && let Some(blob) = &def.blob
-                    {
-                        ready.push((
-                            db_key.clone(),
-                            table_key.clone(),
-                            i,
-                            provider.deserialize(blob)?,
-                        ));
+            for (schema_key, schema) in &cat.schemas {
+                for (table_key, t) in &schema.tables {
+                    for (i, def) in t.vector_indexes.iter().enumerate() {
+                        if def.index.is_none()
+                            && def.provider.eq_ignore_ascii_case(provider.name())
+                            && let Some(blob) = &def.blob
+                        {
+                            ready.push((
+                                SchemaPath::new(db_key, schema_key),
+                                table_key.clone(),
+                                i,
+                                provider.deserialize(blob)?,
+                            ));
+                        }
                     }
                 }
             }
@@ -3530,11 +3875,11 @@ impl PinkDb {
         &mut self,
         ready: Vec<crate::vector_index::HydratedVectorIndex>,
     ) {
-        for (db_key, table_key, slot, index) in ready {
+        for (ns, table_key, slot, index) in ready {
             let t = self
-                .databases
-                .get_mut(&db_key)
-                .and_then(|c| c.tables.get_mut(&table_key))
+                .schema_mut(&ns)
+                .ok()
+                .and_then(|s| s.tables.get_mut(&table_key))
                 .expect("table still present");
             t.vector_indexes[slot].index = Some(std::sync::Arc::from(index));
             t.vector_indexes[slot].blob = None;
@@ -3544,11 +3889,12 @@ impl PinkDb {
     /// Rebuild one table's stale hash indexes from its live chunks. The
     /// optimizer calls this lazily, just before it rewrites an equality lookup
     /// into an `IndexScan` (see [`DataTable::invalidate_indexes`]).
-    pub fn rebuild_indexes_in(&mut self, db: &str, table: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+    pub fn rebuild_indexes_in(&mut self, ns: impl Into<SchemaPath>, table: &str) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
-        self.table_mut_in(db, table)?.rebuild_indexes();
+        self.table_mut_in(&ns, table)?.rebuild_indexes();
         Ok(())
     }
 
@@ -3561,19 +3907,27 @@ impl PinkDb {
     /// only costs performance.
     pub fn rebuild_stale_indexes(&mut self) {
         for catalog in self.databases.values_mut() {
-            for table in catalog.tables.values_mut() {
-                if table.indexes_stale {
-                    table.rebuild_indexes();
+            for schema in catalog.schemas.values_mut() {
+                for table in schema.tables.values_mut() {
+                    if table.indexes_stale {
+                        table.rebuild_indexes();
+                    }
                 }
             }
         }
     }
 
-    pub fn drop_index_in(&mut self, db: &str, table: &str, name: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, table) {
+    pub fn drop_index_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        table: &str,
+        name: &str,
+    ) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, table) {
             return Err(err);
         }
-        let t = self.table_mut_in(db, table)?;
+        let t = self.table_mut_in(&ns, table)?;
         let before = t.indexes.len() + t.vector_indexes.len();
         t.indexes.retain(|i| !i.name.eq_ignore_ascii_case(name));
         t.vector_indexes
@@ -3592,11 +3946,17 @@ impl PinkDb {
     /// metadata only, like DuckDB. The new name must be free among the
     /// database's tables and views; a case-only rename updates the display
     /// name in place.
-    pub fn rename_table_in(&mut self, db: &str, from: &str, to: &str) -> Result<()> {
-        if let Some(err) = self.attached_read_only(db, from) {
+    pub fn rename_table_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, from) {
             return Err(err);
         }
-        let cat = self.catalog_mut(db)?;
+        let cat = self.schema_mut(&ns)?;
         let key_from = Self::key(from);
         let key_to = Self::key(to);
         if key_to == key_from {
@@ -3625,11 +3985,12 @@ impl PinkDb {
     }
 
     pub fn table(&self, name: &str) -> Result<&DataTable> {
-        self.table_in(&self.current_db, name)
+        self.table_in(SchemaPath::main(&self.current_db), name)
     }
 
-    pub fn table_in(&self, db: &str, name: &str) -> Result<&DataTable> {
-        self.catalog(db)?
+    pub fn table_in(&self, ns: impl Into<SchemaPath>, name: &str) -> Result<&DataTable> {
+        let ns = ns.into();
+        self.schema(&ns)?
             .tables
             .get(&Self::key(name))
             .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))
@@ -3637,14 +3998,19 @@ impl PinkDb {
 
     pub fn table_mut(&mut self, name: &str) -> Result<&mut DataTable> {
         let db = self.current_db.clone();
-        self.table_mut_in(&db, name)
+        self.table_mut_in(SchemaPath::main(&db), name)
     }
 
-    pub fn table_mut_in(&mut self, db: &str, name: &str) -> Result<&mut DataTable> {
-        if let Some(err) = self.attached_read_only(db, name) {
+    pub fn table_mut_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+    ) -> Result<&mut DataTable> {
+        let ns = ns.into();
+        if let Some(err) = self.attached_read_only(&ns, name) {
             return Err(err);
         }
-        self.catalog_mut(db)?
+        self.schema_mut(&ns)?
             .tables
             .get_mut(&Self::key(name))
             .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))
@@ -3652,15 +4018,14 @@ impl PinkDb {
 
     /// Sorted table names (stable output for `.tables`).
     pub fn list_tables(&self) -> Vec<String> {
-        self.list_tables_in(&self.current_db)
+        self.list_tables_in(SchemaPath::main(&self.current_db))
     }
 
-    /// Sorted table display names in `db`.
-    pub fn list_tables_in(&self, db: &str) -> Vec<String> {
+    /// Sorted table display names in `ns`.
+    pub fn list_tables_in(&self, ns: impl Into<SchemaPath>) -> Vec<String> {
         let mut names: Vec<String> = self
-            .databases
-            .get(&Self::db_key(db))
-            .map(|c| c.tables.values().map(|t| t.name.clone()).collect())
+            .schema(&ns.into())
+            .map(|s| s.tables.values().map(|t| t.name.clone()).collect())
             .unwrap_or_default();
         names.sort();
         names
@@ -3674,18 +4039,18 @@ impl PinkDb {
         cols: Option<Vec<String>>,
     ) -> Result<()> {
         let db = self.current_db.clone();
-        self.create_view_in(&db, name, query, cols)
+        self.create_view_in(SchemaPath::main(&db), name, query, cols)
     }
 
     pub fn create_view_in(
         &mut self,
-        db: &str,
+        ns: impl Into<SchemaPath>,
         name: &str,
         query: Select,
         cols: Option<Vec<String>>,
     ) -> Result<()> {
         let key = Self::key(name);
-        let cat = self.catalog_mut(db)?;
+        let cat = self.schema_mut(&ns.into())?;
         if cat.tables.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "a table named \"{name}\" already exists"
@@ -3710,9 +4075,14 @@ impl PinkDb {
 
     /// Stamp the statement text a view was created from, so the engine catalog
     /// image can rebuild it (wave 96b).
-    pub fn set_view_source_in(&mut self, db: &str, name: &str, sql: &str) -> Result<()> {
+    pub fn set_view_source_in(
+        &mut self,
+        ns: impl Into<SchemaPath>,
+        name: &str,
+        sql: &str,
+    ) -> Result<()> {
         let key = Self::key(name);
-        match self.catalog_mut(db)?.views.get_mut(&key) {
+        match self.schema_mut(&ns.into())?.views.get_mut(&key) {
             Some(view) => {
                 view.sql = sql.to_string();
                 Ok(())
@@ -3723,11 +4093,11 @@ impl PinkDb {
 
     pub fn drop_view(&mut self, name: &str) -> Result<()> {
         let db = self.current_db.clone();
-        self.drop_view_in(&db, name)
+        self.drop_view_in(SchemaPath::main(&db), name)
     }
 
-    pub fn drop_view_in(&mut self, db: &str, name: &str) -> Result<()> {
-        self.catalog_mut(db)?
+    pub fn drop_view_in(&mut self, ns: impl Into<SchemaPath>, name: &str) -> Result<()> {
+        self.schema_mut(&ns.into())?
             .views
             .remove(&Self::key(name))
             .map(|_| ())
@@ -3735,11 +4105,11 @@ impl PinkDb {
     }
 
     pub fn view(&self, name: &str) -> Result<&ViewDef> {
-        self.view_in(&self.current_db, name)
+        self.view_in(SchemaPath::main(&self.current_db), name)
     }
 
-    pub fn view_in(&self, db: &str, name: &str) -> Result<&ViewDef> {
-        self.catalog(db)?
+    pub fn view_in(&self, ns: impl Into<SchemaPath>, name: &str) -> Result<&ViewDef> {
+        self.schema(&ns.into())?
             .views
             .get(&Self::key(name))
             .ok_or_else(|| PinkDbError::Catalog(format!("view \"{name}\" not found")))
@@ -3747,15 +4117,14 @@ impl PinkDb {
 
     /// Sorted view display names.
     pub fn list_views(&self) -> Vec<String> {
-        self.list_views_in(&self.current_db)
+        self.list_views_in(SchemaPath::main(&self.current_db))
     }
 
-    /// Sorted view display names in `db`.
-    pub fn list_views_in(&self, db: &str) -> Vec<String> {
+    /// Sorted view display names in `ns`.
+    pub fn list_views_in(&self, ns: impl Into<SchemaPath>) -> Vec<String> {
         let mut names: Vec<String> = self
-            .databases
-            .get(&Self::db_key(db))
-            .map(|c| c.views.values().map(|v| v.name.clone()).collect())
+            .schema(&ns.into())
+            .map(|s| s.views.values().map(|v| v.name.clone()).collect())
             .unwrap_or_default();
         names.sort();
         names
@@ -4204,5 +4573,113 @@ mod tests {
             db.rebuild_stale_indexes();
             assert_index_matches_table(&db);
         }
+    }
+
+    /// Wave 131a: every database has a `main` schema, and a created schema is
+    /// a catalog level of its own (objects never leak between schemas).
+    #[test]
+    fn schemas_are_created_listed_and_hold_their_own_objects() {
+        let mut db = PinkDb::new();
+        let main = SchemaPath::main("main");
+        assert!(db.schema_exists(&main));
+        assert_eq!(db.list_schemas("main"), vec!["main".to_string()]);
+        // Keys are lowercased; the display name is what `list_schemas` sorts.
+        let s = SchemaPath::new("main", "Sales");
+        assert_eq!(s.schema(), "sales");
+        // `Display` quotes an identifier only when it needs quoting.
+        assert_eq!(s.to_string(), "main.sales");
+        assert_eq!(SchemaPath::new("db", "we ird").to_string(), "db.\"we ird\"");
+        db.create_schema(&s, false).unwrap();
+        assert_eq!(
+            db.list_schemas("main"),
+            vec!["main".to_string(), "sales".to_string()]
+        );
+        // `IF NOT EXISTS` is a no-op; the plain form refuses a duplicate.
+        db.create_schema(&s, true).unwrap();
+        assert_eq!(
+            db.create_schema(&s, false).unwrap_err().to_string(),
+            "schema \"sales\" already exists"
+        );
+        db.create_table_in(&s, "t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        assert!(db.table_in(&s, "t").is_ok());
+        assert!(db.table_in(&main, "t").is_err());
+        assert!(db.table_in(SchemaPath::new("main", "other"), "t").is_err());
+        // A schema needs a database to live in.
+        assert_eq!(
+            db.create_schema(&SchemaPath::new("nope", "s"), false)
+                .unwrap_err()
+                .to_string(),
+            "database \"nope\" not found"
+        );
+        assert!(db.list_schemas("nope").is_empty());
+    }
+
+    /// Wave 131a: `main` cannot be dropped, a non-empty schema needs
+    /// `CASCADE`, and `CASCADE` removes the schema's objects with it.
+    #[test]
+    fn drop_schema_refuses_main_and_non_empty_schemas() {
+        let mut db = PinkDb::new();
+        let err = db
+            .drop_schema(&SchemaPath::main("main"), false, true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "cannot drop schema \"main\": it is the database's default schema"
+        );
+        let s = SchemaPath::new("main", "s");
+        db.create_schema(&s, false).unwrap();
+        db.create_table_in(&s, "t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        assert_eq!(
+            db.drop_schema(&s, false, false).unwrap_err().to_string(),
+            "schema \"s\" is not empty: use DROP SCHEMA ... CASCADE"
+        );
+        db.drop_schema(&s, false, true).unwrap();
+        assert!(!db.schema_exists(&s));
+        assert!(db.table_in(&s, "t").is_err());
+        // A missing schema: refused, or a no-op with `IF EXISTS`.
+        assert!(db.drop_schema(&s, true, false).is_ok());
+        assert!(db.drop_schema(&s, false, false).is_err());
+    }
+
+    /// Review fix: dropping a schema drops its grants (schema and table), so
+    /// a later schema of the same name starts clean; a non-empty schema is
+    /// only dropped with `cascade`.
+    #[test]
+    fn drop_schema_removes_its_grants() {
+        use crate::rbac::{GrantObject, Privilege};
+        let mut db = PinkDb::new();
+        let s = SchemaPath::new("main", "s");
+        let schema_grant = GrantObject::Schema {
+            db: "main".to_string(),
+            schema: "s".to_string(),
+        };
+        let table_grant = GrantObject::Table {
+            db: "main".to_string(),
+            schema: "s".to_string(),
+            table: "t".to_string(),
+        };
+        db.create_schema(&s, false).unwrap();
+        db.rbac_mut()
+            .grant(&schema_grant, "alice", &[Privilege::Select]);
+        assert!(db.rbac().allowed("alice", &schema_grant, Privilege::Select));
+        // An empty schema dropped without `cascade` still drops the grant.
+        db.drop_schema(&s, false, false).unwrap();
+        assert!(!db.rbac().allowed("alice", &schema_grant, Privilege::Select));
+        db.create_schema(&s, false).unwrap();
+        assert!(
+            !db.rbac().allowed("alice", &schema_grant, Privilege::Select),
+            "a re-created schema must not inherit the old grants"
+        );
+        // A table grant goes with the schema as well.
+        db.create_table_in(&s, "t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        db.rbac_mut()
+            .grant(&table_grant, "alice", &[Privilege::Select]);
+        assert!(db.rbac().allowed("alice", &table_grant, Privilege::Select));
+        db.drop_schema(&s, false, true).unwrap();
+        assert!(!db.rbac().allowed("alice", &table_grant, Privilege::Select));
     }
 }

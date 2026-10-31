@@ -362,7 +362,10 @@ fn privileges_are_enforced_per_statement_through_the_server() {
         // No grants: reads and writes are refused with the engine's message.
         let e = err_of(alice.execute("SELECT * FROM t;"));
         assert!(e.contains("permission denied"), "{flavor:?}: {e}");
-        assert!(e.contains("GRANT SELECT ON TABLE main.t TO alice"), "{e}");
+        assert!(
+            e.contains("GRANT SELECT ON TABLE main.main.t TO alice"),
+            "{e}"
+        );
         let e = err_of(alice.execute("INSERT INTO t VALUES (3);"));
         assert!(e.contains("INSERT privilege"), "{e}");
         let e = err_of(alice.execute("CREATE TABLE other (a INTEGER);"));

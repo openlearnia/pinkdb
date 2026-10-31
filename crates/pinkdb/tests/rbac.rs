@@ -424,18 +424,36 @@ fn authenticated_sessions_are_checked_per_statement() {
     // naming the missing privilege.
     let e = execute(&mut alice, "SELECT * FROM t;");
     assert!(e.contains("permission denied"), "{e}");
-    assert!(e.contains("SELECT privilege on table \"main.t\""), "{e}");
-    assert!(e.contains("GRANT SELECT ON TABLE main.t TO alice"), "{e}");
+    assert!(
+        e.contains("SELECT privilege on table \"main.main.t\""),
+        "{e}"
+    );
+    assert!(
+        e.contains("GRANT SELECT ON TABLE main.main.t TO alice"),
+        "{e}"
+    );
     let e = execute(&mut alice, "INSERT INTO t VALUES (3, 'c');");
-    assert!(e.contains("INSERT privilege on table \"main.t\""), "{e}");
+    assert!(
+        e.contains("INSERT privilege on table \"main.main.t\""),
+        "{e}"
+    );
     let e = execute(&mut alice, "UPDATE t SET s = 'x';");
-    assert!(e.contains("UPDATE privilege on table \"main.t\""), "{e}");
+    assert!(
+        e.contains("UPDATE privilege on table \"main.main.t\""),
+        "{e}"
+    );
     let e = execute(&mut alice, "DELETE FROM t WHERE i = 1;");
-    assert!(e.contains("DELETE privilege on table \"main.t\""), "{e}");
+    assert!(
+        e.contains("DELETE privilege on table \"main.main.t\""),
+        "{e}"
+    );
     let e = execute(&mut alice, "CREATE TABLE bob_table (a INTEGER);");
     assert!(e.contains("CREATE privilege on database \"main\""), "{e}");
     let e = execute(&mut alice, "SELECT * FROM other.o;");
-    assert!(e.contains("SELECT privilege on table \"other.o\""), "{e}");
+    assert!(
+        e.contains("SELECT privilege on table \"other.main.o\""),
+        "{e}"
+    );
 
     // Granting SELECT lets the read through; the writes stay refused.
     admin_sql(&shared, "GRANT SELECT ON TABLE t TO alice;");
@@ -448,7 +466,10 @@ fn authenticated_sessions_are_checked_per_statement() {
     // A join needs SELECT on every table it reads.
     admin_sql(&shared, "CREATE TABLE other.o2 (i INTEGER);");
     let e = execute(&mut alice, "SELECT * FROM t JOIN other.o2 ON t.i = o2.i;");
-    assert!(e.contains("SELECT privilege on table \"other.o2\""), "{e}");
+    assert!(
+        e.contains("SELECT privilege on table \"other.main.o2\""),
+        "{e}"
+    );
 
     // UPDATE/DELETE need their own privilege *and* SELECT (they read their
     // predicate).
@@ -462,7 +483,10 @@ fn authenticated_sessions_are_checked_per_statement() {
     admin_sql(&shared, "GRANT INSERT ON TABLE t TO alice;");
     assert!(execute(&mut alice, "INSERT INTO t VALUES (4, 'd');").is_empty());
     let e = execute(&mut alice, "INSERT INTO t SELECT i, 'x' FROM other.o;");
-    assert!(e.contains("SELECT privilege on table \"other.o\""), "{e}");
+    assert!(
+        e.contains("SELECT privilege on table \"other.main.o\""),
+        "{e}"
+    );
 
     // Schema DDL is gated by CREATE on the database.
     admin_sql(&shared, "GRANT CREATE ON DATABASE main TO alice;");
@@ -474,7 +498,10 @@ fn authenticated_sessions_are_checked_per_statement() {
     assert!(execute(&mut alice, "DROP INDEX ix;").is_empty());
     // CREATE TABLE AS reads its source, so it needs SELECT too.
     let e = execute(&mut alice, "CREATE TABLE copy AS SELECT * FROM other.o;");
-    assert!(e.contains("SELECT privilege on table \"other.o\""), "{e}");
+    assert!(
+        e.contains("SELECT privilege on table \"other.main.o\""),
+        "{e}"
+    );
     assert!(execute(&mut alice, "CREATE TABLE copy AS SELECT * FROM t;").is_empty());
     admin_sql(&shared, "DROP TABLE copy;");
     // A stored procedure can be defined with CREATE…
@@ -546,31 +573,55 @@ fn the_dml_forms_check_every_table_they_touch() {
 
     // The write privilege of each action the MERGE spells out.
     let e = execute(&mut alice, merge_update);
-    assert!(e.contains("UPDATE privilege on table \"main.t\""), "{e}");
+    assert!(
+        e.contains("UPDATE privilege on table \"main.main.t\""),
+        "{e}"
+    );
     let e = execute(&mut alice, merge_delete);
-    assert!(e.contains("DELETE privilege on table \"main.t\""), "{e}");
+    assert!(
+        e.contains("DELETE privilege on table \"main.main.t\""),
+        "{e}"
+    );
     let e = execute(&mut alice, merge_insert);
-    assert!(e.contains("INSERT privilege on table \"main.t\""), "{e}");
+    assert!(
+        e.contains("INSERT privilege on table \"main.main.t\""),
+        "{e}"
+    );
 
     // A data-modifying CTE's target needs its write privilege.
     let e = execute(
         &mut alice,
         "WITH x AS (INSERT INTO t VALUES (9, 'z') RETURNING i) SELECT * FROM x;",
     );
-    assert!(e.contains("INSERT privilege on table \"main.t\""), "{e}");
+    assert!(
+        e.contains("INSERT privilege on table \"main.main.t\""),
+        "{e}"
+    );
 
     // `UPDATE … FROM` / `DELETE … USING` also read their source.
     admin_sql(&shared, "GRANT UPDATE ON TABLE t TO alice;");
     let e = execute(&mut alice, "UPDATE t SET s = u.s FROM u WHERE t.i = u.i;");
-    assert!(e.contains("SELECT privilege on table \"main.t\""), "{e}");
+    assert!(
+        e.contains("SELECT privilege on table \"main.main.t\""),
+        "{e}"
+    );
     admin_sql(&shared, "GRANT SELECT ON TABLE t TO alice;");
     let e = execute(&mut alice, "UPDATE t SET s = u.s FROM u WHERE t.i = u.i;");
-    assert!(e.contains("SELECT privilege on table \"main.u\""), "{e}");
+    assert!(
+        e.contains("SELECT privilege on table \"main.main.u\""),
+        "{e}"
+    );
     admin_sql(&shared, "GRANT DELETE ON TABLE t TO alice;");
     let e = execute(&mut alice, "DELETE FROM t USING u WHERE t.i = u.i;");
-    assert!(e.contains("SELECT privilege on table \"main.u\""), "{e}");
+    assert!(
+        e.contains("SELECT privilege on table \"main.main.u\""),
+        "{e}"
+    );
     let e = execute(&mut alice, merge_update);
-    assert!(e.contains("SELECT privilege on table \"main.u\""), "{e}");
+    assert!(
+        e.contains("SELECT privilege on table \"main.main.u\""),
+        "{e}"
+    );
 
     // With both tables granted, every form runs.
     admin_sql(&shared, "GRANT SELECT ON TABLE u TO alice;");

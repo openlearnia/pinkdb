@@ -88,6 +88,8 @@ pub mod serve;
 pub mod sql;
 pub mod stats;
 pub mod storage;
+/// The `database.schema` namespace (wave 131).
+pub use storage::SchemaPath;
 pub mod strings;
 /// Host-registered table sources (wave 70): the engine-adjacent surface the
 /// `pinkdb-parquet` crate (`read_parquet`, `FROM 'file.parquet'`) plugs into.
@@ -269,6 +271,7 @@ impl PinkDb {
                 self.boundary_auto_refresh()?;
             }
             let session_db = self.current_db().to_string();
+            let ns = crate::storage::SchemaPath::main(&session_db);
             // Indexes are invalidated by mutation and rebuilt lazily here:
             // one rebuild per indexed table at the next statement boundary,
             // rather than per-row maintenance on every INSERT/UPDATE/DELETE.
@@ -351,7 +354,7 @@ impl PinkDb {
                 if self.is_durable() {
                     // Store-aware: a materialized-view statement depends on
                     // objects the plan alone cannot name (wave 80).
-                    let sets = self.plan_sets_store(&plan, &session_db);
+                    let sets = self.plan_sets_store(&plan, &ns);
                     self.txn_touched.extend(&sets);
                     if let plan::LogicalPlan::Use { name } = &plan {
                         self.txn_touched.add_database(name);
@@ -361,7 +364,7 @@ impl PinkDb {
                     // The transaction's writes become the ON COMMIT trigger
                     // when it finally commits (never on ROLLBACK) — durable
                     // and in-memory stores alike.
-                    let writes = self.plan_writes_of(&plan, &session_db);
+                    let writes = self.plan_writes_of(&plan, &ns);
                     self.txn_writes.extend(writes);
                 }
             }
@@ -382,7 +385,7 @@ impl PinkDb {
                     && plan::optimistic_eligible(&plan);
                 if optimistic {
                     let mut sets = crate::wal::FrameSets::default();
-                    plan::plan_sets(&plan, &session_db, &mut sets);
+                    plan::plan_sets(&plan, &ns, &mut sets);
                     sets.canonicalize();
                     let base = self.capture_base()?;
                     // The execution span no other writer waits for.
@@ -438,7 +441,7 @@ impl PinkDb {
                         }
                         _ => {}
                     }
-                    self.mark_committed_mv_writes(&plan, &session_db);
+                    self.mark_committed_mv_writes(&plan, &ns);
                     execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
                     let log_start = profiling.then(std::time::Instant::now);
                     if let Some(texts) = &texts {
@@ -508,7 +511,7 @@ impl PinkDb {
                     }
                     _ => {}
                 }
-                self.mark_committed_mv_writes(&plan, &session_db);
+                self.mark_committed_mv_writes(&plan, &ns);
                 execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
                 let log_start = profiling.then(std::time::Instant::now);
                 if let Some(texts) = &texts {

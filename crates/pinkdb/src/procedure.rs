@@ -1725,7 +1725,7 @@ pub(crate) struct ProcFrame {
     touched: crate::wal::FrameSets,
     /// The `(database, table)` pairs among those that were *written* (the ON
     /// COMMIT materialized-view trigger's dirty set).
-    writes: std::collections::HashSet<(String, String)>,
+    writes: std::collections::HashSet<crate::storage::TableRef>,
     /// Wave 83: set when the call used `COMMIT`/`ROLLBACK`. The runner then
     /// logs these statements (the final segment, executed in the named
     /// database) instead of the `CALL` text — re-running a call that
@@ -1742,7 +1742,10 @@ impl ProcFrame {
         self.touched.extend(sets);
     }
 
-    pub(crate) fn add_writes(&mut self, writes: &std::collections::HashSet<(String, String)>) {
+    pub(crate) fn add_writes(
+        &mut self,
+        writes: &std::collections::HashSet<crate::storage::TableRef>,
+    ) {
         self.writes.extend(writes.iter().cloned());
     }
 
@@ -1761,14 +1764,18 @@ impl ProcFrame {
     }
 
     /// The set of tables the call wrote.
-    pub(crate) fn writes(&self) -> std::collections::HashSet<(String, String)> {
+    pub(crate) fn writes(&self) -> std::collections::HashSet<crate::storage::TableRef> {
         self.writes.clone()
     }
 
     /// The set of tables the call `read` (touched minus written).
-    pub(crate) fn reads(&self) -> std::collections::HashSet<(String, String)> {
-        let mut out: std::collections::HashSet<(String, String)> =
-            self.touched.table_pairs().iter().cloned().collect();
+    pub(crate) fn reads(&self) -> std::collections::HashSet<crate::storage::TableRef> {
+        let mut out: std::collections::HashSet<crate::storage::TableRef> = self
+            .touched
+            .table_refs()
+            .iter()
+            .map(|(db, schema, table)| (crate::storage::SchemaPath::new(db, schema), table.clone()))
+            .collect();
         for w in &self.writes {
             out.remove(w);
         }
@@ -2508,8 +2515,9 @@ pub(crate) fn run_call_statement(
     // The call's actual touched set (the WAL frame's payload and the
     // transaction's conflict set): collected here because loop conditions are
     // data-dependent and cannot be approximated before execution.
-    let sets = db.plan_sets_store(&plan, db_name);
-    let writes = db.plan_writes_of(&plan, db_name);
+    let ns = crate::storage::SchemaPath::main(db_name);
+    let sets = db.plan_sets_store(&plan, &ns);
+    let writes = db.plan_writes_of(&plan, &ns);
     db.proc_frame.add_sets(&sets);
     db.proc_frame.add_writes(&writes);
     let wrote = crate::plan::writes_tables(&plan);
