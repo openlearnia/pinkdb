@@ -1943,9 +1943,11 @@ impl Lake {
                     bytes_written: 0,
                 });
             }
-            let (author, commit_message) = match &self.pending_commit {
-                Some((author, message)) => (author.clone(), message.clone()),
-                None => (None, None),
+            let (author, commit_message, commit_extra_info) = match &self.pending_commit {
+                Some((author, message, extra_info)) => {
+                    (author.clone(), message.clone(), extra_info.clone())
+                }
+                None => (None, None, None),
             };
             let changes = manifest_for(&*self.store, self.catalog_path(), Some(head.version))
                 .ok()
@@ -1980,7 +1982,7 @@ impl Lake {
                 data_files,
                 bytes_written: file_bytes,
             };
-            match self.publish_catalog_version(&new_catalog, commit_manifest) {
+            match self.publish_catalog_version(&new_catalog, commit_manifest, commit_extra_info) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -2242,9 +2244,11 @@ impl Lake {
             tables.insert(table.to_string(), new_entry);
             let mut deltas: BTreeMap<String, TableDelta> = BTreeMap::new();
             deltas.insert(table.to_string(), delta);
-            let (author, commit_message) = match &self.pending_commit {
-                Some((author, message)) => (author.clone(), message.clone()),
-                None => (None, None),
+            let (author, commit_message, commit_extra_info) = match &self.pending_commit {
+                Some((author, message, extra_info)) => {
+                    (author.clone(), message.clone(), extra_info.clone())
+                }
+                None => (None, None, None),
             };
             let changes = manifest_for(&*self.store, self.catalog_path(), Some(head.version))
                 .ok()
@@ -2278,7 +2282,7 @@ impl Lake {
                 files: registered,
                 bytes_written: 0,
             };
-            match self.publish_catalog_version(&new_catalog, commit_manifest) {
+            match self.publish_catalog_version(&new_catalog, commit_manifest, commit_extra_info) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);
@@ -2996,9 +3000,11 @@ impl Lake {
         // The per-version record, mirroring a save: the author/message kept
         // pending by `Lake::set_commit_message` and the change summary diffed
         // against the base manifest (absent when it is unavailable).
-        let (author, commit_message) = match &self.pending_commit {
-            Some((author, message)) => (author.clone(), message.clone()),
-            None => (None, None),
+        let (author, commit_message, commit_extra_info) = match &self.pending_commit {
+            Some((author, message, extra_info)) => {
+                (author.clone(), message.clone(), extra_info.clone())
+            }
+            None => (None, None, None),
         };
         let updated = crate::time::iso8601_utc(std::time::SystemTime::now());
         // SQL catalogs persist the typed tables, not the audit summary; the
@@ -3071,6 +3077,7 @@ impl Lake {
             lake_id: new_catalog.lake_id.clone(),
             author: new_catalog.author.clone(),
             commit_message: new_catalog.commit_message.clone(),
+            commit_extra_info,
             engine_catalog: self.pending_engine_catalog.clone(),
             schemas: commit.catalog_schemas().map(|s| s.to_vec()),
         };
@@ -3115,6 +3122,7 @@ impl Lake {
         &mut self,
         catalog: &crate::catalog::Catalog,
         manifest: crate::catalog::CommitManifest,
+        commit_extra_info: Option<String>,
     ) -> Result<()> {
         let change = crate::metadata::CatalogChange {
             catalog: None,
@@ -3125,6 +3133,7 @@ impl Lake {
             lake_id: catalog.lake_id.clone(),
             author: catalog.author.clone(),
             commit_message: catalog.commit_message.clone(),
+            commit_extra_info,
             engine_catalog: None,
             schemas: None,
         };
@@ -3285,18 +3294,16 @@ fn partition_specs_for(
 }
 
 /// Assign `row_id_start` ranges to the commit's new data files, continuing
-/// `next` (the table's row-id counter) in file order. A zero-row file gets no
-/// range. Backdating is not possible: the counter never moves backwards.
+/// `next` (the table's row-id counter) in file order. A zero-row file starts
+/// where the counter stands, so DuckDB can still read row ids from it.
+/// Backdating is not possible: the counter never moves backwards.
 fn stamp_file_row_ids(files: &[FileRef], next: &mut u64) -> Vec<FileRef> {
     files
         .iter()
         .map(|f| {
-            let start = f.rows().filter(|r| *r > 0).map(|rows| {
-                let start = *next;
-                *next = next.saturating_add(rows);
-                start
-            });
-            f.with_row_id_start(start)
+            let start = *next;
+            *next = next.saturating_add(f.rows().unwrap_or(0));
+            f.with_row_id_start(Some(start))
         })
         .collect()
 }

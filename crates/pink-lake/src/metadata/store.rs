@@ -36,7 +36,10 @@ use pinkdb::DataType;
 
 use super::conn::{SqlConnection, SqlConnectionExt, SqlValue, encode_hex, params, query_one};
 use super::dialect::{DUCKLAKE_VERSION, Dialect};
-use super::{CatalogChange, MetadataStore, pink_version, snapshot_id};
+use super::{
+    CatalogChange, MetadataOptionRow, MetadataStore, SnapshotChanges, TableIdentity, pink_version,
+    snapshot_id,
+};
 use crate::catalog::{
     Catalog, ColumnEntry, CommitManifest, DeleteRef, DeltaKind, FileFormat, FileRef, InlinedRow,
     PartitionKey, RenameEntry, TableDelta, TableEntry, TableMeta, TableRuntime,
@@ -581,6 +584,162 @@ impl SqlMetadataStore {
         })
     }
 
+    /// [`MetadataStore::catalog_type`].
+    pub(crate) fn data_file_footers(&self) -> Result<Vec<(String, u64)>> {
+        self.with_conn(|conn| {
+            let stmt = conn
+                .prepare(
+                    "SELECT path, footer_size FROM ducklake_data_file
+                     WHERE footer_size IS NOT NULL",
+                )
+                .map_err(|e| sql_error("reading data file footers", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| sql_error("reading data file footers", e))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (path, footer_size) =
+                    row.map_err(|e| sql_error("reading data file footers", e))?;
+                let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                out.push((name, footer_size.max(0) as u64));
+            }
+            Ok(out)
+        })
+    }
+
+    pub(crate) fn table_delete_files(&self) -> Result<Vec<(i64, u64, Option<u64>)>> {
+        self.with_conn(|conn| {
+            let head = head_snapshot_id(conn)?;
+            let stmt = conn
+                .prepare(
+                    "SELECT d.table_id, COUNT(*), SUM(d.file_size_bytes)
+                     FROM ducklake_delete_file d
+                     WHERE d.begin_snapshot <= ?1
+                       AND (d.end_snapshot IS NULL OR d.end_snapshot > ?1)
+                     GROUP BY d.table_id
+                     ORDER BY d.table_id",
+                )
+                .map_err(|e| sql_error("reading delete files", e))?;
+            let rows = stmt
+                .query_map(params![head], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?.max(0) as u64,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })
+                .map_err(|e| sql_error("reading delete files", e))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (table_id, count, bytes) =
+                    row.map_err(|e| sql_error("reading delete files", e))?;
+                out.push((table_id, count, bytes.map(|bytes| bytes.max(0) as u64)));
+            }
+            Ok(out)
+        })
+    }
+
+    pub(crate) fn catalog_type(&self) -> &'static str {
+        match self.inner.conn.dialect() {
+            Dialect::Sqlite => "sqlite",
+            Dialect::Postgres => "postgres",
+            Dialect::Pink => "pinkdb",
+        }
+    }
+
+    /// [`MetadataStore::snapshot_changes`].
+    pub(crate) fn snapshot_changes(&self, version: u64) -> Result<Option<SnapshotChanges>> {
+        self.with_conn(|conn| {
+            let sid = snapshot_id(version)?;
+            // The time lives on `ducklake_snapshot`, the rest on
+            // `ducklake_snapshot_changes`; a catalog written by another tool
+            // need not have the change row, and snapshot 0 never does.
+            let row: Option<SnapshotChanges> = conn
+                .query_row(
+                    "SELECT CAST(s.snapshot_time AS VARCHAR), c.changes_made, c.author,
+                            c.commit_message, c.commit_extra_info
+                     FROM ducklake_snapshot s
+                     LEFT JOIN ducklake_snapshot_changes c ON c.snapshot_id = s.snapshot_id
+                     WHERE s.snapshot_id = ?1",
+                    params![sid],
+                    |row| {
+                        Ok(SnapshotChanges {
+                            snapshot_time: row.get(0)?,
+                            changes_made: row.get(1)?,
+                            author: row.get(2)?,
+                            commit_message: row.get(3)?,
+                            commit_extra_info: row.get(4)?,
+                        })
+                    },
+                )
+                .map_err(|e| sql_error("reading a snapshot's change row", e))?;
+            Ok(row)
+        })
+    }
+
+    /// [`MetadataStore::catalog_table_ids`].
+    pub(crate) fn catalog_table_ids(&self) -> Result<Vec<TableIdentity>> {
+        self.with_conn(|conn| {
+            let Some(sid) = head_snapshot_id(conn)? else {
+                return Ok(Vec::new());
+            };
+            let stmt = conn
+                .prepare(
+                    "SELECT t.schema_id, t.table_id, CAST(t.table_uuid AS VARCHAR),
+                            s.schema_name, t.table_name
+                     FROM ducklake_table t
+                     JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                     WHERE t.begin_snapshot <= ?1
+                       AND (t.end_snapshot IS NULL OR t.end_snapshot > ?1)
+                       AND s.begin_snapshot <= ?1
+                       AND (s.end_snapshot IS NULL OR s.end_snapshot > ?1)
+                     ORDER BY t.table_id",
+                )
+                .map_err(|e| sql_error("reading table identities", e))?;
+            let rows = stmt
+                .query_map(params![sid], |row| {
+                    Ok(TableIdentity {
+                        key: format!("{}.{}", row.get::<_, String>(3)?, row.get::<_, String>(4)?),
+                        schema_id: row.get(0)?,
+                        table_id: row.get(1)?,
+                        uuid: row.get(2)?,
+                    })
+                })
+                .map_err(|e| sql_error("reading table identities", e))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| sql_error("reading table identities", e))?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// [`MetadataStore::metadata_options`].
+    pub(crate) fn metadata_options(&self) -> Result<Vec<MetadataOptionRow>> {
+        self.with_conn(|conn| {
+            let stmt = conn
+                .prepare("SELECT key, value, scope, scope_id FROM ducklake_metadata ORDER BY key")
+                .map_err(|e| sql_error("reading the catalog's options", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(MetadataOptionRow {
+                        key: row.get(0)?,
+                        value: row.get(1)?,
+                        scope: row.get(2)?,
+                        scope_id: row.get(3)?,
+                    })
+                })
+                .map_err(|e| sql_error("reading the catalog's options", e))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| sql_error("reading the catalog's options", e))?);
+            }
+            Ok(out)
+        })
+    }
+
     /// The version numbers with a snapshot row, ascending.
     pub(crate) fn snapshot_versions(&self) -> Result<Vec<u64>> {
         self.with_conn(|conn| {
@@ -927,6 +1086,28 @@ impl MetadataStore for SqlMetadataStore {
 
     fn set_encrypted(&self, encrypted: bool) -> Result<()> {
         SqlMetadataStore::set_encrypted(self, encrypted)
+    }
+
+    fn catalog_type(&self) -> &'static str {
+        SqlMetadataStore::catalog_type(self)
+    }
+    fn table_delete_files(&self) -> Result<Vec<(i64, u64, Option<u64>)>> {
+        SqlMetadataStore::table_delete_files(self)
+    }
+    fn data_file_footers(&self) -> Result<Vec<(String, u64)>> {
+        SqlMetadataStore::data_file_footers(self)
+    }
+
+    fn snapshot_changes(&self, version: u64) -> Result<Option<SnapshotChanges>> {
+        SqlMetadataStore::snapshot_changes(self, version)
+    }
+
+    fn catalog_table_ids(&self) -> Result<Vec<TableIdentity>> {
+        SqlMetadataStore::catalog_table_ids(self)
+    }
+
+    fn metadata_options(&self) -> Result<Vec<MetadataOptionRow>> {
+        SqlMetadataStore::metadata_options(self)
     }
 
     fn commit(&self, base_version: u64, change: CatalogChange) -> Result<u64> {
@@ -3729,9 +3910,15 @@ fn commit_in_conn(
     };
     conn.execute(
         "INSERT INTO ducklake_snapshot_changes
-         (snapshot_id, changes_made, author, commit_message)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![sid, changes_made, target.author, target.commit_message],
+         (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            sid,
+            changes_made,
+            target.author,
+            target.commit_message,
+            change.commit_extra_info.clone()
+        ],
     )
     .map_err(|e| sql_error("inserting the snapshot change row", e))?;
     conn.execute(
@@ -4420,9 +4607,15 @@ fn insert_snapshot(
     };
     conn.execute(
         "INSERT INTO ducklake_snapshot_changes
-         (snapshot_id, changes_made, author, commit_message)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![sid, changes_made, change.author, change.commit_message],
+         (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            sid,
+            changes_made,
+            change.author,
+            change.commit_message,
+            change.commit_extra_info
+        ],
     )
     .map_err(|e| sql_error("inserting the snapshot change row", e))?;
     conn.execute(

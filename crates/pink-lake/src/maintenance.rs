@@ -687,9 +687,11 @@ impl Lake {
                 });
                 tables.insert(planned.key, planned.entry);
             }
-            let (author, commit_message) = match &self.pending_commit {
-                Some((author, message)) => (author.clone(), message.clone()),
-                None => (None, None),
+            let (author, commit_message, commit_extra_info) = match &self.pending_commit {
+                Some((author, message, extra_info)) => {
+                    (author.clone(), message.clone(), extra_info.clone())
+                }
+                None => (None, None, None),
             };
             let changes = manifest_for(&*self.store, self.catalog_path(), Some(head.version))
                 .ok()
@@ -724,7 +726,7 @@ impl Lake {
                 skipped,
                 bytes_written: files_bytes,
             };
-            match self.publish_catalog_version(&new_catalog, commit_manifest) {
+            match self.publish_catalog_version(&new_catalog, commit_manifest, commit_extra_info) {
                 Ok(()) => {
                     self.pending_commit = None;
                     return Ok(report);

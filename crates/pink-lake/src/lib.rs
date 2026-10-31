@@ -409,6 +409,7 @@ pub mod database;
 mod delete_file;
 pub mod engine;
 pub mod format;
+pub mod functions;
 mod incremental;
 mod inlined;
 mod local;
@@ -433,6 +434,7 @@ use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry}
 pub use cdc::{ChangeKind, ChangeRow};
 pub use crypto::EncryptionKey;
 pub use engine::{EngineLease, LEASE_PATH, LEASE_TIMEOUT, LeaseError};
+pub use functions::{DuckLakeCall, FnArg, call_read, call_write, is_mutating, output_schema};
 pub use incremental::{
     AddFilesReport, Commit, CommitReport, CommitSettings, FlushReport, WritableAttachment,
 };
@@ -822,11 +824,11 @@ pub struct Lake {
     lake_id: String,
     format_version: u32,
     version: u64,
-    /// The author/commit message [`Lake::set_commit_message`] recorded for the
-    /// next published save (DuckLake's `ducklake_set_commit_message`
-    /// transaction metadata). Kept across a failed save, cleared by a
-    /// successful one.
-    pending_commit: Option<(Option<String>, Option<String>)>,
+    /// The author/commit message/extra info [`Lake::set_commit_message`]
+    /// recorded for the next published save (DuckLake's
+    /// `ducklake_set_commit_message` transaction metadata). Kept across a
+    /// failed save, cleared by a successful one.
+    pending_commit: Option<(Option<String>, Option<String>, Option<String>)>,
     /// The engine catalog image [`Lake::set_engine_catalog`] staged for the
     /// next published commit (wave 96b). Kept across a failed save, cleared by
     /// a successful one — like `pending_commit`, so a retry publishes it once.
@@ -1345,7 +1347,19 @@ impl Lake {
     /// field; the pair is cleared once a save succeeds and kept when one
     /// fails, so a retry still carries it.
     pub fn set_commit_message(&mut self, author: Option<String>, message: Option<String>) {
-        self.pending_commit = Some((author, message));
+        self.set_commit_message_with_extra(author, message, None);
+    }
+
+    /// [`Lake::set_commit_message`] plus DuckLake's `extra_info`, the fourth
+    /// argument `ducklake_set_commit_message` writes beside the author and
+    /// message.
+    pub fn set_commit_message_with_extra(
+        &mut self,
+        author: Option<String>,
+        message: Option<String>,
+        extra_info: Option<String>,
+    ) {
+        self.pending_commit = Some((author, message, extra_info));
     }
 
     /// Stage the engine catalog image (wave 96b) for the next published
@@ -1717,12 +1731,12 @@ impl Lake {
                 let files: Vec<crate::catalog::FileRef> = files
                     .into_iter()
                     .map(|f| {
-                        let start = f.rows().filter(|r| *r > 0).map(|r| {
-                            let start = next_row_id;
-                            next_row_id = next_row_id.saturating_add(r);
-                            start
-                        });
-                        f.with_schema_version(Some(1)).with_row_id_start(start)
+                        // A zero-row file starts where the counter stands, so
+                        // DuckDB can still read row ids from it.
+                        let start = next_row_id;
+                        next_row_id = next_row_id.saturating_add(f.rows().unwrap_or(0));
+                        f.with_schema_version(Some(1))
+                            .with_row_id_start(Some(start))
                     })
                     .collect();
                 // The v5 schema record: the store table's live columns, with
@@ -1849,9 +1863,11 @@ impl Lake {
                     inlining_changed: false,
                 });
         }
-        let (author, commit_message) = match &self.pending_commit {
-            Some((author, message)) => (author.clone(), message.clone()),
-            None => (None, None),
+        let (author, commit_message, commit_extra_info) = match &self.pending_commit {
+            Some((author, message, extra_info)) => {
+                (author.clone(), message.clone(), extra_info.clone())
+            }
+            None => (None, None, None),
         };
         let schema_version = next_schema_version(previous.as_ref(), &tables);
         let changes = previous
@@ -1885,6 +1901,7 @@ impl Lake {
             lake_id: manifest.lake_id.clone(),
             author: manifest.author.clone(),
             commit_message: manifest.commit_message.clone(),
+            commit_extra_info,
             engine_catalog: self.pending_engine_catalog.clone(),
             schemas: None,
         };

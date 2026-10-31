@@ -1262,6 +1262,7 @@ fn a_duckdb_sqlite_lake_matches_pinkdb_at_every_snapshot() {
     let catalog = format!("sqlite:{}", catalog_path.display());
     let lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
     check_every_snapshot(&binary, &attach, &data, &lake);
+    check_read_functions(&lake, &binary, &attach, &data);
     drop(lake);
     cleanup(&dir);
 }
@@ -1460,6 +1461,651 @@ fn a_duckdb_postgres_conninfo_lake_matches_pinkdb_at_every_snapshot() {
     let catalog = format!("postgres:{}", server.conninfo());
     let lake = Lake::open_with_catalog(&catalog, Some(data.to_str().unwrap())).unwrap();
     check_every_snapshot(&binary, &attach, &data, &lake);
+    check_read_functions(&lake, &binary, &attach, &data);
+    drop(lake);
+    cleanup(&dir);
+}
+
+// ===== Wave 132c: DuckLake's functions as result tables =====================
+
+use pink_lake::functions::{DuckLakeCall, FnArg, call_read, call_write, output_schema};
+
+/// DuckDB's `-json` rows for the last statement of `script`, as text: `NULL`
+/// is `"<null>"`, everything else is the value the SQL cast it to.
+fn duckdb_json_rows(binary: &Path, script: &str, columns: &[&str]) -> Vec<Vec<String>> {
+    let output = Command::new(binary)
+        .args(["-no-agent", "-json", "-c", script])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "DuckDB failed: {}\n{script}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // One statement's rows arrive either as one JSON array or as one object
+    // per line, depending on the DuckDB build.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = stdout.trim();
+    let rows: Vec<serde_json::Map<String, serde_json::Value>> = match serde_json::from_str(text) {
+        Ok(rows) => rows,
+        Err(error) => text
+            .lines()
+            .map(|line| line.trim().trim_end_matches([',', ']', '[', ' ']))
+            .filter(|line| line.starts_with('{'))
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|_| panic!("{error}: {line}\n{text}"))
+            })
+            .collect(),
+    };
+    rows.iter()
+        .map(|row| {
+            columns
+                .iter()
+                .map(|column| match row.get(*column) {
+                    None | Some(serde_json::Value::Null) => "<null>".to_string(),
+                    Some(serde_json::Value::String(text)) => text.clone(),
+                    Some(other) => other.to_string(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn pinkdb_rows(table: &DataTable) -> Vec<Vec<String>> {
+    (0..table.num_rows())
+        .map(|row| {
+            (0..table.schema().len())
+                .map(|column| match table.get(row, column) {
+                    None | Some(Value::Null) => "<null>".to_string(),
+                    Some(Value::Varchar(text)) => text,
+                    Some(Value::Boolean(flag)) => flag.to_string(),
+                    Some(Value::Integer(number)) => number.to_string(),
+                    Some(Value::Bigint(number)) => number.to_string(),
+                    Some(Value::Timestamp(micros)) => micros.to_string(),
+                    Some(other) => panic!("unexpected value {other}"),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn attach_script(attach: &str, data: &Path) -> String {
+    format!(
+        "LOAD ducklake;\n\
+         ATTACH '{attach}' AS l (DATA_PATH '{}', OVERRIDE_DATA_PATH true);\n",
+        data.display()
+    )
+}
+
+/// Runs `call` through both DuckDB (`script`) and pink-lake and compares every
+/// value. The `CAST` in `script` gives DuckDB's own text for each column, so
+/// the comparison also pins the declared schema to DuckDB's column names.
+fn check_function(lake: &Lake, binary: &Path, script: &str, call: DuckLakeCall, sorted: bool) {
+    let schema = output_schema(lake, &call)
+        .unwrap_or_else(|error| panic!("{}: {error}", call.name))
+        .unwrap_or_else(|| panic!("{} is not a DuckLake function", call.name));
+    let columns: Vec<&str> = schema.iter().map(|(name, _)| name.as_str()).collect();
+    let theirs = duckdb_json_rows(binary, script, &columns);
+    let ours = call_read(lake, &call).unwrap_or_else(|error| panic!("{}: {error}", call.name));
+    let mut ours = pinkdb_rows(&ours);
+    let mut theirs = theirs;
+    if sorted {
+        ours.sort();
+        theirs.sort();
+    }
+    assert_eq!(ours, theirs, "{}: rows", call.name);
+}
+
+fn call(name: &str, positional: Vec<FnArg>) -> DuckLakeCall {
+    DuckLakeCall::new(name, positional)
+}
+
+fn text(value: &str) -> FnArg {
+    FnArg::Text(value.to_string())
+}
+
+/// The lake every read function is compared on: inlined rows, two Parquet
+/// files, a DELETE, an UPDATE, an added column, a second table and a commit
+/// message with extra info.
+fn write_duckdb_function_lake(binary: &Path, attach: &str, data: &Path) -> bool {
+    let statements = [
+        "CALL ducklake_set_commit_message('l', 'duckdb-author', 'first commit');",
+        "CREATE TABLE l.t (i INTEGER, s VARCHAR);",
+        "INSERT INTO l.t VALUES (1, 'a'), (2, 'b');",
+        "CALL ducklake_flush_inlined_data('l');",
+        "INSERT INTO l.t VALUES (3, 'c'), (4, 'd');",
+        "CALL ducklake_flush_inlined_data('l');",
+        "DELETE FROM l.t WHERE i = 2;",
+        "UPDATE l.t SET s = 'u' WHERE i = 3;",
+        "ALTER TABLE l.t ADD COLUMN c INTEGER;",
+        "UPDATE l.t SET c = i * 10;",
+        "CREATE TABLE l.t2 (x BIGINT);",
+        "INSERT INTO l.t2 VALUES (7), (8);",
+        "INSERT INTO l.t VALUES (5, 'e', 50);",
+        "CALL ducklake_set_commit_message('l', 'duckdb-author', 'last commit', extra_info := 'extra');",
+        "INSERT INTO l.t VALUES (6, 'f', 60);",
+    ];
+    let script = format!("{}{}", attach_script(attach, data), statements.join("\n"));
+    match run_duckdb(binary, &script) {
+        Ok(_) => true,
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip DuckDB interop test: {message}");
+            false
+        }
+        Err(message) => panic!("{message}"),
+    }
+}
+
+/// Every read function and argument form, compared to DuckDB on the same lake.
+fn check_read_functions(lake: &Lake, binary: &Path, attach: &str, data: &Path) {
+    let prefix = attach_script(attach, data);
+    // A snapshot id both tools can resolve, with data files behind it.
+    let version = lake
+        .snapshots()
+        .map(|snapshots| snapshots.iter().map(|info| info.version).max().unwrap_or(4) as i64 - 3)
+        .unwrap_or(1)
+        .max(1);
+
+    check_function(
+        lake,
+        binary,
+        &format!(
+            "{prefix}SELECT CAST(snapshot_id AS VARCHAR) AS snapshot_id, \
+             CAST(epoch_us(snapshot_time) AS VARCHAR) AS snapshot_time, \
+             CAST(schema_version AS VARCHAR) AS schema_version, \
+             CAST(changes AS VARCHAR) AS changes, author, commit_message, \
+             commit_extra_info FROM ducklake_snapshots('l')"
+        ),
+        call("ducklake_snapshots", vec![text("l")]),
+        true,
+    );
+    check_function(
+        lake,
+        binary,
+        &format!("{prefix}SELECT CAST(id AS VARCHAR) AS id FROM ducklake_current_snapshot('l')"),
+        call("ducklake_current_snapshot", vec![text("l")]),
+        false,
+    );
+    check_function(
+        lake,
+        binary,
+        &format!(
+            "{prefix}SELECT CAST(id AS VARCHAR) AS id FROM ducklake_last_committed_snapshot('l')"
+        ),
+        call("ducklake_last_committed_snapshot", vec![text("l")]),
+        false,
+    );
+    check_function(
+        lake,
+        binary,
+        &format!(
+            "{prefix}SELECT table_name, CAST(schema_id AS VARCHAR) AS schema_id, \
+             CAST(table_id AS VARCHAR) AS table_id, CAST(table_uuid AS VARCHAR) AS table_uuid, \
+             CAST(file_count AS VARCHAR) AS file_count, \
+             CAST(file_size_bytes AS VARCHAR) AS file_size_bytes, \
+             CAST(delete_file_count AS VARCHAR) AS delete_file_count, \
+             CAST(delete_file_size_bytes AS VARCHAR) AS delete_file_size_bytes \
+             FROM ducklake_table_info('l') ORDER BY table_name"
+        ),
+        call("ducklake_table_info", vec![text("l")]),
+        false,
+    );
+    let list_files = |extra: &str| {
+        format!(
+            "{prefix}SELECT data_file, CAST(data_file_size_bytes AS VARCHAR) AS data_file_size_bytes, \
+             CAST(data_file_footer_size AS VARCHAR) AS data_file_footer_size, \
+             CAST(data_file_encryption_key AS VARCHAR) AS data_file_encryption_key, \
+             delete_file, CAST(delete_file_size_bytes AS VARCHAR) AS delete_file_size_bytes, \
+             CAST(delete_file_footer_size AS VARCHAR) AS delete_file_footer_size, \
+             CAST(delete_file_encryption_key AS VARCHAR) AS delete_file_encryption_key \
+             FROM ducklake_list_files('l', 't'{extra}) ORDER BY data_file, delete_file"
+        )
+    };
+    check_function(
+        lake,
+        binary,
+        &list_files(""),
+        call("ducklake_list_files", vec![text("l"), text("t")]),
+        // DuckDB orders the rows by data file id; the manifest's order is its
+        // own, so the comparison is order-insensitive.
+        true,
+    );
+    let mut named = call("ducklake_list_files", vec![text("l"), text("t")]);
+    named.named.push(("schema".to_string(), text("main")));
+    named
+        .named
+        .push(("snapshot_version".to_string(), FnArg::Int(version)));
+    check_function(
+        lake,
+        binary,
+        &list_files(&format!(
+            ", schema := 'main', snapshot_version := {version}"
+        )),
+        named,
+        true,
+    );
+    check_function(
+        lake,
+        binary,
+        &format!(
+            "{prefix}SELECT option_name, description, value, scope, scope_entry \
+             FROM ducklake_options('l') ORDER BY option_name"
+        ),
+        call("ducklake_options", vec![text("l")]),
+        false,
+    );
+
+    // pinkdb reports its own extension version and its catalog backend's name,
+    // so only the other columns can be compared value for value.
+    let settings = call_read(lake, &call("ducklake_settings", vec![text("l")])).unwrap();
+    let ours = pinkdb_rows(&settings);
+    let theirs = duckdb_json_rows(
+        binary,
+        &format!(
+            "{prefix}SELECT catalog_type, extension_version, data_path FROM ducklake_settings('l')"
+        ),
+        &["catalog_type", "extension_version", "data_path"],
+    );
+    assert_eq!(ours.len(), 1);
+    assert_eq!(theirs.len(), 1);
+    assert_eq!(ours[0][0], theirs[0][0], "catalog_type");
+    assert_eq!(ours[0][2], theirs[0][2], "data_path");
+    assert!(
+        ours[0][1].contains('.'),
+        "extension_version: {}",
+        ours[0][1]
+    );
+}
+
+#[test]
+fn ducklake_functions_match_duckdb_on_a_duckdb_lake() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("functions-duckdb-lake");
+    let catalog_path = dir.join("catalog.db");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let attach = format!("ducklake:sqlite:{}", catalog_path.display());
+    if !write_duckdb_function_lake(&binary, &attach, &data) {
+        cleanup(&dir);
+        return;
+    }
+    let lake = Lake::open_with_catalog(
+        &format!("sqlite:{}", catalog_path.display()),
+        Some(data.to_str().unwrap()),
+    )
+    .unwrap();
+    check_read_functions(&lake, &binary, &attach, &data);
+    drop(lake);
+    cleanup(&dir);
+}
+
+/// A pinkdb-written lake: inlined rows, a flushed Parquet file, a second table
+/// and a commit message.
+/// A lake with two tables and inlined rows only; `flush` decides whether the
+/// first commit's rows go to a Parquet file (so a reader sees both a file and
+/// inlined rows), which also keeps pinkdb's inlined bookkeeping out of a
+/// later `ducklake_flush_inlined_data` comparison.
+fn write_pinkdb_function_lake(dir: &Path, flush: bool) -> Lake {
+    let catalog = format!("sqlite:{}", dir.join("catalog.db").display());
+    let data = dir.join("data");
+    let mut lake = Lake::create_with_catalog(&catalog, data.to_str().unwrap()).unwrap();
+    lake.set_write_format(FORMAT_ID).unwrap();
+    lake.set_data_inlining_row_limit(20);
+    let mut empty = PinkDb::new();
+    empty
+        .execute("CREATE TABLE main.t (i INTEGER, s VARCHAR);")
+        .unwrap();
+    empty.execute("CREATE TABLE main.t2 (x BIGINT);").unwrap();
+    lake.write_from_store(&empty).unwrap();
+
+    let table_schema = || {
+        vec![
+            ("i".to_string(), DataType::Integer),
+            ("s".to_string(), DataType::Varchar),
+        ]
+    };
+    let mut first = DataTable::new("t".to_string(), table_schema()).unwrap();
+    for i in 0..3 {
+        first
+            .append_row(vec![Value::Integer(i), Value::Varchar(format!("v{i}"))])
+            .unwrap();
+    }
+    let mut commit = Commit::new();
+    commit.append("main.t", Arc::new(first));
+    assert!(lake.commit(&commit).unwrap().committed);
+    if flush {
+        assert!(lake.flush_inlined_data(Some("main.t")).unwrap().committed);
+    }
+
+    let mut second = DataTable::new("t".to_string(), table_schema()).unwrap();
+    for i in 3..5 {
+        second
+            .append_row(vec![Value::Integer(i), Value::Varchar(format!("v{i}"))])
+            .unwrap();
+    }
+    let mut t2 =
+        DataTable::new("t2".to_string(), vec![("x".to_string(), DataType::Bigint)]).unwrap();
+    t2.append_row(vec![Value::Bigint(7)]).unwrap();
+    let mut commit = Commit::new();
+    commit.append("main.t", Arc::new(second));
+    commit.append("main.t2", Arc::new(t2));
+    assert!(lake.commit(&commit).unwrap().committed);
+
+    let mut last =
+        DataTable::new("t2".to_string(), vec![("x".to_string(), DataType::Bigint)]).unwrap();
+    last.append_row(vec![Value::Bigint(8)]).unwrap();
+    lake.set_commit_message(
+        Some("pinkdb-author".to_string()),
+        Some("pinkdb commit".to_string()),
+    );
+    let mut commit = Commit::new();
+    commit.append("main.t2", Arc::new(last));
+    assert!(lake.commit(&commit).unwrap().committed);
+    lake
+}
+
+#[test]
+fn ducklake_functions_match_duckdb_on_a_pinkdb_lake() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("functions-pinkdb-lake");
+    let lake = write_pinkdb_function_lake(&dir, true);
+    let data = dir.join("data");
+    let attach = format!("ducklake:sqlite:{}", dir.join("catalog.db").display());
+    check_read_functions(&lake, &binary, &attach, &data);
+
+    // The row-level functions: pinkdb reconstructs them from its own commit
+    // deltas, so only a pinkdb-written lake can answer them, and only one that
+    // never flushed: DuckDB derives changes from file and inlined-table state,
+    // so it shows a flush as a delete of the inlined row plus an insert into
+    // the new file, which pinkdb's deltas do not model.
+    drop(lake);
+    cleanup(&dir);
+    let dir = scratch("functions-pinkdb-changes");
+    let lake = write_pinkdb_function_lake(&dir, false);
+    let attach = format!("ducklake:sqlite:{}", dir.join("catalog.db").display());
+    let prefix = attach_script(&attach, &dir.join("data"));
+    let head = lake
+        .snapshots()
+        .unwrap()
+        .iter()
+        .map(|info| info.version)
+        .max()
+        .unwrap() as i64
+        - 1;
+    for (name, extra) in [
+        ("ducklake_table_changes", true),
+        ("ducklake_table_insertions", false),
+        ("ducklake_table_deletions", false),
+    ] {
+        let selection = if extra {
+            format!(
+                "SELECT CAST(snapshot_id AS VARCHAR) AS snapshot_id, CAST(rowid AS VARCHAR) AS rowid, \
+                 change_type, CAST(i AS VARCHAR) AS i, s FROM {name}('l', 'main', 't', 0, {head})"
+            )
+        } else {
+            format!("SELECT CAST(i AS VARCHAR) AS i, s FROM {name}('l', 'main', 't', 0, {head})")
+        };
+        check_function(
+            &lake,
+            &binary,
+            &format!("{prefix}{selection}"),
+            call(
+                name,
+                vec![
+                    text("l"),
+                    text("main"),
+                    text("t"),
+                    FnArg::Int(0),
+                    FnArg::Int(head),
+                ],
+            ),
+            true,
+        );
+    }
+
+    drop(lake);
+    cleanup(&dir);
+}
+
+/// `flush_inlined_data` and `expire_snapshots` on two identical copies of one
+/// lake: pinkdb's rows must equal DuckDB's, and DuckDB must read pinkdb's
+/// flushed lake exactly as it reads its own copy.
+#[test]
+fn ducklake_write_functions_match_duckdb_on_copies() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("functions-write");
+    let lake = write_pinkdb_function_lake(&dir, false);
+    drop(lake);
+    // The copies live outside `dir`: copying a tree into its own subdirectory
+    // would make `copy_tree` recurse into what it is writing.
+    let ours_dir = scratch("functions-write-ours");
+    let theirs_dir = scratch("functions-write-theirs");
+    copy_tree(&dir, &ours_dir);
+    copy_tree(&dir, &theirs_dir);
+    // The copies' catalogs still point at the original data directory, so the
+    // lake is opened through its own catalog path with the copy's data.
+    let catalog_of = |copy: &Path| format!("sqlite:{}", copy.join("catalog.db").display());
+
+    let mut ours = Lake::open_with_catalog(
+        &catalog_of(&ours_dir),
+        Some(ours_dir.join("data").to_str().unwrap()),
+    )
+    .unwrap();
+    let inlined = ours
+        .table_info()
+        .unwrap()
+        .iter()
+        .map(|info| info.inlined_rows)
+        .sum::<u64>();
+    assert!(inlined > 0, "the copy must start with inlined rows");
+    let mut flush = call("ducklake_flush_inlined_data", vec![text("l")]);
+    flush.named.push(("schema_name".to_string(), text("main")));
+    flush.named.push(("table_name".to_string(), text("t")));
+    let flushed = call_write(&mut ours, &flush).unwrap();
+    assert!(flushed.num_rows() > 0, "{flushed:?}");
+    drop(ours);
+
+    let table = format!(
+        "{prefix}SELECT CAST(rows_flushed AS VARCHAR) AS rows_flushed, schema_name, table_name \
+         FROM ducklake_flush_inlined_data('l', schema_name := 'main', table_name := 't')",
+        prefix = attach_script(
+            &format!(
+                "ducklake:sqlite:{}",
+                theirs_dir.join("catalog.db").display()
+            ),
+            &theirs_dir.join("data")
+        )
+    );
+    let mut theirs = duckdb_json_rows(
+        &binary,
+        &table,
+        &["rows_flushed", "schema_name", "table_name"],
+    );
+    let ours_rows = pinkdb_rows(&flushed);
+    let mut ours_rows: Vec<Vec<String>> = ours_rows
+        .into_iter()
+        .map(|row| vec![row[2].clone(), row[0].clone(), row[1].clone()])
+        .collect();
+    ours_rows.sort();
+    theirs.sort();
+    assert_eq!(ours_rows, theirs, "ducklake_flush_inlined_data rows");
+
+    // Both lakes must now read the same, whichever tool flushed them.
+    let read = |copy: &Path| {
+        let script = format!(
+            "{}SELECT i, s FROM l.t ORDER BY i",
+            attach_script(
+                &format!("ducklake:sqlite:{}", copy.join("catalog.db").display()),
+                &copy.join("data")
+            )
+        );
+        run_duckdb(&binary, &script).unwrap()
+    };
+    assert_eq!(read(&ours_dir), read(&theirs_dir), "flushed lake contents");
+
+    // `expire_snapshots` reports the victims' snapshot rows; a dry run on
+    // copies shows the same ids without mutating anything.
+    let mut ours = Lake::open_with_catalog(
+        &catalog_of(&ours_dir),
+        Some(ours_dir.join("data").to_str().unwrap()),
+    )
+    .unwrap();
+    let preview = call_write(&mut ours, &{
+        let mut call = call("ducklake_expire_snapshots", vec![text("l")]);
+        call.named
+            .push(("older_than".to_string(), FnArg::Timestamp(i64::MAX / 4)));
+        call.named.push(("dry_run".to_string(), FnArg::Bool(true)));
+        call
+    })
+    .unwrap();
+    let mut ours_ids: Vec<String> = pinkdb_rows(&preview)
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    ours_ids.sort();
+
+    let their_script = format!(
+        "{prefix}SELECT CAST(snapshot_id AS VARCHAR) AS snapshot_id FROM ducklake_expire_snapshots('l', older_than := TIMESTAMPTZ '2500-01-01 00:00:00+00', dry_run := true)",
+        prefix = attach_script(
+            &format!(
+                "ducklake:sqlite:{}",
+                theirs_dir.join("catalog.db").display()
+            ),
+            &theirs_dir.join("data")
+        )
+    );
+    let mut theirs_ids: Vec<String> = duckdb_json_rows(&binary, &their_script, &["snapshot_id"])
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    theirs_ids.sort();
+    assert_eq!(ours_ids, theirs_ids, "ducklake_expire_snapshots ids");
+
+    // A real run over an explicit version on both sides leaves the same
+    // snapshots behind.
+    let expired = call_write(&mut ours, &{
+        let mut call = call("ducklake_expire_snapshots", vec![text("l")]);
+        call.named
+            .push(("versions".to_string(), FnArg::IntList(vec![2])));
+        call
+    })
+    .unwrap();
+    assert_eq!(expired.num_rows(), 1, "{expired:?}");
+    drop(ours);
+    let their_script = format!(
+        "{prefix}CALL ducklake_expire_snapshots('l', versions := [2]);",
+        prefix = attach_script(
+            &format!(
+                "ducklake:sqlite:{}",
+                theirs_dir.join("catalog.db").display()
+            ),
+            &theirs_dir.join("data")
+        )
+    );
+    run_duckdb(&binary, &their_script).unwrap();
+    let remaining = |copy: &Path| {
+        let script = format!(
+            "{}SELECT CAST(snapshot_id AS VARCHAR) AS snapshot_id FROM ducklake_snapshots('l') ORDER BY snapshot_id",
+            attach_script(
+                &format!("ducklake:sqlite:{}", copy.join("catalog.db").display()),
+                &copy.join("data")
+            )
+        );
+        let mut ids: Vec<String> = duckdb_json_rows(&binary, &script, &["snapshot_id"])
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        remaining(&ours_dir),
+        remaining(&theirs_dir),
+        "surviving snapshots"
+    );
+
+    cleanup(&ours_dir);
+    cleanup(&theirs_dir);
+    cleanup(&dir);
+}
+
+/// Wrong arity, an unknown named argument and a snapshot that does not exist
+/// are refused in DuckDB's words.
+#[test]
+fn ducklake_function_argument_errors_are_duckdb_like() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("functions-errors");
+    let lake = write_pinkdb_function_lake(&dir, false);
+
+    let error = |call: &DuckLakeCall| {
+        call_read(&lake, call)
+            .err()
+            .unwrap_or_else(|| panic!("{} should be refused", call.name))
+            .to_string()
+    };
+    let message = error(&call(
+        "ducklake_table_changes",
+        vec![text("l"), text("main")],
+    ));
+    assert!(
+        message.starts_with("ducklake_table_changes: needs 5 positional argument(s), got 2; expected ducklake_table_changes(catalog, schema, table, start_snapshot, end_snapshot)"),
+        "{message}"
+    );
+    let mut unknown = call("ducklake_snapshots", vec![text("l")]);
+    unknown.named.push(("snapshot".to_string(), FnArg::Int(1)));
+    let message = error(&unknown);
+    assert!(
+        message.contains("unknown named argument \"snapshot\""),
+        "{message}"
+    );
+    let message = error(&call("ducklake_nope", vec![text("l")]));
+    assert!(message.contains("is not a DuckLake function"), "{message}");
+    let message = error(&call(
+        "ducklake_table_changes",
+        vec![
+            text("l"),
+            text("main"),
+            text("t"),
+            FnArg::Int(0),
+            FnArg::Int(99),
+        ],
+    ));
+    assert_eq!(
+        message,
+        "ducklake_table_changes: No snapshot found at version 99; expected ducklake_table_changes(catalog, schema, table, start_snapshot, end_snapshot)"
+    );
+
+    // DuckDB's own words for the same bad snapshot, to show the message the
+    // port copies.
+    let script = format!(
+        "{}SELECT * FROM ducklake_table_changes('l', 'main', 't', 0, 99)",
+        attach_script(
+            &format!("ducklake:sqlite:{}", dir.join("catalog.db").display()),
+            &dir.join("data")
+        )
+    );
+    let output = Command::new(&binary)
+        .args(["-no-agent", "-csv", "-c", &script])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No snapshot found at version 99"),
+        "{stderr}"
+    );
+
     drop(lake);
     cleanup(&dir);
 }
