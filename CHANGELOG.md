@@ -8,6 +8,40 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-31
+### Wave 131 — schemas and three-part names ✅
+
+Every database now holds schemas, as in DuckDB: `catalog.schema.table`
+works everywhere a table is named, and QuackLab's SQL runs as written —
+`r2_cat."master"."FACT"`, a `CREATE SCHEMA` per model — with no workaround
+(117 of 117 golden statements and setups DuckDB runs).
+
+- **SQL:** `CREATE SCHEMA [IF NOT EXISTS]`, `DROP SCHEMA [IF EXISTS] … [CASCADE
+  | RESTRICT]`, `USE db.schema` / `USE schema`, `current_database()`,
+  `current_schema()`, `current_schemas()`. Names take up to three parts and
+  column references up to four; `x.t` is database `x` or schema `x` by
+  DuckDB's rule, and an ambiguous `x` is an error naming both readings.
+  Macros can be called as `s.m()` and expand in the caller's schema, as in
+  DuckDB; views, materialized views, procedures and triggers bind in their
+  own. Cross-schema foreign keys are refused.
+- **Catalog functions:** `duckdb_databases()`, `duckdb_schemas()`,
+  `duckdb_tables()`, `duckdb_views()`, `duckdb_columns()`,
+  `information_schema.{schemata,tables,columns,views}`, a few `pg_catalog`
+  views and `SHOW ALL TABLES`, with DuckDB's columns; `pinkdb_catalog()`
+  gains a `schema` column.
+- **Access control:** `GRANT … ON SCHEMA s` covers every table of the
+  schema, including later ones; table grants name their schema.
+- **Lakes:** a lake database shows every DuckLake schema of its lake, and
+  `CREATE SCHEMA` / `DROP SCHEMA` reach the lake's catalog.
+- **Console:** a schema selector beside the database, schemas (empty ones
+  too) in the explorer, three-part names in generated SQL, schema grants.
+- **Formats:** `.pink` footer version 4, WAL frame sets format 2, lake image
+  format 2 and wire protocol 14; files from earlier builds are refused.
+- **Fixed:** an uncorrelated subquery in a join condition re-ran on every
+  probe chunk instead of once per join.
+- **Fixed:** the console's Preview of a table never finished (the new tab
+  lost its state when the explorer refreshed).
+
 ## 2026-10-30
 ### Wave 129 — QuackLab's DuckDB dialect ✅
 

@@ -194,6 +194,19 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-31">2026-10-31<a class="anchor" href="#2026-10-31" aria-label="Permalink: 2026-10-31">#</a></h2>
+<h3>Wave 131 — schemas and three-part names ✅</h3>
+<p>Every database now holds schemas, as in DuckDB: <code>catalog.schema.table</code> works everywhere a table is named, and QuackLab's SQL runs as written — <code>r2_cat."master"."FACT"</code>, a <code>CREATE SCHEMA</code> per model — with no workaround (117 of 117 golden statements and setups DuckDB runs).</p>
+<ul>
+<li><strong>SQL:</strong> <code>CREATE SCHEMA [IF NOT EXISTS]</code>, <code>DROP SCHEMA [IF EXISTS] … [CASCADE | RESTRICT]</code>, <code>USE db.schema</code> / <code>USE schema</code>, <code>current_database()</code>, <code>current_schema()</code>, <code>current_schemas()</code>. Names take up to three parts and column references up to four; <code>x.t</code> is database <code>x</code> or schema <code>x</code> by DuckDB's rule, and an ambiguous <code>x</code> is an error naming both readings. Macros can be called as <code>s.m()</code> and expand in the caller's schema, as in DuckDB; views, materialized views, procedures and triggers bind in their own. Cross-schema foreign keys are refused.</li>
+<li><strong>Catalog functions:</strong> <code>duckdb_databases()</code>, <code>duckdb_schemas()</code>, <code>duckdb_tables()</code>, <code>duckdb_views()</code>, <code>duckdb_columns()</code>, <code>information_schema.{schemata,tables,columns,views}</code>, a few <code>pg_catalog</code> views and <code>SHOW ALL TABLES</code>, with DuckDB's columns; <code>pinkdb_catalog()</code> gains a <code>schema</code> column.</li>
+<li><strong>Access control:</strong> <code>GRANT … ON SCHEMA s</code> covers every table of the schema, including later ones; table grants name their schema.</li>
+<li><strong>Lakes:</strong> a lake database shows every DuckLake schema of its lake, and <code>CREATE SCHEMA</code> / <code>DROP SCHEMA</code> reach the lake's catalog.</li>
+<li><strong>Console:</strong> a schema selector beside the database, schemas (empty ones too) in the explorer, three-part names in generated SQL, schema grants.</li>
+<li><strong>Formats:</strong> <code>.pink</code> footer version 4, WAL frame sets format 2, lake image format 2 and wire protocol 14; files from earlier builds are refused.</li>
+<li><strong>Fixed:</strong> an uncorrelated subquery in a join condition re-ran on every probe chunk instead of once per join.</li>
+<li><strong>Fixed:</strong> the console's Preview of a table never finished (the new tab lost its state when the explorer refreshed).</li>
+</ul>
 <h2 id="2026-10-30">2026-10-30<a class="anchor" href="#2026-10-30" aria-label="Permalink: 2026-10-30">#</a></h2>
 <h3>Wave 129 — QuackLab's DuckDB dialect ✅</h3>
 <p>pinkdb now runs every statement of QuackLab's golden fixtures that DuckDB runs (114 of 114, up from 56), given schemas and three-part names — those are their own wave.</p>
@@ -1261,6 +1274,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-31">2026-10-31</a></li>
   <li><a href="#2026-10-30">2026-10-30</a></li>
   <li><a href="#2026-10-29">2026-10-29</a></li>
   <li><a href="#2026-10-28">2026-10-28</a></li>
