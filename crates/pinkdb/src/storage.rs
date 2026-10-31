@@ -3978,6 +3978,55 @@ mod tests {
         assert!(Arc::ptr_eq(&shared2.columns[1].chunks[0], &full2[1]));
     }
 
+    /// The bulk write paths append whole chunks instead of rows; the catalog
+    /// statistics and zone maps they leave behind must be the ones the row
+    /// path would have produced, cell for cell.
+    #[test]
+    fn append_chunk_leaves_the_statistics_append_row_leaves() {
+        let schema = vec![
+            ("k".to_string(), DataType::Integer),
+            ("s".to_string(), DataType::Varchar),
+            ("d".to_string(), DataType::Double),
+        ];
+        // More than two chunks, with NULLs, repeats, NULL in every chunk and
+        // the non-finite doubles (NaN must not enter min/max; -0.0 is 0).
+        let value = |row: usize, col: usize| -> Value {
+            match (col, row % 11) {
+                (_, 0) => Value::Null,
+                (0, _) => Value::Integer((row % 97) as i32),
+                (1, r) => Value::Varchar(format!("v{r}")),
+                (2, 1) => Value::Double(f64::NAN),
+                (2, 2) => Value::Double(-0.0),
+                (2, _) => Value::Double((row % 13) as f64 * 0.5),
+                _ => Value::Null,
+            }
+        };
+        let rows: Vec<Vec<Value>> = (0..CHUNK_SIZE * 2 + 300)
+            .map(|row| (0..schema.len()).map(|col| value(row, col)).collect())
+            .collect();
+
+        let mut by_row = DataTable::new("row".to_string(), schema.clone()).unwrap();
+        let mut by_chunk = DataTable::new("chunk".to_string(), schema.clone()).unwrap();
+        for block in rows.chunks(CHUNK_SIZE) {
+            let mut columns = Vec::with_capacity(schema.len());
+            for (col, (_, ty)) in schema.iter().enumerate() {
+                let mut v = Vector::with_capacity(*ty, block.len());
+                for r in block {
+                    v.push_value(r[col].clone()).unwrap();
+                }
+                columns.push(Arc::new(v));
+            }
+            by_chunk.append_shared_chunk(&columns).unwrap();
+            for r in block {
+                by_row.append_row(r.clone()).unwrap();
+            }
+        }
+
+        assert_eq!(by_row.num_rows(), by_chunk.num_rows());
+        assert_eq!(by_row.stats, by_chunk.stats);
+        assert_eq!(by_row.zones, by_chunk.zones);
+    }
+
     #[test]
     fn duplicate_columns_rejected() {
         let err = DataTable::new(

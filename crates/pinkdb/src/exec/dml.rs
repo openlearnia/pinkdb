@@ -76,24 +76,28 @@ pub(crate) fn returning_result(
         });
     }
     let width = rows[0].len();
-    let mut columns = Vec::with_capacity(width);
-    for i in 0..width {
-        let mut col = Vector::with_capacity(schema[i].1, rows.len());
-        for row in &rows {
-            col.push_value(row[i].clone())?;
-        }
-        columns.push(col);
-    }
-    let chunk = DataChunk::new(columns)?;
     let cx = Cx::with_budget(db, Arc::new(ExecBudget::unbounded()));
     let mut out = Vec::with_capacity(rows.len());
-    for i in 0..chunk.num_rows() {
-        out.push(
-            r.exprs
-                .iter()
-                .map(|e| eval_expr(e, &chunk, &cx).map(|v| v.get(i)))
-                .collect::<Result<Vec<_>>>()?,
-        );
+    // Expressions run over a chunk at a time; one chunk per `CHUNK_SIZE` rows
+    // because a statement can return more rows than a chunk holds.
+    for window in rows.chunks(CHUNK_SIZE) {
+        let mut columns = Vec::with_capacity(width);
+        for i in 0..width {
+            let mut col = Vector::with_capacity(schema[i].1, window.len());
+            for row in window {
+                col.push_value(row[i].clone())?;
+            }
+            columns.push(col);
+        }
+        let chunk = DataChunk::new(columns)?;
+        let values = r
+            .exprs
+            .iter()
+            .map(|e| eval_expr(e, &chunk, &cx))
+            .collect::<Result<Vec<_>>>()?;
+        for i in 0..chunk.num_rows() {
+            out.push(values.iter().map(|v| v.get(i)).collect());
+        }
     }
     Ok(QueryResult::Selected {
         names: r.names.clone(),
@@ -1147,17 +1151,21 @@ pub(crate) fn dml_cte_outputs(
 }
 
 fn rows_output(names: Vec<String>, types: Vec<DataType>, rows: Vec<Vec<Value>>) -> Result<Output> {
-    let mut columns: Vec<Vector> = types
-        .iter()
-        .map(|t| Vector::with_capacity(*t, rows.len()))
-        .collect();
-    for row in rows {
-        for (i, value) in row.into_iter().enumerate() {
-            columns[i].push_value(value)?;
+    let mut chunks = Vec::with_capacity(rows.len().div_ceil(CHUNK_SIZE));
+    for window in rows.chunks(CHUNK_SIZE) {
+        let mut columns: Vec<Vector> = types
+            .iter()
+            .map(|t| Vector::with_capacity(*t, window.len()))
+            .collect();
+        for row in window {
+            for (i, value) in row.iter().enumerate() {
+                columns[i].push_value(value.clone())?;
+            }
         }
+        chunks.push(DataChunk::new(columns)?);
     }
     Ok(Output {
-        chunks: vec![DataChunk::new(columns)?],
+        chunks,
         names,
         types,
     })
