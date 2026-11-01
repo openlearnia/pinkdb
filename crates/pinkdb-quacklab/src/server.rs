@@ -269,6 +269,25 @@ impl QuacklabHandle {
         let _ = self.stop.send(true);
     }
 
+    /// Stop accepting, then wait up to `grace` for in-flight requests to
+    /// finish. Returns false when one is still running; the caller checkpoints
+    /// anyway, because a platform kill would lose the checkpoint entirely.
+    pub fn drain(&mut self, grace: Duration) -> bool {
+        self.shutdown();
+        let Some(thread) = self.thread.take() else {
+            return true;
+        };
+        // A JoinHandle has no timeout: a watcher thread reports the join.
+        let (finished, done) = std::sync::mpsc::channel();
+        let watcher = std::thread::Builder::new()
+            .name("pinkdb-quacklab-drain".to_string())
+            .spawn(move || {
+                let _ = thread.join();
+                let _ = finished.send(());
+            });
+        watcher.is_ok() && done.recv_timeout(grace).is_ok()
+    }
+
     pub fn join(&mut self) -> std::thread::Result<()> {
         match self.thread.take() {
             Some(thread) => thread.join(),
@@ -315,6 +334,32 @@ mod tests {
         assert_eq!(parse_row_limit(Some("abc")), 5_000);
         assert_eq!(parse_row_limit(Some("999999")), 100_000);
         assert_eq!(parse_row_limit(Some("100000")), 100_000);
+    }
+
+    #[test]
+    fn draining_stops_the_listener() {
+        let options = QuacklabOptions {
+            sql_token: "tok".to_string(),
+            ..QuacklabOptions::default()
+        };
+        let mut handle = QuacklabServer::bind("127.0.0.1:0", Database::new(), options)
+            .expect("bind")
+            .spawn()
+            .expect("spawn");
+        let addr = handle.local_addr();
+        assert!(
+            handle.drain(Duration::from_secs(5)),
+            "nothing was in flight"
+        );
+        // The listener is closed once the drain returns.
+        assert!(
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err(),
+            "a drained adapter still accepts connections"
+        );
+        assert!(
+            handle.drain(Duration::from_secs(5)),
+            "a second drain is a no-op"
+        );
     }
 
     #[test]
