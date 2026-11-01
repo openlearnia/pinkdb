@@ -195,7 +195,13 @@ pub(crate) fn chunk_span(chunk: &crate::file_meta::ChunkInfo) -> Option<ByteSpan
 /// [`MAX_REQUEST_BYTES`]-sized requests (adjacent chunks always merge; gaps up
 /// to [`COALESCE_GAP`] merge when the result stays under the cap). The output
 /// is sorted by offset.
-pub(crate) fn coalesce_spans(mut spans: Vec<ByteSpan>) -> Vec<ByteSpan> {
+pub(crate) fn coalesce_spans(spans: Vec<ByteSpan>) -> Vec<ByteSpan> {
+    coalesce_spans_with_gap(spans, COALESCE_GAP)
+}
+
+/// [`coalesce_spans`] with an explicit gap: page-granular spans are small, so
+/// a row-group-sized gap would read far more bytes than it saves requests.
+pub(crate) fn coalesce_spans_with_gap(mut spans: Vec<ByteSpan>, gap: u64) -> Vec<ByteSpan> {
     spans.retain(|span| span.len > 0);
     spans.sort_by_key(|span| span.start);
     let mut out: Vec<ByteSpan> = Vec::with_capacity(spans.len());
@@ -204,9 +210,7 @@ pub(crate) fn coalesce_spans(mut spans: Vec<ByteSpan>) -> Vec<ByteSpan> {
             let last_end = last.end();
             let end = span.end().max(last_end);
             let merged_len = end - last.start;
-            if span.start <= last_end.saturating_add(COALESCE_GAP)
-                && merged_len <= MAX_REQUEST_BYTES
-            {
+            if span.start <= last_end.saturating_add(gap) && merged_len <= MAX_REQUEST_BYTES {
                 *last = ByteSpan {
                     start: last.start,
                     len: merged_len,

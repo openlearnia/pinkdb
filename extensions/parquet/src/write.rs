@@ -214,6 +214,15 @@ pub fn read_identity(path: &Path) -> Result<Option<(String, String)>, WriteError
 /// pays a dictionary it cannot exploit.
 pub const DICTIONARY_PAGE_LIMIT: usize = 1024 * 1024;
 
+/// Rows per data page. Every column breaks at the same row, so a page index
+/// reader can drop a page and keep the rest aligned; 16 Ki rows keeps a page a
+/// few hundred KB even for wide strings.
+pub const PAGE_ROW_LIMIT: usize = 16 * 1024;
+
+/// The byte limit stays far above a page of `PAGE_ROW_LIMIT` rows so the row
+/// limit wins and pages stay row-aligned; it only bounds pathological columns.
+pub const PAGE_SIZE_LIMIT: usize = 8 * 1024 * 1024;
+
 /// The page codec. Snappy is DuckDB's Parquet default and is the reason a
 /// pinkdb-written file is comparable with a DuckDB one; a build without the
 /// codec feature (never the extension's default) writes plain pages.
@@ -258,9 +267,14 @@ fn write_table_with_key_values(
     }
     let root = build_schema(&schema, &policies, field_ids)?;
     let mut builder = WriterProperties::builder()
-        // Chunk statistics travel in the footer (min/max/NULL count), so the
-        // file is self-describing for other readers and for pruning.
-        .set_statistics_enabled(EnabledStatistics::Chunk)
+        // Statistics at page granularity: the column index travels in the
+        // footer, so a reader can skip a page whose min/max proves no match.
+        .set_statistics_enabled(EnabledStatistics::Page)
+        // A fixed row limit makes every column's pages break at the same rows,
+        // which is what lets a reader drop a page and keep the surviving
+        // pages' rows aligned across columns.
+        .set_data_page_row_count_limit(PAGE_ROW_LIMIT)
+        .set_data_page_size_limit(PAGE_SIZE_LIMIT)
         .set_compression(PAGE_COMPRESSION)
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(DICTIONARY_PAGE_LIMIT);

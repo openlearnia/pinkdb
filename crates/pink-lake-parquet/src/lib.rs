@@ -335,6 +335,68 @@ impl LakeFormat for ParquetLakeFormat {
         true
     }
 
+    fn scan(
+        &self,
+        file: &DataFile<'_>,
+        columns: &[usize],
+        filters: &[pinkdb::PrunePredicate],
+        sink: &mut dyn FnMut(u64, pinkdb::DataChunk) -> Result<()>,
+    ) -> Result<(u64, pink_lake::format::ScanCounters)> {
+        let Some(source) = file.range_source() else {
+            // Encrypted (or a backend without positioned reads): decode whole.
+            return pink_lake::format::scan_whole_file(self, file, columns, filters, sink);
+        };
+        let path_text = file.path().display().to_string();
+        let mut rows = 0u64;
+        let mut offset = 0u64;
+        let mut failure: Option<LakeError> = None;
+        let scan = pinkdb_parquet::scan_source_streamed(
+            &path_text,
+            Arc::new(LakeRange(source)),
+            Some(columns),
+            filters,
+            &mut |chunk| {
+                let n = chunk.num_rows() as u64;
+                match sink(offset, chunk) {
+                    Ok(()) => {
+                        offset += n;
+                        rows += n;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        failure = Some(e);
+                        // The parquet core only propagates this; our error is
+                        // returned below, keeping the lake error type.
+                        Err(PinkDbError::Execution("lake scan sink failed".to_string()))
+                    }
+                }
+            },
+        );
+        let streamed = match scan {
+            Ok(streamed) => streamed,
+            Err(e) => {
+                // A failure the sink itself reported is the engine's error,
+                // not a corrupt file.
+                return match failure {
+                    Some(error) => Err(error),
+                    None => Err(corrupt(
+                        file,
+                        format!("cannot decode the parquet data: {e}"),
+                    )),
+                };
+            }
+        };
+        Ok((
+            rows,
+            pink_lake::format::ScanCounters {
+                row_groups: streamed.output.row_groups,
+                row_groups_pruned: streamed.output.row_groups_pruned,
+                pages: streamed.pages.pages,
+                pages_pruned: streamed.pages.pages_pruned,
+            },
+        ))
+    }
+
     fn read_projected(
         &self,
         file: &DataFile<'_>,

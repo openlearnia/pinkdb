@@ -429,7 +429,7 @@ mod zone;
 
 pub mod replication;
 
-pub use attach::AttachmentReport;
+pub use attach::{AttachmentReport, ScanIo};
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
 pub use cdc::{ChangeKind, ChangeRow};
 pub use crypto::EncryptionKey;

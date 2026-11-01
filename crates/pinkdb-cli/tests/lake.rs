@@ -1014,7 +1014,8 @@ fn attach_answers_equal_open_and_in_memory() {
 
 /// `pinkdb_lake_decodes()` reports data-file decodes end to end:
 /// statistics-only queries decode nothing, projection pushdown decodes
-/// exactly the referenced columns, and columns already decoded stay cached.
+/// exactly the referenced columns, and nothing is kept between queries
+/// (wave 133a dropped the session's materialized table).
 #[test]
 fn attach_decode_stats_show_projection_pushdown() {
     let dir = scratch("attach_stats");
@@ -1044,7 +1045,7 @@ fn attach_decode_stats_show_projection_pushdown() {
             "decodes: 1 loads, 1 columns, 1 files", // ORDER BY b: b only
             "decodes: 2 loads, 2 columns, 2 files", // + c (the file decodes again)
             "decodes: 3 loads, 3 columns, 3 files", // + a
-            "decodes: 3 loads, 3 columns, 3 files", // SELECT *: everything was cached
+            "decodes: 4 loads, 6 columns, 4 files", // SELECT *: all three columns
         ],
         "{out}"
     );
