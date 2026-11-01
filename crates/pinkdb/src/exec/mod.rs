@@ -4789,12 +4789,8 @@ fn eval_join_key(
 /// (`MurmurHash64` in src/include/duckdb/common/types/hash.hpp): spreads a
 /// key's bits over the whole word so the low bits index buckets well.
 #[inline]
-fn mix64(mut h: u64) -> u64 {
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    h ^ (h >> 33)
+fn mix64(h: u64) -> u64 {
+    crate::strings::mix(h)
 }
 
 /// Hash of an integer join key.
@@ -4803,19 +4799,10 @@ fn hash_int_key(key: i64) -> u64 {
     mix64(key as u64)
 }
 
-/// Hash of an encoded (byte) join key: eight bytes at a time, then mixed.
+/// Hash of an encoded (byte) join key.
 #[inline]
 fn hash_bytes_key(key: &[u8]) -> u64 {
-    let mut h = 0x9e37_79b9_7f4a_7c15u64 ^ key.len() as u64;
-    let (words, rest) = key.as_chunks::<8>();
-    for w in words {
-        let x = u64::from_le_bytes(*w);
-        h = (h ^ x).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(31);
-    }
-    let mut tail = [0u8; 8];
-    tail[..rest.len()].copy_from_slice(rest);
-    h ^= u64::from_le_bytes(tail);
-    mix64(h)
+    crate::strings::word_hash(key)
 }
 
 /// The build side's keys, one entry per build row in input order.
@@ -4823,8 +4810,12 @@ enum BuildKeys {
     /// INTEGER/BIGINT/DATE/TIMESTAMP payloads widened to i64 — no encoding
     /// and no `coerce_to`.
     Ints(Vec<i64>),
+    /// One VARCHAR key column as string views, in build input order: hashed
+    /// and compared through the view ([`crate::strings::view_hash`]), never
+    /// byte-encoded. A row's key bytes are its cell's, copied or shared.
+    Str(crate::strings::StrVec),
     /// The generic `Vector::encode_into` encoding for every other dtype
-    /// (VARCHAR, DOUBLE, BOOLEAN, mixed numeric): row `r`'s key is
+    /// (DOUBLE, BOOLEAN, mixed numeric, VARCHAR tuples): row `r`'s key is
     /// `data[offsets[r]..offsets[r + 1]]`.
     Bytes { data: Vec<u8>, offsets: Vec<usize> },
 }
@@ -4835,6 +4826,7 @@ struct ChunkKeys {
     /// False for a row with a NULL key cell: it never matches.
     valid: Vec<bool>,
     ints: Vec<i64>,
+    strs: crate::strings::StrVec,
     bytes: Vec<u8>,
     ends: Vec<usize>,
 }
@@ -4890,6 +4882,7 @@ impl MatchTable {
     /// The table over already evaluated build keys, one list per build
     /// chunk.
     fn from_key_vectors(key_vectors: &[Vec<Vector>], ints: bool) -> MatchTable {
+        let strs = !ints && string_keys(key_vectors);
         let per_chunk: Vec<ChunkKeys> = key_vectors
             .par_iter()
             .map(|kvs| -> ChunkKeys {
@@ -4898,11 +4891,14 @@ impl MatchTable {
                     hashes: Vec::with_capacity(n),
                     valid: Vec::with_capacity(n),
                     ints: Vec::new(),
+                    strs: crate::strings::StrVec::with_capacity(n),
                     bytes: Vec::new(),
                     ends: Vec::new(),
                 };
                 if ints {
                     keys.ints.reserve(n);
+                } else if strs {
+                    keys.strs.extend_from(varchar(&kvs[0]), 0, n);
                 } else {
                     keys.ends.reserve(n);
                 }
@@ -4913,6 +4909,8 @@ impl MatchTable {
                         let key = if valid { int_key_at(&kvs[0], i) } else { 0 };
                         keys.ints.push(key);
                         keys.hashes.push(hash_int_key(key));
+                    } else if strs {
+                        keys.hashes.push(crate::strings::view_hash(&keys.strs, i));
                     } else {
                         let start = keys.bytes.len();
                         if valid {
@@ -4933,6 +4931,8 @@ impl MatchTable {
         let mut locs = Vec::with_capacity(rows);
         let mut keys = if ints {
             BuildKeys::Ints(Vec::with_capacity(rows))
+        } else if strs {
+            BuildKeys::Str(crate::strings::StrVec::with_capacity(rows))
         } else {
             let mut offsets = Vec::with_capacity(rows + 1);
             offsets.push(0);
@@ -4947,6 +4947,7 @@ impl MatchTable {
             valid.extend_from_slice(&k.valid);
             match &mut keys {
                 BuildKeys::Ints(all) => all.extend_from_slice(&k.ints),
+                BuildKeys::Str(all) => all.extend_from(&k.strs, 0, k.hashes.len()),
                 BuildKeys::Bytes { data, offsets } => {
                     let base = data.len();
                     data.extend_from_slice(&k.bytes);
@@ -5023,66 +5024,38 @@ impl MatchTable {
             .collect()
     }
 
-    /// The build rows whose key equals the integer `key`, in input order.
-    #[inline]
-    fn matches_int(&self, key: i64) -> Matches<'_> {
-        let hash = hash_int_key(key);
-        Matches {
-            table: self,
-            row: self.heads[(hash & self.mask) as usize],
-            hash,
-            key: ProbeKey::Int(key),
-        }
-    }
-
-    /// A probe chunk's integer keys with their hashes and chain heads, loaded
-    /// in one pass before any chain is walked: the bucket loads of different
-    /// rows do not depend on each other, so the CPU overlaps their cache
-    /// misses instead of taking them one probe at a time (DuckDB probes a
-    /// vector at a time the same way: hashes, then bucket pointers, then key
-    /// comparisons — `JoinHashTable::Probe`). A NULL row's slot holds a
+    /// A probe chunk's key hashes and chain heads, loaded in one pass before
+    /// any chain is walked: the bucket loads of different rows do not depend
+    /// on each other, so the CPU overlaps their cache misses instead of
+    /// taking them one probe at a time (DuckDB probes a vector at a time the
+    /// same way: hashes, then bucket pointers, then key comparisons —
+    /// `JoinHashTable::Probe`). `None` for a table whose keys are encoded
+    /// tuples, which are per-row variable-length. A NULL row's slot holds a
     /// placeholder key; callers skip NULL keys first.
-    fn probe_ints(&self, kv: &Vector) -> IntProbe {
-        let keys: Vec<i64> = match kv.data() {
-            VectorData::Int32(d) | VectorData::Date32(d) => {
-                d.iter().map(|&x| i64::from(x)).collect()
+    fn key_batch(&self, kvs: &[Vector]) -> Option<KeyBatch> {
+        let mut ints = Vec::new();
+        let hashes: Vec<u64> = match &self.keys {
+            BuildKeys::Ints(_) => {
+                ints = int_keys(&kvs[0]);
+                ints.iter().map(|&k| hash_int_key(k)).collect()
             }
-            VectorData::Int64(d) | VectorData::TimestampMicros(d) => d.clone(),
-            _ => unreachable!("probe_ints called on a non-integer-payload key vector"),
+            BuildKeys::Str(_) => {
+                let d = varchar(&kvs[0]);
+                (0..d.len())
+                    .map(|i| crate::strings::view_hash(d, i))
+                    .collect()
+            }
+            BuildKeys::Bytes { .. } => return None,
         };
-        let hashes: Vec<u64> = keys.iter().map(|&k| hash_int_key(k)).collect();
         let heads = hashes
             .iter()
             .map(|&h| self.heads[(h & self.mask) as usize])
             .collect();
-        IntProbe {
-            keys,
+        Some(KeyBatch {
+            ints,
             hashes,
             heads,
-        }
-    }
-
-    /// The build rows matching row `i` of a [`MatchTable::probe_ints`] batch.
-    #[inline]
-    fn matches_at(&self, probe: &IntProbe, i: usize) -> Matches<'_> {
-        Matches {
-            table: self,
-            row: probe.heads[i],
-            hash: probe.hashes[i],
-            key: ProbeKey::Int(probe.keys[i]),
-        }
-    }
-
-    /// The build rows whose encoded key equals `key`, in input order.
-    #[inline]
-    fn matches_bytes<'k>(&'k self, key: &'k [u8]) -> Matches<'k> {
-        let hash = hash_bytes_key(key);
-        Matches {
-            table: self,
-            row: self.heads[(hash & self.mask) as usize],
-            hash,
-            key: ProbeKey::Bytes(key),
-        }
+        })
     }
 
     /// `(chunk, row)` of global build row `row`.
@@ -5092,30 +5065,104 @@ impl MatchTable {
     }
 }
 
-/// One probe chunk's integer keys, hashes and chain heads
-/// ([`MatchTable::probe_ints`]).
-struct IntProbe {
-    keys: Vec<i64>,
+/// Whether the evaluated build keys are one VARCHAR column, whose cells a
+/// join hashes and compares as string views instead of bytes.
+fn string_keys(key_vectors: &[Vec<Vector>]) -> bool {
+    let Some(first) = key_vectors.first().and_then(|kvs| kvs.first()) else {
+        return false;
+    };
+    matches!(first.data(), VectorData::VarChar(_)) && key_vectors.iter().all(|kvs| kvs.len() == 1)
+}
+
+/// The VARCHAR payload of a key vector.
+#[inline]
+fn varchar(v: &Vector) -> &crate::strings::StrVec {
+    match v.data() {
+        VectorData::VarChar(d) => d,
+        other => unreachable!(
+            "expected a VARCHAR key vector, got {}",
+            other.dtype().name()
+        ),
+    }
+}
+
+/// One integer-payload key vector widened to i64 ([`int_key_at`]).
+fn int_keys(v: &Vector) -> Vec<i64> {
+    match v.data() {
+        VectorData::Int32(d) | VectorData::Date32(d) => d.iter().map(|&x| i64::from(x)).collect(),
+        VectorData::Int64(d) | VectorData::TimestampMicros(d) => d.clone(),
+        _ => unreachable!("expected an integer-payload key vector"),
+    }
+}
+
+/// One probe chunk's key hashes and chain heads
+/// ([`MatchTable::key_batch`]), plus the integer keys they belong to.
+struct KeyBatch {
+    /// Empty for the string-view table, whose keys stay in the probe vector.
+    ints: Vec<i64>,
     hashes: Vec<u64>,
     heads: Vec<u32>,
 }
 
-/// A probe key, borrowed for the walk of its bucket chain.
-#[derive(Clone, Copy)]
-enum ProbeKey<'k> {
-    Int(i64),
-    Bytes(&'k [u8]),
+/// A probe row's key as one chain walk compares it: the build key column is
+/// part of it, so the compare is monomorphic (the representation is chosen
+/// once per chunk, in [`ProbeChunk::keys`]).
+trait KeyEq {
+    /// Whether build row `row`'s key equals the probe key.
+    fn eq(&self, row: usize) -> bool;
+}
+
+/// Integer keys: the build column is a plain `i64` array.
+struct IntKey<'k> {
+    build: &'k [i64],
+    key: i64,
+}
+
+impl KeyEq for IntKey<'_> {
+    #[inline]
+    fn eq(&self, row: usize) -> bool {
+        self.build[row] == self.key
+    }
+}
+
+/// One VARCHAR key column. Two equal strings of at most the inline length have
+/// equal views, so this compares two words unless one side is long.
+struct StrKey<'k> {
+    build: &'k crate::strings::StrVec,
+    probe: &'k crate::strings::StrVec,
+    row: usize,
+}
+
+impl KeyEq for StrKey<'_> {
+    #[inline]
+    fn eq(&self, row: usize) -> bool {
+        crate::strings::views_eq(self.build, row, self.probe, self.row)
+    }
+}
+
+/// Encoded key tuples, compared as bytes.
+struct BytesKey<'k> {
+    data: &'k [u8],
+    offsets: &'k [usize],
+    key: &'k [u8],
+}
+
+impl KeyEq for BytesKey<'_> {
+    #[inline]
+    fn eq(&self, row: usize) -> bool {
+        &self.data[self.offsets[row]..self.offsets[row + 1]] == self.key
+    }
 }
 
 /// Iterator over one key's matching build rows (global ids, input order).
-struct Matches<'t> {
+struct Matches<'t, K> {
     table: &'t MatchTable,
     row: u32,
     hash: u64,
-    key: ProbeKey<'t>,
+    key: K,
 }
 
-impl Iterator for Matches<'_> {
+impl<K: KeyEq> Iterator for Matches<'_, K> {
     type Item = u32;
 
     #[inline]
@@ -5124,22 +5171,259 @@ impl Iterator for Matches<'_> {
         while self.row != NIL {
             let r = self.row as usize;
             self.row = t.next[r];
-            if t.hashes[r] != self.hash {
-                continue;
-            }
-            let equal = match (&t.keys, self.key) {
-                (BuildKeys::Ints(keys), ProbeKey::Int(k)) => keys[r] == k,
-                (BuildKeys::Bytes { data, offsets }, ProbeKey::Bytes(k)) => {
-                    &data[offsets[r]..offsets[r + 1]] == k
-                }
-                _ => unreachable!("probe key representation differs from the build's"),
-            };
-            if equal {
+            if t.hashes[r] == self.hash && self.key.eq(r) {
                 return Some(r as u32);
             }
         }
         None
     }
+}
+
+/// One probe chunk's keys in the table's encoding: a [`KeyBatch`] when the
+/// build keys are integers or one VARCHAR column, else every row's encoded
+/// tuple, built once so the probe loop compares a slice.
+struct ProbeChunk {
+    kvs: Vec<Vector>,
+    batch: Option<KeyBatch>,
+    /// Encoded tuples: row `row`'s is `bytes[ends[row - 1]..ends[row]]`.
+    bytes: Vec<u8>,
+    ends: Vec<u32>,
+}
+
+impl ProbeChunk {
+    /// `kvs` are the chunk's evaluated key vectors
+    /// ([`MatchTable::probe_keys`]).
+    fn new(table: &MatchTable, kvs: Vec<Vector>) -> ProbeChunk {
+        let batch = table.key_batch(&kvs);
+        // A batched key needs no tuple bytes: only the encoded path pays for
+        // the per-row offsets.
+        let mut bytes = Vec::new();
+        let mut ends = Vec::new();
+        if batch.is_none() {
+            let rows = kvs.first().map_or(0, Vector::len);
+            ends.reserve(rows);
+            for row in 0..rows {
+                if !any_null(&kvs, row) {
+                    for kv in &kvs {
+                        kv.encode_into(&mut bytes, row);
+                    }
+                }
+                ends.push(bytes.len() as u32);
+            }
+        }
+        ProbeChunk {
+            kvs,
+            batch,
+            bytes,
+            ends,
+        }
+    }
+
+    /// The chunk's keys in the table's representation, resolved once per chunk
+    /// so that the loop over its rows is monomorphic (see [`Keys`]).
+    fn keys<'k>(&'k self, table: &'k MatchTable) -> Keys<'k> {
+        let kvs = &self.kvs;
+        match (&table.keys, &self.batch) {
+            (BuildKeys::Ints(build), Some(batch)) => Keys::Int(IntKeys { batch, build, kvs }),
+            (BuildKeys::Str(build), Some(batch)) => Keys::Str(StrKeys {
+                batch,
+                build,
+                probe: varchar(&kvs[0]),
+                kvs,
+            }),
+            (BuildKeys::Bytes { data, offsets }, None) => Keys::Bytes(BytesKeys {
+                bytes: &self.bytes,
+                ends: &self.ends,
+                build: data,
+                offsets,
+                kvs,
+            }),
+            _ => unreachable!("probe chunk does not match its table's key representation"),
+        }
+    }
+}
+
+/// Whether any of the row's key cells is NULL (`=` is never true for it).
+#[inline]
+fn any_null(kvs: &[Vector], row: usize) -> bool {
+    kvs.iter().any(|kv| kv.is_null(row))
+}
+
+/// A probe chunk's keys in one representation, chosen once per chunk
+/// ([`ProbeChunk::keys`]): the row loop that reads it compiles to one
+/// monomorphic match walk per representation, so an integer join runs the
+/// integer loop it ran before string keys existed.
+enum Keys<'k> {
+    Int(IntKeys<'k>),
+    Str(StrKeys<'k>),
+    Bytes(BytesKeys<'k>),
+}
+
+/// One probe chunk's keys of one representation: what a probe loop reads per
+/// row.
+trait KeyRows<'k> {
+    /// What a probe row's key is compared as.
+    type Key: KeyEq;
+
+    /// The build rows whose key equals row `row`'s, in build input order.
+    fn matches(&self, table: &'k MatchTable, row: usize) -> Matches<'k, Self::Key>;
+
+    /// Whether any of row `row`'s key cells is NULL.
+    fn null(&self, row: usize) -> bool;
+}
+
+/// Integer keys: hashed and bucket-loaded per chunk.
+struct IntKeys<'k> {
+    batch: &'k KeyBatch,
+    build: &'k [i64],
+    kvs: &'k [Vector],
+}
+
+impl<'k> KeyRows<'k> for IntKeys<'k> {
+    type Key = IntKey<'k>;
+
+    #[inline]
+    fn matches(&self, table: &'k MatchTable, row: usize) -> Matches<'k, IntKey<'k>> {
+        Matches {
+            table,
+            row: self.batch.heads[row],
+            hash: self.batch.hashes[row],
+            key: IntKey {
+                build: self.build,
+                key: self.batch.ints[row],
+            },
+        }
+    }
+
+    #[inline]
+    fn null(&self, row: usize) -> bool {
+        any_null(self.kvs, row)
+    }
+}
+
+/// One VARCHAR key column, compared as string views.
+struct StrKeys<'k> {
+    batch: &'k KeyBatch,
+    build: &'k crate::strings::StrVec,
+    /// The probe column, row-indexed by [`KeyRows::matches`].
+    probe: &'k crate::strings::StrVec,
+    kvs: &'k [Vector],
+}
+
+impl<'k> KeyRows<'k> for StrKeys<'k> {
+    type Key = StrKey<'k>;
+
+    #[inline]
+    fn matches(&self, table: &'k MatchTable, row: usize) -> Matches<'k, StrKey<'k>> {
+        Matches {
+            table,
+            row: self.batch.heads[row],
+            hash: self.batch.hashes[row],
+            key: StrKey {
+                build: self.build,
+                probe: self.probe,
+                row,
+            },
+        }
+    }
+
+    #[inline]
+    fn null(&self, row: usize) -> bool {
+        any_null(self.kvs, row)
+    }
+}
+
+/// Every row's encoded key tuple, compared as bytes.
+struct BytesKeys<'k> {
+    /// Row `row`'s tuple is `bytes[ends[row - 1]..ends[row]]`.
+    bytes: &'k [u8],
+    ends: &'k [u32],
+    build: &'k [u8],
+    offsets: &'k [usize],
+    kvs: &'k [Vector],
+}
+
+impl<'k> KeyRows<'k> for BytesKeys<'k> {
+    type Key = BytesKey<'k>;
+
+    #[inline]
+    fn matches(&self, table: &'k MatchTable, row: usize) -> Matches<'k, BytesKey<'k>> {
+        let end = self.ends[row] as usize;
+        let start = if row == 0 {
+            0
+        } else {
+            self.ends[row - 1] as usize
+        };
+        let key = &self.bytes[start..end];
+        let hash = hash_bytes_key(key);
+        Matches {
+            table,
+            row: table.heads[(hash & table.mask) as usize],
+            hash,
+            key: BytesKey {
+                data: self.build,
+                offsets: self.offsets,
+                key,
+            },
+        }
+    }
+
+    #[inline]
+    fn null(&self, row: usize) -> bool {
+        any_null(self.kvs, row)
+    }
+}
+
+/// Marks every build row whose key equals a key of `rows`.
+fn mark_matches<'k, K: KeyRows<'k>>(
+    keys: &K,
+    table: &'k MatchTable,
+    rows: &[u32],
+    mark: &mut impl FnMut(u32),
+) {
+    for &row in rows {
+        let row = row as usize;
+        if keys.null(row) {
+            continue;
+        }
+        keys.matches(table, row).for_each(&mut *mark);
+    }
+}
+
+/// Calls `f` for each of `rows` with its matches: a NULL key has none (`=` is
+/// never true for a NULL), which an outer join still has to see, so the row and
+/// `None` are passed on.
+fn each_row<'k, K: KeyRows<'k>>(
+    keys: &K,
+    table: &'k MatchTable,
+    rows: &[u32],
+    f: &mut impl FnMut(usize, Option<Matches<'k, K::Key>>) -> Result<()>,
+) -> Result<()> {
+    for &row in rows {
+        let row = row as usize;
+        let hit = (!keys.null(row)).then(|| keys.matches(table, row));
+        f(row, hit)?;
+    }
+    Ok(())
+}
+
+/// Whether each of `n` rows has a matching build row, in row order: a NULL key
+/// has none, and a `pass` (the bloom filter's answer) rejects a row before its
+/// chain walk.
+fn any_hits<'k, K: KeyRows<'k>>(
+    keys: &K,
+    table: &'k MatchTable,
+    n: usize,
+    pass: Option<&[bool]>,
+) -> Vec<bool> {
+    (0..n)
+        .map(|row| {
+            if pass.is_some_and(|pass| !pass[row]) || keys.null(row) {
+                return false;
+            }
+            keys.matches(table, row).next().is_some()
+        })
+        .collect()
 }
 
 /// One candidate key match: `(preserved row, build chunk, build row)`.
@@ -5153,36 +5437,34 @@ type MatchPair = (u32, u32, u32);
 /// filters exactly the pairs the join would otherwise materialize.
 fn candidate_pairs(
     chunk: &DataChunk,
-    kvs: &[Vector],
+    probe: &ProbeChunk,
     table: &MatchTable,
-    ints: bool,
     filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
-    buf: &mut Vec<u8>,
+) -> Vec<MatchPair> {
+    let pass = filters.map(|f| row_filter_pass(f, &probe.kvs, chunk.num_rows()));
+    let rows = 0..chunk.num_rows();
+    match probe.keys(table) {
+        Keys::Int(keys) => candidate_pairs_of(&keys, table, rows, pass.as_deref()),
+        Keys::Str(keys) => candidate_pairs_of(&keys, table, rows, pass.as_deref()),
+        Keys::Bytes(keys) => candidate_pairs_of(&keys, table, rows, pass.as_deref()),
+    }
+}
+
+/// [`candidate_pairs`] for a chunk whose keys use representation `K`.
+fn candidate_pairs_of<'k, K: KeyRows<'k>>(
+    keys: &K,
+    table: &'k MatchTable,
+    rows: std::ops::Range<usize>,
+    pass: Option<&[bool]>,
 ) -> Vec<MatchPair> {
     let mut pairs: Vec<MatchPair> = Vec::new();
-    let probe = ints.then(|| table.probe_ints(&kvs[0]));
-    let pass = filters.map(|f| row_filter_pass(f, kvs, chunk.num_rows()));
-    for i in 0..chunk.num_rows() {
-        if let Some(pass) = &pass
-            && !pass[i]
-        {
+    for row in rows {
+        if pass.is_some_and(|pass| !pass[row]) || keys.null(row) {
             continue;
         }
-        if kvs.iter().any(|kv| kv.is_null(i)) {
-            continue;
-        }
-        let matches = if ints {
-            table.matches_at(probe.as_ref().expect("integer keys"), i)
-        } else {
-            buf.clear();
-            for kv in kvs {
-                kv.encode_into(buf, i);
-            }
-            table.matches_bytes(buf)
-        };
-        for r in matches {
+        for r in keys.matches(table, row) {
             let (bci, bi) = table.loc(r);
-            pairs.push((i as u32, bci, bi));
+            pairs.push((row as u32, bci, bi));
         }
     }
     pairs
@@ -5344,56 +5626,28 @@ impl DmlIndex {
         let kvs = self
             .table
             .probe_keys(cx, &self.keys, chunk, &self.commons, self.ints)?;
-        let rows = chunk.num_rows();
-        let mut null = vec![false; rows];
-        for kv in &kvs {
-            for (row, null) in null.iter_mut().enumerate() {
-                *null |= kv.is_null(row);
-            }
-        }
-        // Encoded once per row, the layout `MatchTable`'s byte keys use.
-        let mut bytes = Vec::new();
-        let mut ends = Vec::with_capacity(rows);
-        if !self.ints {
-            for (row, is_null) in null.iter().enumerate() {
-                if !is_null {
-                    for kv in &kvs {
-                        kv.encode_into(&mut bytes, row);
-                    }
-                }
-                ends.push(bytes.len() as u32);
-            }
-        }
         Ok(ProbeKeys {
-            kvs,
-            bytes,
-            ends,
-            null,
+            probe: ProbeChunk::new(&self.table, kvs),
         })
     }
 
-    /// The source `(chunk, row)` candidates for `row` of the chunk its
-    /// [`ProbeKeys`] were evaluated over, in source input order. A NULL key
-    /// matches nothing (`=` is never true for NULL).
-    pub(crate) fn matches<'k>(
-        &'k self,
-        keys: &'k ProbeKeys,
+    /// Calls `visit` for the source `(chunk, row)` candidates of `row` of the
+    /// chunk its [`ProbeKeys`] were evaluated over, in source input order;
+    /// stops when `visit` returns `false`. A NULL key matches nothing (`=` is
+    /// never true for NULL). A DML statement probes one row at a time, so the
+    /// chunk-level key type is re-stated per row here — the walk itself is one
+    /// monomorphic loop per representation.
+    pub(crate) fn for_each_match(
+        &self,
+        keys: &ProbeKeys,
         row: usize,
-    ) -> impl Iterator<Item = (u32, u32)> + 'k {
-        let hit = (!keys.null[row]).then(|| {
-            if self.ints {
-                self.table.matches_int(int_key_at(&keys.kvs[0], row))
-            } else {
-                let end = keys.ends[row] as usize;
-                let start = if row == 0 {
-                    0
-                } else {
-                    keys.ends[row - 1] as usize
-                };
-                self.table.matches_bytes(&keys.bytes[start..end])
-            }
-        });
-        hit.into_iter().flatten().map(|row| self.table.loc(row))
+        mut visit: impl FnMut(u32, u32) -> Result<bool>,
+    ) -> Result<()> {
+        match keys.probe.keys(&self.table) {
+            Keys::Int(k) => dml_matches(self, &k, row, &mut visit),
+            Keys::Str(k) => dml_matches(self, &k, row, &mut visit),
+            Keys::Bytes(k) => dml_matches(self, &k, row, &mut visit),
+        }
     }
 
     /// Zone of each hash key's *source* side, for keys whose target side is a
@@ -5433,14 +5687,30 @@ impl DmlIndex {
     }
 }
 
+/// [`DmlIndex::for_each_match`] for one key representation.
+fn dml_matches<'k, K: KeyRows<'k>>(
+    index: &'k DmlIndex,
+    keys: &K,
+    row: usize,
+    visit: &mut impl FnMut(u32, u32) -> Result<bool>,
+) -> Result<()> {
+    let mut walk = |_row: usize, hit: Option<Matches<'k, K::Key>>| -> Result<()> {
+        if let Some(it) = hit {
+            for r in it {
+                let (c, i) = index.table.loc(r);
+                if !visit(c, i)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    };
+    each_row(keys, &index.table, &[row as u32], &mut walk)
+}
+
 /// One target chunk's keys under a [`DmlIndex`].
 pub(crate) struct ProbeKeys {
-    kvs: Vec<Vector>,
-    /// Each non-NULL-keyed row's encoded key, row by row; `ends[row]` is where
-    /// row `row`'s encoding stops (unchanged for a NULL-keyed row).
-    bytes: Vec<u8>,
-    ends: Vec<u32>,
-    null: Vec<bool>,
+    probe: ProbeChunk,
 }
 
 /// Flatten `a AND b AND …` into its conjuncts.
@@ -5802,7 +6072,7 @@ fn semi_by_marking_left(
                 None => (0..chunk.num_rows() as u32).collect(),
             };
             let kvs = table.probe_keys(cx, right_keys, chunk, commons, ints)?;
-            let mut buf = Vec::new();
+            let probe = ProbeChunk::new(&table, kvs);
             let set = |c: u32, i: u32| {
                 let m = &marks[c as usize][i as usize];
                 if !m.load(Ordering::Relaxed) {
@@ -5810,7 +6080,7 @@ fn semi_by_marking_left(
                 }
             };
             if let Some(residual) = &residual {
-                let pairs = candidate_pairs(chunk, &kvs, &table, ints, None, &mut buf);
+                let pairs = candidate_pairs(chunk, &probe, &table, None);
                 let kept = residual_selection(
                     cx,
                     residual,
@@ -5829,23 +6099,10 @@ fn semi_by_marking_left(
                 let (c, i) = table.loc(r);
                 set(c, i);
             };
-            let probe = ints.then(|| table.probe_ints(&kvs[0]));
-            for &i in &rows {
-                let i = i as usize;
-                if kvs.iter().any(|kv| kv.is_null(i)) {
-                    continue;
-                }
-                if ints {
-                    table
-                        .matches_at(probe.as_ref().expect("integer keys"), i)
-                        .for_each(&mut mark);
-                } else {
-                    buf.clear();
-                    for kv in &kvs {
-                        kv.encode_into(&mut buf, i);
-                    }
-                    table.matches_bytes(&buf).for_each(&mut mark);
-                }
+            match probe.keys(&table) {
+                Keys::Int(keys) => mark_matches(&keys, &table, &rows, &mut mark),
+                Keys::Str(keys) => mark_matches(&keys, &table, &rows, &mut mark),
+                Keys::Bytes(keys) => mark_matches(&keys, &table, &rows, &mut mark),
             }
             Ok(())
         })?;
@@ -6005,6 +6262,7 @@ fn hash_mark_join(
         .map(|chunk| -> Result<Vec<DataChunk>> {
             cx.check_deadline()?;
             let kvs = table.probe_keys(cx, left_keys, chunk, &commons, ints)?;
+            let probe = ProbeChunk::new(&table, kvs);
             let mut buf = Vec::new();
             // A row hits only when one of its key matches survives the
             // residual: a pair the predicate rejects is not a match, so the
@@ -6014,7 +6272,7 @@ fn hash_mark_join(
             let row_pass: Option<Vec<bool>> = match residual {
                 None => None,
                 Some(residual) => {
-                    let pairs = candidate_pairs(chunk, &kvs, &table, ints, filters, &mut buf);
+                    let pairs = candidate_pairs(chunk, &probe, &table, filters);
                     let kept = residual_selection(
                         cx,
                         residual,
@@ -6056,8 +6314,14 @@ fn hash_mark_join(
                 .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
                 .collect();
             let mut cur_rows = 0usize;
-            let probe = ints.then(|| table.probe_ints(&kvs[0]));
-            let pass = filters.map(|f| row_filter_pass(f, &kvs, chunk.num_rows()));
+            let pass = filters.map(|f| row_filter_pass(f, &probe.kvs, chunk.num_rows()));
+            // One existence probe per row, monomorphic on the key
+            // representation: the row loop below only reads the answer.
+            let hits = match probe.keys(&table) {
+                Keys::Int(keys) => any_hits(&keys, &table, chunk.num_rows(), pass.as_deref()),
+                Keys::Str(keys) => any_hits(&keys, &table, chunk.num_rows(), pass.as_deref()),
+                Keys::Bytes(keys) => any_hits(&keys, &table, chunk.num_rows(), pass.as_deref()),
+            };
             for i in 0..chunk.num_rows() {
                 // Build keys the bloom rejects cannot match, and a SEMI join
                 // emits nothing for them (wave 122).
@@ -6066,20 +6330,7 @@ fn hash_mark_join(
                 {
                     continue;
                 }
-                let null_key = kvs.iter().any(|kv| kv.is_null(i));
-                let mut hit = !null_key
-                    && if ints {
-                        table
-                            .matches_at(probe.as_ref().expect("integer keys"), i)
-                            .next()
-                            .is_some()
-                    } else {
-                        buf.clear();
-                        for kv in &kvs {
-                            kv.encode_into(&mut buf, i);
-                        }
-                        table.matches_bytes(&buf).next().is_some()
-                    };
+                let mut hit = hits[i];
                 if let Some(pass) = &row_pass {
                     hit = hit && pass[i];
                 }
@@ -6113,16 +6364,21 @@ fn hash_mark_join(
                     // Inside a group that exists, a NULL operand is unknown, a
                     // hit is TRUE, a NULL in the group's values is unknown, and
                     // anything else is FALSE.
-                    let marker = if kvs[..kvs.len() - 1].iter().any(|kv| kv.is_null(i)) {
+                    let marker = if probe.kvs[..probe.kvs.len() - 1]
+                        .iter()
+                        .any(|kv| kv.is_null(i))
+                    {
                         Some(false)
                     } else {
                         buf.clear();
-                        for kv in &kvs[..kvs.len() - 1] {
+                        for kv in &probe.kvs[..probe.kvs.len() - 1] {
                             kv.encode_into(&mut buf, i);
                         }
                         match groups.get(&buf) {
                             None => Some(false),
-                            Some((star, nonnull)) if kvs[kvs.len() - 1].is_null(i) => None,
+                            Some((star, nonnull)) if probe.kvs[probe.kvs.len() - 1].is_null(i) => {
+                                None
+                            }
                             Some(_) if hit => Some(true),
                             Some((star, nonnull)) if star > nonnull => None,
                             Some(_) => Some(false),
@@ -6518,7 +6774,7 @@ impl<'a> ProbePlan<'a> {
         let kvs =
             self.table
                 .probe_keys(cx, self.preserved_keys, chunk, &self.commons, self.ints)?;
-        let mut buf = Vec::new();
+        let probe = ProbeChunk::new(&self.table, kvs);
         let mut sink = JoinAssembler::new(
             cx,
             &self.dtypes,
@@ -6530,14 +6786,7 @@ impl<'a> ProbePlan<'a> {
         if let Some(residual) = self.residual {
             // Two passes: the residual decides which candidate pairs are
             // matches before any of them is assembled.
-            let pairs = candidate_pairs(
-                chunk,
-                &kvs,
-                &self.table,
-                self.ints,
-                self.filters.as_deref(),
-                &mut buf,
-            );
+            let pairs = candidate_pairs(chunk, &probe, &self.table, self.filters.as_deref());
             let kept =
                 residual_selection(cx, residual, &pairs, chunk, self.n_preserved, self.build)?;
             for k in kept {
@@ -6546,40 +6795,53 @@ impl<'a> ProbePlan<'a> {
             }
             return sink.finish(chunk);
         }
-        let probe = self.ints.then(|| self.table.probe_ints(&kvs[0]));
         let pass = self
             .filters
             .as_deref()
-            .map(|f| row_filter_pass(f, &kvs, chunk.num_rows()));
-        for &i in &rows {
+            .map(|f| row_filter_pass(f, &probe.kvs, chunk.num_rows()));
+        match probe.keys(&self.table) {
+            Keys::Int(keys) => {
+                self.probe_rows(&keys, chunk, &rows, pass.as_deref(), full, &mut sink)?
+            }
+            Keys::Str(keys) => {
+                self.probe_rows(&keys, chunk, &rows, pass.as_deref(), full, &mut sink)?
+            }
+            Keys::Bytes(keys) => {
+                self.probe_rows(&keys, chunk, &rows, pass.as_deref(), full, &mut sink)?
+            }
+        }
+        sink.finish(chunk)
+    }
+
+    /// [`ProbePlan::probe`]'s assembling loop, for a chunk whose keys use
+    /// representation `K`: the representation is fixed here, so the loop is
+    /// monomorphic.
+    fn probe_rows<'k, K: KeyRows<'k>>(
+        &'k self,
+        keys: &K,
+        chunk: &DataChunk,
+        rows: &[u32],
+        pass: Option<&[bool]>,
+        full: Option<&FullMark>,
+        sink: &mut JoinAssembler,
+    ) -> Result<()> {
+        for &i in rows {
             let i = i as usize;
             // A row the build side's bloom rules out cannot match, so it is
             // dropped before any of its columns are materialized (wave
             // 122). Filters are only set for an INNER join, where no
             // preserved row is owed an output.
-            if let Some(pass) = &pass
-                && !pass[i]
-            {
+            if pass.is_some_and(|pass| !pass[i]) {
                 debug_assert!(!self.extend_unmatched);
                 continue;
             }
-            let null_key = kvs.iter().any(|kv| kv.is_null(i));
+            let null_key = keys.null(i);
             if null_key && !self.extend_unmatched {
                 continue;
             }
             let mut matched = false;
             if !null_key {
-                let matches = if self.ints {
-                    self.table
-                        .matches_at(probe.as_ref().expect("integer keys"), i)
-                } else {
-                    buf.clear();
-                    for kv in &kvs {
-                        kv.encode_into(&mut buf, i);
-                    }
-                    self.table.matches_bytes(&buf)
-                };
-                for r in matches {
+                for r in keys.matches(&self.table, i) {
                     matched = true;
                     if let Some(full) = full {
                         full.mark(self.table.loc(r));
@@ -6587,19 +6849,16 @@ impl<'a> ProbePlan<'a> {
                     sink.push(chunk, i, self.table.loc(r))?;
                 }
             }
-            match matched {
-                true => {}
-                false => {
-                    // Inner: no match, drop the row. Outer: unmatched (or
-                    // NULL-keyed) preserved row — NULL-extend.
-                    if !self.extend_unmatched {
-                        continue;
-                    }
-                    sink.push(chunk, i, (crate::vector::GATHER_NULL, 0))?;
+            if !matched {
+                // Inner: no match, drop the row. Outer: unmatched (or
+                // NULL-keyed) preserved row — NULL-extend.
+                if !self.extend_unmatched {
+                    continue;
                 }
+                sink.push(chunk, i, (crate::vector::GATHER_NULL, 0))?;
             }
         }
-        sink.finish(chunk)
+        Ok(())
     }
 }
 
@@ -9261,6 +9520,256 @@ mod tests {
                 vec![V::Varchar("b".to_string()), V::Varchar("y".to_string())],
                 vec![V::Varchar("c".to_string()), V::Varchar("x".to_string())],
                 vec![V::Varchar("c".to_string()), V::Varchar("z".to_string())],
+            ]
+        );
+    }
+
+    /// The VARCHAR keys a join hashes and compares as string views: every
+    /// `StrView` shape (empty, 1 byte, 12 = the last inline length, 13 = the
+    /// first heap length, and longer), one pair that differs only past the
+    /// 4-byte stored prefix, and NULL keys (never a match).
+    const VIEW_KEYS: [&str; 8] = [
+        "",
+        "a",
+        "abcdefghijkl",
+        "abcdefghijklm",
+        "abcd0000",
+        "abcd0001",
+        "abcdefghijkl0000",
+        "abcdefghijkl0001",
+    ];
+
+    /// Run `sql` with join-filter pushdown on and off, which is also the
+    /// bloom-filter path A/B: the filters are only derived when it is on.
+    fn assert_pushdown_agrees(db: &mut PinkDb, sql: &str) -> Vec<Vec<V>> {
+        let on = assert_both_paths(db, sql);
+        db.execute("SET join_filter_pushdown = false;").unwrap();
+        let off = select(db, sql);
+        db.execute("SET join_filter_pushdown = true;").unwrap();
+        assert_eq!(on, off, "{sql}");
+        on
+    }
+
+    #[test]
+    fn varchar_join_keys_cover_every_view_length() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE f (k VARCHAR, i INTEGER, tag INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE d (k VARCHAR, label INTEGER);")
+            .unwrap();
+        let mut probe = String::from("INSERT INTO f VALUES ");
+        let mut build = String::from("INSERT INTO d VALUES ");
+        for (i, k) in VIEW_KEYS.iter().enumerate() {
+            if i > 0 {
+                probe.push(',');
+                build.push(',');
+            }
+            // Two probe rows per key, so a key repeats within one chunk.
+            probe.push_str(&format!("('{k}', {i}, {i}), ('{k}', {i}, 100 + {i})"));
+            build.push_str(&format!("('{k}', {i})"));
+        }
+        // NULL keys on both sides.
+        probe.push_str(", (NULL, 0, 0)");
+        build.push_str(", (NULL, 99)");
+        probe.push(';');
+        build.push(';');
+        db.execute(&probe).unwrap();
+        db.execute(&build).unwrap();
+        assert_eq!(
+            assert_pushdown_agrees(&mut db, "SELECT count(*) FROM f JOIN d ON f.k = d.k;"),
+            vec![vec![V::Bigint(16)]]
+        );
+        // A key whose only difference is past the 4-byte prefix must not
+        // match its twin, and an empty query key matches only ''.
+        assert_eq!(
+            assert_pushdown_agrees(
+                &mut db,
+                "SELECT count(*) FROM f JOIN d ON f.k = d.k WHERE f.k = 'abcd0000';"
+            ),
+            vec![vec![V::Bigint(2)]]
+        );
+        assert_eq!(
+            assert_pushdown_agrees(
+                &mut db,
+                "SELECT count(*) FROM f JOIN d ON f.k = d.k WHERE f.k = '';"
+            ),
+            vec![vec![V::Bigint(2)]]
+        );
+        // Every probe row keeps its match through a LEFT join, NULL keys
+        // included (they are extended, not matched).
+        assert_eq!(
+            assert_pushdown_agrees(
+                &mut db,
+                "SELECT count(*), count(d.label) FROM f LEFT JOIN d ON f.k = d.k;"
+            ),
+            vec![vec![V::Bigint(17), V::Bigint(16)]]
+        );
+    }
+
+    /// Multi-column keys mixing VARCHAR and INTEGER keep the byte-encoded
+    /// tuple path; the VARCHAR part still has to agree between build and
+    /// probe.
+    #[test]
+    fn varchar_and_integer_join_keys_mix() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE f (k VARCHAR, i INTEGER, tag INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE d (k VARCHAR, i INTEGER, label INTEGER);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO f VALUES ('', 1, 0), ('a', 2, 1), ('abcdefghijkl', 1, 2),\
+             ('abcdefghijklm', 2, 3), ('abcd0000', 1, 4), ('abcd0001', 1, 5), (NULL, 1, 6);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO d VALUES ('', 1, 0), ('a', 1, 1), ('abcdefghijkl', 1, 2),\
+             ('abcdefghijklm', 1, 3), ('abcd0001', 1, 5), (NULL, 1, 6);",
+        )
+        .unwrap();
+        // Only the pairs equal in both columns, in build input order.
+        assert_eq!(
+            assert_pushdown_agrees(
+                &mut db,
+                "SELECT f.tag, d.label FROM f JOIN d ON f.k = d.k AND f.i = d.i ORDER BY 1;"
+            ),
+            vec![
+                vec![V::Integer(0), V::Integer(0)],
+                vec![V::Integer(2), V::Integer(2)],
+                vec![V::Integer(5), V::Integer(5)],
+            ]
+        );
+    }
+
+    /// Equal key strings hash and compare equal when they come from different
+    /// vectors: a chunk decoded back from a `.pink` file, a literal, and a
+    /// gathered (subquery) vector.
+    #[test]
+    fn varchar_join_keys_agree_across_vectors_and_buffers() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE d (k VARCHAR, label INTEGER);")
+            .unwrap();
+        let mut build = String::from("INSERT INTO d VALUES ");
+        for (i, k) in VIEW_KEYS.iter().enumerate() {
+            if i > 0 {
+                build.push(',');
+            }
+            build.push_str(&format!("('{k}', {i})"));
+        }
+        build.push(';');
+        db.execute(&build).unwrap();
+        // Persist and reopen: the build side's strings now live in buffers a
+        // decoder produced, not the ones the INSERT built.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "pinkdb_view_keys_{}_{}.pink",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        db.save(path.to_str().unwrap()).unwrap();
+        let mut db = PinkDb::open(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        db.execute("CREATE TABLE f (k VARCHAR, tag INTEGER);")
+            .unwrap();
+        let mut probe = String::from("INSERT INTO f VALUES ");
+        for (i, k) in VIEW_KEYS.iter().enumerate() {
+            if i > 0 {
+                probe.push(',');
+            }
+            probe.push_str(&format!("('{k}', {i})"));
+        }
+        probe.push(';');
+        db.execute(&probe).unwrap();
+        // The literal side, and a probe side gathered by a subquery.
+        assert_eq!(
+            assert_pushdown_agrees(
+                &mut db,
+                "SELECT count(*) FROM f JOIN d ON f.k = d.k WHERE f.k IN ('', 'a', 'abcdefghijkl0001');"
+            ),
+            vec![vec![V::Bigint(3)]]
+        );
+        assert_eq!(
+            assert_pushdown_agrees(
+                &mut db,
+                "SELECT count(*) FROM (SELECT k FROM f WHERE tag % 2 = 0) g JOIN d ON g.k = d.k;"
+            ),
+            vec![vec![V::Bigint(4)]]
+        );
+    }
+
+    /// One VARCHAR key column takes the view path (`BuildKeys::Str`, hashes
+    /// and comparisons on the view), not the byte-encoded tuple path: a
+    /// silently wrong table would still answer correctly, only slower.
+    #[test]
+    fn varchar_join_table_keeps_views_not_bytes() {
+        let mut build = Vector::new_empty(DataType::Varchar);
+        for s in ["", "a", "abcdefghijkl", "abcdefghijklm", "abcdefghijkl0001"] {
+            build.push_valid(V::Varchar(s.to_string())).unwrap();
+        }
+        build.push_null().unwrap();
+        let table = MatchTable::from_key_vectors(&[vec![build.clone()]], false);
+        assert!(matches!(table.keys, BuildKeys::Str(_)), "one VARCHAR key");
+        // Two key columns cannot use the view path: they encode the tuple.
+        let table = MatchTable::from_key_vectors(&[vec![build.clone(), build.clone()]], false);
+        assert!(matches!(table.keys, BuildKeys::Bytes { .. }), "two keys");
+        // A probe vector the build never saw matches by view: same strings,
+        // different buffers.
+        let mut probe = Vector::new_empty(DataType::Varchar);
+        for s in ["abcdefghijklm", "", "zzz"] {
+            probe.push_valid(V::Varchar(s.to_string())).unwrap();
+        }
+        let table = MatchTable::from_key_vectors(&[vec![build]], false);
+        let pc = ProbeChunk::new(&table, vec![probe]);
+        let rows = 0..pc.kvs[0].len();
+        let Keys::Str(keys) = pc.keys(&table) else {
+            panic!("a stored VARCHAR chunk probes as views");
+        };
+        let hits: Vec<Vec<(u32, u32)>> = rows
+            .map(|i| keys.matches(&table, i).map(|r| table.loc(r)).collect())
+            .collect();
+        assert_eq!(hits, vec![vec![(0, 3)], vec![(0, 0)], vec![]]);
+    }
+
+    /// GROUP BY VARCHAR keys of every view length, with NULL kept apart from
+    /// `''`, in first-seen order.
+    #[test]
+    fn varchar_group_keys_compare_as_views() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE g (k VARCHAR, n INTEGER);")
+            .unwrap();
+        let mut sql = String::from("INSERT INTO g VALUES ");
+        let rows = [
+            "NULL",
+            "''",
+            "'a'",
+            "'abcdefghijkl'",
+            "'abcdefghijklm'",
+            "'abcd0000'",
+            "'abcd0001'",
+            "NULL",
+            "''",
+            "'abcdefghijkl'",
+        ];
+        for (i, k) in rows.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({k}, {i})"));
+        }
+        sql.push(';');
+        db.execute(&sql).unwrap();
+        let got = assert_both_paths(&mut db, "SELECT k, count(*), sum(n) FROM g GROUP BY k;");
+        let s = |x: &str| V::Varchar(x.to_string());
+        assert_eq!(
+            got,
+            vec![
+                vec![V::Null, V::Bigint(2), V::Bigint(7)],
+                vec![s(""), V::Bigint(2), V::Bigint(9)],
+                vec![s("a"), V::Bigint(1), V::Bigint(2)],
+                vec![s("abcdefghijkl"), V::Bigint(2), V::Bigint(12)],
+                vec![s("abcdefghijklm"), V::Bigint(1), V::Bigint(4)],
+                vec![s("abcd0000"), V::Bigint(1), V::Bigint(5)],
+                vec![s("abcd0001"), V::Bigint(1), V::Bigint(6)],
             ]
         );
     }

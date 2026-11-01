@@ -171,12 +171,6 @@ impl FlatPartial {
     fn len(&self) -> usize {
         self.hashes.len()
     }
-
-    /// Group `g`'s string in VARCHAR key slot `slot`.
-    #[inline]
-    fn str_at(&self, g: usize, slot: usize) -> &str {
-        &self.strs[g * self.nstr + slot]
-    }
 }
 
 impl FlatPartial {
@@ -319,7 +313,7 @@ fn fill_words(
         VectorData::Int64(d) | VectorData::TimestampMicros(d) => put(&|i| d[i] as u64),
         // DECIMAL(≤18) values fit an i64 (`KeyKind::matches`).
         VectorData::Decimal { values, .. } => put(&|i| values[i] as i64 as u64),
-        VectorData::VarChar(d) => put(&|i| super::hash_bytes_key(d[i].as_bytes())),
+        VectorData::VarChar(d) => put(&|i| crate::strings::view_hash(d, i)),
         _ => unreachable!("KeyKind::matches admits only fixed-width payloads"),
     }
 }
@@ -456,7 +450,13 @@ impl Spec<'_> {
                         && self.str_cols.iter().enumerate().all(|(slot, &c)| {
                             let (d, i, valid) = cell(c, k);
                             // A NULL's NULL bit already matched; its cell is "".
-                            !valid || part.str_at(g as usize, slot) == &d[i]
+                            !valid
+                                || crate::strings::views_eq(
+                                    &part.strs,
+                                    g as usize * nstr + slot,
+                                    d,
+                                    i,
+                                )
                         })
                     {
                         break g;
@@ -529,7 +529,7 @@ fn merge_and_emit(
                             slots[s] = out.first.len() as u32;
                             out.keys.extend_from_slice(key);
                             for slot in 0..nstr {
-                                out.strs.push(p.str_at(g, slot));
+                                out.strs.push(p.strs.get(g * nstr + slot));
                             }
                             out.accs.extend_from_slice(src);
                             out.first.push((pi as u64) << 32 | u64::from(p.pos[g]));
@@ -539,7 +539,14 @@ fn merge_and_emit(
                         let t = t as usize;
                         if hashes[t] == h
                             && out.keys[t * width..(t + 1) * width] == *key
-                            && (0..nstr).all(|slot| &out.strs[t * nstr + slot] == p.str_at(g, slot))
+                            && (0..nstr).all(|slot| {
+                                crate::strings::views_eq(
+                                    &out.strs,
+                                    t * nstr + slot,
+                                    &p.strs,
+                                    g * nstr + slot,
+                                )
+                            })
                         {
                             for (acc, other) in
                                 out.accs[t * naggs..(t + 1) * naggs].iter_mut().zip(src)

@@ -46,6 +46,18 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
     mix(h)
 }
 
+/// The hash of one non-NULL cell of a join filter's key column. The filter is
+/// built and probed inside one statement, so its values need only agree with
+/// themselves — unlike [`key_hash`], whose values are written into the `.pink`
+/// file's sketches. A VARCHAR cell hashes through its string view, which is
+/// cheaper than its bytes and agrees across vectors and buffers.
+pub(crate) fn filter_hash(v: &Vector, row: usize) -> u64 {
+    match v.data() {
+        VectorData::VarChar(d) => crate::strings::view_hash(d, row),
+        _ => key_hash(v, row),
+    }
+}
+
 /// The hash of one non-NULL cell of a key column: equal keys hash equally and
 /// NULL is not a key (callers check `is_valid` first).
 ///
@@ -854,7 +866,7 @@ impl JoinFilterBuilder {
         self.zone.merge(&Zone::of_vector(v));
         for row in 0..v.len() {
             if v.is_valid(row) {
-                self.bloom.insert(key_hash(v, row));
+                self.bloom.insert(filter_hash(v, row));
             }
         }
     }
@@ -968,7 +980,7 @@ impl JoinFilter {
                 }
             }
         }
-        self.bloom.contains(key_hash(v, row))
+        self.bloom.contains(filter_hash(v, row))
     }
 }
 

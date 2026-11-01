@@ -263,9 +263,10 @@ pub(crate) fn update_from(
                     };
                 match (&index, &probe_keys) {
                     (Some(index), Some(keys)) => {
-                        for (sc, srow) in index.matches(keys, row) {
+                        index.for_each_match(keys, row, |sc, srow| {
                             visit(sc as usize, srow as usize, &mut chosen)?;
-                        }
+                            Ok(true)
+                        })?;
                     }
                     _ => {
                         for (sc, source_chunk) in src_chunks.iter().enumerate() {
@@ -338,12 +339,10 @@ pub(crate) fn delete_using(
                 let matched = match (&index, &probe_keys) {
                     (Some(index), Some(keys)) => {
                         let mut found = false;
-                        for (sc, srow) in index.matches(keys, row) {
-                            if hit(sc as usize, srow as usize)? {
-                                found = true;
-                                break;
-                            }
-                        }
+                        index.for_each_match(keys, row, |sc, srow| {
+                            found = hit(sc as usize, srow as usize)?;
+                            Ok(!found)
+                        })?;
                         found
                     }
                     _ => {
@@ -540,12 +539,13 @@ pub(crate) fn merge(
                 budget.check_deadline()?;
                 match (&index, &probe_keys) {
                     (Some(index), Some(probe_keys)) => {
-                        for (sc, sr) in index.matches(probe_keys, row) {
+                        index.for_each_match(probe_keys, row, |sc, sr| {
                             batch.push((row as u32, sc, sr));
                             if batch.len() == CHUNK_SIZE {
                                 flush(&mut batch, &mut hits, &mut source_matched)?;
                             }
-                        }
+                            Ok(true)
+                        })?;
                     }
                     // No equality between the source and the target: every pair
                     // is a candidate.
