@@ -2282,7 +2282,14 @@ pub(crate) struct FrameSets {
 impl FrameSets {
     /// Record a `(database, schema, table)` dependency (called for both reads
     /// and writes; duplicates are removed by [`FrameSets::canonicalize`]).
+    ///
+    /// A temporary table is session-local, so it can never conflict with — or
+    /// be rebuilt by — another session's replay; dropping it here keeps a
+    /// transaction's touched set from naming `temp` at all.
     pub(crate) fn add_table(&mut self, ns: &crate::storage::SchemaPath, table: &str) {
+        if ns.temp_id().is_some() {
+            return;
+        }
         self.tables.push((
             ns.db().to_ascii_lowercase(),
             ns.schema().to_ascii_lowercase(),
@@ -4773,6 +4780,11 @@ impl PinkDb {
         let previously_loaded: HashSet<String> =
             self.loaded_extension_paths().into_iter().collect();
         self.replaying = true;
+        // A frame may carry a procedure that writes a temp table as well as a
+        // persistent one. Its temp effect belongs to the session that ran it,
+        // not to this store's embedded session, so replay into a throwaway
+        // catalog set and restore the live one afterwards.
+        let saved_temp = std::mem::take(&mut self.temp);
         let mut result = Ok(());
         for rec in records {
             if let Err(e) = replay_record(self, rec) {
@@ -4780,6 +4792,7 @@ impl PinkDb {
                 break;
             }
         }
+        self.temp = saved_temp;
         self.replaying = false;
         if result.is_ok() {
             // Extensions these frames loaded are covered by the current WAL

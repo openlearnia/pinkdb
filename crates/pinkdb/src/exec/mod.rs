@@ -1126,6 +1126,13 @@ fn sql_load_gate(db: &PinkDb, statement: &str, source: &str) -> Result<()> {
 /// closes the window for the multi-writer `Connection` path (bind and run are
 /// separate lock acquisitions) and keeps `run` self-contained.
 fn use_result(db: &PinkDb, ns: &crate::storage::SchemaPath) -> Result<QueryResult> {
+    // `temp` exists for the session but is never a current database: DuckDB
+    // refuses `USE temp` as an internal schema.
+    if ns.db().eq_ignore_ascii_case("temp") {
+        return Err(PinkDbError::Catalog(
+            "cannot USE the internal database \"temp\"".to_string(),
+        ));
+    }
     if !db.database_exists(ns.db()) {
         return Err(PinkDbError::Catalog(format!(
             "database \"{}\" not found",
@@ -3673,8 +3680,12 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             index_scan_output(cx, &target, table, *column, &rows)
         }
         LogicalPlan::ShowTables { ns } => {
-            // DuckDB lists tables and views together, sorted by name.
-            let mut names = cx.db.list_tables_in(ns);
+            // DuckDB lists tables and views together, sorted by name, with the
+            // session's temporary tables first in the search path (they keep
+            // their duplicate names: `SHOW TABLES` is a name list, not a map).
+            let temp = crate::storage::SchemaPath::temp(cx.session.id());
+            let mut names = cx.db.list_tables_in(&temp);
+            names.extend(cx.db.list_tables_in(ns));
             for v in cx.db.list_views_in(ns) {
                 if !names.iter().any(|n| n.eq_ignore_ascii_case(&v)) {
                     names.push(v);

@@ -128,7 +128,7 @@ fn catalog_functions_report_duckdb_shape_and_join_on_oids() {
             &mut db,
             "SELECT database_name FROM duckdb_databases() ORDER BY 1"
         ),
-        vec!["alpha", "beta", "main", "system"]
+        vec!["alpha", "beta", "main", "system", "temp"]
     );
     let db_row = rows(
         &mut db,
@@ -290,7 +290,7 @@ fn catalog_functions_report_duckdb_shape_and_join_on_oids() {
             "SELECT count(*) FROM duckdb_schemas() s \
              JOIN duckdb_databases() d ON s.database_oid = d.database_oid"
         ),
-        vec![vec![Value::Bigint(8)]]
+        vec![vec![Value::Bigint(9)]]
     );
     assert_eq!(
         rows(
@@ -432,6 +432,7 @@ fn information_schema_views_list_every_database_in_all_qualifications() {
             "system.information_schema",
             "system.main",
             "system.pg_catalog",
+            "temp.main",
         ]
     );
     assert_eq!(
@@ -614,7 +615,8 @@ fn catalog_functions_filter_by_select_grants() {
     assert_eq!(
         conn_strings(
             &mut alice,
-            "SELECT schema_name FROM duckdb_schemas() WHERE database_name <> 'system' \
+            "SELECT schema_name FROM duckdb_schemas() \
+             WHERE database_name NOT IN ('system', 'temp') \
              AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1"
         ),
         vec!["s1"]
@@ -719,7 +721,7 @@ fn system_database_is_reserved_and_virtual() {
             &mut db,
             "SELECT database_name FROM duckdb_databases() ORDER BY 1"
         ),
-        vec!["main", "system"]
+        vec!["main", "system", "temp"]
     );
 }
 

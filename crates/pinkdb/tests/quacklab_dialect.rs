@@ -203,11 +203,20 @@ fn create_or_replace_keeps_the_last_definition_after_replay() {
 }
 
 #[test]
-fn create_temp_is_refused_with_a_reason() {
+fn create_temp_table_is_session_local() {
     let mut db = PinkDb::new();
+    db.execute("CREATE TEMP TABLE t (a INTEGER);").unwrap();
+    db.execute("INSERT INTO t VALUES (1);").unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT a FROM t;"),
+        vec![vec![Value::Integer(1)]]
+    );
     let err = db
-        .execute("CREATE TEMP TABLE t (a INTEGER);")
+        .execute("CREATE TABLE temp.t (a INTEGER);")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("CREATE TEMP is not supported"), "{err}");
+    assert!(
+        err.contains("Only TEMPORARY table names can use the \"temp\" catalog"),
+        "{err}"
+    );
 }

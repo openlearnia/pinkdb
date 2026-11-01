@@ -974,6 +974,23 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
     )
 }
 
+/// True when `plan` writes at least one table outside the session's `temp`
+/// catalog. A temp-only statement is never WAL-logged: replay could not
+/// recreate the table, and it dies with the session.
+pub(crate) fn writes_persistent_tables(
+    plan: &LogicalPlan,
+    default_ns: &crate::storage::SchemaPath,
+) -> bool {
+    let mut writes = std::collections::HashSet::new();
+    let mut views = std::collections::HashSet::new();
+    crate::db::record_writes(plan, default_ns, &mut writes, &mut views);
+    if writes.is_empty() {
+        // Catalog or session DDL records no table write; it is still logged.
+        return writes_tables(plan);
+    }
+    writes.iter().any(|(ns, _)| ns.temp_id().is_none())
+}
+
 /// Statements refused inside a transaction: store/process-level operations a
 /// snapshot commit cannot undo. Returns the SQL statement name for the error
 /// message (`None` = allowed).

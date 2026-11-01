@@ -1629,6 +1629,10 @@ impl SchemaCatalog {
 pub struct SchemaPath {
     db: String,
     schema: String,
+    /// The session that owns this `temp` catalog. `None` for every persistent
+    /// database: `temp` never lives in [`PinkDb::databases`], so the owner is
+    /// part of the name (two sessions' `temp.main` are different namespaces).
+    temp: Option<u64>,
 }
 
 impl SchemaPath {
@@ -1637,12 +1641,28 @@ impl SchemaPath {
         Self {
             db: db.to_ascii_lowercase(),
             schema: schema.to_ascii_lowercase(),
+            temp: None,
         }
     }
 
     /// The database's default schema, `db.main`.
     pub fn main(db: &str) -> Self {
         Self::new(db, "main")
+    }
+
+    /// The session's temporary catalog, `temp.main`. Only the binder creates
+    /// these; the session id keeps two sessions' temp namespaces apart.
+    pub(crate) fn temp(session: u64) -> Self {
+        Self {
+            db: "temp".to_string(),
+            schema: "main".to_string(),
+            temp: Some(session),
+        }
+    }
+
+    /// The session that owns this temp namespace, if it is one.
+    pub(crate) fn temp_id(&self) -> Option<u64> {
+        self.temp
     }
 
     /// The lowercased database name.
@@ -1762,8 +1782,12 @@ impl DbCatalog {
 /// to the WAL. A statement the engine logs may not *read* one (see
 /// `sql::bind_tracked_with`): replay re-binds the logged text against a fresh
 /// session, so a reference there could not reproduce its value.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Session {
+    /// Session identity, unique for the life of the process. Keys the
+    /// session's `temp` catalog, so two connections never see each other's
+    /// temporary tables (a transaction snapshot shares its session's).
+    id: u64,
     /// Lowercased name -> value.
     vars: Arc<Mutex<BTreeMap<String, Value>>>,
     /// The authenticated user of this session (wave 48's login), lowercased:
@@ -1790,10 +1814,27 @@ impl std::fmt::Debug for Session {
     }
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Session {
     /// A session with no variables set.
     pub fn new() -> Self {
-        Self::default()
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            vars: Arc::default(),
+            principal: Arc::default(),
+            roles: Arc::default(),
+        }
+    }
+
+    /// This session's identity: what keys its `temp` catalog.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// Adopt `principal` as this session's user (`None` = trusted embedded).
@@ -1972,6 +2013,12 @@ impl RecordSeed {
 pub struct PinkDb {
     /// Key = lowercased database name.
     pub(crate) databases: HashMap<String, DbCatalog>,
+    /// Each session's `temp` catalog, keyed by [`Session::id`]. Never
+    /// persisted, never in the WAL, and deliberately not in `databases`: a
+    /// temporary table exists only for the session that created it, and the
+    /// catalog is created on its first temp table and dropped with the
+    /// session.
+    pub(crate) temp: HashMap<u64, DbCatalog>,
     /// Loadable-extension scalar functions (ABI v1 `dlopen`, wave 29A; linked
     /// registry, wave 49), keyed by lowercased name. Registered by
     /// [`PinkDb::load_extension`] / [`PinkDb::load_linked_extension`]; shared
@@ -2246,6 +2293,7 @@ impl Clone for PinkDb {
     fn clone(&self) -> Self {
         Self {
             databases: self.databases.clone(),
+            temp: self.temp.clone(),
             dynamic_functions: self.dynamic_functions.clone(),
             loaded_extensions: self.loaded_extensions.clone(),
             current_db: self.current_db.clone(),
@@ -2353,6 +2401,7 @@ impl PinkDb {
         }
         Self {
             databases,
+            temp: HashMap::new(),
             dynamic_functions: HashMap::new(),
             loaded_extensions: HashMap::new(),
             current_db: "main".to_string(),
@@ -2527,7 +2576,7 @@ impl PinkDb {
     }
 
     pub fn database_exists(&self, name: &str) -> bool {
-        self.databases.contains_key(&Self::db_key(name))
+        name.eq_ignore_ascii_case("temp") || self.databases.contains_key(&Self::db_key(name))
     }
 
     /// The as-created spelling of a database (for diagnostics), else the key
@@ -2542,6 +2591,11 @@ impl PinkDb {
     /// Create a new, empty database. Case-insensitive; errors if it exists.
     pub fn create_database(&mut self, name: &str) -> Result<()> {
         let key = Self::db_key(name);
+        if key == "temp" {
+            return Err(PinkDbError::Catalog(
+                "database \"temp\" is reserved for each session's temporary tables".to_string(),
+            ));
+        }
         if self.databases.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "database \"{name}\" already exists"
@@ -2562,6 +2616,11 @@ impl PinkDb {
     /// database is the caller's job (see [`PinkDb::fallback_db`]).
     pub fn drop_database(&mut self, name: &str) -> Result<()> {
         let key = Self::db_key(name);
+        if key == "temp" {
+            return Err(PinkDbError::Catalog(
+                "database \"temp\" is session-local and disappears with its session".to_string(),
+            ));
+        }
         if !self.databases.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "database \"{name}\" not found"
@@ -2598,6 +2657,11 @@ impl PinkDb {
 
     /// Switch the embedded session to `name` (validated).
     pub fn use_database(&mut self, name: &str) -> Result<()> {
+        if name.eq_ignore_ascii_case("temp") {
+            return Err(PinkDbError::Catalog(
+                "cannot USE the internal database \"temp\"".to_string(),
+            ));
+        }
         if !self.database_exists(name) {
             return Err(PinkDbError::Catalog(format!(
                 "database \"{name}\" not found"
@@ -2610,6 +2674,11 @@ impl PinkDb {
 
     /// Switch the embedded session to `ns` (validated; wave 131b).
     pub fn use_schema(&mut self, ns: &SchemaPath) -> Result<()> {
+        if ns.temp_id().is_some() || ns.db().eq_ignore_ascii_case("temp") {
+            return Err(PinkDbError::Catalog(
+                "cannot USE the internal schema \"temp\"".to_string(),
+            ));
+        }
         if !self.database_exists(ns.db()) {
             return Err(PinkDbError::Catalog(format!(
                 "database \"{}\" not found",
@@ -2655,21 +2724,66 @@ impl PinkDb {
     }
 
     fn catalog(&self, db: &str) -> Result<&DbCatalog> {
+        if db.eq_ignore_ascii_case("temp") {
+            return Err(PinkDbError::Catalog(
+                "database \"temp\" is session-local; a namespace carries the session that owns it"
+                    .to_string(),
+            ));
+        }
         self.databases
             .get(&Self::db_key(db))
             .ok_or_else(|| PinkDbError::Catalog(format!("database \"{db}\" not found")))
     }
 
     fn catalog_mut(&mut self, db: &str) -> Result<&mut DbCatalog> {
+        if db.eq_ignore_ascii_case("temp") {
+            return Err(PinkDbError::Catalog(
+                "database \"temp\" is session-local; a namespace carries the session that owns it"
+                    .to_string(),
+            ));
+        }
         self.databases
             .get_mut(&Self::db_key(db))
             .ok_or_else(|| PinkDbError::Catalog(format!("database \"{db}\" not found")))
+    }
+
+    /// The `temp` catalog of session `id`, if it has created one.
+    pub(crate) fn temp_catalog(&self, id: u64) -> Option<&DbCatalog> {
+        self.temp.get(&id)
+    }
+
+    /// The `temp` catalog of session `id`, created on first use: a session
+    /// pays for the catalog only once it creates a temp table.
+    pub(crate) fn temp_catalog_mut(&mut self, id: u64) -> &mut DbCatalog {
+        self.temp.entry(id).or_insert_with(|| DbCatalog {
+            name: "temp".to_string(),
+            ..DbCatalog::default()
+        })
+    }
+
+    /// Does session `id` hold a temp catalog (has it created a temporary
+    /// table)?
+    pub(crate) fn has_session_temp(&self, id: u64) -> bool {
+        self.temp.contains_key(&id)
+    }
+
+    /// Drop a session's temp catalog when the session ends.
+    pub(crate) fn drop_session_temp(&mut self, id: u64) {
+        self.temp.remove(&id);
     }
 
     /// The schema `ns` names. A missing database and a missing schema are
     /// different errors: `ns` may be fully qualified, so a typo in either part
     /// has to be reported as the part that is wrong.
     pub(crate) fn schema(&self, ns: &SchemaPath) -> Result<&SchemaCatalog> {
+        if let Some(id) = ns.temp_id() {
+            return self
+                .temp_catalog(id)
+                .and_then(|c| c.schemas.get(ns.schema()))
+                .ok_or_else(|| {
+                    PinkDbError::Catalog(format!("schema \"{}\" not found", ns.schema()))
+                });
+        }
         self.catalog(ns.db())?
             .schemas
             .get(ns.schema())
@@ -2677,6 +2791,15 @@ impl PinkDb {
     }
 
     pub(crate) fn schema_mut(&mut self, ns: &SchemaPath) -> Result<&mut SchemaCatalog> {
+        if let Some(id) = ns.temp_id() {
+            return self
+                .temp_catalog_mut(id)
+                .schemas
+                .get_mut(ns.schema())
+                .ok_or_else(|| {
+                    PinkDbError::Catalog(format!("schema \"{}\" not found", ns.schema()))
+                });
+        }
         self.catalog_mut(ns.db())?
             .schemas
             .get_mut(ns.schema())
@@ -2685,6 +2808,11 @@ impl PinkDb {
 
     /// Does `ns` name an existing schema?
     pub fn schema_exists(&self, ns: &SchemaPath) -> bool {
+        if let Some(id) = ns.temp_id() {
+            return self
+                .temp_catalog(id)
+                .is_some_and(|c| c.schemas.contains_key(ns.schema()));
+        }
         self.databases
             .get(ns.db())
             .is_some_and(|c| c.schemas.contains_key(ns.schema()))
@@ -3471,7 +3599,8 @@ impl PinkDb {
         // per-statement source text unconditional, which took the old
         // `is_durable()` shield away. Buffering here would append the frame's
         // own statements to this transaction's record and replay them twice.
-        if self.replaying || !crate::plan::writes_tables(plan) {
+        if self.replaying || !crate::plan::writes_persistent_tables(plan, &self.current_ns.clone())
+        {
             return Ok(());
         }
         // A statement that read the clock (`now()`) carries the reading in its

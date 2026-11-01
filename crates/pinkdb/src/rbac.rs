@@ -1557,6 +1557,11 @@ pub(crate) fn check_statement(
         ))
     };
     let create_on_ns = |ns: &crate::storage::SchemaPath| -> Result<()> {
+        // A session's temp catalog needs no grant (PostgreSQL grants TEMP to
+        // PUBLIC by default; DuckDB has no RBAC at all).
+        if ns.temp_id().is_some() {
+            return Ok(());
+        }
         let object = GrantObject::Schema {
             db: ns.db().to_string(),
             schema: ns.schema().to_string(),
@@ -1778,6 +1783,9 @@ fn check_table(
     table: &str,
     privilege: Privilege,
 ) -> Result<()> {
+    if ns.temp_id().is_some() {
+        return Ok(());
+    }
     let object = GrantObject::Table {
         db: ns.db().to_string(),
         schema: ns.schema().to_string(),

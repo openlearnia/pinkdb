@@ -1047,6 +1047,8 @@ CREATE VIEW c1.s.v AS SELECT a, b FROM c1.s.t;
 CREATE MACRO c1.s.plus1(a) AS a + 1;
 CREATE SCHEMA c2.s;
 CREATE TABLE c2.s.u (id BIGINT, ts TIMESTAMP);
+CREATE TEMP TABLE tmp (a INTEGER, b VARCHAR);
+INSERT INTO tmp VALUES (1, 'x');
 """
 
 CATALOG_DUCK_SETUP = """
@@ -1060,6 +1062,8 @@ CREATE VIEW c1.s.v AS SELECT a, b FROM c1.s.t;
 CREATE MACRO c1.s.plus1(a) AS a + 1;
 CREATE SCHEMA c2.s;
 CREATE TABLE c2.s.u (id BIGINT, ts TIMESTAMP);
+CREATE TEMP TABLE tmp (a INTEGER, b VARCHAR);
+INSERT INTO tmp VALUES (1, 'x');
 """
 
 CATALOG_PROBES = [
@@ -1133,6 +1137,45 @@ CATALOG_PROBES = [
     ("catalog-show-all-tables",
      "SHOW ALL TABLES;",
      "SHOW ALL TABLES;"),
+    ("catalog-show-all-tables-temp",
+     "SHOW ALL TABLES;",
+     "SHOW ALL TABLES;"),
+    ("catalog-temp-duckdb-databases",
+     "SELECT database_name, internal FROM duckdb_databases() "
+     "WHERE database_name = 'temp';",
+     "SELECT database_name, internal FROM duckdb_databases() "
+     "WHERE database_name = 'temp';"),
+    ("catalog-temp-duckdb-schemas",
+     "SELECT database_name, schema_name, internal FROM duckdb_schemas() "
+     "WHERE database_name = 'temp';",
+     "SELECT database_name, schema_name, internal FROM duckdb_schemas() "
+     "WHERE database_name = 'temp';"),
+    ("catalog-temp-duckdb-tables",
+     "SELECT database_name, schema_name, table_name, internal, temporary, "
+     "column_count FROM duckdb_tables() WHERE database_name = 'temp' "
+     "ORDER BY 3;",
+     "SELECT database_name, schema_name, table_name, internal, temporary, "
+     "column_count FROM duckdb_tables() WHERE database_name = 'temp' "
+     "ORDER BY 3;"),
+    ("catalog-temp-duckdb-columns",
+     "SELECT database_name, schema_name, table_name, column_name, column_index, "
+     "data_type FROM duckdb_columns() WHERE database_name = 'temp' "
+     "ORDER BY 3, 5;",
+     "SELECT database_name, schema_name, table_name, column_name, column_index, "
+     "data_type FROM duckdb_columns() WHERE database_name = 'temp' "
+     "ORDER BY 3, 5;"),
+    ("catalog-temp-information-schema-schemata",
+     "SELECT catalog_name, schema_name FROM information_schema.schemata "
+     "WHERE catalog_name = 'temp';",
+     "SELECT catalog_name, schema_name FROM information_schema.schemata "
+     "WHERE catalog_name = 'temp';"),
+    ("catalog-temp-information-schema-tables",
+     "SELECT table_catalog, table_schema, table_name, table_type, "
+     "is_insertable_into, commit_action FROM information_schema.tables "
+     "WHERE table_catalog = 'temp';",
+     "SELECT table_catalog, table_schema, table_name, table_type, "
+     "is_insertable_into, commit_action FROM information_schema.tables "
+     "WHERE table_catalog = 'temp';"),
 ]
 
 
@@ -1161,15 +1204,17 @@ def run_catalog():
             check(label, False, f"pinkdb error: {got[1]}")
             continue
         _, types, prows = got
-        if label == "catalog-show-all-tables":
-            prows = [r for r in prows if r[0] in ("c1", "c2")]
+        if label.startswith("catalog-show-all-tables"):
+            keep = ("temp",) if label.endswith("-temp") else ("c1", "c2")
+            prows = [r for r in prows if r[0] in keep]
         d = duck_query(CATALOG_DUCK_SETUP, dsql)
         if d[0] == "error":
             check(label, False, f"duckdb error: {d[1]}")
             continue
         drows = d[1]
-        if label == "catalog-show-all-tables":
-            drows = [r for r in drows if r[0] in ("c1", "c2")]
+        if label.startswith("catalog-show-all-tables"):
+            keep = ("temp",) if label.endswith("-temp") else ("c1", "c2")
+            drows = [r for r in drows if r[0] in keep]
             drows = [
                 [duck_list_text(c) if isinstance(c, list) else c for c in row]
                 for row in drows
@@ -1177,6 +1222,55 @@ def run_catalog():
         prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
         ok = rows_equal(prows_n, drows, True)
         check(label, ok, "" if ok else f"\npink={prows_n}\nduck={drows}")
+
+
+# ---- wave 139c: temporary tables ----
+#
+# A session's `temp.main` comes before the current schema in the search path,
+# so an unqualified name shadows the persistent table of the same name while
+# `main.t` still names the persistent one. Both engines run the same setup.
+TEMP_SETUP = """
+CREATE TABLE t (a INTEGER);
+INSERT INTO t VALUES (1);
+CREATE TEMP TABLE t (a INTEGER);
+INSERT INTO t VALUES (2);
+CREATE TEMP TABLE stage AS SELECT 42 AS a;
+CREATE SCHEMA s;
+"""
+
+TEMP_QUERIES = [
+    ("temp-shadow-unqualified", "SELECT a FROM t;"),
+    ("temp-two-part", "SELECT a FROM temp.t;"),
+    ("temp-three-part", "SELECT a FROM temp.main.t;"),
+    ("temp-main-qualified", "SELECT a FROM main.t;"),
+    ("temp-ctas", "SELECT a FROM stage;"),
+    ("temp-update", "UPDATE t SET a = a + 10;\nSELECT a FROM t;"),
+    ("temp-delete", "DELETE FROM t WHERE a = 2;\nSELECT count(*) FROM t;"),
+    ("temp-drop", "DROP TABLE t;\nSELECT a FROM t;"),
+    (
+        "temp-or-replace",
+        "CREATE OR REPLACE TEMP TABLE stage (b INTEGER);\n"
+        "INSERT INTO stage VALUES (9);\nSELECT b FROM temp.stage;",
+    ),
+    ("temp-search-path", "USE s;\nSELECT a FROM stage;"),
+]
+
+
+def run_temp():
+    print("== temporary tables battery (wave 139c) ==")
+    for label, sql in TEMP_QUERIES:
+        got = pink_query(TEMP_SETUP, sql)
+        if got[0] == "error":
+            check(label, False, f"pinkdb error: {got[1]}")
+            continue
+        _, types, prows = got
+        d = duck_query(TEMP_SETUP, sql)
+        if d[0] == "error":
+            check(label, False, f"duckdb error: {d[1]}")
+            continue
+        prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+        ok = rows_equal(prows_n, d[1], True)
+        check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
 
 
 # ---- wave 139a: column DEFAULTs are expressions ----
@@ -1611,6 +1705,8 @@ CSV_PROBES = [
     ("csv-gzip-option", "SELECT * FROM read_csv('{gz}', compression='gzip', header=true, delim=',') ORDER BY id;", True),
     ("csv-gzip-suffix", "SELECT COUNT(*), SUM(total) FROM read_csv('{gz}');", False),
     ("csv-insert-select-casts", "CREATE TABLE st (id VARCHAR, total DOUBLE); INSERT INTO st SELECT id, total FROM read_csv('{gz}', compression='gzip', header=true); SELECT * FROM st ORDER BY id;", True),
+    # QuackLab's ETL: stage the gzip CSV in a temp table, then load the real one.
+    ("csv-temp-stage-etl", "CREATE TABLE master (id INTEGER, region VARCHAR, total DECIMAL(10,2)); CREATE TEMP TABLE stage AS SELECT id, region, total FROM read_csv('{gz}'); INSERT INTO master SELECT id, region, total FROM stage; SELECT * FROM master ORDER BY id;", True),
 ]
 
 
@@ -1808,6 +1904,7 @@ def main():
     run_expression_names()
     run_csv()
     run_remote()
+    run_temp()
     if "--big" in sys.argv:
         idx = sys.argv.index("--big")
         run_big(sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "/tmp/sales_1m.csv")

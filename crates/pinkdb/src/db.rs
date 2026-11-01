@@ -512,6 +512,28 @@ pub struct Connection {
     cancel: Option<crate::exec::CancelFlag>,
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // A session's temporary catalog dies with it. The embedded handle's
+        // own session lives as long as the store, so only connections clean
+        // up here.
+        // Most sessions never create a temporary table: check under the
+        // shared read lock first, so closing one does not queue for the write
+        // lock behind every running query (and, with a writer waiting, hold
+        // up new readers) on a busy server.
+        let id = self.session.id();
+        let has_temp = self
+            .db
+            .shared
+            .read()
+            .map(|store| store.has_session_temp(id))
+            .unwrap_or(false);
+        if has_temp && let Ok(mut store) = self.db.shared.write() {
+            store.drop_session_temp(id);
+        }
+    }
+}
+
 impl Connection {
     /// Allow or refuse `external_io` host scalars in this session (the serve
     /// policy's `allow-external-services` switch). Refused calls return a
@@ -1036,7 +1058,7 @@ impl Connection {
                 // Buffer the committed statement for the transaction's single
                 // WAL record (flushed by txn_commit; never by ROLLBACK).
                 if let Some(text) = sql_text
-                    && crate::plan::writes_tables(&plan)
+                    && crate::plan::writes_persistent_tables(&plan, &pre_ns)
                 {
                     if txn.wal_db_before.is_none() {
                         txn.wal_db_before = Some(pre_ns.clone());
@@ -1436,7 +1458,13 @@ impl Connection {
         if matches!(plan, LogicalPlan::Call { .. })
             && let Some((db, stmts)) = shared.proc_frame.segment_log().cloned()
         {
-            if !stmts.is_empty() {
+            if !stmts.is_empty()
+                && shared
+                    .proc_frame
+                    .writes()
+                    .iter()
+                    .any(|(ns, _)| ns.temp_id().is_none())
+            {
                 let sets = shared.proc_frame.touched();
                 shared.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), &memo)?;
                 shared.maybe_auto_checkpoint(lease);
@@ -1444,7 +1472,7 @@ impl Connection {
             return Ok(());
         }
         if let Some(text) = sql_text
-            && crate::plan::writes_tables(plan)
+            && crate::plan::writes_persistent_tables(plan, &pre_ns)
         {
             let after = session_after(result, pre, &self.current_schema, shared);
             let touched = shared.dynamic_function_paths(dynamic_functions_used);
@@ -1569,6 +1597,9 @@ impl Connection {
         // unreplayable (its statements or `USE` targets name it): conflict
         // instead of logging a dead record or silently no-op'ing the merge.
         for (ns, name) in &txn.table_writes {
+            if ns.temp_id().is_some() {
+                continue;
+            }
             if !shared.database_exists(ns.db()) {
                 return Err(conflict(&format!("database \"{}\"", ns.db())));
             }
@@ -1587,6 +1618,9 @@ impl Connection {
         let writes = !txn.table_writes.is_empty() || !txn.view_writes.is_empty();
         if writes {
             for (ns, name) in &txn.table_reads {
+                if ns.temp_id().is_some() {
+                    continue;
+                }
                 if txn.table_writes.contains(&(ns.clone(), name.clone())) {
                     continue;
                 }
@@ -1611,6 +1645,9 @@ impl Connection {
         // Every session the record's replay switches into (implicit `USE`
         // prefixes and `USE` targets) must still exist.
         for ns in &txn.wal_dbs {
+            if ns.temp_id().is_some() {
+                continue;
+            }
             if !shared.schema_exists(ns) {
                 return Err(conflict(&format!("schema \"{ns}\"")));
             }
@@ -1621,7 +1658,9 @@ impl Connection {
         // publishes after the merge instead of logging.
         let mut written: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (ns, _) in &txn.table_writes {
-            written.insert(ns.db().to_string());
+            if ns.temp_id().is_none() {
+                written.insert(ns.db().to_string());
+            }
         }
         let storages = txn.work.write_storages(&written)?;
         txn.work.refuse_mixed_storages(&storages, "transaction")?;
@@ -1671,11 +1710,14 @@ impl Connection {
             }
             // Wave 48: grants follow their table through the same merge — a
             // transaction's `DROP TABLE`/`RENAME` also decided the table's
-            // grant entry, which lives outside the table itself.
-            let snapshot = txn.work.rbac();
-            shared
-                .rbac_mut()
-                .sync_table_grants(snapshot, ns.db(), ns.schema(), name);
+            // grant entry, which lives outside the table itself. A temp
+            // table has no grants (and no entry to sync).
+            if ns.temp_id().is_none() {
+                let snapshot = txn.work.rbac();
+                shared
+                    .rbac_mut()
+                    .sync_table_grants(snapshot, ns.db(), ns.schema(), name);
+            }
         }
         for (ns, name) in &txn.view_writes {
             match txn.work.views_remove_in(ns, name) {

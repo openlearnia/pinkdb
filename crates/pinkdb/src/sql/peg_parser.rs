@@ -1353,9 +1353,37 @@ fn at_timestamp_value(text: &str) -> std::result::Result<i64, &'static str> {
         .ok_or("valid TIMESTAMP literal")
 }
 
+/// Validate a `CREATE TABLE` target's qualifier (DuckDB's rules): a
+/// temporary table always lives in `temp.main`, so `main`, `temp` and
+/// `temp.main` all name it and anything else is refused. A permanent table
+/// cannot use the `temp` catalog.
+fn table_qualifier(qual: Qualifier, is_temp: bool) -> std::result::Result<Qualifier, &'static str> {
+    let named_temp = |part: &str| part.eq_ignore_ascii_case("temp");
+    if !is_temp {
+        let uses_temp = qual.catalog.as_deref().is_some_and(named_temp)
+            || qual.schema.as_deref().is_some_and(named_temp);
+        return if uses_temp {
+            Err("Only TEMPORARY table names can use the \"temp\" catalog")
+        } else {
+            Ok(qual)
+        };
+    }
+    match (qual.catalog.as_deref(), qual.schema.as_deref()) {
+        (Some(db), _) if !named_temp(db) => {
+            Err("TEMPORARY table names can *only* use the \"temp\" catalog")
+        }
+        (_, Some(schema))
+            if !schema.eq_ignore_ascii_case("main") && !schema.eq_ignore_ascii_case("temp") =>
+        {
+            Err("TEMPORARY tables can only live in the \"temp\" schema")
+        }
+        _ => Ok(Qualifier::both("temp", "main")),
+    }
+}
+
 peg::parser! {
     grammar peg_sql() for str {
-        use super::{apply_cmp, desugar_case, int_value, CmpTail};
+        use super::{apply_cmp, desugar_case, int_value, table_qualifier, CmpTail};
 
         // Source text between two positions. `DEFAULT` keeps the expression
         // as written for introspection and persistence; the bound expression
@@ -1921,24 +1949,22 @@ peg::parser! {
             / kw(Keyword::Create) orr:or_replace() kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
                   Statement::CreateView { qual: t.0, name: t.1, cols, query: Box::new(query), or_replace: orr }
               }
-            / kw(Keyword::Create) or_replace() (word("temp") / word("temporary")) {?
-                  Err("CREATE TEMP is not supported: pinkdb has no session-local temporary \
-                       catalog yet; create a regular table and drop it when done")
-              }
-            / kw(Keyword::Create) orr:or_replace() kw(Keyword::Table) ifne:if_not_exists() t:table_ref() kw(Keyword::As) query:select() {?
+            / kw(Keyword::Create) orr:or_replace() tmp:temp_table() kw(Keyword::Table) ifne:if_not_exists() t:table_ref() kw(Keyword::As) query:select() {?
                   if orr && ifne {
                       return Err("OR REPLACE and IF NOT EXISTS cannot both be used");
                   }
-                  Ok(Statement::CreateTableAs { qual: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne, or_replace: orr })
+                  let qual = table_qualifier(t.0, tmp)?;
+                  Ok(Statement::CreateTableAs { qual, name: t.1, query: Box::new(query), if_not_exists: ifne, or_replace: orr })
               }
-            / kw(Keyword::Create) orr:or_replace() kw(Keyword::Table) ifne:if_not_exists() t:table_ref() lparen() first:table_item()
+            / kw(Keyword::Create) orr:or_replace() tmp:temp_table() kw(Keyword::Table) ifne:if_not_exists() t:table_ref() lparen() first:table_item()
               rest:(comma() i:table_item() { i })* rparen() {?
                   if orr && ifne {
                       return Err("OR REPLACE and IF NOT EXISTS cannot both be used");
                   }
+                  let qual = table_qualifier(t.0, tmp)?;
                   let mut items = vec![first];
                   items.extend(rest);
-                  Ok(Statement::CreateTable { qual: t.0, name: t.1, items, if_not_exists: ifne, or_replace: orr })
+                  Ok(Statement::CreateTable { qual, name: t.1, items, if_not_exists: ifne, or_replace: orr })
               }
             / kw(Keyword::Create) orr:or_replace() word("procedure") t:table_ref() params:proc_params()
               lang:procedure_language()? kw(Keyword::As) body:string_lit() lang2:procedure_language()? {
@@ -1974,6 +2000,13 @@ peg::parser! {
                       or_replace: orr,
                   }
               }
+
+        /// `TEMP`/`TEMPORARY` on `CREATE TABLE` (DuckDB's session-local
+        /// catalog), absent on every other `CREATE`.
+        rule temp_table() -> bool
+            = word("temporary") { true }
+            / word("temp") { true }
+            / { false }
 
         /// `OR REPLACE` on `CREATE TABLE/VIEW/MACRO/PROCEDURE/TRIGGER`.
         rule or_replace() -> bool
