@@ -3421,52 +3421,77 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
                 Value::Varchar(s) => s.to_ascii_lowercase(),
                 v => return Err(PinkDbError::Execution(format!("date_trunc part {v}"))),
             };
-            match &row[1] {
-                Value::Date(d) => {
-                    let (y, m, _) = crate::types::civil_from_days(*d);
-                    let trunc = match part.as_str() {
-                        "year" => crate::types::days_from_civil(y, 1, 1),
-                        "month" => crate::types::days_from_civil(y, m, 1),
-                        "day" => *d,
-                        _ => {
-                            return Err(PinkDbError::Execution(format!(
-                                "date_trunc: bad part \"{part}\" for DATE (want year|month|day)"
-                            )));
-                        }
-                    };
-                    Ok(Value::Date(trunc))
+            // A DATE truncates at its midnight TIMESTAMP: DuckDB returns
+            // TIMESTAMP for both input types.
+            let us = match &row[1] {
+                Value::Date(d) => i64::from(*d) * 86_400_000_000,
+                Value::Timestamp(us) => *us,
+                v => return Err(PinkDbError::Execution(format!("date_trunc of {v}"))),
+            };
+            let (days, h, mi, s, _) = crate::types::split_timestamp(us);
+            let day_us = days as i64 * 86_400_000_000;
+            let trunc = match part.as_str() {
+                "year" => {
+                    let (y, _, _) = crate::types::civil_from_days(days);
+                    crate::types::days_from_civil(y, 1, 1) as i64 * 86_400_000_000
                 }
-                Value::Timestamp(us) => {
-                    let (days, h, mi, s, _) = crate::types::split_timestamp(*us);
-                    let day_us = days as i64 * 86_400_000_000;
-                    let trunc = match part.as_str() {
-                        "year" => {
-                            let (y, _, _) = crate::types::civil_from_days(days);
-                            crate::types::days_from_civil(y, 1, 1) as i64 * 86_400_000_000
-                        }
-                        "month" => {
-                            let (y, m, _) = crate::types::civil_from_days(days);
-                            crate::types::days_from_civil(y, m, 1) as i64 * 86_400_000_000
-                        }
-                        "day" => day_us,
-                        "hour" => day_us + h as i64 * 3_600_000_000,
-                        "minute" => day_us + h as i64 * 3_600_000_000 + mi as i64 * 60_000_000,
-                        "second" => {
-                            day_us
-                                + h as i64 * 3_600_000_000
-                                + mi as i64 * 60_000_000
-                                + s as i64 * 1_000_000
-                        }
-                        _ => {
-                            return Err(PinkDbError::Execution(format!(
-                                "date_trunc: bad part \"{part}\" (want year|month|day|hour|minute|second)"
-                            )));
-                        }
-                    };
-                    Ok(Value::Timestamp(trunc))
+                "quarter" => {
+                    let (y, m, _) = crate::types::civil_from_days(days);
+                    let m = (m - 1) / 3 * 3 + 1;
+                    crate::types::days_from_civil(y, m, 1) as i64 * 86_400_000_000
                 }
-                v => Err(PinkDbError::Execution(format!("date_trunc of {v}"))),
-            }
+                "month" => {
+                    let (y, m, _) = crate::types::civil_from_days(days);
+                    crate::types::days_from_civil(y, m, 1) as i64 * 86_400_000_000
+                }
+                // ISO weeks start on Monday.
+                "week" => {
+                    let iso_dow = (days as i64 + 3).rem_euclid(7);
+                    (days as i64 - iso_dow) * 86_400_000_000
+                }
+                "day" => day_us,
+                "hour" => day_us + h as i64 * 3_600_000_000,
+                "minute" => day_us + h as i64 * 3_600_000_000 + mi as i64 * 60_000_000,
+                "second" => {
+                    day_us
+                        + h as i64 * 3_600_000_000
+                        + mi as i64 * 60_000_000
+                        + s as i64 * 1_000_000
+                }
+                _ => {
+                    return Err(PinkDbError::Execution(format!(
+                        "date_trunc: bad part \"{part}\" (want year|quarter|month|week|day|hour|minute|second)"
+                    )));
+                }
+            };
+            Ok(Value::Timestamp(trunc))
+        }
+        ScalarFunc::IntervalCount => {
+            let Value::Varchar(unit) = &row[1] else {
+                return Err(PinkDbError::Execution(format!(
+                    "interval_count unit {}",
+                    row[1]
+                )));
+            };
+            let Some(unit) = crate::types::IntervalUnit::from_word(unit) else {
+                return Err(PinkDbError::Execution(format!(
+                    "interval_count: unknown interval unit \"{unit}\""
+                )));
+            };
+            let Value::Double(count) = &row[0] else {
+                return Err(PinkDbError::Execution(format!(
+                    "interval_count count {}",
+                    row[0]
+                )));
+            };
+            let iv = crate::types::interval_from_count(unit, *count).ok_or_else(|| {
+                PinkDbError::Execution("interval_count: interval out of range".to_string())
+            })?;
+            Ok(Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            })
         }
         ScalarFunc::Substr => {
             let s = match &row[0] {

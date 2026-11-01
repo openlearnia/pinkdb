@@ -1342,6 +1342,63 @@ fn parse_int(text: &str) -> Option<i64> {
     text.replace('_', "").parse().ok()
 }
 
+/// `INTERVAL '<duration>'` and `INTERVAL '<count>' <unit>`: the quoted form
+/// keeps DuckDB's duration grammar, and with a unit word the string is the
+/// count DuckDB casts to DOUBLE (`INTERVAL '5' MINUTE`).
+fn interval_literal_value(text: &str, unit: Option<crate::types::IntervalUnit>) -> Option<Expr> {
+    let iv = match unit {
+        Some(unit) => {
+            let count: f64 = text.trim().parse().ok()?;
+            crate::types::interval_from_count(unit, count)
+        }
+        None => crate::types::parse_interval(text),
+    }?;
+    Some(Expr::Literal(Value::Interval {
+        months: iv.months,
+        days: iv.days,
+        micros: iv.micros,
+    }))
+}
+
+/// `INTERVAL <count> <unit>`: a literal count folds here to an interval value
+/// (so `REFRESH` and `generate_series` still see a literal); a row-dependent
+/// count becomes the `interval_count` call the binder types.
+fn interval_count_expr(count: Expr, unit: crate::types::IntervalUnit) -> Expr {
+    if let Expr::Literal(v) = &count {
+        let folded = literal_as_double(v).and_then(|n| crate::types::interval_from_count(unit, n));
+        if let Some(iv) = folded {
+            return Expr::Literal(Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            });
+        }
+    }
+    Expr::Function {
+        qual: Box::new(Qualifier::none()),
+        name: "interval_count".to_string(),
+        args: vec![
+            count,
+            Expr::Literal(Value::Varchar(unit.name().to_string())),
+        ],
+        distinct: false,
+        filter: None,
+    }
+}
+
+/// A numeric literal (or a numeric string) as the DOUBLE DuckDB casts an
+/// interval count to.
+fn literal_as_double(v: &Value) -> Option<f64> {
+    match v {
+        Value::Integer(n) => Some(f64::from(*n)),
+        Value::Bigint(n) => Some(*n as f64),
+        Value::Double(d) => Some(*d),
+        Value::Decimal { value, scale, .. } => Some(*value as f64 / 10f64.powi(i32::from(*scale))),
+        Value::Varchar(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// A numeric literal typed like DuckDB's `NumberToValue`: a point literal
 /// with no exponent is `DECIMAL(written width, written scale)`, where the
 /// width counts every written digit including leading zeros (`0.06` is
@@ -3583,14 +3640,29 @@ peg::parser! {
                   crate::types::parse_interval(&s).ok_or("valid INTERVAL literal")
               }
 
-        /// `INTERVAL '...'` — matched as a bare word (like `extract`) so
-        /// `interval` stays usable as a column/table name and a type name.
+        /// `INTERVAL '<duration>'` or DuckDB's unquoted `INTERVAL <count>
+        /// <unit>` (`INTERVAL 6 DAY`, `INTERVAL (2+1) HOUR`,
+        /// `INTERVAL '5' MINUTE`) — matched as a bare word (like `extract`)
+        /// so `interval` stays usable as a column/table name and a type name.
         rule interval_literal() -> Expr
-            = iv:interval_value() { Expr::Literal(Value::Interval {
-                  months: iv.months,
-                  days: iv.days,
-                  micros: iv.micros,
-              }) }
+            = interval_name() body:interval_body() { body }
+
+        rule interval_body() -> Expr
+            = s:string_lit() u:interval_unit_word()? {?
+                  interval_literal_value(&s, u).ok_or("valid INTERVAL literal")
+              }
+            / c:interval_count_expr() u:interval_unit_word() { interval_count_expr(c, u) }
+
+        /// The count of `INTERVAL <count> <unit>`: a number literal or a
+        /// parenthesized expression (`(x)`, `(2+1)`, ...).
+        rule interval_count_expr() -> Expr
+            = v:number() { Expr::Literal(v) }
+            / lparen() e:expr() rparen() { e }
+
+        rule interval_unit_word() -> crate::types::IntervalUnit
+            = ws() w:ident_raw() ws() {?
+                  crate::types::IntervalUnit::from_word(w).ok_or("an interval unit")
+              }
 
         rule interval_name()
             = s:ident_raw() ws() {? if s.eq_ignore_ascii_case("interval") { Ok(()) } else { Err("INTERVAL") } }
@@ -6844,5 +6916,151 @@ mod tests {
                 "{bad} must be a clean parse/parameter error"
             );
         }
+    }
+
+    #[test]
+    fn interval_count_forms_and_units() {
+        // The quoted duration grammar is unchanged.
+        assert_eq!(
+            lit("SELECT INTERVAL '6 days';"),
+            Value::Interval {
+                months: 0,
+                days: 6,
+                micros: 0
+            }
+        );
+        assert_eq!(
+            lit("SELECT INTERVAL '1.5 days';"),
+            Value::Interval {
+                months: 0,
+                days: 1,
+                micros: 43_200_000_000
+            }
+        );
+        // Unquoted counts fold when constant; the count truncates toward
+        // zero, except for milliseconds and seconds (DuckDB 2.0).
+        let days = |days| Value::Interval {
+            months: 0,
+            days,
+            micros: 0,
+        };
+        assert_eq!(lit("SELECT INTERVAL 3 DAY;"), days(3));
+        assert_eq!(lit("SELECT INTERVAL 1 DAYS;"), days(1));
+        assert_eq!(lit("SELECT interval 1.5 day;"), days(1));
+        assert_eq!(lit("SELECT INTERVAL (1.5) DAY;"), days(1));
+        assert_eq!(
+            lit("SELECT INTERVAL '5' MINUTE;"),
+            Value::Interval {
+                months: 0,
+                days: 0,
+                micros: 300_000_000
+            }
+        );
+        assert_eq!(
+            lit("SELECT INTERVAL 1.2345675 SECOND;"),
+            Value::Interval {
+                months: 0,
+                days: 0,
+                micros: 1_234_568
+            }
+        );
+        for (word, months, days, micros) in [
+            ("MICROSECOND", 0, 0, 3),
+            ("MILLISECOND", 0, 0, 3_000),
+            ("SECOND", 0, 0, 3_000_000),
+            ("MINUTE", 0, 0, 180_000_000),
+            ("HOUR", 0, 0, 10_800_000_000),
+            ("DAY", 0, 3, 0),
+            ("WEEK", 0, 21, 0),
+            ("MONTH", 3, 0, 0),
+            ("QUARTER", 9, 0, 0),
+            ("YEAR", 36, 0, 0),
+            ("DECADE", 360, 0, 0),
+            ("CENTURY", 3_600, 0, 0),
+            ("MILLENNIUM", 36_000, 0, 0),
+        ] {
+            let want = Value::Interval {
+                months,
+                days,
+                micros,
+            };
+            assert_eq!(lit(&format!("SELECT INTERVAL 3 {word};")), want, "{word}");
+        }
+        for (plural, singular) in [
+            ("MICROSECONDS", "MICROSECOND"),
+            ("MILLISECONDS", "MILLISECOND"),
+            ("SECONDS", "SECOND"),
+            ("MINUTES", "MINUTE"),
+            ("HOURS", "HOUR"),
+            ("DAYS", "DAY"),
+            ("WEEKS", "WEEK"),
+            ("MONTHS", "MONTH"),
+            ("QUARTERS", "QUARTER"),
+            ("YEARS", "YEAR"),
+            ("DECADES", "DECADE"),
+            ("CENTURIES", "CENTURY"),
+            ("MILLENNIA", "MILLENNIUM"),
+        ] {
+            assert_eq!(
+                lit(&format!("SELECT INTERVAL 2 {plural};")),
+                lit(&format!("SELECT INTERVAL 2 {singular};")),
+                "{plural}"
+            );
+        }
+        // A row-dependent count stays a call for the binder to type.
+        let (count, unit) = interval_call("SELECT INTERVAL (x) DAY;");
+        assert!(matches!(count, Expr::Column { .. }));
+        assert_eq!(unit, "day");
+        let (count, unit) = interval_call("SELECT INTERVAL (2 + x) WEEK;");
+        assert!(matches!(count, Expr::Binary { .. }));
+        assert_eq!(unit, "week");
+        // `interval` and unit words stay usable as column names.
+        let Statement::Select(sel) = parse_one("SELECT interval, day FROM t;") else {
+            panic!()
+        };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Column { name, .. }, .. } if name == "interval"
+        ));
+        assert!(matches!(
+            &sel.projections[1],
+            Projection::Expr { expr: Expr::Column { name, .. }, .. } if name == "day"
+        ));
+        // DuckDB reads `INTERVAL -2 DAY` as `interval` minus 2 aliased `day`
+        // (a binder error when no such column exists), not the interval form.
+        let Statement::Select(sel) = parse_one("SELECT INTERVAL -2 DAY;") else {
+            panic!()
+        };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr {
+                expr: Expr::Binary { .. },
+                ..
+            }
+        ));
+        // A unit word is mandatory, and the duration grammar does not take
+        // one after it.
+        for bad in [
+            "SELECT INTERVAL 3;",
+            "SELECT INTERVAL '1 day' HOUR;",
+            "SELECT INTERVAL 3 FORTNIGHT;",
+            "SELECT INTERVAL 2 MILLENNIUMS;",
+            "SELECT INTERVAL 2 CENTURYS;",
+        ] {
+            assert!(parse(bad).is_err(), "{bad} must not parse");
+        }
+    }
+
+    /// The desugared `interval_count(count, '<unit>')` call of an unquoted
+    /// interval with a non-constant count.
+    fn interval_call(sql: &str) -> (Expr, String) {
+        let Expr::Function { name, args, .. } = projection_expr(parse_one(sql)) else {
+            panic!("not a call: {sql}");
+        };
+        assert_eq!(name, "interval_count");
+        let Expr::Literal(Value::Varchar(unit)) = &args[1] else {
+            panic!("unit is not a string literal: {sql}");
+        };
+        (args[0].clone(), unit.clone())
     }
 }

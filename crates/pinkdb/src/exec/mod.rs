@@ -11431,10 +11431,16 @@ mod tests {
         // NULL propagates.
         let rows = select(&mut db, "SELECT d + 1 FROM ev WHERE id = 3;");
         assert_eq!(rows, vec![vec![V::Null]]);
-        // Rejected: timestamp ± int, date ± date (non-minus), mixed compare.
+        // Rejected: timestamp ± int, date ± date (non-minus).
         assert!(db.execute("SELECT ts + 1 FROM ev;").is_err());
         assert!(db.execute("SELECT d + d FROM ev;").is_err());
-        assert!(db.execute("SELECT * FROM ev WHERE d = ts;").is_err());
+        // A DATE compares with a TIMESTAMP as its midnight timestamp, which is
+        // the date-range filter `ts >= d AND ts < d + INTERVAL 1 DAY`.
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM ev WHERE ts >= d AND ts < d + INTERVAL 1 DAY;",
+        );
+        assert_eq!(rows, vec![vec![V::Bigint(2)]]);
         assert!(
             db.execute("SELECT * FROM ev WHERE d = '2024-01-15';")
                 .is_err()
@@ -11476,8 +11482,25 @@ mod tests {
             &mut db,
             "SELECT date_trunc('month', d), date_trunc('day', ts) FROM ev WHERE id = 1;",
         );
-        assert_eq!(rows[0][0].to_string(), "2024-01-01");
+        assert_eq!(rows[0][0].to_string(), "2024-01-01 00:00:00");
         assert_eq!(rows[0][1].to_string(), "2024-01-15 00:00:00");
+        // DATE truncates as a midnight TIMESTAMP, weeks start on Monday, and
+        // quarters on their first month (DuckDB).
+        let rows = select(
+            &mut db,
+            "SELECT date_trunc('week', DATE '2024-01-17'), date_trunc('quarter', DATE '2024-05-06');",
+        );
+        assert_eq!(rows[0][0].to_string(), "2024-01-15 00:00:00");
+        assert_eq!(rows[0][1].to_string(), "2024-04-01 00:00:00");
+        // A row-dependent interval count runs per row and truncates.
+        let rows = select(
+            &mut db,
+            "SELECT INTERVAL (x) DAY, INTERVAL (x) HOUR, INTERVAL (x) MONTH FROM (VALUES (2), (2.5)) t(x) ORDER BY x;",
+        );
+        assert_eq!(rows[0][0].to_string(), "2 days");
+        assert_eq!(rows[0][1].to_string(), "02:00:00");
+        assert_eq!(rows[0][2].to_string(), "2 months");
+        assert_eq!(rows[1], rows[0]);
         let rows = select(
             &mut db,
             "SELECT date_trunc('year', TIMESTAMP '2024-05-06 07:08:09');",

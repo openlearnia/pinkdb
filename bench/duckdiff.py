@@ -1620,6 +1620,96 @@ DIALECT_QUERIES = [
     ("dialect-fk-grouped-derived", "SELECT c.did, (SELECT sum(s) FROM (SELECT k * 10 AS d, sum(v) AS s FROM pn GROUP BY k) g WHERE g.d = c.did) FROM emp c WHERE c.did IS NOT NULL ORDER BY c.did;", True, False),
     ("dialect-fk-null-keys", "SELECT c.id FROM emp c WHERE NOT EXISTS (SELECT 1 FROM (SELECT x FROM nn UNION SELECT did FROM dept) p WHERE p.x = c.did) ORDER BY c.id;", True, False),
     ("dialect-fk-correlation-under-limit", "SELECT c.id FROM emp c WHERE EXISTS (SELECT 1 FROM dept d WHERE d.did = c.did LIMIT 1) ORDER BY c.id;", True, False),
+    # Unquoted intervals (wave 141): DuckDB's `INTERVAL <count> <unit>`. The
+    # values are read back through timestamp arithmetic, where both engines
+    # yield an exact TIMESTAMP; an interval value itself prints differently.
+    ("dialect-interval-units", "SELECT " + ", ".join(
+        f"TIMESTAMP '2026-01-31 00:00:00' {op} INTERVAL 3 {u}"
+        for u in ("MICROSECOND", "MILLISECOND", "SECOND", "MINUTE", "HOUR",
+                  "DAY", "WEEK", "MONTH", "QUARTER", "YEAR", "DECADE")
+        for op in ("+", "-")
+    ) + ";", False, False),
+    # Century and millennium pass out of four-digit years, where the two
+    # engines print timestamps differently, so compare them as booleans.
+    ("dialect-interval-large-units", "SELECT TIMESTAMP '2026-01-31' + INTERVAL 3 CENTURY = TIMESTAMP '2326-01-31', "
+     "TIMESTAMP '2326-01-31' - INTERVAL 3 CENTURY = TIMESTAMP '2026-01-31', "
+     "TIMESTAMP '2026-01-31' + INTERVAL 3 MILLENNIUM = TIMESTAMP '5026-01-31', "
+     "TIMESTAMP '5026-01-31' - INTERVAL 3 MILLENNIUM = TIMESTAMP '2026-01-31';", False, False),
+    ("dialect-interval-unit-plurals", "SELECT " + ", ".join(
+        f"TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 2 {u}"
+        for u in ("MICROSECONDS", "MILLISECONDS", "SECONDS", "MINUTES", "HOURS",
+                  "DAYS", "WEEKS", "MONTHS", "QUARTERS", "YEARS", "DECADES",
+                  "CENTURIES", "MILLENNIA")
+    ) + ";", False, False),
+    ("dialect-interval-count-forms", "SELECT TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (2+1) HOUR, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL '5' MINUTE, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1.5 DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1 DAYS, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1.2345675 SECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1.5 SECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 1.5 MILLISECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (1.5) WEEK, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (2.5) MONTH, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (-2) DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (-1.9) DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 0 DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + interval 2 hours;", False, False),
+    ("dialect-interval-table-rows", "SELECT DATE '2026-01-31' + INTERVAL 1 MONTH, "
+     "DATE '2026-03-01' - INTERVAL 1 DAY, "
+     "TIMESTAMP '2026-01-31 12:30:00' + INTERVAL 1 MONTH, "
+     "DATE '2026-01-31' + INTERVAL 1 QUARTER, "
+     "TIMESTAMP '2026-01-31 12:30:00' - INTERVAL 1 YEAR, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 90 SECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 10 MILLISECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL 2 WEEK;", False, False),
+    ("dialect-interval-types", "SELECT typeof(INTERVAL 3 DAY), typeof(INTERVAL (NULL) DAY), "
+     "typeof(INTERVAL 1.5 SECOND), typeof(date_trunc('week', DATE '2026-05-17')), "
+     "typeof(date_trunc('month', DATE '2026-05-17')), typeof(current_date), "
+     "typeof(current_date - INTERVAL 6 DAY), typeof(current_date + INTERVAL 1 DAY), "
+     "typeof(date_trunc('month', current_date)), typeof(date_trunc('quarter', current_date)), "
+     "typeof(date_trunc('year', current_date)), typeof(DATE '2026-01-31' + INTERVAL 1 MONTH);", False, False),
+    ("dialect-interval-null-counts", "SELECT INTERVAL (NULL) DAY, INTERVAL (CAST(NULL AS INTEGER)) DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (NULL) DAY, "
+     "date_trunc('month', CAST(NULL AS DATE)), "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) DAY FROM (VALUES (NULL)) t(x);", False, False),
+    ("dialect-interval-row-dependent", "SELECT TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) DAY, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) HOUR, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) WEEK, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (z) MINUTE, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (z) SECOND, "
+     "TIMESTAMP '2026-01-31 00:00:00' + INTERVAL (x) QUARTER "
+     "FROM (VALUES (2, -1.7), (3, 1.7)) t(x, z) ORDER BY 1;", True, False),
+    ("dialect-interval-quacklab-relative", "SELECT "
+     "(DATE '2026-05-17' + INTERVAL 1 DAY), "
+     "(DATE '2026-05-17' - INTERVAL 1 DAY), "
+     "(DATE '2026-05-17' - INTERVAL 6 DAY), "
+     "(DATE '2026-05-17' - INTERVAL 29 DAY), "
+     "(DATE '2026-05-17' - INTERVAL 89 DAY), "
+     "date_trunc('week', DATE '2026-05-17'), "
+     "(date_trunc('week', DATE '2026-05-17') - INTERVAL 7 DAY), "
+     "date_trunc('month', DATE '2026-05-17'), "
+     "(date_trunc('month', DATE '2026-05-17') - INTERVAL 1 MONTH), "
+     "(date_trunc('month', DATE '2026-05-17') - INTERVAL 11 MONTH), "
+     "date_trunc('quarter', DATE '2026-05-17'), "
+     "(date_trunc('quarter', DATE '2026-05-17') - INTERVAL 3 MONTH), "
+     "date_trunc('year', DATE '2026-05-17'), "
+     "(date_trunc('year', DATE '2026-05-17') - INTERVAL 1 YEAR);", False, False),
+    ("dialect-interval-quacklab-filter", "SELECT (DATE '2026-05-17' >= DATE '2026-01-01'), "
+     "(DATE '2026-05-17' < (DATE '2026-01-31' + INTERVAL 1 DAY)), "
+     "(DATE '2026-05-17' >= (DATE '2026-05-17' - INTERVAL 6 DAY)), "
+     "COUNT(*) FROM emp WHERE hired >= DATE '2026-01-01' AND hired < (DATE '2024-01-31' + INTERVAL 1 DAY);", False, False),
+    ("dialect-interval-date-trunc-parts", "SELECT date_trunc('week', DATE '2026-05-17'), "
+     "date_trunc('quarter', DATE '2026-05-17'), "
+     "date_trunc('week', TIMESTAMP '2026-05-17 13:45:00'), "
+     "date_trunc('quarter', TIMESTAMP '2026-05-17 13:45:00'), "
+     "date_trunc('day', DATE '2026-05-17'), date_trunc('hour', DATE '2026-05-17'), "
+     "date_trunc('minute', TIMESTAMP '2026-05-17 13:45:59'), "
+     "date_trunc('year', DATE '2026-05-17'), date_trunc('second', DATE '2026-05-17');", False, False),
+    # `INTERVAL -2 DAY` is `interval - 2` aliased `day` to DuckDB too, so both
+    # engines fail it at bind, not at parse.
+    ("dialect-interval-unary-minus", "SELECT INTERVAL -2 DAY;", False, True),
+    ("dialect-interval-no-unit", "SELECT INTERVAL 3;", False, True),
+    ("dialect-interval-bad-plural", "SELECT INTERVAL 2 MILLENNIUMS;", False, True),
 ]
 
 
