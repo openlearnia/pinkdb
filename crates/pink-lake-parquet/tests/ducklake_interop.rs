@@ -1270,6 +1270,7 @@ fn check_snapshot(
     }
 }
 
+#[cfg(feature = "catalog-postgres")]
 /// Every snapshot of a lake a test wrote itself: each table's tuple carries the
 /// snapshot that created it, and `snapshots` is how many the script makes.
 fn check_snapshots(
@@ -1611,6 +1612,7 @@ fn duckdb_json_rows(binary: &Path, script: &str, columns: &[&str]) -> Vec<Vec<St
         .collect()
 }
 
+#[cfg(feature = "catalog-postgres")]
 fn pinkdb_sql_rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<String>> {
     match db.execute(sql).unwrap().pop().unwrap() {
         QueryResult::Selected { rows, .. } => rows
@@ -1628,6 +1630,7 @@ fn pinkdb_sql_rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<String>> {
     }
 }
 
+#[cfg(feature = "catalog-postgres")]
 /// Compare one SQL statement's rows between DuckDB (`l`) and pinkdb (`w`).
 fn check_sql(
     db: &mut PinkDb,
@@ -2479,59 +2482,63 @@ fn stock_duckdb_and_pinkdb_write_the_same_catalog_tables() {
         "the SQLite catalog columns differ from stock DuckDB's"
     );
 
-    // Postgres: the same comparison with a server that has real types.
-    let _postgres = postgres_guard();
-    let Some(server) = TestPostgres::start() else {
-        cleanup(&dir);
-        return;
-    };
-    server.create_database("ddl_duck");
-    server.create_database("ddl_pink");
-    let duck_conninfo = "host=127.0.0.1 port=55433 user=postgres dbname=ddl_duck";
-    let pink_conninfo = "host=127.0.0.1 port=55433 user=postgres dbname=ddl_pink";
-    let duck_data = dir.join("pg-duck-data");
-    let pink_data = dir.join("pg-pink-data");
-    for path in [&duck_data, &pink_data] {
-        std::fs::create_dir_all(path).unwrap();
-    }
-    let script = format!(
-        "LOAD ducklake;\n\
+    // Postgres: the same comparison with a server that has real types (only
+    // when the Postgres catalog backend is built).
+    #[cfg(feature = "catalog-postgres")]
+    {
+        let _postgres = postgres_guard();
+        let Some(server) = TestPostgres::start() else {
+            cleanup(&dir);
+            return;
+        };
+        server.create_database("ddl_duck");
+        server.create_database("ddl_pink");
+        let duck_conninfo = "host=127.0.0.1 port=55433 user=postgres dbname=ddl_duck";
+        let pink_conninfo = "host=127.0.0.1 port=55433 user=postgres dbname=ddl_pink";
+        let duck_data = dir.join("pg-duck-data");
+        let pink_data = dir.join("pg-pink-data");
+        for path in [&duck_data, &pink_data] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let script = format!(
+            "LOAD ducklake;\n\
          LOAD postgres_scanner;\n\
          ATTACH 'ducklake:postgres:{duck_conninfo}' AS l (DATA_PATH '{}/');\n\
          CREATE SCHEMA staging;\n\
          CREATE TABLE staging.t (i INTEGER);\n\
          INSERT INTO staging.t VALUES (1);\n",
-        duck_data.display()
-    );
-    run_duckdb(&binary, &script)
-        .unwrap_or_else(|message| panic!("DuckDB Postgres catalog: {message}"));
-    Lake::create_with_catalog(
-        &format!("postgres:{pink_conninfo}"),
-        pink_data.to_str().unwrap(),
-    )
-    .unwrap();
-    let duckdb_side = ducklake_columns(
-        &binary,
-        &format!(
-            "LOAD postgres_scanner;\nATTACH '{duck_conninfo}' AS probe (TYPE POSTGRES, READ_ONLY);\n"
-        ),
-    );
-    let pinkdb_side = ducklake_columns(
-        &binary,
-        &format!(
-            "LOAD postgres_scanner;\nATTACH '{pink_conninfo}' AS probe (TYPE POSTGRES, READ_ONLY);\n"
-        ),
-    );
-    assert!(
-        duckdb_side
-            .iter()
-            .any(|line| line.to_lowercase().ends_with(",uuid\"")),
-        "the uuid columns are missing from DuckDB's Postgres catalog"
-    );
-    assert_eq!(
-        pinkdb_side, duckdb_side,
-        "the Postgres catalog columns differ from stock DuckDB's"
-    );
+            duck_data.display()
+        );
+        run_duckdb(&binary, &script)
+            .unwrap_or_else(|message| panic!("DuckDB Postgres catalog: {message}"));
+        Lake::create_with_catalog(
+            &format!("postgres:{pink_conninfo}"),
+            pink_data.to_str().unwrap(),
+        )
+        .unwrap();
+        let duckdb_side = ducklake_columns(
+            &binary,
+            &format!(
+                "LOAD postgres_scanner;\nATTACH '{duck_conninfo}' AS probe (TYPE POSTGRES, READ_ONLY);\n"
+            ),
+        );
+        let pinkdb_side = ducklake_columns(
+            &binary,
+            &format!(
+                "LOAD postgres_scanner;\nATTACH '{pink_conninfo}' AS probe (TYPE POSTGRES, READ_ONLY);\n"
+            ),
+        );
+        assert!(
+            duckdb_side
+                .iter()
+                .any(|line| line.to_lowercase().ends_with(",uuid\"")),
+            "the uuid columns are missing from DuckDB's Postgres catalog"
+        );
+        assert_eq!(
+            pinkdb_side, duckdb_side,
+            "the Postgres catalog columns differ from stock DuckDB's"
+        );
+    }
     cleanup(&dir);
 }
 

@@ -1130,9 +1130,28 @@ fn encrypted_lakes_inline_flush_and_read() {
     let db = lake.load(None).unwrap();
     assert_eq!(rows_of(&db).len(), 2);
 
-    // Change data over the encrypted lake: insertions at v2, no deletions.
+    // Change data over the encrypted lake reads it the way DuckDB reads any
+    // flushed lake (see `flush_materializes_inlined_rows_and_keeps_the_history`):
+    // the inlined rows are inserted at v2, then the flush at v3 deletes them
+    // and inserts the sealed file's copies.
     let insertions = lake.table_insertions("main.t", 1, None).unwrap();
-    assert_eq!(insertions.len(), 2, "{insertions:?}");
+    assert_eq!(
+        insertions
+            .iter()
+            .map(|r| (r.version, r.row_id))
+            .collect::<Vec<_>>(),
+        vec![(2, Some(0)), (2, Some(1)), (3, Some(2)), (3, Some(3))],
+        "{insertions:?}"
+    );
+    let deletions = lake.table_deletions("main.t", 1, None).unwrap();
+    assert_eq!(
+        deletions
+            .iter()
+            .map(|r| (r.version, r.row_id))
+            .collect::<Vec<_>>(),
+        vec![(3, Some(0)), (3, Some(1))],
+        "{deletions:?}"
+    );
 
     cleanup(&dir);
 }
