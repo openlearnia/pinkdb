@@ -12,6 +12,7 @@
 //!               [--mcp-extension PATH [--mcp-port PORT] [--mcp-user NAME]]
 //!               [--tls-cert PATH --tls-key PATH]        (built with `tls`)
 //!               [--enable-ui --ui-host HOST --ui-port PORT]  (built with `ui`)
+//!               [--quacklab-bind ADDR]                 (built with `quacklab`)
 //! pinkdb-server --health-check [HOST:PORT]
 //! ```
 //!
@@ -138,6 +139,10 @@ struct Args {
     /// `--copy-root PATH`: the directory every COPY … TO destination is
     /// confined to. Opting in without it refuses every COPY.
     copy_root: Option<String>,
+    /// Wave 138a: serve QuackLab's `/sql` adapter on this address (`None`
+    /// also covers `DUCKDB_BIND`: see `quacklab::bind`).
+    #[cfg(feature = "quacklab")]
+    quacklab_bind: Option<String>,
     /// `--tls-cert PATH`: must be paired with `--tls-key`.
     tls_cert: Option<String>,
     /// `--tls-key PATH`: must be paired with `--tls-cert`.
@@ -263,6 +268,11 @@ fn usage() -> &'static str {
      \x20                        defined this is required, and PINKDB_MCP_PASSWORD\n\
      \x20                        holds its password (an unauthenticated bridge would\n\
      \x20                        bypass the store's authentication)\n\
+     \x20 --quacklab-bind ADDR  serve QuackLab's SQL adapter (`POST /sql`,\n\
+     \x20                        `GET /health`, `POST /recover`) on ADDR over this\n\
+     \x20                        store; DUCKDB_BIND is read when the flag is absent;\n\
+     \x20                        needs a build with the `quacklab` feature; off by\n\
+     \x20                        default\n\
      \x20 --enable-ui           serve the warehouse console: catalog browser, SQL\n\
      \x20                        worksheets and the ask box (waves 78, 121);\n\
      \x20                        needs a build with the `ui` feature; off by default\n\
@@ -342,6 +352,8 @@ fn parse_args() -> Result<Args, String> {
         mcp_user: None,
         allow_copy_to: false,
         copy_root: None,
+        #[cfg(feature = "quacklab")]
+        quacklab_bind: None,
         tls_cert: None,
         tls_key: None,
         #[cfg(feature = "ui")]
@@ -477,6 +489,21 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid --mcp-port value {raw:?}"))?;
             }
             "--mcp-user" => args.mcp_user = Some(value("--mcp-user")?),
+            "--quacklab-bind" => {
+                let raw = value("--quacklab-bind")?;
+                #[cfg(feature = "quacklab")]
+                {
+                    if raw.trim().is_empty() {
+                        return Err("--quacklab-bind needs an address".to_string());
+                    }
+                    args.quacklab_bind = Some(raw);
+                }
+                #[cfg(not(feature = "quacklab"))]
+                {
+                    let _ = raw;
+                    return Err(quacklab_feature_missing());
+                }
+            }
             "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
             "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             "--enable-ui" => {
@@ -725,6 +752,14 @@ fn parse_args() -> Result<Args, String> {
 fn ui_feature_missing() -> String {
     "--enable-ui and the --ui-* flags need a build with the `ui` feature (this build has \
      no warehouse console); rebuild with `cargo build -p pinkdb-server --features ui`."
+        .to_string()
+}
+
+/// The message for a build without QuackLab's adapter.
+#[cfg(not(feature = "quacklab"))]
+fn quacklab_feature_missing() -> String {
+    "--quacklab-bind needs a build with the `quacklab` feature (this build has no QuackLab \
+     adapter); rebuild with `cargo build -p pinkdb-server --features quacklab`."
         .to_string()
 }
 
@@ -1206,6 +1241,22 @@ fn main() -> ExitCode {
         None
     };
 
+    // QuackLab's `/sql` adapter (wave 138a): opt-in, its own listener over the
+    // same store, stopped by its handle's Drop like the console.
+    #[cfg(feature = "quacklab")]
+    let _quacklab_handle =
+        if let Some(bind) = pinkdb_server::quacklab::bind(args.quacklab_bind.clone()) {
+            match start_quacklab(&db, &bind) {
+                Ok(handle) => Some(handle),
+                Err(msg) => {
+                    eprintln!("Error: {msg}");
+                    return ExitCode::from(2);
+                }
+            }
+        } else {
+            None
+        };
+
     // The bridge (wave 105) starts before the server binds: it shares the
     // same store and its own loopback listener, so a failure to load or log
     // in stops the process instead of leaving a half-configured server.
@@ -1444,6 +1495,37 @@ fn start_ui(
         } else {
             "worksheets"
         }
+    );
+    Ok(handle)
+}
+
+/// Start QuackLab's `/sql` adapter (wave 138a).
+#[cfg(feature = "quacklab")]
+fn start_quacklab(
+    db: &Database,
+    bind: &str,
+) -> Result<pinkdb_server::quacklab::QuacklabHandle, String> {
+    use pinkdb_server::quacklab::{QuacklabOptions, QuacklabServer};
+    let options = QuacklabOptions::from_env();
+    // DuckDB's own knobs have no counterpart here: say once that they are
+    // ignored rather than let a deployment believe it configured something.
+    let ignored = pinkdb_server::quacklab::ignored_settings_from_env();
+    if !ignored.is_empty() {
+        println!(
+            "pinkdb-server: QuackLab adapter ignores DuckDB-only settings: {}",
+            ignored.join(", ")
+        );
+    }
+    let server = QuacklabServer::bind(bind, db.clone(), options)
+        .map_err(|e| format!("cannot start the QuackLab adapter on {bind}: {e}"))?;
+    let url = server.url();
+    let read_only = server.options().read_only;
+    let handle = server
+        .spawn()
+        .map_err(|e| format!("cannot start the QuackLab adapter on {bind}: {e}"))?;
+    println!(
+        "pinkdb-server: QuackLab adapter on {url} ({})",
+        if read_only { "read-only" } else { "read-write" }
     );
     Ok(handle)
 }

@@ -384,6 +384,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
  "hyper-util",
  "itoa",
  "matchit",
@@ -2031,6 +2032,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinkdb-quacklab"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "pinkdb",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pinkdb-server"
 version = "0.1.0"
 dependencies = [
@@ -2047,6 +2058,7 @@ dependencies = [
  "pinkdb-json",
  "pinkdb-math",
  "pinkdb-parquet",
+ "pinkdb-quacklab",
  "pinkdb-server-ui",
  "pinkdb-vss",
  "rcgen",

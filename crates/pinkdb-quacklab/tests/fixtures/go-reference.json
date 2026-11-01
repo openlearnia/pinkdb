@@ -1,0 +1,382 @@
+[
+ {
+  "sql": "CREATE SCHEMA IF NOT EXISTS fx",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Count"
+   ],
+   "rowCount": 0,
+   "rows": [],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "CREATE OR REPLACE TABLE fx.t(a INT, b VARCHAR, d DECIMAL(18,3), f DOUBLE, dt DATE, ts TIMESTAMP, ok BOOLEAN)",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Count"
+   ],
+   "rowCount": 0,
+   "rows": [],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "INSERT INTO fx.t VALUES (1,'x',12.345,1.5,DATE '2026-01-02',TIMESTAMP '2026-01-02 03:04:05.123456',true),(2,NULL,NULL,NULL,NULL,NULL,NULL)",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Count"
+   ],
+   "rowCount": 1,
+   "rows": [
+    [
+     2
+    ]
+   ],
+   "rowsAffected": 2,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "SELECT * FROM fx.t ORDER BY a",
+  "status": 200,
+  "body": {
+   "columns": [
+    "a",
+    "b",
+    "d",
+    "f",
+    "dt",
+    "ts",
+    "ok"
+   ],
+   "rowCount": 2,
+   "rows": [
+    [
+     1,
+     "x",
+     {
+      "Width": 18,
+      "Scale": 3,
+      "Value": 12345
+     },
+     1.5,
+     "2026-01-02T00:00:00Z",
+     "2026-01-02T03:04:05.123456Z",
+     true
+    ],
+    [
+     2,
+     null,
+     null,
+     null,
+     null,
+     null,
+     null
+    ]
+   ],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "SELECT 1::INTEGER AS i, 2::BIGINT AS b, 1.5 AS d, 1e300 AS big, -0.0::DOUBLE AS nz, 'it''s' AS s, NULL AS n, DATE '2026-01-02' AS dt, TIMESTAMP '2026-01-02 03:04:05' AS ts0, TIME '01:02:03' AS tm, INTERVAL 3 DAY AS iv, 170141183460469231731687303715884105727::HUGEINT AS h",
+  "status": 200,
+  "body": {
+   "columns": [
+    "i",
+    "b",
+    "d",
+    "big",
+    "nz",
+    "s",
+    "n",
+    "dt",
+    "ts0",
+    "tm",
+    "iv",
+    "h"
+   ],
+   "rowCount": 1,
+   "rows": [
+    [
+     1,
+     2,
+     {
+      "Width": 2,
+      "Scale": 1,
+      "Value": 15
+     },
+     1e+300,
+     0,
+     "it's",
+     null,
+     "2026-01-02T00:00:00Z",
+     "2026-01-02T03:04:05Z",
+     "0001-01-01T01:02:03Z",
+     {
+      "days": 3,
+      "months": 0,
+      "micros": 0
+     },
+     170141183460469231731687303715884105727
+    ]
+   ],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "SELECT 12.5::DECIMAL(4,1) AS a, -0.05::DECIMAL(3,2) AS b, 123456789012345678.123::DECIMAL(38,3) AS c",
+  "status": 200,
+  "body": {
+   "columns": [
+    "a",
+    "b",
+    "c"
+   ],
+   "rowCount": 1,
+   "rows": [
+    [
+     {
+      "Width": 4,
+      "Scale": 1,
+      "Value": 125
+     },
+     {
+      "Width": 3,
+      "Scale": 2,
+      "Value": -5
+     },
+     {
+      "Width": 38,
+      "Scale": 3,
+      "Value": 123456789012345678123
+     }
+    ]
+   ],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "UPDATE fx.t SET b='z' WHERE a=1",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Count"
+   ],
+   "rowCount": 1,
+   "rows": [
+    [
+     1
+    ]
+   ],
+   "rowsAffected": 1,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "DELETE FROM fx.t WHERE a=2",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Count"
+   ],
+   "rowCount": 1,
+   "rows": [
+    [
+     1
+    ]
+   ],
+   "rowsAffected": 1,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "CREATE TABLE fx.u(a INT); MERGE INTO fx.u USING (SELECT 1 AS a) s ON fx.u.a=s.a WHEN NOT MATCHED THEN INSERT VALUES (s.a)",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Count"
+   ],
+   "rowCount": 1,
+   "rows": [
+    [
+     1
+    ]
+   ],
+   "rowsAffected": 1,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "SELECT * FROM fx.t; SELECT 42 AS answer",
+  "status": 200,
+  "body": {
+   "columns": [
+    "answer"
+   ],
+   "rowCount": 1,
+   "rows": [
+    [
+     42
+    ]
+   ],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "BEGIN; INSERT INTO fx.u VALUES (9); COMMIT",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Success"
+   ],
+   "rowCount": 0,
+   "rows": [],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "SET threads=2",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Success"
+   ],
+   "rowCount": 0,
+   "rows": [],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "DROP TABLE fx.u",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Success"
+   ],
+   "rowCount": 0,
+   "rows": [],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "CREATE VIEW fx.v AS SELECT a FROM fx.t",
+  "status": 200,
+  "body": {
+   "columns": [
+    "Count"
+   ],
+   "rowCount": 0,
+   "rows": [],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "SELECT count(*), sum(a), avg(a) FROM fx.t",
+  "status": 200,
+  "body": {
+   "columns": [
+    "count_star()",
+    "sum(a)",
+    "avg(a)"
+   ],
+   "rowCount": 1,
+   "rows": [
+    [
+     1,
+     1,
+     1
+    ]
+   ],
+   "rowsAffected": 0,
+   "truncated": false
+  }
+ },
+ {
+  "sql": "SELECT * FROM fx.nope",
+  "status": 400,
+  "body": {
+   "error": {
+    "code": "sql_error",
+    "message": "Catalog Error: Table with name nope does not exist!\nDid you mean \"pg_catalog.pg_enum\"?\n\nLINE 1: SELECT * FROM fx.nope\n                      ^"
+   }
+  }
+ },
+ {
+  "sql": "SELEC 1",
+  "status": 400,
+  "body": {
+   "error": {
+    "code": "sql_error",
+    "message": "Parser Error: syntax error at or near \"SELEC\"\n\nLINE 1: SELEC 1\n        ^"
+   }
+  }
+ },
+ {
+  "sql": "SELECT 'a'::INTEGER",
+  "status": 400,
+  "body": {
+   "error": {
+    "code": "sql_error",
+    "message": "Conversion Error: Could not convert string 'a' to INT32\n\nLINE 1: SELECT 'a'::INTEGER\n                  ^"
+   }
+  }
+ },
+ {
+  "sql": "SELECT i FROM range(5005) t(i)",
+  "status": 200,
+  "body": {
+   "columns": [
+    "i"
+   ],
+   "rowCount": 5005,
+   "rows": [
+    [
+     0
+    ],
+    [
+     1
+    ],
+    [
+     2
+    ],
+    "...(5000 rows)"
+   ],
+   "rowsAffected": 0,
+   "truncated": true
+  }
+ },
+ {
+  "sql": "",
+  "status": 400,
+  "body": {
+   "error": {
+    "code": "empty_sql",
+    "message": "sql required"
+   }
+  }
+ },
+ {
+  "sql": "<no body>",
+  "status": 400,
+  "body": {
+   "error": {
+    "code": "bad_json",
+    "message": "EOF"
+   }
+  }
+ }
+]

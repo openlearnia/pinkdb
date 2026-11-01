@@ -13,6 +13,10 @@ members = [
     # member: it has its own lockfile and is built by
     # `scripts/build-console.sh`, so the workspace never compiles Leptos.
     "crates/pinkdb-server-ui-api",
+    # Wave 138a: QuackLab's `/sql` adapter — DuckDB's HTTP response shapes over
+    # the same store, pulled in by `pinkdb-server`'s optional `quacklab`
+    # feature so the default server binary stays exactly as it was.
+    "crates/pinkdb-quacklab",
     "crates/pinkdb-ffi",
     "crates/pinkdb-ext-loader",
     "crates/pinkdb-js",
