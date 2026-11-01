@@ -1331,11 +1331,50 @@ fn desugar_case(operand: Option<Expr>, branches: Vec<(Expr, Expr)>) -> Vec<(Expr
     }
 }
 
+/// Integer literal text → `i64`, underscores dropped.
+fn parse_int(text: &str) -> Option<i64> {
+    text.replace('_', "").parse().ok()
+}
+
+/// A numeric literal typed like DuckDB's `NumberToValue`: a point literal
+/// with no exponent is `DECIMAL(written width, written scale)`, where the
+/// width counts every written digit including leading zeros (`0.06` is
+/// (3,2), `.5` is (1,1), `1.50` is (3,2)); an exponent or more than 38
+/// digits is DOUBLE; no point is INTEGER/BIGINT.
+fn number_value(text: &str) -> std::result::Result<Value, &'static str> {
+    let digits = text.replace('_', "");
+    if digits.bytes().any(|b| b == b'e' || b == b'E') {
+        return digits
+            .parse::<f64>()
+            .map(Value::Double)
+            .map_err(|_| "double literal");
+    }
+    let Some(point) = digits.find('.') else {
+        return int_value(&digits);
+    };
+    let (int, frac) = (&digits[..point], &digits[point + 1..]);
+    let precision = int.len() + frac.len();
+    if precision > crate::types::DECIMAL_MAX_PRECISION as usize {
+        return digits
+            .parse::<f64>()
+            .map(Value::Double)
+            .map_err(|_| "double literal");
+    }
+    let value: i128 = format!("{int}{frac}")
+        .parse()
+        .map_err(|_| "decimal literal")?;
+    Ok(Value::Decimal {
+        value,
+        precision: precision as u8,
+        scale: frac.len() as u8,
+    })
+}
+
 /// Integer literal → `Value` with DuckDB's magnitude rule (INTEGER when it
 /// fits i32, else BIGINT); out-of-i64-range text is a parse error, exactly like
 /// the lexer's `Token::Integer` overflow error.
 fn int_value(text: &str) -> std::result::Result<Value, &'static str> {
-    let n: i64 = text.parse().map_err(|_| "integer literal out of range")?;
+    let n = parse_int(text).ok_or("integer literal out of range")?;
     if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
         Ok(Value::Integer(n as i32))
     } else {
@@ -1501,23 +1540,45 @@ peg::parser! {
               }
             / "$$" "$$" ws() { String::new() }
 
-        /// Float lexemes: fraction and/or exponent (mirrors `lex_number`).
+        /// Numeric digits with optional single underscores between them
+        /// (DuckDB's numeric lexer); the value rules strip them.
+        rule digits()
+            = ['0'..='9'] (['_']? ['0'..='9'])*
+
+        /// Float lexemes: fraction and/or exponent.
         rule float_text() -> &'input str
-            = $(['0'..='9']+ "." ['0'..='9']+ (['e' | 'E'] ['+' | '-']? ['0'..='9']+)?)
-            / $(['0'..='9']+ ['e' | 'E'] ['+' | '-']? ['0'..='9']+)
-            / $("." ['0'..='9']+ (['e' | 'E'] ['+' | '-']? ['0'..='9']+)?)
+            = $(digits() "." digits() (['e' | 'E'] ['+' | '-']? digits())?)
+            / $(digits() ['e' | 'E'] ['+' | '-']? digits())
+            / $("." digits() (['e' | 'E'] ['+' | '-']? digits())?)
 
         /// Integer lexemes: digits that are *not* followed by a fraction or a
         /// valid exponent (otherwise the lexer would have produced a float).
         rule int_text() -> &'input str
-            = n:$(['0'..='9']+) !("." ['0'..='9']) !(['e' | 'E'] ['+' | '-']? ['0'..='9']) { n }
+            = n:$(digits()) !("." digits()) !(['e' | 'E'] ['+' | '-']? digits()) { n }
 
         rule number() -> Value
-            = n:float_text() ws() {? n.parse::<f64>().map(Value::Double).or(Err("double literal")) }
+            = n:float_text() ws() {? number_value(n) }
             / n:int_text() ws() {? int_value(n) }
 
         rule nonneg_integer() -> usize
-            = n:int_text() ws() {? n.parse::<i64>().map(|v| v as usize).or(Err("integer")) }
+            = n:int_text() ws() {? parse_int(n).map(|v| v as usize).ok_or("integer") }
+
+        /// A row count (LIMIT/OFFSET/FETCH and window frame bounds): a decimal
+        /// literal rounds to BIGINT like DuckDB's assignment cast, so
+        /// `LIMIT 2.5` keeps three rows.
+        rule row_count() -> usize
+            = n:number() {?
+                let count = match n {
+                    Value::Integer(i) => i128::from(i),
+                    Value::Bigint(i) => i128::from(i),
+                    Value::Decimal { value, scale, .. } =>
+                        crate::types::rescale_decimal(value, scale, 0)
+                            .ok_or("row count")?,
+                    Value::Double(x) if x.is_finite() => x.round() as i128,
+                    _ => return Err("a row count must be an integer"),
+                };
+                usize::try_from(count).map_err(|_| "row count")
+            }
 
         // ---------- statements ----------
 
@@ -2286,7 +2347,7 @@ peg::parser! {
         /// the variable-length LIST, which has no implementation yet.
         rule array_suffix() -> Option<u32>
             = lbracket() n:int_text() ws() rbracket() {?
-                  n.parse::<u32>().map(Some).or(Err("array length"))
+                  parse_int(n).and_then(|v| u32::try_from(v).ok()).map(Some).ok_or("array length")
               }
             / lbracket() ws() rbracket() {?
                   Err("T[] is a variable-length LIST; pinkdb has fixed-size ARRAY only (wave 107a2)")
@@ -2301,7 +2362,7 @@ peg::parser! {
               }
             / { Vec::new() }
 
-        rule type_param() -> i64 = n:int_text() ws() {? n.parse::<i64>().or(Err("integer")) }
+        rule type_param() -> i64 = n:int_text() ws() {? parse_int(n).ok_or("integer") }
 
         rule col_name_list() -> Vec<String>
             = lparen() first:ident() rest:(comma() c:ident() { c })* rparen() {
@@ -2931,8 +2992,8 @@ peg::parser! {
 
         /// A sample size: an integer count or a fractional percentage.
         rule sample_number() -> f64
-            = n:float_text() ws() {? n.parse::<f64>().or(Err("sample size")) }
-            / n:int_text() ws() {? n.parse::<f64>().or(Err("sample size")) }
+            = n:float_text() ws() {? n.replace('_', "").parse::<f64>().or(Err("sample size")) }
+            / n:int_text() ws() {? n.replace('_', "").parse::<f64>().or(Err("sample size")) }
 
         rule sample_method() -> SampleMethod
             = word("bernoulli") { SampleMethod::Bernoulli }
@@ -3103,15 +3164,15 @@ peg::parser! {
 
         rule having_clause() -> Expr = kw(Keyword::Having) e:expr() { e }
         rule order_by_clause() -> Vec<OrderItem> = kw(Keyword::Order) kw(Keyword::By) l:order_list() { l }
-        rule limit_clause() -> usize = kw(Keyword::Limit) n:nonneg_integer() { n }
+        rule limit_clause() -> usize = kw(Keyword::Limit) n:row_count() { n }
 
         /// `OFFSET n [ROW|ROWS]`.
         rule offset_clause() -> usize
-            = kw(Keyword::Offset) n:nonneg_integer() (kw(Keyword::Row) / kw(Keyword::Rows))? { n }
+            = kw(Keyword::Offset) n:row_count() (kw(Keyword::Row) / kw(Keyword::Rows))? { n }
 
         /// `FETCH FIRST|NEXT n ROW|ROWS ONLY` — the standard spelling of LIMIT.
         rule fetch_clause() -> usize
-            = word("fetch") (word("first") / word("next")) n:nonneg_integer()
+            = word("fetch") (word("first") / word("next")) n:row_count()
               (kw(Keyword::Row) / kw(Keyword::Rows)) word("only") { n }
 
         rule expr_list() -> Vec<Expr>
@@ -3737,10 +3798,10 @@ peg::parser! {
                       end: FrameBound::UnboundedFollowing,
                   }
               }
-            / n:nonneg_integer() kw(Keyword::Preceding) {
+            / n:row_count() kw(Keyword::Preceding) {
                   FrameSpec { mode, start: FrameBound::Preceding(n), end: FrameBound::CurrentRow }
               }
-            / n:nonneg_integer() kw(Keyword::Following) {
+            / n:row_count() kw(Keyword::Following) {
                   FrameSpec { mode, start: FrameBound::CurrentRow, end: FrameBound::Following(n) }
               }
 
@@ -3748,8 +3809,8 @@ peg::parser! {
             = kw(Keyword::Unbounded) kw(Keyword::Preceding) { FrameBound::UnboundedPreceding }
             / kw(Keyword::Unbounded) kw(Keyword::Following) { FrameBound::UnboundedFollowing }
             / kw(Keyword::Current) kw(Keyword::Row) { FrameBound::CurrentRow }
-            / n:nonneg_integer() kw(Keyword::Preceding) { FrameBound::Preceding(n) }
-            / n:nonneg_integer() kw(Keyword::Following) { FrameBound::Following(n) }
+            / n:row_count() kw(Keyword::Preceding) { FrameBound::Preceding(n) }
+            / n:row_count() kw(Keyword::Following) { FrameBound::Following(n) }
     }
 }
 
@@ -4651,6 +4712,8 @@ mod tests {
         "SELECT a FROM t ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST;",
         "SELECT a FROM t ORDER BY a OFFSET 3;",
         "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 3;",
+        "SELECT 1 LIMIT 1.5 OFFSET 1.5;",
+        "SELECT 1 LIMIT 1e3;",
         "SELECT COUNT(DISTINCT a) FROM t;",
         "SELECT COUNT(DISTINCT a + 1), COUNT(DISTINCT b) FROM t;",
         "SELECT SUM(x) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
@@ -4738,7 +4801,6 @@ mod tests {
         "SELECT 1.e2;",
         "SELECT 99999999999999999999;",
         "SELECT -9223372036854775808;",
-        "SELECT 1 LIMIT 1e2;",
         "SELECT `x`;",
         "SELECT 1)",
         "SELECT (1;",
@@ -4762,7 +4824,6 @@ mod tests {
         "SELECT (*) FROM t;",
         "SELECT DISTINCT;",
         "SELECT a FROM t ORDER BY a ASC DESC;",
-        "SELECT 1 LIMIT 1.5;",
         "SELECT 1 LIMIT x;",
         "SELECT a FROM;",
         "SELECT a FROM t WHERE;",
@@ -4834,7 +4895,6 @@ mod tests {
         "SHOW TABLESS;",
         "SHOW INDEXES;",
         "DESCRIBE;",
-        "SELECT SUM(x) OVER (ORDER BY k RANGE BETWEEN 0.5 PRECEDING AND CURRENT ROW) FROM t;",
         "SELECT SUM(x) OVER (ORDER BY k RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t;",
         "INSERT INTO t SELECT;",
         "CREATE TABLE t AS;",
@@ -4983,7 +5043,36 @@ mod tests {
 
     #[test]
     fn number_formats_and_i64_overflow() {
-        assert_eq!(lit("SELECT .5;"), Value::Double(0.5));
+        // A point literal is DECIMAL(width of every written digit, digits after
+        // the point) — DuckDB's `NumberToValue`; only exponents and over-38-digit
+        // literals stay DOUBLE.
+        let dec = |value, precision, scale| Value::Decimal {
+            value,
+            precision,
+            scale,
+        };
+        assert_eq!(lit("SELECT .5;"), dec(5, 1, 1));
+        assert_eq!(lit("SELECT 0.5;"), dec(5, 2, 1));
+        assert_eq!(lit("SELECT .05;"), dec(5, 2, 2));
+        assert_eq!(lit("SELECT 0.06;"), dec(6, 3, 2));
+        assert_eq!(lit("SELECT 00.5;"), dec(5, 3, 1));
+        assert_eq!(lit("SELECT 1.50;"), dec(150, 3, 2));
+        assert_eq!(lit("SELECT 1_000.5;"), dec(10005, 5, 1));
+        assert_eq!(
+            lit("SELECT 12345678901234567890.5;"),
+            dec(123456789012345678905, 21, 1)
+        );
+        // The written width is bounded by DECIMAL's 38 digits; one digit more
+        // and the literal is DOUBLE.
+        assert_eq!(
+            lit("SELECT 1234567890123456789012345678901234567.5;"),
+            dec(12345678901234567890123456789012345675, 38, 1)
+        );
+        assert_eq!(
+            lit("SELECT 12345678901234567890123456789012345678.5;"),
+            Value::Double(12345678901234567890123456789012345678.5)
+        );
+        assert_eq!(lit("SELECT 1e3;"), Value::Double(1000.0));
         assert_eq!(lit("SELECT 1e+2;"), Value::Double(100.0));
         assert_eq!(lit("SELECT 1E-2;"), Value::Double(0.01));
         assert_eq!(lit("SELECT 0.5E-3;"), Value::Double(0.0005));
@@ -5044,6 +5133,19 @@ mod tests {
     }
 
     #[test]
+    fn decimal_row_counts_round_like_a_bigint_cast() {
+        let Statement::Select(sel) = parse_one("SELECT 1 LIMIT 2.5 OFFSET 1.4;") else {
+            panic!()
+        };
+        assert_eq!((sel.limit, sel.offset), (Some(3), Some(1)));
+        // An exponent literal is DOUBLE; DuckDB still takes it as a row count.
+        let Statement::Select(sel) = parse_one("SELECT 1 LIMIT 1e3;") else {
+            panic!()
+        };
+        assert_eq!(sel.limit, Some(1000));
+    }
+
+    #[test]
     fn bad_sql_errors_are_parse_kind() {
         for sql in [
             "select `x`",
@@ -5093,7 +5195,14 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(exprs[2], Expr::Literal(Value::Double(v)) if *v == 2.5));
+        assert!(matches!(
+            exprs[2],
+            Expr::Literal(Value::Decimal {
+                value: 25,
+                scale: 1,
+                ..
+            })
+        ));
         assert!(matches!(exprs[3], Expr::Literal(Value::Varchar(v)) if v == "x"));
         assert!(matches!(exprs[4], Expr::Literal(Value::Double(v)) if *v == 300.0));
         assert!(matches!(exprs[5], Expr::Literal(Value::Boolean(true))));

@@ -506,16 +506,35 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
         && rebuilt.is_aggregate_free()
         && !rebuilt.has_subquery()
         && !rebuilt.contains_dynamic_scalar()
-        // A folded value cannot carry a parameterized type (a DECIMAL value
-        // only knows its scale, not its precision) while downstream
-        // output-schema/flush paths read the type off the expression, so
-        // DECIMAL/INTERVAL casts stay unfolded. Evaluation is per-row either
-        // way; this is a correctness guard, not a perf choice.
-        && !contains_parameterized_cast(&rebuilt)
         && let Ok(v) = eval_expr(&rebuilt, &const_chunk(), cx)
-            && v.len() == 1
+        && v.len() == 1
     {
-        let value = v.get(0);
+        let dtype = rebuilt.dtype();
+        let mut value = v.get(0);
+        // Keep the expression's type: a DECIMAL value cannot reproduce the
+        // precision its arithmetic type carries (`3 * 0.5` is DECIMAL(12,1)
+        // while the value 1.5 alone is (2,1)), and a folded literal is typed
+        // by its value.
+        if let Value::Decimal {
+            value: x, scale, ..
+        } = value
+        {
+            let DataType::Decimal {
+                precision,
+                scale: want,
+            } = dtype
+            else {
+                return rebuilt;
+            };
+            if want != scale {
+                return rebuilt;
+            }
+            value = Value::Decimal {
+                value: x,
+                precision,
+                scale,
+            };
+        }
         // A folded NULL would lose the expression's type: a bare
         // `Literal(Null)` is INTEGER-typed (the `SELECT NULL`
         // convention), while the folded expression may be BOOLEAN (a
@@ -523,54 +542,15 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
         // (`WHERE` needs BOOLEAN), so pin the original type with a
         // CAST of NULL. Fixes `SELECT * FROM t WHERE NULL` and
         // `WHERE 1 = NULL` (plus procedure variables that are NULL).
-        if value.is_null() {
-            let dtype = rebuilt.dtype();
-            if dtype != DataType::Integer {
-                return BoundExpr::Cast {
-                    expr: Box::new(BoundExpr::Literal(crate::types::Value::Null)),
-                    dtype,
-                };
-            }
+        if value.is_null() && dtype != DataType::Integer {
+            return BoundExpr::Cast {
+                expr: Box::new(BoundExpr::Literal(crate::types::Value::Null)),
+                dtype,
+            };
         }
         return BoundExpr::Literal(value);
     }
     rebuilt
-}
-
-/// True when any node of `expr` is a cast whose target type carries
-/// parameters a `Value` cannot round-trip (DECIMAL precision, INTERVAL).
-/// Such a tree must not be constant-folded into a literal.
-fn contains_parameterized_cast(expr: &BoundExpr) -> bool {
-    match expr {
-        BoundExpr::Cast { expr, dtype } => {
-            matches!(
-                dtype,
-                crate::types::DataType::Decimal { .. } | crate::types::DataType::Interval
-            ) || contains_parameterized_cast(expr)
-        }
-        BoundExpr::Literal(_) | BoundExpr::Column { .. } | BoundExpr::AggRef { .. } => false,
-        BoundExpr::Not(e)
-        | BoundExpr::Negate { expr: e, .. }
-        | BoundExpr::IsNull { expr: e, .. } => contains_parameterized_cast(e),
-        BoundExpr::Binary { left, right, .. } => {
-            contains_parameterized_cast(left) || contains_parameterized_cast(right)
-        }
-        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
-            args.iter().any(contains_parameterized_cast)
-        }
-        BoundExpr::Case {
-            branches, else_, ..
-        } => {
-            branches
-                .iter()
-                .any(|(c, v)| contains_parameterized_cast(c) || contains_parameterized_cast(v))
-                || else_
-                    .as_ref()
-                    .is_some_and(|e| contains_parameterized_cast(e))
-        }
-        // Subqueries/dynamic calls/window refs: not folded anyway.
-        _ => false,
-    }
 }
 
 fn fold_aggs(
@@ -898,7 +878,9 @@ fn value_num(v: &Value) -> Option<f64> {
         Value::Integer(i) => Some(*i as f64),
         Value::Bigint(i) => Some(*i as f64),
         Value::Double(f) => Some(*f),
-        Value::Decimal(i, s) => Some(*i as f64 / 10f64.powi(*s as i32)),
+        Value::Decimal {
+            value: i, scale: s, ..
+        } => Some(*i as f64 / 10f64.powi(*s as i32)),
         Value::Date(d) => Some(*d as f64),
         Value::Timestamp(t) => Some(*t as f64),
         _ => None,
@@ -1539,7 +1521,9 @@ fn numeric(v: &Value) -> Option<f64> {
         Value::Double(d) if d.is_finite() => Some(*d),
         Value::Date(d) => Some(f64::from(*d)),
         Value::Timestamp(t) => Some(*t as f64),
-        Value::Decimal(v, scale) => Some(*v as f64 / 10f64.powi(i32::from(*scale))),
+        Value::Decimal {
+            value: v, scale, ..
+        } => Some(*v as f64 / 10f64.powi(i32::from(*scale))),
         _ => None,
     }
 }

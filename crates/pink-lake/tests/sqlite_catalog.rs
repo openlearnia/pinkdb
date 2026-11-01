@@ -437,7 +437,7 @@ fn inlined_rows_round_trip_every_type_through_the_typed_ducklake_tables() {
             Value::Varchar("héllo 🌸 Δ".to_string()),
             Value::Date(i32::MIN),
             Value::Timestamp(i64::MIN),
-            Value::Decimal(-999_999_999_999_999_999, 3),
+            Value::decimal(-999_999_999_999_999_999, 3),
             Value::Interval {
                 months: -13,
                 days: -2,
@@ -452,7 +452,7 @@ fn inlined_rows_round_trip_every_type_through_the_typed_ducklake_tables() {
             Value::Varchar(String::new()),
             Value::Date(i32::MAX),
             Value::Timestamp(i64::MAX),
-            Value::Decimal(999_999_999_999_999_999, 3),
+            Value::decimal(999_999_999_999_999_999, 3),
             Value::Interval {
                 months: 0,
                 days: 0,
@@ -478,7 +478,7 @@ fn inlined_rows_round_trip_every_type_through_the_typed_ducklake_tables() {
             Value::Varchar("plain".to_string()),
             Value::Date(0),
             Value::Timestamp(0),
-            Value::Decimal(0, 3),
+            Value::decimal(0, 3),
             Value::Interval {
                 months: 14,
                 days: 3,
@@ -493,7 +493,7 @@ fn inlined_rows_round_trip_every_type_through_the_typed_ducklake_tables() {
             Value::Varchar("zero".to_string()),
             Value::Date(-1),
             Value::Timestamp(-1),
-            Value::Decimal(1, 3),
+            Value::decimal(1, 3),
             Value::Interval {
                 months: -14,
                 days: -3,

@@ -936,20 +936,25 @@ impl DataTable {
             // DECIMAL/INTERVAL columns accept numeric values and string cells
             // (parsed like an implicit cast), mirroring DuckDB's INSERT/CSV
             // behavior.
-            (Value::Decimal(x, from), DataType::Decimal { precision, scale }) => {
-                crate::types::rescale_decimal(x, from, scale)
-                    .filter(|y| crate::types::decimal_fits(*y, precision))
-                    .map(|y| Value::Decimal(y, scale))
-                    .ok_or_else(|| {
-                        PinkDbError::Type(format!(
-                            "cannot coerce {} to DECIMAL({precision},{scale}): value out of range",
-                            crate::types::format_decimal(x, from)
-                        ))
-                    })
-            }
+            (
+                Value::Decimal {
+                    value: x,
+                    scale: from,
+                    ..
+                },
+                DataType::Decimal { precision, scale },
+            ) => crate::types::rescale_decimal(x, from, scale)
+                .filter(|y| crate::types::decimal_fits(*y, precision))
+                .map(|y| Value::decimal(y, scale))
+                .ok_or_else(|| {
+                    PinkDbError::Type(format!(
+                        "cannot coerce {} to DECIMAL({precision},{scale}): value out of range",
+                        crate::types::format_decimal(x, from)
+                    ))
+                }),
             (Value::Integer(i), DataType::Decimal { precision, scale }) => {
                 crate::types::int_to_decimal(i as i128, precision, scale)
-                    .map(|x| Value::Decimal(x, scale))
+                    .map(|x| Value::decimal(x, scale))
                     .ok_or_else(|| {
                         PinkDbError::Type(format!(
                             "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
@@ -958,7 +963,7 @@ impl DataTable {
             }
             (Value::Bigint(i), DataType::Decimal { precision, scale }) => {
                 crate::types::int_to_decimal(i as i128, precision, scale)
-                    .map(|x| Value::Decimal(x, scale))
+                    .map(|x| Value::decimal(x, scale))
                     .ok_or_else(|| {
                         PinkDbError::Type(format!(
                             "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
@@ -967,7 +972,7 @@ impl DataTable {
             }
             (Value::Double(x), DataType::Decimal { precision, scale }) => {
                 crate::types::f64_to_decimal(x, precision, scale)
-                    .map(|v| Value::Decimal(v, scale))
+                    .map(|v| Value::decimal(v, scale))
                     .ok_or_else(|| {
                         PinkDbError::Type(format!(
                             "cannot coerce {x} to DECIMAL({precision},{scale}): value out of range"
@@ -976,7 +981,7 @@ impl DataTable {
             }
             (Value::Varchar(s), DataType::Decimal { precision, scale }) => {
                 crate::types::parse_decimal_str(&s, precision, scale)
-                    .map(|x| Value::Decimal(x, scale))
+                    .map(|x| Value::decimal(x, scale))
                     .map_err(PinkDbError::Type)
             }
             (
@@ -1024,7 +1029,7 @@ impl DataTable {
                 | Value::Integer(_)
                 | Value::Bigint(_)
                 | Value::Double(_)
-                | Value::Decimal(..)),
+                | Value::Decimal { .. }),
                 t @ (DataType::Boolean
                 | DataType::Integer
                 | DataType::Bigint
@@ -1044,7 +1049,7 @@ impl DataTable {
                 | Value::Integer(_)
                 | Value::Bigint(_)
                 | Value::Double(_)
-                | Value::Decimal(..)
+                | Value::Decimal { .. }
                 | Value::Date(_)
                 | Value::Timestamp(_)
                 | Value::Interval { .. }

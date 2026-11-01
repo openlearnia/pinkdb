@@ -6016,7 +6016,7 @@ fn compare_values(a: &pinkdb::Value, b: &pinkdb::Value) -> std::cmp::Ordering {
         (Value::Date(a), Value::Date(b)) => a.cmp(b),
         (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
         (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
-        (Value::Decimal(a, _), Value::Decimal(b, _)) => a.cmp(b),
+        (Value::Decimal { value: a, .. }, Value::Decimal { value: b, .. }) => a.cmp(b),
         _ => std::cmp::Ordering::Equal,
     }
 }

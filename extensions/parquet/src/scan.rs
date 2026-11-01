@@ -933,7 +933,7 @@ fn decode_column(
             match column.ty {
                 DataType::Decimal { .. } => {
                     read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                        Ok(Value::Decimal(
+                        Ok(Value::decimal(
                             crate::schema_map::fixed_decimal_value(v.data()),
                             scale,
                         ))

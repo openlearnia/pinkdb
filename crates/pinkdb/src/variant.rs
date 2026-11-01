@@ -1387,7 +1387,7 @@ pub fn cast(v: &Variant, target: DataType) -> Result<Value> {
                 Variant::Str(s) => types::parse_decimal_str(s, precision, scale).ok(),
                 _ => None,
             };
-            unscaled.map(|u| Value::Decimal(u, scale)).ok_or_else(|| {
+            unscaled.map(|u| Value::decimal(u, scale)).ok_or_else(|| {
                 PinkDbError::Execution(format!(
                     "cannot CAST VARIANT({}) value {v} to DECIMAL({precision},{scale})",
                     v.type_name()
@@ -1432,7 +1432,9 @@ pub fn from_value(v: &Value) -> Result<Variant> {
         // VARIANT has no UUID kind, so the text form is the lossless carrier
         // (DuckDB tags its VARIANT as UUID; `variant_type` differs).
         Value::Uuid(bits) => Variant::Str(Arc::from(crate::uuid::format(*bits).as_str())),
-        Value::Decimal(x, scale) => Variant::Decimal(*x, *scale),
+        Value::Decimal {
+            value: x, scale, ..
+        } => Variant::Decimal(*x, *scale),
         Value::Varchar(s) => {
             return from_json_str(s).map_err(|e| {
                 PinkDbError::Execution(format!("cannot CAST VARCHAR to VARIANT: {e}"))

@@ -300,11 +300,20 @@ fn engine_math_builtins_stay_duckdb_pinned() {
     );
     assert!(dbl(&mut db, "SELECT pow(-1.0, 0.5);").is_nan());
     assert_eq!(dbl(&mut db, "SELECT pow(0.0, -1.0);"), f64::INFINITY);
-    // floor/ceil on DOUBLE and integer columns (DuckDB returns DOUBLE).
-    assert_eq!(dbl(&mut db, "SELECT floor(1.7);"), 1.0);
-    assert_eq!(dbl(&mut db, "SELECT floor(-1.5);"), -2.0);
-    assert_eq!(dbl(&mut db, "SELECT ceil(1.2);"), 2.0);
-    assert_eq!(dbl(&mut db, "SELECT ceil(-1.2);"), -1.0);
+    // floor/ceil keep a DECIMAL argument's type — a decimal literal is
+    // DECIMAL(2,0) here, exactly as in DuckDB — and return DOUBLE for a
+    // DOUBLE argument.
+    let dec = |value, scale| Value::Decimal {
+        value,
+        precision: 2,
+        scale,
+    };
+    assert_eq!(one(&mut db, "SELECT floor(1.7);"), dec(1, 0));
+    assert_eq!(one(&mut db, "SELECT floor(-1.5);"), dec(-2, 0));
+    assert_eq!(one(&mut db, "SELECT ceil(1.2);"), dec(2, 0));
+    assert_eq!(one(&mut db, "SELECT ceil(-1.2);"), dec(-1, 0));
+    assert_eq!(dbl(&mut db, "SELECT floor(1.7e0);"), 1.0);
+    assert_eq!(dbl(&mut db, "SELECT ceil(-1.2e0);"), -1.0);
     assert_eq!(dbl(&mut db, "SELECT floor(id) FROM emp WHERE id = 3;"), 3.0);
     assert_eq!(
         dbl(&mut db, "SELECT ceil(salary) FROM emp WHERE id = 3;"),
@@ -330,7 +339,8 @@ fn engine_math_builtins_stay_duckdb_pinned() {
             Value::Integer(3),
             Value::Integer(1),
             Value::Null,
-            Value::Double(2.5),
+            // greatest(INTEGER, DECIMAL(2,1)) is DECIMAL(11,1).
+            Value::decimal(25, 1),
             Value::Varchar("a".to_string()),
         ]]
     );

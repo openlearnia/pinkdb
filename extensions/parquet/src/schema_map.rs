@@ -444,7 +444,9 @@ pub fn render_stat(value: &Value) -> String {
         Value::Varchar(s) => s.clone(),
         Value::Date(d) => pinkdb::types::format_date(*d),
         Value::Timestamp(us) => pinkdb::types::format_timestamp(*us),
-        Value::Decimal(v, s) => pinkdb::types::format_decimal(*v, *s),
+        Value::Decimal {
+            value: v, scale: s, ..
+        } => pinkdb::types::format_decimal(*v, *s),
         Value::Interval {
             months,
             days,
@@ -471,7 +473,7 @@ pub fn fixed_decimal_value(bytes: &[u8]) -> i128 {
 
 /// The engine DECIMAL value of an INT32/INT64-backed parquet decimal.
 pub fn int_decimal_value(unscaled: i64, scale: u8) -> Value {
-    Value::Decimal(unscaled as i128, scale)
+    Value::decimal(unscaled as i128, scale)
 }
 
 #[cfg(test)]
@@ -665,7 +667,7 @@ mod tests {
             render_stat(&Value::Timestamp(1_705_279_496_000_000)),
             "2024-01-15 00:44:56"
         );
-        assert_eq!(render_stat(&Value::Decimal(0, 1)), "0.0");
+        assert_eq!(render_stat(&Value::decimal(0, 1)), "0.0");
         assert_eq!(render_stat(&Value::Varchar("n0".to_string())), "n0");
         assert_eq!(render_stat(&Value::Boolean(true)), "true");
     }

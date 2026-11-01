@@ -977,7 +977,9 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) -> Result<(), ProtocolError> {
             put_u8(buf, value_tag::TIMESTAMP);
             buf.extend_from_slice(&us.to_le_bytes());
         }
-        Value::Decimal(x, scale) => {
+        Value::Decimal {
+            value: x, scale, ..
+        } => {
             put_u8(buf, value_tag::DECIMAL);
             buf.extend_from_slice(&x.to_le_bytes());
             put_u8(buf, *scale);
@@ -1135,7 +1137,7 @@ impl<'a> Reader<'a> {
                 let mut x = [0u8; 16];
                 x.copy_from_slice(b);
                 let scale = self.u8(what)?;
-                Value::Decimal(i128::from_le_bytes(x), scale)
+                Value::decimal(i128::from_le_bytes(x), scale)
             }
             value_tag::INTERVAL => {
                 let b = self.take(16, what)?;

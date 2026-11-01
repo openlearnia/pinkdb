@@ -7042,6 +7042,18 @@ fn fusible_expr(
     Some(FusedExpr { expr, side })
 }
 
+/// `a ± b` on DECIMAL cannot overflow when the binder's result width is not
+/// clamped: the extra integer digit covers the carry/borrow.
+fn decimal_sum_total(a: DataType, b: DataType) -> bool {
+    use crate::sql::binder::decimal_operand_width;
+    let (Some((pa, sa)), Some((pb, sb))) = (decimal_operand_width(a), decimal_operand_width(b))
+    else {
+        return false;
+    };
+    let int_digits = (pa - sa).max(pb - sb) as u16;
+    int_digits + (sa.max(sb) as u16) < 38
+}
+
 /// True when evaluating `e` on any valid value of its input type cannot
 /// return an error (a panic-free, error-free evaluation). Used to keep the
 /// fused join→aggregate path from observing value-dependent errors on rows
@@ -7082,7 +7094,12 @@ fn expr_is_total(e: &BoundExpr) -> bool {
                 let date_diff = *op == BinaryOp::Subtract
                     && left.dtype() == DataType::Date
                     && right.dtype() == DataType::Date;
-                (*dtype == DataType::Double || date_diff)
+                // DECIMAL `+`/`-` widens by one integer digit, so it only
+                // overflows once the result width is clamped at 38.
+                let decimal_sum = *op != BinaryOp::Multiply
+                    && matches!(dtype, DataType::Decimal { .. })
+                    && decimal_sum_total(left.dtype(), right.dtype());
+                (*dtype == DataType::Double || date_diff || decimal_sum)
                     && expr_is_total(left)
                     && expr_is_total(right)
             }
@@ -10041,7 +10058,7 @@ mod tests {
     fn float_key_encoding_matches_equality() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE d (v DOUBLE);").unwrap();
-        db.execute("INSERT INTO d VALUES (-0.0), (0.0), (1.0);")
+        db.execute("INSERT INTO d VALUES (-0.0e0), (0.0e0), (1.0e0);")
             .unwrap();
         let rows = select(&mut db, "SELECT v, COUNT(*) FROM d GROUP BY v;");
         assert_eq!(rows.len(), 2);
@@ -12906,7 +12923,8 @@ mod tests {
                 V::Integer(3),
                 V::Integer(1),
                 V::Null,
-                V::Double(2.5),
+                // greatest(INTEGER, DECIMAL(2,1)) is DECIMAL(11,1).
+                V::decimal(25, 1),
                 V::Varchar("a".to_string()),
             ]]
         );
@@ -12983,17 +13001,19 @@ mod tests {
             rows,
             vec![vec![
                 V::Double(2.0),
-                V::Double(1.0),
-                V::Double(-2.0),
+                // floor/ceil of a DECIMAL stay DECIMAL(p, 0); mod() of a
+                // DECIMAL is DECIMAL(11,1), like `%` (DuckDB).
+                V::decimal(1, 0),
+                V::decimal(-2, 0),
                 V::Double(3.0),
-                V::Double(2.0),
+                V::decimal(2, 0),
                 V::Integer(-1),
                 V::Integer(1),
                 V::Double(1024.0),
                 V::Double(0.5),
                 V::Integer(1),
                 V::Integer(-1),
-                V::Double(1.5),
+                V::decimal(15, 1),
             ]]
         );
         match &select(&mut db, "SELECT sqrt(-1);")[0][0] {
@@ -13750,7 +13770,8 @@ mod tests {
                 vec![V::Varchar("anon".to_string())],
             ]
         );
-        // Nested CASE + mixed numeric widths unify to DOUBLE.
+        // Nested CASE + mixed numeric widths unify to DECIMAL(11,1) (DuckDB:
+        // INTEGER widens to DECIMAL(10,0) next to the decimal literal).
         let rows = select(
             &mut db,
             "SELECT CASE WHEN id = 1 THEN 1 WHEN id = 2 THEN 2.5 ELSE 0 END FROM t ORDER BY id;",
@@ -13758,9 +13779,9 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                vec![V::Double(1.0)],
-                vec![V::Double(2.5)],
-                vec![V::Double(0.0)]
+                vec![V::decimal(10, 1)],
+                vec![V::decimal(25, 1)],
+                vec![V::decimal(0, 1)]
             ]
         );
         let rows = select(

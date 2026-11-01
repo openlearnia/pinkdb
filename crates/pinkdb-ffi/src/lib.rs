@@ -333,7 +333,9 @@ impl Cell {
                 d: 0.0,
                 text: None,
             },
-            Value::Decimal(x, scale) => {
+            Value::Decimal {
+                value: x, scale, ..
+            } => {
                 let mut b = pinkdb::types::format_decimal(*x, *scale).into_bytes();
                 b.push(0);
                 Cell {

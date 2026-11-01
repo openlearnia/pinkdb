@@ -25,8 +25,8 @@ use crate::storage::{
 };
 use crate::table_source::{TableFunctionArg, TableFunctionCall};
 use crate::types::{
-    ArrayElem, DECIMAL_MAX_PRECISION, DataType, ExtractField, PinkDbError, Result, Value,
-    extract_field,
+    ArrayElem, DECIMAL_MAX_PRECISION, DataType, ExtractField, POW10_I128, PinkDbError, Result,
+    Value, extract_field,
 };
 
 // ---------- bound expressions ----------
@@ -839,7 +839,7 @@ fn fixed_operand_dtype(op: BinaryOp, other: DataType) -> Option<DataType> {
 /// DECIMAL `(precision, scale)` of a value operand: DECIMAL keeps its own,
 /// INTEGER/BIGINT widen like DuckDB (`INTEGER → DECIMAL(10,0)`,
 /// `BIGINT → DECIMAL(19,0)`); anything else (DOUBLE) is not decimal-exact.
-fn decimal_operand_width(t: DataType) -> Option<(u8, u8)> {
+pub(crate) fn decimal_operand_width(t: DataType) -> Option<(u8, u8)> {
     match t {
         DataType::Decimal { precision, scale } => Some((precision, scale)),
         DataType::Integer => Some((10, 0)),
@@ -946,9 +946,9 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
             if matches!(l, DataType::Decimal { .. }) || matches!(r, DataType::Decimal { .. }) {
                 let wa = decimal_operand_width(l).expect("numeric without a decimal width");
                 let wb = decimal_operand_width(r).expect("numeric without a decimal width");
-                // DuckDB: min integer digits + the wider scale.
+                // DuckDB: the wider of the two integer parts + the wider scale.
                 let scale = wa.1.max(wb.1);
-                let int_digits = (wa.0 - wa.1).min(wb.0 - wb.1) as i32;
+                let int_digits = (wa.0 - wa.1).max(wb.0 - wb.1) as i32;
                 return Ok(DataType::Decimal {
                     precision: clamp_precision(int_digits + scale as i32, scale),
                     scale,
@@ -1036,6 +1036,28 @@ fn distance_type_error(func: ScalarFunc) -> PinkDbError {
 /// Element type and length of an ARRAY constructor: the numeric tower over
 /// the argument types (DECIMAL widens to DOUBLE, as in a CAST into a DOUBLE
 /// column) and the argument count. All-NULL arguments have no type to infer.
+/// ARRAY has no DECIMAL element kind (docs/sql-conformance.md), so a
+/// decimal literal element becomes the element's scalar type, as DuckDB's
+/// own `CAST(... AS DOUBLE[])` would make it.
+fn coerce_array_elems(dtype: DataType, args: Vec<BoundExpr>) -> Vec<BoundExpr> {
+    let DataType::Array { elem, .. } = dtype else {
+        return args;
+    };
+    let want = elem.dtype();
+    args.into_iter()
+        .map(|a| {
+            if matches!(a.dtype(), DataType::Decimal { .. }) {
+                BoundExpr::Cast {
+                    expr: Box::new(a),
+                    dtype: want,
+                }
+            } else {
+                a
+            }
+        })
+        .collect()
+}
+
 fn array_ctor_dtype(args: &[BoundExpr]) -> Result<DataType> {
     if args.is_empty() {
         return Err(PinkDbError::Type(
@@ -1295,12 +1317,18 @@ fn percentile_fraction(name: &str, e: &Expr) -> Result<f64> {
     let p = match e {
         Expr::Literal(Value::Double(p)) => *p,
         Expr::Literal(Value::Integer(i)) => f64::from(*i),
+        Expr::Literal(Value::Decimal { value, scale, .. }) => {
+            crate::types::decimal_to_f64(*value, *scale)
+        }
         Expr::Unary {
             op: UnaryOp::Negate,
             expr,
         } => match &**expr {
             Expr::Literal(Value::Double(p)) => -*p,
             Expr::Literal(Value::Integer(i)) => -f64::from(*i),
+            Expr::Literal(Value::Decimal { value, scale, .. }) => {
+                -crate::types::decimal_to_f64(*value, *scale)
+            }
             _ => f64::NAN,
         },
         _ => f64::NAN,
@@ -1388,6 +1416,45 @@ fn null_of(dtype: DataType) -> BoundExpr {
             dtype,
         }
     }
+}
+
+/// A DECIMAL literal compared with a numeric column is compared in the
+/// column's domain, as DuckDB does (`d = 1.5` casts the literal to DOUBLE,
+/// `i = 2.0` to INTEGER). Resolving it at bind time keeps the filter kernels,
+/// zone-map pruning and index probes on the column's type, with no per-row
+/// conversion of the column. A literal with no exact value in the column's
+/// domain (`i = 1.5` on an INTEGER column) keeps its DECIMAL type; decimal
+/// comparison is exact there.
+fn cast_decimal_literal_to_column(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
+    fn in_domain(v: &Value, target: DataType) -> Option<Value> {
+        let Value::Decimal { value, scale, .. } = v else {
+            return None;
+        };
+        // `value / 10^scale` with no remainder is the only exact integer.
+        let p = POW10_I128[*scale as usize];
+        let whole = (value % p == 0).then(|| value / p);
+        Some(match target {
+            DataType::Double => Value::Double(crate::types::decimal_to_f64(*value, *scale)),
+            DataType::Integer => Value::Integer(i32::try_from(whole?).ok()?),
+            DataType::Bigint => Value::Bigint(i64::try_from(whole?).ok()?),
+            _ => return None,
+        })
+    }
+    fn substitute(literal: &BoundExpr, other: &BoundExpr) -> Option<BoundExpr> {
+        match literal {
+            BoundExpr::Literal(v) => in_domain(v, other.dtype()).map(BoundExpr::Literal),
+            _ => None,
+        }
+    }
+    if matches!(r, BoundExpr::Literal(_))
+        && let Some(lit) = substitute(&r, &l)
+    {
+        return (l, lit);
+    }
+    if let Some(lit) = substitute(&l, &r) {
+        return (lit, r);
+    }
+    (l, r)
 }
 
 /// A string literal compared with a UUID is that UUID's text: DuckDB gives
@@ -2364,6 +2431,7 @@ impl<'a> Binder<'a> {
             args.push(self.bind_expr(item, aggs, allow_agg)?);
         }
         let dtype = array_ctor_dtype(&args)?;
+        let args = coerce_array_elems(dtype, args);
         Ok(BoundExpr::Scalar {
             func: ScalarFunc::ArrayValue,
             args,
@@ -2507,6 +2575,7 @@ impl<'a> Binder<'a> {
                             }
                             _ => (l, r),
                         };
+                        let (l, r) = cast_decimal_literal_to_column(l, r);
                         let (l, r) = match comparison_ok(*op, l.dtype(), r.dtype()) {
                             Ok(()) => (l, r),
                             Err(error) => {
@@ -4665,6 +4734,7 @@ fn coerce_scalar_args(
     let want = match func {
         ScalarFunc::Concat => DataType::Varchar,
         ScalarFunc::Greatest | ScalarFunc::Least | ScalarFunc::Mod => dtype,
+        ScalarFunc::ArrayValue => return Ok(coerce_array_elems(dtype, args)),
         _ => return Ok(args),
     };
     args.into_iter()
@@ -12101,7 +12171,9 @@ fn literal_arg_value(expr: &Expr) -> Option<Value> {
             Value::Integer(n) => Some(Value::Integer(-n)),
             Value::Bigint(n) => Some(Value::Bigint(-n)),
             Value::Double(d) => Some(Value::Double(-d)),
-            Value::Decimal(v, s) => Some(Value::Decimal(-v, s)),
+            Value::Decimal {
+                value: v, scale: s, ..
+            } => Some(Value::decimal(-v, s)),
             _ => None,
         },
         _ => None,

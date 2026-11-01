@@ -49,7 +49,7 @@ fn durable_roundtrip_through_the_c_abi() {
         h,
         "CREATE TABLE t (i INTEGER, b BIGINT, d DOUBLE, s VARCHAR, dt DATE, ts TIMESTAMP, va VARIANT);
          INSERT INTO t VALUES
-           (-2147483647 - 1, 9223372036854775807, -0.0, '', DATE '1970-01-01',
+           (-2147483647 - 1, 9223372036854775807, -0.0e0, '', DATE '1970-01-01',
             TIMESTAMP '1970-01-01 00:00:00.000001',
             CAST('{\"a\":[1,2.5,\"s\",null,true]}' AS VARIANT)),
            (NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
@@ -682,7 +682,7 @@ fn arrays_cross_the_c_abi_as_double_payloads() {
     pinkdb_result_free(exec(h, "CREATE TABLE t(id INTEGER, v DOUBLE[3]);"));
     pinkdb_result_free(exec(
         h,
-        "INSERT INTO t VALUES (1, [1.5, -0.0, 2.0]), (2, NULL), (3, [4.0, 5.0, 6.0]);",
+        "INSERT INTO t VALUES (1, [1.5, -0.0e0, 2.0]), (2, NULL), (3, [4.0, 5.0, 6.0]);",
     ));
 
     let r = exec(h, "SELECT id, v, v[2], len(v) FROM t ORDER BY id;");

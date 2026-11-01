@@ -148,7 +148,7 @@ fn push_value(out: &mut String, v: &Value) {
         // lowercase 8-4-4-4-12 form, like the C ABI).
         Value::Date(_)
         | Value::Timestamp(_)
-        | Value::Decimal(..)
+        | Value::Decimal { .. }
         | Value::Interval { .. }
         | Value::Uuid(_) => {
             push_json_string(out, &v.to_string());
@@ -592,7 +592,7 @@ mod tests {
     fn temporal_and_exact_values_cross_as_display_text() {
         assert_eq!(json_of(&Value::Date(19_737)), "\"2024-01-15\"");
         assert_eq!(
-            json_of(&Value::Decimal(12_345, 2)),
+            json_of(&Value::decimal(12_345, 2)),
             "\"123.45\"",
             "DECIMAL crosses as its Display text"
         );

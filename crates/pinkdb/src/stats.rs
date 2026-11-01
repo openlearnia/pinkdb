@@ -92,9 +92,9 @@ pub(crate) fn value_hash(v: &Value) -> u64 {
         Value::Double(x) => mix(double_bits(*x)),
         Value::Varchar(s) => hash_bytes(s.as_bytes()),
         Value::Uuid(x) => mix(*x as u64 ^ ((*x >> 64) as u64).rotate_left(17) ^ 0x60),
-        Value::Decimal(x, scale) => {
-            mix(*x as u64 ^ ((*x >> 64) as u64).rotate_left(17) ^ ((*scale as u64) << 56))
-        }
+        Value::Decimal {
+            value: x, scale, ..
+        } => mix(*x as u64 ^ ((*x >> 64) as u64).rotate_left(17) ^ ((*scale as u64) << 56)),
         Value::Interval {
             months,
             days,
@@ -476,8 +476,8 @@ impl Zone {
             }
             VectorData::Decimal { values, scale, .. } => {
                 let (min, max) = int_stats(v, values);
-                zone.min = min.map(|x| Value::Decimal(x, *scale));
-                zone.max = max.map(|x| Value::Decimal(x, *scale));
+                zone.min = min.map(|x| Value::decimal(x, *scale));
+                zone.max = max.map(|x| Value::decimal(x, *scale));
             }
             VectorData::Interval(data) => {
                 let (mut min, mut max): (Option<Interval>, Option<Interval>) = (None, None);
@@ -1218,10 +1218,10 @@ mod tests {
                         },
                         1,
                     );
-                    v.push_valid(Value::Decimal(12345, 2)).expect("push");
+                    v.push_valid(Value::decimal(12345, 2)).expect("push");
                     v
                 },
-                vec![Value::Decimal(12345, 2)],
+                vec![Value::decimal(12345, 2)],
             ),
         ];
         for (vector, values) in cases {

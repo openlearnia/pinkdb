@@ -487,9 +487,12 @@ pub(crate) fn encode_value(dtype: DataType, v: &Value) -> Option<String> {
         (DataType::Double, Value::Double(x)) => format!("{:016x}", x.to_bits()),
         (DataType::Varchar, Value::Varchar(s)) => s.clone(),
         (DataType::Uuid, Value::Uuid(bits)) => pinkdb::uuid::format(*bits),
-        (DataType::Decimal { scale, .. }, Value::Decimal(x, s)) if *s == scale => {
-            pinkdb::types::format_decimal(*x, *s)
-        }
+        (
+            DataType::Decimal { scale, .. },
+            Value::Decimal {
+                value: x, scale: s, ..
+            },
+        ) if *s == scale => pinkdb::types::format_decimal(*x, *s),
         (
             DataType::Interval,
             Value::Interval {
@@ -528,7 +531,7 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
             Value::Double(f64::from_bits(u64::from_str_radix(s, 16).ok()?))
         }
         DataType::Varchar => Value::Varchar(s.to_string()),
-        DataType::Decimal { precision, scale } => Value::Decimal(
+        DataType::Decimal { precision, scale } => Value::decimal(
             pinkdb::types::parse_decimal_str(s, precision, scale).ok()?,
             scale,
         ),

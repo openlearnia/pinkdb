@@ -3075,7 +3075,7 @@ mod tests {
             vec![vec![
                 Value::Integer(1),
                 Value::Varchar("x".to_string()),
-                Value::Decimal(150, 2),
+                Value::decimal(150, 2),
                 Value::Date(19_724),
             ]]
         );

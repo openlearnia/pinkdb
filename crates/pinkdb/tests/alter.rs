@@ -344,7 +344,7 @@ fn defaults_survive_pink_save_and_load() {
         rows(&mut db, "SELECT n, d, dt, v FROM t WHERE i = 9;"),
         vec![vec![
             Value::Integer(42),
-            Value::Decimal(125, 2),
+            Value::decimal(125, 2),
             Value::Date(pinkdb::types::parse_date("2020-01-02").unwrap()),
             Value::Varchar("hi".into()),
         ]]

@@ -285,13 +285,14 @@ impl Vector {
             ),
             Value::Date(d) => (VectorData::Date32(vec![*d; n]), true),
             Value::Timestamp(us) => (VectorData::TimestampMicros(vec![*us; n]), true),
-            Value::Decimal(v, scale) => (
+            Value::Decimal {
+                value: v,
+                precision,
+                scale,
+            } => (
                 VectorData::Decimal {
                     values: vec![*v; n],
-                    precision: crate::types::decimal_digits(*v)
-                        .max(*scale as u32)
-                        .clamp(1, crate::types::DECIMAL_MAX_PRECISION as u32)
-                        as u8,
+                    precision: *precision,
                     scale: *scale,
                 },
                 true,
@@ -492,7 +493,15 @@ impl Vector {
             VectorData::VarChar(v) => Value::Varchar(v[idx].to_string()),
             VectorData::Date32(v) => Value::Date(v[idx]),
             VectorData::TimestampMicros(v) => Value::Timestamp(v[idx]),
-            VectorData::Decimal { values, scale, .. } => Value::Decimal(values[idx], *scale),
+            VectorData::Decimal {
+                values,
+                precision,
+                scale,
+            } => Value::Decimal {
+                value: values[idx],
+                precision: *precision,
+                scale: *scale,
+            },
             VectorData::Interval(v) => Value::Interval {
                 months: v[idx].months,
                 days: v[idx].days,
@@ -564,7 +573,12 @@ impl Vector {
             (VectorData::VarChar(v), Value::Varchar(s)) => v.push(&s),
             (VectorData::Date32(v), Value::Date(d)) => v.push(d),
             (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v.push(us),
-            (VectorData::Decimal { values, scale, .. }, Value::Decimal(v, s)) if s == *scale => {
+            (
+                VectorData::Decimal { values, scale, .. },
+                Value::Decimal {
+                    value: v, scale: s, ..
+                },
+            ) if s == *scale => {
                 values.push(v);
             }
             (
@@ -824,7 +838,12 @@ impl Vector {
             (VectorData::VarChar(v), Value::Varchar(s)) => v.set(idx, &s),
             (VectorData::Date32(v), Value::Date(d)) => v[idx] = d,
             (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v[idx] = us,
-            (VectorData::Decimal { values, scale, .. }, Value::Decimal(v, s)) if s == *scale => {
+            (
+                VectorData::Decimal { values, scale, .. },
+                Value::Decimal {
+                    value: v, scale: s, ..
+                },
+            ) if s == *scale => {
                 values[idx] = v;
             }
             (

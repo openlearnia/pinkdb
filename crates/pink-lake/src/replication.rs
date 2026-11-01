@@ -2573,7 +2573,18 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
-        (Value::Decimal(x, sx), Value::Decimal(y, sy)) => {
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+                ..
+            },
+            Value::Decimal {
+                value: y,
+                scale: sy,
+                ..
+            },
+        ) => {
             let scale = (*sx).max(*sy);
             let raise = |value: i128, from: u8| -> Option<i128> {
                 value.checked_mul(10i128.checked_pow(u32::from(scale - from))?)
@@ -2674,7 +2685,7 @@ fn encode_key(value: &Value, out: &mut Vec<u8>) {
             out.push(7);
             out.extend_from_slice(&value.to_le_bytes());
         }
-        Value::Decimal(value, scale) => {
+        Value::Decimal { value, scale, .. } => {
             out.push(8);
             out.extend_from_slice(&value.to_le_bytes());
             out.push(*scale);

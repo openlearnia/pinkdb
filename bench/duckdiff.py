@@ -720,6 +720,66 @@ NAN_QUERIES = [
     ("nan-window-rank", "SELECT id, rank() OVER (ORDER BY d) FROM fz ORDER BY id;", True, False),
 ]
 
+# ---- wave 126a: decimal literal typing ----
+#
+# A point literal is DECIMAL(written width, written scale) like DuckDB's
+# `NumberToValue`; exponents and over-38-digit literals stay DOUBLE. The
+# battery pins the dtype (via `typeof`) and the value of the table in the
+# wave's brief, then every place a literal meets another type: arithmetic,
+# CASE/LEAST/GREATEST/COALESCE/UNION, IN/BETWEEN, GROUP BY, ORDER BY, window
+# frames, LIMIT/OFFSET, INTERVAL arithmetic and assignment into typed columns.
+LITERAL_SETUP = """
+CREATE TABLE xd (x DECIMAL(15,2));
+INSERT INTO xd VALUES (10.25), (0.00);
+CREATE TABLE xi (i INTEGER);
+INSERT INTO xi VALUES (3), (7);
+CREATE TABLE xv (d DOUBLE);
+INSERT INTO xv VALUES (1.5), (2.5);
+"""
+
+LITERAL_QUERIES = [
+    # (label, sql, ordered, expect_error)
+    ("lit-typeof", "SELECT typeof(1.5), typeof(0.06), typeof(.5), typeof(1.50), typeof(12345678901234567890.5), typeof(1e3), typeof(1.5e2);", False, False),
+    ("lit-typeof-corners", "SELECT typeof(-1.5), typeof(-.5), typeof(1_000.5), typeof(00.5), typeof(0.00), typeof(.00);", False, False),
+    ("lit-typeof-width", "SELECT typeof(12345678901234567890123456789012345678.5), typeof(123456789012345678901234567890123456789.5), typeof(12345678901234567890123456789012345678901234567890.5);", False, False),
+    ("lit-values", "SELECT 1.5, 0.06, .5, 1.50, 12345678901234567890.5, 1e3, 1.5e2, 00.5, 1_000.5;", False, False),
+    ("lit-arith-types", "SELECT typeof(3 * 0.5), typeof(1.5 + 1), typeof(0.1 + 0.2), typeof(10 / 4.0), typeof(sqrt(2.0)), typeof(power(1.5, 2)), typeof(1.5 * 1.0);", False, False),
+    ("lit-arith-values", "SELECT 3 * 0.5, 1.5 + 1, 0.1 + 0.2, 10 / 4.0, sqrt(2.0), power(1.5, 2), 1.5 * 1.0, 1.5 % 1, -1.5 * 1;", False, False),
+    ("lit-unify-types", "SELECT typeof(CASE WHEN true THEN 1.5 ELSE 2 END), typeof(least(1.5, 2.25)), typeof(greatest(1.5, 2)), typeof(coalesce(NULL, 1.5)), typeof(1.5 % 1), typeof(123.45 % 2);", False, False),
+    ("lit-unify-values", "SELECT CASE WHEN true THEN 1.5 ELSE 2 END, least(1.5, 2.25), greatest(1.5, 2), coalesce(NULL, 1.5), 1.5 % 1;", False, False),
+    ("lit-union", "SELECT v, typeof(v) FROM (SELECT 1.5 AS v UNION ALL SELECT 2) s ORDER BY v;", True, False),
+    ("lit-comparisons", "SELECT 1.5 = 1.50, 1.5 < 1.51, -1.5 = -1.50, 1.5 = 1.5e0, 1.5 > 1;", False, False),
+    ("lit-in", "SELECT 1.5 IN (1.5, 2.5), 2 IN (1.5, 2.5), 1.25 IN (1.5, 2.5), 1.5 NOT IN (1.5);", False, False),
+    ("lit-between", "SELECT 1.5 BETWEEN 1.0 AND 2.0, 1.25 BETWEEN 1.5 AND 2.5, 2 BETWEEN 1.5 AND 2.5, 1.5 NOT BETWEEN 1 AND 1.5;", False, False),
+    ("lit-dec-column", "SELECT x, typeof(x - 1.5), x - 1.5 FROM xd ORDER BY x;", True, False),
+    ("lit-dec-column-aggs", "SELECT typeof(sum(x - 1.5)), sum(x - 1.5), typeof(avg(x * 0.1)), avg(x * 0.1), typeof(min(x * 1.5)), min(x * 1.5) FROM xd;", False, False),
+    ("lit-dec-column-filter", "SELECT x FROM xd WHERE x > 1.5 ORDER BY x;", True, False),
+    ("lit-int-column-filter", "SELECT i FROM xi WHERE i < 4.5 ORDER BY i;", True, False),
+    ("lit-int-column-eq", "SELECT i FROM xi WHERE i = 3.0 ORDER BY i;", True, False),
+    ("lit-double-column-filter", "SELECT d FROM xv WHERE d > 1.5 ORDER BY d;", True, False),
+    ("lit-index-probe", "CREATE TABLE xix (i INTEGER); INSERT INTO xix VALUES (2), (3); CREATE INDEX xixi ON xix(i); SELECT i FROM xix WHERE i = 2.0;", True, False),
+    ("lit-group-by-literal", "SELECT 1.5 AS k, count(*) FROM xi GROUP BY 1.5 ORDER BY 1;", True, False),
+    ("lit-group-by-column", "SELECT i > 1.5 AS k, count(*) FROM xi GROUP BY k ORDER BY k;", True, False),
+    ("lit-order-by-expr", "SELECT i FROM xi ORDER BY i * 1.5 DESC;", True, False),
+    ("lit-window-frame", "SELECT i, sum(i) OVER (ORDER BY i ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) AS s FROM xi ORDER BY i;", True, False),
+    ("lit-window-range", "SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) AS s FROM xi ORDER BY i;", True, False),
+    ("lit-limit", "SELECT i FROM xi ORDER BY i LIMIT 1.5;", True, False),
+    ("lit-offset", "SELECT i FROM xi ORDER BY i OFFSET 1.4;", True, False),
+    ("lit-interval-arith", "SELECT INTERVAL '1 day' * 1.5, INTERVAL '3 days' / 2.0, TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '1 day' * 1.5;", False, False),
+    ("lit-date-plus-literal", "SELECT DATE '2024-01-01' + 1.5;", False, True),
+    ("lit-concat", "SELECT 'a' || 1.5, 'a' || .5, 'a' || 0.5, CAST(.5 AS VARCHAR), 1.5 || 'x';", False, False),
+    ("lit-assign", "CREATE TABLE ca (d DOUBLE, i INTEGER, b BIGINT, s VARCHAR, m DECIMAL(4,2), n DECIMAL(2,1)); INSERT INTO ca VALUES (1.5, 1.5, 1.5, 1.5, 1.567, 1.567), (NULL, 2.5, 2.5, NULL, NULL, NULL); SELECT d, i, b, s, m, n FROM ca ORDER BY i;", True, False),
+    ("lit-assign-out-of-range", "CREATE TABLE cb (n DECIMAL(2,1)); INSERT INTO cb VALUES (100.0);", False, True),
+    ("lit-variant", "SELECT variant_type(CAST(1.5 AS VARIANT)), variant_type(CAST(1.5e0 AS VARIANT));", False, False),
+]
+
+
+def run_literals():
+    print("== decimal-literal battery (wave 126a) ==")
+    for label, sql, ordered, expect_error in LITERAL_QUERIES:
+        run_case(label, sql, ordered, expect_error, LITERAL_SETUP, LITERAL_SETUP)
+
+
 
 def run_parquet():
     print("== parquet battery ==")
@@ -1914,6 +1974,7 @@ def run_remote():
 def main():
     import sys
     run_small()
+    run_literals()
     run_expression_names()
     run_csv()
     run_remote()

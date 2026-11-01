@@ -1043,7 +1043,7 @@ fn field_value(text: &str, dtype: DataType) -> Result<Value> {
         DataType::Decimal { precision, scale } => {
             let v = crate::types::parse_decimal_str(text, precision, scale)
                 .map_err(PinkDbError::Type)?;
-            Value::Decimal(v, scale)
+            Value::decimal(v, scale)
         }
         DataType::Interval => match crate::types::parse_interval(text) {
             Some(iv) => Value::Interval {

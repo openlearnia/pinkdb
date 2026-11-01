@@ -253,12 +253,12 @@ fn default_values_inserts_one_row_of_defaults() {
         vec![
             vec![
                 Value::Integer(0),
-                Value::Decimal(150, 2),
+                Value::decimal(150, 2),
                 Value::Varchar("x'y".into())
             ],
             vec![
                 Value::Integer(0),
-                Value::Decimal(150, 2),
+                Value::decimal(150, 2),
                 Value::Varchar("x'y".into())
             ],
         ]
@@ -525,7 +525,7 @@ fn introspection_prints_the_written_default_text() {
         rows(&mut db, "SELECT c, d, e FROM w;"),
         vec![vec![
             Value::Varchar("x'y".into()),
-            Value::Decimal(150, 2),
+            Value::decimal(150, 2),
             Value::Double(1.5)
         ]]
     );

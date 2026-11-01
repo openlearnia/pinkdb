@@ -3033,7 +3033,9 @@ fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
             w.u8(SV_TIMESTAMP);
             w.i64(*t);
         }
-        Some(Value::Decimal(x, scale)) => {
+        Some(Value::Decimal {
+            value: x, scale, ..
+        }) => {
             w.u8(SV_DECIMAL);
             w.bytes(&x.to_le_bytes());
             w.u8(*scale);
@@ -3089,7 +3091,7 @@ fn read_stat_value(r: &mut Reader) -> Result<Option<Value>> {
             if scale > 38 {
                 return r.err("bad DECIMAL statistics scale");
             }
-            Some(Value::Decimal(x, scale))
+            Some(Value::decimal(x, scale))
         }
         SV_INTERVAL => Some(Value::Interval {
             months: r.i32()?,
@@ -7348,7 +7350,7 @@ mod tests {
         }
         match dtype {
             DataType::Boolean => Value::Boolean(i.is_multiple_of(3)),
-            DataType::Decimal { scale, .. } => Value::Decimal(
+            DataType::Decimal { scale, .. } => Value::decimal(
                 match i % 6 {
                     0 => 0,
                     1 => -1,
@@ -8298,7 +8300,7 @@ mod tests {
                     DataType::Date => Value::Date(r as i32),
                     DataType::Timestamp => Value::Timestamp(r as i64),
                     DataType::Uuid => Value::Uuid(u128::from(r) << 64 | u128::from(r >> 1)),
-                    DataType::Decimal { scale, .. } => Value::Decimal(r as i128, scale),
+                    DataType::Decimal { scale, .. } => Value::decimal(r as i128, scale),
                     DataType::Interval => Value::Interval {
                         months: (r % 1000) as i32,
                         days: (r % 60) as i32,
@@ -8468,7 +8470,7 @@ mod tests {
         db.execute("CREATE TABLE t (i INTEGER, v VARCHAR, d DOUBLE, b BOOLEAN);")
             .unwrap();
         db.execute(
-            "INSERT INTO t VALUES (1, 'a', 1.5, true), (2, NULL, -0.0, false), \
+            "INSERT INTO t VALUES (1, 'a', 1.5, true), (2, NULL, -0.0e0, false), \
              (NULL, 'b', 1e300, NULL);",
         )
         .unwrap();

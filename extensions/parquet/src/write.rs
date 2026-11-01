@@ -591,7 +591,11 @@ fn write_column(
                     cursor,
                     name,
                     |v| match v {
-                        Value::Decimal(unscaled, value_scale) => {
+                        Value::Decimal {
+                            value: unscaled,
+                            scale: value_scale,
+                            ..
+                        } => {
                             decimal_scale_check(*value_scale, scale)?;
                             i32::try_from(*unscaled).map_err(|_| {
                                 format!(
@@ -610,7 +614,11 @@ fn write_column(
                     cursor,
                     name,
                     |v| match v {
-                        Value::Decimal(unscaled, value_scale) => {
+                        Value::Decimal {
+                            value: unscaled,
+                            scale: value_scale,
+                            ..
+                        } => {
                             decimal_scale_check(*value_scale, scale)?;
                             i64::try_from(*unscaled).map_err(|_| {
                                 format!(
@@ -629,7 +637,11 @@ fn write_column(
                     cursor,
                     name,
                     |v| match v {
-                        Value::Decimal(unscaled, value_scale) => {
+                        Value::Decimal {
+                            value: unscaled,
+                            scale: value_scale,
+                            ..
+                        } => {
                             decimal_scale_check(*value_scale, scale)?;
                             // Big-endian two's complement, sign extended to
                             // the fixed width the schema declares.

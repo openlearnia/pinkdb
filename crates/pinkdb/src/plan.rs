@@ -2974,27 +2974,70 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         // DECIMAL compares numerically across scales; INTERVAL normalizes
         // months to 30-day months (DuckDB rules).
-        (Value::Decimal(x, sx), Value::Decimal(y, sy)) => {
-            crate::types::decimal_cmp(*x, *sx, *y, *sy)
-        }
-        (Value::Decimal(x, sx), y) if y.data_type() == Some(DataType::Double) => {
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+                ..
+            },
+            Value::Decimal {
+                value: y,
+                scale: sy,
+                ..
+            },
+        ) => crate::types::decimal_cmp(*x, *sx, *y, *sy),
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+                ..
+            },
+            y,
+        ) if y.data_type() == Some(DataType::Double) => {
             num_cmp(crate::types::decimal_to_f64(*x, *sx), as_double(y))
         }
-        (x, Value::Decimal(y, sy)) if x.data_type() == Some(DataType::Double) => {
+        (
+            x,
+            Value::Decimal {
+                value: y,
+                scale: sy,
+                ..
+            },
+        ) if x.data_type() == Some(DataType::Double) => {
             num_cmp(as_double(x), crate::types::decimal_to_f64(*y, *sy))
         }
-        (Value::Decimal(x, sx), Value::Integer(y)) => {
-            crate::types::decimal_cmp(*x, *sx, *y as i128, 0)
-        }
-        (Value::Integer(x), Value::Decimal(y, sy)) => {
-            crate::types::decimal_cmp(*x as i128, 0, *y, *sy)
-        }
-        (Value::Decimal(x, sx), Value::Bigint(y)) => {
-            crate::types::decimal_cmp(*x, *sx, *y as i128, 0)
-        }
-        (Value::Bigint(x), Value::Decimal(y, sy)) => {
-            crate::types::decimal_cmp(*x as i128, 0, *y, *sy)
-        }
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+                ..
+            },
+            Value::Integer(y),
+        ) => crate::types::decimal_cmp(*x, *sx, *y as i128, 0),
+        (
+            Value::Integer(x),
+            Value::Decimal {
+                value: y,
+                scale: sy,
+                ..
+            },
+        ) => crate::types::decimal_cmp(*x as i128, 0, *y, *sy),
+        (
+            Value::Decimal {
+                value: x,
+                scale: sx,
+                ..
+            },
+            Value::Bigint(y),
+        ) => crate::types::decimal_cmp(*x, *sx, *y as i128, 0),
+        (
+            Value::Bigint(x),
+            Value::Decimal {
+                value: y,
+                scale: sy,
+                ..
+            },
+        ) => crate::types::decimal_cmp(*x as i128, 0, *y, *sy),
         (
             Value::Interval {
                 months: am,

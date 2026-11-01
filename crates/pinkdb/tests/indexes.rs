@@ -275,7 +275,7 @@ fn probe_key_matches_decimal_column_with_integer_and_other_scales() {
 
     // Integer literal against DECIMAL column.
     let int_query = "SELECT d FROM t WHERE d = 2;";
-    let int_expected = vec![vec![Value::Decimal(200, 2)]];
+    let int_expected = vec![vec![Value::decimal(200, 2)]];
     assert_eq!(rows(&mut db, int_query), int_expected);
 
     db.execute("CREATE INDEX ix ON t(d);").unwrap();
@@ -283,12 +283,12 @@ fn probe_key_matches_decimal_column_with_integer_and_other_scales() {
 
     // Literal with a different DECIMAL scale (one fractional digit).
     let scale_query = "SELECT d FROM t WHERE d = 1.5;";
-    let scale_expected = vec![vec![Value::Decimal(150, 2)]];
+    let scale_expected = vec![vec![Value::decimal(150, 2)]];
     assert_eq!(rows(&mut db, scale_query), scale_expected);
 
     // Explicit three-digit scale literal: DECIMAL(10,3) -> column scale 2.
     let cast_query = "SELECT d FROM t WHERE d = CAST(2.250 AS DECIMAL(10,3));";
-    let cast_expected = vec![vec![Value::Decimal(225, 2)]];
+    let cast_expected = vec![vec![Value::decimal(225, 2)]];
     assert_eq!(rows(&mut db, cast_query), cast_expected);
 }
 
@@ -319,7 +319,7 @@ fn collapsing_numeric_literals_fall_back_to_the_full_scan() {
     db.execute("INSERT INTO d VALUES (CAST('1000000000000000000000000000000' AS DECIMAL(38,0)));")
         .unwrap();
     let decimal_query = "SELECT v FROM d WHERE v = 1e30;";
-    let decimal_expected = vec![vec![Value::Decimal(
+    let decimal_expected = vec![vec![Value::decimal(
         1_000_000_000_000_000_000_000_000_000_000i128,
         0,
     )]];
@@ -333,11 +333,15 @@ fn collapsing_numeric_literals_fall_back_to_the_full_scan() {
     db.execute("CREATE TABLE b (v BIGINT);").unwrap();
     db.execute("INSERT INTO b VALUES (9007199254740993);")
         .unwrap();
-    let big_query = "SELECT v FROM b WHERE v = 9007199254740992.0;";
+    let big_query = "SELECT v FROM b WHERE v = 9007199254740992e0;";
     let big_expected = vec![vec![Value::Bigint(9_007_199_254_740_993)]];
     assert_eq!(rows(&mut db, big_query), big_expected);
     db.execute("CREATE INDEX ixb ON b(v);").unwrap();
     assert_eq!(rows(&mut db, big_query), big_expected);
+    // The decimal literal is exact, so no row matches (DuckDB's answer) —
+    // through the index (now a BIGINT probe) exactly as in a full scan.
+    let decimal_query = "SELECT v FROM b WHERE v = 9007199254740992.0;";
+    assert_eq!(rows(&mut db, decimal_query), Vec::<Vec<Value>>::new());
 }
 
 // ---------------------------------------------------------------------------

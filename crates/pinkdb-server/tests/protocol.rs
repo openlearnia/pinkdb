@@ -870,10 +870,10 @@ fn result_set_length_mismatch_does_not_encode() {
 fn decimal_and_interval_values_round_trip() {
     let rows = vec![
         vec![
-            Value::Decimal(0, 0),
-            Value::Decimal(-123_456_789_012_345_678_901_234_567_890, 18),
-            Value::Decimal(i128::MIN, 38),
-            Value::Decimal(i128::MAX, 38),
+            Value::decimal(0, 0),
+            Value::decimal(-123_456_789_012_345_678_901_234_567_890, 18),
+            Value::decimal(i128::MIN, 38),
+            Value::decimal(i128::MAX, 38),
             Value::Interval {
                 months: i32::MIN,
                 days: i32::MAX,

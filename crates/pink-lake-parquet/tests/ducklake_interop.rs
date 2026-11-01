@@ -239,7 +239,7 @@ fn duckdb_reads_pinkdb_inlined_rows_with_the_right_types() {
             Value::Varchar("héllo".to_string()),
             Value::Date(0),
             Value::Timestamp(0),
-            Value::Decimal(123_456, 3),
+            Value::decimal(123_456, 3),
         ])
         .unwrap();
     table
@@ -251,7 +251,7 @@ fn duckdb_reads_pinkdb_inlined_rows_with_the_right_types() {
             Value::Varchar("x".to_string()),
             Value::Date(1),
             Value::Timestamp(1_000_000),
-            Value::Decimal(0, 3),
+            Value::decimal(0, 3),
         ])
         .unwrap();
     table

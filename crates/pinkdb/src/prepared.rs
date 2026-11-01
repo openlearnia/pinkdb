@@ -311,16 +311,26 @@ pub(crate) fn value_literal(value: &Value) -> Result<String> {
             format!("CAST('{}' AS BIGINT)", i)
         }
         Value::Bigint(i) => i.to_string(),
-        // `{:?}` is the shortest form that round-trips an f64, with a `.0`
-        // for integral values (so the literal stays DOUBLE, never INTEGER).
-        Value::Double(x) if x.is_finite() => format!("{x:?}"),
+        // `{:?}` is the shortest form that round-trips an f64. A bare
+        // `2.5` would now parse as DECIMAL, so pin an exponent (`2.5e0`) in
+        // the text; integral values get `.0e0` so they stay DOUBLE.
+        Value::Double(x) if x.is_finite() => {
+            let text = format!("{x:?}");
+            if text.contains('e') {
+                text
+            } else {
+                text + "e0"
+            }
+        }
         Value::Double(x) if x.is_nan() => "CAST('NaN' AS DOUBLE)".to_string(),
         Value::Double(x) if x.is_sign_negative() => "CAST('-inf' AS DOUBLE)".to_string(),
         Value::Double(_) => "CAST('inf' AS DOUBLE)".to_string(),
         Value::Varchar(s) => format!("'{}'", s.replace('\'', "''")),
         // DECIMAL keeps its exact unscaled value: pin through the widest
         // precision, which every engine-produced DECIMAL(p ≤ 38) fits.
-        Value::Decimal(x, scale) => format!(
+        Value::Decimal {
+            value: x, scale, ..
+        } => format!(
             "CAST('{}' AS DECIMAL(38,{scale}))",
             crate::types::format_decimal(*x, *scale)
         ),
@@ -457,7 +467,9 @@ mod tests {
             value_literal(&Value::Bigint(0)).unwrap(),
             "CAST(0 AS BIGINT)"
         );
-        assert_eq!(value_literal(&Value::Double(1.0)).unwrap(), "1.0");
+        // The exponent keeps the text parsing as DOUBLE (a bare `1.0` is
+        // DECIMAL now).
+        assert_eq!(value_literal(&Value::Double(1.0)).unwrap(), "1.0e0");
         assert_eq!(value_literal(&Value::Date(0)).unwrap(), "DATE '1970-01-01'");
         assert_eq!(
             value_literal(&Value::Timestamp(0)).unwrap(),

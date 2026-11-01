@@ -558,7 +558,9 @@ fn mix_value(h: &mut u64, v: &Value) {
         Value::Varchar(s) => mix(h, 5, s.as_bytes()),
         Value::Date(d) => mix(h, 6, &d.to_le_bytes()),
         Value::Timestamp(t) => mix(h, 7, &t.to_le_bytes()),
-        Value::Decimal(v, scale) => {
+        Value::Decimal {
+            value: v, scale, ..
+        } => {
             let mut b = [0u8; 17];
             b[..16].copy_from_slice(&v.to_le_bytes());
             b[16] = *scale;

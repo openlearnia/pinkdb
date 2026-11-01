@@ -212,7 +212,9 @@ fn bit_exact_roundtrip_multi_database() {
         .unwrap();
     db.execute("CREATE DATABASE empty;").unwrap();
     db.execute("CREATE TABLE empty.t2 (x DOUBLE);").unwrap();
-    db.execute("INSERT INTO empty.t2 VALUES (1.5), (-0.0);")
+    // `-0.0e0` is a DOUBLE literal (`-0.0` alone is DECIMAL, which has no
+    // signed zero) so the stored bits exercise the sign.
+    db.execute("INSERT INTO empty.t2 VALUES (1.5), (-0.0e0);")
         .unwrap();
 
     db.save_with_key(s.path(), &raw_key()).unwrap();

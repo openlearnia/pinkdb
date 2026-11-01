@@ -224,14 +224,14 @@ fn special_values(dtype: DataType) -> Vec<Value> {
         DataType::Decimal { precision, scale } => {
             let max = 10i128.pow(u32::from(precision)) - 1;
             vec![
-                Value::Decimal(-max, scale),
-                Value::Decimal(max, scale),
+                Value::decimal(-max, scale),
+                Value::decimal(max, scale),
                 Value::Null,
-                Value::Decimal(0, scale),
-                Value::Decimal(-1, scale),
+                Value::decimal(0, scale),
+                Value::decimal(-1, scale),
                 Value::Null,
-                Value::Decimal(max / 3, scale),
-                Value::Decimal(-42, scale),
+                Value::decimal(max / 3, scale),
+                Value::decimal(-42, scale),
             ]
         }
         // Kinds a JSON-text encoding would flatten (DATE, TIMESTAMP, a
@@ -394,7 +394,7 @@ fn sample_value(dtype: DataType) -> Value {
         DataType::Varchar => Value::Varchar("x".to_string()),
         DataType::Date => Value::Date(1),
         DataType::Timestamp => Value::Timestamp(1),
-        DataType::Decimal { scale, .. } => Value::Decimal(1, scale),
+        DataType::Decimal { scale, .. } => Value::decimal(1, scale),
         DataType::Uuid => Value::Uuid(1),
         DataType::Interval => Value::Interval {
             months: 1,

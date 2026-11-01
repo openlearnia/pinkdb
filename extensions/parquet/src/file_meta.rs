@@ -338,7 +338,7 @@ fn stat_value(stats: &Statistics, column: &FileColumn, min: bool) -> Option<Valu
             let v = if min { s.min_opt() } else { s.max_opt() }?;
             match column.ty {
                 DataType::Decimal { .. } => {
-                    Some(fixed_decimal_value(v.data())).map(|u| Value::Decimal(u, scale))
+                    Some(fixed_decimal_value(v.data())).map(|u| Value::decimal(u, scale))
                 }
                 DataType::Uuid => {
                     let bytes: [u8; 16] = v.data().try_into().ok()?;

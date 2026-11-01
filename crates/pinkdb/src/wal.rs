@@ -2635,7 +2635,9 @@ fn encode_value(out: &mut Vec<u8>, value: &crate::types::Value) -> Result<()> {
             out.push(VALUE_TIMESTAMP);
             out.extend_from_slice(&t.to_le_bytes());
         }
-        Value::Decimal(v, scale) => {
+        Value::Decimal {
+            value: v, scale, ..
+        } => {
             out.push(VALUE_DECIMAL);
             out.extend_from_slice(&v.to_le_bytes());
             out.push(*scale);
@@ -2763,7 +2765,7 @@ fn decode_value(r: &mut Payload<'_>) -> std::result::Result<Value, String> {
         VALUE_DECIMAL => {
             let value = r.i128()?;
             let scale = r.u8()?;
-            Value::Decimal(value, scale)
+            Value::decimal(value, scale)
         }
         VALUE_INTERVAL => Value::Interval {
             months: r.i32()?,

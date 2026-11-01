@@ -983,7 +983,7 @@ fn placeholder(dtype: DataType) -> Value {
         DataType::Varchar => Value::Varchar(String::new()),
         DataType::Date => Value::Date(0),
         DataType::Timestamp => Value::Timestamp(0),
-        DataType::Decimal { scale, .. } => Value::Decimal(0, scale),
+        DataType::Decimal { scale, .. } => Value::decimal(0, scale),
         // Interval and anything newer: a NULL is enough to validate names.
         _ => Value::Null,
     }
