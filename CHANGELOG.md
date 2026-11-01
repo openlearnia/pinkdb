@@ -9,6 +9,16 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-01
+### Wave 126a — decimal literals typed like DuckDB ✅
+
+`1.5` is now `DECIMAL(2,1)`, as in DuckDB, instead of `DOUBLE`, so
+arithmetic with decimal columns keeps DuckDB's types and exact values:
+`x - 1.5` over a `DECIMAL(15,2)` column is `DECIMAL(16,2)`, `0.1 + 0.2` is
+`0.3`, and unaliased column names keep the literal as written (`(10 / 4.0)`).
+Literals with an exponent (`1e3`) or more than 38 digits stay `DOUBLE`;
+array literals keep `DOUBLE` elements. Filters against a column convert the
+literal once, so queries run as fast as before.
+
 ### Wave 140 — QuackLab's ETL hot spots ✅
 
 QuackLab's ETL on its NYC-taxi benchmark (local storage) went from 68 s to

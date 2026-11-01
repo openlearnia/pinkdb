@@ -195,6 +195,8 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-11-01">2026-11-01<a class="anchor" href="#2026-11-01" aria-label="Permalink: 2026-11-01">#</a></h2>
+<h3>Wave 126a — decimal literals typed like DuckDB ✅</h3>
+<p><code>1.5</code> is now <code>DECIMAL(2,1)</code>, as in DuckDB, instead of <code>DOUBLE</code>, so arithmetic with decimal columns keeps DuckDB's types and exact values: <code>x - 1.5</code> over a <code>DECIMAL(15,2)</code> column is <code>DECIMAL(16,2)</code>, <code>0.1 + 0.2</code> is <code>0.3</code>, and unaliased column names keep the literal as written (<code>(10 / 4.0)</code>). Literals with an exponent (<code>1e3</code>) or more than 38 digits stay <code>DOUBLE</code>; array literals keep <code>DOUBLE</code> elements. Filters against a column convert the literal once, so queries run as fast as before.</p>
 <h3>Wave 140 — QuackLab's ETL hot spots ✅</h3>
 <p>QuackLab's ETL on its NYC-taxi benchmark (local storage) went from 68 s to 1.8 s for the 1.87M-row initial batch (DuckDB: 2.2 s on the same machine), from 43 s to 1.5 s for the next batch and from 15 s to 1.4 s for a one-row correction. Results are unchanged.</p>
 <ul>
