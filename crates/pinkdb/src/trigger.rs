@@ -321,6 +321,21 @@ pub(crate) fn has_triggers(
         .any(|t| t.table.eq_ignore_ascii_case(table))
 }
 
+/// True when `event` has a row-level trigger on the table. The bulk write
+/// paths ask this before they skip the per-row machinery a trigger needs.
+pub(crate) fn has_row_triggers(
+    db: &PinkDb,
+    target_ns: &crate::storage::SchemaPath,
+    table: &str,
+    event: TriggerEvent,
+) -> bool {
+    db.triggers_in(target_ns).iter().any(|t| {
+        t.level == TriggerLevel::Row
+            && t.table.eq_ignore_ascii_case(table)
+            && t.fires_on(event, None)
+    })
+}
+
 /// Run a DML statement that has at least one trigger, wrapping the plain
 /// execution with the statement-level triggers and the atomicity/depth guard.
 pub(crate) fn run_with_triggers(
@@ -345,10 +360,15 @@ pub(crate) fn run_with_triggers(
             .filter(|d| d.timing == TriggerTiming::After && d.level == TriggerLevel::Statement)
             .collect();
         if !after.is_empty() {
-            // Only an AFTER STATEMENT trigger needs the changed rows; the DML
-            // arms append to this. Nested statements save/restore it (see
-            // `run_trigger`), so a body's own rows never leak into it.
-            db.trigger_capture = Some(Vec::new());
+            // A transition table is the only consumer of the changed rows. A
+            // plain `AFTER STATEMENT` trigger needs none, so a bulk write keeps
+            // its whole-chunk append and the trigger still fires afterwards.
+            if after
+                .iter()
+                .any(|d| d.old_table.is_some() || d.new_table.is_some())
+            {
+                db.trigger_capture = Some(Vec::new());
+            }
         }
         let result = crate::exec::run_plain(db, plan, budget.clone());
         let capture = db.trigger_capture.take().unwrap_or_default();

@@ -5,7 +5,7 @@
 //! `EXISTS`/`IN`, a grouped left join for scalars — see
 //! `docs/wave-120-plan.md`); the rest keep the executor's per-row path. Both
 //! are pinned here against DuckDB 2.0, whose answers are also re-measured when
-//! `/tmp/duckdb-2.0.0/duckdb` is present, so a pin cannot drift.
+//! `~/.local/bin/duckdb` is present, so a pin cannot drift.
 //!
 //! The classic COUNT bug of naive decorrelation — `count(*)` over no rows is
 //! 0, while a left join NULL-extends the missing group — has its own case
@@ -19,14 +19,23 @@ use pinkdb::{PinkDb, QueryResult, SyncPolicy, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-const DUCKDB: &str = "/tmp/duckdb-2.0.0/duckdb";
+/// The DuckDB reference binary: `HOME/.local/bin/duckdb`, or `PINKDB_DUCKDB`.
+fn duckdb_bin() -> String {
+    std::env::var("PINKDB_DUCKDB").unwrap_or_else(|_| {
+        format!(
+            "{}/.local/bin/duckdb",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    })
+}
 
 /// `oc` is the outer block, `ic` an inner table with duplicate and NULL keys,
 /// `mc` a two-column correlation target, `ec` a table whose `x` holds a NULL,
 /// `qc` an ordered set for the `ANY`/`ALL` quantifiers, and `xc`/`xci`/`yc` the
 /// correlated `IN` shapes: an operand that is *not* the correlation column
 /// (`xc`), a body group that mixes a NULL with values (`xci.oid = 5`), and an
-/// operand column that sits before the correlation column (`yc`).
+/// operand column that sits before the correlation column (`yc`), and `uc` a
+/// foreign-key table whose key holds a NULL.
 const SETUP: &str = "CREATE TABLE oc (k INT, v INT); \
      INSERT INTO oc VALUES (1,10),(2,20),(3,NULL),(4,40),(4,40); \
      CREATE TABLE ic (k INT, x INT); \
@@ -48,7 +57,9 @@ const SETUP: &str = "CREATE TABLE oc (k INT, v INT); \
      CREATE TABLE di (k INT, j INT, x INT); \
      INSERT INTO di VALUES (1,1,5),(1,2,6),(2,1,NULL),(4,2,40); \
      CREATE TABLE gc (a INT, b INT); \
-     INSERT INTO gc VALUES (10,1),(20,2),(30,3),(40,4);";
+     INSERT INTO gc VALUES (10,1),(20,2),(30,3),(40,4); \
+     CREATE TABLE uc (g INT, w INT); \
+     INSERT INTO uc VALUES (1,10),(2,20),(NULL,30);";
 
 fn db() -> PinkDb {
     let mut db = PinkDb::new();
@@ -91,10 +102,11 @@ fn tabs(db: &mut PinkDb, sql: &str) -> Vec<String> {
 
 /// `Some(rows)` when the DuckDB reference binary exists, else `None`.
 fn duck(sql: &str) -> Option<Vec<String>> {
-    if !std::path::Path::new(DUCKDB).exists() {
+    let bin = duckdb_bin();
+    if !std::path::Path::new(&bin).exists() {
         return None;
     }
-    let mut child = Command::new(DUCKDB)
+    let mut child = Command::new(bin)
         .args(["-no-agent", "-noheader", "-list", "-separator", "\t"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -525,6 +537,157 @@ const CASES: &[(&str, &str, &[&str])] = &[
          FROM dc ORDER BY k",
         &["1\t2", "2\t2", "3\t0", "4\t0"],
     ),
+    // ---- the staging foreign-key check (wave 140) ---------------------------
+    // A derived table that is a UNION used to run once per outer row: filter
+    // pushdown clones the correlated conjunct into both branches, below their
+    // projections, and the lift has to carry it back up over the set operation.
+    (
+        "union_not_exists",
+        "SELECT k FROM oc WHERE NOT EXISTS \
+         (SELECT 1 FROM (SELECT k FROM ic UNION SELECT k FROM mc) p WHERE p.k = oc.k) ORDER BY k",
+        &["4", "4"],
+    ),
+    (
+        "union_exists",
+        "SELECT k FROM oc WHERE EXISTS \
+         (SELECT 1 FROM (SELECT k FROM ic UNION SELECT k FROM mc) p WHERE p.k = oc.k) ORDER BY k",
+        &["1", "2", "3"],
+    ),
+    (
+        "union_in",
+        "SELECT k FROM oc WHERE k IN \
+         (SELECT k FROM (SELECT k FROM ic UNION SELECT k FROM mc) p WHERE p.k = oc.k) ORDER BY k",
+        &["1", "2", "3"],
+    ),
+    (
+        "union_scalar_count",
+        "SELECT k, (SELECT count(*) FROM (SELECT k FROM ic UNION ALL SELECT k FROM mc) p \
+         WHERE p.k = oc.k) AS c FROM oc ORDER BY k",
+        &["1\t4", "2\t3", "3\t1", "4\t0", "4\t0"],
+    ),
+    (
+        "union_multi_column",
+        "SELECT k, j FROM mc WHERE EXISTS (SELECT 1 FROM \
+         (SELECT k, j FROM mc WHERE x > 15 UNION SELECT k, j FROM di WHERE x > 10) p \
+         WHERE p.k = mc.k AND p.j = mc.j) ORDER BY k, j",
+        &["1\t2", "2\t1", "2\t2", "3\t1"],
+    ),
+    (
+        "union_multi_column_not_exists",
+        "SELECT k, j FROM mc WHERE NOT EXISTS (SELECT 1 FROM \
+         (SELECT k, j FROM mc WHERE x > 15 UNION SELECT k, j FROM di WHERE x > 10) p \
+         WHERE p.k = mc.k AND p.j = mc.j) ORDER BY k, j",
+        &["1\t1"],
+    ),
+    // The derived table renames one column and computes the other, so the
+    // conjunct arrives below the projection as `k` / `x + 1` and has to be
+    // rewritten over the projection's outputs.
+    (
+        "derived_renamed_column",
+        "SELECT k FROM dc WHERE EXISTS (SELECT 1 FROM \
+         (SELECT di.k AS dk, di.x + 1 AS y FROM di) z WHERE z.dk = dc.k) ORDER BY k",
+        &["1", "2", "4"],
+    ),
+    (
+        "derived_computed_column",
+        "SELECT k FROM dc WHERE EXISTS (SELECT 1 FROM \
+         (SELECT di.k AS dk, di.x + 1 AS y FROM di) z WHERE z.y = dc.v) ORDER BY k",
+        &[],
+    ),
+    (
+        "derived_renamed_and_computed",
+        "SELECT k FROM dc WHERE EXISTS (SELECT 1 FROM \
+         (SELECT di.k AS dk, di.x + 1 AS y FROM di) z \
+         WHERE z.dk = dc.k AND z.y = dc.v) ORDER BY k",
+        &[],
+    ),
+    (
+        "derived_distinct",
+        "SELECT k FROM oc WHERE EXISTS \
+         (SELECT 1 FROM (SELECT DISTINCT k FROM ic) z WHERE z.k = oc.k) ORDER BY k",
+        &["1", "2"],
+    ),
+    // Grouped derived table: the correlation on the group key rides out on the
+    // key, the one on the aggregate's output on the projection above it.
+    (
+        "derived_grouped_on_key",
+        "SELECT k, (SELECT sum(s) FROM (SELECT k, sum(x) AS s FROM ic GROUP BY k) g \
+         WHERE g.k = oc.k) AS s FROM oc ORDER BY k",
+        &["1\t300", "2\t300", "3\tNULL", "4\tNULL", "4\tNULL"],
+    ),
+    (
+        "derived_grouped_on_aggregate_output",
+        "SELECT k, (SELECT sum(s) FROM (SELECT k, sum(x) AS s FROM ic GROUP BY k) g \
+         WHERE g.s = oc.v) AS s FROM oc ORDER BY k",
+        &["1\tNULL", "2\tNULL", "3\tNULL", "4\tNULL", "4\tNULL"],
+    ),
+    // A NULL key on both sides: the inner set holds a NULL and the outer row
+    // holds one too, and neither ever equals anything.
+    (
+        "union_null_keys_not_exists",
+        "SELECT g FROM uc WHERE NOT EXISTS \
+         (SELECT 1 FROM (SELECT k FROM ic UNION SELECT k FROM mc) p WHERE p.k = uc.g) ORDER BY g",
+        &["NULL"],
+    ),
+    (
+        "union_null_keys_not_in",
+        "SELECT g FROM uc WHERE g NOT IN \
+         (SELECT k FROM (SELECT k FROM ic UNION SELECT k FROM mc) p WHERE p.k = uc.g) ORDER BY g",
+        &["NULL"],
+    ),
+    // ---- shapes the lift cannot reach, still answered per row --------------
+    (
+        "correlation_under_limit",
+        "SELECT k FROM oc WHERE EXISTS (SELECT 1 FROM ic WHERE ic.k = oc.k LIMIT 1) ORDER BY k",
+        &["1", "2"],
+    ),
+    (
+        "correlation_under_except",
+        "SELECT k FROM oc WHERE EXISTS (SELECT 1 FROM \
+         (SELECT k FROM mc WHERE mc.k = oc.k EXCEPT SELECT k FROM ic) p) ORDER BY k",
+        &["3"],
+    ),
+    (
+        "correlation_in_window_input",
+        "SELECT k FROM oc WHERE EXISTS (SELECT 1 FROM (SELECT k, \
+         row_number() OVER (ORDER BY k) AS rn FROM ic WHERE ic.x > oc.v) z \
+         WHERE z.k = oc.k) ORDER BY k",
+        &["1", "2"],
+    ),
+    (
+        "correlation_on_window_output",
+        "SELECT k FROM oc WHERE EXISTS (SELECT 1 FROM (SELECT k, \
+         row_number() OVER (ORDER BY k) AS rn FROM ic) z WHERE z.rn = oc.k) ORDER BY k",
+        &["1", "2", "3", "4", "4"],
+    ),
+    // A `HAVING` correlation lifted out of a grouped derived table names the
+    // aggregate's output by `AggRef`, which only the projection that exposes
+    // it can turn into a column: a filter between that projection and the
+    // aggregate leaves it unaddressable, so the lift must decline.
+    (
+        "correlation_above_grouped_derived_table",
+        "SELECT k FROM oc WHERE EXISTS (SELECT 1 FROM (SELECT ic.k FROM ic \
+         GROUP BY ic.k HAVING count(*) >= oc.k) z WHERE z.k IS NOT NULL) ORDER BY k",
+        &["1", "2"],
+    ),
+    // A `HAVING` conjunct names the aggregate's output by `AggRef`, which only
+    // the node directly above the aggregate can evaluate, so lifting it out of
+    // the aggregate would strand it. (The one above rides out on the enclosing
+    // `Project` instead.)
+    (
+        "correlation_in_having",
+        "SELECT k, v FROM oc WHERE EXISTS (SELECT 1 FROM ic GROUP BY ic.k \
+         HAVING sum(ic.x) > oc.v AND ic.k = oc.k) ORDER BY 1",
+        &["1\t10", "2\t20"],
+    ),
+    // The derived table's projection reads the enclosing row itself, so it
+    // cannot be lifted: the base would carry a read of a row that is not there.
+    (
+        "correlation_in_projection",
+        "SELECT k, v FROM oc WHERE EXISTS (SELECT 1 FROM \
+         (SELECT mc.k, oc.v AS vv FROM mc) p WHERE p.k = oc.k AND p.vv > 15) ORDER BY 1",
+        &["2\t20"],
+    ),
 ];
 
 #[test]
@@ -551,8 +714,9 @@ fn scalar_subquery_multiple_rows_errors() {
     // Both engines refuse with the same *kind*. DuckDB places this check in the
     // plan only for some shapes (`a < (subquery)` silently keeps the first
     // row), so the randomized test stays on aggregate scalars.
-    if Path::new(DUCKDB).exists() {
-        let mut child = Command::new(DUCKDB)
+    let bin = duckdb_bin();
+    if Path::new(&bin).exists() {
+        let mut child = Command::new(bin)
             .args(["-no-agent", "-noheader", "-list"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -631,6 +795,84 @@ fn explain_shows_the_decorrelated_plans() {
     );
     assert!(left.contains("Join left"), "{left}");
     assert!(left.contains("Aggregate keys="), "{left}");
+}
+
+/// A body whose correlation sits below a derived table's projection, a
+/// `DISTINCT`, a grouped aggregate or a `UNION` lifts out of the whole shape
+/// (wave 140): the subquery runs once, not once per outer row.
+#[test]
+fn derived_tables_and_unions_decorrelate() {
+    let mut db = db();
+    let plan = |db: &mut PinkDb, sql: &str| tabs(db, &format!("EXPLAIN {sql}")).join("\n");
+    for (want, sql) in [
+        (
+            "Join anti",
+            "SELECT k FROM oc WHERE NOT EXISTS \
+             (SELECT 1 FROM (SELECT k FROM ic UNION SELECT k FROM mc) p WHERE p.k = oc.k)",
+        ),
+        (
+            "Join semi",
+            "SELECT k FROM oc WHERE EXISTS \
+             (SELECT 1 FROM (SELECT k FROM ic UNION SELECT k FROM mc) p WHERE p.k = oc.k)",
+        ),
+        (
+            "Join mark",
+            "SELECT k FROM oc WHERE k IN \
+             (SELECT k FROM (SELECT k FROM ic UNION SELECT k FROM mc) p WHERE p.k = oc.k)",
+        ),
+        (
+            "Join left",
+            "SELECT k, (SELECT count(*) FROM (SELECT k FROM ic UNION ALL SELECT k FROM mc) p \
+             WHERE p.k = oc.k) FROM oc",
+        ),
+        (
+            "Join semi",
+            "SELECT k FROM dc WHERE EXISTS (SELECT 1 FROM \
+             (SELECT di.k AS dk, di.x + 1 AS y FROM di) z WHERE z.dk = dc.k AND z.y = dc.v)",
+        ),
+        (
+            "Join semi",
+            "SELECT k FROM oc WHERE EXISTS \
+             (SELECT 1 FROM (SELECT DISTINCT k FROM ic) z WHERE z.k = oc.k)",
+        ),
+        (
+            "Join left",
+            "SELECT k, (SELECT sum(s) FROM (SELECT k, sum(x) AS s FROM ic GROUP BY k) g \
+             WHERE g.k = oc.k) FROM oc",
+        ),
+    ] {
+        let text = plan(&mut db, sql);
+        assert!(text.contains(want), "{sql}: {text}");
+        // The per-row path keeps the subquery as an expression, where its
+        // filter reads `EXISTS (subquery)` / `#0 IN (subquery)`.
+        assert!(!text.contains("EXISTS (subquery)"), "{sql}: {text}");
+        assert!(!text.contains("IN (subquery)"), "{sql}: {text}");
+    }
+}
+
+/// What the lift refuses — a correlation under a `LIMIT`, inside an `EXCEPT`
+/// branch, or in the input of a window — keeps the executor's per-row path.
+/// The answers are pinned in [`CASES`].
+#[test]
+fn shapes_the_lift_cannot_reach_keep_the_per_row_path() {
+    let mut db = db();
+    for sql in [
+        "SELECT k FROM oc WHERE EXISTS (SELECT 1 FROM ic WHERE ic.k = oc.k LIMIT 1)",
+        "SELECT k FROM oc WHERE EXISTS (SELECT 1 FROM \
+         (SELECT k FROM mc WHERE mc.k = oc.k EXCEPT SELECT k FROM ic) p)",
+        "SELECT k FROM oc WHERE EXISTS (SELECT 1 FROM (SELECT k, \
+         row_number() OVER (ORDER BY k) AS rn FROM ic WHERE ic.x > oc.v) z \
+         WHERE z.k = oc.k)",
+        "SELECT k FROM oc WHERE EXISTS (SELECT 1 FROM (SELECT ic.k FROM ic \
+         GROUP BY ic.k HAVING count(*) >= oc.k) z WHERE z.k IS NOT NULL)",
+        "SELECT k, v FROM oc WHERE EXISTS (SELECT 1 FROM ic GROUP BY ic.k \
+         HAVING sum(ic.x) > oc.v AND ic.k = oc.k)",
+        "SELECT k, v FROM oc WHERE EXISTS (SELECT 1 FROM \
+         (SELECT mc.k, oc.v AS vv FROM mc) p WHERE p.k = oc.k AND p.vv > 15)",
+    ] {
+        let text = tabs(&mut db, &format!("EXPLAIN {sql}")).join("\n");
+        assert!(text.contains("EXISTS (subquery)"), "{sql}: {text}");
+    }
 }
 
 /// A correlated subquery in `UPDATE … WHERE` / `DELETE … WHERE` decides each

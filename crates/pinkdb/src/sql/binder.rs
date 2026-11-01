@@ -6024,80 +6024,426 @@ fn rewire_to_keys(expr: BoundExpr, keys: &[(usize, usize)], key_base: usize) -> 
     })
 }
 
-/// Whether `plan` is built only from FROM-clause nodes, so a conjunction above
-/// it filters the rows it produces without changing their meaning.
-/// Replace every `Filter` in a from-tree with its input, collecting the
-/// conjuncts and renumbering them into the tree's own column space (`offset`
-/// is the tree's first column in it).
+/// Whether any expression in `plan` reads a row of the block enclosing the
+/// subquery body `plan` is part of.
 ///
-/// A subquery body is optimized before it is bound here, and pushdown leaves a
-/// predicate on the table it reads with that table's local indices; over the
-/// inner and cross joins a from-tree may contain, a conjunct sees the same row
-/// either way.
-fn strip_from_filters(plan: &LogicalPlan, out: &mut Vec<BoundExpr>, offset: usize) -> LogicalPlan {
+/// A derived table, a view body and a set-operation branch all bind in the
+/// frame of the block they sit in, so an `OuterRef` at depth 0 anywhere in the
+/// body's plan names that enclosing row. A nested subquery keeps its own frame
+/// instead: depth 0 there is this body's row, so only a read past it (`deep`,
+/// or a depth of 1 and beyond) names the enclosing row.
+///
+/// A node whose expressions this does not inspect counts as reading the row,
+/// so the extraction below declines such a plan instead of lifting a
+/// correlation out of a shape it does not model.
+fn plan_reads_enclosing_row(plan: &LogicalPlan) -> bool {
+    let expr = reads_enclosing_row;
+    match plan {
+        LogicalPlan::Scan { .. } | LogicalPlan::SingleRow | LogicalPlan::TableFunction { .. } => {
+            false
+        }
+        LogicalPlan::Values { rows, .. } => rows.iter().flatten().any(expr),
+        LogicalPlan::Filter { input, predicate } => {
+            expr(predicate) || plan_reads_enclosing_row(input)
+        }
+        LogicalPlan::Cte {
+            query,
+            body,
+            recursive,
+            ..
+        } => {
+            plan_reads_enclosing_row(query)
+                || plan_reads_enclosing_row(body)
+                || recursive
+                    .as_ref()
+                    .is_some_and(|r| plan_reads_enclosing_row(&r.step))
+        }
+        LogicalPlan::Window { input, windows, .. } => {
+            plan_reads_enclosing_row(input)
+                || windows.iter().any(|w| {
+                    w.arg.iter().chain(&w.default).chain(&w.filter).any(expr)
+                        || w.partition.iter().any(expr)
+                        || w.order.iter().any(|(key, _)| expr(key))
+                })
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            residual,
+            ..
+        } => {
+            plan_reads_enclosing_row(left)
+                || plan_reads_enclosing_row(right)
+                || left_keys.iter().chain(right_keys).any(expr)
+                || residual.as_ref().is_some_and(expr)
+        }
+        LogicalPlan::NestedLoopJoin {
+            left, right, on, ..
+        } => {
+            plan_reads_enclosing_row(left)
+                || plan_reads_enclosing_row(right)
+                || on.as_ref().is_some_and(expr)
+        }
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            plan_reads_enclosing_row(input)
+                || keys.iter().any(&expr)
+                || aggs
+                    .iter()
+                    .any(|a| a.arg.iter().chain(&a.filter).any(&expr))
+        }
+        LogicalPlan::Project { input, exprs, .. } => {
+            plan_reads_enclosing_row(input) || exprs.iter().any(expr)
+        }
+        LogicalPlan::Distinct { input, .. } => plan_reads_enclosing_row(input),
+        LogicalPlan::SetOp { left, right, .. } => {
+            plan_reads_enclosing_row(left) || plan_reads_enclosing_row(right)
+        }
+        LogicalPlan::Sort { input, keys } => {
+            plan_reads_enclosing_row(input) || keys.iter().any(|(key, _)| expr(key))
+        }
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Sample { input, .. } => plan_reads_enclosing_row(input),
+        _ => true,
+    }
+}
+
+/// Whether `expr` reads a row of the block enclosing its subquery body (see
+/// [`plan_reads_enclosing_row`]).
+fn reads_enclosing_row(expr: &BoundExpr) -> bool {
+    let mut read = false;
+    walk_bound_expr(expr, &mut |e| {
+        read |= match e {
+            BoundExpr::OuterRef { depth, .. } => *depth == 0,
+            BoundExpr::ScalarSubquery { outer, .. }
+            | BoundExpr::Exists { outer, .. }
+            | BoundExpr::InSubquery { outer, .. } => {
+                outer.deep || outer.refs.iter().any(|(depth, _)| *depth > 0)
+            }
+            _ => false,
+        };
+    });
+    read
+}
+
+/// A subquery body with its correlation lifted off it: `base` produces the
+/// rows, `conjuncts` say which enclosing row each must match, in `base`'s own
+/// column space.
+struct Lifted {
+    base: LogicalPlan,
+    conjuncts: Vec<BoundExpr>,
+}
+
+/// Parked column index base: a column that now names output column `pos` is
+/// written `PARKED - pos`, above any index a plan can hold, so a column left
+/// over from the node's input stays recognisable below it.
+const PARKED: usize = usize::MAX;
+
+/// Turn the parked output columns of `expr` back into output column indices,
+/// or fail when the conjunct is not addressable in the node's output at all:
+/// a column of the node's input left unparked.
+fn unpark(expr: BoundExpr, outputs: usize) -> Option<BoundExpr> {
+    let mut addressable = true;
+    walk_bound_expr(&expr, &mut |e| {
+        if let BoundExpr::Column { index, .. } = e {
+            addressable &= *index > PARKED - outputs;
+        }
+    });
+    addressable.then(|| crate::plan::map_columns(expr, &|i| PARKED - i))
+}
+
+/// Whether `expr` names an aggregate or window output. Only the node directly
+/// above an `Aggregate` or `Window` can evaluate those, and it does so by
+/// position in its own output, so a lifted conjunct must not carry one: the
+/// plan above the base reads plain columns.
+fn names_aggregate_or_window(expr: &BoundExpr) -> bool {
+    let mut names = false;
+    walk_bound_expr(expr, &mut |e| {
+        names |= matches!(e, BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. });
+    });
+    names
+}
+
+/// Split a body plan into the rows it produces and the conjuncts that tie them
+/// to the enclosing block, lifting each conjunct as far up as the node above
+/// it allows.
+///
+/// The returned base always has `plan`'s output columns, so a body's `In`
+/// value and `Scalar` aggregate still address it. `None` when a correlation
+/// sits under a node that changes which rows or columns reach the conjunct; the
+/// caller then keeps the per-row path.
+///
+/// DuckDB reaches the same split from the other side: an independent subtree
+/// gets the domain attached and only the correlated nodes are pushed down (see
+/// `src/planner/subquery/flatten_dependent_join.cpp`,
+/// `PushDownCorrelatedNodeInternal`, `RequiresDomain` and
+/// `AttachDomainToIndependentSubtree`).
+fn lift_correlation(plan: &LogicalPlan) -> Result<Option<Lifted>> {
+    // Nothing here reads the enclosing row, so the rows stand as they are and
+    // the conjuncts above already address them.
+    if !plan_reads_enclosing_row(plan) {
+        return Ok(Some(Lifted {
+            base: plan.clone(),
+            conjuncts: Vec::new(),
+        }));
+    }
     match plan {
         LogicalPlan::Filter { input, predicate } => {
             let mut flat = Vec::new();
             split_conjuncts(predicate.clone(), &mut flat);
-            out.extend(
-                flat.into_iter()
-                    .map(|c| crate::plan::map_columns(c, &|i| i + offset)),
-            );
-            strip_from_filters(input, out, offset)
+            let (lifted, kept): (Vec<_>, Vec<_>) = flat.into_iter().partition(reads_enclosing_row);
+            let Some(inner) = lift_correlation(input)? else {
+                return Ok(None);
+            };
+            // The conjuncts came from this filter or below it, so lifting them
+            // past a leaf `Aggregate`/`Window` would strand an `AggRef` or
+            // `WindowRef` above the only node that can evaluate it.
+            if lifted.iter().any(names_aggregate_or_window) {
+                return Ok(None);
+            }
+            // A filter's row is its input's row, so both halves keep their
+            // indices: the uncorrelated conjuncts stay on the base and the
+            // lifted ones join the ones below.
+            let base = match and_all(kept) {
+                Some(predicate) => LogicalPlan::Filter {
+                    input: Box::new(inner.base),
+                    predicate,
+                },
+                None => inner.base,
+            };
+            let mut conjuncts = inner.conjuncts;
+            conjuncts.extend(lifted);
+            Ok(Some(Lifted { base, conjuncts }))
         }
+        // Only an inner or cross join keeps every pair it reads, so a
+        // conjunct of either side filters the same pairs before or after it.
         LogicalPlan::Join {
-            kind,
+            kind: kind @ (JoinKind::Inner | JoinKind::Cross),
             left,
             right,
             left_keys,
             right_keys,
             left_cols,
             residual,
-        } => LogicalPlan::Join {
-            kind: *kind,
-            left: Box::new(strip_from_filters(left, out, offset)),
-            right: Box::new(strip_from_filters(right, out, offset + left_cols)),
-            left_keys: left_keys.clone(),
-            right_keys: right_keys.clone(),
-            left_cols: *left_cols,
-            residual: residual.clone(),
-        },
+        } => {
+            // Keys and a residual test a candidate pair, not a row, so a
+            // correlation inside them cannot be lifted.
+            if left_keys.iter().chain(right_keys).any(reads_enclosing_row)
+                || residual.as_ref().is_some_and(reads_enclosing_row)
+            {
+                return Ok(None);
+            }
+            let (Some(left), Some(right)) = (lift_correlation(left)?, lift_correlation(right)?)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(Lifted {
+                base: LogicalPlan::Join {
+                    kind: *kind,
+                    left: Box::new(left.base),
+                    right: Box::new(right.base),
+                    left_keys: left_keys.clone(),
+                    right_keys: right_keys.clone(),
+                    left_cols: *left_cols,
+                    residual: residual.clone(),
+                },
+                conjuncts: left
+                    .conjuncts
+                    .into_iter()
+                    .chain(
+                        right
+                            .conjuncts
+                            .into_iter()
+                            .map(|c| crate::plan::map_columns(c, &|i| i + left_cols)),
+                    )
+                    .collect(),
+            }))
+        }
         LogicalPlan::NestedLoopJoin {
-            kind,
+            kind: kind @ (JoinKind::Inner | JoinKind::Cross),
             left,
             right,
             on,
             left_cols,
-        } => LogicalPlan::NestedLoopJoin {
-            kind: *kind,
-            left: Box::new(strip_from_filters(left, out, offset)),
-            right: Box::new(strip_from_filters(right, out, offset + left_cols)),
-            on: on.clone(),
-            left_cols: *left_cols,
-        },
-        other => other.clone(),
-    }
-}
-
-fn is_from_tree(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan { .. }
-        | LogicalPlan::Values { .. }
-        | LogicalPlan::SingleRow
-        | LogicalPlan::TableFunction { .. } => true,
-        LogicalPlan::Join {
-            kind: JoinKind::Inner | JoinKind::Cross,
-            left,
-            right,
-            ..
+        } => {
+            if on.as_ref().is_some_and(reads_enclosing_row) {
+                return Ok(None);
+            }
+            let (Some(left), Some(right)) = (lift_correlation(left)?, lift_correlation(right)?)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(Lifted {
+                base: LogicalPlan::NestedLoopJoin {
+                    kind: *kind,
+                    left: Box::new(left.base),
+                    right: Box::new(right.base),
+                    on: on.clone(),
+                    left_cols: *left_cols,
+                },
+                conjuncts: left
+                    .conjuncts
+                    .into_iter()
+                    .chain(
+                        right
+                            .conjuncts
+                            .into_iter()
+                            .map(|c| crate::plan::map_columns(c, &|i| i + left_cols)),
+                    )
+                    .collect(),
+            }))
         }
-        | LogicalPlan::NestedLoopJoin {
-            kind: JoinKind::Inner | JoinKind::Cross,
+        // A projection emits one row per input row, so a conjunct over its
+        // output filters the same rows above it. Each column the conjunct
+        // reads is rewritten to the output column that produces it.
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => {
+            // `exprs` shape the rows the base still produces, so one that
+            // reads the enclosing row has no outer row left to read it.
+            if exprs.iter().any(reads_enclosing_row) {
+                return Ok(None);
+            }
+            let Some(inner) = lift_correlation(input)? else {
+                return Ok(None);
+            };
+            let mut conjuncts = Vec::with_capacity(inner.conjuncts.len());
+            for conjunct in inner.conjuncts {
+                // The subquery's own body reads the input row, which the
+                // output no longer names.
+                if conjunct.has_subquery() {
+                    return Ok(None);
+                }
+                let lifted = map_bound_expr(conjunct, &mut |e| {
+                    Ok(match exprs.iter().position(|p| *p == e) {
+                        Some(pos) => BoundExpr::Column {
+                            index: PARKED - pos,
+                            dtype: e.dtype(),
+                        },
+                        None => e,
+                    })
+                })?;
+                match unpark(lifted, exprs.len()) {
+                    Some(conjunct) => conjuncts.push(conjunct),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(Lifted {
+                base: LogicalPlan::Project {
+                    input: Box::new(inner.base),
+                    exprs: exprs.clone(),
+                    names: names.clone(),
+                },
+                conjuncts,
+            }))
+        }
+        // Grouping emits one row per group: a conjunct over plain group keys
+        // describes that row, anything else (an aggregate's value, an
+        // ungrouped aggregate's single row) does not.
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            if keys.is_empty()
+                || keys.iter().any(reads_enclosing_row)
+                || aggs
+                    .iter()
+                    .any(|a| a.arg.iter().chain(&a.filter).any(reads_enclosing_row))
+            {
+                return Ok(None);
+            }
+            let Some(inner) = lift_correlation(input)? else {
+                return Ok(None);
+            };
+            let mut conjuncts = Vec::with_capacity(inner.conjuncts.len());
+            for conjunct in inner.conjuncts {
+                if conjunct.has_subquery() {
+                    return Ok(None);
+                }
+                let lifted = crate::plan::map_columns(conjunct, &|i| match keys
+                    .iter()
+                    .position(|k| matches!(k, BoundExpr::Column { index, .. } if *index == i))
+                {
+                    Some(pos) => PARKED - pos,
+                    None => i,
+                });
+                match unpark(lifted, keys.len()) {
+                    Some(conjunct) => conjuncts.push(conjunct),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(Lifted {
+                base: LogicalPlan::Aggregate {
+                    input: Box::new(inner.base),
+                    keys: keys.clone(),
+                    aggs: aggs.clone(),
+                },
+                conjuncts,
+            }))
+        }
+        LogicalPlan::Distinct { input, on } => {
+            let Some(inner) = lift_correlation(input)? else {
+                return Ok(None);
+            };
+            // Plain DISTINCT removes whole-row duplicates, so a conjunct over
+            // any column filters the same rows before or after it. DISTINCT ON
+            // keeps the first row per key: only a conjunct over those keys
+            // cannot change which row that is.
+            if let Some(keys) = on {
+                for conjunct in &inner.conjuncts {
+                    let mut over_keys = !conjunct.has_subquery();
+                    walk_bound_expr(conjunct, &mut |e| {
+                        if let BoundExpr::Column { index, .. } = e {
+                            over_keys &= keys.contains(index);
+                        }
+                    });
+                    if !over_keys {
+                        return Ok(None);
+                    }
+                }
+            }
+            Ok(Some(Lifted {
+                base: LogicalPlan::Distinct {
+                    input: Box::new(inner.base),
+                    on: on.clone(),
+                },
+                conjuncts: inner.conjuncts,
+            }))
+        }
+        // Both branches of a union produce the same output row, so one
+        // predicate cloned into each lifts back out once; a predicate that
+        // reached only one branch stands for different rows per branch.
+        LogicalPlan::SetOp {
+            op: op @ (SetOp::Union | SetOp::UnionAll),
             left,
             right,
-            ..
-        } => is_from_tree(left) && is_from_tree(right),
-        _ => false,
+            types,
+        } => {
+            let (Some(left), Some(right)) = (lift_correlation(left)?, lift_correlation(right)?)
+            else {
+                return Ok(None);
+            };
+            // Equal as multisets: a conjunct that reached only one branch
+            // stands for different rows there, so the two cannot be one
+            // predicate above the union.
+            if left.conjuncts.len() != right.conjuncts.len()
+                || left.conjuncts.iter().any(|c| !right.conjuncts.contains(c))
+                || right.conjuncts.iter().any(|c| !left.conjuncts.contains(c))
+            {
+                return Ok(None);
+            }
+            Ok(Some(Lifted {
+                base: LogicalPlan::SetOp {
+                    op: *op,
+                    left: Box::new(left.base),
+                    right: Box::new(right.base),
+                    types: types.clone(),
+                },
+                conjuncts: left.conjuncts,
+            }))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -6527,21 +6873,25 @@ impl Binder<'_> {
                 _ => return Ok(None),
             },
         }
-        // A comma-join extraction can leave a correlation predicate as a
-        // `Filter` above a leaf (`p_partkey = ps_partkey` over the `partsupp`
-        // scan), so splice away every filter in the tree: over inner and cross
-        // joins those conjuncts are ordinary conditions on the row the tree
-        // produces.
-        let mut conjuncts = Vec::new();
-        let plan = &strip_from_filters(plan, &mut conjuncts, 0);
-        if !is_from_tree(plan) {
+        // A body bound with a comma join can carry a correlation predicate as
+        // a `Filter` over a leaf (`p_partkey = ps_partkey` over the `partsupp`
+        // scan), so lift every filter above the rows it describes, as far up as
+        // the node above it allows.
+        let Some(lifted) = lift_correlation(plan)? else {
             return Ok(None);
-        }
-        let base_width = plan_schema(self.db, &self.default_ns, &self.ctes, plan)?.len();
+        };
+        // The dependent join evaluates the conjuncts itself, so the base must
+        // not leave one behind that needs the enclosing row.
+        debug_assert!(
+            !plan_reads_enclosing_row(&lifted.base),
+            "lifted base still reads the enclosing row: {:?}",
+            lifted.base
+        );
+        let base_width = plan_schema(self.db, &self.default_ns, &self.ctes, &lifted.base)?.len();
         Ok(Some(CorrelatedBody {
-            base: plan.clone(),
+            base: lifted.base,
             base_width,
-            conjuncts,
+            conjuncts: lifted.conjuncts,
             value,
             aggs,
             counts,

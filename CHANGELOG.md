@@ -9,6 +9,29 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-01
+### Wave 140 — QuackLab's ETL hot spots ✅
+
+QuackLab's ETL on its NYC-taxi benchmark (local storage) went from 68 s to
+1.8 s for the 1.87M-row initial batch (DuckDB: 2.2 s on the same machine),
+from 43 s to 1.5 s for the next batch and from 15 s to 1.4 s for a one-row
+correction. Results are unchanged.
+
+- **Foreign-key checks over a `UNION`:** a correlated `EXISTS`, `NOT
+  EXISTS`, `IN` or scalar subquery whose body reads a derived table (a
+  `UNION`, `UNION ALL`, `DISTINCT`, a projection, a `GROUP BY` on the
+  correlated key) now runs as a join instead of once per outer row. QuackLab's
+  staging check over 1.92M rows: 5 s → 7 ms.
+- **`MERGE`** matches with a hash table, evaluates `ON`, the clause
+  conditions and the `SET` / `INSERT` values a chunk at a time, skips target
+  chunks that cannot match, and writes in bulk. One source row into 1.92M
+  rows: 6.6 s → 0.09 s; 960k matched rows: 45 s → 0.7 s; 1.92M inserts into
+  an empty table: 0.24 s. `UPDATE … FROM` and `DELETE … USING` probe the same
+  way.
+- **`CREATE TABLE … AS SELECT` and `INSERT … SELECT`** append whole column
+  vectors instead of one row at a time (1.92M × 18 columns: 1.5 s → 0.06 s).
+- **Fixed:** `RETURNING`, a data-modifying CTE and a `REFERENCING`
+  transition table failed with "vector overflow" past 2048 rows.
+
 ### Wave 139 — QuackLab leftovers: defaults, uuid(), TEMP tables ✅
 
 QuackLab's golden fixtures now run with their column defaults as written

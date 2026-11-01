@@ -195,6 +195,14 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-11-01">2026-11-01<a class="anchor" href="#2026-11-01" aria-label="Permalink: 2026-11-01">#</a></h2>
+<h3>Wave 140 — QuackLab's ETL hot spots ✅</h3>
+<p>QuackLab's ETL on its NYC-taxi benchmark (local storage) went from 68 s to 1.8 s for the 1.87M-row initial batch (DuckDB: 2.2 s on the same machine), from 43 s to 1.5 s for the next batch and from 15 s to 1.4 s for a one-row correction. Results are unchanged.</p>
+<ul>
+<li><strong>Foreign-key checks over a <code>UNION</code>:</strong> a correlated <code>EXISTS</code>, <code>NOT EXISTS</code>, <code>IN</code> or scalar subquery whose body reads a derived table (a <code>UNION</code>, <code>UNION ALL</code>, <code>DISTINCT</code>, a projection, a <code>GROUP BY</code> on the correlated key) now runs as a join instead of once per outer row. QuackLab's staging check over 1.92M rows: 5 s → 7 ms.</li>
+<li><strong><code>MERGE</code></strong> matches with a hash table, evaluates <code>ON</code>, the clause conditions and the <code>SET</code> / <code>INSERT</code> values a chunk at a time, skips target chunks that cannot match, and writes in bulk. One source row into 1.92M rows: 6.6 s → 0.09 s; 960k matched rows: 45 s → 0.7 s; 1.92M inserts into an empty table: 0.24 s. <code>UPDATE … FROM</code> and <code>DELETE … USING</code> probe the same way.</li>
+<li><strong><code>CREATE TABLE … AS SELECT</code> and <code>INSERT … SELECT</code></strong> append whole column vectors instead of one row at a time (1.92M × 18 columns: 1.5 s → 0.06 s).</li>
+<li><strong>Fixed:</strong> <code>RETURNING</code>, a data-modifying CTE and a <code>REFERENCING</code> transition table failed with "vector overflow" past 2048 rows.</li>
+</ul>
 <h3>Wave 139 — QuackLab leftovers: defaults, uuid(), TEMP tables ✅</h3>
 <p>QuackLab's golden fixtures now run with their column defaults as written (117 of 117, no workaround left in the harness).</p>
 <ul>

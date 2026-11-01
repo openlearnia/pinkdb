@@ -520,23 +520,27 @@ impl Output {
     }
 }
 
-/// Build a one-chunk output from materialized rows — how a trigger's
-/// transition table reaches the executor (`FROM <alias>`).
+/// Build an output from materialized rows — how a trigger's transition table
+/// reaches the executor (`FROM <alias>`). Split at [`CHUNK_SIZE`]: a statement
+/// can change more rows than one chunk holds.
 pub(crate) fn output_from_rows(
     schema: &[(String, DataType)],
     rows: &[Vec<Value>],
 ) -> Result<Output> {
-    let mut columns = Vec::with_capacity(schema.len());
-    for (i, (_, dtype)) in schema.iter().enumerate() {
-        let mut vector = Vector::with_capacity(*dtype, rows.len());
-        for row in rows {
-            vector.push_value(row.get(i).cloned().unwrap_or(Value::Null))?;
+    let mut chunks = Vec::with_capacity(rows.len().div_ceil(CHUNK_SIZE));
+    for window in rows.chunks(CHUNK_SIZE) {
+        let mut columns = Vec::with_capacity(schema.len());
+        for (i, (_, dtype)) in schema.iter().enumerate() {
+            let mut vector = Vector::with_capacity(*dtype, window.len());
+            for row in window {
+                vector.push_value(row.get(i).cloned().unwrap_or(Value::Null))?;
+            }
+            columns.push(vector);
         }
-        columns.push(vector);
+        chunks.push(DataChunk::new(columns)?);
     }
-    let chunk = DataChunk::new(columns)?;
     Ok(Output {
-        chunks: vec![chunk],
+        chunks,
         names: schema.iter().map(|(n, _)| n.clone()).collect(),
         types: schema.iter().map(|(_, t)| *t).collect(),
     })
@@ -1372,6 +1376,78 @@ fn finish_dml(
     returning_result(db, r, &schema, rows)
 }
 
+/// Stage `chunks` as target-width append batches of at most [`CHUNK_SIZE`]
+/// rows: `sources[target]` names that target column's source column in the
+/// chunk, and `None` repeats the column's `default`.
+///
+/// A source column that already is in the target's type is shared whole, with
+/// no per-cell `Value`; a different type is coerced cell by cell through
+/// [`DataTable::coerce`], the matrix an `INSERT` applies today. Every batch is
+/// built before the caller appends the first one, so a failed coercion leaves
+/// the target untouched.
+fn stage_batches(
+    chunks: &[DataChunk],
+    sources: &[Option<usize>],
+    schema: &[(String, DataType)],
+    defaults: &[Value],
+    budget: &ExecBudget,
+) -> Result<Vec<Vec<std::sync::Arc<Vector>>>> {
+    let mut staged = Vec::new();
+    for chunk in chunks {
+        budget.check_deadline()?;
+        for start in (0..chunk.num_rows()).step_by(CHUNK_SIZE) {
+            let end = (start + CHUNK_SIZE).min(chunk.num_rows());
+            staged.push(stage_batch(chunk, start..end, sources, schema, defaults)?);
+        }
+    }
+    Ok(staged)
+}
+
+/// One [`stage_batches`] batch: the rows `rows` of `chunk` in target schema
+/// order.
+fn stage_batch(
+    chunk: &DataChunk,
+    rows: std::ops::Range<usize>,
+    sources: &[Option<usize>],
+    schema: &[(String, DataType)],
+    defaults: &[Value],
+) -> Result<Vec<std::sync::Arc<Vector>>> {
+    let len = rows.len();
+    let mut batch = Vec::with_capacity(schema.len());
+    for (tgt, (_, ty)) in schema.iter().enumerate() {
+        let column = match sources.get(tgt).copied().flatten() {
+            Some(src) => {
+                let col = chunk.expect_column(src)?;
+                // The whole chunk in the target's own type: append the query's
+                // vector as it is (chunking may split an oversized chunk, and
+                // a converted column has to be copied anyway).
+                if rows.start == 0 && len == chunk.num_rows() && col.dtype() == *ty {
+                    std::sync::Arc::clone(col)
+                } else {
+                    let mut out = Vector::with_capacity(*ty, len);
+                    for i in rows.clone() {
+                        out.push_value(DataTable::coerce(col.get(i), *ty)?)?;
+                    }
+                    std::sync::Arc::new(out)
+                }
+            }
+            None => std::sync::Arc::new(const_vector(&defaults[tgt], *ty, len)?),
+        };
+        batch.push(column);
+    }
+    Ok(batch)
+}
+
+/// `n` copies of one column `DEFAULT`, in the column's type.
+fn const_vector(value: &Value, ty: DataType, n: usize) -> Result<Vector> {
+    let value = DataTable::coerce(value.clone(), ty)?;
+    let mut out = Vector::with_capacity(ty, n);
+    for _ in 0..n {
+        out.push_value(value.clone())?;
+    }
+    Ok(out)
+}
+
 /// The statement executor without trigger handling: `run_with_budget` is the
 /// entry point that wraps this with any triggers the statement fires.
 pub(crate) fn run_plain(
@@ -1427,8 +1503,9 @@ pub(crate) fn run_plain(
                 return Ok(QueryResult::Created);
             }
             // Evaluate the query first (it must not see the new table), then
-            // create and fill. Every cell is coerced before the first append,
-            // so a type error leaves no half-filled table.
+            // create and fill. The output columns already have the new table's
+            // types, so their vectors append whole; staging every batch first
+            // keeps a type error from leaving a half-filled table.
             let out = {
                 let cx = Cx::with_budget(db, budget.clone()).with_projections(plan);
                 eval(&cx, query)?
@@ -1439,24 +1516,16 @@ pub(crate) fn run_plain(
                 .cloned()
                 .zip(out.types.iter().copied())
                 .collect();
-            let mut staged = Vec::new();
-            for chunk in &out.chunks {
-                budget.check_deadline()?;
-                for i in 0..chunk.num_rows() {
-                    let mut values = Vec::with_capacity(schema.len());
-                    for (col, (_, t)) in chunk.columns.iter().zip(schema.iter()) {
-                        values.push(DataTable::coerce(col.get(i), *t)?);
-                    }
-                    staged.push(values);
-                }
-            }
+            let sources: Vec<Option<usize>> = (0..schema.len()).map(Some).collect();
+            let defaults = vec![Value::Null; schema.len()];
+            let staged = stage_batches(&out.chunks, &sources, &schema, &defaults, &budget)?;
             if *or_replace {
                 replace_table(db, &target, name)?;
             }
             db.create_table_in(&target, name, schema)?;
             let t = db.table_mut_in(&target, name)?;
-            for values in staged {
-                t.append_row(values)?;
+            for batch in &staged {
+                t.append_shared_chunk(batch)?;
             }
             Ok(QueryResult::Created)
         }
@@ -1551,6 +1620,69 @@ pub(crate) fn run_plain(
             let order: Vec<usize> = columns
                 .clone()
                 .unwrap_or_else(|| (0..schema.len()).collect());
+            // The bulk path below appends whole batches, so it is taken only
+            // when a row-at-a-time write adds nothing: no conflict clause, no
+            // RETURNING (whose capture `finish_dml` installs), no row trigger
+            // and no declared key. Otherwise the row path runs unchanged.
+            let row_path = conflict.is_some()
+                || returning.is_some()
+                || db.trigger_capture.is_some()
+                || !t0.constraints.keys.is_empty()
+                || crate::trigger::has_row_triggers(
+                    db,
+                    &target,
+                    table,
+                    crate::trigger::TriggerEvent::Insert,
+                );
+            if !row_path {
+                let mut sources = vec![None; schema.len()];
+                for (src, &tgt) in order.iter().enumerate() {
+                    sources[tgt] = Some(src);
+                }
+                // Each unlisted column with a DEFAULT (wave 139a) evaluates it
+                // once per source chunk, against that chunk, so a volatile
+                // default varies per row; the result rides as one more shared
+                // column of the chunk, mapped like a source column.
+                let unlisted: Vec<(usize, &BoundExpr)> = default_exprs
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| !order.contains(idx))
+                    .filter_map(|(idx, e)| e.as_ref().map(|e| (idx, e)))
+                    .collect();
+                for (k, (idx, _)) in unlisted.iter().enumerate() {
+                    sources[*idx] = Some(order.len() + k);
+                }
+                let chunks: Vec<DataChunk> = if unlisted.is_empty() {
+                    out.chunks.clone()
+                } else {
+                    let cx = Cx::with_budget(db, budget.clone());
+                    let mut widened = Vec::with_capacity(out.chunks.len());
+                    for chunk in &out.chunks {
+                        let mut cols = chunk.columns.clone();
+                        for (_, expr) in &unlisted {
+                            let v = eval_expr(expr, chunk, &cx)?;
+                            if v.len() != chunk.num_rows() {
+                                return Err(PinkDbError::Execution(
+                                    "a column DEFAULT did not evaluate per row".to_string(),
+                                ));
+                            }
+                            cols.push(std::sync::Arc::new(v));
+                        }
+                        let mut widened_chunk = DataChunk::projected(cols, chunk.num_rows());
+                        widened_chunk.ordinal = chunk.ordinal;
+                        widened.push(widened_chunk);
+                    }
+                    widened
+                };
+                let defaults = vec![Value::Null; schema.len()];
+                let count: usize = out.chunks.iter().map(|c| c.num_rows()).sum();
+                let staged = stage_batches(&chunks, &sources, &schema, &defaults, &budget)?;
+                let t = db.table_mut_in(&target, table)?;
+                for batch in &staged {
+                    t.append_shared_chunk(batch)?;
+                }
+                return Ok(QueryResult::Inserted { count });
+            }
             // Stage every row (mapped into full table width, coerced), then
             // append — a type error leaves the table untouched.
             let mut staged = Vec::new();
@@ -5374,11 +5506,14 @@ fn residual_selection(
 /// results are exactly the nested loop's.
 ///
 /// Key expressions live in the joined `[source…, target…]` column space the
-/// DML executor builds its one-row chunks in: source keys evaluate against a
-/// source chunk as-is, target keys are shifted into target space.
+/// DML executor builds its chunks in: source keys evaluate against a source
+/// chunk as-is, target keys are shifted into target space. A target chunk's
+/// keys are evaluated once ([`DmlIndex::probe_keys`]); probing a row is then a
+/// lookup, not an evaluation over the whole chunk.
 pub(crate) struct DmlIndex {
     table: MatchTable,
     keys: Vec<BoundExpr>,
+    src_keys: Vec<BoundExpr>,
     commons: Vec<Option<DataType>>,
     ints: bool,
 }
@@ -5432,40 +5567,114 @@ impl DmlIndex {
         Ok(Some(DmlIndex {
             table,
             keys,
+            src_keys,
             commons,
             ints,
         }))
     }
 
-    /// The source `(chunk, row)` candidates for one target row, in source input
-    /// order. A NULL key matches nothing (`=` is never true for NULL).
-    pub(crate) fn probe(
+    /// Evaluate the target-side key expressions once for a whole target chunk.
+    pub(crate) fn probe_keys(&self, cx: &Cx, chunk: &DataChunk) -> Result<ProbeKeys> {
+        let kvs = self
+            .table
+            .probe_keys(cx, &self.keys, chunk, &self.commons, self.ints)?;
+        let rows = chunk.num_rows();
+        let mut null = vec![false; rows];
+        for kv in &kvs {
+            for (row, null) in null.iter_mut().enumerate() {
+                *null |= kv.is_null(row);
+            }
+        }
+        // Encoded once per row, the layout `MatchTable`'s byte keys use.
+        let mut bytes = Vec::new();
+        let mut ends = Vec::with_capacity(rows);
+        if !self.ints {
+            for (row, is_null) in null.iter().enumerate() {
+                if !is_null {
+                    for kv in &kvs {
+                        kv.encode_into(&mut bytes, row);
+                    }
+                }
+                ends.push(bytes.len() as u32);
+            }
+        }
+        Ok(ProbeKeys {
+            kvs,
+            bytes,
+            ends,
+            null,
+        })
+    }
+
+    /// The source `(chunk, row)` candidates for `row` of the chunk its
+    /// [`ProbeKeys`] were evaluated over, in source input order. A NULL key
+    /// matches nothing (`=` is never true for NULL).
+    pub(crate) fn matches<'k>(
+        &'k self,
+        keys: &'k ProbeKeys,
+        row: usize,
+    ) -> impl Iterator<Item = (u32, u32)> + 'k {
+        let hit = (!keys.null[row]).then(|| {
+            if self.ints {
+                self.table.matches_int(int_key_at(&keys.kvs[0], row))
+            } else {
+                let end = keys.ends[row] as usize;
+                let start = if row == 0 {
+                    0
+                } else {
+                    keys.ends[row - 1] as usize
+                };
+                self.table.matches_bytes(&keys.bytes[start..end])
+            }
+        });
+        hit.into_iter().flatten().map(|row| self.table.loc(row))
+    }
+
+    /// Zone of each hash key's *source* side, for keys whose target side is a
+    /// plain column (returned as that column's index in the target). A target
+    /// chunk whose own zone cannot overlap has no match, the same min/max
+    /// bound a hash join derives in [`derive_join_filters`]. Types the key
+    /// encoding does not normalize (anything but a numeric pair or one type on
+    /// both sides) order no better than by shape, so they are left out.
+    pub(crate) fn target_zones(
         &self,
         cx: &Cx,
-        chunk: &DataChunk,
-        row: usize,
-        buf: &mut Vec<u8>,
-    ) -> Result<Vec<(u32, u32)>> {
-        let kvs: Vec<Vector> = self
-            .keys
-            .iter()
-            .zip(self.commons.iter())
-            .map(|(k, c)| eval_join_key(cx, k, chunk, *c, self.ints))
-            .collect::<Result<_>>()?;
-        if kvs.iter().any(|kv| kv.is_null(row)) {
-            return Ok(Vec::new());
-        }
-        let matches = if self.ints {
-            self.table.matches_int(int_key_at(&kvs[0], row))
-        } else {
-            buf.clear();
-            for kv in &kvs {
-                kv.encode_into(buf, row);
+        source: &[DataChunk],
+        src_cols: usize,
+        schema: &[(String, DataType)],
+    ) -> Result<Vec<(usize, crate::stats::Zone)>> {
+        let mut out = Vec::new();
+        for (i, key) in self.keys.iter().enumerate() {
+            let BoundExpr::Column { index, .. } = key else {
+                continue;
+            };
+            if *index < src_cols {
+                continue;
             }
-            self.table.matches_bytes(buf)
-        };
-        Ok(matches.map(|r| self.table.loc(r)).collect())
+            let src_dtype = self.src_keys[i].dtype();
+            let target_dtype = schema[*index - src_cols].1;
+            if src_dtype != target_dtype && common_numeric(src_dtype, target_dtype).is_err() {
+                continue;
+            }
+            let mut zone = crate::stats::Zone::empty();
+            for chunk in source {
+                let kv = eval_join_key(cx, &self.src_keys[i], chunk, self.commons[i], self.ints)?;
+                zone.merge(&crate::stats::Zone::of_vector(&kv));
+            }
+            out.push((*index - src_cols, zone));
+        }
+        Ok(out)
     }
+}
+
+/// One target chunk's keys under a [`DmlIndex`].
+pub(crate) struct ProbeKeys {
+    kvs: Vec<Vector>,
+    /// Each non-NULL-keyed row's encoded key, row by row; `ends[row]` is where
+    /// row `row`'s encoding stops (unchanged for a NULL-keyed row).
+    bytes: Vec<u8>,
+    ends: Vec<u32>,
+    null: Vec<bool>,
 }
 
 /// Flatten `a AND b AND …` into its conjuncts.
@@ -9328,6 +9537,66 @@ mod tests {
         assert_send_sync::<DataChunk>();
         assert_send_sync::<Value>();
         assert_send_sync::<QueryResult>();
+    }
+
+    /// The bulk write paths' staging: an oversized query chunk is split at the
+    /// append boundary, a column already in the target's type is shared, a
+    /// different one is coerced, and an unwritten one takes its DEFAULT.
+    #[test]
+    fn stage_batches_split_retype_default_and_share() {
+        use crate::vector::{CHUNK_SIZE, VectorData};
+        let schema = vec![
+            ("n".to_string(), DataType::Integer),
+            ("w".to_string(), DataType::Bigint),
+            ("d".to_string(), DataType::Varchar),
+        ];
+        let rows = 2 * CHUNK_SIZE + 5;
+        let mask = vec![u64::MAX; rows.div_ceil(64)];
+        // An oversized chunk, which `Vector::push_value` cannot build.
+        let n = Vector::from_raw(VectorData::Int32((0..rows as i32).collect()), mask.clone());
+        let w = Vector::from_raw(VectorData::Int32((0..rows as i32).collect()), mask);
+        let chunk = DataChunk::new(vec![n, w]).unwrap();
+        let sources = [Some(0), Some(1), None];
+        let defaults = [Value::Null, Value::Null, Value::Varchar("dflt".to_string())];
+        let staged = stage_batches(
+            &[chunk],
+            &sources,
+            &schema,
+            &defaults,
+            &ExecBudget::unbounded(),
+        )
+        .unwrap();
+        let lens: Vec<usize> = staged.iter().map(|b| b[0].len()).collect();
+        assert_eq!(lens, vec![CHUNK_SIZE, CHUNK_SIZE, 5]);
+        let mut row = 0;
+        for batch in &staged {
+            for i in 0..batch[0].len() {
+                assert_eq!(batch[0].get(i), Value::Integer(row as i32));
+                assert_eq!(batch[1].get(i), Value::Bigint(row as i64));
+                assert_eq!(batch[2].get(i), Value::Varchar("dflt".to_string()));
+                row += 1;
+            }
+        }
+        assert_eq!(row, rows);
+
+        // A CHUNK_SIZE-row chunk in the target's own type is appended as the
+        // query's vector, not copied.
+        let mut shared = Vector::with_capacity(DataType::Integer, CHUNK_SIZE);
+        for i in 0..CHUNK_SIZE {
+            shared.push_value(Value::Integer(i as i32)).unwrap();
+        }
+        let shared = std::sync::Arc::new(shared);
+        let chunk = DataChunk::from_arcs(vec![std::sync::Arc::clone(&shared)]).unwrap();
+        let staged = stage_batches(
+            &[chunk],
+            &[Some(0)],
+            &schema[..1],
+            &[Value::Null],
+            &ExecBudget::unbounded(),
+        )
+        .unwrap();
+        assert_eq!(staged.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&staged[0][0], &shared));
     }
 
     fn sales_db() -> PinkDb {

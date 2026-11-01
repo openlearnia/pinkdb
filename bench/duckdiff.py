@@ -1483,6 +1483,9 @@ DML_QUERIES = [
     ("dml-merge-upsert", "CREATE TABLE m2 (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO m2 VALUES (1,10),(2,20); CREATE TABLE src2 (id INTEGER, v INTEGER); INSERT INTO src2 VALUES (2,200),(3,30); MERGE INTO m2 USING src2 ON m2.id = src2.id WHEN MATCHED THEN UPDATE SET v = src2.v WHEN NOT MATCHED THEN INSERT VALUES (src2.id, src2.v); SELECT * FROM m2 ORDER BY id;", True, False),
     ("dml-merge-delete", "CREATE TABLE m2 (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO m2 VALUES (1,10),(2,20); CREATE TABLE src2 (id INTEGER, v INTEGER); INSERT INTO src2 VALUES (2,200); MERGE INTO m2 USING src2 ON m2.id = src2.id WHEN MATCHED AND src2.v > 150 THEN DELETE WHEN MATCHED THEN UPDATE SET v = src2.v; SELECT * FROM m2 ORDER BY id;", True, False),
     ("dml-merge-by-source", "CREATE TABLE m2 (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO m2 VALUES (1,10),(2,20); CREATE TABLE src2 (id INTEGER, v INTEGER); INSERT INTO src2 VALUES (1,100); MERGE INTO m2 USING src2 ON m2.id = src2.id WHEN NOT MATCHED BY SOURCE THEN DELETE; SELECT * FROM m2 ORDER BY id;", True, False),
+    ("dml-merge-multi-chunk", "CREATE TABLE m3 AS SELECT CAST(i AS INTEGER) AS id, CAST(i * 2 AS INTEGER) AS v FROM range(0, 5000) t(i); CREATE TABLE src3 AS SELECT id, v + 1 AS v FROM m3 WHERE id % 7 = 0; MERGE INTO m3 USING src3 ON m3.id = src3.id WHEN MATCHED THEN UPDATE SET v = src3.v WHEN NOT MATCHED THEN INSERT VALUES (src3.id, src3.v); SELECT COUNT(*), SUM(v) FROM m3;", False, False),
+    ("dml-merge-multi-chunk-by-source", "CREATE TABLE m4 AS SELECT CAST(i AS INTEGER) AS id, CAST(i % 4 AS INTEGER) AS v FROM range(0, 5000) t(i); CREATE TABLE src4 AS SELECT id, v FROM m4 WHERE id BETWEEN 100 AND 110; MERGE INTO m4 USING src4 ON m4.id = src4.id WHEN MATCHED THEN UPDATE SET v = 9 WHEN NOT MATCHED BY SOURCE AND m4.v < 2 THEN DELETE; SELECT COUNT(*), SUM(id), SUM(v) FROM m4;", False, False),
+    ("dml-merge-duplicate-late", "CREATE TABLE m5 AS SELECT CAST(i AS INTEGER) AS id, CAST(i AS INTEGER) AS v FROM range(0, 3000) t(i); CREATE TABLE src5 AS SELECT id, v FROM m5; INSERT INTO src5 SELECT id, v FROM m5 WHERE id = 2999; MERGE INTO m5 USING src5 ON m5.id = src5.id WHEN MATCHED THEN UPDATE SET v = src5.v;", False, True),
     ("dml-merge-multi-match", "CREATE TABLE m2 (id INTEGER PRIMARY KEY, v INTEGER); INSERT INTO m2 VALUES (2,20); CREATE TABLE src2 (id INTEGER, v INTEGER); INSERT INTO src2 VALUES (2,100),(2,200); MERGE INTO m2 USING src2 ON m2.id = src2.id WHEN MATCHED THEN UPDATE SET v = src2.v; SELECT * FROM m2 ORDER BY id;", True, True),
     ("dml-cte-insert", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); WITH i AS (INSERT INTO oc VALUES (9,90),(10,100) RETURNING a) SELECT * FROM i ORDER BY a;", True, False),
     ("dml-cte-update", "CREATE TABLE oc (a INTEGER PRIMARY KEY, b INTEGER); INSERT INTO oc VALUES (1,10),(2,20); WITH u AS (UPDATE oc SET b = b + 10 RETURNING a, b) SELECT * FROM u ORDER BY a;", True, False),
@@ -1547,6 +1550,16 @@ DIALECT_QUERIES = [
     ("dialect-pivot-default-group", "CREATE TABLE pv AS SELECT * FROM (VALUES ('x','a',1),('x','b',2),('y','a',3),('y','a',4)) v(g,c,n); SELECT * FROM (PIVOT pv ON c) p ORDER BY g, n;", True, False),
     ("dialect-pivot-multi-agg", "CREATE TABLE pv AS SELECT * FROM (VALUES ('x','a',1),('x','b',2),('y','a',3),('y','a',4)) v(g,c,n); SELECT * FROM (PIVOT pv ON c USING sum(n) AS s, max(n) AS m GROUP BY g) p ORDER BY g;", True, False),
     ("dialect-split-part", "SELECT split_part('a,b,c', ',', 2), starts_with('abc', 'a'), ends_with('abc', 'bc'), reverse('abc');", False, False),
+    # Correlated subqueries over derived tables and UNIONs (wave 140): the
+    # staging foreign-key checks, which must not run the body per outer row.
+    ("dialect-fk-exists-union", "SELECT c.id FROM emp c WHERE EXISTS (SELECT 1 FROM (SELECT did FROM dept UNION SELECT k FROM pn) p WHERE p.did = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-not-exists-union", "SELECT c.id FROM emp c WHERE c.did IS NOT NULL AND NOT EXISTS (SELECT 1 FROM (SELECT did FROM dept UNION SELECT k FROM pn) p WHERE p.did = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-in-union", "SELECT c.id FROM emp c WHERE c.did IN (SELECT did FROM (SELECT did FROM dept UNION SELECT k FROM pn) p WHERE p.did = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-scalar-count-union-all", "SELECT c.id, (SELECT count(*) FROM (SELECT did FROM dept UNION ALL SELECT k FROM pn) p WHERE p.did = c.did) FROM emp c ORDER BY c.id;", True, False),
+    ("dialect-fk-derived-computed", "SELECT c.id FROM emp c WHERE EXISTS (SELECT 1 FROM (SELECT did AS d, did + 10 AS d10 FROM emp) z WHERE z.d10 = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-grouped-derived", "SELECT c.did, (SELECT sum(s) FROM (SELECT k * 10 AS d, sum(v) AS s FROM pn GROUP BY k) g WHERE g.d = c.did) FROM emp c WHERE c.did IS NOT NULL ORDER BY c.did;", True, False),
+    ("dialect-fk-null-keys", "SELECT c.id FROM emp c WHERE NOT EXISTS (SELECT 1 FROM (SELECT x FROM nn UNION SELECT did FROM dept) p WHERE p.x = c.did) ORDER BY c.id;", True, False),
+    ("dialect-fk-correlation-under-limit", "SELECT c.id FROM emp c WHERE EXISTS (SELECT 1 FROM dept d WHERE d.did = c.did LIMIT 1) ORDER BY c.id;", True, False),
 ]
 
 
