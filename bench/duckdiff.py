@@ -1240,6 +1240,11 @@ BIG_QUERIES = [
     ("big-group", "SELECT region, COUNT(*), AVG(total), SUM(total), MIN(total), MAX(total) FROM sales GROUP BY region ORDER BY region;", True, False),
     ("big-filter", "SELECT COUNT(*) FROM sales WHERE total > 500;", True, False),
     ("big-having", "SELECT region, AVG(total) FROM sales WHERE active GROUP BY region HAVING COUNT(*) > 100000 ORDER BY 2 DESC LIMIT 3;", True, False),
+    # wave 135d: a million groups, one per row, through the flat group table.
+    # The outer row pins the group count and each group's value without
+    # shipping a million rows; MIN/MAX are order-free, unlike a float SUM.
+    ("big-group-million", "SELECT COUNT(*), SUM(c), MIN(s), MAX(s), MIN(a), MAX(a) FROM (SELECT id, COUNT(*) AS c, SUM(total) AS s, AVG(total) AS a FROM sales GROUP BY id) g;", False, False),
+    ("big-group-million-text", "SELECT COUNT(*), MIN(s), MAX(s) FROM (SELECT 'k' || id::VARCHAR || '-tail' AS k, SUM(total) AS s FROM sales GROUP BY k) g;", False, False),
 ]
 
 

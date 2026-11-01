@@ -29,6 +29,7 @@ use crate::strings::StrVec;
 use crate::types::{DataType, Result};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How one key column's cells become a `u64` word, and back.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -107,20 +108,21 @@ fn eligible(keys: &[BoundExpr], aggs: &[BoundAgg]) -> Option<Vec<KeyKind>> {
 
 /// One chunk's groups: `keys` holds `width` words per group (one per key
 /// column, then a word of NULL bits), `accs` one accumulator per aggregate.
-/// Once folded, the groups are laid out by merge partition (`starts` holds
-/// the partition boundaries) and `pos` keeps each one's first-seen index in
-/// the chunk, so a partition's merge reads one contiguous run per partial.
+/// The rows stay in first-seen order, which is the output order, and `ix`
+/// lists them merge partition by merge partition, so a partition's merge
+/// reads one run of indices per partial and no group's row is ever rewritten.
 pub(crate) struct FlatPartial {
     width: usize,
     naggs: usize,
-    /// VARCHAR key columns: `strs` holds `nstr` strings per group (an empty
-    /// one for a NULL cell, whose NULL bit tells it apart from `''`).
-    nstr: usize,
+    /// One string per VARCHAR key column per group (an empty one for a NULL
+    /// cell, whose NULL bit tells it apart from `''`).
     strs: StrVec,
     keys: Vec<u64>,
     hashes: Vec<u64>,
     accs: Vec<Acc>,
-    pos: Vec<u32>,
+    /// The groups' first-seen indices, grouped by merge partition.
+    ix: Vec<u32>,
+    /// Where each merge partition's run of `ix` starts.
     starts: Vec<usize>,
 }
 
@@ -174,12 +176,14 @@ impl FlatPartial {
 }
 
 impl FlatPartial {
-    /// Reorder the groups by merge partition (a stable counting sort, on the
-    /// thread that folded them while they are still in cache).
-    fn partition(&mut self, buckets: usize) {
+    /// Index the groups by merge partition (a stable counting sort, on the
+    /// thread that folded them while their hashes are still in cache). The
+    /// rows stay in first-seen order — the order the groups come out in — so
+    /// only the indices move, not the keys and accumulators.
+    fn index_buckets(&mut self, buckets: usize) {
         let n = self.len();
         if buckets == 1 {
-            self.pos = (0..n as u32).collect();
+            self.ix = (0..n as u32).collect();
             self.starts = vec![0, n];
             return;
         }
@@ -197,29 +201,8 @@ impl FlatPartial {
             perm[next[b]] = g as u32;
             next[b] += 1;
         }
-        let (width, naggs) = (self.width, self.naggs);
-        let mut keys = Vec::with_capacity(self.keys.len());
-        let mut hashes = Vec::with_capacity(n);
-        let mut accs = Vec::with_capacity(self.accs.len());
-        let nstr = self.nstr;
-        let strs = self.strs.take(
-            perm.iter()
-                .flat_map(|&g| (g as usize * nstr)..((g as usize + 1) * nstr)),
-        );
-        for &g in &perm {
-            let g = g as usize;
-            keys.extend_from_slice(&self.keys[g * width..(g + 1) * width]);
-            hashes.push(self.hashes[g]);
-            for acc in &mut self.accs[g * naggs..(g + 1) * naggs] {
-                accs.push(std::mem::replace(acc, Acc::Count(0)));
-            }
-        }
-        self.keys = keys;
-        self.hashes = hashes;
-        self.accs = accs;
-        self.strs = strs;
-        self.pos = perm;
         self.starts = starts;
+        self.ix = perm;
     }
 }
 
@@ -373,12 +356,11 @@ impl Spec<'_> {
         let mut part = FlatPartial {
             width,
             naggs: aggs.len(),
-            nstr,
             strs: StrVec::new(),
             keys: Vec::new(),
             hashes: Vec::new(),
             accs: Vec::new(),
-            pos: Vec::new(),
+            ix: Vec::new(),
             starts: Vec::new(),
         };
         let new_group = |part: &mut FlatPartial, key: &[u64], h: u64, k: usize| -> u32 {
@@ -476,23 +458,127 @@ impl Spec<'_> {
                 sel,
             );
         }
-        part.partition(self.buckets);
+        part.index_buckets(self.buckets);
         Ok(Some(part))
     }
 }
 
-/// One merge partition's groups, each with its first-seen position
-/// (`partial << 32 | index in the partial`).
+/// One merge partition's groups: an accumulator row per group, and where the
+/// group's first occurrence sits in the partials.
 struct Merged {
-    keys: Vec<u64>,
-    strs: StrVec,
     accs: Vec<Acc>,
-    first: Vec<u64>,
+    /// The group's first occurrence: the partial that folded it in the high
+    /// word, its row there in the low one. Packed so the emit reads both in
+    /// one access.
+    at: Vec<u64>,
+    /// Where each partial's new groups start in `accs`/`at`; one per partial
+    /// plus a sentinel.
+    starts: Vec<u32>,
 }
 
-/// Merge the partials (in chunk order, so first-seen order and the order
-/// accumulators merge in match the general path) and emit the groups as
-/// `[keys..., aggs...]` chunks in first-seen order.
+/// Marks an input row whose group first appeared in an earlier partial, so it
+/// has no row of its own in the merged tables.
+const NO_GROUP: u64 = u64::MAX;
+
+/// One key column's cells on the way out: the groups' words decoded into the
+/// column's own payload and its validity word, filled in one pass over the
+/// rows (a group's whole key row is one cache line, so reading it for every
+/// column at once reads it once).
+struct KeyBuild {
+    nulls: Vec<u64>,
+    data: KeyData,
+}
+
+enum KeyData {
+    Bool(Vec<bool>),
+    I32(Vec<i32>),
+    Date(Vec<i32>),
+    I64(Vec<i64>),
+    Timestamp(Vec<i64>),
+    Decimal {
+        values: Vec<i128>,
+        precision: u8,
+        scale: u8,
+    },
+    /// String views are gathered after the pass: `picks` holds each group's
+    /// partial and view index, `slot` the column's rank among the VARCHAR
+    /// keys.
+    Varchar {
+        picks: Vec<(u32, u32)>,
+        slot: usize,
+    },
+}
+
+impl KeyBuild {
+    fn new(kind: KeyKind, len: usize, slot: usize) -> KeyBuild {
+        let capacity = len;
+        let data = match kind {
+            KeyKind::Bool => KeyData::Bool(Vec::with_capacity(capacity)),
+            KeyKind::Int32 => KeyData::I32(Vec::with_capacity(capacity)),
+            KeyKind::Date32 => KeyData::Date(Vec::with_capacity(capacity)),
+            KeyKind::Int64 => KeyData::I64(Vec::with_capacity(capacity)),
+            KeyKind::Timestamp => KeyData::Timestamp(Vec::with_capacity(capacity)),
+            KeyKind::Decimal { precision, scale } => KeyData::Decimal {
+                values: Vec::with_capacity(capacity),
+                precision,
+                scale,
+            },
+            KeyKind::Varchar => KeyData::Varchar {
+                picks: Vec::with_capacity(capacity),
+                slot,
+            },
+        };
+        KeyBuild {
+            nulls: vec![u64::MAX; len.div_ceil(64)],
+            data,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, word: u64, source: u32, views: u32) {
+        match &mut self.data {
+            KeyData::Bool(d) => d.push(word != 0),
+            KeyData::I32(d) | KeyData::Date(d) => d.push(word as i64 as i32),
+            KeyData::I64(d) | KeyData::Timestamp(d) => d.push(word as i64),
+            KeyData::Decimal { values, .. } => values.push(i128::from(word as i64)),
+            KeyData::Varchar { picks, slot } => picks.push((source, views + *slot as u32)),
+        }
+    }
+
+    #[inline]
+    fn null(&mut self, r: usize) {
+        self.nulls[r / 64] &= !(1u64 << (r % 64));
+    }
+
+    fn finish(self, sources: &[&StrVec]) -> (VectorData, Vec<u64>) {
+        let data = match self.data {
+            KeyData::Bool(d) => VectorData::Boolean(d),
+            KeyData::I32(d) => VectorData::Int32(d),
+            KeyData::Date(d) => VectorData::Date32(d),
+            KeyData::I64(d) => VectorData::Int64(d),
+            KeyData::Timestamp(d) => VectorData::TimestampMicros(d),
+            KeyData::Decimal {
+                values,
+                precision,
+                scale,
+            } => VectorData::Decimal {
+                values,
+                precision,
+                scale,
+            },
+            KeyData::Varchar { picks, .. } => {
+                VectorData::VarChar(StrVec::gather(sources, &picks, u32::MAX))
+            }
+        };
+        (data, self.nulls)
+    }
+}
+
+/// Merge the partials (in chunk order, so the order accumulators merge in
+/// matches the general path) and emit the groups as `[keys..., aggs...]`
+/// chunks. With `ordered` they come out in first-seen order; otherwise each
+/// merge partition's groups come out one partition after another, which is
+/// all a set consumer needs.
 fn merge_and_emit(
     partials: Vec<FlatPartial>,
     kinds: &[KeyKind],
@@ -503,22 +589,42 @@ fn merge_and_emit(
     let width = kinds.len() + 1;
     let naggs = aggs.len();
     let nstr = kinds.iter().filter(|k| **k == KeyKind::Varchar).count();
-    let total: usize = partials.iter().map(FlatPartial::len).sum();
     let buckets = partials.first().map_or(1, |p| p.starts.len() - 1);
+    let mut base: Vec<usize> = Vec::with_capacity(partials.len() + 1);
+    let mut rows = 0;
+    for p in &partials {
+        base.push(rows);
+        rows += p.len();
+    }
+    // The first occurrence of each group, per partial: its merged row (bucket
+    // and row), or `NO_GROUP` for a row whose group was seen earlier. The
+    // merge fills this in, so the emit needs neither a copy of the keys nor a
+    // sort of the groups, and the partials' first-seen order is the output
+    // order. Only the merge writes it (one slot per group, and the parallel
+    // partitions own disjoint slots), and the emit reads it after that join,
+    // so `Relaxed` is enough. Without `ordered` nothing reads it, so it stays
+    // empty.
+    let map: Vec<AtomicU64> = if ordered {
+        (0..rows).map(|_| AtomicU64::new(NO_GROUP)).collect()
+    } else {
+        Vec::new()
+    };
     let merged: Vec<Merged> = (0..buckets)
         .into_par_iter()
         .map(|b| {
             let size: usize = partials.iter().map(|p| p.starts[b + 1] - p.starts[b]).sum();
             let (mut slots, mask) = slot_table(size);
             let mut out = Merged {
-                keys: Vec::with_capacity(size * width),
-                strs: StrVec::with_capacity(size * nstr),
                 accs: Vec::with_capacity(size * naggs),
-                first: Vec::with_capacity(size),
+                at: Vec::with_capacity(size),
+                starts: vec![0; partials.len() + 1],
             };
             let mut hashes: Vec<u64> = Vec::with_capacity(size);
             for (pi, p) in partials.iter().enumerate() {
-                for g in p.starts[b]..p.starts[b + 1] {
+                let from = base[pi];
+                out.starts[pi] = out.at.len() as u32;
+                for k in p.starts[b]..p.starts[b + 1] {
+                    let g = p.ix[k] as usize;
                     let h = p.hashes[g];
                     let key = p.key(g);
                     let src = &p.accs[g * naggs..(g + 1) * naggs];
@@ -526,23 +632,25 @@ fn merge_and_emit(
                     loop {
                         let t = slots[s];
                         if t == u32::MAX {
-                            slots[s] = out.first.len() as u32;
-                            out.keys.extend_from_slice(key);
-                            for slot in 0..nstr {
-                                out.strs.push(p.strs.get(g * nstr + slot));
+                            slots[s] = hashes.len() as u32;
+                            let row = out.at.len() as u64;
+                            if ordered {
+                                map[from + g].store((b as u64) << 32 | row, Ordering::Relaxed);
                             }
                             out.accs.extend_from_slice(src);
-                            out.first.push((pi as u64) << 32 | u64::from(p.pos[g]));
+                            out.at.push((pi as u64) << 32 | g as u64);
                             hashes.push(h);
                             break;
                         }
                         let t = t as usize;
+                        let at = (out.at[t] & 0xffff_ffff) as usize;
+                        let first = &partials[(out.at[t] >> 32) as usize];
                         if hashes[t] == h
-                            && out.keys[t * width..(t + 1) * width] == *key
+                            && first.key(at) == key
                             && (0..nstr).all(|slot| {
                                 crate::strings::views_eq(
-                                    &out.strs,
-                                    t * nstr + slot,
+                                    &first.strs,
+                                    at * nstr + slot,
                                     &p.strs,
                                     g * nstr + slot,
                                 )
@@ -559,83 +667,138 @@ fn merge_and_emit(
                     }
                 }
             }
+            out.starts[partials.len()] = out.at.len() as u32;
             out
         })
         .collect();
-    drop(partials);
-    // Every partition lists its groups in first-seen order; one sort by
-    // position interleaves them into the global order.
-    let mut order: Vec<(u64, u32, u32)> = Vec::with_capacity(total);
-    for (b, m) in merged.iter().enumerate() {
-        order.extend(
-            m.first
-                .iter()
-                .enumerate()
-                .map(|(i, &f)| (f, b as u32, i as u32)),
-        );
-    }
-    // A set consumer (`Cx::unordered`) takes the partitions as they are.
-    if buckets > 1 && ordered {
-        order.par_sort_unstable_by_key(|e| e.0);
-    }
-    let build = |part: &[(u64, u32, u32)]| -> Result<DataChunk> {
+    // Where each chunk of output rows starts: per partial when the order is
+    // first-seen (a repeat's row was already emitted where it first appeared,
+    // so a partial contributes only the groups it holds first), per merge
+    // partition otherwise.
+    let dbase: Vec<usize> = if ordered {
+        let distinct: Vec<usize> = (0..partials.len())
+            .into_par_iter()
+            .map(|pi| {
+                (0..buckets)
+                    .map(|b| merged[b].starts[pi + 1] as usize - merged[b].starts[pi] as usize)
+                    .sum()
+            })
+            .collect();
+        let mut dbase: Vec<usize> = Vec::with_capacity(partials.len() + 1);
+        let mut total = 0;
+        for d in &distinct {
+            dbase.push(total);
+            total += d;
+        }
+        dbase.push(total);
+        dbase
+    } else {
+        let mut dbase: Vec<usize> = Vec::with_capacity(buckets + 1);
+        let mut total = 0;
+        for m in &merged {
+            dbase.push(total);
+            total += m.at.len();
+        }
+        dbase.push(total);
+        dbase
+    };
+    let total = dbase[dbase.len() - 1];
+    let sources: Vec<&StrVec> = partials.iter().map(|p| &p.strs).collect();
+    // Emit the groups a chunk holds, each given as its merge partition and its
+    // row there. The key's row stays where the fold wrote it, in its first
+    // partial.
+    let emit = |pairs: &[(u32, u32)]| -> Result<DataChunk> {
+        let len = pairs.len();
         let mut cols = Vec::with_capacity(kinds.len() + naggs);
-        let mut slot = 0;
-        for (c, kind) in kinds.iter().enumerate() {
-            let word =
-                |&(_, b, i): &(u64, u32, u32)| merged[b as usize].keys[i as usize * width + c];
-            let data = match *kind {
-                KeyKind::Bool => VectorData::Boolean(part.iter().map(|e| word(e) != 0).collect()),
-                KeyKind::Int32 => {
-                    VectorData::Int32(part.iter().map(|e| word(e) as i64 as i32).collect())
-                }
-                KeyKind::Date32 => {
-                    VectorData::Date32(part.iter().map(|e| word(e) as i64 as i32).collect())
-                }
-                KeyKind::Int64 => VectorData::Int64(part.iter().map(|e| word(e) as i64).collect()),
-                KeyKind::Timestamp => {
-                    VectorData::TimestampMicros(part.iter().map(|e| word(e) as i64).collect())
-                }
-                KeyKind::Decimal { precision, scale } => VectorData::Decimal {
-                    values: part.iter().map(|e| i128::from(word(e) as i64)).collect(),
-                    precision,
-                    scale,
-                },
-                KeyKind::Varchar => {
-                    let at = slot;
-                    slot += 1;
-                    let sources: Vec<&StrVec> = merged.iter().map(|m| &m.strs).collect();
-                    let picks: Vec<(u32, u32)> = part
-                        .iter()
-                        .map(|&(_, b, i)| (b, (i as usize * nstr + at) as u32))
-                        .collect();
-                    VectorData::VarChar(StrVec::gather(&sources, &picks, u32::MAX))
-                }
-            };
-            let mut validity = vec![u64::MAX; part.len().div_ceil(64)];
-            for (r, &(_, b, i)) in part.iter().enumerate() {
-                if merged[b as usize].keys[i as usize * width + width - 1] >> c & 1 == 1 {
-                    validity[r / 64] &= !(1u64 << (r % 64));
+        // A group's whole key row is one cache line, so one pass decodes every
+        // key column at once instead of walking the row per column.
+        let mut keys: Vec<KeyBuild> = Vec::with_capacity(kinds.len());
+        let mut vslot = 0;
+        for kind in kinds {
+            keys.push(KeyBuild::new(*kind, len, vslot));
+            if *kind == KeyKind::Varchar {
+                vslot += 1;
+            }
+        }
+        let mut agg_cols: Vec<Vector> = aggs
+            .iter()
+            .map(|a| Vector::with_capacity(a.dtype, len))
+            .collect();
+        for (out_row, &(b, t)) in pairs.iter().enumerate() {
+            let m = &merged[b as usize];
+            let t = t as usize;
+            let at = (m.at[t] & 0xffff_ffff) as usize;
+            let source = (m.at[t] >> 32) as u32;
+            let p = &partials[source as usize];
+            let key_row = p.key(at);
+            let nulls = key_row[width - 1];
+            let views = (at * nstr) as u32;
+            for (c, kb) in keys.iter_mut().enumerate() {
+                kb.push(key_row[c], source, views);
+                if nulls >> c & 1 == 1 {
+                    kb.null(out_row);
                 }
             }
+            let accs = &m.accs[t * naggs..(t + 1) * naggs];
+            for (j, col) in agg_cols.iter_mut().enumerate() {
+                col.push_value(accs[j].finalize_ref(aggs[j].dtype)?)?;
+            }
+        }
+        for (c, kb) in keys.into_iter().enumerate() {
+            let (data, validity) = kb.finish(&sources);
             let v = Vector::from_raw(data, validity);
             debug_assert_eq!(v.dtype(), key_types[c]);
             cols.push(v);
         }
-        for (j, a) in aggs.iter().enumerate() {
-            let mut col = Vector::with_capacity(a.dtype, part.len());
-            for &(_, b, i) in part {
-                let acc = &merged[b as usize].accs[i as usize * naggs + j];
-                col.push_value(acc.finalize_ref(a.dtype)?)?;
-            }
-            cols.push(col);
-        }
+        cols.extend(agg_cols);
         DataChunk::new(cols)
     };
-    if order.is_empty() {
-        return Ok(vec![build(&[])?]);
+    if total == 0 {
+        return Ok(vec![emit(&[])?]);
     }
-    let built: Vec<Result<DataChunk>> = order.par_chunks(CHUNK_SIZE).map(build).collect();
+    let built: Vec<Result<DataChunk>> = (0..total.div_ceil(CHUNK_SIZE))
+        .into_par_iter()
+        .map(|k| {
+            let lo = k * CHUNK_SIZE;
+            let hi = (lo + CHUNK_SIZE).min(total);
+            let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(hi - lo);
+            if ordered {
+                let mut pi = dbase.partition_point(|&e| e <= lo) - 1;
+                let mut pending = lo - dbase[pi];
+                while pairs.len() < hi - lo {
+                    let p = &partials[pi];
+                    for g in 0..p.len() {
+                        if pairs.len() == hi - lo {
+                            break;
+                        }
+                        let e = map[base[pi] + g].load(Ordering::Relaxed);
+                        if e == NO_GROUP {
+                            continue;
+                        }
+                        if pending > 0 {
+                            pending -= 1;
+                            continue;
+                        }
+                        pairs.push(((e >> 32) as u32, (e & 0xffff_ffff) as u32));
+                    }
+                    pi += 1;
+                }
+            } else {
+                let mut b = dbase.partition_point(|&e| e <= lo) - 1;
+                let mut t = lo - dbase[b];
+                while pairs.len() < hi - lo {
+                    if t == dbase[b + 1] - dbase[b] {
+                        b += 1;
+                        t = 0;
+                        continue;
+                    }
+                    pairs.push((b as u32, t as u32));
+                    t += 1;
+                }
+            }
+            emit(&pairs)
+        })
+        .collect();
     built.into_iter().collect()
 }
 
