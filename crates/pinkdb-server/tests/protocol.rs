@@ -85,11 +85,12 @@ fn requests_round_trip() {
 /// `Login`/`LoggedIn` tags, and the seven RBAC `Done` kinds. Wave 84 adds the
 /// v10 profiling messages; wave 101a adds the VARIANT value and dtype tags;
 /// wave 95c adds the `SetVariable` `Done` kind (v12); wave 107a adds the ARRAY
-/// value (tag 11) and dtype (tag 10) tags (v13).
+/// value (tag 11) and dtype (tag 10) tags (v13); wave 139b adds the UUID value
+/// (tag 12) and dtype (tag 11) tags (v15).
 /// A change here is a protocol change and must bump [`PROTOCOL_VERSION`].
 #[test]
-fn protocol_v14_pins_the_schema_done_kinds_and_keeps_the_v13_surface() {
-    assert_eq!(PROTOCOL_VERSION, 14);
+fn protocol_v15_pins_the_schema_done_kinds_and_keeps_the_v14_surface() {
+    assert_eq!(PROTOCOL_VERSION, 15);
     assert_eq!(msg_type::LOGIN, 6);
     assert_eq!(msg_type::LOGGED_IN, 18);
     assert_eq!(msg_type::SET_PROFILING, 7);
@@ -258,9 +259,11 @@ fn set_profiling_rejects_a_non_boolean_byte() {
 
 #[test]
 fn result_set_round_trips_every_data_type() {
-    let names = ["b", "i", "bi", "d", "v", "dt", "ts", "va", "ai", "ab", "ad"]
-        .map(String::from)
-        .to_vec();
+    let names = [
+        "b", "i", "bi", "d", "v", "dt", "ts", "va", "ai", "ab", "ad", "uu",
+    ]
+    .map(String::from)
+    .to_vec();
     let types = vec![
         DataType::Boolean,
         DataType::Integer,
@@ -282,6 +285,7 @@ fn result_set_round_trips_every_data_type() {
             elem: ArrayElem::Double,
             len: 768,
         },
+        DataType::Uuid,
     ];
     response_round_trip(Response::ResultSet { names, types });
 }
@@ -837,6 +841,19 @@ fn ragged_rows_frames_do_not_encode() {
     };
     let err = encode_response(&response).unwrap_err();
     assert!(err.to_string().contains("ragged"), "{err}");
+}
+
+#[test]
+fn uuid_values_round_trip() {
+    let rows = vec![
+        vec![
+            Value::Uuid(0),
+            Value::Uuid(u128::MAX),
+            Value::Uuid(0x550e_8400_e29b_41d4_a716_4466_5544_0000),
+        ],
+        vec![Value::Null, Value::Null, Value::Null],
+    ];
+    response_round_trip(Response::Rows { rows });
 }
 
 #[test]

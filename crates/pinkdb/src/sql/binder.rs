@@ -156,10 +156,12 @@ pub enum ScalarFunc {
     ArrayNegativeInnerProduct,
     /// `contains(s, search)`: whether `search` occurs in `s`.
     Contains,
-    /// `uuid()` / `gen_random_uuid()`: a random version-4 UUID per row, as
-    /// VARCHAR (pinkdb has no UUID type). Volatile: never folded, and refused
-    /// in a WAL-logged statement like any nondeterministic function.
+    /// `uuid()` / `gen_random_uuid()`: a version-4 UUID per row. Volatile:
+    /// never folded, and in a WAL-logged statement derived from the record's
+    /// seed (see [`Volatile`]) so replay reproduces it.
     Uuid,
+    /// `random()`: a DOUBLE in `[0, 1)` per row, seeded like [`ScalarFunc::Uuid`].
+    Random,
 }
 
 impl ScalarFunc {
@@ -209,6 +211,7 @@ impl ScalarFunc {
             "similar_to" => ScalarFunc::SimilarTo,
             "contains" => ScalarFunc::Contains,
             "uuid" | "gen_random_uuid" => ScalarFunc::Uuid,
+            "random" => ScalarFunc::Random,
             _ => return None,
         })
     }
@@ -503,6 +506,21 @@ impl OuterBind {
     }
 }
 
+/// The derivation input of a volatile built-in call site (`uuid()`,
+/// `random()`): the call site's id, fixed at bind and numbered in bind order,
+/// so it is the same for every evaluation of the bound statement. The seed is
+/// not baked in: it belongs to the WAL record being filled
+/// ([`crate::storage::PinkDb::begin_volatile_statement`]), because a later
+/// statement of the same record must draw its own values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Volatile {
+    /// Stable index of the call site within the statement, so two calls in one
+    /// statement draw different values. The statement's seed itself is
+    /// resolved when it evaluates (`PinkDb::volatile_evaluation`): a bind can
+    /// happen before the statement that carries it starts.
+    pub site: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
     Literal(Value),
@@ -530,6 +548,9 @@ pub enum BoundExpr {
         func: ScalarFunc,
         args: Vec<BoundExpr>,
         dtype: DataType,
+        /// Set for the volatile built-ins: the derivation inputs for this call
+        /// site, fixed at bind so replay reproduces every value.
+        volatile: Option<Volatile>,
     },
     /// Aggregate output column. Index is relative to the agg list until
     /// [`resolve_agg_refs`] rebases it past the group keys.
@@ -756,10 +777,10 @@ impl BoundExpr {
     pub fn contains_dynamic_scalar(&self) -> bool {
         match self {
             BoundExpr::DynamicScalar { .. } => true,
-            // Volatile: a constant-looking `uuid()` must run per row.
+            // Volatile: a constant-looking `uuid()` or `random()` must run per
+            // row, never be folded to a literal.
             BoundExpr::Scalar {
-                func: ScalarFunc::Uuid,
-                ..
+                volatile: Some(_), ..
             } => true,
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
@@ -1133,14 +1154,36 @@ fn clock_function(name: &str) -> Option<ClockKind> {
 /// [`Binder::bind_clock`]); no function name can contain `@`.
 pub(crate) const CLOCK_DEP: &str = "@clock:";
 
-/// The dependency `uuid()` records: no function name can contain `@`.
-const VOLATILE_UUID_DEP: &str = "@volatile:uuid";
-
 /// The replay-memo name a WAL record stores the statement clock under.
 pub(crate) const CLOCK_MEMO: &str = "@clock";
 
-/// The replay-memo entry of a statement whose dependencies include a clock
-/// reading.
+/// The replay-memo name a WAL record stores volatile statement seeds under; no
+/// SQL function can be called `@seed`. A record carries one entry per statement
+/// that drew a volatile value, in the order the statements ran, and a replay
+/// takes them in that same order
+/// ([`crate::storage::PinkDb::begin_volatile_statement`]).
+pub(crate) const SEED_MEMO: &str = "@seed";
+
+/// The memo entry that records one statement's volatile seed; `position` is its
+/// index among the record's seeds.
+pub(crate) fn seed_memo(position: usize, seed: u128) -> crate::wal::ExtCall {
+    crate::wal::ExtCall {
+        name: SEED_MEMO.to_string(),
+        args: vec![Value::Integer(position as i32)],
+        // The memo is WAL payload, so its values use the WAL's encodings.
+        result: Value::Varchar(format!("{seed:032x}")),
+    }
+}
+
+/// The seed a `@seed` memo entry carries.
+pub(crate) fn seed_reading(value: &Value) -> Option<u128> {
+    match value {
+        Value::Varchar(text) => u128::from_str_radix(text, 16).ok(),
+        _ => None,
+    }
+}
+
+/// The memo entry of a statement that read the clock.
 pub(crate) fn clock_memo(deps: &[String]) -> Option<crate::wal::ExtCall> {
     let micros = deps.iter().find_map(|d| clock_reading(d))?;
     Some(crate::wal::ExtCall {
@@ -1156,46 +1199,77 @@ pub(crate) fn clock_reading(dep: &str) -> Option<i64> {
 }
 
 thread_local! {
-    /// `(scope open, reading)` of the statement being bound on this thread.
-    static STATEMENT_CLOCK: std::cell::Cell<(bool, Option<i64>)> =
-        const { std::cell::Cell::new((false, None)) };
+    /// `(scope open, clock reading, next call site)` of the statement being
+    /// bound on this thread: one clock reading and one call-site counter per
+    /// statement, shared by its nested binders.
+    static STATEMENT_SCOPE: std::cell::Cell<(bool, Option<i64>, u32)> =
+        const { std::cell::Cell::new((false, None, 0)) };
 }
 
-/// One statement's clock scope: the outermost bind on a thread opens it, and
-/// every binder inside it shares the first reading. Nested binds (a view or
-/// macro body) join the open scope.
-struct ClockScope {
+/// One statement's clock and call-site scope: the outermost bind on a thread
+/// opens it, and every binder inside it shares the first reading. Nested binds
+/// (a view or macro body) join the open scope.
+struct StatementScope {
     outer: bool,
 }
 
-impl ClockScope {
+impl StatementScope {
     fn enter() -> Self {
-        let outer = !STATEMENT_CLOCK.with(|c| c.get().0);
+        let outer = !STATEMENT_SCOPE.with(|c| c.get().0);
         if outer {
-            STATEMENT_CLOCK.with(|c| c.set((true, None)));
+            STATEMENT_SCOPE.with(|c| c.set((true, None, 0)));
         }
         Self { outer }
     }
 
-    fn reading() -> Option<i64> {
-        STATEMENT_CLOCK.with(|c| c.get().1)
+    fn clock() -> Option<i64> {
+        STATEMENT_SCOPE.with(|c| c.get().1)
     }
 
-    fn record(micros: i64) {
-        STATEMENT_CLOCK.with(|c| {
-            if c.get().0 {
-                c.set((true, Some(micros)));
+    fn record_clock(micros: i64) {
+        STATEMENT_SCOPE.with(|c| {
+            let (open, _, site) = c.get();
+            if open {
+                c.set((true, Some(micros), site));
             }
         });
     }
+
+    /// The next volatile call site's id. Call sites are numbered in bind
+    /// order, so they are stable across replays of the same statement.
+    fn next_site() -> u32 {
+        STATEMENT_SCOPE.with(|c| {
+            let (open, clock, site) = c.get();
+            c.set((open, clock, site.wrapping_add(1)));
+            site
+        })
+    }
 }
 
-impl Drop for ClockScope {
+impl Drop for StatementScope {
     fn drop(&mut self) {
         if self.outer {
-            STATEMENT_CLOCK.with(|c| c.set((false, None)));
+            STATEMENT_SCOPE.with(|c| c.set((false, None, 0)));
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn fresh_seed() -> Result<u128> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| {
+        PinkDbError::Execution(format!(
+            "uuid() and random() need OS randomness, which is unavailable: {e}"
+        ))
+    })?;
+    Ok(u128::from_le_bytes(bytes))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn fresh_seed() -> Result<u128> {
+    Err(PinkDbError::Execution(
+        "uuid() and random() need OS randomness, which the wasm build has not".to_string(),
+    ))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1316,12 +1390,30 @@ fn null_of(dtype: DataType) -> BoundExpr {
     }
 }
 
+/// A string literal compared with a UUID is that UUID's text: DuckDB gives
+/// literals the other operand's type implicitly, and every other pair still
+/// has to agree.
+fn cast_uuid_literal(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
+    let cast = |e: BoundExpr, t: DataType| BoundExpr::Cast {
+        expr: Box::new(e),
+        dtype: t,
+    };
+    if l.dtype() == DataType::Uuid && matches!(r, BoundExpr::Literal(Value::Varchar(_))) {
+        return (l, cast(r, DataType::Uuid));
+    }
+    if r.dtype() == DataType::Uuid && matches!(l, BoundExpr::Literal(Value::Varchar(_))) {
+        return (cast(l, DataType::Uuid), r);
+    }
+    (l, r)
+}
+
 pub(crate) fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
     if (is_numeric(l) && is_numeric(r))
         || (l == DataType::Varchar && r == DataType::Varchar)
         || (l == DataType::Date && r == DataType::Date)
         || (l == DataType::Timestamp && r == DataType::Timestamp)
         || (l == DataType::Interval && r == DataType::Interval)
+        || (l == DataType::Uuid && r == DataType::Uuid)
         || (l == DataType::Variant && r == DataType::Variant)
     {
         return match op {
@@ -2210,6 +2302,7 @@ impl<'a> Binder<'a> {
             func: ScalarFunc::ArrayValue,
             args,
             dtype,
+            volatile: None,
         })
     }
 
@@ -2296,6 +2389,7 @@ impl<'a> Binder<'a> {
                                         BoundExpr::Literal(Value::Varchar(part.to_string())),
                                     ],
                                     dtype: DataType::Variant,
+                                    volatile: None,
                                 };
                             }
                             return Ok(acc);
@@ -2314,6 +2408,7 @@ impl<'a> Binder<'a> {
                     return self.bind_is_distinct(*op, left, right, aggs, allow_agg);
                 }
                 let (l, r) = self.bind_binary_operands(*op, left, right, aggs, allow_agg)?;
+                let (l, r) = cast_uuid_literal(l, r);
                 let dtype = match op {
                     BinaryOp::And | BinaryOp::Or => {
                         if l.dtype() != DataType::Boolean || r.dtype() != DataType::Boolean {
@@ -2517,6 +2612,7 @@ impl<'a> Binder<'a> {
                     func: ScalarFunc::TryCast,
                     args: vec![bound],
                     dtype: *dtype,
+                    volatile: None,
                 })
             }
             Expr::Subscript { base, index } => {
@@ -2538,6 +2634,7 @@ impl<'a> Binder<'a> {
                             func: ScalarFunc::ArrayExtract,
                             args: vec![base, index],
                             dtype: elem.dtype(),
+                            volatile: None,
                         })
                     }
                     // `v['a']` / `v[1]`: a VARIANT member, by name or by
@@ -2551,12 +2648,14 @@ impl<'a> Binder<'a> {
                                 func: ScalarFunc::VariantIndex,
                                 args: vec![base, index],
                                 dtype: DataType::Variant,
+                                volatile: None,
                             })
                         } else if index.dtype() == DataType::Varchar {
                             Ok(BoundExpr::Scalar {
                                 func: ScalarFunc::VariantField,
                                 args: vec![base, index],
                                 dtype: DataType::Variant,
+                                volatile: None,
                             })
                         } else {
                             Err(PinkDbError::Type(format!(
@@ -2570,6 +2669,7 @@ impl<'a> Binder<'a> {
                         func: ScalarFunc::StringSlice,
                         args: vec![base, index.clone(), index],
                         dtype: DataType::Varchar,
+                        volatile: None,
                     }),
                     t => Err(PinkDbError::Type(format!(
                         "subscripting a {t} is not supported: only VARCHAR and VARIANT have \
@@ -2606,6 +2706,7 @@ impl<'a> Binder<'a> {
                     func: ScalarFunc::StringSlice,
                     args: vec![base, from, to],
                     dtype: DataType::Varchar,
+                    volatile: None,
                 })
             }
             Expr::Cast { expr, dtype } => {
@@ -3650,18 +3751,18 @@ impl<'a> Binder<'a> {
             }
             let dtype = scalar_dtype(func, &bound)?;
             let bound = coerce_scalar_args(func, dtype, bound)?;
-            if func == ScalarFunc::Uuid {
-                // Volatile: a WAL-logged statement refuses it (see
-                // `bind_tracked_with`).
-                let mut deps = self.dynamic_functions_used.borrow_mut();
-                if !deps.iter().any(|d| d == VOLATILE_UUID_DEP) {
-                    deps.push(VOLATILE_UUID_DEP.to_string());
-                }
-            }
+            let volatile = if matches!(func, ScalarFunc::Uuid | ScalarFunc::Random) {
+                Some(Volatile {
+                    site: StatementScope::next_site(),
+                })
+            } else {
+                None
+            };
             return Ok(BoundExpr::Scalar {
                 func,
                 args: bound,
                 dtype,
+                volatile,
             });
         }
         // Not a built-in: a loaded extension may provide it (case-insensitive)
@@ -3798,12 +3899,12 @@ impl<'a> Binder<'a> {
             .ext_replay()
             .and_then(|memo| recorded(memo.get(CLOCK_MEMO, &[])))
             .or_else(|| recorded(self.db.txn_memo_result(CLOCK_MEMO, &[])))
-            .or_else(ClockScope::reading)
+            .or_else(StatementScope::clock)
         {
             Some(t) => t,
             None => wall_clock_micros()?,
         };
-        ClockScope::record(micros);
+        StatementScope::record_clock(micros);
         deps.push(format!("{CLOCK_DEP}{micros}"));
         Ok(micros)
     }
@@ -3905,6 +4006,7 @@ impl<'a> Binder<'a> {
             func,
             args: bound,
             dtype,
+            volatile: None,
         })
     }
 
@@ -4567,6 +4669,7 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                 && t != DataType::Timestamp
                 && t != DataType::Interval
                 && t != DataType::Variant
+                && t != DataType::Uuid
                 && !matches!(t, DataType::Array { .. })
             {
                 return Err(PinkDbError::Type(
@@ -4857,7 +4960,11 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
         }
         ScalarFunc::Uuid => {
             arity(&[0])?;
-            Ok(DataType::Varchar)
+            Ok(DataType::Uuid)
+        }
+        ScalarFunc::Random => {
+            arity(&[0])?;
+            Ok(DataType::Double)
         }
         ScalarFunc::JsonSet | ScalarFunc::JsonInsert | ScalarFunc::JsonReplace => {
             unreachable!("bound by bind_json_mutator")
@@ -5104,6 +5211,10 @@ fn qual_text(qual: &Qualifier) -> String {
 
 fn default_name(expr: &Expr) -> String {
     match expr {
+        // DuckDB renders a string literal with its quotes (and doubled inner
+        // quotes), so `SELECT s NOT LIKE 'a%'` names the column
+        // `(s !~~ 'a%')`. Other literals have an unambiguous text form.
+        Expr::Literal(Value::Varchar(s)) => format!("'{}'", s.replace('\'', "''")),
         Expr::Literal(v) => v.to_string(),
         Expr::Default => "DEFAULT".to_string(),
         Expr::ArrayLiteral(items) => format!(
@@ -5138,15 +5249,16 @@ fn default_name(expr: &Expr) -> String {
                 BinaryOp::Divide => "/",
                 BinaryOp::Modulo => "%",
                 BinaryOp::Eq => "=",
-                BinaryOp::NotEq => "<>",
+                BinaryOp::NotEq => "!=",
                 BinaryOp::Lt => "<",
                 BinaryOp::LtEq => "<=",
                 BinaryOp::Gt => ">",
                 BinaryOp::GtEq => ">=",
                 BinaryOp::And => "AND",
                 BinaryOp::Or => "OR",
-                BinaryOp::Like => "LIKE",
-                BinaryOp::NotLike => "NOT LIKE",
+                // DuckDB's internal spellings: `~~` is LIKE, `!~~` NOT LIKE.
+                BinaryOp::Like => "~~",
+                BinaryOp::NotLike => "!~~",
                 BinaryOp::Concat => "||",
                 BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
                 BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
@@ -5155,12 +5267,12 @@ fn default_name(expr: &Expr) -> String {
         }
         Expr::Unary { op, expr } => match op {
             UnaryOp::Not => format!("(NOT {})", default_name(expr)),
-            UnaryOp::Negate => format!("(-{})", default_name(expr)),
+            UnaryOp::Negate => format!("(-({}))", default_name(expr)),
             UnaryOp::Plus => default_name(expr),
         },
         Expr::IsNull { expr, negated } => {
-            let not = if *negated { " NOT" } else { "" };
-            format!("({}{not} IS NULL)", default_name(expr))
+            let not = if *negated { " IS NOT NULL" } else { " IS NULL" };
+            format!("({}{not})", default_name(expr))
         }
         Expr::Between {
             expr,
@@ -5168,13 +5280,17 @@ fn default_name(expr: &Expr) -> String {
             high,
             negated,
         } => {
-            let not = if *negated { "NOT " } else { "" };
-            format!(
-                "({} {not}BETWEEN {} AND {})",
+            let text = format!(
+                "({} BETWEEN {} AND {})",
                 default_name(expr),
                 default_name(low),
                 default_name(high)
-            )
+            );
+            if *negated {
+                format!("(NOT {text})")
+            } else {
+                text
+            }
         }
         Expr::Function {
             name,
@@ -5234,10 +5350,12 @@ fn default_name(expr: &Expr) -> String {
         }
         Expr::Coalesce(args) => {
             let inner: Vec<String> = args.iter().map(default_name).collect();
-            format!("coalesce({})", inner.join(", "))
+            format!("COALESCE({})", inner.join(", "))
         }
-        Expr::Cast { expr, dtype } => format!("cast({} as {dtype})", default_name(expr)),
-        Expr::TryCast { expr, dtype } => format!("try_cast({} as {dtype})", default_name(expr)),
+        // DuckDB spells CAST in upper case in expression text, and both
+        // `CAST(x AS INT)` and `x::INT` name the result `CAST(x AS INTEGER)`.
+        Expr::Cast { expr, dtype } => format!("CAST({} AS {dtype})", default_name(expr)),
+        Expr::TryCast { expr, dtype } => format!("TRY_CAST({} AS {dtype})", default_name(expr)),
         Expr::Subscript { base, index } => {
             format!("{}[{}]", default_name(base), default_name(index))
         }
@@ -5612,10 +5730,16 @@ fn map_bound_expr(
                 expr: Box::new(go(*expr, f)?),
                 negated,
             },
-            BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+            BoundExpr::Scalar {
+                func,
+                args,
+                dtype,
+                volatile,
+            } => BoundExpr::Scalar {
                 func,
                 args: args.into_iter().map(|a| go(a, f)).collect::<Result<_>>()?,
                 dtype,
+                volatile,
             },
             BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
                 expr: Box::new(go(*expr, f)?),
@@ -6694,13 +6818,19 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
             right: Box::new(rebase_to_keys(right, keys)?),
             dtype: *dtype,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func: *func,
             args: args
                 .iter()
                 .map(|a| rebase_to_keys(a, keys))
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
+            volatile: *volatile,
         },
         BoundExpr::DynamicScalar {
             name,
@@ -6779,13 +6909,19 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
             expr: Box::new(resolve_window_refs(*expr, input_width)),
             negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func,
             args: args
                 .into_iter()
                 .map(|a| resolve_window_refs(a, input_width))
                 .collect(),
             dtype,
+            volatile,
         },
         BoundExpr::DynamicScalar {
             name,
@@ -6875,13 +7011,19 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
             expr: Box::new(resolve_agg_refs(*expr, num_keys)),
             negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func,
             args: args
                 .into_iter()
                 .map(|a| resolve_agg_refs(a, num_keys))
                 .collect(),
             dtype,
+            volatile,
         },
         BoundExpr::DynamicScalar {
             name,
@@ -7203,14 +7345,6 @@ pub(crate) fn bind_tracked_with(
             name.trim_start_matches('$')
         )));
     }
-    if crate::plan::writes_tables(&plan) && dynamic.iter().any(|d| d == VOLATILE_UUID_DEP) {
-        return Err(PinkDbError::Execution(
-            "uuid() is volatile (nondeterministic) and cannot be called in a statement the \
-             engine WAL-logs: replaying it would produce different values. Use it in a \
-             read-only statement"
-                .to_string(),
-        ));
-    }
     if crate::plan::writes_tables(&plan)
         && let Some(function) = db.first_volatile_dynamic_function(&dynamic)
     {
@@ -7233,7 +7367,7 @@ fn bind_tracked_plan(
 ) -> Result<(LogicalPlan, Vec<String>)> {
     // Every binder this statement creates (RETURNING, ON CONFLICT, …) reads
     // one clock.
-    let _clock = ClockScope::enter();
+    let _clock = StatementScope::enter();
     let empty = |plan| Ok((plan, Vec::new()));
     match stmt {
         Statement::CreateTable {
@@ -9338,6 +9472,7 @@ fn can_assign(from: DataType, to: DataType) -> bool {
                 | DataType::Date
                 | DataType::Timestamp
                 | DataType::Interval
+                | DataType::Uuid
         )
     };
     let numeric = |t: DataType| {
@@ -12150,6 +12285,8 @@ fn duckdb_data_type_id(dtype: DataType) -> i64 {
         // Pinkdb arrays always carry a length, so they are DuckDB's fixed
         // ARRAY type (id 108), not a variable LIST (101).
         DataType::Array { .. } => 108,
+        // DuckDB's LogicalTypeId::UUID.
+        DataType::Uuid => 54,
         DataType::Variant => 109,
     }
 }

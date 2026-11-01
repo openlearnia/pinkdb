@@ -790,17 +790,21 @@ fn run_trigger(
         .trigger_invoker
         .replace(db.session_principal.clone().unwrap_or_default());
     let result = (|| -> Result<()> {
-        let slots = || {
+        // A plain function, not a closure: binding borrows `db` immutably and
+        // the body then records its dynamic functions on the store.
+        fn slots(db: &PinkDb) -> crate::sql::binder::ParamSlots {
             crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(trigger_variables(db))
-        };
+        }
         if let Some(when) = &def.when {
             let (bound, dynamic) = crate::sql::binder::bind_constant_expr_tracked(
                 db,
                 &def_ns(def),
                 when,
-                Some(slots()),
+                Some(slots(db)),
             )
             .map_err(|e| err(def, format!("WHEN: {e}")))?;
+            // A `now()` in the WHEN clause is part of the record too.
+            db.proc_frame.add_memo_deps(&dynamic);
             if let Some(function) = db.first_volatile_dynamic_function(&dynamic) {
                 return Err(err(
                     def,
@@ -814,6 +818,7 @@ fn run_trigger(
             let single = crate::vector::DataChunk {
                 columns: Vec::new(),
                 num_rows: 1,
+                ordinal: 0,
             };
             let cx = crate::exec::Cx::with_budget(db, budget.clone());
             let v = crate::exec::expr::eval_expr(&bound, &single, &cx)?;
@@ -841,7 +846,7 @@ fn run_trigger(
         crate::procedure::run_call_statement(
             db,
             &def_ns(def),
-            slots(),
+            slots(db),
             &def.action,
             Some(budget),
             |msg| err(def, msg.to_string()),

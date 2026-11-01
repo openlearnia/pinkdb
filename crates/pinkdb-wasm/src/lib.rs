@@ -144,8 +144,13 @@ fn push_value(out: &mut String, v: &Value) {
             }
             out.push(']');
         }
-        // Canonical DuckDB-style display text.
-        Value::Date(_) | Value::Timestamp(_) | Value::Decimal(..) | Value::Interval { .. } => {
+        // Canonical DuckDB-style display text (a UUID crosses as its
+        // lowercase 8-4-4-4-12 form, like the C ABI).
+        Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::Decimal(..)
+        | Value::Interval { .. }
+        | Value::Uuid(_) => {
             push_json_string(out, &v.to_string());
         }
     }

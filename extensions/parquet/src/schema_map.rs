@@ -21,7 +21,8 @@
 //! | FIXED_LEN_BYTE_ARRAY INTERVAL (12) | INTERVAL | INTERVAL |
 //! | INT64 TIME_MICROS, INT32 TIME_MILLIS, TIME(NANOS) | **refused** (no TIME type) | TIME |
 //! | TIMESTAMP(NANOS) | **refused** (microsecond precision) | TIMESTAMP_NS |
-//! | FIXED_LEN_BYTE_ARRAY UUID / FLOAT16, BSON, VARIANT, GEOMETRY, GEOGRAPHY | **refused** | UUID et al. |
+//! | FIXED_LEN_BYTE_ARRAY UUID (16) | UUID | UUID |
+//! | FIXED_LEN_BYTE_ARRAY FLOAT16, BSON, VARIANT, GEOMETRY, GEOGRAPHY | **refused** | FLOAT16 et al. |
 //!
 //! "Refused" is a bind-time error naming the column — never a silent
 //! re-typing: a TIME column read as VARCHAR would compare wrongly in SQL.
@@ -85,7 +86,12 @@ pub fn engine_type(
                 Err("TIME is not supported (pinkdb has no TIME type)".to_string())
             }
             LogicalType::Integer(i) => integer_type(i.is_signed, i.bit_width, physical),
-            LogicalType::Uuid => Err("UUID is not supported".to_string()),
+            // The annotation fixes the byte order: RFC 4122 order, which is
+            // the unsigned integer order pinkdb compares by.
+            LogicalType::Uuid if physical == PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                Ok(DataType::Uuid)
+            }
+            LogicalType::Uuid => Err("UUID needs FIXED_LEN_BYTE_ARRAY(16)".to_string()),
             LogicalType::Float16 => Err("FLOAT16 is not supported".to_string()),
             LogicalType::Bson => Err("BSON is not supported".to_string()),
             LogicalType::List | LogicalType::Map => {
@@ -423,7 +429,8 @@ pub fn alpha_type_name(ty: DataType) -> Option<String> {
         | DataType::Timestamp
         | DataType::Interval
         | DataType::Array { .. }
-        | DataType::Variant => ty.name(),
+        | DataType::Variant
+        | DataType::Uuid => ty.name(),
         DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
     })
 }
@@ -550,6 +557,14 @@ mod tests {
                     scale: 2,
                 },
             ),
+            (
+                leaf(
+                    Some(LogicalType::Uuid),
+                    ConvertedType::NONE,
+                    PhysicalType::FIXED_LEN_BYTE_ARRAY,
+                ),
+                DataType::Uuid,
+            ),
         ];
         for (schema, expected) in cases {
             let info = schema.get_basic_info();
@@ -579,11 +594,6 @@ mod tests {
                 PhysicalType::INT64,
             ),
             leaf(
-                Some(LogicalType::Uuid),
-                ConvertedType::NONE,
-                PhysicalType::FIXED_LEN_BYTE_ARRAY,
-            ),
-            leaf(
                 Some(LogicalType::Float16),
                 ConvertedType::NONE,
                 PhysicalType::FIXED_LEN_BYTE_ARRAY,
@@ -604,6 +614,19 @@ mod tests {
                 "expected a refusal for {schema:?}"
             );
         }
+        // The annotation alone does not make 16 bytes: a UUID must be
+        // FIXED_LEN_BYTE_ARRAY. (parquet-rs will not build such a schema, so
+        // the guard is checked directly.)
+        assert!(
+            engine_type(
+                PhysicalType::BYTE_ARRAY,
+                ConvertedType::NONE,
+                Some(&LogicalType::Uuid),
+                -1,
+                -1,
+            )
+            .is_err()
+        );
         // A nested group is refused by `map_columns`.
         let child = leaf(None, ConvertedType::INT_32, PhysicalType::INT32);
         let group = SchemaType::group_type_builder("nested")

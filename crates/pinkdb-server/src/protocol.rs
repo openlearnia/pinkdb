@@ -87,7 +87,7 @@ use pinkdb::{DataType, Value};
 /// dtype carries an element byte and a `u32` length.
 /// v14: `CREATE/DROP SCHEMA` `Done` kinds (tags 27–28); `Used`'s `name` is
 /// `db\0schema` (wave 131b).
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -167,6 +167,8 @@ mod value_tag {
     /// encoding, which carries the element kind, the size and the NULL-element
     /// bitmap.
     pub const ARRAY: u8 = 11;
+    /// v15: `UUID(16 bytes)` — the unsigned 128-bit value, little endian.
+    pub const UUID: u8 = 12;
 }
 
 /// DataType tag bytes (one per [`DataType`] variant).
@@ -186,6 +188,8 @@ mod dtype_tag {
     pub const VARIANT: u8 = 9;
     /// v13: an element byte and a `u32` length ride after the tag.
     pub const ARRAY: u8 = 10;
+    /// v15: no parameters.
+    pub const UUID: u8 = 11;
 }
 
 // ---------- errors ----------
@@ -1001,6 +1005,10 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) -> Result<(), ProtocolError> {
             put_u32(buf, count_u32(bytes.len(), "ARRAY value")?);
             buf.extend_from_slice(&bytes);
         }
+        Value::Uuid(bits) => {
+            put_u8(buf, value_tag::UUID);
+            buf.extend_from_slice(&bits.to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -1018,6 +1026,7 @@ fn dtype_byte(dtype: DataType) -> u8 {
         DataType::Interval => dtype_tag::INTERVAL,
         DataType::Variant => dtype_tag::VARIANT,
         DataType::Array { .. } => dtype_tag::ARRAY,
+        DataType::Uuid => dtype_tag::UUID,
     }
 }
 
@@ -1154,6 +1163,12 @@ impl<'a> Reader<'a> {
                         .map_err(|e| ProtocolError::Malformed(format!("bad ARRAY value: {e}")))?,
                 ))
             }
+            value_tag::UUID => {
+                let b = self.take(16, what)?;
+                let mut x = [0u8; 16];
+                x.copy_from_slice(b);
+                Value::Uuid(u128::from_le_bytes(x))
+            }
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown value tag {other}"
@@ -1183,6 +1198,7 @@ impl<'a> Reader<'a> {
             }
             dtype_tag::INTERVAL => DataType::Interval,
             dtype_tag::VARIANT => DataType::Variant,
+            dtype_tag::UUID => DataType::Uuid,
             dtype_tag::ARRAY => {
                 let elem = self.u8(what)?;
                 let len = self.u32(what)?;

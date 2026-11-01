@@ -942,6 +942,15 @@ fn decode_column(
                 DataType::Interval => read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
                     Ok(interval_value(v.data()))
                 })?,
+                // Parquet stores a UUID's 16 bytes in RFC 4122 order (the
+                // parquet-format UUID annotation says so), so big-endian.
+                DataType::Uuid => read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
+                    let bytes: [u8; 16] = v
+                        .data()
+                        .try_into()
+                        .map_err(|_| "the UUID column is not 16 bytes wide".to_string())?;
+                    Ok(Value::Uuid(u128::from_be_bytes(bytes)))
+                })?,
                 other => return Err(unsupported_decode(&name, other)),
             }
         }

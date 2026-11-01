@@ -589,6 +589,7 @@ fn mix_value(h: &mut u64, v: &Value) {
             a.hash_key(&mut b);
             mix(h, 11, &b);
         }
+        Value::Uuid(bits) => mix(h, 12, &bits.to_le_bytes()),
     }
 }
 

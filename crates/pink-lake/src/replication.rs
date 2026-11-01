@@ -2699,6 +2699,10 @@ fn encode_key(value: &Value, out: &mut Vec<u8>) {
             out.push(11);
             out.extend_from_slice(&pinkdb::array::encode_cell(a));
         }
+        Value::Uuid(bits) => {
+            out.push(12);
+            out.extend_from_slice(&bits.to_le_bytes());
+        }
     }
 }
 

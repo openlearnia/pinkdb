@@ -17,6 +17,7 @@
 //! | DATE | INT32 + DATE |
 //! | TIMESTAMP | INT64 + TIMESTAMP(MICROS), `is_adjusted_to_utc = false` |
 //! | DECIMAL(p,s) | INT32 (p ≤ 9) / INT64 (p ≤ 18) / FIXED_LEN_BYTE_ARRAY(16) + DECIMAL(p,s) |
+//! | UUID | FIXED_LEN_BYTE_ARRAY(16) + UUID |
 //! | VARIANT | GROUP + `Variant` logical type: `metadata`, `value`, and a `typed_value` group with one typed column per shredded key ([`variant_shred`]) |
 //! | ARRAY | the three-level LIST group DuckDB 2.0 writes, whose length is only in the number of element slots per row (plus a `pinkdb.array.<name>` key-value entry) |
 //!
@@ -73,6 +74,8 @@ pub const DEFAULT_ROW_GROUP_ROWS: usize = 64 * 1024;
 /// The fixed byte width of a DECIMAL wider than INT64 (precision up to 38
 /// fits in 16 two's-complement bytes: 10^38 < 2^127).
 const DECIMAL_FIXED_LEN: i32 = 16;
+/// A UUID is always 16 bytes (`FIXED_LEN_BYTE_ARRAY(16)` + the UUID annotation).
+const UUID_FIXED_LEN: i32 = 16;
 
 /// A parquet write failure: an unsupported column, a value that does not
 /// match its column, or a parquet/integrity error.
@@ -346,6 +349,7 @@ fn physical_type(dtype: DataType, column: &str) -> Result<PhysicalType, WriteErr
         DataType::Bigint | DataType::Timestamp => PhysicalType::INT64,
         DataType::Double => PhysicalType::DOUBLE,
         DataType::Varchar => PhysicalType::BYTE_ARRAY,
+        DataType::Uuid => PhysicalType::FIXED_LEN_BYTE_ARRAY,
         DataType::Decimal { precision, .. } => {
             if precision <= 9 {
                 PhysicalType::INT32
@@ -457,6 +461,11 @@ fn build_schema(
                     // Naive microseconds: `is_adjusted_to_utc = false`, so no
                     // reader shifts the value by a time zone.
                     .with_logical_type(Some(LogicalType::timestamp(false, TimeUnit::MICROS)));
+            }
+            DataType::Uuid => {
+                builder = builder
+                    .with_length(UUID_FIXED_LEN)
+                    .with_logical_type(Some(LogicalType::Uuid));
             }
             DataType::Decimal { precision, scale } => {
                 builder = builder
@@ -631,6 +640,17 @@ fn write_column(
                 )?;
             }
         }
+        DataType::Uuid => write_typed(
+            column.typed::<FixedLenByteArrayType>(),
+            rows,
+            cursor,
+            name,
+            |v| match v {
+                // RFC 4122 byte order, the parquet UUID annotation's.
+                Value::Uuid(bits) => Ok(FixedLenByteArray::from(bits.to_be_bytes().to_vec())),
+                _ => Err(wrong_type(v, DataType::Uuid)),
+            },
+        )?,
         // Refused in `physical_type`/`build_schema` before any row is read.
         DataType::Interval => unreachable!("interval columns are refused before writing"),
         DataType::Variant => unreachable!("variant columns use write_variant_column"),

@@ -731,6 +731,74 @@ def run_parquet():
         return
     for label, sql, ordered, expect_error in PARQUET_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP)
+    run_parquet_writer()
+
+
+PARQUET_WRITER_SETUP = """
+CREATE TABLE pqw (id BIGINT, u UUID);
+INSERT INTO pqw VALUES
+ (1, '00000000-0000-0000-0000-000000000001'),
+ (2, NULL),
+ (3, '80000000-0000-4000-8000-000000000000'),
+ (4, 'ffffffff-ffff-ffff-ffff-ffffffffffff');
+COPY pqw TO '{path}' (FORMAT parquet);
+"""
+
+PARQUET_WRITER_QUERY = (
+    "SELECT CAST(id AS VARCHAR), u::VARCHAR, typeof(u) "
+    "FROM read_parquet('{path}') WHERE u IS NOT NULL ORDER BY id;"
+)
+
+PARQUET_WRITER_EXPECTED = [
+    ["1", "00000000-0000-0000-0000-000000000001", "UUID"],
+    ["3", "80000000-0000-4000-8000-000000000000", "UUID"],
+    ["4", "ffffffff-ffff-ffff-ffff-ffffffffffff", "UUID"],
+]
+
+
+def run_parquet_writer():
+    """Each engine writes the file, then both engines read it.
+
+    `run_case` cannot express this: it runs the same SQL in both engines, so
+    each would read back its own file. Reading the *other* writer's file is
+    what pins the physical type and the UUID logical type pinkdb writes: a
+    wrong layout would make DuckDB refuse the schema or read garbage.
+    """
+    directory = tempfile.mkdtemp(prefix="duckdiff_pq_")
+    try:
+        for writer in ("pinkdb", "duckdb"):
+            path = os.path.join(directory, f"{writer}.parquet")
+            setup = PARQUET_WRITER_SETUP.format(path=path)
+            if writer == "pinkdb":
+                # COPY prints its own count table, so this goes through the
+                # table reader rather than pink_query's one-table contract.
+                tables = pink_tables(setup, "SELECT 1;")
+                failed = [t for t in tables if t[0] == "error"]
+                ok = not failed and os.path.exists(path)
+                detail = failed[0][1] if failed else "no file written"
+            else:
+                wrote = duck_query(setup, "SELECT 1;")
+                ok = wrote[0] != "error" and os.path.exists(path)
+                detail = wrote[1] if wrote[0] == "error" else "no file written"
+            check(f"pq-writer-{writer}", ok, detail)
+            if not ok:
+                continue
+            for reader in ("pinkdb", "duckdb"):
+                read = pink_query if reader == "pinkdb" else duck_query
+                got = read("", PARQUET_WRITER_QUERY.format(path=path))
+                if got[0] == "error":
+                    check(f"pq-writer-{writer}-reader-{reader}", False, got[1])
+                    continue
+                rows = got[2] if reader == "pinkdb" else got[1]
+                check(
+                    f"pq-writer-{writer}-reader-{reader}",
+                    rows == PARQUET_WRITER_EXPECTED,
+                    f"{rows!r}",
+                )
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
 
 
 def run_small():
@@ -1173,6 +1241,77 @@ def run_defaults():
               f"\npink={pink_msg!r}\nduck={duck_msg!r}")
 
 
+# ---- unaliased expression names ----
+#
+# QuackLab reads result column names, so a select item without an alias must
+# render the name DuckDB gives it. `pink_tables` deliberately ignores the
+# header row, so this battery parses it instead and compares it with DuckDB's
+# `DESCRIBE` (whose first column is the name). `x NOT IN (…)` is not probed:
+# pinkdb's parser desugars IN into OR-of-equals before naming, so the names
+# cannot match without an InList node.
+NAME_SETUP = """
+CREATE TABLE nt (x INTEGER, s VARCHAR);
+INSERT INTO nt VALUES (1, 'abc'), (2, 'axy'), (NULL, NULL);
+"""
+
+NAME_QUERIES = [
+    ("name-is-null", "SELECT x IS NOT NULL, x IS NULL FROM nt;"),
+    ("name-not", "SELECT NOT (x = 1) FROM nt;"),
+    ("name-like", "SELECT s NOT LIKE 'a%', s LIKE 'a%' FROM nt;"),
+    ("name-between", "SELECT x NOT BETWEEN 1 AND 2, x BETWEEN 1 AND 2 FROM nt;"),
+    ("name-arith", "SELECT -x, x + 1, x % 2, x <> 1 FROM nt;"),
+    ("name-cast", "SELECT CAST(x AS INT), x::INT, CAST(s AS VARCHAR) FROM nt;"),
+    ("name-call", "SELECT substr(s, 2, 1), upper(s), coalesce(x, 0), 'it''s' FROM nt;"),
+]
+
+
+def pink_names(setup, sql):
+    """The result column names pinkdb printed for the last result table."""
+    script = setup + "\n" + sql + "\n.quit\n"
+    env = dict(os.environ)
+    env["PINKDB_ALLOW_LOAD_EXTENSION"] = "1"
+    env["PINKDB_AGENT_MODE"] = "0"
+    p = subprocess.run(PINKDB, input=script, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, timeout=300,
+                       env=env)
+    header, state = None, 0
+    for line in p.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("Error:"):
+            return ("error", s)
+        if s.startswith("│"):
+            if state == 0:
+                header = [c.strip() for c in s.split("│")[1:-1]]
+                state = 1
+        elif s.startswith("└"):
+            state = 0
+    if header is None:
+        return ("error", f"harness: no result table for {sql[:60]!r}")
+    return ("rows", header)
+
+
+def duck_names(setup, sql):
+    got = duck_query(setup, f"DESCRIBE {sql}")
+    if got[0] != "rows":
+        return got
+    return ("rows", [r[0] for r in got[1]])
+
+
+def run_expression_names():
+    print("== expression-name battery ==")
+    for label, sql in NAME_QUERIES:
+        p = pink_names(NAME_SETUP, sql)
+        if p[0] == "error":
+            check(label, False, f"pinkdb error: {p[1]}")
+            continue
+        d = duck_names(NAME_SETUP, sql)
+        if d[0] == "error":
+            check(label, False, f"duckdb error: {d[1]}")
+            continue
+        ok = p[1] == d[1]
+        check(label, ok, "" if ok else f"\npink={p[1]}\nduck={d[1]}")
+
+
 # (label, pinkdb sql, duckdb sql, ordered). DuckDB's parser rejects a
 # database qualifier on a star (`db1.t.*` — "more than one column in front of
 # a star"), so those probes spell the same columns out on its side; the pinkdb
@@ -1294,6 +1433,13 @@ DIALECT_QUERIES = [
     ("dialect-quantile", "SELECT quantile_cont(salary, 0.25), quantile_disc(id, 0.5) FROM emp;", False, False),
     ("dialect-contains", "SELECT contains('hello', 'ell'), contains('hello', 'z'), contains(name, 'a') FROM emp ORDER BY id;", True, False),
     ("dialect-uuid", "SELECT length(CAST(uuid() AS VARCHAR)), CAST(gen_random_uuid() AS VARCHAR) LIKE '________-____-4___-____-____________', count(DISTINCT CAST(uuid() AS VARCHAR)) FROM range(5);", False, False),
+    ("dialect-uuid-typeof", "SELECT typeof(uuid()), typeof(gen_random_uuid()), typeof(random()), length(CAST(uuid() AS VARCHAR)), CAST(CAST(uuid() AS VARCHAR) AS UUID) = uuid();", False, False),
+    ("dialect-uuid-input-forms", "SELECT CAST('{550E8400-E29B-41D4-A716-446655440000}' AS UUID), CAST('550E8400E29B41D4A716446655440000' AS UUID), CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID);", False, False),
+    ("dialect-uuid-order", "SELECT u FROM (VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID), ('00000000-0000-0000-0000-000000000001'::UUID), ('80000000-0000-4000-8000-000000000000'::UUID)) t(u) ORDER BY u;", True, False),
+    ("dialect-uuid-compare", "SELECT 'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID < '00000000-0000-0000-0000-000000000001'::UUID, '550e8400-e29b-41d4-a716-446655440000'::UUID = '550E8400-E29B-41D4-A716-446655440000'::UUID, '7fffffff-ffff-4fff-bfff-ffffffffffff'::UUID < '80000000-0000-4000-8000-000000000000'::UUID;", False, False),
+    ("dialect-uuid-group", "SELECT count(DISTINCT u), count(*) FROM (SELECT CAST('00000000-0000-4000-8000-00000000000' || CAST(i % 3 AS VARCHAR) AS UUID) AS u FROM range(9) t(i)) s;", False, False),
+    ("dialect-uuid-group-by", "CREATE TABLE ug (u UUID, k INTEGER); INSERT INTO ug VALUES ('00000000-0000-4000-8000-000000000001', 1), ('00000000-0000-4000-8000-000000000001', 2), ('ffffffff-ffff-ffff-ffff-ffffffffffff', 3); SELECT u, count(*), sum(k) FROM ug GROUP BY u ORDER BY u;", True, False),
+    ("dialect-uuid-join", "CREATE TABLE ua (u UUID, a INTEGER); INSERT INTO ua VALUES ('550e8400-e29b-41d4-a716-446655440000', 1), ('ffffffff-ffff-ffff-ffff-ffffffffffff', 2); CREATE TABLE ub (u UUID, b INTEGER); INSERT INTO ub VALUES ('550e8400-e29b-41d4-a716-446655440000', 10), ('00000000-0000-0000-0000-000000000001', 20); SELECT ua.u, ua.a, ub.b FROM ua JOIN ub ON ua.u = ub.u;", True, False),
     ("dialect-range", "SELECT * FROM range(3);", True, False),
     ("dialect-range-step", "SELECT * FROM range(10, 1, -3);", True, False),
     ("dialect-range-null", "SELECT count(*) FROM range(NULL);", False, False),
@@ -1525,7 +1671,12 @@ COPY (
          CASE i % 3 WHEN 0 THEN 'west' WHEN 1 THEN 'east' ELSE 'north' END AS region,
          (i * 1.5)::DOUBLE AS total,
          (i % 2 = 0) AS active,
-         DATE '2024-01-01' + i::INTEGER AS day
+         DATE '2024-01-01' + i::INTEGER AS day,
+         CASE i % 4
+           WHEN 0 THEN '00000000-0000-4000-8000-000000000000'::UUID
+           WHEN 1 THEN 'ffffffff-ffff-4fff-bfff-ffffffffffff'::UUID
+           WHEN 2 THEN '550e8400-e29b-41d4-a716-446655440000'::UUID
+         END AS u
   FROM range(0, 50) t(i)
 ) TO '{path}' (FORMAT parquet);
 """
@@ -1615,6 +1766,8 @@ def run_remote():
         ("remote-parquet-count", f"SELECT COUNT(*), MIN(id), MAX(id), SUM(total) FROM read_parquet('{parquet_url}');", False),
         ("remote-parquet-filter", f"SELECT id, region FROM read_parquet('{parquet_url}') WHERE id >= 40 ORDER BY id;", True),
         ("remote-parquet-group", f"SELECT region, COUNT(*), SUM(total) FROM read_parquet('{parquet_url}') GROUP BY region ORDER BY region;", True),
+        ("remote-parquet-uuid", f"SELECT COUNT(*), COUNT(u), COUNT(DISTINCT u), MIN(u)::VARCHAR, MAX(u)::VARCHAR FROM read_parquet('{parquet_url}');", False),
+        ("remote-parquet-uuid-order", f"SELECT u::VARCHAR FROM read_parquet('{parquet_url}') WHERE u IS NOT NULL ORDER BY u;", True),
         ("remote-parquet-replacement", f"SELECT COUNT(*) FROM '{parquet_url}';", False),
         ("remote-csv-count", f"SELECT COUNT(*), COUNT(total), SUM(total) FROM read_csv('{csv_url}');", False),
         ("remote-csv-filter", f"SELECT id FROM read_csv('{csv_url}') WHERE active ORDER BY id;", True),
@@ -1652,6 +1805,7 @@ def run_remote():
 def main():
     import sys
     run_small()
+    run_expression_names()
     run_csv()
     run_remote()
     if "--big" in sys.argv:

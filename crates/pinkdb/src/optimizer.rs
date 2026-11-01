@@ -395,6 +395,7 @@ fn const_chunk() -> DataChunk {
     DataChunk {
         columns: Vec::new(),
         num_rows: 1,
+        ordinal: 0,
     }
 }
 
@@ -440,10 +441,16 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
             expr: Box::new(fold_expr(cx, *expr)),
             negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func,
             args: args.into_iter().map(|a| fold_expr(cx, a)).collect(),
             dtype,
+            volatile,
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(fold_expr(cx, *expr)),
@@ -2564,13 +2571,19 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
             right: Box::new(rewrite_through_project(right, exprs)?),
             dtype: *dtype,
         }),
-        BoundExpr::Scalar { func, args, dtype } => Some(BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => Some(BoundExpr::Scalar {
             func: *func,
             args: args
                 .iter()
                 .map(|a| rewrite_through_project(a, exprs))
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
+            volatile: *volatile,
         }),
         // A dynamic call is row-wise like any other function: pushing a
         // predicate through a projection is row-preserving (same rows, same
@@ -2642,13 +2655,19 @@ fn rewrite_through_keys(pred: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExp
             expr: Box::new(rewrite_through_keys(expr, keys)?),
             negated: *negated,
         }),
-        BoundExpr::Scalar { func, args, dtype } => Some(BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => Some(BoundExpr::Scalar {
             func: *func,
             args: args
                 .iter()
                 .map(|a| rewrite_through_keys(a, keys))
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
+            volatile: *volatile,
         }),
         BoundExpr::Cast { expr, dtype } => Some(BoundExpr::Cast {
             expr: Box::new(rewrite_through_keys(expr, keys)?),

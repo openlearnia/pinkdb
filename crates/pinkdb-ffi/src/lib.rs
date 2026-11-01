@@ -344,6 +344,15 @@ impl Cell {
                     text: Some(b),
                 }
             }
+            // UUID has no cell in the ABI, so it crosses as its text form
+            // (and its column type tag is PINKDB_TYPE_VARCHAR).
+            Value::Uuid(bits) => Cell {
+                tag: PINKDB_TYPE_VARCHAR,
+                is_null: false,
+                i: 0,
+                d: 0.0,
+                text: Some(nul_terminated(&pinkdb::uuid::format(*bits))),
+            },
             Value::Variant(v) => {
                 let mut b = v.to_json().into_bytes();
                 b.push(0);
@@ -469,6 +478,7 @@ fn dtype_tag(t: DataType) -> i32 {
         DataType::Decimal { .. } => PINKDB_TYPE_DECIMAL,
         DataType::Interval => PINKDB_TYPE_INTERVAL,
         DataType::Variant => PINKDB_TYPE_VARIANT,
+        DataType::Uuid => PINKDB_TYPE_VARCHAR,
     }
 }
 

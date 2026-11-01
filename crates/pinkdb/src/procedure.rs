@@ -1731,6 +1731,11 @@ pub(crate) struct ProcFrame {
     /// database) instead of the `CALL` text — re-running a call that
     /// committed part of its work would apply that part twice.
     segment_log: Option<(crate::storage::SchemaPath, Vec<String>)>,
+    /// The dynamic functions the body's statements reference, so the record
+    /// that carries the call (its text, or one segment at a time) can pin the
+    /// clock reading they bound (`now()` inside a body is as much part of the
+    /// record as one in the `CALL` statement itself).
+    memo_deps: Vec<String>,
 }
 
 impl ProcFrame {
@@ -1740,6 +1745,23 @@ impl ProcFrame {
 
     pub(crate) fn add_sets(&mut self, sets: &crate::wal::FrameSets) {
         self.touched.extend(sets);
+    }
+
+    /// Note the dynamic functions a body statement bound.
+    pub(crate) fn add_memo_deps(&mut self, deps: &[String]) {
+        self.memo_deps.extend(deps.iter().cloned());
+    }
+
+    /// The dynamic functions the body's statements bound since the last
+    /// segment was logged.
+    pub(crate) fn memo_deps(&self) -> &[String] {
+        &self.memo_deps
+    }
+
+    /// A logged segment ends the record: the next one starts with no body
+    /// bindings of its own.
+    pub(crate) fn clear_memo_deps(&mut self) {
+        self.memo_deps.clear();
     }
 
     pub(crate) fn add_writes(
@@ -2410,6 +2432,7 @@ fn eval_bound(
     let single = crate::vector::DataChunk {
         columns: Vec::new(),
         num_rows: 1,
+        ordinal: 0,
     };
     let cx = crate::exec::Cx::with_budget(db, frame.budget.clone());
     let v = crate::exec::expr::eval_expr(bound, &single, &cx)?;
@@ -2466,8 +2489,11 @@ pub(crate) fn run_call_statement(
     let slots = slots.with_logged_procedure(db.is_durable());
     // `db` is the handle this call runs on, so its session is the caller's
     // (a network connection installs its own before running the statement).
-    let (plan, _dynamic) =
+    let (plan, dynamic_used) =
         crate::sql::binder::bind_tracked_with(db, sql, db_name, Some(slots), &db.session)?;
+    // The statement's clock reading (and anything else it recorded) has to
+    // reach the record that will carry this call, which may be a segment.
+    db.proc_frame.add_memo_deps(&dynamic_used);
     // Lazy index lifecycle: mutation times only set a flag (see
     // `PinkDb::rebuild_stale_indexes`).
     db.rebuild_stale_indexes();
@@ -2520,6 +2546,10 @@ pub(crate) fn run_call_statement(
     db.proc_frame.add_sets(&sets);
     db.proc_frame.add_writes(&writes);
     let wrote = crate::plan::writes_tables(&plan);
+    // A body statement joins the record being filled (the caller's segment or
+    // the statement that fired the trigger), so it draws from that record's
+    // seed at its own ordinal.
+    db.begin_volatile_statement(&plan)?;
     let result = match budget {
         Some(budget) => crate::exec::run_with_budget(db, &plan, budget.clone())?,
         None => crate::exec::run(db, &plan)?,
@@ -2568,7 +2598,14 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
             && !segment.is_empty()
         {
             let sets = db.proc_frame.touched();
-            let memo = frame.budget.take_external_calls();
+            // The segment's statements drew from the record's seed; it travels
+            // with the record so replay reproduces them.
+            let memo = frame
+                .budget
+                .take_external_calls()
+                .into_iter()
+                .chain(db.statement_memo(&[]))
+                .collect::<Vec<_>>();
             db.wal_append_session(
                 &frame.db_name,
                 &frame.db_name,
@@ -2579,6 +2616,9 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
                 &memo,
             )?;
             segment.clear();
+            // The segment's clock reading is in its record now; the next
+            // segment's statements bind their own.
+            db.proc_frame.clear_memo_deps();
         }
     } else {
         if let Some(point) = frame.restore.take() {
@@ -2589,6 +2629,7 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
         }
         // The rolled-back segment is gone: so is what it recorded.
         frame.budget.take_external_calls();
+        db.proc_frame.clear_memo_deps();
     }
     frame.restore = Some(boxed_snapshot(db));
     frame.txn_controlled = true;

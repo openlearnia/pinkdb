@@ -291,6 +291,9 @@ const MAX_LITERAL_DAY: i32 = 2_932_896; // 9999-12-31
 pub(crate) fn value_literal(value: &Value) -> Result<String> {
     Ok(match value {
         Value::Null => "NULL".to_string(),
+        // CAST keeps the logged text unambiguous (a bare literal has no UUID
+        // form) while re-parsing to exactly the same 128 bits.
+        Value::Uuid(bits) => format!("CAST('{}' AS UUID)", crate::uuid::format(*bits)),
         Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
         // The negative extremes cannot be written as plain literals (`-2147483648`
         // parses as BIGINT negation, `-9223372036854775808` overflows the

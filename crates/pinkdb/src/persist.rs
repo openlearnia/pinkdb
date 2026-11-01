@@ -212,6 +212,7 @@ const SV_DATE: u8 = 6;
 const SV_TIMESTAMP: u8 = 7;
 const SV_DECIMAL: u8 = 8;
 const SV_INTERVAL: u8 = 9;
+const SV_UUID: u8 = 10;
 
 /// Constraint-section kinds (one byte per constraint).
 const CK_PRIMARY_KEY: u8 = 0;
@@ -412,6 +413,8 @@ fn dtype_tag(t: DataType) -> u8 {
         // ARRAY's tag is incomplete like DECIMAL's: the schema writer stores
         // the element kind and length immediately after it.
         DataType::Array { .. } => 10,
+        // UUID is a fixed 16-byte payload, so the tag carries no parameters.
+        DataType::Uuid => 11,
     }
 }
 
@@ -425,6 +428,7 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
         5 => Ok(DataType::Date),
         6 => Ok(DataType::Timestamp),
         9 => Ok(DataType::Variant),
+        11 => Ok(DataType::Uuid),
         _ => Err(PinkDbError::Execution(format!(
             "corrupt file: bad dtype tag {b}"
         ))),
@@ -1854,6 +1858,22 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
             }
             best = Some((ENC_PLAIN, w.buf));
         }
+        // UUID: `u32 row count | raw 16-byte little-endian values`, the same
+        // shape as wide DECIMAL. Invalid rows are zeroed so the bytes stay
+        // deterministic; the validity bitmap wins on decode.
+        DataType::Uuid => {
+            let VectorData::Uuid(values) = v.data() else {
+                unreachable!("uuid chunk has a non-uuid payload")
+            };
+            let nulls = v.has_nulls();
+            let mut w = Writer::new();
+            w.u32(values.len() as u32);
+            for (i, &x) in values.iter().enumerate() {
+                let x = if nulls && !v.is_valid(i) { 0 } else { x };
+                w.bytes(&x.to_le_bytes());
+            }
+            best = Some((ENC_PLAIN, w.buf));
+        }
         // INTERVAL: `u32 row count | months(i32) days(i32) micros(i64)` each.
         DataType::Interval => {
             let VectorData::Interval(values) = v.data() else {
@@ -2432,6 +2452,17 @@ fn decode_payload(dtype: DataType, tag: u8, r: &mut Reader) -> Result<(VectorDat
                 },
                 n,
             ))
+        }
+        (DataType::Uuid, ENC_PLAIN) => {
+            let n = r.chunk_count("chunk length")?;
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                let b = r.take(16)?;
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(b);
+                values.push(u128::from_le_bytes(arr));
+            }
+            Ok((VectorData::Uuid(values), n))
         }
         (DataType::Interval, ENC_PLAIN) => {
             let n = r.chunk_count("chunk length")?;
@@ -3017,6 +3048,10 @@ fn write_stat_value(w: &mut Writer, v: Option<&Value>) {
             w.i32(*days);
             w.i64(*micros);
         }
+        Some(Value::Uuid(bits)) => {
+            w.u8(SV_UUID);
+            w.bytes(&bits.to_le_bytes());
+        }
         Some(Value::Null) => w.u8(SV_NONE),
         // VARIANT columns carry no min/max: the total order spans kinds, so the
         // extremes prune nothing a reader would not compare anyway. Their
@@ -3061,6 +3096,12 @@ fn read_stat_value(r: &mut Reader) -> Result<Option<Value>> {
             days: r.i32()?,
             micros: r.i64()?,
         }),
+        SV_UUID => {
+            let b = r.take(16)?;
+            let mut arr = [0u8; 16];
+            arr.copy_from_slice(b);
+            Some(Value::Uuid(u128::from_le_bytes(arr)))
+        }
         other => {
             return Err(PinkDbError::Execution(format!(
                 "corrupt file: unknown statistics value tag {other}"
@@ -4612,6 +4653,7 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
             precision,
             scale,
         },
+        DataType::Uuid => VectorData::Uuid(vec![0; rows]),
         DataType::Interval => VectorData::Interval(vec![
             crate::types::Interval {
                 months: 0,
@@ -5883,6 +5925,19 @@ fn plain_payload(v: &Vector) -> Vec<u8> {
         DataType::Varchar => enc_strs_plain(&varchar_payload(v)),
         DataType::Variant => variant_payload(v),
         DataType::Array { .. } => array_payload(v, 1),
+        DataType::Uuid => {
+            let VectorData::Uuid(values) = v.data() else {
+                unreachable!()
+            };
+            let nulls = v.has_nulls();
+            let mut w = Writer::new();
+            w.u32(values.len() as u32);
+            for (i, &x) in values.iter().enumerate() {
+                let x = if nulls && !v.is_valid(i) { 0 } else { x };
+                w.bytes(&x.to_le_bytes());
+            }
+            w.buf
+        }
         DataType::Decimal { .. } => {
             let VectorData::Decimal { values, .. } = v.data() else {
                 unreachable!()
@@ -7304,6 +7359,13 @@ mod tests {
                 },
                 scale,
             ),
+            DataType::Uuid => Value::Uuid(match i % 5 {
+                0 => 0,
+                1 => u128::MAX,
+                2 => 0x550e_8400_e29b_41d4_a716_4466_5544_0000,
+                3 => 0x8000_0000_0000_4000_8000_0000_0000_0000,
+                _ => (i as u128) << 64 | i as u128,
+            }),
             DataType::Interval => Value::Interval {
                 months: match i % 5 {
                     0 => 0,
@@ -8202,7 +8264,7 @@ mod tests {
         };
         for case in 0..2000 {
             let n = (next() % 300) as usize;
-            let dtype = match next() % 10 {
+            let dtype = match next() % 11 {
                 0 => DataType::Boolean,
                 1 => DataType::Integer,
                 2 => DataType::Bigint,
@@ -8215,6 +8277,7 @@ mod tests {
                     scale: 3,
                 },
                 8 => DataType::Interval,
+                9 => DataType::Uuid,
                 _ => DataType::Variant,
             };
             let mut values: Vec<Value> = Vec::with_capacity(n);
@@ -8234,6 +8297,7 @@ mod tests {
                     }
                     DataType::Date => Value::Date(r as i32),
                     DataType::Timestamp => Value::Timestamp(r as i64),
+                    DataType::Uuid => Value::Uuid(u128::from(r) << 64 | u128::from(r >> 1)),
                     DataType::Decimal { scale, .. } => Value::Decimal(r as i128, scale),
                     DataType::Interval => Value::Interval {
                         months: (r % 1000) as i32,

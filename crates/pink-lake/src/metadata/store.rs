@@ -5397,7 +5397,8 @@ fn canonical_sql_value(
         | DataType::Decimal { .. }
         | DataType::Interval
         | DataType::Variant
-        | DataType::Array { .. } => match canonical_to_ducklake(dtype, canonical) {
+        | DataType::Array { .. }
+        | DataType::Uuid => match canonical_to_ducklake(dtype, canonical) {
             Some(text) => SqlValue::Text(text),
             None => SqlValue::Text(canonical.to_string()),
         },
@@ -5810,6 +5811,7 @@ fn pink_dtype(ducklake: &str) -> pinkdb::DataType {
         }
         "interval" => pinkdb::DataType::Interval,
         "variant" => pinkdb::DataType::Variant,
+        "uuid" => pinkdb::DataType::Uuid,
         _ => pinkdb::DataType::Varchar,
     }
 }
@@ -5835,6 +5837,8 @@ fn canonical_to_ducklake(dtype: pinkdb::DataType, canonical: &str) -> Option<Str
             }
         }
         pinkdb::DataType::Varchar => canonical.to_string(),
+        // The canonical statistic text is already the UUID text form.
+        pinkdb::DataType::Uuid => canonical.to_string(),
         pinkdb::DataType::Decimal { .. }
         | pinkdb::DataType::Interval
         | pinkdb::DataType::Variant
@@ -5858,6 +5862,7 @@ fn ducklake_to_canonical(dtype: pinkdb::DataType, ducklake: &str) -> Option<Stri
             format!("{:016x}", value.to_bits())
         }
         pinkdb::DataType::Varchar => ducklake.to_string(),
+        pinkdb::DataType::Uuid => pinkdb::uuid::format(pinkdb::uuid::parse(ducklake)?),
         pinkdb::DataType::Decimal { precision, scale } => {
             let value = pinkdb::types::parse_decimal_str(ducklake, precision, scale).ok()?;
             pinkdb::types::format_decimal(value, scale)

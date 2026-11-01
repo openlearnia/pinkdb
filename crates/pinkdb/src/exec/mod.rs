@@ -1068,6 +1068,7 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
     let single = DataChunk {
         columns: Vec::new(),
         num_rows: 1,
+        ordinal: 0,
     };
     let v = eval_expr(value, &single, cx)?;
     if v.len() != 1 {
@@ -1300,6 +1301,7 @@ fn run_call_plan(
     let single = DataChunk {
         columns: Vec::new(),
         num_rows: 1,
+        ordinal: 0,
     };
     let mut values = Vec::with_capacity(args.len());
     {
@@ -1460,15 +1462,18 @@ pub(crate) fn run_plain(
         } => {
             let target = resolve_ns(db, qdb);
             // Evaluate constant cells against an empty single-row chunk, then
-            // append (storage coerces INTEGER → BIGINT → DOUBLE).
-            let single = DataChunk {
-                columns: Vec::new(),
-                num_rows: 1,
-            };
+            // append (storage coerces INTEGER → BIGINT → DOUBLE). The chunk's
+            // ordinal is the row's position, so a volatile cell (a DEFAULT
+            // like `uuid()`) gives each row its own value.
             let mut staged = Vec::with_capacity(rows.len());
             {
                 let cx = Cx::with_budget(db, budget.clone());
-                for row in rows {
+                for (ordinal, row) in rows.iter().enumerate() {
+                    let single = DataChunk {
+                        columns: Vec::new(),
+                        num_rows: 1,
+                        ordinal,
+                    };
                     let values: Vec<Value> = row
                         .iter()
                         .map(|e| {
@@ -1544,32 +1549,32 @@ pub(crate) fn run_plain(
             let mut staged = Vec::new();
             for chunk in &out.chunks {
                 budget.check_deadline()?;
+                // Unlisted columns take their DEFAULT once per source chunk,
+                // evaluated against that chunk so a volatile default (`uuid()`)
+                // varies per row the way the source rows do.
+                let cx = Cx::with_budget(db, budget.clone());
+                let mut defaults = Vec::new();
+                for (idx, default) in default_exprs.iter().enumerate() {
+                    if order.contains(&idx) {
+                        continue;
+                    }
+                    let Some(expr) = default else { continue };
+                    let v = eval_expr(expr, chunk, &cx)?;
+                    if v.len() != chunk.num_rows() {
+                        return Err(PinkDbError::Execution(
+                            "a column DEFAULT did not evaluate per row".to_string(),
+                        ));
+                    }
+                    defaults.push((idx, v));
+                }
                 for i in 0..chunk.num_rows() {
                     let mut values = vec![Value::Null; schema.len()];
                     for (src, &target_idx) in order.iter().enumerate() {
                         values[target_idx] =
                             DataTable::coerce(chunk.columns[src].get(i), schema[target_idx].1)?;
                     }
-                    // Unlisted columns take their DEFAULT per row (a clock
-                    // default is the statement's instant, a UUID default is
-                    // fresh per row).
-                    let single = DataChunk {
-                        columns: Vec::new(),
-                        num_rows: 1,
-                    };
-                    for (idx, default) in default_exprs.iter().enumerate() {
-                        if order.contains(&idx) {
-                            continue;
-                        }
-                        let Some(expr) = default else { continue };
-                        let cx = Cx::with_budget(db, budget.clone());
-                        let v = eval_expr(expr, &single, &cx)?;
-                        if v.len() != 1 {
-                            return Err(PinkDbError::Execution(
-                                "a column DEFAULT did not evaluate to one value".to_string(),
-                            ));
-                        }
-                        values[idx] = DataTable::coerce(v.get(0), schema[idx].1)?;
+                    for (idx, v) in &defaults {
+                        values[*idx] = DataTable::coerce(v.get(i), schema[*idx].1)?;
                     }
                     staged.push(values);
                 }
@@ -1883,12 +1888,17 @@ pub(crate) fn run_plain(
                     let values = match default {
                         None => vec![Value::Null; rows],
                         Some(default) => {
-                            let single = DataChunk {
-                                columns: Vec::new(),
-                                num_rows: 1,
-                            };
                             let mut values = Vec::with_capacity(rows);
-                            for _ in 0..rows {
+                            // One row at a time, with the row's own ordinal:
+                            // a volatile default (`uuid()`) must differ per
+                            // row, and a one-row chunk's ordinal is what the
+                            // seeded mixer reads.
+                            for row in 0..rows {
+                                let single = DataChunk {
+                                    columns: Vec::new(),
+                                    num_rows: 1,
+                                    ordinal: row,
+                                };
                                 let cx = Cx::with_budget(db, budget.clone());
                                 let v = eval_expr(&default.expr, &single, &cx)?;
                                 if v.len() != 1 {
@@ -3456,6 +3466,19 @@ fn project_mask(cx: &Cx, plan: &LogicalPlan, width: usize) -> Option<Vec<bool>> 
 }
 
 fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
+    let mut out = eval_planned(cx, plan)?;
+    // A chunk's ordinal is its position in this operator's output — which is
+    // its consumer's input order — never the worker that happened to produce
+    // it. Parallel operators collect in input order, so serial and parallel
+    // runs agree, and the volatile built-ins derive identical per-row values
+    // from it on WAL replay.
+    for (i, chunk) in out.chunks.iter_mut().enumerate() {
+        chunk.ordinal = i;
+    }
+    Ok(out)
+}
+
+fn eval_planned(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     if matches!(plan, LogicalPlan::Join { .. }) && cx.subplans.has_candidates() {
         return eval_shared_join(cx, plan);
     }
@@ -3948,7 +3971,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let scope = DataChunk {
                 columns: Vec::new(),
                 num_rows: 1,
-            };
+            ordinal: 0,
+};
             // A chunk holds at most CHUNK_SIZE rows: a longer VALUES list
             // (or a catalog relation of many rows) spans several chunks.
             let empty = || -> Vec<Vector> { types.iter().map(|t| Vector::new_empty(*t)).collect() };
@@ -3977,7 +4001,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             chunks: vec![DataChunk {
                 columns: Vec::new(),
                 num_rows: 1,
-            }],
+            ordinal: 0,
+}],
             names: vec![],
             types: vec![],
         }),
@@ -6605,13 +6630,19 @@ fn rewrite_through_project(expr: &BoundExpr, project: Option<&[BoundExpr]>) -> O
             expr: Box::new(rewrite_through_project(expr, project)?),
             negated: *negated,
         }),
-        BoundExpr::Scalar { func, args, dtype } => Some(BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => Some(BoundExpr::Scalar {
             func: *func,
             args: args
                 .iter()
                 .map(|a| rewrite_through_project(a, project))
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
+            volatile: *volatile,
         }),
         BoundExpr::Cast { expr, dtype } => Some(BoundExpr::Cast {
             expr: Box::new(rewrite_through_project(expr, project)?),
@@ -6690,13 +6721,19 @@ fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
             expr: Box::new(shift_join_columns(expr, left_cols)),
             negated: *negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func: *func,
             args: args
                 .iter()
                 .map(|a| shift_join_columns(a, left_cols))
                 .collect(),
             dtype: *dtype,
+            volatile: *volatile,
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(shift_join_columns(expr, left_cols)),
@@ -7597,6 +7634,15 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) {
                 + iv.days as i128 * 86_400_000_000i128
                 + iv.micros as i128;
             push_be_i128(out, key, desc);
+        }
+        // UUID: unsigned 128-bit big-endian, the order `compare_values` uses.
+        VectorData::Uuid(d) => {
+            let be = d[idx].to_be_bytes();
+            if desc {
+                out.extend(be.iter().map(|b| !b));
+            } else {
+                out.extend_from_slice(&be);
+            }
         }
         // Unreachable: `encode_sort_keys` bails to the `Value` comparator for
         // VARIANT and ARRAY, whose byte order is not their sort order.
@@ -9138,6 +9184,7 @@ impl<'p> Stream<'p> {
                     return Ok(Some(DataChunk {
                         columns: Vec::new(),
                         num_rows: 1,
+                        ordinal: 0,
                     }));
                 }
                 StreamKind::Filter { input, predicate } => {

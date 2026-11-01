@@ -51,6 +51,10 @@ pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         }
+        Value::Uuid(bits) => {
+            buf.push(15);
+            buf.extend_from_slice(&bits.to_le_bytes());
+        }
         // Dates encode as their raw payloads under distinct tags so same-type
         // equality (GROUP BY / DISTINCT / JOIN) never mixes them with ints.
         Value::Date(d) => {
@@ -1238,6 +1242,7 @@ fn cell_value(data: &VectorData, i: usize) -> Value {
             micros: d[i].micros,
         },
         VectorData::Variant(d) => Value::Variant(std::sync::Arc::clone(&d[i])),
+        VectorData::Uuid(d) => Value::Uuid(d[i]),
         VectorData::Array {
             elem,
             len,

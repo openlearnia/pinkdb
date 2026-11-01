@@ -1002,11 +1002,21 @@ impl Connection {
                 budget.set_collect_external_calls(
                     txn.work.is_durable() && crate::plan::writes_tables(&plan),
                 );
+                // The statement's record state: the transaction's record seed
+                // and this statement's ordinal (a nested statement joins its
+                // caller's unit instead).
+                txn.work.begin_volatile_statement(&plan)?;
                 let exec_start = profile.as_ref().map(|_| Instant::now());
                 let (result, _) = txn.work.run_storage_checked(&plan, &pre, &prior, |work| {
                     crate::exec::run_with_budget(work, &plan, budget.clone())
                 })?;
-                let memo = budget.take_external_calls();
+                // The record's statement seeds are drained once, at COMMIT:
+                // they belong to the transaction's single WAL record.
+                let memo = budget
+                    .take_external_calls()
+                    .into_iter()
+                    .chain(txn.work.statement_clock_memo(&dynamic_functions_used))
+                    .collect::<Vec<_>>();
                 if let Some(p) = profile.as_deref_mut() {
                     p.execute += exec_start.map(|s| s.elapsed()).unwrap_or_default();
                 }
@@ -1255,6 +1265,7 @@ impl Connection {
             );
             // Wave 83: an autocommit CALL may COMMIT/ROLLBACK in its body.
             shared.standalone_call = true;
+            shared.begin_volatile_statement(&plan)?;
             let result = shared
                 .run_storage_checked(&plan, pre, &Default::default(), |shared| {
                     crate::exec::run_with_budget(shared, &plan, budget.clone())
@@ -1295,6 +1306,7 @@ impl Connection {
         sets.canonicalize();
         let base = shared.capture_base()?;
         // Execute with no lease: this is the span other writers overlap.
+        shared.begin_volatile_statement(&plan)?;
         let (result, _) =
             shared.run_storage_checked(&plan, pre, &Default::default(), |shared| {
                 crate::exec::run_with_budget(shared, &plan, budget.clone())
@@ -1356,6 +1368,9 @@ impl Connection {
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
+        // `rebuild_under_lease` reloaded the committed state, so the record
+        // state restarts here: this attempt is the one that reaches the WAL.
+        shared.begin_volatile_statement(&plan)?;
         let (result, _) =
             shared.run_storage_checked(&plan, pre, &Default::default(), |shared| {
                 crate::exec::run_with_budget(shared, &plan, budget.clone())
@@ -1402,8 +1417,14 @@ impl Connection {
     ) -> Result<()> {
         let pre_ns = crate::storage::SchemaPath::new(pre, &self.current_schema);
         // The statement's recorded external-call results travel in its record:
-        // a replay serves them and never calls the provider (wave 107c).
-        let memo = budget.take_external_calls();
+        // a replay serves them and never calls the provider (wave 107c). A
+        // statement that read the clock or drew a volatile value also carries
+        // the reading and the statement seed, so replay binds both.
+        let memo = budget
+            .take_external_calls()
+            .into_iter()
+            .chain(shared.statement_memo(dynamic_functions_used))
+            .collect::<Vec<_>>();
         if crate::plan::writes_tables(plan) {
             // Wave 80: the committed unit's writes feed the ON COMMIT trigger
             // for the next statement boundary (a no-op for MV-free stores).
@@ -1615,6 +1636,19 @@ impl Connection {
                 .unwrap_or_else(|| txn.wal_db_after.clone());
             let mut sets = txn.wal_sets.clone();
             sets.canonicalize();
+            // One seed per logged statement of the record rides with the
+            // transaction's single WAL record.
+            for call in txn.work.volatile.take_memos() {
+                // A retried COMMIT keeps the entries already buffered.
+                if !txn
+                    .wal_memo
+                    .iter()
+                    .any(|c| c.name == call.name && c.args == call.args)
+                {
+                    txn.wal_memo.push(call);
+                }
+            }
+            let memo = &txn.wal_memo;
             shared.wal_append_local(
                 &before,
                 &txn.wal_db_after,
@@ -1622,7 +1656,7 @@ impl Connection {
                 &txn.wal_ext_paths,
                 &txn.wal_ext_loaded,
                 Some(&sets),
-                &txn.wal_memo,
+                memo,
             )?;
         }
         // Merge: swap written tables (carrying bumped versions) and views.

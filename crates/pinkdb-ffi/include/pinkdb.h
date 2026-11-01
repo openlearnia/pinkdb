@@ -111,6 +111,9 @@ enum {
     /* v1 additive: a FLOAT[N] array — the 4-byte counterpart of
        PINKDB_TYPE_ARRAY. See PINKDB_ARRAY_FLOAT_TAG. */
     PINKDB_TYPE_ARRAY_FLOAT = 12
+    /* UUID columns report PINKDB_TYPE_VARCHAR and carry the canonical
+       lowercase text form: the ABI has no 128-bit cell, so it is not a tag of
+       its own. */
 };
 
 /* An ARRAY's type tag: the type in the low byte, the element count above it.

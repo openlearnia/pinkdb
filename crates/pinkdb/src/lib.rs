@@ -98,6 +98,7 @@ pub mod table_source;
 pub mod text;
 pub mod trigger;
 pub mod types;
+pub mod uuid;
 pub mod variant;
 pub mod variant_shred;
 pub mod vector;
@@ -387,6 +388,7 @@ impl PinkDb {
                     sets.canonicalize();
                     let base = self.capture_base()?;
                     // The execution span no other writer waits for.
+                    self.begin_volatile_statement(&plan)?;
                     let first = run_plan(self, &plan)?;
                     // Past this point a failure must not leave the uncommitted
                     // effect observable: without the lease it cannot be undone,
@@ -425,6 +427,7 @@ impl PinkDb {
                         if plan::writes_tables(&p) {
                             self.refuse_logged_attached_reads(&p)?;
                         }
+                        self.begin_volatile_statement(&p)?;
                         (run_plan(self, &p)?, p, d)
                     };
                     // Session transitions are applied before WAL logging so the
@@ -492,6 +495,7 @@ impl PinkDb {
                 // Wave 83: a `CALL` outside a transaction may `COMMIT`/`ROLLBACK`
                 // in its body (the flag never outlives this statement).
                 self.standalone_call = !self.in_transaction();
+                self.begin_volatile_statement(&plan)?;
                 let result = run_plan(self, &plan);
                 self.standalone_call = false;
                 let result = result?;

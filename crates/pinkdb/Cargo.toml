@@ -91,3 +91,8 @@ getrandom = "0.2"
 [[bench]]
 name = "durable"
 harness = false
+
+[dev-dependencies]
+# The replay test runs one statement on a one-thread pool and the same
+# statement on an eight-thread pool; it is the engine's own pool either way.
+rayon = "1.12.0"

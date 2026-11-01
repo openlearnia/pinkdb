@@ -2584,6 +2584,7 @@ const VALUE_DECIMAL: u8 = 8;
 const VALUE_INTERVAL: u8 = 9;
 const VALUE_VARIANT: u8 = 10;
 const VALUE_ARRAY: u8 = 11;
+const VALUE_UUID: u8 = 12;
 
 fn encode_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     let n = u32::try_from(bytes.len()).map_err(|_| {
@@ -2651,6 +2652,10 @@ fn encode_value(out: &mut Vec<u8>, value: &crate::types::Value) -> Result<()> {
         Value::Array(a) => {
             out.push(VALUE_ARRAY);
             encode_bytes(out, &crate::array::encode_cell(a))?;
+        }
+        Value::Uuid(bits) => {
+            out.push(VALUE_UUID);
+            out.extend_from_slice(&bits.to_le_bytes());
         }
     }
     Ok(())
@@ -2765,6 +2770,12 @@ fn decode_value(r: &mut Payload<'_>) -> std::result::Result<Value, String> {
         VALUE_ARRAY => {
             let value = crate::array::decode_cell(r.bytes()?).map_err(|e| e.to_string())?;
             Value::Array(std::sync::Arc::new(value))
+        }
+        VALUE_UUID => {
+            let bytes = r.take(16)?;
+            Value::Uuid(u128::from_le_bytes(
+                bytes.try_into().expect("16 bytes were read"),
+            ))
         }
         other => return Err(format!("unknown WAL memo value tag {other}")),
     })
@@ -5187,6 +5198,19 @@ fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
         PinkDbError::Execution(format!("WAL replay failed at lsn {}: {e}", rec.lsn))
     })?;
     let previous = db.set_ext_replay(Some(std::sync::Arc::new(ReplayMemo::new(&rec.memo))));
+    // The record's volatile seeds are taken in the order it recorded them, so
+    // every statement (and every trigger action or `CALL` body inside one)
+    // draws exactly the seed its original run drew.
+    db.volatile.clear();
+    db.set_replay_seeds(
+        rec.memo
+            .iter()
+            .filter(|call| {
+                call.name
+                    .eq_ignore_ascii_case(crate::sql::binder::SEED_MEMO)
+            })
+            .filter_map(|call| crate::sql::binder::seed_reading(&call.result)),
+    );
     let mut outcome = Ok(());
     for sql in &rec.stmts {
         if let Err(e) = db.execute(sql) {
@@ -5199,6 +5223,7 @@ fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
     }
     db.set_ext_replay(previous);
     db.restore_replay_pins(pins);
+    db.volatile.clear();
     outcome
 }
 
@@ -5210,6 +5235,32 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn a_record_that_lost_its_seed_fails_closed() {
+        // A store, its clients and any lake may already hold the values a
+        // statement's seed produced, so a replay that cannot find the seed
+        // must stop instead of drawing fresh ones.
+        let mut db = crate::PinkDb::with_databases(["main"]);
+        db.execute("CREATE TABLE t (id UUID);").unwrap();
+        let rec = Record {
+            lsn: 1,
+            stmts: vec!["INSERT INTO t SELECT uuid() FROM range(2);".to_string()],
+            sets: None,
+            memo: Vec::new(),
+        };
+        let err = replay_record(&mut db, &rec).unwrap_err().to_string();
+        assert!(err.contains("does not carry a seed"), "{err}");
+        let results = db.execute("SELECT count(*) FROM t;").unwrap();
+        assert_eq!(
+            results,
+            vec![QueryResult::Selected {
+                names: vec!["count(*)".to_string()],
+                types: vec![crate::types::DataType::Bigint],
+                rows: vec![vec![Value::Bigint(0)]],
+            }]
+        );
+    }
 
     #[test]
     fn the_replay_memo_matches_calls_exactly_by_hash() {

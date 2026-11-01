@@ -44,6 +44,8 @@ pub enum VectorData {
         values: ArrayElems,
         valid: Option<Vec<u8>>,
     },
+    /// UUID: the unsigned 128-bit values.
+    Uuid(Vec<u128>),
 }
 
 /// Bit `i` of an optional element bitmap; no bitmap means every element is
@@ -138,6 +140,7 @@ impl VectorData {
                 elem: *elem,
                 len: *len,
             },
+            VectorData::Uuid(_) => DataType::Uuid,
         }
     }
 
@@ -161,6 +164,7 @@ impl VectorData {
             VectorData::Variant(v) => v.len(),
             // Rows, like every other variant; `len` is never zero.
             VectorData::Array { len, values, .. } => values.len() / *len as usize,
+            VectorData::Uuid(v) => v.len(),
         }
     }
 
@@ -186,6 +190,7 @@ impl VectorData {
                 values: ArrayElems::with_capacity(elem, cap * len as usize),
                 valid: None,
             },
+            DataType::Uuid => VectorData::Uuid(Vec::with_capacity(cap)),
         }
     }
 }
@@ -326,6 +331,7 @@ impl Vector {
                     true,
                 )
             }
+            Value::Uuid(bits) => (VectorData::Uuid(vec![*bits; n]), true),
         };
         let mut validity = vec![if all_valid { u64::MAX } else { 0 }; mask_len(n)];
         if all_valid && !n.is_multiple_of(64) {
@@ -380,6 +386,7 @@ impl Vector {
                     }
                 }
             }
+            VectorData::Uuid(v) => v.push(0),
         }
     }
 
@@ -504,6 +511,7 @@ impl Vector {
                         .expect("ARRAY cell slice");
                 Value::Array(Arc::new(cell))
             }
+            VectorData::Uuid(v) => Value::Uuid(v[idx]),
         }
     }
 
@@ -583,6 +591,7 @@ impl Vector {
             ) => {
                 array_push_cell(*elem, *len, values, valid, &x)?;
             }
+            (VectorData::Uuid(v), Value::Uuid(bits)) => v.push(bits),
             (data, other) => {
                 return Err(PinkDbError::Type(format!(
                     "type mismatch: cannot push {other} into {:?} vector",
@@ -682,6 +691,17 @@ impl Vector {
         Ok(())
     }
 
+    /// Typed UUID append.
+    pub(crate) fn push_uuid(&mut self, bits: u128) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::Uuid(v) => v.push(bits),
+            data => return Err(typed_push_error("a uuid", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
     /// Shared tail of the typed push helpers: bump `len`, mark the new row valid.
     fn finish_typed_push(&mut self) {
         self.len += 1;
@@ -729,6 +749,9 @@ impl Vector {
             (VectorData::Variant(d), VectorData::Variant(s)) => {
                 // Variants share their Arc value instead of copying.
                 d.extend(s[start..start + len].iter().cloned());
+            }
+            (VectorData::Uuid(d), VectorData::Uuid(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
             }
             (
                 VectorData::Array {
@@ -819,6 +842,7 @@ impl Vector {
                 }
             }
             (VectorData::Variant(v), Value::Variant(x)) => v[idx] = x,
+            (VectorData::Uuid(v), Value::Uuid(bits)) => v[idx] = bits,
             (
                 VectorData::Array {
                     elem,
@@ -980,6 +1004,10 @@ impl Vector {
                     buf,
                 );
             }
+            VectorData::Uuid(v) => {
+                buf.push(12);
+                buf.extend_from_slice(&v[idx].to_le_bytes());
+            }
         }
     }
     /// Copy element `idx` from `other` into `self` (for UPDATE-adjacent
@@ -1010,6 +1038,7 @@ impl Vector {
             }
             (VectorData::Interval(d), VectorData::Interval(s)) => d.push(s[idx]),
             (VectorData::Variant(d), VectorData::Variant(s)) => d.push(Arc::clone(&s[idx])),
+            (VectorData::Uuid(d), VectorData::Uuid(s)) => d.push(s[idx]),
             (
                 VectorData::Array {
                     elem,
@@ -1160,6 +1189,7 @@ impl Vector {
                 Arc::new(crate::variant::Variant::Null),
                 |x: &Arc<crate::variant::Variant>| Arc::clone(x)
             )),
+            VectorData::Uuid(_) => VectorData::Uuid(gather!(Uuid, 0, |x: &u128| *x)),
             VectorData::Array { .. } => return per_row(),
         };
         let mut validity = vec![0u64; mask_len(n)];
@@ -1217,6 +1247,7 @@ impl Vector {
             VectorData::Variant(v) => {
                 VectorData::Variant(selection.iter().map(|i| Arc::clone(&v[pick(i)])).collect())
             }
+            VectorData::Uuid(v) => VectorData::Uuid(selection.iter().map(|i| v[pick(i)]).collect()),
             VectorData::Array { .. } => {
                 let mut out = Vector::with_capacity(self.dtype(), n);
                 for i in selection {
@@ -1254,6 +1285,12 @@ pub struct DataChunk {
     /// instead of cloning megabytes per query.
     pub columns: Vec<Arc<Vector>>,
     pub num_rows: usize,
+    /// This chunk's position in the operator that produced it: `exec::eval`
+    /// stamps it after every operator, so it is the position in the consumer's
+    /// input order, never the worker that happened to process the chunk.
+    /// Volatile functions (`uuid()`, `random()`) derive their per-row values
+    /// from it, which is what makes them identical on WAL replay.
+    pub ordinal: usize,
 }
 
 impl DataChunk {
@@ -1270,6 +1307,7 @@ impl DataChunk {
         Ok(Self {
             columns: columns.into_iter().map(Arc::new).collect(),
             num_rows,
+            ordinal: 0,
         })
     }
 
@@ -1279,7 +1317,11 @@ impl DataChunk {
         if columns.iter().any(|c| c.len() != num_rows) {
             return None;
         }
-        Some(Self { columns, num_rows })
+        Some(Self {
+            columns,
+            num_rows,
+            ordinal: 0,
+        })
     }
 
     /// Build a chunk that may carry *absent* columns: a zero-length
@@ -1300,7 +1342,11 @@ impl DataChunk {
             "projected chunks hold present columns (num_rows long) and \
              zero-length absent placeholders"
         );
-        Self { columns, num_rows }
+        Self {
+            columns,
+            num_rows,
+            ordinal: 0,
+        }
     }
 
     /// True when column `index` is present (exactly `num_rows` values
@@ -1338,6 +1384,7 @@ impl DataChunk {
         Self {
             columns: Vec::new(),
             num_rows: 0,
+            ordinal: 0,
         }
     }
 
@@ -1373,6 +1420,7 @@ impl DataChunk {
         DataChunk {
             columns,
             num_rows: selection.len(),
+            ordinal: self.ordinal,
         }
     }
 
@@ -1394,6 +1442,7 @@ impl DataChunk {
         DataChunk {
             columns,
             num_rows: selection.len(),
+            ordinal: self.ordinal,
         }
     }
 }

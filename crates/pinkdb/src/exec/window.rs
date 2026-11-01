@@ -256,6 +256,9 @@ fn eval_one_window(cx: &Cx, chunks: &[DataChunk], w: &BoundWindow) -> Result<Vec
             Ok(DataChunk {
                 columns,
                 num_rows: chunk.num_rows(),
+                // Stamped in bind order: the window operator's output row
+                // order matches its input's.
+                ordinal: 0,
             })
         })
         .filter(|c: &Result<DataChunk>| c.as_ref().map_or(true, |c| c.num_rows > 0))

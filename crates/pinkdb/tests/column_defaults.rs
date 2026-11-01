@@ -162,20 +162,32 @@ fn duckdb_refusals_for_default_expressions() {
 }
 
 #[test]
-fn a_volatile_default_is_accepted_at_create_and_refused_when_a_write_evaluates_it() {
+fn a_volatile_default_is_evaluated_per_row() {
     let mut db = PinkDb::new();
-    // pinkdb has no UUID type; `uuid()` yields VARCHAR.
+    // Since wave 139b the statement's seed rides in the WAL memo, so a
+    // volatile DEFAULT is legal in a logged write and each row gets its own
+    // value.
     run(
         &mut db,
-        "CREATE TABLE t (id VARCHAR DEFAULT uuid(), a INTEGER);",
+        "CREATE TABLE t (id UUID DEFAULT uuid(), a INTEGER);",
     );
-    // Wave 139b makes the write legal; until then the existing refusal moves
-    // from CREATE (where nothing is evaluated) to the INSERT.
-    let e = err(&mut db, "INSERT INTO t (a) VALUES (1);");
-    assert!(e.contains("uuid() is volatile"), "{e}");
+    run(&mut db, "INSERT INTO t (a) VALUES (1), (2), (3);");
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT count(*), count(DISTINCT id), typeof(min(id)) FROM t;"
+        ),
+        vec![vec![
+            Value::Bigint(3),
+            Value::Bigint(3),
+            Value::Varchar("UUID".to_string())
+        ]]
+    );
     // A read-only use stays fine.
-    let out = rows(&mut db, "SELECT length(uuid());");
-    assert_eq!(out, vec![vec![Value::Integer(36)]]);
+    assert_eq!(
+        rows(&mut db, "SELECT length(uuid()::VARCHAR);"),
+        vec![vec![Value::Integer(36)]]
+    );
 }
 
 #[test]

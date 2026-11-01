@@ -16,7 +16,7 @@ use super::{Cx, Memo, eval};
 use crate::array::ArrayElems;
 use crate::plan::{compare_values, num_cmp};
 use crate::sql::ast::BinaryOp;
-use crate::sql::binder::{BoundExpr, OuterBind, ScalarFunc, common_numeric};
+use crate::sql::binder::{BoundExpr, OuterBind, ScalarFunc, Volatile, common_numeric};
 use crate::types::FastSet;
 use crate::types::{
     DataType, POW10_I128, PinkDbError, Result, Value, decimal_fits, format_decimal, rescale_decimal,
@@ -194,10 +194,14 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             _ => eval_arith(*op, *dtype, left, right, chunk, cx),
         },
         BoundExpr::Scalar {
-            func: ScalarFunc::Uuid,
-            ..
-        } => random_uuids(chunk.num_rows()),
-        BoundExpr::Scalar { func, args, dtype } => {
+            func,
+            args,
+            dtype,
+            volatile: Some(v),
+        } => eval_volatile(*func, *dtype, args, *v, chunk, cx),
+        BoundExpr::Scalar {
+            func, args, dtype, ..
+        } => {
             let mut vecs = Vec::with_capacity(args.len());
             for a in args {
                 vecs.push(eval_expr(a, chunk, cx)?);
@@ -972,6 +976,9 @@ fn eval_comparison(
                     |x, y| crate::types::interval_cmp(*x, *y),
                     &mut out,
                 )?;
+            }
+            (VectorData::Uuid(a), VectorData::Uuid(b)) => {
+                cmp_loop(op, &l, &r, a, b, |x, y| x.cmp(y), &mut out)?;
             }
             (VectorData::Variant(a), VectorData::Variant(b)) => {
                 // `variant::cmp` is the same total order (and equality) that
@@ -2629,34 +2636,55 @@ fn decimal_scalar(func: ScalarFunc, dtype: DataType, v: &Value) -> Result<Option
     })
 }
 
-/// `n` random version-4 UUIDs in their canonical text form.
-#[cfg(not(target_arch = "wasm32"))]
-fn random_uuids(n: usize) -> Result<Vector> {
-    let mut bytes = vec![0u8; n * 16];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| PinkDbError::Execution(format!("cannot obtain randomness for uuid(): {e}")))?;
-    let mut out = Vector::new_empty(DataType::Varchar);
-    for raw in bytes.as_chunks_mut::<16>().0 {
-        raw[6] = (raw[6] & 0x0f) | 0x40;
-        raw[8] = (raw[8] & 0x3f) | 0x80;
-        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-        out.push_valid(Value::Varchar(format!(
-            "{}-{}-{}-{}-{}",
-            &hex[0..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..32]
-        )))?;
+/// Volatile built-ins (`uuid()`, `gen_random_uuid()`, `random()`): the value
+/// is `mix(seed, call site, chunk ordinal, row)` — a pure function of inputs
+/// fixed at bind and of the row's position in the operator's input, so a
+/// parallel run and a WAL replay produce the same values.
+fn eval_volatile(
+    func: ScalarFunc,
+    dtype: DataType,
+    args: &[BoundExpr],
+    v: Volatile,
+    chunk: &DataChunk,
+    cx: &Cx,
+) -> Result<Vector> {
+    // A volatile function has no arguments today; evaluate any that appear so
+    // their errors and NULL handling do not change.
+    for a in args {
+        eval_expr(a, chunk, cx)?;
     }
-    Ok(out)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn random_uuids(_n: usize) -> Result<Vector> {
-    Err(PinkDbError::Execution(
-        "uuid() needs OS randomness, which the wasm build has not".to_string(),
-    ))
+    let n = chunk.num_rows;
+    let chunk_ordinal = chunk.ordinal as u64;
+    // The statement seed (from the WAL record, or a fresh one) plus the nest,
+    // the call site, the chunk and the row: every input is
+    // scheduling-independent, so a replay draws the same bits.
+    let (seed, nest) = cx.db.volatile_evaluation()?;
+    let site = v.site;
+    match func {
+        ScalarFunc::Uuid => {
+            let mut out = Vector::new_empty(DataType::Uuid);
+            for row in 0..n {
+                let bits = crate::uuid::version4(crate::uuid::mix(
+                    seed,
+                    nest,
+                    site,
+                    chunk_ordinal,
+                    row as u64,
+                ));
+                out.push_uuid(bits)?;
+            }
+            Ok(out)
+        }
+        ScalarFunc::Random => {
+            let mut out = Vector::new_empty(dtype);
+            for row in 0..n {
+                let bits = crate::uuid::mix(seed, nest, site, chunk_ordinal, row as u64);
+                out.push_valid(Value::Double(crate::uuid::random_unit(bits)))?;
+            }
+            Ok(out)
+        }
+        other => Err(PinkDbError::Execution(format!("{other:?} is not volatile"))),
+    }
 }
 
 fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vector> {
@@ -3530,8 +3558,10 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
                 "contains of {s} and {search}"
             ))),
         },
-        ScalarFunc::Uuid => Err(PinkDbError::Execution(
-            "uuid() is evaluated per chunk".to_string(),
+        // Volatile: `eval_expr` routes both of these through
+        // `eval_volatile`, which owns the seed, so no row-wise path sees them.
+        ScalarFunc::Uuid | ScalarFunc::Random => Err(PinkDbError::Execution(
+            "the volatile built-ins are evaluated per chunk".to_string(),
         )),
         ScalarFunc::SimilarTo => match (&row[0], &row[1]) {
             (Value::Varchar(s), Value::Varchar(pat)) => {
@@ -4605,6 +4635,10 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         }
         // VARCHAR → INTERVAL (INTERVAL → VARCHAR rides the generic
         // "everything formats to VARCHAR" arm above).
+        // VARCHAR → UUID: DuckDB accepts braces and upper case on input.
+        (Value::Varchar(s), DataType::Uuid) => crate::uuid::parse(&s)
+            .map(Value::Uuid)
+            .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS UUID"))),
         (Value::Varchar(s), DataType::Interval) => crate::types::parse_interval(s.as_str())
             .map(|iv| Value::Interval {
                 months: iv.months,
@@ -5517,6 +5551,7 @@ mod tests {
                     dtype: DataType::Varchar,
                 }],
                 dtype,
+                volatile: None,
             };
             eval_expr(&e, &chunk, &cx).unwrap()
         };
@@ -5546,6 +5581,7 @@ mod tests {
                 dtype: DataType::Integer,
             }],
             dtype: DataType::Integer,
+            volatile: None,
         };
         let err = eval_expr(&abs, &chunk2, &cx).unwrap_err();
         assert!(
@@ -5568,6 +5604,7 @@ mod tests {
                 dtype: DataType::Double,
             }],
             dtype: DataType::Double,
+            volatile: None,
         };
         let out = eval_expr(&round, &chunk2, &cx).unwrap();
         assert_eq!((out.get(0), out.get(1)), (V::Double(3.0), V::Double(-3.0)));

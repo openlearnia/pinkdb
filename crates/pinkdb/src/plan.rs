@@ -3001,6 +3001,8 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
                 micros: *bu,
             },
         ),
+        // UUID: DuckDB orders them by their unsigned 128-bit value.
+        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         // VARIANT: the documented cross-kind total order (`variant::cmp`),
         // which is also its equality and its hash key.
         (Value::Variant(x), Value::Variant(y)) => crate::variant::cmp(x, y),
@@ -3118,10 +3120,16 @@ pub(crate) fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
             expr: Box::new(shift_columns(*expr, by)),
             negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func,
             args: args.into_iter().map(|a| shift_columns(a, by)).collect(),
             dtype,
+            volatile,
         },
         BoundExpr::DynamicScalar {
             name,
@@ -3204,10 +3212,16 @@ pub(crate) fn map_columns(expr: BoundExpr, f: &dyn Fn(usize) -> usize) -> BoundE
             expr: Box::new(map_columns(*expr, f)),
             negated,
         },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+        BoundExpr::Scalar {
+            func,
+            args,
+            dtype,
+            volatile,
+        } => BoundExpr::Scalar {
             func,
             args: args.into_iter().map(|a| map_columns(a, f)).collect(),
             dtype,
+            volatile,
         },
         BoundExpr::DynamicScalar {
             name,

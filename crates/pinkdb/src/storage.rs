@@ -1001,6 +1001,12 @@ impl DataTable {
                     "cannot parse \"{s}\" as INTERVAL"
                 ))),
             },
+            // UUID columns take the value as it is, and a string cell is
+            // parsed the way the CAST matrix parses it.
+            (Value::Uuid(bits), DataType::Uuid) => Ok(Value::Uuid(bits)),
+            (Value::Varchar(s), DataType::Uuid) => crate::uuid::parse(&s)
+                .map(Value::Uuid)
+                .ok_or_else(|| PinkDbError::Type(format!("cannot parse \"{s}\" as UUID"))),
             // ARRAY columns follow the CAST matrix: same length, any element
             // tower, and the text/JSON spellings an INSERT or CSV gives.
             (v @ Value::Array(_), t @ DataType::Array { .. })
@@ -1041,7 +1047,8 @@ impl DataTable {
                 | Value::Decimal(..)
                 | Value::Date(_)
                 | Value::Timestamp(_)
-                | Value::Interval { .. }),
+                | Value::Interval { .. }
+                | Value::Uuid(_)),
                 DataType::Varchar,
             ) => crate::exec::expr::cast_value(v, DataType::Varchar),
             (v, t) => Err(PinkDbError::Type(format!("cannot coerce {v} to {t}"))),
@@ -1482,7 +1489,12 @@ impl DataTable {
             return None;
         }
         let cols = self.columns.iter().map(|c| c.chunks[idx].clone()).collect();
-        DataChunk::from_arcs(cols)
+        let mut chunk = DataChunk::from_arcs(cols)?;
+        // Volatile expressions read the ordinal: a chunk read straight from
+        // storage (an UPDATE, a trigger) is still the idx-th chunk in scan
+        // order, which is what a plan-driven scan would stamp.
+        chunk.ordinal = idx;
+        Some(chunk)
     }
 
     /// Value at (row, col).
@@ -1834,6 +1846,118 @@ impl Session {
     }
 }
 
+/// The volatile-function state of the WAL record being filled.
+///
+/// A record — an autocommit statement, a transaction, a procedure segment, a
+/// trigger's refire, a view refresh — records one seed per statement that drew
+/// a volatile value, in the order the statements ran. That order is the whole
+/// key: a replay runs the record's statements in the same order (a procedure
+/// body and a trigger action re-execute exactly as they did) and takes the
+/// seeds back in it, so two identical statements of one record still draw
+/// different values and nothing about statement positions has to survive the
+/// WAL.
+///
+/// A mutex, not atomics, because the slots form a sequence and a bind only has
+/// `&PinkDb`: the state needs interior mutability, and this is never on a hot
+/// path.
+#[derive(Debug, Default)]
+pub(crate) struct RecordSeed {
+    state: std::sync::Mutex<RecordState>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RecordState {
+    /// One slot per statement that could draw a volatile value, in execution
+    /// order. It stays empty until the statement's first seeded call, so a
+    /// statement that calls none consumes no recorded seed.
+    slots: Vec<Option<u128>>,
+    /// While replaying, the record's seeds in the order it recorded them; each
+    /// logged statement takes the next one, so no statement position has to be
+    /// carried across the WAL.
+    replay: std::collections::VecDeque<u128>,
+}
+
+impl Clone for RecordSeed {
+    fn clone(&self) -> Self {
+        Self {
+            state: std::sync::Mutex::new(self.lock().clone()),
+        }
+    }
+}
+
+impl RecordSeed {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RecordState> {
+        // A panic elsewhere must not turn every later statement into a panic.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Start a new record: no statement, no seeds to replay.
+    pub(crate) fn clear(&self) {
+        *self.lock() = RecordState::default();
+    }
+
+    /// Load the seeds a record being replayed recorded, in order.
+    fn set_replay(&self, seeds: impl IntoIterator<Item = u128>) {
+        let mut state = self.lock();
+        state.slots.clear();
+        state.replay = seeds.into_iter().collect();
+    }
+
+    /// Open the slot of the statement about to execute.
+    fn open_slot(&self) {
+        self.lock().slots.push(None);
+    }
+
+    /// The seed for the value being evaluated: this statement's seed if it
+    /// already drew one, else a fresh one — or, while replaying, the next seed
+    /// its record recorded.
+    fn seed(&self, replay: bool) -> Result<u128> {
+        let mut state = self.lock();
+        if state.slots.is_empty() {
+            // A read-only statement has no record to replay: its values only
+            // need to differ from each other.
+            return crate::sql::binder::fresh_seed();
+        }
+        if let Some(seed) = state.slots.last().copied().flatten() {
+            return Ok(seed);
+        }
+        let seed = if replay {
+            match state.replay.pop_front() {
+                Some(seed) => seed,
+                // Fail closed: the store, its clients and any lake may hold
+                // the values that seed produced, so a fresh draw would make
+                // the replayed tables disagree with what was committed.
+                None => {
+                    return Err(PinkDbError::Execution(
+                        "WAL replay failed: the record does not carry a seed for a statement that \
+                         draws volatile values"
+                            .to_string(),
+                    ));
+                }
+            }
+        } else {
+            crate::sql::binder::fresh_seed()?
+        };
+        if let Some(slot) = state.slots.last_mut() {
+            *slot = Some(seed);
+        }
+        Ok(seed)
+    }
+
+    /// Take the memo entries for the record that is being appended: one per
+    /// statement that used a seeded function, in execution order. Replay reads
+    /// them back in the same order, so the position is informational.
+    pub(crate) fn take_memos(&self) -> Vec<crate::wal::ExtCall> {
+        let slots = std::mem::take(&mut self.lock().slots);
+        slots
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(position, seed)| crate::sql::binder::seed_memo(position, seed))
+            .collect()
+    }
+}
+
 /// `current_db` is the *embedded session's* default database: unqualified
 /// names resolve against it. [`crate::Connection`]s carry their own session
 /// database and never mutate this one.
@@ -1938,6 +2062,11 @@ pub struct PinkDb {
     /// exact path match is a no-op instead of the user-facing "already
     /// loaded" error. Normal SQL keeps the strict duplicate-load refusal.
     pub(crate) replaying: bool,
+    /// The position of the record statement being replayed. A statement's
+    /// volatile seed is keyed by it in the record's memo.
+    /// The seed and statement slots of the WAL record being filled (see
+    /// [`RecordSeed`]).
+    pub(crate) volatile: RecordSeed,
     /// Recorded results of the `external_io` host scalars of the WAL record
     /// being replayed (wave 107c), keyed by (function, arguments) inside the
     /// record. `None` outside a replay: a live statement records instead.
@@ -2139,6 +2268,7 @@ impl Clone for PinkDb {
             allow_extension_replay: self.allow_extension_replay,
             extension_root: self.extension_root.clone(),
             replaying: false,
+            volatile: self.volatile.clone(),
             // A clone is a snapshot, never the record being replayed, and
             // the memo of an open transaction belongs to the store that
             // opened it (the committing clone flushes it).
@@ -2243,6 +2373,7 @@ impl PinkDb {
             allow_extension_replay: false,
             extension_root: None,
             replaying: false,
+            volatile: RecordSeed::default(),
             ext_replay: None,
             wal_txn_memo: Vec::new(),
             external_services: true,
@@ -3099,6 +3230,92 @@ impl PinkDb {
         self.ext_replay.as_deref()
     }
 
+    /// Start the record state for a statement that is about to execute.
+    ///
+    /// A record is one WAL unit: an autocommit statement, a transaction, a
+    /// procedure segment, the statements two triggers fire. Its seed is drawn
+    /// once, at the first statement that writes, and travels in the record's
+    /// memo (see [`crate::sql::binder::seed_memo`]). Every statement of the
+    /// record then advances an ordinal, so two identical statements in one
+    /// record draw different values while a replay, which executes the same
+    /// statements in the same order after `clear`, draws the same ones.
+    ///
+    /// Nested statements (a `CALL` body, a trigger action, a materialized-view
+    /// refresh) belong to the unit being built, so they do not start a new one.
+    /// Read-only statements never seed: they have no record to replay.
+    pub(crate) fn begin_volatile_statement(&self, plan: &crate::plan::LogicalPlan) -> Result<()> {
+        let in_replay = self.replaying || self.ext_replay.is_some();
+        if !in_replay && !self.in_transaction() && self.proc_depth == 0 && self.trigger_depth == 0 {
+            self.volatile.clear();
+        }
+        if self.logged_statement(plan) {
+            self.begin_volatile_write();
+        }
+        Ok(())
+    }
+
+    /// Whether this statement needs a seed of its own in the record it logs.
+    ///
+    /// Every statement that can be logged gets one, and so does every nested
+    /// statement that can draw a value: a trigger action, a `DO` block body
+    /// and a `CALL` body all execute inside the statement that carries the
+    /// record, so their seeds ride in that record. The rule must not depend on
+    /// how a `CALL` happens to be logged (its text, or its body's statements
+    /// one segment at a time), because a replay takes the seeds in order.
+    fn logged_statement(&self, plan: &crate::plan::LogicalPlan) -> bool {
+        matches!(plan, crate::plan::LogicalPlan::Call { .. })
+            || self.proc_depth > 0
+            || self.trigger_depth > 0
+            || crate::plan::writes_tables(plan)
+    }
+
+    /// Open the statement's slot in the record being built.
+    pub(crate) fn begin_volatile_write(&self) {
+        self.volatile.open_slot();
+    }
+
+    /// Load the seeds a record being replayed recorded, in order.
+    pub(crate) fn set_replay_seeds(&self, seeds: impl IntoIterator<Item = u128>) {
+        self.volatile.set_replay(seeds);
+    }
+
+    /// The seed and nesting depth the statement being evaluated draws from.
+    ///
+    /// The statement's slot was opened when it started executing, so a
+    /// statement that never calls a seeded function leaves no memo entry. A
+    /// read-only statement has no slot and draws a fresh seed per evaluation:
+    /// a read has no record to replay, so its values only need to differ from
+    /// each other.
+    pub(crate) fn volatile_evaluation(&self) -> Result<(u128, u64)> {
+        // Depth keeps a trigger's action apart from the statement that fired
+        // it, even where both draw from seeds of the same record.
+        let nest = u64::from((self.proc_depth + self.trigger_depth) as u32) << 32;
+        let replay = self.replaying || self.ext_replay.is_some();
+        Ok((self.volatile.seed(replay)?, nest))
+    }
+
+    /// The clock reading a statement's record pins: from the statement's own
+    /// dependencies, or from the statements a `CALL`/`DO` body or a trigger
+    /// action ran (a `now()` inside a body is part of the same record).
+    pub(crate) fn statement_clock_memo(
+        &self,
+        dependencies: &[String],
+    ) -> Option<crate::wal::ExtCall> {
+        let mut deps = dependencies.to_vec();
+        deps.extend(self.proc_frame.memo_deps().iter().cloned());
+        crate::sql::binder::clock_memo(&deps)
+    }
+
+    /// The memo entries a record needs for the volatile functions it used: the
+    /// clock reading and the seed of every statement of the record that drew
+    /// one.
+    pub(crate) fn statement_memo(&self, dependencies: &[String]) -> Vec<crate::wal::ExtCall> {
+        self.statement_clock_memo(dependencies)
+            .into_iter()
+            .chain(self.volatile.take_memos())
+            .collect()
+    }
+
     /// The result an earlier statement of the open transaction recorded for
     /// `name(args)` in the transaction's replay memo, if any.
     pub(crate) fn txn_memo_result(&self, name: &str, args: &[Value]) -> Option<&Value> {
@@ -3257,12 +3474,15 @@ impl PinkDb {
         if self.replaying || !crate::plan::writes_tables(plan) {
             return Ok(());
         }
-        // A statement that read the clock (`now()`) carries the reading in
-        // its replay memo, so replay binds the same instant.
+        // A statement that read the clock (`now()`) carries the reading in its
+        // replay memo, so replay binds the same instant. The seeds ride with
+        // the record itself: one per logged statement that drew a volatile
+        // value, added where the record is appended (a transaction drains them
+        // at commit, `PinkDb::commit`).
         let with_clock;
-        let memo = match crate::sql::binder::clock_memo(dynamic_functions_used) {
-            Some(call) => {
-                with_clock = memo.iter().cloned().chain([call]).collect::<Vec<_>>();
+        let memo = match self.statement_clock_memo(dynamic_functions_used) {
+            Some(clock) => {
+                with_clock = memo.iter().cloned().chain([clock]).collect::<Vec<_>>();
                 &with_clock[..]
             }
             None => memo,
@@ -3278,7 +3498,12 @@ impl PinkDb {
                 return Ok(());
             }
             let sets = self.proc_frame.touched();
-            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), memo);
+            let memo: Vec<_> = memo
+                .iter()
+                .cloned()
+                .chain(self.volatile.take_memos())
+                .collect();
+            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), &memo);
         }
         // Wave 48: a `CREATE/ALTER USER` is logged in its `PASSWORD_HASH`
         // form — the plaintext of the statement text must never reach the
@@ -3328,6 +3553,11 @@ impl PinkDb {
             return Ok(());
         }
         let ns = self.current_ns().clone();
+        let memo: Vec<_> = memo
+            .iter()
+            .cloned()
+            .chain(self.volatile.take_memos())
+            .collect();
         self.wal_append_session(
             &ns,
             &ns,
@@ -3335,7 +3565,7 @@ impl PinkDb {
             &touched,
             &loaded,
             Some(&sets),
-            memo,
+            &memo,
         )
     }
 
@@ -3454,6 +3684,8 @@ impl PinkDb {
         self.wal_txn_ext_loaded.clear();
         self.wal_txn_sets = crate::wal::FrameSets::default();
         self.wal_txn_memo.clear();
+        // A transaction is a new record: it draws its own seed.
+        self.volatile.clear();
         self.txn_touched = crate::wal::FrameSets::default();
         self.txn_storages.clear();
         // A new transaction starts with no writes; ROLLBACK must not leave
@@ -3522,7 +3754,19 @@ impl PinkDb {
             let touched = std::mem::take(&mut self.wal_txn_ext_paths);
             let loaded = std::mem::take(&mut self.wal_txn_ext_loaded);
             let sets = std::mem::take(&mut self.wal_txn_sets);
-            let memo = std::mem::take(&mut self.wal_txn_memo);
+            // One seed per logged statement of the record rides with the
+            // transaction's single WAL record, exactly like an autocommit
+            // statement's.
+            let mut memo = std::mem::take(&mut self.wal_txn_memo);
+            for call in self.volatile.take_memos() {
+                // A retried COMMIT keeps the entries it already restored.
+                if !memo
+                    .iter()
+                    .any(|c| c.name == call.name && c.args == call.args)
+                {
+                    memo.push(call);
+                }
+            }
             let before = self
                 .wal_txn_db
                 .take()

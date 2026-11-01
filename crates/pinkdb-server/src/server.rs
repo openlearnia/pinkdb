@@ -426,6 +426,7 @@ fn row_encoded_len(row: &[Value]) -> usize {
                 Value::Bigint(_) | Value::Double(_) | Value::Timestamp(_) => 8,
                 Value::Decimal(_, _) => 16 + 1,
                 Value::Interval { .. } => 16,
+                Value::Uuid(_) => 16,
                 Value::Varchar(s) => 4 + s.len(),
                 // A VARIANT's wire length is its encoding's length; encoding
                 // into a reused buffer keeps the frame-size estimate exact so

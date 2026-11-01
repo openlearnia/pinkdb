@@ -207,6 +207,48 @@ fn every_supported_type_round_trips_through_the_existing_reader() {
 }
 
 #[test]
+fn a_uuid_column_round_trips_as_fixed_len_byte_array() {
+    use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
+
+    let dir = scratch("uuid");
+    let expected = vec![
+        vec![Value::Uuid(0)],
+        vec![Value::Uuid(u128::MAX)],
+        vec![Value::Uuid(0x550e_8400_e29b_41d4_a716_4466_5544_0000)],
+        vec![Value::Uuid(0x8000_0000_0000_4000_8000_0000_0000_0000)],
+        vec![Value::Null],
+    ];
+    let src = table(
+        "t",
+        vec![("u".to_string(), DataType::Uuid)],
+        expected.clone(),
+    );
+    let (schema, rows) = round_trip(&src, &dir);
+    assert_eq!(schema, vec![("u".to_string(), DataType::Uuid)]);
+    assert_rows_equal(&expected, &rows, "uuid");
+
+    // DuckDB reads a UUID column as FIXED_LEN_BYTE_ARRAY(16) with the UUID
+    // logical type; anything else would not be readable by it.
+    let reader =
+        SerializedFileReader::new(std::fs::File::open(dir.join("data.parquet")).unwrap()).unwrap();
+    let column = reader.metadata().file_metadata().schema_descr().column(0);
+    assert_eq!(column.physical_type(), PhysicalType::FIXED_LEN_BYTE_ARRAY);
+    assert_eq!(column.type_length(), 16);
+    assert_eq!(column.converted_type(), ConvertedType::NONE);
+    assert!(matches!(column.logical_type_ref(), Some(LogicalType::Uuid)));
+
+    // And the statistics are UUID values, so pruning compares them as such.
+    let stats = reader
+        .metadata()
+        .row_group(0)
+        .column(0)
+        .statistics()
+        .unwrap();
+    assert_eq!(stats.null_count_opt(), Some(1));
+    cleanup(&dir);
+}
+
+#[test]
 fn empty_tables_and_null_only_columns_round_trip() {
     let dir = scratch("empty");
     // A schema-only file: zero row groups, the schema still binds.

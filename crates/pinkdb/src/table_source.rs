@@ -951,6 +951,7 @@ impl TableSource for RangeSource {
                 chunks.push(DataChunk {
                     columns: vec![Arc::new(vector)],
                     num_rows,
+                    ordinal: 0,
                 });
             }
         };

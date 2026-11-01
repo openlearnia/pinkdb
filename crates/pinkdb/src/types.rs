@@ -171,6 +171,9 @@ pub enum DataType {
         elem: ArrayElem,
         len: u32,
     },
+    /// 16-byte universally unique identifier, ordered and grouped by its
+    /// unsigned 128-bit value (DuckDB's rules).
+    Uuid,
 }
 
 /// Element kind of an [`DataType::Array`]. A small `Copy` enum, not a boxed
@@ -276,6 +279,7 @@ impl DataType {
             DataType::Interval => "INTERVAL".to_string(),
             DataType::Variant => "VARIANT".to_string(),
             DataType::Array { elem, len } => format!("{}[{len}]", elem.name()),
+            DataType::Uuid => "UUID".to_string(),
         }
     }
 
@@ -303,6 +307,7 @@ impl DataType {
             }),
             "INTERVAL" => Some(DataType::Interval),
             "VARIANT" => Some(DataType::Variant),
+            "UUID" => Some(DataType::Uuid),
             _ => None,
         }
     }
@@ -413,6 +418,8 @@ pub enum Value {
     Variant(std::sync::Arc<crate::variant::Variant>),
     /// One row of a fixed-size array, shared for the same reason.
     Array(std::sync::Arc<crate::array::ArrayValue>),
+    /// UUID: the unsigned 128-bit value (see [`crate::uuid`]).
+    Uuid(u128),
 }
 
 impl Value {
@@ -445,6 +452,7 @@ impl Value {
                 elem: a.elem,
                 len: a.len() as u32,
             }),
+            Value::Uuid(_) => Some(DataType::Uuid),
         }
     }
 }
@@ -469,6 +477,7 @@ impl fmt::Display for Value {
             // The JSON text, so `CAST(v AS VARCHAR)` and this agree.
             Value::Variant(v) => write!(f, "{v}"),
             Value::Array(a) => f.write_str(&a.text()),
+            Value::Uuid(bits) => f.write_str(&crate::uuid::format(*bits)),
         }
     }
 }

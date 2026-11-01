@@ -1429,6 +1429,9 @@ pub fn from_value(v: &Value) -> Result<Variant> {
         Value::Integer(i) => Variant::Int(*i as i64),
         Value::Bigint(i) => Variant::Int(*i),
         Value::Double(x) => Variant::Double(*x),
+        // VARIANT has no UUID kind, so the text form is the lossless carrier
+        // (DuckDB tags its VARIANT as UUID; `variant_type` differs).
+        Value::Uuid(bits) => Variant::Str(Arc::from(crate::uuid::format(*bits).as_str())),
         Value::Decimal(x, scale) => Variant::Decimal(*x, *scale),
         Value::Varchar(s) => {
             return from_json_str(s).map_err(|e| {

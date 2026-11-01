@@ -3,10 +3,10 @@
 //!
 //! The WAL stores each statement's text and replay re-executes it, so the
 //! clock (`now()`, `CURRENT_TIMESTAMP`) must replay as the instant the
-//! original statement read, a transaction must read one instant, and
-//! `uuid()` — which no replay could reproduce — is refused in a logged
-//! statement. A crash is modeled by dropping the store without a checkpoint
-//! and reopening it: the tail replays.
+//! original statement read, a transaction must read one instant, and `uuid()`
+//! reads one statement seed that the record's memo carries, so the values
+//! replay exactly. A crash is modeled by dropping the store without a
+//! checkpoint and reopening it: the tail replays.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,17 +90,33 @@ fn the_clock_replays_as_the_instant_the_statement_read() {
 }
 
 #[test]
-fn uuid_is_refused_in_a_logged_statement_and_fine_in_a_read() {
-    let mut db = PinkDb::new();
-    run(&mut db, "CREATE TABLE u (id VARCHAR);");
-    let err = db
-        .execute("INSERT INTO u SELECT uuid();")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("uuid() is volatile"), "{err}");
+fn uuid_in_a_logged_statement_replays_the_same_values() {
+    let scratch = Scratch::new("uuid");
+    let before;
+    {
+        let mut db = open(&scratch);
+        run(&mut db, "CREATE TABLE u (id UUID);");
+        run(&mut db, "INSERT INTO u SELECT uuid() FROM range(100);");
+        // A UUID written into a VARCHAR column takes its text form.
+        run(&mut db, "CREATE TABLE v (id VARCHAR);");
+        run(&mut db, "INSERT INTO v SELECT uuid();");
+        before = rows(&mut db, "SELECT id FROM u ORDER BY id;");
+        assert_eq!(before.len(), 100);
+        assert_eq!(
+            rows(&mut db, "SELECT count(DISTINCT id) FROM u;"),
+            vec![vec![Value::Bigint(100)]]
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT count(*) FROM v WHERE length(id) = 36;"),
+            vec![vec![Value::Bigint(1)]]
+        );
+    }
+    // Crash: the tail replays the statement with its recorded seed.
+    let mut db = open(&scratch);
+    assert_eq!(rows(&mut db, "SELECT id FROM u ORDER BY id;"), before);
     let out = rows(
         &mut db,
-        "SELECT count(DISTINCT gen_random_uuid()), min(length(uuid())) FROM range(100);",
+        "SELECT count(DISTINCT gen_random_uuid()), min(length(uuid()::VARCHAR)) FROM range(100);",
     );
     assert_eq!(out, vec![vec![Value::Bigint(100), Value::Integer(36)]]);
 }

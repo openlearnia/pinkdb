@@ -340,6 +340,10 @@ fn stat_value(stats: &Statistics, column: &FileColumn, min: bool) -> Option<Valu
                 DataType::Decimal { .. } => {
                     Some(fixed_decimal_value(v.data())).map(|u| Value::Decimal(u, scale))
                 }
+                DataType::Uuid => {
+                    let bytes: [u8; 16] = v.data().try_into().ok()?;
+                    Some(Value::Uuid(u128::from_be_bytes(bytes)))
+                }
                 DataType::Interval => None,
                 _ => None,
             }

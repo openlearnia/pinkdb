@@ -346,6 +346,11 @@ impl PinkDb {
                 done.insert((ns.clone(), key.clone()));
                 progressed = true;
                 let name = key.clone();
+                // The refresh executes the view's query here, outside the
+                // statement path, and its record logs the `REFRESH` texts:
+                // give it its own statement state, as a replayed `REFRESH`
+                // draws one too.
+                self.begin_volatile_write();
                 match crate::exec::refresh_materialized_view(self, &ns, &name) {
                     Ok(()) => {
                         // The fresh table is itself a base table for views
@@ -412,7 +417,8 @@ impl PinkDb {
     /// must be held by the caller for durable stores).
     pub(crate) fn log_auto_refresh(&mut self, report: &AutoRefresh) -> Result<()> {
         let ns = self.current_ns.clone();
-        self.wal_append_session(&ns, &ns, &report.stmts, &[], &[], Some(&report.sets), &[])
+        let memo = self.statement_memo(&[]);
+        self.wal_append_session(&ns, &ns, &report.stmts, &[], &[], Some(&report.sets), &memo)
     }
 
     /// Mark a successful refresh: the wall-clock stamp, the attempt stamp and
