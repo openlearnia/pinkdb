@@ -365,6 +365,8 @@ pub fn write_target(stmt: &Statement, current_db: Option<&str>) -> WriteTarget {
             WriteTarget::Databases(vec![name.to_ascii_lowercase()])
         }
         Attach { .. } | Detach { .. } => WriteTarget::Global,
+        // Secrets are store state as well (wave 132b).
+        CreateSecret { .. } | DropSecret { .. } => WriteTarget::Global,
         // Everything else a policy can see here changes the store outside one
         // database, or runs SQL this function cannot inspect.
         LoadExtension { .. }

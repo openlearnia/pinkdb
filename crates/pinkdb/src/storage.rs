@@ -1805,6 +1805,9 @@ pub struct Session {
     /// its connection carries the caller's roles from the warehouse instead
     /// of resolving them in its own (empty) user catalog.
     roles: Arc<Mutex<Option<Vec<String>>>>,
+    /// The session's temporary secrets, shadowing a persistent secret of
+    /// the same name. Values are credentials: `Debug` shows only the count.
+    secrets: Arc<Mutex<BTreeMap<String, crate::secret::Secret>>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -1814,6 +1817,7 @@ impl std::fmt::Debug for Session {
         // a secret and is what a `current_user()` bug report needs.
         f.debug_struct("Session")
             .field("variables", &self.len())
+            .field("secrets", &self.secrets().len())
             .field("principal", &self.principal())
             .finish()
     }
@@ -1832,6 +1836,7 @@ impl Session {
         Self {
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             vars: Arc::default(),
+            secrets: Arc::default(),
             principal: Arc::default(),
             roles: Arc::default(),
         }
@@ -1884,6 +1889,31 @@ impl Session {
     /// `true` when the session set no variables.
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+
+    /// The session's temporary secrets, name order.
+    pub(crate) fn secrets(&self) -> std::collections::BTreeMap<String, crate::secret::Secret> {
+        self.secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Install a temporary secret, replacing one of the same name.
+    pub(crate) fn put_secret(&self, secret: crate::secret::Secret) {
+        self.secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(secret.name().to_string(), secret);
+    }
+
+    /// Remove a temporary secret; `true` when it existed.
+    pub(crate) fn remove_secret(&self, name: &str) -> bool {
+        self.secrets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)
+            .is_some()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Value>> {
@@ -2180,6 +2210,10 @@ pub struct PinkDb {
     /// RBAC section + replayed from the WAL; an empty catalog is the
     /// documented "no users: every connection is trusted" state.
     pub(crate) rbac: crate::rbac::RbacCatalog,
+    /// Wave 132b: the store's persistent secrets. Values are credentials, so
+    /// nothing renders this map (`Secret`'s Debug redacts them) and only
+    /// `persist`/`wal` carry it to disk, in their own sections.
+    pub(crate) secrets: BTreeMap<String, crate::secret::Secret>,
     /// The row images and transition tables a trigger body sees (wave 100),
     /// installed by [`crate::trigger`] while the body runs and read back by
     /// the binder (as `NEW`/`OLD` variables and `FROM <alias>`). Never
@@ -2355,6 +2389,7 @@ impl Clone for PinkDb {
             txn_storages: self.txn_storages.clone(),
             trigger_invoker: self.trigger_invoker.clone(),
             rbac: self.rbac.clone(),
+            secrets: self.secrets.clone(),
             file_formats: self.file_formats.clone(),
             loaded_packages: self.loaded_packages.clone(),
             package_table_sources: self.package_table_sources.clone(),
@@ -2452,6 +2487,7 @@ impl PinkDb {
             txn_storages: std::collections::BTreeSet::new(),
             trigger_invoker: None,
             rbac: crate::rbac::RbacCatalog::default(),
+            secrets: BTreeMap::new(),
             // Process-global sinks (`filefmt::register_global_file_format`)
             // seed every store constructed after the registration.
             file_formats: crate::filefmt::seeded_global_formats(),
@@ -3637,13 +3673,27 @@ impl PinkDb {
                 .cloned()
                 .chain(self.volatile.take_memos())
                 .collect();
-            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), &memo);
+            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), None, &memo);
         }
         // Wave 48: a `CREATE/ALTER USER` is logged in its `PASSWORD_HASH`
         // form — the plaintext of the statement text must never reach the
         // WAL (and the hash is exactly the one the catalog stored).
         let logged = crate::rbac::wal_statement_text(plan, sql);
         let sql: &str = &logged;
+        // A statement that changes the stored secrets carries the whole
+        // (persistent) secret set in its record, so replay can install the
+        // password an `ATTACH` needs before it replays the attach itself.
+        // Values never ride in the statement text (see `wal_statement_text`).
+        let secret_snapshot = if matches!(
+            plan,
+            crate::plan::LogicalPlan::Attach { .. }
+                | crate::plan::LogicalPlan::CreateSecret { .. }
+                | crate::plan::LogicalPlan::DropSecret { .. }
+        ) {
+            Some(self.persistent_secrets())
+        } else {
+            None
+        };
         let touched = self.dynamic_function_paths(dynamic_functions_used);
         let loaded = loaded_extension_path(plan);
         // The frame's touched set (wave 45o), recorded in the payload so
@@ -3681,7 +3731,7 @@ impl PinkDb {
                 let mut guard = wal.lock().map_err(|_| {
                     PinkDbError::Execution("internal lock error (poisoned)".to_string())
                 })?;
-                guard.append(&[sql.to_string()], Some(&sets), memo)?;
+                guard.append(&[sql.to_string()], Some(&sets), None, memo)?;
                 guard.set_session_db(ns);
             }
             return Ok(());
@@ -3699,6 +3749,7 @@ impl PinkDb {
             &touched,
             &loaded,
             Some(&sets),
+            secret_snapshot.as_deref(),
             &memo,
         )
     }
@@ -3735,6 +3786,7 @@ impl PinkDb {
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&crate::wal::FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
         // Wave 124: a unit that changed lake databases commits there, and the
@@ -3750,6 +3802,7 @@ impl PinkDb {
             touched_extensions,
             loaded_extensions,
             sets,
+            secrets,
             memo,
         )
     }
@@ -3768,6 +3821,7 @@ impl PinkDb {
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&crate::wal::FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
@@ -3790,6 +3844,7 @@ impl PinkDb {
                 touched_extensions,
                 loaded_extensions,
                 sets,
+                secrets,
                 &memo,
             )?;
         }
@@ -3913,6 +3968,7 @@ impl PinkDb {
                 &touched,
                 &loaded,
                 Some(&sets),
+                None,
                 &memo,
             ) {
                 // Keep the statements: a retried COMMIT must never publish

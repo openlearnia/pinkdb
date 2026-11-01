@@ -8281,13 +8281,48 @@ fn bind_tracked_plan(
                         .to_string(),
                 ));
             }
+            let (spec, secret) = bind_attach_options(name, location, options)?;
             empty(LogicalPlan::Attach {
                 name: name.clone(),
-                spec: bind_attach_options(location, options)?,
+                spec,
+                secret,
             })
         }
         Statement::Detach { name, if_exists } => empty(LogicalPlan::Detach {
             name: name.clone(),
+            if_exists: *if_exists,
+        }),
+        // Wave 132b: the binder validates the type and every option name; the
+        // values only live in the plan and the secret stores, never in SQL
+        // text that is logged.
+        Statement::CreateSecret {
+            name,
+            secret_type,
+            fields,
+            persistent,
+            or_replace,
+            if_not_exists,
+        } => {
+            let Some(type_) = crate::secret::SecretType::parse(secret_type) else {
+                return Err(PinkDbError::Catalog(format!(
+                    "unknown secret type \"{secret_type}\" (supported: s3, r2, gcs, postgres)"
+                )));
+            };
+            let secret = crate::secret::Secret::new(name.clone(), type_, fields.clone())?;
+            empty(LogicalPlan::CreateSecret {
+                secret,
+                persistent: *persistent,
+                or_replace: *or_replace,
+                if_not_exists: *if_not_exists,
+            })
+        }
+        Statement::DropSecret {
+            name,
+            persistent,
+            if_exists,
+        } => empty(LogicalPlan::DropSecret {
+            name: name.clone(),
+            persistent: *persistent,
             if_exists: *if_exists,
         }),
         Statement::DropDatabase { name, if_exists } => empty(LogicalPlan::DropDatabase {
@@ -12024,6 +12059,8 @@ pub(crate) fn plan_schema(
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
+        | LogicalPlan::CreateSecret { .. }
+        | LogicalPlan::DropSecret { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -12210,13 +12247,24 @@ fn bind_table_function(
     if name.eq_ignore_ascii_case("pinkdb_users") || name.eq_ignore_ascii_case("pinkdb_grants") {
         return bind_access(db, binder, &name.to_ascii_lowercase(), args, alias);
     }
+    if name.eq_ignore_ascii_case("duckdb_secrets") {
+        return bind_duckdb_secrets(db, binder, args, alias);
+    }
+    if name.eq_ignore_ascii_case("which_secret") {
+        return bind_which_secret(db, binder, args, alias);
+    }
     let call = TableFunctionCall::Function {
         name: name.to_string(),
         args: args.to_vec(),
     };
     let builtin = crate::table_source::builtin_table_source(crate::table_source::RANGE_SOURCE);
+    let secrets: Vec<_> = db
+        .visible_secrets(&binder.session)
+        .into_iter()
+        .map(|entry| entry.secret)
+        .collect();
     for source in builtin.into_iter().chain(db.table_sources()) {
-        if let Some(schema) = source.bind(&call)? {
+        if let Some(schema) = source.bind_with(&call, &secrets)? {
             binder.note_extension_package(db.package_of_table_source(source.name()));
             let eff = alias.clone().unwrap_or_else(|| name.to_string());
             return Ok((
@@ -12240,6 +12288,146 @@ fn bind_table_function(
         "unknown table function \"{name}\": {}",
         no_file_source_hint(db)
     )))
+}
+
+/// `duckdb_secrets([redact := true])`: the secrets this session can use
+/// (wave 132b). DuckDB's column set, with `scope` rendered as text (pinkdb
+/// has no LIST type) and every credential field already `redacted` inside
+/// `secret_string`; `redact := false` is refused because unredacted output
+/// would put a password into a result stream, the session history and any
+/// `COPY` of it.
+fn bind_duckdb_secrets(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    for arg in args {
+        match arg.name.as_deref() {
+            Some(name) if name.eq_ignore_ascii_case("redact") => {
+                if matches!(arg.value, Value::Boolean(false)) {
+                    return Err(PinkDbError::Execution(
+                        "Displaying unredacted secrets is disabled".to_string(),
+                    ));
+                }
+            }
+            Some(other) => {
+                return Err(PinkDbError::Catalog(format!(
+                    "duckdb_secrets() has no argument \"{other}\""
+                )));
+            }
+            None => {
+                return Err(PinkDbError::Type(
+                    "duckdb_secrets() takes no positional arguments; use redact := true"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    let names: Vec<String> = [
+        "name",
+        "type",
+        "provider",
+        "persistent",
+        "storage",
+        "scope",
+        "secret_string",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let types = vec![
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Boolean,
+        DataType::Varchar,
+        DataType::Varchar,
+        DataType::Varchar,
+    ];
+    let mut rows = Vec::new();
+    for entry in db.visible_secrets(&binder.session) {
+        rows.push(vec![
+            BoundExpr::Literal(Value::Varchar(entry.secret.name().to_string())),
+            BoundExpr::Literal(Value::Varchar(entry.secret.type_().as_str().to_string())),
+            BoundExpr::Literal(Value::Varchar("config".to_string())),
+            BoundExpr::Literal(Value::Boolean(entry.persistent)),
+            BoundExpr::Literal(Value::Varchar(entry.storage().to_string())),
+            BoundExpr::Literal(Value::Varchar(entry.secret.scope_text())),
+            BoundExpr::Literal(Value::Varchar(entry.secret.secret_string())),
+        ]);
+    }
+    Ok(values_scope(alias, "duckdb_secrets", names, types, rows))
+}
+
+/// `which_secret(path, type)`: the name and persistence of the secret a URL
+/// would use, or no row (wave 132b).
+fn bind_which_secret(
+    db: &PinkDb,
+    binder: &Binder<'_>,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    if args.len() != 2 || args.iter().any(|arg| arg.name.is_some()) {
+        return Err(PinkDbError::Type(
+            "which_secret() takes a path and a type".to_string(),
+        ));
+    }
+    let Value::Varchar(path) = &args[0].value else {
+        return Err(PinkDbError::Type(
+            "which_secret() takes a VARCHAR path".to_string(),
+        ));
+    };
+    let Value::Varchar(type_name) = &args[1].value else {
+        return Err(PinkDbError::Type(
+            "which_secret() takes a VARCHAR type".to_string(),
+        ));
+    };
+    let Some(type_) = crate::secret::SecretType::parse(type_name) else {
+        return Err(PinkDbError::Catalog(format!(
+            "unknown secret type \"{type_name}\" (supported: s3, r2, gcs, postgres)"
+        )));
+    };
+    let names = vec!["name".to_string(), "persistent".to_string()];
+    let types = vec![DataType::Varchar, DataType::Varchar];
+    let mut rows = Vec::new();
+    if let Some(entry) = db.secret_for(path, type_, &binder.session) {
+        rows.push(vec![
+            BoundExpr::Literal(Value::Varchar(entry.secret.name().to_string())),
+            BoundExpr::Literal(Value::Varchar(entry.persistence().to_string())),
+        ]);
+    }
+    Ok(values_scope(alias, "which_secret", names, types, rows))
+}
+
+/// Wrap literal rows in a `Values` plan with a table-function scope.
+fn values_scope(
+    alias: &Option<String>,
+    default_name: &str,
+    names: Vec<String>,
+    types: Vec<DataType>,
+    rows: Vec<Vec<BoundExpr>>,
+) -> (ScopeTable, LogicalPlan) {
+    let scope = ScopeTable {
+        name: alias
+            .clone()
+            .unwrap_or_else(|| default_name.to_string())
+            .to_ascii_lowercase(),
+        original: None,
+        ns: None,
+        is_alias: alias.is_some(),
+        qualified_only: false,
+        columns: names.iter().cloned().zip(types.iter().copied()).collect(),
+    };
+    (
+        scope,
+        LogicalPlan::Values {
+            rows,
+            names,
+            types,
+            sources: Vec::new(),
+        },
+    )
 }
 
 /// `pinkdb_catalog()`: one row per catalog object of the store (wave 121) —
@@ -14318,8 +14506,13 @@ fn bind_source_raw(
             // DuckDB's replacement scan: the first registered source that
             // claims the path owns it.
             let call = TableFunctionCall::Path(path.clone());
+            let secrets: Vec<_> = db
+                .visible_secrets(&binder.session)
+                .into_iter()
+                .map(|entry| entry.secret)
+                .collect();
             for source in db.table_sources() {
-                if let Some(schema) = source.bind(&call)? {
+                if let Some(schema) = source.bind_with(&call, &secrets)? {
                     binder.note_extension_package(db.package_of_table_source(source.name()));
                     let eff = alias.clone().unwrap_or_else(|| replacement_scan_name(path));
                     return Ok((
@@ -15332,6 +15525,12 @@ fn bind_create_database_options(
             "READ_ONLY and VERSION apply to ATTACH, not to CREATE DATABASE".to_string(),
         ));
     }
+    if options.create_if_not_exists {
+        return Err(PinkDbError::Catalog(
+            "CREATE_IF_NOT_EXISTS applies to ATTACH, not to CREATE DATABASE".to_string(),
+        ));
+    }
+    refuse_unsupported_lake_options(options)?;
     if options.data.is_some() && options.catalog.is_none() {
         return Err(PinkDbError::Catalog(
             "DATA needs a CATALOG: a managed lake keeps its data under the store's lake \
@@ -15344,25 +15543,106 @@ fn bind_create_database_options(
         data: options.data.clone(),
         read_only: false,
         version: None,
+        data_inlining_row_limit: options.data_inlining_row_limit,
+        create_if_not_exists: false,
+        data_file_format: None,
     }))
 }
 
-/// `ATTACH`'s location and options (wave 124): a lake, named with the
-/// `lake:` prefix or `TYPE LAKE`.
+/// DuckLake options pinkdb parses but does not implement. Refused by name, so
+/// a caller never thinks an option took effect.
+fn refuse_unsupported_lake_options(options: &crate::sql::ast::DatabaseOptions) -> Result<()> {
+    if let Some(time) = &options.snapshot_time {
+        return Err(PinkDbError::Catalog(format!(
+            "SNAPSHOT_TIME '{time}' is not supported: pin the attachment with SNAPSHOT_VERSION n \
+             (the lake's version is what pinkdb can select)"
+        )));
+    }
+    if options.metadata_schema.is_some() {
+        return Err(PinkDbError::Catalog(
+            "METADATA_SCHEMA is not supported: pink-lake keeps the DuckLake metadata tables in \
+             the catalog's own (default) schema"
+                .to_string(),
+        ));
+    }
+    if options.encrypted {
+        return Err(PinkDbError::Catalog(
+            "ENCRYPTED is not supported per attachment (encrypted DuckLakes are a follow-up): \
+             pinkdb encrypts a lake's files with the store key (PINKDB_KEY) when the lake catalog \
+             is encrypted"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The catalog inside a `ducklake:` location: a SQLite file, a Postgres
+/// catalog (URI or libpq conninfo), or a refusal naming the DuckDB database
+/// file pinkdb cannot open.
+fn ducklake_catalog(rest: &str) -> Result<String> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err(PinkDbError::Catalog(
+            "ATTACH 'ducklake:' needs a catalog: sqlite:<path> or postgres:<conninfo>".to_string(),
+        ));
+    }
+    if let Some(path) = rest.strip_prefix("sqlite:") {
+        if path.is_empty() {
+            return Err(PinkDbError::Catalog(
+                "ATTACH 'ducklake:sqlite:' needs a path".to_string(),
+            ));
+        }
+        return Ok(format!("sqlite:{path}"));
+    }
+    if let Some(conn) = rest.strip_prefix("postgres:") {
+        if conn.is_empty() {
+            return Err(PinkDbError::Catalog(
+                "ATTACH 'ducklake:postgres:' needs a libpq conninfo or a postgres:// URI"
+                    .to_string(),
+            ));
+        }
+        // libpq takes both spellings: a URI passes through unchanged, a
+        // conninfo keeps the `postgres:` prefix so pink-lake reads it as a
+        // remote catalog, not as a local path.
+        if conn.starts_with("postgres://") || conn.starts_with("postgresql://") {
+            return Ok(conn.to_string());
+        }
+        return Ok(format!("postgres:{conn}"));
+    }
+    Err(PinkDbError::Catalog(format!(
+        "ATTACH 'ducklake:…' needs a sqlite: or postgres: catalog; '{}' names a DuckDB \
+         database file, which pinkdb cannot open",
+        crate::lake_db::redact_location(rest)
+    )))
+}
+
+/// `ATTACH`'s location and options (wave 124, DuckLake form in wave 132b): a
+/// lake, named with the `lake:` / `ducklake:` prefix or `TYPE LAKE`.
+///
+/// A password in a Postgres catalog location (URI userinfo or conninfo
+/// `password=`) is moved into a persistent `postgres` secret scoped to the
+/// redacted location: the spec that reaches the footer and the WAL never
+/// carries it. The returned secret is installed by the executor before the
+/// attach.
 fn bind_attach_options(
+    database: &str,
     location: &str,
     options: &crate::sql::ast::DatabaseOptions,
-) -> Result<crate::lake_db::LakeSpec> {
-    let catalog = match location.strip_prefix("lake:") {
-        Some(rest) => rest,
-        None if options.lake => location,
-        None => {
-            return Err(PinkDbError::Catalog(format!(
-                "ATTACH '{}' is not a lake: name a lake with the lake: prefix or TYPE LAKE \
-                 (attaching a .pink file is not supported yet)",
-                crate::lake_db::redact_location(location)
-            )));
-        }
+) -> Result<(crate::lake_db::LakeSpec, Option<crate::secret::Secret>)> {
+    let ducklake = location.strip_prefix("ducklake:");
+    let catalog = match ducklake {
+        Some(rest) => ducklake_catalog(rest)?,
+        None => match location.strip_prefix("lake:") {
+            Some(rest) => rest.to_string(),
+            None if options.lake => location.to_string(),
+            None => {
+                return Err(PinkDbError::Catalog(format!(
+                    "ATTACH '{}' is not a lake: name a lake with the lake: or ducklake: prefix \
+                     or TYPE LAKE (attaching a .pink file is not supported yet)",
+                    crate::lake_db::redact_location(location)
+                )));
+            }
+        },
     };
     if catalog.trim().is_empty() {
         return Err(PinkDbError::Catalog(
@@ -15379,12 +15659,49 @@ fn bind_attach_options(
             "VERSION pins a read-only attachment: add READ_ONLY".to_string(),
         ));
     }
-    Ok(crate::lake_db::LakeSpec {
-        catalog: Some(catalog.to_string()),
-        data: options.data.clone(),
-        read_only: options.read_only,
-        version: options.version,
-    })
+    if options.create_if_not_exists && options.read_only {
+        return Err(PinkDbError::Catalog(
+            "CREATE_IF_NOT_EXISTS cannot create a READ_ONLY attachment".to_string(),
+        ));
+    }
+    refuse_unsupported_lake_options(options)?;
+    let (catalog, password) = if ducklake.is_some() {
+        crate::lake_db::split_catalog_password(&catalog)
+    } else {
+        (catalog, None)
+    };
+    // Defensive: no location that still carries a password may reach the
+    // footer or a WAL statement.
+    if crate::lake_db::location_has_password(&catalog) {
+        return Err(PinkDbError::Catalog(format!(
+            "lake location {} carries a password: give credentials through a secret \
+             (CREATE SECRET … TYPE postgres) or the environment (PGPASSWORD)",
+            crate::lake_db::redact_location(&catalog)
+        )));
+    }
+    let secret = match password {
+        Some(password) => Some(crate::secret::Secret::new(
+            Some(format!("__attach_{}", database.to_ascii_lowercase())),
+            crate::secret::SecretType::Postgres,
+            vec![
+                ("PASSWORD".to_string(), password),
+                ("SCOPE".to_string(), catalog.clone()),
+            ],
+        )?),
+        None => None,
+    };
+    Ok((
+        crate::lake_db::LakeSpec {
+            catalog: Some(catalog),
+            data: options.data.clone(),
+            read_only: options.read_only,
+            version: options.version,
+            data_inlining_row_limit: options.data_inlining_row_limit,
+            create_if_not_exists: options.create_if_not_exists,
+            data_file_format: ducklake.map(|_| "parquet".to_string()),
+        },
+        secret,
+    ))
 }
 
 /// `pinkdb_lake_decodes()` (wave 124): the data-file decode counters of every
@@ -15779,5 +16096,40 @@ mod tests {
         // `v` is not visible from main, and `src` does not exist there.
         let err = bind_in(&db, "SELECT * FROM v;", "main").unwrap_err();
         assert!(err.to_string().contains("table \"v\" not found"), "{err}");
+    }
+
+    #[test]
+    fn attach_password_moves_into_a_scoped_secret() {
+        use crate::secret::SecretType;
+
+        let (spec, secret) = bind_attach_options(
+            "warehouse",
+            "ducklake:postgres:postgres://user:hunter2@127.0.0.1:55433/lake?sslmode=require",
+            &crate::sql::ast::DatabaseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            spec.catalog.as_deref(),
+            Some("postgres://user@127.0.0.1:55433/lake?sslmode=require")
+        );
+        let secret = secret.expect("a URI password mints a secret");
+        assert_eq!(secret.name(), "__attach_warehouse");
+        assert_eq!(secret.type_(), SecretType::Postgres);
+        assert_eq!(secret.field("PASSWORD"), Some("hunter2"));
+        assert_eq!(secret.scopes(), vec![spec.catalog.clone().unwrap()]);
+        assert!(!format!("{spec:?}").contains("hunter2"));
+
+        let (spec, secret) = bind_attach_options(
+            "w",
+            "ducklake:postgres:postgres:host=h user=u password='p w' dbname=d",
+            &crate::sql::ast::DatabaseOptions::default(),
+        )
+        .unwrap();
+        let catalog = spec.catalog.unwrap();
+        assert!(
+            !catalog.contains("password") && !catalog.contains("p w"),
+            "{catalog}"
+        );
+        assert_eq!(secret.unwrap().field("PASSWORD"), Some("p w"));
     }
 }

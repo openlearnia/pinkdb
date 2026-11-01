@@ -314,10 +314,29 @@ pub enum LogicalPlan {
     Attach {
         name: String,
         spec: crate::lake_db::LakeSpec,
+        /// A password lifted out of the catalog location, installed as a
+        /// persistent `postgres` secret before the lake opens.
+        secret: Option<crate::secret::Secret>,
     },
     /// `DETACH <name>` (wave 124; store-level).
     Detach {
         name: String,
+        if_exists: bool,
+    },
+    /// `CREATE [OR REPLACE] [PERSISTENT | TEMPORARY] SECRET …` (wave 132b).
+    /// The definition carries the values in memory only: install it into the
+    /// store or the session; the WAL and the footer carry them in their own
+    /// sections and never as statement text.
+    CreateSecret {
+        secret: crate::secret::Secret,
+        persistent: bool,
+        or_replace: bool,
+        if_not_exists: bool,
+    },
+    /// `DROP [PERSISTENT | TEMPORARY] SECRET [IF EXISTS] <name>` (wave 132b).
+    DropSecret {
+        name: String,
+        persistent: Option<bool>,
         if_exists: bool,
     },
     /// `DROP DATABASE <name>` (store-level; never inside a transaction).
@@ -921,6 +940,12 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::DropDatabase { .. }
             | LogicalPlan::Attach { .. }
             | LogicalPlan::Detach { .. }
+            // Wave 132b: secret DDL mutates the store's secret set (a
+            // temporary secret is logged too: replay re-creates it in the
+            // replay session, and the record carries the persistent
+            // snapshot either way).
+            | LogicalPlan::CreateSecret { .. }
+            | LogicalPlan::DropSecret { .. }
             | LogicalPlan::Use { .. }
             // `SET VARIABLE` is session state, not store state: it is
             // read-only for the store (no lock upgrade) and never logged —
@@ -997,6 +1022,8 @@ pub(crate) fn writes_persistent_tables(
 pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str> {
     Some(match plan {
         LogicalPlan::CreateDatabase { .. } => "CREATE DATABASE",
+        LogicalPlan::CreateSecret { .. } => "CREATE SECRET",
+        LogicalPlan::DropSecret { .. } => "DROP SECRET",
         LogicalPlan::CreateSchema { .. } => "CREATE SCHEMA",
         LogicalPlan::DropDatabase { .. } => "DROP DATABASE",
         LogicalPlan::DropSchema { .. } => "DROP SCHEMA",
@@ -1088,6 +1115,10 @@ pub(crate) fn plan_sets(
             out.add_database(name);
             return;
         }
+        // A secret is store-global: it names no table, schema or database, so
+        // its frame set stays empty (like a user/role statement). Replay
+        // installs the record's secret snapshot before these statements run.
+        LogicalPlan::CreateSecret { .. } | LogicalPlan::DropSecret { .. } => return,
         // Wave 48: a grant depends on the existence of its object, so the
         // frame records it — a concurrent `DROP TABLE`/`DROP DATABASE`
         // elsewhere in the WAL then conflicts instead of leaving a grant
@@ -1171,6 +1202,8 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
+        | LogicalPlan::CreateSecret { .. }
+        | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
@@ -1650,6 +1683,8 @@ pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
+        | LogicalPlan::CreateSecret { .. }
+        | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
@@ -1894,6 +1929,8 @@ fn walk_scan_filters(
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
+        | LogicalPlan::CreateSecret { .. }
+        | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
@@ -2336,6 +2373,8 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut Vec<String>) {
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
+        | LogicalPlan::CreateSecret { .. }
+        | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }
@@ -2805,6 +2844,8 @@ fn walk_scan_projections(
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
+        | LogicalPlan::CreateSecret { .. }
+        | LogicalPlan::DropSecret { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::SetVariable { .. }
         | LogicalPlan::LoadExtension { .. }

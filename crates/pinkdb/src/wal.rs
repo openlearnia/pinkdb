@@ -207,10 +207,13 @@ pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
 /// (wave 45o) extends the record payload with the frame's touched-object set
 /// (see [`FrameSets`]), which is what optimistic multi-writer commits
 /// validate against; version 5 (wave 107c) appends the replay memo of the
-/// record's `external_io` host-scalar calls (see [`ExtCall`]). Every durable
-/// open rewrites legacy files in place under the write lease; an older build
-/// refuses a v5 file with a clean version error before it reads any record.
-pub const WAL_VERSION: u32 = 5;
+/// record's `external_io` host-scalar calls (see [`ExtCall`]); version 6 (wave
+/// 132b) appends the record's persistent-secret section (see
+/// [`SECRETS_MARKER`]) when the record changed the store's secrets. Every
+/// durable open rewrites a v2/v3 file in place under the write lease; an
+/// older build refuses a v6 file with a clean version error before it reads
+/// any record.
+pub const WAL_VERSION: u32 = 6;
 /// An engine WAL payload detached from a local WAL file. Object-backed
 /// catalog stores use this framing so each immutable object is one logical
 /// WAL record without inheriting a local file's generation, LSN, or nonce.
@@ -1112,6 +1115,10 @@ pub(crate) struct Record {
     sets: Option<FrameSets>,
     /// The external-call memo (payload v5); empty for a legacy record.
     memo: Vec<ExtCall>,
+    /// The store's persistent secrets after this record's statements ran
+    /// (wave 132b), in their own section. `None` = no section, so replay
+    /// keeps whatever the checkpoint and earlier records installed.
+    secrets: Option<Vec<crate::secret::Secret>>,
 }
 
 /// Default WAL size that triggers an automatic checkpoint after a commit
@@ -1894,6 +1901,7 @@ impl Wal {
         &mut self,
         stmts: &[String],
         sets: Option<&FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
         memo: &[ExtCall],
     ) -> Result<()> {
         if let Some(msg) = &self.poisoned {
@@ -1914,7 +1922,7 @@ impl Wal {
         if let Some(s) = &mut sets {
             s.canonicalize();
         }
-        let payload = encode_payload(stmts, sets.as_ref(), memo)?;
+        let payload = encode_payload(stmts, sets.as_ref(), secrets, memo)?;
         let len = record_len_guard(payload.len())?;
         let portable = encode_portable_record(&payload)?;
         let lsn = self.last_lsn.checked_add(1).ok_or_else(|| {
@@ -2033,6 +2041,7 @@ impl Wal {
         touched_extensions: &[String],
         loaded_extensions: &[String],
         sets: Option<&FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
         memo: &[ExtCall],
     ) -> Result<()> {
         let mut rec: Vec<String> = Vec::with_capacity(stmts.len() + touched_extensions.len() + 1);
@@ -2059,7 +2068,7 @@ impl Wal {
             rec.push(format!("LOAD EXTENSION '{}'", path.replace('\'', "''")));
         }
         rec.extend_from_slice(stmts);
-        self.append(&rec, sets, memo)?;
+        self.append(&rec, sets, secrets, memo)?;
         // Covered only after a successful append.
         self.tracked_extensions
             .extend(touched_extensions.iter().cloned());
@@ -2235,13 +2244,14 @@ fn decode_portable_record(bytes: &[u8], lsn: u64) -> Result<Record> {
             "catalog WAL record checksum mismatch".to_string(),
         ));
     }
-    let (stmts, sets, memo) = decode_payload(payload).map_err(|message| {
+    let (stmts, sets, secrets, memo) = decode_payload(payload).map_err(|message| {
         PinkDbError::Execution(format!("invalid catalog WAL record: {message}"))
     })?;
     Ok(Record {
         lsn,
         stmts,
         sets,
+        secrets,
         memo,
     })
 }
@@ -2417,6 +2427,14 @@ fn both<T: PartialEq>(a: &[T], b: &[T], item: &T) -> bool {
 /// reach a validation window it is treated as conflicting (conservative).
 const SETS_UNKNOWN: u32 = u32::MAX;
 
+/// Marks the optional secret-snapshot section that follows the touched sets
+/// (wave 132b). A payload without secrets is byte-identical to a v5 one, so
+/// the marker is the whole version gate: it is larger than any possible
+/// record length, which no statement length can be. A build that predates
+/// the section refuses the record (its first "statement length" overruns the
+/// payload), never misreads it.
+const SECRETS_MARKER: u32 = 0x5343_5254;
+
 /// Encode the frame's touched set (payload v4, format 2):
 /// `u8 ver(=2) | u32 n_tables | n*(u16 db_len | db | u16 s_len | s |
 ///  u16 t_len | t) | u32 n_schemas | n*(u16 db_len | db | u16 s_len | s) |
@@ -2536,7 +2554,12 @@ fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
 /// `sets_len` is [`SETS_UNKNOWN`] when the frame's touched set is unknown (a
 /// legacy record adopted by an upgrade), else the [`encode_sets`] block's
 /// byte length.
-fn encode_payload(stmts: &[String], sets: Option<&FrameSets>, memo: &[ExtCall]) -> Result<Vec<u8>> {
+fn encode_payload(
+    stmts: &[String],
+    sets: Option<&FrameSets>,
+    secrets: Option<&[crate::secret::Secret]>,
+    memo: &[ExtCall],
+) -> Result<Vec<u8>> {
     let count = u32::try_from(stmts.len()).map_err(|_| {
         PinkDbError::Execution("transaction has too many statements for one WAL record".to_string())
     })?;
@@ -2549,8 +2572,17 @@ fn encode_payload(stmts: &[String], sets: Option<&FrameSets>, memo: &[ExtCall]) 
             .map_err(|_| PinkDbError::Execution("frame sets too large".to_string()))?,
         None => SETS_UNKNOWN,
     };
+    let secrets_bytes = match secrets {
+        Some(secrets) => {
+            let mut out = Vec::new();
+            out.extend_from_slice(&SECRETS_MARKER.to_le_bytes());
+            encode_secrets(&mut out, secrets)?;
+            out
+        }
+        None => Vec::new(),
+    };
     let memo_bytes = encode_ext_calls(memo)?;
-    let mut total = 8usize + sets_bytes.len();
+    let mut total = 8usize + sets_bytes.len() + secrets_bytes.len();
     for s in stmts {
         let n = u32::try_from(s.len()).map_err(|_| {
             PinkDbError::Execution("statement is too large for a WAL record".to_string())
@@ -2568,6 +2600,7 @@ fn encode_payload(stmts: &[String], sets: Option<&FrameSets>, memo: &[ExtCall]) 
     out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&sets_len.to_le_bytes());
     out.extend_from_slice(&sets_bytes);
+    out.extend_from_slice(&secrets_bytes);
     for s in stmts {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
@@ -2868,8 +2901,14 @@ fn decode_payload_legacy(payload: &[u8]) -> std::result::Result<Vec<String>, Str
     Ok(stmts)
 }
 
-/// A decoded payload: its statements, the touched sets and the replay memo.
-type PayloadParts = (Vec<String>, Option<FrameSets>, Vec<ExtCall>);
+/// A decoded payload: its statements, the touched sets, the secret snapshot
+/// and the replay memo.
+type PayloadParts = (
+    Vec<String>,
+    Option<FrameSets>,
+    Option<Vec<crate::secret::Secret>>,
+    Vec<ExtCall>,
+);
 
 /// Bounds-checked v4/v5 payload decode. `Err` means a CRC-valid record is
 /// malformed (hard error on replay, never a silent drop).
@@ -2879,7 +2918,7 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<PayloadParts, String> {
     }
     let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
     let sets_len = u32::from_le_bytes(payload[4..8].try_into().expect("4 bytes"));
-    let (sets, stmts_start) = if sets_len == SETS_UNKNOWN {
+    let (sets, sets_end) = if sets_len == SETS_UNKNOWN {
         (None, 8usize)
     } else {
         let n = sets_len as usize;
@@ -2891,9 +2930,95 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<PayloadParts, String> {
         }
         (Some(decode_sets(&payload[8..8 + n])?), 8 + n)
     };
+    let (secrets, stmts_start) = decode_secrets(payload, sets_end)?;
     let (stmts, pos) = decode_statements(payload, stmts_start, count)?;
     let memo = decode_ext_calls(payload, pos)?;
-    Ok((stmts, sets, memo))
+    Ok((stmts, sets, secrets, memo))
+}
+
+/// Decode the optional secret section at `pos` (wave 132b). Absent when the
+/// marker is missing, which is the v4/v5 layout.
+fn decode_secrets(
+    payload: &[u8],
+    pos: usize,
+) -> std::result::Result<(Option<Vec<crate::secret::Secret>>, usize), String> {
+    if payload.len().saturating_sub(pos) < 4 {
+        return Ok((None, pos));
+    }
+    if u32::from_le_bytes(payload[pos..pos + 4].try_into().expect("4 bytes")) != SECRETS_MARKER {
+        return Ok((None, pos));
+    }
+    let mut r = Payload::new(payload, pos + 4);
+    let count = r.u32()? as usize;
+    if count > payload.len() / 8 + 1 {
+        return Err(format!("implausible secret count {count}"));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = std::str::from_utf8(r.bytes()?)
+            .map_err(|_| "secret name is not UTF-8".to_string())?
+            .to_string();
+        let Some(type_) = crate::secret::SecretType::from_tag(r.u8()?) else {
+            return Err("unknown secret type tag".to_string());
+        };
+        let n_scopes = r.u32()? as usize;
+        if n_scopes > r.remaining() {
+            return Err("truncated secret scopes".to_string());
+        }
+        let mut scopes = Vec::with_capacity(n_scopes);
+        for _ in 0..n_scopes {
+            scopes.push(
+                std::str::from_utf8(r.bytes()?)
+                    .map_err(|_| "secret scope is not UTF-8".to_string())?
+                    .to_string(),
+            );
+        }
+        let n_fields = r.u32()? as usize;
+        if n_fields > r.remaining() {
+            return Err("truncated secret fields".to_string());
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        for _ in 0..n_fields {
+            let key = std::str::from_utf8(r.bytes()?)
+                .map_err(|_| "secret field name is not UTF-8".to_string())?
+                .to_string();
+            let value = std::str::from_utf8(r.bytes()?)
+                .map_err(|_| "secret field value is not UTF-8".to_string())?
+                .to_string();
+            fields.insert(key, value);
+        }
+        out.push(crate::secret::Secret::from_stored(
+            name, type_, fields, scopes,
+        ));
+    }
+    Ok((Some(out), r.pos))
+}
+
+/// Encode the secret-snapshot entries that follow [`SECRETS_MARKER`].
+fn encode_secrets(out: &mut Vec<u8>, secrets: &[crate::secret::Secret]) -> Result<()> {
+    let count = u32::try_from(secrets.len())
+        .map_err(|_| PinkDbError::Execution("too many secrets for one WAL record".to_string()))?;
+    out.extend_from_slice(&count.to_le_bytes());
+    for secret in secrets {
+        let name = secret.name().as_bytes();
+        let n = u32::try_from(name.len())
+            .map_err(|_| PinkDbError::Execution("secret name is too long".to_string()))?;
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(name);
+        out.push(secret.type_().tag());
+        let scopes = secret.scopes();
+        out.extend_from_slice(&(scopes.len() as u32).to_le_bytes());
+        for scope in scopes {
+            encode_bytes(out, scope.as_bytes())?;
+        }
+        let fields = secret.fields();
+        out.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        for (key, value) in fields {
+            encode_bytes(out, key.as_bytes())?;
+            encode_bytes(out, value.as_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse records from `start` onward. A short read, or an LSN that does not
@@ -2945,7 +3070,7 @@ fn parse_records(
         if end > data.len() {
             break;
         }
-        let (stmts, sets, memo) = match cipher {
+        let (stmts, sets, secrets, memo) = match cipher {
             Some(c) => {
                 let next = ordinal_base
                     .checked_add(ordinal)
@@ -2975,6 +3100,7 @@ fn parse_records(
                                 decode_payload_legacy(&plain).map_err(|e| {
                                     format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                                 })?,
+                                None,
                                 None,
                                 Vec::new(),
                             )
@@ -3016,6 +3142,7 @@ fn parse_records(
                             format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
                         })?,
                         None,
+                        None,
                         Vec::new(),
                     )
                 }
@@ -3025,6 +3152,7 @@ fn parse_records(
             lsn,
             stmts,
             sets,
+            secrets,
             memo,
         });
         prev = lsn;
@@ -3063,7 +3191,12 @@ fn rewrite_encrypted(
             Some((1, last_lsn)),
         )?)?;
         for rec in records {
-            let payload = encode_payload(&rec.stmts, rec.sets.as_ref(), &rec.memo)?;
+            let payload = encode_payload(
+                &rec.stmts,
+                rec.sets.as_ref(),
+                rec.secrets.as_deref(),
+                &rec.memo,
+            )?;
             let len = record_len_guard(payload.len())?;
             let ct = fresh.seal(rec.lsn, &payload)?;
             f.write_all(&len.to_le_bytes())?;
@@ -3102,7 +3235,7 @@ fn upgrade_plain(path: &Path, data: &[u8], generation: u64, records_start: usize
     let slot = slot_bytes(1, last_lsn, WAL_SLOT_DOMAIN);
     out[WAL_SLOT_A as usize..WAL_SLOT_A as usize + SLOT_LEN].copy_from_slice(&slot);
     for rec in &records {
-        let payload = encode_payload(&rec.stmts, None, &rec.memo)?;
+        let payload = encode_payload(&rec.stmts, None, rec.secrets.as_deref(), &rec.memo)?;
         let len = record_len_guard(payload.len())?;
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(&rec.lsn.to_le_bytes());
@@ -5204,6 +5337,12 @@ fn normalized_path(p: &Path) -> Option<PathBuf> {
 /// Apply one recovered record: every statement must replay cleanly. A
 /// CRC-valid record that fails to parse/bind/execute is a hard error.
 fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
+    // A record that changed the store's secrets carries the whole persistent
+    // set (values in their own section, never in the statement text); install
+    // it before the statements so an `ATTACH` finds its password.
+    if let Some(secrets) = &rec.secrets {
+        db.install_persistent_secrets(secrets.clone());
+    }
     // Every `external_io` host scalar of this record is served from the
     // record's memo, never called: a replay must not reach a provider (it may
     // have no key and no network) and must reproduce the original vectors.
@@ -5262,6 +5401,7 @@ mod tests {
             lsn: 1,
             stmts: vec!["INSERT INTO t SELECT uuid() FROM range(2);".to_string()],
             sets: None,
+            secrets: None,
             memo: Vec::new(),
         };
         let err = replay_record(&mut db, &rec).unwrap_err().to_string();
@@ -5710,7 +5850,7 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(&Wal::header_fresh(generation)).unwrap();
         for (lsn, stmts) in records {
-            let payload = encode_payload(stmts, None, &[]).unwrap();
+            let payload = encode_payload(stmts, None, None, &[]).unwrap();
             f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
             f.write_all(&lsn.to_le_bytes()).unwrap();
             f.write_all(&crc32(&payload).to_le_bytes()).unwrap();
@@ -6231,16 +6371,17 @@ mod tests {
         );
 
         // A future version is refused cleanly through the same BadVersion
-        // path an older build would use to refuse our version 5 (that
-        // direction cannot be executed from this tree).
+        // path an older build would use to refuse ours (that direction cannot
+        // be executed from this tree).
         let mut future = Vec::new();
         future.extend_from_slice(WAL_MAGIC);
-        future.extend_from_slice(&6u32.to_le_bytes());
+        future.extend_from_slice(&(WAL_VERSION + 1).to_le_bytes());
         future.extend_from_slice(b"payload-bytes");
         std::fs::write(wal_path(&p), &future).unwrap();
         let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("version 6 is not supported"),
+            err.to_string()
+                .contains(&format!("version {} is not supported", WAL_VERSION + 1)),
             "{err}"
         );
 
@@ -6320,10 +6461,13 @@ mod tests {
         assert_eq!(info.replayed_records, 2);
         assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
 
-        // The file is now v5: 96-byte header, the records re-encoded in the
-        // v5 payload layout (same statements, same LSNs, same order).
+        // The file is now current: 96-byte header, the records re-encoded in
+        // the current payload layout (same statements, same LSNs, same order).
         let data = std::fs::read(&wal).unwrap();
-        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 5);
+        assert_eq!(
+            u32::from_le_bytes(data[8..12].try_into().unwrap()),
+            WAL_VERSION
+        );
         assert_eq!(
             u32::from_le_bytes(data[36..40].try_into().unwrap()),
             crc32(&data[..36])
@@ -6522,7 +6666,7 @@ mod tests {
             assert!(err.to_string().contains("exceeds the u32"), "{err}");
         }
         // Real encodings stay far under the limit.
-        let payload = encode_payload(&["SELECT 1".to_string()], None, &[]).unwrap();
+        let payload = encode_payload(&["SELECT 1".to_string()], None, None, &[]).unwrap();
         assert!(payload.len() < 100);
     }
 
@@ -6644,7 +6788,7 @@ mod tests {
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
         let sql = "LOAD EXTENSION '/nonexistent/pinkdb-h5-test.dylib';";
-        let payload = encode_payload(&[sql.to_string()], None, &[]).unwrap();
+        let payload = encode_payload(&[sql.to_string()], None, None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -6740,7 +6884,7 @@ mod tests {
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
         let payload =
-            encode_payload(&["INSERT INTO t VALUES (7);".to_string()], None, &[]).unwrap();
+            encode_payload(&["INSERT INTO t VALUES (7);".to_string()], None, None, &[]).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -8964,8 +9108,8 @@ mod tests {
             let upgraded = std::fs::read(&wal).unwrap();
             assert_eq!(
                 u32::from_le_bytes(upgraded[8..12].try_into().unwrap()),
-                5,
-                "the upgrade published a v5 header"
+                WAL_VERSION,
+                "the upgrade published the current header version"
             );
             assert!(!upgrade.exists(), "the temp was renamed over the WAL");
 
@@ -9237,6 +9381,7 @@ mod tests {
                 .append(
                     &["CREATE DATABASE x;".to_string()],
                     Some(&sets_of_ns(&[("x", "main", "u")], &[], &["x"])),
+                    None,
                     &[],
                 )
                 .unwrap();
@@ -9393,6 +9538,7 @@ mod tests {
                 .append(
                     &["INSERT INTO t VALUES (9);".to_string()],
                     Some(&sets_of(&[("main", "t")], &[])),
+                    None,
                     &[],
                 )
                 .unwrap();

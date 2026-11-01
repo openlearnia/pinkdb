@@ -418,7 +418,16 @@ impl PinkDb {
     pub(crate) fn log_auto_refresh(&mut self, report: &AutoRefresh) -> Result<()> {
         let ns = self.current_ns.clone();
         let memo = self.statement_memo(&[]);
-        self.wal_append_session(&ns, &ns, &report.stmts, &[], &[], Some(&report.sets), &memo)
+        self.wal_append_session(
+            &ns,
+            &ns,
+            &report.stmts,
+            &[],
+            &[],
+            Some(&report.sets),
+            None,
+            &memo,
+        )
     }
 
     /// Mark a successful refresh: the wall-clock stamp, the attempt stamp and

@@ -2300,7 +2300,11 @@ pub(crate) fn run_plain(
         }
         // Wave 124: `ATTACH` reports the database it created, `DETACH` the one
         // it removed (so a session on it falls back like after a DROP).
-        LogicalPlan::Attach { name, spec } => {
+        LogicalPlan::Attach { name, spec, secret } => {
+            if let Some(secret) = secret {
+                let session = db.session.clone();
+                db.put_secret(secret.clone(), true, true, false, &session)?;
+            }
             db.attach_lake_database(name, spec.clone())?;
             Ok(QueryResult::CreatedDatabase { name: name.clone() })
         }
@@ -2309,6 +2313,39 @@ pub(crate) fn run_plain(
                 db.rbac_mut().remove_database(name);
             }
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
+        }
+        // Wave 132b: secrets are the only carrier of a credential. A
+        // temporary secret lives in the session (and shadows a persistent
+        // one); a persistent secret is store state, checkpointed in the
+        // footer's own sealed section and shipped in WAL records' own
+        // section, never as statement text.
+        LogicalPlan::CreateSecret {
+            secret,
+            persistent,
+            or_replace,
+            if_not_exists,
+        } => {
+            let session = db.session.clone();
+            db.put_secret(
+                secret.clone(),
+                *persistent,
+                *or_replace,
+                *if_not_exists,
+                &session,
+            )?;
+            Ok(QueryResult::Created)
+        }
+        LogicalPlan::DropSecret {
+            name,
+            persistent,
+            if_exists,
+        } => {
+            let session = db.session.clone();
+            // Replay re-runs a logged DROP against the record's snapshot; the
+            // statement may have dropped a temporary secret only, so a
+            // missing name is not a recovery error.
+            db.remove_secret(name, *persistent, *if_exists || db.replaying, &session)?;
+            Ok(QueryResult::Created)
         }
         LogicalPlan::DropDatabase { name, if_exists } => {
             if *if_exists && !db.database_exists(name) {
@@ -2362,6 +2399,9 @@ pub(crate) fn run_plain(
             Ok(QueryResult::LoadedExtension { name })
         }
         LogicalPlan::InstallExtension { name, from, force } => {
+            if is_builtin_extension(name) {
+                return Ok(QueryResult::LoadedExtension { name: name.clone() });
+            }
             // Name a missing `repo` feature before gate or network: the
             // build, not the connection, is what cannot install.
             db.require_repository_support()?;
@@ -2374,6 +2414,9 @@ pub(crate) fn run_plain(
             Ok(QueryResult::LoadedExtension { name })
         }
         LogicalPlan::LoadInstalledExtension { name } => {
+            if is_builtin_extension(name) {
+                return Ok(QueryResult::LoadedExtension { name: name.clone() });
+            }
             let path = db.installed_extension_path(name)?;
             if db.replaying {
                 // The cache path is the source a logged statement that calls
@@ -2955,7 +2998,13 @@ fn table_function_output(
     };
     let projection = cx.projections.for_scan(plan);
     let prunes = cx.prunes.for_scan(plan);
-    let scan = src.scan(call, projection, prunes)?;
+    let secrets: Vec<_> = cx
+        .db
+        .visible_secrets(&cx.session)
+        .into_iter()
+        .map(|entry| entry.secret)
+        .collect();
+    let scan = src.scan_with(call, projection, prunes, &secrets)?;
     let mut chunks = Vec::with_capacity(scan.chunks.len());
     for chunk in scan.chunks {
         check_source_chunk(source, schema, &chunk)?;
@@ -3687,6 +3736,8 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::DropSchema { .. }
         | LogicalPlan::Attach { .. }
         | LogicalPlan::Detach { .. }
+        | LogicalPlan::CreateSecret { .. }
+        | LogicalPlan::DropSecret { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::InstallExtension { .. }
         | LogicalPlan::LoadInstalledExtension { .. }
@@ -7652,7 +7703,13 @@ fn stream_leaf_chunks(
                 check_source_chunk(source, schema, &chunk)?;
                 sink(chunk)
             };
-            src.scan_stream(call, projection, prunes, &mut push)?;
+            let secrets: Vec<_> = cx
+                .db
+                .visible_secrets(&cx.session)
+                .into_iter()
+                .map(|entry| entry.secret)
+                .collect();
+            src.scan_stream_with(call, projection, prunes, &secrets, &mut push)?;
             cx.check_deadline()
         }
         LogicalPlan::Scan { ns, table, .. } => {
@@ -8948,6 +9005,8 @@ fn explain_into(
         LogicalPlan::DropSchema { ns, .. } => format!("DropSchema {ns}"),
         LogicalPlan::DropDatabase { name, .. } => format!("DropDatabase {name}"),
         LogicalPlan::Attach { name, .. } => format!("Attach {name}"),
+        LogicalPlan::CreateSecret { secret, .. } => format!("CreateSecret {}", secret.name()),
+        LogicalPlan::DropSecret { name, .. } => format!("DropSecret {name}"),
         LogicalPlan::Detach { name, .. } => format!("Detach {name}"),
         LogicalPlan::Use { ns } => format!("Use {ns}"),
         LogicalPlan::Sample { input, sample } => {
@@ -9537,6 +9596,16 @@ fn plan_schema_of(cx: &Cx, plan: &LogicalPlan) -> Result<(Vec<String>, Vec<DataT
         .collect();
     let schema = crate::sql::binder::plan_schema(cx.db, cx.db.current_ns(), &ctes, plan)?;
     Ok(schema.into_iter().unzip())
+}
+
+/// Extensions pinkdb ships in-process. DuckDB scripts install and load them
+/// unconditionally, so their names are accepted as no-ops; every other name
+/// keeps the repository path.
+fn is_builtin_extension(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "ducklake" | "postgres_scanner" | "httpfs"
+    )
 }
 
 #[cfg(test)]
@@ -16056,7 +16125,13 @@ mod tests {
     #[test]
     fn install_and_load_are_refused_in_transactions_and_by_explain() {
         let mut db = PinkDb::new();
-        for sql in ["INSTALL httpfs;", "FORCE INSTALL httpfs;", "LOAD httpfs;"] {
+        // `spatial` is not built in (ducklake/postgres_scanner/httpfs are
+        // accepted as no-ops), so the refusal paths stay exercised.
+        for sql in [
+            "INSTALL spatial;",
+            "FORCE INSTALL spatial;",
+            "LOAD spatial;",
+        ] {
             let e = db.execute(&format!("EXPLAIN {sql}")).expect_err("refused");
             assert!(
                 e.to_string()
@@ -16066,12 +16141,12 @@ mod tests {
         }
         db.execute("BEGIN;").unwrap();
         for (sql, what) in [
-            ("INSTALL httpfs;", "INSTALL"),
+            ("INSTALL spatial;", "INSTALL"),
             (
-                "FORCE INSTALL httpfs FROM 'https://example.test';",
+                "FORCE INSTALL spatial FROM 'https://example.test';",
                 "INSTALL",
             ),
-            ("LOAD httpfs;", "LOAD"),
+            ("LOAD spatial;", "LOAD"),
         ] {
             let e = db.execute(sql).expect_err("refused inside a transaction");
             assert_eq!(
@@ -16083,7 +16158,7 @@ mod tests {
         db.execute("ROLLBACK;").unwrap();
         // Outside a transaction the statements reach execution (and, in a
         // build without the repository, say precisely that).
-        let e = db.execute("LOAD httpfs;").expect_err("not installed");
+        let e = db.execute("LOAD spatial;").expect_err("not installed");
         assert!(
             e.to_string().contains("no extension repository support")
                 || e.to_string().contains("is not installed"),

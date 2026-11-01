@@ -66,11 +66,42 @@ fn lease_error(error: LeaseError) -> PinkDbError {
 /// A catalog location as `Lake::create_with_catalog` wants it: a bare path
 /// is a `pink:` catalog file.
 fn catalog_url(catalog: &str) -> String {
-    if catalog.contains("://") || catalog.starts_with("pink:") || catalog.starts_with("sqlite:") {
+    if catalog.contains("://")
+        || catalog.starts_with("pink:")
+        || catalog.starts_with("sqlite:")
+        || catalog.starts_with("postgres:")
+    {
         catalog.to_string()
     } else {
         format!("pink:{catalog}")
     }
+}
+
+/// The engine's resolved credentials as this crate's open-time credentials.
+/// The secret values are handed to the client here and to nothing else.
+fn credentials(request: &LakeOpenRequest) -> crate::LakeCredentials {
+    #[cfg(feature = "s3")]
+    let s3 = match (&request.s3, request.data.as_deref()) {
+        (Some(secret), Some(data)) => s3_config(data, secret),
+        _ => None,
+    };
+    crate::LakeCredentials {
+        postgres_password: request
+            .postgres_password
+            .as_ref()
+            .map(|password| password.expose().to_string()),
+        #[cfg(feature = "s3")]
+        s3,
+    }
+}
+
+/// An `s3://` data location's bucket/prefix with a secret's credentials.
+#[cfg(feature = "s3")]
+fn s3_config(data: &str, secret: &pinkdb::secret::S3Secret) -> Option<crate::S3Config> {
+    let Ok(crate::Location::S3 { bucket, prefix }) = crate::Location::parse(data) else {
+        return None;
+    };
+    Some(pinkdb_httpfs::s3::config_from_secret(bucket, secret).with_prefix(prefix))
 }
 
 fn open_lake(
@@ -78,13 +109,19 @@ fn open_lake(
     key: Option<&crate::EncryptionKey>,
 ) -> pinkdb::Result<Lake> {
     let catalog = catalog_url(&request.catalog);
+    let credentials = credentials(request);
     if request.create {
         let created = match (&request.data, key) {
-            (Some(data), None) => Lake::create_with_catalog(&catalog, data),
-            (None, None) => Lake::create_url(&catalog),
-            (Some(data), Some(key)) => {
-                Lake::create_with_catalog_with_key(&catalog, data, key.clone())
+            (Some(data), None) => {
+                Lake::create_with_catalog_credentials(&catalog, data, &credentials)
             }
+            (None, None) => Lake::create_url(&catalog),
+            (Some(data), Some(key)) => Lake::create_with_catalog_credentials_with_key(
+                &catalog,
+                data,
+                key.clone(),
+                &credentials,
+            ),
             (None, Some(key)) => Lake::create_url_with_key(&catalog, key.clone()),
         };
         return created.map_err(|e| match e {
@@ -96,12 +133,33 @@ fn open_lake(
         });
     }
     match key {
-        Some(key) => {
-            Lake::open_with_catalog_with_key(&catalog, request.data.as_deref(), key.clone())
+        Some(key) => Lake::open_with_catalog_credentials_with_key(
+            &catalog,
+            request.data.as_deref(),
+            key.clone(),
+            &credentials,
+        ),
+        None => {
+            Lake::open_with_catalog_credentials(&catalog, request.data.as_deref(), &credentials)
         }
-        None => Lake::open_with_catalog(&catalog, request.data.as_deref()),
     }
     .map_err(lake_error)
+}
+
+/// The format a lake's new tables are written in (wave 132b): DuckLake's
+/// `data_file_format` global option when the catalog records one, else the
+/// attach's own declaration — `ATTACH 'ducklake:…'` declares Parquet, which is
+/// also what DuckDB writes into a catalog it creates. A pinkdb lake database
+/// declares neither and keeps the build default.
+fn declared_format(lake: &Lake, request: &LakeOpenRequest) -> Option<String> {
+    let recorded = lake
+        .store
+        .metadata_options()
+        .ok()?
+        .into_iter()
+        .find(|row| row.scope.is_none() && row.key.eq_ignore_ascii_case("data_file_format"))
+        .map(|row| row.value);
+    recorded.or_else(|| request.data_file_format.clone())
 }
 
 /// Whether a `schema.table` catalog key names `(schema, table)`.
@@ -125,7 +183,15 @@ fn tables_at(lake: &Lake, version: u64) -> pinkdb::Result<Vec<(String, String, A
 
 impl DatabaseOpener for LakeOpener {
     fn open(&self, request: &LakeOpenRequest) -> pinkdb::Result<Arc<dyn LakeDatabase>> {
-        let lake = open_lake(request, self.key.as_ref())?;
+        let mut lake = open_lake(request, self.key.as_ref())?;
+        // Wave 132b: a catalog another writer made (stock DuckDB's, always
+        // Parquet) keeps its data-file format, so a table pinkdb creates in it
+        // is readable there too.
+        if !request.read_only
+            && let Some(format) = declared_format(&lake, request)
+        {
+            lake.set_data_file_format(&format);
+        }
         let location = crate::redact_location(&request.catalog);
         if request.read_only {
             let report = lake.attach(request.version).map_err(lake_error)?;
@@ -140,7 +206,7 @@ impl DatabaseOpener for LakeOpener {
         }
         let lease = acquire_lease(&lake, request.startup)?;
         let mut attachment = WritableAttachment::attach(lake, None).map_err(lake_error)?;
-        if let Some(limit) = inlining_limit() {
+        if let Some(limit) = request.data_inlining_row_limit.or_else(inlining_limit) {
             attachment.set_data_inlining_row_limit(limit);
         }
         let (lake, version, base) = attachment.into_parts();

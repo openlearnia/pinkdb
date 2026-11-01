@@ -1186,6 +1186,7 @@ impl Connection {
                             &[],
                             &[],
                             Some(&sets),
+                            None,
                             &[],
                         )?;
                     }
@@ -1466,7 +1467,7 @@ impl Connection {
                     .any(|(ns, _)| ns.temp_id().is_none())
             {
                 let sets = shared.proc_frame.touched();
-                shared.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), &memo)?;
+                shared.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets), None, &memo)?;
                 shared.maybe_auto_checkpoint(lease);
             }
             return Ok(());
@@ -1491,6 +1492,7 @@ impl Connection {
                 &touched,
                 &loaded,
                 Some(&sets),
+                None,
                 &memo,
             )?;
             shared.maybe_auto_checkpoint(lease);
@@ -1695,6 +1697,7 @@ impl Connection {
                 &txn.wal_ext_paths,
                 &txn.wal_ext_loaded,
                 Some(&sets),
+                None,
                 memo,
             )?;
         }

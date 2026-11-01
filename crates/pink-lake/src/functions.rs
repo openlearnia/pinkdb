@@ -1583,7 +1583,7 @@ fn snapshot_micros(info: &SnapshotInfo) -> Option<i64> {
     info.time_micros.or_else(|| parse_lake_time(&info.time))
 }
 
-fn parse_lake_time(text: &str) -> Option<i64> {
+pub(crate) fn parse_lake_time(text: &str) -> Option<i64> {
     let text = text.trim();
     let (text, offset) = match text.strip_suffix('Z') {
         Some(text) => (text, 0),

@@ -452,7 +452,7 @@ fn a_version_four_footer_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("footer version 4"), "{e}");
-    assert!(e.contains("reads footer version 5 only"), "{e}");
+    assert!(e.contains("reads footer version 6 only"), "{e}");
 }
 
 /// Rewrite a `.pink` image's footer version word (and its trailer CRC), so the

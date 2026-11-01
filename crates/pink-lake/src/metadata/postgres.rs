@@ -124,16 +124,25 @@ fn is_conflict(error: &postgres::Error) -> bool {
     )
 }
 
-/// Open (or create) the one lake in `url`'s schema.
-pub(crate) fn open(url: &str, create: bool) -> Result<SqlMetadataStore> {
+/// Open (or create) the one lake in `url`'s schema, with the password a
+/// secret supplied, if any. The password goes to the driver's config, never
+/// into the catalog location the engine stores, so a URI and a password-less
+/// conninfo both work and every error and printed location stays scrubbed of
+/// it.
+pub(crate) fn open_with_password(
+    url: &str,
+    create: bool,
+    password: Option<&str>,
+) -> Result<SqlMetadataStore> {
     let parsed = PostgresUrl::parse(url).map_err(|message| LakeError::BadLocation {
         location: crate::redact_location(url),
         message,
     })?;
     let info = UrlInfo::new(&parsed);
     let policy = tls_policy(&parsed, &info)?;
-    let client = connect(&parsed, &info, policy)?;
+    let client = connect(&parsed, &info, policy, password)?;
     let schema_ident = quote_ident(parsed.schema());
+    let password = password.map(str::to_string);
     SqlMetadataStore::open_remote(url, create, |_url, _path, create| {
         let mut client = client;
         if create {
@@ -146,6 +155,7 @@ pub(crate) fn open(url: &str, create: bool) -> Result<SqlMetadataStore> {
         Ok(Box::new(PostgresConnection {
             client: store,
             url: url.to_string(),
+            password,
             info,
             in_transaction: false,
             total: AtomicU64::new(0),
@@ -158,9 +168,11 @@ pub(crate) fn open(url: &str, create: bool) -> Result<SqlMetadataStore> {
 /// stays usable by readers.
 pub(crate) struct PostgresConnection {
     client: Arc<Mutex<Client>>,
-    /// The URL as given, password included: each transaction connects with
-    /// it. Never shown; errors and `Debug` use `info.redacted`.
+    /// The URL as given: each transaction connects with it.
     url: String,
+    /// The password a secret supplied, applied at connect time like the
+    /// initial connection. Never shown.
+    password: Option<String>,
     info: UrlInfo,
     in_transaction: bool,
     total: AtomicU64,
@@ -233,7 +245,7 @@ impl SqlConnection for PostgresConnection {
         })?;
         let info = UrlInfo::new(&parsed);
         let policy = tls_policy(&parsed, &info)?;
-        let mut client = connect(&parsed, &info, policy)?;
+        let mut client = connect(&parsed, &info, policy, self.password.as_deref())?;
         set_search_path(&mut client, &quote_ident(parsed.schema()), &info)?;
         client
             .batch_execute(Dialect::Postgres.begin_write())
@@ -241,6 +253,7 @@ impl SqlConnection for PostgresConnection {
         Ok(Box::new(PostgresConnection {
             client: Arc::new(Mutex::new(client)),
             url: self.url.clone(),
+            password: self.password.clone(),
             info,
             in_transaction: true,
             total: AtomicU64::new(0),
@@ -308,11 +321,32 @@ impl ToSql for Owned {
         ty: &Type,
         out: &mut BytesMut,
     ) -> std::result::Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        match self {
-            Owned::Integer(v) => ToSql::to_sql(v, ty, out),
-            Owned::Real(v) => ToSql::to_sql(v, ty, out),
-            Owned::Text(v) => ToSql::to_sql(v, ty, out),
-            Owned::Blob(v) => ToSql::to_sql(&v.as_slice(), ty, out),
+        // The value layer carries text and integers; a DuckLake column DuckDB
+        // declares as `uuid`, `timestamp with time zone` or `BOOLEAN` needs
+        // its own binary form, so those three are encoded here.
+        match (self, ty) {
+            (Owned::Text(v), &Type::UUID) => match uuid_bytes(v) {
+                Some(bytes) => {
+                    out.extend_from_slice(&bytes);
+                    Ok(IsNull::No)
+                }
+                None => Err(format!("{v:?} is not a uuid").into()),
+            },
+            (Owned::Text(v), &Type::TIMESTAMPTZ) => {
+                // `ducklake_time` renders an absent time as an empty string.
+                if v.is_empty() {
+                    return Ok(IsNull::Yes);
+                }
+                match crate::functions::parse_lake_time(v) {
+                    Some(micros) => ToSql::to_sql(&(micros - PG_EPOCH_OFFSET_MICROS), ty, out),
+                    None => Err(format!("{v:?} is not a timestamp").into()),
+                }
+            }
+            (Owned::Integer(v), &Type::BOOL) => ToSql::to_sql(&(*v != 0), ty, out),
+            (Owned::Integer(v), _) => ToSql::to_sql(v, ty, out),
+            (Owned::Real(v), _) => ToSql::to_sql(v, ty, out),
+            (Owned::Text(v), _) => ToSql::to_sql(v, ty, out),
+            (Owned::Blob(v), _) => ToSql::to_sql(&v.as_slice(), ty, out),
         }
     }
 
@@ -333,6 +367,24 @@ impl ToSql for Owned {
         }
         self.to_sql(ty, out)
     }
+}
+
+/// Postgres's epoch is 2000-01-01; [`crate::functions::parse_lake_time`] counts
+/// from 1970.
+const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
+
+/// A canonical uuid's bytes: DuckLake writes both the dashed 36-character form
+/// and bare 32 hex.
+fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
+    let hex: String = text.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
 }
 
 /// Rewrite the core's numbered placeholders into Postgres `$n` and drop NULL
@@ -507,12 +559,19 @@ fn create_schema(client: &mut Client, schema_ident: &str, info: &UrlInfo) -> Res
     }
 }
 
-fn connect(url: &PostgresUrl, info: &UrlInfo, policy: TlsPolicy) -> Result<Client> {
+fn connect(
+    url: &PostgresUrl,
+    info: &UrlInfo,
+    policy: TlsPolicy,
+    password: Option<&str>,
+) -> Result<Client> {
     let connection = url.connection_url();
     let mut config: Config = connection
         .parse()
         .map_err(|_| info.bad_location("the URL is not a valid Postgres connection string"))?;
-    if url.password().is_none()
+    if let Some(password) = password {
+        config.password(password);
+    } else if url.password().is_none()
         && let Ok(password) = std::env::var("PGPASSWORD")
         && !password.is_empty()
     {
@@ -624,7 +683,7 @@ mod tests {
             format!("postgres://alice:{password}@db.example.com:99999/lakes"),
             "postgres://alice:hunter%32@db.example.com/lakes?sslmode=disable".to_string(),
         ] {
-            let err = open(&raw, false).unwrap_err();
+            let err = open_with_password(&raw, false, Some(password)).unwrap_err();
             let text = err.to_string();
             assert!(!text.contains(password), "{text}");
             assert!(!text.contains("hunter%32"), "{text}");

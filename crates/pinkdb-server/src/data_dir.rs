@@ -205,6 +205,10 @@ mod tests {
             create: true,
             managed: false,
             startup: false,
+            s3: None,
+            postgres_password: None,
+            data_inlining_row_limit: None,
+            data_file_format: None,
         }
     }
 

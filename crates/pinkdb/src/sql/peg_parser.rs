@@ -908,6 +908,12 @@ enum DbOpt {
     Data(String),
     ReadOnly,
     Version(u64),
+    Inlining(u64),
+    CreateIfNotExists,
+    SnapshotTime(String),
+    MetadataSchema(String),
+    Encrypted,
+    AutomaticMigration(bool),
 }
 
 /// What may follow the left operand of a comparison-level expression.
@@ -1713,6 +1719,48 @@ peg::parser! {
                   Statement::Use { qual: crate::sql::ast::Qualifier::part(&name) }
               }
 
+        /// `CREATE [OR REPLACE] [PERSISTENT | TEMPORARY] SECRET [IF NOT
+        /// EXISTS] [<name>] (TYPE <kind>, <option> '…', …)` (wave 132b).
+        /// `secret`, `persistent` and `temporary` stay words, not reserved
+        /// keywords, so existing columns keep their names.
+        rule create_secret() -> Statement
+            = kw(Keyword::Create) orr:or_replace()
+              scope:(word("persistent") { true } / word("temporary") { false })?
+              word("secret") ifne:if_not_exists() name:ident()?
+              lparen() opts:(secret_option() ++ comma()) rparen() {?
+                  let mut secret_type = None;
+                  let mut fields = Vec::new();
+                  for (key, value) in opts {
+                      if key.eq_ignore_ascii_case("type") {
+                          if secret_type.replace(value).is_some() {
+                              return Err("TYPE given twice");
+                          }
+                      } else {
+                          fields.push((key, value));
+                      }
+                  }
+                  let Some(secret_type) = secret_type else {
+                      return Err("a secret needs TYPE s3, r2, gcs or postgres");
+                  };
+                  Ok(Statement::CreateSecret {
+                      name,
+                      secret_type,
+                      fields,
+                      persistent: scope.unwrap_or(false),
+                      or_replace: orr,
+                      if_not_exists: ifne,
+                  })
+              }
+
+        /// One `KEY 'value'` or `TYPE <kind>` pair of a secret definition.
+        rule secret_option() -> (String, String)
+            = word("type") eq()? t:ident() { ("type".to_string(), t) }
+            / word("use_ssl") eq()? v:(word("false") { false } / word("true") { true }) {
+                  ("use_ssl".to_string(), v.to_string())
+              }
+            / word("provider") eq()? v:ident() { ("provider".to_string(), v) }
+            / key:ident() eq()? v:string_lit() { (key, v) }
+
         /// `ATTACH '<location>' AS <name> [(options)]` and `DETACH [DATABASE]
         /// [IF EXISTS] <name>` (wave 124). Words, not reserved keywords.
         rule attach_stmt() -> Statement
@@ -1742,17 +1790,41 @@ peg::parser! {
                           DbOpt::Data(d) => out.data = Some(d),
                           DbOpt::ReadOnly => out.read_only = true,
                           DbOpt::Version(v) => out.version = Some(v),
+                          DbOpt::Inlining(n) => out.data_inlining_row_limit = Some(n),
+                          DbOpt::CreateIfNotExists => out.create_if_not_exists = true,
+                          DbOpt::SnapshotTime(t) => out.snapshot_time = Some(t),
+                          DbOpt::MetadataSchema(s) => out.metadata_schema = Some(s),
+                          DbOpt::Encrypted => out.encrypted = true,
+                          DbOpt::AutomaticMigration(b) => out.automatic_migration = b,
                       }
                   }
                   Ok(out)
               }
 
         rule database_option() -> (&'static str, DbOpt)
-            = word("type") eq()? word("lake") { ("type", DbOpt::Lake) }
+            = word("type") eq()? (word("ducklake") / word("lake")) { ("type", DbOpt::Lake) }
             / word("catalog") eq()? s:string_lit() { ("catalog", DbOpt::Catalog(s)) }
             / word("data") eq()? s:string_lit() { ("data", DbOpt::Data(s)) }
-            / word("read_only") { ("read_only", DbOpt::ReadOnly) }
+            // DuckDB spells the attach option `DATA_PATH`; `DATA` stays for
+            // `CREATE DATABASE … (TYPE LAKE)`.
+            / word("data_path") eq()? s:string_lit() { ("data_path", DbOpt::Data(s)) }
+            / word("read_only") eq()? { ("read_only", DbOpt::ReadOnly) }
             / word("version") eq()? n:nonneg_integer() { ("version", DbOpt::Version(n as u64)) }
+            / word("data_inlining_row_limit") eq()? n:nonneg_integer() {
+                  ("data_inlining_row_limit", DbOpt::Inlining(n as u64))
+              }
+            / word("create_if_not_exists") eq()? { ("create_if_not_exists", DbOpt::CreateIfNotExists) }
+            / word("snapshot_time") eq()? s:string_lit() {
+                  ("snapshot_time", DbOpt::SnapshotTime(s))
+              }
+            / word("metadata_schema") eq()? s:string_lit() {
+                  ("metadata_schema", DbOpt::MetadataSchema(s))
+              }
+            / word("encrypted") eq()? { ("encrypted", DbOpt::Encrypted) }
+            / word("automatic_migration") eq()?
+              b:(word("false") { false } / word("true") { true })? {
+                  ("automatic_migration", DbOpt::AutomaticMigration(b.unwrap_or(true)))
+              }
 
         /// `SHOW TABLES` / `SHOW DATABASES` / `SHOW MATERIALIZED VIEWS` —
         /// matched as words, not reserved keywords, so `show` and `tables`
@@ -1964,7 +2036,8 @@ peg::parser! {
             / name:ident() { (crate::sql::ast::Qualifier::none(), name) }
 
         rule create() -> Statement
-            = kw(Keyword::Create) word("user") ifne:if_not_exists() name:ident()
+            = create_secret()
+            / kw(Keyword::Create) word("user") ifne:if_not_exists() name:ident()
               p:password_clause() {
                   Statement::CreateUser { name, password: p, if_not_exists: ifne }
               }
@@ -2620,6 +2693,10 @@ peg::parser! {
               }
             / kw(Keyword::Drop) kw(Keyword::Database) ife:if_exists() name:ident() {
                   Statement::DropDatabase { name, if_exists: ife }
+              }
+            / kw(Keyword::Drop) scope:(word("persistent") { true } / word("temporary") { false })?
+              word("secret") ife:if_exists() name:ident() {
+                  Statement::DropSecret { name, persistent: scope, if_exists: ife }
               }
             / kw(Keyword::Drop) word("user") ife:if_exists() name:ident() {
                   Statement::DropUser { name, if_exists: ife }

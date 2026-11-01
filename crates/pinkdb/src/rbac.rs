@@ -1610,6 +1610,12 @@ pub(crate) fn check_statement(
         | LogicalPlan::Detach { .. } => {
             return admin_only("database management");
         }
+        // Wave 132b: a secret is a credential. Creating, replacing or
+        // dropping one is ADMIN; using one needs no grant of its own — a
+        // session runs with the secrets its statements' scopes match.
+        LogicalPlan::CreateSecret { .. } | LogicalPlan::DropSecret { .. } => {
+            return admin_only("secret management");
+        }
         LogicalPlan::Checkpoint => return admin_only("CHECKPOINT"),
         // ANALYZE rewrites optimizer statistics every session can read; keep
         // it with the other maintenance statements instead of letting any
@@ -1829,8 +1835,72 @@ pub(crate) fn check_select(store: &PinkDb, principal: &str, db: &str, table: &st
 /// `.pink` has no index section and replay re-executes the text, so it must
 /// re-bind exactly regardless of how the session spelled it. Every other
 /// statement logs its own source text unchanged.
+/// Quote a string literal for the SQL pinkdb re-parses on replay.
+fn quote_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Rebuild an `ATTACH` from its redacted spec: the catalog has no password
+/// (the record's secret section carries it) and every persisted option is
+/// kept so replay produces the same lake attachment. The declared data-file
+/// format rides in the location's prefix (`ducklake:` declares Parquet,
+/// `lake:` the build default), so replay keeps it too.
+fn render_attach(name: &str, spec: &crate::lake_db::LakeSpec) -> String {
+    let Some(catalog) = &spec.catalog else {
+        return format!("ATTACH {} AS {}", quote_string(name), quote_ident(name));
+    };
+    let location = if spec.data_file_format.is_some() {
+        format!("ducklake:{catalog}")
+    } else {
+        format!("lake:{catalog}")
+    };
+    let mut options = Vec::new();
+    if let Some(data) = &spec.data {
+        options.push(format!("DATA_PATH {}", quote_string(data)));
+    }
+    if spec.read_only {
+        options.push("READ_ONLY".to_string());
+    }
+    if let Some(version) = spec.version {
+        options.push(format!("SNAPSHOT_VERSION {version}"));
+    }
+    if let Some(limit) = spec.data_inlining_row_limit {
+        options.push(format!("DATA_INLINING_ROW_LIMIT {limit}"));
+    }
+    if spec.create_if_not_exists {
+        options.push("CREATE_IF_NOT_EXISTS".to_string());
+    }
+    let options = if options.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", options.join(", "))
+    };
+    format!(
+        "ATTACH {} AS {}{}",
+        quote_string(&location),
+        quote_ident(name),
+        options
+    )
+}
+
 pub(crate) fn wal_statement_text(plan: &LogicalPlan, sql: &str) -> String {
     match plan {
+        // Wave 132b: secret values never reach statement text. Replay
+        // installs the record's own secret section before running these, so
+        // the logged statement is only a marker (a comment parses to no
+        // statement).
+        // A password given in an attach string is moved into the record's
+        // secret section; the logged ATTACH is rebuilt from the redacted spec
+        // so replay attaches the same lake without the credential in text.
+        LogicalPlan::Attach { name, spec, .. } => render_attach(name, spec),
+        LogicalPlan::CreateSecret { secret, .. } => format!(
+            "-- CREATE SECRET {} (values in the record section)",
+            quote_ident(secret.name())
+        ),
+        LogicalPlan::DropSecret { name, .. } => format!(
+            "-- DROP SECRET {} (values in the record section)",
+            quote_ident(name)
+        ),
         LogicalPlan::CreateUser {
             name,
             password_hash,
@@ -2250,6 +2320,36 @@ mod tests {
             }
             .label(),
             "SCHEMA db.s"
+        );
+    }
+
+    #[test]
+    fn attach_statement_text_carries_no_password() {
+        use crate::lake_db::LakeSpec;
+        use crate::plan::LogicalPlan;
+        let plan = LogicalPlan::Attach {
+            name: "warehouse".to_string(),
+            spec: LakeSpec {
+                catalog: Some("postgres://user@127.0.0.1:55433/lake".to_string()),
+                data: Some("s3://bucket/prefix/".to_string()),
+                read_only: true,
+                version: Some(7),
+                data_inlining_row_limit: None,
+                create_if_not_exists: false,
+                data_file_format: Some("parquet".to_string()),
+            },
+            secret: None,
+        };
+        let text = wal_statement_text(
+            &plan,
+            "ATTACH 'ducklake:postgres:postgres://user:hunter2@127.0.0.1:55433/lake' AS warehouse \
+             (DATA_PATH 's3://bucket/prefix/', READ_ONLY);",
+        );
+        assert!(!text.contains("hunter2"), "{text}");
+        assert_eq!(
+            text,
+            "ATTACH 'ducklake:postgres://user@127.0.0.1:55433/lake' AS warehouse \
+             (DATA_PATH 's3://bucket/prefix/', READ_ONLY, SNAPSHOT_VERSION 7)"
         );
     }
 }

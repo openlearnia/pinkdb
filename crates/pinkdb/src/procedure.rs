@@ -2613,6 +2613,7 @@ fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> 
                 &[],
                 &[],
                 Some(&sets),
+                None,
                 &memo,
             )?;
             segment.clear();

@@ -82,6 +82,8 @@ mod regex;
 /// The extension-repository client (cargo feature `repo`) — see [`install`].
 #[cfg(feature = "repo")]
 pub mod repo;
+/// Wave 132b: DuckDB-style secrets, the only carrier of a credential.
+pub mod secret;
 /// Serving an extension's client (ABI minor 2; native targets only).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod serve;

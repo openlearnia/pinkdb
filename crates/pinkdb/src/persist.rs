@@ -135,15 +135,19 @@ pub const CHUNKS_PER_ROW_GROUP: usize = ROW_GROUP_ROWS / CHUNK_SIZE;
 /// The footer's own version word (bumped when the footer layout changes).
 /// Version 4 (wave 131a) puts every database's catalog sections under its
 /// schemas. Version 5 (wave 139a) stores a column DEFAULT as its SQL text
-/// instead of an encoded constant value; the text is rebound at load. Files
-/// written by older builds are refused.
-const FOOTER_VERSION: u32 = 5;
+/// instead of an encoded constant value; the text is rebound at load. Version
+/// 6 (wave 132b) always carries the store's persistent-secret section and a
+/// lake's declared data-file format. Files written by older builds are
+/// refused.
+const FOOTER_VERSION: u32 = 6;
 
 /// A database's storage tag in the footer: rows in the file.
 const STORAGE_LOCAL: u8 = 0;
-/// A database's storage tag in the footer: a lake (its location follows,
-/// and the database carries no tables or catalog sections in the file).
-const STORAGE_LAKE: u8 = 1;
+/// A database's storage tag in the footer: a lake (its location, its options
+/// and the data-file format it declares for new tables follow, and the
+/// database carries no tables or catalog sections in the file). Tag 1 — the
+/// pre-wave-132b lake row — is not read, like every other older layout.
+const STORAGE_LAKE: u8 = 2;
 
 /// Flags bit 0: every table carries the constraint section described in the
 /// module docs. Set iff at least one table has constraints.
@@ -2865,6 +2869,7 @@ struct DbDir {
 struct StoreFooter {
     databases: Vec<DbDir>,
     rbac: Option<crate::rbac::RbacCatalog>,
+    secrets: Vec<crate::secret::Secret>,
 }
 
 /// One encoded page (one engine chunk): its framed bytes and its statistics.
@@ -3579,6 +3584,10 @@ impl PinkDb {
         if with_rbac {
             write_rbac(&mut fw, self);
         }
+        // Wave 132b: unconditional — a section that is present even when empty
+        // is what lets a load replace the checkpoint's secrets instead of
+        // keeping stale ones.
+        write_secrets(&mut fw, self);
         let footer = fw.buf;
         // The footer, then the trailer: the footer's CRC32C, its length and
         // the magic.
@@ -3943,6 +3952,10 @@ impl PinkDb {
         if let Some(rbac) = footer.rbac {
             *db.rbac_mut() = rbac;
         }
+        // Wave 132b: the store's secrets must exist before the checkpoint's
+        // lakes are reopened (a lake's postgres catalog password lives in
+        // one), and `reopen_lake_databases` runs right after this load.
+        db.install_persistent_secrets(footer.secrets);
         if db.list_databases().is_empty() {
             db.create_database("main")?;
         }
@@ -4195,7 +4208,9 @@ fn check_footer_version(version: u32) -> Result<()> {
 
 /// A database's storage, after its name in the footer:
 /// `u8 STORAGE_LOCAL` or `u8 STORAGE_LAKE | u8 has_catalog [str catalog] |
-/// u8 has_data [str data] | u8 read_only | u8 has_version [u64 version]`.
+/// u8 has_data [str data] | u8 read_only | u8 has_version [u64 version] |
+/// has_data_inlining_row_limit [u64] | create_if_not_exists |
+/// has_data_file_format [str]`.
 fn write_storage(fw: &mut Writer, storage: &crate::lake_db::DbStorage) {
     match storage {
         crate::lake_db::DbStorage::Local => fw.u8(STORAGE_LOCAL),
@@ -4218,12 +4233,28 @@ fn write_storage(fw: &mut Writer, storage: &crate::lake_db::DbStorage) {
                 }
                 None => fw.u8(0),
             }
+            match spec.data_inlining_row_limit {
+                Some(n) => {
+                    fw.u8(1);
+                    fw.u64(n);
+                }
+                None => fw.u8(0),
+            }
+            fw.u8(u8::from(spec.create_if_not_exists));
+            match spec.data_file_format.as_deref() {
+                Some(id) => {
+                    fw.u8(1);
+                    fw.str(id);
+                }
+                None => fw.u8(0),
+            }
         }
     }
 }
 
 fn read_storage(r: &mut Reader<'_>) -> Result<crate::lake_db::DbStorage> {
-    match r.u8()? {
+    let tag = r.u8()?;
+    match tag {
         STORAGE_LOCAL => Ok(crate::lake_db::DbStorage::Local),
         STORAGE_LAKE => {
             let mut text = || -> Result<Option<String>> {
@@ -4255,11 +4286,41 @@ fn read_storage(r: &mut Reader<'_>) -> Result<crate::lake_db::DbStorage> {
                     )));
                 }
             };
+            let data_inlining_row_limit = match r.u8()? {
+                0 => None,
+                1 => Some(r.u64()?),
+                t => {
+                    return Err(PinkDbError::Execution(format!(
+                        "corrupt file: bad data-inlining row limit flag {t}"
+                    )));
+                }
+            };
+            let create_if_not_exists = match r.u8()? {
+                0 => false,
+                1 => true,
+                t => {
+                    return Err(PinkDbError::Execution(format!(
+                        "corrupt file: bad create-if-not-exists flag {t}"
+                    )));
+                }
+            };
+            let data_file_format = match r.u8()? {
+                0 => None,
+                1 => Some(r.str()?),
+                t => {
+                    return Err(PinkDbError::Execution(format!(
+                        "corrupt file: bad data-file format flag {t}"
+                    )));
+                }
+            };
             Ok(crate::lake_db::DbStorage::Lake(crate::lake_db::LakeSpec {
                 catalog,
                 data,
                 read_only,
                 version,
+                data_inlining_row_limit,
+                create_if_not_exists,
+                data_file_format,
             }))
         }
         t => Err(PinkDbError::Execution(format!(
@@ -4984,12 +5045,17 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
         });
     }
     let rbac = if rbac { Some(read_rbac(&mut r)?) } else { None };
+    let secrets = read_secrets(&mut r)?;
     if !r.end() {
         return Err(PinkDbError::Execution(
             "corrupt file: trailing bytes after the footer".to_string(),
         ));
     }
-    Ok(StoreFooter { databases, rbac })
+    Ok(StoreFooter {
+        databases,
+        rbac,
+        secrets,
+    })
 }
 
 /// Load one table's data region: every column chunk is read, its CRC32C is
@@ -5581,6 +5647,62 @@ fn read_procedure_defs(r: &mut Reader) -> Result<Vec<crate::procedure::Procedure
     Ok(out)
 }
 
+/// Encode the store-global secrets section (wave 132b). The values live here
+/// and nowhere else on disk: the footer is sealed as a whole when the store
+/// is keyed, and a WAL record carries the same list in its own section.
+/// Statement text never does (see `rbac::wal_statement_text`).
+fn write_secrets(w: &mut Writer, db: &PinkDb) {
+    let secrets = db.persistent_secrets();
+    w.u32(secrets.len() as u32);
+    for secret in secrets {
+        w.str(secret.name());
+        w.u8(secret.type_().tag());
+        w.u32(secret.scopes().len() as u32);
+        for scope in secret.scopes() {
+            w.str(scope);
+        }
+        w.u32(secret.fields().len() as u32);
+        for (key, value) in secret.fields() {
+            w.str(key);
+            w.str(value);
+        }
+    }
+}
+
+fn read_secrets(r: &mut Reader) -> Result<Vec<crate::secret::Secret>> {
+    let n = r.u32()? as usize;
+    if n > r.remaining() / 8 + 1 {
+        return r.err("secret count exceeds the remaining file");
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        let Some(type_) = crate::secret::SecretType::from_tag(r.u8()?) else {
+            return r.err("unknown secret type tag");
+        };
+        let n_scopes = r.u32()? as usize;
+        if n_scopes > r.remaining() / 4 + 1 {
+            return r.err("secret scope count exceeds the remaining file");
+        }
+        let mut scopes = Vec::with_capacity(n_scopes);
+        for _ in 0..n_scopes {
+            scopes.push(r.str()?);
+        }
+        let n_fields = r.u32()? as usize;
+        if n_fields > r.remaining() / 8 + 1 {
+            return r.err("secret field count exceeds the remaining file");
+        }
+        let mut fields = std::collections::BTreeMap::new();
+        for _ in 0..n_fields {
+            fields.insert(r.str()?, r.str()?);
+        }
+        out.push(crate::secret::Secret::from_stored(
+            name, type_, fields, scopes,
+        ));
+    }
+    Ok(out)
+}
+
 /// Encode the store-global RBAC section: the users (display name + Argon2id
 /// PHC password hash), the roles, the role memberships, the table grants, the
 /// database grants and the global `ADMIN` holders, each list sorted by its
@@ -6135,9 +6257,9 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
 /// The pinned length and footer checksum of the golden corpus's `PINKDB06`
 /// image (see `golden_pinkdb06_bytes_are_pinned`).
 #[cfg(test)]
-const GOLDEN_V6_LEN: usize = 143_738;
+const GOLDEN_V6_LEN: usize = 143_742;
 #[cfg(test)]
-const GOLDEN_V6_FOOTER_CRC: u32 = 2_513_587_345;
+const GOLDEN_V6_FOOTER_CRC: u32 = 376_858_327;
 
 #[cfg(test)]
 mod tests {
@@ -6450,6 +6572,9 @@ mod tests {
             data: Some("s3://bucket/lk".to_string()),
             read_only: true,
             version: Some(7),
+            data_inlining_row_limit: Some(1234),
+            create_if_not_exists: true,
+            data_file_format: Some("parquet".to_string()),
         };
         db.databases.get_mut("lk").unwrap().storage = crate::lake_db::DbStorage::Lake(spec.clone());
         let back = PinkDb::load_bytes(&db.to_bytes().unwrap()).unwrap();

@@ -176,6 +176,27 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    /// `CREATE [OR REPLACE] [PERSISTENT | TEMPORARY] SECRET [IF NOT EXISTS]
+    /// [<name>] (TYPE <kind>, <option> '…', …)` (wave 132b). `name = None`
+    /// picks DuckDB's `__default_<type>`. `fields` keeps the written option
+    /// names; the binder canonicalizes and validates them.
+    CreateSecret {
+        name: Option<String>,
+        secret_type: String,
+        fields: Vec<(String, String)>,
+        /// `PERSISTENT` (in the store) vs `TEMPORARY` (this session only).
+        persistent: bool,
+        or_replace: bool,
+        if_not_exists: bool,
+    },
+    /// `DROP [PERSISTENT | TEMPORARY] SECRET [IF EXISTS] <name>` (wave 132b).
+    /// `persistent = None` drops a temporary secret first, then a persistent
+    /// one with the same name.
+    DropSecret {
+        name: String,
+        persistent: Option<bool>,
+        if_exists: bool,
+    },
     /// `CREATE SCHEMA [IF NOT EXISTS] [db.]s` (wave 131). `qual.catalog`
     /// holds the database when written; a schema never names a second schema.
     CreateSchema {
@@ -1179,4 +1200,16 @@ pub struct DatabaseOptions {
     pub read_only: bool,
     /// `VERSION n` (`ATTACH … READ_ONLY` only).
     pub version: Option<u64>,
+    /// `DATA_INLINING_ROW_LIMIT n`.
+    pub data_inlining_row_limit: Option<u64>,
+    /// `CREATE_IF_NOT_EXISTS` (`ATTACH` only).
+    pub create_if_not_exists: bool,
+    /// `SNAPSHOT_TIME '…'` (`ATTACH` only).
+    pub snapshot_time: Option<String>,
+    /// `METADATA_SCHEMA '…'`.
+    pub metadata_schema: Option<String>,
+    /// `ENCRYPTED`.
+    pub encrypted: bool,
+    /// `AUTOMATIC_MIGRATION [true|false]`.
+    pub automatic_migration: bool,
 }

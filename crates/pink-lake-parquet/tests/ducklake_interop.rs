@@ -24,6 +24,11 @@ use pink_lake::{Commit, Lake};
 use pink_lake_parquet::{FORMAT_ID, register};
 use pinkdb::{ArrayElem, DataTable, DataType, PinkDb, QueryResult, Value};
 
+// Wave 132b: QuackLab's attach sequence. The mock S3 is std-only and is
+// included the same way pink-lake's own S3 tests include it.
+#[path = "../../pink-lake/src/mock_s3.rs"]
+mod mock_s3;
+
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn scratch(tag: &str) -> PathBuf {
@@ -1117,6 +1122,7 @@ fn write_interop_lake(binary: &Path, attach: &str, data: &Path) -> bool {
 /// followed by one `row,…` line per dumped row.
 fn duckdb_snapshot_lines(
     binary: &Path,
+    setup: &str,
     attach: &str,
     data: &Path,
     snapshot: i64,
@@ -1133,12 +1139,17 @@ fn duckdb_snapshot_lines(
     }
     let script = format!(
         "LOAD ducklake;\n\
+         {setup}\
          ATTACH '{attach}' AS l (DATA_PATH '{}');\n\
          {selects}",
         data.display()
     );
     run_duckdb(binary, &script)
         .unwrap_or_else(|message| panic!("DuckDB at snapshot {snapshot}: {message}"))
+        .into_iter()
+        // `LOAD` echoes `true` on this DuckDB build; it is not a query row.
+        .filter(|line| line != "true")
+        .collect()
 }
 
 fn pink_snapshot_lines(
@@ -1222,25 +1233,87 @@ fn check_every_snapshot(binary: &Path, attach: &str, data: &Path, lake: &Lake) {
                 }
             })
             .collect();
-        let expected = duckdb_snapshot_lines(binary, attach, data, *snapshot, &active);
-        let actual = pink_snapshot_lines(lake, *version, &active);
-        if expected != actual {
-            let first = expected
-                .iter()
-                .zip(&actual)
-                .position(|(a, b)| a != b)
-                .unwrap_or(expected.len().min(actual.len()));
-            panic!(
-                "snapshot {snapshot} (pink version {version}): first difference at line {first}\n\
-                 duckdb: {:?}\n\
-                 pinkdb: {:?}\n\
-                 lines: duckdb {}, pinkdb {}",
-                expected.get(first),
-                actual.get(first),
-                expected.len(),
-                actual.len()
-            );
-        }
+        check_snapshot(binary, "", attach, data, lake, *snapshot, &active);
+    }
+}
+
+/// One snapshot's rows from both sides, line for line: DuckDB's answer and
+/// pinkdb's (pink version = snapshot id + 1).
+fn check_snapshot(
+    binary: &Path,
+    setup: &str,
+    attach: &str,
+    data: &Path,
+    lake: &Lake,
+    snapshot: i64,
+    tables: &[(&str, &str, &str, &str, i64)],
+) {
+    let version = u64::try_from(snapshot).unwrap() + 1;
+    let expected = duckdb_snapshot_lines(binary, setup, attach, data, snapshot, tables);
+    let actual = pink_snapshot_lines(lake, version, tables);
+    if expected != actual {
+        let first = expected
+            .iter()
+            .zip(&actual)
+            .position(|(a, b)| a != b)
+            .unwrap_or(expected.len().min(actual.len()));
+        panic!(
+            "snapshot {snapshot} (pink version {version}): first difference at line {first}\n\
+             duckdb: {:?}\n\
+             pinkdb: {:?}\n\
+             lines: duckdb {}, pinkdb {}",
+            expected.get(first),
+            actual.get(first),
+            expected.len(),
+            actual.len()
+        );
+    }
+}
+
+/// Every snapshot of a lake a test wrote itself: each table's tuple carries the
+/// snapshot that created it, and `snapshots` is how many the script makes.
+fn check_snapshots(
+    binary: &Path,
+    setup: &str,
+    attach: &str,
+    data: &Path,
+    lake: &Lake,
+    tables: &[(&str, &str, &str, &str, i64)],
+    snapshots: usize,
+) {
+    let script = format!(
+        "LOAD ducklake;\n\
+         {setup}\
+         ATTACH '{attach}' AS l (DATA_PATH '{}');\n\
+         SELECT snapshot_id FROM ducklake_snapshots('l') ORDER BY 1;\n",
+        data.display()
+    );
+    let ids: Vec<i64> = run_duckdb(binary, &script)
+        .unwrap_or_else(|message| panic!("DuckDB snapshot list: {message}"))
+        .iter()
+        // `LOAD` echoes `true` on this DuckDB build; it is not a query row.
+        .filter(|line| line.as_str() != "true")
+        .map(|line| line.parse().unwrap())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        snapshots,
+        "the script makes snapshots 0..={}: {ids:?}",
+        snapshots - 1
+    );
+    let versions = lake.versions().unwrap();
+    assert_eq!(
+        ids.len(),
+        versions.len(),
+        "pink versions {versions:?} vs DuckLake snapshots {ids:?}"
+    );
+    for snapshot in ids {
+        let active: Vec<_> = tables
+            .iter()
+            .filter(|table| snapshot >= table.4)
+            .copied()
+            .collect();
+        check_snapshot(binary, setup, attach, data, lake, snapshot, &active);
     }
 }
 
@@ -1421,6 +1494,22 @@ impl TestPostgres {
 
     fn conninfo(&self) -> &'static str {
         "host=127.0.0.1 port=55433 user=postgres dbname=duck"
+    }
+
+    /// An additional empty database on the same server, for a test that needs a
+    /// catalog of its own.
+    #[cfg_attr(not(feature = "catalog-postgres"), allow(dead_code))]
+    fn create_database(&self, name: &str) {
+        let createdb = binary_on_path("createdb").expect("createdb is next to initdb");
+        let output = Command::new(createdb)
+            .args(["-h", "127.0.0.1", "-p", "55433", "-U", "postgres", name])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "createdb {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -2263,4 +2352,428 @@ fn ducklake_function_argument_errors_are_duckdb_like() {
 
     drop(lake);
     cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 132b: stock DuckDB's catalog shape, then QuackLab's attach sequence.
+// ---------------------------------------------------------------------------
+
+/// The catalog's `ducklake_*` columns as DuckDB reports them for the catalog
+/// attached as `probe`: one `table,column,type` line per column in declaration
+/// order. DuckDB's per-table inlined-data tables are not part of the shape.
+fn ducklake_columns(binary: &Path, attach: &str) -> Vec<String> {
+    run_duckdb(
+        binary,
+        &format!(
+            "{attach}\n\
+             SELECT table_name || ',' || column_name || ',' || data_type\n\
+               FROM information_schema.columns\n\
+              WHERE table_catalog = 'probe'\n\
+                AND table_name LIKE 'ducklake%'\n\
+                AND table_name NOT LIKE 'ducklake_inlined_data_%'\n\
+              ORDER BY table_name, ordinal_position;\n"
+        ),
+    )
+    .unwrap_or_else(|message| panic!("DuckDB column dump: {message}"))
+}
+
+/// A catalog's tables carry DuckLake's columns and types, not pinkdb's: stock
+/// DuckDB's SQLite and Postgres catalogs are the reference. Postgres is where
+/// `uuid`, `BOOLEAN` and `timestamptz` differ from SQLite's affinities.
+#[test]
+fn stock_duckdb_and_pinkdb_write_the_same_catalog_tables() {
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    register().unwrap();
+    let dir = scratch("ddl-parity");
+
+    // SQLite: DuckDB writes the reference catalog, pink-lake its own.
+    let duck_catalog = dir.join("duck.sqlite");
+    let duck_data = dir.join("duck-data");
+    let pink_catalog = dir.join("pink.sqlite");
+    let pink_data = dir.join("pink-data");
+    for path in [&duck_data, &pink_data] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let script = format!(
+        "LOAD ducklake;\n\
+         ATTACH 'ducklake:sqlite:{}' AS l (DATA_PATH '{}/');\n\
+         CREATE SCHEMA staging;\n\
+         CREATE TABLE staging.t (i INTEGER);\n\
+         INSERT INTO staging.t VALUES (1);\n",
+        duck_catalog.display(),
+        duck_data.display()
+    );
+    match run_duckdb(&binary, &script) {
+        Ok(_) => {}
+        Err(message) if message.contains("extension") || message.contains("Extension") => {
+            println!("skip DuckDB DDL parity test: {message}");
+            cleanup(&dir);
+            return;
+        }
+        Err(message) => panic!("{message}"),
+    }
+    Lake::create_with_catalog(
+        &format!("sqlite:{}", pink_catalog.display()),
+        pink_data.to_str().unwrap(),
+    )
+    .unwrap();
+    let duckdb_side = ducklake_columns(
+        &binary,
+        &format!(
+            "LOAD sqlite;\nATTACH '{}' AS probe (TYPE SQLITE, READ_ONLY);\n",
+            duck_catalog.display()
+        ),
+    );
+    let pinkdb_side = ducklake_columns(
+        &binary,
+        &format!(
+            "LOAD sqlite;\nATTACH '{}' AS probe (TYPE SQLITE, READ_ONLY);\n",
+            pink_catalog.display()
+        ),
+    );
+    assert!(
+        duckdb_side.len() > 150,
+        "too few catalog columns for a real comparison: {}",
+        duckdb_side.len()
+    );
+    assert_eq!(
+        pinkdb_side, duckdb_side,
+        "the SQLite catalog columns differ from stock DuckDB's"
+    );
+
+    // Postgres: the same comparison with a server that has real types.
+    let _postgres = postgres_guard();
+    let Some(server) = TestPostgres::start() else {
+        cleanup(&dir);
+        return;
+    };
+    server.create_database("ddl_duck");
+    server.create_database("ddl_pink");
+    let duck_conninfo = "host=127.0.0.1 port=55433 user=postgres dbname=ddl_duck";
+    let pink_conninfo = "host=127.0.0.1 port=55433 user=postgres dbname=ddl_pink";
+    let duck_data = dir.join("pg-duck-data");
+    let pink_data = dir.join("pg-pink-data");
+    for path in [&duck_data, &pink_data] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let script = format!(
+        "LOAD ducklake;\n\
+         LOAD postgres_scanner;\n\
+         ATTACH 'ducklake:postgres:{duck_conninfo}' AS l (DATA_PATH '{}/');\n\
+         CREATE SCHEMA staging;\n\
+         CREATE TABLE staging.t (i INTEGER);\n\
+         INSERT INTO staging.t VALUES (1);\n",
+        duck_data.display()
+    );
+    run_duckdb(&binary, &script)
+        .unwrap_or_else(|message| panic!("DuckDB Postgres catalog: {message}"));
+    Lake::create_with_catalog(
+        &format!("postgres:{pink_conninfo}"),
+        pink_data.to_str().unwrap(),
+    )
+    .unwrap();
+    let duckdb_side = ducklake_columns(
+        &binary,
+        &format!(
+            "LOAD postgres_scanner;\nATTACH '{duck_conninfo}' AS probe (TYPE POSTGRES, READ_ONLY);\n"
+        ),
+    );
+    let pinkdb_side = ducklake_columns(
+        &binary,
+        &format!(
+            "LOAD postgres_scanner;\nATTACH '{pink_conninfo}' AS probe (TYPE POSTGRES, READ_ONLY);\n"
+        ),
+    );
+    assert!(
+        duckdb_side
+            .iter()
+            .any(|line| line.to_lowercase().ends_with(",uuid\"")),
+        "the uuid columns are missing from DuckDB's Postgres catalog"
+    );
+    assert_eq!(
+        pinkdb_side, duckdb_side,
+        "the Postgres catalog columns differ from stock DuckDB's"
+    );
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 132b: QuackLab's own attach sequence, end to end.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "catalog-postgres")]
+mod quacklab_attach {
+    use super::*;
+
+    use pink_lake::{LakeCredentials, S3Config};
+
+    /// The loads and S3 secret a script needs to read the mock-bucket data:
+    /// the endpoint has no scheme, as MinIO/R2 configs give it.
+    fn s3_setup(endpoint: &str, key: &str, secret: &str) -> String {
+        format!(
+            "LOAD httpfs;\n\
+             CREATE OR REPLACE SECRET quacklab_s3 (TYPE S3, KEY_ID '{key}', SECRET '{secret}', \
+               ENDPOINT '{endpoint}', URL_STYLE 'path', USE_SSL false);\n"
+        )
+    }
+
+    /// Run a script in DuckDB, creating the S3 secret with the mock's
+    /// credentials.
+    fn duckdb_with_lake(
+        binary: &Path,
+        endpoint: &str,
+        key: &str,
+        secret: &str,
+        data: &str,
+        uri: &str,
+        tail: &str,
+    ) -> Result<Vec<String>, String> {
+        // `LOAD` echoes `true` on this DuckDB build; it is not a query row.
+        run_duckdb(
+            binary,
+            &format!(
+                "LOAD ducklake;\n\
+                 LOAD postgres_scanner;\n\
+                 {setup}\
+                 ATTACH 'ducklake:postgres:{uri}' AS warehouse (DATA_PATH '{data}/');\n\
+                 {tail}",
+                setup = s3_setup(endpoint, key, secret)
+            ),
+        )
+        .map(|rows| rows.into_iter().filter(|row| row != "true").collect())
+    }
+
+    /// The lake's object-store credentials for the mock endpoint: what the
+    /// engine builds from the `r2_lake` secret, for the snapshot reads below
+    /// that need a [`Lake`] handle.
+    fn lake_credentials(
+        data: &str,
+        endpoint: &str,
+        key: &str,
+        secret: &str,
+        password: &str,
+    ) -> LakeCredentials {
+        let path = data
+            .strip_prefix("s3://")
+            .unwrap_or_else(|| panic!("the mock S3 data location is not an s3:// path: {data}"));
+        let (bucket, prefix) = path.split_once('/').unwrap_or((path, ""));
+        LakeCredentials {
+            s3: Some(
+                S3Config::new(bucket)
+                    .with_prefix(prefix)
+                    .with_region("auto")
+                    .with_endpoint(format!("http://{endpoint}"))
+                    .with_path_style(true)
+                    .allow_http(true)
+                    .with_credentials(key, secret),
+            ),
+            postgres_password: Some(password.to_string()),
+        }
+    }
+
+    #[test]
+    fn quacklabs_attach_sequence_round_trips_with_duckdb() {
+        let Some(binary) = duckdb_binary() else {
+            return;
+        };
+        let _guard = postgres_guard();
+        let Some(pg) = TestPostgres::start() else {
+            return;
+        };
+        let mock = mock_s3::MockS3::start();
+        let data = mock.url("warehouse", "quacklab");
+        let data = data.trim_end_matches('/').to_string();
+        let endpoint = mock.endpoint().trim_start_matches("http://").to_string();
+        let key = mock.access_key_id();
+        let secret = mock.secret_access_key();
+        let uri = "postgres://postgres:hunter2@127.0.0.1:55433/duck?sslmode=disable";
+
+        // 1. DuckDB creates the catalog: two schemas, three tables, an inlined
+        //    insert, Parquet inserts (past the inlining limit) and a delete.
+        let rows = match duckdb_with_lake(
+            &binary,
+            &endpoint,
+            &key,
+            &secret,
+            &data,
+            uri,
+            "USE warehouse;\n\
+             CREATE SCHEMA staging;\n\
+             CREATE SCHEMA mart;\n\
+             CREATE TABLE staging.t (i INTEGER, s VARCHAR);\n\
+             INSERT INTO staging.t VALUES (1, 'a'), (2, 'b'), (3, 'c');\n\
+             CREATE TABLE staging.x (i INTEGER, s VARCHAR);\n\
+             INSERT INTO staging.x SELECT i, 'x' || i FROM range(100) t(i);\n\
+             CREATE TABLE mart.big (i INTEGER, s VARCHAR);\n\
+             INSERT INTO mart.big SELECT i, 'v' || i FROM range(200) t(i);\n\
+             DELETE FROM mart.big WHERE i % 10 = 0;\n\
+             SELECT count(*) FROM staging.t;\n\
+             SELECT count(*) FROM staging.x;\n\
+             SELECT count(*) FROM mart.big;\n",
+        ) {
+            Ok(rows) => rows,
+            Err(message) if message.contains("extension") || message.contains("Extension") => {
+                println!("skip QuackLab interop test: {message}");
+                return;
+            }
+            Err(message) => panic!("{message}"),
+        };
+        assert_eq!(
+            rows,
+            vec!["3".to_string(), "100".to_string(), "180".to_string()]
+        );
+
+        // 2. pinkdb runs the same sequence, password in the URI, and writes
+        //    into the catalog DuckDB made: a schema and table of its own, two
+        //    Parquet files, a delete, and an append to a DuckDB table.
+        pink_lake::database::register();
+        pink_lake_parquet::register().unwrap();
+        let dir = scratch("quacklab-pinkdb");
+        let store = dir.join("warehouse.pink");
+        let mut db = PinkDb::open_durable(store.to_str().unwrap()).unwrap();
+        db.execute(&format!(
+            "CREATE OR REPLACE PERSISTENT SECRET r2_lake (TYPE S3, KEY_ID '{key}', SECRET '{secret}', \
+             ENDPOINT '{endpoint}', URL_STYLE 'path', REGION 'auto', USE_SSL false);"
+        ))
+        .unwrap();
+        db.execute(&format!(
+            "ATTACH 'ducklake:postgres:{uri}' AS warehouse (DATA_PATH '{data}/');"
+        ))
+        .unwrap();
+        db.execute("USE warehouse;").unwrap();
+        assert_eq!(count(&mut db, "SELECT count(*) FROM staging.t;"), 3);
+        assert_eq!(count(&mut db, "SELECT count(*) FROM mart.big;"), 180);
+        // The attach password became a scoped secret, not statement text.
+        let secret_rows = query(&mut db, "SELECT name, type FROM duckdb_secrets();");
+        assert!(
+            secret_rows.iter().any(|row| {
+                row[0] == Value::Varchar("__attach_warehouse".into())
+                    && row[1] == Value::Varchar("postgres".into())
+            }),
+            "{secret_rows:?}"
+        );
+        db.execute("CREATE SCHEMA pinkmade;").unwrap();
+        db.execute("CREATE TABLE pinkmade.t (i INTEGER, s VARCHAR);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO pinkmade.t SELECT CAST(i AS INTEGER), 'p' || CAST(i AS VARCHAR) \
+             FROM range(0, 500) t(i);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO pinkmade.t SELECT CAST(i AS INTEGER), 'q' || CAST(i AS VARCHAR) \
+             FROM range(500, 900) t(i);",
+        )
+        .unwrap();
+        db.execute("DELETE FROM pinkmade.t WHERE i % 7 = 0;")
+            .unwrap();
+        db.execute("INSERT INTO staging.x VALUES (1000, 'pink');")
+            .unwrap();
+        // 900 rows less the 129 multiples of 7 in 0..=899; the appended row.
+        assert_eq!(count(&mut db, "SELECT count(*) FROM pinkmade.t;"), 771);
+        assert_eq!(count(&mut db, "SELECT count(*) FROM staging.x;"), 101);
+        drop(db);
+
+        // The catalog says the written files are Parquet, which is why DuckDB
+        // reads them below; a `.pink` file would be unreadable there.
+        let formats = run_duckdb(
+            &binary,
+            &format!(
+                "LOAD postgres_scanner;\n\
+                 ATTACH '{conninfo}' AS cat (TYPE POSTGRES, READ_ONLY);\n\
+                 SELECT DISTINCT f.file_format FROM cat.ducklake_data_file f\n\
+                   JOIN cat.ducklake_table t ON t.table_id = f.table_id\n\
+                   JOIN cat.ducklake_schema s ON s.schema_id = t.schema_id\n\
+                  WHERE t.table_name = 't' AND s.schema_name = 'pinkmade';\n\
+                 SELECT DISTINCT d.format FROM cat.ducklake_delete_file d\n\
+                   JOIN cat.ducklake_table t ON t.table_id = d.table_id\n\
+                   JOIN cat.ducklake_schema s ON s.schema_id = t.schema_id\n\
+                  WHERE t.table_name = 't' AND s.schema_name = 'pinkmade';\n",
+                conninfo = pg.conninfo()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            formats,
+            vec!["parquet".to_string(), "parquet".to_string()],
+            "pinkdb wrote files of another format into DuckLake's catalog"
+        );
+
+        // 3. DuckDB reads the same catalog: every table and every snapshot
+        //    equal to pinkdb's view, `pinkmade.t` included.
+        // A `Lake` handle takes the catalog as a conninfo plus the password
+        // beside it (the engine keeps that password in `__attach_warehouse`);
+        // DuckDB's own location carries it in the URI.
+        let credentials = lake_credentials(&data, &endpoint, &key, &secret, "hunter2");
+        let catalog = "postgres:host=127.0.0.1 port=55433 user=postgres dbname=duck";
+        let attach = format!("ducklake:postgres:{uri}");
+        let lake = Lake::open_with_catalog_credentials(catalog, Some(&data), &credentials).unwrap();
+        let tables: &[(&str, &str, &str, &str, i64)] = &[
+            ("staging.t", "i", "i, s", "i", 3),
+            ("staging.x", "i", "i, s", "i", 5),
+            ("mart.big", "i", "i, s", "i", 7),
+            ("pinkmade.t", "i", "i, s", "i", 11),
+        ];
+        let setup = s3_setup(&endpoint, &key, &secret);
+        check_snapshots(
+            &binary,
+            &setup,
+            &attach,
+            Path::new(&data),
+            &lake,
+            tables,
+            16,
+        );
+        drop(lake);
+
+        // 4. DuckDB writes again; pinkdb (reopened, after WAL replay) reads
+        //    the new snapshot equal.
+        let rows = match duckdb_with_lake(
+            &binary,
+            &endpoint,
+            &key,
+            &secret,
+            &data,
+            uri,
+            "USE warehouse;\n\
+             INSERT INTO pinkmade.t VALUES (9000, 'duck');\n\
+             DELETE FROM mart.big WHERE i = 1;\n\
+             INSERT INTO staging.t VALUES (4, 'd');\n\
+             SELECT count(*) FROM pinkmade.t;\n\
+             SELECT count(*) FROM mart.big;\n\
+             SELECT count(*) FROM staging.t;\n",
+        ) {
+            Ok(rows) => rows,
+            Err(message) => panic!("{message}"),
+        };
+        assert_eq!(
+            rows,
+            vec!["772".to_string(), "179".to_string(), "4".to_string()]
+        );
+
+        let mut db = PinkDb::open_durable(store.to_str().unwrap()).unwrap();
+        db.execute("USE warehouse;").unwrap();
+        assert_eq!(count(&mut db, "SELECT count(*) FROM pinkmade.t;"), 772);
+        assert_eq!(count(&mut db, "SELECT count(*) FROM mart.big;"), 179);
+        assert_eq!(count(&mut db, "SELECT count(*) FROM staging.t;"), 4);
+        drop(db);
+
+        let lake = Lake::open_with_catalog_credentials(catalog, Some(&data), &credentials).unwrap();
+        assert_eq!(lake.versions().unwrap().len(), 19);
+        for snapshot in 16..19 {
+            check_snapshot(
+                &binary,
+                &setup,
+                &attach,
+                Path::new(&data),
+                &lake,
+                snapshot,
+                tables,
+            );
+        }
+        drop(lake);
+        cleanup(&dir);
+    }
 }

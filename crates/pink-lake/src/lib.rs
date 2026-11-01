@@ -803,6 +803,33 @@ pub struct SaveReport {
     pub bytes_written: u64,
 }
 
+/// Credentials for one lake open, resolved from the engine's secrets by the
+/// caller. Kept out of the catalog URL so nothing that logs a location ever
+/// sees a password.
+#[derive(Clone, Default)]
+pub struct LakeCredentials {
+    /// Object-store credentials for an `s3://` data location. `S3Config`'s
+    /// `Debug` redacts the secret values.
+    #[cfg(feature = "s3")]
+    pub s3: Option<S3Config>,
+    /// The Postgres catalog's password; `None` falls back to `PGPASSWORD` and
+    /// the environment at connect time.
+    pub postgres_password: Option<String>,
+}
+
+impl std::fmt::Debug for LakeCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("LakeCredentials");
+        #[cfg(feature = "s3")]
+        s.field("s3", &self.s3.as_ref().map(|_| "<set>"));
+        s.field(
+            "postgres_password",
+            &self.postgres_password.as_ref().map(|_| "<set>"),
+        )
+        .finish()
+    }
+}
+
 /// A handle to a lake.
 ///
 /// The handle caches the catalog's current version (single-writer contract:
@@ -905,13 +932,13 @@ impl Lake {
     /// `s3://` URL alone is not a lake: data on S3 needs a catalog database.
     pub fn create_url(location: &str) -> Result<Self> {
         let (catalog, data) = default_catalog_split(location, "create")?;
-        Self::create_with_catalog_keyed(&catalog, &data, None)
+        Self::create_with_catalog_keyed(&catalog, &data, None, &LakeCredentials::default())
     }
 
     /// [`Lake::create_url`] with per-file-key encryption.
     pub fn create_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
         let (catalog, data) = default_catalog_split(location, "create")?;
-        Self::create_with_catalog_keyed(&catalog, &data, Some(key))
+        Self::create_with_catalog_keyed(&catalog, &data, Some(key), &LakeCredentials::default())
     }
 
     /// Create a lake whose metadata lives in `catalog_url` and whose data
@@ -919,7 +946,21 @@ impl Lake {
     /// data location is recorded in the catalog, so [`Lake::open_url`] needs
     /// only the catalog location afterwards.
     pub fn create_with_catalog(catalog_url: &str, data_location: &str) -> Result<Self> {
-        Self::create_with_catalog_keyed(catalog_url, data_location, None)
+        Self::create_with_catalog_keyed(
+            catalog_url,
+            data_location,
+            None,
+            &LakeCredentials::default(),
+        )
+    }
+
+    /// [`Lake::create_with_catalog`] with credentials resolved from secrets.
+    pub fn create_with_catalog_credentials(
+        catalog_url: &str,
+        data_location: &str,
+        credentials: &LakeCredentials,
+    ) -> Result<Self> {
+        Self::create_with_catalog_keyed(catalog_url, data_location, None, credentials)
     }
 
     /// [`Lake::create_with_catalog`] with per-file-key encryption.
@@ -928,13 +969,29 @@ impl Lake {
         data_location: &str,
         key: EncryptionKey,
     ) -> Result<Self> {
-        Self::create_with_catalog_keyed(catalog_url, data_location, Some(key))
+        Self::create_with_catalog_keyed(
+            catalog_url,
+            data_location,
+            Some(key),
+            &LakeCredentials::default(),
+        )
+    }
+
+    /// [`Lake::create_with_catalog_credentials`] with per-file-key encryption.
+    pub fn create_with_catalog_credentials_with_key(
+        catalog_url: &str,
+        data_location: &str,
+        key: EncryptionKey,
+        credentials: &LakeCredentials,
+    ) -> Result<Self> {
+        Self::create_with_catalog_keyed(catalog_url, data_location, Some(key), credentials)
     }
 
     fn create_with_catalog_keyed(
         catalog_url: &str,
         data_location: &str,
         key: Option<EncryptionKey>,
+        credentials: &LakeCredentials,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
         if !matches!(
@@ -951,12 +1008,13 @@ impl Lake {
                     .to_string(),
             });
         }
-        let data = data_storage(data_location)?;
+        let data = data_storage_credentialed(data_location, credentials)?;
         let Some(store) = catalog_store::open_metadata_store_keyed(
             catalog_url,
             &catalog_location,
             true,
             key.as_ref(),
+            credentials.postgres_password.as_deref(),
         )?
         else {
             return Err(catalog_feature_missing(catalog_url, &catalog_location));
@@ -967,18 +1025,7 @@ impl Lake {
             });
         }
         ensure_data_location_free(&*data, data_location)?;
-        Self::create_sql_catalog(catalog_url, store, data_location, key.as_ref())
-    }
-
-    /// Create a catalog lake directly on the DuckLake tables.
-    fn create_sql_catalog(
-        catalog_url: &str,
-        store: catalog_store::SqlMetadataStore,
-        data_location: &str,
-        key: Option<&EncryptionKey>,
-    ) -> Result<Self> {
-        let data = data_storage(data_location)?;
-        Self::create_sql_catalog_data(catalog_url, store, data_location, data, key)
+        Self::create_sql_catalog_data(catalog_url, store, data_location, data, key.as_ref())
     }
 
     fn create_sql_catalog_data(
@@ -1043,19 +1090,33 @@ impl Lake {
     /// `s3://…` alone is not a lake.
     pub fn open_url(location: &str) -> Result<Self> {
         let catalog = open_catalog_location(location, "open")?;
-        Self::open_with_catalog_keyed(&catalog, None, None)
+        Self::open_with_catalog_keyed(&catalog, None, None, &LakeCredentials::default())
     }
 
     /// [`Lake::open_url`] with per-file-key encryption.
     pub fn open_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
         let catalog = open_catalog_location(location, "open")?;
-        Self::open_with_catalog_keyed(&catalog, None, Some(key))
+        Self::open_with_catalog_keyed(&catalog, None, Some(key), &LakeCredentials::default())
     }
 
     /// Open the lake whose metadata lives in `catalog_url`. The data location
     /// comes from the catalog unless `data_location` overrides it.
     pub fn open_with_catalog(catalog_url: &str, data_location: Option<&str>) -> Result<Self> {
-        Self::open_with_catalog_keyed(catalog_url, data_location, None)
+        Self::open_with_catalog_keyed(
+            catalog_url,
+            data_location,
+            None,
+            &LakeCredentials::default(),
+        )
+    }
+
+    /// [`Lake::open_with_catalog`] with credentials resolved from secrets.
+    pub fn open_with_catalog_credentials(
+        catalog_url: &str,
+        data_location: Option<&str>,
+        credentials: &LakeCredentials,
+    ) -> Result<Self> {
+        Self::open_with_catalog_keyed(catalog_url, data_location, None, credentials)
     }
 
     /// [`Lake::open_with_catalog`] with per-file-key encryption.
@@ -1064,13 +1125,29 @@ impl Lake {
         data_location: Option<&str>,
         key: EncryptionKey,
     ) -> Result<Self> {
-        Self::open_with_catalog_keyed(catalog_url, data_location, Some(key))
+        Self::open_with_catalog_keyed(
+            catalog_url,
+            data_location,
+            Some(key),
+            &LakeCredentials::default(),
+        )
+    }
+
+    /// [`Lake::open_with_catalog_credentials`] with per-file-key encryption.
+    pub fn open_with_catalog_credentials_with_key(
+        catalog_url: &str,
+        data_location: Option<&str>,
+        key: EncryptionKey,
+        credentials: &LakeCredentials,
+    ) -> Result<Self> {
+        Self::open_with_catalog_keyed(catalog_url, data_location, Some(key), credentials)
     }
 
     fn open_with_catalog_keyed(
         catalog_url: &str,
         data_location: Option<&str>,
         key: Option<EncryptionKey>,
+        credentials: &LakeCredentials,
     ) -> Result<Self> {
         let catalog_location = Location::parse(catalog_url)?;
         let Some(store) = catalog_store::open_metadata_store_keyed(
@@ -1078,11 +1155,12 @@ impl Lake {
             &catalog_location,
             false,
             key.as_ref(),
+            credentials.postgres_password.as_deref(),
         )?
         else {
             return Err(catalog_feature_missing(catalog_url, &catalog_location));
         };
-        Self::open_sql_catalog(catalog_url, store, data_location, key.as_ref())
+        Self::open_sql_catalog(catalog_url, store, data_location, key.as_ref(), credentials)
     }
 
     fn open_sql_catalog(
@@ -1090,6 +1168,7 @@ impl Lake {
         store: catalog_store::SqlMetadataStore,
         data_location: Option<&str>,
         key: Option<&EncryptionKey>,
+        credentials: &LakeCredentials,
     ) -> Result<Self> {
         let encrypted = crate::metadata::MetadataStore::is_encrypted(&store)?;
         if encrypted && key.is_none() {
@@ -1118,7 +1197,7 @@ impl Lake {
                     .to_string(),
             });
         };
-        let data = data_storage(&data_location)?;
+        let data = data_storage_credentialed(&data_location, credentials)?;
         Self::open_sql_catalog_data(catalog_url, store, &data_location, data, key)
     }
 
@@ -1277,8 +1356,9 @@ impl Lake {
         }
         let data_location = s3_location(&config);
         let data: Arc<dyn Storage> = Arc::new(s3::S3Storage::new(config)?);
-        let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, true, None)?
-            .ok_or_else(|| catalog_feature_missing(catalog_url, &location))?;
+        let store =
+            catalog_store::open_metadata_store_keyed(catalog_url, &location, true, None, None)?
+                .ok_or_else(|| catalog_feature_missing(catalog_url, &location))?;
         if crate::metadata::MetadataStore::head_version(&store)?.is_some() {
             return Err(LakeError::AlreadyALake {
                 path: PathBuf::from(redact_location(catalog_url)),
@@ -1295,8 +1375,9 @@ impl Lake {
         let location = Location::parse(catalog_url)?;
         let data_location = s3_location(&config);
         let data: Arc<dyn Storage> = Arc::new(s3::S3Storage::new(config)?);
-        let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
-            .ok_or_else(|| catalog_feature_missing(catalog_url, &location))?;
+        let store =
+            catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None, None)?
+                .ok_or_else(|| catalog_feature_missing(catalog_url, &location))?;
         Self::open_sql_catalog_data(catalog_url, store, &data_location, data, None)
     }
 
@@ -1936,6 +2017,20 @@ impl Lake {
         Ok(())
     }
 
+    /// Declare the data-file format the **catalog** asks new tables to be
+    /// written in (wave 132b): DuckLake's `data_file_format` option, or the
+    /// format the `ATTACH` named (`ducklake:` is Parquet, DuckLake's own
+    /// default).
+    ///
+    /// Unlike [`Lake::set_write_format`] the id is not resolved against the
+    /// registry here: a build without the provider still opens the catalog
+    /// for reading, and names the format at the first write or read that
+    /// needs it ([`LakeError::UnknownFormat`]) instead of silently writing
+    /// `.pink` into a lake another writer cannot read.
+    pub fn set_data_file_format(&mut self, id: &str) {
+        self.write_format_choice = Some(FileFormat::new(id));
+    }
+
     /// Choose the data-file format for one table on this handle, keyed by
     /// `db.table` (wave 88). The id is validated against the registry exactly
     /// like [`Lake::set_write_format`] — an id with no provider is
@@ -2552,6 +2647,29 @@ pub fn redact_location(location: &str) -> String {
 
 /// The data half of a split lake: a local directory or an `s3://` URL, never
 /// another catalog.
+/// [`data_storage`] with a secret's S3 credentials: when the location is
+/// `s3://…` and the credentials name the same bucket/prefix, they replace the
+/// environment's.
+fn data_storage_credentialed(
+    location: &str,
+    credentials: &LakeCredentials,
+) -> Result<Arc<dyn Storage>> {
+    #[cfg(feature = "s3")]
+    if let Some(config) = &credentials.s3
+        && let Ok(Location::S3 { bucket, prefix }) = Location::parse(location)
+    {
+        if config.bucket != bucket || config.prefix != prefix {
+            return Err(LakeError::BadLocation {
+                location: redact_location(location),
+                message: "the secret's bucket/prefix does not match the data location".to_string(),
+            });
+        }
+        return Ok(Arc::new(s3::S3Storage::new(config.clone())?));
+    }
+    let _ = credentials;
+    data_storage(location)
+}
+
 fn data_storage(location: &str) -> Result<Arc<dyn Storage>> {
     let parsed = Location::parse(location)?;
     if is_catalog_location(&parsed) {
@@ -2875,11 +2993,16 @@ pub fn catalog_encryption_keys(
     key: Option<EncryptionKey>,
 ) -> Result<Vec<Vec<u8>>> {
     let location = Location::parse(catalog_url)?;
-    let store =
-        catalog_store::open_metadata_store_keyed(catalog_url, &location, false, key.as_ref())?
-            .ok_or_else(|| LakeError::NotALake {
-                path: PathBuf::from(redact_location(catalog_url)),
-            })?;
+    let store = catalog_store::open_metadata_store_keyed(
+        catalog_url,
+        &location,
+        false,
+        key.as_ref(),
+        None,
+    )?
+    .ok_or_else(|| LakeError::NotALake {
+        path: PathBuf::from(redact_location(catalog_url)),
+    })?;
     crate::metadata::MetadataStore::file_keys(&store)
 }
 
@@ -2887,10 +3010,11 @@ pub fn catalog_encryption_keys(
 #[doc(hidden)]
 pub fn catalog_execute(catalog_url: &str, sql: &str) -> Result<()> {
     let location = Location::parse(catalog_url)?;
-    let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
-        .ok_or_else(|| LakeError::NotALake {
-            path: PathBuf::from(redact_location(catalog_url)),
-        })?;
+    let store =
+        catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None, None)?
+            .ok_or_else(|| LakeError::NotALake {
+                path: PathBuf::from(redact_location(catalog_url)),
+            })?;
     store.execute_sql(sql)
 }
 
@@ -2899,10 +3023,11 @@ pub fn catalog_execute(catalog_url: &str, sql: &str) -> Result<()> {
 #[doc(hidden)]
 pub fn catalog_snapshot_json(catalog_url: &str, version: u64) -> Result<Option<serde_json::Value>> {
     let location = Location::parse(catalog_url)?;
-    let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
-        .ok_or_else(|| LakeError::NotALake {
-            path: PathBuf::from(redact_location(catalog_url)),
-        })?;
+    let store =
+        catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None, None)?
+            .ok_or_else(|| LakeError::NotALake {
+                path: PathBuf::from(redact_location(catalog_url)),
+            })?;
     match crate::metadata::MetadataStore::load(&store, Some(version))? {
         Some(catalog) => {
             serde_json::to_value(&catalog)
@@ -2920,10 +3045,11 @@ pub fn catalog_snapshot_json(catalog_url: &str, version: u64) -> Result<Option<s
 #[doc(hidden)]
 pub fn catalog_table_json(catalog_url: &str, key: &str) -> Result<Option<serde_json::Value>> {
     let location = Location::parse(catalog_url)?;
-    let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
-        .ok_or_else(|| LakeError::NotALake {
-            path: PathBuf::from(redact_location(catalog_url)),
-        })?;
+    let store =
+        catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None, None)?
+            .ok_or_else(|| LakeError::NotALake {
+                path: PathBuf::from(redact_location(catalog_url)),
+            })?;
     match store.table(key, None)? {
         Some(entry) => serde_json::to_value(&entry)
             .map(Some)
@@ -2940,10 +3066,11 @@ pub fn catalog_table_json(catalog_url: &str, key: &str) -> Result<Option<serde_j
 #[doc(hidden)]
 pub fn catalog_set_table_format(catalog_url: &str, key: &str, format: &str) -> Result<()> {
     let location = Location::parse(catalog_url)?;
-    let store = catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None)?
-        .ok_or_else(|| LakeError::NotALake {
-            path: PathBuf::from(redact_location(catalog_url)),
-        })?;
+    let store =
+        catalog_store::open_metadata_store_keyed(catalog_url, &location, false, None, None)?
+            .ok_or_else(|| LakeError::NotALake {
+                path: PathBuf::from(redact_location(catalog_url)),
+            })?;
     store.set_table_format(key, format)
 }
 

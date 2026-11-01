@@ -209,6 +209,46 @@ impl std::fmt::Debug for S3Config {
     }
 }
 
+/// A config for `bucket` carrying a secret's explicit settings: region,
+/// endpoint (`https://` added when the secret gives a host, `http://` when it
+/// says `USE_SSL false`), path style and credentials. Anything the secret
+/// leaves unset keeps the environment fallback.
+pub fn config_from_secret(
+    bucket: impl Into<String>,
+    secret: &pinkdb::secret::S3Secret,
+) -> S3Config {
+    let mut config = S3Config::new(bucket);
+    if let Some(region) = &secret.region {
+        config = config.with_region(region.clone());
+    }
+    if let Some(endpoint) = &secret.endpoint {
+        let endpoint = if endpoint.contains("://") {
+            endpoint.clone()
+        } else {
+            let scheme = if secret.use_ssl == Some(false) {
+                "http"
+            } else {
+                "https"
+            };
+            format!("{scheme}://{endpoint}")
+        };
+        config = config.with_endpoint(endpoint);
+        if secret.use_ssl == Some(false) {
+            config = config.allow_http(true);
+        }
+    }
+    if let Some(path_style) = secret.path_style {
+        config = config.with_path_style(path_style);
+    }
+    if let (Some(key_id), Some(secret_key)) = (&secret.key_id, &secret.secret) {
+        config = config.with_credentials(key_id.clone(), secret_key.clone());
+        if let Some(token) = &secret.session_token {
+            config = config.with_session_token(token.clone());
+        }
+    }
+    config
+}
+
 impl S3Config {
     /// A configuration with no environment lookups (region `us-east-1`,
     /// no endpoint, conditional writes required; credentials still fall back

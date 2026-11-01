@@ -1847,9 +1847,9 @@ fn create_in_conn(
     conn.execute(
         "INSERT INTO ducklake_schema
          (schema_id, schema_uuid, begin_snapshot, end_snapshot, schema_name, path,
-          path_is_relative, parent_schema_id)
-         VALUES (0, ?1, 0, NULL, 'main', 'data/', 1, NULL)",
-        params![schema_uuid],
+          path_is_relative)
+         VALUES (0, ?1, 0, NULL, 'main', 'data/', ?2)",
+        params![schema_uuid, true],
     )
     .map_err(|e| sql_error("creating the main schema", e))?;
     conn.execute(
@@ -3661,8 +3661,10 @@ fn commit_in_conn(
                 "INSERT INTO ducklake_table
                  (table_id, table_uuid, begin_snapshot, end_snapshot, schema_id, table_name,
                   path, path_is_relative)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 1)",
-                params![table_id, table_uuid, sid, schema_id, table_name, table_path],
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+                params![
+                    table_id, table_uuid, sid, schema_id, table_name, table_path, true
+                ],
             )
             .map_err(|e| sql_error("creating a table row", e))?;
             let schema_path: String = query_one(
@@ -3879,8 +3881,10 @@ fn commit_delta_in_conn(
                 "INSERT INTO ducklake_table
                  (table_id, table_uuid, begin_snapshot, end_snapshot, schema_id, table_name,
                   path, path_is_relative)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 1)",
-                params![table_id, table_uuid, sid, schema_id, table_name, table_path],
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7)",
+                params![
+                    table_id, table_uuid, sid, schema_id, table_name, table_path, true
+                ],
             )
             .map_err(|e| sql_error("creating a table row", e))?;
             let schema_path: String = query_one(
@@ -3983,7 +3987,7 @@ fn commit_delta_in_conn(
                   path_is_relative, file_format, record_count, file_size_bytes, footer_size,
                   row_id_start, partition_id, encryption_key, mapping_id, partial_max,
                   row_group_count)
-                 VALUES (?1, ?2, ?3, NULL, NULL, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL,
+                 VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?12, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL,
                          NULL, 1)",
                 params![
                     file_id,
@@ -3999,6 +4003,7 @@ fn commit_delta_in_conn(
                     file.row_id_start().map(i64_from_u64).transpose()?,
                     partition_id,
                     crate::storage::written_file_key(file.path()).map(|key| encode_hex(&key)),
+                    true,
                 ],
             )
             .map_err(|e| sql_error("inserting a data file", e))?;
@@ -4047,7 +4052,7 @@ fn commit_delta_in_conn(
                  (delete_file_id, table_id, begin_snapshot, end_snapshot, data_file_id, path,
                   path_is_relative, format, delete_count, file_size_bytes, footer_size,
                   encryption_key, partial_max, row_group_count)
-                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, 1, ?6, ?7, ?8, NULL, ?9, NULL, 1)",
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?10, ?6, ?7, ?8, NULL, ?9, NULL, 1)",
                 params![
                     file_id,
                     row.table_id,
@@ -4058,6 +4063,7 @@ fn commit_delta_in_conn(
                     i64_from_u64(delete.count)?,
                     i64_from_u64(size)?,
                     crate::storage::written_file_key(&delete.path).map(|key| encode_hex(&key)),
+                    true,
                 ],
             )
             .map_err(|e| sql_error("inserting a delete file", e))?;
@@ -4407,9 +4413,9 @@ fn update_table_column_stats(
             .execute(
                 "UPDATE ducklake_table_column_stats
                  SET contains_null = ?3, contains_nan = ?4, min_value = ?5, max_value = ?6,
-                     extra_stats = NULL, min_is_exact = 1, max_is_exact = 1
+                     extra_stats = NULL, min_is_exact = ?7, max_is_exact = ?7
                  WHERE table_id = ?1 AND column_id = ?2",
-                params![row.table_id, column_id, contains_null, nan, min, max],
+                params![row.table_id, column_id, contains_null, nan, min, max, true],
             )
             .map_err(|e| sql_error("updating table column statistics", e))?;
         if updated == 0 {
@@ -4417,8 +4423,8 @@ fn update_table_column_stats(
                 "INSERT INTO ducklake_table_column_stats
                  (table_id, column_id, contains_null, contains_nan, min_value, max_value,
                   extra_stats, min_is_exact, max_is_exact)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 1, 1)",
-                params![row.table_id, column_id, contains_null, nan, min, max],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7)",
+                params![row.table_id, column_id, contains_null, nan, min, max, true],
             )
             .map_err(|e| sql_error("inserting table column statistics", e))?;
         }
@@ -4560,9 +4566,9 @@ fn ensure_schema(
     conn.execute(
         "INSERT INTO ducklake_schema
          (schema_id, schema_uuid, begin_snapshot, end_snapshot, schema_name, path,
-          path_is_relative, parent_schema_id)
-         VALUES (?1, ?2, ?3, NULL, ?4, 'data/', 1, NULL)",
-        params![schema_id, crate::fresh_id(), sid, schema_name],
+          path_is_relative)
+         VALUES (?1, ?2, ?3, NULL, ?4, 'data/', ?5)",
+        params![schema_id, crate::fresh_id(), sid, schema_name, true],
     )
     .map_err(|e| sql_error("creating a schema", e))?;
     Ok(schema_id)
@@ -4659,7 +4665,7 @@ fn sync_table(
               path_is_relative, file_format, record_count, file_size_bytes, footer_size,
               row_id_start, partition_id, encryption_key, mapping_id, partial_max,
               row_group_count)
-             VALUES (?1, ?2, ?3, NULL, NULL, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL,
+             VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?12, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL,
                      NULL, 1)",
             params![
                 file_id,
@@ -4675,6 +4681,7 @@ fn sync_table(
                 file.row_id_start().map(i64_from_u64).transpose()?,
                 current_partition_id(conn, row.table_id, sid)?,
                 crate::storage::written_file_key(file.path()).map(|key| encode_hex(&key)),
+                true,
             ],
         )
         .map_err(|e| sql_error("inserting a data file", e))?;
@@ -4742,7 +4749,7 @@ fn sync_table(
              (delete_file_id, table_id, begin_snapshot, end_snapshot, data_file_id, path,
               path_is_relative, format, delete_count, file_size_bytes, footer_size,
               encryption_key, partial_max, row_group_count)
-             VALUES (?1, ?2, ?3, NULL, ?4, ?5, 1, ?6, ?7, ?8, NULL, ?9, NULL, 1)",
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?10, ?6, ?7, ?8, NULL, ?9, NULL, 1)",
             params![
                 file_id,
                 row.table_id,
@@ -4753,6 +4760,7 @@ fn sync_table(
                 i64_from_u64(delete.count)?,
                 i64_from_u64(size)?,
                 crate::storage::written_file_key(&delete.path).map(|key| encode_hex(&key)),
+                true,
             ],
         )
         .map_err(|e| sql_error("inserting a delete file", e))?;
@@ -4960,7 +4968,7 @@ fn insert_column(
          (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name,
           column_type, initial_default, default_value, nulls_allowed, parent_column,
           default_value_type, default_value_dialect)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, ?7, 1, NULL, 'literal', 'duckdb')",
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, ?7, ?8, NULL, 'literal', 'duckdb')",
         params![
             column_id,
             sid,
@@ -4968,7 +4976,8 @@ fn insert_column(
             order,
             name,
             ducklake_type(dtype),
-            column.default
+            column.default,
+            true
         ],
     )
     .map_err(|e| sql_error("inserting a column", e))?;
@@ -5007,14 +5016,15 @@ fn insert_column(
          (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name,
           column_type, initial_default, default_value, nulls_allowed, parent_column,
           default_value_type, default_value_dialect)
-         VALUES (?1, ?2, NULL, ?3, ?4, 'element', ?5, NULL, NULL, 1, ?6, 'literal', 'duckdb')",
+         VALUES (?1, ?2, NULL, ?3, ?4, 'element', ?5, NULL, NULL, ?7, ?6, 'literal', 'duckdb')",
         params![
             child_id,
             sid,
             row.table_id,
             child_order,
             ducklake_elem_type(elem),
-            column_id
+            column_id,
+            true
         ],
     )
     .map_err(|e| sql_error("inserting a nested column", e))?;
@@ -5170,7 +5180,7 @@ fn write_file_stats(
              (data_file_id, table_id, column_id, column_size_bytes, value_count,
               null_count, min_value, max_value, contains_nan, extra_stats,
               min_is_exact, max_is_exact)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, NULL, 1, 1)",
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9)",
             params![
                 file_id,
                 row.table_id,
@@ -5179,7 +5189,8 @@ fn write_file_stats(
                 i64_from_u64(column.nulls)?,
                 min,
                 max,
-                contains_nan
+                contains_nan,
+                true
             ],
         )
         .map_err(|e| sql_error("inserting file column statistics", e))?;
@@ -5328,7 +5339,7 @@ fn write_table_stats(conn: &dyn SqlConnection, row: &TableRow, entry: &TableEntr
             "INSERT INTO ducklake_table_column_stats
              (table_id, column_id, contains_null, contains_nan, min_value, max_value,
               extra_stats, min_is_exact, max_is_exact)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 1, 1)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?7)",
             params![
                 row.table_id,
                 column_id,
@@ -5339,7 +5350,8 @@ fn write_table_stats(conn: &dyn SqlConnection, row: &TableRow, entry: &TableEntr
                     None
                 },
                 min,
-                max
+                max,
+                true
             ],
         )
         .map_err(|e| sql_error("inserting table column statistics", e))?;

@@ -98,6 +98,17 @@ pub struct LakeSpec {
     pub read_only: bool,
     /// `VERSION n`: a read-only attachment pinned to one lake version.
     pub version: Option<u64>,
+    /// `DATA_INLINING_ROW_LIMIT n`: rows per data file before a new one is
+    /// started. The lake catalog's own setting applies when `None`.
+    pub data_inlining_row_limit: Option<u64>,
+    /// `CREATE_IF_NOT_EXISTS`: create the lake when it does not exist yet.
+    pub create_if_not_exists: bool,
+    /// The data-file format the attachment declares for new tables (wave
+    /// 132b): `Some("parquet")` for `ATTACH 'ducklake:…'`, whose catalogs are
+    /// Parquet so another DuckLake reader can read what pinkdb writes. `None`
+    /// keeps the build default except where the catalog records its own
+    /// `data_file_format` option.
+    pub data_file_format: Option<String>,
 }
 
 /// What a host's [`DatabaseOpener`] is asked to open: the spec resolved
@@ -123,6 +134,17 @@ pub struct LakeOpenRequest {
     /// The store is opening (a reopen or a replay): an opener may wait out a
     /// stale lease a crashed predecessor left behind.
     pub startup: bool,
+    /// The S3 credentials of a secret whose scope covers the data (or the
+    /// catalog) location; `None` lets the opener fall back to the environment.
+    pub s3: Option<crate::secret::S3Secret>,
+    /// The Postgres password of a secret whose scope covers the catalog; the
+    /// catalog location itself never carries one.
+    pub postgres_password: Option<crate::secret::Password>,
+    /// `DATA_INLINING_ROW_LIMIT` (`None`: the lake catalog's own setting).
+    pub data_inlining_row_limit: Option<u64>,
+    /// The data-file format the attachment declares for new tables (see
+    /// [`LakeSpec::data_file_format`]).
+    pub data_file_format: Option<String>,
 }
 
 /// A writable lake's content at the version it was opened at.
@@ -312,7 +334,13 @@ pub fn redact_location(location: &str) -> String {
 /// The local path inside a catalog location, if it names one (`pink:`,
 /// `sqlite:` or a bare path; never a URL).
 fn local_catalog_path(location: &str) -> Option<(&str, &str)> {
-    if location.contains("://") {
+    // A URL, a libpq conninfo (`host=… dbname=…`) and a named remote catalog
+    // are never paths: `postgres:` takes the rest of the string as libpq
+    // conninfo, which contains `=` and no `://`.
+    if location.contains("://")
+        || location.starts_with("postgres:")
+        || location.split_whitespace().any(|word| word.contains('='))
+    {
         return None;
     }
     for prefix in ["pink:", "sqlite:"] {
@@ -321,6 +349,121 @@ fn local_catalog_path(location: &str) -> Option<(&str, &str)> {
         }
     }
     Some(("", location))
+}
+
+/// Split a password out of a Postgres catalog location, returning the
+/// location without it and the password. Both libpq spellings are handled: a
+/// URI (`postgres://user:pw@host/db`) and a conninfo
+/// (`postgres:host=h dbname=d password=pw`). The password is percent-decoded
+/// (URI) or unquoted (conninfo) — it is about to become a secret value.
+pub(crate) fn split_catalog_password(location: &str) -> (String, Option<String>) {
+    if let Some((scheme, rest)) = location.split_once("://") {
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(end);
+        let Some((userinfo, host)) = authority.rsplit_once('@') else {
+            return (location.to_string(), None);
+        };
+        let (user, password) = match userinfo.split_once(':') {
+            Some((user, password)) => (user, Some(percent_decode(password))),
+            None => (userinfo, None),
+        };
+        return (format!("{scheme}://{user}@{host}{tail}"), password);
+    }
+    let (prefix, body) = match location.strip_prefix("postgres:") {
+        Some(body) => ("postgres:", body),
+        None => ("", location),
+    };
+    let (body, password) = remove_conninfo_password(body);
+    (format!("{prefix}{body}"), password)
+}
+
+/// Drop every `password=…` pair from a libpq conninfo, keeping the other
+/// pairs (and their quoting) as written.
+fn remove_conninfo_password(input: &str) -> (String, Option<String>) {
+    let bytes = input.as_bytes();
+    let mut pairs: Vec<String> = Vec::new();
+    let mut password = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == bytes.len() {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key = &input[start..i];
+        if i == bytes.len() || bytes[i] != b'=' {
+            // Not a `key=value` pair: keep the rest verbatim.
+            pairs.push(input[start..].trim().to_string());
+            break;
+        }
+        i += 1;
+        let value_start = i;
+        if i < bytes.len() && bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if i + 1 < bytes.len() => i += 2,
+                    b'\'' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+        } else {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+        let raw = &input[value_start..i];
+        if key.eq_ignore_ascii_case("password") {
+            password = Some(unquote_conninfo(raw));
+        } else {
+            pairs.push(format!("{key}={raw}"));
+        }
+    }
+    (pairs.join(" "), password)
+}
+
+fn unquote_conninfo(raw: &str) -> String {
+    if let Some(inner) = raw.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            out.push(if c == '\\' {
+                chars.next().unwrap_or(c)
+            } else {
+                c
+            });
+        }
+        out
+    } else {
+        raw.to_string()
+    }
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&text[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A relative local path resolved against `base`.
@@ -609,11 +752,21 @@ impl PinkDb {
         };
         Ok(LakeOpenRequest {
             database: name.to_string(),
+            // A secret scoped to the data location (or the catalog, for an
+            // S3 catalog) supplies the object-store credentials; without one
+            // the opener falls back to `AWS_*` as before.
+            s3: self.s3_secret_for(&catalog, &self.session).or_else(|| {
+                data.as_deref()
+                    .and_then(|d| self.s3_secret_for(d, &self.session))
+            }),
+            postgres_password: self.postgres_password_for(&catalog, &self.session),
+            data_inlining_row_limit: spec.data_inlining_row_limit,
+            data_file_format: spec.data_file_format.clone(),
             catalog,
             data,
             read_only: spec.read_only,
             version: spec.version,
-            create,
+            create: create || (spec.create_if_not_exists && !spec.read_only),
             managed,
             startup,
         })
@@ -1402,6 +1555,9 @@ mod tests {
             data: None,
             read_only: false,
             version: None,
+            data_inlining_row_limit: None,
+            create_if_not_exists: false,
+            data_file_format: None,
         };
         let r = db
             .lake_request("a", &spec("sqlite:x.sqlite"), false, false)
@@ -1420,11 +1576,20 @@ mod tests {
             data: None,
             read_only: false,
             version: None,
+            data_inlining_row_limit: None,
+            create_if_not_exists: false,
+            data_file_format: None,
         };
         let r = db.lake_request("Sales", &managed, true, false).unwrap();
         assert_eq!(r.catalog, "pink:/data/lakes/sales/catalog.pink");
         assert_eq!(r.data.as_deref(), Some("/data/lakes/sales/data"));
         assert!(r.managed);
+        // A libpq conninfo carries no `://`; it is still a remote catalog and
+        // must never be resolved against the lake directory.
+        let r = db
+            .lake_request("a", &spec("postgres:host=h dbname=db"), false, false)
+            .unwrap();
+        assert_eq!(r.catalog, "postgres:host=h dbname=db");
         let err = db
             .lake_request("a", &spec("postgres://u:pw@h/db"), false, false)
             .unwrap_err()

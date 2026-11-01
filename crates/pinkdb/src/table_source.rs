@@ -264,6 +264,42 @@ pub trait TableSource: fmt::Debug + Send + Sync {
         })
     }
 
+    /// [`Self::bind`] with the session's secrets: a source that reads remote
+    /// objects resolves credentials here (the default ignores them).
+    fn bind_with(
+        &self,
+        call: &TableFunctionCall,
+        secrets: &[crate::secret::Secret],
+    ) -> Result<Option<Vec<(String, DataType)>>> {
+        let _ = secrets;
+        self.bind(call)
+    }
+
+    /// [`Self::scan`] with the session's secrets.
+    fn scan_with(
+        &self,
+        call: &TableFunctionCall,
+        projection: Option<&[usize]>,
+        filters: &[PrunePredicate],
+        secrets: &[crate::secret::Secret],
+    ) -> Result<TableScanOutput> {
+        let _ = secrets;
+        self.scan(call, projection, filters)
+    }
+
+    /// [`Self::scan_stream`] with the session's secrets.
+    fn scan_stream_with(
+        &self,
+        call: &TableFunctionCall,
+        projection: Option<&[usize]>,
+        filters: &[PrunePredicate],
+        secrets: &[crate::secret::Secret],
+        sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+    ) -> Result<TableScanOutput> {
+        let _ = secrets;
+        self.scan_stream(call, projection, filters, sink)
+    }
+
     /// Whether [`Self::scan_stream`] pays off for a bound call (wave 98c):
     /// the executor fuses an aggregate over a call into a fold only when it
     /// does, and otherwise materializes the scan and folds it in parallel.
