@@ -9,6 +9,16 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-11-01</h2>
+<h3>Wave 132 — DuckLake interop ✅</h3>
+<p>pinkdb opens the DuckLakes stock DuckDB writes and writes ones DuckDB reads, with QuackLab's own attach sequence.</p>
+<ul>
+<li><strong><code>ATTACH 'ducklake:…'</code></strong> with <code>sqlite:</code>, <code>postgres:&lt;conninfo&gt;</code> and <code>postgres:postgresql://…</code> catalogs and DuckLake's options (<code>DATA_PATH</code>, <code>READ_ONLY</code>, <code>SNAPSHOT_VERSION</code>, <code>CREATE_IF_NOT_EXISTS</code>, <code>DATA_INLINING_ROW_LIMIT</code>); options pinkdb lacks are refused by name.</li>
+<li><strong>Secrets:</strong> <code>CREATE [OR REPLACE] [PERSISTENT | TEMPORARY] SECRET</code> for <code>s3</code>, <code>r2</code>, <code>gcs</code> and <code>postgres</code>, <code>DROP SECRET</code>, <code>duckdb_secrets()</code>, <code>which_secret()</code>. Lake data, <code>read_csv</code>/<code>read_parquet</code> over <code>s3://</code> and Postgres catalogs use the matching secret. A password in an <code>ATTACH</code> string is kept as a secret; no secret value reaches the WAL, statement history, <code>SHOW</code> or errors.</li>
+<li><strong>Reading DuckDB's lakes:</strong> catalog versions <code>1.1-dev1</code> to <code>1.3</code>, DuckLake's path rules (including absolute paths), Parquet delete files and inlined deletes.</li>
+<li><strong>Writing for DuckDB:</strong> the catalog tables have DuckDB's exact columns and types, and <code>ducklake:</code> lakes write Parquet data and delete files (server feature <code>parquetlake</code>).</li>
+<li><strong>DuckLake's functions in SQL:</strong> <code>ducklake_snapshots</code>, <code>table_info</code>, <code>list_files</code>, <code>table_changes</code> / <code>insertions</code> / <code>deletions</code>, <code>options</code>, <code>settings</code>, <code>current_snapshot</code>, <code>last_committed_snapshot</code>, and <code>CALL</code>s for flushing inlined data, expiring snapshots, compaction, cleanup, <code>set_option</code> (including <code>CALL db.set_option(…)</code>) and commit messages. The CLI's matching <code>.lake</code> dot-commands are gone.</li>
+<li><strong>Formats:</strong> <code>.pink</code> footer version 6 and WAL version 6; files from earlier builds are refused.</li>
+</ul>
 <h3>Wave 126a — decimal literals typed like DuckDB ✅</h3>
 <p><code>1.5</code> is now <code>DECIMAL(2,1)</code>, as in DuckDB, instead of <code>DOUBLE</code>, so arithmetic with decimal columns keeps DuckDB's types and exact values: <code>x - 1.5</code> over a <code>DECIMAL(15,2)</code> column is <code>DECIMAL(16,2)</code>, <code>0.1 + 0.2</code> is <code>0.3</code>, and unaliased column names keep the literal as written (<code>(10 / 4.0)</code>). Literals with an exponent (<code>1e3</code>) or more than 38 digits stay <code>DOUBLE</code>; array literals keep <code>DOUBLE</code> elements. Filters against a column convert the literal once, so queries run as fast as before.</p>
 <h3>Wave 140 — QuackLab's ETL hot spots ✅</h3>

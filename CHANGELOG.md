@@ -9,6 +9,36 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-01
+### Wave 132 — DuckLake interop ✅
+
+pinkdb opens the DuckLakes stock DuckDB writes and writes ones DuckDB reads,
+with QuackLab's own attach sequence.
+
+- **`ATTACH 'ducklake:…'`** with `sqlite:`, `postgres:<conninfo>` and
+  `postgres:postgresql://…` catalogs and DuckLake's options (`DATA_PATH`,
+  `READ_ONLY`, `SNAPSHOT_VERSION`, `CREATE_IF_NOT_EXISTS`,
+  `DATA_INLINING_ROW_LIMIT`); options pinkdb lacks are refused by name.
+- **Secrets:** `CREATE [OR REPLACE] [PERSISTENT | TEMPORARY] SECRET` for
+  `s3`, `r2`, `gcs` and `postgres`, `DROP SECRET`, `duckdb_secrets()`,
+  `which_secret()`. Lake data, `read_csv`/`read_parquet` over `s3://` and
+  Postgres catalogs use the matching secret. A password in an `ATTACH` string
+  is kept as a secret; no secret value reaches the WAL, statement history,
+  `SHOW` or errors.
+- **Reading DuckDB's lakes:** catalog versions `1.1-dev1` to `1.3`, DuckLake's
+  path rules (including absolute paths), Parquet delete files and inlined
+  deletes.
+- **Writing for DuckDB:** the catalog tables have DuckDB's exact columns and
+  types, and `ducklake:` lakes write Parquet data and delete files (server
+  feature `parquetlake`).
+- **DuckLake's functions in SQL:** `ducklake_snapshots`, `table_info`,
+  `list_files`, `table_changes` / `insertions` / `deletions`, `options`,
+  `settings`, `current_snapshot`, `last_committed_snapshot`, and `CALL`s for
+  flushing inlined data, expiring snapshots, compaction, cleanup,
+  `set_option` (including `CALL db.set_option(…)`) and commit messages. The
+  CLI's matching `.lake` dot-commands are gone.
+- **Formats:** `.pink` footer version 6 and WAL version 6; files from earlier
+  builds are refused.
+
 ### Wave 126a — decimal literals typed like DuckDB ✅
 
 `1.5` is now `DECIMAL(2,1)`, as in DuckDB, instead of `DOUBLE`, so

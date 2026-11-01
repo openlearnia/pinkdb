@@ -49,6 +49,20 @@ removed ones, published by an optimistic commit. Nothing may be held or diffed i
   inlining, conflict rules; delete `commit_from_tables` and `PINKDL1`.
 - **134c**: interop tests with DuckDB writing the same lake; benchmark rerun.
 
+## Added 2026-11-01 (top priority, from the parent session)
+
+- **No `materialize_tables`** of the writable lake database: a writable lake
+  opens as fast as a read-only one.
+- **`INSERT` streams into new Parquet files** with bounded row-group buffers
+  (a row group at the target size, a new file at DuckLake's
+  `target_file_size`), collecting `ducklake_file_column_stats` while writing.
+- **`DELETE` / `UPDATE` / `MERGE` write DuckLake delete files plus new rows**,
+  built on wave 140's batched MERGE / INSERT…SELECT path (matched rowids become
+  delete-file positions; new and updated rows go through the streaming writer).
+- Metrics as in 133, plus ETL wall, refresh wall and bytes written per phase.
+- Stream C does the same for the local `.pink` store (lazy open, streamed
+  checkpoint, format 6→7, building on 132's 6).
+
 ## Gate
 
 Full gate. TPC-H refresh functions (RF1/RF2) against a lake match DuckDB; the QuackLab bench's

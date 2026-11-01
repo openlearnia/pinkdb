@@ -58,6 +58,26 @@ Wave 134 does the same for writes; the two share this wave's table model.
 - **133c**: benchmark rerun (charts and cold start on the lake path); TPC-H SF 1 from a lake vs
   DuckDB attaching the same DuckLake.
 
+## Added 2026-11-01 (top priority, from the parent session)
+
+- **No whole-table decode on first touch**: `LakeAttachment::load` /
+  `load_filtered` (`pink-lake/src/attach.rs`) and the session table cache go;
+  every read is a streamed, projected, pruned scan.
+- **Pruning down to pages**: catalog file statistics, then row-group footer
+  statistics, then the **Parquet page index** (column index + offset index),
+  which pinkdb's Parquet reader does not read yet — port DuckDB's page
+  filtering (`parquet_reader.cpp`, `column_reader.cpp`), credited.
+- **Projected columns only, ranged and coalesced reads** on R2/S3: the footer
+  once per file version, then only the projected chunks' or pages' byte
+  ranges, merged across small gaps; never a whole-object GET for a scan.
+- **Parallel, streamed, bounded**: a fixed number of in-flight row-group or
+  page-range morsels.
+- **Metrics in `bench/quacklab/run.py` (lake mode), before and after**: lake
+  attach time, first-query latency, bytes and requests read from object
+  storage per query (pink-lake's `StorageStats`, surfaced in `EXPLAIN ANALYZE`
+  and a function the bench reads), peak RSS. Baseline: the 132 emitted-lake
+  numbers in `docs/wave-132-plan.md`.
+
 ## Gate
 
 Full gate (lake/catalog code). Plus: TPC-H 22/22 equal to DuckDB from a pinkdb lake at SF 0.01 and

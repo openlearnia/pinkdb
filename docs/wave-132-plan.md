@@ -119,8 +119,37 @@ DuckDB under QuackLab, and DuckDB has to keep reading what pinkdb writes.
 - After 131d: attach multi-schema QuackLab catalogs; the benchmark's lake path
   moves from "blocked by 132" to emitted.
 
+## Done
+
+132a (read stock DuckDB's lakes: versions, DuckLake's path rule, Parquet and
+inlined deletes, libpq conninfo), 132c (19 DuckLake functions in pink-lake, with
+change functions derived from catalog state), 132b (`ATTACH 'ducklake:…'`,
+secrets, passwords out of the WAL and footer, DuckDB's exact catalog columns,
+Parquet data for `ducklake:` lakes, footer/WAL version 6), 132d (the functions in
+SQL, `set_option` like DuckLake, the CLI's duplicate dot-commands removed, the
+benchmark's emitted lake path). Deferred: encrypted DuckLakes (132e);
+`parquet_compression`/`_version`/`_row_group_size` and `skip_stats_columns` are
+stored but not honoured by the Parquet writer.
+
 ## Measured
 
-To fill in: the benchmark's lake path before and after (wave 130 baseline:
-pinkdb's emitted lake path is blocked by 132; workaround lake numbers in
-`docs/wave-130-plan.md`).
+Benchmark lake path, `--size smoke`, 2026-11-01, emitted mode (QuackLab's real
+sequence: S3 secret, `ATTACH 'ducklake:postgres:…'` with the password, `USE`,
+`CREATE SCHEMA`): before, blocked by 132 (wave 130 measured only the
+workaround). After: nothing blocked, no failed phase, table counts and widget
+rows agree with DuckDB.
+
+| phase (lake, emitted) | pinkdb | DuckDB | ratio |
+|---|---|---|---|
+| setup | 12.96 s | 3.56 s | 3.6× |
+| ETL, smoke batch | 5.67 s | 1.64 s | 3.5× |
+| ETL, 50k append | 8.36 s | 2.33 s | 3.6× |
+| ETL, one-row correction | 2.66 s | 0.76 s | 3.5× |
+| refresh, smoke batch | 18.1 s | 3.96 s | 4.6× |
+| refresh, after append | 39.8 s | 2.61 s | 15× |
+| refresh, after correction | 56.9 s | 3.21 s | 18× |
+| charts, 1 client, p50 | 0.27 ms | 4.0 ms (incl. its CLI) | — |
+| cold start (`kpi_totals`) | 1.55 s | 0.20 s | 7.9× |
+
+The refresh and cold-start gaps are wave 124's in-memory writable lake
+(whole-table materialization and diffs), which 133 and 134 replace.
