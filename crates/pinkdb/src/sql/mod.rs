@@ -351,7 +351,10 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
                                     work.push((NodeRef::Expr(e), child));
                                 }
                             }
-                            ast::MergeAction::Delete => {}
+                            ast::MergeAction::Delete
+                            | ast::MergeAction::UpdateAll
+                            | ast::MergeAction::InsertAll
+                            | ast::MergeAction::InsertByName => {}
                         }
                     }
                     for p in returning.iter().flatten() {
@@ -719,7 +722,10 @@ fn take_statement_children(
                         }
                     }
                     ast::MergeAction::Insert { values, .. } => exprs.extend(values),
-                    ast::MergeAction::Delete => {}
+                    ast::MergeAction::Delete
+                    | ast::MergeAction::UpdateAll
+                    | ast::MergeAction::InsertAll
+                    | ast::MergeAction::InsertByName => {}
                 }
             }
             for p in returning.iter_mut().flatten() {

@@ -71,6 +71,9 @@ pub enum Statement {
     Insert {
         qual: Qualifier,
         table: String,
+        /// `INSERT INTO t BY NAME SELECT …`: match the query's columns to the
+        /// target's by name instead of by position.
+        by_name: bool,
         columns: Option<Vec<String>>,
         source: InsertSource,
         /// `ON CONFLICT …` / `INSERT OR REPLACE|IGNORE` (wave 95b).
@@ -733,12 +736,20 @@ pub enum MergeAction {
     Update {
         sets: Vec<(SetTarget, Expr)>,
     },
+    /// `UPDATE SET *`: every target column takes the source column in the same
+    /// position (DuckDB's `*` is positional, not by name).
+    UpdateAll,
     Delete,
     Insert {
         /// `INSERT (a, b) VALUES (…, …)`; `None` fills every column.
         columns: Option<Vec<String>>,
         values: Vec<Expr>,
     },
+    /// `INSERT *`: every target column from the source column at its position.
+    InsertAll,
+    /// `INSERT BY NAME`: target columns matched by the source's column names;
+    /// the rest take their DEFAULT.
+    InsertByName,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -808,7 +819,14 @@ pub enum FromSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableFunctionCallArg {
     pub name: Option<String>,
+    /// The literal value. For the `{…}` form this is [`Expr::Literal`] of
+    /// NULL: the fields are in `fields` instead, because pinkdb has no STRUCT
+    /// value type and the form exists only here.
     pub expr: Expr,
+    /// `types={'a': 'DATE'}` — a brace map literal. DuckDB passes these as
+    /// STRUCT arguments; with no STRUCT type, a table-function argument is
+    /// the one place this engine carries them.
+    pub fields: Option<Vec<(String, Expr)>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

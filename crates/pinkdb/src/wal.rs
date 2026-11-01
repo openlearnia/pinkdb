@@ -5410,7 +5410,7 @@ mod tests {
         assert_eq!(
             results,
             vec![QueryResult::Selected {
-                names: vec!["count(*)".to_string()],
+                names: vec!["count_star()".to_string()],
                 types: vec![crate::types::DataType::Bigint],
                 rows: vec![vec![Value::Bigint(0)]],
             }]

@@ -199,8 +199,14 @@ fn parse_options(args: &[TableFunctionArg]) -> Result<CsvOptions> {
 
 /// One option value as text. DuckDB accepts numbers/booleans where the value
 /// is a scalar (`header := 1`, `sample_size := 100`), so only the string-ish
-/// kinds are converted and everything else is refused precisely.
+/// kinds are converted and everything else is refused precisely. The struct and
+/// list literals of `types` / `columns` become the same text `.import` writes.
 fn option_text(arg: &TableFunctionArg, name: &str) -> Result<String> {
+    // `types={'a': 'DATE'}` / `dtypes=['DATE', 'VARCHAR']`: the binder hands the
+    // literal's text over as-is, the option table parses it.
+    if let Some(literal) = &arg.literal {
+        return Ok(literal.clone());
+    }
     Ok(match &arg.value {
         pinkdb::Value::Varchar(s) => s.clone(),
         pinkdb::Value::Integer(i) => i.to_string(),
@@ -737,6 +743,7 @@ mod tests {
                     Some(name.to_string())
                 },
                 value,
+                literal: None,
             })
             .collect()
     }
@@ -914,6 +921,93 @@ mod tests {
             ]
         );
         assert_eq!(rows(&mut db, &sql(&server.url("/o/opts.csv"))), local_rows);
+    }
+
+    /// `types` / `dtypes` / `column_types` take a struct literal (the engine
+    /// has no STRUCT value, so it travels as an argument shape) and override
+    /// the inferred type of the named columns; `columns` gives every name and
+    /// type. The list form of `types` is positional, as in DuckDB.
+    #[test]
+    fn types_and_columns_options_read_a_local_file() {
+        let dir = scratch_dir("types");
+        let path = dir.join("t.csv");
+        std::fs::write(
+            &path,
+            "DAY_ID,AMT,NOTE\n2024-01-02,12.50,x\n2024-01-03,3.25,y\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+        let mut db = PinkDb::new();
+        db.register_table_source(source());
+
+        let got = rows(
+            &mut db,
+            &format!(
+                "SELECT DAY_ID::VARCHAR, AMT::DOUBLE FROM read_csv('{path}', \
+                 types := {{'DAY_ID': 'DATE', 'AMT': 'DECIMAL(10,2)'}}) ORDER BY DAY_ID;"
+            ),
+        );
+        assert_eq!(
+            got,
+            vec![
+                vec![Value::Varchar("2024-01-02".into()), Value::Double(12.5)],
+                vec![Value::Varchar("2024-01-03".into()), Value::Double(3.25)],
+            ]
+        );
+        // The list form overrides by position, and `dtypes` is the same option.
+        let got = rows(
+            &mut db,
+            &format!(
+                "SELECT DAY_ID, AMT FROM read_csv('{path}', dtypes := ['DATE', 'DECIMAL(10,2)']) ORDER BY DAY_ID;"
+            ),
+        );
+        assert_eq!(
+            got,
+            vec![
+                vec![
+                    Value::Date(19724),
+                    Value::Decimal {
+                        value: 1250,
+                        precision: 10,
+                        scale: 2
+                    }
+                ],
+                vec![
+                    Value::Date(19725),
+                    Value::Decimal {
+                        value: 325,
+                        precision: 10,
+                        scale: 2
+                    }
+                ],
+            ]
+        );
+        // `columns` names and types every column: nothing is inferred and the
+        // header row is still skipped.
+        let single = dir.join("d.csv");
+        std::fs::write(&single, "DAY_ID\n2024-01-02\n2024-01-03\n").unwrap();
+        let got = rows(
+            &mut db,
+            &format!(
+                "SELECT * FROM read_csv('{}', columns := {{'d': 'DATE'}});",
+                single.to_str().unwrap()
+            ),
+        );
+        assert_eq!(
+            got,
+            vec![vec![Value::Date(19724)], vec![Value::Date(19725)]]
+        );
+        // An unknown name is DuckDB's COLUMN_TYPES error.
+        let err = db
+            .execute(&format!(
+                "SELECT * FROM read_csv('{path}', types := {{'zz': 'DATE'}});"
+            ))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "COLUMN_TYPES error: Columns with names: \"zz\" do not exist in the CSV File"
+        );
     }
 
     /// `errors=warn` skips a malformed row in a scan; the default fails.

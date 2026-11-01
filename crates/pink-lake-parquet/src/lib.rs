@@ -379,6 +379,7 @@ fn read_local_path(file: &DataFile<'_>, path: &std::path::Path) -> Result<PinkDb
         args: vec![TableFunctionArg {
             name: None,
             value: Value::Varchar(path_text),
+            literal: None,
         }],
     };
     let schema = source

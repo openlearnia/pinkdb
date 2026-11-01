@@ -11649,9 +11649,24 @@ mod tests {
     }
 
     #[test]
-    fn derived_table_needs_alias() {
+    fn derived_table_without_alias_is_unnamed_subquery() {
         let mut db = sub_db();
-        assert!(db.execute("SELECT * FROM (SELECT * FROM emp);").is_err());
+        // DuckDB names an alias-less derived table `unnamed_subquery` (then
+        // `unnamed_subquery2`, ... within one FROM list) and nothing else.
+        let rows = select(
+            &mut db,
+            "SELECT * FROM (SELECT name FROM emp WHERE id = 2);",
+        );
+        assert_eq!(rows, vec![vec![V::Varchar("bob".to_string())]]);
+        let rows = select(
+            &mut db,
+            "SELECT unnamed_subquery.name FROM (SELECT name FROM emp WHERE id = 2);",
+        );
+        assert_eq!(rows, vec![vec![V::Varchar("bob".to_string())]]);
+        assert!(
+            db.execute("SELECT unnamed_subquery1.name FROM (SELECT name FROM emp);")
+                .is_err()
+        );
         let rows = select(
             &mut db,
             "SELECT name FROM (SELECT * FROM emp WHERE id = 2) AS s;",

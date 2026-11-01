@@ -929,6 +929,7 @@ fn the_replacement_scan_claims_parquet_paths_only() {
         args: vec![pinkdb::TableFunctionArg {
             name: None,
             value: Value::Varchar("whatever.dat".to_string()),
+            literal: None,
         }],
     };
     // (The bind fails on the missing file, which proves it was claimed.)
@@ -1095,6 +1096,7 @@ fn the_reader_agrees_with_duckdb_on_the_committed_people_fixture() {
             args: vec![pinkdb::TableFunctionArg {
                 name: None,
                 value: Value::Varchar(people.clone()),
+                literal: None,
             }],
         })
         .unwrap()

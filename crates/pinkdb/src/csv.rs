@@ -146,6 +146,12 @@ pub struct CsvOptions {
     /// Column names, overriding the header row (and its presence is still
     /// decided by `header`).
     pub names: Option<Vec<String>>,
+    /// `types` / `dtypes` / `column_types`: override the inferred type of a
+    /// column — by name (the `{name: TYPE}` form) or, in the list form, by
+    /// position of the list entry.
+    pub column_types: Vec<(Option<String>, DataType)>,
+    /// `columns`: every column's name and type, read without inference.
+    pub columns: Option<(Vec<String>, Vec<DataType>)>,
     /// Cells that read as NULL in addition to the empty-cell rule.
     pub nullstr: Vec<String>,
     /// Keep a quoted empty cell as `""` instead of NULL (DuckDB's
@@ -165,6 +171,8 @@ impl Default for CsvOptions {
             header: Header::Auto,
             errors: ErrorPolicy::Error,
             names: None,
+            column_types: Vec::new(),
+            columns: None,
             nullstr: Vec::new(),
             allow_quoted_nulls: true,
             force_not_null: Vec::new(),
@@ -233,13 +241,20 @@ impl CsvOptions {
             "nullstr" | "null" => self.nullstr = split_list(value),
             "names" | "column_names" => self.names = Some(split_list(value)),
             "force_not_null" => self.force_not_null = split_list(value),
+            // `types`/`dtypes`/`column_types` override the inferred type of the
+            // named columns; `columns` gives every name and type, so nothing is
+            // inferred.
+            "types" | "dtypes" | "column_types" => {
+                self.column_types = parse_type_overrides(&name, value)?
+            }
+            "columns" => self.columns = Some(parse_columns(value)?),
             // Recognised, still unimplemented: refused precisely, never ignored.
-            "auto_detect" | "all_varchar" | "columns" | "types" | "dtypes" | "column_types"
-            | "sample_size" | "skip" | "store_rejects" | "rejects_table" | "rejects_scan"
-            | "rejects_limit" | "strict_mode" | "null_padding" | "compression" | "new_line"
-            | "comment" | "date_format" | "dateformat" | "timestamp_format" | "timestampformat"
-            | "decimal_separator" | "thousands" | "normalize_names" | "union_by_name"
-            | "filename" | "hive_partitioning" | "file_row_number" | "parallel" | "buffer_size"
+            "auto_detect" | "all_varchar" | "sample_size" | "skip" | "store_rejects"
+            | "rejects_table" | "rejects_scan" | "rejects_limit" | "strict_mode"
+            | "null_padding" | "compression" | "new_line" | "comment" | "date_format"
+            | "dateformat" | "timestamp_format" | "timestampformat" | "decimal_separator"
+            | "thousands" | "normalize_names" | "union_by_name" | "filename"
+            | "hive_partitioning" | "file_row_number" | "parallel" | "buffer_size"
             | "max_line_size" | "maximum_line_size" => {
                 return Err(PinkDbError::Parameter(format!(
                     "CSV option `{name}` is not supported yet"
@@ -292,6 +307,125 @@ fn split_list(value: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// The body of a `{…}` struct literal, if `text` is one.
+fn struct_body(text: &str) -> Option<&str> {
+    text.trim().strip_prefix('{')?.strip_suffix('}')
+}
+
+/// The body of a `[…]` list literal, if `text` is one.
+fn list_body(text: &str) -> Option<&str> {
+    text.trim().strip_prefix('[')?.strip_suffix(']')
+}
+
+/// Split a literal at its top-level commas: a quoted name or the parentheses of
+/// a parameterized type (`DECIMAL(10,2)`) are not separators.
+fn split_top_level(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+                continue;
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    out.push(&text[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    out.push(&text[start..]);
+    out.into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// A name or type as written in a literal: `DAY_ID` or `'DAY_ID'`.
+fn unquote(text: &str) -> &str {
+    let text = text.trim();
+    for q in ['\'', '"'] {
+        if let Some(inner) = text.strip_prefix(q).and_then(|r| r.strip_suffix(q)) {
+            return inner;
+        }
+    }
+    text
+}
+
+/// A type name out of a CSV option: `DATE`, `DECIMAL(10,2)`.
+fn parse_type_name(text: &str) -> Result<DataType> {
+    let text = unquote(text);
+    let unknown = || PinkDbError::Type(format!("unknown CSV column type `{text}`"));
+    let (name, params) = match text.split_once('(') {
+        Some((name, rest)) => {
+            let inner = rest.strip_suffix(')').ok_or_else(unknown)?;
+            let params: Option<Vec<i64>> = inner
+                .split(',')
+                .map(|p| p.trim().parse::<i64>().ok())
+                .collect();
+            (name.trim(), params.ok_or_else(unknown)?)
+        }
+        None => (text, Vec::new()),
+    };
+    DataType::from_sql_params(name, &params).ok_or_else(unknown)
+}
+
+/// `types`/`dtypes`/`column_types`: `{name: TYPE, …}` names the columns, a
+/// `[TYPE, …]` list gives them by position.
+fn parse_type_overrides(name: &str, text: &str) -> Result<Vec<(Option<String>, DataType)>> {
+    if let Some(body) = struct_body(text) {
+        return split_top_level(body)
+            .into_iter()
+            .map(|entry| {
+                let (column, dtype) = entry.split_once(':').ok_or_else(|| {
+                    PinkDbError::Parameter(format!(
+                        "option `{name}` entry `{entry}` is not `name: TYPE`"
+                    ))
+                })?;
+                Ok((Some(unquote(column).to_string()), parse_type_name(dtype)?))
+            })
+            .collect();
+    }
+    if let Some(body) = list_body(text) {
+        return split_top_level(body)
+            .into_iter()
+            .map(|dtype| Ok((None, parse_type_name(dtype)?)))
+            .collect();
+    }
+    Err(PinkDbError::Parameter(format!(
+        "option `{name}` expects `{{name: TYPE, …}}` or `[TYPE, …]`, got `{text}`"
+    )))
+}
+
+/// `columns`: `{name: TYPE, …}` for every column.
+fn parse_columns(text: &str) -> Result<(Vec<String>, Vec<DataType>)> {
+    let body = struct_body(text).ok_or_else(|| {
+        PinkDbError::Catalog("read_csv columns requires a struct as input".to_string())
+    })?;
+    let mut names = Vec::new();
+    let mut types = Vec::new();
+    for entry in split_top_level(body) {
+        let (column, dtype) = entry.split_once(':').ok_or_else(|| {
+            PinkDbError::Parameter(format!(
+                "option `columns` entry `{entry}` is not `name: TYPE`"
+            ))
+        })?;
+        names.push(unquote(column).to_string());
+        types.push(parse_type_name(dtype)?);
+    }
+    Ok((names, types))
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +1007,21 @@ fn forced_indices(schema: &CsvSchema, opts: &CsvOptions) -> Result<Vec<usize>> {
 }
 
 fn sniff(data: &[u8], opts: &CsvOptions, forced: &[usize], limit: usize) -> Result<CsvSchema> {
+    // `columns` names and types every column, so nothing is inferred and the
+    // first row is the header (unless `header=false`).
+    if let Some((names, types)) = &opts.columns {
+        let mut options = opts.clone();
+        options.header = match options.header {
+            Header::Auto => Header::Present,
+            header => header,
+        };
+        return Ok(CsvSchema {
+            names: names.clone(),
+            types: types.clone(),
+            options,
+            partial: false,
+        });
+    }
     let mut records = Records::new(std::io::Cursor::new(data), opts);
     let mut rec = Record::new();
     if !records.next(&mut rec)? {
@@ -936,6 +1085,36 @@ fn sniff(data: &[u8], opts: &CsvOptions, forced: &[usize], limit: usize) -> Resu
         types_skip
     } else {
         types_all
+    };
+    // `types={'DAY_ID': 'DATE'}`: the named (or positional) columns take the
+    // given type back from inference.
+    let types = if opts.column_types.is_empty() {
+        types
+    } else {
+        let mut types = types;
+        let width = types.len();
+        for (pos, (name, dtype)) in opts.column_types.iter().enumerate() {
+            let idx = match name {
+                Some(name) => names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        PinkDbError::Catalog(format!(
+                            "COLUMN_TYPES error: Columns with names: \"{name}\" do not exist \
+                             in the CSV File"
+                        ))
+                    })?,
+                None => pos,
+            };
+            if idx >= width {
+                return Err(PinkDbError::Catalog(format!(
+                    "COLUMN_TYPES error: {} types given for {width} columns",
+                    opts.column_types.len()
+                )));
+            }
+            types[idx] = *dtype;
+        }
+        types
     };
     let mut options = opts.clone();
     options.header = if header {
@@ -2988,6 +3167,95 @@ mod tests {
         assert!(err.contains("inside a transaction"), "{err}");
         db.execute("ROLLBACK;").unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `types` / `dtypes` / `column_types` override inferred types, and
+    /// `columns` gives every name and type; both take DuckDB's struct-literal
+    /// text, and only `columns` also accepts it as a struct (a list is a
+    /// binder error there).
+    #[test]
+    fn options_accept_column_types_and_columns() {
+        let mut o = CsvOptions::default();
+        o.apply("types", "{DAY_ID: DATE, AMT: DECIMAL(10,2)}")
+            .unwrap();
+        assert_eq!(
+            o.column_types,
+            vec![
+                (Some("DAY_ID".to_string()), DataType::Date),
+                (
+                    Some("AMT".to_string()),
+                    DataType::Decimal {
+                        precision: 10,
+                        scale: 2
+                    }
+                ),
+            ]
+        );
+        o.apply("dtypes", "['DATE', 'VARCHAR']").unwrap();
+        assert_eq!(
+            o.column_types,
+            vec![(None, DataType::Date), (None, DataType::Varchar)],
+            "the list form gives the types by position"
+        );
+        o.apply("column_types", "{'a': 'INTEGER'}").unwrap();
+        assert_eq!(
+            o.column_types,
+            vec![(Some("a".to_string()), DataType::Integer)]
+        );
+        o.apply("columns", "{x: INT, y: VARCHAR}").unwrap();
+        assert_eq!(
+            o.columns,
+            Some((
+                vec!["x".to_string(), "y".to_string()],
+                vec![DataType::Integer, DataType::Varchar]
+            ))
+        );
+        // An unknown type name and a shape that is not a literal are refused
+        // precisely, and `columns` takes only the struct form.
+        assert!(o.apply("types", "{a: WIDGET}").is_err());
+        assert!(o.apply("types", "DATE").is_err());
+        let err = o.apply("columns", "['INT']").unwrap_err().to_string();
+        assert_eq!(err, "read_csv columns requires a struct as input");
+    }
+
+    #[test]
+    fn sniff_applies_type_overrides_and_explicit_columns() {
+        // An override rewrites only the named column; the rest is inferred.
+        let mut o = CsvOptions::default();
+        o.apply("types", "{a: VARCHAR}").unwrap();
+        let schema = sniff_csv(b"a,b\n1,2\n3,4\n", &o).unwrap();
+        assert_eq!(schema.names, vec!["a", "b"]);
+        assert_eq!(schema.types, vec![DataType::Varchar, DataType::Integer]);
+        assert_eq!(
+            reader_rows(b"a,b\n1,2\n3,4\n", &schema),
+            vec![
+                vec![v("1"), Value::Integer(2)],
+                vec![v("3"), Value::Integer(4)],
+            ]
+        );
+        // DuckDB's error for a name the file does not have.
+        let mut o = CsvOptions::default();
+        o.apply("types", "{zz: VARCHAR}").unwrap();
+        let err = sniff_csv(b"a,b\n1,2\n", &o).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "COLUMN_TYPES error: Columns with names: \"zz\" do not exist in the CSV File"
+        );
+        // `columns` reads with the given names and types: no inference, and
+        // the first row is the header.
+        let mut o = CsvOptions::default();
+        o.apply("columns", "{x: INTEGER, y: VARCHAR}").unwrap();
+        let schema = sniff_csv(b"a,b\n1,hello\n2,world\n", &o).unwrap();
+        assert_eq!(schema.names, vec!["x", "y"]);
+        assert_eq!(schema.types, vec![DataType::Integer, DataType::Varchar]);
+        assert_eq!(schema.options.header, Header::Present);
+        assert_eq!(
+            reader_rows(b"a,b\n1,hello\n2,world\n", &schema),
+            vec![
+                vec![Value::Integer(1), v("hello")],
+                vec![Value::Integer(2), v("world")],
+            ]
+        );
     }
 
     #[derive(Debug)]
