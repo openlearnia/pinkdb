@@ -101,6 +101,7 @@ works everywhere a table is named, and QuackLab's SQL runs as written —
   probe chunk instead of once per join.
 - **Fixed:** the console's Preview of a table never finished (the new tab
   lost its state when the explorer refreshed).
+
 ### Wave 130 — the QuackLab benchmark ✅
 
 `bench/quacklab/run.py` measures QuackLab's own workload on pinkdb and DuckDB

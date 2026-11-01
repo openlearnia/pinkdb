@@ -41,8 +41,8 @@ progress log</a>.</p>
 <li><strong>Console:</strong> a schema selector beside the database, schemas (empty ones too) in the explorer, three-part names in generated SQL, schema grants.</li>
 <li><strong>Formats:</strong> <code>.pink</code> footer version 4, WAL frame sets format 2, lake image format 2 and wire protocol 14; files from earlier builds are refused.</li>
 <li><strong>Fixed:</strong> an uncorrelated subquery in a join condition re-ran on every probe chunk instead of once per join.</li>
-</ul>
 <li><strong>Fixed:</strong> the console's Preview of a table never finished (the new tab lost its state when the explorer refreshed).</li>
+</ul>
 <h3>Wave 130 — the QuackLab benchmark ✅</h3>
 <p><code>bench/quacklab/run.py</code> measures QuackLab's own workload on pinkdb and DuckDB on the same machine: the NYC-taxi model compiled by QuackLab's compiler, its ETL plan per batch, a full refresh of its 55 materialized views, and 12 dashboard widgets at 1, 4 and 16 concurrent clients, plus cold start and peak memory, on local storage and on a lake (Postgres catalog, S3 data).</p>
 <ul>
