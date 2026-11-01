@@ -8,6 +8,33 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-11-01
+### Wave 139 — QuackLab leftovers: defaults, uuid(), TEMP tables ✅
+
+QuackLab's golden fixtures now run with their column defaults as written
+(117 of 117, no workaround left in the harness).
+
+- **Column defaults are expressions**, evaluated for every row that takes
+  them: `DEFAULT now()`, `DEFAULT uuid()`, `DEFAULT 'now()'` (which, as in
+  DuckDB, creates fine and fails at insert), the `DEFAULT` keyword in
+  `VALUES` and `UPDATE … SET`, `INSERT … DEFAULT VALUES`, and `ADD COLUMN …
+  DEFAULT` per existing row. `information_schema.columns` shows the written
+  expression.
+- **`uuid()`, `gen_random_uuid()` and `random()` in writes**, replayed
+  exactly after a crash: each statement's values come from a seed recorded
+  in the WAL.
+- **A `UUID` type**, with DuckDB's text forms, ordering, Parquet encoding and
+  DuckLake type name.
+- **`CREATE TEMP TABLE`**: per-session, never persisted, found before
+  persistent tables of the same name, as in DuckDB. A durable local write
+  that reads one is refused; loading a lake from one is allowed.
+- **Fixed:** `now()` inside a procedure body, `DO` block or trigger action
+  did not replay with its original instant; `x IS NOT NULL` and similar
+  expressions are now named as in DuckDB.
+- **Formats:** `.pink` footer version 5, wire protocol 15.
+- LIST and STRUCT are scoped in `docs/nested-types-plan.md`, not built:
+  QuackLab's SQL uses neither.
+
 ## 2026-10-31
 ### Wave 131 — schemas and three-part names ✅
 

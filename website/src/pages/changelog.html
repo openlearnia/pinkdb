@@ -8,6 +8,18 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2>2026-11-01</h2>
+<h3>Wave 139 — QuackLab leftovers: defaults, uuid(), TEMP tables ✅</h3>
+<p>QuackLab's golden fixtures now run with their column defaults as written (117 of 117, no workaround left in the harness).</p>
+<ul>
+<li><strong>Column defaults are expressions</strong>, evaluated for every row that takes them: <code>DEFAULT now()</code>, <code>DEFAULT uuid()</code>, <code>DEFAULT 'now()'</code> (which, as in DuckDB, creates fine and fails at insert), the <code>DEFAULT</code> keyword in <code>VALUES</code> and <code>UPDATE … SET</code>, <code>INSERT … DEFAULT VALUES</code>, and <code>ADD COLUMN … DEFAULT</code> per existing row. <code>information_schema.columns</code> shows the written expression.</li>
+<li><strong><code>uuid()</code>, <code>gen_random_uuid()</code> and <code>random()</code> in writes</strong>, replayed exactly after a crash: each statement's values come from a seed recorded in the WAL.</li>
+<li><strong>A <code>UUID</code> type</strong>, with DuckDB's text forms, ordering, Parquet encoding and DuckLake type name.</li>
+<li><strong><code>CREATE TEMP TABLE</code></strong>: per-session, never persisted, found before persistent tables of the same name, as in DuckDB. A durable local write that reads one is refused; loading a lake from one is allowed.</li>
+<li><strong>Fixed:</strong> <code>now()</code> inside a procedure body, <code>DO</code> block or trigger action did not replay with its original instant; <code>x IS NOT NULL</code> and similar expressions are now named as in DuckDB.</li>
+<li><strong>Formats:</strong> <code>.pink</code> footer version 5, wire protocol 15.</li>
+<li>LIST and STRUCT are scoped in <code>docs/nested-types-plan.md</code>, not built: QuackLab's SQL uses neither.</li>
+</ul>
 <h2>2026-10-31</h2>
 <h3>Wave 131 — schemas and three-part names ✅</h3>
 <p>Every database now holds schemas, as in DuckDB: <code>catalog.schema.table</code> works everywhere a table is named, and QuackLab's SQL runs as written — <code>r2_cat."master"."FACT"</code>, a <code>CREATE SCHEMA</code> per model — with no workaround (117 of 117 golden statements and setups DuckDB runs).</p>
