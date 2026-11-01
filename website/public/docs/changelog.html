@@ -195,6 +195,14 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-11-01">2026-11-01<a class="anchor" href="#2026-11-01" aria-label="Permalink: 2026-11-01">#</a></h2>
+<h3>Wave 135 (steps a–d) — pipelines, string keys, big GROUP BYs ✅</h3>
+<p>QuackLab's mart refresh SELECTs run 1.5–2.9× faster than after wave 140, and the refresh's peak memory fell by about a third. Results are unchanged.</p>
+<ul>
+<li><strong>Pipelines:</strong> aggregates and every other query root now push chunks through filters, projections and join probes (inner, left, right, semi, anti, mark) in parallel without materializing intermediate join results. <code>SET pipeline_execution = false</code> runs the previous executor, for comparison.</li>
+<li><strong>VARCHAR join and GROUP BY keys</strong> of up to 12 bytes are hashed and compared as their 16-byte string views, without touching the string bytes.</li>
+<li><strong><code>COALESCE</code></strong> is evaluated a vector at a time.</li>
+<li><strong>GROUP BY with millions of groups</strong> merges per-chunk partial tables without copying their keys and without a final sort: 17–21 % faster on QuackLab's 1.9M-group fact roll-up, 250 MB less memory.</li>
+</ul>
 <h3>Wave 140 — QuackLab's ETL hot spots ✅</h3>
 <p>QuackLab's ETL on its NYC-taxi benchmark (local storage) went from 68 s to 1.8 s for the 1.87M-row initial batch (DuckDB: 2.2 s on the same machine), from 43 s to 1.5 s for the next batch and from 15 s to 1.4 s for a one-row correction. Results are unchanged.</p>
 <ul>

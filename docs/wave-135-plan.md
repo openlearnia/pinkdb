@@ -94,21 +94,42 @@ TPC-H queries identical to DuckDB at SF 0.01 and SF 1.
 
 ## Steps (one pi brief each; TPC-H 22/22 and duckdiff at every commit)
 
-| step | content | measure |
+The order changed as the profiles came in: after 135a, QuackLab's refresh
+was dominated by VARCHAR key handling and by high-cardinality grouping, not
+by the operator barriers.
+
+| step | content | status |
 |---|---|---|
-| 135a | `exec/pipeline.rs`: scan → filter → project → inner-probe chain → aggregate sink (flat and general partials); replaces `fused_join_aggregate` and `selected_chunks` for the shapes it covers | QuackLab refresh statements, TPC-H Q1, Q3, Q5, Q7–Q10, Q12, Q14, Q18, Q19 |
-| 135b | collect sink and non-aggregate roots (sort, top-N, projection over joins); semi/anti/mark/left probes; build sides as pipelines with a parallel hash-build sink; `probe_through_selection` folds in | Q2, Q4, Q11, Q13, Q16, Q20–Q22, QuackLab charts |
-| 135c | single-reference CTE inlining | QuackLab refresh |
-| 135d | late materialization of join payload columns (122b) | Q9, Q10, Q18, peak RSS |
-| 135e | dictionary vectors for low-cardinality strings | Q1, Q12, Q16, QuackLab charts |
+| 135a | `exec/pipeline.rs`: scan → filter → project → inner-probe chain → aggregate sink (flat and general partials); replaces `fused_join_aggregate`, `selected_chunks`, `aggregate_selected` | done, eecf3dc |
+| 135b | VARCHAR join/group keys hashed and compared as 16-byte views; per-chunk key dispatch; vectorized `COALESCE` | done, 5bf81b0 |
+| 135c | collect sink for every root; left, right, semi, anti and mark probes as streaming operators | done, 4b1dfa3 |
+| 135d | high-cardinality GROUP BY merges without copying (copy-free partition index, first-occurrence map) | done, 4eb59c3 |
+| 135e | late materialization of join payload columns (122b) — measure first | next |
+| 135f | parallel hash build as a pipeline sink | queued |
+| 135g | single-reference CTE inlining | queued (measured small on r106: 0.36 → 0.34 s) |
+| 135h | dictionary vectors for low-cardinality strings (full gate) | queued |
 
 ## Measurements
 
-Per step, before and after: TPC-H SF 1 as an interleaved A/B against the
-previous commit (`pinkdb-wt/tools/tpch-ab.py`, 7 rounds) and against
-DuckDB; QuackLab (`bench/quacklab/run.py --size small --storage local`):
-mart refresh per scenario, the five slowest refresh statements, chart p50,
-peak RSS.
+TPC-H SF 1, interleaved A/B per step (`pinkdb-wt/tools/tpch-ab.py`, 5–15
+rounds; the machine ran two other streams, load 5–16):
+
+| step | geomean vs previous | notable |
+|---|---|---|
+| 135a | 0.94 | Q12 0.60, Q3/Q10/Q14 0.83; Q17 1.08 (the deleted fused row-wise fold avoided gathering joined rows) |
+| 135b | 0.97 (0.92–1.00 over runs) | Q21 0.92 after the per-chunk dispatch fix; first cut was Q21 1.23 |
+| 135c | 1.007 | no change: the removed barriers were not where TPC-H spends its time |
+| 135d | 0.985–1.015 | Q18 1.06–1.10 (1.5M narrow groups; a known regression) |
+
+QuackLab refresh SELECTs (`pinkdb-wt/bench-c/scratch/r*sel.sql`), wave 140
+against 135d, 5 interleaved rounds at load 12–15 (absolute times inflated,
+ratios comparable): r50 0.35, r56 0.63, r80 0.68, r106 0.66, r110 0.68.
+Full benchmark (`bench/quacklab/run.py --size
+small --storage local`, run under load average 26–36, so ratios only): mart
+refresh 3.1–3.6× DuckDB (wave 140: 3.7–4.1×), refresh peak RSS 3.2–3.6 GB
+(wave 140: 4.4–5.6 GB), agreement with DuckDB unchanged.
+
+Known regressions carried: Q17 +8 % (135a), Q18 +6–10 % (135d).
 
 ## Tests
 
