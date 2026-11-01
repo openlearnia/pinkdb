@@ -48,9 +48,9 @@ use rayon::prelude::*;
 use super::aggregate::{self, Partial};
 use super::group_table::{FlatPartial, FlatSink};
 use super::{
-    Cx, MARK_NAME, MarkJoin, Output, ProbePlan, build_on_left, derive_join_filters, estimate_rows,
-    eval, expr, filter_pays, mark_probe_chunk, project_chunk, project_mask, scan_targets,
-    selection, swap_join_space,
+    Cx, MARK_NAME, MarkJoin, Output, ProbePlan, build_on_left, chunk_approx_bytes,
+    derive_join_filters, estimate_rows, eval, expr, filter_pays, mark_probe_chunk, project_chunk,
+    project_mask, scan_targets, selection, swap_join_space,
 };
 use crate::plan::LogicalPlan;
 use crate::sql::ast::JoinKind;
@@ -103,7 +103,7 @@ impl Sink for GeneralSink<'_> {
         sel: Option<&[u32]>,
     ) -> Result<Option<Partial>> {
         let rows = sel.map_or(chunk.num_rows(), <[u32]>::len);
-        let mut partial = Partial::for_rows(rows);
+        let mut partial = Partial::for_rows(rows, cx.budget.memory());
         match aggregate::fold_chunk(cx, &mut partial, chunk, sel, self.keys, self.aggs) {
             Ok(()) => Ok(Some(partial)),
             // A row the selection dropped must not raise: retry on the kept
@@ -111,7 +111,7 @@ impl Sink for GeneralSink<'_> {
             Err(err) => match sel {
                 None => Err(err),
                 Some(sel) => {
-                    let mut partial = Partial::for_rows(rows);
+                    let mut partial = Partial::for_rows(rows, cx.budget.memory());
                     match aggregate::fold_chunk(
                         cx,
                         &mut partial,
@@ -128,9 +128,9 @@ impl Sink for GeneralSink<'_> {
         }
     }
 
-    fn finish(self, items: Vec<Partial>, _cx: &Cx) -> Result<Vec<DataChunk>> {
+    fn finish(self, items: Vec<Partial>, cx: &Cx) -> Result<Vec<DataChunk>> {
         let key_types: Vec<DataType> = self.keys.iter().map(BoundExpr::dtype).collect();
-        aggregate::merge_and_emit(items, &key_types, self.aggs)
+        aggregate::merge_and_emit(items, &key_types, self.aggs, cx.budget.memory())
     }
 }
 
@@ -147,7 +147,7 @@ impl Sink for FlatSink<'_> {
     }
 
     fn finish(self, items: Vec<FlatPartial>, cx: &Cx) -> Result<Vec<DataChunk>> {
-        FlatSink::merge(self, items, !cx.unordered)
+        FlatSink::merge(self, items, !cx.unordered, cx.budget.memory())
     }
 }
 
@@ -433,7 +433,7 @@ pub(crate) fn collect(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Output>> {
     let Some(compiled) = compile(cx, plan)? else {
         return Ok(None);
     };
-    let Some(chunks) = run(cx, &compiled, &CollectSink)? else {
+    let Some(chunks) = run(cx, &compiled, &CollectSink::default())? else {
         return Err(PinkDbError::Execution(
             "internal: the pipeline's collect sink declined a chunk".to_string(),
         ));
@@ -446,22 +446,42 @@ pub(crate) fn collect(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Output>> {
 }
 
 /// The collect sink: the morsels' chunks themselves, in morsel order — what the
-/// materialized path's intermediate result holds, chunk for chunk.
-struct CollectSink;
+/// materialized path's intermediate result holds, chunk for chunk. The chunks
+/// accumulate, so they are charged to the statement's pool as they arrive
+/// (wave 136a) and released when the sink finishes.
+#[derive(Default)]
+struct CollectSink {
+    held: std::sync::Mutex<crate::memory::Reservation>,
+}
+
+impl Default for crate::memory::Reservation {
+    fn default() -> crate::memory::Reservation {
+        crate::memory::Reservation::empty()
+    }
+}
 
 impl Sink for CollectSink {
     type Partial = DataChunk;
 
     fn fold_into(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         chunk: &DataChunk,
         sel: Option<&[u32]>,
     ) -> Result<Option<DataChunk>> {
-        Ok(Some(match sel {
+        let out = match sel {
             None => chunk.clone(),
             Some(sel) => chunk.take(sel),
-        }))
+        };
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if held.bytes() == 0 {
+            *held = cx.budget.memory().empty_reservation();
+        }
+        held.grow(chunk_approx_bytes(&out))?;
+        Ok(Some(out))
     }
 
     fn finish(self, items: Vec<DataChunk>, _cx: &Cx) -> Result<Vec<DataChunk>> {

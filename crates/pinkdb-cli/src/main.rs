@@ -1940,13 +1940,19 @@ fn print_phase_breakdown(profiles: &[QueryProfile]) {
         log += profile.log;
     }
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    // Wave 136a: the peak of the statement's memory pool next to the limit it
+    // ran under. Remote profiles carry the same fields since protocol v14.
+    let peak = profiles.iter().map(|p| p.memory_peak).max().unwrap_or(0);
+    let limit = profiles.first().map_or(0, |p| p.memory_limit);
     print!(
-        " (parse {:.3}, bind {:.3}, optimize {:.3}, execute {:.3}, log {:.3} ms)",
+        " (parse {:.3}, bind {:.3}, optimize {:.3}, execute {:.3}, log {:.3} ms, memory {}/{})",
         ms(parse),
         ms(bind),
         ms(optimize),
         ms(execute),
-        ms(log)
+        ms(log),
+        pinkdb::memory::human_bytes(peak as usize),
+        pinkdb::memory::human_bytes(limit as usize)
     );
 }
 

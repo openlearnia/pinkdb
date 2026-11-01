@@ -1493,6 +1493,7 @@ peg::parser! {
             / describe_stmt()
             / explain_stmt()
             / merge_stmt()
+            / reset_stmt()
             / set_variable_stmt()
             / select_statement()
 
@@ -2378,6 +2379,14 @@ peg::parser! {
         rule set_variable_stmt() -> Statement
             = kw(Keyword::Set) word("variable")? name:ident() eq() value:expr() {
                   Statement::SetVariable { name, value }
+              }
+
+        /// `RESET <setting>`: the reset form of a process-wide setting
+        /// (`RESET memory_limit`). Parsed as `SET <name> = NULL`, which the
+        /// executor reads as "back to the default".
+        rule reset_stmt() -> Statement
+            = word("reset") name:ident() {
+                  Statement::SetVariable { name, value: Expr::Literal(Value::Null) }
               }
 
         /// `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71).

@@ -18,6 +18,7 @@ use std::cmp::Ordering;
 use super::Cx;
 use super::aggregate::EvalVec as FusedVec;
 use super::aggregate::{Acc, eval_agg_vec};
+use super::chunks_approx_bytes;
 use crate::plan::compare_values;
 use crate::sql::ast::{FrameMode, SortSpec};
 use crate::sql::binder::{BoundWindow, FrameBound, WindowFunc};
@@ -95,8 +96,12 @@ pub(crate) fn eval_window(
     windows: &[BoundWindow],
 ) -> Result<Vec<DataChunk>> {
     let mut out: Vec<DataChunk> = chunks.to_vec();
+    // Every window materializes the previous result, so the chain holds about
+    // `windows.len()` row sets at once; charge it per window (wave 136a).
+    let mut held = cx.budget.memory().reserve(0)?;
     for w in windows {
         out = eval_one_window(cx, &out, w)?;
+        held.resize(chunks_approx_bytes(&out))?;
     }
     Ok(out)
 }

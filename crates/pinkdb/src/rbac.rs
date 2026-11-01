@@ -1355,6 +1355,12 @@ pub(crate) fn check_statement(
             return admin_only("database management");
         }
         LogicalPlan::Checkpoint => return admin_only("CHECKPOINT"),
+        // Wave 136a: the memory limit is process-wide — every session's
+        // statements run under it — so only an administrator may move it
+        // (and `RESET memory_limit`, which parses as this node with NULL).
+        LogicalPlan::SetVariable { name, .. } if crate::memory::is_limit_setting(name) => {
+            return admin_only("SET memory_limit");
+        }
         // ANALYZE rewrites optimizer statistics every session can read; keep
         // it with the other maintenance statements instead of letting any
         // SELECT grant reshape other sessions' plans.

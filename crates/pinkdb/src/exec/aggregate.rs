@@ -1264,6 +1264,11 @@ pub(crate) struct Group {
 pub(crate) struct Partial {
     pub(crate) groups: Vec<(Vec<u8>, Group)>,
     pub(crate) index: FastMap<Vec<u8>, usize>,
+    /// Approximate bytes of the groups built so far, updated per new group.
+    bytes: usize,
+    /// Wave 136a: `bytes` reserved from the statement's pool, re-sized once
+    /// per folded chunk (never per row).
+    held: crate::memory::Reservation,
 }
 
 impl Partial {
@@ -1274,13 +1279,15 @@ impl Partial {
     /// free, on the merging thread) a multi-hundred-kilobyte table. A chunk
     /// that outgrows this is high-cardinality and pays one jump to the full
     /// size instead (see the insert in [`group_ids`]).
-    pub(crate) fn for_rows(rows: usize) -> Partial {
+    pub(crate) fn for_rows(rows: usize, account: &crate::memory::Account) -> Partial {
         Partial {
             groups: Vec::new(),
             index: FastMap::with_capacity_and_hasher(
                 local_index_capacity(rows),
                 Default::default(),
             ),
+            bytes: 0,
+            held: account.empty_reservation(),
         }
     }
 }
@@ -1320,7 +1327,7 @@ pub(crate) fn fold_stream(
             .map(|_| {
                 let receiver = &receiver;
                 scope.spawn(move || -> Result<Partial> {
-                    let mut partial = Partial::for_rows(CHUNK_SIZE);
+                    let mut partial = Partial::for_rows(CHUNK_SIZE, cx.budget.memory());
                     let mut failed: Option<PinkDbError> = None;
                     loop {
                         let Ok(chunk) = receiver
@@ -1458,6 +1465,9 @@ pub(crate) fn fold_chunk(
             sel,
         );
     }
+    // One pool resize per chunk, after the state grew: a runaway GROUP BY
+    // fails at the chunk that crossed the limit, not at the end.
+    partial.held.resize(partial.bytes)?;
     Ok(())
 }
 
@@ -1636,7 +1646,7 @@ pub(crate) fn aggregate(
     let partials: Vec<Partial> = inputs
         .par_iter()
         .map(|chunk| {
-            let mut partial = Partial::for_rows(chunk.num_rows());
+            let mut partial = Partial::for_rows(chunk.num_rows(), cx.budget.memory());
             fold_chunk(cx, &mut partial, chunk, None, keys, aggs)?;
             Ok(partial)
         })
@@ -1645,7 +1655,7 @@ pub(crate) fn aggregate(
     // Phase 2 + emit, shared with the fused join→aggregate executor (which
     // builds the same `Partial`s from joined rows it never materializes).
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    merge_and_emit(partials, &key_types, aggs)
+    merge_and_emit(partials, &key_types, aggs, cx.budget.memory())
 }
 
 /// Distinct keys a single-VARCHAR-key chunk resolves by linear scan before
@@ -1669,6 +1679,13 @@ fn new_group(
     if indexed {
         partial.index.insert(enc.clone(), idx);
     }
+    // A group's approximate footprint: its encoded key, the key values, its
+    // accumulator slots, and its hash-index entry (wave 136a).
+    partial.bytes += enc.len()
+        + 2 * std::mem::size_of::<Vec<u8>>()
+        + std::mem::size_of::<Group>()
+        + 4 * std::mem::size_of::<Acc>()
+        + 16;
     partial.groups.push((
         enc,
         Group {
@@ -2492,9 +2509,15 @@ pub(crate) fn merge_and_emit(
     partials: Vec<Partial>,
     key_types: &[DataType],
     aggs: &[BoundAgg],
+    account: &crate::memory::Account,
 ) -> Result<Vec<DataChunk>> {
     let has_keys = !key_types.is_empty();
     let total_groups: usize = partials.iter().map(|p| p.groups.len()).sum();
+    // The merge copies the partials' groups (they are freed one by one), so
+    // the peak is about twice a partial's bytes; charge the merged copy
+    // (wave 136a) and let it go once the chunks are built.
+    let merged_bytes: usize = partials.iter().map(|p| p.bytes).sum();
+    let _held = account.reserve(merged_bytes)?;
     if !(has_keys && total_groups >= PARALLEL_MERGE_MIN) {
         return emit_groups(merge_partials(partials, has_keys, aggs), key_types, aggs);
     }
@@ -2749,7 +2772,7 @@ mod tests {
             crate::exec::group_table::FlatSink::new(keys, aggs, chunk.num_rows(), chunk.num_cols())
                 .expect("flat table");
         let partial = flat.fold(cx, chunk, Some(sel)).unwrap().unwrap();
-        let flat = flat.merge(vec![partial], true).unwrap();
+        let flat = flat.merge(vec![partial], true, cx.budget.memory()).unwrap();
         let general = GeneralSink::new(keys, aggs);
         let partial = general.fold_into(cx, chunk, Some(sel)).unwrap().unwrap();
         let general = general.finish(vec![partial], cx).unwrap();

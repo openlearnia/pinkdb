@@ -63,6 +63,9 @@ pub(crate) mod js;
 mod keys;
 pub mod lake_db;
 pub mod macros;
+/// The process-wide memory budget (wave 136a): `SET memory_limit` and the
+/// reservations operators take against it.
+pub mod memory;
 pub(crate) mod mv;
 pub mod optimizer;
 /// Extension packages (wave 86): one host-published registry entry that
@@ -539,6 +542,8 @@ impl PinkDb {
                     columns,
                     kind: kind.to_string(),
                     in_transaction,
+                    memory_limit: crate::memory::limit() as u64,
+                    memory_peak: budget.memory_peak() as u64,
                     engine_version: env!("CARGO_PKG_VERSION"),
                 });
             }
