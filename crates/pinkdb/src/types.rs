@@ -1125,6 +1125,93 @@ pub fn interval_div(iv: Interval, f: f64) -> Option<Interval> {
     interval_mul(iv, 1.0 / f)
 }
 
+/// The unit of an unquoted `INTERVAL <count> <unit>` literal. Only the full
+/// words DuckDB accepts as units appear here; the abbreviations the quoted
+/// form takes (`'5 m'`) are not unit words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalUnit {
+    Microsecond,
+    Millisecond,
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+    Decade,
+    Century,
+    Millennium,
+}
+
+impl IntervalUnit {
+    /// Resolve a unit word, singular or plural (`INTERVAL 1 DAYS`).
+    pub fn from_word(word: &str) -> Option<IntervalUnit> {
+        Some(match word.to_ascii_lowercase().as_str() {
+            "microsecond" | "microseconds" => IntervalUnit::Microsecond,
+            "millisecond" | "milliseconds" => IntervalUnit::Millisecond,
+            "second" | "seconds" => IntervalUnit::Second,
+            "minute" | "minutes" => IntervalUnit::Minute,
+            "hour" | "hours" => IntervalUnit::Hour,
+            "day" | "days" => IntervalUnit::Day,
+            "week" | "weeks" => IntervalUnit::Week,
+            "month" | "months" => IntervalUnit::Month,
+            "quarter" | "quarters" => IntervalUnit::Quarter,
+            "year" | "years" => IntervalUnit::Year,
+            "decade" | "decades" => IntervalUnit::Decade,
+            "century" | "centuries" => IntervalUnit::Century,
+            "millennium" | "millennia" => IntervalUnit::Millennium,
+            _ => return None,
+        })
+    }
+
+    /// The canonical (singular) spelling, which the desugared call carries.
+    pub fn name(self) -> &'static str {
+        match self {
+            IntervalUnit::Microsecond => "microsecond",
+            IntervalUnit::Millisecond => "millisecond",
+            IntervalUnit::Second => "second",
+            IntervalUnit::Minute => "minute",
+            IntervalUnit::Hour => "hour",
+            IntervalUnit::Day => "day",
+            IntervalUnit::Week => "week",
+            IntervalUnit::Month => "month",
+            IntervalUnit::Quarter => "quarter",
+            IntervalUnit::Year => "year",
+            IntervalUnit::Decade => "decade",
+            IntervalUnit::Century => "century",
+            IntervalUnit::Millennium => "millennium",
+        }
+    }
+}
+
+/// `INTERVAL <count> <unit>`: DuckDB casts the count to DOUBLE and truncates
+/// it toward zero — except milliseconds and seconds, where the fraction is
+/// kept. Negative counts truncate toward zero too (`-1.9 DAY` → `-1 day`).
+pub fn interval_from_count(unit: IntervalUnit, count: f64) -> Option<Interval> {
+    if !count.is_finite() {
+        return None;
+    }
+    let whole = count.trunc();
+    let (months, days, micros) = match unit {
+        IntervalUnit::Microsecond => (0.0, 0.0, whole),
+        IntervalUnit::Millisecond => (0.0, 0.0, (count * 1_000.0).round()),
+        IntervalUnit::Second => (0.0, 0.0, (count * 1_000_000.0).round()),
+        IntervalUnit::Minute => (0.0, 0.0, whole * 60_000_000.0),
+        IntervalUnit::Hour => (0.0, 0.0, whole * 3_600_000_000.0),
+        IntervalUnit::Day => (0.0, whole, 0.0),
+        IntervalUnit::Week => (0.0, whole * 7.0, 0.0),
+        IntervalUnit::Month => (whole, 0.0, 0.0),
+        IntervalUnit::Quarter => (whole * 3.0, 0.0, 0.0),
+        IntervalUnit::Year => (whole * 12.0, 0.0, 0.0),
+        IntervalUnit::Decade => (whole * 120.0, 0.0, 0.0),
+        IntervalUnit::Century => (whole * 1_200.0, 0.0, 0.0),
+        IntervalUnit::Millennium => (whole * 12_000.0, 0.0, 0.0),
+    };
+    interval_scale_fields(months, days, micros)
+}
+
 fn plural(n: i64) -> &'static str {
     if n == 1 || n == -1 { "" } else { "s" }
 }

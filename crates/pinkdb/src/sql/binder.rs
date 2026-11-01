@@ -162,6 +162,10 @@ pub enum ScalarFunc {
     Uuid,
     /// `random()`: a DOUBLE in `[0, 1)` per row, seeded like [`ScalarFunc::Uuid`].
     Random,
+    /// `interval_count(count, '<unit>')`: the desugared second half of
+    /// `INTERVAL <count> <unit>` when the count is not a literal (the parser
+    /// folds literals itself). Internal — see the parser.
+    IntervalCount,
 }
 
 impl ScalarFunc {
@@ -180,6 +184,7 @@ impl ScalarFunc {
             "minute" => ScalarFunc::Minute,
             "second" => ScalarFunc::Second,
             "date_trunc" => ScalarFunc::DateTrunc,
+            "interval_count" => ScalarFunc::IntervalCount,
             "concat" => ScalarFunc::Concat,
             "trim" => ScalarFunc::Trim,
             "ltrim" => ScalarFunc::LTrim,
@@ -1474,6 +1479,22 @@ fn cast_uuid_literal(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
     (l, r)
 }
 
+/// DATE and TIMESTAMP compare as TIMESTAMPs (DuckDB): the date-range filter
+/// `hired < (DATE '2024-01-31' + INTERVAL 1 DAY)` compares a DATE column with
+/// a TIMESTAMP. Arithmetic has its own rules, so this only runs for
+/// comparisons.
+fn cast_date_to_timestamp(l: BoundExpr, r: BoundExpr) -> (BoundExpr, BoundExpr) {
+    let cast = |e: BoundExpr| BoundExpr::Cast {
+        expr: Box::new(e),
+        dtype: DataType::Timestamp,
+    };
+    match (l.dtype(), r.dtype()) {
+        (DataType::Date, DataType::Timestamp) => (cast(l), r),
+        (DataType::Timestamp, DataType::Date) => (l, cast(r)),
+        _ => (l, r),
+    }
+}
+
 pub(crate) fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
     if (is_numeric(l) && is_numeric(r))
         || (l == DataType::Varchar && r == DataType::Varchar)
@@ -2049,6 +2070,7 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundExpr> {
         let l = self.bind_expr(left, aggs, allow_agg)?;
         let r = self.bind_expr(right, aggs, allow_agg)?;
+        let (l, r) = cast_date_to_timestamp(l, r);
         comparison_ok(BinaryOp::Eq, l.dtype(), r.dtype())?;
         Ok(distinct_from_bound(op, l, r))
     }
@@ -2576,6 +2598,7 @@ impl<'a> Binder<'a> {
                             _ => (l, r),
                         };
                         let (l, r) = cast_decimal_literal_to_column(l, r);
+                        let (l, r) = cast_date_to_timestamp(l, r);
                         let (l, r) = match comparison_ok(*op, l.dtype(), r.dtype()) {
                             Ok(()) => (l, r),
                             Err(error) => {
@@ -4731,6 +4754,24 @@ fn coerce_scalar_args(
     dtype: DataType,
     args: Vec<BoundExpr>,
 ) -> Result<Vec<BoundExpr>> {
+    // Only the count is coerced; the unit word stays a VARCHAR literal.
+    if func == ScalarFunc::IntervalCount {
+        let mut args = args;
+        let count = args.remove(0);
+        let count = if count.dtype() == DataType::Double
+            || matches!(count, BoundExpr::Literal(Value::Null))
+        {
+            count
+        } else {
+            check_cast(count.dtype(), DataType::Double)?;
+            BoundExpr::Cast {
+                expr: Box::new(count),
+                dtype: DataType::Double,
+            }
+        };
+        args.insert(0, count);
+        return Ok(args);
+    }
     let want = match func {
         ScalarFunc::Concat => DataType::Varchar,
         ScalarFunc::Greatest | ScalarFunc::Least | ScalarFunc::Mod => dtype,
@@ -5146,14 +5187,39 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
             arity(&[2])?;
             if args[0].dtype() != DataType::Varchar {
                 return Err(PinkDbError::Type(
-                    "date_trunc needs a VARCHAR part ('year', 'month', 'day', 'hour', 'minute', 'second')".to_string(),
+                    "date_trunc needs a VARCHAR part ('year', 'quarter', 'month', 'week', 'day', 'hour', 'minute', 'second')".to_string(),
                 ));
             }
+            // DuckDB returns TIMESTAMP for both DATE and TIMESTAMP input.
             match args[1].dtype() {
-                DataType::Date | DataType::Timestamp => Ok(args[1].dtype()),
+                DataType::Date | DataType::Timestamp => Ok(DataType::Timestamp),
                 t => Err(PinkDbError::Type(format!(
                     "date_trunc needs DATE or TIMESTAMP, got {t}"
                 ))),
+            }
+        }
+        ScalarFunc::IntervalCount => {
+            arity(&[2])?;
+            let Some(BoundExpr::Literal(Value::Varchar(unit))) = args.get(1) else {
+                return Err(PinkDbError::Type(
+                    "interval_count needs a unit word".to_string(),
+                ));
+            };
+            if crate::types::IntervalUnit::from_word(unit).is_none() {
+                return Err(PinkDbError::Type(format!(
+                    "interval_count: unknown interval unit \"{unit}\""
+                )));
+            }
+            let t = args[0].dtype();
+            if is_numeric(t)
+                || t == DataType::Varchar
+                || matches!(&args[0], BoundExpr::Literal(Value::Null))
+            {
+                Ok(DataType::Interval)
+            } else {
+                Err(PinkDbError::Type(format!(
+                    "interval_count needs a numeric count, got {t}"
+                )))
             }
         }
         ScalarFunc::Concat => {
