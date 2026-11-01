@@ -195,6 +195,15 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-11-01">2026-11-01<a class="anchor" href="#2026-11-01" aria-label="Permalink: 2026-11-01">#</a></h2>
+<h3>Dialect, second pass — DuckDB forms dashboards and ETL use ✅</h3>
+<ul>
+<li><strong><code>INTERVAL 1 DAY</code></strong>, <code>INTERVAL (n) DAYS</code>, <code>INTERVAL '3' MONTH</code> and date arithmetic typed as in DuckDB; <code>date_trunc</code> on a DATE returns TIMESTAMP and takes <code>week</code> and <code>quarter</code>; DATE compares with TIMESTAMP.</li>
+<li><strong><code>ILIKE</code></strong> and <code>NOT ILIKE</code>, with or without <code>ESCAPE</code>.</li>
+<li><strong>GROUP BY</strong> prefers a table column over a select alias of the same name, so <code>SELECT date_trunc('month', d) AS d … GROUP BY date_trunc('month', d)</code> runs.</li>
+<li><strong><code>INSERT INTO t BY NAME SELECT …</code></strong>, and <code>INSERT BY NAME</code>, <code>INSERT *</code> and <code>UPDATE SET *</code> in <code>MERGE</code>.</li>
+<li><strong><code>read_csv(…, types={'col': 'DATE'})</code></strong>, <code>dtypes</code>, <code>column_types</code> and <code>columns={…}</code>.</li>
+<li><strong>Subqueries in <code>FROM</code> need no alias</strong> (<code>unnamed_subquery</code>, …), and an unaliased <code>count(*)</code> is named <code>count_star()</code> as in DuckDB.</li>
+</ul>
 <h3>Wave 132 — DuckLake interop ✅</h3>
 <p>pinkdb opens the DuckLakes stock DuckDB writes and writes ones DuckDB reads, with QuackLab's own attach sequence.</p>
 <ul>

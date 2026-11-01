@@ -9,6 +9,21 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-11-01
+### Dialect, second pass — DuckDB forms dashboards and ETL use ✅
+
+- **`INTERVAL 1 DAY`**, `INTERVAL (n) DAYS`, `INTERVAL '3' MONTH` and date
+  arithmetic typed as in DuckDB; `date_trunc` on a DATE returns TIMESTAMP and
+  takes `week` and `quarter`; DATE compares with TIMESTAMP.
+- **`ILIKE`** and `NOT ILIKE`, with or without `ESCAPE`.
+- **GROUP BY** prefers a table column over a select alias of the same name, so
+  `SELECT date_trunc('month', d) AS d … GROUP BY date_trunc('month', d)` runs.
+- **`INSERT INTO t BY NAME SELECT …`**, and `INSERT BY NAME`, `INSERT *` and
+  `UPDATE SET *` in `MERGE`.
+- **`read_csv(…, types={'col': 'DATE'})`**, `dtypes`, `column_types` and
+  `columns={…}`.
+- **Subqueries in `FROM` need no alias** (`unnamed_subquery`, …), and an
+  unaliased `count(*)` is named `count_star()` as in DuckDB.
+
 ### Wave 132 — DuckLake interop ✅
 
 pinkdb opens the DuckLakes stock DuckDB writes and writes ones DuckDB reads,
