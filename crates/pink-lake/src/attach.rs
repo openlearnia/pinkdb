@@ -1280,6 +1280,14 @@ fn decode_via_provider(
 ) -> Result<DataTable> {
     let mini = entry.format.read(file)?;
     let (file_db, file_table) = only_table(&mini, file.rel(), root)?;
+    // The lake's readers materialize whole tables (this path is the one that
+    // runs for formats without a projected reader), and `from_columns` folds
+    // statistics over the rows it is handed. The engine `.pink` reader keeps
+    // its data encoded, so decode it here.
+    file_table.decode_all().map_err(|e| LakeError::Engine {
+        context: format!("decoding data file \"{}\"", file.rel()),
+        source: e,
+    })?;
     if !file_db.eq_ignore_ascii_case(&entry.db)
         || !file_table.name.eq_ignore_ascii_case(&entry.table)
     {
@@ -1325,11 +1333,12 @@ fn merge_projected(
         }
         merged[i] = fresh.columns[i].clone();
     }
-    Ok(DataTable::from_columns(
-        existing.name.clone(),
-        merged,
-        existing.num_rows,
-    ))
+    DataTable::from_columns(existing.name.clone(), merged, existing.num_rows).map_err(|e| {
+        LakeError::Engine {
+            context: format!("building table \"{tablename}\""),
+            source: e,
+        }
+    })
 }
 
 /// One `.pink` file's schema + gated statistics: its published per-file block

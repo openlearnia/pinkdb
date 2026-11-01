@@ -945,11 +945,10 @@ mod tests {
                 if present[i] {
                     out.push(col.clone());
                 } else {
-                    let chunks = col
-                        .chunks_decoded()
-                        .map(|c| {
+                    let chunks = (0..col.num_chunks())
+                        .map(|i| {
                             let mut v = Vector::new_empty(col.dtype);
-                            for _ in 0..c.len() {
+                            for _ in 0..col.chunk_rows(i) {
                                 v.push_null().expect("push_null");
                             }
                             Arc::new(v)
@@ -963,7 +962,7 @@ mod tests {
                     ));
                 }
             }
-            let table = DataTable::from_columns(full.name.clone(), out, full.num_rows);
+            let table = DataTable::from_columns(full.name.clone(), out, full.num_rows)?;
             Ok(AttachedScan {
                 table: Arc::new(table),
                 present,

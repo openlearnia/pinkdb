@@ -230,7 +230,13 @@ pub(crate) fn materialize_live(
         ));
         present.push(wanted[i]);
     }
-    let table = DataTable::from_columns(table_name.to_string(), columns, decoded.len());
+    let table =
+        DataTable::from_columns(table_name.to_string(), columns, decoded.len()).map_err(|e| {
+            LakeError::Engine {
+                context: format!("building table \"{table_name}\""),
+                source: e,
+            }
+        })?;
     Ok((table, present))
 }
 

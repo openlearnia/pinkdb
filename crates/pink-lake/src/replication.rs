@@ -2074,11 +2074,12 @@ fn extended_base(base: &DataTable, source: &DataTable) -> Result<DataTable> {
             base,
         )?);
     }
-    Ok(DataTable::from_columns(
-        base.name.clone(),
-        columns,
-        base.num_rows(),
-    ))
+    DataTable::from_columns(base.name.clone(), columns, base.num_rows()).map_err(|e| {
+        LakeError::Engine {
+            context: format!("building table \"{}\"", base.name),
+            source: e,
+        }
+    })
 }
 
 /// How the destination schema relates to the source schema.

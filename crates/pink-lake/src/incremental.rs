@@ -874,11 +874,12 @@ fn project_base_table(
             )?),
         }
     }
-    Ok(DataTable::from_columns(
-        current.name.clone(),
-        columns,
-        base.num_rows(),
-    ))
+    DataTable::from_columns(current.name.clone(), columns, base.num_rows()).map_err(|e| {
+        LakeError::Engine {
+            context: format!("building table \"{}\"", current.name),
+            source: e,
+        }
+    })
 }
 
 /// The base table's logical content after a diff lands: the data files' rows
@@ -2202,7 +2203,13 @@ impl Lake {
                         message: format!("table \"{table}\": row ids overflow u64"),
                     });
                 };
-                let saved = pinkdb::persist::table_stats(dbname, table_name, file_table);
+                let saved =
+                    pinkdb::persist::table_stats(dbname, table_name, file_table).map_err(|e| {
+                        LakeError::Engine {
+                            context: format!("folding the statistics of \"{table}\""),
+                            source: e,
+                        }
+                    })?;
                 let stats = crate::stats::StatsBlock::from_saved(table, rel, &saved)?;
                 let file = FileRef::Entry {
                     path: rel.to_string(),

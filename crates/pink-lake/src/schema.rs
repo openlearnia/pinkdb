@@ -333,7 +333,12 @@ impl TableSchema {
             }
         }
         Ok((
-            pinkdb::DataTable::from_columns(table_name.to_string(), columns, num_rows),
+            pinkdb::DataTable::from_columns(table_name.to_string(), columns, num_rows).map_err(
+                |e| LakeError::Engine {
+                    context: format!("building table \"{table_name}\""),
+                    source: e,
+                },
+            )?,
             present,
         ))
     }

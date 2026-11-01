@@ -1152,7 +1152,7 @@ fn analyze_tables(db: &mut PinkDb, dbname: &str, table: Option<&str>) -> Result<
         None => db.list_tables_in(dbname),
     };
     for name in &names {
-        db.table_mut_in(dbname, name)?.analyze();
+        db.table_mut_in(dbname, name)?.analyze()?;
     }
     Ok(names.len())
 }
@@ -3621,17 +3621,18 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // The optimizer already canonicalized the literal to the indexed
             // column's type (H-5); re-apply the cast defensively so a plan
             // built by another path can never probe with a type-tagged key.
-            let column_type = t
+            let column = t
                 .columns
                 .get(idx.column)
-                .map(|c| c.dtype)
                 .ok_or_else(|| {
                     PinkDbError::Catalog(format!("index \"{index}\" has no column"))
                 })?;
-            let key_val = crate::exec::expr::cast_value(key_val, column_type)?;
+            let key_val = crate::exec::expr::cast_value(key_val, column.dtype)?;
             let mut key_buf = Vec::new();
             crate::exec::aggregate::encode_value(&mut key_buf, &key_val);
-            let row_indices = idx.map.get(&key_buf).cloned().unwrap_or_default();
+            // Builds the map on first use (decoding only the indexed column),
+            // then answers from it.
+            let row_indices = idx.lookup(column, &key_buf)?;
             index_scan_output(cx, &target, table, idx.column, &row_indices)
         }
         LogicalPlan::VectorTopK {
