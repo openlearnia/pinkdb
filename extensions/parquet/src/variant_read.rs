@@ -25,7 +25,7 @@ use parquet::file::reader::RowGroupReader;
 use parquet::schema::types::Type;
 use pinkdb::variant::Variant;
 use pinkdb::variant_shred::{self, ShredKind, decode_metadata, decode_value};
-use pinkdb::{CHUNK_SIZE, DataType, PinkDbError, Result, Value as EngineValue, Vector};
+use pinkdb::{DataType, PinkDbError, Result, Value as EngineValue, Vector};
 
 /// One `{ value, typed_value }` pair of the spec — a shredded object field or
 /// a shredded array element.
@@ -361,18 +361,18 @@ pub fn read_column(
     row_group: &dyn RowGroupReader,
     first_leaf: usize,
     column: &VariantColumn,
-    rows: usize,
+    lens: &[usize],
     name: &str,
 ) -> Result<Vec<Vector>> {
+    let rows: usize = lens.iter().sum();
     let mut leaves = Vec::with_capacity(column.leaves);
     for offset in 0..column.leaves {
         leaves.push(read_leaf(row_group, first_leaf + offset, rows, name)?);
     }
-    let mut out = Vec::with_capacity(rows.div_ceil(CHUNK_SIZE));
+    let mut out = Vec::with_capacity(lens.len());
     let mut done = 0usize;
     let mut dictionary: Option<(Vec<u8>, Vec<Arc<str>>)> = None;
-    while done < rows {
-        let count = CHUNK_SIZE.min(rows - done);
+    for &count in lens {
         let mut vector = Vector::with_capacity(DataType::Variant, count);
         for row in done..done + count {
             let keys = dictionary_for(row, column, &leaves, &mut dictionary)?;

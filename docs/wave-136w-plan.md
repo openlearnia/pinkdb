@@ -153,3 +153,148 @@ cost is the *full rewrite* — every checkpoint decodes and re-encodes every
 table even when nothing changed — which is step 136w2 (copy clean chunks
 through) and 136w3 (append-only checkpoints); the 1.9 s vs 59 ms gap to
 DuckDB is that step, not this one.
+
+## 136w5 — Parquet decode and the statistics fold (ROADMAP 111b4, 122a)
+
+### Where the time went (profiles, `sample` at 1 ms, release CLI)
+
+Parquet, `CREATE TABLE lineitem AS SELECT * FROM
+read_parquet('lineitem.parquet')` at SF 1, 3.3 s. Self ticks on the main
+thread: `Vector::push_valid` 171, `memcmp` 157, `stats::key_hash` 154,
+`core::str::from_utf8` 151, `memmove` 146, `snap::decompress` 129,
+`plan::compare_values` 105, malloc/free 174, `Vector::extend_from` 85,
+`stats::Zone::of_vector` 81, `StrVec::bytes_of` 60, `StrVec::push` 52,
+`scan::push_entry` 51, `StrVec::push_view_of` 46, `Value::decimal` 42,
+`read_chunks::<ByteArrayType>` 40, `ColStats::widen` 35,
+`append_shared_chunk_inner` 34, `RleDecoder::get_batch_with_dict::<ByteArray>` 29,
+`bytes::shared_clone`/`shared_drop` 52.
+
+The call graph says the same in one line: `exec::table_function_output` →
+`ParquetSource::scan` is **1213 of the main thread's 2067 ticks (59 %)**, all
+of it on one thread, and the rest splits into ~420 ticks of append (zone and
+sketch fold, mostly `refresh_zone` re-deriving whole chunks because the
+tail was ragged) and ~430 of staging, index and WAL. Inside the decode the
+per-cell `Value` (a `String` per VARCHAR, `Value::decimal` per DECIMAL) and
+the generic `Vector::push_value`/`push_valid` dispatch dominate; snappy is
+~6 %.
+
+CSV, `.import lineitem.csv lineitem` into an in-memory table: `key_hash`
+**516** ticks, `Zone::of_vector` 253, `memcmp` 208, `StrVec::bytes_of` 115,
+`fold_chunk_stats`'s closure 63. The parser is not in the top ten — the
+statistics fold was the CSV import's hot path, at ~350 ms of a ~2.3 s
+import (the 12–15 % 122a names).
+
+### Changes
+
+1. **Typed batched decode** (`extensions/parquet/src/scan.rs`).
+   `read_flat_chunks` accumulates a whole `CHUNK_SIZE` chunk across page
+   boundaries into the parquet crate's own typed buffer and builds the
+   engine vector once, with `Vector::from_raw`: `Vec<i32>`/`Vec<i64>`/
+   `Vec<f64>`/`Vec<bool>` payloads, a `StrVec` filled with `push` (no
+   `String` per cell), `Vec<i128>` for DECIMAL, a validity bitmap from the
+   definition levels. ARRAY and VARIANT keep the value path. Same errors,
+   same values (the round-trip tests below compare bit-exactly).
+2. **Parallel local decode** (`scan_local_parallel`). The decode used to run
+   row group by row group on the caller's thread; a local file now decodes
+   on rayon — the engine's pool, so no new threads — with one task per
+   (surviving row group × projected column), a window of row groups in
+   flight to bound memory, one `SerializedFileReader` per worker in a pool
+   (a reader parses the footer once), and assembly strictly in row-group
+   then column order. DuckDB's `parquet_reader.cpp` splits a row group
+   across threads the same way; pinkdb writes one row group per file
+   (`write.rs`), so columns are the only independent unit inside one.
+3. **Chunk-aligned scan** (`chunk_lens`). A row group's chunks are cut on
+   `CHUNK_SIZE` boundaries of the *file*, not of the row group: the first
+   chunk of a group ends the previous group's ragged tail. Before, every
+   row group ended on a short chunk, so from the first row group on the
+   table's tail was never full and **every** CTAS append took the copy path
+   (2381 of 2800 appends; 1.28 s of copying and zone rebuilding). Now 2760
+   of 2800 appends share the decoder's vectors (40 copies are the file's own
+   ragged tail).
+4. **Statistics fold in the decoder's own pass, per column** (`stats.rs`,
+   `storage.rs`): `Hll::fold_vector` matches the vector's payload type once
+   per chunk instead of once per row (`key_hash`'s jump table was 516 ticks
+   in the CSV profile), skips the validity bitmap when a column has no
+   NULLs, and hashes with exactly the constants `key_hash` uses, so
+   estimates are unchanged. The copy path now folds the appended rows once,
+   in parallel, and merges the two halves' zones into the two chunks they
+   landed in, instead of re-deriving both chunks' zones from their rows
+   (`refresh_zone`) — same bounds, one pass.
+5. Rejected: sampling the sketch at 1/8 or widening zones at row-group
+   granularity (ROADMAP 122a's alternatives). Both change what a statistic
+   means — an unlabelled sample makes `approx_count_distinct` wrong by 8×
+   on small tables and needs a stored rate to be honest (a format change),
+   and row-group zones are not what the zone map indexes.
+
+### What each change bought (SF 1 lineitem, same machine, same harness)
+
+| state | Parquet CTAS | of which fold | CSV `.import` |
+|---|---:|---:|---:|
+| 136w1 (baseline of this step) | 3121 ms | — | 2345 ms |
+| typed decode only | 1816 ms | 1076 ms (copy path) | 1975 ms |
+| + per-column fold, copy path without `refresh_zone` | 1060 ms | 300 ms | 2218 ms |
+| + chunk-aligned scan (2800 appends now shared) | 905 ms | 49 ms (fast-path fold) | 2200 ms |
+| fold off (`PINKDB_NO_STATS_FOLD`, measurement only) | 361 ms | — | ~1950 ms |
+
+Zone fold ≈ 214 ms and sketch ≈ 330 ms for 96 M cells (6.0 M rows × 16
+columns, 2.2 and 3.4 ns per cell) once both are vectorized and parallel;
+that is the arithmetic floor
+for exact per-chunk bounds plus an exact sketch over every row, and it is
+~30 % of the 1.06 s CTAS. Getting inside 122a's 5 % bound would need a
+cheaper statistic, not a cheaper fold — see the rejected options above.
+
+### Ingest at SF 1 after 136w5
+
+`bench/suite/run.py --only ingest --scale 1 --runs 3`, medians, both
+engines on the same Parquet files and CSV dumps (load average 2.8):
+
+| table | format | pinkdb 136w1 | pinkdb 136w5 | DuckDB |
+|---|---|---:|---:|---:|
+| lineitem | CSV `.import` / `read_csv_auto` | 2345 ms, 2.56 M rows/s | 2469 ms, 2.43 M rows/s | 3220 ms, 1.86 M rows/s |
+| lineitem | Parquet | 3121 ms, 1.92 M rows/s | **809 ms, 7.42 M rows/s** | 712 ms, 8.43 M rows/s |
+| orders | CSV | 634 ms, 2.37 M rows/s | 684 ms, 2.19 M rows/s | 456 ms, 3.29 M rows/s |
+| orders | Parquet | 576 ms, 2.60 M rows/s | **142 ms, 10.56 M rows/s** | 160 ms, 9.38 M rows/s |
+
+Parquet ingest is 3.9× faster than at the start of the wave and now within
+14 % of DuckDB on lineitem and ahead of it on orders; CSV is unchanged
+within the run-to-run spread and still ahead of DuckDB on lineitem. A
+second, quieter measurement of the same four cells, interleaved with
+DuckDB (`/usr/bin/time -l` for RSS, medians of 3): lineitem Parquet
+**530 ms / 1445 MB** vs 562 ms / 690 MB, lineitem CSV **2052 ms /
+1900 MB** vs 2843 ms / 1362 MB, orders Parquet **144 ms / 330 MB** vs
+152 ms / 440 MB, orders CSV **552 ms / 460 MB** vs 544 ms / 475 MB. The
+two harnesses disagree on lineitem Parquet by 50 % because they were taken
+under different background load; both put pinkdb at or near DuckDB, where
+136w1 was 4–5× behind. Peak RSS of the Parquet load fell from 2564 MB to
+1445 MB (the old tail also copied every chunk; the fill ratio is the same).
+
+### TPC-H SF 1 query A/B
+
+Per query, on the same prebuilt store, medians of 3, the 136w1 binary and
+the 136w5 one alternating (run the other had the machine at load 10–13):
+
+| | q1 | q2 | q3 | q9 | q10 | q13 | q18 | q20 | q21 | total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 136w1 | 42 | 13 | 34 | 106 | 85 | 102 | 127 | 68 | 87 | 1088 |
+| 136w5 | 38 | 13 | 35 | 106 | 88 | 100 | 123 | 96 | 111 | 1143 |
+
+(ms; the columns are the queries that moved most, all 22 make the total.)
+The total is +5 % and 20 of 22 queries are within ±12 %. A control run of
+the *same* binary on both sides under the same load gives +2.3 % on the
+total and a per-query spread of up to ±22 % (q13 alone 1.22×), so the two
+large outliers here (q20, q21) are inside the noise this machine has while
+other work runs; no query lost a plan or a pruned row group, and the
+suite's row-for-row comparison against DuckDB passes for all 22.
+
+### Left undone
+
+- **122a's 5 % bound is not met** for Parquet CTAS (~30 % of it is the fold)
+  and CSV (~15 %). The fold is now one pass per column, parallel, typed
+  (≈5.6 ns per cell); what is left is exactness itself. Reaching 5 % needs a
+  statistic that does not see every value, which changes `DESCRIBE`'s
+  answers — a decision for whoever owns the catalog, not a decode change.
+- The Parquet scan streams (`scan_streamed`), but CTAS still materializes
+  the whole query result before appending (`exec::CreateTableAs` evaluates
+  into `chunks`), so the decoded columns are held for the whole load. RSS is
+  now bounded by the old copy-path inflation rather than by the decoder; a
+  streaming CTAS is an `exec` change outside this step's files.

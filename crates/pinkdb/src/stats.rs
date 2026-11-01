@@ -159,6 +159,7 @@ impl Hll {
 
     /// Fold one already-hashed value in. `h`'s top bits choose the register
     /// and the rank of the first set bit in the rest is the observation.
+    #[inline]
     pub fn insert_hash(&mut self, h: u64) {
         let idx = (h >> (64 - HLL_PRECISION)) as usize;
         let rank = ((h << HLL_PRECISION).leading_zeros() + 1).min(64 - HLL_PRECISION + 1) as u8;
@@ -172,6 +173,65 @@ impl Hll {
     pub(crate) fn insert_cell(&mut self, vector: &Vector, row: usize) {
         if vector.is_valid(row) {
             self.insert_hash(key_hash(vector, row));
+        }
+    }
+
+    /// Fold every non-NULL cell of a chunk in, hashing exactly as
+    /// [`Hll::insert_cell`] does: the column kind is matched once per column
+    /// instead of once per row, and the all-valid case skips the bitmap.
+    pub(crate) fn fold_vector(&mut self, v: &Vector) {
+        match v.data() {
+            VectorData::Boolean(d) => self.fold_typed(v, d, |x: bool| mix(x as u64 ^ 0x10)),
+            VectorData::Int32(d) => self.fold_typed(v, d, |x: i32| mix(x as u64)),
+            VectorData::Int64(d) => self.fold_typed(v, d, |x: i64| mix(x as u64 ^ 0x20)),
+            VectorData::Date32(d) => self.fold_typed(v, d, |x: i32| mix(x as u64 ^ 0x30)),
+            VectorData::TimestampMicros(d) => self.fold_typed(v, d, |x: i64| mix(x as u64 ^ 0x40)),
+            VectorData::Float64(d) => self.fold_typed(v, d, |x: f64| mix(double_bits(x))),
+            VectorData::Decimal { values, scale, .. } => {
+                let scale = *scale as u64;
+                self.fold_typed(v, values, move |x: i128| {
+                    mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ (scale << 56))
+                })
+            }
+            VectorData::Interval(d) => self.fold_typed(v, d, |iv: Interval| {
+                mix(crate::types::interval_key(iv.months, iv.days, iv.micros) as u64 ^ 0x50)
+            }),
+            VectorData::Uuid(d) => self.fold_typed(v, d, |x: u128| {
+                mix(x as u64 ^ ((x >> 64) as u64).rotate_left(17) ^ 0x60)
+            }),
+            VectorData::VarChar(data) => {
+                if v.has_nulls() {
+                    for row in 0..v.len() {
+                        if v.is_valid(row) {
+                            self.insert_hash(hash_bytes(data.get(row).as_bytes()));
+                        }
+                    }
+                } else {
+                    for row in 0..v.len() {
+                        self.insert_hash(hash_bytes(data.get(row).as_bytes()));
+                    }
+                }
+            }
+            // The general encodings hash their canonical `Value`.
+            VectorData::Variant(_) | VectorData::Array { .. } => {
+                for row in 0..v.len() {
+                    self.insert_cell(v, row);
+                }
+            }
+        }
+    }
+
+    fn fold_typed<T: Copy>(&mut self, v: &Vector, data: &[T], hash: impl Fn(T) -> u64) {
+        if v.has_nulls() {
+            for (row, &x) in data.iter().enumerate() {
+                if v.is_valid(row) {
+                    self.insert_hash(hash(x));
+                }
+            }
+        } else {
+            for &x in data {
+                self.insert_hash(hash(x));
+            }
         }
     }
 
@@ -382,15 +442,30 @@ impl Zone {
     /// [`Zone::of_vector`]'s work, kept typed so no `Value` is allocated per
     /// row. Moved from the `.pink` writer (which now shares it through here).
     pub(crate) fn of_vector(v: &Vector) -> Zone {
-        let null_count = v.null_count() as u64;
+        Self::of_vector_range(v, 0, v.len())
+    }
+
+    /// [`Zone::of_vector`] over the `len` rows starting at `start`. The append
+    /// path splits one batch at a chunk boundary and merges each part's zone
+    /// into the chunk it landed in, so a chunk is never re-derived from data
+    /// that is already there.
+    pub(crate) fn of_vector_range(v: &Vector, start: usize, len: usize) -> Zone {
         let mut zone = Zone {
-            null_count,
+            null_count: 0,
             min: None,
             max: None,
             nan_count: 0,
         };
+        if len == 0 {
+            return zone;
+        }
+        let nulls = v.has_nulls();
+        if nulls {
+            zone.null_count = (start..start + len).filter(|&row| v.is_null(row)).count() as u64;
+        }
         match v.data() {
             VectorData::Boolean(data) => {
+                let data = &data[start..start + len];
                 let (mut has_false, mut has_true) = (false, false);
                 let mut see = |x: bool| {
                     if x {
@@ -399,9 +474,9 @@ impl Zone {
                         has_false = true;
                     }
                 };
-                if v.has_nulls() {
+                if nulls {
                     for (i, &x) in data.iter().enumerate() {
-                        if v.is_valid(i) {
+                        if v.is_valid(start + i) {
                             see(x);
                         }
                     }
@@ -416,32 +491,33 @@ impl Zone {
                 }
             }
             VectorData::Int32(data) => {
-                let (min, max) = int_stats(v, data);
+                let (min, max) = int_stats(v, &data[start..start + len], start);
                 zone.min = min.map(Value::Integer);
                 zone.max = max.map(Value::Integer);
             }
             VectorData::Int64(data) => {
-                let (min, max) = int_stats(v, data);
+                let (min, max) = int_stats(v, &data[start..start + len], start);
                 zone.min = min.map(Value::Bigint);
                 zone.max = max.map(Value::Bigint);
             }
             // UUIDs zone on their unsigned 128-bit value, like `ORDER BY`.
             VectorData::Uuid(data) => {
-                let (min, max) = int_stats(v, data);
+                let (min, max) = int_stats(v, &data[start..start + len], start);
                 zone.min = min.map(Value::Uuid);
                 zone.max = max.map(Value::Uuid);
             }
             VectorData::Date32(data) => {
-                let (min, max) = int_stats(v, data);
+                let (min, max) = int_stats(v, &data[start..start + len], start);
                 zone.min = min.map(Value::Date);
                 zone.max = max.map(Value::Date);
             }
             VectorData::TimestampMicros(data) => {
-                let (min, max) = int_stats(v, data);
+                let (min, max) = int_stats(v, &data[start..start + len], start);
                 zone.min = min.map(Value::Timestamp);
                 zone.max = max.map(Value::Timestamp);
             }
             VectorData::Float64(data) => {
+                let data = &data[start..start + len];
                 let (mut min, mut max): (Option<f64>, Option<f64>) = (None, None);
                 let mut see = |x: f64| {
                     if x.is_nan() {
@@ -455,9 +531,9 @@ impl Zone {
                         max = Some(x);
                     }
                 };
-                if v.has_nulls() {
+                if nulls {
                     for (i, &x) in data.iter().enumerate() {
-                        if v.is_valid(i) {
+                        if v.is_valid(start + i) {
                             see(x);
                         }
                     }
@@ -470,16 +546,17 @@ impl Zone {
                 zone.max = max.map(Value::Double);
             }
             VectorData::VarChar(data) => {
-                let (min, max) = str_stats(v, data);
+                let (min, max) = str_stats(v, data, start, len);
                 zone.min = min.map(|s| Value::Varchar(s.to_string()));
                 zone.max = max.map(|s| Value::Varchar(s.to_string()));
             }
             VectorData::Decimal { values, scale, .. } => {
-                let (min, max) = int_stats(v, values);
+                let (min, max) = int_stats(v, &values[start..start + len], start);
                 zone.min = min.map(|x| Value::decimal(x, *scale));
                 zone.max = max.map(|x| Value::decimal(x, *scale));
             }
             VectorData::Interval(data) => {
+                let data = &data[start..start + len];
                 let (mut min, mut max): (Option<Interval>, Option<Interval>) = (None, None);
                 let mut see = |x: Interval| {
                     if min.is_none_or(|m| crate::types::interval_cmp(x, m).is_lt()) {
@@ -489,9 +566,9 @@ impl Zone {
                         max = Some(x);
                     }
                 };
-                if v.has_nulls() {
+                if nulls {
                     for (i, &x) in data.iter().enumerate() {
-                        if v.is_valid(i) {
+                        if v.is_valid(start + i) {
                             see(x);
                         }
                     }
@@ -519,7 +596,7 @@ impl Zone {
 }
 
 /// min/max over the valid elements of an integer chunk, first-seen on ties.
-fn int_stats<T: Copy + Ord>(v: &Vector, data: &[T]) -> (Option<T>, Option<T>) {
+fn int_stats<T: Copy + Ord>(v: &Vector, data: &[T], offset: usize) -> (Option<T>, Option<T>) {
     let (mut min, mut max): (Option<T>, Option<T>) = (None, None);
     let mut see = |x: T| {
         if min.is_none_or(|m| x < m) {
@@ -531,7 +608,7 @@ fn int_stats<T: Copy + Ord>(v: &Vector, data: &[T]) -> (Option<T>, Option<T>) {
     };
     if v.has_nulls() {
         for (i, &x) in data.iter().enumerate() {
-            if v.is_valid(i) {
+            if v.is_valid(offset + i) {
                 see(x);
             }
         }
@@ -548,6 +625,8 @@ fn int_stats<T: Copy + Ord>(v: &Vector, data: &[T]) -> (Option<T>, Option<T>) {
 fn str_stats<'a>(
     v: &Vector,
     data: &'a crate::strings::StrVec,
+    start: usize,
+    len: usize,
 ) -> (Option<&'a str>, Option<&'a str>) {
     let (mut min, mut max): (Option<&'a str>, Option<&'a str>) = (None, None);
     let mut see = |x: &'a str| {
@@ -559,14 +638,14 @@ fn str_stats<'a>(
         }
     };
     if v.has_nulls() {
-        for (i, s) in data.iter().enumerate() {
-            if v.is_valid(i) {
-                see(s);
+        for row in start..start + len {
+            if v.is_valid(row) {
+                see(data.get(row));
             }
         }
     } else {
-        for s in data.iter() {
-            see(s);
+        for row in start..start + len {
+            see(data.get(row));
         }
     }
     (min, max)
@@ -672,16 +751,7 @@ impl ColStats {
     pub(crate) fn observe_chunk(&mut self, v: &Vector, zone: &Zone) {
         self.absorb_zone(zone);
         let Some(hll) = &mut self.hll else { return };
-        let hll = Arc::make_mut(hll);
-        if v.has_nulls() {
-            for row in 0..v.len() {
-                hll.insert_cell(v, row);
-            }
-        } else {
-            for row in 0..v.len() {
-                hll.insert_hash(key_hash(v, row));
-            }
-        }
+        Arc::make_mut(hll).fold_vector(v);
     }
 
     /// The distinct-count estimate, or `None` when unknown.

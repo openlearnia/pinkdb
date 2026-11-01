@@ -34,14 +34,18 @@ use std::sync::Arc;
 
 use parquet::column::reader::{ColumnReader, get_typed_column_reader};
 use parquet::data_type::{
-    BoolType, ByteArrayType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type, Int64Type,
-    Int96Type,
+    BoolType, ByteArray, ByteArrayType, DoubleType, FixedLenByteArray, FixedLenByteArrayType,
+    FloatType, Int32Type, Int64Type, Int96Type,
 };
 use parquet::file::reader::{ChunkReader, FileReader, RowGroupReader, SerializedFileReader};
 use pinkdb::attached::{PruneOp, PrunePredicate};
+use pinkdb::strings::StrVec;
+use pinkdb::types::Interval;
 use pinkdb::{
     CHUNK_SIZE, DataChunk, DataType, PinkDbError, Result, TableScanOutput, Value, Vector,
+    VectorData,
 };
+use rayon::prelude::*;
 
 use crate::ranged::RemoteReadStats;
 use crate::resolve::{FileResolved, OutKind, Resolved, convert_value, file_constant_value};
@@ -57,11 +61,30 @@ pub fn scan(
     filters: &[PrunePredicate],
 ) -> Result<(TableScanOutput, RemoteReadStats)> {
     let mut chunks = Vec::new();
-    let (out, stats) = scan_into(resolved, projection, filters, &mut |chunk| {
+    let (out, stats) = scan_into(resolved, projection, filters, false, &mut |chunk| {
         chunks.push(chunk);
         Ok(())
     })?;
     Ok((TableScanOutput { chunks, ..out }, stats))
+}
+
+/// As [`scan`], but every local file is decoded on the calling thread.
+///
+/// The worker pool only changes how fast the file is read: rows, values and
+/// chunk boundaries are the same either way, which is what the round-trip
+/// tests assert by scanning a fixture both ways.
+#[cfg(test)]
+pub fn scan_serial(
+    resolved: &Resolved,
+    projection: Option<&[usize]>,
+    filters: &[PrunePredicate],
+) -> Result<TableScanOutput> {
+    let mut chunks = Vec::new();
+    let (out, _) = scan_into(resolved, projection, filters, true, &mut |chunk| {
+        chunks.push(chunk);
+        Ok(())
+    })?;
+    Ok(TableScanOutput { chunks, ..out })
 }
 
 /// As [`scan`], but each chunk goes to `sink` as soon as its row group is
@@ -73,13 +96,14 @@ pub fn scan_streamed(
     filters: &[PrunePredicate],
     sink: &mut dyn FnMut(DataChunk) -> Result<()>,
 ) -> Result<(TableScanOutput, RemoteReadStats)> {
-    scan_into(resolved, projection, filters, sink)
+    scan_into(resolved, projection, filters, false, sink)
 }
 
 fn scan_into(
     resolved: &Resolved,
     projection: Option<&[usize]>,
     filters: &[PrunePredicate],
+    serial: bool,
     sink: &mut dyn FnMut(DataChunk) -> Result<()>,
 ) -> Result<(TableScanOutput, RemoteReadStats)> {
     let width = resolved.schema.len();
@@ -157,21 +181,24 @@ fn scan_into(
             }
             continue;
         }
-        let reader =
-            SerializedFileReader::new(std::fs::File::open(&file.meta.path).map_err(|e| {
-                PinkDbError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("cannot open \"{}\": {e}", file.meta.path),
-                ))
-            })?)
-            .map_err(|e| {
-                PinkDbError::Execution(format!(
-                    "cannot read parquet file \"{}\": {e}",
-                    file.meta.path
-                ))
-            })?;
-
-        scan_reader(&reader, file, &plan, &mut out, sink)?;
+        if serial {
+            let reader =
+                SerializedFileReader::new(std::fs::File::open(&file.meta.path).map_err(|e| {
+                    PinkDbError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("cannot open \"{}\": {e}", file.meta.path),
+                    ))
+                })?)
+                .map_err(|e| {
+                    PinkDbError::Execution(format!(
+                        "cannot read parquet file \"{}\": {e}",
+                        file.meta.path
+                    ))
+                })?;
+            scan_reader(&reader, file, &plan, &mut out, sink)?;
+        } else {
+            scan_local_parallel(file, &plan, &mut out, sink)?;
+        }
     }
     Ok((out, transport.snapshot()))
 }
@@ -210,6 +237,25 @@ fn decoded_columns<'a>(
         .collect()
 }
 
+/// The chunk sizes a row group of `rows` rows decodes into when it starts
+/// `offset` rows into its file: every chunk but the last starts on a
+/// `CHUNK_SIZE` boundary of the file, so a whole-file scan hands the writer
+/// chunk-aligned batches and its append shares them instead of copying them
+/// into a ragged tail. A row-group boundary is invisible to the chunking; a
+/// chunk never exceeds `CHUNK_SIZE` rows, which is all a vector may hold.
+fn chunk_lens(rows: usize, offset: usize) -> Vec<usize> {
+    let mut lens = Vec::with_capacity(rows.div_ceil(CHUNK_SIZE) + 1);
+    let mut left = rows;
+    let mut at = offset;
+    while left > 0 {
+        let n = (CHUNK_SIZE - at % CHUNK_SIZE).min(left);
+        lens.push(n);
+        left -= n;
+        at += n;
+    }
+    lens
+}
+
 /// Decode one opened file serially (local `File`, or a remote `RemoteFile`
 /// on the serial path): the row groups that survive pruning, the projected
 /// columns, and the engine chunks.
@@ -221,6 +267,7 @@ fn scan_reader<R: ChunkReader + 'static>(
     sink: &mut dyn FnMut(DataChunk) -> Result<()>,
 ) -> Result<()> {
     let decoded = decoded_columns(file, plan);
+    let mut offset = 0usize;
     for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
         if !row_group_survives(plan.resolved, file, rg_index, plan.filters) {
             out.row_groups_pruned += 1;
@@ -228,13 +275,15 @@ fn scan_reader<R: ChunkReader + 'static>(
         }
         out.row_groups += 1;
         let rows = rg.rows as usize;
+        let lens = chunk_lens(rows, offset);
+        offset += rows;
         if decoded.is_empty() {
-            assemble_row_group(file, plan, rows, &decoded, Vec::new(), sink)?;
+            assemble_row_group(file, plan, &lens, &decoded, Vec::new(), sink)?;
             continue;
         }
-        let pieces = decode_row_group(reader, rg_index, &decoded, rows, &file.meta.path)?;
+        let pieces = decode_row_group(reader, rg_index, &decoded, &lens, &file.meta.path)?;
         out.columns_decoded += decoded.len() as u64;
-        assemble_row_group(file, plan, rows, &decoded, pieces, sink)?;
+        assemble_row_group(file, plan, &lens, &decoded, pieces, sink)?;
     }
     Ok(())
 }
@@ -248,15 +297,143 @@ fn scan_metadata_only(
     out: &mut TableScanOutput,
     sink: &mut dyn FnMut(DataChunk) -> Result<()>,
 ) -> Result<()> {
+    let mut offset = 0usize;
     for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
         if !row_group_survives(plan.resolved, file, rg_index, plan.filters) {
             out.row_groups_pruned += 1;
             continue;
         }
         out.row_groups += 1;
-        assemble_row_group(file, plan, rg.rows as usize, &[], Vec::new(), sink)?;
+        let rows = rg.rows as usize;
+        let lens = chunk_lens(rows, offset);
+        offset += rows;
+        assemble_row_group(file, plan, &lens, &[], Vec::new(), sink)?;
     }
     Ok(())
+}
+
+/// Decode a local file with the engine's worker pool.
+///
+/// The unit of work is one (row group, projected column) column chunk, so a
+/// file that holds one row group — every file `COPY … TO parquet` writes here
+/// — still fills the pool, and a file of many narrow row groups fills it from
+/// row groups. Results are assembled strictly in row-group then column order,
+/// which is the serial path's order, so rows and values are identical
+/// whichever way the pool schedules the tasks (wave 136w5).
+///
+/// DuckDB's parquet reader splits the same way, but at row-group granularity
+/// (duckdb/extension/parquet/parquet_reader.cpp, `ParquetReader::Scan`);
+/// columns are the only independent unit left inside a single row group.
+fn scan_local_parallel(
+    file: &FileResolved,
+    plan: &DecodePlan<'_>,
+    out: &mut TableScanOutput,
+    sink: &mut dyn FnMut(DataChunk) -> Result<()>,
+) -> Result<()> {
+    let decoded = decoded_columns(file, plan);
+    if decoded.is_empty() {
+        return scan_metadata_only(file, plan, out, sink);
+    }
+    let mut surviving: Vec<(usize, usize, usize)> = Vec::new();
+    let mut offset = 0usize;
+    for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
+        if !row_group_survives(plan.resolved, file, rg_index, plan.filters) {
+            out.row_groups_pruned += 1;
+            continue;
+        }
+        out.row_groups += 1;
+        let rows = rg.rows as usize;
+        surviving.push((rg_index, rows, offset));
+        offset += rows;
+    }
+    let workers = rayon::current_num_threads().max(1);
+    let open = || -> Result<SerializedFileReader<std::fs::File>> {
+        SerializedFileReader::new(std::fs::File::open(&file.meta.path).map_err(|e| {
+            PinkDbError::Io(std::io::Error::new(
+                e.kind(),
+                format!("cannot open \"{}\": {e}", file.meta.path),
+            ))
+        })?)
+        .map_err(|e| {
+            PinkDbError::Execution(format!(
+                "cannot read parquet file \"{}\": {e}",
+                file.meta.path
+            ))
+        })
+    };
+    // A reader parses the footer once; one per worker covers the pool.
+    let pool: std::sync::Mutex<Vec<SerializedFileReader<std::fs::File>>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut at = 0usize;
+    while at < surviving.len() {
+        // A window bounds the decoded bytes in flight: enough row groups to
+        // fill the pool four times over, but never a whole file at once.
+        let mut end = at + 1;
+        while end < surviving.len() && (end - at) * decoded.len() < workers * 4 {
+            end += 1;
+        }
+        let window = &surviving[at..end];
+        let tasks: Vec<(usize, usize, Vec<usize>)> = window
+            .iter()
+            .flat_map(|&(rg_index, rows, start)| {
+                let lens = chunk_lens(rows, start);
+                (0..decoded.len()).map(move |slot| (rg_index, slot, lens.clone()))
+            })
+            .collect();
+        let results: Vec<Result<Vec<Vector>>> = tasks
+            .par_iter()
+            .map(|(rg_index, slot, lens)| {
+                let reader = {
+                    let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+                    match pool.pop() {
+                        Some(reader) => reader,
+                        None => open()?,
+                    }
+                };
+                let pieces = decode_in_row_group(
+                    &reader,
+                    *rg_index,
+                    decoded[*slot].2,
+                    lens,
+                    &file.meta.path,
+                );
+                // A failed decode hands its reader back for the tasks after it.
+                pool.lock().unwrap_or_else(|e| e.into_inner()).push(reader);
+                pieces
+            })
+            .collect();
+        let mut results = results.into_iter();
+        for &(_, rows, start) in window {
+            let mut pieces = Vec::with_capacity(decoded.len());
+            for _ in 0..decoded.len() {
+                let Some(result) = results.next() else {
+                    unreachable!("scan_local_parallel makes one task per projected column")
+                };
+                pieces.push(result?);
+            }
+            out.columns_decoded += decoded.len() as u64;
+            let lens = chunk_lens(rows, start);
+            assemble_row_group(file, plan, &lens, &decoded, pieces, sink)?;
+        }
+        at = end;
+    }
+    Ok(())
+}
+
+/// Decode one projected column of one row group.
+fn decode_in_row_group<R: ChunkReader + 'static>(
+    reader: &SerializedFileReader<R>,
+    rg_index: usize,
+    column: &FileColumn,
+    lens: &[usize],
+    path: &str,
+) -> Result<Vec<Vector>> {
+    let row_group_reader = reader.get_row_group(rg_index).map_err(|e| {
+        PinkDbError::Execution(format!(
+            "cannot read row group {rg_index} of \"{path}\": {e}"
+        ))
+    })?;
+    decode_column(&*row_group_reader, column, lens)
 }
 
 /// Decode the projected columns of one row group into chunk-sized vectors.
@@ -264,7 +441,7 @@ fn decode_row_group<R: ChunkReader + 'static>(
     reader: &SerializedFileReader<R>,
     rg_index: usize,
     decoded: &[(usize, usize, &FileColumn)],
-    rows: usize,
+    lens: &[usize],
     path: &str,
 ) -> Result<Vec<Vec<Vector>>> {
     let row_group_reader = reader.get_row_group(rg_index).map_err(|e| {
@@ -272,11 +449,11 @@ fn decode_row_group<R: ChunkReader + 'static>(
             "cannot read row group {rg_index} of \"{path}\": {e}"
         ))
     })?;
-    // One column at a time: each needed file column decodes into
-    // chunk-sized pieces (a vector cannot exceed CHUNK_SIZE rows).
+    // One column at a time: each needed file column decodes into the pieces
+    // `lens` describes (a vector never exceeds CHUNK_SIZE rows).
     let mut pieces: Vec<Vec<Vector>> = Vec::with_capacity(decoded.len());
     for (_, _, column) in decoded {
-        pieces.push(decode_column(&*row_group_reader, column, rows)?);
+        pieces.push(decode_column(&*row_group_reader, column, lens)?);
     }
     Ok(pieces)
 }
@@ -287,7 +464,7 @@ fn decode_row_group<R: ChunkReader + 'static>(
 fn assemble_row_group(
     file: &FileResolved,
     plan: &DecodePlan<'_>,
-    rows: usize,
+    lens: &[usize],
     decoded: &[(usize, usize, &FileColumn)],
     mut pieces: Vec<Vec<Vector>>,
     sink: &mut dyn FnMut(DataChunk) -> Result<()>,
@@ -295,9 +472,8 @@ fn assemble_row_group(
     let resolved = plan.resolved;
     let placeholders = &plan.placeholders;
     let width = resolved.schema.len();
-    for start in (0..rows).step_by(CHUNK_SIZE) {
-        let chunk_index = start / CHUNK_SIZE;
-        let n = CHUNK_SIZE.min(rows - start);
+    let mut start = 0usize;
+    for (chunk_index, &n) in lens.iter().enumerate() {
         let mut cols: Vec<Arc<Vector>> = Vec::with_capacity(width);
         for (out_index, placeholder) in placeholders.iter().enumerate() {
             if let Some(placeholder) = placeholder {
@@ -369,6 +545,7 @@ fn assemble_row_group(
             cols.push(value);
         }
         sink(DataChunk::projected(cols, n))?;
+        start += n;
     }
     Ok(())
 }
@@ -398,7 +575,8 @@ fn scan_remote_parallel(
     }
 
     // The surviving row groups and the coalesced byte ranges each needs.
-    let mut surviving: Vec<(usize, usize, Vec<ByteSpan>)> = Vec::new();
+    let mut surviving: Vec<(usize, usize, usize, Vec<ByteSpan>)> = Vec::new();
+    let mut offset = 0usize;
     for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
         if !row_group_survives(plan.resolved, file, rg_index, plan.filters) {
             out.row_groups_pruned += 1;
@@ -418,11 +596,9 @@ fn scan_remote_parallel(
             // lazy path (it cannot be split without chaining reads).
             .filter(|span| span.len <= crate::ranged::MAX_REQUEST_BYTES)
             .collect();
-        surviving.push((
-            rg_index,
-            rg.rows as usize,
-            crate::ranged::coalesce_spans(spans),
-        ));
+        let rows = rg.rows as usize;
+        surviving.push((rg_index, rows, offset, crate::ranged::coalesce_spans(spans)));
+        offset += rows;
     }
 
     let mut at = 0;
@@ -431,7 +607,7 @@ fn scan_remote_parallel(
         let mut end = at;
         let mut window_bytes = 0u64;
         while end < surviving.len() {
-            let bytes: u64 = surviving[end].2.iter().map(|span| span.len).sum();
+            let bytes: u64 = surviving[end].3.iter().map(|span| span.len).sum();
             if end > at && window_bytes.saturating_add(bytes) > crate::ranged::MAX_PREFETCH_BYTES {
                 break;
             }
@@ -441,7 +617,7 @@ fn scan_remote_parallel(
         let window = &surviving[at..end];
         let spans: Vec<ByteSpan> = window
             .iter()
-            .flat_map(|(_, _, spans)| spans.iter().copied())
+            .flat_map(|(_, _, _, spans)| spans.iter().copied())
             .collect();
         let fetched = crate::ranged::fetch_spans(source, &spans, parallelism, transport);
         for (span, result) in spans.iter().zip(fetched) {
@@ -463,16 +639,16 @@ fn scan_remote_parallel(
 
         // Decode row groups concurrently when the window has more than one;
         // assembly below still runs in row-group order.
-        let indexes: Vec<(usize, usize)> = window
+        let indexes: Vec<(usize, Vec<usize>)> = window
             .iter()
-            .map(|(rg_index, rows, _)| (*rg_index, *rows))
+            .map(|(rg_index, rows, start, _)| (*rg_index, chunk_lens(*rows, *start)))
             .collect();
         let results: Vec<Result<Vec<Vec<Vector>>>> = if indexes.len() > 1 {
             std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(indexes.len());
-                for &(rg_index, rows) in &indexes {
+                for (rg_index, lens) in &indexes {
                     handles.push(scope.spawn(move || {
-                        decode_row_group(reader, rg_index, decoded, rows, &file.meta.path)
+                        decode_row_group(reader, *rg_index, decoded, lens, &file.meta.path)
                     }));
                 }
                 handles
@@ -483,16 +659,16 @@ fn scan_remote_parallel(
         } else {
             indexes
                 .iter()
-                .map(|&(rg_index, rows)| {
-                    decode_row_group(reader, rg_index, decoded, rows, &file.meta.path)
+                .map(|(rg_index, lens)| {
+                    decode_row_group(reader, *rg_index, decoded, lens, &file.meta.path)
                 })
                 .collect()
         };
 
-        for (index, result) in indexes.iter().zip(results) {
+        for ((_, lens), result) in indexes.iter().zip(results) {
             let pieces = result?;
             out.columns_decoded += decoded.len() as u64;
-            assemble_row_group(file, plan, index.1, decoded, pieces, sink)?;
+            assemble_row_group(file, plan, lens, decoded, pieces, sink)?;
         }
 
         let starts: Vec<u64> = spans.iter().map(|span| span.start).collect();
@@ -808,18 +984,18 @@ fn stats_keeps(
 fn decode_column(
     row_group: &dyn RowGroupReader,
     column: &FileColumn,
-    rows: usize,
+    lens: &[usize],
 ) -> Result<Vec<Vector>> {
     if let Some(shred) = &column.shred {
-        return crate::variant_read::read_column(row_group, column.leaf, shred, rows, &column.name);
+        return crate::variant_read::read_column(row_group, column.leaf, shred, lens, &column.name);
     }
     if let DataType::Array { .. } = column.ty {
-        return read_array_column(row_group, column, rows);
+        return read_array_column(row_group, column, lens);
     }
     let leaf = column.leaf;
-    let scale = match column.ty {
-        DataType::Decimal { scale, .. } => scale,
-        _ => 0,
+    let (precision, scale) = match column.ty {
+        DataType::Decimal { precision, scale } => (precision, scale),
+        _ => (0, 0),
     };
     let optional = column.optional;
     let reader = row_group.get_column_reader(leaf).map_err(|e| {
@@ -832,96 +1008,124 @@ fn decode_column(
     let chunks = match (column.physical, reader) {
         (parquet::basic::Type::BOOLEAN, ColumnReader::BoolColumnReader(r)) => {
             let mut r = get_typed_column_reader::<BoolType>(ColumnReader::BoolColumnReader(r));
-            read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                Ok(Value::Boolean(*v))
-            })?
+            read_flat_chunks(&mut r, lens, optional, &name, bool_chunk)?
         }
         (parquet::basic::Type::INT32, ColumnReader::Int32ColumnReader(r)) => {
             let mut r = get_typed_column_reader::<Int32Type>(ColumnReader::Int32ColumnReader(r));
             match column.ty {
-                DataType::Integer => {
-                    if column.unsigned {
-                        read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                            i32::try_from(*v as u32)
-                                .map(Value::Integer)
-                                .map_err(|_| format!("{v} does not fit in INTEGER"))
-                        })?
-                    } else {
-                        read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                            Ok(Value::Integer(*v))
-                        })?
-                    }
-                }
-                DataType::Date => read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                    Ok(Value::Date(*v))
-                })?,
-                DataType::Decimal { .. } => {
-                    read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                        Ok(crate::schema_map::int_decimal_value(*v as i64, scale))
-                    })?
-                }
+                // UINT_32 values above i32::MAX cannot be represented.
+                DataType::Integer if column.unsigned => read_flat_chunks(
+                    &mut r,
+                    lens,
+                    optional,
+                    &name,
+                    |values, levels, n, column| {
+                        for value in values.iter() {
+                            if i32::try_from(*value as u32).is_err() {
+                                return Err(decode_error(
+                                    column,
+                                    format!("{value} does not fit in INTEGER"),
+                                ));
+                            }
+                        }
+                        int32_chunk(values, levels, n, column)
+                    },
+                )?,
+                DataType::Integer => read_flat_chunks(&mut r, lens, optional, &name, int32_chunk)?,
+                DataType::Date => read_flat_chunks(&mut r, lens, optional, &name, date_chunk)?,
+                DataType::Decimal { .. } => read_flat_chunks(
+                    &mut r,
+                    lens,
+                    optional,
+                    &name,
+                    |values, levels, n, column| {
+                        let mut unscaled: Vec<i128> = values.iter().map(|&v| v as i128).collect();
+                        decimal_chunk(&mut unscaled, levels, n, column, precision, scale)
+                    },
+                )?,
                 other => return Err(unsupported_decode(&name, other)),
             }
         }
         (parquet::basic::Type::INT64, ColumnReader::Int64ColumnReader(r)) => {
             let mut r = get_typed_column_reader::<Int64Type>(ColumnReader::Int64ColumnReader(r));
             match column.ty {
-                DataType::Bigint if column.unsigned => {
-                    // UINT_64 values above i64::MAX cannot be represented.
-                    read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                        i64::try_from(*v as u64)
-                            .map(Value::Bigint)
-                            .map_err(|_| format!("{v} does not fit in BIGINT"))
-                    })?
-                }
-                DataType::Bigint => read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                    Ok(Value::Bigint(*v))
-                })?,
+                // UINT_64 values above i64::MAX cannot be represented.
+                DataType::Bigint if column.unsigned => read_flat_chunks(
+                    &mut r,
+                    lens,
+                    optional,
+                    &name,
+                    |values, levels, n, column| {
+                        for value in values.iter() {
+                            if i64::try_from(*value as u64).is_err() {
+                                return Err(decode_error(
+                                    column,
+                                    format!("{value} does not fit in BIGINT"),
+                                ));
+                            }
+                        }
+                        int64_chunk(values, levels, n, column)
+                    },
+                )?,
+                DataType::Bigint => read_flat_chunks(&mut r, lens, optional, &name, int64_chunk)?,
                 DataType::Timestamp => {
-                    read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                        Ok(Value::Timestamp(*v))
-                    })?
+                    read_flat_chunks(&mut r, lens, optional, &name, timestamp_chunk)?
                 }
-                DataType::Decimal { .. } => {
-                    read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                        Ok(crate::schema_map::int_decimal_value(*v, scale))
-                    })?
-                }
+                DataType::Decimal { .. } => read_flat_chunks(
+                    &mut r,
+                    lens,
+                    optional,
+                    &name,
+                    |values, levels, n, column| {
+                        let mut unscaled: Vec<i128> = values.iter().map(|&v| v as i128).collect();
+                        decimal_chunk(&mut unscaled, levels, n, column, precision, scale)
+                    },
+                )?,
                 other => return Err(unsupported_decode(&name, other)),
             }
         }
         (parquet::basic::Type::INT96, ColumnReader::Int96ColumnReader(r)) => {
             let mut r = get_typed_column_reader::<Int96Type>(ColumnReader::Int96ColumnReader(r));
-            read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                let d = v.data();
-                let nanos = (d[0] as u64) | ((d[1] as u64) << 32);
-                let days = d[2] as i64;
-                let epoch_days = days - 2_440_588;
-                Ok(Value::Timestamp(
-                    epoch_days * 86_400_000_000 + (nanos / 1_000) as i64,
-                ))
-            })?
+            read_flat_chunks(
+                &mut r,
+                lens,
+                optional,
+                &name,
+                |values, levels, n, column| {
+                    let mut micros: Vec<i64> = values
+                        .iter()
+                        .map(|v| {
+                            let d = v.data();
+                            let nanos = (d[0] as u64) | ((d[1] as u64) << 32);
+                            let epoch_days = d[2] as i64 - 2_440_588;
+                            epoch_days * 86_400_000_000 + (nanos / 1_000) as i64
+                        })
+                        .collect();
+                    timestamp_chunk(&mut micros, levels, n, column)
+                },
+            )?
         }
         (parquet::basic::Type::FLOAT, ColumnReader::FloatColumnReader(r)) => {
             let mut r = get_typed_column_reader::<FloatType>(ColumnReader::FloatColumnReader(r));
-            read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                Ok(Value::Double(*v as f64))
-            })?
+            read_flat_chunks(
+                &mut r,
+                lens,
+                optional,
+                &name,
+                |values, levels, n, column| {
+                    let mut widened: Vec<f64> = values.iter().map(|&v| v as f64).collect();
+                    f64_chunk(&mut widened, levels, n, column)
+                },
+            )?
         }
         (parquet::basic::Type::DOUBLE, ColumnReader::DoubleColumnReader(r)) => {
             let mut r = get_typed_column_reader::<DoubleType>(ColumnReader::DoubleColumnReader(r));
-            read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                Ok(Value::Double(*v))
-            })?
+            read_flat_chunks(&mut r, lens, optional, &name, f64_chunk)?
         }
         (parquet::basic::Type::BYTE_ARRAY, ColumnReader::ByteArrayColumnReader(r)) => {
             let mut r =
                 get_typed_column_reader::<ByteArrayType>(ColumnReader::ByteArrayColumnReader(r));
-            read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                std::str::from_utf8(v.data())
-                    .map(|s| Value::Varchar(s.to_string()))
-                    .map_err(|_| "the bytes are not valid UTF-8".to_string())
-            })?
+            read_flat_chunks(&mut r, lens, optional, &name, varchar_chunk)?
         }
         (
             parquet::basic::Type::FIXED_LEN_BYTE_ARRAY,
@@ -931,26 +1135,40 @@ fn decode_column(
                 ColumnReader::FixedLenByteArrayColumnReader(r),
             );
             match column.ty {
-                DataType::Decimal { .. } => {
-                    read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                        Ok(Value::decimal(
-                            crate::schema_map::fixed_decimal_value(v.data()),
-                            scale,
-                        ))
-                    })?
+                DataType::Decimal { .. } => read_flat_chunks(
+                    &mut r,
+                    lens,
+                    optional,
+                    &name,
+                    |values, levels, n, column| {
+                        let mut unscaled: Vec<i128> = values
+                            .iter()
+                            .map(|v| crate::schema_map::fixed_decimal_value(v.data()))
+                            .collect();
+                        decimal_chunk(&mut unscaled, levels, n, column, precision, scale)
+                    },
+                )?,
+                DataType::Interval => {
+                    read_flat_chunks(&mut r, lens, optional, &name, interval_chunk)?
                 }
-                DataType::Interval => read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                    Ok(interval_value(v.data()))
-                })?,
                 // Parquet stores a UUID's 16 bytes in RFC 4122 order (the
                 // parquet-format UUID annotation says so), so big-endian.
-                DataType::Uuid => read_chunks(&mut r, rows, optional, column.ty, &name, |v| {
-                    let bytes: [u8; 16] = v
-                        .data()
-                        .try_into()
-                        .map_err(|_| "the UUID column is not 16 bytes wide".to_string())?;
-                    Ok(Value::Uuid(u128::from_be_bytes(bytes)))
-                })?,
+                DataType::Uuid => read_flat_chunks(
+                    &mut r,
+                    lens,
+                    optional,
+                    &name,
+                    |values, levels, n, column| {
+                        let mut uuids = Vec::with_capacity(values.len());
+                        for value in values.iter() {
+                            let bytes: [u8; 16] = value.data().try_into().map_err(|_| {
+                                decode_error(column, "the UUID column is not 16 bytes wide")
+                            })?;
+                            uuids.push(u128::from_be_bytes(bytes));
+                        }
+                        uuid_chunk(&mut uuids, levels, n, column)
+                    },
+                )?,
                 other => return Err(unsupported_decode(&name, other)),
             }
         }
@@ -969,7 +1187,7 @@ fn decode_column(
 fn read_array_column(
     row_group: &dyn RowGroupReader,
     column: &FileColumn,
-    rows: usize,
+    lens: &[usize],
 ) -> Result<Vec<Vector>> {
     let leaf = column.leaf;
     let ty = column.ty;
@@ -980,19 +1198,19 @@ fn read_array_column(
     match (column.physical, reader) {
         (parquet::basic::Type::INT32, ColumnReader::Int32ColumnReader(r)) => {
             let mut r = get_typed_column_reader::<Int32Type>(ColumnReader::Int32ColumnReader(r));
-            read_array_chunks(&mut r, rows, ty, &name, |v| Value::Integer(*v))
+            read_array_chunks(&mut r, lens, ty, &name, |v| Value::Integer(*v))
         }
         (parquet::basic::Type::INT64, ColumnReader::Int64ColumnReader(r)) => {
             let mut r = get_typed_column_reader::<Int64Type>(ColumnReader::Int64ColumnReader(r));
-            read_array_chunks(&mut r, rows, ty, &name, |v| Value::Bigint(*v))
+            read_array_chunks(&mut r, lens, ty, &name, |v| Value::Bigint(*v))
         }
         (parquet::basic::Type::FLOAT, ColumnReader::FloatColumnReader(r)) => {
             let mut r = get_typed_column_reader::<FloatType>(ColumnReader::FloatColumnReader(r));
-            read_array_chunks(&mut r, rows, ty, &name, |v| Value::Double(*v as f64))
+            read_array_chunks(&mut r, lens, ty, &name, |v| Value::Double(*v as f64))
         }
         (parquet::basic::Type::DOUBLE, ColumnReader::DoubleColumnReader(r)) => {
             let mut r = get_typed_column_reader::<DoubleType>(ColumnReader::DoubleColumnReader(r));
-            read_array_chunks(&mut r, rows, ty, &name, |v| Value::Double(*v))
+            read_array_chunks(&mut r, lens, ty, &name, |v| Value::Double(*v))
         }
         (physical, _) => Err(PinkDbError::Execution(format!(
             "column \"{name}\" has physical type {physical:?}, which is not an ARRAY element type"
@@ -1006,7 +1224,7 @@ fn read_array_column(
 /// other width is a variable-length LIST, refused rather than misread.
 fn read_array_chunks<T>(
     reader: &mut parquet::column::reader::ColumnReaderImpl<T>,
-    rows: usize,
+    lens: &[usize],
     dtype: DataType,
     column: &str,
     convert: impl Fn(&T::T) -> Value,
@@ -1018,7 +1236,8 @@ where
         unreachable!("read_array_chunks is called for ARRAY columns only")
     };
     let len = len as usize;
-    let mut out: Vec<Vector> = Vec::with_capacity(rows.div_ceil(CHUNK_SIZE));
+    let rows: usize = lens.iter().sum();
+    let mut out: Vec<Vector> = Vec::with_capacity(lens.len());
     let mut vector = Vector::with_capacity(dtype, CHUNK_SIZE.min(rows));
     let mut in_chunk = 0usize;
     let mut done = 0usize;
@@ -1029,8 +1248,8 @@ where
     // element) and `null_row` for a NULL array. A batch can end mid-row.
     let mut row: Vec<Value> = Vec::with_capacity(len);
     let mut null_row = false;
-    while done < rows {
-        let want = CHUNK_SIZE.min(rows - done) * len;
+    for &n in lens {
+        let want = n * len;
         values.clear();
         levels.clear();
         reps.clear();
@@ -1094,11 +1313,10 @@ where
             null_row = false;
             in_chunk += 1;
             done += 1;
-            if in_chunk == CHUNK_SIZE {
-                let spare = CHUNK_SIZE.min(rows - done);
+            if in_chunk == n {
                 out.push(std::mem::replace(
                     &mut vector,
-                    Vector::with_capacity(dtype, spare),
+                    Vector::with_capacity(dtype, CHUNK_SIZE),
                 ));
                 in_chunk = 0;
             }
@@ -1124,51 +1342,64 @@ fn unsupported_decode(name: &str, ty: DataType) -> PinkDbError {
 }
 
 /// The parquet INTERVAL encoding: 12 little-endian bytes, months/days/millis.
-fn interval_value(bytes: &[u8]) -> Value {
+fn interval_parts(bytes: &[u8]) -> Option<Interval> {
     if bytes.len() != 12 {
-        return Value::Null;
+        return None;
     }
     let months = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i32;
     let days = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as i32;
     let millis = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as i64;
-    Value::Interval {
+    Some(Interval {
         months,
         days,
         micros: millis * 1_000,
-    }
+    })
 }
 
-/// Read `rows` records of a flat column into chunk-sized vectors, mapping
-/// every defined value through `convert` and pushing NULLs where the
-/// definition level says absent.
-fn read_chunks<T>(
+/// A decode error about `column`; `why` is the bare reason.
+fn decode_error(column: &str, why: impl std::fmt::Display) -> PinkDbError {
+    PinkDbError::Execution(format!("column \"{column}\": {why}"))
+}
+
+/// Read `rows` records of a flat column into chunk-sized engine vectors: one
+/// typed batch per chunk, and `finish` turns the batch's decoded values (in row
+/// order), its definition levels and its row count into the vector.
+///
+/// This is the decoder's hot path, so no [`Value`] is built and no cell is
+/// pushed one at a time: parquet's buffers land in the `VectorData` payload
+/// directly, which also lets a VARCHAR chunk be copied into a `StrVec` without
+/// a `String` per cell. A chunk is gathered across page boundaries (parquet's
+/// `read_records` appends to its buffers), the way DuckDB's parquet reader
+/// decodes a whole batch into one column vector
+/// (duckdb/extension/parquet/column_reader.cpp, `ColumnReader::Read`).
+fn read_flat_chunks<T>(
     reader: &mut parquet::column::reader::ColumnReaderImpl<T>,
-    rows: usize,
+    lens: &[usize],
     optional: bool,
-    dtype: DataType,
     column: &str,
-    convert: impl Fn(&T::T) -> std::result::Result<Value, String>,
+    mut finish: impl FnMut(&mut Vec<T::T>, &[i16], usize, &str) -> Result<Vector>,
 ) -> Result<Vec<Vector>>
 where
     T: parquet::data_type::DataType,
 {
-    let mut out = Vec::with_capacity(rows.div_ceil(CHUNK_SIZE));
+    let rows: usize = lens.iter().sum();
+    let mut out = Vec::with_capacity(lens.len());
     let mut done = 0usize;
     let mut values: Vec<T::T> = Vec::new();
     let mut levels: Vec<i16> = Vec::new();
-    while done < rows {
-        let n = CHUNK_SIZE.min(rows - done);
-        let mut vector = Vector::with_capacity(dtype, n);
+    for &n in lens {
+        values.clear();
+        levels.clear();
         let mut filled = 0usize;
         while filled < n {
-            values.clear();
-            levels.clear();
+            let want = n - filled;
+            // A REQUIRED column has no definition levels to collect.
+            let levels_out = if optional { Some(&mut levels) } else { None };
             let read = reader
-                .read_records(n - filled, Some(&mut levels), None, &mut values)
+                .read_records(want, levels_out, None, &mut values)
                 .map_err(|e| {
                     PinkDbError::Execution(format!(
-                        "cannot decode column \"{column}\" ({} more rows): {e}",
-                        n - filled
+                        "cannot decode column \"{column}\" ({want} more rows): {e}"
                     ))
                 })?;
             let records = read.0;
@@ -1178,51 +1409,466 @@ where
                     done + filled
                 )));
             }
-            // `levels` holds one entry per record for a nullable column; an
-            // absent record (`level < 1`) has no value in `values`.
-            let mut next = 0usize;
-            for record in 0..records {
-                if optional {
-                    let level = levels.get(record).copied().unwrap_or(0);
-                    if level >= 1 {
-                        let Some(value) = values.get(next) else {
-                            return Err(PinkDbError::Execution(format!(
-                                "column \"{column}\": a definition level has no value"
-                            )));
-                        };
-                        next += 1;
-                        push_entry(&mut vector, convert(value), column)?;
-                    } else {
-                        vector.push_null()?;
-                    }
-                } else {
-                    match values.get(next) {
-                        Some(value) => {
-                            next += 1;
-                            push_entry(&mut vector, convert(value), column)?;
-                        }
-                        None => {
-                            return Err(PinkDbError::Execution(format!(
-                                "column \"{column}\": a REQUIRED record has no value"
-                            )));
-                        }
-                    }
-                }
-            }
             filled += records;
         }
-        out.push(vector);
+        out.push(finish(&mut values, &levels, n, column)?);
         done += n;
     }
     Ok(out)
 }
 
-fn push_entry(
-    out: &mut Vector,
-    value: std::result::Result<Value, String>,
+/// Whether each of a chunk's `n` rows has a value, from its definition levels
+/// (empty for a REQUIRED column).
+fn present_rows(levels: &[i16], n: usize, column: &str) -> Result<Vec<bool>> {
+    if levels.is_empty() {
+        return Ok(vec![true; n]);
+    }
+    if levels.len() < n {
+        return Err(PinkDbError::Execution(format!(
+            "column \"{column}\" ended after {} of {n} rows",
+            levels.len()
+        )));
+    }
+    Ok(levels[..n].iter().map(|&level| level >= 1).collect())
+}
+
+/// One chunk of a flat column as a payload in row order, with `fill` in the
+/// NULL rows: `Vector::from_raw` takes the length from the payload, so a NULL
+/// row still needs an element.
+fn flat_chunk<T: Copy>(
+    present: &mut Vec<T>,
+    levels: &[i16],
+    n: usize,
     column: &str,
-) -> Result<()> {
-    let value =
-        value.map_err(|why| PinkDbError::Execution(format!("column \"{column}\": {why}")))?;
-    out.push_value(value)
+    fill: T,
+) -> Result<(Vec<T>, Vec<u64>)> {
+    let has = present_rows(levels, n, column)?;
+    if has.iter().all(|&has_value| has_value) {
+        if present.len() != n {
+            return Err(decode_error(column, "a definition level has no value"));
+        }
+        return Ok((std::mem::take(present), vec![u64::MAX; n.div_ceil(64)]));
+    }
+    let mut values = Vec::with_capacity(n);
+    let mut validity = vec![u64::MAX; n.div_ceil(64)];
+    let mut next = 0usize;
+    for (row, &has_value) in has.iter().enumerate() {
+        if !has_value {
+            values.push(fill);
+            validity[row / 64] &= !(1u64 << (row % 64));
+            continue;
+        }
+        let Some(value) = present.get(next) else {
+            return Err(decode_error(column, "a definition level has no value"));
+        };
+        values.push(*value);
+        next += 1;
+    }
+    Ok((values, validity))
+}
+
+fn bool_chunk(values: &mut Vec<bool>, levels: &[i16], n: usize, column: &str) -> Result<Vector> {
+    let (values, validity) = flat_chunk(values, levels, n, column, false)?;
+    Ok(Vector::from_raw(VectorData::Boolean(values), validity))
+}
+
+fn int32_chunk(values: &mut Vec<i32>, levels: &[i16], n: usize, column: &str) -> Result<Vector> {
+    let (values, validity) = flat_chunk(values, levels, n, column, 0)?;
+    Ok(Vector::from_raw(VectorData::Int32(values), validity))
+}
+
+fn date_chunk(values: &mut Vec<i32>, levels: &[i16], n: usize, column: &str) -> Result<Vector> {
+    let (values, validity) = flat_chunk(values, levels, n, column, 0)?;
+    Ok(Vector::from_raw(VectorData::Date32(values), validity))
+}
+
+fn int64_chunk(values: &mut Vec<i64>, levels: &[i16], n: usize, column: &str) -> Result<Vector> {
+    let (values, validity) = flat_chunk(values, levels, n, column, 0)?;
+    Ok(Vector::from_raw(VectorData::Int64(values), validity))
+}
+
+fn timestamp_chunk(
+    values: &mut Vec<i64>,
+    levels: &[i16],
+    n: usize,
+    column: &str,
+) -> Result<Vector> {
+    let (values, validity) = flat_chunk(values, levels, n, column, 0)?;
+    Ok(Vector::from_raw(
+        VectorData::TimestampMicros(values),
+        validity,
+    ))
+}
+
+fn f64_chunk(values: &mut Vec<f64>, levels: &[i16], n: usize, column: &str) -> Result<Vector> {
+    let (values, validity) = flat_chunk(values, levels, n, column, 0.0)?;
+    Ok(Vector::from_raw(VectorData::Float64(values), validity))
+}
+
+fn uuid_chunk(values: &mut Vec<u128>, levels: &[i16], n: usize, column: &str) -> Result<Vector> {
+    let (values, validity) = flat_chunk(values, levels, n, column, 0)?;
+    Ok(Vector::from_raw(VectorData::Uuid(values), validity))
+}
+
+/// DECIMAL: the unscaled values plus the column's own precision and scale, so
+/// the vector carries the declared `DECIMAL(p,s)`.
+fn decimal_chunk(
+    values: &mut Vec<i128>,
+    levels: &[i16],
+    n: usize,
+    column: &str,
+    precision: u8,
+    scale: u8,
+) -> Result<Vector> {
+    let (values, validity) = flat_chunk(values, levels, n, column, 0)?;
+    Ok(Vector::from_raw(
+        VectorData::Decimal {
+            values,
+            precision,
+            scale,
+        },
+        validity,
+    ))
+}
+
+// Every column of a row group is finished by the same callback, which hands
+// out the decoder's buffer by `&mut Vec` (`flat_chunk` takes it over); this
+// one only reads it.
+#[allow(clippy::ptr_arg)]
+fn varchar_chunk(
+    values: &mut Vec<ByteArray>,
+    levels: &[i16],
+    n: usize,
+    column: &str,
+) -> Result<Vector> {
+    let has = present_rows(levels, n, column)?;
+    let mut strings = StrVec::with_capacity(n);
+    let mut validity = vec![u64::MAX; n.div_ceil(64)];
+    let mut next = 0usize;
+    for (row, &has_value) in has.iter().enumerate() {
+        if !has_value {
+            // Any payload does for a NULL row; the validity bit decides it.
+            strings.push("");
+            validity[row / 64] &= !(1u64 << (row % 64));
+            continue;
+        }
+        let Some(value) = values.get(next) else {
+            return Err(decode_error(column, "a definition level has no value"));
+        };
+        next += 1;
+        strings.push(
+            std::str::from_utf8(value.data())
+                .map_err(|_| decode_error(column, "the bytes are not valid UTF-8"))?,
+        );
+    }
+    Ok(Vector::from_raw(VectorData::VarChar(strings), validity))
+}
+
+#[allow(clippy::ptr_arg)]
+fn interval_chunk(
+    values: &mut Vec<FixedLenByteArray>,
+    levels: &[i16],
+    n: usize,
+    column: &str,
+) -> Result<Vector> {
+    let has = present_rows(levels, n, column)?;
+    let mut intervals = Vec::with_capacity(n);
+    let mut validity = vec![u64::MAX; n.div_ceil(64)];
+    let mut next = 0usize;
+    for (row, &has_value) in has.iter().enumerate() {
+        let mut interval = None;
+        if has_value {
+            let Some(value) = values.get(next) else {
+                return Err(decode_error(column, "a definition level has no value"));
+            };
+            next += 1;
+            interval = interval_parts(value.data());
+        }
+        // Bytes that are not 12 wide hold no interval: the row is NULL.
+        match interval {
+            Some(interval) => intervals.push(interval),
+            None => {
+                intervals.push(Interval::default());
+                validity[row / 64] &= !(1u64 << (row % 64));
+            }
+        }
+    }
+    Ok(Vector::from_raw(VectorData::Interval(intervals), validity))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolve::Options;
+    use parquet::basic::{Compression, Repetition};
+    use parquet::file::properties::WriterProperties;
+    use parquet::file::writer::SerializedFileWriter;
+    use parquet::schema::types::Type as SchemaType;
+    use pinkdb::DataTable;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pinkdb_parquet_scan_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn chunk_lens_fills_vectors_and_keeps_the_file_aligned() {
+        // A row group that starts mid-chunk emits a short first piece; every
+        // later piece is full, so the next row group starts aligned again.
+        let lens = chunk_lens(5000, 1000);
+        assert_eq!(lens[0], CHUNK_SIZE - 1000);
+        assert_eq!(&lens[1..], &[CHUNK_SIZE, 1904]);
+        assert_eq!(lens.iter().sum::<usize>(), 5000);
+        // Aligned starts keep the start aligned, and a ragged tail is last.
+        assert_eq!(chunk_lens(3000, 0), vec![CHUNK_SIZE, 952]);
+        assert_eq!(chunk_lens(0, 7), Vec::<usize>::new());
+        for (rows, offset) in [(1, 0), (2048, 0), (2049, 5), (9000, 2047), (77, 3)] {
+            let lens = chunk_lens(rows, offset);
+            assert_eq!(lens.iter().sum::<usize>(), rows);
+            assert!(lens.iter().all(|&n| n > 0 && n <= CHUNK_SIZE));
+            // Only the first piece of a row group may be short: it ends on the
+            // boundary the previous row group left open.
+            let mut at = offset;
+            for (i, &n) in lens.iter().enumerate() {
+                if i > 0 {
+                    assert!(
+                        at.is_multiple_of(CHUNK_SIZE),
+                        "chunk {i} of {rows} rows at {offset}"
+                    );
+                }
+                at += n;
+            }
+        }
+    }
+
+    /// Every row of the file behind `resolved`, read either on the pool or on
+    /// one thread, with the row counts of the chunks that mode emitted.
+    fn read(resolved: &Resolved, serial: bool) -> (Vec<Vec<Value>>, Vec<usize>) {
+        let output = if serial {
+            scan_serial(resolved, None, &[]).expect("serial scan")
+        } else {
+            scan(resolved, None, &[]).expect("parallel scan").0
+        };
+        let mut rows = Vec::new();
+        let mut lens = Vec::new();
+        for chunk in &output.chunks {
+            lens.push(chunk.num_rows);
+            for r in 0..chunk.num_rows {
+                rows.push(
+                    (0..chunk.columns.len())
+                        .map(|c| chunk.columns[c].get(r))
+                        .collect(),
+                );
+            }
+        }
+        (rows, lens)
+    }
+
+    /// Read `path` both ways: identical rows in identical order and identical
+    /// chunks, and every chunk starts on a `CHUNK_SIZE` boundary or at a row
+    /// group's first row (which is where the alignment of the previous group's
+    /// ragged tail was picked up).
+    fn assert_both_modes_agree(path: &Path) {
+        let resolved = crate::resolve::resolve(&path.display().to_string(), &Options::default())
+            .expect("resolve");
+        assert_eq!(resolved.files.len(), 1, "one file per fixture");
+        let mut group_starts = Vec::new();
+        let mut at = 0usize;
+        for rg in &resolved.files[0].meta.row_groups {
+            group_starts.push(at);
+            at += rg.rows as usize;
+        }
+        let (parallel, parallel_lens) = read(&resolved, false);
+        let (serial, serial_lens) = read(&resolved, true);
+        assert_eq!(parallel_lens, serial_lens, "chunk row counts");
+        let mut start = 0usize;
+        for &n in &parallel_lens {
+            assert!(
+                start.is_multiple_of(CHUNK_SIZE) || group_starts.contains(&start),
+                "chunk at row {start} starts neither on a boundary nor at a row group: \
+                 {parallel_lens:?}"
+            );
+            start += n;
+        }
+        assert_eq!(start, parallel.len(), "chunk rows sum to the file");
+        assert_eq!(parallel.len(), serial.len(), "row count");
+        for (r, (want, got)) in serial.iter().zip(&parallel).enumerate() {
+            assert_eq!(got, want, "row {r}");
+        }
+    }
+
+    /// A three-column file (`i` nullable INT32, `s` dictionary BYTE_ARRAY,
+    /// `b` RLE BOOLEAN) laid out in row groups of the given sizes.
+    fn write_groups(path: &Path, groups: &[usize]) {
+        let optional = |name: &str, physical| {
+            Arc::new(
+                SchemaType::primitive_type_builder(name, physical)
+                    .with_repetition(Repetition::OPTIONAL)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let schema = Arc::new(
+            SchemaType::group_type_builder("pinkdb_schema")
+                .with_fields(vec![
+                    optional("i", parquet::basic::Type::INT32),
+                    optional("s", parquet::basic::Type::BYTE_ARRAY),
+                    optional("b", parquet::basic::Type::BOOLEAN),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build(),
+        );
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = SerializedFileWriter::new(file, schema, props).unwrap();
+        let mut written = 0usize;
+        for &rows in groups {
+            let window = written..written + rows;
+            let levels = |step: usize| -> Vec<i16> {
+                window
+                    .clone()
+                    .map(|r| if r % step == 0 { 0 } else { 1 })
+                    .collect()
+            };
+            let mut group = writer.next_row_group().unwrap();
+            let mut column = group.next_column().unwrap().unwrap();
+            let values: Vec<i32> = window
+                .clone()
+                .filter(|r| r % 5 != 0)
+                .map(|r| r as i32)
+                .collect();
+            column
+                .typed::<Int32Type>()
+                .write_batch(&values, Some(&levels(5)), None)
+                .unwrap();
+            column.close().unwrap();
+            let mut column = group.next_column().unwrap().unwrap();
+            let values: Vec<ByteArray> = window
+                .clone()
+                .filter(|r| r % 7 != 0)
+                .map(|r| ByteArray::from(["a", "bb", "ccc"][r % 3].as_bytes()))
+                .collect();
+            column
+                .typed::<ByteArrayType>()
+                .write_batch(&values, Some(&levels(7)), None)
+                .unwrap();
+            column.close().unwrap();
+            let mut column = group.next_column().unwrap().unwrap();
+            let values: Vec<bool> = window
+                .clone()
+                .filter(|r| r % 11 != 0)
+                .map(|r| r % 3 == 0)
+                .collect();
+            column
+                .typed::<BoolType>()
+                .write_batch(&values, Some(&levels(11)), None)
+                .unwrap();
+            column.close().unwrap();
+            group.close().unwrap();
+            written += rows;
+        }
+        writer.close().unwrap();
+    }
+
+    /// Row groups of different sizes chunk into one aligned stream, and both
+    /// decode modes return the same rows in the same order.
+    #[test]
+    fn row_groups_of_different_sizes_read_the_same_in_both_modes() {
+        let groups = [1usize, 2047, 3000, 5, 2048, 977, 922];
+        assert_eq!(groups.iter().sum::<usize>(), 9000);
+        let dir = scratch("groups");
+        let path = dir.join("groups.parquet");
+        write_groups(&path, &groups);
+        assert_both_modes_agree(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every engine type the decoder builds from a payload (BOOLEAN, integers,
+    /// DOUBLE, dictionary VARCHAR, DATE, TIMESTAMP, DECIMAL at both widths,
+    /// NULLs throughout) reads the same on the pool and on one thread.
+    #[test]
+    fn every_engine_type_reads_the_same_in_both_modes() {
+        let schema: Vec<(String, DataType)> = [
+            ("b", DataType::Boolean),
+            ("i", DataType::Integer),
+            ("g", DataType::Bigint),
+            ("d", DataType::Double),
+            ("s", DataType::Varchar),
+            ("dt", DataType::Date),
+            ("ts", DataType::Timestamp),
+            (
+                "dc9",
+                DataType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                },
+            ),
+            (
+                "dc38",
+                DataType::Decimal {
+                    precision: 38,
+                    scale: 6,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty))
+        .collect();
+        let mut table = DataTable::new("all_types".to_string(), schema).expect("table");
+        for r in 0..3000usize {
+            table
+                .append_row(vec![
+                    if r % 5 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Boolean(r % 3 == 0)
+                    },
+                    Value::Integer(r as i32 - 1500),
+                    if r % 7 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Bigint(-3 * r as i64)
+                    },
+                    if r % 9 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Double(r as f64 / 7.0)
+                    },
+                    if r % 4 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Varchar(format!("v{r}-{}", "x".repeat(r % 20)))
+                    },
+                    Value::Date(19_000 + r as i32 % 400),
+                    Value::Timestamp(1_700_000_000_000_000 + r as i64),
+                    Value::decimal(r as i128 % 9000 - 4500, 2),
+                    Value::Decimal {
+                        value: 10i128.pow(30) + r as i128,
+                        precision: 38,
+                        scale: 6,
+                    },
+                ])
+                .unwrap();
+        }
+        let bytes = crate::write::write_table(&table).expect("write");
+        let dir = scratch("types");
+        let path = dir.join("types.parquet");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_both_modes_agree(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

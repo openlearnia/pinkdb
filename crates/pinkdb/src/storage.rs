@@ -524,27 +524,40 @@ impl DataTable {
             .unwrap_or(&EMPTY)
     }
 
-    /// Recompute one column's table-level aggregates from its zone maps: the
-    /// exact repair after a mutation touched the chunk a bound came from.
-    /// Per-column `(zone, folded sketch)` for one appended batch. Bulk
-    /// ingestion is the write hot path and its columns are independent, so the
-    /// min/max/NULL pass and the sketch's hashing run on the worker pool; the
-    /// sketch is cloned per column and installed by the caller, which keeps
-    /// the fold free of mutable table access. Small batches stay serial
-    /// (the pool costs more than a few thousand cells).
-    fn fold_chunk_stats(&self, chunk: &[std::sync::Arc<Vector>]) -> Vec<(Zone, Option<Hll>)> {
+    /// Per-column `(zone of the first `split` rows, zone of the rest, folded
+    /// sketch)` for one appended batch. Bulk ingestion is the write hot path
+    /// and its columns are independent, so the min/max/NULL pass and the
+    /// sketch's hashing run on the worker pool; the sketch is cloned per
+    /// column and installed by the caller, which keeps the fold free of
+    /// mutable table access. Small batches stay serial (the pool costs more
+    /// than a few thousand cells).
+    ///
+    /// The split exists for the copy path: a batch that starts behind a
+    /// partial tail lands in two chunks, and merging each part's own zone into
+    /// the chunk it landed in keeps the chunk maps exact without re-deriving a
+    /// full chunk from its data.
+    fn fold_chunk_stats(
+        &self,
+        chunk: &[std::sync::Arc<Vector>],
+        split: usize,
+    ) -> Vec<(Zone, Zone, Option<Hll>)> {
         use rayon::prelude::*;
         let cells = chunk.first().map(|c| c.len()).unwrap_or(0) * chunk.len();
-        let fold = |ci: usize, src: &Vector| -> (Zone, Option<Hll>) {
-            let zone = Zone::of_vector(src);
+        let fold = |ci: usize, src: &Vector| -> (Zone, Zone, Option<Hll>) {
+            let rows = src.len();
+            let split = split.min(rows);
+            let zone = Zone::of_vector_range(src, 0, split);
+            let rest = if split < rows {
+                Zone::of_vector_range(src, split, rows - split)
+            } else {
+                Zone::empty()
+            };
             let hll = self.stats.cols[ci].hll.as_ref().map(|hll| {
                 let mut hll = (**hll).clone();
-                for row in 0..src.len() {
-                    hll.insert_cell(src, row);
-                }
+                hll.fold_vector(src);
                 hll
             });
-            (zone, hll)
+            (zone, rest, hll)
         };
         if cells >= 4096 {
             chunk
@@ -561,6 +574,8 @@ impl DataTable {
         }
     }
 
+    /// Recompute one column's table-level aggregates from its zone maps: the
+    /// exact repair after a mutation touched the chunk a bound came from.
     fn rebuild_column_stats(&mut self, col: usize) {
         let mut st = ColStats {
             null_count: 0,
@@ -1193,7 +1208,8 @@ impl DataTable {
                 }
             }
             if track_stats {
-                for (ci, (zone, hll)) in self.fold_chunk_stats(chunk).into_iter().enumerate() {
+                let folded = self.fold_chunk_stats(chunk, rows);
+                for (ci, (zone, _, hll)) in folded.into_iter().enumerate() {
                     self.stats.cols[ci].absorb_zone(&zone);
                     self.stats.cols[ci].set_sketch(hll.map(std::sync::Arc::new));
                     if replacing {
@@ -1212,6 +1228,7 @@ impl DataTable {
         // Partial tail: merge, splitting at chunk boundaries as needed.
         let first_chunk = self.columns[0].chunks.len().saturating_sub(1);
         let mut offset = 0;
+        let mut split = rows;
         while offset < rows {
             let tail_full = self.columns[0]
                 .chunks
@@ -1237,23 +1254,25 @@ impl DataTable {
                 Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
                     .extend_from(src, offset, take);
             }
+            if offset == 0 {
+                split = take;
+            }
             offset += take;
             self.num_rows += take;
         }
         self.stats.rows += rows as u64;
         if track_stats {
-            // Only the touched chunks are re-derived, and only their appended
-            // source rows are hashed (folded from the whole chunk instead
-            // would count the existing rows twice).
-            for (ci, src) in chunk.iter().enumerate() {
-                for c in first_chunk..self.columns[0].chunks.len() {
-                    self.refresh_zone(ci, c, false);
-                }
-                if let Some(hll) = &mut self.stats.cols[ci].hll {
-                    let hll = Arc::make_mut(hll);
-                    for row in 0..rows {
-                        hll.insert_cell(src, row);
-                    }
+            // The batch extends the old tail and then starts a new chunk, so
+            // each part's own zone is merged into the chunk it landed in; the
+            // sketch folds the source rows once, on the worker pool.
+            let folded = self.fold_chunk_stats(chunk, split);
+            for (ci, (zone, rest, hll)) in folded.into_iter().enumerate() {
+                self.stats.cols[ci].absorb_zone(&zone);
+                self.stats.cols[ci].absorb_zone(&rest);
+                self.stats.cols[ci].set_sketch(hll.map(std::sync::Arc::new));
+                self.zones[ci][first_chunk].merge(&zone);
+                if split < rows {
+                    self.zones[ci][first_chunk + 1] = rest;
                 }
             }
         }
@@ -5322,5 +5341,77 @@ mod tests {
         assert!(db.rbac().allowed("alice", &table_grant, Privilege::Select));
         db.drop_schema(&s, false, true).unwrap();
         assert!(!db.rbac().allowed("alice", &table_grant, Privilege::Select));
+    }
+
+    /// Row statistics (bounds, NULL counts, zone maps and the distinct sketch)
+    /// do not depend on how the rows reached the table: one row per call
+    /// (hash per value), one chunk per call (the share fast path) and 700-row
+    /// pieces (which copy into a ragged tail over several chunks) all agree.
+    #[test]
+    fn statistics_do_not_depend_on_how_rows_were_appended() {
+        fn chunk_vectors(rows: &[Vec<Value>], schema: &[(String, DataType)]) -> Vec<Vector> {
+            schema
+                .iter()
+                .enumerate()
+                .map(|(c, (_, ty))| {
+                    let mut v = Vector::with_capacity(*ty, rows.len());
+                    for row in rows {
+                        match &row[c] {
+                            Value::Null => v.push_null().unwrap(),
+                            value => v.push_valid(value.clone()).unwrap(),
+                        }
+                    }
+                    v
+                })
+                .collect()
+        }
+
+        let schema = vec![
+            ("i".to_string(), DataType::Integer),
+            ("s".to_string(), DataType::Varchar),
+            ("d".to_string(), DataType::Double),
+            ("g".to_string(), DataType::Bigint),
+        ];
+        let rows: Vec<Vec<Value>> = (0..5000usize)
+            .map(|r| {
+                vec![
+                    if r % 11 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Integer(r as i32 % 97 - 48)
+                    },
+                    if r % 13 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Varchar(format!("row-{}", r % 250))
+                    },
+                    if r % 17 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Double(r as f64 / 8.0)
+                    },
+                    Value::Bigint(if r % 3 == 0 { -1 } else { r as i64 }),
+                ]
+            })
+            .collect();
+        let build = |name: &str| DataTable::new(name.to_string(), schema.clone()).unwrap();
+        let mut per_row = build("per_row");
+        for row in &rows {
+            per_row.append_row(row.clone()).unwrap();
+        }
+        let mut whole = build("whole");
+        for part in rows.chunks(CHUNK_SIZE) {
+            whole.append_chunk(chunk_vectors(part, &schema)).unwrap();
+        }
+        let mut pieces = build("pieces");
+        for part in rows.chunks(700) {
+            pieces.append_chunk(chunk_vectors(part, &schema)).unwrap();
+        }
+        assert_eq!(whole.num_rows, rows.len());
+        assert_eq!(pieces.num_rows, rows.len());
+        for table in [&whole, &pieces] {
+            assert_eq!(table.stats, per_row.stats, "table statistics");
+            assert_eq!(table.zones, per_row.zones, "zone maps");
+        }
     }
 }
