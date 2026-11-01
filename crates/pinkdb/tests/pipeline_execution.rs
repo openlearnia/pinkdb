@@ -1,4 +1,4 @@
-//! Wave 135a: the pipeline executor answers exactly like the materialized
+//! Wave 135a/135c: the pipeline executor answers exactly like the materialized
 //! path.
 //!
 //! `Aggregate`-rooted plans flow through `exec::pipeline` when their input is
@@ -92,7 +92,8 @@ fn mart() -> PinkDb {
          CREATE TABLE dim_b (k INTEGER, label VARCHAR, size INTEGER);
          CREATE TABLE dim_c (k INTEGER, tier VARCHAR);
          CREATE TABLE dim_wide (k INTEGER, w INTEGER);
-         CREATE TABLE dim_empty (k INTEGER, z INTEGER);",
+         CREATE TABLE dim_empty (k INTEGER, z INTEGER);
+         CREATE TABLE dim_null (k INTEGER, tag VARCHAR);",
     )
     .unwrap();
     let fact: Vec<String> = (0..FACT_ROWS).map(fact_row).collect();
@@ -119,6 +120,10 @@ fn mart() -> PinkDb {
         .unwrap();
     let wide: Vec<String> = (0..5000).map(|w| format!("(1, {w})")).collect();
     db.execute(&format!("INSERT INTO dim_wide VALUES {};", wide.join(",")))
+        .unwrap();
+    // A build side with a NULL key: `NOT IN` over it answers unknown for every
+    // preserved row, whatever the probe key.
+    db.execute("INSERT INTO dim_null VALUES (NULL, 'n'), (5, 'a'), (5, 'b');")
         .unwrap();
     db
 }
@@ -351,4 +356,213 @@ fn explain_text_ignores_the_pipeline() {
         assert!(text.contains("Join"), "{text}");
         assert!(!text.to_lowercase().contains("pipeline"), "{text}");
     }
+}
+
+/// Wave 135c: chains the materialized path evaluates node by node, collected by
+/// a parent that wants a materialized result — the statement root, a sort with a
+/// top-N, `DISTINCT`, a CTE read twice, and a left join over a join chain.
+const COLLECT_SHAPES: &[&str] = &[
+    // The statement root: a projection over a join chain, no ORDER BY, so the
+    // collect sink's chunk order has to be the materialized path's.
+    "SELECT f.k_b, a.region, f.qty FROM fact f JOIN dim_a a ON f.k_a = a.k
+     WHERE f.qty = 999;",
+    // Sort + top-N above the chain.
+    "SELECT f.k_b, a.region, f.qty FROM fact f JOIN dim_a a ON f.k_a = a.k
+     ORDER BY f.qty DESC, f.k_b LIMIT 20 OFFSET 5;",
+    // DISTINCT over a two-join chain.
+    "SELECT DISTINCT a.region, b.size FROM fact f JOIN dim_b b ON f.k_b = b.k
+     JOIN dim_a a ON f.k_a = a.k ORDER BY 1, 2;",
+    // A CTE read twice: the shared subtree is both probes' source.
+    "WITH j AS (SELECT f.k_a, f.qty FROM fact f JOIN dim_b b ON f.k_b = b.k
+                WHERE f.qty > 990)
+     SELECT COUNT(*) FROM j x JOIN j y ON x.k_a = y.k_a;",
+    // A left join over the chain, unmatched rows NULL-extended.
+    "SELECT f.k_b, a.region, c.tier FROM fact f JOIN dim_a a ON f.k_a = a.k
+     LEFT JOIN dim_c c ON a.k % 50 = c.k ORDER BY f.k_b, f.qty DESC LIMIT 40;",
+    // Empty build side under a root projection.
+    "SELECT f.k_a, e.z FROM fact f LEFT JOIN dim_empty e ON f.k_b = e.k;",
+];
+
+/// Wave 135c: every probe kind the materialized `hash_join` streams — semi,
+/// anti, mark, left and right — with residuals, NULL keys and empty build
+/// sides.
+const PROBE_SHAPES: &[&str] = &[
+    // Semi and anti with a residual: the match must also pass a predicate over
+    // the pair.
+    "SELECT COUNT(*), SUM(f.qty) FROM fact f
+     WHERE EXISTS (SELECT 1 FROM dim_b b WHERE b.k = f.k_b AND b.size > f.qty);",
+    "SELECT COUNT(*), SUM(f.qty) FROM fact f
+     WHERE NOT EXISTS (SELECT 1 FROM dim_b b WHERE b.k = f.k_b AND b.size > f.qty);",
+    // IN / NOT IN: NULLs on the probe side (`k_b` every 53rd row) answer
+    // unknown, so `NOT IN` drops them.
+    "SELECT COUNT(*), SUM(f.qty) FROM fact f WHERE f.k_b IN (SELECT k FROM dim_b);",
+    "SELECT COUNT(*) FROM fact f WHERE f.k_b NOT IN (SELECT k FROM dim_b);",
+    // NOT IN with a NULL on the build side: unknown for every row.
+    "SELECT COUNT(*) FROM fact f WHERE f.k_b NOT IN (SELECT k FROM dim_null);",
+    "SELECT COUNT(*) FROM fact f
+     WHERE f.k_b NOT IN (SELECT k FROM dim_null WHERE k IS NOT NULL);",
+    // Left joins: unmatched rows, NULL keys, and an empty build side.
+    "SELECT COUNT(*), COUNT(b.label), SUM(b.size)
+     FROM fact f LEFT JOIN dim_b b ON f.k_b = b.k;",
+    "SELECT f.k_a, c.tier FROM fact f LEFT JOIN dim_c c ON f.k_a = c.k
+     ORDER BY f.k_a, c.tier LIMIT 30;",
+    "SELECT COUNT(*), COUNT(e.z) FROM fact f LEFT JOIN dim_empty e ON f.k_b = e.k;",
+    // Right join: the preserved side is the right one, so the probe builds
+    // left.
+    "SELECT COUNT(*), COUNT(f.qty) FROM fact f RIGHT JOIN dim_b b ON f.k_b = b.k;",
+    // Semi / anti over an empty build side.
+    "SELECT COUNT(*) FROM fact f WHERE f.k_b IN (SELECT k FROM dim_empty);",
+    "SELECT COUNT(*) FROM fact f WHERE f.k_b NOT IN (SELECT k FROM dim_empty);",
+    // A probe fanning out past CHUNK_SIZE, as a left join and as a semi.
+    "SELECT COUNT(*), SUM(d.w) FROM fact f LEFT JOIN dim_wide d ON f.k_b = d.k;",
+    "SELECT COUNT(*) FROM fact f WHERE f.k_b IN (SELECT k FROM dim_wide);",
+    // One chain mixing kinds: inner, left and semi, under an aggregate and as
+    // the root.
+    "SELECT a.region, COUNT(*) FROM fact f JOIN dim_a a ON f.k_a = a.k
+     LEFT JOIN dim_c c ON a.k % 50 = c.k
+     WHERE EXISTS (SELECT 1 FROM dim_b b WHERE b.k = f.k_b) GROUP BY a.region;",
+    "SELECT f.k_a, a.region, c.tier FROM fact f JOIN dim_a a ON f.k_a = a.k
+     LEFT JOIN dim_c c ON a.k % 50 = c.k
+     WHERE EXISTS (SELECT 1 FROM dim_b b WHERE b.k = f.k_b)
+     ORDER BY f.k_a, c.tier LIMIT 25;",
+];
+
+fn check_wave_135c(db: &mut PinkDb) {
+    for sql in COLLECT_SHAPES.iter().chain(PROBE_SHAPES) {
+        both_paths(db, sql);
+    }
+    // Pinned counts: 600 keys x 2 rows, every NULL `k_b` and every key past
+    // the dimension's range unmatched.
+    let matched = (0..FACT_ROWS)
+        .filter(|i| i % 53 != 0 && i % (DIM_B_KEYS + 50) < DIM_B_KEYS)
+        .count() as i64;
+    assert_eq!(
+        both_paths(
+            db,
+            "SELECT COUNT(*), COUNT(b.label) FROM fact f LEFT JOIN dim_b b ON f.k_b = b.k;"
+        ),
+        vec![format!("{FACT_ROWS}|{matched}")]
+    );
+    // A build-side NULL makes every `NOT IN` unknown.
+    assert_eq!(
+        both_paths(
+            db,
+            "SELECT COUNT(*) FROM fact f WHERE f.k_b NOT IN (SELECT k FROM dim_null);"
+        ),
+        vec!["0".to_string()]
+    );
+    assert_eq!(
+        both_paths(
+            db,
+            "SELECT COUNT(*) FROM fact f LEFT JOIN dim_empty e ON f.k_b = e.k;"
+        ),
+        vec![format!("{FACT_ROWS}")]
+    );
+}
+
+#[test]
+fn pipeline_covers_collect_roots_and_every_probe_kind() {
+    for threads in [1, 8] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| check_wave_135c(&mut mart()));
+    }
+}
+
+/// An error raised by a row the collect-rooted projection evaluates fails the
+/// statement, and only where the row is reached.
+#[test]
+fn collect_error_in_a_late_morsel_fails_the_statement() {
+    let mut db = PinkDb::new();
+    db.execute(
+        "CREATE TABLE fact (k INTEGER, q INTEGER);
+         CREATE TABLE dim (k INTEGER);
+         INSERT INTO dim VALUES (1);",
+    )
+    .unwrap();
+    let mut insert = String::from("INSERT INTO fact VALUES (1, 1)");
+    for _ in 1..FACT_ROWS {
+        insert.push_str(", (1, 1)");
+    }
+    insert.push_str(", (1, 0);");
+    db.execute(&insert).unwrap();
+    // The projection above the join divides by zero on the last row: both
+    // paths raise it.
+    let sql = "SELECT 10 / f.q FROM fact f JOIN dim d ON f.k = d.k;";
+    for pipeline_execution in ["true", "false"] {
+        db.execute(&format!("SET pipeline_execution = {pipeline_execution};"))
+            .unwrap();
+        let e = db
+            .execute(sql)
+            .expect_err("a matched row with q = 0 must divide by zero")
+            .to_string();
+        assert!(e.contains("division by zero"), "{e}");
+    }
+    // A zero row no match reaches is never evaluated.
+    let mut db = PinkDb::new();
+    db.execute(
+        "CREATE TABLE fact (k INTEGER, q INTEGER);
+         CREATE TABLE dim (k INTEGER);
+         INSERT INTO dim VALUES (1);
+         INSERT INTO fact VALUES (1, 2), (2, 0);",
+    )
+    .unwrap();
+    assert_eq!(
+        both_paths(
+            &mut db,
+            "SELECT 10 / f.q FROM fact f JOIN dim d ON f.k = d.k;"
+        ),
+        vec!["5".to_string()]
+    );
+}
+
+/// A deadline that expires while a collect-rooted pipeline runs fails the
+/// statement: the collect sink checks it on every chunk it folds.
+#[test]
+fn collect_deadline_expiring_inside_the_pipeline_times_out() {
+    let mut store = PinkDb::new();
+    store
+        .execute(
+            "CREATE TABLE probe_side (k INTEGER, v INTEGER);
+             CREATE TABLE build_side (k INTEGER, w INTEGER);",
+        )
+        .unwrap();
+    let probe: Vec<String> = (0..3000).map(|i| format!("({}, {i})", i % 350)).collect();
+    store
+        .execute(&format!(
+            "INSERT INTO probe_side VALUES {};",
+            probe.join(",")
+        ))
+        .unwrap();
+    let build: Vec<String> = (0..350)
+        .flat_map(|k| (0..40).map(move |w| format!("({k}, {w})")))
+        .collect();
+    store
+        .execute(&format!(
+            "INSERT INTO build_side VALUES {};",
+            build.join(",")
+        ))
+        .unwrap();
+    let db = Database::from_store(store);
+    let mut conn = db.connect();
+    // The root is the projection over the join chain: the collect sink folds
+    // 120k rows over 40-row chunks.
+    let sql = "SELECT p.v + b.w FROM probe_side p JOIN build_side b ON p.k = b.k;";
+    conn.set_exec_limits(ExecLimits {
+        statement_timeout: Some(Duration::from_millis(1)),
+        max_result_rows: None,
+        max_result_bytes: None,
+    });
+    let e = conn
+        .execute(sql)
+        .expect_err("the deadline must expire inside the collect sink")
+        .to_string();
+    assert!(e.contains("statement timeout"), "{e}");
+    conn.clear_exec_limits();
+    let pipelined = rows(&mut conn, sql);
+    conn.execute("SET pipeline_execution = false;").unwrap();
+    assert_eq!(pipelined, rows(&mut conn, sql));
+    assert_eq!(pipelined.len(), 3000 * 40);
 }

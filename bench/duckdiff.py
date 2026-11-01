@@ -362,6 +362,10 @@ QUERIES = [
     # ---- wave 58: SQL completeness (joins / set ops / DML-DDL / windows) ----
     ("multi-join", "SELECT a.x AS ax, b.x AS bx, c.x AS cx FROM jx a JOIN jy b ON a.x < b.x JOIN jz c ON b.x < c.x ORDER BY 1, 2, 3;", True, False),
     ("multi-join-left-chain", "SELECT a.x, b.z, c.w FROM jx a LEFT JOIN jy b ON a.x = b.x LEFT JOIN jz c ON b.x = c.x ORDER BY 1, 2, 3;", True, False),
+    # Wave 135c: one pipeline over a mixed probe chain — inner, left and semi
+    # as the statement root, and inner, left and anti under a projection.
+    ("pipeline-mixed-chain", "SELECT a.x, b.z, c.w FROM jx a JOIN jy b ON a.x = b.x LEFT JOIN jz c ON b.x = c.x WHERE EXISTS (SELECT 1 FROM jz e WHERE e.x = a.x) ORDER BY 1, 2, 3;", True, False),
+    ("pipeline-mixed-chain-anti", "SELECT a.x, b.z FROM jx a LEFT JOIN jy b ON a.x = b.x WHERE NOT EXISTS (SELECT 1 FROM jz e WHERE e.x = a.x) ORDER BY 1, 2;", True, False),
     ("join-composite-on", "SELECT a.x AS ax, b.x AS bx FROM jx a JOIN jy b ON a.x = b.x AND a.y = b.x * 10;", True, False),
     ("join-composite-null-keys", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.x = b.x AND a.y = b.y;", False, False),
     ("join-single-null-keys", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.x = b.x;", False, False),

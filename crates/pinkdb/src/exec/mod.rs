@@ -3481,6 +3481,16 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     // below re-checks, so a timeout observed here unwinds before any write
     // back starts.
     cx.check_deadline()?;
+    // A filter, projection or join chain is one pipeline when its parent wants
+    // a materialized result: `collect` hands back the same chunks in the same
+    // order, having evaluated each join's build side exactly once.
+    if matches!(
+        plan,
+        LogicalPlan::Filter { .. } | LogicalPlan::Project { .. } | LogicalPlan::Join { .. }
+    ) && let Some(out) = pipeline::collect(cx, plan)?
+    {
+        return Ok(out);
+    }
     match plan {
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateTableAs { .. }
@@ -6130,6 +6140,103 @@ fn semi_by_marking_left(
     Ok(parts.into_iter().flatten().collect())
 }
 
+/// A SEMI/ANTI/MARK join settled before its first preserved chunk: the match
+/// table over the build side and the NULL bookkeeping a MARK join's
+/// three-valued `[NOT] IN` answer needs, plus the emitted layout. Built once
+/// per statement, by the materialized join or by the pipeline's probe, which
+/// then share [`mark_probe_chunk`].
+struct MarkJoin<'a> {
+    kind: JoinKind,
+    ints: bool,
+    table: MatchTable,
+    commons: Vec<Option<DataType>>,
+    /// Per correlation group: rows seen, and rows whose match value was not
+    /// NULL. Only a MARK join reads them.
+    groups: std::collections::HashMap<Vec<u8>, (u32, u32)>,
+    /// The build side's row filters, which only a SEMI join may drop rows
+    /// through.
+    filters: Option<Vec<std::sync::Arc<crate::stats::JoinFilter>>>,
+    /// The residual in `preserved ++ build` space.
+    residual: Option<BoundExpr>,
+    /// The preserved side's column count.
+    preserved_cols: usize,
+    /// The build side's kept rows, which the residual gathers pairs from.
+    build: &'a [DataChunk],
+    /// The output dtypes: the preserved side's, plus the marker for MARK.
+    dtypes: Vec<DataType>,
+}
+
+impl<'a> MarkJoin<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        cx: &Cx,
+        kind: JoinKind,
+        preserved_keys: &[BoundExpr],
+        preserved_types: &[DataType],
+        build_chunks: &'a [DataChunk],
+        build_keys: &[BoundExpr],
+        filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
+        residual: Option<&BoundExpr>,
+    ) -> Result<MarkJoin<'a>> {
+        let (ints, commons) = key_encoding(preserved_keys, build_keys);
+        // A MARK join's marker is a value per preserved row, not an existence
+        // bit in the table, so its keys are never packed.
+        let (table, ints) = join_table(
+            cx,
+            build_chunks,
+            build_keys,
+            preserved_keys,
+            &commons,
+            ints,
+            kind != JoinKind::Mark,
+        )?;
+        // A packed pair has one key vector, while row filters test each key
+        // column: they only save probes, so a packed table goes without.
+        let filters = filters.filter(|_| !table.packed).map(<[_]>::to_vec);
+        let mut groups = std::collections::HashMap::new();
+        if kind == JoinKind::Mark && preserved_keys.len() > 1 {
+            let mut buf = Vec::new();
+            for chunk in build_chunks {
+                let kvs: Vec<Vector> = build_keys
+                    .iter()
+                    .zip(commons.iter())
+                    .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
+                    .collect::<Result<_>>()?;
+                for i in 0..chunk.num_rows() {
+                    if kvs[..kvs.len() - 1].iter().any(|kv| kv.is_null(i)) {
+                        continue;
+                    }
+                    buf.clear();
+                    for kv in &kvs[..kvs.len() - 1] {
+                        kv.encode_into(&mut buf, i);
+                    }
+                    let entry = groups.entry(buf.clone()).or_insert((0, 0));
+                    entry.0 += 1;
+                    if !kvs[kvs.len() - 1].is_null(i) {
+                        entry.1 += 1;
+                    }
+                }
+            }
+        }
+        let mut dtypes = preserved_types.to_vec();
+        if kind == JoinKind::Mark {
+            dtypes.push(DataType::Boolean);
+        }
+        Ok(MarkJoin {
+            kind,
+            ints,
+            table,
+            commons,
+            groups,
+            filters,
+            residual: residual.cloned(),
+            preserved_cols: preserved_types.len(),
+            build: build_chunks,
+            dtypes,
+        })
+    }
+}
+
 /// SEMI/ANTI/MARK hash join (wave 120): hash the right side on `right_keys`,
 /// probe with the left, and emit the left schema — plus the BOOLEAN marker for
 /// MARK. Semi/anti are produced by unnesting `EXISTS`/`NOT EXISTS`, mark by
@@ -6211,196 +6318,183 @@ fn hash_mark_join(
         }
         None => right,
     };
-    let (table, ints) = join_table(
+    let how = MarkJoin::new(
         cx,
+        kind,
+        left_keys,
+        left.types,
         right.chunks,
         right_keys,
-        left_keys,
-        &commons,
-        ints,
-        !mark,
+        filters,
+        residual,
     )?;
-    // A packed pair has one key vector, while row filters test each key
-    // column: they only save probes, so a packed table goes without.
-    let filters = if table.packed { None } else { filters };
-    // Per correlation group: rows seen, and rows whose match value was not
-    // NULL. Only a mark join reads them.
-    let mut groups: std::collections::HashMap<Vec<u8>, (u32, u32)> =
-        std::collections::HashMap::new();
-    if mark && left_keys.len() > 1 {
-        let mut buf = Vec::new();
-        for chunk in right.chunks {
-            let kvs: Vec<Vector> = right_keys
-                .iter()
-                .zip(commons.iter())
-                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
-                .collect::<Result<_>>()?;
-            for i in 0..chunk.num_rows() {
-                if kvs[..kvs.len() - 1].iter().any(|kv| kv.is_null(i)) {
-                    continue;
-                }
-                buf.clear();
-                for kv in &kvs[..kvs.len() - 1] {
-                    kv.encode_into(&mut buf, i);
-                }
-                let entry = groups.entry(buf.clone()).or_insert((0, 0));
-                entry.0 += 1;
-                if !kvs[kvs.len() - 1].is_null(i) {
-                    entry.1 += 1;
-                }
-            }
-        }
-    }
-
-    let mut dtypes: Vec<DataType> = left.types.to_vec();
-    if mark {
-        dtypes.push(DataType::Boolean);
-    }
-    let partitions: Vec<Vec<DataChunk>> = left
+    let parts: Vec<Vec<DataChunk>> = left
         .chunks
         .par_iter()
-        .map(|chunk| -> Result<Vec<DataChunk>> {
-            cx.check_deadline()?;
-            let kvs = table.probe_keys(cx, left_keys, chunk, &commons, ints)?;
-            let probe = ProbeChunk::new(&table, kvs);
-            let mut buf = Vec::new();
-            // A row hits only when one of its key matches survives the
-            // residual: a pair the predicate rejects is not a match, so the
-            // row answers exactly as if that right row did not exist.
-            // A residual can only arrive on a semi/anti join (see the guard above), so
-            // a row "passes" when at least one candidate pair survives it.
-            let row_pass: Option<Vec<bool>> = match residual {
-                None => None,
-                Some(residual) => {
-                    let pairs = candidate_pairs(chunk, &probe, &table, filters);
-                    let kept = residual_selection(
-                        cx,
-                        residual,
-                        &pairs,
-                        chunk,
-                        left.types.len(),
-                        right.chunks,
-                    )?;
-                    let mut pass = vec![false; chunk.num_rows()];
-                    for k in kept {
-                        pass[pairs[k as usize].0 as usize] = true;
-                    }
-                    Some(pass)
+        .map(|chunk| mark_probe_chunk(cx, &how, left_keys, chunk, None))
+        .collect::<Result<_>>()?;
+    Ok(parts.into_iter().flatten().collect())
+}
+
+/// One preserved chunk of a SEMI/ANTI/MARK join's probe — or the rows `sel`
+/// kept of it — assembled into the join's output chunks, in preserved-row
+/// order. The materialized join and the pipeline's probe both go through it, so
+/// they answer chunk for chunk.
+fn mark_probe_chunk(
+    cx: &Cx,
+    how: &MarkJoin<'_>,
+    preserved_keys: &[BoundExpr],
+    chunk: &DataChunk,
+    sel: Option<&[u32]>,
+) -> Result<Vec<DataChunk>> {
+    let (kind, ints) = (how.kind, how.ints);
+    let mark = kind == JoinKind::Mark;
+    cx.check_deadline()?;
+    let kvs = how
+        .table
+        .probe_keys(cx, preserved_keys, chunk, &how.commons, ints)?;
+    let probe = ProbeChunk::new(&how.table, kvs);
+    let mut buf = Vec::new();
+    // A row hits only when one of its key matches survives the residual: a
+    // pair the predicate rejects is not a match, so the row answers exactly as
+    // if that right row did not exist. A residual can only arrive on a
+    // semi/anti join (see the guard above), so a row "passes" when at least
+    // one candidate pair survives it.
+    let row_pass: Option<Vec<bool>> = match how.residual.as_ref() {
+        None => None,
+        Some(residual) => {
+            let pairs = candidate_pairs(chunk, &probe, &how.table, how.filters.as_deref());
+            let kept =
+                residual_selection(cx, residual, &pairs, chunk, how.preserved_cols, how.build)?;
+            let mut pass = vec![false; chunk.num_rows()];
+            for k in kept {
+                pass[pairs[k as usize].0 as usize] = true;
+            }
+            Some(pass)
+        }
+    };
+    // Left columns no consumer reads arrive as placeholders (wave 127): they
+    // are never copied, and the output carries the input's placeholder in
+    // their slot.
+    let absent: Vec<bool> = (0..how.preserved_cols)
+        .map(|c| !chunk.is_present(c))
+        .collect();
+    let assemble = |cur: Vec<Vector>, rows: usize| -> DataChunk {
+        let columns = cur
+            .into_iter()
+            .enumerate()
+            .map(|(c, v)| {
+                if absent.get(c).copied().unwrap_or(false) {
+                    std::sync::Arc::clone(&chunk.columns[c])
+                } else {
+                    std::sync::Arc::new(v)
                 }
-            };
-            // Left columns no consumer reads arrive as placeholders (wave
-            // 127): they are never copied, and the output carries the
-            // input's placeholder in their slot.
-            let absent: Vec<bool> = (0..left.types.len())
-                .map(|c| !chunk.is_present(c))
-                .collect();
-            let assemble = |cur: Vec<Vector>, rows: usize| -> DataChunk {
-                let columns = cur
-                    .into_iter()
-                    .enumerate()
-                    .map(|(c, v)| {
-                        if absent.get(c).copied().unwrap_or(false) {
-                            std::sync::Arc::clone(&chunk.columns[c])
-                        } else {
-                            std::sync::Arc::new(v)
-                        }
-                    })
-                    .collect();
-                DataChunk::projected(columns, rows)
-            };
-            let mut finished = Vec::new();
-            let mut cur: Vec<Vector> = dtypes
+            })
+            .collect();
+        DataChunk::projected(columns, rows)
+    };
+    let mut finished = Vec::new();
+    let mut cur: Vec<Vector> = how
+        .dtypes
+        .iter()
+        .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+        .collect();
+    let mut cur_rows = 0usize;
+    let mut pass = how
+        .filters
+        .as_deref()
+        .map(|f| row_filter_pass(f, &probe.kvs, chunk.num_rows()));
+    // The rows an enclosing filter kept: the rows it dropped never reached
+    // this join, so they neither match nor emit.
+    if let Some(sel) = sel {
+        let kept = pass.take().unwrap_or_else(|| vec![true; chunk.num_rows()]);
+        let mut merged = vec![false; chunk.num_rows()];
+        for &row in sel {
+            merged[row as usize] = kept[row as usize];
+        }
+        pass = Some(merged);
+    }
+    // One existence probe per row, monomorphic on the key representation: the
+    // row loop below only reads the answer.
+    let hits = match probe.keys(&how.table) {
+        Keys::Int(keys) => any_hits(&keys, &how.table, chunk.num_rows(), pass.as_deref()),
+        Keys::Str(keys) => any_hits(&keys, &how.table, chunk.num_rows(), pass.as_deref()),
+        Keys::Bytes(keys) => any_hits(&keys, &how.table, chunk.num_rows(), pass.as_deref()),
+    };
+    for i in 0..chunk.num_rows() {
+        // Build keys the bloom rejects cannot match, and a SEMI join emits
+        // nothing for them (wave 122).
+        if let Some(pass) = &pass
+            && !pass[i]
+        {
+            continue;
+        }
+        let mut hit = hits[i];
+        if let Some(pass) = &row_pass {
+            hit = hit && pass[i];
+        }
+        if !mark && hit != (kind == JoinKind::Semi) {
+            continue;
+        }
+        if cur_rows >= CHUNK_SIZE {
+            let full = assemble(std::mem::take(&mut cur), cur_rows);
+            cx.add_materialized(full.num_rows(), chunk_approx_bytes(&full))?;
+            finished.push(full);
+            cur = how
+                .dtypes
                 .iter()
                 .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
                 .collect();
-            let mut cur_rows = 0usize;
-            let pass = filters.map(|f| row_filter_pass(f, &probe.kvs, chunk.num_rows()));
-            // One existence probe per row, monomorphic on the key
-            // representation: the row loop below only reads the answer.
-            let hits = match probe.keys(&table) {
-                Keys::Int(keys) => any_hits(&keys, &table, chunk.num_rows(), pass.as_deref()),
-                Keys::Str(keys) => any_hits(&keys, &table, chunk.num_rows(), pass.as_deref()),
-                Keys::Bytes(keys) => any_hits(&keys, &table, chunk.num_rows(), pass.as_deref()),
+            cur_rows = 0;
+        }
+        for ((dst, col), skip) in cur
+            .iter_mut()
+            .take(how.preserved_cols)
+            .zip(chunk.columns.iter())
+            .zip(&absent)
+        {
+            if !*skip {
+                dst.push_from(col, i)?;
+            }
+        }
+        if mark {
+            // Three-valued IN: the correlation-key group decides the empty
+            // case first, because "x IN (no rows)" is FALSE even when x is
+            // NULL — `NOT IN` over an empty set is TRUE. Inside a group that
+            // exists, a NULL operand is unknown, a hit is TRUE, a NULL in the
+            // group's values is unknown, and anything else is FALSE.
+            let marker = if probe.kvs[..probe.kvs.len() - 1]
+                .iter()
+                .any(|kv| kv.is_null(i))
+            {
+                Some(false)
+            } else {
+                buf.clear();
+                for kv in &probe.kvs[..probe.kvs.len() - 1] {
+                    kv.encode_into(&mut buf, i);
+                }
+                match how.groups.get(&buf) {
+                    None => Some(false),
+                    Some((star, nonnull)) if probe.kvs[probe.kvs.len() - 1].is_null(i) => None,
+                    Some(_) if hit => Some(true),
+                    Some((star, nonnull)) if star > nonnull => None,
+                    Some(_) => Some(false),
+                }
             };
-            for i in 0..chunk.num_rows() {
-                // Build keys the bloom rejects cannot match, and a SEMI join
-                // emits nothing for them (wave 122).
-                if let Some(pass) = &pass
-                    && !pass[i]
-                {
-                    continue;
-                }
-                let mut hit = hits[i];
-                if let Some(pass) = &row_pass {
-                    hit = hit && pass[i];
-                }
-                if !mark && hit != (kind == JoinKind::Semi) {
-                    continue;
-                }
-                if cur_rows >= CHUNK_SIZE {
-                    let full = assemble(std::mem::take(&mut cur), cur_rows);
-                    cx.add_materialized(full.num_rows(), chunk_approx_bytes(&full))?;
-                    finished.push(full);
-                    cur = dtypes
-                        .iter()
-                        .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
-                        .collect();
-                    cur_rows = 0;
-                }
-                for ((dst, col), skip) in cur
-                    .iter_mut()
-                    .take(left.types.len())
-                    .zip(chunk.columns.iter())
-                    .zip(&absent)
-                {
-                    if !*skip {
-                        dst.push_from(col, i)?;
-                    }
-                }
-                if mark {
-                    // Three-valued IN: the correlation-key group decides the
-                    // empty case first, because "x IN (no rows)" is FALSE even
-                    // when x is NULL — `NOT IN` over an empty set is TRUE.
-                    // Inside a group that exists, a NULL operand is unknown, a
-                    // hit is TRUE, a NULL in the group's values is unknown, and
-                    // anything else is FALSE.
-                    let marker = if probe.kvs[..probe.kvs.len() - 1]
-                        .iter()
-                        .any(|kv| kv.is_null(i))
-                    {
-                        Some(false)
-                    } else {
-                        buf.clear();
-                        for kv in &probe.kvs[..probe.kvs.len() - 1] {
-                            kv.encode_into(&mut buf, i);
-                        }
-                        match groups.get(&buf) {
-                            None => Some(false),
-                            Some((star, nonnull)) if probe.kvs[probe.kvs.len() - 1].is_null(i) => {
-                                None
-                            }
-                            Some(_) if hit => Some(true),
-                            Some((star, nonnull)) if star > nonnull => None,
-                            Some(_) => Some(false),
-                        }
-                    };
-                    let dst = cur.last_mut().expect("marker column");
-                    match marker {
-                        Some(b) => dst.push_valid(Value::Boolean(b))?,
-                        None => dst.push_null()?,
-                    }
-                }
-                cur_rows += 1;
+            let dst = cur.last_mut().expect("marker column");
+            match marker {
+                Some(b) => dst.push_valid(Value::Boolean(b))?,
+                None => dst.push_null()?,
             }
-            if cur_rows > 0 {
-                let full = assemble(cur, cur_rows);
-                cx.add_materialized(full.num_rows(), chunk_approx_bytes(&full))?;
-                finished.push(full);
-            }
-            Ok(finished)
-        })
-        .collect::<Result<_>>()?;
-    Ok(partitions.into_iter().flatten().collect())
+        }
+        cur_rows += 1;
+    }
+    if cur_rows > 0 {
+        let full = assemble(cur, cur_rows);
+        cx.add_materialized(full.num_rows(), chunk_approx_bytes(&full))?;
+        finished.push(full);
+    }
+    Ok(finished)
 }
 
 /// Shared hash-join probe/assembly loop. `preserved` is the side whose rows
@@ -10832,28 +10926,32 @@ mod tests {
         );
     }
 
-    /// The fused join→aggregate path feeds only matched pairs, so it must
-    /// never fire for outer joins; the materialized path counts the
-    /// NULL-extended rows instead.
+    /// An outer join's probe NULL-extends the preserved rows no build row
+    /// matched, so it fuses like an inner one (wave 135c) and must agree with
+    /// the materialized path that counts the NULL-extended rows.
     #[test]
-    fn fusion_rejects_outer_joins() {
-        let db = pipeline_db();
-        let cx = Cx::new(&db);
+    fn fusion_covers_outer_joins() {
+        let mut db = pipeline_db();
         for sql in [
             "SELECT COUNT(*) FROM fa LEFT JOIN fb ON fa.id = fb.id;",
             "SELECT fa.region, COUNT(*), SUM(fb.total) FROM fa LEFT JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
             "SELECT COUNT(*) FROM fa RIGHT JOIN fb ON fa.id = fb.id;",
+            "SELECT COUNT(*), COUNT(fb.total) FROM fa LEFT JOIN fb ON fa.id = fb.id AND fb.total > 5;",
         ] {
             let plan = bound_plan(&db, sql);
             let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
                 unreachable!()
             };
-            assert!(
-                pipeline::aggregate(&cx, input, keys, aggs)
-                    .unwrap()
-                    .is_none(),
-                "must not fuse: {sql}"
-            );
+            {
+                let cx = Cx::new(&db);
+                assert!(
+                    pipeline::aggregate(&cx, input, keys, aggs)
+                        .unwrap()
+                        .is_some(),
+                    "must fuse: {sql}"
+                );
+            }
+            assert_both_paths(&mut db, sql);
         }
         // Materialized correctness: 5 left rows, 4 matched pairs for id=1,
         // 4 for id=2, one NULL-key left row NULL-extended → 9 rows.
@@ -14549,6 +14647,73 @@ mod tests {
         assert_eq!(pipelined, vec![vec![V::Bigint(4), V::Double(61.0)]]);
     }
 
+    /// Wave 135c: a collect-rooted chain hands its parent the materialized
+    /// path's chunks — boundaries, names and types included — and every shape
+    /// here really compiled rather than falling back.
+    #[test]
+    fn collect_matches_materialized_chunk_for_chunk() {
+        let mut db = pipeline_db();
+        let shapes = [
+            // Root projection over a join chain.
+            "SELECT fa.id, fb.total FROM fa JOIN fb ON fa.id = fb.id;",
+            // Filter between the projection and the join.
+            "SELECT fa.region FROM fa JOIN fb ON fa.id = fb.id WHERE fb.total > 5;",
+            // Controls: a chain the pipeline folds, and an empty build side.
+            "SELECT fa.id FROM fa JOIN fb ON fa.id = fb.id WHERE fa.id = 2;",
+            // Outer joins, both orientations.
+            "SELECT fa.id, fb.total FROM fa LEFT JOIN fb ON fa.id = fb.id;",
+            "SELECT fa.id, fb.total FROM fa RIGHT JOIN fb ON fa.id = fb.id;",
+            // Semi, anti and mark with NULLs on both sides.
+            "SELECT fa.id FROM fa WHERE EXISTS (SELECT 1 FROM fb WHERE fb.id = fa.id);",
+            "SELECT fa.id FROM fa WHERE NOT EXISTS (SELECT 1 FROM fb WHERE fb.id = fa.id);",
+            "SELECT fa.id FROM fa WHERE fa.id NOT IN (SELECT fb.id FROM fb);",
+            "SELECT fa.id FROM fa WHERE fa.id NOT IN (SELECT fb.id FROM fb WHERE fb.id IS NOT NULL);",
+            // An inner join with a residual over the pair.
+            "SELECT fa.id, fb.total FROM fa JOIN fb ON fa.id = fb.id AND fb.total > fa.x;",
+        ];
+        let cells = |chunks: &[DataChunk]| -> Vec<Vec<Value>> {
+            let mut rows = Vec::new();
+            for c in chunks {
+                for i in 0..c.num_rows() {
+                    rows.push(c.columns.iter().map(|col| col.get(i)).collect());
+                }
+            }
+            rows
+        };
+        let sizes = |chunks: &[DataChunk]| -> Vec<usize> {
+            chunks.iter().map(DataChunk::num_rows).collect()
+        };
+        for sql in shapes {
+            let plan = bound_plan(&db, sql);
+            let pipelined = {
+                let cx = Cx::new(&db).with_projections(&plan);
+                pipeline::collect(&cx, &plan)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("expected a collected plan: {sql}"))
+            };
+            // The switch is session state, so the reference run needs its own
+            // context.
+            db.execute("SET pipeline_execution = false;").unwrap();
+            let materialized = {
+                let cx = Cx::new(&db).with_projections(&plan);
+                eval(&cx, &plan).unwrap()
+            };
+            db.execute("SET pipeline_execution = true;").unwrap();
+            assert_eq!(pipelined.names, materialized.names, "{sql}");
+            assert_eq!(pipelined.types, materialized.types, "{sql}");
+            assert_eq!(
+                sizes(&pipelined.chunks),
+                sizes(&materialized.chunks),
+                "{sql}"
+            );
+            assert_eq!(
+                cells(&pipelined.chunks),
+                cells(&materialized.chunks),
+                "{sql}"
+            );
+        }
+    }
+
     /// The shapes the pipeline does not compile still answer through the
     /// materialized path; the ones it does compile agree with it exactly.
     #[test]
@@ -14557,9 +14722,6 @@ mod tests {
         let declined = [
             // No accumulators: a keys-only aggregate is DISTINCT.
             "SELECT fa.region FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
-            // Outer joins (only inner probes are compiled).
-            "SELECT fa.region, COUNT(*) FROM fa LEFT JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
-            "SELECT COUNT(*) FROM fa RIGHT JOIN fb ON fa.id = fb.id;",
             // Distinct and Limit between the aggregate and the join.
             "SELECT COUNT(*) FROM (SELECT DISTINCT fa.region FROM fa JOIN fb ON fa.id = fb.id) s;",
             "SELECT COUNT(*) FROM (SELECT fa.region FROM fa JOIN fb ON fa.id = fb.id LIMIT 3) s;",
@@ -14591,6 +14753,10 @@ mod tests {
             // Filter between the aggregate and the join.
             "SELECT fa.region, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id
              WHERE fa.id = fb.id GROUP BY fa.region;",
+            // Outer joins: the probe NULL-extends the preserved rows no build
+            // row matched.
+            "SELECT fa.region, COUNT(*) FROM fa LEFT JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
+            "SELECT COUNT(*) FROM fa RIGHT JOIN fb ON fa.id = fb.id;",
         ] {
             let plan = bound_plan(&db, sql);
             let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {

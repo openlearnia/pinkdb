@@ -20,14 +20,26 @@
 //! # What is covered
 //!
 //! [`aggregate`] compiles `Aggregate` over a chain of `Filter`, `Project` and
-//! `Inner` `Join` nodes down to a source. Each join's build side is evaluated
-//! (by `eval`) before the probe pipeline runs, exactly as an operator would
-//! have, and the pipeline flows through the *probe* (preserved) side. A chain
-//! of joins therefore never materializes a result between two probes. Every
-//! shape this module does not compile — an outer join, an unsupported input,
-//! an aggregate in an outer context — is declined with `Ok(None)` and the
-//! caller runs the materialized path unchanged. `SET pipeline_execution =
-//! false` forces that path, which is how the two are compared.
+//! join nodes down to a source. Each join's build side is evaluated (by `eval`)
+//! before the probe pipeline runs, exactly as an operator would have, and the
+//! pipeline flows through the *probe* (preserved) side. A chain of joins
+//! therefore never materializes a result between two probes. Inner, left and
+//! right joins are probes; semi, anti and mark joins reuse the materialized
+//! path's match table and NULL bookkeeping ([`MarkJoin`]) and stream their
+//! preserved side.
+//!
+//! [`collect`] runs the same compilation for a chain the materialized path
+//! would have evaluated node by node and hands its parent the chunks it would
+//! have produced, in the same order, so a `Sort`, top-N, `Distinct`, `Limit`,
+//! set operation, CTE materialization or the statement root reads a pipeline's
+//! result without noticing it.
+//!
+//! Every shape this module does not compile — a full join, a semi/anti/mark
+//! join the materialized path decides to build the preserved side for, an
+//! unsupported input, an aggregate in an outer context — is declined with
+//! `Ok(None)` and the caller runs the materialized path unchanged. `SET
+//! pipeline_execution = false` forces that path, which is how the two are
+//! compared.
 
 use std::sync::Arc;
 
@@ -36,8 +48,9 @@ use rayon::prelude::*;
 use super::aggregate::{self, Partial};
 use super::group_table::{FlatPartial, FlatSink};
 use super::{
-    Cx, Output, ProbePlan, build_on_left, derive_join_filters, eval, expr, filter_pays,
-    project_chunk, project_mask, scan_targets, selection, swap_join_space,
+    Cx, MARK_NAME, MarkJoin, Output, ProbePlan, build_on_left, derive_join_filters, estimate_rows,
+    eval, expr, filter_pays, mark_probe_chunk, project_chunk, project_mask, scan_targets,
+    selection, swap_join_space,
 };
 use crate::plan::LogicalPlan;
 use crate::sql::ast::JoinKind;
@@ -148,6 +161,9 @@ struct ProbeOp<'a> {
     residual: Option<BoundExpr>,
     filters: Option<Vec<Arc<crate::stats::JoinFilter>>>,
     preserved_is_right: bool,
+    /// Emit the preserved rows no build row matched, NULL-extended: a left or
+    /// right join.
+    extend_unmatched: bool,
     /// The probe's input dtypes, for [`ProbePlan`].
     probe_types: Vec<DataType>,
     /// Which of the join's output columns anything above reads (wave 127).
@@ -168,11 +184,70 @@ impl<'a> ProbeOp<'a> {
             self.preserved_keys,
             self.build_keys,
             self.preserved_is_right,
-            false,
+            self.extend_unmatched,
             self.filters.as_deref(),
             self.residual.as_ref(),
             self.present.as_deref(),
         )
+    }
+}
+
+/// One draining semi/anti/mark probe: the materialized path's match table and
+/// NULL bookkeeping, built once from the completed build side, then probed
+/// chunk for chunk with the same assembly the materialized join uses.
+struct MarkOp<'a> {
+    build: usize,
+    kind: JoinKind,
+    preserved_keys: &'a [BoundExpr],
+    build_keys: &'a [BoundExpr],
+    residual: Option<BoundExpr>,
+    filters: Option<Vec<Arc<crate::stats::JoinFilter>>>,
+    /// The preserved side's dtypes.
+    probe_types: Vec<DataType>,
+}
+
+impl<'a> MarkOp<'a> {
+    fn prepare(&'a self, cx: &Cx, builds: &'a [Output]) -> Result<MarkProbe<'a>> {
+        let build = &builds[self.build];
+        Ok(MarkProbe {
+            how: MarkJoin::new(
+                cx,
+                self.kind,
+                self.preserved_keys,
+                &self.probe_types,
+                &build.chunks,
+                self.build_keys,
+                self.filters.as_deref(),
+                self.residual.as_ref(),
+            )?,
+            preserved_keys: self.preserved_keys,
+        })
+    }
+}
+
+/// A prepared [`MarkOp`]: the settled match state. Boxed by [`Step`], like a
+/// probe's match table.
+struct MarkProbe<'a> {
+    how: MarkJoin<'a>,
+    preserved_keys: &'a [BoundExpr],
+}
+
+impl MarkProbe<'_> {
+    /// One output chunk, or `None` when every preserved row was dropped: a
+    /// preserved chunk holds at most `CHUNK_SIZE` rows, so one goes out.
+    fn probe(&self, cx: &Cx, chunk: &DataChunk, sel: Option<&[u32]>) -> Result<Option<DataChunk>> {
+        // A residual tests gathered build pairs, so it needs a compacted chunk
+        // (the materialized join compacts a filtered side too).
+        let compacted;
+        let (chunk, sel) = match (sel, self.how.residual.is_some()) {
+            (Some(sel), true) => {
+                compacted = chunk.take(sel);
+                (&compacted, None)
+            }
+            (sel, _) => (chunk, sel),
+        };
+        let mut chunks = mark_probe_chunk(cx, &self.how, self.preserved_keys, chunk, sel)?;
+        Ok(chunks.pop())
     }
 }
 
@@ -191,6 +266,7 @@ enum RunOp<'a> {
         read: Option<Vec<bool>>,
     },
     Probe(ProbeOp<'a>),
+    Mark(MarkOp<'a>),
 }
 
 impl<'a> Step<'a> {
@@ -233,6 +309,12 @@ impl<'a> Step<'a> {
                 }
                 Ok(())
             }
+            Step::Mark(plan) => {
+                if let Some(chunk) = plan.probe(cx, &morsel.chunk, morsel.sel.as_deref())? {
+                    out.push(Morsel { chunk, sel: None });
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -248,11 +330,30 @@ enum Step<'a> {
     },
     /// Boxed: the match table dwarfs the other variants.
     Probe(Box<ProbePlan<'a>>),
+    Mark(Box<MarkProbe<'a>>),
 }
 
 /// Prepare the compiled operators once, so a statement builds each probe's
 /// match table once rather than once per morsel.
 fn steps<'a>(cx: &Cx, builds: &'a [Output], ops: &'a [RunOp<'a>]) -> Result<Vec<Step<'a>>> {
+    // Fill the subquery memo before the morsels fan out, as every materialized
+    // operator does (see `expr::prime`): a worker that finds the memo empty
+    // computes the body without waiting, so a filter over a subquery would run
+    // that subquery once per morsel on every worker instead of once.
+    for op in ops {
+        match op {
+            RunOp::Filter { predicate } => expr::prime(cx, [*predicate])?,
+            RunOp::Project { exprs, .. } => expr::prime(cx, *exprs)?,
+            RunOp::Probe(probe) => {
+                expr::prime(cx, probe.preserved_keys)?;
+                expr::prime(cx, probe.residual.as_ref())?;
+            }
+            RunOp::Mark(probe) => {
+                expr::prime(cx, probe.preserved_keys)?;
+                expr::prime(cx, probe.residual.as_ref())?;
+            }
+        }
+    }
     ops.iter()
         .map(|op| {
             Ok(match op {
@@ -262,6 +363,7 @@ fn steps<'a>(cx: &Cx, builds: &'a [Output], ops: &'a [RunOp<'a>]) -> Result<Vec<
                     read: read.as_deref(),
                 },
                 RunOp::Probe(probe) => Step::Probe(Box::new(probe.prepare(cx, builds)?)),
+                RunOp::Mark(probe) => Step::Mark(Box::new(probe.prepare(cx, builds)?)),
             })
         })
         .collect()
@@ -275,9 +377,11 @@ enum Node<'a> {
     Project {
         plan: &'a LogicalPlan,
         exprs: &'a [BoundExpr],
+        names: &'a [String],
     },
     Join {
         plan: &'a LogicalPlan,
+        kind: JoinKind,
         build: usize,
         preserved_keys: &'a [BoundExpr],
         build_keys: &'a [BoundExpr],
@@ -301,7 +405,7 @@ pub(crate) fn aggregate(
     let Some(compiled) = compile(cx, input)? else {
         return Ok(None);
     };
-    let chunks = match FlatSink::new(keys, aggs, compiled.rows, compiled.width) {
+    let chunks = match FlatSink::new(keys, aggs, compiled.rows, compiled.types.len()) {
         Some(flat) => match run(cx, &compiled, &flat)? {
             Some(items) => flat.finish(items, cx)?,
             // A key column whose payload is not the one its type promises:
@@ -318,14 +422,63 @@ pub(crate) fn aggregate(
     }))
 }
 
+/// Fold a chain of `Filter`, `Project` and join nodes into the materialized
+/// `Output` the node above it consumes, or `Ok(None)` when the shape is not one
+/// this module compiles. The chunks are the materialized path's: same chunks,
+/// same order, so whatever reads them sees no difference.
+pub(crate) fn collect(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Output>> {
+    if !cx.pipeline_execution() {
+        return Ok(None);
+    }
+    let Some(compiled) = compile(cx, plan)? else {
+        return Ok(None);
+    };
+    let Some(chunks) = run(cx, &compiled, &CollectSink)? else {
+        return Err(PinkDbError::Execution(
+            "internal: the pipeline's collect sink declined a chunk".to_string(),
+        ));
+    };
+    Ok(Some(Output {
+        chunks,
+        names: compiled.names,
+        types: compiled.types,
+    }))
+}
+
+/// The collect sink: the morsels' chunks themselves, in morsel order — what the
+/// materialized path's intermediate result holds, chunk for chunk.
+struct CollectSink;
+
+impl Sink for CollectSink {
+    type Partial = DataChunk;
+
+    fn fold_into(
+        &self,
+        _cx: &Cx,
+        chunk: &DataChunk,
+        sel: Option<&[u32]>,
+    ) -> Result<Option<DataChunk>> {
+        Ok(Some(match sel {
+            None => chunk.clone(),
+            Some(sel) => chunk.take(sel),
+        }))
+    }
+
+    fn finish(self, items: Vec<DataChunk>, _cx: &Cx) -> Result<Vec<DataChunk>> {
+        Ok(items)
+    }
+}
+
 /// A compiled pipeline: the materialized source, every join's completed build
 /// side, and the operators a morsel passes through, bottom-up.
 struct Compiled<'a> {
     source: Output,
     builds: Vec<Output>,
     ops: Vec<RunOp<'a>>,
-    /// Columns a morsel carries above the last operator: what the sink folds.
-    width: usize,
+    /// The dtypes a morsel carries above the last operator: what the sink folds.
+    types: Vec<DataType>,
+    /// Their names, for [`collect`]' parent.
+    names: Vec<String>,
     /// Source rows, the flat table's bucket-count hint (never a result).
     rows: usize,
 }
@@ -383,16 +536,17 @@ fn descend<'a>(
             LogicalPlan::Project {
                 input: inner,
                 exprs,
-                ..
+                names,
             } => {
                 nodes.push(Node::Project {
                     plan: cursor,
                     exprs,
+                    names,
                 });
                 cursor = inner;
             }
             LogicalPlan::Join {
-                kind: JoinKind::Inner,
+                kind,
                 left,
                 right,
                 left_keys,
@@ -400,16 +554,54 @@ fn descend<'a>(
                 residual,
                 ..
             } => {
-                let build_left = build_on_left(cx, JoinKind::Inner, left, right);
-                let (build_plan, build_keys, probe_plan, probe_keys) = if build_left {
-                    (&**left, left_keys, &**right, right_keys)
-                } else {
-                    (&**right, right_keys, &**left, left_keys)
+                // Which side is built and which streams through: the side the
+                // materialized `hash_join` builds today — `build_on_left` for an
+                // inner join, the unpreserved side for every other kind.
+                let (build_plan, build_keys, probe_plan, probe_keys, build_left) = match kind {
+                    JoinKind::Inner => {
+                        if build_on_left(cx, *kind, left, right) {
+                            (&**left, left_keys, &**right, right_keys, true)
+                        } else {
+                            (&**right, right_keys, &**left, left_keys, false)
+                        }
+                    }
+                    JoinKind::Left => (&**right, right_keys, &**left, left_keys, false),
+                    JoinKind::Right => (&**left, left_keys, &**right, right_keys, true),
+                    JoinKind::Mark if residual.is_some() => {
+                        // A mark join with a residual is the materialized
+                        // path's error to raise.
+                        break;
+                    }
+                    // The materialized path marks or probes the left instead
+                    // when it is provably smaller (wave 125a). That needs the
+                    // left's exact row count, so an estimate that says so leaves
+                    // the shape to it rather than ruling differently.
+                    JoinKind::Semi | JoinKind::Anti | JoinKind::Mark
+                        if matches!(
+                            (estimate_rows(cx, left), estimate_rows(cx, right)),
+                            (Some(l), Some(r)) if l < r
+                        ) =>
+                    {
+                        break;
+                    }
+                    JoinKind::Semi | JoinKind::Anti | JoinKind::Mark => {
+                        (&**right, right_keys, &**left, left_keys, false)
+                    }
+                    _ => break,
                 };
+                // Same reason as the loop-top break: a probe side the statement
+                // shares is computed once, by its cache slot, so the join over
+                // it is the source rather than one more operator streaming it.
+                if cx.subplans.has_candidates() && cx.subplans.slot(probe_plan).is_some() {
+                    break;
+                }
                 let build = eval(cx, build_plan)?;
                 let mut filters = None;
                 let mut frame = None;
-                if cx.join_filter_pushdown() {
+                // Only an inner or semi probe may drop rows through a bloom
+                // filter: a left, right, anti or mark probe keeps or counts
+                // every preserved row.
+                if cx.join_filter_pushdown() && matches!(kind, JoinKind::Inner | JoinKind::Semi) {
                     // Only a probe key that reaches a scan is worth a filter,
                     // and only a small build pays for one (wave 128).
                     let reachable = probe_keys.iter().any(|key| match key {
@@ -434,6 +626,7 @@ fn descend<'a>(
                 }
                 nodes.push(Node::Join {
                     plan: cursor,
+                    kind: *kind,
                     build: builds.len(),
                     preserved_keys: probe_keys,
                     build_keys,
@@ -477,17 +670,24 @@ fn compile<'a>(cx: &Cx, input: &'a LogicalPlan) -> Result<Option<Compiled<'a>>> 
     };
     // Bottom-up: each node's output dtypes are its input's, transformed.
     let mut types: Vec<DataType> = source.types.clone();
+    let mut names: Vec<String> = source.names.clone();
     let mut ops: Vec<RunOp<'a>> = Vec::with_capacity(nodes.len());
     for node in nodes.into_iter().rev() {
         match node {
             Node::Filter { predicate } => ops.push(RunOp::Filter { predicate }),
-            Node::Project { plan, exprs } => {
+            Node::Project {
+                plan,
+                exprs,
+                names: out_names,
+            } => {
                 let read = project_mask(cx, plan, exprs.len());
                 types = exprs.iter().map(|e| e.dtype()).collect();
+                names = out_names.to_vec();
                 ops.push(RunOp::Project { exprs, read });
             }
             Node::Join {
                 plan,
+                kind,
                 build,
                 preserved_keys,
                 build_keys,
@@ -496,6 +696,7 @@ fn compile<'a>(cx: &Cx, input: &'a LogicalPlan) -> Result<Option<Compiled<'a>>> 
                 build_left,
             } => {
                 let build_types = &builds[build].types;
+                let build_names = &builds[build].names;
                 let present = cx.projections.for_join(plan).map(|cols| {
                     let mut mask = vec![false; build_types.len() + types.len()];
                     for &c in cols {
@@ -510,8 +711,26 @@ fn compile<'a>(cx: &Cx, input: &'a LogicalPlan) -> Result<Option<Compiled<'a>>> 
                 } else {
                     (&types, build_types)
                 };
+                let (left_names, right_names) = if build_left {
+                    (build_names, &names)
+                } else {
+                    (&names, build_names)
+                };
                 let mut out = left_types.clone();
-                out.extend(right_types.iter().copied());
+                let mut out_names = left_names.clone();
+                match kind {
+                    // A semi/anti join emits the preserved row, a mark join the
+                    // same row plus the marker (wave 120).
+                    JoinKind::Semi | JoinKind::Anti => {}
+                    JoinKind::Mark => {
+                        out.push(DataType::Boolean);
+                        out_names.push(MARK_NAME.to_string());
+                    }
+                    _ => {
+                        out.extend(right_types.iter().copied());
+                        out_names.extend(right_names.iter().cloned());
+                    }
+                }
                 // The residual reads `left ++ right`; a probe that assembles
                 // the preserved (right) side first is swapped to match.
                 let residual = match residual {
@@ -520,16 +739,32 @@ fn compile<'a>(cx: &Cx, input: &'a LogicalPlan) -> Result<Option<Compiled<'a>>> 
                     }
                     residual => residual,
                 };
-                ops.push(RunOp::Probe(ProbeOp {
-                    build,
-                    preserved_keys,
-                    build_keys,
-                    residual,
-                    filters,
-                    preserved_is_right: build_left,
-                    probe_types: std::mem::replace(&mut types, out),
-                    present,
-                }));
+                let probe_types = std::mem::replace(&mut types, out);
+                match kind {
+                    JoinKind::Semi | JoinKind::Anti | JoinKind::Mark => {
+                        ops.push(RunOp::Mark(MarkOp {
+                            build,
+                            kind,
+                            preserved_keys,
+                            build_keys,
+                            residual,
+                            filters,
+                            probe_types,
+                        }));
+                    }
+                    _ => ops.push(RunOp::Probe(ProbeOp {
+                        build,
+                        preserved_keys,
+                        build_keys,
+                        residual,
+                        filters,
+                        preserved_is_right: build_left,
+                        extend_unmatched: kind != JoinKind::Inner,
+                        probe_types,
+                        present,
+                    })),
+                }
+                names = out_names;
             }
         }
     }
@@ -538,7 +773,8 @@ fn compile<'a>(cx: &Cx, input: &'a LogicalPlan) -> Result<Option<Compiled<'a>>> 
         source,
         builds,
         ops,
-        width: types.len(),
+        types,
+        names,
         rows,
     }))
 }
