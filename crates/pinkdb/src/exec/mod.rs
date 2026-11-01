@@ -10,6 +10,7 @@ pub mod aggregate;
 pub(crate) mod dml;
 pub mod expr;
 pub(crate) mod group_table;
+pub(crate) mod pipeline;
 pub(crate) mod selection;
 pub(crate) mod window;
 
@@ -17,15 +18,11 @@ use crate::types::{FastMap, FastSet};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use aggregate::{
-    Acc, Group, HIGH_CARDINALITY_KEYS, Partial, aggregate, aggregate_selected, fold_stream,
-    local_index_capacity, merge_and_emit,
-};
 use aggregate::{EvalVec as FusedVec, eval_agg_vec as eval_fused_vec};
+use aggregate::{aggregate, fold_stream, merge_and_emit};
 use dml::{captured, returning_result};
 use expr::{coerce_to, eval_expr, select_true};
 use rayon::prelude::*;
-use selection::Selected;
 use window::eval_window;
 
 use crate::attached::{AttachedTable, PruneOp, PrunePredicate};
@@ -35,7 +32,7 @@ use crate::plan::{
     compare_values, win_output_schema,
 };
 use crate::sql::ast::{BinaryOp, JoinKind, SortSpec};
-use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, common_numeric};
+use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr, common_numeric};
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
@@ -996,6 +993,22 @@ impl<'a> Cx<'a> {
     /// changes a result.
     pub(crate) fn join_filter_pushdown(&self) -> bool {
         match self.session.get("join_filter_pushdown") {
+            None => true,
+            Some(Value::Boolean(b)) => b,
+            Some(Value::Bigint(n)) => n != 0,
+            Some(Value::Varchar(s)) => !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "off" | "false" | "no"
+            ),
+            Some(_) => true,
+        }
+    }
+
+    /// Whether `Aggregate` may run as a pipeline instead of materializing its
+    /// input node by node. `SET pipeline_execution = false` forces the
+    /// materialized path; the differential tests use it to compare the two.
+    pub(crate) fn pipeline_execution(&self) -> bool {
+        match self.session.get("pipeline_execution") {
             None => true,
             Some(Value::Boolean(b)) => b,
             Some(Value::Bigint(n)) => n != 0,
@@ -3314,46 +3327,6 @@ fn count_selected(cx: &Cx, plan: &LogicalPlan) -> Result<Option<i64>> {
     Ok(Some(counts.into_iter().sum()))
 }
 
-/// The chunks below `plan` with their filter's selection still attached, or
-/// `None` when the shape has none to offer (the caller then goes through
-/// `filter_chunk` and materializes).
-///
-/// Only a `Filter` hands a selection on, and only to a consumer that reads
-/// through it; its own input is evaluated the ordinary way.
-pub(crate) fn selected_chunks(cx: &Cx, plan: &LogicalPlan) -> Result<Option<Vec<Selected>>> {
-    let LogicalPlan::Filter { input, predicate } = plan else {
-        return Ok(None);
-    };
-    let inner = eval(cx, input)?;
-    expr::prime(cx, [predicate])?;
-    let selected: Vec<Option<Selected>> = inner
-        .chunks
-        .par_iter()
-        .map(|chunk| {
-            let mut sel = selection::all_rows(chunk.num_rows());
-            expr::select_predicate(predicate, chunk, cx, &mut sel)?;
-            if sel.is_empty() {
-                return Ok(None);
-            }
-            // Sparse enough that one compaction beats one indirection per
-            // column read from here on.
-            if selection::worth_materializing(sel.len(), chunk.num_rows()) {
-                let rows = sel.len();
-                let chunk = chunk.take(&sel);
-                return Ok(Some(Selected {
-                    chunk,
-                    sel: selection::all_rows(rows),
-                }));
-            }
-            Ok(Some(Selected {
-                chunk: chunk.clone(),
-                sel,
-            }))
-        })
-        .collect::<Result<_>>()?;
-    Ok(Some(selected.into_iter().flatten().collect()))
-}
-
 /// An INNER join's probe side, read through its filter's selection when it
 /// is a filter (TPC-H Q3's `l_shipdate > …` keeps 3.2M of 6M `lineitem` rows,
 /// and the filtered copy was its largest cost): the probe walks the kept
@@ -4227,18 +4200,11 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         .flat_map(|a| a.arg.iter().chain(a.filter.iter())),
                 ),
             )?;
-            // `FILTER (WHERE …)` is not modeled by the fused paths below, which
-            // read whole columns; a filtered aggregate takes the general path.
+            // `FILTER (WHERE …)` is not modeled by the statistics, streaming
+            // scan and COUNT(*) fast paths below, which read whole columns: a
+            // filtered aggregate skips them and reaches the pipeline, whose
+            // sink folds each aggregate through its own mask.
             let filtered = aggs.iter().any(|a| a.filter.is_some());
-            // Fused join→aggregate: feed joined rows straight into per-group
-            // accumulators without ever materializing them. All fusibility
-            // checks are static, so a blocked shape falls through without
-            // having evaluated anything.
-            if !filtered
-                && let Some(out) = fused_join_aggregate(cx, input, keys, aggs)?
-            {
-                return Ok(out);
-            }
             // Attached-lake statistics: an exact COUNT/COUNT(col)/MIN/MAX
             // over a plain attached table is answered from the data file's
             // footer without decoding it; every other shape falls through and
@@ -4293,20 +4259,12 @@ fn eval_node(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     types,
                 });
             }
-            // Selection path: a Filter hands on the rows it kept, so the fold
-            // reads through them and the filtered copy `filter_chunk` builds
-            // is never made.
-            if !filtered
-                && !aggs.is_empty()
-                && let Some(selected) = selected_chunks(cx, input)?
-            {
-                let chunks = aggregate_selected(cx, &selected, keys, aggs)?;
-                let (names, types) = agg_output_schema(keys, aggs);
-                return Ok(Output {
-                    chunks,
-                    names,
-                    types,
-                });
+            // Pipeline (wave 135a): the input's chunks flow through filter,
+            // projection and hash-join probes into the aggregate sink, so no
+            // intermediate result is ever materialized. A shape it does not
+            // compile falls back to the materialized path below.
+            if let Some(out) = pipeline::aggregate(cx, input, keys, aggs)? {
+                return Ok(out);
             }
             let inner = eval(cx, input)?;
             let chunks = aggregate(cx, &inner.chunks, keys, aggs)?;
@@ -5518,6 +5476,101 @@ fn split_sides<'e>(
     (source_only && target_only).then_some((a, b))
 }
 
+/// Shift a joined-space expression down by `left_cols`: column index `i`
+/// becomes `i - left_cols`, so the expression evaluates against the right
+/// input alone (the same rewrite the optimizer applies to right-side
+/// predicates pushed below a join). Only right-side expressions are shifted,
+/// so no index underflows. Rejected variants clone through, keeping the walk
+/// total.
+fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::Column { index, dtype } => BoundExpr::Column {
+            index: index - left_cols,
+            dtype: *dtype,
+        },
+        // An outer ref is not a column of either side of this join.
+        BoundExpr::Literal(_) | BoundExpr::OuterRef { .. } => expr.clone(),
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => BoundExpr::Binary {
+            op: *op,
+            left: Box::new(shift_join_columns(left, left_cols)),
+            right: Box::new(shift_join_columns(right, left_cols)),
+            dtype: *dtype,
+        },
+        BoundExpr::Not(e) => BoundExpr::Not(Box::new(shift_join_columns(e, left_cols))),
+        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
+            expr: Box::new(shift_join_columns(expr, left_cols)),
+            dtype: *dtype,
+        },
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(shift_join_columns(expr, left_cols)),
+            negated: *negated,
+        },
+        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+            func: *func,
+            args: args
+                .iter()
+                .map(|a| shift_join_columns(a, left_cols))
+                .collect(),
+            dtype: *dtype,
+        },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(shift_join_columns(expr, left_cols)),
+            dtype: *dtype,
+        },
+        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+            args: args
+                .iter()
+                .map(|a| shift_join_columns(a, left_cols))
+                .collect(),
+            dtype: *dtype,
+        },
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => BoundExpr::Case {
+            branches: branches
+                .iter()
+                .map(|(c, v)| {
+                    (
+                        shift_join_columns(c, left_cols),
+                        shift_join_columns(v, left_cols),
+                    )
+                })
+                .collect(),
+            else_: else_
+                .as_ref()
+                .map(|e| Box::new(shift_join_columns(e, left_cols))),
+            dtype: *dtype,
+        },
+        BoundExpr::DynamicScalar {
+            name,
+            args,
+            dtype,
+            reads,
+        } => BoundExpr::DynamicScalar {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| shift_join_columns(a, left_cols))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            dtype: *dtype,
+            reads: reads.clone(),
+        },
+        BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::InSubquery { .. }
+        | BoundExpr::Exists { .. } => expr.clone(),
+    }
+}
+
 /// One hash-join input: its chunks plus its output dtypes.
 #[derive(Clone, Copy)]
 struct JoinSide<'a> {
@@ -6305,6 +6358,251 @@ impl<'a> JoinAssembler<'a> {
     }
 }
 
+/// FULL JOIN bookkeeping shared by the parallel probe: where each build
+/// chunk starts in the global build-row index, and one matched flag per
+/// build row.
+struct FullMark {
+    starts: Vec<u32>,
+    marked: Vec<std::sync::atomic::AtomicBool>,
+}
+
+impl FullMark {
+    fn new(build: &[DataChunk]) -> FullMark {
+        let mut starts = Vec::with_capacity(build.len() + 1);
+        let mut acc = 0u32;
+        for c in build {
+            starts.push(acc);
+            acc += c.num_rows() as u32;
+        }
+        starts.push(acc);
+        FullMark {
+            marked: (0..acc as usize)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            starts,
+        }
+    }
+
+    /// Remember that the build row at `(build chunk, row)` matched.
+    #[inline]
+    fn mark(&self, at: (u32, u32)) {
+        let i = self.starts[at.0 as usize] + at.1;
+        self.marked[i as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn matched(&self, chunk: usize, row: usize) -> bool {
+        let i = self.starts[chunk] as usize + row;
+        self.marked[i].load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A probe prepared once and then run against any number of preserved
+/// chunks: the match table over the completed build side, the build columns
+/// to gather, and the output layout. [`hash_join_probe`] runs it over a whole
+/// input; the pipeline executor (`exec::pipeline`) runs it one morsel at a
+/// time, which is what lets a chain of probes flow without materializing a
+/// result between them.
+struct ProbePlan<'a> {
+    table: MatchTable,
+    ints: bool,
+    commons: Vec<Option<DataType>>,
+    preserved_keys: &'a [BoundExpr],
+    build: &'a [DataChunk],
+    n_preserved: usize,
+    filters: Option<Vec<std::sync::Arc<crate::stats::JoinFilter>>>,
+    residual: Option<&'a BoundExpr>,
+    /// Output layout `left ++ right`: the dtypes, the left width, and whether
+    /// the preserved (probe) side is the right one.
+    dtypes: Vec<DataType>,
+    n_left: usize,
+    preserved_is_right: bool,
+    present: Option<Vec<bool>>,
+    /// NULL-extend a preserved row that matches nothing (LEFT/RIGHT/FULL).
+    extend_unmatched: bool,
+    /// Every preserved key is a plain column, so probing reads only the rows a
+    /// selection kept and needs no compaction (`probe_through_selection`'s
+    /// rule: nothing is evaluated on a row the filter dropped).
+    sel_safe: bool,
+    /// The build side's columns, per column: the gather layout every probe of
+    /// a preserved chunk shares, so it is built once per statement.
+    build_cols: Vec<Vec<&'a Vector>>,
+}
+
+impl<'a> ProbePlan<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        cx: &Cx,
+        preserved_types: &[DataType],
+        build: &'a [DataChunk],
+        build_types: &[DataType],
+        preserved_keys: &'a [BoundExpr],
+        build_keys: &[BoundExpr],
+        preserved_is_right: bool,
+        extend_unmatched: bool,
+        filters: Option<&[std::sync::Arc<crate::stats::JoinFilter>]>,
+        residual: Option<&'a BoundExpr>,
+        present: Option<&[bool]>,
+    ) -> Result<ProbePlan<'a>> {
+        let (ints, commons) = key_encoding(preserved_keys, build_keys);
+        let build_rows: usize = build.iter().map(DataChunk::num_rows).sum();
+        if build_rows > u32::MAX as usize {
+            return Err(PinkDbError::Execution(
+                "hash join build side exceeds u32 rows".to_string(),
+            ));
+        }
+        let (table, ints) =
+            join_table(cx, build, build_keys, preserved_keys, &commons, ints, true)?;
+        // A packed pair has one key vector, while row filters test each key
+        // column: they only save probes, so a packed table goes without.
+        let filters = match filters {
+            Some(f) if !table.packed => Some(f.to_vec()),
+            _ => None,
+        };
+        let (left_types, right_types) = if preserved_is_right {
+            (build_types, preserved_types)
+        } else {
+            (preserved_types, build_types)
+        };
+        let mut dtypes: Vec<DataType> = left_types.to_vec();
+        dtypes.extend(right_types.iter().copied());
+        let sel_safe = preserved_keys
+            .iter()
+            .all(|key| matches!(key, BoundExpr::Column { .. }));
+        let build_cols = JoinAssembler::build_columns(build, build_types.len());
+        Ok(ProbePlan {
+            table,
+            ints,
+            commons,
+            preserved_keys,
+            build,
+            n_preserved: preserved_types.len(),
+            filters,
+            residual,
+            dtypes,
+            n_left: left_types.len(),
+            preserved_is_right,
+            present: present.map(<[_]>::to_vec),
+            extend_unmatched,
+            sel_safe,
+            build_cols,
+        })
+    }
+
+    /// Probe one preserved chunk — or the rows `sel` kept of it — and assemble
+    /// the matches, in preserved-row order. A preserved chunk can produce more
+    /// than `CHUNK_SIZE` rows, so the output is a list of chunks.
+    fn probe(
+        &self,
+        cx: &Cx,
+        chunk: &DataChunk,
+        sel: Option<&[u32]>,
+        full: Option<&FullMark>,
+    ) -> Result<Vec<DataChunk>> {
+        cx.check_deadline()?;
+        // The rows to probe: a filter's selection, or every row. A residual
+        // tests gathered pairs, and a key expression reads whole columns, so
+        // both get a compacted chunk.
+        let compacted;
+        let (chunk, sel) = match (sel, self.residual, self.sel_safe) {
+            (Some(sel), Some(_), _) | (Some(sel), None, false) => {
+                compacted = chunk.take(sel);
+                (&compacted, None)
+            }
+            (sel, _, _) => (chunk, sel),
+        };
+        let rows: Vec<u32> = match sel {
+            Some(sel) => sel.to_vec(),
+            None => (0..chunk.num_rows() as u32).collect(),
+        };
+        let kvs =
+            self.table
+                .probe_keys(cx, self.preserved_keys, chunk, &self.commons, self.ints)?;
+        let mut buf = Vec::new();
+        let mut sink = JoinAssembler::new(
+            cx,
+            &self.dtypes,
+            self.n_left,
+            self.preserved_is_right,
+            self.present.as_deref(),
+            &self.build_cols,
+        );
+        if let Some(residual) = self.residual {
+            // Two passes: the residual decides which candidate pairs are
+            // matches before any of them is assembled.
+            let pairs = candidate_pairs(
+                chunk,
+                &kvs,
+                &self.table,
+                self.ints,
+                self.filters.as_deref(),
+                &mut buf,
+            );
+            let kept =
+                residual_selection(cx, residual, &pairs, chunk, self.n_preserved, self.build)?;
+            for k in kept {
+                let (row, bci, bi) = pairs[k as usize];
+                sink.push(chunk, row as usize, (bci, bi))?;
+            }
+            return sink.finish(chunk);
+        }
+        let probe = self.ints.then(|| self.table.probe_ints(&kvs[0]));
+        let pass = self
+            .filters
+            .as_deref()
+            .map(|f| row_filter_pass(f, &kvs, chunk.num_rows()));
+        for &i in &rows {
+            let i = i as usize;
+            // A row the build side's bloom rules out cannot match, so it is
+            // dropped before any of its columns are materialized (wave
+            // 122). Filters are only set for an INNER join, where no
+            // preserved row is owed an output.
+            if let Some(pass) = &pass
+                && !pass[i]
+            {
+                debug_assert!(!self.extend_unmatched);
+                continue;
+            }
+            let null_key = kvs.iter().any(|kv| kv.is_null(i));
+            if null_key && !self.extend_unmatched {
+                continue;
+            }
+            let mut matched = false;
+            if !null_key {
+                let matches = if self.ints {
+                    self.table
+                        .matches_at(probe.as_ref().expect("integer keys"), i)
+                } else {
+                    buf.clear();
+                    for kv in &kvs {
+                        kv.encode_into(&mut buf, i);
+                    }
+                    self.table.matches_bytes(&buf)
+                };
+                for r in matches {
+                    matched = true;
+                    if let Some(full) = full {
+                        full.mark(self.table.loc(r));
+                    }
+                    sink.push(chunk, i, self.table.loc(r))?;
+                }
+            }
+            match matched {
+                true => {}
+                false => {
+                    // Inner: no match, drop the row. Outer: unmatched (or
+                    // NULL-keyed) preserved row — NULL-extend.
+                    if !self.extend_unmatched {
+                        continue;
+                    }
+                    sink.push(chunk, i, (crate::vector::GATHER_NULL, 0))?;
+                }
+            }
+        }
+        sink.finish(chunk)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn hash_join_probe(
     cx: &Cx,
@@ -6324,166 +6622,46 @@ fn hash_join_probe(
             "internal: an outer join cannot carry a residual".to_string(),
         ));
     }
-    let (ints, commons) = key_encoding(preserved_keys, build_keys);
-    let build_rows: usize = build.chunks.iter().map(|c| c.num_rows()).sum();
-    if build_rows > u32::MAX as usize {
-        return Err(PinkDbError::Execution(
-            "hash join build side exceeds u32 rows".to_string(),
-        ));
-    }
-    let (table, ints) = join_table(
+    let plan = ProbePlan::new(
         cx,
+        preserved.types,
         build.chunks,
-        build_keys,
+        build.types,
         preserved_keys,
-        &commons,
-        ints,
-        true,
+        build_keys,
+        preserved_is_right,
+        extend_unmatched,
+        filters,
+        residual,
+        present,
     )?;
-    // A packed pair has one key vector, while row filters test each key
-    // column: they only save probes, so a packed table goes without.
-    let filters = if table.packed { None } else { filters };
-    // FULL JOIN bookkeeping: global build-row index per chunk, and one flag
-    // per build row (shared across the parallel probe).
-    let build_chunk_starts: Vec<u32> = {
-        let mut starts = Vec::with_capacity(build.chunks.len() + 1);
-        let mut acc = 0u32;
-        for c in build.chunks {
-            starts.push(acc);
-            acc += c.num_rows() as u32;
-        }
-        starts.push(acc);
-        starts
-    };
-    let marked: Option<Vec<std::sync::atomic::AtomicBool>> = full.then(|| {
-        (0..build_rows)
-            .map(|_| std::sync::atomic::AtomicBool::new(false))
-            .collect()
-    });
-
+    let mark = full.then(|| FullMark::new(build.chunks));
     // Probe + assemble, parallel per preserved chunk: matches push straight
     // from the source chunks into per-partition output vectors (no
     // intermediate location tuples, no serial assembly pass). A partition can
     // exceed CHUNK_SIZE rows, so it emits chunks as they fill; the caller
     // concatenates partitions in order, preserving preserved-row order.
-    let (left_types, right_types) = if preserved_is_right {
-        (build.types, preserved.types)
-    } else {
-        (preserved.types, build.types)
-    };
-    let mut dtypes: Vec<DataType> = left_types.to_vec();
-    dtypes.extend(right_types.iter().copied());
-    let n_left = left_types.len();
-    let build_cols = JoinAssembler::build_columns(build.chunks, build.types.len());
     let partitions: Vec<Vec<DataChunk>> = preserved
         .chunks
         .par_iter()
         .enumerate()
-        .map(|(ci, chunk)| -> Result<Vec<DataChunk>> {
-            cx.check_deadline()?;
-            // The rows to probe: a filter's selection, or every row. A
-            // residual tests gathered pairs, so it gets a compacted chunk.
-            let sel = preserved.sels.map(|s| s[ci].as_slice());
-            let compacted;
-            let (chunk, sel) = match (sel, residual) {
-                (Some(sel), Some(_)) => {
-                    compacted = chunk.take(sel);
-                    (&compacted, None)
-                }
-                (sel, _) => (chunk, sel),
-            };
-            let rows: Vec<u32> = match sel {
-                Some(sel) => sel.to_vec(),
-                None => (0..chunk.num_rows() as u32).collect(),
-            };
-            let kvs = table.probe_keys(cx, preserved_keys, chunk, &commons, ints)?;
-            let mut buf = Vec::new();
-            let mut sink = JoinAssembler::new(
+        .map(|(ci, chunk)| {
+            plan.probe(
                 cx,
-                &dtypes,
-                n_left,
-                preserved_is_right,
-                present,
-                &build_cols,
-            );
-            if let Some(residual) = residual {
-                // Two passes: the residual decides which candidate pairs are
-                // matches before any of them is assembled.
-                let pairs = candidate_pairs(chunk, &kvs, &table, ints, filters, &mut buf);
-                let kept = residual_selection(
-                    cx,
-                    residual,
-                    &pairs,
-                    chunk,
-                    preserved.types.len(),
-                    build.chunks,
-                )?;
-                for k in kept {
-                    let (row, bci, bi) = pairs[k as usize];
-                    sink.push(chunk, row as usize, (bci, bi))?;
-                }
-                return sink.finish(chunk);
-            }
-            let probe = ints.then(|| table.probe_ints(&kvs[0]));
-            let pass = filters.map(|f| row_filter_pass(f, &kvs, chunk.num_rows()));
-            for &i in &rows {
-                let i = i as usize;
-                // A row the build side's bloom rules out cannot match, so it is
-                // dropped before any of its columns are materialized (wave
-                // 122). Filters are only set for an INNER join, where no
-                // preserved row is owed an output.
-                if let Some(pass) = &pass
-                    && !pass[i]
-                {
-                    debug_assert!(!extend_unmatched);
-                    continue;
-                }
-                let null_key = kvs.iter().any(|kv| kv.is_null(i));
-                if null_key && !extend_unmatched {
-                    continue;
-                }
-                let mut matched = false;
-                if !null_key {
-                    let matches = if ints {
-                        table.matches_at(probe.as_ref().expect("integer keys"), i)
-                    } else {
-                        buf.clear();
-                        for kv in &kvs {
-                            kv.encode_into(&mut buf, i);
-                        }
-                        table.matches_bytes(&buf)
-                    };
-                    for r in matches {
-                        matched = true;
-                        if let Some(marked) = &marked {
-                            marked[r as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        sink.push(chunk, i, table.loc(r))?;
-                    }
-                }
-                match matched {
-                    true => {}
-                    false => {
-                        // Inner: no match, drop the row. Outer: unmatched (or
-                        // NULL-keyed) preserved row — NULL-extend.
-                        if !extend_unmatched {
-                            continue;
-                        }
-                        sink.push(chunk, i, (crate::vector::GATHER_NULL, 0))?;
-                    }
-                }
-            }
-            sink.finish(chunk)
+                chunk,
+                preserved.sels.map(|s| s[ci].as_slice()),
+                mark.as_ref(),
+            )
         })
         .collect::<Result<_>>()?;
     let mut out: Vec<DataChunk> = partitions.into_iter().flatten().collect();
+    let (dtypes, n_left) = (&plan.dtypes, plan.n_left);
     // FULL JOIN: emit every unmatched build row, NULL-extended on the other
     // side. Build rows keep build input order (chunk order, row order).
-    if let Some(marked) = &marked {
+    if let Some(mark) = &mark {
         for (bci, bchunk) in build.chunks.iter().enumerate() {
-            let base = build_chunk_starts[bci] as usize;
             let unmatched: Vec<usize> = (0..bchunk.num_rows())
-                .filter(|i| !marked[base + i].load(std::sync::atomic::Ordering::Relaxed))
+                .filter(|i| !mark.matched(bci, *i))
                 .collect();
             if unmatched.is_empty() {
                 continue;
@@ -6492,6 +6670,7 @@ fn hash_join_probe(
             // NULL-extend the preserved side's columns, except the ones no
             // consumer reads (wave 127): those stay placeholders, like the
             // build columns `gather` already carried through.
+            let present = plan.present.as_deref();
             let nulls = |t: &DataType, out_col: usize| -> Result<std::sync::Arc<Vector>> {
                 if present.is_some_and(|m| !m.get(out_col).copied().unwrap_or(true)) {
                     return Ok(std::sync::Arc::new(Vector::new_empty(*t)));
@@ -6524,801 +6703,6 @@ fn hash_join_probe(
         }
     }
     Ok(out)
-}
-
-// ---------- fused join → aggregate ----------
-
-/// Which join input one rewritten aggregate expression reads from.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Side {
-    /// Every column reference is `< left_cols` (left input).
-    Left,
-    /// Every column reference is `>= left_cols` (right input).
-    Right,
-    /// No column references at all.
-    Constant,
-}
-
-/// Combine the sides of a binary/vector expression: a constant operand
-/// never conflicts; two different data sides do (not fusible).
-fn merge_sides(a: Side, b: Side) -> Option<Side> {
-    match (a, b) {
-        (Side::Constant, s) | (s, Side::Constant) => Some(s),
-        (a, b) if a == b => Some(a),
-        _ => None,
-    }
-}
-
-/// Side classification of a join-space expression: `Some(Left)`/`Some(Right)`
-/// when every column reference lies entirely on one side, `Some(Constant)`
-/// for column-free trees, `None` when the sides mix or the tree holds a
-/// subquery / AggRef / WindowRef (none of which the fused path can evaluate
-/// per side).
-fn classify_side(expr: &BoundExpr, left_cols: usize) -> Option<Side> {
-    match expr {
-        BoundExpr::Literal(_) => Some(Side::Constant),
-        BoundExpr::Column { index, .. } => Some(if *index < left_cols {
-            Side::Left
-        } else {
-            Side::Right
-        }),
-        BoundExpr::Binary { left, right, .. } => merge_sides(
-            classify_side(left, left_cols)?,
-            classify_side(right, left_cols)?,
-        ),
-        BoundExpr::Not(e)
-        | BoundExpr::Negate { expr: e, .. }
-        | BoundExpr::IsNull { expr: e, .. }
-        | BoundExpr::Cast { expr: e, .. } => classify_side(e, left_cols),
-        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
-            let mut side = Side::Constant;
-            for a in args {
-                side = merge_sides(side, classify_side(a, left_cols)?)?;
-            }
-            Some(side)
-        }
-        BoundExpr::Case {
-            branches, else_, ..
-        } => {
-            let mut side = Side::Constant;
-            for (c, v) in branches {
-                side = merge_sides(side, classify_side(c, left_cols)?)?;
-                side = merge_sides(side, classify_side(v, left_cols)?)?;
-            }
-            if let Some(e) = else_ {
-                side = merge_sides(side, classify_side(e, left_cols)?)?;
-            }
-            Some(side)
-        }
-        // Aggregate/window output columns, subqueries, and extension calls
-        // (opaque: possibly impure and fallible) are not fusible.
-        BoundExpr::AggRef { .. }
-        | BoundExpr::WindowRef { .. }
-        | BoundExpr::ScalarSubquery { .. }
-        | BoundExpr::InSubquery { .. }
-        | BoundExpr::OuterRef { .. }
-        | BoundExpr::DynamicScalar { .. }
-        | BoundExpr::Exists { .. } => None,
-    }
-}
-
-/// Rewrite an aggregate expression from project-output space into join
-/// space: every `BoundExpr::Column { index, .. }` becomes
-/// `project.exprs[index]`. `None` (reject the fusion) when a subquery,
-/// AggRef, or WindowRef occurs anywhere — including inside a substituted
-/// project expression — or an index is out of range. `project` is `None`
-/// when the aggregate's input is the join itself (expressions are already
-/// join-space).
-fn rewrite_through_project(expr: &BoundExpr, project: Option<&[BoundExpr]>) -> Option<BoundExpr> {
-    match expr {
-        BoundExpr::Literal(v) => Some(BoundExpr::Literal(v.clone())),
-        BoundExpr::Column { index, dtype } => match project {
-            None => Some(BoundExpr::Column {
-                index: *index,
-                dtype: *dtype,
-            }),
-            Some(pexprs) => {
-                let p = pexprs.get(*index)?;
-                if p.has_subquery() {
-                    return None;
-                }
-                Some(p.clone())
-            }
-        },
-        BoundExpr::Binary {
-            op,
-            left,
-            right,
-            dtype,
-        } => Some(BoundExpr::Binary {
-            op: *op,
-            left: Box::new(rewrite_through_project(left, project)?),
-            right: Box::new(rewrite_through_project(right, project)?),
-            dtype: *dtype,
-        }),
-        BoundExpr::Not(e) => Some(BoundExpr::Not(Box::new(rewrite_through_project(
-            e, project,
-        )?))),
-        BoundExpr::Negate { expr, dtype } => Some(BoundExpr::Negate {
-            expr: Box::new(rewrite_through_project(expr, project)?),
-            dtype: *dtype,
-        }),
-        BoundExpr::IsNull { expr, negated } => Some(BoundExpr::IsNull {
-            expr: Box::new(rewrite_through_project(expr, project)?),
-            negated: *negated,
-        }),
-        BoundExpr::Scalar { func, args, dtype } => Some(BoundExpr::Scalar {
-            func: *func,
-            args: args
-                .iter()
-                .map(|a| rewrite_through_project(a, project))
-                .collect::<Option<Vec<_>>>()?,
-            dtype: *dtype,
-        }),
-        BoundExpr::Cast { expr, dtype } => Some(BoundExpr::Cast {
-            expr: Box::new(rewrite_through_project(expr, project)?),
-            dtype: *dtype,
-        }),
-        BoundExpr::Coalesce { args, dtype } => Some(BoundExpr::Coalesce {
-            args: args
-                .iter()
-                .map(|a| rewrite_through_project(a, project))
-                .collect::<Option<Vec<_>>>()?,
-            dtype: *dtype,
-        }),
-        BoundExpr::Case {
-            branches,
-            else_,
-            dtype,
-        } => Some(BoundExpr::Case {
-            branches: branches
-                .iter()
-                .map(|(c, v)| {
-                    Some((
-                        rewrite_through_project(c, project)?,
-                        rewrite_through_project(v, project)?,
-                    ))
-                })
-                .collect::<Option<Vec<_>>>()?,
-            else_: match else_ {
-                Some(e) => Some(Box::new(rewrite_through_project(e, project)?)),
-                None => None,
-            },
-            dtype: *dtype,
-        }),
-        // Aggregate/window output columns, subqueries, and extension calls
-        // (opaque: possibly impure and fallible) are not fusible.
-        BoundExpr::AggRef { .. }
-        | BoundExpr::WindowRef { .. }
-        | BoundExpr::ScalarSubquery { .. }
-        | BoundExpr::InSubquery { .. }
-        | BoundExpr::OuterRef { .. }
-        | BoundExpr::DynamicScalar { .. }
-        | BoundExpr::Exists { .. } => None,
-    }
-}
-
-/// Shift a joined-space expression down by `left_cols`: column index `i`
-/// becomes `i - left_cols`, so the expression evaluates against the right
-/// input alone (the same rewrite the optimizer applies to right-side
-/// predicates pushed below a join). Only right-side expressions are shifted,
-/// so no index underflows. Rejected variants clone through, keeping the walk
-/// total.
-fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
-    match expr {
-        BoundExpr::Column { index, dtype } => BoundExpr::Column {
-            index: index - left_cols,
-            dtype: *dtype,
-        },
-        // An outer ref is not a column of either side of this join.
-        BoundExpr::Literal(_) | BoundExpr::OuterRef { .. } => expr.clone(),
-        BoundExpr::Binary {
-            op,
-            left,
-            right,
-            dtype,
-        } => BoundExpr::Binary {
-            op: *op,
-            left: Box::new(shift_join_columns(left, left_cols)),
-            right: Box::new(shift_join_columns(right, left_cols)),
-            dtype: *dtype,
-        },
-        BoundExpr::Not(e) => BoundExpr::Not(Box::new(shift_join_columns(e, left_cols))),
-        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
-            expr: Box::new(shift_join_columns(expr, left_cols)),
-            dtype: *dtype,
-        },
-        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
-            expr: Box::new(shift_join_columns(expr, left_cols)),
-            negated: *negated,
-        },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
-            func: *func,
-            args: args
-                .iter()
-                .map(|a| shift_join_columns(a, left_cols))
-                .collect(),
-            dtype: *dtype,
-        },
-        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
-            expr: Box::new(shift_join_columns(expr, left_cols)),
-            dtype: *dtype,
-        },
-        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
-            args: args
-                .iter()
-                .map(|a| shift_join_columns(a, left_cols))
-                .collect(),
-            dtype: *dtype,
-        },
-        BoundExpr::Case {
-            branches,
-            else_,
-            dtype,
-        } => BoundExpr::Case {
-            branches: branches
-                .iter()
-                .map(|(c, v)| {
-                    (
-                        shift_join_columns(c, left_cols),
-                        shift_join_columns(v, left_cols),
-                    )
-                })
-                .collect(),
-            else_: else_
-                .as_ref()
-                .map(|e| Box::new(shift_join_columns(e, left_cols))),
-            dtype: *dtype,
-        },
-        BoundExpr::DynamicScalar {
-            name,
-            args,
-            dtype,
-            reads,
-        } => BoundExpr::DynamicScalar {
-            name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| shift_join_columns(a, left_cols))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            dtype: *dtype,
-            reads: reads.clone(),
-        },
-        BoundExpr::AggRef { .. }
-        | BoundExpr::WindowRef { .. }
-        | BoundExpr::ScalarSubquery { .. }
-        | BoundExpr::InSubquery { .. }
-        | BoundExpr::Exists { .. } => expr.clone(),
-    }
-}
-
-/// A rewritten key/argument expression plus the join side it reads from.
-struct FusedExpr {
-    expr: BoundExpr,
-    side: Side,
-}
-
-/// Where one key/agg-arg gets its runtime values.
-#[derive(Clone, Copy)]
-enum ExprSource {
-    /// Left-side or constant expression: index into the vectors evaluated
-    /// once per left chunk.
-    Left(usize),
-    /// Right-side expression: index into the per-right-chunk vectors.
-    Right(usize),
-}
-
-/// Rewrite + classify one aggregate key/argument. `None` ⇒ not fusible.
-fn fusible_expr(
-    expr: &BoundExpr,
-    project: Option<&[BoundExpr]>,
-    left_cols: usize,
-) -> Option<FusedExpr> {
-    let expr = rewrite_through_project(expr, project)?;
-    // The fused path pre-evaluates this expression over the *whole* left or
-    // right input, but the materialized path only evaluates it on matched
-    // join rows. A value-dependent error on a never-matched row would then
-    // surface only under fusion, so reject any expression that can error.
-    if !expr_is_total(&expr) {
-        return None;
-    }
-    let side = classify_side(&expr, left_cols)?;
-    Some(FusedExpr { expr, side })
-}
-
-/// True when evaluating `e` on any valid value of its input type cannot
-/// return an error (a panic-free, error-free evaluation). Used to keep the
-/// fused join→aggregate path from observing value-dependent errors on rows
-/// the materialized path never evaluates.
-///
-/// The rules mirror `exec::expr`'s evaluation:
-/// - `Literal` / `Column` are pure reads;
-/// - `Not` / `IsNull` only recurse; `Negate` is total only on DOUBLE
-///   (integer negation of `MIN` is an overflow error);
-/// - comparisons, `AND`/`OR`, `LIKE` never fail on well-typed operands;
-///   `+`/`-`/`*` are total only when they produce DOUBLE (IEEE) or subtract
-///   two DATEs (an i32 difference always fits BIGINT) — integer arithmetic
-///   and DATE ± n raise overflow errors;
-/// - `/` avoids the integer divide-by-zero rule only when both operands are
-///   DOUBLE (pure IEEE); `%` is integer-only and errors on a zero divisor;
-/// - `CAST` can fail per value (VARCHAR→numeric parses, date parses,
-///   out-of-range timestamp widening);
-/// - `COALESCE`/`CASE` evaluate every arm, so all arms must be total;
-/// - only the scalar functions verified in `apply_scalar` to never return a
-///   value-dependent `Err` on binder-typed arguments are whitelisted
-///   (`substr` is left out with the rest; `date_trunc` errors on bad parts;
-///   `abs` only on DOUBLE, since integer `abs(MIN)` overflows);
-/// - subqueries / aggregate / window refs are rejected before this point.
-fn expr_is_total(e: &BoundExpr) -> bool {
-    match e {
-        BoundExpr::Literal(_) | BoundExpr::Column { .. } => true,
-        // An outer value may be NULL and is not the fused path's to inspect.
-        BoundExpr::OuterRef { .. } => false,
-        BoundExpr::Not(x) | BoundExpr::IsNull { expr: x, .. } => expr_is_total(x),
-        BoundExpr::Negate { expr, dtype } => *dtype == DataType::Double && expr_is_total(expr),
-        BoundExpr::Binary {
-            op,
-            left,
-            right,
-            dtype,
-        } => match op {
-            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => {
-                let date_diff = *op == BinaryOp::Subtract
-                    && left.dtype() == DataType::Date
-                    && right.dtype() == DataType::Date;
-                (*dtype == DataType::Double || date_diff)
-                    && expr_is_total(left)
-                    && expr_is_total(right)
-            }
-            BinaryOp::Eq
-            | BinaryOp::NotEq
-            | BinaryOp::Lt
-            | BinaryOp::LtEq
-            | BinaryOp::Gt
-            | BinaryOp::GtEq
-            | BinaryOp::And
-            | BinaryOp::Or
-            | BinaryOp::Like
-            | BinaryOp::NotLike
-            | BinaryOp::Concat => expr_is_total(left) && expr_is_total(right),
-            // int/int division errors on a zero divisor; only DOUBLE/DOUBLE
-            // (both sides, so the int-div rule can never trigger) is safe.
-            BinaryOp::Divide => {
-                left.dtype() == DataType::Double
-                    && right.dtype() == DataType::Double
-                    && expr_is_total(left)
-                    && expr_is_total(right)
-            }
-            BinaryOp::Modulo => false,
-            // The binder desugars both into total comparisons.
-            BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom => false,
-        },
-        BoundExpr::Cast { .. } => false,
-        BoundExpr::Coalesce { args, .. } => args.iter().all(expr_is_total),
-        BoundExpr::Case {
-            branches, else_, ..
-        } => {
-            branches
-                .iter()
-                .all(|(c, v)| expr_is_total(c) && expr_is_total(v))
-                && else_.as_ref().is_none_or(|e| expr_is_total(e))
-        }
-        BoundExpr::Scalar { func, args, .. } => {
-            let abs_ok = *func != ScalarFunc::Abs
-                || args.first().is_some_and(|a| a.dtype() == DataType::Double);
-            abs_ok
-                && matches!(
-                    func,
-                    ScalarFunc::Upper
-                        | ScalarFunc::Lower
-                        | ScalarFunc::Length
-                        | ScalarFunc::Abs
-                        | ScalarFunc::Round
-                        | ScalarFunc::Year
-                        | ScalarFunc::Month
-                        | ScalarFunc::Day
-                        | ScalarFunc::Hour
-                        | ScalarFunc::Minute
-                        | ScalarFunc::Second
-                )
-                && args.iter().all(expr_is_total)
-        }
-        BoundExpr::AggRef { .. }
-        | BoundExpr::WindowRef { .. }
-        | BoundExpr::ScalarSubquery { .. }
-        | BoundExpr::InSubquery { .. }
-        | BoundExpr::DynamicScalar { .. }
-        | BoundExpr::Exists { .. } => false,
-    }
-}
-/// Try to execute `Aggregate` over `Join` or `Project over Join` without
-/// materializing the joined rows: each match feeds one row into its group's
-/// accumulators directly. Returns `Ok(None)` — before evaluating anything —
-/// when the shape or any aggregate key/argument is not fusible.
-///
-/// Row feed order is exactly the materialized pipeline's, orientation
-/// included: the build-side choice is the same [`build_on_left`] the
-/// materialized `hash_join` makes, the probe side is iterated chunk by chunk
-/// in order, and within a probe row matches come in build-row order — so
-/// first-seen group order and accumulation order match whichever side is
-/// hashed. Group-key encoding, key `Value`s, and accumulator updates read
-/// the same source vectors the materialized path sees, so integer/exact
-/// results are bit-identical (float partials may differ at the ulp level —
-/// accepted).
-fn fused_join_aggregate(
-    cx: &Cx,
-    input: &LogicalPlan,
-    keys: &[BoundExpr],
-    aggs: &[BoundAgg],
-) -> Result<Option<Output>> {
-    // Shape: Aggregate over Join, or over Project over Join. A Filter /
-    // Distinct / Window / Limit / Cte between the aggregate and the join
-    // (or any other input) keeps the materialized path.
-    let (kind, left, right, left_keys, right_keys, left_cols, project) = match input {
-        LogicalPlan::Join {
-            kind,
-            left,
-            right,
-            left_keys,
-            right_keys,
-            left_cols,
-            residual: None,
-        } => (
-            *kind, &**left, &**right, left_keys, right_keys, *left_cols, None,
-        ),
-        LogicalPlan::Project {
-            input: inner,
-            exprs,
-            ..
-        } => match &**inner {
-            LogicalPlan::Join {
-                kind,
-                left,
-                right,
-                left_keys,
-                right_keys,
-                left_cols,
-                residual: None,
-            } => (
-                *kind,
-                &**left,
-                &**right,
-                left_keys,
-                right_keys,
-                *left_cols,
-                Some(&exprs[..]),
-            ),
-            _ => return Ok(None),
-        },
-        _ => return Ok(None),
-    };
-    // Outer joins must materialize their NULL-extended rows: fusion only
-    // feeds matched pairs into the accumulators, so it would undercount.
-    // Static kind check — nothing has been evaluated yet.
-    if kind != JoinKind::Inner {
-        return Ok(None);
-    }
-    // Fusion probes one key column pair; composite and DISTINCT aggregates
-    // take the materialized path.
-    let (left_key, right_key) = match (left_keys.as_slice(), right_keys.as_slice()) {
-        ([l], [r]) => (l, r),
-        _ => return Ok(None),
-    };
-    if aggs.iter().any(|a| a.distinct) {
-        return Ok(None);
-    }
-    // The same build-side choice the materialized `hash_join` makes: hash
-    // the estimated-smaller input and probe the other. `probe_left` decides
-    // the feed order below, so both paths agree chunk for chunk.
-    let probe_left = !build_on_left(cx, kind, left, right);
-
-    // With a Project in the shape, fusion rewrites only the aggregate's
-    // keys/args through it, so project exprs the aggregate does not reference
-    // are never evaluated — while the materialized path evaluates all of
-    // them. Evaluating a total, subquery-free expr has no observable effect,
-    // so skipping an unused one is safe; a non-total or subquery-bearing
-    // project expr must force the materialized path so it errors exactly as
-    // before. (Side classification is irrelevant for exprs nothing reads.)
-    if let Some(exprs) = project
-        && exprs.iter().any(|e| e.has_subquery() || !expr_is_total(e))
-    {
-        return Ok(None);
-    }
-
-    // Static fusibility: rewrite every key/arg into join space and classify
-    // its side. Nothing is evaluated before all checks pass.
-    let mut key_exprs: Vec<FusedExpr> = Vec::with_capacity(keys.len());
-    for k in keys {
-        match fusible_expr(k, project, left_cols) {
-            Some(f) => key_exprs.push(f),
-            None => return Ok(None),
-        }
-    }
-    let mut arg_exprs: Vec<Option<FusedExpr>> = Vec::with_capacity(aggs.len());
-    for a in aggs {
-        let spec = match &a.arg {
-            None => None, // COUNT(*)
-            Some(e) => match fusible_expr(e, project, left_cols) {
-                Some(f) => Some(f),
-                None => return Ok(None),
-            },
-        };
-        arg_exprs.push(spec);
-    }
-    // Right-side expressions evaluate over the right input alone, so their
-    // joined-space column indices shift down by `left_cols`.
-    for f in key_exprs.iter_mut().chain(arg_exprs.iter_mut().flatten()) {
-        if f.side == Side::Right {
-            f.expr = shift_join_columns(&f.expr, left_cols);
-        }
-    }
-    // Left-side and constant expressions evaluate once per left chunk; right
-    // expressions once per right chunk.
-    let mut left_exprs: Vec<&BoundExpr> = Vec::new();
-    let mut right_exprs: Vec<&BoundExpr> = Vec::new();
-    let mut key_srcs: Vec<ExprSource> = Vec::with_capacity(key_exprs.len());
-    for k in &key_exprs {
-        key_srcs.push(match k.side {
-            Side::Right => {
-                right_exprs.push(&k.expr);
-                ExprSource::Right(right_exprs.len() - 1)
-            }
-            Side::Left | Side::Constant => {
-                left_exprs.push(&k.expr);
-                ExprSource::Left(left_exprs.len() - 1)
-            }
-        });
-    }
-    let mut arg_srcs: Vec<Option<ExprSource>> = Vec::with_capacity(arg_exprs.len());
-    for a in &arg_exprs {
-        arg_srcs.push(a.as_ref().map(|f| match f.side {
-            Side::Right => {
-                right_exprs.push(&f.expr);
-                ExprSource::Right(right_exprs.len() - 1)
-            }
-            Side::Left | Side::Constant => {
-                left_exprs.push(&f.expr);
-                ExprSource::Left(left_exprs.len() - 1)
-            }
-        }));
-    }
-
-    let l = eval(cx, left)?;
-    let r = eval(cx, right)?;
-
-    // Orientation: `probe` is the side iterated chunk by chunk, `build`
-    // feeds the match table.
-    let (probe, build, probe_key, build_key) = if probe_left {
-        (&l, &r, left_key, right_key)
-    } else {
-        (&r, &l, right_key, left_key)
-    };
-    let (probe_exprs, build_exprs) = if probe_left {
-        (&left_exprs, &right_exprs)
-    } else {
-        (&right_exprs, &left_exprs)
-    };
-    let probe_side = if probe_left { Side::Left } else { Side::Right };
-
-    /// One key/arg source resolved for the active orientation: `probe`
-    /// selects the pulled probe chunk (row `pi`) or the arena's build row;
-    /// `idx` indexes the matching per-chunk expression vectors.
-    #[derive(Clone, Copy)]
-    struct OrientSource {
-        probe: bool,
-        idx: usize,
-    }
-    let orient = |src: ExprSource| match (src, probe_side) {
-        (ExprSource::Left(s), Side::Left) | (ExprSource::Right(s), Side::Right) => OrientSource {
-            probe: true,
-            idx: s,
-        },
-        (ExprSource::Left(s), _) | (ExprSource::Right(s), _) => OrientSource {
-            probe: false,
-            idx: s,
-        },
-    };
-    let key_srcs: Vec<OrientSource> = key_srcs.iter().map(|s| orient(*s)).collect();
-    let arg_srcs: Vec<Option<OrientSource>> = arg_srcs.iter().map(|s| s.map(orient)).collect();
-
-    // Build the match table exactly like `hash_join`: same int
-    // specialization, `common_numeric` canonicalization, u32 guard, and
-    // capacity policy.
-    let ints = is_int_key(probe_key.dtype()) && is_int_key(build_key.dtype());
-    let common = common_numeric(probe_key.dtype(), build_key.dtype()).ok();
-    let build_rows: usize = build.chunks.iter().map(|c| c.num_rows()).sum();
-    if build_rows > u32::MAX as usize {
-        return Err(PinkDbError::Execution(
-            "hash join build side exceeds u32 rows".to_string(),
-        ));
-    }
-    let table = MatchTable::build(
-        cx,
-        &build.chunks,
-        std::slice::from_ref(build_key),
-        std::slice::from_ref(&common),
-        ints,
-    )?;
-
-    // Fast path: keys-free pure COUNT(*) counts matched pairs by walking the
-    // match chains — no per-pair `Value` work, no group state.
-    if keys.is_empty()
-        && !aggs.is_empty()
-        && aggs
-            .iter()
-            .all(|a| a.func == AggFunc::Count && a.arg.is_none())
-    {
-        // Binder dedup leaves exactly one COUNT(*); this path emits one
-        // column (and `agg_output_schema` below still reflects `aggs`).
-        debug_assert_eq!(aggs.len(), 1);
-        let total: i64 = probe
-            .chunks
-            .par_iter()
-            .map(|chunk| -> Result<i64> {
-                let kv = eval_join_key(cx, probe_key, chunk, common, ints)?;
-                let mut count = 0i64;
-                let mut buf = Vec::new();
-                let probe = ints.then(|| table.probe_ints(&kv));
-                for pi in 0..chunk.num_rows() {
-                    if kv.is_null(pi) {
-                        continue;
-                    }
-                    let matches = if ints {
-                        table.matches_at(probe.as_ref().expect("integer keys"), pi)
-                    } else {
-                        buf.clear();
-                        kv.encode_into(&mut buf, pi);
-                        table.matches_bytes(&buf)
-                    };
-                    count += matches.count() as i64;
-                }
-                Ok(count)
-            })
-            .collect::<Result<Vec<i64>>>()?
-            .into_iter()
-            .sum();
-        let mut vec = Vector::new_empty(DataType::Bigint);
-        vec.push_valid(Value::Bigint(total))?;
-        let chunks = vec![DataChunk::new(vec![vec])?];
-        let (names, types) = agg_output_schema(keys, aggs);
-        return Ok(Some(Output {
-            chunks,
-            names,
-            types,
-        }));
-    }
-
-    // Pre-evaluate every build-side key/arg expression once per build chunk
-    // (shared by all probe chunks).
-    let build_vecs: Vec<Vec<FusedVec>> = build
-        .chunks
-        .par_iter()
-        .map(|chunk| {
-            cx.check_deadline()?;
-            build_exprs
-                .iter()
-                .map(|e| eval_fused_vec(e, chunk, cx))
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<_>>()?;
-
-    // Probe + accumulate, parallel per probe chunk: each match feeds one row
-    // into its group's partial. A partition can cover arbitrarily many
-    // joined rows, so groups are created on first sight exactly like
-    // `aggregate()` does per chunk.
-    let partials: Vec<Partial> = probe
-        .chunks
-        .par_iter()
-        .map(|chunk| -> Result<Partial> {
-            cx.check_deadline()?;
-            let probe_vecs: Vec<FusedVec> = probe_exprs
-                .iter()
-                .map(|e| eval_fused_vec(e, chunk, cx))
-                .collect::<Result<_>>()?;
-            let kv = eval_join_key(cx, probe_key, chunk, common, ints)?;
-            let mut partial = Partial {
-                groups: Vec::new(),
-                index: FastMap::with_capacity_and_hasher(
-                    local_index_capacity(chunk.num_rows()),
-                    Default::default(),
-                ),
-            };
-            let mut buf = Vec::new();
-            let mut kbuf = Vec::new();
-            let mut full_reserved = false;
-            let probe = ints.then(|| table.probe_ints(&kv));
-            for pi in 0..chunk.num_rows() {
-                if kv.is_null(pi) {
-                    continue;
-                }
-                let matches = if ints {
-                    table.matches_at(probe.as_ref().expect("integer keys"), pi)
-                } else {
-                    kbuf.clear();
-                    kv.encode_into(&mut kbuf, pi);
-                    table.matches_bytes(&kbuf)
-                };
-                for r in matches {
-                    let (bci, bi) = table.loc(r);
-                    let (bci, bi) = (bci as usize, bi as usize);
-                    // Group key encoding byte-identical to `aggregate()`:
-                    // the same source vectors, indexed by the probe row for
-                    // probe-side keys and the build row for build-side ones.
-                    buf.clear();
-                    for src in &key_srcs {
-                        let (vecs, row) = if src.probe {
-                            (&probe_vecs, pi)
-                        } else {
-                            (&build_vecs[bci], bi)
-                        };
-                        vecs[src.idx].v().encode_into(&mut buf, row);
-                    }
-                    let idx = match partial.index.get(&buf) {
-                        Some(&idx) => idx,
-                        None => {
-                            let enc = buf.clone();
-                            let idx = partial.groups.len();
-                            if !full_reserved && partial.index.len() >= HIGH_CARDINALITY_KEYS {
-                                partial
-                                    .index
-                                    .reserve(chunk.num_rows().saturating_sub(partial.index.len()));
-                                full_reserved = true;
-                            }
-                            partial.index.insert(enc.clone(), idx);
-                            partial.groups.push((
-                                enc,
-                                Group {
-                                    keys: key_srcs
-                                        .iter()
-                                        .map(|src| {
-                                            let (vecs, row) = if src.probe {
-                                                (&probe_vecs, pi)
-                                            } else {
-                                                (&build_vecs[bci], bi)
-                                            };
-                                            vecs[src.idx].v().get(row)
-                                        })
-                                        .collect(),
-                                    accs: aggs.iter().map(Acc::for_agg).collect(),
-                                },
-                            ));
-                            idx
-                        }
-                    };
-                    let group = &mut partial.groups[idx].1;
-                    for (acc, src) in group.accs.iter_mut().zip(arg_srcs.iter()) {
-                        match src {
-                            // COUNT(*): every row counts.
-                            None => acc.count_star(),
-                            // Typed read of the cell (NULL skips), the same
-                            // accumulator update the materialized path makes.
-                            Some(src) => {
-                                let (vecs, row) = if src.probe {
-                                    (&probe_vecs, pi)
-                                } else {
-                                    (&build_vecs[bci], bi)
-                                };
-                                acc.update_vec(vecs[src.idx].v(), row)
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(partial)
-        })
-        .collect::<Result<_>>()?;
-
-    // Merge in probe-chunk order and emit through the shared post-partial
-    // phase, exactly like `aggregate()`.
-    let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
-    let chunks = merge_and_emit(partials, &key_types, aggs)?;
-    let (names, types) = agg_output_schema(keys, aggs);
-    Ok(Some(Output {
-        chunks,
-        names,
-        types,
-    }))
 }
 
 /// Try to execute `Aggregate` over `Filter`s over a streaming leaf (a table
@@ -10944,7 +10328,7 @@ mod tests {
     /// NULL-extended rows instead.
     #[test]
     fn fusion_rejects_outer_joins() {
-        let db = fused_db();
+        let db = pipeline_db();
         let cx = Cx::new(&db);
         for sql in [
             "SELECT COUNT(*) FROM fa LEFT JOIN fb ON fa.id = fb.id;",
@@ -10956,7 +10340,7 @@ mod tests {
                 unreachable!()
             };
             assert!(
-                fused_join_aggregate(&cx, input, keys, aggs)
+                pipeline::aggregate(&cx, input, keys, aggs)
                     .unwrap()
                     .is_none(),
                 "must not fuse: {sql}"
@@ -10964,7 +10348,7 @@ mod tests {
         }
         // Materialized correctness: 5 left rows, 4 matched pairs for id=1,
         // 4 for id=2, one NULL-key left row NULL-extended → 9 rows.
-        let mut db = fused_db();
+        let mut db = pipeline_db();
         assert_eq!(
             select(
                 &mut db,
@@ -14079,7 +13463,7 @@ mod tests {
 
     /// Two small tables with duplicate keys (INTEGER = BIGINT), NULL join
     /// keys on both sides, NULL measures, and two group regions.
-    fn fused_db() -> PinkDb {
+    fn pipeline_db() -> PinkDb {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE fa (id INTEGER, region VARCHAR, x INTEGER);")
             .unwrap();
@@ -14118,23 +13502,33 @@ mod tests {
         }
     }
 
-    /// Execute the top aggregate of `sql` through the fusion helper and
-    /// assert it fused and produced exactly the materialized path's output
-    /// (chunk for chunk, order included).
-    fn assert_fused_matches_materialized(db: &PinkDb, sql: &str) {
+    /// Execute `sql` through the pipeline and through the materialized path
+    /// (`pipeline_execution = off`) and assert the rows are exactly equal.
+    fn assert_both_paths(db: &mut PinkDb, sql: &str) -> Vec<Vec<V>> {
+        let pipelined = select(db, sql);
+        db.execute("SET pipeline_execution = false;").unwrap();
+        let materialized = select(db, sql);
+        db.execute("SET pipeline_execution = true;").unwrap();
+        assert_eq!(pipelined, materialized, "{sql}");
+        pipelined
+    }
+
+    /// Execute the top aggregate of `sql` through the pipeline and assert it
+    /// compiled and produced exactly the materialized path's output (chunk for
+    /// chunk, order and float bits included).
+    fn assert_pipeline_matches_materialized(db: &PinkDb, sql: &str) {
         let plan = bound_plan(db, sql);
         let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
             unreachable!()
         };
-        let cx = Cx::new(db);
-        let fused = fused_join_aggregate(&cx, input, keys, aggs)
+        // The projections bind the write-once read sets the engine analyses
+        // before execution (an unbound context assembles every column).
+        let cx = Cx::new(db).with_projections(&plan);
+        let pipelined = pipeline::aggregate(&cx, input, keys, aggs)
             .unwrap()
-            .unwrap_or_else(|| panic!("expected a fusible plan: {sql}"));
+            .unwrap_or_else(|| panic!("expected a pipelined plan: {sql}"));
         let inner = eval(&cx, input).unwrap();
         let materialized = aggregate(&cx, &inner.chunks, keys, aggs).unwrap();
-        // Rows (in order) + chunk boundaries; validity-mask padding can
-        // differ because the COUNT(*) fast path builds a tight vector while
-        // `aggregate()` preallocates CHUNK_SIZE — same observable rows.
         let rows = |chunks: &[DataChunk]| -> Vec<Vec<Value>> {
             let mut rows = Vec::new();
             for c in chunks {
@@ -14144,34 +13538,11 @@ mod tests {
             }
             rows
         };
-        // Fused partial boundaries are per left chunk, the materialized ones
-        // per joined output chunk, so float SUM/AVG partials can sum in a
-        // different order and differ by a few ulps (accepted behavior).
-        // Compare Double cells with a small relative tolerance (absolute
-        // floor 1e-12, NaN == NaN); every other type stays exact.
-        let close = |a: &Value, b: &Value| -> bool {
-            match (a, b) {
-                (Value::Double(x), Value::Double(y)) => {
-                    (x.is_nan() && y.is_nan())
-                        || x == y
-                        || (x - y).abs() <= 1e-12_f64.max(1e-9 * x.abs().max(y.abs()))
-                }
-                _ => a == b,
-            }
-        };
-        let (fr, mr) = (rows(&fused.chunks), rows(&materialized));
-        assert_eq!(fr.len(), mr.len(), "row count: {sql}");
-        for (i, (a, b)) in fr.iter().zip(&mr).enumerate() {
-            assert_eq!(a.len(), b.len(), "width row {i}: {sql}");
-            for (j, (x, y)) in a.iter().zip(b).enumerate() {
-                assert!(
-                    close(x, y),
-                    "row {i} col {j}: fused {x:?} vs materialized {y:?}: {sql}"
-                );
-            }
-        }
+        // Both paths fold one partial per chunk, in chunk order: groups keep
+        // their first-seen order and float sums their accumulation order, so
+        // the chunks compare exactly.
         assert_eq!(
-            fused
+            pipelined
                 .chunks
                 .iter()
                 .map(|c| c.num_rows())
@@ -14182,13 +13553,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             "{sql}"
         );
-        assert_eq!(fused.names, agg_output_schema(keys, aggs).0, "{sql}");
-        assert_eq!(fused.types, agg_output_schema(keys, aggs).1, "{sql}");
+        assert_eq!(rows(&pipelined.chunks), rows(&materialized), "{sql}");
+        assert_eq!(pipelined.names, agg_output_schema(keys, aggs).0, "{sql}");
+        assert_eq!(pipelined.types, agg_output_schema(keys, aggs).1, "{sql}");
     }
 
     #[test]
-    fn fused_count_star_over_join_counts_matches() {
-        let mut db = fused_db();
+    fn pipeline_count_star_over_join_counts_matches() {
+        let mut db = pipeline_db();
         // Direct Aggregate-over-Join shape and the Project-over-Join shape
         // (derived table) both count the 8 matched pairs.
         assert_eq!(
@@ -14215,23 +13587,23 @@ mod tests {
     }
 
     #[test]
-    fn fused_group_by_matches_fallback_and_order() {
-        let mut db = fused_db();
+    fn pipeline_group_by_matches_fallback_and_order() {
+        let mut db = pipeline_db();
         let sql =
             "SELECT fa.region, COUNT(*), COUNT(fa.x), SUM(fa.x), AVG(fa.x), MIN(fa.x), MAX(fa.x)
                    FROM fa JOIN fb ON fa.id = fb.id";
-        let fused = select(&mut db, &format!("{sql} GROUP BY fa.region;"));
+        let pipelined = select(&mut db, &format!("{sql} GROUP BY fa.region;"));
         // Same semantics with a mixed-side predicate above the join: the
         // optimizer keeps it there, so the materialized path runs.
         let fallback = select(
             &mut db,
             &format!("{sql} WHERE fa.id = fb.id GROUP BY fa.region;"),
         );
-        assert_eq!(fused, fallback);
+        assert_eq!(pipelined, fallback);
         // First-seen group order (west before east); NULL args skipped by
         // COUNT/SUM/AVG/MIN/MAX.
         assert_eq!(
-            fused,
+            pipelined,
             vec![
                 vec![
                     V::Varchar("west".to_string()),
@@ -14256,25 +13628,25 @@ mod tests {
     }
 
     #[test]
-    fn fused_compound_single_side_args() {
-        let mut db = fused_db();
+    fn pipeline_compound_single_side_args() {
+        let mut db = pipeline_db();
         let sql =
             "SELECT COUNT(*), SUM(fb.total * 2), SUM(fa.x * 3) FROM fa JOIN fb ON fa.id = fb.id";
-        let fused = select(&mut db, &format!("{sql};"));
+        let pipelined = select(&mut db, &format!("{sql};"));
         let fallback = select(&mut db, &format!("{sql} WHERE fa.id = fb.id;"));
-        assert_eq!(fused, fallback);
+        assert_eq!(pipelined, fallback);
         // 8 matches; totals sum 69.5 → ×2 = 139.0; x sums 30 → ×3 = 90.
         assert_eq!(
-            fused,
+            pipelined,
             vec![vec![V::Bigint(8), V::Double(139.0), V::Bigint(90)]]
         );
     }
 
     #[test]
-    fn fused_project_reorders_drops_and_right_keys() {
-        let mut db = fused_db();
+    fn pipeline_project_reorders_drops_and_right_keys() {
+        let mut db = pipeline_db();
         // Reordering project: region (left) grouped, t (right) summed.
-        let fused = select(
+        let pipelined = select(
             &mut db,
             "SELECT region, COUNT(*), SUM(t)
              FROM (SELECT fa.region AS region, fb.total AS t FROM fa JOIN fb ON fa.id = fb.id) s
@@ -14287,9 +13659,9 @@ mod tests {
                    WHERE fa.id = fb.id) s
              GROUP BY region;",
         );
-        assert_eq!(fused, fallback);
+        assert_eq!(pipelined, fallback);
         assert_eq!(
-            fused,
+            pipelined,
             vec![
                 vec![
                     V::Varchar("west".to_string()),
@@ -14346,8 +13718,8 @@ mod tests {
     }
 
     #[test]
-    fn fused_string_keys() {
-        let mut db = fused_db();
+    fn pipeline_string_keys() {
+        let mut db = pipeline_db();
         db.execute("CREATE TABLE fsa (k VARCHAR, v INTEGER);")
             .unwrap();
         db.execute("CREATE TABLE fsb (k VARCHAR, w INTEGER);")
@@ -14363,7 +13735,7 @@ mod tests {
             ),
             vec![vec![V::Bigint(5)]]
         );
-        let fused = select(
+        let pipelined = select(
             &mut db,
             "SELECT fsa.k, COUNT(*), SUM(fsb.w) FROM fsa JOIN fsb ON fsa.k = fsb.k GROUP BY fsa.k;",
         );
@@ -14372,10 +13744,10 @@ mod tests {
             "SELECT fsa.k, COUNT(*), SUM(fsb.w)
              FROM fsa JOIN fsb ON fsa.k = fsb.k WHERE fsa.k = fsb.k GROUP BY fsa.k;",
         );
-        assert_eq!(fused, fallback);
+        assert_eq!(pipelined, fallback);
         // 'a': 2 left × 2 right = 4 matches, w sum 80; 'b': 1 match, 20.
         assert_eq!(
-            fused,
+            pipelined,
             vec![
                 vec![V::Varchar("a".to_string()), V::Bigint(4), V::Bigint(80)],
                 vec![V::Varchar("b".to_string()), V::Bigint(1), V::Bigint(20)],
@@ -14384,7 +13756,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_timestamp_and_double_keys() {
+    fn pipeline_timestamp_and_double_keys() {
         let mut db = PinkDb::new();
         // TIMESTAMP keys take the int path (i64 micros, NULLs skipped).
         db.execute("CREATE TABLE tl (ts TIMESTAMP, lv INTEGER);")
@@ -14445,8 +13817,8 @@ mod tests {
     }
 
     #[test]
-    fn fused_empty_right_side_single_empty_group() {
-        let mut db = fused_db();
+    fn pipeline_empty_right_side_single_empty_group() {
+        let mut db = pipeline_db();
         db.execute("CREATE TABLE fbe (id BIGINT, total DOUBLE);")
             .unwrap();
         // No keys: one row of zero/NULL results, like `aggregate()` over ∅.
@@ -14493,8 +13865,8 @@ mod tests {
 
     #[test]
     fn mixed_side_group_key_uses_fallback() {
-        let mut db = fused_db();
-        // Mixed-side key: fusion rejects statically; the materialized path
+        let mut db = pipeline_db();
+        // Mixed-side key: pipeline rejects statically; the materialized path
         // groups fa.id + fb.id (BIGINT) in first-seen order.
         assert_eq!(
             select(
@@ -14510,8 +13882,8 @@ mod tests {
     }
 
     #[test]
-    fn fused_agg_in_derived_table_and_cte() {
-        let mut db = fused_db();
+    fn pipeline_agg_in_derived_table_and_cte() {
+        let mut db = pipeline_db();
         // The grouped aggregate over the join sits inside the derived table.
         assert_eq!(
             select(
@@ -14538,7 +13910,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_multi_chunk_order_matches_fallback() {
+    fn pipeline_multi_chunk_order_matches_fallback() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE ml (k INTEGER, v INTEGER);")
             .unwrap();
@@ -14549,7 +13921,7 @@ mod tests {
         // across chunks on both sides.
         insert_rows(&mut db, "ml", 3000, |i| format!("({}, {i})", i % 7));
         insert_rows(&mut db, "mr", 3000, |i| format!("({}, {i})", (i * 3) % 7));
-        let fused = select(
+        let pipelined = select(
             &mut db,
             "SELECT ml.k, COUNT(*), SUM(ml.v), SUM(mr.w)
              FROM ml JOIN mr ON ml.k = mr.k GROUP BY ml.k;",
@@ -14559,22 +13931,22 @@ mod tests {
             "SELECT ml.k, COUNT(*), SUM(ml.v), SUM(mr.w)
              FROM ml JOIN mr ON ml.k = mr.k WHERE ml.k = mr.k GROUP BY ml.k;",
         );
-        assert_eq!(fused, fallback);
-        assert_eq!(fused.len(), 7);
+        assert_eq!(pipelined, fallback);
+        assert_eq!(pipelined.len(), 7);
         // First-seen group order is 0, 1, ..., 6.
-        for (i, row) in fused.iter().enumerate() {
+        for (i, row) in pipelined.iter().enumerate() {
             assert_eq!(row[0], V::Integer(i as i32), "group {i}");
         }
         // Independent count: left rows per key × right rows per key.
         for k in 0..7i32 {
             let l = (0..3000).filter(|i| i % 7 == k).count() as i64;
             let r = (0..3000).filter(|i| (i * 3) % 7 == k).count() as i64;
-            assert_eq!(fused[k as usize][1], V::Bigint(l * r), "group {k}");
+            assert_eq!(pipelined[k as usize][1], V::Bigint(l * r), "group {k}");
         }
     }
 
     #[test]
-    fn fused_expansion_spans_right_chunks() {
+    fn pipeline_expansion_spans_right_chunks() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE xl (k INTEGER, v INTEGER);")
             .unwrap();
@@ -14583,7 +13955,7 @@ mod tests {
         db.execute("INSERT INTO xl VALUES (1, 5);").unwrap();
         // 5000 right rows across 3 chunks; 2500 match key 1 (even i).
         insert_rows(&mut db, "xr", 5000, |i| format!("({}, {i})", 1 + i % 2));
-        let fused = select(
+        let pipelined = select(
             &mut db,
             "SELECT xl.k, COUNT(*), SUM(xr.w) FROM xl JOIN xr ON xl.k = xr.k GROUP BY xl.k;",
         );
@@ -14592,83 +13964,117 @@ mod tests {
             "SELECT xl.k, COUNT(*), SUM(xr.w)
              FROM xl JOIN xr ON xl.k = xr.k WHERE xl.k = xr.k GROUP BY xl.k;",
         );
-        assert_eq!(fused, fallback);
+        assert_eq!(pipelined, fallback);
         assert_eq!(
-            fused,
+            pipelined,
             vec![vec![V::Integer(1), V::Bigint(2500), V::Bigint(6_247_500)]]
         );
     }
 
     #[test]
-    fn fused_join_aggregate_equals_materialized() {
-        let db = fused_db();
+    fn pipeline_join_aggregate_equals_materialized() {
+        let db = pipeline_db();
         // Direct Aggregate-over-Join shapes.
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT fa.region, COUNT(*), SUM(fa.x), AVG(fb.total), MIN(fb.total), MAX(fb.total)
              FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
         );
         // Compound left key (including the NULL+1 group) and right scalar
         // key. DOUBLE arithmetic is total; integer `+` can overflow and is
-        // covered by `fusion_rejects_value_erroring_shapes`.
-        assert_fused_matches_materialized(
+        // covered by `pipeline_value_erroring_shapes`.
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT fa.x + 1.5, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.x + 1.5;",
         );
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT upper(fb.region), COUNT(*), SUM(fb.total)
              FROM fa JOIN fb ON fa.id = fb.id GROUP BY upper(fb.region);",
         );
         // Project-over-Join: reorder + drop + right-side arg through the project.
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT region, COUNT(*), SUM(t)
              FROM (SELECT fa.region AS region, fb.total AS t
                    FROM fa JOIN fb ON fa.id = fb.id) s GROUP BY region;",
         );
         // Global aggregate with a compound right-side arg (keys-empty path).
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT COUNT(*), SUM(fb.total * 2) FROM fa JOIN fb ON fa.id = fb.id;",
         );
-        // Keys-only aggregate (no accumulators).
-        assert_fused_matches_materialized(
+        // COUNT(*) without keys.
+        assert_pipeline_matches_materialized(
             &db,
+            "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;",
+        );
+        // Keys-only aggregate (no accumulators): DISTINCT, which the
+        // materialized path answers with its typed int fast path.
+        let mut db = pipeline_db();
+        assert_both_paths(
+            &mut db,
             "SELECT fa.region FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
         );
-        // COUNT(*) fast path.
-        assert_fused_matches_materialized(&db, "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;");
     }
 
     #[test]
-    fn fused_agg_over_filter_pushed_below_join() {
-        let mut db = fused_db();
+    fn pipeline_agg_over_filter_pushed_below_join() {
+        let mut db = pipeline_db();
         // A right-side WHERE is pushed below the join by the optimizer, so
-        // the aggregate input is still Project-over-Join and fuses (the
-        // filter is not *between* the aggregate and the join).
-        let fused = select(
+        // the aggregate input is still Project-over-Join.
+        let pipelined = select(
             &mut db,
             "SELECT COUNT(*), SUM(fb.total)
              FROM fa JOIN fb ON fa.id = fb.id WHERE fb.total > 5;",
         );
         // Adding a mixed-side no-op conjunct keeps a Filter above the join,
-        // forcing the materialized path; semantics are identical.
+        // which the pipeline runs as a streaming operator; same rows.
         let fallback = select(
             &mut db,
             "SELECT COUNT(*), SUM(fb.total)
              FROM fa JOIN fb ON fa.id = fb.id WHERE fa.id = fb.id AND fb.total > 5;",
         );
-        assert_eq!(fused, fallback);
+        assert_eq!(pipelined, fallback);
         // Matches only the (id=1, total>5) right rows: 2 left × 2 right.
-        assert_eq!(fused, vec![vec![V::Bigint(4), V::Double(61.0)]]);
+        assert_eq!(pipelined, vec![vec![V::Bigint(4), V::Double(61.0)]]);
     }
 
+    /// The shapes the pipeline does not compile still answer through the
+    /// materialized path; the ones it does compile agree with it exactly.
     #[test]
-    fn fusion_rejects_blocked_shapes() {
-        let db = fused_db();
-        let cx = Cx::new(&db);
-        let blocked = [
+    fn pipeline_declines_uncovered_shapes() {
+        let mut db = pipeline_db();
+        let declined = [
+            // No accumulators: a keys-only aggregate is DISTINCT.
+            "SELECT fa.region FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
+            // Outer joins (only inner probes are compiled).
+            "SELECT fa.region, COUNT(*) FROM fa LEFT JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
+            "SELECT COUNT(*) FROM fa RIGHT JOIN fb ON fa.id = fb.id;",
+            // Distinct and Limit between the aggregate and the join.
+            "SELECT COUNT(*) FROM (SELECT DISTINCT fa.region FROM fa JOIN fb ON fa.id = fb.id) s;",
+            "SELECT COUNT(*) FROM (SELECT fa.region FROM fa JOIN fb ON fa.id = fb.id LIMIT 3) s;",
+        ];
+        for sql in declined {
+            let plan = bound_plan(&db, sql);
+            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+                unreachable!()
+            };
+            {
+                let cx = Cx::new(&db);
+                assert!(
+                    pipeline::aggregate(&cx, input, keys, aggs)
+                        .unwrap()
+                        .is_none(),
+                    "pipeline must decline: {sql}"
+                );
+            }
+            assert_both_paths(&mut db, sql);
+        }
+        // Shapes the old fused path declined because an expression could
+        // error on a row no match reached: the pipeline evaluates an operator
+        // only on the rows that reached it, so these compile and agree.
+        for sql in [
             // Mixed-side group key.
             "SELECT fa.id + fb.id, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.id + fb.id;",
             // Mixed-side aggregate argument.
@@ -14676,27 +14082,158 @@ mod tests {
             // Filter between the aggregate and the join.
             "SELECT fa.region, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id
              WHERE fa.id = fb.id GROUP BY fa.region;",
-            // Distinct between the aggregate and the join.
-            "SELECT COUNT(*) FROM (SELECT DISTINCT fa.region FROM fa JOIN fb ON fa.id = fb.id) s;",
-        ];
-        for sql in blocked {
+        ] {
             let plan = bound_plan(&db, sql);
             let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
                 unreachable!()
             };
+            {
+                let cx = Cx::new(&db);
+                assert!(
+                    pipeline::aggregate(&cx, input, keys, aggs)
+                        .unwrap()
+                        .is_some(),
+                    "pipeline must compile: {sql}"
+                );
+            }
+            assert_both_paths(&mut db, sql);
+        }
+    }
+
+    /// Join chains of any length compile as one pipeline: every inner join is
+    /// a probe, its build side is a completed table, and the output columns
+    /// stay `left ++ right` whatever side was built.
+    #[test]
+    fn pipeline_covers_join_chains() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE TABLE fact (k INTEGER, j INTEGER, v INTEGER);
+             CREATE TABLE d1 (k INTEGER, region VARCHAR);
+             CREATE TABLE d2 (j INTEGER, label VARCHAR);
+             CREATE TABLE d3 (k INTEGER, tier VARCHAR);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO d1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+             INSERT INTO d2 VALUES (1, 'x'), (2, 'y');
+             INSERT INTO d3 VALUES (1, 'p'), (2, 'q'), (3, 'r');",
+        )
+        .unwrap();
+        // Every 7th fact row has NULL keys: it matches nothing, so an
+        // expression evaluated only on matches never sees it.
+        let fact: Vec<String> = (0..40)
+            .map(|i| {
+                if i % 7 == 0 {
+                    "(NULL, NULL, 0)".to_string()
+                } else {
+                    format!("({}, {}, {})", i % 3 + 1, i % 2 + 1, i)
+                }
+            })
+            .collect();
+        db.execute(&format!("INSERT INTO fact VALUES {};", fact.join(",")))
+            .unwrap();
+        // Three probes in one pipeline, then a filter over the second join
+        // and a projection under the aggregate.
+        let chained = [
+            "SELECT d1.region, d2.label, d3.tier, COUNT(*), SUM(f.v)
+             FROM fact f JOIN d1 ON f.k = d1.k JOIN d2 ON f.j = d2.j
+                  JOIN d3 ON f.k = d3.k
+             GROUP BY d1.region, d2.label, d3.tier;",
+            "SELECT region, COUNT(*), SUM(v)
+             FROM (SELECT d1.region AS region, f.v AS v
+                   FROM fact f JOIN d1 ON f.k = d1.k JOIN d2 ON f.j = d2.j
+                   WHERE f.v > 5 AND d2.label = 'x') s
+             GROUP BY region;",
+            // The smaller side on the left: the build side is the left
+            // input, so the probe assembles the preserved right side first.
+            "SELECT d1.region, COUNT(*), SUM(f.v)
+             FROM d1 JOIN fact f ON d1.k = f.k GROUP BY d1.region;",
+            // Global aggregate over the chain (one group, no keys).
+            "SELECT COUNT(*), SUM(f.v)
+             FROM fact f JOIN d1 ON f.k = d1.k JOIN d2 ON f.j = d2.j
+                  JOIN d3 ON f.k = d3.k;",
+        ];
+        for sql in chained {
+            let plan = bound_plan(&db, sql);
+            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+                unreachable!()
+            };
+            {
+                let cx = Cx::new(&db);
+                assert!(
+                    pipeline::aggregate(&cx, input, keys, aggs)
+                        .unwrap()
+                        .is_some(),
+                    "expected a pipelined plan: {sql}"
+                );
+            }
+            assert_both_paths(&mut db, sql);
+        }
+        // One row per non-NULL fact row: each chain branch matches once.
+        assert_eq!(
+            assert_both_paths(
+                &mut db,
+                "SELECT COUNT(*) FROM fact f JOIN d1 ON f.k = d1.k
+                      JOIN d2 ON f.j = d2.j JOIN d3 ON f.k = d3.k;"
+            ),
+            vec![vec![V::Bigint(34)]]
+        );
+    }
+
+    /// A join the statement uses twice belongs to `eval_shared_join`'s cache:
+    /// the pipeline leaves it as its source instead of flowing through it, so
+    /// its second use reads the cached output rather than joining again.
+    #[test]
+    fn pipeline_leaves_a_repeated_join_to_the_shared_cache() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE TABLE fact (k INTEGER, v INTEGER);
+             CREATE TABLE dim (k INTEGER, region VARCHAR);
+             INSERT INTO dim VALUES (1, 'a'), (2, 'b'), (3, 'a');
+             INSERT INTO fact VALUES (1, 10), (2, 20), (3, 30), (4, 40);",
+        )
+        .unwrap();
+        // The same join written twice: one shared candidate, joined once.
+        let sql = "SELECT COUNT(*)
+                   FROM (SELECT f.k AS k FROM fact f JOIN dim d ON f.k = d.k) x
+                   JOIN (SELECT f.k AS k FROM fact f JOIN dim d ON f.k = d.k) y
+                     ON x.k = y.k;";
+        let plan = bound_plan(&db, sql);
+        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            unreachable!()
+        };
+        {
+            let cx = Cx::new(&db).with_projections(&plan);
+            // The repeated join is a cache candidate, so the compile below
+            // takes the branch that leaves it to `eval_shared_join`.
+            assert!(cx.subplans.has_candidates());
             assert!(
-                fused_join_aggregate(&cx, input, keys, aggs)
+                pipeline::aggregate(&cx, input, keys, aggs)
                     .unwrap()
-                    .is_none(),
-                "should not fuse: {sql}"
+                    .is_some(),
+                "expected a pipelined plan: {sql}"
             );
         }
+        // k = 1, 2 and 3 match on both sides; k = 4 has no dimension row.
+        assert_eq!(assert_both_paths(&mut db, sql), vec![vec![V::Bigint(3)]]);
+        // Grouped through the same reused join, on the fact's own column.
+        assert_both_paths(
+            &mut db,
+            "SELECT x.k, COUNT(*)
+             FROM (SELECT f.k AS k FROM fact f JOIN dim d ON f.k = d.k) x
+             JOIN (SELECT f.k AS k FROM fact f JOIN dim d ON f.k = d.k) y
+               ON x.k = y.k
+             GROUP BY x.k;",
+        );
     }
 
     // --- wave 19 follow-up: value-dependent errors on unmatched rows ---
 
+    /// A probe pushes only matched rows, so an aggregate argument that would
+    /// error is evaluated exactly where the materialized path evaluates it:
+    /// never on a row no match reaches, always on one a match does reach.
     #[test]
-    fn fusion_falls_back_on_value_dependent_error() {
+    fn pipeline_spares_unmatched_rows() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t1 (k INTEGER, x INTEGER);")
             .unwrap();
@@ -14705,26 +14242,25 @@ mod tests {
         db.execute("INSERT INTO t1 VALUES (1, 10);").unwrap();
         db.execute("INSERT INTO t2 VALUES (1, 2), (2, 0);").unwrap();
         let sql = "SELECT SUM(100 / q) FROM t1 JOIN t2 ON t1.k = t2.k;";
-        // `100 / q` pre-evaluated over the whole right input would divide by
-        // zero on the never-matched q=0 row, so the helper must reject the
-        // shape...
+        // Pre-evaluating `100 / q` over the whole right input would divide by
+        // zero on the never-matched q=0 row; the pipeline never sees it.
         let plan = bound_plan(&db, sql);
         let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
             unreachable!()
         };
-        let cx = Cx::new(&db);
-        assert!(
-            fused_join_aggregate(&cx, input, keys, aggs)
-                .unwrap()
-                .is_none()
-        );
-        // ...and the query must keep materialized semantics: only the matched
-        // (q=2) row feeds the sum, so no error and 100/2 = 50.
-        assert_eq!(select(&mut db, sql), vec![vec![V::Double(50.0)]]);
+        {
+            let cx = Cx::new(&db);
+            assert!(
+                pipeline::aggregate(&cx, input, keys, aggs)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(assert_both_paths(&mut db, sql), vec![vec![V::Double(50.0)]]);
     }
 
     #[test]
-    fn fusion_rejects_value_erroring_shapes() {
+    fn pipeline_value_erroring_shapes() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE va (k INTEGER, x INTEGER);")
             .unwrap();
@@ -14734,8 +14270,7 @@ mod tests {
         // Key 2 rows never match; they hold the erroring values.
         db.execute("INSERT INTO vb VALUES (1, 2, '3', 4, 2), (2, 0, 'nope', 5, 0);")
             .unwrap();
-        let cx = Cx::new(&db);
-        let blocked = [
+        for sql in [
             // Integer division by zero on an unmatched right row.
             "SELECT SUM(100 / vb.qty) FROM va JOIN vb ON va.k = vb.k;",
             // VARCHAR→INTEGER parse failure on an unmatched right row.
@@ -14747,21 +14282,23 @@ mod tests {
             "SELECT vb.a + 1, COUNT(*) FROM va JOIN vb ON va.k = vb.k GROUP BY vb.a + 1;",
             "SELECT SUM(-vb.a) FROM va JOIN vb ON va.k = vb.k;",
             "SELECT SUM(abs(vb.a)) FROM va JOIN vb ON va.k = vb.k;",
-        ];
-        for sql in blocked {
+        ] {
             let plan = bound_plan(&db, sql);
             let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
                 unreachable!()
             };
-            assert!(
-                fused_join_aggregate(&cx, input, keys, aggs)
-                    .unwrap()
-                    .is_none(),
-                "should not fuse: {sql}"
-            );
+            {
+                let cx = Cx::new(&db);
+                assert!(
+                    pipeline::aggregate(&cx, input, keys, aggs)
+                        .unwrap()
+                        .is_some(),
+                    "pipeline must compile: {sql}"
+                );
+            }
+            assert_both_paths(&mut db, sql);
         }
-        // Same queries through the engine run the materialized path and only
-        // see the matched (qty=2, s='3') row.
+        // Only the matched (qty=2, s='3') row feeds the accumulators.
         assert_eq!(
             select(
                 &mut db,
@@ -14779,21 +14316,24 @@ mod tests {
     }
 
     #[test]
-    fn fusion_keeps_total_shapes() {
-        let db = fused_db();
+    fn pipeline_accepts_total_shapes() {
+        let db = pipeline_db();
         // Each shape must still fuse (the helper asserts `Some`) and produce
         // exactly the materialized output.
-        assert_fused_matches_materialized(&db, "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;");
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
+            &db,
+            "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;",
+        );
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT SUM(fb.total * 2) FROM fa JOIN fb ON fa.id = fb.id;",
         );
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT SUM(abs(fb.total)) FROM fa JOIN fb ON fa.id = fb.id;",
         );
         // `upper(region)` reached through a Project over the join.
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT region, COUNT(*) FROM (SELECT upper(fa.region) AS region
              FROM fa JOIN fb ON fa.id = fb.id) s GROUP BY region;",
@@ -14806,8 +14346,8 @@ mod tests {
     /// so the engine errors exactly like the fallback; a total unused
     /// expression stays fusible and equivalent.
     #[test]
-    fn fused_unused_project_expr_error_equivalence() {
-        let mut db = fused_db();
+    fn pipeline_unused_project_expr_error_equivalence() {
+        let mut db = pipeline_db();
         let erroring = [
             "SELECT region, COUNT(*) FROM (SELECT fa.region AS region,
                     CAST(fb.region AS INTEGER) AS junk
@@ -14815,57 +14355,41 @@ mod tests {
             "SELECT region, COUNT(*) FROM (SELECT fa.region AS region, 1/0 AS junk
              FROM fa JOIN fb ON fa.id = fb.id) s GROUP BY region;",
         ];
-        // Static check: the fusion helper rejects the erroring shapes.
-        let cx = Cx::new(&db);
-        for sql in erroring {
-            let plan = bound_plan(&db, sql);
-            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
-                unreachable!()
-            };
-            assert!(
-                fused_join_aggregate(&cx, input, keys, aggs)
-                    .unwrap()
-                    .is_none(),
-                "erroring projection must not fuse: {sql}"
-            );
-        }
-        // Engine check (wave 127b, DuckDB 2.0 parity): an output column no
-        // consumer reads is never evaluated, so the unused erroring
-        // expression does not error on either path, and both variants return
-        // the same rows. (DuckDB removes unused columns before execution and
-        // answers these queries; the old rule forced an error instead.)
+        // The unused column carries no read set: the compiler binds the
+        // projection mask, so the pipeline skips the expression exactly like
+        // the materialized path (wave 127b, DuckDB 2.0 parity: an output
+        // column no consumer reads is never evaluated).
         for sql in erroring {
             let fallback = sql.replace(
                 "FROM fa JOIN fb ON fa.id = fb.id) s",
                 "FROM fa JOIN fb ON fa.id = fb.id WHERE fa.id = fb.id) s",
             );
             assert_ne!(fallback, sql);
-            let fused = db
+            let pipelined = db
                 .execute(sql)
                 .unwrap_or_else(|e| panic!("unused junk must not be evaluated: {sql}: {e}"));
             let materialized = db
                 .execute(&fallback)
                 .unwrap_or_else(|e| panic!("unused junk must not be evaluated: {fallback}: {e}"));
             assert_eq!(
-                format!("{fused:?}"),
+                format!("{pipelined:?}"),
                 format!("{materialized:?}"),
-                "fused and materialized variants differ: {sql}"
+                "pipelined and materialized variants differ: {sql}"
             );
         }
-        // A total unused projection expression is safe to skip: fusion
-        // proceeds and the engine matches the materialized variant.
+        // A total unused projection expression is skipped the same way.
         let sql = "SELECT region, COUNT(*) FROM (SELECT fa.region AS region,
                           upper(fb.region) AS junk
                    FROM fa JOIN fb ON fa.id = fb.id) s GROUP BY region;";
-        assert_fused_matches_materialized(&db, sql);
-        let fused = select(&mut db, sql);
+        assert_pipeline_matches_materialized(&db, sql);
+        let pipelined = select(&mut db, sql);
         let fallback = sql.replace(
             "FROM fa JOIN fb ON fa.id = fb.id) s",
             "FROM fa JOIN fb ON fa.id = fb.id WHERE fa.id = fb.id) s",
         );
-        assert_eq!(fused, select(&mut db, &fallback));
+        assert_eq!(pipelined, select(&mut db, &fallback));
         assert_eq!(
-            fused,
+            pipelined,
             vec![
                 vec![V::Varchar("west".to_string()), V::Bigint(4)],
                 vec![V::Varchar("east".to_string()), V::Bigint(4)],
@@ -14873,12 +14397,12 @@ mod tests {
         );
     }
 
-    /// Fused partial boundaries (per left chunk) differ from the
+    /// Pipelined partial boundaries (per left chunk) differ from the
     /// materialized ones (per joined output chunk), so float `SUM`/`AVG` can
     /// differ by a few ulps; the differential helper's tolerance must absorb
     /// that on a multi-chunk join.
     #[test]
-    fn fused_float_partial_boundaries_within_tolerance() {
+    fn pipeline_float_partials_are_bit_identical() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE fl (k INTEGER, d DOUBLE);")
             .unwrap();
@@ -14889,36 +14413,29 @@ mod tests {
             format!("(1, {:?})", (i % 10) as f64 / 7.0)
         });
         insert_rows(&mut db, "fr", 3, |_| "(1)".to_string());
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k;",
         );
-        // Both engine paths agree within the documented tolerance (the mixed
-        // WHERE keeps the fallback on the materialized path).
-        let fused = select(
-            &mut db,
-            "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k;",
+        // The mixed WHERE keeps the fallback on the materialized path; the
+        // two must agree exactly, bit for bit.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k;"
+            ),
+            select(
+                &mut db,
+                "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k WHERE fl.k = fr.k;"
+            ),
         );
-        let materialized = select(
-            &mut db,
-            "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k WHERE fl.k = fr.k;",
-        );
-        for (a, b) in fused[0].iter().zip(&materialized[0]) {
-            let (V::Double(x), V::Double(y)) = (a, b) else {
-                panic!("expected doubles: {a:?} vs {b:?}")
-            };
-            assert!(
-                (x - y).abs() <= 1e-12_f64.max(1e-9 * x.abs().max(y.abs())),
-                "float drift: fused {x:?} vs materialized {y:?}"
-            );
-        }
     }
 
     /// Cross-type numeric join keys: INTEGER = DOUBLE and DOUBLE = INTEGER
     /// take the byte path (canonicalized to DOUBLE) and must group and count
     /// exactly like the materialized pipeline.
     #[test]
-    fn fused_int_double_cross_keys() {
+    fn pipeline_int_double_cross_keys() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE ija (k INTEGER, v INTEGER);")
             .unwrap();
@@ -14935,11 +14452,11 @@ mod tests {
             ),
             vec![vec![V::Bigint(5)]]
         );
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT ija.k, COUNT(*), SUM(ijb.w) FROM ija JOIN ijb ON ija.k = ijb.k GROUP BY ija.k;",
         );
-        let fused = select(
+        let pipelined = select(
             &mut db,
             "SELECT ija.k, COUNT(*), SUM(ijb.w) FROM ija JOIN ijb ON ija.k = ijb.k GROUP BY ija.k;",
         );
@@ -14948,10 +14465,10 @@ mod tests {
             "SELECT ija.k, COUNT(*), SUM(ijb.w)
              FROM ija JOIN ijb ON ija.k = ijb.k WHERE ija.k = ijb.k GROUP BY ija.k;",
         );
-        assert_eq!(fused, fallback);
+        assert_eq!(pipelined, fallback);
         // Key 1: one match (w=2); key 2: 2×2 matches (1+3+1+3).
         assert_eq!(
-            fused,
+            pipelined,
             vec![
                 vec![V::Integer(1), V::Bigint(1), V::Bigint(2)],
                 vec![V::Integer(2), V::Bigint(4), V::Bigint(8)],
@@ -14959,16 +14476,16 @@ mod tests {
         );
         // Mirrored DOUBLE = INTEGER: groups keyed by the left (DOUBLE) side,
         // first-seen order 2.0 then 1.0.
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT ijb.k, COUNT(*), SUM(ija.v) FROM ijb JOIN ija ON ijb.k = ija.k GROUP BY ijb.k;",
         );
-        let fused = select(
+        let pipelined = select(
             &mut db,
             "SELECT ijb.k, COUNT(*), SUM(ija.v) FROM ijb JOIN ija ON ijb.k = ija.k GROUP BY ijb.k;",
         );
         assert_eq!(
-            fused,
+            pipelined,
             vec![
                 vec![V::Double(2.0), V::Bigint(4), V::Bigint(82)],
                 vec![V::Double(1.0), V::Bigint(1), V::Bigint(10)],
@@ -14978,9 +14495,9 @@ mod tests {
 
     /// Extreme i64 keys (MIN/MAX, spelled as expressions because a literal
     /// cannot hold i64::MIN) and DATE keys (int path, raw day payloads) must
-    /// group and count correctly through fusion.
+    /// group and count correctly through pipeline.
     #[test]
-    fn fused_extreme_and_date_keys() {
+    fn pipeline_extreme_and_date_keys() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE ela (k BIGINT, v INTEGER);")
             .unwrap();
@@ -15004,11 +14521,11 @@ mod tests {
             ),
             vec![vec![V::Bigint(3)]]
         );
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT ela.k, COUNT(*), SUM(elb.w) FROM ela JOIN elb ON ela.k = elb.k GROUP BY ela.k;",
         );
-        let fused = select(
+        let pipelined = select(
             &mut db,
             "SELECT ela.k, COUNT(*), SUM(elb.w) FROM ela JOIN elb ON ela.k = elb.k GROUP BY ela.k;",
         );
@@ -15017,10 +14534,10 @@ mod tests {
             "SELECT ela.k, COUNT(*), SUM(elb.w)
              FROM ela JOIN elb ON ela.k = elb.k WHERE ela.k = elb.k GROUP BY ela.k;",
         );
-        assert_eq!(fused, fallback);
+        assert_eq!(pipelined, fallback);
         // First-seen: i64::MIN (1 match, w=20), then i64::MAX (2 matches, 40).
         assert_eq!(
-            fused,
+            pipelined,
             vec![
                 vec![V::Bigint(i64::MIN), V::Bigint(1), V::Bigint(20)],
                 vec![V::Bigint(i64::MAX), V::Bigint(2), V::Bigint(40)],
@@ -15039,39 +14556,39 @@ mod tests {
              (DATE '2024-01-15', 10), (DATE '2000-01-01', 20), (DATE '2024-01-15', 30);",
         )
         .unwrap();
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT dta.d, COUNT(*), SUM(dtb.w) FROM dta JOIN dtb ON dta.d = dtb.d GROUP BY dta.d;",
         );
-        let fused = select(
+        let pipelined = select(
             &mut db,
             "SELECT dta.d, COUNT(*), SUM(dtb.w) FROM dta JOIN dtb ON dta.d = dtb.d GROUP BY dta.d;",
         );
         // 2 left × 2 right matches on 2024-01-15 → 4 rows, w sum 80; the
         // unmatched 1969/2000 keys vanish.
-        assert_eq!(fused.len(), 1);
+        assert_eq!(pipelined.len(), 1);
         assert!(
-            matches!(fused[0][0], V::Date(_)),
+            matches!(pipelined[0][0], V::Date(_)),
             "date key: {:?}",
-            fused[0][0]
+            pipelined[0][0]
         );
-        assert_eq!(fused[0][1], V::Bigint(4));
-        assert_eq!(fused[0][2], V::Bigint(80));
+        assert_eq!(pipelined[0][1], V::Bigint(4));
+        assert_eq!(pipelined[0][2], V::Bigint(80));
         assert_eq!(
             select(
                 &mut db,
                 "SELECT dta.d, COUNT(*), SUM(dtb.w) FROM dta JOIN dtb ON dta.d = dtb.d
                  WHERE dta.d = dtb.d GROUP BY dta.d;"
             ),
-            fused
+            pipelined
         );
     }
 
     /// BOOLEAN, comparison, AND, CASE, COALESCE, LIKE, YEAR, and HOUR group
     /// keys all fuse and match the materialized pipeline.
     #[test]
-    fn fused_scalar_group_keys_match_materialized() {
-        let mut db = fused_db();
+    fn pipeline_scalar_group_keys_match_materialized() {
+        let mut db = pipeline_db();
         let keys = [
             "fa.x > 4",
             "fb.total > 10",
@@ -15084,8 +14601,8 @@ mod tests {
             let sql = format!(
                 "SELECT {k}, COUNT(*), SUM(fa.x) FROM fa JOIN fb ON fa.id = fb.id GROUP BY {k};"
             );
-            assert_fused_matches_materialized(&db, &sql);
-            let fused = select(&mut db, &sql);
+            assert_pipeline_matches_materialized(&db, &sql);
+            let pipelined = select(&mut db, &sql);
             let fallback = select(
                 &mut db,
                 &format!(
@@ -15093,8 +14610,8 @@ mod tests {
                      WHERE fa.id = fb.id GROUP BY {k};"
                 ),
             );
-            assert_eq!(fused, fallback, "key: {k}");
-            assert!(!fused.is_empty(), "key produced no groups: {k}");
+            assert_eq!(pipelined, fallback, "key: {k}");
+            assert!(!pipelined.is_empty(), "key produced no groups: {k}");
         }
         // YEAR/HOUR keys need DATE/TIMESTAMP inputs.
         db.execute("CREATE TABLE gka (d DATE, ts TIMESTAMP, k INTEGER, v INTEGER);")
@@ -15112,8 +14629,8 @@ mod tests {
             let sql = format!(
                 "SELECT {k}, COUNT(*), SUM(gka.v) FROM gka JOIN gkb ON gka.k = gkb.k GROUP BY {k};"
             );
-            assert_fused_matches_materialized(&db, &sql);
-            let fused = select(&mut db, &sql);
+            assert_pipeline_matches_materialized(&db, &sql);
+            let pipelined = select(&mut db, &sql);
             let fallback = select(
                 &mut db,
                 &format!(
@@ -15121,17 +14638,17 @@ mod tests {
                      WHERE gka.k = gkb.k GROUP BY {k};"
                 ),
             );
-            assert_eq!(fused, fallback, "key: {k}");
-            assert!(!fused.is_empty(), "key produced no groups: {k}");
+            assert_eq!(pipelined, fallback, "key: {k}");
+            assert!(!pipelined.is_empty(), "key produced no groups: {k}");
         }
     }
 
-    /// Both join sides empty through fusion: a global aggregate yields one
+    /// Both join sides empty through pipeline: a global aggregate yields one
     /// zero/NULL row, a grouped aggregate zero rows, and the
     /// Project-over-Join shape stays equivalent to materialized execution.
     #[test]
-    fn fused_both_sides_empty() {
-        let mut db = fused_db();
+    fn pipeline_both_sides_empty() {
+        let mut db = pipeline_db();
         db.execute("CREATE TABLE lea (id INTEGER, x INTEGER);")
             .unwrap();
         db.execute("CREATE TABLE leb (id BIGINT, total DOUBLE);")
@@ -15159,7 +14676,7 @@ mod tests {
             ),
             Vec::<Vec<V>>::new()
         );
-        assert_fused_matches_materialized(
+        assert_pipeline_matches_materialized(
             &db,
             "SELECT g, COUNT(*), SUM(t) FROM (SELECT lea.id AS g, leb.total AS t
              FROM lea JOIN leb ON lea.id = leb.id) s GROUP BY g;",
@@ -15171,24 +14688,24 @@ mod tests {
     /// to materialized execution, and results match the all-materialized
     /// variant.
     #[test]
-    fn fused_nested_project_over_join_left() {
-        let mut db = fused_db();
+    fn pipeline_nested_project_over_join_left() {
+        let mut db = pipeline_db();
         let sql = "SELECT g, COUNT(*), SUM(v) FROM (SELECT x.id AS g, x.x AS v
                    FROM (SELECT fa.id AS id, fa.x AS x FROM fa JOIN fb ON fa.id = fb.id) x
                    JOIN fb f2 ON x.id = f2.id) s GROUP BY g;";
         let fallback = "SELECT g, COUNT(*), SUM(v) FROM (SELECT x.id AS g, x.x AS v
                         FROM (SELECT fa.id AS id, fa.x AS x FROM fa JOIN fb ON fa.id = fb.id) x
                         JOIN fb f2 ON x.id = f2.id WHERE x.id = f2.id) s GROUP BY g;";
-        assert_fused_matches_materialized(&db, sql);
+        assert_pipeline_matches_materialized(&db, sql);
         assert_eq!(select(&mut db, sql), select(&mut db, fallback));
     }
 
-    /// Binder dedup: `COUNT(*), COUNT(*)` reaches the fused fast path with
+    /// Binder dedup: `COUNT(*), COUNT(*)` reaches the pipelined fast path with
     /// one aggregate but must still emit the user-visible two columns;
-    /// `COUNT(*), COUNT(1)` takes the generic fused path (two aggregates).
+    /// `COUNT(*), COUNT(1)` takes the generic pipelined path (two aggregates).
     #[test]
-    fn fused_duplicate_count_columns() {
-        let mut db = fused_db();
+    fn pipeline_duplicate_count_columns() {
+        let mut db = pipeline_db();
         assert_eq!(
             select(
                 &mut db,
@@ -15212,12 +14729,12 @@ mod tests {
         };
         assert_eq!(aggs.len(), 1);
         let cx = Cx::new(&db);
-        let fused = fused_join_aggregate(&cx, input, keys, aggs)
+        let pipelined = pipeline::aggregate(&cx, input, keys, aggs)
             .unwrap()
             .unwrap();
-        assert_eq!(fused.chunks.len(), 1);
-        assert_eq!(fused.chunks[0].columns.len(), 1);
-        assert_eq!(fused.names.len(), 1);
+        assert_eq!(pipelined.chunks.len(), 1);
+        assert_eq!(pipelined.chunks[0].columns.len(), 1);
+        assert_eq!(pipelined.names.len(), 1);
     }
 
     // ---------- multi-database (embedded session) ----------
@@ -15718,12 +15235,12 @@ mod tests {
         assert!(!build_on_left(&cx, *kind, left, right));
     }
 
-    /// The fused join→aggregate path uses the same build side as the
+    /// The pipelined join→aggregate path uses the same build side as the
     /// materialized path (fa is smaller than fb), so group order and exact
     /// values agree.
     #[test]
-    fn fused_build_side_matches_materialized() {
-        let db = fused_db();
+    fn pipeline_build_side_matches_materialized() {
+        let db = pipeline_db();
         let sql = "SELECT fb.region, COUNT(*), SUM(fa.x) \
                    FROM fa JOIN fb ON fa.id = fb.id GROUP BY fb.region;";
         let plan = bound_plan(&db, sql);
@@ -15741,7 +15258,7 @@ mod tests {
             build_on_left(&cx, *kind, left, right),
             "fa (5 rows) is smaller than fb (6): probe fb"
         );
-        let fused = fused_join_aggregate(&cx, input, keys, aggs)
+        let pipelined = pipeline::aggregate(&cx, input, keys, aggs)
             .unwrap()
             .expect("fa/fb fuse");
         let inner = eval(&cx, input).unwrap();
@@ -15755,7 +15272,7 @@ mod tests {
             }
             rows
         };
-        assert_eq!(rows(&fused.chunks), rows(&materialized));
+        assert_eq!(rows(&pipelined.chunks), rows(&materialized));
     }
 
     // ---------- wave 41: declarative constraints (metadata, not enforced) ----------

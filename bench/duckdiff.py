@@ -1443,9 +1443,95 @@ def run_remote():
     )
 
 
+# ---- wave 135a: the pipeline's aggregate-rooted mart shape ----
+#
+# QuackLab's mart refresh — a fact joined to small dimensions, grouped by the
+# dimensions' VARCHAR columns — is what the pipeline executor was built for.
+# 6000 fact rows span three engine chunks, so the per-morsel partials and their
+# merge order are exercised; every case runs on both engines, so the streaming
+# path must also match DuckDB value for value.
+_mart_fact = ",".join(
+    f"({i}, {i % 97}, {i % 31}, {i % 500}, {i % 7}.5)" for i in range(6000)
+)
+_mart_cust = ",".join(f"({i}, 'region-{i % 5}', {i % 3}.25)" for i in range(97))
+_mart_prod = ",".join(f"({i}, 'cat-{i % 4}', {i % 6})" for i in range(31))
+_mart_month = ",".join(f"({i}, 'month-{i:02d}')" for i in range(12))
+
+MART_SETUP = f"""
+CREATE TABLE mart_fact (id INTEGER, cust_key INTEGER, prod_key INTEGER, qty INTEGER, amount DOUBLE);
+INSERT INTO mart_fact VALUES {_mart_fact};
+CREATE TABLE mart_cust (k INTEGER, region VARCHAR, factor DOUBLE);
+INSERT INTO mart_cust VALUES {_mart_cust};
+CREATE TABLE mart_prod (k INTEGER, category VARCHAR, size INTEGER);
+INSERT INTO mart_prod VALUES {_mart_prod};
+CREATE TABLE mart_month (k INTEGER, month VARCHAR);
+INSERT INTO mart_month VALUES {_mart_month};
+"""
+
+MART_QUERIES = [
+    # fact ⋈ dim ⋈ dim, GROUP BY two dimension VARCHAR columns
+    ("mart-two-dims",
+     "SELECT c.region, p.category, COUNT(*), SUM(f.qty), SUM(f.amount) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "GROUP BY c.region, p.category ORDER BY c.region, p.category;", True, False),
+    # three joins, filtering the streamed side above the second join
+    ("mart-three-dims",
+     "SELECT c.region, p.category, d.month, COUNT(*), SUM(f.qty) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "JOIN mart_month d ON f.id % 12 = d.k "
+     "GROUP BY c.region, p.category, d.month ORDER BY c.region, p.category, d.month;", True, False),
+    # a filter on the fact side and one on a dimension side
+    ("mart-fact-filter",
+     "SELECT c.region, p.category, COUNT(*), SUM(f.qty) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "WHERE f.qty > 100 GROUP BY c.region, p.category ORDER BY c.region, p.category;", True, False),
+    ("mart-dim-filter",
+     "SELECT c.region, p.category, COUNT(*), SUM(f.amount) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "WHERE c.factor > 1.0 AND p.size > 1 "
+     "GROUP BY c.region, p.category ORDER BY c.region, p.category;", True, False),
+    # FILTER (WHERE ...) accumulators over the chain
+    ("mart-aggregate-filter",
+     "SELECT c.region, COUNT(*) FILTER (WHERE f.qty > 250), "
+     "SUM(f.amount) FILTER (WHERE p.size < 3), COUNT(*) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "GROUP BY c.region ORDER BY c.region;", True, False),
+    # DISTINCT accumulators and AVG over the joined stream
+    ("mart-distinct-avg",
+     "SELECT c.region, COUNT(DISTINCT p.category), COUNT(DISTINCT f.prod_key), "
+     "AVG(f.amount), MIN(f.qty), MAX(f.qty) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "GROUP BY c.region ORDER BY c.region;", True, False),
+    # a fact INTEGER group key beside a dimension VARCHAR key
+    ("mart-fact-int-key",
+     "SELECT f.prod_key % 5, c.region, COUNT(*), SUM(f.qty) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k "
+     "GROUP BY f.prod_key % 5, c.region ORDER BY 1, 2;", True, False),
+    # one group, no keys: the global accumulator over the chain
+    ("mart-global",
+     "SELECT COUNT(*), SUM(f.qty), SUM(f.amount), AVG(f.amount) "
+     "FROM mart_fact f JOIN mart_cust c ON f.cust_key = c.k "
+     "JOIN mart_prod p ON f.prod_key = p.k;", False, False),
+]
+
+
+def run_mart():
+    print("== mart battery (wave 135a: pipeline aggregates) ==")
+    for label, sql, ordered, expect_error in MART_QUERIES:
+        run_case(label, sql, ordered, expect_error, MART_SETUP, MART_SETUP)
+
+
 def main():
     import sys
     run_small()
+    run_mart()
     run_csv()
     run_remote()
     if "--big" in sys.argv:
