@@ -35,6 +35,14 @@
 //! engine's `open` reads the whole file (it materializes every column
 //! eagerly, as before) but decodes the column chunks **in parallel**.
 //!
+//! A **write** streams the data region: each table is read, encoded and
+//! written one row group at a time through a positioned [`Sink`] (a
+//! `BufWriter<File>` plus the running offset) for file targets, or a `Vec`
+//! sink for the in-memory `to_pink_bytes*` API — the same code, so the bytes
+//! are identical either way. Peak memory is the decoded store plus one row
+//! group, not the whole file image. Encrypted saves still seal the whole
+//! image in memory: the `PINKENC1` container is whole-file.
+//!
 //! ## Row groups and statistics
 //!
 //! A row group holds 122,880 rows (60 engine chunks). The footer records,
@@ -547,6 +555,79 @@ impl Writer {
     fn str(&mut self, s: &str) {
         self.u32(s.len() as u32);
         self.bytes(s.as_bytes());
+    }
+}
+
+/// Where a serialization's bytes go: an in-memory buffer or the file itself.
+///
+/// The data region is written through this one path, so a `save`'s file and
+/// the lake's in-memory `to_pink_bytes*` images are byte-identical by
+/// construction.
+trait Sink {
+    fn bytes(&mut self, b: &[u8]) -> Result<()>;
+
+    /// The offset the next byte lands at: the data-region prefix length the
+    /// footer records in its directory entries.
+    fn offset(&self) -> u64;
+}
+
+/// A [`Sink`] over a `Vec`: the `to_pink_bytes*` API and pink-lake's data
+/// files.
+struct VecSink {
+    buf: Vec<u8>,
+}
+
+impl VecSink {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+}
+
+impl Sink for VecSink {
+    fn bytes(&mut self, b: &[u8]) -> Result<()> {
+        self.buf.extend_from_slice(b);
+        Ok(())
+    }
+
+    fn offset(&self) -> u64 {
+        self.buf.len() as u64
+    }
+}
+
+/// A positioned [`Sink`] over an open file: buffered appends plus the running
+/// offset. `save`/checkpoint write the data region through it, so only one
+/// row group is ever held in memory.
+struct FileSink {
+    out: std::io::BufWriter<std::fs::File>,
+    pos: u64,
+}
+
+impl FileSink {
+    fn new(file: std::fs::File) -> Self {
+        // 1 MiB: large enough that the column chunks reach the file in a few
+        // writes, small enough to stay far below a row group's payload.
+        Self {
+            out: std::io::BufWriter::with_capacity(1 << 20, file),
+            pos: 0,
+        }
+    }
+
+    /// Flush the buffered bytes and hand the file back for the fsync.
+    fn finish(self) -> Result<std::fs::File> {
+        Ok(self.out.into_inner().map_err(|e| e.into_error())?)
+    }
+}
+
+impl Sink for FileSink {
+    fn bytes(&mut self, b: &[u8]) -> Result<()> {
+        use std::io::Write;
+        self.out.write_all(b)?;
+        self.pos += b.len() as u64;
+        Ok(())
+    }
+
+    fn offset(&self) -> u64 {
+        self.pos
     }
 }
 
@@ -3368,6 +3449,21 @@ impl PinkDb {
         collect_stats: bool,
         omit_rows: bool,
     ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
+        let mut data = VecSink::new();
+        let saved = self.write_image(&mut data, parallel, collect_stats, omit_rows)?;
+        Ok((data.buf, saved))
+    }
+
+    /// [`PinkDb::to_bytes_inner`]'s image, written through `data`: the one
+    /// serialization path, shared by the `Vec` sink of the in-memory API and
+    /// the file sink of `save`/checkpoint.
+    fn write_image<S: Sink>(
+        &self,
+        data: &mut S,
+        parallel: bool,
+        collect_stats: bool,
+        omit_rows: bool,
+    ) -> Result<Vec<SavedTableStats>> {
         // The optional catalog sections exist iff some object needs them (the
         // flags word is written in the footer, so decide it up front).
         let all_tables: Vec<&crate::storage::DataTable> = self
@@ -3401,7 +3497,6 @@ impl PinkDb {
             | if with_rbac { FLAG_RBAC } else { 0 };
 
         // The data region.
-        let mut data = Writer::new();
         let mut saved: Vec<SavedTableStats> = Vec::new();
         let mut dbs = self.list_databases();
         dbs.sort();
@@ -3455,15 +3550,7 @@ impl PinkDb {
                                 zones: vec![Vec::new(); t.columns.len()],
                             }
                         } else {
-                            write_table(
-                                &mut data,
-                                &ns,
-                                name,
-                                t,
-                                parallel,
-                                collect_stats,
-                                &mut saved,
-                            )?
+                            write_table(data, &ns, name, t, parallel, collect_stats, &mut saved)?
                         };
                         tables.push(dir);
                     }
@@ -3590,13 +3677,16 @@ impl PinkDb {
         write_secrets(&mut fw, self);
         let footer = fw.buf;
         // The footer, then the trailer: the footer's CRC32C, its length and
-        // the magic.
+        // the magic. Both go through the sink after the data region, so a
+        // file target is written strictly front to back.
         let crc = crc32c(&footer);
-        data.bytes(&footer);
-        data.u32(crc);
-        data.u64(footer.len() as u64);
-        data.bytes(MAGIC_V6);
-        Ok((data.buf, saved))
+        let mut trailer = Writer::new();
+        trailer.u32(crc);
+        trailer.u64(footer.len() as u64);
+        trailer.bytes(MAGIC_V6);
+        data.bytes(&footer)?;
+        data.bytes(&trailer.buf)?;
+        Ok(saved)
     }
 
     /// The bytes [`PinkDb::save`] would write: every database in the `.pink`
@@ -3655,8 +3745,9 @@ impl PinkDb {
     pub fn save(&self, path: &str) -> Result<()> {
         self.ensure_wal_healthy()?;
         self.guard_snapshot_target(path)?;
-        let bytes = self.to_pink_bytes()?;
-        Self::write_atomic(std::path::Path::new(path), &bytes)
+        Self::write_atomic(std::path::Path::new(path), |sink| {
+            self.write_image(sink, true, false, false).map(|_| ())
+        })
     }
 
     /// [`PinkDb::save`] with at-rest encryption: the `PINKDB06` bytes are
@@ -3673,15 +3764,21 @@ impl PinkDb {
         {
             self.ensure_wal_healthy()?;
             self.guard_snapshot_target(path)?;
+            // Encrypted stores take the in-memory path: the `PINKENC1`
+            // container seals the whole image, so it cannot be written while
+            // it is still being produced (136w3 adds a block container that
+            // can).
             let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
-            Self::write_atomic(std::path::Path::new(path), &sealed)
+            Self::write_atomic(std::path::Path::new(path), |sink| sink.bytes(&sealed))
         }
     }
 
     /// [`PinkDb::save`] plus `fsync` on the written file — the checkpoint
     /// primitive (the WAL is only rolled once this returns).
     pub(crate) fn save_sync(&self, path: &std::path::Path) -> Result<()> {
-        Self::write_sync(path, &self.to_bytes()?)
+        Self::write_sync(path, |sink| {
+            self.write_image(sink, true, false, false).map(|_| ())
+        })
     }
 
     /// [`PinkDb::save_sync`] with at-rest encryption (checkpoint primitive for
@@ -3692,40 +3789,56 @@ impl PinkDb {
         path: &std::path::Path,
         key: &EncryptionKey,
     ) -> Result<()> {
+        // See `save_with_key`: the whole-buffer container is sealed in memory.
         let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
-        Self::write_sync(path, &sealed)
+        Self::write_sync(path, |sink| sink.bytes(&sealed))
     }
 
-    fn write_sync(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
+    /// Stream the image into `path` and fsync it. `path` is a checkpoint's
+    /// staging file: a failure removes it, so a partial image is never left
+    /// where recovery could trust it.
+    fn write_sync<F>(path: &std::path::Path, write: F) -> Result<()>
+    where
+        F: FnOnce(&mut FileSink) -> Result<()>,
+    {
         // M-5: checkpoints (and the `.tmp` staging file they are written to)
         // are owner-only, never umask-derived.
         crate::fsutil::tighten(path);
-        let mut f = crate::fsutil::create_private(path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        Ok(())
+        let written = (|| -> Result<()> {
+            let f = crate::fsutil::create_private(path)?;
+            let mut sink = FileSink::new(f);
+            write(&mut sink)?;
+            sink.finish()?.sync_all()?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        written
     }
 
-    /// Write `bytes` to `path` atomically: a unique temp sibling is written and
-    /// fsynced, then renamed over the target, then the parent directory is
-    /// fsynced. An interrupted write leaves the previous target intact; a
-    /// failure removes the temp file.
-    fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
+    /// Write the image `write` produces to `path` atomically: a unique temp
+    /// sibling is written and fsynced, then renamed over the target, then the
+    /// parent directory is fsynced. An interrupted write leaves the previous
+    /// target intact; a failure removes the temp file.
+    fn write_atomic<F>(path: &std::path::Path, write: F) -> Result<()>
+    where
+        F: FnOnce(&mut FileSink) -> Result<()>,
+    {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(format!(".tmp-{}-{seq}", std::process::id()));
         let tmp = std::path::PathBuf::from(tmp);
-        let write = (|| -> Result<()> {
-            let mut f = crate::fsutil::create_new_private(&tmp)?;
-            f.write_all(bytes)?;
-            f.sync_all()?;
+        let written = (|| -> Result<()> {
+            let f = crate::fsutil::create_new_private(&tmp)?;
+            let mut sink = FileSink::new(f);
+            write(&mut sink)?;
+            sink.finish()?.sync_all()?;
             Ok(())
         })();
-        if let Err(e) = write {
+        if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
@@ -3977,8 +4090,13 @@ pub fn is_pinkdb06(bytes: &[u8]) -> bool {
 
 /// Write one table's data region (its column chunks) and collect its footer
 /// entry.
-fn write_table(
-    data: &mut Writer,
+///
+/// One row group is read, encoded and written at a time: the row group's
+/// chunks are encoded in parallel, written through the sink, then dropped.
+/// The sink is a [`VecSink`] for the in-memory API and a [`FileSink`] for
+/// `save`/checkpoint, so both paths produce the same bytes.
+fn write_table<S: Sink>(
+    data: &mut S,
     ns: &crate::storage::SchemaPath,
     name: &str,
     t: &DataTable,
@@ -3988,54 +4106,111 @@ fn write_table(
 ) -> Result<TableDir> {
     let schema = t.schema();
     let n_chunks = t.num_chunks();
-    // Share the chunk vectors first (Arc clones only), then encode per
-    // chunk. Order-preserving collect: the bytes are identical to a
-    // serial pass.
-    let mut scans: Vec<Vec<Arc<Vector>>> = Vec::with_capacity(n_chunks);
-    for chunk_idx in 0..n_chunks {
-        let chunk = t
-            .scan_chunk(chunk_idx)
-            .ok_or_else(|| PinkDbError::Execution("storage changed during save".to_string()))?;
-        scans.push(chunk.columns);
-    }
-    // The string layout stores offsets as `u32`; a chunk whose total
-    // VARCHAR bytes exceed that cannot be encoded faithfully (the
-    // offsets would wrap and the reader would reject the file). Refuse
-    // before writing instead of emitting a corrupt file.
-    for cols in &scans {
-        for v in cols {
-            if let VectorData::VarChar(strs) = v.data() {
-                let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
-                if !varchar_offsets_fit(total) {
-                    return Err(PinkDbError::Execution(format!(
-                        "table \"{}.{name}\" has a VARCHAR chunk of {total} \
+    // The per-column statistics of the whole table (the lake's stats
+    // block), accumulated as each row group is encoded.
+    let mut accs: Vec<ChunkColumnStats> =
+        schema.iter().map(|_| ChunkColumnStats::empty()).collect();
+    // The row groups: 60 engine chunks each.
+    let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
+    let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
+    for g in 0..n_groups {
+        let first = g * CHUNKS_PER_ROW_GROUP;
+        let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
+        // Share this row group's chunk vectors (Arc clones only), then encode
+        // per chunk. Order-preserving collect: the bytes are identical to a
+        // serial pass.
+        let mut scans: Vec<Vec<Arc<Vector>>> = Vec::with_capacity(last - first);
+        for chunk_idx in first..last {
+            let chunk = t
+                .scan_chunk(chunk_idx)
+                .ok_or_else(|| PinkDbError::Execution("storage changed during save".to_string()))?;
+            scans.push(chunk.columns);
+        }
+        // The string layout stores offsets as `u32`; a chunk whose total
+        // VARCHAR bytes exceed that cannot be encoded faithfully (the
+        // offsets would wrap and the reader would reject the file). Refuse
+        // before writing instead of emitting a corrupt file.
+        for cols in &scans {
+            for v in cols {
+                if let VectorData::VarChar(strs) = v.data() {
+                    let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
+                    if !varchar_offsets_fit(total) {
+                        return Err(PinkDbError::Execution(format!(
+                            "table \"{}.{name}\" has a VARCHAR chunk of {total} \
                              bytes, over the .pink format's u32 string-offset limit",
-                        ns.db()
-                    )));
+                            ns.db()
+                        )));
+                    }
                 }
             }
         }
-    }
-    // Encode every page (one engine chunk per column) in parallel.
-    let pages: Vec<Vec<EncodedPage>> = if parallel && n_chunks >= PARALLEL_SAVE_MIN_CHUNKS {
-        scans
-            .par_iter()
-            .map(|cols| cols.iter().map(|v| encode_page(v)).collect())
-            .collect()
-    } else {
-        scans
-            .iter()
-            .map(|cols| cols.iter().map(|v| encode_page(v)).collect())
-            .collect()
-    };
-    // The per-column statistics of the whole table (the lake's stats
-    // block).
-    let mut accs: Vec<ChunkColumnStats> =
-        schema.iter().map(|_| ChunkColumnStats::empty()).collect();
-    for chunk in &pages {
-        for (acc, page) in accs.iter_mut().zip(chunk.iter()) {
-            acc.merge(&page.stats);
+        // Encode every page of the group (one engine chunk per column) in
+        // parallel.
+        let pages: Vec<Vec<EncodedPage>> = if parallel && scans.len() >= PARALLEL_SAVE_MIN_CHUNKS {
+            scans
+                .par_iter()
+                .map(|cols| cols.iter().map(|v| encode_page(v)).collect())
+                .collect()
+        } else {
+            scans
+                .iter()
+                .map(|cols| cols.iter().map(|v| encode_page(v)).collect())
+                .collect()
+        };
+        for chunk in &pages {
+            for (acc, page) in accs.iter_mut().zip(chunk.iter()) {
+                acc.merge(&page.stats);
+            }
         }
+        // The group's row count: its chunks' first-column pages.
+        let rows: u64 = pages
+            .iter()
+            .filter_map(|cols| cols.first())
+            .map(|p| p.rows as u64)
+            .sum();
+        let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(schema.len());
+        for ci in 0..schema.len() {
+            // The column chunk: the page index, then the pages.
+            let page_count = pages.len() as u32;
+            let index_len = 4 + page_count as usize * 8;
+            let mut chunk = Writer::new();
+            chunk.u32(page_count);
+            let mut rel = index_len as u32;
+            for cols in &pages {
+                let len = cols[ci].frame.len() as u32;
+                chunk.u32(rel);
+                chunk.u32(len);
+                rel += len;
+            }
+            for cols in &pages {
+                chunk.bytes(&cols[ci].frame);
+            }
+            let bytes = chunk.buf;
+            let crc = crc32c(&bytes);
+            let offset = data.offset();
+            let length = bytes.len() as u64;
+            data.bytes(&bytes)?;
+            // The chunk's exact statistics and encoding summary.
+            let mut acc = ChunkColumnStats::empty();
+            let mut encodings = 0u32;
+            for cols in &pages {
+                let page = &cols[ci];
+                acc.merge(&page.stats);
+                encodings |= 1u32 << page.frame[0];
+            }
+            columns.push(ColumnChunkDir {
+                offset,
+                length,
+                page_count,
+                encodings,
+                crc32c: crc,
+                null_count: acc.null_count,
+                nan_count: acc.nan_count,
+                min: acc.min,
+                max: acc.max,
+            });
+        }
+        row_groups.push(RowGroupDir { rows, columns });
     }
     if collect_stats {
         let mut entry = SavedTableStats {
@@ -4059,68 +4234,6 @@ fn write_table(
         };
         variant_path_stats(t, &mut entry);
         saved.push(entry);
-    }
-    // The pages, column by column: `by_column[ci]` holds the column's pages
-    // in chunk order.
-    let mut by_column: Vec<Vec<&EncodedPage>> = vec![Vec::with_capacity(n_chunks); schema.len()];
-    for chunk in &pages {
-        for (ci, page) in chunk.iter().enumerate() {
-            by_column[ci].push(page);
-        }
-    }
-    // The row groups: 60 engine chunks each.
-    let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
-    let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
-    for g in 0..n_groups {
-        let first = g * CHUNKS_PER_ROW_GROUP;
-        let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
-        let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(schema.len());
-        let rows: u64 = by_column
-            .first()
-            .map(|c| c[first..last].iter().map(|p| p.rows as u64).sum())
-            .unwrap_or(0);
-        for column_pages in &by_column {
-            // The column chunk: the page index, then the pages.
-            let group = &column_pages[first..last];
-            let page_count = group.len() as u32;
-            let index_len = 4 + page_count as usize * 8;
-            let mut chunk = Writer::new();
-            chunk.u32(page_count);
-            let mut rel = index_len as u32;
-            for page in group {
-                let len = page.frame.len() as u32;
-                chunk.u32(rel);
-                chunk.u32(len);
-                rel += len;
-            }
-            for page in group {
-                chunk.bytes(&page.frame);
-            }
-            let bytes = chunk.buf;
-            let crc = crc32c(&bytes);
-            let offset = data.buf.len() as u64;
-            let length = bytes.len() as u64;
-            data.bytes(&bytes);
-            // The chunk's exact statistics and encoding summary.
-            let mut acc = ChunkColumnStats::empty();
-            let mut encodings = 0u32;
-            for page in group {
-                acc.merge(&page.stats);
-                encodings |= 1u32 << page.frame[0];
-            }
-            columns.push(ColumnChunkDir {
-                offset,
-                length,
-                page_count,
-                encodings,
-                crc32c: crc,
-                null_count: acc.null_count,
-                nan_count: acc.nan_count,
-                min: acc.min,
-                max: acc.max,
-            });
-        }
-        row_groups.push(RowGroupDir { rows, columns });
     }
     Ok(TableDir {
         name: name.to_string(),
@@ -8585,6 +8698,163 @@ mod tests {
         let a = db.to_bytes_impl(true).unwrap();
         let b = db.to_bytes_impl(false).unwrap();
         assert_eq!(a, b, "parallel and serial saves differ");
+    }
+
+    /// A store wide enough to exercise every footer section and a table of
+    /// more than one row group: VARCHAR/DECIMAL/NULL-heavy columns, indexes,
+    /// constraints, macros, an empty table, two databases and two schemas.
+    fn multi_row_group_corpus() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE big (i INTEGER, d DECIMAL(18,4), v VARCHAR, n INTEGER);")
+            .unwrap();
+        {
+            let t = db.table_mut("big").unwrap();
+            for i in 0..(ROW_GROUP_ROWS + 137) {
+                t.append_row(vec![
+                    Value::Integer(i as i32),
+                    if i % 5 == 0 {
+                        Value::Null
+                    } else {
+                        Value::decimal(i as i128 * 12_345, 4)
+                    },
+                    if i % 7 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Varchar(format!("row-{}-{}", i % 41, "x".repeat(i % 13)))
+                    },
+                    if i % 3 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Integer((i % 97) as i32)
+                    },
+                ])
+                .unwrap();
+            }
+        }
+        db.execute("CREATE INDEX i_big_v ON big(v);").unwrap();
+        db.execute("CREATE TABLE main.small (k BIGINT PRIMARY KEY, s VARCHAR UNIQUE);")
+            .unwrap();
+        db.execute("INSERT INTO main.small VALUES (1, 'one'), (2, NULL), (3, 'three');")
+            .unwrap();
+        db.execute("CREATE MACRO twice(x) AS x + x;").unwrap();
+        db.execute("CREATE TABLE main.empty (x INTEGER);").unwrap();
+        db.execute("CREATE DATABASE analytics;").unwrap();
+        db.execute("CREATE SCHEMA analytics.audit;").unwrap();
+        db.execute("CREATE TABLE analytics.audit.events (at TIMESTAMP, msg VARCHAR);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO analytics.audit.events VALUES \
+             (TIMESTAMP '2026-01-01 00:00:00', 'start'), (NULL, NULL);",
+        )
+        .unwrap();
+        db
+    }
+
+    /// `save` streams the image through the file sink; the bytes must be
+    /// exactly the in-memory image, for the serial encode too.
+    #[test]
+    fn streamed_save_writes_the_in_memory_bytes() {
+        let db = multi_row_group_corpus();
+        let want = db.to_pink_bytes().unwrap();
+        assert_eq!(db.to_bytes_impl(false).unwrap(), want, "serial ≠ parallel");
+
+        // The parallel file path (`save`, atomic).
+        let path = temp_file("stream_parallel");
+        db.save(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            want,
+            "streamed save ≠ to_pink_bytes"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // The serial file path: the same staging writer `save_sync` uses,
+        // with the test-only serial switch on.
+        let path = temp_file("stream_serial");
+        PinkDb::write_sync(&path, |sink| {
+            db.write_image(sink, false, false, false).map(|_| ())
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            want,
+            "serial streamed save ≠ to_pink_bytes"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // The checkpoint primitive writes the same bytes.
+        let path = temp_file("stream_checkpoint");
+        db.save_sync(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), want);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            PinkDb::load_bytes(&want).unwrap().to_pink_bytes().unwrap(),
+            want,
+            "the streamed image must round-trip"
+        );
+    }
+
+    /// A save that fails after bytes have reached the staging file leaves the
+    /// previous target intact and no temp file behind.
+    #[test]
+    fn a_failed_save_keeps_the_previous_target() {
+        let path = temp_file("fail_save");
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        db.table_mut("t")
+            .unwrap()
+            .append_row(vec![Value::Integer(1)])
+            .unwrap();
+        db.save(path.to_str().unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // Tables are written in sorted order, so `a`'s data region lands in
+        // the staging file before `z`'s row group is encoded; the pending
+        // vector index serializes to an error at the end of `z`.
+        let mut bad = PinkDb::new();
+        bad.execute("CREATE TABLE a (x INTEGER);").unwrap();
+        {
+            let t = bad.table_mut("a").unwrap();
+            for i in 0..(CHUNK_SIZE + 1) {
+                t.append_row(vec![Value::Integer(i as i32)]).unwrap();
+            }
+        }
+        bad.execute("CREATE TABLE z (y INTEGER);").unwrap();
+        {
+            let t = bad.table_mut("z").unwrap();
+            t.append_row(vec![Value::Integer(7)]).unwrap();
+            t.vector_indexes.push(crate::storage::VectorIndexDef {
+                name: "v".to_string(),
+                column: 0,
+                provider: "vss".to_string(),
+                options: Vec::new(),
+                index: None,
+                blob: None,
+            });
+        }
+        let err = bad.save(path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("needs the \"vss\" extension"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a failed save must keep the previous target"
+        );
+        let stem = path.file_name().unwrap().to_string_lossy().to_string();
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(&format!("{stem}.tmp-")))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     /// save → open → save must reproduce the same bytes.
