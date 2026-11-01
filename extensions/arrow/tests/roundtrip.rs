@@ -194,8 +194,8 @@ fn assert_tables_equal(got: &DataTable, want: &DataTable) {
     for row in 0..want.num_rows {
         for col in 0..want.num_cols() {
             let (g, w) = (
-                got.get(row, col).expect("cell"),
-                want.get(row, col).expect("cell"),
+                got.get(row, col).expect("cell").expect("cell"),
+                want.get(row, col).expect("cell").expect("cell"),
             );
             match (g, w) {
                 (Value::Double(a), Value::Double(b)) => {
@@ -286,7 +286,7 @@ fn nulls_in_every_column_survive() {
     let back = pinkdb_arrow::read::read(&path).unwrap();
     // Row 1 is all-NULL in every column.
     for col in 0..back.num_cols() {
-        assert_eq!(back.get(1, col), Some(Value::Null), "column {col}");
+        assert_eq!(back.get(1, col).unwrap(), Some(Value::Null), "column {col}");
     }
     std::fs::remove_file(&path).ok();
 }
@@ -347,7 +347,11 @@ fn reads_pyarrow_golden_types() {
     let col = |name: &str| t.columns[t.column_index(name).unwrap()].dtype;
     assert_eq!(col("i8"), DataType::Integer);
 
-    let get = |row: usize, name: &str| t.get(row, t.column_index(name).unwrap()).expect("cell");
+    let get = |row: usize, name: &str| {
+        t.get(row, t.column_index(name).unwrap())
+            .expect("cell")
+            .expect("cell")
+    };
     // Batch 1, row 0/2 and batch 2 (rows 3..5) — NULLs at row 1.
     assert_eq!(get(0, "b"), Value::Boolean(true));
     assert_eq!(get(1, "b"), Value::Null);
@@ -397,12 +401,15 @@ fn reads_multi_batch_files_and_rechunks_at_chunk_size() {
     assert_eq!(t.num_rows, 2050);
     // Two source batches (1234 + 816) re-chunk into 2048 + 2.
     assert_eq!(t.num_chunks(), 2);
-    assert_eq!(t.columns[0].chunks[0].len(), CHUNK_SIZE);
-    assert_eq!(t.columns[0].chunks[1].len(), 2);
-    assert_eq!(t.get(0, 0), Some(Value::Integer(0)));
-    assert_eq!(t.get(2047, 0), Some(Value::Integer(2047)));
-    assert_eq!(t.get(2048, 0), Some(Value::Integer(2048)));
-    assert_eq!(t.get(2049, 1), Some(Value::Varchar("t5".to_string())));
+    assert_eq!(t.columns[0].chunk_rows(0), CHUNK_SIZE);
+    assert_eq!(t.columns[0].chunk_rows(1), 2);
+    assert_eq!(t.get(0, 0).unwrap(), Some(Value::Integer(0)));
+    assert_eq!(t.get(2047, 0).unwrap(), Some(Value::Integer(2047)));
+    assert_eq!(t.get(2048, 0).unwrap(), Some(Value::Integer(2048)));
+    assert_eq!(
+        t.get(2049, 1).unwrap(),
+        Some(Value::Varchar("t5".to_string()))
+    );
 }
 
 #[test]
@@ -410,12 +417,12 @@ fn reads_compressed_ipc_files() {
     for file in ["golden_lz4.arrow", "golden_zstd.arrow"] {
         let t = pinkdb_arrow::read::read(&fixtures(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
         assert_eq!(t.num_rows, 3, "{file}");
-        assert_eq!(t.get(0, 0), Some(Value::Integer(1)), "{file}");
+        assert_eq!(t.get(0, 0).unwrap(), Some(Value::Integer(1)), "{file}");
         // Same payload in both files — the compression wrapper is the only
         // difference.
         for (row, text) in [(0, "lz4"), (1, "zstd"), (2, "none")] {
             assert_eq!(
-                t.get(row, 1),
+                t.get(row, 1).unwrap(),
                 Some(Value::Varchar(text.to_string())),
                 "{file} row {row}"
             );
@@ -479,10 +486,10 @@ fn explicit_validity_masks_survive_the_roundtrip() {
     ArrowSink::new().write(&path, &t).unwrap();
     let back = pinkdb_arrow::read::read(&path).unwrap();
     // 0b1011: rows 0, 1 and 3 valid, row 2 NULL.
-    assert_eq!(back.get(0, 0), Some(Value::Integer(7)));
-    assert_eq!(back.get(1, 0), Some(Value::Integer(9)));
-    assert_eq!(back.get(2, 0), Some(Value::Null));
-    assert_eq!(back.get(3, 0), Some(Value::Integer(13)));
+    assert_eq!(back.get(0, 0).unwrap(), Some(Value::Integer(7)));
+    assert_eq!(back.get(1, 0).unwrap(), Some(Value::Integer(9)));
+    assert_eq!(back.get(2, 0).unwrap(), Some(Value::Null));
+    assert_eq!(back.get(3, 0).unwrap(), Some(Value::Integer(13)));
     std::fs::remove_file(&path).ok();
 }
 

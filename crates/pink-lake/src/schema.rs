@@ -365,10 +365,11 @@ pub(crate) fn constant_column(
     default: Option<&Value>,
     file_table: &pinkdb::DataTable,
 ) -> Result<pinkdb::storage::Column> {
-    let mut chunks = Vec::with_capacity(file_table.columns[0].chunks.len());
-    for chunk in &file_table.columns[0].chunks {
-        let mut v = pinkdb::Vector::with_capacity(dtype, chunk.len());
-        for _ in 0..chunk.len() {
+    let mut chunks = Vec::with_capacity(file_table.columns[0].num_chunks());
+    for c in 0..file_table.columns[0].num_chunks() {
+        let rows = file_table.columns[0].chunk_rows(c);
+        let mut v = pinkdb::Vector::with_capacity(dtype, rows);
+        for _ in 0..rows {
             match default {
                 Some(d) if !d.is_null() => {
                     v.push_valid(d.clone()).map_err(|e| LakeError::Internal {
@@ -382,12 +383,12 @@ pub(crate) fn constant_column(
         }
         chunks.push(std::sync::Arc::new(v));
     }
-    Ok(pinkdb::storage::Column {
-        name: name.to_string(),
+    Ok(pinkdb::storage::Column::from_chunks(
+        name.to_string(),
         dtype,
-        default: default.cloned(),
+        default.cloned(),
         chunks,
-    })
+    ))
 }
 
 /// How each *current* column reads from a base-version row (the write-side

@@ -3090,7 +3090,10 @@ fn index_defs(t: &DataTable) -> Vec<IndexDef> {
             } else {
                 index.map.len()
             };
-            let indexed: usize = column.chunks.iter().map(|c| c.len() - c.null_count()).sum();
+            let indexed: usize = column
+                .chunks_decoded()
+                .map(|c| c.len() - c.null_count())
+                .sum();
             IndexDef {
                 name: index.name.clone(),
                 column: index.column,
@@ -3895,7 +3898,7 @@ fn write_table(
     let mut scans: Vec<Vec<Arc<Vector>>> = Vec::with_capacity(n_chunks);
     for chunk_idx in 0..n_chunks {
         let chunk = t
-            .scan_chunk(chunk_idx)
+            .scan_chunk(chunk_idx)?
             .ok_or_else(|| PinkDbError::Execution("storage changed during save".to_string()))?;
         scans.push(chunk.columns);
     }
@@ -4501,12 +4504,12 @@ pub fn decode_projected_columns(
                 }
             }
         }
-        out.push(crate::storage::Column {
-            name: name.clone(),
-            dtype: *dtype,
-            default: None,
+        out.push(crate::storage::Column::from_chunks(
+            name.clone(),
+            *dtype,
+            None,
             chunks,
-        });
+        ));
     }
     Ok(DataTable::from_columns(
         table.table.clone(),
@@ -5771,11 +5774,9 @@ pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
     let schema = src.schema();
     let mut accs: Vec<ChunkColumnStats> =
         schema.iter().map(|_| ChunkColumnStats::empty()).collect();
-    for c in 0..src.num_chunks() {
-        if let Some(chunk) = src.scan_chunk(c) {
-            for (acc, v) in accs.iter_mut().zip(chunk.columns.iter()) {
-                acc.merge(&crate::stats::Zone::of_vector(v));
-            }
+    for (ci, column) in src.columns.iter().enumerate() {
+        for chunk in column.chunks_decoded() {
+            accs[ci].merge(&crate::stats::Zone::of_vector(chunk));
         }
     }
     let mut saved = SavedTableStats {
@@ -5815,7 +5816,7 @@ fn variant_path_stats(src: &DataTable, saved: &mut SavedTableStats) {
             continue;
         }
         let mut values: Vec<std::sync::Arc<Variant>> = Vec::new();
-        for chunk in &column.chunks {
+        for chunk in column.chunks_decoded() {
             let VectorData::Variant(items) = chunk.data() else {
                 continue;
             };
@@ -5836,7 +5837,7 @@ fn variant_path_stats(src: &DataTable, saved: &mut SavedTableStats) {
             continue;
         }
         let mut acc = crate::variant_shred::PathStatsAcc::new(&policy);
-        for chunk in &src.columns[index].chunks {
+        for chunk in src.columns[index].chunks_decoded() {
             let VectorData::Variant(items) = chunk.data() else {
                 continue;
             };
@@ -6147,7 +6148,11 @@ mod tests {
     fn all_values(db: &PinkDb, table: &str) -> Vec<Vec<Value>> {
         let t = db.table(table).unwrap();
         (0..t.num_rows())
-            .map(|r| (0..t.num_cols()).map(|c| t.get(r, c).unwrap()).collect())
+            .map(|r| {
+                (0..t.num_cols())
+                    .map(|c| t.get(r, c).unwrap().unwrap())
+                    .collect()
+            })
             .collect()
     }
 
@@ -7046,7 +7051,7 @@ mod tests {
         assert_eq!(back.list_tables_in("analytics"), vec!["t", "u"]);
         assert_eq!(back.table_in("analytics", "u").unwrap().num_rows(), 1);
         assert_eq!(
-            back.table_in("analytics", "t").unwrap().get(0, 0),
+            back.table_in("analytics", "t").unwrap().get(0, 0).unwrap(),
             Some(Value::Double(1.5))
         );
         assert!(back.list_tables_in("empty").is_empty());
@@ -7395,7 +7400,10 @@ mod tests {
                 let tb = back.table("t").unwrap();
                 for r in 0..n {
                     for c in 0..9 {
-                        assert_bits_equal(&ta.get(r, c).unwrap(), &tb.get(r, c).unwrap());
+                        assert_bits_equal(
+                            &ta.get(r, c).unwrap().unwrap(),
+                            &tb.get(r, c).unwrap().unwrap(),
+                        );
                     }
                 }
             }
@@ -7967,7 +7975,7 @@ mod tests {
         }
         // The chunks really do use the frame.
         let t = db.table("t").unwrap();
-        let chunk = t.scan_chunk(0).unwrap();
+        let chunk = t.scan_chunk(0).unwrap().unwrap();
         assert_eq!(
             encode_chunk_typed(&chunk.columns[0]).0,
             ENC_LZ_FRAME,
@@ -8241,7 +8249,7 @@ mod tests {
         }
         let t = db.table("t").unwrap();
         for chunk_idx in 0..t.num_chunks() {
-            let chunk = t.scan_chunk(chunk_idx).unwrap();
+            let chunk = t.scan_chunk(chunk_idx).unwrap().unwrap();
             for (col, vec) in chunk.columns.iter().enumerate() {
                 let (tag_a, payload_a) = encode_chunk_typed(vec);
                 let values: Vec<Value> = (0..vec.len()).map(|i| vec.get(i)).collect();
@@ -8285,7 +8293,7 @@ mod tests {
         }
         let t = db.table("z").unwrap();
         assert_eq!(
-            encode_chunk_typed(&t.scan_chunk(0).unwrap().columns[0]).0,
+            encode_chunk_typed(&t.scan_chunk(0).unwrap().unwrap().columns[0]).0,
             ENC_LZ_FRAME,
             "the identity corpus must exercise the compression frame"
         );
@@ -8400,7 +8408,7 @@ mod tests {
         {
             let db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
             assert_eq!(db.table("t").unwrap().num_rows(), 2);
-            assert_eq!(db.table("t").unwrap().get(1, 1), Some(Value::Null));
+            assert_eq!(db.table("t").unwrap().get(1, 1).unwrap(), Some(Value::Null));
             // The checkpoint is a PINKDB06 image.
             let bytes = std::fs::read(&ckpt).unwrap();
             assert!(is_pinkdb06(&bytes), "the checkpoint must be PINKDB06");
@@ -8508,7 +8516,7 @@ mod tests {
             for tname in db.list_tables_in(&dbname) {
                 let t = db.table_in(&dbname, &tname).unwrap();
                 for c in 0..t.num_chunks() {
-                    let chunk = t.scan_chunk(c).unwrap();
+                    let chunk = t.scan_chunk(c).unwrap().unwrap();
                     for v in chunk.columns.iter() {
                         if let VectorData::VarChar(_) = v.data() {
                             payloads.push(enc_strs_plain(&varchar_payload(v)));
@@ -8673,7 +8681,7 @@ mod tests {
                 let mut nan_count = 0u64;
                 let (mut min, mut max): (Option<Value>, Option<Value>) = (None, None);
                 for row in 0..decoded.num_rows() {
-                    let v = decoded.get(row, i).unwrap();
+                    let v = decoded.get(row, i).unwrap().unwrap();
                     if v.is_null() {
                         nulls += 1;
                         continue;

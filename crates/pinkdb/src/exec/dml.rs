@@ -167,7 +167,7 @@ pub(crate) fn insert(
             let old = match pending_images.get(&id) {
                 Some(image) => image.clone(),
                 None => {
-                    let chunk = t.scan_chunk(id.chunk).ok_or_else(|| {
+                    let chunk = t.scan_chunk(id.chunk)?.ok_or_else(|| {
                         PinkDbError::Execution("storage changed during INSERT".to_string())
                     })?;
                     row_values(&chunk, id.row)
@@ -238,7 +238,7 @@ pub(crate) fn update_from(
         let mut probe_keys = None;
         for (ci, writes) in per_chunk.iter_mut().enumerate() {
             cx.check_deadline()?;
-            let chunk = t.scan_chunk(ci).ok_or_else(|| {
+            let chunk = t.scan_chunk(ci)?.ok_or_else(|| {
                 PinkDbError::Execution("storage changed during UPDATE".to_string())
             })?;
             if let Some(index) = &index {
@@ -319,7 +319,7 @@ pub(crate) fn delete_using(
         let mut probe_keys = None;
         for ci in 0..t.num_chunks() {
             cx.check_deadline()?;
-            let chunk = t.scan_chunk(ci).ok_or_else(|| {
+            let chunk = t.scan_chunk(ci)?.ok_or_else(|| {
                 PinkDbError::Execution("storage changed during DELETE".to_string())
             })?;
             if let Some(index) = &index {
@@ -503,7 +503,7 @@ pub(crate) fn merge(
         let mut hits: Vec<RowHit> = Vec::new();
         for ci in 0..num_chunks {
             cx.check_deadline()?;
-            let chunk = t.scan_chunk(ci).ok_or_else(|| {
+            let chunk = t.scan_chunk(ci)?.ok_or_else(|| {
                 PinkDbError::Execution("storage changed during MERGE".to_string())
             })?;
             let rows = chunk.num_rows();
@@ -1048,7 +1048,7 @@ fn apply(
             Op::Update(id, new) => {
                 let chunk = db
                     .table_in(target_db, table)?
-                    .scan_chunk(id.chunk)
+                    .scan_chunk(id.chunk)?
                     .ok_or_else(|| {
                         PinkDbError::Execution("storage changed during UPDATE".to_string())
                     })?;
@@ -1107,7 +1107,7 @@ fn append_id(t: &DataTable) -> RowId {
         return RowId::new(0, 0);
     }
     let tail = chunks - 1;
-    let len = t.scan_chunk(tail).map(|c| c.num_rows()).unwrap_or(0);
+    let len = t.chunk_rows(tail);
     if len >= CHUNK_SIZE {
         RowId::new(tail + 1, 0)
     } else {

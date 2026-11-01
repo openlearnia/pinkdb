@@ -139,17 +139,17 @@ impl ArrowSource {
 
     /// The scan shape for one materialized table (shared by local and
     /// remote reads).
-    fn scan_table(table: pinkdb::DataTable) -> TableScanOutput {
+    fn scan_table(table: pinkdb::DataTable) -> Result<TableScanOutput> {
         let columns = table.num_cols() as u64;
-        let chunks = AttachedScan::complete(Arc::new(table)).chunks();
-        TableScanOutput {
+        let chunks = AttachedScan::complete(Arc::new(table)).chunks()?;
+        Ok(TableScanOutput {
             chunks,
             files: 1,
             // The IPC file format has no row groups.
             row_groups: 0,
             row_groups_pruned: 0,
             columns_decoded: columns,
-        }
+        })
     }
 }
 
@@ -209,7 +209,7 @@ impl TableSource for ArrowSource {
                     None => Arc::new(remote::fetch(&path)?),
                 };
                 let table = read::read_bytes(&bytes, &path, remote::table_name(&path))?;
-                return Ok(Self::scan_table(table));
+                return Self::scan_table(table);
             }
             #[cfg(not(feature = "remote"))]
             {
@@ -217,7 +217,7 @@ impl TableSource for ArrowSource {
             }
         }
         let table = read::read(Path::new(&path))?;
-        Ok(Self::scan_table(table))
+        Self::scan_table(table)
     }
 
     fn stats(&self) -> TableSourceStats {

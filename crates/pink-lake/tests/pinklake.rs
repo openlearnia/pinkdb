@@ -113,7 +113,10 @@ fn assert_same_store(a: &PinkDb, b: &PinkDb) {
             assert_eq!(ta.num_rows(), tb.num_rows(), "{dbname}.{table} rows");
             for r in 0..ta.num_rows() {
                 for c in 0..ta.num_cols() {
-                    let (va, vb) = (ta.get(r, c).unwrap(), tb.get(r, c).unwrap());
+                    let (va, vb) = (
+                        ta.get(r, c).unwrap().unwrap(),
+                        tb.get(r, c).unwrap().unwrap(),
+                    );
                     match (&va, &vb) {
                         (Value::Double(x), Value::Double(y)) => assert_eq!(
                             x.to_bits(),
@@ -192,7 +195,7 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
         "the loaded store re-saves byte-identically"
     );
     assert_eq!(
-        loaded.table("héllo✓").unwrap().get(0, 0),
+        loaded.table("héllo✓").unwrap().get(0, 0).unwrap(),
         Some(Value::Varchar("π≈3.14".into()))
     );
     assert_eq!(
@@ -200,6 +203,7 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
             .table_in("analytics", "a.b")
             .unwrap()
             .get(1, 0)
+            .unwrap()
             .unwrap(),
         Value::Double(-0.0)
     );

@@ -75,11 +75,11 @@ fn rows_of(db: &PinkDb) -> Vec<(i32, String)> {
     let t = db.table("t").unwrap();
     (0..t.num_rows())
         .map(|r| {
-            let i = match t.get(r, 0).unwrap() {
+            let i = match t.get(r, 0).unwrap().unwrap() {
                 Value::Integer(i) => i,
                 other => panic!("row {r}: {other:?}"),
             };
-            let s = match t.get(r, 1).unwrap() {
+            let s = match t.get(r, 1).unwrap().unwrap() {
                 Value::Varchar(s) => s,
                 other => panic!("row {r}: {other:?}"),
             };
@@ -496,7 +496,7 @@ fn diff_is_bit_exact_for_doubles_and_duplicates() {
     let t = t.table("t").unwrap();
     assert_eq!(t.num_rows(), 5);
     let bits: Vec<Option<u64>> = (0..t.num_rows())
-        .map(|r| match t.get(r, 0).unwrap() {
+        .map(|r| match t.get(r, 0).unwrap().unwrap() {
             Value::Double(x) => Some(x.to_bits()),
             Value::Null => None,
             other => panic!("{other:?}"),

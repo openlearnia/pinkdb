@@ -225,7 +225,7 @@ fn write_table_with_key_values(
     field_ids: &[(i32, i32)],
 ) -> Result<Vec<u8>, WriteError> {
     let schema = table.schema();
-    let policies = column_policies(table);
+    let policies = column_policies(table)?;
     // Tell readers that every VARIANT column was shredded with a policy
     // inferred over the whole column, so each typed leaf bounds every value of
     // its path (`crate::variant_stats` trusts this key, and nothing else).
@@ -268,11 +268,13 @@ fn write_table_with_key_values(
 
     // A cursor per column, kept across row groups so encoding is one linear
     // pass over the table (no per-row `DataTable::get` chunk walk).
-    let mut cursors: Vec<ColumnCursor<'_>> = table
+    let mut cursors: Vec<ColumnCursor> = table
         .columns
         .iter()
         .map(|column| ColumnCursor {
-            chunks: &column.chunks,
+            chunks: (0..column.num_chunks())
+                .map(|i| column.chunk(i).expect("a built table decodes"))
+                .collect(),
             chunk: 0,
             offset: 0,
         })
@@ -316,13 +318,13 @@ fn write_table_with_key_values(
 }
 
 /// One column's position while walking the table's chunks in row order.
-struct ColumnCursor<'a> {
-    chunks: &'a [Arc<Vector>],
+struct ColumnCursor {
+    chunks: Vec<Arc<Vector>>,
     chunk: usize,
     offset: usize,
 }
 
-impl ColumnCursor<'_> {
+impl ColumnCursor {
     fn next(&mut self) -> Value {
         while self.chunk < self.chunks.len() && self.offset >= self.chunks[self.chunk].len() {
             self.chunk += 1;
@@ -386,20 +388,24 @@ fn skipped(column: &str) -> WriteError {
 /// A Parquet schema cannot change between row groups, so the policy is fixed
 /// at the file level: this is why the plan asks for a *sampled* policy rather
 /// than an exact one.
-fn column_policies(table: &DataTable) -> Vec<ShredPolicy> {
+fn column_policies(table: &DataTable) -> Result<Vec<ShredPolicy>, WriteError> {
     table
         .columns
         .iter()
         .map(|column| {
             if column.dtype != DataType::Variant {
-                return ShredPolicy::default();
+                return Ok(ShredPolicy::default());
             }
             // The policy is inferred over the **whole** column, not a sample:
             // a typed leaf is a complete bound for its path only if no later
             // row holds another kind there, and the per-path statistics of
             // both lake formats rely on that (see `crate::variant_stats`).
             let mut values: Vec<Arc<Variant>> = Vec::new();
-            for chunk in &column.chunks {
+            for i in 0..column.num_chunks() {
+                let chunk = column.chunk(i).map_err(|e| WriteError::InvalidValue {
+                    column: column.name.clone(),
+                    message: format!("chunk {i} could not be decoded: {e}"),
+                })?;
                 let pinkdb::VectorData::Variant(items) = chunk.data() else {
                     continue;
                 };
@@ -410,7 +416,7 @@ fn column_policies(table: &DataTable) -> Vec<ShredPolicy> {
                 }
             }
             let refs: Vec<&Variant> = values.iter().map(|value| value.as_ref()).collect();
-            infer_policy(&refs)
+            Ok(infer_policy(&refs))
         })
         .collect()
 }
@@ -490,7 +496,7 @@ fn write_column(
     mut column: SerializedColumnWriter<'_>,
     dtype: &DataType,
     rows: usize,
-    cursor: &mut ColumnCursor<'_>,
+    cursor: &mut ColumnCursor,
     name: &str,
 ) -> Result<(), WriteError> {
     match dtype {
@@ -656,7 +662,7 @@ fn decimal_scale_check(value_scale: u8, column_scale: u8) -> Result<(), String> 
 fn write_typed<T: ParquetDataType>(
     writer: &mut ColumnWriterImpl<T>,
     rows: usize,
-    cursor: &mut ColumnCursor<'_>,
+    cursor: &mut ColumnCursor,
     column: &str,
     convert: impl Fn(&Value) -> Result<T::T, String>,
 ) -> Result<(), WriteError> {
@@ -800,7 +806,7 @@ fn write_array_column<W: std::io::Write + Send>(
     group: &mut SerializedRowGroupWriter<'_, W>,
     dtype: &DataType,
     rows: usize,
-    cursor: &mut ColumnCursor<'_>,
+    cursor: &mut ColumnCursor,
     name: &str,
 ) -> Result<(), WriteError> {
     let DataType::Array { elem, len } = *dtype else {
@@ -938,7 +944,7 @@ fn write_variant_column<W: std::io::Write + Send>(
     group: &mut SerializedRowGroupWriter<'_, W>,
     policy: &ShredPolicy,
     rows: usize,
-    cursor: &mut ColumnCursor<'_>,
+    cursor: &mut ColumnCursor,
     name: &str,
 ) -> Result<(), WriteError> {
     let mut values: Vec<Option<Variant>> = Vec::with_capacity(rows);

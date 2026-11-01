@@ -942,6 +942,10 @@ fn build_pink_store(
         for index in 0..decoded.num_chunks() {
             let chunk = decoded
                 .scan_chunk(index)
+                .map_err(|e| LakeError::Engine {
+                    context: format!("decoding chunk {index} of \"{db}.{table}\""),
+                    source: e,
+                })?
                 .ok_or_else(|| LakeError::Internal {
                     message: format!(
                         "chunk {index} of \"{db}.{table}\" disappeared while decoding"

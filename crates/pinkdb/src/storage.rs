@@ -52,11 +52,87 @@ pub struct Column {
     /// the defaults flag; lake v5 manifests carry it in the table entry's
     /// `columns` record.
     pub default: Option<Value>,
-    /// Reference-counted chunks: scans share storage instead of cloning
-    /// megabytes per query. Mutations use copy-on-write (`Arc::make_mut`),
-    /// which never actually clones — the executor never holds chunks
-    /// across a `&mut` borrow.
-    pub chunks: Vec<Arc<Vector>>,
+    /// The chunks, oldest first. Private since wave 136b: the payload lives
+    /// behind a [`ChunkHandle`] so a chunk can be decoded late (or not at all)
+    /// without a caller knowing. Read them through [`Column::chunk`],
+    /// [`Column::chunk_mut`] and [`Column::chunk_rows`].
+    chunks: Vec<ChunkHandle>,
+}
+
+/// A chunk's bytes in the retained store image: the footer's descriptor for
+/// it (offset, length, CRC32C, page count). No producer yet — step 1 of wave
+/// 136b keeps decoding every chunk at open — the lazy reader fills these from
+/// footer v4.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct EncodedChunk {
+    offset: u64,
+    length: u64,
+    crc32c: u32,
+    pages: u32,
+    rows: usize,
+}
+
+/// One chunk of a column: its row count plus where its payload lives.
+///
+/// Wave 136b made this the seam for lazy loading: `.pink` `open` will hand back
+/// handles whose rows are still in the file image, decoded on first touch and
+/// charged to the memory pool, instead of decoding everything up front. Step 1
+/// introduces the seam with every handle already decoded; the shape is what
+/// stays. `rows` is the chunking metadata a pruned or projected scan needs
+/// without touching the payload, `encoded` the store-image descriptor the lazy
+/// reader fills in, and `dirty` whether the rows differ from what was stored.
+#[derive(Clone)]
+struct ChunkHandle {
+    /// The store-image descriptor, while the chunk has not been decoded.
+    encoded: Option<EncodedChunk>,
+    /// The decoded payload, shared: scans clone the `Arc`, mutations
+    /// copy-on-write it (`Column::chunk_mut`).
+    decoded: Arc<Vector>,
+    /// The rows differ from the stored form, so a save must re-encode this
+    /// chunk instead of copying its bytes through.
+    dirty: bool,
+}
+
+impl ChunkHandle {
+    /// A handle over a payload the caller just built or decoded: nothing on
+    /// disk describes it yet, so it is dirty.
+    fn new(decoded: Arc<Vector>) -> Self {
+        Self {
+            encoded: None,
+            decoded,
+            dirty: true,
+        }
+    }
+
+    /// Rows in this chunk: a decoded payload is authoritative (it grows
+    /// through [`Column::chunk_mut`]), a still-encoded one carries the count
+    /// the footer recorded. Every column of a table shares the boundaries.
+    fn rows(&self) -> usize {
+        match &self.encoded {
+            Some(encoded) => encoded.rows,
+            None => self.decoded.len(),
+        }
+    }
+}
+
+/// Print the chunk's shape, not its payload (a derived impl would dump values
+/// through every `Debug` of a table, column or query result).
+impl std::fmt::Debug for ChunkHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkHandle")
+            .field("rows", &self.rows())
+            .field("decoded", &self.decoded.len())
+            .field(
+                "encoded",
+                &self
+                    .encoded
+                    .as_ref()
+                    .map(|e| (e.offset, e.length, e.crc32c, e.pages)),
+            )
+            .field("dirty", &self.dirty)
+            .finish()
+    }
 }
 
 /// Chunks above which a dropped column releases them in parallel.
@@ -83,8 +159,109 @@ impl Column {
             name,
             dtype,
             default: None,
-            chunks: vec![Arc::new(Vector::new_empty(dtype))],
+            chunks: vec![ChunkHandle::new(Arc::new(Vector::new_empty(dtype)))],
         }
+    }
+
+    /// Build a column from finished chunks: the lake's projected decode and
+    /// `ALTER TABLE … ADD COLUMN` assemble columns this way.
+    pub fn from_chunks(
+        name: String,
+        dtype: DataType,
+        default: Option<Value>,
+        chunks: Vec<Arc<Vector>>,
+    ) -> Self {
+        Self {
+            name,
+            dtype,
+            default,
+            chunks: chunks.into_iter().map(ChunkHandle::new).collect(),
+        }
+    }
+
+    fn out_of_range(&self, i: usize) -> PinkDbError {
+        PinkDbError::Execution(format!(
+            "chunk {i} out of range for column \"{}\" ({} chunks)",
+            self.name,
+            self.chunks.len()
+        ))
+    }
+
+    /// Chunk `i`'s decoded payload, shared (`Arc::clone`, never a copy).
+    ///
+    /// Fallible even though nothing fails today: a lazily loaded chunk decodes
+    /// from the store image here on first touch, and a corrupt or truncated
+    /// image has to surface as an error, not a panic.
+    pub fn chunk(&self, i: usize) -> Result<Arc<Vector>> {
+        match self.chunks.get(i) {
+            Some(handle) => Ok(Arc::clone(&handle.decoded)),
+            None => Err(self.out_of_range(i)),
+        }
+    }
+
+    /// Chunk `i` for writing: copy-on-write, and the chunk is marked dirty so a
+    /// later save re-encodes it instead of copying its stored bytes through.
+    ///
+    /// The executor never holds a chunk across a `&mut` borrow of its column,
+    /// so the `Arc::make_mut` never actually clones.
+    pub fn chunk_mut(&mut self, i: usize) -> Result<&mut Vector> {
+        let chunks = self.chunks.len();
+        let Some(handle) = self.chunks.get_mut(i) else {
+            return Err(PinkDbError::Execution(format!(
+                "chunk {i} out of range for column \"{}\" ({chunks} chunks)",
+                self.name
+            )));
+        };
+        handle.dirty = true;
+        Ok(Arc::make_mut(&mut handle.decoded))
+    }
+
+    /// Rows in chunk `i`. Metadata only: a pruned or projected scan asks this
+    /// without decoding the payload. Out of range is a caller bug and panics,
+    /// exactly like the chunk slicing it replaces.
+    pub fn chunk_rows(&self, i: usize) -> usize {
+        self.chunks[i].rows()
+    }
+
+    pub fn num_chunks(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Total rows across the chunks.
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(|c| c.rows()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.iter().all(|c| c.rows() == 0)
+    }
+
+    /// Append a finished chunk (the loader's and bulk append's paths).
+    pub fn push_chunk(&mut self, chunk: Arc<Vector>) {
+        self.chunks.push(ChunkHandle::new(chunk));
+    }
+
+    /// Replace chunk `i`'s payload in place (the loader reuses the empty tail,
+    /// a delete rewrites a chunk as its gathered survivor rows).
+    fn set_chunk(&mut self, i: usize, chunk: Arc<Vector>) {
+        self.chunks[i] = ChunkHandle::new(chunk);
+    }
+
+    /// Chunk `i`'s payload when it is known to be in memory: the statistics,
+    /// zone and index-map folds, which need every chunk anyway
+    /// ([`Self::chunks_decoded`]).
+    fn chunk_decoded(&self, i: usize) -> &Arc<Vector> {
+        &self.chunks[i].decoded
+    }
+
+    /// The decoded payloads, for the internal passes that fold a whole column:
+    /// statistics, zone maps and hash-index maps.
+    ///
+    /// shortcut: these passes require every payload, so a lazily loaded table
+    /// can only use them after decoding it whole; step 2 builds them from the
+    /// footer instead (and makes `ANALYZE` decode explicitly).
+    pub(crate) fn chunks_decoded(&self) -> impl Iterator<Item = &Arc<Vector>> + '_ {
+        self.chunks.iter().map(|c| &c.decoded)
     }
 }
 
@@ -227,7 +404,7 @@ pub struct Index {
 pub(crate) fn index_map_for(column: &Column) -> std::collections::HashMap<Vec<u8>, Vec<usize>> {
     let mut map = std::collections::HashMap::new();
     let mut offset = 0usize;
-    for chunk in column.chunks.iter() {
+    for chunk in column.chunks_decoded() {
         for row in 0..chunk.len() {
             let v = chunk.get(row);
             if matches!(v, Value::Null) {
@@ -409,13 +586,10 @@ impl DataTable {
         );
         debug_assert!(
             {
-                let chunks = columns[0].chunks.len();
+                let chunks = columns[0].num_chunks();
                 columns.iter().all(|c| {
-                    c.chunks.len() == chunks
-                        && c.chunks
-                            .iter()
-                            .zip(&columns[0].chunks)
-                            .all(|(a, b)| a.len() == b.len())
+                    c.num_chunks() == chunks
+                        && (0..chunks).all(|i| c.chunk_rows(i) == columns[0].chunk_rows(i))
                 })
             },
             "from_columns needs chunk-aligned columns"
@@ -469,7 +643,7 @@ impl DataTable {
             && zones
                 .iter()
                 .zip(&self.columns)
-                .all(|(z, c)| z.len() == c.chunks.len());
+                .all(|(z, c)| z.len() == c.num_chunks());
         if stats.cols.len() == self.columns.len() {
             self.stats = stats;
         } else {
@@ -486,7 +660,7 @@ impl DataTable {
     fn rebuilt_zones(&self) -> Vec<Vec<Zone>> {
         self.columns
             .iter()
-            .map(|c| c.chunks.iter().map(|v| Zone::of_vector(v)).collect())
+            .map(|c| c.chunks_decoded().map(|v| Zone::of_vector(v)).collect())
             .collect()
     }
 
@@ -504,7 +678,7 @@ impl DataTable {
     pub(crate) fn clear_rows(&mut self) {
         self.num_rows = 0;
         for col in &mut self.columns {
-            col.chunks = vec![Arc::new(Vector::new_empty(col.dtype))];
+            col.chunks = vec![ChunkHandle::new(Arc::new(Vector::new_empty(col.dtype)))];
         }
         self.stats = TableStats::new(self.columns.len());
         self.zones = self.columns.iter().map(|_| vec![Zone::empty()]).collect();
@@ -587,7 +761,7 @@ impl DataTable {
     /// deleted or overwritten extreme value is the one case that can shrink a
     /// bound).
     fn refresh_zone(&mut self, col: usize, chunk: usize, dirty: bool) {
-        let new = Zone::of_vector(&self.columns[col].chunks[chunk]);
+        let new = Zone::of_vector(self.columns[col].chunk_decoded(chunk));
         let old = std::mem::replace(&mut self.zones[col][chunk], new.clone());
         let st = &mut self.stats.cols[col];
         let held = old.holds(&st.min, &st.max);
@@ -653,17 +827,12 @@ impl DataTable {
                 "Column with name \"{name}\" already exists!"
             )));
         }
-        let mut col = Column {
-            name,
-            dtype,
-            default: default.clone(),
-            chunks: Vec::new(),
-        };
         let lens: Vec<usize> = self
             .columns
             .first()
-            .map(|c| c.chunks.iter().map(|v| v.len()).collect())
+            .map(|c| (0..c.num_chunks()).map(|i| c.chunk_rows(i)).collect())
             .unwrap_or_default();
+        let mut chunks: Vec<Arc<Vector>> = Vec::with_capacity(lens.len());
         for len in lens {
             let mut v = Vector::with_capacity(dtype, len);
             for _ in 0..len {
@@ -672,18 +841,19 @@ impl DataTable {
                     _ => v.push_null()?,
                 }
             }
-            col.chunks.push(Arc::new(v));
+            chunks.push(Arc::new(v));
         }
         // A new column's statistics are exact from birth: every existing row
         // just received the same DEFAULT (usually NULL).
         let mut stats = ColStats::new();
-        let mut zones = Vec::with_capacity(col.chunks.len());
-        for chunk in &col.chunks {
+        let mut zones = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
             let zone = Zone::of_vector(chunk);
             stats.observe_chunk(chunk, &zone);
             zones.push(zone);
         }
-        self.columns.push(col);
+        self.columns
+            .push(Column::from_chunks(name, dtype, default, chunks));
         self.stats.cols.push(stats);
         self.zones.push(zones);
         Ok(())
@@ -765,7 +935,7 @@ impl DataTable {
             let values: Vec<Value> = self
                 .columns
                 .iter()
-                .map(|c| c.chunks[id.chunk].get(id.row))
+                .map(|c| c.chunk_decoded(id.chunk).get(id.row))
                 .collect();
             keys.reserve(&values, id);
         }
@@ -794,7 +964,8 @@ impl DataTable {
             // global lookup would rescan the chunk list for every row, which
             // makes a bulk append into an indexed table O(rows × chunks).
             let mut offset = 0usize;
-            for chunk in &column.chunks {
+            for i in 0..column.num_chunks() {
+                let chunk = column.chunk(i)?;
                 let len = chunk.len();
                 if offset + len > start {
                     for local in start.saturating_sub(offset)..len {
@@ -838,12 +1009,13 @@ impl DataTable {
                 let table = self.name.clone();
                 let mut pending: Vec<(u64, Vec<f32>)> = Vec::new();
                 let mut offset = 0usize;
-                for chunk in &column.chunks {
+                for i in 0..column.num_chunks() {
+                    let chunk = column.chunk(i)?;
                     let len = chunk.len();
                     if offset + len > start {
                         for local in start.saturating_sub(offset)..len {
                             let global = (offset + local) as u64;
-                            let Some(vector) = crate::vector_index::row_vector(chunk, local, n)
+                            let Some(vector) = crate::vector_index::row_vector(&chunk, local, n)
                             else {
                                 continue;
                             };
@@ -1062,12 +1234,11 @@ impl DataTable {
         let tail_full = self.columns[0]
             .chunks
             .last()
-            .map(|c| c.len() >= CHUNK_SIZE)
+            .map(|c| c.rows() >= CHUNK_SIZE)
             .unwrap_or(true);
         if tail_full {
             for (ci, col) in self.columns.iter_mut().enumerate() {
-                col.chunks
-                    .push(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
+                col.push_chunk(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
                 self.zones[ci].push(Zone::empty());
             }
         }
@@ -1075,14 +1246,14 @@ impl DataTable {
         let mut coerced = Vec::with_capacity(self.columns.len());
         for (col, val) in self.columns.iter_mut().zip(values) {
             let value = Self::coerce(val, col.dtype)?;
-            Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
+            col.chunk_mut(col.num_chunks() - 1)?
                 .push_value(value.clone())?;
             coerced.push(value);
         }
         self.num_rows += 1;
         // Exact incremental statistics: one value, one zone, one hash.
         self.stats.rows += 1;
-        let chunk = self.columns[0].chunks.len() - 1;
+        let chunk = self.columns[0].num_chunks() - 1;
         for (ci, value) in coerced.iter().enumerate() {
             self.stats.cols[ci].observe(value);
             self.zones[ci][chunk].observe(value);
@@ -1165,16 +1336,20 @@ impl DataTable {
         // produce exactly the same chunking; bulk loaders (CSV import, lake
         // load) append CHUNK_SIZE-row batches, so after the first batch every
         // append lands behind a full tail and takes the second fast path.
-        let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
+        let tail_len = if self.columns[0].num_chunks() == 0 {
+            0
+        } else {
+            self.columns[0].chunk_rows(self.columns[0].num_chunks() - 1)
+        };
         if tail_len == 0 || tail_len >= CHUNK_SIZE {
-            let replacing = tail_len == 0 && !self.columns[0].chunks.is_empty();
+            let replacing = tail_len == 0 && self.columns[0].num_chunks() > 0;
             if replacing {
                 for (col, src) in self.columns.iter_mut().zip(chunk) {
-                    *col.chunks.last_mut().expect("tail chunk exists") = Arc::clone(src);
+                    col.set_chunk(col.num_chunks() - 1, Arc::clone(src));
                 }
             } else {
                 for (col, src) in self.columns.iter_mut().zip(chunk) {
-                    col.chunks.push(Arc::clone(src));
+                    col.push_chunk(Arc::clone(src));
                 }
             }
             if track_stats {
@@ -1195,18 +1370,17 @@ impl DataTable {
             return Ok(());
         }
         // Partial tail: merge, splitting at chunk boundaries as needed.
-        let first_chunk = self.columns[0].chunks.len().saturating_sub(1);
+        let first_chunk = self.columns[0].num_chunks().saturating_sub(1);
         let mut offset = 0;
         while offset < rows {
             let tail_full = self.columns[0]
                 .chunks
                 .last()
-                .map(|c| c.len() >= CHUNK_SIZE)
+                .map(|c| c.rows() >= CHUNK_SIZE)
                 .unwrap_or(true);
             if tail_full {
                 for col in &mut self.columns {
-                    col.chunks
-                        .push(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
+                    col.push_chunk(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
                 }
                 if track_stats {
                     for zones in &mut self.zones {
@@ -1214,13 +1388,13 @@ impl DataTable {
                     }
                 }
             }
+            let tail = self.columns[0].num_chunks() - 1;
             let take = {
-                let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
+                let tail_len = self.columns[0].chunk_rows(tail);
                 (CHUNK_SIZE - tail_len).min(rows - offset)
             };
             for (col, src) in self.columns.iter_mut().zip(chunk) {
-                Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
-                    .extend_from(src, offset, take);
+                col.chunk_mut(tail)?.extend_from(src, offset, take);
             }
             offset += take;
             self.num_rows += take;
@@ -1231,7 +1405,7 @@ impl DataTable {
             // source rows are hashed (folded from the whole chunk instead
             // would count the existing rows twice).
             for (ci, src) in chunk.iter().enumerate() {
-                for c in first_chunk..self.columns[0].chunks.len() {
+                for c in first_chunk..self.columns[0].num_chunks() {
                     self.refresh_zone(ci, c, false);
                 }
                 if let Some(hll) = &mut self.stats.cols[ci].hll {
@@ -1283,7 +1457,7 @@ impl DataTable {
                 .get(*col)
                 .ok_or_else(|| PinkDbError::Execution(format!("column {col} out of range")))?
                 .dtype;
-            if *row >= self.columns[*col].chunks[chunk].len() {
+            if *row >= self.columns[*col].chunk_rows(chunk) {
                 return Err(PinkDbError::Execution(format!(
                     "row {row} out of bounds in chunk {chunk}"
                 )));
@@ -1291,7 +1465,9 @@ impl DataTable {
             staged.push((*col, *row, Self::coerce(v.clone(), dtype)?));
         }
         for (col, row, v) in &staged {
-            Arc::make_mut(&mut self.columns[*col].chunks[chunk]).set_value(*row, v.clone())?;
+            self.columns[*col]
+                .chunk_mut(chunk)?
+                .set_value(*row, v.clone())?;
         }
         if !staged.is_empty() {
             // The new values join the sketch and the zone is re-derived from
@@ -1363,12 +1539,11 @@ impl DataTable {
                 let n = n as usize;
                 let table = self.name.clone();
                 let index = def.writable(&table)?;
+                let payload = column.chunk(chunk)?;
                 for row in rows {
                     let global = chunk_start + row as u64;
                     index.delete(global);
-                    if let Some(vector) =
-                        crate::vector_index::row_vector(&column.chunks[chunk], row, n)
-                    {
+                    if let Some(vector) = crate::vector_index::row_vector(&payload, row, n) {
                         index.insert(global, &vector)?;
                     }
                 }
@@ -1391,9 +1566,9 @@ impl DataTable {
             return Ok(0);
         }
         self.require_vector_indexes_loaded()?;
-        let len = self.columns[0].chunks[chunk].len();
+        let len = self.columns[0].chunk_rows(chunk);
         let chunk_start = self.chunk_start(chunk);
-        let chunks_before = self.columns[0].chunks.len();
+        let chunks_before = self.columns[0].num_chunks();
         let mut drop_sorted = drop.to_vec();
         drop_sorted.sort_unstable();
         drop_sorted.dedup();
@@ -1413,10 +1588,11 @@ impl DataTable {
         }
         let removed = len - keep.len();
         for col in &mut self.columns {
-            col.chunks[chunk] = Arc::new(col.chunks[chunk].gather(&keep));
+            let gathered = Arc::new(col.chunk(chunk)?.gather(&keep));
+            col.set_chunk(chunk, gathered);
         }
         // Drop chunks left empty (all columns share chunk boundaries).
-        let dropped_chunk = self.columns[0].chunks[chunk].is_empty();
+        let dropped_chunk = self.columns[0].chunk_rows(chunk) == 0;
         if dropped_chunk {
             for col in &mut self.columns {
                 col.chunks.remove(chunk);
@@ -1447,7 +1623,7 @@ impl DataTable {
                 chunk_start,
                 chunk_len: len as u64,
                 deleted: drop_sorted,
-                chunk_dropped: self.columns[0].chunks.len() < chunks_before,
+                chunk_dropped: self.columns[0].num_chunks() < chunks_before,
             };
             let table = self.name.clone();
             for def in &mut self.vector_indexes {
@@ -1459,42 +1635,73 @@ impl DataTable {
 
     /// Number of stored chunks (all columns share the same count).
     pub fn num_chunks(&self) -> usize {
-        self.columns.first().map(|c| c.chunks.len()).unwrap_or(0)
+        self.columns.first().map(|c| c.num_chunks()).unwrap_or(0)
+    }
+
+    /// Rows in chunk `i` without decoding it (all columns share the
+    /// boundaries).
+    pub fn chunk_rows(&self, i: usize) -> usize {
+        self.columns.first().map(|c| c.chunk_rows(i)).unwrap_or(0)
     }
 
     /// Global row id of the first row in `chunk`. Deleting rows leaves
     /// interior chunks partially full, so this cannot assume full chunks
     /// before the tail.
     fn chunk_start(&self, chunk: usize) -> u64 {
-        self.columns[0].chunks[..chunk]
-            .iter()
-            .map(|c| c.len() as u64)
-            .sum()
+        (0..chunk).map(|i| self.chunk_rows(i) as u64).sum()
     }
 
     /// Read chunk `idx` as a `DataChunk` (columns shared by reference —
     /// scans never copy data).
-    pub fn scan_chunk(&self, idx: usize) -> Option<DataChunk> {
+    pub fn scan_chunk(&self, idx: usize) -> Result<Option<DataChunk>> {
         if idx >= self.num_chunks() {
-            return None;
+            return Ok(None);
         }
-        let cols = self.columns.iter().map(|c| c.chunks[idx].clone()).collect();
-        DataChunk::from_arcs(cols)
+        let mut cols = Vec::with_capacity(self.columns.len());
+        for c in &self.columns {
+            cols.push(c.chunk(idx)?);
+        }
+        Ok(DataChunk::from_arcs(cols))
+    }
+
+    /// Read chunk `idx` with only the columns marked in `present` decoded; the
+    /// others come back as empty placeholders of the right type.
+    ///
+    /// A projector replaces every column it references anyway, so decoding a
+    /// pruned one is pure waste — and once chunks decode on demand, it is a
+    /// whole read the query never asked for (wave 136b step 2). Placeholders
+    /// stay checked: `DataChunk::expect_column` rejects one the projection does
+    /// reach.
+    pub fn scan_chunk_projected(&self, idx: usize, present: &[bool]) -> Result<Option<DataChunk>> {
+        if idx >= self.num_chunks() {
+            return Ok(None);
+        }
+        let mut cols = Vec::with_capacity(self.columns.len());
+        for (ci, c) in self.columns.iter().enumerate() {
+            if present.get(ci).copied().unwrap_or(false) {
+                cols.push(c.chunk(idx)?);
+            } else {
+                cols.push(Arc::new(Vector::new_empty(c.dtype)));
+            }
+        }
+        Ok(Some(DataChunk::projected(cols, self.chunk_rows(idx))))
     }
 
     /// Value at (row, col).
-    pub fn get(&self, row: usize, col: usize) -> Option<Value> {
+    pub fn get(&self, row: usize, col: usize) -> Result<Option<Value>> {
         if row >= self.num_rows || col >= self.columns.len() {
-            return None;
+            return Ok(None);
         }
+        let column = &self.columns[col];
         let mut base = row;
-        for chunk in &self.columns[col].chunks {
-            if base < chunk.len() {
-                return Some(chunk.get(base));
+        for i in 0..column.num_chunks() {
+            let len = column.chunk_rows(i);
+            if base < len {
+                return Ok(Some(column.chunk(i)?.get(base)));
             }
-            base -= chunk.len();
+            base -= len;
         }
-        None
+        Ok(None)
     }
 }
 
@@ -3383,10 +3590,11 @@ impl PinkDb {
             let t = self.table_in(db, table)?;
             let col = &t.columns[column];
             let mut offset = 0usize;
-            for chunk in &col.chunks {
+            for i in 0..col.num_chunks() {
+                let chunk = col.chunk(i)?;
                 let rows: Vec<(u64, Vec<f32>)> = (0..chunk.len())
                     .filter_map(|row| {
-                        crate::vector_index::row_vector(chunk, row, dim)
+                        crate::vector_index::row_vector(&chunk, row, dim)
                             .map(|vector| ((offset + row) as u64, vector))
                     })
                     .collect();
@@ -3819,10 +4027,94 @@ mod tests {
     fn append_and_get_with_coercion() {
         let t = sample();
         assert_eq!(t.num_rows(), 2);
-        assert_eq!(t.get(0, 0), Some(Value::Bigint(1)));
-        assert_eq!(t.get(1, 0), Some(Value::Bigint(2)));
-        assert_eq!(t.get(1, 1), Some(Value::Null));
-        assert_eq!(t.get(9, 0), None);
+        assert_eq!(t.get(0, 0).unwrap(), Some(Value::Bigint(1)));
+        assert_eq!(t.get(1, 0).unwrap(), Some(Value::Bigint(2)));
+        assert_eq!(t.get(1, 1).unwrap(), Some(Value::Null));
+        assert_eq!(t.get(9, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn chunk_rows_match_the_decoded_chunks() {
+        let mut t = DataTable::new(
+            "big".to_string(),
+            vec![
+                ("a".to_string(), DataType::Integer),
+                ("b".to_string(), DataType::Varchar),
+            ],
+        )
+        .unwrap();
+        for i in 0..(CHUNK_SIZE + 5) {
+            t.append_row(vec![
+                Value::Integer(i as i32),
+                Value::Varchar(format!("v{i}")),
+            ])
+            .unwrap();
+        }
+        assert_eq!(t.chunk_rows(0), CHUNK_SIZE);
+        assert_eq!(t.chunk_rows(1), 5);
+        for column in &t.columns {
+            assert_eq!(column.num_chunks(), t.num_chunks());
+            for i in 0..column.num_chunks() {
+                assert_eq!(column.chunk_rows(i), column.chunk(i).unwrap().len());
+            }
+            assert_eq!(column.len(), t.num_rows());
+        }
+        assert!(t.columns[0].chunk(2).is_err());
+    }
+
+    /// The metadata accessor keeps the old chunk-slicing contract: an index
+    /// past the end is a caller bug (a panic), not an error.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn chunk_rows_out_of_range_panics() {
+        let t = sample();
+        let _ = t.chunk_rows(1);
+    }
+
+    #[test]
+    fn scan_chunk_projected_yields_placeholders() {
+        let t = sample();
+        let chunk = t.scan_chunk_projected(0, &[true, false]).unwrap().unwrap();
+        assert_eq!(chunk.num_rows(), 2);
+        assert!(chunk.is_present(0));
+        assert!(!chunk.is_present(1));
+        // The projected column is the stored chunk, not a copy.
+        assert!(Arc::ptr_eq(
+            &chunk.columns[0],
+            &t.columns[0].chunk(0).unwrap()
+        ));
+        assert_eq!(chunk.columns[0].get(0), Value::Bigint(1));
+        assert!(chunk.columns[1].is_empty());
+        // The full projection is the plain scan chunk.
+        let full = t.scan_chunk_projected(0, &[true, true]).unwrap().unwrap();
+        assert!(full.is_present(1));
+        assert_eq!(full.columns[1].get(0), Value::Varchar("ann".to_string()));
+        assert!(t.scan_chunk_projected(1, &[true, false]).unwrap().is_none());
+    }
+
+    #[test]
+    fn chunk_mut_copies_on_write_and_marks_dirty() {
+        let mut t = sample();
+        let snapshot = t.clone();
+        assert!(Arc::ptr_eq(
+            &snapshot.columns[0].chunk(0).unwrap(),
+            &t.columns[0].chunk(0).unwrap()
+        ));
+        t.columns[0]
+            .chunk_mut(0)
+            .unwrap()
+            .set_value(0, Value::Bigint(42))
+            .unwrap();
+        assert!(t.columns[0].chunks[0].dirty);
+        assert_eq!(t.get(0, 0).unwrap(), Some(Value::Bigint(42)));
+        // The snapshot kept the old payload: `chunk_mut` cloned the `Arc`
+        // instead of writing through the shared one.
+        assert_eq!(snapshot.get(0, 0).unwrap(), Some(Value::Bigint(1)));
+        assert!(!Arc::ptr_eq(
+            &snapshot.columns[0].chunk(0).unwrap(),
+            &t.columns[0].chunk(0).unwrap()
+        ));
+        assert!(t.columns[0].chunk_mut(1).is_err());
     }
 
     #[test]
@@ -3850,11 +4142,11 @@ mod tests {
             t.append_row(vec![Value::Integer(i as i32)]).unwrap();
         }
         assert_eq!(t.num_chunks(), 2);
-        assert_eq!(t.scan_chunk(0).unwrap().num_rows(), CHUNK_SIZE);
-        assert_eq!(t.scan_chunk(1).unwrap().num_rows(), 5);
-        assert!(t.scan_chunk(2).is_none());
+        assert_eq!(t.scan_chunk(0).unwrap().unwrap().num_rows(), CHUNK_SIZE);
+        assert_eq!(t.scan_chunk(1).unwrap().unwrap().num_rows(), 5);
+        assert!(t.scan_chunk(2).unwrap().is_none());
         assert_eq!(
-            t.get(CHUNK_SIZE, 0),
+            t.get(CHUNK_SIZE, 0).unwrap(),
             Some(Value::Integer(CHUNK_SIZE as i32))
         );
     }
@@ -3893,15 +4185,18 @@ mod tests {
         t.append_chunk(chunk_rows(CHUNK_SIZE as i64, 2)).unwrap();
         assert_eq!(t.num_rows(), 2 + CHUNK_SIZE);
         assert_eq!(t.num_chunks(), 2);
-        assert_eq!(t.scan_chunk(0).unwrap().num_rows(), CHUNK_SIZE);
-        assert_eq!(t.scan_chunk(1).unwrap().num_rows(), 2);
+        assert_eq!(t.scan_chunk(0).unwrap().unwrap().num_rows(), CHUNK_SIZE);
+        assert_eq!(t.scan_chunk(1).unwrap().unwrap().num_rows(), 2);
         assert_eq!(
-            t.get(CHUNK_SIZE - 1, 0),
+            t.get(CHUNK_SIZE - 1, 0).unwrap(),
             Some(Value::Bigint(CHUNK_SIZE as i64 - 1))
         );
-        assert_eq!(t.get(CHUNK_SIZE, 0), Some(Value::Bigint(CHUNK_SIZE as i64)));
         assert_eq!(
-            t.get(CHUNK_SIZE + 1, 1),
+            t.get(CHUNK_SIZE, 0).unwrap(),
+            Some(Value::Bigint(CHUNK_SIZE as i64))
+        );
+        assert_eq!(
+            t.get(CHUNK_SIZE + 1, 1).unwrap(),
             Some(Value::Varchar(format!("v{}", CHUNK_SIZE + 1)))
         );
 
@@ -3963,8 +4258,8 @@ mod tests {
         assert_eq!(shared.num_rows(), copied.num_rows());
         assert_eq!(shared.num_chunks(), copied.num_chunks());
         for i in 0..shared.num_chunks() {
-            let a = shared.scan_chunk(i).unwrap();
-            let b = copied.scan_chunk(i).unwrap();
+            let a = shared.scan_chunk(i).unwrap().unwrap();
+            let b = copied.scan_chunk(i).unwrap().unwrap();
             assert_eq!(a.columns, b.columns, "chunk {i} differs");
             assert_eq!(a.num_rows(), b.num_rows());
         }
@@ -3974,8 +4269,14 @@ mod tests {
         let (mut shared2, full2, _) = mk();
         shared2.append_shared_chunk(&full2).unwrap();
         assert_eq!(shared2.num_chunks(), 1); // empty tail is replaced
-        assert!(Arc::ptr_eq(&shared2.columns[0].chunks[0], &full2[0]));
-        assert!(Arc::ptr_eq(&shared2.columns[1].chunks[0], &full2[1]));
+        assert!(Arc::ptr_eq(
+            &shared2.columns[0].chunk(0).unwrap(),
+            &full2[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &shared2.columns[1].chunk(0).unwrap(),
+            &full2[1]
+        ));
     }
 
     /// The bulk write paths append whole chunks instead of rows; the catalog

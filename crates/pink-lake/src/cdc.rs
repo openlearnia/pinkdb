@@ -460,7 +460,7 @@ impl Lake {
         for row in indices {
             let mut values = Vec::with_capacity(file_table.num_cols());
             for col in 0..file_table.num_cols() {
-                values.push(file_table.get(row, col).unwrap_or(Value::Null));
+                values.push(file_table.get(row, col).unwrap().unwrap_or(Value::Null));
             }
             rows_out.push(values);
         }

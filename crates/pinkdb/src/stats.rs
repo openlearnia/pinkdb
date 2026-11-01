@@ -722,8 +722,8 @@ impl TableStats {
         let mut stats = Self::new(columns.len());
         stats.rows = rows;
         for (ci, col) in columns.iter().enumerate() {
-            let mut col_zones = Vec::with_capacity(col.chunks.len());
-            for chunk in &col.chunks {
+            let mut col_zones = Vec::with_capacity(col.num_chunks());
+            for chunk in col.chunks_decoded() {
                 let zone = Zone::of_vector(chunk);
                 stats.cols[ci].observe_chunk(chunk, &zone);
                 col_zones.push(zone);

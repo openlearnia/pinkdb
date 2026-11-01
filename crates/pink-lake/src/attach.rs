@@ -595,7 +595,7 @@ impl AttachedLake for LakeAttachment {
         if live_rows(&entry) <= MATERIALIZE_MAX_ROWS {
             let scan = self.load_filtered(db, table, columns, predicates)?;
             let mut rows = 0u64;
-            for chunk in scan.chunks() {
+            for chunk in scan.chunks()? {
                 rows += chunk.num_rows() as u64;
                 sink(chunk)?;
             }
@@ -639,7 +639,7 @@ impl AttachedLake for LakeAttachment {
                 table: Arc::new(chunked),
                 present: file_present,
             };
-            for chunk in file_scan.chunks() {
+            for chunk in file_scan.chunks()? {
                 rows += chunk.num_rows() as u64;
                 sink(chunk)?;
             }
@@ -678,7 +678,7 @@ impl AttachedLake for LakeAttachment {
                 table: Arc::new(table),
                 present: inlined_present,
             };
-            for chunk in inlined_scan.chunks() {
+            for chunk in inlined_scan.chunks()? {
                 rows += chunk.num_rows() as u64;
                 sink(chunk)?;
             }
@@ -1305,10 +1305,14 @@ fn merge_projected(
     columns: &[usize],
     tablename: &str,
 ) -> Result<DataTable> {
-    let rows: Vec<usize> = existing.columns[0].chunks.iter().map(|c| c.len()).collect();
+    let rows: Vec<usize> = (0..existing.num_chunks())
+        .map(|c| existing.chunk_rows(c))
+        .collect();
     let mut merged = existing.columns.clone();
     for &i in columns {
-        let lens: Vec<usize> = fresh.columns[i].chunks.iter().map(|c| c.len()).collect();
+        let lens: Vec<usize> = (0..fresh.columns[i].num_chunks())
+            .map(|c| fresh.columns[i].chunk_rows(c))
+            .collect();
         if lens != rows {
             return Err(LakeError::Internal {
                 message: format!(
@@ -2139,7 +2143,7 @@ mod tests {
                 let mut min: Option<Value> = None;
                 let mut max: Option<Value> = None;
                 for row in 0..decoded.num_rows() {
-                    let v = decoded.get(row, i).unwrap();
+                    let v = decoded.get(row, i).unwrap().unwrap();
                     if v.is_null() {
                         nulls += 1;
                         continue;
@@ -2417,8 +2421,8 @@ mod tests {
         for j in 0..full.num_chunks() {
             for i in 0..full.num_cols() {
                 assert_eq!(
-                    sparse.table.columns[i].chunks[j].len(),
-                    full.columns[i].chunks[j].len(),
+                    sparse.table.columns[i].chunk_rows(j),
+                    full.columns[i].chunk_rows(j),
                     "chunk {j} column {i} length"
                 );
             }
@@ -2431,7 +2435,10 @@ mod tests {
             (4, true),
         ] {
             for row in 0..full.num_rows() {
-                let (a, b) = (sparse.table.get(row, i).unwrap(), full.get(row, i).unwrap());
+                let (a, b) = (
+                    sparse.table.get(row, i).unwrap().unwrap(),
+                    full.get(row, i).unwrap().unwrap(),
+                );
                 if decoded {
                     match (&a, &b) {
                         (Value::Double(x), Value::Double(y)) => assert_eq!(
@@ -2459,8 +2466,8 @@ mod tests {
             for j in 0..full.num_chunks() {
                 assert!(
                     Arc::ptr_eq(
-                        &sparse.table.columns[i].chunks[j],
-                        &extended.table.columns[i].chunks[j]
+                        &sparse.table.columns[i].chunk(j).unwrap(),
+                        &extended.table.columns[i].chunk(j).unwrap()
                     ),
                     "column {i} chunk {j} must be shared across projections"
                 );
@@ -2470,8 +2477,8 @@ mod tests {
         for i in 0..full.num_cols() {
             for row in 0..full.num_rows() {
                 let (a, b) = (
-                    extended.table.get(row, i).unwrap(),
-                    full.get(row, i).unwrap(),
+                    extended.table.get(row, i).unwrap().unwrap(),
+                    full.get(row, i).unwrap().unwrap(),
                 );
                 match (&a, &b) {
                     (Value::Double(x), Value::Double(y)) => {

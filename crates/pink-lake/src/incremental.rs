@@ -68,7 +68,7 @@ pub(crate) fn profile() -> bool {
     std::env::var_os("PINKDB_LAKE_PROFILE").is_some()
 }
 
-use pinkdb::{AttachedLake, DataTable, PinkDb, Value};
+use pinkdb::{AttachedLake, DataTable, PinkDb, Value, Vector};
 
 use crate::catalog::{
     Catalog, CommitManifest, DeleteRef, FileRef, PartitionKey, TableDelta, TableEntry,
@@ -507,13 +507,25 @@ impl TableDiff {
 /// otherwise). `rows_identical` resolves any collision; the hash is only an
 /// index. `(chunk, row-in-chunk)` addressing keeps the walk O(rows), never
 /// O(rows × chunks): the diff runs over whole tables.
-fn hash_row(table: &DataTable, chunk: usize, row: usize) -> u64 {
+fn hash_row(table: &DataTable, chunk: usize, row: usize) -> Result<u64> {
     // FNV-1a, 64-bit.
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for col in 0..table.num_cols() {
-        mix_value(&mut h, &table.columns[col].chunks[chunk].get(row));
+        mix_value(&mut h, &decoded_chunk(table, col, chunk)?.get(row));
     }
-    h
+    Ok(h)
+}
+
+/// The decoded payload of one column chunk, with engine decode failures
+/// named for the table: a chunk that will not decode means the file and its
+/// footer disagree.
+fn decoded_chunk(table: &DataTable, column: usize, chunk: usize) -> Result<Arc<Vector>> {
+    table.columns[column]
+        .chunk(chunk)
+        .map_err(|e| LakeError::Engine {
+            context: format!("decoding chunk {chunk} of \"{}\"", table.name),
+            source: e,
+        })
 }
 
 /// One current-schema column as a base-version row reads it (the write-side
@@ -576,15 +588,17 @@ fn mix_value(h: &mut u64, v: &Value) {
 }
 
 /// [`hash_row`] for a base row read through a schema-delta view.
-fn hash_row_view(base: &DataTable, chunk: usize, row: usize, view: &[DiffCol]) -> u64 {
+fn hash_row_view(base: &DataTable, chunk: usize, row: usize, view: &[DiffCol]) -> Result<u64> {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for col in view {
         match col {
-            DiffCol::Base(index) => mix_value(&mut h, &base.columns[*index].chunks[chunk].get(row)),
+            DiffCol::Base(index) => {
+                mix_value(&mut h, &decoded_chunk(base, *index, chunk)?.get(row))
+            }
             DiffCol::Added(v) => mix_value(&mut h, v.as_ref().unwrap_or(&Value::Null)),
         }
     }
-    h
+    Ok(h)
 }
 
 /// Bit-exact value equality (the diff's identity relation): `DOUBLE` by bit
@@ -602,41 +616,40 @@ fn values_identical(a: &Value, b: &Value) -> bool {
 /// rows, in order. This is the append-only fast path of the writable diff: if
 /// true, every base row still exists at the same position and the only change
 /// is the suffix.
-fn rows_prefix_equal(base: &DataTable, current: &DataTable) -> bool {
+fn rows_prefix_equal(base: &DataTable, current: &DataTable) -> Result<bool> {
     if base.num_cols() != current.num_cols()
         || base.num_cols() == 0
         || base.num_chunks() == 0
         || current.num_chunks() == 0
         || current.num_rows() < base.num_rows()
     {
-        return false;
+        return Ok(false);
     }
     let (mut bc, mut br) = (0usize, 0usize);
     let (mut cc, mut cr) = (0usize, 0usize);
     for _ in 0..base.num_rows() {
-        while bc < base.num_chunks() && br >= base.columns[0].chunks[bc].len() {
+        while bc < base.num_chunks() && br >= base.chunk_rows(bc) {
             bc += 1;
             br = 0;
         }
-        while cc < current.num_chunks() && cr >= current.columns[0].chunks[cc].len() {
+        while cc < current.num_chunks() && cr >= current.chunk_rows(cc) {
             cc += 1;
             cr = 0;
         }
-        if bc >= base.num_chunks()
-            || cc >= current.num_chunks()
-            || !(0..base.num_cols()).all(|c| {
-                values_identical(
-                    &base.columns[c].chunks[bc].get(br),
-                    &current.columns[c].chunks[cc].get(cr),
-                )
-            })
-        {
-            return false;
+        if bc >= base.num_chunks() || cc >= current.num_chunks() {
+            return Ok(false);
+        }
+        for c in 0..base.num_cols() {
+            let bv = decoded_chunk(base, c, bc)?.get(br);
+            let cv = decoded_chunk(current, c, cc)?.get(cr);
+            if !values_identical(&bv, &cv) {
+                return Ok(false);
+            }
         }
         br += 1;
         cr += 1;
     }
-    true
+    Ok(true)
 }
 
 /// [`rows_identical`] for a base row read through a schema-delta view: `a` is
@@ -650,15 +663,24 @@ fn rows_identical_view(
     bc: usize,
     br: usize,
     view: &[DiffCol],
-) -> bool {
-    view.len() == b.num_cols()
-        && view.iter().enumerate().all(|(i, col)| {
-            let bv = &b.columns[i].chunks[bc].get(br);
-            match col {
-                DiffCol::Base(bi) => values_identical(&a.columns[*bi].chunks[ac].get(ar), bv),
-                DiffCol::Added(v) => values_identical(v.as_ref().unwrap_or(&Value::Null), bv),
+) -> Result<bool> {
+    if view.len() != b.num_cols() {
+        return Ok(false);
+    }
+    for (i, col) in view.iter().enumerate() {
+        let bv = decoded_chunk(b, i, bc)?.get(br);
+        let same = match col {
+            DiffCol::Base(bi) => {
+                let av = decoded_chunk(a, *bi, ac)?.get(ar);
+                values_identical(&av, &bv)
             }
-        })
+            DiffCol::Added(v) => values_identical(v.as_ref().unwrap_or(&Value::Null), &bv),
+        };
+        if !same {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The exact row-level diff between `base`'s logical rows (data files in
@@ -709,10 +731,10 @@ pub(crate) fn diff_table(
         let mut flat = 0usize;
         for c in 0..current.num_chunks() {
             flat_of.push(flat);
-            let len = current.columns[0].chunks[c].len();
+            let len = current.chunk_rows(c);
             for r in 0..len {
                 buckets
-                    .entry(hash_row(current, c, r))
+                    .entry(hash_row(current, c, r)?)
                     .or_default()
                     .push((c, r));
             }
@@ -726,9 +748,9 @@ pub(crate) fn diff_table(
 
     let mut p = 0usize;
     for bc in 0..base.num_chunks() {
-        let len = base.columns[0].chunks[bc].len();
+        let len = base.chunk_rows(bc);
         for br in 0..len {
-            let h = hash_row_view(base, bc, br, view);
+            let h = hash_row_view(base, bc, br, view)?;
             let mut found: Option<(usize, usize)> = None;
             if let Some(list) = buckets.get(&h) {
                 let cursor = cursors.entry(h).or_insert(0);
@@ -737,7 +759,7 @@ pub(crate) fn diff_table(
                 }
                 for &(cand_c, cand_r) in &list[*cursor..] {
                     if !taken[flat_of[cand_c] + cand_r]
-                        && rows_identical_view(base, bc, br, current, cand_c, cand_r, view)
+                        && rows_identical_view(base, bc, br, current, cand_c, cand_r, view)?
                     {
                         found = Some((cand_c, cand_r));
                         break;
@@ -787,9 +809,15 @@ pub(crate) fn sub_table(src: &DataTable, indices: &[usize]) -> Result<DataTable>
     let mut seen = 0usize;
     let mut start = 0usize;
     for c in 0..src.num_chunks() {
-        let chunk = src.scan_chunk(c).ok_or_else(|| LakeError::Internal {
-            message: format!("chunk {c} of \"{}\" disappeared", src.name),
-        })?;
+        let chunk = src
+            .scan_chunk(c)
+            .map_err(|e| LakeError::Engine {
+                context: format!("reading chunk {c} of \"{}\"", src.name),
+                source: e,
+            })?
+            .ok_or_else(|| LakeError::Internal {
+                message: format!("chunk {c} of \"{}\" disappeared", src.name),
+            })?;
         let end = start + chunk.num_rows;
         // The indices that fall in this chunk, chunk-relative.
         let mut sel: Vec<usize> = Vec::new();
@@ -1631,7 +1659,7 @@ impl Lake {
                     // diff and the merge-order rebuild both reduce to "keep the
                     // current table, publish the suffix", so skip the per-row
                     // hash pass and the full base copy.
-                    if delta.record.is_none() && rows_prefix_equal(base_table, table) {
+                    if delta.record.is_none() && rows_prefix_equal(base_table, table)? {
                         let start = base_table.num_rows();
                         if start < table.num_rows() {
                             let indices: Vec<usize> = (start..table.num_rows()).collect();

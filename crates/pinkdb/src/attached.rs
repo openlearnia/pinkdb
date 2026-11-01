@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
-use crate::vector::{DataChunk, Vector};
+use crate::vector::DataChunk;
 
 /// A time-travel target for one table reference: DuckLake's
 /// `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` clause after a table name.
@@ -262,35 +262,15 @@ impl AttachedScan {
     }
 
     /// The scan as engine chunks, in table order: present columns as stored,
-    /// absent columns as a shared zero-length placeholder of their dtype.
-    pub fn chunks(&self) -> Vec<DataChunk> {
-        let num_cols = self.table.columns.len();
-        let rows: Vec<usize> = self
-            .table
-            .columns
-            .first()
-            .map(|c| c.chunks.iter().map(|c| c.len()).collect())
-            .unwrap_or_default();
-        // One shared placeholder per absent column; nothing reads it.
-        let absent: Vec<Option<Arc<Vector>>> = (0..num_cols)
-            .map(|i| {
-                let dtype = self.table.columns[i].dtype;
-                (!self.present.get(i).copied().unwrap_or(false))
-                    .then(|| Arc::new(Vector::new_empty(dtype)))
-            })
-            .collect();
-        rows.into_iter()
-            .enumerate()
-            .map(|(j, n)| {
-                let cols: Vec<Arc<Vector>> = (0..num_cols)
-                    .map(|i| match &absent[i] {
-                        Some(placeholder) => Arc::clone(placeholder),
-                        None => self.table.columns[i].chunks[j].clone(),
-                    })
-                    .collect();
-                DataChunk::projected(cols, n)
-            })
-            .collect()
+    /// absent columns as a zero-length placeholder of their dtype.
+    pub fn chunks(&self) -> Result<Vec<DataChunk>> {
+        let mut chunks = Vec::with_capacity(self.table.num_chunks());
+        for j in 0..self.table.num_chunks() {
+            if let Some(chunk) = self.table.scan_chunk_projected(j, &self.present)? {
+                chunks.push(chunk);
+            }
+        }
+        Ok(chunks)
     }
 }
 
@@ -375,7 +355,7 @@ pub trait AttachedLake: fmt::Debug + Send + Sync {
     ) -> Result<u64> {
         let scan = self.load_filtered(db, table, columns, predicates)?;
         let mut rows = 0u64;
-        for chunk in scan.chunks() {
+        for chunk in scan.chunks()? {
             rows += chunk.num_rows() as u64;
             sink(chunk)?;
         }
@@ -669,6 +649,7 @@ impl PinkDb {
 mod tests {
     use super::*;
     use crate::types::PinkDbError;
+    use crate::vector::Vector;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -965,8 +946,7 @@ mod tests {
                     out.push(col.clone());
                 } else {
                     let chunks = col
-                        .chunks
-                        .iter()
+                        .chunks_decoded()
                         .map(|c| {
                             let mut v = Vector::new_empty(col.dtype);
                             for _ in 0..c.len() {
@@ -975,12 +955,12 @@ mod tests {
                             Arc::new(v)
                         })
                         .collect();
-                    out.push(crate::storage::Column {
-                        name: col.name.clone(),
-                        dtype: col.dtype,
-                        default: None,
+                    out.push(crate::storage::Column::from_chunks(
+                        col.name.clone(),
+                        col.dtype,
+                        None,
                         chunks,
-                    });
+                    ));
                 }
             }
             let table = DataTable::from_columns(full.name.clone(), out, full.num_rows);
@@ -1591,7 +1571,10 @@ mod tests {
         // The WAL is clean: the store reopens and replays.
         drop(db);
         let db = PinkDb::open_durable(path).unwrap();
-        assert_eq!(db.table("t").unwrap().get(0, 0), Some(Value::Bigint(1)));
+        assert_eq!(
+            db.table("t").unwrap().get(0, 0).unwrap(),
+            Some(Value::Bigint(1))
+        );
 
         // The multi-writer connection path takes the same guard.
         let path2 = dir.join("c.pink");
@@ -1620,7 +1603,10 @@ mod tests {
         drop(conn);
         drop(database);
         let db = PinkDb::open_durable(path2).unwrap();
-        assert_eq!(db.table("t").unwrap().get(0, 0), Some(Value::Bigint(1)));
+        assert_eq!(
+            db.table("t").unwrap().get(0, 0).unwrap(),
+            Some(Value::Bigint(1))
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

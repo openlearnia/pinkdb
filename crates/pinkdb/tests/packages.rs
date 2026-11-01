@@ -211,13 +211,15 @@ impl FileFormat for TsvFormat {
         let mut out = String::new();
         for row in 0..table.num_rows() {
             let cells: Vec<String> = (0..table.num_cols())
-                .map(|c| match table.get(row, c).unwrap_or(Value::Null) {
-                    Value::Null => String::new(),
-                    Value::Bigint(v) => v.to_string(),
-                    Value::Integer(v) => v.to_string(),
-                    Value::Varchar(s) => s,
-                    other => format!("{other:?}"),
-                })
+                .map(
+                    |c| match table.get(row, c).unwrap().unwrap_or(Value::Null) {
+                        Value::Null => String::new(),
+                        Value::Bigint(v) => v.to_string(),
+                        Value::Integer(v) => v.to_string(),
+                        Value::Varchar(s) => s,
+                        other => format!("{other:?}"),
+                    },
+                )
                 .collect();
             out.push_str(&cells.join("\t"));
             out.push('\n');

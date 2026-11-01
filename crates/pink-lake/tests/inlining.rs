@@ -122,11 +122,11 @@ fn rows_of(db: &PinkDb) -> Vec<(i32, Option<String>)> {
     let t = db.table("t").unwrap();
     (0..t.num_rows())
         .map(|r| {
-            let i = match t.get(r, 0).unwrap() {
+            let i = match t.get(r, 0).unwrap().unwrap() {
                 Value::Integer(i) => i,
                 other => panic!("row {r}: {other:?}"),
             };
-            let s = match t.get(r, 1).unwrap() {
+            let s = match t.get(r, 1).unwrap().unwrap() {
                 Value::Varchar(s) => Some(s),
                 Value::Null => None,
                 other => panic!("row {r}: {other:?}"),
@@ -1009,17 +1009,17 @@ fn schema_evolution_reads_inlined_rows_through_the_record() {
     assert_eq!(t.num_cols(), 3);
     let values: Vec<(i32, Option<String>, Option<i32>)> = (0..t.num_rows())
         .map(|r| {
-            let label = match t.get(r, 1).unwrap() {
+            let label = match t.get(r, 1).unwrap().unwrap() {
                 Value::Varchar(s) => Some(s),
                 Value::Null => None,
                 other => panic!("{other:?}"),
             };
-            let n = match t.get(r, 2).unwrap() {
+            let n = match t.get(r, 2).unwrap().unwrap() {
                 Value::Integer(n) => Some(n),
                 Value::Null => None,
                 other => panic!("{other:?}"),
             };
-            let i = match t.get(r, 0).unwrap() {
+            let i = match t.get(r, 0).unwrap().unwrap() {
                 Value::Integer(i) => i,
                 other => panic!("{other:?}"),
             };

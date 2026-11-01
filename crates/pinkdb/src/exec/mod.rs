@@ -1766,7 +1766,7 @@ pub(crate) fn run_plain(
                         // Deadline boundary: a timed-out UPDATE fails here, before
                         // any row is written back (atomic, no partial state).
                         cx.check_deadline()?;
-                        let chunk = t.scan_chunk(ci).ok_or_else(|| {
+                        let chunk = t.scan_chunk(ci)?.ok_or_else(|| {
                             PinkDbError::Execution("storage changed during UPDATE".to_string())
                         })?;
                         let targets = match predicate {
@@ -1824,7 +1824,7 @@ pub(crate) fn run_plain(
                     drops = Vec::with_capacity(t.num_chunks());
                     for ci in 0..t.num_chunks() {
                         cx.check_deadline()?;
-                        let chunk = t.scan_chunk(ci).ok_or_else(|| {
+                        let chunk = t.scan_chunk(ci)?.ok_or_else(|| {
                             PinkDbError::Execution("storage changed during DELETE".to_string())
                         })?;
                         drops.push(match predicate {
@@ -2740,19 +2740,18 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 /// Every stored chunk of `t`, in order (columns shared by `Arc`, never
 /// copied).
 /// The chunks of `t` selected by `keep` (`None` reads every chunk).
-fn scan_chunks_of(t: &DataTable, keep: Option<&[usize]>) -> Vec<DataChunk> {
-    match keep {
-        None => {
-            let mut chunks = Vec::with_capacity(t.num_chunks());
-            for i in 0..t.num_chunks() {
-                if let Some(c) = t.scan_chunk(i) {
-                    chunks.push(c);
-                }
-            }
-            chunks
+fn scan_chunks_of(t: &DataTable, keep: Option<&[usize]>) -> Result<Vec<DataChunk>> {
+    let selected: Vec<usize> = match keep {
+        Some(keep) => keep.to_vec(),
+        None => (0..t.num_chunks()).collect(),
+    };
+    let mut chunks = Vec::with_capacity(selected.len());
+    for i in selected {
+        if let Some(c) = t.scan_chunk(i)? {
+            chunks.push(c);
         }
-        Some(keep) => keep.iter().filter_map(|&i| t.scan_chunk(i)).collect(),
     }
+    Ok(chunks)
 }
 
 /// The chunks of `t` whose stored zone maps leave every simple predicate
@@ -2779,10 +2778,7 @@ fn scan_candidates(
     }
     let mut keep = Vec::with_capacity(t.num_chunks());
     for chunk in 0..t.num_chunks() {
-        let Some(c) = t.scan_chunk(chunk) else {
-            continue;
-        };
-        let rows = c.num_rows() as u64;
+        let rows = t.chunk_rows(chunk) as u64;
         let static_ok = prunes.iter().all(|p| {
             t.zone(p.column, chunk)
                 .may_match(rows, p.op, p.value.as_ref())
@@ -2845,7 +2841,7 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         };
         let (names, types) = scan.table.schema().into_iter().unzip();
         return Ok(Output {
-            chunks: scan.chunks(),
+            chunks: scan.chunks()?,
             names,
             types,
         });
@@ -2856,7 +2852,7 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     let chunks = match projected {
         Some(cols) => project_scan_chunks_of(t, cols, keep.as_deref()),
         None => scan_chunks_of(t, keep.as_deref()),
-    };
+    }?;
     cx.check_deadline()?;
     Ok(Output {
         chunks,
@@ -2999,7 +2995,8 @@ fn exact_topk_rows(
     let (start32, start64, query_is_f64) = query_vector(query, dim)?;
     let mut heap: std::collections::BinaryHeap<ExactHit> = std::collections::BinaryHeap::new();
     let mut row = 0u64;
-    for chunk in &col.chunks {
+    for i in 0..col.num_chunks() {
+        let chunk = col.chunk(i)?;
         for r in 0..chunk.len() {
             if let Some((_elem, values, valid)) = chunk.array_row(r) {
                 let off = r * dim;
@@ -3071,14 +3068,9 @@ fn index_scan_output(
     let offsets: Vec<usize> = {
         let mut offsets = Vec::with_capacity(t.num_chunks() + 1);
         let mut offset = 0usize;
-        for chunk in t
-            .columns
-            .first()
-            .map(|c| c.chunks.as_slice())
-            .unwrap_or(&[])
-        {
+        for i in 0..t.num_chunks() {
             offsets.push(offset);
-            offset += chunk.len();
+            offset += t.chunk_rows(i);
         }
         offsets.push(offset);
         offsets
@@ -3099,12 +3091,11 @@ fn index_scan_output(
         let mut values = Vec::with_capacity(t.columns.len());
         let mut valid = true;
         for col in &t.columns {
-            match col.chunks.get(chunk_idx) {
-                Some(chunk) if row_in_chunk < chunk.len() => values.push(chunk.get(row_in_chunk)),
-                _ => {
-                    valid = false;
-                    break;
-                }
+            if chunk_idx < col.num_chunks() && row_in_chunk < col.chunk_rows(chunk_idx) {
+                values.push(col.chunk(chunk_idx)?.get(row_in_chunk));
+            } else {
+                valid = false;
+                break;
             }
         }
         if !valid {
@@ -3141,13 +3132,17 @@ fn index_scan_output(
 /// mirroring the lake reader's always-correct fallback. An empty `cols`
 /// still materializes column 0: a chunk carries its shape on its columns.
 #[cfg(test)]
-fn project_scan_chunks(t: &DataTable, cols: &[usize]) -> Vec<DataChunk> {
+fn project_scan_chunks(t: &DataTable, cols: &[usize]) -> Result<Vec<DataChunk>> {
     project_scan_chunks_of(t, cols, None)
 }
 
 /// [`project_scan_chunks`] over the chunks `keep` selects (`None` reads every
 /// chunk; a zone-map pruned scan passes the surviving indices).
-fn project_scan_chunks_of(t: &DataTable, cols: &[usize], keep: Option<&[usize]>) -> Vec<DataChunk> {
+fn project_scan_chunks_of(
+    t: &DataTable,
+    cols: &[usize],
+    keep: Option<&[usize]>,
+) -> Result<Vec<DataChunk>> {
     let ncols = t.num_cols();
     if cols.iter().any(|&i| i >= ncols) {
         return scan_chunks_of(t, keep);
@@ -3162,30 +3157,17 @@ fn project_scan_chunks_of(t: &DataTable, cols: &[usize], keep: Option<&[usize]>)
     if present.iter().all(|&p| p) {
         return scan_chunks_of(t, keep);
     }
-    let absent: Vec<Option<std::sync::Arc<Vector>>> = t
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (!present[i]).then(|| std::sync::Arc::new(Vector::new_empty(c.dtype))))
-        .collect();
     let selected: Vec<usize> = match keep {
         Some(keep) => keep.to_vec(),
         None => (0..t.num_chunks()).collect(),
     };
     let mut chunks = Vec::with_capacity(selected.len());
     for i in selected {
-        let Some(chunk) = t.scan_chunk(i) else {
-            continue;
-        };
-        let cols: Vec<std::sync::Arc<Vector>> = (0..ncols)
-            .map(|c| match &absent[c] {
-                Some(placeholder) => std::sync::Arc::clone(placeholder),
-                None => std::sync::Arc::clone(&chunk.columns[c]),
-            })
-            .collect();
-        chunks.push(DataChunk::projected(cols, chunk.num_rows()));
+        if let Some(chunk) = t.scan_chunk_projected(i, &present)? {
+            chunks.push(chunk);
+        }
     }
-    chunks
+    Ok(chunks)
 }
 
 /// Exact aggregate answers from an attached lake table's stored statistics
@@ -11262,7 +11244,7 @@ mod tests {
                 ("ts".to_string(), DataType::Timestamp),
             ]
         );
-        assert_eq!(t.get(1, 0), Some(Value::Null));
+        assert_eq!(t.get(1, 0).unwrap(), Some(Value::Null));
         // Almost-dates stay VARCHAR.
         let mut db2 = PinkDb::new();
         crate::csv::import_csv_string(&mut db2, "c", "d\n2024-13-01\n2024-01-15\n").unwrap();
@@ -11287,7 +11269,11 @@ mod tests {
         assert_eq!(a.num_rows(), b.num_rows());
         for r in 0..a.num_rows() {
             for c in 0..3 {
-                assert_eq!(a.get(r, c), b.get(r, c), "row {r} col {c}");
+                assert_eq!(
+                    a.get(r, c).unwrap(),
+                    b.get(r, c).unwrap(),
+                    "row {r} col {c}"
+                );
             }
         }
         std::fs::remove_file(&path).ok();
@@ -13865,7 +13851,7 @@ mod tests {
         let cx = Cx::new(&db);
         let t = db.table("f").unwrap();
         let chunks: Vec<DataChunk> = (0..t.num_chunks())
-            .map(|i| t.scan_chunk(i).unwrap())
+            .map(|i| t.scan_chunk(i).unwrap().unwrap())
             .collect();
         // `Value::Double(NaN) != Value::Double(NaN)`, so compare Debug forms.
         let debug_rows =
@@ -13989,7 +13975,7 @@ mod tests {
         let cx = Cx::new(&db);
         let t = db.table("m").unwrap();
         let chunks: Vec<DataChunk> = (0..t.num_chunks())
-            .map(|i| t.scan_chunk(i).unwrap())
+            .map(|i| t.scan_chunk(i).unwrap().unwrap())
             .collect();
         let asc = |index: usize, dtype: DataType| {
             (
@@ -15731,9 +15717,9 @@ mod tests {
         let t = db.table("w").unwrap();
         assert!(t.num_chunks() > 2, "the corpus must span chunks");
         let rows = t.num_rows();
-        let stored = t.scan_chunk(0).unwrap();
+        let stored = t.scan_chunk(0).unwrap().unwrap();
 
-        let chunks = project_scan_chunks(t, &[2]);
+        let chunks = project_scan_chunks(t, &[2]).unwrap();
         assert_eq!(chunks.len(), t.num_chunks());
         assert_eq!(chunks.iter().map(|c| c.num_rows()).sum::<usize>(), rows);
         let c = &chunks[0];
@@ -15744,17 +15730,18 @@ mod tests {
             assert_eq!(c.columns[i].len(), 0, "column {i} is a placeholder");
         }
         assert!(std::sync::Arc::ptr_eq(&c.columns[2], &stored.columns[2]));
-        // One shared placeholder per absent column, across all chunks.
+        // Absent columns are empty placeholders in every chunk.
         let c2 = &chunks[1];
-        assert!(std::sync::Arc::ptr_eq(&c.columns[0], &c2.columns[0]));
+        assert!(!c2.is_present(0));
+        assert_eq!(c2.columns[0].len(), 0);
 
         // An empty projection still materializes column 0 (chunk shape).
-        let empty = project_scan_chunks(t, &[]);
+        let empty = project_scan_chunks(t, &[]).unwrap();
         assert!(empty[0].is_present(0));
         assert!(!empty[0].is_present(1));
 
         // A full projection returns the stored chunks unchanged.
-        let full = project_scan_chunks(t, &[0, 1, 2, 3, 4]);
+        let full = project_scan_chunks(t, &[0, 1, 2, 3, 4]).unwrap();
         assert!(full[0].is_present(0));
         assert!(std::sync::Arc::ptr_eq(
             &full[0].columns[3],
@@ -15762,7 +15749,7 @@ mod tests {
         ));
 
         // Out-of-range indices fall back to a full scan.
-        let oob = project_scan_chunks(t, &[9]);
+        let oob = project_scan_chunks(t, &[9]).unwrap();
         assert!(oob[0].is_present(4));
     }
 

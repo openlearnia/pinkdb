@@ -414,7 +414,7 @@ fn sqlite_and_pink_catalogs_are_equivalent() {
                 column.default = source.default.clone();
             }
             for chunk in 0..base.num_chunks() {
-                let chunk = base.scan_chunk(chunk).unwrap();
+                let chunk = base.scan_chunk(chunk).unwrap().unwrap();
                 target.append_shared_chunk(&chunk.columns).unwrap();
             }
         }

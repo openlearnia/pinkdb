@@ -193,7 +193,12 @@ fn parquet_lake_attach_and_queries_use_the_ranged_read_path() {
         .unwrap();
     let table = loaded.table("t").unwrap();
     let expected: Vec<Vec<Value>> = (0..table.num_rows())
-        .map(|row| vec![table.get(row, 0).unwrap(), table.get(row, 1).unwrap()])
+        .map(|row| {
+            vec![
+                table.get(row, 0).unwrap().unwrap(),
+                table.get(row, 1).unwrap().unwrap(),
+            ]
+        })
         .collect();
     assert_eq!(scan_rows, expected);
 }

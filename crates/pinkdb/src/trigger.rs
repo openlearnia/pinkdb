@@ -431,7 +431,7 @@ fn next_row_id(t: &DataTable) -> (usize, usize) {
         return (0, 0);
     }
     // Appends only ever extend the tail chunk.
-    let tail = t.columns[0].chunks[chunks - 1].len();
+    let tail = t.chunk_rows(chunks - 1);
     if tail >= crate::vector::CHUNK_SIZE {
         (chunks, 0)
     } else {
@@ -619,7 +619,7 @@ pub(crate) fn update_rows(
             let images: Vec<Vec<Value>> = {
                 let chunk = db
                     .table_in(target_db, table)?
-                    .scan_chunk(ci)
+                    .scan_chunk(ci)?
                     .ok_or_else(|| {
                         PinkDbError::Execution("storage changed during UPDATE".to_string())
                     })?;
@@ -727,12 +727,12 @@ pub(crate) fn delete_rows(
             for row in rows {
                 budget.check_deadline()?;
                 let old: Vec<Value> = {
-                    let chunk = db
-                        .table_in(target_db, table)?
-                        .scan_chunk(ci)
-                        .ok_or_else(|| {
-                            PinkDbError::Execution("storage changed during DELETE".to_string())
-                        })?;
+                    let chunk =
+                        db.table_in(target_db, table)?
+                            .scan_chunk(ci)?
+                            .ok_or_else(|| {
+                                PinkDbError::Execution("storage changed during DELETE".to_string())
+                            })?;
                     (0..chunk.columns.len())
                         .map(|c| chunk.columns[c].get(row))
                         .collect()

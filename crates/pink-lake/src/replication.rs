@@ -2516,7 +2516,7 @@ fn table_rows(table: &DataTable) -> Vec<Vec<Value>> {
     for row in 0..table.num_rows() {
         let mut values = Vec::with_capacity(table.num_cols());
         for column in 0..table.num_cols() {
-            values.push(table.get(row, column).unwrap_or(Value::Null));
+            values.push(table.get(row, column).unwrap().unwrap_or(Value::Null));
         }
         rows.push(values);
     }
