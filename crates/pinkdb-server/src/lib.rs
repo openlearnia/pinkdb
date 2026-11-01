@@ -124,6 +124,13 @@ pub mod tls;
 #[cfg(feature = "ui")]
 pub mod ui;
 
+/// QuackLab's `/sql` adapter (wave 138a): the HTTP surface the customer's Go
+/// service speaks — `POST /sql`, `GET /health`, `POST /recover` — over this
+/// server's store. Only in a build with the `quacklab` cargo feature (off by
+/// default).
+#[cfg(feature = "quacklab")]
+pub mod quacklab;
+
 #[cfg(feature = "async-server")]
 pub mod async_server;
 

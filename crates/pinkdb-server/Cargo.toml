@@ -40,6 +40,10 @@ catalog-s3 = ["lake-s3", "pink-lake/catalog-s3"]
 # build does not even compile the console crate, so the lean server binary is
 # unchanged (see `docs/server-ui.md`).
 ui = ["dep:pinkdb-server-ui"]
+# Opt-in QuackLab adapter (wave 138a): the HTTP `/sql`, `/health` and
+# `/recover` surface the customer's Go service speaks, over this server's
+# store. Off by default: the default build has no HTTP server.
+quacklab = ["dep:pinkdb-quacklab"]
 # Wave 121b: the file readers an import uses, registered process-wide before
 # the store opens (the CLI's order). `parquet` reads local Parquet files;
 # `httpfs` adds the CSV table source (local, https://, s3://) and remote
@@ -117,6 +121,10 @@ rustls-pemfile = { version = "2.2", optional = true }
 # (axum/tokio) with its own runtime on its own thread. Optional, so the
 # default build pulls neither the console nor its async runtime.
 pinkdb-server-ui = { path = "../pinkdb-server-ui", optional = true }
+# QuackLab's `/sql` adapter (`quacklab` feature only): the same axum/tokio
+# stack, serving the customer's HTTP surface over this store. Optional, so the
+# default build pulls neither it nor its HTTP server.
+pinkdb-quacklab = { path = "../pinkdb-quacklab", optional = true }
 
 # Graceful shutdown (wave 124): SIGINT/SIGTERM set a flag the accept loop
 # polls (already in the dependency tree through the engine's crates).

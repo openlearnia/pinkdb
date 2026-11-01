@@ -1,0 +1,37 @@
+[package]
+name = "pinkdb-quacklab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "QuackLab's /sql adapter over a pinkdb warehouse (wave 138a)"
+license = "MIT"
+
+[lib]
+name = "pinkdb_quacklab"
+path = "src/lib.rs"
+
+[dependencies]
+pinkdb = { path = "../pinkdb" }
+# The HTTP surface, at the console's versions and with the same features
+# (crates/pinkdb-server-ui/Cargo.toml): JSON bodies on HTTP/1.1, no forms, no
+# multipart, no HTTP/2. The runtime is the adapter's own, on its own thread,
+# like the console's.
+axum = { version = "0.8", default-features = false, features = [
+    "json",
+    "query",
+    "tokio",
+    # `axum::serve` over hyper's HTTP/1.1 server (the console serves through
+    # hyper directly and needs no such feature).
+    "http1",
+] }
+tokio = { version = "1.53", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "io-util",
+    "net",
+    "sync",
+    "time",
+] }
+# Escaping strings the way Go's encoding/json does (see src/encode.rs); the
+# numbers are written by hand.
+serde_json = "1"
