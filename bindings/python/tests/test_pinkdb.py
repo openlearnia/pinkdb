@@ -75,7 +75,7 @@ class MemoryValueTests(unittest.TestCase):
             "CREATE TABLE types (b BOOLEAN, i INTEGER, bi BIGINT, d DOUBLE, "
             "s VARCHAR, dt DATE, ts TIMESTAMP);"
             "INSERT INTO types VALUES "
-            "(TRUE, -2147483647 - 1, 9223372036854775807, -0.0, "
+            "(TRUE, -2147483647 - 1, 9223372036854775807, -0.0::DOUBLE, "
             "'héllo 🌍', DATE '2024-01-15', "
             "TIMESTAMP '2024-01-15 10:00:00.123456'), "
             "(NULL, NULL, NULL, NULL, NULL, NULL, NULL), "

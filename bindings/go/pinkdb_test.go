@@ -123,7 +123,7 @@ func TestMemoryAllTypesRoundTrip(t *testing.T) {
 	results := mustExecute(t, db, `
 		CREATE TABLE types (b BOOLEAN, i INTEGER, bi BIGINT, d DOUBLE, s VARCHAR, dt DATE, ts TIMESTAMP);
 		INSERT INTO types VALUES
-			(TRUE, -2147483647 - 1, 9223372036854775807, -0.0, 'héllo 🌍', DATE '2024-01-15', TIMESTAMP '2024-01-15 10:00:00.123456'),
+			(TRUE, -2147483647 - 1, 9223372036854775807, -0.0::DOUBLE, 'héllo 🌍', DATE '2024-01-15', TIMESTAMP '2024-01-15 10:00:00.123456'),
 			(NULL, NULL, NULL, NULL, NULL, NULL, NULL),
 			(FALSE, 7, 8, 2.5, '', DATE '1970-01-01', TIMESTAMP '1970-01-01 00:00:00');
 		SELECT * FROM types ORDER BY i;
@@ -296,7 +296,7 @@ func TestDoubleSpecialValues(t *testing.T) {
 	defer db.Close()
 
 	results := mustExecute(t, db,
-		"SELECT 1.0 / 0.0 AS pos, -1.0 / 0.0 AS neg, 0.0 / 0.0 AS nan, -0.0 AS negzero;")
+		"SELECT 1.0 / 0.0 AS pos, -1.0 / 0.0 AS neg, 0.0 / 0.0 AS nan, -0.0::DOUBLE AS negzero;")
 	row := results[0].Rows[0]
 	pos := floatAt(t, row, 0)
 	if !math.IsInf(pos, 1) {
