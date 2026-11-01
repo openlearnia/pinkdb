@@ -4007,7 +4007,14 @@ impl<'a> Binder<'a> {
             deps.push(dep);
         }
         drop(deps);
-        match self.session.get(name) {
+        // A store setting (`wal_sync_method`) reads back through the same
+        // spellings when the session does not override it, so what the query
+        // sees is what the engine does.
+        match self
+            .session
+            .get(name)
+            .or_else(|| self.db.store_setting_value(name))
+        {
             Some(v) => Ok(BoundExpr::Literal(v)),
             None if !strict => Ok(BoundExpr::Literal(Value::Null)),
             None => Err(PinkDbError::Catalog(format!(

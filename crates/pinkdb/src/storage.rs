@@ -3557,6 +3557,31 @@ impl PinkDb {
         self.lease.clone()
     }
 
+    /// The WAL sync method this process commits with (`None` in memory).
+    pub(crate) fn wal_sync_method(&self) -> Option<crate::wal::WalSyncMethod> {
+        self.lease.as_ref().map(|lease| lease.sync_method())
+    }
+
+    /// `SET wal_sync_method`: per process, not transactional, not persisted
+    /// (see [`crate::wal::WalSyncMethod`]). No-op in memory.
+    pub(crate) fn set_wal_sync_method(&self, method: crate::wal::WalSyncMethod) {
+        if let Some(lease) = &self.lease {
+            lease.set_sync_method(method);
+        }
+    }
+
+    /// A store-wide setting readable through `getvariable`/`$name` when the
+    /// session does not set it. Only `wal_sync_method`, which reflects what the
+    /// engine actually does: a session copy could disagree with the WAL.
+    pub(crate) fn store_setting_value(&self, name: &str) -> Option<Value> {
+        match name.to_ascii_lowercase().as_str() {
+            "wal_sync_method" => self
+                .wal_sync_method()
+                .map(|method| Value::Varchar(method.as_str().to_string())),
+            _ => None,
+        }
+    }
+
     /// Swap the catalog and data of `self` with `other` (a checkpoint loaded
     /// from disk), preserving every process-local facet of `self`: the WAL
     /// handle, the lease, loaded extensions, attached lakes, the encryption
@@ -3811,13 +3836,43 @@ impl PinkDb {
         secrets: Option<&[crate::secret::Secret]>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
+        if let Some(pending) = self.wal_append_session_pending(
+            db_before,
+            db_after,
+            stmts,
+            touched_extensions,
+            loaded_extensions,
+            sets,
+            secrets,
+            memo,
+        )? {
+            pending.wait()?;
+        }
+        Ok(())
+    }
+
+    /// [`PinkDb::wal_append_session`] without the durable wait: the caller must
+    /// [`crate::wal::CommitSync::wait`] on the returned token after releasing
+    /// the store's write lock, so concurrent commits share one sync.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wal_append_session_pending(
+        &mut self,
+        db_before: &SchemaPath,
+        db_after: &SchemaPath,
+        stmts: &[String],
+        touched_extensions: &[String],
+        loaded_extensions: &[String],
+        sets: Option<&crate::wal::FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
+        memo: &[crate::wal::ExtCall],
+    ) -> Result<Option<crate::wal::CommitSync>> {
         // Wave 124: a unit that changed lake databases commits there, and the
         // storage checks guarantee it wrote nothing local — so it is not
         // appended to the local WAL.
         if self.route_committed_unit()? {
-            return Ok(());
+            return Ok(None);
         }
-        self.wal_append_local(
+        self.wal_append_local_pending(
             db_before,
             db_after,
             stmts,
@@ -3846,6 +3901,36 @@ impl PinkDb {
         secrets: Option<&[crate::secret::Secret]>,
         memo: &[crate::wal::ExtCall],
     ) -> Result<()> {
+        if let Some(pending) = self.wal_append_local_pending(
+            db_before,
+            db_after,
+            stmts,
+            touched_extensions,
+            loaded_extensions,
+            sets,
+            secrets,
+            memo,
+        )? {
+            pending.wait()?;
+        }
+        Ok(())
+    }
+
+    /// [`PinkDb::wal_append_local`] without the durable wait (group commit: the
+    /// caller waits after releasing the store's write lock). A transaction
+    /// commit keeps the eager form — it must be durable before it merges.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wal_append_local_pending(
+        &self,
+        db_before: &SchemaPath,
+        db_after: &SchemaPath,
+        stmts: &[String],
+        touched_extensions: &[String],
+        loaded_extensions: &[String],
+        sets: Option<&crate::wal::FrameSets>,
+        secrets: Option<&[crate::secret::Secret]>,
+        memo: &[crate::wal::ExtCall],
+    ) -> Result<Option<crate::wal::CommitSync>> {
         if let Some(wal) = self.durable_handle() {
             let pins = self.lake_pins(sets);
             let memo: std::borrow::Cow<'_, [crate::wal::ExtCall]> = if pins.is_empty() {
@@ -3859,7 +3944,7 @@ impl PinkDb {
                 PinkDbError::Execution("internal lock error (poisoned)".to_string())
             })?;
             let before = self.schema_exists(db_before).then_some(db_before);
-            guard.append_in_session(
+            return guard.append_in_session(
                 before,
                 db_after,
                 stmts,
@@ -3868,9 +3953,9 @@ impl PinkDb {
                 sets,
                 secrets,
                 &memo,
-            )?;
+            );
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Open a transaction: refresh (a short lease only when something was

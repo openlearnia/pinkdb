@@ -1065,9 +1065,12 @@ fn resolve_ns(db: &PinkDb, qdb: &Option<crate::storage::SchemaPath>) -> crate::s
     qdb.clone().unwrap_or_else(|| db.current_ns().clone())
 }
 
-/// `SET VARIABLE`: evaluate the value (a constant expression, like a `CALL`
-/// argument) and bind it in the running session. Never touches the store, so
-/// nothing is logged or persisted.
+/// `SET [VARIABLE] name = value`: evaluate the value (a constant expression,
+/// like a `CALL` argument) and bind it. Session variables never touch the
+/// store, so nothing is logged or persisted. `wal_sync_method` is the exception
+/// that is not a session variable: the WAL is shared by every session and
+/// process, so the method lives on the store's lease (an in-memory store has
+/// nothing to sync and keeps a session variable instead).
 fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
     let single = DataChunk {
         columns: Vec::new(),
@@ -1079,6 +1082,22 @@ fn set_variable(cx: &Cx, name: &str, value: &BoundExpr) -> Result<QueryResult> {
         return Err(PinkDbError::Execution(
             "a SET VARIABLE value did not evaluate to one value".to_string(),
         ));
+    }
+    if name.eq_ignore_ascii_case("wal_sync_method") && cx.db.wal_sync_method().is_some() {
+        let Value::Varchar(text) = v.get(0) else {
+            return Err(PinkDbError::Type(
+                "wal_sync_method takes a string: 'full', 'fsync' or 'fdatasync'".to_string(),
+            ));
+        };
+        let method = crate::wal::WalSyncMethod::parse(&text).ok_or_else(|| {
+            PinkDbError::Type(format!(
+                "unknown wal_sync_method {text:?}: expected 'full', 'fsync' or 'fdatasync'"
+            ))
+        })?;
+        cx.db.set_wal_sync_method(method);
+        return Ok(QueryResult::SetVariable {
+            name: name.to_string(),
+        });
     }
     cx.session.set(name, v.get(0));
     Ok(QueryResult::SetVariable {
