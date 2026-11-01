@@ -1,0 +1,1735 @@
+{
+ "cases": {
+  "filter_between": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "product.category_id"
+     ],
+     "filters": [
+      {
+       "member": "product.category_id",
+       "operator": "between",
+       "values": [
+        "c0",
+        "c3"
+       ]
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "product.category_id"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"CATEGORY_ID\" AS \"CATEGORY_ID\", \"REVENUE\" AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"CATEGORY_ID\" BETWEEN 'c0' AND 'c3' ORDER BY \"CATEGORY_ID\" ASC"
+  },
+  "filter_contains_percent": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "category_name"
+     ],
+     "filters": [
+      {
+       "member": "category_name",
+       "operator": "contains",
+       "values": [
+        "ooks%"
+       ]
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "category_name"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"CATEGORY_NAME\" AS \"CATEGORY_NAME\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE CAST(\"CATEGORY_NAME\" AS VARCHAR) ILIKE '%ooks\\%%' ESCAPE '\\' GROUP BY \"CATEGORY_NAME\" ORDER BY \"CATEGORY_NAME\" ASC"
+  },
+  "filter_equals": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "category_name"
+     ],
+     "filters": [
+      {
+       "member": "category_name",
+       "operator": "equals",
+       "values": [
+        "Books%"
+       ]
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "category_name"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"CATEGORY_NAME\" AS \"CATEGORY_NAME\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"CATEGORY_NAME\" = 'Books%' GROUP BY \"CATEGORY_NAME\" ORDER BY \"CATEGORY_NAME\" ASC"
+  },
+  "filter_in": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "category_name"
+     ],
+     "filters": [
+      {
+       "member": "category_name",
+       "operator": "in",
+       "values": [
+        "Books%",
+        "Toys_2"
+       ]
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "category_name"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"CATEGORY_NAME\" AS \"CATEGORY_NAME\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"CATEGORY_NAME\" IN ('Books%', 'Toys_2') GROUP BY \"CATEGORY_NAME\" ORDER BY \"CATEGORY_NAME\" ASC"
+  },
+  "filter_includes_null_dims": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "brand"
+     ],
+     "filters": [
+      {
+       "member": "category_name",
+       "operator": "notIn",
+       "values": [
+        "Books%"
+       ]
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "brand"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"BRAND\" AS \"BRAND\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE (\"CATEGORY_NAME\" NOT IN ('Books%') OR \"CATEGORY_NAME\" IS NULL) GROUP BY \"BRAND\" ORDER BY \"BRAND\" ASC"
+  },
+  "filter_not_equals_nullable": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "brand"
+     ],
+     "filters": [
+      {
+       "member": "brand",
+       "operator": "notEquals",
+       "values": [
+        "Acme"
+       ]
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "brand"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"BRAND\" AS \"BRAND\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"BRAND\" IS DISTINCT FROM 'Acme' GROUP BY \"BRAND\" ORDER BY \"BRAND\" ASC"
+  },
+  "filter_not_in": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "brand"
+     ],
+     "filters": [
+      {
+       "member": "brand",
+       "operator": "notIn",
+       "values": [
+        "Acme"
+       ]
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "brand"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"BRAND\" AS \"BRAND\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE (\"BRAND\" NOT IN ('Acme') OR \"BRAND\" IS NULL) GROUP BY \"BRAND\" ORDER BY \"BRAND\" ASC"
+  },
+  "filter_not_set": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "product.category_id"
+     ],
+     "filters": [
+      {
+       "member": "brand",
+       "operator": "notSet"
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "product.category_id"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    },
+    "unordered": true
+   },
+   "sql": "SELECT \"CATEGORY_ID\" AS \"CATEGORY_ID\", \"REVENUE\" AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"BRAND\" IS NULL ORDER BY \"CATEGORY_ID\" ASC"
+  },
+  "filter_set": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "brand"
+     ],
+     "filters": [
+      {
+       "member": "brand",
+       "operator": "set"
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "brand"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"BRAND\" AS \"BRAND\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"BRAND\" IS NOT NULL GROUP BY \"BRAND\" ORDER BY \"BRAND\" ASC"
+  },
+  "filter_starts_with_quote": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "category_name"
+     ],
+     "filters": [
+      {
+       "member": "category_name",
+       "operator": "startsWith",
+       "values": [
+        "Kids'"
+       ]
+      }
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "category_name"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"CATEGORY_NAME\" AS \"CATEGORY_NAME\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE CAST(\"CATEGORY_NAME\" AS VARCHAR) ILIKE 'Kids''%' ESCAPE '\\' GROUP BY \"CATEGORY_NAME\" ORDER BY \"CATEGORY_NAME\" ASC"
+  },
+  "norollup_grain_all": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "product.category_id"
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "product.category_id"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    },
+    "unordered": true
+   },
+   "sql": "SELECT \"CATEGORY_ID\" AS \"CATEGORY_ID\", \"REVENUE\" AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" ORDER BY \"CATEGORY_ID\" ASC"
+  },
+  "order_measure_desc_limit": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "category_name"
+     ],
+     "limit": 3,
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "desc",
+       "member": "revenue"
+      },
+      {
+       "direction": "asc",
+       "member": "category_name"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"CATEGORY_NAME\" AS \"CATEGORY_NAME\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" GROUP BY \"CATEGORY_NAME\" ORDER BY \"REVENUE\" DESC, \"CATEGORY_NAME\" ASC LIMIT 3"
+  },
+  "rollup_dim": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "category_name"
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "category_name"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"CATEGORY_NAME\" AS \"CATEGORY_NAME\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" GROUP BY \"CATEGORY_NAME\" ORDER BY \"CATEGORY_NAME\" ASC"
+  },
+  "rollup_no_dims": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "measures": [
+      "revenue"
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\""
+  },
+  "rollup_two_dims_with_nulls": {
+   "entryPoint": "query",
+   "spec": {
+    "entryPoint": "query",
+    "query": {
+     "dimensions": [
+      "category_name",
+      "brand"
+     ],
+     "measures": [
+      "revenue"
+     ],
+     "order": [
+      {
+       "direction": "asc",
+       "member": "category_name"
+      },
+      {
+       "direction": "asc",
+       "member": "brand"
+      }
+     ],
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT \"CATEGORY_NAME\" AS \"CATEGORY_NAME\", \"BRAND\" AS \"BRAND\", SUM(\"REVENUE\") AS \"REVENUE\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" GROUP BY \"CATEGORY_NAME\", \"BRAND\" ORDER BY \"CATEGORY_NAME\" ASC, \"BRAND\" ASC"
+  },
+  "values_brand_search_quote": {
+   "entryPoint": "memberValues",
+   "spec": {
+    "entryPoint": "memberValues",
+    "memberValues": {
+     "dimension": "brand",
+     "search": "'",
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT DISTINCT \"BRAND\" AS \"BRAND\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"BRAND\" IS NOT NULL AND CAST(\"BRAND\" AS VARCHAR) ILIKE '%''%' ESCAPE '\\' ORDER BY 1 LIMIT 200"
+  },
+  "values_brand_search_underscore": {
+   "entryPoint": "memberValues",
+   "spec": {
+    "entryPoint": "memberValues",
+    "memberValues": {
+     "dimension": "brand",
+     "search": "_r",
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT DISTINCT \"BRAND\" AS \"BRAND\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"BRAND\" IS NOT NULL AND CAST(\"BRAND\" AS VARCHAR) ILIKE '%\\_r%' ESCAPE '\\' ORDER BY 1 LIMIT 200"
+  },
+  "values_category_id_limit": {
+   "entryPoint": "memberValues",
+   "spec": {
+    "entryPoint": "memberValues",
+    "memberValues": {
+     "dimension": "product.category_id",
+     "limit": 2,
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT DISTINCT \"CATEGORY_ID\" AS \"CATEGORY_ID\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"CATEGORY_ID\" IS NOT NULL ORDER BY 1 LIMIT 2"
+  },
+  "values_category_name": {
+   "entryPoint": "memberValues",
+   "spec": {
+    "entryPoint": "memberValues",
+    "memberValues": {
+     "dimension": "category_name",
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT DISTINCT \"CATEGORY_NAME\" AS \"CATEGORY_NAME\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"CATEGORY_NAME\" IS NOT NULL ORDER BY 1 LIMIT 200"
+  },
+  "values_category_name_search": {
+   "entryPoint": "memberValues",
+   "spec": {
+    "entryPoint": "memberValues",
+    "memberValues": {
+     "dimension": "category_name",
+     "search": "oo",
+     "semanticId": "by_category.by_category"
+    }
+   },
+   "sql": "SELECT DISTINCT \"CATEGORY_NAME\" AS \"CATEGORY_NAME\" FROM \"BY_CATEGORY\".\"BY_CATEGORY\" WHERE \"CATEGORY_NAME\" IS NOT NULL AND CAST(\"CATEGORY_NAME\" AS VARCHAR) ILIKE '%oo%' ESCAPE '\\' ORDER BY 1 LIMIT 200"
+  }
+ },
+ "model": "Single Source - by_category (required attrs)",
+ "quacklabCommit": "24efcd0db046d10ddafcbd147f7a101f11203336",
+ "semanticModels": {
+  "by_category.by_category": {
+   "description": "By Category",
+   "dimensions": {
+    "brand": {
+     "sql": "BRAND",
+     "title": "Brand",
+     "type": "string"
+    },
+    "category_name": {
+     "sql": "CATEGORY_NAME",
+     "title": "Category Name",
+     "type": "string"
+    },
+    "product.category_id": {
+     "sql": "CATEGORY_ID",
+     "title": "Category",
+     "type": "string"
+    }
+   },
+   "grain": [
+    "product.category_id"
+   ],
+   "id": "by_category.by_category",
+   "measures": {
+    "revenue": {
+     "additive": true,
+     "aggregation": "sum",
+     "sql": "REVENUE",
+     "title": "Revenue"
+    }
+   },
+   "schema": "BY_CATEGORY",
+   "table": "BY_CATEGORY",
+   "title": "By Category"
+  }
+ },
+ "tableSpecs": [
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "day_id",
+     "name": "DAY_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "month_id",
+     "name": "MONTH_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "year_id",
+     "name": "YEAR_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "day_name",
+     "name": "DAY_NAME",
+     "nullable": false
+    }
+   ],
+   "id": "staging.DIM_DATE",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "staging"
+   },
+   "primaryKey": [
+    "DAY_ID"
+   ],
+   "schema": "staging",
+   "table": "DIM_DATE",
+   "type": "staging",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"DAY_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"MONTH_ID\" IS NULL) AS null_1,\n       COUNT(*) FILTER (WHERE \"YEAR_ID\" IS NULL) AS null_2,\n       COUNT(*) FILTER (WHERE \"DAY_NAME\" IS NULL) AS null_3\n  FROM \"staging\".\"DIM_DATE\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:DAY_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:MONTH_ID' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:YEAR_ID' AS check_name,\n       CASE WHEN null_2 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_2 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:DAY_NAME' AS check_name,\n       CASE WHEN null_3 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_3 AS count\nFROM agg\nUNION ALL\nSELECT 'unique:DAY_ID' AS check_name,\n       CASE WHEN COUNT(*) = 0 THEN 'pass' ELSE 'fail' END AS result,\n       COUNT(*) AS count\nFROM (\n  SELECT \"DAY_ID\"\n  FROM \"staging\".\"DIM_DATE\"\n  GROUP BY \"DAY_ID\"\n  HAVING COUNT(*) > 1\n) AS dupes"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "year_id",
+     "name": "YEAR_ID",
+     "nullable": false,
+     "unique": true
+    }
+   ],
+   "dependsOn": [
+    "ingest.DIM_DATE"
+   ],
+   "id": "master.DIM_DATE_YEAR_ID",
+   "lifecycle": {
+    "materialization": "materialized_view",
+    "stage": "master"
+   },
+   "primaryKey": [
+    "YEAR_ID"
+   ],
+   "schema": "master",
+   "selectSql": "SELECT DISTINCT \"YEAR_ID\" FROM \"ingest\".\"DIM_DATE\"",
+   "table": "DIM_DATE_YEAR_ID",
+   "type": "dimension",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"YEAR_ID\" IS NULL) AS null_0\n  FROM \"master\".\"DIM_DATE_YEAR_ID\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:YEAR_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "month_id",
+     "name": "MONTH_ID",
+     "nullable": false,
+     "unique": true
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "year_id",
+     "name": "YEAR_ID",
+     "nullable": false
+    }
+   ],
+   "dependsOn": [
+    "ingest.DIM_DATE",
+    "master.DIM_DATE_YEAR_ID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "YEAR_ID"
+     ],
+     "references": {
+      "columns": [
+       "YEAR_ID"
+      ],
+      "schema": "master",
+      "table": "DIM_DATE_YEAR_ID"
+     }
+    }
+   ],
+   "id": "master.DIM_DATE_MONTH_ID",
+   "lifecycle": {
+    "materialization": "materialized_view",
+    "stage": "master"
+   },
+   "primaryKey": [
+    "MONTH_ID"
+   ],
+   "schema": "master",
+   "selectSql": "SELECT DISTINCT \"MONTH_ID\", \"YEAR_ID\" FROM \"ingest\".\"DIM_DATE\"",
+   "table": "DIM_DATE_MONTH_ID",
+   "type": "dimension",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"MONTH_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"YEAR_ID\" IS NULL) AS null_1\n  FROM \"master\".\"DIM_DATE_MONTH_ID\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:MONTH_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:YEAR_ID' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "day_id",
+     "name": "DAY_ID",
+     "nullable": false,
+     "unique": true
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "year_id",
+     "name": "YEAR_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "month_id",
+     "name": "MONTH_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "day_name",
+     "name": "DAY_NAME",
+     "nullable": false
+    }
+   ],
+   "dependsOn": [
+    "ingest.DIM_DATE",
+    "master.DIM_DATE_MONTH_ID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "MONTH_ID"
+     ],
+     "references": {
+      "columns": [
+       "MONTH_ID"
+      ],
+      "schema": "master",
+      "table": "DIM_DATE_MONTH_ID"
+     }
+    }
+   ],
+   "id": "master.DIM_DATE_DAY_ID",
+   "lifecycle": {
+    "materialization": "materialized_view",
+    "stage": "master"
+   },
+   "primaryKey": [
+    "DAY_ID"
+   ],
+   "schema": "master",
+   "selectSql": "SELECT DISTINCT \"DAY_ID\", \"YEAR_ID\", \"MONTH_ID\", \"DAY_NAME\" FROM \"ingest\".\"DIM_DATE\"",
+   "table": "DIM_DATE_DAY_ID",
+   "type": "dimension",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"DAY_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"YEAR_ID\" IS NULL) AS null_1,\n       COUNT(*) FILTER (WHERE \"MONTH_ID\" IS NULL) AS null_2,\n       COUNT(*) FILTER (WHERE \"DAY_NAME\" IS NULL) AS null_3\n  FROM \"master\".\"DIM_DATE_DAY_ID\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:DAY_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:YEAR_ID' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:MONTH_ID' AS check_name,\n       CASE WHEN null_2 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_2 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:DAY_NAME' AS check_name,\n       CASE WHEN null_3 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_3 AS count\nFROM agg"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "day_id",
+     "name": "DAY_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "month_id",
+     "name": "MONTH_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "year_id",
+     "name": "YEAR_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "day_name",
+     "name": "DAY_NAME",
+     "nullable": false
+    }
+   ],
+   "dependsOn": [
+    "staging.DIM_DATE"
+   ],
+   "id": "ingest.DIM_DATE",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "ingest"
+   },
+   "primaryKey": [
+    "DAY_ID"
+   ],
+   "schema": "ingest",
+   "table": "DIM_DATE",
+   "type": "ingest",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"DAY_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"MONTH_ID\" IS NULL) AS null_1,\n       COUNT(*) FILTER (WHERE \"YEAR_ID\" IS NULL) AS null_2,\n       COUNT(*) FILTER (WHERE \"DAY_NAME\" IS NULL) AS null_3\n  FROM \"ingest\".\"DIM_DATE\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:DAY_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:MONTH_ID' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:YEAR_ID' AS check_name,\n       CASE WHEN null_2 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_2 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:DAY_NAME' AS check_name,\n       CASE WHEN null_3 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_3 AS count\nFROM agg"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "category_id",
+     "name": "CATEGORY_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "sku_id",
+     "name": "SKU_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "brand",
+     "name": "BRAND",
+     "nullable": true
+    },
+    {
+     "dataType": "string",
+     "id": "category_name",
+     "name": "CATEGORY_NAME",
+     "nullable": false
+    }
+   ],
+   "id": "staging.DIM_PRODUCT",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "staging"
+   },
+   "primaryKey": [
+    "SKU_ID"
+   ],
+   "schema": "staging",
+   "table": "DIM_PRODUCT",
+   "type": "staging",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"CATEGORY_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"SKU_ID\" IS NULL) AS null_1,\n       COUNT(*) FILTER (WHERE \"CATEGORY_NAME\" IS NULL) AS null_2\n  FROM \"staging\".\"DIM_PRODUCT\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:CATEGORY_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:SKU_ID' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:CATEGORY_NAME' AS check_name,\n       CASE WHEN null_2 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_2 AS count\nFROM agg\nUNION ALL\nSELECT 'unique:SKU_ID' AS check_name,\n       CASE WHEN COUNT(*) = 0 THEN 'pass' ELSE 'fail' END AS result,\n       COUNT(*) AS count\nFROM (\n  SELECT \"SKU_ID\"\n  FROM \"staging\".\"DIM_PRODUCT\"\n  GROUP BY \"SKU_ID\"\n  HAVING COUNT(*) > 1\n) AS dupes"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "category_id",
+     "name": "CATEGORY_ID",
+     "nullable": false,
+     "unique": true
+    },
+    {
+     "dataType": "string",
+     "id": "category_name",
+     "name": "CATEGORY_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "brand",
+     "name": "BRAND",
+     "nullable": true
+    }
+   ],
+   "dependsOn": [
+    "ingest.DIM_PRODUCT"
+   ],
+   "id": "master.DIM_PRODUCT_CATEGORY_ID",
+   "lifecycle": {
+    "materialization": "materialized_view",
+    "stage": "master"
+   },
+   "primaryKey": [
+    "CATEGORY_ID"
+   ],
+   "schema": "master",
+   "selectSql": "SELECT DISTINCT \"CATEGORY_ID\", \"CATEGORY_NAME\", \"BRAND\" FROM \"ingest\".\"DIM_PRODUCT\"",
+   "table": "DIM_PRODUCT_CATEGORY_ID",
+   "type": "dimension",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"CATEGORY_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"CATEGORY_NAME\" IS NULL) AS null_1\n  FROM \"master\".\"DIM_PRODUCT_CATEGORY_ID\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:CATEGORY_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:CATEGORY_NAME' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "sku_id",
+     "name": "SKU_ID",
+     "nullable": false,
+     "unique": true
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "category_id",
+     "name": "CATEGORY_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "category_name",
+     "name": "CATEGORY_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "brand",
+     "name": "BRAND",
+     "nullable": true
+    }
+   ],
+   "dependsOn": [
+    "ingest.DIM_PRODUCT",
+    "master.DIM_PRODUCT_CATEGORY_ID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "CATEGORY_ID"
+     ],
+     "references": {
+      "columns": [
+       "CATEGORY_ID"
+      ],
+      "schema": "master",
+      "table": "DIM_PRODUCT_CATEGORY_ID"
+     }
+    }
+   ],
+   "id": "master.DIM_PRODUCT_SKU_ID",
+   "lifecycle": {
+    "materialization": "materialized_view",
+    "stage": "master"
+   },
+   "primaryKey": [
+    "SKU_ID"
+   ],
+   "schema": "master",
+   "selectSql": "SELECT DISTINCT \"SKU_ID\", \"CATEGORY_ID\", \"CATEGORY_NAME\", \"BRAND\" FROM \"ingest\".\"DIM_PRODUCT\"",
+   "table": "DIM_PRODUCT_SKU_ID",
+   "type": "dimension",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"SKU_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"CATEGORY_ID\" IS NULL) AS null_1,\n       COUNT(*) FILTER (WHERE \"CATEGORY_NAME\" IS NULL) AS null_2\n  FROM \"master\".\"DIM_PRODUCT_SKU_ID\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:SKU_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:CATEGORY_ID' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:CATEGORY_NAME' AS check_name,\n       CASE WHEN null_2 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_2 AS count\nFROM agg"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "category_id",
+     "name": "CATEGORY_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "sku_id",
+     "name": "SKU_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "brand",
+     "name": "BRAND",
+     "nullable": true
+    },
+    {
+     "dataType": "string",
+     "id": "category_name",
+     "name": "CATEGORY_NAME",
+     "nullable": false
+    }
+   ],
+   "dependsOn": [
+    "staging.DIM_PRODUCT"
+   ],
+   "id": "ingest.DIM_PRODUCT",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "ingest"
+   },
+   "primaryKey": [
+    "SKU_ID"
+   ],
+   "schema": "ingest",
+   "table": "DIM_PRODUCT",
+   "type": "ingest",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"CATEGORY_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"SKU_ID\" IS NULL) AS null_1,\n       COUNT(*) FILTER (WHERE \"CATEGORY_NAME\" IS NULL) AS null_2\n  FROM \"ingest\".\"DIM_PRODUCT\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:CATEGORY_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:SKU_ID' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:CATEGORY_NAME' AS check_name,\n       CASE WHEN null_2 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_2 AS count\nFROM agg"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "sku_id",
+     "name": "SKU_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "day_id",
+     "name": "DAY_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "number",
+     "id": "revenue",
+     "name": "REVENUE",
+     "nullable": true
+    }
+   ],
+   "dependsOn": [
+    "ingest.FACT_REVENUE",
+    "master.DIM_PRODUCT_SKU_ID",
+    "master.DIM_DATE_DAY_ID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "SKU_ID"
+     ],
+     "references": {
+      "columns": [
+       "SKU_ID"
+      ],
+      "schema": "master",
+      "table": "DIM_PRODUCT_SKU_ID"
+     }
+    },
+    {
+     "columns": [
+      "DAY_ID"
+     ],
+     "references": {
+      "columns": [
+       "DAY_ID"
+      ],
+      "schema": "master",
+      "table": "DIM_DATE_DAY_ID"
+     }
+    }
+   ],
+   "id": "master.FACT_REVENUE",
+   "lifecycle": {
+    "materialization": "materialized_view",
+    "stage": "master"
+   },
+   "primaryKey": [
+    "SKU_ID",
+    "DAY_ID"
+   ],
+   "schema": "master",
+   "selectSql": "SELECT \"SKU_ID\", \"DAY_ID\", \"REVENUE\" FROM \"ingest\".\"FACT_REVENUE\"",
+   "table": "FACT_REVENUE",
+   "type": "fact"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "sku_id",
+     "name": "SKU_ID",
+     "nullable": true
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "day_id",
+     "name": "DAY_ID",
+     "nullable": true
+    },
+    {
+     "dataType": "number",
+     "id": "revenue",
+     "name": "REVENUE",
+     "nullable": true
+    }
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "SKU_ID"
+     ],
+     "references": {
+      "columns": [
+       "SKU_ID"
+      ],
+      "schema": "staging",
+      "table": "DIM_PRODUCT"
+     }
+    },
+    {
+     "columns": [
+      "DAY_ID"
+     ],
+     "references": {
+      "columns": [
+       "DAY_ID"
+      ],
+      "schema": "staging",
+      "table": "DIM_DATE"
+     }
+    }
+   ],
+   "id": "staging.FACT_REVENUE",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "staging"
+   },
+   "primaryKey": [
+    "SKU_ID",
+    "DAY_ID"
+   ],
+   "schema": "staging",
+   "table": "FACT_REVENUE",
+   "type": "staging",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"SKU_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"DAY_ID\" IS NULL) AS null_1\n  FROM \"staging\".\"FACT_REVENUE\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:SKU_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:DAY_ID' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg\nUNION ALL\nSELECT 'unique:SKU_ID,DAY_ID' AS check_name,\n       CASE WHEN COUNT(*) = 0 THEN 'pass' ELSE 'fail' END AS result,\n       COUNT(*) AS count\nFROM (\n  SELECT \"SKU_ID\", \"DAY_ID\"\n  FROM \"staging\".\"FACT_REVENUE\"\n  GROUP BY \"SKU_ID\", \"DAY_ID\"\n  HAVING COUNT(*) > 1\n) AS dupes\nUNION ALL\nSELECT 'fk:SKU_ID\u2192DIM_PRODUCT.SKU_ID' AS check_name,\n       CASE WHEN COUNT(*) = 0 THEN 'pass' ELSE 'fail' END AS result,\n       COUNT(*) AS count\nFROM \"staging\".\"FACT_REVENUE\" AS c\nWHERE c.\"SKU_ID\" IS NOT NULL\n  AND NOT EXISTS (\n    SELECT 1 FROM (\n      SELECT \"SKU_ID\" FROM \"ingest\".\"DIM_PRODUCT\"\n      UNION\n      SELECT \"SKU_ID\" FROM \"staging\".\"DIM_PRODUCT\"\n    ) AS parents\n    WHERE parents.\"SKU_ID\" = c.\"SKU_ID\"\n  )\nUNION ALL\nSELECT 'fk:DAY_ID\u2192DIM_DATE.DAY_ID' AS check_name,\n       CASE WHEN COUNT(*) = 0 THEN 'pass' ELSE 'fail' END AS result,\n       COUNT(*) AS count\nFROM \"staging\".\"FACT_REVENUE\" AS c\nWHERE c.\"DAY_ID\" IS NOT NULL\n  AND NOT EXISTS (\n    SELECT 1 FROM (\n      SELECT \"DAY_ID\" FROM \"ingest\".\"DIM_DATE\"\n      UNION\n      SELECT \"DAY_ID\" FROM \"staging\".\"DIM_DATE\"\n    ) AS parents\n    WHERE parents.\"DAY_ID\" = c.\"DAY_ID\"\n  )"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "sku_id",
+     "name": "SKU_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "day_id",
+     "name": "DAY_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "number",
+     "id": "revenue",
+     "name": "REVENUE",
+     "nullable": true
+    }
+   ],
+   "dependsOn": [
+    "staging.FACT_REVENUE"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "SKU_ID"
+     ],
+     "references": {
+      "columns": [
+       "SKU_ID"
+      ],
+      "schema": "ingest",
+      "table": "DIM_PRODUCT"
+     }
+    },
+    {
+     "columns": [
+      "DAY_ID"
+     ],
+     "references": {
+      "columns": [
+       "DAY_ID"
+      ],
+      "schema": "ingest",
+      "table": "DIM_DATE"
+     }
+    }
+   ],
+   "id": "ingest.FACT_REVENUE",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "ingest"
+   },
+   "primaryKey": [
+    "SKU_ID",
+    "DAY_ID"
+   ],
+   "schema": "ingest",
+   "table": "FACT_REVENUE",
+   "type": "ingest",
+   "validationSql": "WITH agg AS (\n  SELECT\n       COUNT(*) AS n,\n       COUNT(*) FILTER (WHERE \"SKU_ID\" IS NULL) AS null_0,\n       COUNT(*) FILTER (WHERE \"DAY_ID\" IS NULL) AS null_1\n  FROM \"ingest\".\"FACT_REVENUE\"\n)\nSELECT 'row_count' AS check_name,\n       CASE WHEN n > 0 THEN 'pass' ELSE 'fail' END AS result,\n       n AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:SKU_ID' AS check_name,\n       CASE WHEN null_0 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_0 AS count\nFROM agg\nUNION ALL\nSELECT 'not_null:DAY_ID' AS check_name,\n       CASE WHEN null_1 = 0 THEN 'pass' ELSE 'fail' END AS result,\n       null_1 AS count\nFROM agg"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "category_id",
+     "name": "CATEGORY_ID",
+     "nullable": false,
+     "unique": true
+    },
+    {
+     "dataType": "string",
+     "id": "category_name",
+     "name": "CATEGORY_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "brand",
+     "name": "BRAND",
+     "nullable": true
+    }
+   ],
+   "dependsOn": [
+    "master.DIM_PRODUCT_CATEGORY_ID"
+   ],
+   "id": "BY_CATEGORY.DIM_PRODUCT_CATEGORY_ID",
+   "lifecycle": {
+    "materialization": "materialized_view",
+    "stage": "mart"
+   },
+   "primaryKey": [
+    "CATEGORY_ID"
+   ],
+   "schema": "BY_CATEGORY",
+   "selectSql": "SELECT \"CATEGORY_ID\", \"CATEGORY_NAME\", \"BRAND\" FROM \"master\".\"DIM_PRODUCT_CATEGORY_ID\"",
+   "table": "DIM_PRODUCT_CATEGORY_ID",
+   "type": "mart_dimension"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "sku_id",
+     "name": "SKU_ID",
+     "nullable": false,
+     "unique": true
+    },
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "category_id",
+     "name": "CATEGORY_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "category_name",
+     "name": "CATEGORY_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "brand",
+     "name": "BRAND",
+     "nullable": true
+    }
+   ],
+   "dependsOn": [
+    "master.DIM_PRODUCT_SKU_ID",
+    "BY_CATEGORY.DIM_PRODUCT_CATEGORY_ID"
+   ],
+   "foreignKeys": [
+    {
+     "columns": [
+      "CATEGORY_ID"
+     ],
+     "references": {
+      "columns": [
+       "CATEGORY_ID"
+      ],
+      "schema": "BY_CATEGORY",
+      "table": "DIM_PRODUCT_CATEGORY_ID"
+     }
+    }
+   ],
+   "id": "BY_CATEGORY.DIM_PRODUCT_SKU_ID",
+   "lifecycle": {
+    "materialization": "materialized_view",
+    "stage": "mart"
+   },
+   "primaryKey": [
+    "SKU_ID"
+   ],
+   "schema": "BY_CATEGORY",
+   "selectSql": "SELECT \"SKU_ID\", \"CATEGORY_ID\", \"CATEGORY_NAME\", \"BRAND\" FROM \"master\".\"DIM_PRODUCT_SKU_ID\"",
+   "table": "DIM_PRODUCT_SKU_ID",
+   "type": "mart_dimension"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "format": {
+      "length": 24
+     },
+     "id": "category_id",
+     "name": "CATEGORY_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "category_name",
+     "name": "CATEGORY_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "brand",
+     "name": "BRAND",
+     "nullable": true
+    },
+    {
+     "dataType": "number",
+     "id": "revenue",
+     "name": "REVENUE",
+     "nullable": true
+    }
+   ],
+   "dependsOn": [
+    "master.FACT_REVENUE",
+    "BY_CATEGORY.DIM_PRODUCT_SKU_ID"
+   ],
+   "id": "BY_CATEGORY.BY_CATEGORY",
+   "lifecycle": {
+    "materialization": "materialized_view",
+    "stage": "mart"
+   },
+   "primaryKey": [
+    "CATEGORY_ID"
+   ],
+   "schema": "BY_CATEGORY",
+   "selectSql": "WITH \"base_fact_revenue\" AS (\n  SELECT\n    \"fact\".\"DAY_ID\" AS \"DAY_ID\",\n    \"fact\".\"SKU_ID\" AS \"SKU_ID\",\n    COALESCE(\"fact\".\"REVENUE\", 0) AS \"REVENUE\"\n  FROM \"master\".\"FACT_REVENUE\" AS \"fact\"\n)\nSELECT\n  \"dim_product\".\"CATEGORY_ID\",\n  COALESCE(\"dim_product\".\"CATEGORY_NAME\", 'UNKNOWN'),\n  \"dim_product\".\"BRAND\",\n  SUM(\"fact_revenue\".\"REVENUE\") AS \"REVENUE\"\nFROM \"base_fact_revenue\" AS \"fact_revenue\"\nJOIN \"BY_CATEGORY\".\"DIM_PRODUCT_SKU_ID\" AS \"dim_product\" ON \"fact_revenue\".\"SKU_ID\" = \"dim_product\".\"SKU_ID\"\nGROUP BY\n  \"dim_product\".\"CATEGORY_ID\",\n  COALESCE(\"dim_product\".\"CATEGORY_NAME\", 'UNKNOWN'),\n  \"dim_product\".\"BRAND\"",
+   "table": "BY_CATEGORY",
+   "type": "mart"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "id": "table_name",
+     "name": "TABLE_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "file_name",
+     "name": "FILE_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "schema_name",
+     "name": "SCHEMA_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "table_kind",
+     "name": "TABLE_KIND",
+     "nullable": false
+    },
+    {
+     "dataType": "boolean",
+     "id": "full_required",
+     "name": "FULL_REQUIRED",
+     "nullable": false
+    },
+    {
+     "dataType": "boolean",
+     "id": "incremental_allowed",
+     "name": "INCREMENTAL_ALLOWED",
+     "nullable": false
+    },
+    {
+     "dataType": "timestamp",
+     "id": "created_at",
+     "name": "CREATED_AT",
+     "nullable": false
+    }
+   ],
+   "id": "metadata.MANIFEST_TABLES",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "metadata"
+   },
+   "primaryKey": [
+    "TABLE_NAME"
+   ],
+   "schema": "metadata",
+   "table": "MANIFEST_TABLES",
+   "type": "metadata"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "id": "id",
+     "name": "ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "schema_name",
+     "name": "SCHEMA_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "table_name",
+     "name": "TABLE_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "column_name",
+     "name": "COLUMN_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "integer",
+     "id": "ordinal_position",
+     "name": "ORDINAL_POSITION",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "data_type",
+     "name": "DATA_TYPE",
+     "nullable": false
+    },
+    {
+     "dataType": "boolean",
+     "id": "required",
+     "name": "REQUIRED",
+     "nullable": false
+    },
+    {
+     "dataType": "boolean",
+     "id": "unique_column",
+     "name": "UNIQUE_COLUMN",
+     "nullable": false
+    },
+    {
+     "dataType": "boolean",
+     "id": "primary_key",
+     "name": "PRIMARY_KEY",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "format",
+     "name": "FORMAT",
+     "nullable": true
+    },
+    {
+     "dataType": "string",
+     "id": "reference_schema",
+     "name": "REFERENCE_SCHEMA",
+     "nullable": true
+    },
+    {
+     "dataType": "string",
+     "id": "reference_table",
+     "name": "REFERENCE_TABLE",
+     "nullable": true
+    },
+    {
+     "dataType": "string",
+     "id": "reference_column",
+     "name": "REFERENCE_COLUMN",
+     "nullable": true
+    },
+    {
+     "dataType": "timestamp",
+     "id": "created_at",
+     "name": "CREATED_AT",
+     "nullable": false
+    }
+   ],
+   "id": "metadata.COLUMN_DEFINITIONS",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "metadata"
+   },
+   "primaryKey": [
+    "ID"
+   ],
+   "schema": "metadata",
+   "table": "COLUMN_DEFINITIONS",
+   "type": "dimension"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "id": "batch_id",
+     "name": "BATCH_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "status",
+     "name": "STATUS",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "batch_type",
+     "name": "BATCH_TYPE",
+     "nullable": true
+    },
+    {
+     "dataType": "timestamp",
+     "id": "started_at",
+     "name": "STARTED_AT",
+     "nullable": false
+    },
+    {
+     "dataType": "timestamp",
+     "id": "completed_at",
+     "name": "COMPLETED_AT",
+     "nullable": true
+    },
+    {
+     "dataType": "string",
+     "id": "error_message",
+     "name": "ERROR_MESSAGE",
+     "nullable": true
+    }
+   ],
+   "id": "metadata.BATCH_STATUS",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "metadata"
+   },
+   "primaryKey": [
+    "BATCH_ID"
+   ],
+   "schema": "metadata",
+   "table": "BATCH_STATUS",
+   "type": "metadata"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "id": "id",
+     "name": "ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "type",
+     "name": "TYPE",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "batch_id",
+     "name": "BATCH_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "table_name",
+     "name": "TABLE_NAME",
+     "nullable": true
+    },
+    {
+     "dataType": "string",
+     "id": "message",
+     "name": "MESSAGE",
+     "nullable": false
+    },
+    {
+     "dataType": "timestamp",
+     "id": "created_at",
+     "name": "CREATED_AT",
+     "nullable": false
+    }
+   ],
+   "id": "metadata.ALERTS",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "metadata"
+   },
+   "primaryKey": [
+    "ID"
+   ],
+   "schema": "metadata",
+   "table": "ALERTS",
+   "type": "metadata"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "id": "id",
+     "name": "ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "batch_id",
+     "name": "BATCH_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "table_name",
+     "name": "TABLE_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "check_name",
+     "name": "CHECK_NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "result",
+     "name": "RESULT",
+     "nullable": false
+    },
+    {
+     "dataType": "integer",
+     "id": "count",
+     "name": "COUNT",
+     "nullable": false
+    },
+    {
+     "dataType": "timestamp",
+     "id": "created_at",
+     "name": "CREATED_AT",
+     "nullable": false
+    }
+   ],
+   "id": "metadata.VALIDATION_RESULTS",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "metadata"
+   },
+   "primaryKey": [
+    "ID"
+   ],
+   "schema": "metadata",
+   "table": "VALIDATION_RESULTS",
+   "type": "metadata"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "id": "id",
+     "name": "ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "build_id",
+     "name": "BUILD_ID",
+     "nullable": false
+    },
+    {
+     "dataType": "timestamp",
+     "id": "validated_at",
+     "name": "VALIDATED_AT",
+     "nullable": true
+    },
+    {
+     "dataType": "string",
+     "id": "key",
+     "name": "KEY",
+     "nullable": true
+    }
+   ],
+   "id": "metadata.MANIFEST_STATUS",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "metadata"
+   },
+   "primaryKey": [
+    "ID"
+   ],
+   "schema": "metadata",
+   "table": "MANIFEST_STATUS",
+   "type": "metadata"
+  },
+  {
+   "columns": [
+    {
+     "dataType": "string",
+     "id": "id",
+     "name": "ID",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "name",
+     "name": "NAME",
+     "nullable": false
+    },
+    {
+     "dataType": "string",
+     "id": "definition",
+     "name": "DEFINITION",
+     "nullable": true
+    },
+    {
+     "dataType": "timestamp",
+     "id": "created_at",
+     "name": "CREATED_AT",
+     "nullable": false
+    }
+   ],
+   "id": "metadata.METRIC_DEFINITIONS",
+   "lifecycle": {
+    "materialization": "table",
+    "stage": "metadata"
+   },
+   "primaryKey": [
+    "ID"
+   ],
+   "schema": "metadata",
+   "table": "METRIC_DEFINITIONS",
+   "type": "metadata"
+  }
+ ]
+}
