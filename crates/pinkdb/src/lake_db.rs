@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex};
 use crate::attached::{AtSpec, AttachedLake, AttachedScan, AttachedTable, PrunePredicate};
 use crate::catalog_image::load_database_image;
 use crate::storage::{DataTable, DbCatalog, PinkDb, SchemaCatalog};
-use crate::types::{PinkDbError, Result, Value};
+use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::DataChunk;
 
 /// The memo name a WAL record's lake-version pins are stored under. The
@@ -129,6 +129,9 @@ pub struct LakeOpenRequest {
     /// Create the lake (`CREATE DATABASE … TYPE LAKE`); otherwise it must
     /// exist.
     pub create: bool,
+    /// Open an existing lake, or create it when the location holds none
+    /// (`ATTACH … CREATE_IF_NOT_EXISTS`, and every `ducklake:` attach).
+    pub create_if_missing: bool,
     /// The lake lives under the store's lake directory.
     pub managed: bool,
     /// The store is opening (a reopen or a replay): an opener may wait out a
@@ -185,6 +188,71 @@ pub trait LakeDatabase: fmt::Debug + Send + Sync {
     ) -> Result<u64>;
     /// The lake's tables at an older version (a WAL record's pinned read).
     fn tables_at(&self, version: u64) -> Result<Vec<(String, String, Arc<DataTable>)>>;
+    /// Bind one DuckLake function call: its output columns, without reading
+    /// data. `Ok(None)` means this lake does not know the function.
+    fn function_schema(&self, _call: &LakeFunctionCall) -> Result<Option<Vec<(String, DataType)>>> {
+        Ok(None)
+    }
+    /// Whether the named DuckLake function writes the lake.
+    fn function_mutates(&self, _name: &str) -> bool {
+        false
+    }
+    /// Run a read-only DuckLake function on a borrowed lake.
+    fn call_read(&self, _call: &LakeFunctionCall) -> Result<DataTable> {
+        Err(PinkDbError::Execution(
+            "this lake backend does not implement DuckLake functions".to_string(),
+        ))
+    }
+    /// Run a writing DuckLake function on an exclusive lake, then make the
+    /// lake's new state visible to the engine.
+    fn call_write(&self, _call: &LakeFunctionCall) -> Result<DataTable> {
+        Err(PinkDbError::Execution(
+            "this lake backend does not implement DuckLake functions".to_string(),
+        ))
+    }
+}
+
+/// One evaluated DuckLake function call, in DuckDB's argument shape: the
+/// first positional argument names the lake database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LakeFunctionCall {
+    pub name: String,
+    pub positional: Vec<Value>,
+    pub named: Vec<(String, Value)>,
+}
+
+impl LakeFunctionCall {
+    /// Convert a table-function call (`SELECT * FROM ducklake_…`) to the
+    /// lake-function shape.
+    pub fn from_table_call(
+        name: &str,
+        args: &[crate::table_source::TableFunctionArg],
+    ) -> LakeFunctionCall {
+        let mut positional = Vec::new();
+        let mut named = Vec::new();
+        for arg in args {
+            match &arg.name {
+                Some(name) => named.push((name.to_ascii_lowercase(), arg.value.clone())),
+                None => positional.push(arg.value.clone()),
+            }
+        }
+        LakeFunctionCall {
+            name: name.to_string(),
+            positional,
+            named,
+        }
+    }
+
+    /// The lake database the first positional argument names.
+    pub fn database(&self) -> Result<&str> {
+        match self.positional.first() {
+            Some(Value::Varchar(db)) if !db.is_empty() => Ok(db),
+            _ => Err(PinkDbError::Type(format!(
+                "{}: the first argument must be the name of a lake database",
+                self.name
+            ))),
+        }
+    }
 }
 
 /// Opens lakes for the engine. Registered once per process by the host.
@@ -766,7 +834,8 @@ impl PinkDb {
             data,
             read_only: spec.read_only,
             version: spec.version,
-            create: create || (spec.create_if_not_exists && !spec.read_only),
+            create,
+            create_if_missing: spec.create_if_not_exists && !spec.read_only,
             managed,
             startup,
         })
@@ -1262,6 +1331,169 @@ impl PinkDb {
         scratch.metadata_image()
     }
 
+    /// Resolve a DuckLake function's first argument to its lake database.
+    fn lake_function_target(&self, call: &LakeFunctionCall) -> Result<(String, Arc<LakeSlot>)> {
+        let name = call.database()?.to_string();
+        let key = name.to_ascii_lowercase();
+        let Some(cat) = self.databases.get(&key) else {
+            return Err(PinkDbError::Catalog(format!(
+                "{}: database \"{name}\" does not exist",
+                call.name
+            )));
+        };
+        if !matches!(cat.storage, DbStorage::Lake(_)) {
+            return Err(PinkDbError::Catalog(format!(
+                "{}: database \"{name}\" is not a lake database",
+                call.name
+            )));
+        }
+        let slot = self.lake_slot(&key).ok_or_else(|| {
+            PinkDbError::Catalog(format!(
+                "{}: database \"{name}\" is not a lake database",
+                call.name
+            ))
+        })?;
+        if let Err(reason) = &slot.state {
+            return Err(PinkDbError::Execution(format!(
+                "{}: lake database \"{name}\" is unavailable: {reason}",
+                call.name
+            )));
+        }
+        Ok((key, slot))
+    }
+
+    /// The output columns of a DuckLake function call. Only the catalog is
+    /// read, so binding a statement does no lake I/O.
+    pub(crate) fn lake_function_schema(
+        &self,
+        call: &LakeFunctionCall,
+    ) -> Result<Option<Vec<(String, DataType)>>> {
+        let (_, slot) = self.lake_function_target(call)?;
+        let Some(handle) = slot.handle() else {
+            return Ok(None);
+        };
+        handle.function_schema(call)
+    }
+
+    /// Whether a DuckLake function name writes the lake.
+    pub(crate) fn lake_function_mutates(&self, call: &LakeFunctionCall) -> bool {
+        match self.lake_function_target(call) {
+            Ok((_, slot)) => slot
+                .handle()
+                .is_some_and(|handle| handle.function_mutates(&call.name)),
+            Err(_) => false,
+        }
+    }
+
+    /// Run a read-only DuckLake function. `ducklake_last_committed_snapshot`
+    /// is session state, so the engine answers it here rather than in the
+    /// lake handle (which does not know which connection committed).
+    pub(crate) fn lake_function_read(&self, call: &LakeFunctionCall) -> Result<DataTable> {
+        let (db, slot) = self.lake_function_target(call)?;
+        let handle = slot.handle().ok_or_else(|| {
+            PinkDbError::Execution(format!("lake database \"{db}\" is unavailable"))
+        })?;
+        if call
+            .name
+            .eq_ignore_ascii_case("ducklake_last_committed_snapshot")
+        {
+            let schema = handle.function_schema(call)?.ok_or_else(|| {
+                PinkDbError::Catalog(format!("unknown DuckLake function \"{}\"", call.name))
+            })?;
+            let mut table = DataTable::new(call.name.clone(), schema)?;
+            table.append_row(vec![match self.session.last_lake_commit(&db) {
+                Some(id) => Value::Bigint(id as i64),
+                None => Value::Null,
+            }])?;
+            return Ok(table);
+        }
+        handle.call_read(call)
+    }
+
+    /// Run a writing DuckLake function, then make its committed lake state
+    /// the engine's view of that database. The engine's catalog holds the
+    /// same rows as the lake's base; leaving it stale would let the next
+    /// publish overwrite the function's work.
+    pub(crate) fn lake_function_write(&mut self, call: &LakeFunctionCall) -> Result<DataTable> {
+        let (db, slot) = self.lake_function_target(call)?;
+        let handle = slot.handle().cloned().ok_or_else(|| {
+            PinkDbError::Execution(format!("lake database \"{db}\" is unavailable"))
+        })?;
+        if handle.read_only() {
+            return Err(PinkDbError::Execution(format!(
+                "{}: database \"{db}\" is a read-only lake; attach it without READ_ONLY to write",
+                call.name
+            )));
+        }
+        let before = handle.version();
+        let table = handle.call_write(call)?;
+        let after = handle.version();
+        if after != before {
+            self.refresh_lake_function(&db, &slot, &handle)?;
+            self.session
+                .set_last_lake_commit(&db, after.saturating_sub(1));
+        }
+        Ok(table)
+    }
+
+    /// Replace the live catalog's tables with the lake's current tables while
+    /// keeping engine-only metadata (constraints, indexes).
+    fn refresh_lake_function(
+        &mut self,
+        key: &str,
+        slot: &LakeSlot,
+        handle: &Arc<dyn LakeDatabase>,
+    ) -> Result<()> {
+        let content = handle.content()?;
+        let mut cat = self
+            .databases
+            .remove(key)
+            .ok_or_else(|| PinkDbError::Catalog(format!("database \"{key}\" does not exist")))?;
+        cat.lake_version = handle.version();
+        let current: BTreeMap<(String, String), (String, String, Arc<DataTable>)> = content
+            .tables
+            .into_iter()
+            .map(|(schema, table, data)| {
+                (
+                    (schema.to_ascii_lowercase(), table.to_ascii_lowercase()),
+                    (schema, table, data),
+                )
+            })
+            .collect();
+        for (schema_key, schema) in cat.schemas.iter_mut() {
+            schema
+                .tables
+                .retain(|table, _| current.contains_key(&(schema_key.clone(), table.clone())));
+        }
+        for ((schema_key, table_key), (schema, _table, fresh)) in current {
+            let sc = cat
+                .schemas
+                .entry(schema_key)
+                .or_insert_with(|| SchemaCatalog::empty(&schema));
+            match sc.tables.get_mut(&table_key) {
+                Some(existing) => {
+                    let mut next = (*fresh).clone();
+                    next.constraints = existing.constraints.clone();
+                    next.indexes = existing.indexes.clone();
+                    next.vector_indexes = existing.vector_indexes.clone();
+                    next.indexes_stale = !next.indexes.is_empty();
+                    next.key_index = None;
+                    *existing = next;
+                }
+                None => {
+                    sc.tables.insert(table_key, (*fresh).clone());
+                }
+            }
+        }
+        let image = self.catalog_image_of(&cat)?;
+        *slot.published.lock().unwrap_or_else(|p| p.into_inner()) = Some(Published {
+            catalog: cat.clone(),
+            image,
+        });
+        self.databases.insert(key.to_string(), cat);
+        Ok(())
+    }
+
     /// The writable lake databases whose tables or metadata changed since
     /// their last publish.
     pub(crate) fn dirty_lake_databases(&self) -> Result<Vec<String>> {
@@ -1333,6 +1565,8 @@ impl PinkDb {
                                 image,
                             });
                     }
+                    self.session
+                        .set_last_lake_commit(key, version.saturating_sub(1));
                 }
                 Err(e) => {
                     let restored = slot

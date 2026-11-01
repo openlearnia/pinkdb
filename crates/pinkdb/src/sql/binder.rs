@@ -8554,6 +8554,7 @@ fn bind_tracked_plan(
                     source: body.clone(),
                     body: Some(parsed),
                 })),
+                lake: None,
             })
         }
         Statement::CreateMacro {
@@ -9129,6 +9130,75 @@ fn bind_call(
     let target = Binder::new(db, default_ns)
         .with_session(session.clone())
         .resolve_ns(qdb)?;
+    // A DuckLake function is a lake method, not a stored procedure. The
+    // unqualified `ducklake_<fn>(…)` form names its lake in argument 1; the
+    // catalog-scoped `CALL <lake>.<fn>(…)` form implies it.
+    let lake_name = name.to_ascii_lowercase();
+    let lake_scoped = !qdb.is_empty()
+        && matches!(
+            db.database_storage(target.db()),
+            Some(crate::lake_db::DbStorage::Lake(_))
+        );
+    if lake_name.starts_with("ducklake_") || lake_scoped {
+        let canonical = if lake_name.starts_with("ducklake_") {
+            lake_name.clone()
+        } else {
+            format!("ducklake_{lake_name}")
+        };
+        let mut positional = Vec::new();
+        let mut named = Vec::new();
+        if lake_scoped {
+            positional.push(Value::Varchar(target.db().to_string()));
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let (name, expr) = match arg {
+                Expr::NamedArg { name, expr } => (Some(name.to_ascii_lowercase()), expr.as_ref()),
+                other => (None, other),
+            };
+            let value = match literal_arg_value(expr) {
+                Some(value) => value,
+                None => {
+                    let bound = bind_constant_expr(db, &target, expr, params.clone())?;
+                    refuse_opaque_call_arg(i + 1, &bound)?;
+                    match bound {
+                        BoundExpr::Literal(value) => value,
+                        _ => {
+                            return Err(PinkDbError::Type(format!(
+                                "{canonical}: argument {} must be a literal",
+                                i + 1
+                            )));
+                        }
+                    }
+                }
+            };
+            match name {
+                Some(name) => named.push((name, value)),
+                None => positional.push(value),
+            }
+        }
+        let call = crate::lake_db::LakeFunctionCall {
+            name: canonical.clone(),
+            positional,
+            named,
+        };
+        if db.lake_function_schema(&call)?.is_some() {
+            return Ok((
+                LogicalPlan::Call {
+                    ns: None,
+                    name: canonical,
+                    args: Vec::new(),
+                    inline: None,
+                    lake: Some(call),
+                },
+                Vec::new(),
+            ));
+        }
+        if qdb.is_empty() {
+            return Err(PinkDbError::Catalog(format!(
+                "unknown table function \"{name}\""
+            )));
+        }
+    }
     let procedure = db.procedure_in(&target, name);
     // A package's host statement (wave 108a) answers the name when no stored
     // procedure does: user DDL always wins, and an unqualified call is the
@@ -9172,6 +9242,7 @@ fn bind_call(
                 name: host.name().to_string(),
                 args: bound,
                 inline: None,
+                lake: None,
             },
             vec![host.name().to_ascii_lowercase()],
         ));
@@ -9197,6 +9268,7 @@ fn bind_call(
             name: def.name.clone(),
             args: bound,
             inline: None,
+            lake: None,
         },
         Vec::new(),
     ))
@@ -12201,6 +12273,15 @@ fn literal_arg_value(expr: &Expr) -> Option<Value> {
         Expr::Cast { expr, dtype } => {
             crate::exec::expr::cast_value(literal_arg_value(expr)?, *dtype).ok()
         }
+        // `versions := [2, 3]`: a literal array is still a literal.
+        Expr::ArrayLiteral(items) => {
+            let items: Vec<Value> = items
+                .iter()
+                .map(literal_arg_value)
+                .collect::<Option<Vec<_>>>()?;
+            let (_, array) = crate::array::ArrayValue::infer(&items).ok()?;
+            Some(Value::Array(std::sync::Arc::new(array)))
+        }
         Expr::Unary {
             op: crate::sql::ast::UnaryOp::Negate,
             expr,
@@ -12252,6 +12333,39 @@ fn bind_table_function(
     }
     if name.eq_ignore_ascii_case("which_secret") {
         return bind_which_secret(db, binder, args, alias);
+    }
+    if lower.starts_with("ducklake_") {
+        let lake = crate::lake_db::LakeFunctionCall::from_table_call(&lower, args);
+        let Some(schema) = db.lake_function_schema(&lake)? else {
+            return Err(PinkDbError::Catalog(format!(
+                "unknown table function \"{name}\""
+            )));
+        };
+        if db.lake_function_mutates(&lake) {
+            return Err(PinkDbError::Execution(format!(
+                "{name} writes the lake and must be called as CALL"
+            )));
+        }
+        let call = TableFunctionCall::Function {
+            name: name.to_string(),
+            args: args.to_vec(),
+        };
+        let eff = alias.clone().unwrap_or_else(|| name.to_string());
+        return Ok((
+            ScopeTable {
+                name: eff.to_ascii_lowercase(),
+                original: None,
+                ns: None,
+                is_alias: alias.is_some(),
+                qualified_only: false,
+                columns: schema.clone(),
+            },
+            LogicalPlan::TableFunction {
+                source: "ducklake".to_string(),
+                call,
+                schema,
+            },
+        ));
     }
     let call = TableFunctionCall::Function {
         name: name.to_string(),
@@ -15697,7 +15811,9 @@ fn bind_attach_options(
             read_only: options.read_only,
             version: options.version,
             data_inlining_row_limit: options.data_inlining_row_limit,
-            create_if_not_exists: options.create_if_not_exists,
+            // DuckLake's ATTACH creates the catalog when the database is
+            // empty; pinkdb's own `lake:` scheme keeps the explicit option.
+            create_if_not_exists: ducklake.is_some() || options.create_if_not_exists,
             data_file_format: ducklake.map(|_| "parquet".to_string()),
         },
         secret,

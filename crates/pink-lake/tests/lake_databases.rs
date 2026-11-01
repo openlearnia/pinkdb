@@ -666,3 +666,208 @@ fn passwords_in_lake_urls_are_refused() {
     let e = err(&mut db, "ATTACH '/tmp/x.pink' AS p;");
     assert!(e.contains("not a lake"), "{e}");
 }
+
+/// Wave 132d: DuckLake's functions are SQL over a lake database, and a
+/// writing `CALL` refreshes the engine's view of the lake in the same session.
+#[test]
+fn ducklake_functions_run_through_sql_on_a_lake_database() {
+    let scratch = Scratch::new("functions");
+    let mut db = PinkDb::new();
+    db.execute(&create_lake_sql("w", &scratch, "w")).unwrap();
+    db.execute("CREATE TABLE w.t (a INTEGER);").unwrap();
+    db.execute("INSERT INTO w.t VALUES (1), (2);").unwrap();
+
+    // Reads bind and run through the engine's SQL surface.
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT id + 1 FROM ducklake_current_snapshot('w');"
+        ),
+        vec![3]
+    );
+    let snapshots = ints(&mut db, "SELECT COUNT(*) FROM ducklake_snapshots('w');");
+    assert_eq!(snapshots, vec![3]);
+
+    // `CALL <db>.<fn>` implies the catalog; every scope stores an option row.
+    db.execute("CALL w.set_option('parquet_compression', 'zstd');")
+        .unwrap();
+    db.execute("CALL ducklake_set_option('w', 'data_inlining_row_limit', 5);")
+        .unwrap();
+    db.execute("CALL ducklake_set_option('w', 'data_inlining_row_limit', 2, table_name := 't');")
+        .unwrap();
+    db.execute("CALL ducklake_set_option('w', 'expire_older_than', '1 week');")
+        .unwrap();
+    let options: Vec<(String, String, Option<String>)> = match db
+        .execute("SELECT option_name, value, scope_entry FROM ducklake_options('w');")
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        QueryResult::Selected { rows, .. } => rows
+            .into_iter()
+            .map(|r| match (&r[0], &r[1], &r[2]) {
+                (Value::Varchar(name), Value::Varchar(value), entry) => (
+                    name.clone(),
+                    value.clone(),
+                    match entry {
+                        Value::Varchar(entry) => Some(entry.clone()),
+                        _ => None,
+                    },
+                ),
+                other => panic!("unexpected option row: {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert!(options.contains(&("parquet_compression".to_string(), "zstd".to_string(), None)));
+    assert!(options.contains(&(
+        "data_inlining_row_limit".to_string(),
+        "2".to_string(),
+        Some("main.t".to_string())
+    )));
+    assert!(options.contains(&("expire_older_than".to_string(), "1 week".to_string(), None)));
+
+    // A writing CALL that changes rows refreshes the engine's catalog: the
+    // file the flush wrote is registered again and the table now reads twice.
+    db.execute("CALL ducklake_flush_inlined_data('w');")
+        .unwrap();
+    // The session that committed the flush knows its snapshot id (DuckLake is
+    // 0-based; pinkdb versions are 1-based).
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT id FROM ducklake_last_committed_snapshot('w');"
+        ),
+        vec![3]
+    );
+    let files: Vec<String> = match db
+        .execute("SELECT data_file FROM ducklake_list_files('w', 't');")
+        .unwrap()
+        .pop()
+        .unwrap()
+    {
+        QueryResult::Selected { rows, .. } => rows
+            .into_iter()
+            .map(|r| match &r[0] {
+                Value::Varchar(path) => path.clone(),
+                other => panic!("not a path: {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert!(!files.is_empty(), "{files:?}");
+    // Register a copy under a new path: re-registering the same path would
+    // name a file the table already lists and read the same rows. The flush
+    // lists an empty schema-only file first, so copy the last (data) file.
+    let source = files.last().unwrap();
+    let copy = source.replace(".pink", "-copy.pink");
+    std::fs::copy(source, &copy).unwrap();
+    db.execute(&format!(
+        "CALL ducklake_add_data_files('w', 't', '{copy}');"
+    ))
+    .unwrap();
+    assert_eq!(ints(&mut db, "SELECT COUNT(*) FROM w.t;"), vec![4]);
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT id FROM ducklake_last_committed_snapshot('w');"
+        ),
+        vec![4]
+    );
+
+    // A database that is not a lake, and a read-only lake for a write.
+    db.execute("CREATE DATABASE plain;").unwrap();
+    let e = err(&mut db, "SELECT * FROM ducklake_snapshots('plain');");
+    assert!(e.contains("not a lake database"), "{e}");
+    let mut ro = PinkDb::new();
+    ro.execute(&format!(
+        "ATTACH 'lake:pink:{}' AS r (READ_ONLY);",
+        scratch.s("w.pink")
+    ))
+    .unwrap();
+    let e = err(&mut ro, "CALL ducklake_flush_inlined_data('r');");
+    assert!(e.contains("read-only lake"), "{e}");
+}
+
+/// DuckLake's `set_option` values are not only reported: the inlining limit
+/// and the expire/delete defaults decide what a commit writes and prunes.
+#[test]
+fn ducklake_options_change_behaviour_like_ducklake() {
+    let scratch = Scratch::new("options");
+    let mut db = PinkDb::new();
+    db.execute(&create_lake_sql("w", &scratch, "w")).unwrap();
+    db.execute("CREATE TABLE w.t (a INTEGER);").unwrap();
+    db.execute("CREATE TABLE w.u (a INTEGER);").unwrap();
+
+    // Creating a table writes its schema-only data file and nothing else.
+    let files_dir = scratch.path("w.files").join("data/main.t");
+    let files_on_disk = || {
+        std::fs::read_dir(&files_dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "pink")
+            })
+            .count()
+    };
+    assert_eq!(files_on_disk(), 1);
+
+    // The global `data_inlining_row_limit` decides per append batch, and a
+    // table-scoped 0 turns inlining off for that table alone.
+    db.execute("CALL ducklake_set_option('w', 'data_inlining_row_limit', 5);")
+        .unwrap();
+    db.execute("INSERT INTO w.t VALUES (1), (2), (3);").unwrap();
+    assert_eq!(files_on_disk(), 1, "3 rows <= 5 stay inlined");
+    db.execute("INSERT INTO w.t VALUES (4), (5), (6), (7), (8), (9);")
+        .unwrap();
+    assert_eq!(files_on_disk(), 2, "6 rows > 5 write a data file");
+    db.execute("CALL ducklake_set_option('w', 'data_inlining_row_limit', 0, table_name := 'u');")
+        .unwrap();
+    db.execute("INSERT INTO w.u VALUES (1);").unwrap();
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT COUNT(*) FROM ducklake_list_files('w', 'u');"
+        ),
+        vec![2]
+    );
+    db.execute("INSERT INTO w.t VALUES (10);").unwrap();
+    assert_eq!(files_on_disk(), 2, "t keeps the global limit of 5");
+    assert_eq!(ints(&mut db, "SELECT COUNT(*) FROM w.t;"), vec![10]);
+    assert_eq!(ints(&mut db, "SELECT COUNT(*) FROM w.u;"), vec![1]);
+
+    // A third data file, merged into one: the sources are only unreferenced
+    // once the snapshots that name them are gone.
+    db.execute("INSERT INTO w.t VALUES (11), (12), (13), (14), (15), (16);")
+        .unwrap();
+    assert_eq!(files_on_disk(), 3);
+    db.execute("CALL ducklake_merge_adjacent_files('w');")
+        .unwrap();
+    assert_eq!(
+        ints(
+            &mut db,
+            "SELECT COUNT(*) FROM ducklake_list_files('w', 't');"
+        ),
+        vec![1]
+    );
+    assert!(files_on_disk() > 1, "the merged sources are still on disk");
+
+    // `expire_older_than` and `delete_older_than` are the defaults the calls
+    // fall back on when no cutoff is passed.
+    db.execute("CALL ducklake_set_option('w', 'expire_older_than', '0 seconds');")
+        .unwrap();
+    db.execute("CALL ducklake_set_option('w', 'delete_older_than', '0 seconds');")
+        .unwrap();
+    db.execute("CALL ducklake_expire_snapshots('w');").unwrap();
+    assert_eq!(
+        ints(&mut db, "SELECT COUNT(*) FROM ducklake_snapshots('w');"),
+        vec![1]
+    );
+    db.execute("CALL ducklake_cleanup_old_files('w');").unwrap();
+    assert_eq!(files_on_disk(), 1);
+    assert_eq!(ints(&mut db, "SELECT COUNT(*) FROM w.t;"), vec![16]);
+}

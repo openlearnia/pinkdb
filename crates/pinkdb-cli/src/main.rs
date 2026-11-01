@@ -543,32 +543,6 @@ fn print_help() {
         println!(
             "                                (0 disables; commits at most `limit` rows inline)"
         );
-        println!("  .lake flush {LAKE} [t]");
-        println!("                                materialize inlined rows into data files");
-        println!("  .lake changes {LAKE} [t] [from] [to]");
-        println!(
-            "                                row-level changes of a version range (inclusive)"
-        );
-        println!("  .lake add_data_files {LAKE} <t> <path> [path ...]");
-        println!("                                register existing data/ files as table rows");
-        println!(
-            "  .lake merge {LAKE} [t] [min_file_size=N] [max_file_size=N] [max_compacted_files=N]"
-        );
-        println!(
-            "                                consolidate adjacent data files into one version"
-        );
-        println!("  .lake rewrite {LAKE} [t] [delete_threshold=F] [max_compacted_files=N]");
-        println!("                                materialize delete files into fresh data files");
-        println!("  .lake expire {LAKE} [versions=a,b] [older_than=T] [keep=N] [dry-run]");
-        println!("                                remove old snapshots + commit manifests");
-        println!("  .lake cleanup {LAKE} [older_than=T] [all] [dry-run] [confirm]");
-        println!("  .lake orphans {LAKE} [older_than=T] [all] [dry-run] [confirm]");
-        println!("                                delete data objects no version references");
-        println!("  .lake files {LAKE} [t] [all] [version=N]");
-        println!("                                list data files (rows, size, partition, epoch)");
-        println!("  .lake table_info {LAKE}     per-table file/delete counts and sizes");
-        println!("  .lake options {LAKE}        catalog facts (data path, format, encryption)");
-        println!("  .lake settings {LAKE}       catalog_type / extension_version / data_path");
         println!("  .lake versions {LAKE}       list the lake's published versions");
         println!(
             "  .lake snapshots {LAKE}      per-version records: time, author, message, changes"
@@ -579,6 +553,8 @@ fn print_help() {
         );
         println!("  .lake format [<id>]         show or choose the data-file format for");
         println!("                                subsequent .lake save writes");
+        println!("  .lake rewrite {LAKE} <t> format <id>  convert one table's data files");
+        println!("                                to another format (no DuckLake function)");
         println!("  .lake replicate create {LAKE} from <dir|s3://...|store:<db>> [every s] [...]");
         println!("                                table-level replication jobs (wave 89)");
         println!(
@@ -587,6 +563,8 @@ fn print_help() {
         println!(
             "                                run/inspect jobs; start keeps a session supervisor"
         );
+        println!("  FROM ducklake_<fn>('{LAKE}', …)  snapshots, options, table_info, files …");
+        println!("  CALL ducklake_<fn>('{LAKE}', …)  flush, merge, rewrite, expire, cleanup …");
         println!("  Lake databases (SQL, wave 124):");
         println!("    ATTACH 'lake:{LAKE}' AS name [(READ_ONLY, DATA '…', VERSION n)]");
         println!("    CREATE DATABASE name (TYPE LAKE, CATALOG '{LAKE}' [, DATA '…'])");

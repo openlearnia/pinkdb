@@ -278,9 +278,8 @@ fn lake_errors_are_clear() {
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
         out.contains(
-            "Usage: .lake <save|open|replicate|partition|inlining|\
-             flush|changes|add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|\
-             options|settings|format|versions|snapshots|tables|info> ..."
+            "Usage: .lake <save|open|replicate|partition|inlining|format|rewrite|versions|\
+             snapshots|tables|info> ..."
         ),
         "{out}"
     );
@@ -493,13 +492,14 @@ fn keyed_lake_commands_roundtrip_and_fail_closed() {
         out.contains("Partitioned main.t by (a)"),
         "a keyed .lake partition must unseal the lake: {out}"
     );
-    // The other maintenance subcommands use the same keyed open.
+    // The other maintenance paths use the same keyed open: an attachment and
+    // the write functions unseal an encrypted lake.
     let out = run_with_env(
         &format!(
             ".lake inlining {lake} main.t 0\n\
              .lake inlining {lake} main.t default\n\
-             .lake flush {lake}\n\
-             .lake add_data_files {lake} main.t data/main.t/does-not-exist.pink\n\
+             ATTACH 'lake:{lake}' AS lk;\n\
+             CALL ducklake_flush_inlined_data('lk');\n\
              .quit\n",
             lake = lake.display()
         ),
@@ -507,20 +507,21 @@ fn keyed_lake_commands_roundtrip_and_fail_closed() {
     );
     assert!(
         !out.contains("the lake is encrypted"),
-        "inlining/flush/add_data_files must unseal a keyed lake: {out}"
+        "inlining/attach/flush must unseal a keyed lake: {out}"
     );
-    // ... and without the key the same subcommands still fail closed.
-    for sub in [
+    // ... and without the key the same work still fails closed.
+    for work in [
         ".lake partition {lake} t clear",
         ".lake inlining {lake} main.t 0",
-        ".lake flush {lake}",
-        ".lake add_data_files {lake} main.t data/main.t/x.pink",
+        "ATTACH 'lake:{lake}' AS lk;\nCALL ducklake_flush_inlined_data('lk');",
+        "ATTACH 'lake:{lake}' AS lk;\n\
+         CALL ducklake_add_data_files('lk', 'main.t', './x.pink');",
     ] {
-        let command = sub.replace("{lake}", &lake.display().to_string());
-        let out = run_no_key(&format!("{command}\n.quit\n"));
+        let script = work.replace("{lake}", &lake.display().to_string());
+        let out = run_no_key(&format!("{script}\n.quit\n"));
         assert!(
             out.contains("the lake is encrypted"),
-            "a keyless {sub} must refuse an encrypted lake: {out}"
+            "a keyless {work} must refuse an encrypted lake: {out}"
         );
     }
 
@@ -1760,30 +1761,32 @@ fn maintenance_commands_merge_expire_and_cleanup() {
         .collect();
     assert_eq!(before.len(), 3, "three data files before the merge");
 
-    // Merge and inspect. The 2-day cleanup gate protects the merged sources
-    // even after `all` until their snapshots are expired, so this run shows
-    // "nothing to clean" and the dry-run expiration of version 2.
+    // Merge and inspect through the DuckLake SQL functions.
     let out = run(&format!(
-        ".lake merge {lake}\n\
-         .lake files {lake}\n\
-         .lake table_info {lake}\n\
-         .lake cleanup {lake} all dry-run\n\
-         .lake expire {lake} versions=2 dry-run\n\
+        "{attach}\
+         CALL ducklake_merge_adjacent_files('lk');\n\
+         SELECT 'version=' || CAST(id AS VARCHAR) AS version \
+           FROM ducklake_current_snapshot('lk');\n\
+         SELECT 'files=' || CAST(COUNT(*) AS VARCHAR) AS files \
+           FROM ducklake_list_files('lk', 't');\n\
+         SELECT 'rows=' || CAST(COUNT(*) AS VARCHAR) AS n FROM t;\n\
+         SELECT 'table_files=' || CAST(SUM(file_count) AS VARCHAR) AS table_files \
+           FROM ducklake_table_info('lk');\n\
+         CALL ducklake_cleanup_old_files('lk', cleanup_all := true, dry_run := true);\n\
+         SELECT 'still=' || CAST(COUNT(*) AS VARCHAR) AS still \
+           FROM ducklake_list_files('lk', 't');\n\
+         CALL ducklake_expire_snapshots('lk', versions := [1], dry_run := true);\n\
+         SELECT 'kept=' || CAST(COUNT(*) AS VARCHAR) AS kept \
+           FROM ducklake_snapshots('lk') WHERE snapshot_id = 1;\n\
          .quit\n",
-        lake = lake.display()
+        attach = attach_rw(&lake),
     ));
-    assert!(out.contains("main.t: merged 3 files into 1"), "{out}");
-    assert!(out.contains("Merged 3 files into 1 in"), "{out}");
-    assert!(out.contains("version 5"), "{out}");
-    // The head file listing: one consolidated file with the exact rows.
-    assert!(out.contains("table=main.t rows=4"), "{out}");
-    assert!(out.contains("schema_version=1"), "{out}");
-    // Table info: one file, four rows.
-    assert!(out.contains("main.t: 1 file,"), "{out}");
-    assert!(out.contains(", 4 rows,"), "{out}");
-    // Every source is still referenced by a retained snapshot.
-    assert!(out.contains("Nothing to cleanup in"), "{out}");
-    assert!(out.contains("would expire version 2"), "{out}");
+    assert!(out.contains("version=4"), "{out}");
+    assert!(out.contains("files=1"), "{out}");
+    assert!(out.contains("rows=4"), "{out}");
+    assert!(out.contains("table_files=1"), "{out}");
+    assert!(out.contains("still=1"), "{out}");
+    assert!(out.contains("kept=1"), "{out}");
     assert!(!out.contains("Error:"), "{out}");
 
     // The merge never mutated a published file: byte-identical sources plus
@@ -1803,39 +1806,38 @@ fn maintenance_commands_merge_expire_and_cleanup() {
     );
 
     // Expire every pre-merge snapshot: the three sources become
-    // unreferenced. Cleanup previews, refuses without confirmation, then
-    // deletes on confirm; time travel to the expired version fails cleanly.
+    // unreferenced. Cleanup previews, then deletes on the real call; time
+    // travel to an expired version fails cleanly.
     let out = run(&format!(
-        ".lake expire {lake} versions=2,3,4\n\
-         .lake cleanup {lake} all dry-run\n\
-         .lake cleanup {lake} all\n\
-         .lake cleanup {lake} all confirm\n\
-         .lake files {lake} all\n\
-         .lake options {lake}\n\
-         .lake settings {lake}\n\
-         .lake open {lake} 2\n\
-         .lake open {lake}\n\
+        "{attach}\
+         CALL ducklake_expire_snapshots('lk', versions := [1]);\n\
+         CALL ducklake_expire_snapshots('lk', versions := [2]);\n\
+         CALL ducklake_expire_snapshots('lk', versions := [3]);\n\
+         SELECT 'left=' || CAST(COUNT(*) AS VARCHAR) AS remaining \
+           FROM ducklake_snapshots('lk') WHERE snapshot_id = 1 OR snapshot_id = 2 OR snapshot_id = 3;\n\
+         CALL ducklake_cleanup_old_files('lk', cleanup_all := true, dry_run := true);\n\
+         SELECT 'preview=' || CAST(COUNT(*) AS VARCHAR) AS preview \
+           FROM ducklake_list_files('lk', 't');\n\
+         CALL ducklake_cleanup_old_files('lk', cleanup_all := true);\n\
+         SELECT 'files=' || CAST(COUNT(*) AS VARCHAR) AS files \
+           FROM ducklake_list_files('lk', 't');\n\
+         SELECT 'data_path=' || value AS data_path FROM ducklake_options('lk') \
+          WHERE option_name = 'data_path';\n\
+         SELECT 'catalog=' || catalog_type AS catalog FROM ducklake_settings('lk');\n\
+         SELECT 'ext=' || extension_version AS ext FROM ducklake_settings('lk');\n\
+         DETACH lk;\n\
+         ATTACH 'lake:{lake}' AS old (READ_ONLY, VERSION 2);\n\
+         SELECT COUNT(*) FROM old.main.t;\n\
          .quit\n",
-        lake = lake.display()
+        attach = attach_rw(&lake),
+        lake = lake.display(),
     ));
-    assert!(out.contains("expired version 2"), "{out}");
-    assert!(out.contains("expired version 3"), "{out}");
-    assert!(out.contains("expired version 4"), "{out}");
-    assert!(out.contains("Expired 3 snapshots from"), "{out}");
-    assert!(out.contains("3 objects would be cleaned up"), "{out}");
-    assert!(
-        out.contains("refusing to delete 3 scheduled lake file(s) without confirmation"),
-        "{out}"
-    );
-    assert!(out.contains("Deleted 3 objects from"), "{out}");
-    assert!(
-        out.contains("1 file (1 referenced, 0 unreferenced)"),
-        "{out}"
-    );
-    assert!(out.contains("data_format: "), "{out}");
-    assert!(out.contains("data_path: "), "{out}");
-    assert!(out.contains("catalog_type:      database"), "{out}");
-    assert!(out.contains("extension_version: "), "{out}");
+    assert!(out.contains("left=0"), "{out}");
+    assert!(out.contains("preview=1"), "{out}");
+    assert!(out.contains("files=1"), "{out}");
+    assert!(out.contains("data_path="), "{out}");
+    assert!(out.contains("catalog="), "{out}");
+    assert!(out.contains("ext="), "{out}");
     assert!(out.contains("has no snapshot version 2"), "{out}");
     assert!(!out.contains("Error: corrupt"), "{out}");
     // Only the consolidated head file remains.
@@ -1844,8 +1846,8 @@ fn maintenance_commands_merge_expire_and_cleanup() {
 }
 
 /// Wave 68: a small lake database commit inlines its rows into the catalog
-/// (no data file), `.lake flush` materializes
-/// them into a data file, `.lake changes` renders the version range's
+/// (no data file), `CALL ducklake_flush_inlined_data` materializes
+/// them into a data file, `ducklake_table_changes` renders the version range's
 /// insertions/deletions, and `.lake inlining` persists a per-table limit.
 #[test]
 fn inlining_flush_changes_and_inlining_limit_round_trip() {
@@ -1861,15 +1863,21 @@ fn inlining_flush_changes_and_inlining_limit_round_trip() {
     let out = run(&script);
     assert!(out.contains("Saved lake version 2"), "{out}");
 
-    // A one-row append inlines: no data file.
+    // A one-row append inlines: no data file. The SQL functions flush it and
+    // read the version range's changes.
     let out = run(&format!(
         "{attach}\
          INSERT INTO t VALUES (2, 'b');\n\
          SELECT COUNT(*) FROM t;\n\
+         CALL ducklake_flush_inlined_data('lk');\n\
+         SELECT 'files=' || CAST(COUNT(*) AS VARCHAR) AS files \
+           FROM ducklake_list_files('lk', 't');\n\
+         SELECT 'change=' || CAST(snapshot_id AS VARCHAR) || ':' || \
+                CAST(rowid AS VARCHAR) || ':' || change_type || ':' || \
+                CAST(i AS VARCHAR) || ':' || s AS change \
+           FROM ducklake_table_changes('lk', 'main', 't', 1, 2);\n\
          USE main;\n\
          DETACH lk;\n\
-         .lake flush {lake}\n\
-         .lake changes {lake} main.t 2 3\n\
          .lake inlining {lake} main.t 0\n\
          .lake inlining {lake} main.t default\n\
          .quit\n",
@@ -1877,13 +1885,10 @@ fn inlining_flush_changes_and_inlining_limit_round_trip() {
         attach = attach_rw(&lake),
     ));
     assert!(out.contains("│ 2 "), "the inlined row is visible: {out}");
-    assert!(
-        out.contains("Flushed 1 inlined row of main.t"),
-        "the flush materializes it: {out}"
-    );
-    // `.lake changes`: the v2 save's row and the v3 inlined row, inclusive.
-    assert!(out.contains("version 2  rowid 0  insert  1 'a'"), "{out}");
-    assert!(out.contains("version 3  rowid 1  insert  2 'b'"), "{out}");
+    assert!(out.contains("files=2"), "the flush materializes it: {out}");
+    // The v2 save's row and the v3 inlined row, inclusive.
+    assert!(out.contains("change=1:0:insert:1:a"), "{out}");
+    assert!(out.contains("change=2:1:insert:2:b"), "{out}");
     assert!(
         out.contains("commits appending at most 0 rows are stored in the catalog metadata"),
         "{out}"
@@ -1897,9 +1902,9 @@ fn inlining_flush_changes_and_inlining_limit_round_trip() {
     cleanup(&dir);
 }
 
-/// Wave 68: `.lake add_data_files` registers an existing in-lake data file as
-/// rows of a table, `.lake files` names it, and the rows read back; a path
-/// that escapes the lake is refused with the documented message.
+/// Wave 68: `ducklake_add_data_files` registers an existing in-lake data file
+/// as rows of a table, `ducklake_list_files` names it, and the rows read back;
+/// a path that escapes the lake is refused.
 #[test]
 fn add_data_files_registers_through_the_cli() {
     let dir = scratch("register");
@@ -1909,43 +1914,46 @@ fn add_data_files_registers_through_the_cli() {
         "CREATE TABLE t (a INTEGER);\n\
          INSERT INTO t VALUES {};\n\
          .lake save {lake}\n\
-         .lake files {lake}\n\
-         .lake add_data_files {lake} main.t data/main.t/nope.pink\n\
-         .lake add_data_files {lake} main.t ../escape.pink\n\
          .quit\n",
         values.join(", "),
         lake = lake.display()
     ));
     assert!(out.contains("Saved lake version 2"), "{out}");
+
+    let missing = data_root(&lake).join("main.t/nope.pink");
+    let out = run(&format!(
+        "{attach}\
+         CALL ducklake_add_data_files('lk', 'main.t', '{}');\n\
+         CALL ducklake_add_data_files('lk', 'main.t', '../escape.pink');\n\
+         .quit\n",
+        missing.display(),
+        attach = attach_rw(&lake),
+    ));
     assert!(out.contains("no files found that match"), "{out}");
-    assert!(out.contains("must be relative"), "{out}");
+    assert!(out.contains("is not under the lake's data path"), "{out}");
 
     // Register the saved file itself (its rows appear a second time).
-    let files_line = out
-        .lines()
-        .find(|l| l.starts_with("data/main.t/"))
-        .expect("`.lake files` lists the data file")
-        .to_string();
-    let path = files_line.split(':').next().unwrap().to_string();
+    let data_dir = data_root(&lake).join("main.t");
+    let path = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     let out = run(&format!(
-        ".lake add_data_files {lake} main.t {path}\n\
-         .lake open {lake}\n\
-         SELECT COUNT(*) FROM t;\n\
-         .lake changes {lake} main.t\n\
+        "{attach}\
+         CALL ducklake_add_data_files('lk', 'main.t', '{}');\n\
+         SELECT COUNT(*) AS row_count FROM t;\n\
+         SELECT 'change=' || change_type || ':' || CAST(a AS VARCHAR) AS change \
+           FROM ducklake_table_changes('lk', 'main', 't', 0, 2) WHERE rowid = 12;\n\
          .quit\n",
-        lake = lake.display()
+        path.display(),
+        attach = attach_rw(&lake),
     ));
-    assert!(out.contains(&format!("Registered {path}")), "{out}");
-    assert!(out.contains("Opened lake version 3"), "{out}");
-    assert!(out.contains("│ 24 "), "12 saved + 12 registered: {out}");
-    assert!(out.contains("version 3  rowid"), "{out}");
+    assert!(out.contains("│ 24"), "{out}");
+    assert!(out.contains("change=insert:0"), "{out}");
     cleanup(&dir);
 }
-
-/// Wave 88 rule 5: `.lake open` prints one warning line per table whose
-/// data-file format this build cannot read. The lake still opens (the table
-/// is skipped), a lake database still lists it, and a read of it fails
-/// naming the id.
 #[test]
 fn unavailable_tables_print_one_warning_on_open_and_attach() {
     let dir = scratch("unavailable_warn");

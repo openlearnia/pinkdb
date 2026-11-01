@@ -1667,8 +1667,12 @@ impl Lake {
                         if start < table.num_rows() {
                             let indices: Vec<usize> = (start..table.num_rows()).collect();
                             let sub = sub_table(table, &indices)?;
-                            let _appended_inlined =
-                                self.inlines_appends(Some(&entry), false, sub.num_rows() as u64);
+                            let _appended_inlined = self.inlines_appends(
+                                key,
+                                Some(&entry),
+                                false,
+                                sub.num_rows() as u64,
+                            );
                             commit.append(key, Arc::new(sub));
                         }
                         after.insert((*key).to_string(), Arc::clone(table));
@@ -1698,6 +1702,7 @@ impl Lake {
                         // `Lake::inlines_appends`), so the rebuilt base lands
                         // the appended rows exactly where the reader will.
                         appended_inlined = self.inlines_appends(
+                            key,
                             Some(&entry),
                             delta.record.is_some(),
                             sub.num_rows() as u64,
@@ -2358,6 +2363,7 @@ impl Lake {
         for (key, rows) in &commit.appends {
             let entry = head.tables.get(key);
             if self.inlines_appends(
+                key,
                 entry,
                 commit.schemas.contains_key(key),
                 rows.num_rows() as u64,
@@ -2414,6 +2420,7 @@ impl Lake {
     /// always agrees with the reader on where the appended rows land.
     pub(crate) fn inlines_appends(
         &self,
+        table: &str,
         entry: Option<&TableEntry>,
         publishes_record: bool,
         rows: u64,
@@ -2423,6 +2430,7 @@ impl Lake {
         }
         let limit = entry
             .and_then(|e| e.inlined_limit)
+            .or_else(|| self.table_inline_limits.get(table).copied())
             .unwrap_or(self.inline_row_limit);
         // A table this commit creates mints its initial schema record together
         // with the inlined rows (the record is what decodes them); an existing

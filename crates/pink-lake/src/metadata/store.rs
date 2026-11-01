@@ -715,6 +715,27 @@ impl SqlMetadataStore {
     }
 
     /// [`MetadataStore::metadata_options`].
+    pub(crate) fn catalog_schema_ids(&self) -> Result<Vec<(String, i64)>> {
+        self.with_conn(|conn| {
+            let stmt = conn
+                .prepare(
+                    "SELECT schema_name, schema_id FROM ducklake_schema \
+                     WHERE end_snapshot IS NULL ORDER BY schema_id",
+                )
+                .map_err(|e| sql_error("listing schema ids", e))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| sql_error("listing schema ids", e))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| sql_error("listing schema ids", e))?);
+            }
+            Ok(out)
+        })
+    }
+
     pub(crate) fn metadata_options(&self) -> Result<Vec<MetadataOptionRow>> {
         self.with_conn(|conn| {
             let stmt = conn
@@ -911,6 +932,42 @@ impl SqlMetadataStore {
                 "INSERT INTO ducklake_metadata (key, value) VALUES ('data_path', ?1)",
                 params![location],
             )
+        })
+    }
+
+    /// Store one DuckLake option row. A `None` scope is the global row; a
+    /// schema/table scope stores the numeric `scope_id` DuckLake reports.
+    /// DuckDB's `set_option` creates no snapshot, and neither does this.
+    pub(crate) fn set_option(
+        &self,
+        key: &str,
+        value: &str,
+        scope: Option<&str>,
+        scope_id: Option<i64>,
+    ) -> Result<()> {
+        self.with_conn(|conn| match (scope, scope_id) {
+            (None, _) => update_or_insert(
+                conn,
+                "writing a lake option",
+                "UPDATE ducklake_metadata SET value = ?1 \
+                     WHERE key = ?2 AND scope IS NULL",
+                params![value, key],
+                "INSERT INTO ducklake_metadata (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            ),
+            (Some(scope), Some(id)) => update_or_insert(
+                conn,
+                "writing a lake option",
+                "UPDATE ducklake_metadata SET value = ?1 \
+                     WHERE key = ?2 AND scope = ?3 AND scope_id = ?4",
+                params![value, key, scope, id],
+                "INSERT INTO ducklake_metadata (key, value, scope, scope_id) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                params![key, value, scope, id],
+            ),
+            (Some(_), None) => Err(crate::LakeError::InvalidOption {
+                message: format!("option \"{key}\" has a scope but no scope id"),
+            }),
         })
     }
 
@@ -1113,8 +1170,22 @@ impl MetadataStore for SqlMetadataStore {
         SqlMetadataStore::catalog_table_ids(self)
     }
 
+    fn catalog_schema_ids(&self) -> Result<Vec<(String, i64)>> {
+        SqlMetadataStore::catalog_schema_ids(self)
+    }
+
     fn metadata_options(&self) -> Result<Vec<MetadataOptionRow>> {
         SqlMetadataStore::metadata_options(self)
+    }
+
+    fn set_option(
+        &self,
+        key: &str,
+        value: &str,
+        scope: Option<&str>,
+        scope_id: Option<i64>,
+    ) -> Result<()> {
+        SqlMetadataStore::set_option(self, key, value, scope, scope_id)
     }
 
     fn commit(&self, base_version: u64, change: CatalogChange) -> Result<u64> {
@@ -1835,7 +1906,6 @@ fn create_in_conn(
         ("created_by", created_by.to_string()),
         ("data_path", data_path),
         ("encrypted", "false".to_string()),
-        ("data_inlining_row_limit", "0".to_string()),
     ] {
         conn.execute(
             "INSERT INTO ducklake_metadata (key, value) VALUES (?1, ?2)",

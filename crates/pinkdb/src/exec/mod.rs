@@ -1282,8 +1282,12 @@ fn run_with_budget_inner(
         name,
         args,
         inline,
+        lake,
     } = plan
     {
+        if let Some(call) = lake {
+            return db.lake_function_write(call).map(query_result_from_table);
+        }
         return run_call_plan(db, qdb, name, args, inline, &budget);
     }
     if let Some((target, table, event)) = crate::trigger::plan_dml(plan, db.current_ns())
@@ -2652,7 +2656,13 @@ pub(crate) fn run_plain(
             name,
             args,
             inline,
-        } => run_call_plan(db, qdb, name, args, inline, &budget),
+            lake,
+        } => {
+            if let Some(call) = lake {
+                return db.lake_function_write(call).map(query_result_from_table);
+            }
+            run_call_plan(db, qdb, name, args, inline, &budget)
+        }
         LogicalPlan::CreateMacro {
             ns: qdb,
             name,
@@ -2989,6 +2999,35 @@ fn table_function_output(
     call: &crate::table_source::TableFunctionCall,
     schema: &[(String, DataType)],
 ) -> Result<Output> {
+    if source.eq_ignore_ascii_case("ducklake") {
+        let (Some(name), crate::table_source::TableFunctionCall::Function { args, .. }) =
+            (call.function_name(), call)
+        else {
+            return Err(PinkDbError::Execution(
+                "a DuckLake function needs a function call".to_string(),
+            ));
+        };
+        let lake = crate::lake_db::LakeFunctionCall::from_table_call(&name, args);
+        let table = cx.db.lake_function_read(&lake)?;
+        let mut chunks = Vec::with_capacity(table.columns[0].chunks.len());
+        for i in 0..table.columns[0].chunks.len() {
+            chunks.push(DataChunk {
+                columns: table
+                    .columns
+                    .iter()
+                    .map(|c| std::sync::Arc::clone(&c.chunks[i]))
+                    .collect(),
+                num_rows: table.columns[0].chunks[i].len(),
+                ordinal: i,
+            });
+        }
+        let (names, types) = schema.iter().cloned().unzip();
+        return Ok(Output {
+            chunks,
+            names,
+            types,
+        });
+    }
     let Some(src) = cx.db.table_source(source) else {
         return Err(PinkDbError::Execution(format!(
             "the table source \"{source}\" is not registered in this session (it was \
@@ -3017,6 +3056,23 @@ fn table_function_output(
         names,
         types,
     })
+}
+
+/// A DuckLake function's result table as a `CALL` result.
+fn query_result_from_table(table: DataTable) -> QueryResult {
+    let mut rows = Vec::with_capacity(table.num_rows());
+    for row in 0..table.num_rows() {
+        rows.push(
+            (0..table.columns.len())
+                .map(|col| table.get(row, col).unwrap_or(Value::Null))
+                .collect(),
+        );
+    }
+    QueryResult::Selected {
+        names: table.columns.iter().map(|c| c.name.clone()).collect(),
+        types: table.columns.iter().map(|c| c.dtype).collect(),
+        rows,
+    }
 }
 
 /// Check one chunk a table source returned against the schema the binder

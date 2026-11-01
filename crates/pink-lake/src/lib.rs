@@ -867,6 +867,12 @@ pub struct Lake {
     /// [`DEFAULT_INLINING_ROW_LIMIT`] and a table's persisted
     /// [`TableEntry::inlined_limit`] wins over it.
     inline_row_limit: u64,
+    /// Per-table `data_inlining_row_limit` options from `ducklake_metadata`,
+    /// keyed by flat `schema.table`. DuckLake's `set_option` stores these
+    /// without publishing a snapshot, so they live here rather than in the
+    /// manifest's `TableEntry::inlined_limit` (the CLI's `.lake inlining`
+    /// still publishes that).
+    table_inline_limits: BTreeMap<String, u64>,
     /// The data-file format [`Lake::set_write_format`] selected for this
     /// handle's subsequent writes; `None` keeps the build default (`pink`).
     /// Not persisted — a reopened handle starts at the default again.
@@ -1068,6 +1074,7 @@ impl Lake {
             pending_commit: None,
             pending_engine_catalog: None,
             inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
+            table_inline_limits: BTreeMap::new(),
             write_format_choice: None,
             table_format_choices: BTreeMap::new(),
         };
@@ -1242,6 +1249,7 @@ impl Lake {
             pending_commit: None,
             pending_engine_catalog: None,
             inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
+            table_inline_limits: BTreeMap::new(),
             write_format_choice: None,
             table_format_choices: BTreeMap::new(),
         })
@@ -1493,6 +1501,20 @@ impl Lake {
     /// [`Lake::set_inlining_limit`].
     pub fn set_data_inlining_row_limit(&mut self, limit: u64) {
         self.inline_row_limit = limit;
+    }
+
+    /// Set (or with `None` clear) one table's in-memory
+    /// `data_inlining_row_limit`. This is DuckLake's `set_option` form: it
+    /// persists only the option row, so no snapshot is published.
+    pub fn set_table_inlining_limit(&mut self, table: &str, limit: Option<u64>) {
+        match limit {
+            Some(limit) => {
+                self.table_inline_limits.insert(table.to_string(), limit);
+            }
+            None => {
+                self.table_inline_limits.remove(table);
+            }
+        }
     }
 
     /// The per-version records of every published version, ascending: the

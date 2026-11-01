@@ -118,8 +118,8 @@ pub use filefmt::FileFormat;
 pub use fsutil::{CopyToPolicy, write_atomic_private};
 pub use install::{InstalledExtension, NO_REPO_SUPPORT};
 pub use lake_db::{
-    DatabaseInfo, DatabaseOpener, DbStorage, LakeContent, LakeDatabase, LakeOpenRequest,
-    LakePolicy, LakeSpec, register_database_opener,
+    DatabaseInfo, DatabaseOpener, DbStorage, LakeContent, LakeDatabase, LakeFunctionCall,
+    LakeOpenRequest, LakePolicy, LakeSpec, register_database_opener,
 };
 pub use macros::{MacroDef, MacroParamDef};
 pub use package::{ExtensionPackage, extension_package_names, register_extension_package};

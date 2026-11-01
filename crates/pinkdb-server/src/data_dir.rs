@@ -203,6 +203,7 @@ mod tests {
             read_only: false,
             version: None,
             create: true,
+            create_if_missing: false,
             managed: false,
             startup: false,
             s3: None,

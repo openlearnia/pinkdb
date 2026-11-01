@@ -26,11 +26,14 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use pinkdb::{
-    AttachedLake, DataTable, DatabaseOpener, LakeContent, LakeDatabase, LakeOpenRequest,
-    PinkDbError,
+    AttachedLake, DataTable, DataType, DatabaseOpener, LakeContent, LakeDatabase, LakeFunctionCall,
+    LakeOpenRequest, PinkDbError, Value,
 };
 
-use crate::{CommitSettings, EngineLease, Lake, LakeError, LeaseError, WritableAttachment};
+use crate::{
+    CommitSettings, DuckLakeCall, EngineLease, FnArg, Lake, LakeError, LeaseError,
+    WritableAttachment,
+};
 
 /// How often a writable lake's lease heartbeat is refreshed.
 const HEARTBEAT: Duration = Duration::from_millis(1000);
@@ -77,8 +80,43 @@ fn catalog_url(catalog: &str) -> String {
     }
 }
 
-/// The engine's resolved credentials as this crate's open-time credentials.
-/// The secret values are handed to the client here and to nothing else.
+/// The engine's evaluated values as pink-lake's argument shape.
+fn function_call(call: &LakeFunctionCall) -> DuckLakeCall {
+    fn arg(value: &Value) -> FnArg {
+        match value {
+            Value::Null => FnArg::Null,
+            Value::Boolean(v) => FnArg::Bool(*v),
+            Value::Integer(v) => FnArg::Int(*v as i64),
+            Value::Bigint(v) => FnArg::Int(*v),
+            Value::Double(v) => FnArg::Double(*v),
+            Value::Varchar(v) => FnArg::Text(v.clone()),
+            Value::Date(v) => FnArg::Timestamp(*v as i64 * 86_400_000_000),
+            Value::Timestamp(v) => FnArg::Timestamp(*v),
+            Value::Decimal { value, scale, .. } => {
+                FnArg::Double(*value as f64 / 10f64.powi(*scale as i32))
+            }
+            Value::Array(a) => match &a.values {
+                pinkdb::array::ArrayElems::Ints(v) => FnArg::IntList(v.clone()),
+                pinkdb::array::ArrayElems::Floats(v) => {
+                    FnArg::TextList(v.iter().map(|x| x.to_string()).collect())
+                }
+                pinkdb::array::ArrayElems::Floats32(v) => {
+                    FnArg::TextList(v.iter().map(|x| x.to_string()).collect())
+                }
+            },
+            _ => FnArg::Null,
+        }
+    }
+    DuckLakeCall {
+        name: call.name.clone(),
+        positional: call.positional.iter().map(arg).collect(),
+        named: call
+            .named
+            .iter()
+            .map(|(name, value)| (name.clone(), arg(value)))
+            .collect(),
+    }
+}
 fn credentials(request: &LakeOpenRequest) -> crate::LakeCredentials {
     #[cfg(feature = "s3")]
     let s3 = match (&request.s3, request.data.as_deref()) {
@@ -110,21 +148,39 @@ fn open_lake(
 ) -> pinkdb::Result<Lake> {
     let catalog = catalog_url(&request.catalog);
     let credentials = credentials(request);
-    if request.create {
-        let created = match (&request.data, key) {
-            (Some(data), None) => {
-                Lake::create_with_catalog_credentials(&catalog, data, &credentials)
+    let open = || match key {
+        Some(key) => Lake::open_with_catalog_credentials_with_key(
+            &catalog,
+            request.data.as_deref(),
+            key.clone(),
+            &credentials,
+        ),
+        None => {
+            Lake::open_with_catalog_credentials(&catalog, request.data.as_deref(), &credentials)
+        }
+    };
+    let create = || match (&request.data, key) {
+        (Some(data), None) => Lake::create_with_catalog_credentials(&catalog, data, &credentials),
+        (None, None) => Lake::create_url(&catalog),
+        (Some(data), Some(key)) => Lake::create_with_catalog_credentials_with_key(
+            &catalog,
+            data,
+            key.clone(),
+            &credentials,
+        ),
+        (None, Some(key)) => Lake::create_url_with_key(&catalog, key.clone()),
+    };
+    if request.create || request.create_if_missing {
+        // CREATE_IF_NOT_EXISTS: an existing lake is opened, a missing one is
+        // created. A force create still refuses to overwrite.
+        if request.create_if_missing && !request.create {
+            match open() {
+                Ok(lake) => return Ok(lake),
+                Err(LakeError::NotALake { .. }) => {}
+                Err(e) => return Err(lake_error(e)),
             }
-            (None, None) => Lake::create_url(&catalog),
-            (Some(data), Some(key)) => Lake::create_with_catalog_credentials_with_key(
-                &catalog,
-                data,
-                key.clone(),
-                &credentials,
-            ),
-            (None, Some(key)) => Lake::create_url_with_key(&catalog, key.clone()),
-        };
-        return created.map_err(|e| match e {
+        }
+        return create().map_err(|e| match e {
             LakeError::AlreadyALake { .. } => PinkDbError::Catalog(format!(
                 "a lake already exists at {}: ATTACH it instead",
                 crate::redact_location(&request.catalog)
@@ -205,11 +261,17 @@ impl DatabaseOpener for LakeOpener {
             }));
         }
         let lease = acquire_lease(&lake, request.startup)?;
+        let catalog_limit = catalog_inlining_limit(&lake);
         let mut attachment = WritableAttachment::attach(lake, None).map_err(lake_error)?;
-        if let Some(limit) = request.data_inlining_row_limit.or_else(inlining_limit) {
+        if let Some(limit) = request
+            .data_inlining_row_limit
+            .or(catalog_limit)
+            .or_else(inlining_limit)
+        {
             attachment.set_data_inlining_row_limit(limit);
         }
-        let (lake, version, base) = attachment.into_parts();
+        let (mut lake, version, base) = attachment.into_parts();
+        apply_table_inlining_limits(&mut lake);
         let image = lake.engine_catalog().map_err(lake_error)?.map(|(_, i)| i);
         WritableLake::start(location, lake, version, base, image, lease)
     }
@@ -220,6 +282,49 @@ impl DatabaseOpener for LakeOpener {
 /// `ducklake_default_data_inlining_row_limit`; 0 disables inlining so every
 /// commit writes data files). Unset keeps the handle default; a table's
 /// persisted `.lake inlining` limit always wins.
+/// The catalog's global `data_inlining_row_limit` option, if it has one: a
+/// lake written by DuckDB (or by a previous `ducklake_set_option`) keeps the
+/// limit there, and a fresh handle must apply it.
+fn catalog_inlining_limit(lake: &Lake) -> Option<u64> {
+    let row = lake
+        .store
+        .metadata_options()
+        .ok()?
+        .into_iter()
+        .find(|row| {
+            row.scope.is_none() && row.key.eq_ignore_ascii_case("data_inlining_row_limit")
+        })?;
+    row.value.trim().parse().ok()
+}
+
+/// Per-table `data_inlining_row_limit` options written by DuckLake's
+/// `set_option` live only in `ducklake_metadata`; a fresh handle applies them
+/// to the tables they name.
+fn apply_table_inlining_limits(lake: &mut Lake) {
+    let Ok(options) = lake.store.metadata_options() else {
+        return;
+    };
+    let Ok(tables) = lake.store.catalog_table_ids() else {
+        return;
+    };
+    for row in options {
+        if row.scope.as_deref() != Some("table")
+            || !row.key.eq_ignore_ascii_case("data_inlining_row_limit")
+        {
+            continue;
+        }
+        let Some(id) = row.scope_id else {
+            continue;
+        };
+        let Some(identity) = tables.iter().find(|table| table.table_id == id) else {
+            continue;
+        };
+        if let Ok(limit) = row.value.trim().parse() {
+            lake.set_table_inlining_limit(&identity.key, Some(limit));
+        }
+    }
+}
+
 fn inlining_limit() -> Option<u64> {
     let raw = std::env::var("PINKDB_LAKE_INLINING_ROW_LIMIT").ok()?;
     raw.trim().parse::<u64>().ok()
@@ -308,6 +413,23 @@ impl LakeDatabase for ReadOnlyLake {
             &self.lake.lock().unwrap_or_else(|p| p.into_inner()),
             version,
         )
+    }
+    fn function_schema(
+        &self,
+        call: &LakeFunctionCall,
+    ) -> pinkdb::Result<Option<Vec<(String, DataType)>>> {
+        if !crate::functions::is_known(&call.name) {
+            return Ok(None);
+        }
+        let lake = self.lake.lock().unwrap_or_else(|p| p.into_inner());
+        crate::functions::output_schema(&lake, &function_call(call)).map_err(lake_error)
+    }
+    fn function_mutates(&self, name: &str) -> bool {
+        crate::functions::is_mutating(name)
+    }
+    fn call_read(&self, call: &LakeFunctionCall) -> pinkdb::Result<DataTable> {
+        let lake = self.lake.lock().unwrap_or_else(|p| p.into_inner());
+        crate::functions::call_read(&lake, &function_call(call)).map_err(lake_error)
     }
 }
 
@@ -501,5 +623,37 @@ impl LakeDatabase for WritableLake {
     fn tables_at(&self, version: u64) -> pinkdb::Result<Vec<(String, String, Arc<DataTable>)>> {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         tables_at(&state.lake, version)
+    }
+    fn function_schema(
+        &self,
+        call: &LakeFunctionCall,
+    ) -> pinkdb::Result<Option<Vec<(String, DataType)>>> {
+        if !crate::functions::is_known(&call.name) {
+            return Ok(None);
+        }
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        crate::functions::output_schema(&state.lake, &function_call(call)).map_err(lake_error)
+    }
+    fn function_mutates(&self, name: &str) -> bool {
+        crate::functions::is_mutating(name)
+    }
+    fn call_read(&self, call: &LakeFunctionCall) -> pinkdb::Result<DataTable> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        crate::functions::call_read(&state.lake, &function_call(call)).map_err(lake_error)
+    }
+    fn call_write(&self, call: &LakeFunctionCall) -> pinkdb::Result<DataTable> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let before = state.lake.current_version();
+        let table = crate::functions::call_write(&mut state.lake, &function_call(call))
+            .map_err(lake_error)?;
+        let after = state.lake.current_version();
+        if after != before {
+            state.version = after;
+            state.base = tables_at(&state.lake, after)?
+                .into_iter()
+                .map(|(schema, name, table)| (format!("{schema}.{name}"), table))
+                .collect();
+        }
+        Ok(table)
     }
 }

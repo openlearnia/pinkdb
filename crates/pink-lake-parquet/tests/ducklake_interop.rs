@@ -1611,6 +1611,42 @@ fn duckdb_json_rows(binary: &Path, script: &str, columns: &[&str]) -> Vec<Vec<St
         .collect()
 }
 
+fn pinkdb_sql_rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<String>> {
+    match db.execute(sql).unwrap().pop().unwrap() {
+        QueryResult::Selected { rows, .. } => rows
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| match value {
+                        Value::Null => "<null>".to_string(),
+                        other => other.to_string(),
+                    })
+                    .collect()
+            })
+            .collect(),
+        other => panic!("expected rows from {sql}, got {other:?}"),
+    }
+}
+
+/// Compare one SQL statement's rows between DuckDB (`l`) and pinkdb (`w`).
+fn check_sql(
+    db: &mut PinkDb,
+    binary: &Path,
+    prefix: &str,
+    duck_sql: &str,
+    pink_sql: &str,
+    columns: &[&str],
+    sorted: bool,
+) {
+    let mut theirs = duckdb_json_rows(binary, &format!("{prefix}{duck_sql}"), columns);
+    let mut ours = pinkdb_sql_rows(db, pink_sql);
+    if sorted {
+        theirs.sort();
+        ours.sort();
+    }
+    assert_eq!(ours, theirs, "{pink_sql}");
+}
+
 fn pinkdb_rows(table: &DataTable) -> Vec<Vec<String>> {
     (0..table.num_rows())
         .map(|row| {
@@ -2776,4 +2812,193 @@ mod quacklab_attach {
         drop(lake);
         cleanup(&dir);
     }
+}
+
+/// Wave 132d: every read function through SQL on a DuckDB-written, two-schema
+/// Postgres lake, plus QuackLab's `CALL warehouse.set_option(...)` sequence and
+/// a flush whose result the same session then reads.
+#[cfg(feature = "catalog-postgres")]
+#[test]
+fn ducklake_functions_run_through_sql_and_match_duckdb() {
+    let _postgres = postgres_guard();
+    let Some(binary) = duckdb_binary() else {
+        return;
+    };
+    let Some(server) = TestPostgres::start() else {
+        return;
+    };
+    register().unwrap();
+    pink_lake::database::register();
+    let dir = scratch("functions-sql");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let attach = format!("ducklake:postgres:{}", server.conninfo());
+    let prefix = attach_script(&attach, &data);
+    let setup = format!(
+        "{prefix}         CREATE SCHEMA l.s2;
+         CREATE TABLE l.s2.u (x INTEGER);
+         INSERT INTO l.s2.u VALUES (7);
+         CREATE TABLE l.t (i INTEGER, s VARCHAR);
+         INSERT INTO l.t VALUES (1, 'a'), (2, 'b');
+         CALL l.set_option('parquet_compression', 'zstd');
+         CALL l.set_option('parquet_version', '2');
+         CALL l.set_option('parquet_row_group_size', '1000');
+         CALL l.set_option('data_inlining_row_limit', '0');
+         CALL l.set_option('expire_older_than', '1 week');
+         CALL l.set_option('data_inlining_row_limit', '5', table_name := 't');
+"
+    );
+    if let Err(message) = run_duckdb(&binary, &setup) {
+        if message.contains("extension") || message.contains("Extension") {
+            println!("skip DuckDB interop test: {message}");
+            return;
+        }
+        panic!("writing the two-schema lake: {message}");
+    }
+
+    let mut db = PinkDb::new();
+    db.execute(&format!(
+        "ATTACH 'ducklake:postgres:{}' AS w;",
+        server.conninfo()
+    ))
+    .unwrap();
+    // QuackLab's catalog-scoped form, with the same five options DuckDB set.
+    for statement in [
+        "CALL w.set_option('parquet_compression', 'zstd');",
+        "CALL w.set_option('parquet_version', '2');",
+        "CALL w.set_option('parquet_row_group_size', '1000');",
+        "CALL w.set_option('data_inlining_row_limit', '0');",
+        "CALL w.set_option('expire_older_than', '1 week');",
+        "CALL w.set_option('data_inlining_row_limit', '5', table_name := 't');",
+    ] {
+        db.execute(statement).unwrap();
+    }
+
+    check_sql(
+        &mut db,
+        &binary,
+        &prefix,
+        "SELECT CAST(snapshot_id AS VARCHAR) AS snapshot_id, \
+         CAST(snapshot_time AS DATE) AS snapshot_time, \
+         CAST(schema_version AS VARCHAR) AS schema_version, CAST(changes AS VARCHAR) AS changes, \
+         author, commit_message, commit_extra_info \
+         FROM ducklake_snapshots('l') ORDER BY snapshot_id;",
+        "SELECT CAST(snapshot_id AS VARCHAR) AS snapshot_id, \
+         CAST(snapshot_time AS DATE) AS snapshot_time, \
+         CAST(schema_version AS VARCHAR) AS schema_version, CAST(changes AS VARCHAR) AS changes, \
+         author, commit_message, commit_extra_info \
+         FROM ducklake_snapshots('w') ORDER BY snapshot_id;",
+        &[
+            "snapshot_id",
+            "snapshot_time",
+            "schema_version",
+            "changes",
+            "author",
+            "commit_message",
+            "commit_extra_info",
+        ],
+        false,
+    );
+    check_sql(
+        &mut db,
+        &binary,
+        &prefix,
+        "SELECT CAST(id AS VARCHAR) AS id FROM ducklake_current_snapshot('l');",
+        "SELECT CAST(id AS VARCHAR) AS id FROM ducklake_current_snapshot('w');",
+        &["id"],
+        false,
+    );
+    check_sql(
+        &mut db,
+        &binary,
+        &prefix,
+        "SELECT CAST(id AS VARCHAR) AS id FROM ducklake_last_committed_snapshot('l');",
+        "SELECT CAST(id AS VARCHAR) AS id FROM ducklake_last_committed_snapshot('w');",
+        &["id"],
+        false,
+    );
+    check_sql(
+        &mut db,
+        &binary,
+        &prefix,
+        "SELECT table_name, CAST(schema_id AS VARCHAR) AS schema_id, \
+         CAST(table_id AS VARCHAR) AS table_id, CAST(table_uuid AS VARCHAR) AS table_uuid, \
+         CAST(file_count AS VARCHAR) AS file_count, \
+         CAST(file_size_bytes AS VARCHAR) AS file_size_bytes, \
+         CAST(delete_file_count AS VARCHAR) AS delete_file_count, \
+         CAST(delete_file_size_bytes AS VARCHAR) AS delete_file_size_bytes \
+         FROM ducklake_table_info('l') ORDER BY table_name;",
+        "SELECT table_name, CAST(schema_id AS VARCHAR) AS schema_id, \
+         CAST(table_id AS VARCHAR) AS table_id, CAST(table_uuid AS VARCHAR) AS table_uuid, \
+         CAST(file_count AS VARCHAR) AS file_count, \
+         CAST(file_size_bytes AS VARCHAR) AS file_size_bytes, \
+         CAST(delete_file_count AS VARCHAR) AS delete_file_count, \
+         CAST(delete_file_size_bytes AS VARCHAR) AS delete_file_size_bytes \
+         FROM ducklake_table_info('w') ORDER BY table_name;",
+        &[
+            "table_name",
+            "schema_id",
+            "table_id",
+            "table_uuid",
+            "file_count",
+            "file_size_bytes",
+            "delete_file_count",
+            "delete_file_size_bytes",
+        ],
+        false,
+    );
+    check_sql(
+        &mut db,
+        &binary,
+        &prefix,
+        "SELECT data_file, CAST(data_file_size_bytes AS VARCHAR) AS data_file_size_bytes, \
+         CAST(data_file_footer_size AS VARCHAR) AS data_file_footer_size, \
+         CAST(data_file_encryption_key AS VARCHAR) AS data_file_encryption_key, delete_file, \
+         CAST(delete_file_size_bytes AS VARCHAR) AS delete_file_size_bytes, \
+         CAST(delete_file_footer_size AS VARCHAR) AS delete_file_footer_size, \
+         CAST(delete_file_encryption_key AS VARCHAR) AS delete_file_encryption_key \
+         FROM ducklake_list_files('l', 't') ORDER BY data_file, delete_file;",
+        "SELECT data_file, CAST(data_file_size_bytes AS VARCHAR) AS data_file_size_bytes, \
+         CAST(data_file_footer_size AS VARCHAR) AS data_file_footer_size, \
+         CAST(data_file_encryption_key AS VARCHAR) AS data_file_encryption_key, delete_file, \
+         CAST(delete_file_size_bytes AS VARCHAR) AS delete_file_size_bytes, \
+         CAST(delete_file_footer_size AS VARCHAR) AS delete_file_footer_size, \
+         CAST(delete_file_encryption_key AS VARCHAR) AS delete_file_encryption_key \
+         FROM ducklake_list_files('w', 't') ORDER BY data_file, delete_file;",
+        &[
+            "data_file",
+            "data_file_size_bytes",
+            "data_file_footer_size",
+            "data_file_encryption_key",
+            "delete_file",
+            "delete_file_size_bytes",
+            "delete_file_footer_size",
+            "delete_file_encryption_key",
+        ],
+        false,
+    );
+    let options = "SELECT option_name, value, scope, scope_entry \
+         FROM ducklake_options('{}') WHERE option_name IN (\
+         'parquet_compression', 'parquet_version', 'parquet_row_group_size', \
+         'data_inlining_row_limit', 'expire_older_than') \
+         ORDER BY option_name, scope, scope_entry;";
+    check_sql(
+        &mut db,
+        &binary,
+        &prefix,
+        &options.replace("{}", "l"),
+        &options.replace("{}", "w"),
+        &["option_name", "value", "scope", "scope_entry"],
+        false,
+    );
+
+    check_sql(
+        &mut db,
+        &binary,
+        &prefix,
+        "SELECT i, s FROM l.main.t ORDER BY i;",
+        "SELECT i, s FROM w.main.t ORDER BY i;",
+        &["i", "s"],
+        false,
+    );
 }

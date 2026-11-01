@@ -35,9 +35,10 @@
 //!   `v - 1` (pinkdb's version 1 is DuckLake's snapshot 0, the
 //!   `created_schema:"main"` snapshot). The named arguments that take a
 //!   snapshot (`ducklake_list_files(snapshot_version := …)`) take the same id.
-//! - `ducklake_last_committed_snapshot` reports no id: DuckDB answers the last
-//!   snapshot *this connection* committed, and a pinkdb [`Lake`] handle does
-//!   not record its own commits.
+//! - `ducklake_last_committed_snapshot` is answered by the engine's session:
+//!   it is the last snapshot *this connection* committed to the lake. The
+//!   handle itself records no commits, so this function's `call_read` reports
+//!   `NULL` for a bare handle.
 //! - `ducklake_list_files` reports no encryption keys or delete-file footer
 //!   size: pinkdb's catalog keeps a delete file's path and row count but not
 //!   its footer, and the storage facade does not hand out per-file keys. Those
@@ -65,10 +66,13 @@
 //!   `ducklake_flush_inlined_data` would flush floating rows a second time, so
 //!   a lake pinkdb flushed is flushed by pinkdb (a lake DuckDB flushed reads
 //!   the same either way — the rows are gone from the inlined table).
-//! - `ducklake_options` on a pinkdb-written lake shows no
-//!   `data_inlining_row_limit` row: pinkdb keeps that limit on the table, not
-//!   as a table-scoped catalog option, so only `ducklake_set_option` and the
-//!   table's own metadata carry it.
+//! - `ducklake_set_option` stores any option name in `ducklake_metadata`
+//!   with DuckDB's scope rows (global, `schema :=`, `table_name :=`) and
+//!   `ducklake_options` reports them. `data_inlining_row_limit` is also
+//!   applied to the handle (global) or the table's manifest (table scope);
+//!   `expire_older_than` and `delete_older_than` become the defaults of the
+//!   expire/cleanup functions. The Parquet writer settings are stored and
+//!   reported but not applied: pinkdb's writer takes no such options.
 //! - `ducklake_settings.catalog_type` and `extension_version` name the
 //!   metadata backend and the version of *this* build (`pinkdb` for pinkdb's
 //!   own `.pink` catalog), where DuckDB names itself.
@@ -76,10 +80,8 @@
 //!   `ducklake_merge_adjacent_files(newer_than := …)` are refused: pinkdb keeps
 //!   neither snapshot protection nor per-file age, so accepting them would
 //!   silently drop a guarantee the caller asked for.
-//! - `ducklake_set_option` sets `data_inlining_row_limit` (pinkdb's only
-//!   settable option) and it is per table, so `table_name` is required. The
-//!   other DuckLake options name a Parquet/Vortex writer setting pinkdb does
-//!   not have.
+//! - `ducklake_set_option` validates DuckLake's two interval options and
+//!   `skip_stats_columns`; every other name is stored verbatim.
 //! - `ducklake_add_data_files` takes a path under the lake's data directory
 //!   (DuckDB also expands globs) and refuses `allow_missing`,
 //!   `ignore_extra_columns` and `hive_partitioning := true`: pinkdb copies no
@@ -150,6 +152,11 @@ pub fn output_schema(lake: &Lake, call: &DuckLakeCall) -> Result<Option<Vec<(Str
 /// exclusive handle.
 pub fn is_mutating(name: &str) -> bool {
     spec(name).is_some_and(|spec| spec.write)
+}
+
+/// Whether `name` is one of DuckLake's functions.
+pub fn is_known(name: &str) -> bool {
+    spec(name).is_some()
 }
 
 /// Run a read function.
@@ -826,14 +833,10 @@ fn options(lake: &Lake, bound: &Bound<'_>) -> Result<DataTable> {
         .iter()
         .map(|identity| (identity.table_id, identity.key.as_str()))
         .collect();
-    let by_schema: BTreeMap<i64, &str> = tables
+    let schemas = lake.store.catalog_schema_ids()?;
+    let by_schema: BTreeMap<i64, &str> = schemas
         .iter()
-        .filter_map(|identity| {
-            identity
-                .key
-                .split_once('.')
-                .map(|(schema, _)| (identity.schema_id, schema))
-        })
+        .map(|(schema, id)| (*id, schema.as_str()))
         .collect();
     for row in lake.store.metadata_options()? {
         let (scope, entry) = match row.scope.as_deref().map(str::to_ascii_lowercase).as_deref() {
@@ -967,6 +970,10 @@ fn expire_snapshots(lake: &mut Lake, bound: &Bound<'_>) -> Result<DataTable> {
             "takes either older_than or versions, not both",
         ));
     }
+    let older_than = match (older_than, versions.is_some()) {
+        (None, false) => option_cutoff(lake, bound.spec, "expire_older_than")?,
+        (older_than, _) => older_than,
+    };
     let settings = |dry_run| ExpireSettings {
         versions: versions.clone(),
         older_than_micros: older_than,
@@ -1051,6 +1058,11 @@ fn cleanup_files(lake: &mut Lake, bound: &Bound<'_>) -> Result<DataTable> {
         .map(|arg| as_bool(bound.spec, arg, "dry_run"))
         .transpose()?
         .unwrap_or(false);
+    let older_than = if older_than.is_none() && !all {
+        option_cutoff(lake, bound.spec, "delete_older_than")?
+    } else {
+        older_than
+    };
     if !dry_run && older_than.is_none() && !all {
         return Err(invalid(
             bound.spec,
@@ -1065,7 +1077,7 @@ fn cleanup_files(lake: &mut Lake, bound: &Bound<'_>) -> Result<DataTable> {
         dry_run,
         // A non-dry run is the caller's confirmation: this layer only runs on
         // an exclusive handle, which is DuckDB's CALL requirement too.
-        confirm: !dry_run,
+        confirm: true,
     };
     let report = if bound.spec.name == "ducklake_cleanup_old_files" {
         lake.cleanup_old_files(&settings)?
@@ -1084,33 +1096,150 @@ fn cleanup_files(lake: &mut Lake, bound: &Bound<'_>) -> Result<DataTable> {
 fn set_option(lake: &mut Lake, bound: &Bound<'_>) -> Result<DataTable> {
     let mut out = table_for(lake, bound)?;
     let option = as_text(bound.spec, bound.positional(1), "argument 2 (option)")?;
-    let value = as_text(bound.spec, bound.positional(2), "argument 3 (value)")?;
-    if !option.eq_ignore_ascii_case("data_inlining_row_limit") {
-        return Err(invalid(
-            bound.spec,
-            &format!(
-                "\"{option}\" is not settable (this build supports data_inlining_row_limit only)"
-            ),
-        ));
+    let value = option_text(bound.spec, bound.positional(2), "argument 3 (value)")?;
+    let schema = bound
+        .named("schema")
+        .map(|arg| as_text(bound.spec, arg, "schema"))
+        .transpose()?;
+    let table = match bound.named("table_name") {
+        Some(arg) => {
+            let table = as_text(bound.spec, arg, "table_name")?;
+            if table.contains('.') {
+                Some(table)
+            } else {
+                Some(table_key(lake, bound.spec, schema.as_deref(), &table)?)
+            }
+        }
+        None => None,
+    };
+    let tables = lake.store.catalog_table_ids()?;
+    let (scope, scope_id) = if let Some(key) = &table {
+        let id = tables
+            .iter()
+            .find(|identity| identity.key.eq_ignore_ascii_case(key))
+            .map(|identity| identity.table_id)
+            .ok_or_else(|| invalid(bound.spec, &format!("table with name {key} does not exist")))?;
+        (Some("table"), Some(id))
+    } else if let Some(schema) = &schema {
+        let schemas = lake.store.catalog_schema_ids()?;
+        let id = schemas
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(schema))
+            .map(|(_, id)| *id)
+            .ok_or_else(|| {
+                invalid(
+                    bound.spec,
+                    &format!("schema with name {schema} does not exist"),
+                )
+            })?;
+        (Some("schema"), Some(id))
+    } else {
+        (None, None)
+    };
+    let lower = option.to_ascii_lowercase();
+    let mut limit = None;
+    match lower.as_str() {
+        "expire_older_than" | "delete_older_than" => {
+            if pinkdb::types::parse_interval(&value).is_none() {
+                return Err(invalid(
+                    bound.spec,
+                    &format!("{option} is not a valid interval value."),
+                ));
+            }
+        }
+        "skip_stats_columns" => {
+            validate_skip_stats_columns(lake, bound, table.as_deref(), &value)?;
+        }
+        "data_inlining_row_limit" => {
+            limit = match value.trim().to_ascii_lowercase().as_str() {
+                "" | "none" | "null" => None,
+                digits => Some(digits.parse::<u64>().map_err(|_| {
+                    invalid(
+                        bound.spec,
+                        &format!("data_inlining_row_limit must be a whole number, got \"{value}\""),
+                    )
+                })?),
+            };
+        }
+        _ => {}
     }
-    let Some(table) = call_table(lake, bound, "table_name")? else {
-        return Err(invalid(
-            bound.spec,
-            "data_inlining_row_limit is a per-table option: table_name is required",
-        ));
+    // DuckDB normalizes the options it interprets; store the same text so
+    // `ducklake_options` agrees with it after the same calls.
+    let stored = match lower.as_str() {
+        "parquet_compression" | "data_file_format" => value.to_ascii_lowercase(),
+        "parquet_version" => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "v1" => "V1".to_string(),
+            "2" | "v2" => "V2".to_string(),
+            _ => value.clone(),
+        },
+        "data_inlining_row_limit" => limit
+            .map(|limit| limit.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        _ => value.clone(),
     };
-    let limit = match value.trim().to_ascii_lowercase().as_str() {
-        "" | "none" | "null" => None,
-        digits => Some(digits.parse::<u64>().map_err(|_| {
-            invalid(
-                bound.spec,
-                &format!("data_inlining_row_limit must be a whole number, got \"{value}\""),
-            )
-        })?),
-    };
-    let report = lake.set_inlining_limit(&table, limit, &Default::default())?;
-    push(&mut out, vec![Value::Boolean(report.committed)])?;
+    lake.store.set_option(&lower, &stored, scope, scope_id)?;
+    if lower == "data_inlining_row_limit" {
+        if let Some(key) = &table {
+            // DuckLake stores this option without publishing a snapshot.
+            lake.set_table_inlining_limit(key, limit);
+        } else if let Some(limit) = limit {
+            lake.set_data_inlining_row_limit(limit);
+        }
+    }
+    push(&mut out, vec![Value::Boolean(true)])?;
     Ok(out)
+}
+
+/// The cutoff a stored `expire_older_than` / `delete_older_than` option names.
+fn option_cutoff(lake: &Lake, spec: &Spec, name: &str) -> Result<Option<i64>> {
+    let Some(row) = lake
+        .store
+        .metadata_options()?
+        .into_iter()
+        .find(|row| row.scope.is_none() && row.key.eq_ignore_ascii_case(name))
+    else {
+        return Ok(None);
+    };
+    let interval = pinkdb::types::parse_interval(&row.value)
+        .ok_or_else(|| invalid(spec, &format!("{name} is not a valid interval value.")))?;
+    let ago = pinkdb::types::Interval {
+        months: -interval.months,
+        days: -interval.days,
+        micros: -interval.micros,
+    };
+    Ok(pinkdb::types::timestamp_add_interval(
+        crate::maintenance::now_micros(),
+        ago,
+    ))
+}
+
+fn validate_skip_stats_columns(
+    lake: &Lake,
+    bound: &Bound<'_>,
+    table: Option<&str>,
+    value: &str,
+) -> Result<()> {
+    let keys: Vec<String> = match table {
+        Some(key) => vec![key.to_string()],
+        None => lake.tables()?.into_iter().map(|(key, _)| key).collect(),
+    };
+    let mut columns = std::collections::BTreeSet::new();
+    for key in keys {
+        if let Some(entry) = lake.store.table_layout(&key, None)? {
+            for column in entry.columns.unwrap_or_default() {
+                columns.insert(column.name.to_ascii_lowercase());
+            }
+        }
+    }
+    for column in value.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+        if !columns.contains(&column.to_ascii_lowercase()) {
+            return Err(invalid(
+                bound.spec,
+                &format!("column with name \"{column}\" does not exist"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn set_commit_message(lake: &mut Lake, bound: &Bound<'_>) -> Result<DataTable> {
@@ -1352,6 +1481,17 @@ fn as_text(spec: &Spec, arg: &FnArg, label: &str) -> Result<String> {
     match arg {
         FnArg::Text(text) => Ok(text.clone()),
         other => Err(wrong_type(spec, other, label, "VARCHAR")),
+    }
+}
+
+/// An option value as DuckDB stores it: the text form of a scalar.
+fn option_text(spec: &Spec, arg: &FnArg, label: &str) -> Result<String> {
+    match arg {
+        FnArg::Text(text) => Ok(text.clone()),
+        FnArg::Int(value) => Ok(value.to_string()),
+        FnArg::Double(value) => Ok(value.to_string()),
+        FnArg::Bool(value) => Ok(value.to_string()),
+        other => Err(wrong_type(spec, other, label, "a scalar")),
     }
 }
 

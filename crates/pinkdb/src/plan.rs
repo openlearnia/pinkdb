@@ -473,6 +473,9 @@ pub enum LogicalPlan {
         /// `DO` (wave 83): the anonymous block's definition, run instead of
         /// a catalog lookup (`name` is `DO`, `args` is empty).
         inline: Option<Box<crate::procedure::ProcedureDef>>,
+        /// A DuckLake function call: the engine resolves the lake database
+        /// named by `lake.positional[0]` and runs it instead of a procedure.
+        lake: Option<crate::lake_db::LakeFunctionCall>,
     },
     /// `CREATE [OR REPLACE] MACRO ...` (wave 77): store the parsed template
     /// in the target database's catalog. `source` is the statement text the

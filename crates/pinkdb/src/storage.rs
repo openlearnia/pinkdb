@@ -1808,6 +1808,10 @@ pub struct Session {
     /// The session's temporary secrets, shadowing a persistent secret of
     /// the same name. Values are credentials: `Debug` shows only the count.
     secrets: Arc<Mutex<BTreeMap<String, crate::secret::Secret>>>,
+    /// Lowercased lake database -> the last DuckLake snapshot id this session
+    /// committed there (`ducklake_last_committed_snapshot`). Per connection:
+    /// another session's commits are not this session's last commit.
+    last_lake_commits: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -1839,6 +1843,7 @@ impl Session {
             secrets: Arc::default(),
             principal: Arc::default(),
             roles: Arc::default(),
+            last_lake_commits: Arc::default(),
         }
     }
 
@@ -1889,6 +1894,23 @@ impl Session {
     /// `true` when the session set no variables.
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+
+    /// Record the DuckLake snapshot id this session last committed to `lake`.
+    pub(crate) fn set_last_lake_commit(&self, lake: &str, snapshot_id: u64) {
+        self.last_lake_commits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(lake.to_ascii_lowercase(), snapshot_id);
+    }
+
+    /// The DuckLake snapshot id this session last committed to `lake`.
+    pub(crate) fn last_lake_commit(&self, lake: &str) -> Option<u64> {
+        self.last_lake_commits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&lake.to_ascii_lowercase())
+            .copied()
     }
 
     /// The session's temporary secrets, name order.

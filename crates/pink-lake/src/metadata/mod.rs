@@ -294,6 +294,10 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
     /// values name; pinkdb's own manifest keeps only the key and the uuid.
     fn catalog_table_ids(&self) -> Result<Vec<TableIdentity>>;
 
+    /// The live schemas' DuckLake catalog ids as `(name, schema_id)`: the
+    /// numeric id a schema-scoped option names.
+    fn catalog_schema_ids(&self) -> Result<Vec<(String, i64)>>;
+
     /// Every `ducklake_metadata` row as `(key, value, scope, scope_id)`: the
     /// option set `ducklake_options` reports. A `NULL` scope is a global
     /// option, `schema` and `table` are the two scoped forms DuckLake stores
@@ -302,6 +306,16 @@ pub(crate) trait MetadataStore: std::fmt::Debug + Send + Sync {
 
     /// Set `ducklake_metadata.encrypted`.
     fn set_encrypted(&self, encrypted: bool) -> Result<()>;
+
+    /// Store one `ducklake_metadata` option row (`scope`/`scope_id` name a
+    /// schema or table; `None` is global).
+    fn set_option(
+        &self,
+        key: &str,
+        value: &str,
+        scope: Option<&str>,
+        scope_id: Option<i64>,
+    ) -> Result<()>;
 
     /// Publish `change` on top of `base_version` in one transaction.
     ///

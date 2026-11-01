@@ -52,7 +52,11 @@ SEED = 130
 # server that never listens, and a chart client that never returns.
 SERVER_READY_TIMEOUT = 180
 CHART_TIMEOUT = 300
-DUCKLAKE_URI = "ducklake:postgres:dbname=duck host=127.0.0.1 port=55433 user=postgres"
+DUCKLAKE_URI = "ducklake:postgres:dbname=duck host=127.0.0.1 port=55433 user=postgres password=quacklab"
+PINK_LAKE_URI = (
+    "ducklake:postgres:dbname=pink_r2_cat host=127.0.0.1 port=55433 "
+    "user=postgres password=quacklab"
+)
 
 SIZES = {
     "smoke": [
@@ -353,15 +357,21 @@ def setup_units(engine, storage, mode, lake):
     units = []
     prefixed = engine == "duckdb" or mode == "emitted"
     if engine == "pinkdb" and mode == "emitted" and storage == "lake":
-        units.append(("attach", f"ATTACH '{DUCKLAKE_URI}' AS r2_cat;"))
+        units.append(("secret", lake.duck_secret()))
+        units.append(
+            ("attach", f"ATTACH '{PINK_LAKE_URI}' AS r2_cat (DATA_PATH 's3://lake/pink/');")
+        )
+        units.append(("use", "USE r2_cat;"))
     if engine == "pinkdb" and mode == "workaround":
         for schema in SCHEMAS:
             sql = lake.pink_lake_create(schema) if storage == "lake" else f"CREATE DATABASE {q(schema)};"
             units.append((f"database:{schema}", sql))
     else:
         for schema in SCHEMAS:
+            # pinkdb's emitted lake path already ran USE r2_cat.
+            qualifier = "" if engine == "pinkdb" and mode == "emitted" else "r2_cat."
             units.append(
-                (f"schema:{schema}", f"CREATE SCHEMA IF NOT EXISTS r2_cat.{q(schema)};")
+                (f"schema:{schema}", f"CREATE SCHEMA IF NOT EXISTS {qualifier}{q(schema)};")
             )
     for spec in SPECS:
         units.append((f"table:{spec['id']}", create_table(spec, prefixed)))
@@ -495,8 +505,9 @@ def etl_units(engine, storage, mode, batch, files, raw_prefix, data, gaps):
         text = substitute(
             sql, batch, "full" if len(files) > 1 else "incremental", table, files, raw_prefix, data
         )
-        if engine == "pinkdb" and mode == "workaround":
-            text = text.replace("r2_cat.", "")
+        if engine == "pinkdb":
+            if mode == "workaround":
+                text = text.replace("r2_cat.", "")
             if field == "stageLoadByTable":
                 if gaps.get("csv_types"):
                     text = cast_projection(strip_types(text), table)
@@ -519,7 +530,7 @@ def refresh_units(engine, mode, gaps, mv_columns):
         if engine == "pinkdb" and mode == "workaround":
             select = select.replace("r2_cat.", "")
         columns = mv_columns.get(spec["id"]) or [c["name"] for c in spec["columns"]]
-        if engine == "pinkdb" and mode == "workaround" and gaps.get("refresh_insert_by_name"):
+        if engine == "pinkdb" and gaps.get("refresh_insert_by_name"):
             insert = f"INSERT INTO {ref} ({', '.join(q(c) for c in columns)}) {select};"
         else:
             insert = f"INSERT INTO {ref} BY NAME {select};"
@@ -597,6 +608,7 @@ class Lake:
         if r.returncode:
             raise RuntimeError(f"pg_ctl failed: {tail(r.stderr)}\n{tail(log.read_text())}")
         self._createdb("duck")
+        self._createdb("pink_r2_cat")
         for schema in SCHEMAS:
             self._createdb(f"pink_{schema.lower()}")
 
@@ -760,12 +772,18 @@ def terminate(sql: str) -> str:
     return sql.rstrip().rstrip(";") + ";"
 
 
-def phase_script(ctx, engine, storage, store, units):
+def phase_script(ctx, engine, storage, store, units, use_lake=True):
     env = os.environ.copy()
     env["PINKDB_AGENT_MODE"] = "0"
     lines = []
     if engine == "pinkdb":
         lines.append(f".open {store}")
+        if (
+            use_lake
+            and storage == "lake"
+            and ctx["results"]["storages"][storage]["engines"][engine]["mode"] == "emitted"
+        ):
+            lines.append("USE r2_cat;")
         lines.append(".timer on")
         lines.extend(terminate(sql) for _, sql in units)
         lines.append(f".save {store}")
@@ -808,7 +826,7 @@ def validate_rows(boxes):
 
 
 def run_phase(ctx, engine, storage, store, units, label):
-    cmd, script, env = phase_script(ctx, engine, storage, store, units)
+    cmd, script, env = phase_script(ctx, engine, storage, store, units, label != "setup")
     log_dir = ctx["work"] / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{engine}-{storage}-{label}.log"
@@ -842,21 +860,25 @@ def probe_pink(ctx, storage, probe_store):
     if storage == "lake":
         r = run_plain(
             [ctx["bin"]["pink"], "-no-agent"],
-            f".open {probe_store}\nATTACH '{DUCKLAKE_URI}' AS r2_cat;\n",
+            f".open {probe_store}\n"
+            f"{ctx['lake'].duck_secret()}\n"
+            f"ATTACH '{PINK_LAKE_URI}' AS r2_cat (DATA_PATH 's3://lake/pink/');\n"
+            "USE r2_cat;\n",
             env,
             timeout=300,
         )
         if r["rc"]:
-            blocked = {"status": "blocked", "by": "132", "error": first_error(r["stdout"] + r["stderr"])}
+            blocked = {"status": "blocked", "error": first_error(r["stdout"] + r["stderr"])}
     if blocked is None:
         r = run_plain(
             [ctx["bin"]["pink"], "-no-agent"],
-            f'.open {probe_store}\nCREATE SCHEMA IF NOT EXISTS r2_cat."staging";\n',
+            f".open {probe_store}\nUSE r2_cat;\n"
+            'CREATE SCHEMA IF NOT EXISTS r2_cat."staging";\n',
             env,
             timeout=300,
         )
         if r["rc"]:
-            blocked = {"status": "blocked", "by": "131", "error": first_error(r["stdout"] + r["stderr"])}
+            blocked = {"status": "blocked", "error": first_error(r["stdout"] + r["stderr"])}
     for suffix in ("", ".wal"):
         path = Path(str(probe_store) + suffix)
         if path.exists():
@@ -1227,8 +1249,27 @@ def run_pink_charts(ctx, storage, clients, rounds, widgets):
         return chart_server_failure(clients, exc)
     peak, stop = rss_sampler(server["proc"])
     try:
+        # The emitted lake keeps the widget schemas in `r2_cat` and a server
+        # session starts in the store's `main`, so the widgets name the
+        # catalog, as the DuckDB client below does for its `memory` catalog.
+        emitted_lake = (
+            storage == "lake"
+            and ctx["results"]["storages"][storage]["engines"]["pinkdb"]["mode"]
+            == "emitted"
+        )
         queries = ctx["work"] / "charts.json"
-        queries.write_text(json.dumps({name: PLAN["chartSql"][name] for name in widgets}))
+        queries.write_text(
+            json.dumps(
+                {
+                    name: (
+                        qualify_catalog(PLAN["chartSql"][name])
+                        if emitted_lake
+                        else PLAN["chartSql"][name]
+                    )
+                    for name in widgets
+                }
+            )
+        )
         out = []
         for n in clients:
             try:
@@ -1292,8 +1333,12 @@ def run_pink_charts(ctx, storage, clients, rounds, widgets):
         stop_server(server)
 
 
-def qualify_for_quack(sql: str) -> str:
-    """Remote quack sessions start in the ``memory`` catalog: qualify the table."""
+def qualify_catalog(sql: str) -> str:
+    """Name ``r2_cat`` on a two-part widget table for a remote session.
+
+    DuckDB's quack client starts in ``memory`` and a pinkdb server session
+    starts in the store's ``main``; neither has the lake's schemas in scope.
+    """
     return re.sub(r'\b(FROM|JOIN)\s+("[^"]+"\."[^"]+")', r'\1 "r2_cat".\2', sql)
 
 
@@ -1322,7 +1367,7 @@ def run_duck_charts(ctx, storage, clients, rounds, widgets):
         return chart_server_failure(clients, exc)
     peak, stop = rss_sampler(server["proc"])
     widget_sqls = {
-        name: qualify_for_quack(PLAN["chartSql"][name]) for name in widgets
+        name: qualify_catalog(PLAN["chartSql"][name]) for name in widgets
     }
     try:
         out = []

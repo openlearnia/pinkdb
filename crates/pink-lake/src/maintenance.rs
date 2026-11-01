@@ -424,7 +424,7 @@ pub struct LakeSettings {
 }
 
 /// "Now" in microseconds since the Unix epoch (the cutoffs' unit).
-fn now_micros() -> i64 {
+pub(crate) fn now_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
