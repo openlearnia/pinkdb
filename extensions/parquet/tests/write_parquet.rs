@@ -54,6 +54,7 @@ fn read_rows(
         args: vec![TableFunctionArg {
             name: None,
             value: Value::Varchar(path.display().to_string()),
+            literal: None,
         }],
     };
     let schema = source

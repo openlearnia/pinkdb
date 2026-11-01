@@ -420,6 +420,7 @@ mod tests {
                         Some(name.to_string())
                     },
                     value,
+                    literal: None,
                 })
                 .collect(),
         }

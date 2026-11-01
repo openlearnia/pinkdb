@@ -946,6 +946,8 @@ enum CmpTail {
         negated: bool,
         right: Expr,
         escape: Option<Expr>,
+        /// `ILIKE`: the same pattern syntax, compared case-insensitively.
+        ci: bool,
     },
     SimilarTo {
         negated: bool,
@@ -1156,6 +1158,26 @@ fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
             negated,
             right,
             escape,
+            ci: true,
+        } => negate_if(
+            negated,
+            Expr::Function {
+                qual: Box::new(Qualifier::none()),
+                name: "ilike_escape".to_string(),
+                args: vec![
+                    left,
+                    right,
+                    escape.unwrap_or(Expr::Literal(Value::Varchar(String::new()))),
+                ],
+                distinct: false,
+                filter: None,
+            },
+        ),
+        CmpTail::Like {
+            negated,
+            right,
+            escape,
+            ci: false,
         } => match escape {
             None => Expr::Binary {
                 op: if negated {
@@ -1511,6 +1533,8 @@ peg::parser! {
         rule rparen() = ")" ws()
         rule lbracket() = "[" ws()
         rule rbracket() = "]" ws()
+        rule lbrace() = "{" ws()
+        rule rbrace() = "}" ws()
         rule star() = "*" ws()
         rule plus() = "+" ws()
         // `-` never starts a token when it opens a `--` line comment.
@@ -1702,9 +1726,6 @@ peg::parser! {
             = word("pivot") source:from_source() suffix:source_suffix() word("on") on:concat_expr()
               values:pivot_in()? using:pivot_using()? group:pivot_group_by()? tail:query_tail() {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      return Err("derived table needs an alias");
-                  }
                   let from = FromClause {
                       source, alias, col_aliases, at, sample: None, lateral, joins: Vec::new(),
                   };
@@ -2502,14 +2523,15 @@ peg::parser! {
               }
 
         rule insert() -> Statement
-            = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? source:insert_source()
+            = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() by_name:insert_by_name()
+              columns:col_name_list()? source:insert_source()
               oc:on_conflict()? ret:returning_clause() {?
                   if columns.is_some() && matches!(source, InsertSource::DefaultValues) {
                       return Err("You can not provide both a column list and DEFAULT VALUES, \
                                  please remove one of the two");
                   }
                   Ok(Statement::Insert {
-                      qual: t.0, table: t.1, columns, source, on_conflict: oc, returning: ret,
+                      qual: t.0, table: t.1, by_name, columns, source, on_conflict: oc, returning: ret,
                   })
               }
             / kw(Keyword::Insert) word("or") mode:insert_or() kw(Keyword::Into) t:table_ref()
@@ -2519,7 +2541,7 @@ peg::parser! {
                                  please remove one of the two");
                   }
                   Ok(Statement::Insert {
-                      qual: t.0, table: t.1, columns, source,
+                      qual: t.0, table: t.1, by_name: false, columns, source,
                       on_conflict: Some(OnConflict { columns: None, action: mode }),
                       returning: ret,
                   })
@@ -2527,6 +2549,12 @@ peg::parser! {
             / word("replace") kw(Keyword::Into) {?
                   Err("REPLACE INTO is not supported (DuckDB has no REPLACE INTO): spell it INSERT OR REPLACE")
               }
+
+        /// `INSERT INTO t BY NAME SELECT …`: match the query's columns to the
+        /// target's by name. Only the `SELECT` source takes it.
+        rule insert_by_name() -> bool
+            = word("by") word("name") { true }
+            / { false }
 
         /// `OR REPLACE` / `OR IGNORE` after `INSERT` (wave 95b).
         rule insert_or() -> OnConflictAction
@@ -2566,6 +2594,9 @@ peg::parser! {
             = word("default") word("values") { InsertSource::DefaultValues }
             / kw(Keyword::Values) rows:insert_rows() { InsertSource::Values(rows) }
             / q:select() { InsertSource::Select(Box::new(q)) }
+            // `INSERT INTO t BY NAME (SELECT …)`: DuckDB takes the parenthesized
+            // form too.
+            / lparen() q:select() rparen() { InsertSource::Select(Box::new(q)) }
 
         rule insert_rows() -> Vec<Vec<Expr>>
             = first:insert_row() rest:(comma() r:insert_row() { r })* {
@@ -2691,13 +2722,16 @@ peg::parser! {
         rule merge_condition() -> Expr = kw(Keyword::And) e:expr() { e }
 
         rule merge_action() -> MergeAction
-            = kw(Keyword::Update) kw(Keyword::Set) first:set_item()
+            = kw(Keyword::Update) kw(Keyword::Set) star() { MergeAction::UpdateAll }
+            / kw(Keyword::Update) kw(Keyword::Set) first:set_item()
               rest:(comma() s:set_item() { s })* {
                   let mut sets = vec![first];
                   sets.extend(rest);
                   MergeAction::Update { sets }
               }
             / kw(Keyword::Delete) { MergeAction::Delete }
+            / kw(Keyword::Insert) star() { MergeAction::InsertAll }
+            / kw(Keyword::Insert) word("by") word("name") { MergeAction::InsertByName }
             / kw(Keyword::Insert) columns:col_name_list()? kw(Keyword::Values) values:insert_row() {
                   MergeAction::Insert { columns, values }
               }
@@ -3035,9 +3069,7 @@ peg::parser! {
         rule from_list() -> FromClause
             = source:from_source() suffix:source_suffix() sample:sample_clause() joins:(j:from_entry() { j })* {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      Err("derived table needs an alias")
-                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
+                  if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(FromClause { source, alias, col_aliases, at, sample, lateral, joins })
@@ -3051,9 +3083,7 @@ peg::parser! {
         rule from_entry() -> JoinClause
             = comma() source:from_source() suffix:source_suffix() sample:sample_clause() {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      Err("derived table needs an alias")
-                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
+                  if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(JoinClause { kind: JoinKind::Cross, source, alias, col_aliases, at, sample, lateral, on: None })
@@ -3153,12 +3183,34 @@ peg::parser! {
         /// argument (DuckDB's `read_csv(f, header = true)`), never a
         /// comparison.
         rule table_function_arg() -> crate::sql::ast::TableFunctionCallArg
-            = name:ident() (named_arg_arrow() / "=" !"=" ws()) e:expr() {
-                  crate::sql::ast::TableFunctionCallArg { name: Some(name), expr: e }
+            = name:ident() (named_arg_arrow() / "=" !"=" ws()) f:struct_literal() {
+                  crate::sql::ast::TableFunctionCallArg {
+                      name: Some(name), expr: Expr::Literal(Value::Null), fields: Some(f),
+                  }
+              }
+            / name:ident() (named_arg_arrow() / "=" !"=" ws()) e:expr() {
+                  crate::sql::ast::TableFunctionCallArg { name: Some(name), expr: e, fields: None }
               }
             / e:expr() {
-                  crate::sql::ast::TableFunctionCallArg { name: None, expr: e }
+                  crate::sql::ast::TableFunctionCallArg { name: None, expr: e, fields: None }
               }
+
+        /// `{ 'k': v, … }`: DuckDB's STRUCT literal, which the CSV reader
+        /// takes for `types`/`columns`. Only a table-function argument
+        /// accepts the form — pinkdb has no STRUCT value type to hold it.
+        rule struct_literal() -> Vec<(String, Expr)>
+            = lbrace() first:struct_field() rest:(comma() f:struct_field() { f })* rbrace() {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        rule struct_field() -> (String, Expr)
+            = k:struct_key() ":" ws() v:expr() { (k, v) }
+
+        rule struct_key() -> String
+            = s:string_lit() { s }
+            / i:ident() { i }
 
         /// `:=` (DuckDB's named-argument form) or `=>` (accepted too).
         rule named_arg_arrow()
@@ -3214,9 +3266,7 @@ peg::parser! {
         rule join_clause() -> JoinClause
             = kw(Keyword::Cross) kw(Keyword::Join) source:from_source() suffix:source_suffix() sample:sample_clause() {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      Err("derived table needs an alias")
-                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
+                  if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(JoinClause { kind: JoinKind::Cross, source, alias, col_aliases, at, sample, lateral, on: None })
@@ -3224,9 +3274,7 @@ peg::parser! {
               }
             / kind:join_kind() source:from_source() suffix:source_suffix() sample:sample_clause() kw(Keyword::On) on:expr() {?
                   let ((source, lateral), (alias, col_aliases, at)) = (source, suffix);
-                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
-                      Err("derived table needs an alias")
-                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
+                  if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(JoinClause { kind, source, alias, col_aliases, at, sample, lateral, on: Some(on) })
@@ -3396,7 +3444,10 @@ peg::parser! {
               }
             / neg:not_flag() kw(Keyword::In) lparen() t:in_tail(neg) { t }
             / neg:not_flag() kw(Keyword::Like) right:concat_expr() escape:escape_clause()? {
-                  CmpTail::Like { negated: neg, right, escape }
+                  CmpTail::Like { negated: neg, right, escape, ci: false }
+              }
+            / neg:not_flag() word("ilike") right:concat_expr() escape:escape_clause()? {
+                  CmpTail::Like { negated: neg, right, escape, ci: true }
               }
             / neg:not_flag() word("similar") word("to") right:concat_expr() {
                   CmpTail::SimilarTo { negated: neg, right }
@@ -3406,7 +3457,7 @@ peg::parser! {
               }
             / op:cmp_op() right:concat_expr() { CmpTail::Binary { op, right } }
 
-        /// `ESCAPE '<one char>'` after a `LIKE` pattern.
+        /// `ESCAPE '<one char>'` after a `LIKE`/`ILIKE` pattern.
         rule escape_clause() -> Expr = word("escape") e:concat_expr() { e }
 
         rule in_tail(negated: bool) -> CmpTail
@@ -4901,7 +4952,6 @@ mod tests {
         "SELECT * FROM right;",
         "SELECT 1 AS left;",
         "SELECT 1 AS right;",
-        "SELECT * FROM (SELECT * FROM emp);",
         "INSERT INTO wt VALUES ",
         "SELECT/HAVING expression must be an aggregate or appear in GROUP BY",
         "UPDATE needs at least one SET assignment",
@@ -4979,7 +5029,6 @@ mod tests {
         "SELECT a FROM t GROUP BY;",
         "SELECT a FROM t ORDER BY;",
         "SELECT a FROM t HAVING;",
-        "SELECT * FROM (SELECT 1);",
         "SELECT * FROM (1);",
         "WITH a AS SELECT 1 SELECT * FROM a;",
         "SELECT 1 UNION SELECT;",
@@ -7062,5 +7111,162 @@ mod tests {
             panic!("unit is not a string literal: {sql}");
         };
         (args[0].clone(), unit.clone())
+    }
+
+    /// The body of a `NOT x` unary, else the expression itself.
+    fn without_not(e: Expr) -> Expr {
+        match e {
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } => *expr,
+            other => other,
+        }
+    }
+
+    /// `ILIKE` folds case, so it desugars to the `ilike_escape` scalar;
+    /// `LIKE … ESCAPE` keeps `like_escape` and a plain `LIKE` stays `~~`.
+    #[test]
+    fn ilike_and_like_escape_desugar() {
+        let ci = |sql: &str| without_not(projection_expr(parse_one(sql)));
+        let Expr::Function { name, args, .. } = ci("SELECT a ILIKE 'x%' AS b FROM t") else {
+            panic!("ILIKE is not a call");
+        };
+        assert_eq!(name, "ilike_escape");
+        assert_eq!(args.len(), 3, "no ESCAPE means an empty escape string");
+        assert_eq!(args[2], Expr::Literal(Value::Varchar(String::new())));
+        let Expr::Function { name, args, .. } =
+            ci(r#"SELECT a NOT ILIKE 'x\%' ESCAPE '\' AS b FROM t"#)
+        else {
+            panic!("NOT ILIKE ESCAPE is not a call");
+        };
+        assert_eq!(name, "ilike_escape");
+        assert_eq!(args[2], Expr::Literal(Value::Varchar("\\".to_string())));
+        let Expr::Function { name, .. } = without_not(projection_expr(parse_one(
+            r#"SELECT a LIKE 'x\%' ESCAPE '\' AS b"#,
+        ))) else {
+            panic!("LIKE ESCAPE is not a call");
+        };
+        assert_eq!(name, "like_escape");
+        assert!(matches!(
+            projection_expr(parse_one("SELECT a NOT LIKE 'x%' AS b")),
+            Expr::Binary {
+                op: BinaryOp::NotLike,
+                ..
+            }
+        ));
+        // `ILIKE` is a bare word, not a reserved one: a column may be named it.
+        assert!(matches!(
+            projection_expr(parse_one("SELECT ilike FROM t")),
+            Expr::Column { name, .. } if name == "ilike"
+        ));
+    }
+
+    #[test]
+    fn insert_by_name_parses() {
+        let Statement::Insert { by_name, .. } = parse_one("INSERT INTO t BY NAME SELECT 5 AS b")
+        else {
+            panic!("not an INSERT");
+        };
+        assert!(by_name, "BY NAME must reach the AST");
+        let Statement::Insert { by_name, .. } = parse_one("INSERT INTO t SELECT 1") else {
+            panic!("not an INSERT");
+        };
+        assert!(!by_name);
+        // `BY NAME` precedes a column list, as DuckDB's grammar has it.
+        parse_one("INSERT INTO t BY NAME (SELECT 5 AS b)");
+    }
+
+    #[test]
+    fn merge_set_star_and_insert_star_parse() {
+        let Statement::Merge { clauses, .. } = parse_one(
+            "MERGE INTO t USING s ON t.a = s.a \
+             WHEN MATCHED THEN UPDATE SET * \
+             WHEN NOT MATCHED THEN INSERT *",
+        ) else {
+            panic!("not a MERGE");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert!(matches!(clauses[0].action, MergeAction::UpdateAll));
+        assert!(matches!(clauses[1].action, MergeAction::InsertAll));
+        let Statement::Merge { clauses, .. } =
+            parse_one("MERGE INTO t USING s ON t.a = s.a WHEN NOT MATCHED THEN INSERT BY NAME")
+        else {
+            panic!("not a MERGE");
+        };
+        assert!(matches!(clauses[0].action, MergeAction::InsertByName));
+    }
+
+    /// The `{key: value, …}` literal is a table-function argument shape only;
+    /// anywhere else it stays a syntax error.
+    #[test]
+    fn table_function_struct_literal_arguments() {
+        let Statement::Select(sel) = parse_one(
+            "SELECT * FROM read_csv('f.csv', types = {'DAY_ID': 'DATE', AMT: 'DECIMAL(10,2)'})",
+        ) else {
+            panic!("not a SELECT");
+        };
+        let Some(FromClause {
+            source: FromSource::Function { args, .. },
+            ..
+        }) = sel.from
+        else {
+            panic!("not a table function");
+        };
+        assert_eq!(args[1].name.as_deref(), Some("types"));
+        let fields = args[1].fields.as_ref().expect("struct fields");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0, "DAY_ID");
+        assert_eq!(
+            fields[0].1,
+            Expr::Literal(Value::Varchar("DATE".to_string()))
+        );
+        assert_eq!(fields[1].0, "AMT");
+        assert_eq!(
+            fields[1].1,
+            Expr::Literal(Value::Varchar("DECIMAL(10,2)".to_string()))
+        );
+        // A plain argument carries no fields, and the list form stays an array.
+        assert!(args[0].fields.is_none());
+        let Statement::Select(sel) = parse_one("SELECT * FROM read_csv('f.csv', types = ['DATE'])")
+        else {
+            panic!("not a SELECT");
+        };
+        let Some(FromClause {
+            source: FromSource::Function { args, .. },
+            ..
+        }) = sel.from
+        else {
+            panic!("not a table function");
+        };
+        assert!(args[1].fields.is_none());
+        assert!(matches!(args[1].expr, Expr::ArrayLiteral(_)));
+        for bad in ["SELECT {a: 1};", "SELECT * FROM t WHERE {a: 1};"] {
+            assert!(parse(bad).is_err(), "{bad} must not parse");
+        }
+    }
+
+    /// DuckDB names an alias-less derived table `unnamed_subquery`; the parser
+    /// takes one wherever a FROM item goes.
+    #[test]
+    fn derived_tables_need_no_alias() {
+        let Statement::Select(sel) = parse_one("SELECT * FROM (SELECT 1 AS a)") else {
+            panic!("not a SELECT");
+        };
+        let Some(from) = sel.from else {
+            panic!("no FROM");
+        };
+        assert!(from.alias.is_none());
+        assert!(matches!(from.source, FromSource::Derived(_)));
+        for sql in [
+            "SELECT * FROM (SELECT 1 AS a) JOIN (SELECT 1 AS b) ON a = b;",
+            "SELECT (SELECT 1) IN (SELECT * FROM (SELECT 1));",
+            "INSERT INTO t SELECT * FROM (SELECT 1, 2);",
+            "CREATE TABLE t2 AS SELECT * FROM (SELECT 1);",
+            "MERGE INTO t USING (SELECT 1 AS a) ON t.a = a WHEN MATCHED THEN DELETE;",
+            "SELECT * FROM (SELECT 1 AS a), (SELECT 2 AS b);",
+        ] {
+            parse_one(sql);
+        }
     }
 }

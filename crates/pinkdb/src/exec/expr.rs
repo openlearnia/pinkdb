@@ -3624,12 +3624,30 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
             Err(_) => Ok(Value::Null),
         },
         ScalarFunc::LikeEscape => match (&row[0], &row[1], &row[2]) {
+            (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
             (Value::Varchar(s), Value::Varchar(pat), Value::Varchar(esc)) => {
                 let escape = escape_char(esc)?;
                 Ok(Value::Boolean(like_match_escape(s, pat, escape)))
             }
             (s, pat, esc) => Err(PinkDbError::Execution(format!(
                 "like_escape of {s}, {pat} and {esc}"
+            ))),
+        },
+        // `ILIKE … ESCAPE`: the same match over case-folded text.
+        // (A NULL in any position makes the result NULL, like every other
+        // scalar.)
+        ScalarFunc::IlikeEscape => match (&row[0], &row[1], &row[2]) {
+            (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
+            (Value::Varchar(s), Value::Varchar(pat), Value::Varchar(esc)) => {
+                let escape = escape_char(&fold_case(esc))?.map(fold_case_char);
+                Ok(Value::Boolean(like_match_escape(
+                    &fold_case(s),
+                    &fold_case(pat),
+                    escape,
+                )))
+            }
+            (s, pat, esc) => Err(PinkDbError::Execution(format!(
+                "ilike_escape of {s}, {pat} and {esc}"
             ))),
         },
         ScalarFunc::Contains => match (&row[0], &row[1]) {
@@ -4076,6 +4094,16 @@ fn find_segment(hay: &str, needle: &str) -> Option<usize> {
 /// The escape must be a single char or none; the binder checks that.
 fn like_match_escape(s: &str, pat: &str, escape: Option<char>) -> bool {
     LikeMatcher::new(pat, escape).matches(s)
+}
+
+/// `ILIKE`'s case folding: lowercase one char at a time, so `ß` stays `ß`
+/// (DuckDB's `LOWER` would make it `ss`).
+fn fold_case(s: &str) -> String {
+    s.chars().map(fold_case_char).collect()
+}
+
+fn fold_case_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
 }
 
 /// `s[from:to]` over chars: 1-based, inclusive, negative = from the end, and

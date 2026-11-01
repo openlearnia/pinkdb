@@ -593,6 +593,7 @@ fn substitute_source(
                     Ok(crate::sql::ast::TableFunctionCallArg {
                         name: a.name.clone(),
                         expr: substitute_expr(&a.expr, args, used)?,
+                        fields: a.fields.clone(),
                     })
                 })
                 .collect::<Result<_>>()?,

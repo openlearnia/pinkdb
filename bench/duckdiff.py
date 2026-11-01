@@ -875,6 +875,8 @@ def run_small():
         run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in DIALECT_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP)
+    for label, sql, ordered, expect_error in DIALECT3_QUERIES:
+        run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in STRING_EXT_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP + "\n" + STRING_EXT_SETUP)
     for label, sql, ordered, expect_error in NAN_QUERIES:
@@ -1416,6 +1418,12 @@ NAME_QUERIES = [
     ("name-arith", "SELECT -x, x + 1, x % 2, x <> 1 FROM nt;"),
     ("name-cast", "SELECT CAST(x AS INT), x::INT, CAST(s AS VARCHAR) FROM nt;"),
     ("name-call", "SELECT substr(s, 2, 1), upper(s), coalesce(x, 0), 'it''s' FROM nt;"),
+    # dialect-3: DuckDB names the star form `count_star()`, keeps FILTER in the
+    # name, and spells `ILIKE` as its operator.
+    ("name-count-star", "SELECT COUNT(*), (COUNT(*) + 1), COUNT(1), SUM(1) FROM nt;"),
+    ("name-count-filter", "SELECT COUNT(*) FILTER (WHERE x > 1), COUNT(DISTINCT x) FILTER (WHERE x > 0), AVG(x) FILTER (WHERE x > 0) FROM nt;"),
+    ("name-count-over", "SELECT COUNT(*) OVER (), COUNT(*) OVER (PARTITION BY x), SUM(x) OVER (ORDER BY x) FROM nt;"),
+    ("name-ilike", "SELECT s ILIKE 'a%', s NOT ILIKE 'a%', s ILIKE 'a%' ESCAPE '\\', s NOT ILIKE 'a%' ESCAPE '\\' FROM nt;"),
 ]
 
 
@@ -1868,8 +1876,21 @@ CSV_PROBES = [
     ("csv-gzip-option", "SELECT * FROM read_csv('{gz}', compression='gzip', header=true, delim=',') ORDER BY id;", True),
     ("csv-gzip-suffix", "SELECT COUNT(*), SUM(total) FROM read_csv('{gz}');", False),
     ("csv-insert-select-casts", "CREATE TABLE st (id VARCHAR, total DOUBLE); INSERT INTO st SELECT id, total FROM read_csv('{gz}', compression='gzip', header=true); SELECT * FROM st ORDER BY id;", True),
+    # dialect-3: the `types` / `dtypes` / `column_types` overrides and the
+    # `columns` schema, all as DuckDB's struct/list literals.
+    ("csv-types-struct", "SELECT * FROM read_csv('{gz}', types={'total': 'VARCHAR', 'active': 'VARCHAR'}) ORDER BY id;", True),
+    ("csv-types-dtypes", "SELECT * FROM read_csv('{gz}', dtypes={'id': 'VARCHAR'}) ORDER BY id;", True),
+    ("csv-column-types-list", "SELECT * FROM read_csv('{gz}', column_types=['VARCHAR', 'VARCHAR']) ORDER BY id;", True),
+    ("csv-columns-struct", "SELECT * FROM read_csv('{f}', columns={'id': 'INTEGER', 'region': 'VARCHAR', 'total': 'DOUBLE', 'active': 'BOOLEAN', 'day': 'DATE', 'note': 'VARCHAR'}) ORDER BY id;", True),
     # QuackLab's ETL: stage the gzip CSV in a temp table, then load the real one.
     ("csv-temp-stage-etl", "CREATE TABLE master (id INTEGER, region VARCHAR, total DECIMAL(10,2)); CREATE TEMP TABLE stage AS SELECT id, region, total FROM read_csv('{gz}'); INSERT INTO master SELECT id, region, total FROM stage; SELECT * FROM master ORDER BY id;", True),
+]
+
+
+CSV_ERROR_PROBES = [
+    ("csv-types-unknown-name", "SELECT * FROM read_csv('{f}', types={'zz': 'DATE'});"),
+    ("csv-columns-list-form", "SELECT * FROM read_csv('{f}', columns=['INTEGER']);"),
+    ("csv-types-bad-type", "SELECT * FROM read_csv('{f}', types={'id': 'WIDGET'});"),
 ]
 
 
@@ -1910,6 +1931,14 @@ def run_csv():
             prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
             ok = rows_equal(prows_n, d[1], ordered)
             check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
+        # Errors both engines must refuse: an unknown column name, and the
+        # list form of `columns`.
+        for label, template in CSV_ERROR_PROBES:
+            sql = template.replace("{f}", path).replace("{gz}", gz_path)
+            got = pink_query("", sql)
+            d = duck_query("", sql)
+            check(label, got[0] == "error" and d[0] == "error",
+                  f"pink={got[0]} duck={d[0]}")
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 
@@ -2059,6 +2088,74 @@ def run_remote():
         "note: remote Arrow is value-pinned in extensions/arrow/tests/remote.rs "
         "(DuckDB has no Arrow file reader)"
     )
+
+
+# ---- dialect-3 (2026-11): what QuackLab's charts and ETL still trip on ----
+#
+# Each case builds what it needs. Cases that must fail on both engines compare
+# only the class (error vs rows), like every other `expect_error` probe.
+DIALECT3_QUERIES = [
+    # ILIKE / NOT ILIKE, with and without ESCAPE.
+    ("d3-ilike-basic", "SELECT 'JFK' ILIKE 'jfk%', 'jfk' ILIKE 'JFK%', 'abc' ILIKE 'a_c', 'abc' ILIKE 'a%c', NULL ILIKE 'a', '' ILIKE '%';", False, False),
+    ("d3-ilike-not", "SELECT 'JFK' NOT ILIKE 'jfk%', 'jfk' NOT ILIKE 'JFK%', 'abc' NOT ILIKE 'a_c';", False, False),
+    ("d3-ilike-escape", "SELECT 'a%b' ILIKE 'a\\%b' ESCAPE '\\', 'axb' ILIKE 'a\\%b' ESCAPE '\\', 'JFK' NOT ILIKE 'x%' ESCAPE '\\', 'a_b' ILIKE 'a!_b' ESCAPE '!', 'a_b' ILIKE 'a!_b';", False, False),
+    ("d3-ilike-empty-escape", "SELECT 'a_b' ILIKE 'a\\_b' ESCAPE '', 'a_b' ILIKE 'a_b' ESCAPE '';", False, False),
+    ("d3-ilike-unicode", "SELECT 'É' ILIKE 'é', 'Straße' ILIKE 'STRASSE', 'İ' ILIKE 'i', 'ǅ' ILIKE 'ǆ';", False, False),
+    ("d3-ilike-widget", "SELECT COUNT(*) FROM emp WHERE CAST(name AS VARCHAR) ILIKE 'a%' ESCAPE '\\';", False, False),
+    ("d3-ilike-bad-escape", "SELECT 'a' ILIKE 'a' ESCAPE 'ab';", False, True),
+    # GROUP BY: a name binds to the FROM column first; an alias only stands in
+    # for a bare top-level key, never inside an expression.
+    ("d3-groupby-column-shadows-alias", "SELECT b + 1 AS a FROM (SELECT 1 AS a, 2 AS b) t GROUP BY a;", False, True),
+    ("d3-groupby-alias-fallback", "SELECT x + 1 AS z, COUNT(*) FROM (SELECT 1 AS x UNION ALL SELECT 1) t GROUP BY z ORDER BY z;", False, False),
+    ("d3-groupby-alias-in-expression", "SELECT b AS x FROM (SELECT 1 AS b) t GROUP BY x + 0;", False, True),
+    ("d3-groupby-alias-expr-key", "SELECT a + 1 AS a, COUNT(*) FROM (SELECT 1 AS a UNION ALL SELECT 2) t GROUP BY a + 1 ORDER BY a;", False, False),
+    ("d3-groupby-having-alias", "CREATE TABLE gb2 (b INTEGER); INSERT INTO gb2 VALUES (1), (2); SELECT b + 1 AS z FROM gb2 GROUP BY z HAVING z > 2 ORDER BY z;", True, False),
+    # ORDER BY: a bare name prefers the output alias; inside an expression the
+    # FROM column wins.
+    ("d3-orderby-alias-wins", "SELECT -id AS id FROM emp ORDER BY id;", True, False),
+    ("d3-orderby-expr-uses-column", "SELECT -id AS id FROM emp ORDER BY id + 0;", True, False),
+    ("d3-orderby-shadow-in-expr", "SELECT b AS a FROM (SELECT 1 AS a, 2 AS b) t ORDER BY a + 0;", True, False),
+    # The exact QuackLab widget shapes: a grouped date_trunc with the same
+    # alias as the source column, ordered by the expression.
+    ("d3-widget-revenue-month", "CREATE TABLE rm (DAY_ID DATE, AMT DECIMAL(10,2)); INSERT INTO rm VALUES (DATE '2024-01-05', 1.25), (DATE '2024-01-20', 2.50), (DATE '2024-02-01', 3.00); SELECT date_trunc('month', DAY_ID) AS DAY_ID, SUM(AMT) AS AMT FROM rm WHERE DAY_ID >= DATE '2024-01-01' - INTERVAL 1 DAY GROUP BY date_trunc('month', DAY_ID) ORDER BY date_trunc('month', DAY_ID);", True, False),
+    ("d3-widget-vendor-week", "CREATE TABLE wd (VENDOR_NAME VARCHAR, DAY_ID DATE, AMT INTEGER); INSERT INTO wd VALUES ('a', DATE '2024-01-03', 1), ('a', DATE '2024-01-10', 2), ('b', DATE '2024-01-04', 3); SELECT VENDOR_NAME, date_trunc('week', DAY_ID) AS DAY_ID, SUM(AMT) FROM wd GROUP BY VENDOR_NAME, date_trunc('week', DAY_ID) ORDER BY date_trunc('week', DAY_ID) ASC;", False, False),
+    ("d3-widget-od-distance-filtered", "SELECT CASE WHEN CAST(name AS VARCHAR) ILIKE 'JFK%' ESCAPE '\\' THEN 'JFK' ELSE 'other' END AS zone, COUNT(*) FROM emp GROUP BY zone ORDER BY zone;", True, False),
+    # INSERT ... BY NAME: matched by name, the rest default or NULL.
+    ("d3-insert-by-name", "CREATE TABLE bn (a INTEGER, b INTEGER DEFAULT 7, c VARCHAR); INSERT INTO bn BY NAME SELECT 5 AS b, 'x' AS c; INSERT INTO bn (a, c) VALUES (1, 'y'); INSERT INTO bn BY NAME (SELECT 2 AS a); SELECT * FROM bn ORDER BY a;", True, False),
+    ("d3-insert-by-name-case", "CREATE TABLE bn2 (a INTEGER, c VARCHAR); INSERT INTO bn2 BY NAME SELECT 1 AS A, 'x' AS C; SELECT * FROM bn2;", True, False),
+    ("d3-insert-by-name-unknown", "CREATE TABLE bn3 (a INTEGER); INSERT INTO bn3 BY NAME SELECT 1 AS zz;", False, True),
+    ("d3-insert-by-name-duplicate", "CREATE TABLE bn4 (a INTEGER); INSERT INTO bn4 BY NAME SELECT 1 AS a, 2 AS a;", False, True),
+    ("d3-insert-by-name-values", "CREATE TABLE bn5 (a INTEGER); INSERT INTO bn5 BY NAME VALUES (1);", False, True),
+    # MERGE SET * / INSERT * (positional over every target column) and
+    # INSERT BY NAME (by name).
+    ("d3-merge-update-set-star", "CREATE TABLE mt (a INTEGER, b INTEGER, c INTEGER); INSERT INTO mt VALUES (1, 2, 3); CREATE TABLE ms (a INTEGER, b INTEGER, c INTEGER); INSERT INTO ms VALUES (9, 8, 7); MERGE INTO mt USING ms ON mt.a = ms.a WHEN MATCHED THEN UPDATE SET *; SELECT * FROM mt;", True, False),
+    ("d3-merge-update-set-star-count", "CREATE TABLE mt (a INTEGER, b INTEGER, c INTEGER); INSERT INTO mt VALUES (1, 2, 3); CREATE TABLE ms (k INTEGER, a INTEGER, b INTEGER, c INTEGER); INSERT INTO ms VALUES (1, 9, 8, 7); MERGE INTO mt USING ms ON mt.a = ms.k WHEN MATCHED THEN UPDATE SET *;", False, True),
+    ("d3-merge-insert-star", "CREATE TABLE mt2 (a INTEGER, b INTEGER); CREATE TABLE ms2 (a INTEGER, b INTEGER); INSERT INTO ms2 VALUES (4, 5); MERGE INTO mt2 USING ms2 ON mt2.a = ms2.a WHEN NOT MATCHED THEN INSERT *; SELECT * FROM mt2;", True, False),
+    ("d3-merge-insert-by-name", "CREATE TABLE mt3 (a INTEGER, b INTEGER DEFAULT 7, c VARCHAR); CREATE TABLE ms3 (a INTEGER, c VARCHAR); INSERT INTO ms3 VALUES (1, 'x'); MERGE INTO mt3 USING ms3 ON mt3.a = ms3.a WHEN NOT MATCHED THEN INSERT BY NAME; SELECT * FROM mt3;", True, False),
+    ("d3-merge-insert-star-count", "CREATE TABLE mt4 (a INTEGER, b INTEGER); CREATE TABLE ms4 (a INTEGER); INSERT INTO ms4 VALUES (1); MERGE INTO mt4 USING ms4 ON mt4.a = ms4.a WHEN NOT MATCHED THEN INSERT *;", False, True),
+    ("d3-merge-update-set-star-count", "CREATE TABLE mt5 (a INTEGER, b INTEGER, c INTEGER); CREATE TABLE ms5 (a INTEGER, c INTEGER); INSERT INTO ms5 VALUES (1, 2); MERGE INTO mt5 USING ms5 ON mt5.a = ms5.a WHEN MATCHED THEN UPDATE SET *;", False, True),
+    ("d3-merge-unnamed-using", "CREATE TABLE mt6 (a INTEGER, b INTEGER); CREATE TABLE ms6 (a INTEGER); INSERT INTO ms6 VALUES (1); MERGE INTO mt6 USING (SELECT a FROM ms6) ON mt6.a = unnamed_subquery.a WHEN NOT MATCHED THEN INSERT VALUES (unnamed_subquery.a, 9); SELECT * FROM mt6;", True, False),
+    ("d3-merge-unnamed-using-ambiguous", "CREATE TABLE mt6 (a INTEGER, b INTEGER); CREATE TABLE ms6 (a INTEGER); INSERT INTO ms6 VALUES (1); MERGE INTO mt6 USING (SELECT a FROM ms6) ON mt6.a = a WHEN NOT MATCHED THEN INSERT VALUES (a, 9);", False, True),
+    # Derived tables without an alias: DuckDB names them `unnamed_subquery`,
+    # `unnamed_subquery2`, ...
+    ("d3-derived-unnamed", "SELECT * FROM (SELECT 1 AS a);", False, False),
+    ("d3-derived-unnamed-name", "SELECT unnamed_subquery.a FROM (SELECT 1 AS a);", False, False),
+    ("d3-derived-unnamed-join", "SELECT * FROM (SELECT 1 AS a) JOIN (SELECT 1 AS b) ON a = b;", False, False),
+    ("d3-derived-unnamed-second", "SELECT unnamed_subquery2.b FROM (SELECT 1 AS a), (SELECT 1 AS b);", False, False),
+    ("d3-derived-unnamed-first-ref", "SELECT unnamed_subquery1.a FROM (SELECT 1 AS a);", False, True),
+    ("d3-derived-unnamed-in", "SELECT id FROM emp WHERE did IN (SELECT did FROM (SELECT did FROM dept)) ORDER BY id;", True, False),
+    ("d3-derived-unnamed-exists", "SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM (SELECT did FROM dept) WHERE did = emp.did) ORDER BY id;", True, False),
+    ("d3-derived-unnamed-cte", "WITH c AS (SELECT 1 AS a) SELECT * FROM (SELECT a FROM c);", False, False),
+    ("d3-derived-unnamed-insert", "CREATE TABLE di (a INTEGER, b INTEGER); INSERT INTO di SELECT * FROM (SELECT 1, 2); SELECT * FROM di;", True, False),
+    ("d3-derived-unnamed-values", "CREATE TABLE dv (a INTEGER, b INTEGER); INSERT INTO dv SELECT * FROM (VALUES (1, 2)); SELECT * FROM dv;", True, False),
+    ("d3-derived-values-select", "SELECT * FROM (VALUES (3, 4));", True, False),
+    ("d3-derived-unnamed-ctas", "CREATE TABLE dc AS SELECT * FROM (SELECT 1 AS a); SELECT * FROM dc;", True, False),
+    ("d3-derived-unnamed-quacklab", "CREATE SCHEMA s; CREATE TABLE s.t (a INTEGER, b INTEGER); INSERT INTO s.t SELECT * FROM (SELECT 1, 2); SELECT * FROM s.t;", True, False),
+    ("d3-derived-unnamed-setop", "SELECT * FROM (SELECT 1 AS a UNION ALL SELECT 2) t ORDER BY a;", True, False),
+    ("d3-derived-unnamed-nested", "SELECT * FROM (SELECT * FROM (SELECT 1 AS a));", False, False),
+    ("d3-derived-unnamed-function", "SELECT * FROM range(2);", True, False),
+    ("d3-derived-unnamed-group", "SELECT a, COUNT(*) FROM (SELECT x AS a FROM jx) GROUP BY a ORDER BY a;", True, False),
+]
 
 
 def main():

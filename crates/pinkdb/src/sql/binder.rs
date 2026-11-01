@@ -123,6 +123,9 @@ pub enum ScalarFunc {
     TryCast,
     /// `like_escape(s, pattern, escape)` — the desugared `LIKE ... ESCAPE`.
     LikeEscape,
+    /// `ilike_escape(s, pattern, escape)` — the desugared `ILIKE ... ESCAPE`,
+    /// matched case-insensitively.
+    IlikeEscape,
     /// `similar_to(s, pattern)` — the desugared `SIMILAR TO`. DuckDB 2.0
     /// treats the pattern as a fully anchored regex (`%`/`_` are literal),
     /// and so does this.
@@ -213,6 +216,7 @@ impl ScalarFunc {
             "array_inner_product" => ScalarFunc::ArrayInnerProduct,
             "array_negative_inner_product" => ScalarFunc::ArrayNegativeInnerProduct,
             "like_escape" => ScalarFunc::LikeEscape,
+            "ilike_escape" => ScalarFunc::IlikeEscape,
             "similar_to" => ScalarFunc::SimilarTo,
             "contains" => ScalarFunc::Contains,
             "uuid" | "gen_random_uuid" => ScalarFunc::Uuid,
@@ -1777,6 +1781,35 @@ impl ScopeTable {
     }
 }
 
+/// How a bare name in an expression resolves against the select aliases of its
+/// query block.
+///
+/// DuckDB resolves each clause differently: `WHERE` and `ON` bind before the
+/// select list, so they never see an alias; a bare `ORDER BY` name prefers the
+/// alias; a column wins inside `GROUP BY` and inside an `ORDER BY` expression;
+/// and inside a `GROUP BY` expression an alias of that name is an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AliasMode {
+    /// Aliases are invisible: the name is a column (`WHERE`, `ON`, the select
+    /// list).
+    Off,
+    /// A column of that name wins; the alias is the fallback (`GROUP BY` and an
+    /// `ORDER BY` expression).
+    Fallback,
+    /// The alias wins over a column of the same name (`ORDER BY x`, `HAVING`,
+    /// `QUALIFY`).
+    Prefer,
+    /// `Fallback`, but an alias of that name is an error instead of the
+    /// fallback (inside a `GROUP BY` expression).
+    GroupExpr,
+}
+
+/// A single unqualified name: the one name position that can be a select alias
+/// rather than a source column.
+fn is_bare_name(e: &Expr) -> bool {
+    matches!(e, Expr::Column { qual, table: None, .. } if qual.is_empty())
+}
+
 /// One enclosing query block's FROM scope, for a correlated column reference.
 /// A block's tables are fixed by the time a subquery in its WHERE/SELECT/
 /// HAVING/ON binds, so the chain is snapshotted at that moment.
@@ -1808,8 +1841,8 @@ struct Binder<'a> {
     aliases: HashMap<String, Expr>,
     /// Aliases currently being resolved (cycle guard: `SELECT x AS x`).
     resolving: Vec<String>,
-    /// Whether bare columns consult aliases (false for WHERE).
-    allow_alias: bool,
+    /// How a bare column name resolves against the select aliases.
+    alias: AliasMode,
     /// Whether window functions may appear (false for WHERE/GROUP BY/HAVING).
     allow_win: bool,
     /// True while binding a window's own arguments (rejects nesting).
@@ -1882,7 +1915,7 @@ impl<'a> Binder<'a> {
             past: false,
             aliases: HashMap::new(),
             resolving: Vec::new(),
-            allow_alias: true,
+            alias: AliasMode::Prefer,
             allow_win: true,
             in_window: false,
             windows: Vec::new(),
@@ -1944,7 +1977,7 @@ impl<'a> Binder<'a> {
             past: false,
             aliases: HashMap::new(),
             resolving: Vec::new(),
-            allow_alias: true,
+            alias: AliasMode::Prefer,
             allow_win: true,
             in_window: false,
             windows: Vec::new(),
@@ -2507,15 +2540,28 @@ impl<'a> Binder<'a> {
                 // Alias substitution (`... ORDER BY x`), with a cycle guard so
                 // `SELECT x AS x` resolves to the column instead of recursing.
                 // Only unqualified names are select aliases.
-                if qual.is_empty() && table.is_none() && self.allow_alias {
+                if qual.is_empty() && table.is_none() && self.alias != AliasMode::Off {
                     let key = name.to_ascii_lowercase();
                     if !self.resolving.contains(&key)
                         && let Some(aliased) = self.aliases.get(&key).cloned()
                     {
-                        self.resolving.push(key);
-                        let bound = self.bind_expr(&aliased, aggs, allow_agg);
-                        self.resolving.pop();
-                        return bound;
+                        // A source column of that name shadows the alias
+                        // everywhere but a bare ORDER BY name. Inside a GROUP
+                        // BY expression an alias that is not also a column is
+                        // an error, not a fallback (DuckDB's rule).
+                        let shadowed = self.lookup_column(qual, None, name).is_ok();
+                        if !shadowed && self.alias == AliasMode::GroupExpr {
+                            return Err(PinkDbError::Catalog(format!(
+                                "Alias with name \"{name}\" exists, but aliases cannot be used as \
+                                 part of an expression in the GROUP BY"
+                            )));
+                        }
+                        if self.alias == AliasMode::Prefer || !shadowed {
+                            self.resolving.push(key);
+                            let bound = self.bind_expr(&aliased, aggs, allow_agg);
+                            self.resolving.pop();
+                            return bound;
+                        }
                     }
                 }
                 match self.lookup_column(qual, table.as_deref(), name) {
@@ -5107,9 +5153,24 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
         ScalarFunc::LikeEscape => {
             arity(&[3])?;
             for a in args {
-                if a.dtype() != DataType::Varchar {
+                // An untyped NULL is a VARCHAR NULL here; anything else must
+                // already be text.
+                if a.dtype() != DataType::Varchar && !matches!(a, BoundExpr::Literal(Value::Null)) {
                     return Err(PinkDbError::Type(
                         "like_escape needs VARCHAR on all three arguments".to_string(),
+                    ));
+                }
+            }
+            Ok(DataType::Boolean)
+        }
+        ScalarFunc::IlikeEscape => {
+            arity(&[3])?;
+            for a in args {
+                // An untyped NULL is a VARCHAR NULL here; anything else must
+                // already be text.
+                if a.dtype() != DataType::Varchar && !matches!(a, BoundExpr::Literal(Value::Null)) {
+                    return Err(PinkDbError::Type(
+                        "ilike_escape needs VARCHAR on all three arguments".to_string(),
                     ));
                 }
             }
@@ -5411,7 +5472,101 @@ fn qual_text(qual: &Qualifier) -> String {
     out
 }
 
+/// The operands of an escapeless `ILIKE`, as the parser desugars it
+/// (`ilike_escape(left, right, '')`).
+fn plain_ilike(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::Function {
+        name,
+        args,
+        distinct: false,
+        filter: None,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    let [left, right, escape] = args.as_slice() else {
+        return None;
+    };
+    let empty = matches!(escape, Expr::Literal(Value::Varchar(e)) if e.is_empty());
+    (name.eq_ignore_ascii_case("ilike_escape") && empty).then_some((left, right))
+}
+
+/// The `OVER (…)` text of a window, as DuckDB writes it in a column name.
+/// A reference to a named window keeps its name here: the definition lives in
+/// the binder, and DuckDB's own choice to inline it is not worth copying.
+fn over_text(over: &OverSpec) -> String {
+    let Some(clause) = over.inline() else {
+        return match over {
+            OverSpec::Named(name) => format!("OVER {name}"),
+            OverSpec::Inline(_) => unreachable!("inline spec handled above"),
+        };
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if !clause.partition.is_empty() {
+        let keys: Vec<String> = clause.partition.iter().map(default_name).collect();
+        parts.push(format!("PARTITION BY {}", keys.join(", ")));
+    }
+    if !clause.order.is_empty() {
+        let items: Vec<String> = clause
+            .order
+            .iter()
+            .map(|item| {
+                let mut text = default_name(&item.expr);
+                if item.desc {
+                    text.push_str(" DESC");
+                }
+                match item.nulls_first {
+                    Some(true) => text.push_str(" NULLS FIRST"),
+                    Some(false) => text.push_str(" NULLS LAST"),
+                    None => {}
+                }
+                text
+            })
+            .collect();
+        parts.push(format!("ORDER BY {}", items.join(", ")));
+    }
+    if let Some(frame) = &clause.frame {
+        // The binder has its own `FrameBound`/`FrameMode`; name the AST's.
+        use crate::sql::ast::FrameBound as AstBound;
+        let bound = |b: &AstBound| match b {
+            AstBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+            AstBound::Preceding(n) => format!("{n} PRECEDING"),
+            AstBound::CurrentRow => "CURRENT ROW".to_string(),
+            AstBound::Following(n) => format!("{n} FOLLOWING"),
+            AstBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+        };
+        let mode = match frame.mode {
+            crate::sql::ast::FrameMode::Rows => "ROWS",
+            crate::sql::ast::FrameMode::Range => "RANGE",
+        };
+        parts.push(format!(
+            "{mode} BETWEEN {} AND {}",
+            bound(&frame.start),
+            bound(&frame.end)
+        ));
+    }
+    format!("OVER ({})", parts.join(" "))
+}
+
+/// A function call's output name, with DuckDB's spelling for the one call it
+/// renames: an unaliased `count(*)` is `count_star()` (also inside a larger
+/// expression), while `count(1)`, `sum(1)` and `count(DISTINCT x)` keep their
+/// text.
+fn count_named(lower: &str, inner: &[String], distinct: bool) -> String {
+    if lower == "count" && !distinct && inner.len() == 1 && inner[0] == "*" {
+        return "count_star()".to_string();
+    }
+    let distinct = if distinct { "DISTINCT " } else { "" };
+    format!("{lower}({distinct}{})", inner.join(", "))
+}
+
 fn default_name(expr: &Expr) -> String {
+    // `s ILIKE 'a%'` desugars to `ilike_escape(s, 'a%', '')`; DuckDB names the
+    // plain (escapeless) form as the operator it is.
+    if let Some((left, right)) = plain_ilike(expr) {
+        return format!("({} ~~* {})", default_name(left), default_name(right));
+    }
     match expr {
         // DuckDB renders a string literal with its quotes (and doubled inner
         // quotes), so `SELECT s NOT LIKE 'a%'` names the column
@@ -5468,7 +5623,13 @@ fn default_name(expr: &Expr) -> String {
             format!("({} {sym} {})", default_name(left), default_name(right))
         }
         Expr::Unary { op, expr } => match op {
-            UnaryOp::Not => format!("(NOT {})", default_name(expr)),
+            // `NOT ILIKE` is DuckDB's `!~~*` for the escapeless form.
+            UnaryOp::Not => match plain_ilike(expr) {
+                Some((left, right)) => {
+                    format!("({} !~~* {})", default_name(left), default_name(right))
+                }
+                None => format!("(NOT {})", default_name(expr)),
+            },
             UnaryOp::Negate => format!("(-({}))", default_name(expr)),
             UnaryOp::Plus => default_name(expr),
         },
@@ -5498,6 +5659,7 @@ fn default_name(expr: &Expr) -> String {
             name,
             args,
             distinct,
+            filter,
             ..
         } => {
             let inner: Vec<String> = args
@@ -5515,20 +5677,20 @@ fn default_name(expr: &Expr) -> String {
             if name.starts_with('$') {
                 return name.clone();
             }
-            let distinct = if *distinct { "DISTINCT " } else { "" };
             let lower = name.to_ascii_lowercase();
             // An ordered-set aggregate was folded into a plain call by the
             // parser; name it the way it was written.
-            match (lower.as_str(), args.as_slice()) {
-                ("mode", [_]) => {
-                    return format!("mode() WITHIN GROUP (ORDER BY {})", inner[0]);
-                }
+            let mut out = match (lower.as_str(), args.as_slice()) {
+                ("mode", [_]) => format!("mode() WITHIN GROUP (ORDER BY {})", inner[0]),
                 ("percentile_cont" | "percentile_disc", [_, _]) => {
-                    return format!("{lower}({} ORDER BY {})", inner[0], inner[1]);
+                    format!("{lower}({} ORDER BY {})", inner[0], inner[1])
                 }
-                _ => {}
+                _ => count_named(&lower, &inner, *distinct),
+            };
+            if let Some(f) = filter {
+                out.push_str(&format!(" FILTER (WHERE {})", default_name(f)));
             }
-            format!("{lower}({distinct}{})", inner.join(", "))
+            out
         }
         Expr::ScalarSubquery(_) => "(subquery)".to_string(),
         Expr::InSubquery { negated, .. } => {
@@ -5537,7 +5699,13 @@ fn default_name(expr: &Expr) -> String {
         Expr::Exists { negated, .. } => {
             format!("{}exists(subquery)", if *negated { "not " } else { "" })
         }
-        Expr::Window { name, args, .. } => {
+        Expr::Window {
+            name,
+            args,
+            over,
+            filter,
+            ..
+        } => {
             let inner: Vec<String> = args
                 .iter()
                 .map(|a| {
@@ -5548,7 +5716,20 @@ fn default_name(expr: &Expr) -> String {
                     }
                 })
                 .collect();
-            format!("{}({}) OVER", name.to_ascii_lowercase(), inner.join(", "))
+            let lower = name.to_ascii_lowercase();
+            // DuckDB spells `count(*) OVER ()` as `count() OVER ()`, and keeps
+            // the whole window in the name.
+            let mut out = if lower == "count" && inner.len() == 1 && inner[0] == "*" {
+                format!("{lower}()")
+            } else {
+                format!("{lower}({})", inner.join(", "))
+            };
+            if let Some(f) = filter {
+                out.push_str(&format!(" FILTER (WHERE {})", default_name(f)));
+            }
+            out.push(' ');
+            out.push_str(&over_text(over));
+            out
         }
         Expr::Coalesce(args) => {
             let inner: Vec<String> = args.iter().map(default_name).collect();
@@ -7749,13 +7930,13 @@ fn bind_join_shape(
     };
     // ON binds with table columns only (no aliases, no windows, no
     // aggregates), exactly like WHERE.
-    let saved_alias = binder.allow_alias;
+    let saved_alias = binder.alias;
     let saved_win = binder.allow_win;
-    binder.allow_alias = false;
+    binder.alias = AliasMode::Off;
     binder.allow_win = false;
     let mut aggs = Vec::new();
     let bound = binder.bind_expr(on, &mut aggs, false);
-    binder.allow_alias = saved_alias;
+    binder.alias = saved_alias;
     binder.allow_win = saved_win;
     let bound = bound?;
     if !aggs.is_empty() {
@@ -7959,6 +8140,7 @@ fn bind_tracked_plan(
         Statement::Insert {
             qual: qdb,
             table,
+            by_name,
             columns,
             source,
             on_conflict,
@@ -7969,6 +8151,7 @@ fn bind_tracked_plan(
                 default_ns,
                 qdb,
                 table,
+                *by_name,
                 columns,
                 rows,
                 false,
@@ -7982,6 +8165,7 @@ fn bind_tracked_plan(
                 default_ns,
                 qdb,
                 table,
+                *by_name,
                 columns,
                 &[],
                 true,
@@ -7995,6 +8179,7 @@ fn bind_tracked_plan(
                 default_ns,
                 qdb,
                 table,
+                *by_name,
                 columns,
                 query,
                 on_conflict.as_ref(),
@@ -9747,7 +9932,7 @@ pub(crate) fn bind_constant_expr_tracked(
 ) -> Result<(BoundExpr, Vec<String>)> {
     let mut binder = Binder::new(db, default_ns).with_params(params);
     binder.allow_win = false;
-    binder.allow_alias = false;
+    binder.alias = AliasMode::Off;
     let mut aggs = Vec::new();
     let bound = binder.bind_expr(expr, &mut aggs, false)?;
     if !aggs.is_empty() {
@@ -9933,7 +10118,7 @@ fn bind_update(
         }
         bound_sets.push((idx, bound));
     }
-    binder.allow_alias = false;
+    binder.alias = AliasMode::Off;
     let mut no_aggs = Vec::new();
     let predicate = where_clause
         .as_ref()
@@ -10000,7 +10185,7 @@ fn bind_delete(
         .with_session(session.clone())
         .with_params(params.clone());
     binder.allow_win = false;
-    binder.allow_alias = false;
+    binder.alias = AliasMode::Off;
     // `DELETE … USING` binds its sources first (row = source ++ target).
     let using_plan = match using {
         Some(using) => Some(Box::new(bind_from_scope(db, &mut binder, using)?)),
@@ -10123,7 +10308,7 @@ fn bind_returning(
         .with_session(session.clone())
         .with_params(params);
     binder.allow_win = false;
-    binder.allow_alias = false;
+    binder.alias = AliasMode::Off;
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
         original: Some(t.name.to_ascii_lowercase()),
@@ -10602,7 +10787,7 @@ fn bind_conflict(
         .with_session(session.clone())
         .with_params(params);
     binder.allow_win = false;
-    binder.allow_alias = false;
+    binder.alias = AliasMode::Off;
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
         original: Some(t.name.to_ascii_lowercase()),
@@ -10662,6 +10847,84 @@ fn bind_conflict(
     ))
 }
 
+/// `UPDATE SET *` / `INSERT *`: every target column takes the source column at
+/// the same position.
+fn merge_all_columns(
+    t: &DataTable,
+    source: &[(String, DataType)],
+    label: &str,
+) -> Result<Vec<(usize, BoundExpr)>> {
+    let schema = t.schema();
+    if source.len() != schema.len() {
+        return Err(PinkDbError::Catalog(format!(
+            "Data provided for {label} did not match column count in table - expected {} columns \
+             but got {}",
+            schema.len(),
+            source.len()
+        )));
+    }
+    schema
+        .iter()
+        .zip(source.iter())
+        .enumerate()
+        .map(|(i, ((name, want), (_, dtype)))| {
+            if !can_assign(*dtype, *want) {
+                return Err(PinkDbError::Type(format!(
+                    "cannot assign {dtype} to {want} column \"{name}\""
+                )));
+            }
+            Ok((
+                i,
+                BoundExpr::Column {
+                    index: i,
+                    dtype: *dtype,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Finish a MERGE INSERT: every column the source does not write takes its
+/// DEFAULT, or NULL.
+#[allow(clippy::too_many_arguments)]
+fn merge_insert(
+    db: &PinkDb,
+    table_db: &SchemaPath,
+    t: &DataTable,
+    mut bound: Vec<(usize, BoundExpr)>,
+    takes_default: Vec<bool>,
+    params: Option<ParamSlots>,
+    session: &Session,
+    dynamic: &mut Vec<String>,
+) -> Result<crate::plan::MergeActionPlan> {
+    for (col, take) in takes_default.iter().enumerate() {
+        if !take {
+            continue;
+        }
+        let (_, want) = t.schema()[col].clone();
+        let e = match &t.columns[col].default {
+            Some(default) => {
+                let ast = crate::sql::parse_expr(&default.text)?;
+                bind_column_default(
+                    db,
+                    table_db,
+                    &default.text,
+                    &ast,
+                    want,
+                    params.clone(),
+                    session,
+                    dynamic,
+                )?
+                .expr
+            }
+            None => BoundExpr::Literal(Value::Null),
+        };
+        bound.push((col, e));
+    }
+    let (columns, values) = bound.into_iter().unzip();
+    Ok(crate::plan::MergeActionPlan::Insert { columns, values })
+}
+
 /// Bind `MERGE INTO target USING source ON cond WHEN … THEN …`.
 #[allow(clippy::too_many_arguments)]
 fn bind_merge(
@@ -10693,10 +10956,18 @@ fn bind_merge(
         .with_session(session.clone())
         .with_params(params.clone());
     binder.allow_win = false;
-    binder.allow_alias = false;
+    binder.alias = AliasMode::Off;
     // The source binds first (column 0..), then the target row follows it in
     // every expression's input row; the source cannot see the target.
     let source = bind_from_scope(db, &mut binder, using)?;
+    // Source columns come first in every MERGE row, so `SET *` / `INSERT *`
+    // read the source column at the target column's position (DuckDB matches
+    // them positionally, not by name).
+    let source_cols: Vec<(String, DataType)> = binder
+        .tables
+        .iter()
+        .flat_map(|s| s.columns.iter().cloned())
+        .collect();
     let target_name = alias.unwrap_or(&t.name).to_ascii_lowercase();
     binder.tables.push(ScopeTable {
         name: target_name,
@@ -10732,7 +11003,70 @@ fn bind_merge(
             MergeAction::Update { sets } => crate::plan::MergeActionPlan::Update {
                 sets: bind_sets(&mut binder, t, &table_db, sets, "MERGE")?,
             },
+            MergeAction::UpdateAll => crate::plan::MergeActionPlan::Update {
+                sets: merge_all_columns(t, &source_cols, "UPDATE")?,
+            },
             MergeAction::Delete => crate::plan::MergeActionPlan::Delete,
+            MergeAction::InsertAll | MergeAction::InsertByName => {
+                let by_name = matches!(clause.action, MergeAction::InsertByName);
+                let written: Vec<usize> = if by_name {
+                    let mut seen = std::collections::HashSet::new();
+                    source_cols
+                        .iter()
+                        .map(|(name, _)| {
+                            if !seen.insert(name.to_ascii_lowercase()) {
+                                return Err(PinkDbError::Catalog(format!(
+                                    "Duplicate column name \"{name}\" in INSERT"
+                                )));
+                            }
+                            t.column_index(name).map_err(|_| {
+                                PinkDbError::Catalog(format!(
+                                    "Table \"{table}\" does not have a column with name \"{name}\""
+                                ))
+                            })
+                        })
+                        .collect::<Result<_>>()?
+                } else {
+                    if source_cols.len() != t.schema().len() {
+                        return Err(PinkDbError::Catalog(format!(
+                            "table \"{table}\" has {} columns but {} values were supplied",
+                            t.schema().len(),
+                            source_cols.len()
+                        )));
+                    }
+                    (0..t.schema().len()).collect()
+                };
+                let takes_default: Vec<bool> = (0..t.schema().len())
+                    .map(|col| !written.contains(&col))
+                    .collect();
+                let mut bound: Vec<(usize, BoundExpr)> = Vec::with_capacity(written.len());
+                for (src, &col) in written.iter().enumerate() {
+                    let (sname, sdtype) = source_cols[src].clone();
+                    let (_, want) = t.schema()[col].clone();
+                    if !can_assign(sdtype, want) {
+                        return Err(PinkDbError::Type(format!(
+                            "cannot insert {sdtype} into {want} column \"{sname}\""
+                        )));
+                    }
+                    bound.push((
+                        col,
+                        BoundExpr::Column {
+                            index: src,
+                            dtype: sdtype,
+                        },
+                    ));
+                }
+                merge_insert(
+                    db,
+                    &table_db,
+                    t,
+                    bound,
+                    takes_default,
+                    params.clone(),
+                    session,
+                    &mut merge_default_dynamic,
+                )?
+            }
             MergeAction::Insert { columns, values } => {
                 let written: Vec<usize> = match columns {
                     Some(cols) => {
@@ -10813,11 +11147,16 @@ fn bind_merge(
                     };
                     bound.push((col, e));
                 }
-                let (cols, values) = bound.into_iter().unzip();
-                crate::plan::MergeActionPlan::Insert {
-                    columns: cols,
-                    values,
-                }
+                merge_insert(
+                    db,
+                    &table_db,
+                    t,
+                    bound,
+                    takes_default,
+                    params.clone(),
+                    session,
+                    &mut merge_default_dynamic,
+                )?
             }
         };
         bound_clauses.push(crate::plan::MergeClausePlan {
@@ -10860,6 +11199,7 @@ fn bind_insert(
     default_ns: &SchemaPath,
     qdb: &Qualifier,
     table: &str,
+    by_name: bool,
     columns: &Option<Vec<String>>,
     rows: &[Vec<Expr>],
     default_values: bool,
@@ -10868,6 +11208,11 @@ fn bind_insert(
     params: Option<ParamSlots>,
     session: &Session,
 ) -> Result<(LogicalPlan, Vec<String>)> {
+    if by_name {
+        return Err(PinkDbError::Catalog(
+            "INSERT BY NAME can only be used when inserting from a SELECT statement".to_string(),
+        ));
+    }
     let table_db = Binder::new(db, default_ns)
         .with_session(session.clone())
         .resolve_table_ns(qdb, table)?;
@@ -11030,6 +11375,7 @@ fn bind_insert_select(
     default_ns: &SchemaPath,
     qdb: &Qualifier,
     table: &str,
+    by_name: bool,
     columns: &Option<Vec<String>>,
     query: &Select,
     on_conflict: Option<&OnConflict>,
@@ -11070,7 +11416,25 @@ fn bind_insert_select(
         .with_params(params.clone());
     let query_plan = bind_select_in(db, &mut binder, query)?;
     let source = plan_schema(db, &binder.default_ns, &binder.ctes, &query_plan)?;
-    if source.len() != order.len() {
+    let mut order = order;
+    if by_name {
+        // `BY NAME`: the query's output names pick the target columns; the
+        // ones it does not name keep their DEFAULT.
+        order.clear();
+        let mut seen = std::collections::HashSet::new();
+        for (name, _) in &source {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(PinkDbError::Catalog(format!(
+                    "Duplicate column name \"{name}\" in INSERT"
+                )));
+            }
+            order.push(t.column_index(name).map_err(|_| {
+                PinkDbError::Catalog(format!(
+                    "Table \"{table}\" does not have a column with name \"{name}\""
+                ))
+            })?);
+        }
+    } else if source.len() != order.len() {
         return Err(PinkDbError::Execution(format!(
             "INSERT has {} values for {} columns",
             source.len(),
@@ -12315,20 +12679,83 @@ fn bind_table_function_args(
 ) -> Result<Vec<TableFunctionArg>> {
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
-        let value = literal_arg_value(&arg.expr).ok_or_else(|| {
-            PinkDbError::Type(
+        // `{key: value, …}` and `[…]` are carried as the literal's text (the
+        // engine has no STRUCT or text-list value); every other argument must
+        // be a single literal.
+        let (value, literal) = if let Some(fields) = &arg.fields {
+            (Value::Null, Some(struct_text(fields)?))
+        } else if let Some(value) = literal_arg_value(&arg.expr) {
+            (value, None)
+        } else if let Expr::ArrayLiteral(items) = &arg.expr {
+            (Value::Null, Some(list_text(items)?))
+        } else {
+            return Err(PinkDbError::Type(
                 "a table-function argument must be a literal (got an expression); \
                  write the value directly, e.g. read_parquet('file.parquet', \
                  union_by_name := TRUE)"
                     .to_string(),
-            )
-        })?;
+            ));
+        };
         out.push(TableFunctionArg {
             name: arg.name.clone(),
             value,
+            literal,
         });
     }
     Ok(out)
+}
+
+/// The `{'key': 'value', …}` text of a struct literal, for the sources that
+/// read it back (`read_csv(…, types={…})`).
+fn struct_text(fields: &[(String, Expr)]) -> Result<String> {
+    let mut out = String::from("{");
+    for (i, (key, expr)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        // A bare identifier is DuckDB's deprecated implicit string
+        // (`types={a: DATE}`): refused, with the quoting it wants.
+        let value = literal_text(expr).ok_or_else(|| {
+            PinkDbError::Type(format!(
+                "a table-function argument field must be a literal (in field \"{key}\"); \
+                 write a string literal, e.g. {{a: 'DATE'}}"
+            ))
+        })?;
+        out.push('\'');
+        out.push_str(key);
+        out.push_str("': ");
+        out.push_str(&value);
+    }
+    out.push('}');
+    Ok(out)
+}
+
+/// The `['a', …]` text of a list literal, for the same sources.
+fn list_text(items: &[Expr]) -> Result<String> {
+    let mut out = String::from("[");
+    for (i, expr) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&literal_text(expr).ok_or_else(|| {
+            PinkDbError::Type("a table-function argument list must hold literals".to_string())
+        })?);
+    }
+    out.push(']');
+    Ok(out)
+}
+
+/// One literal inside such a literal, as text: strings quoted, the rest by
+/// their own display shape.
+fn literal_text(expr: &Expr) -> Option<String> {
+    Some(match literal_arg_value(expr)? {
+        Value::Varchar(s) => format!("'{s}'"),
+        Value::Integer(i) => i.to_string(),
+        Value::Bigint(i) => i.to_string(),
+        Value::Double(d) => d.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        _ => return None,
+    })
 }
 
 /// The literal value of a table-function argument expression, if it is one.
@@ -14978,12 +15405,32 @@ fn with_sample(plan: LogicalPlan, sample: Option<&crate::sql::ast::SampleSpec>) 
     }
 }
 
+/// DuckDB's name for a derived table without an alias: `unnamed_subquery`, then
+/// `unnamed_subquery2`, `unnamed_subquery3`, … counting only the unnamed
+/// subqueries of one FROM list (`unnamed_subquery1` does not exist).
+fn derived_alias(
+    source: &FromSource,
+    alias: &Option<String>,
+    unnamed: &mut usize,
+) -> Option<String> {
+    if alias.is_some() || !matches!(source, FromSource::Derived(_)) {
+        return alias.clone();
+    }
+    *unnamed += 1;
+    Some(if *unnamed == 1 {
+        "unnamed_subquery".to_string()
+    } else {
+        format!("unnamed_subquery{unnamed}")
+    })
+}
+
 fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Result<LogicalPlan> {
+    let mut unnamed = 0usize;
     let (left, left_plan) = bind_source(
         db,
         binder,
         &from.source,
-        &from.alias,
+        &derived_alias(&from.source, &from.alias, &mut unnamed),
         &from.col_aliases,
         from.at,
         from.lateral,
@@ -14996,7 +15443,7 @@ fn bind_from_scope(db: &PinkDb, binder: &mut Binder, from: &FromClause) -> Resul
             db,
             binder,
             &join.source,
-            &join.alias,
+            &derived_alias(&join.source, &join.alias, &mut unnamed),
             &join.col_aliases,
             join.at,
             join.lateral,
@@ -15101,14 +15548,14 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     // WHERE (aggregates forbidden; aliases NOT visible here — standard SQL
     // resolves WHERE against table columns so aliases never shadow them).
     let mut where_aggs = Vec::new();
-    binder.allow_alias = false;
+    binder.alias = AliasMode::Off;
     binder.allow_win = false;
     let filter = sel
         .where_clause
         .as_ref()
         .map(|e| binder.bind_expr(e, &mut where_aggs, false))
         .transpose()?;
-    binder.allow_alias = true;
+    binder.alias = AliasMode::Prefer;
     binder.allow_win = true;
     debug_assert!(where_aggs.is_empty());
     if let Some(f) = &filter
@@ -15243,14 +15690,16 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     // same list (standard SQL exposes them only to ORDER BY / GROUP BY /
     // HAVING), so `SELECT id*2 AS id, id` resolves the second `id` to the
     // input column, not the alias.
-    let saved_alias = binder.allow_alias;
-    binder.allow_alias = false;
+    let saved_alias = binder.alias;
+    binder.alias = AliasMode::Off;
     for (e, name) in &pending {
         select.push((binder.bind_expr(e, &mut aggs, true)?, name.clone()));
     }
-    binder.allow_alias = saved_alias;
+    binder.alias = saved_alias;
 
-    // GROUP BY keys (pre-agg scope, no aggregates, no windows).
+    // GROUP BY keys (pre-agg scope, no aggregates, no windows). A bare name
+    // binds a FROM column first and a select alias only when no column has
+    // that name; anywhere inside an expression an alias is an error (DuckDB).
     let mut keys: Vec<BoundExpr> = Vec::new();
     binder.allow_win = false;
     for g in &sel.group_by {
@@ -15262,6 +15711,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 PinkDbError::Execution(format!("GROUP BY position {n} out of range"))
             })?;
             let mut no_aggs = Vec::new();
+            binder.alias = AliasMode::GroupExpr;
             let pre = binder.bind_expr(ast_expr, &mut no_aggs, false)?;
             if !no_aggs.is_empty() {
                 return Err(PinkDbError::Execution(
@@ -15272,13 +15722,24 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             continue;
         }
         let mut no_aggs = Vec::new();
+        binder.alias = if is_bare_name(g) {
+            AliasMode::Fallback
+        } else {
+            AliasMode::GroupExpr
+        };
         keys.push(binder.bind_expr(g, &mut no_aggs, false)?);
     }
     // Grouping-set expressions join the aggregate keys, in master order.
     for g in &master_ast[sel.group_by.len()..] {
         let mut no_aggs = Vec::new();
+        binder.alias = if is_bare_name(g) {
+            AliasMode::Fallback
+        } else {
+            AliasMode::GroupExpr
+        };
         keys.push(binder.bind_expr(g, &mut no_aggs, false)?);
     }
+    binder.alias = AliasMode::Prefer;
     binder.allow_win = true;
     sync_grouping_keys(&mut keys, binder);
     let group_sets = if sel.group_sets.is_empty() {
@@ -15550,9 +16011,13 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         // General expression → hidden sort column. It binds in scan scope;
         // in agg queries it is rebased onto Aggregate-output scope (key
         // positions). Aggregate-free in v1: aggregates ride via alias/position.
+        // Inside the expression a column wins over an alias of the same name
+        // (DuckDB); a non-shadowed alias still resolves.
         let mut no_aggs = Vec::new();
         binder.allow_win = false;
+        binder.alias = AliasMode::Fallback;
         let bound = binder.bind_expr(&item.expr, &mut no_aggs, false)?;
+        binder.alias = AliasMode::Prefer;
         binder.allow_win = true;
         if !no_aggs.is_empty() {
             return Err(PinkDbError::Execution(
