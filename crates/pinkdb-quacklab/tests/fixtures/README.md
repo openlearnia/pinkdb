@@ -14,3 +14,13 @@ bodies exactly (key order aside) except where pinkdb cannot, and those cases are
 listed and asserted on status, code and DuckDB's error prefix instead.
 
 Taken on 2026-11-01 from the branch the wave-138 brief names.
+
+# `go-lease-reference.json` — the write-lease choreography
+
+The same service's 18-step write-lease recording: acquire, a second acquire, a
+statement refused while leased, health, the holder's SQL, renew (clamped),
+release, release again, `/recover` ending a lease. Values that cannot be fixed
+in advance are masked: `<ms>` (a non-negative integer), `<rfc3339>`, `<id:32
+hex>`, `<lease>` (the replay substitutes the id it is holding, or an all-zero
+one for the wrong-id step), and `<..>` (any non-null value). `tests/lease.rs`
+replays it in order and compares the answer with the masks applied.

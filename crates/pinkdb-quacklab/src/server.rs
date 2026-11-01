@@ -4,11 +4,13 @@ use std::fmt;
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use pinkdb::Database;
 use tokio::sync::watch;
 
 use crate::app::{Shared, routes};
+use crate::lease::{DEFAULT_DRAIN_TIMEOUT, LocalWarehouse, MIN_WRITE_LEASE_TTL, parse_go_duration};
 
 /// DuckDB's default port, as QuackLab's service binds it.
 pub const DEFAULT_BIND: &str = "127.0.0.1:1294";
@@ -34,6 +36,16 @@ pub struct QuacklabOptions {
     pub row_limit: usize,
     /// `DUCKLAKE_ALIAS`: the database every request is positioned in.
     pub warehouse: String,
+    /// `GRAIN_DUCKDB_SANDBOX`: refuse native-code loading from SQL (see
+    /// [`crate::sandbox`] for what pinkdb can and cannot isolate).
+    pub sandbox: bool,
+    /// `GRAIN_WRITE_LEASE_DRAIN_TIMEOUT`: how long an acquire waits for
+    /// in-flight SQL, in Go duration syntax; 5m when unset or invalid.
+    pub lease_drain_timeout: Duration,
+    /// The write-lease TTL clamp's floor: the Go service's 30s. A test lowers
+    /// it so a lease can expire without a 30 second sleep.
+    #[doc(hidden)]
+    pub lease_ttl_floor: Duration,
 }
 
 impl Default for QuacklabOptions {
@@ -44,6 +56,9 @@ impl Default for QuacklabOptions {
             read_only: false,
             row_limit: DEFAULT_ROW_LIMIT,
             warehouse: DEFAULT_WAREHOUSE.to_string(),
+            sandbox: false,
+            lease_drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+            lease_ttl_floor: MIN_WRITE_LEASE_TTL,
         }
     }
 }
@@ -57,6 +72,8 @@ impl QuacklabOptions {
         let read_only = std::env::var("DUCKDB_READ_ONLY").ok();
         let limit = std::env::var("GRAIN_SQL_RESULT_ROW_LIMIT").ok();
         let alias = std::env::var("DUCKLAKE_ALIAS").ok();
+        let sandbox = std::env::var("GRAIN_DUCKDB_SANDBOX").ok();
+        let drain = std::env::var("GRAIN_WRITE_LEASE_DRAIN_TIMEOUT").ok();
         Self {
             sql_token: token.trim().to_string(),
             iam_trust: truthy(serverless.as_deref()),
@@ -66,6 +83,10 @@ impl QuacklabOptions {
                 Some(name) if !name.is_empty() => name.to_string(),
                 _ => DEFAULT_WAREHOUSE.to_string(),
             },
+            sandbox: truthy(sandbox.as_deref()),
+            lease_drain_timeout: parse_go_duration(drain.as_deref().unwrap_or_default())
+                .unwrap_or(DEFAULT_DRAIN_TIMEOUT),
+            lease_ttl_floor: MIN_WRITE_LEASE_TTL,
         }
     }
 
@@ -115,7 +136,7 @@ fn truthy(raw: Option<&str>) -> bool {
 }
 
 /// Length-independent comparison: the fold touches every byte of both sides.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -153,7 +174,7 @@ impl QuacklabServer {
             .set_nonblocking(true)
             .map_err(QuacklabError::Bind)?;
         let addr = listener.local_addr().map_err(QuacklabError::Bind)?;
-        let shared = Arc::new(Shared::new(db, options));
+        let shared = Arc::new(Shared::new(db, options, Arc::new(LocalWarehouse)));
         shared
             .ensure_warehouse()
             .map_err(QuacklabError::Warehouse)?;
@@ -203,15 +224,18 @@ impl QuacklabServer {
                             return;
                         }
                     };
-                    let served = axum::serve(listener, routes(shared))
-                        .with_graceful_shutdown(async move {
-                            while !*stopped.borrow() {
-                                if stopped.changed().await.is_err() {
-                                    break;
-                                }
+                    let served = axum::serve(
+                        listener,
+                        routes(shared).into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async move {
+                        while !*stopped.borrow() {
+                            if stopped.changed().await.is_err() {
+                                break;
                             }
-                        })
-                        .await;
+                        }
+                    })
+                    .await;
                     if let Err(e) = served {
                         eprintln!("pinkdb-server: the QuackLab adapter stopped: {e}");
                     }

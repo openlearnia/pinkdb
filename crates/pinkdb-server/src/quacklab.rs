@@ -27,17 +27,16 @@
 pub use pinkdb_quacklab::*;
 
 /// The QuackLab settings the adapter accepts and does not use: DuckDB's own
-/// engine knobs and the DuckLake attach (wave 138c), which pinkdb's engine has
-/// no counterpart for. They are named here so the server can say once, at
-/// start, that it is ignoring them instead of silently accepting a
-/// configuration it cannot honour.
+/// engine knobs, the sandbox's file-path allow-list (pinkdb has no file-read
+/// root policy; only `LOAD`/`INSTALL` are refused) and the DuckLake attach
+/// (wave 138c), which pinkdb's engine has no counterpart for. They are named
+/// here so the server can say once, at start, that it is ignoring them instead
+/// of silently accepting a configuration it cannot honour.
 pub const IGNORED_ENVIRONMENT: &[&str] = &[
     "DUCKDB_PATH",
     "DUCKDB_MEMORY_LIMIT",
     "DUCKDB_THREADS",
-    "GRAIN_DUCKDB_SANDBOX",
     "GRAIN_DUCKDB_ALLOWED_PATHS",
-    "GRAIN_WRITE_LEASE_DRAIN_TIMEOUT",
     "GRAIN_DUCKLAKE",
     "DUCKLAKE_PG_URI",
     "DUCKLAKE_DATA_PATH",

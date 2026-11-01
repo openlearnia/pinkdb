@@ -1,0 +1,321 @@
+[
+ {
+  "step": "sql without token",
+  "method": "POST",
+  "path": "/sql",
+  "body": {
+   "sql": "SELECT 1"
+  },
+  "auth": false,
+  "status": 401,
+  "response": {
+   "error": {
+    "code": "unauthorized",
+    "message": "bearer token required"
+   }
+  }
+ },
+ {
+  "step": "sql wrong token",
+  "method": "POST",
+  "path": "/sql",
+  "body": {
+   "sql": "SELECT 1"
+  },
+  "auth": true,
+  "status": 401,
+  "response": {
+   "error": {
+    "code": "unauthorized",
+    "message": "bearer token required"
+   }
+  }
+ },
+ {
+  "step": "sql ok",
+  "method": "POST",
+  "path": "/sql",
+  "body": {
+   "sql": "CREATE TABLE IF NOT EXISTS t(a INT)"
+  },
+  "auth": true,
+  "status": 200,
+  "response": {
+   "columns": [
+    "Count"
+   ],
+   "execMs": "<ms>",
+   "gateWaitMs": "<ms>",
+   "poolWaitMs": "<ms>",
+   "rowCount": 0,
+   "rowScanMs": "<ms>",
+   "rows": [],
+   "rowsAffected": 0,
+   "serializationMs": "<ms>",
+   "setupMs": "<ms>",
+   "tookMs": "<ms>",
+   "truncated": false,
+   "waitMs": "<ms>"
+  }
+ },
+ {
+  "step": "acquire",
+  "method": "POST",
+  "path": "/write-lease/acquire",
+  "body": {
+   "owner": "dbt-run",
+   "ttlSeconds": 120
+  },
+  "status": 200,
+  "response": {
+   "leaseId": "<id:32 hex>",
+   "owner": "dbt-run",
+   "ttlSeconds": 120,
+   "expiresAt": "<rfc3339>",
+   "drainMs": "<ms>",
+   "acquireMs": "<ms>"
+  }
+ },
+ {
+  "step": "acquire again (held)",
+  "method": "POST",
+  "path": "/write-lease/acquire",
+  "body": {
+   "owner": "other",
+   "ttlSeconds": 60
+  },
+  "auth": true,
+  "status": 409,
+  "response": {
+   "error": {
+    "code": "warehouse_write_leased",
+    "message": "another exclusive write lease is active"
+   }
+  }
+ },
+ {
+  "step": "sql while leased",
+  "method": "POST",
+  "path": "/sql",
+  "body": {
+   "sql": "SELECT 1"
+  },
+  "auth": true,
+  "status": 423,
+  "response": {
+   "error": {
+    "code": "warehouse_write_leased",
+    "message": "warehouse is exclusively leased for a transform run"
+   }
+  }
+ },
+ {
+  "step": "health while leased",
+  "method": "GET",
+  "path": "/health",
+  "body": null,
+  "auth": false,
+  "status": 200,
+  "response": {
+   "ok": true,
+   "writeLeased": true
+  }
+ },
+ {
+  "step": "lease sql with wrong id",
+  "method": "POST",
+  "path": "/write-lease/sql",
+  "body": {
+   "leaseId": "<lease>",
+   "sql": "SELECT 1"
+  },
+  "auth": true,
+  "status": 404,
+  "response": {
+   "error": {
+    "code": "unknown_lease",
+    "message": "no matching active write lease"
+   }
+  }
+ },
+ {
+  "step": "lease sql",
+  "method": "POST",
+  "path": "/write-lease/sql",
+  "body": {
+   "leaseId": "<lease>",
+   "sql": "INSERT INTO t VALUES (1)"
+  },
+  "auth": true,
+  "status": 200,
+  "response": {
+   "columns": [
+    "Count"
+   ],
+   "execMs": "<ms>",
+   "gateWaitMs": "<ms>",
+   "poolWaitMs": "<ms>",
+   "rowCount": 1,
+   "rowScanMs": "<ms>",
+   "rows": [
+    [
+     1
+    ]
+   ],
+   "rowsAffected": 1,
+   "serializationMs": "<ms>",
+   "setupMs": "<ms>",
+   "tookMs": "<ms>",
+   "truncated": false,
+   "waitMs": "<ms>"
+  }
+ },
+ {
+  "step": "renew ttl 5s (clamped to 30)",
+  "method": "POST",
+  "path": "/write-lease/renew",
+  "body": {
+   "leaseId": "<lease>",
+   "ttlSeconds": 5
+  },
+  "auth": true,
+  "status": 200,
+  "response": {
+   "leaseId": "<id:32 hex>",
+   "owner": "dbt-run",
+   "ttlSeconds": 30,
+   "expiresAt": "<rfc3339>",
+   "drainMs": "<ms>",
+   "acquireMs": "<ms>"
+  }
+ },
+ {
+  "step": "renew unknown",
+  "method": "POST",
+  "path": "/write-lease/renew",
+  "body": {
+   "leaseId": "<lease>",
+   "ttlSeconds": 60
+  },
+  "auth": true,
+  "status": 404,
+  "response": {
+   "error": {
+    "code": "unknown_lease",
+    "message": "no matching active write lease"
+   }
+  }
+ },
+ {
+  "step": "release",
+  "method": "POST",
+  "path": "/write-lease/release",
+  "body": {
+   "leaseId": "<lease>"
+  },
+  "auth": true,
+  "status": 200,
+  "response": {
+   "ok": true,
+   "heldMs": "<ms>",
+   "reopenMs": "<ms>"
+  }
+ },
+ {
+  "step": "release again",
+  "method": "POST",
+  "path": "/write-lease/release",
+  "body": {
+   "leaseId": "<lease>"
+  },
+  "auth": true,
+  "status": 404,
+  "response": {
+   "error": {
+    "code": "unknown_lease",
+    "message": "no matching active write lease"
+   }
+  }
+ },
+ {
+  "step": "sql after release",
+  "method": "POST",
+  "path": "/sql",
+  "body": {
+   "sql": "SELECT count(*) AS n FROM t"
+  },
+  "auth": true,
+  "status": 200,
+  "response": {
+   "columns": [
+    "n"
+   ],
+   "execMs": "<ms>",
+   "gateWaitMs": "<ms>",
+   "poolWaitMs": "<ms>",
+   "rowCount": 1,
+   "rowScanMs": "<ms>",
+   "rows": [
+    [
+     1
+    ]
+   ],
+   "rowsAffected": 0,
+   "serializationMs": "<ms>",
+   "setupMs": "<ms>",
+   "tookMs": "<ms>",
+   "truncated": false,
+   "waitMs": "<ms>"
+  }
+ },
+ {
+  "step": "acquire without token",
+  "method": "POST",
+  "path": "/write-lease/acquire",
+  "body": {
+   "owner": "x"
+  },
+  "auth": false,
+  "status": 401,
+  "response": {
+   "error": {
+    "code": "unauthorized",
+    "message": "bearer token required"
+   }
+  }
+ },
+ {
+  "step": "acquire empty body (defaults)",
+  "status": 200,
+  "response": {
+   "leaseId": "<..>",
+   "ttlSeconds": 3600,
+   "expiresAt": "<..>",
+   "drainMs": "<..>",
+   "acquireMs": "<..>"
+  }
+ },
+ {
+  "step": "recover ends lease",
+  "method": "POST",
+  "path": "/recover",
+  "body": null,
+  "auth": true,
+  "status": 200,
+  "response": {
+   "ok": true,
+   "reopenMs": "<ms>"
+  }
+ },
+ {
+  "step": "health after recover",
+  "method": "GET",
+  "path": "/health",
+  "body": null,
+  "auth": false,
+  "status": 200,
+  "response": {
+   "ok": true
+  }
+ }
+]

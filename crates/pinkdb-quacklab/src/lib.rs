@@ -1,5 +1,5 @@
-//! QuackLab's `/sql` adapter (wave 138a): the HTTP surface grain's QuackLab
-//! service speaks, over a pinkdb store.
+//! QuackLab's HTTP surface (wave 138): what grain's QuackLab service speaks,
+//! over a pinkdb store.
 //!
 //! One `axum` router over a [`pinkdb::Database`], built like the console
 //! (`pinkdb-server-ui`): [`QuacklabServer::bind`] owns the listener,
@@ -16,9 +16,12 @@
 //!
 //! Statements run on a fresh `Connection` per request, positioned on the
 //! warehouse database (`DUCKLAKE_ALIAS`, `USE "<alias>"`), and a transaction a
-//! script leaves open is rolled back before the response. Write leases
-//! (138b), the DuckDB sandbox (138b) and the DuckLake attach (138c) are not
-//! part of this crate yet; `/health` and `/recover` are where they arrive.
+//! script leaves open is rolled back before the response.
+//!
+//! The exclusive write lease (`/write-lease/*`) freezes the warehouse for one
+//! holder: [`Warehouse`] is what a lease closes and reopens, and 138c gives
+//! the lake one that detaches and re-attaches its catalog. `GRAIN_DUCKDB_SANDBOX`
+//! applies the one isolation policy pinkdb has (no `LOAD`/`INSTALL`).
 //!
 //! Two cells of DuckDB's table have no counterpart here: `TIME`, because
 //! pinkdb has no `TIME` type (so no cell of it can reach the encoder), and
@@ -30,9 +33,12 @@
 mod app;
 mod encode;
 mod errors;
+mod lease;
+mod sandbox;
 mod server;
 
-pub use app::router;
+pub use app::{router, router_with_warehouse};
+pub use lease::Warehouse;
 pub use server::{
     DEFAULT_BIND, DEFAULT_ROW_LIMIT, DEFAULT_WAREHOUSE, MAX_ROW_LIMIT, QuacklabError,
     QuacklabHandle, QuacklabOptions, QuacklabServer, parse_row_limit,

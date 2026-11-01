@@ -35,3 +35,7 @@ tokio = { version = "1.53", default-features = false, features = [
 # Escaping strings the way Go's encoding/json does (see src/encode.rs); the
 # numbers are written by hand.
 serde_json = "1"
+# Write-lease ids are 32 hex chars from the OS RNG, like the Go service's
+# crypto/rand id (src/lease.rs). The same 0.2 line pinkdb already locks, so
+# no new crate version enters the graph.
+getrandom = "0.2"
