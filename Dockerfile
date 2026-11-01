@@ -1,17 +1,24 @@
 # syntax=docker/dockerfile:1.7
 #
-# pinkdb's public image: pinkdb-server (tls + async-server) and the pinkdb CLI
-# in one image, built from source. Two runtime candidates are defined so the
-# choice can be measured; RUNTIME picks the published one (musl by default:
-# the smallest image that passes scripts/docker/smoke.sh).
+# pinkdb's public image: pinkdb-server and the pinkdb CLI in one image, built
+# from source. Two runtime candidates are defined so the choice can be measured;
+# RUNTIME picks the published one (musl by default: the smallest image that
+# passes scripts/docker/smoke.sh).
 #
 #   docker build -t pinkdb:default .
 #   docker build --build-arg VARIANT=lake -t pinkdb:lake .
+#   docker build --build-arg VARIANT=quacklab -t pinkdb:quacklab .
 #   docker build --build-arg RUNTIME=glibc -t pinkdb:glibc .   # measurement
 #
-# VARIANT only selects the CLI's lake features. The server is the same in both
-# variants (tls + async-server); the CLI also gets client + tls so remote mode
-# (`pinkdb --host`) and encrypted remote sessions work out of the box.
+# VARIANT selects what the image is for. `default` and `lake` differ only in the
+# CLI's lake features; the server is `tls,async-server`. `quacklab` is the
+# QuackLab SQL service (wave 138d): pinkdb-server with the HTTP adapter
+# (`quacklab`), the file readers (`parquet`, `httpfs`), the S3 lake transport
+# (`lake-s3`) and the Postgres lake catalog (`catalog-postgres`), under a
+# different entrypoint (docker/entrypoint-quacklab.sh) that serves $PORT and
+# keeps the wire protocol on loopback. Every variant ships the CLI with client +
+# tls so remote mode (`pinkdb --host`) and encrypted remote sessions work out of
+# the box.
 #
 # The musl candidate is built natively on Alpine and both variants are fully
 # static.
@@ -86,14 +93,25 @@ COPY . .
 RUN --mount=type=cache,id=cargo-target-glibc-${VARIANT}-${TARGETARCH},target=/app/target \
     set -eux; \
     case "$VARIANT" in \
-        default) cli_features="client,tls,pinklake,s3" ;; \
-        lake)    cli_features="client,tls,pinklake,s3,parquetlake" ;; \
-        *) echo "unknown VARIANT=$VARIANT (expected default or lake)" >&2; exit 2 ;; \
+        default) \
+            server_features="tls,async-server"; \
+            cli_features="client,tls,pinklake,s3"; \
+            entrypoint="docker/entrypoint.sh" ;; \
+        lake) \
+            server_features="tls,async-server"; \
+            cli_features="client,tls,pinklake,s3,parquetlake"; \
+            entrypoint="docker/entrypoint.sh" ;; \
+        quacklab) \
+            server_features="quacklab,parquet,httpfs,lake-s3,catalog-postgres"; \
+            cli_features="client,tls,pinklake,s3"; \
+            entrypoint="docker/entrypoint-quacklab.sh" ;; \
+        *) echo "unknown VARIANT=$VARIANT (expected default, lake or quacklab)" >&2; exit 2 ;; \
     esac; \
-    cargo build --release --locked -p pinkdb-server --features tls,async-server; \
+    cargo build --release --locked -p pinkdb-server --features "$server_features"; \
     cargo build --release --locked -p pinkdb-cli --features "$cli_features"; \
     mkdir -p /out; \
     cp target/release/pinkdb-server target/release/pinkdb /out/; \
+    cp "$entrypoint" /out/docker-entrypoint.sh; \
     cp /etc/ssl/certs/ca-certificates.crt /out/ca-certificates.crt
 
 # musl: Alpine, where gcc/g++ target musl natively (no cross toolchain).
@@ -122,14 +140,25 @@ COPY . .
 RUN --mount=type=cache,id=cargo-target-musl-${VARIANT}-${TARGETARCH},target=/app/target \
     set -eux; \
     case "$VARIANT" in \
-        default) cli_features="client,tls,pinklake,s3" ;; \
-        lake)    cli_features="client,tls,pinklake,s3,parquetlake" ;; \
-        *) echo "unknown VARIANT=$VARIANT (expected default or lake)" >&2; exit 2 ;; \
+        default) \
+            server_features="tls,async-server"; \
+            cli_features="client,tls,pinklake,s3"; \
+            entrypoint="docker/entrypoint.sh" ;; \
+        lake) \
+            server_features="tls,async-server"; \
+            cli_features="client,tls,pinklake,s3,parquetlake"; \
+            entrypoint="docker/entrypoint.sh" ;; \
+        quacklab) \
+            server_features="quacklab,parquet,httpfs,lake-s3,catalog-postgres"; \
+            cli_features="client,tls,pinklake,s3"; \
+            entrypoint="docker/entrypoint-quacklab.sh" ;; \
+        *) echo "unknown VARIANT=$VARIANT (expected default, lake or quacklab)" >&2; exit 2 ;; \
     esac; \
-    cargo build --release --locked -p pinkdb-server --features tls,async-server; \
+    cargo build --release --locked -p pinkdb-server --features "$server_features"; \
     cargo build --release --locked -p pinkdb-cli --features "$cli_features"; \
     mkdir -p /out; \
     cp target/release/pinkdb-server target/release/pinkdb /out/; \
+    cp "$entrypoint" /out/docker-entrypoint.sh; \
     cp /etc/ssl/certs/ca-certificates.crt /out/ca-certificates.crt
 
 FROM builder-${RUNTIME} AS builder
@@ -144,11 +173,11 @@ RUN set -eux; \
     apk add --no-cache ca-certificates; \
     addgroup -g 10001 -S pinkdb; \
     adduser -u 10001 -S -D -G pinkdb -h /data -s /sbin/nologin pinkdb; \
-    mkdir -p /data; \
-    chown pinkdb:pinkdb /data
+    mkdir -p /data /var/lib/pinkdb; \
+    chown pinkdb:pinkdb /data /var/lib/pinkdb
 
 COPY --from=builder /out/pinkdb /out/pinkdb-server /usr/local/bin/
-COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --from=builder /out/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 # The glibc candidate: Debian slim (matches the builder's bookworm).
@@ -160,11 +189,11 @@ RUN apt-get update \
  && groupadd --gid 10001 pinkdb \
  && useradd --uid 10001 --gid pinkdb --home-dir /data --no-create-home \
         --shell /usr/sbin/nologin pinkdb \
- && mkdir -p /data \
- && chown pinkdb:pinkdb /data
+ && mkdir -p /data /var/lib/pinkdb \
+ && chown pinkdb:pinkdb /data /var/lib/pinkdb
 
 COPY --from=builder /out/pinkdb /out/pinkdb-server /usr/local/bin/
-COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --from=builder /out/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 # ---------------------------------------------------------------- final image
@@ -183,10 +212,11 @@ LABEL org.opencontainers.image.title="pinkdb" \
       org.opencontainers.image.revision="${REVISION}"
 
 # Container-friendly defaults; the entrypoint turns these into server flags,
-# and explicit arguments still win (`docker run … --port 6000`).
+# and explicit arguments still win (`docker run … --port 6000`). The data
+# directory is per variant, so each entrypoint defaults it (/data here,
+# /var/lib/pinkdb for quacklab) and PINKDB_DATA_DIR overrides either.
 ENV PINKDB_HOST=0.0.0.0 \
-    PINKDB_PORT=5433 \
-    PINKDB_DATA_DIR=/data
+    PINKDB_PORT=5433
 
 WORKDIR /data
 VOLUME ["/data"]

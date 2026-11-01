@@ -1,0 +1,18 @@
+{"path": "/sql", "method": "POST", "body": {"sql": "SELECT 1"}, "auth": "none", "unordered": false, "note": "sql without token"}
+{"path": "/sql", "method": "POST", "body": {"sql": "SELECT 1"}, "auth": "token", "unordered": false, "note": "sql ok"}
+{"path": "/sql", "method": "POST", "body": {"sql": "CREATE TABLE IF NOT EXISTS t(a INT)"}, "auth": "token", "unordered": false, "note": "create table"}
+{"path": "/write-lease/acquire", "method": "POST", "body": {"owner": "dbt-run", "ttlSeconds": 120}, "auth": "token", "unordered": false, "note": "acquire"}
+{"path": "/write-lease/acquire", "method": "POST", "body": {"owner": "other", "ttlSeconds": 60}, "auth": "token", "unordered": false, "note": "acquire again while held"}
+{"path": "/sql", "method": "POST", "body": {"sql": "SELECT 1"}, "auth": "token", "unordered": false, "note": "sql while leased"}
+{"path": "/health", "method": "GET", "body": null, "auth": "none", "unordered": false, "note": "health while leased"}
+{"path": "/write-lease/sql", "method": "POST", "body": {"leaseId": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f", "sql": "SELECT 1"}, "auth": "token", "unordered": false, "note": "lease sql with an unknown id"}
+{"path": "/write-lease/sql", "method": "POST", "body": {"leaseId": "$lease", "sql": "INSERT INTO t VALUES (1)"}, "auth": "token", "unordered": false, "note": "lease sql"}
+{"path": "/write-lease/renew", "method": "POST", "body": {"leaseId": "$lease", "ttlSeconds": 5}, "auth": "token", "unordered": false, "note": "renew ttl 5s (clamped to 30)"}
+{"path": "/write-lease/renew", "method": "POST", "body": {"leaseId": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f", "ttlSeconds": 60}, "auth": "token", "unordered": false, "note": "renew an unknown id"}
+{"path": "/write-lease/release", "method": "POST", "body": {"leaseId": "$lease"}, "auth": "token", "unordered": false, "note": "release"}
+{"path": "/write-lease/release", "method": "POST", "body": {"leaseId": "$lease"}, "auth": "token", "unordered": false, "note": "release again"}
+{"path": "/sql", "method": "POST", "body": {"sql": "SELECT count(*) AS n FROM t"}, "auth": "token", "unordered": false, "note": "sql after release (row written)"}
+{"path": "/write-lease/acquire", "method": "POST", "body": {"owner": "x"}, "auth": "none", "unordered": false, "note": "acquire without token"}
+{"path": "/write-lease/acquire", "method": "POST", "body": null, "auth": "token", "unordered": false, "note": "acquire with no body (defaults)"}
+{"path": "/recover", "method": "POST", "body": null, "auth": "token", "unordered": false, "note": "recover ends the lease"}
+{"path": "/health", "method": "GET", "body": null, "auth": "none", "unordered": false, "note": "health after recover"}

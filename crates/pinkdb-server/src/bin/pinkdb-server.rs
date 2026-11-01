@@ -1242,9 +1242,9 @@ fn main() -> ExitCode {
     };
 
     // QuackLab's `/sql` adapter (wave 138a): opt-in, its own listener over the
-    // same store, stopped by its handle's Drop like the console.
+    // same store, drained and stopped below before the stores are checkpointed.
     #[cfg(feature = "quacklab")]
-    let _quacklab_handle =
+    let mut quacklab_handle =
         if let Some(bind) = pinkdb_server::quacklab::bind(args.quacklab_bind.clone()) {
             match start_quacklab(&db, &bind) {
                 Ok(handle) => Some(handle),
@@ -1375,12 +1375,29 @@ fn main() -> ExitCode {
             }
         }
     };
+    // QuackLab's adapter stops admitting and drains its in-flight requests
+    // before the stores are checkpointed: Cloud Run gives SIGTERM 10 s, so the
+    // drain is bounded and the checkpoint runs even when a request outlives it.
+    #[cfg(feature = "quacklab")]
+    if let Some(handle) = quacklab_handle.as_mut()
+        && !handle.drain(QUACKLAB_SHUTDOWN_DRAIN)
+    {
+        eprintln!(
+            "pinkdb-server: a QuackLab request is still running after {QUACKLAB_SHUTDOWN_DRAIN:?}"
+        );
+    }
     shut_down(&served, &state, data_dir.is_some());
     exit
 }
 
 /// Set by SIGINT/SIGTERM (wave 124).
 static SIGNALED: AtomicBool = AtomicBool::new(false);
+
+/// How long a shutdown waits for QuackLab requests in flight: Cloud Run sends
+/// SIGKILL 10 s after SIGTERM, so most of the budget goes to the drain and the
+/// rest to the checkpoint (wave 138d).
+#[cfg(feature = "quacklab")]
+const QUACKLAB_SHUTDOWN_DRAIN: Duration = Duration::from_secs(8);
 
 /// Route SIGINT and SIGTERM to [`SIGNALED`] instead of killing the process.
 #[cfg(unix)]

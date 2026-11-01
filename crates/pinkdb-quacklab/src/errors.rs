@@ -14,6 +14,28 @@ pub(crate) fn error_body(code: &str, message: &str) -> String {
     out
 }
 
+/// The two catalog misses QuackLab tells apart by DuckDB's wording
+/// (`vpsapi/refresh_history.go`: "referenced column", "does not exist"/
+/// "not found"): pinkdb names the missing object, DuckDB names what the
+/// query was looking for. Only the exact shapes are rewritten, so a message
+/// with more context keeps pinkdb's own wording.
+fn duck_catalog_miss(message: &str) -> Option<String> {
+    if let Some(name) = message
+        .strip_prefix("no column \"")
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        return Some(format!(
+            "Binder Error: Referenced column \"{name}\" not found in FROM clause!"
+        ));
+    }
+    let name = message
+        .strip_prefix("table \"")?
+        .strip_suffix("\" not found")?;
+    Some(format!(
+        "Catalog Error: Table with name {name} does not exist!"
+    ))
+}
+
 /// The engine's message under the prefix DuckDB would give the same kind of
 /// error, which is what QuackLab keys on.
 ///
@@ -22,6 +44,9 @@ pub(crate) fn error_body(code: &str, message: &str) -> String {
 /// An error that already carries a prefix is never prefixed twice.
 pub(crate) fn engine_message(err: &PinkDbError) -> String {
     let message = err.to_string();
+    if let Some(miss) = duck_catalog_miss(&message) {
+        return miss;
+    }
     let prefix = match err {
         PinkDbError::Parse(_) => "Parser Error: ",
         PinkDbError::Catalog(_) => "Catalog Error: ",
@@ -69,6 +94,35 @@ mod tests {
         assert!(engine_message(&constraint).starts_with("Constraint Error: "));
         let txn = PinkDbError::Execution("no transaction in progress".to_string());
         assert!(engine_message(&txn).starts_with("TransactionContext Error: "));
+    }
+
+    #[test]
+    fn catalog_misses_use_duckdbs_wording() {
+        // QuackLab's refresh history reads the kind of an error off its text.
+        let column = PinkDbError::Catalog("no column \"DAY_NAME\"".to_string());
+        assert_eq!(
+            engine_message(&column),
+            "Binder Error: Referenced column \"DAY_NAME\" not found in FROM clause!"
+        );
+        let table = PinkDbError::Catalog("table \"BY_DAY\" not found".to_string());
+        assert_eq!(
+            engine_message(&table),
+            "Catalog Error: Table with name BY_DAY does not exist!"
+        );
+    }
+
+    #[test]
+    fn other_catalog_errors_keep_pinkdbs_wording() {
+        let schema = PinkDbError::Catalog("schema \"nope\" not found".to_string());
+        assert_eq!(
+            engine_message(&schema),
+            "Catalog Error: schema \"nope\" not found"
+        );
+        let extra = PinkDbError::Catalog("table \"t\" not found in schema \"s\"".to_string());
+        assert_eq!(
+            engine_message(&extra),
+            "Catalog Error: table \"t\" not found in schema \"s\""
+        );
     }
 
     #[test]
