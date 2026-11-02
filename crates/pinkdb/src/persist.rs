@@ -1,39 +1,85 @@
 //! Persistence: a single-file on-disk columnar format (`.pink`).
 //!
-//! # `PINKDB06` — the one `.pink` format
+//! # `PINKDB07` — the one `.pink` format
 //!
-//! The file is a **data region** of column chunks followed by a **footer**
-//! and a fixed 20-byte **trailer**:
+//! The file starts with two **header slots**, then a **data region**, then a
+//! **footer**; nothing at the end of the file is special:
 //!
 //! ```text
-//! data region: for every table (databases and tables in sorted name order)
-//!   for every row group (122,880 rows = 60 engine chunks of 2,048)
-//!     for every column (schema order)
-//!       column chunk = page index + pages
+//! offset 0      header slot 0   (4,096 bytes)
+//! offset 4,096  header slot 1   (4,096 bytes)
+//! offset 8,192  data region: for every table (databases and tables in
+//!               sorted name order)
+//!                 for every row group (122,880 rows = 60 engine chunks of 2,048)
+//!                   for every column (schema order)
+//!                     column chunk = page index + pages
+//! ...           footer (anywhere after the data it names)
+//!
+//! header slot (little-endian, zero padded to 4,096 bytes):
+//!   magic "PINKDB07" (8) | iteration u64 | footer_offset u64 |
+//!   footer_len u64 | footer_crc32c u32 | file_len u64 | slot_crc32c u32
 //!
 //! footer: store metadata (databases, their schemas, tables, column
 //!   defaults as SQL text, constraints, index definitions + statistics, materialized
-//!   views, procedures, macros, RBAC) and, per table, the row count and the
+//!   views, procedures, macros, RBAC), the data-region ranges no row group
+//!   references (`free_ranges`), and, per table, the row count and the
 //!   row-group directory:
-//!     row groups [ { rows,
+//!     row groups [ { rows, per chunk: rows,
 //!                    per column: offset, length, page count,
 //!                                 encoding summary, crc32c,
 //!                                 stats { min, max, null_count, nan_count } } ]
-//!
-//! trailer (20 bytes): footer_crc32c u32 | footer_len u64 | "PINKDB06"
 //! ```
 //!
 //! A **page** is one engine chunk (2,048 rows) encoded with the existing
 //! per-chunk encoder, so decoding stays chunk-native; a **column chunk** is
 //! the 60 pages of one (row group, column) pair. Every column chunk carries
 //! its own **CRC32C**, so a reader verifies any chunk on its own — there is
-//! **no whole-file CRC**. The footer carries its own CRC32C.
+//! **no whole-file CRC**. The footer carries its own CRC32C, recorded in the
+//! header slot. Row-group directory offsets are **absolute file offsets**.
 //!
-//! A reader needs the 20-byte trailer plus the footer: two small range
-//! requests (the lake's `pink` provider reads exactly those, plus the
-//! projected column chunks of the row groups that survive pruning). The
-//! engine's `open` reads the whole file (it materializes every column
-//! eagerly, as before) but decodes the column chunks **in parallel**.
+//! ## Reading
+//!
+//! A reader validates both header slots (magic, slot CRC, and a footer range
+//! inside the `file_len` the slot records), takes the valid slot with the
+//! higher `iteration`, then reads and CRC-checks the footer it names: two
+//! small range requests, no read of the data region (the lake's `pink`
+//! provider does exactly that, plus the projected column chunks of the row
+//! groups that survive pruning). A torn write therefore leaves the previous
+//! slot valid, naming a footer and a file length that are both on disk. The
+//! engine's `open` reads the whole file (it materializes every column eagerly,
+//! as before) but decodes the column chunks **in parallel**.
+//!
+//! `free_ranges` is a sorted `(offset, len)` list of data-region ranges no row
+//! group references — the holes an append-only checkpoint leaves behind. The
+//! full rewrite writes it empty; a reader range-checks it (inside the data
+//! region, sorted, non-overlapping, clear of every row group) and otherwise
+//! ignores it.
+//!
+//! ## Writing
+//!
+//! A **write** streams the data region: each table is read, encoded and
+//! written one row group at a time through a positioned [`Sink`] (a
+//! `BufWriter<File>` plus the running offset) for file targets, or a `Vec`
+//! sink for the in-memory `to_pink_bytes*` API — the same code, so the bytes
+//! are identical either way. The full rewrite writes `2 * HEADER_SLOT_LEN`
+//! zero bytes, then the data region, then the footer, then slot 0 with
+//! `iteration = 1`; slot 1 stays zero, so it is invalid. Peak memory is the
+//! decoded store plus one row group, not the whole file image. Encrypted saves
+//! still seal the whole image in memory: the `PINKENC1` container seals the
+//! plain image whole.
+//!
+//! An **append-only checkpoint** (136w3, not implemented yet) extends the file
+//! instead of rewriting it:
+//!
+//! 1. append the new data and the new footer at `file_len`;
+//! 2. fsync;
+//! 3. write the *other* header slot with `iteration + 1` and the new
+//!    `file_len`;
+//! 4. fsync.
+//!
+//! Until step 3 is on disk the other slot still names the old footer, which the
+//! file still holds; that is what makes the append crash-safe. [`write_slot`]
+//! and [`read_slots`] are the two primitives it needs.
 //!
 //! ## Row groups and statistics
 //!
@@ -75,10 +121,11 @@
 //!
 //! ## Refusing older files
 //!
-//! `PINKDB01`–`PINKDB05` are **not** readable: their readers, fixtures and
-//! compatibility tests are gone. Such a file is refused with
+//! `PINKDB01`–`PINKDB06` are **not** readable: their readers, fixtures and
+//! compatibility tests are gone. Such a file (a v6 file ends with its
+//! `PINKDB06` trailer magic, older layouts start with theirs) is refused with
 //! `this .pink file was written by an older pinkdb (PINKDB0N); this build
-//! reads PINKDB06 only`.
+//! reads PINKDB07 only`.
 //!
 //! ## Safety
 //!
@@ -116,15 +163,143 @@ use crate::types::ArrayElem;
 use crate::types::{DataType, Interval, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, Vector, VectorData};
 
-/// The trailer magic of the current `.pink` format (`PINKDB06`).
-///
-/// The magic lives at the **end** of the file (the trailer), so a reader can
-/// find the footer with two small range requests and never has to read the
-/// data region to learn what the file is.
-pub const MAGIC_V6: &[u8; 8] = b"PINKDB06";
+/// The magic of the current `.pink` format: the first 8 bytes of both header
+/// slots.
+pub const MAGIC_V7: &[u8; 8] = b"PINKDB07";
 
-/// The trailer's size: `footer_crc32c u32 | footer_len u64 | magic (8)`.
-pub const TRAILER_LEN: usize = 20;
+/// One header slot's size. The file starts with two of them.
+pub const HEADER_SLOT_LEN: usize = 4096;
+
+/// Where the data region starts: right after the two header slots.
+pub const DATA_START: u64 = 2 * HEADER_SLOT_LEN as u64;
+
+/// One header slot's recorded bytes: `magic (8) | iteration u64 |
+/// footer_offset u64 | footer_len u64 | footer_crc32c u32 | file_len u64 |
+/// slot_crc32c u32`. The rest of the 4,096-byte slot is zero padding, and the
+/// slot CRC covers everything before it.
+const SLOT_LEN: usize = 48;
+
+/// One header slot: where the footer is, and how long the file was when the
+/// slot was written.
+///
+/// A slot is valid when its magic and CRC are right and the footer it names
+/// lies inside its own `file_len`. The newest valid slot wins; see
+/// [`read_slots`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Slot {
+    /// Increases with every write of the file: the higher valid one wins.
+    pub(crate) iteration: u64,
+    /// The footer's absolute offset and length in the file.
+    pub(crate) footer_offset: u64,
+    pub(crate) footer_len: u64,
+    /// The CRC32C of the footer's bytes.
+    pub(crate) footer_crc32c: u32,
+    /// The file's length when the slot was written: a footer range past it is
+    /// a torn slot, not a short file.
+    pub(crate) file_len: u64,
+}
+
+impl Slot {
+    /// The slot's recorded bytes, the CRC32C last.
+    fn encode(&self) -> [u8; SLOT_LEN] {
+        let mut out = [0u8; SLOT_LEN];
+        out[0..8].copy_from_slice(MAGIC_V7);
+        out[8..16].copy_from_slice(&self.iteration.to_le_bytes());
+        out[16..24].copy_from_slice(&self.footer_offset.to_le_bytes());
+        out[24..32].copy_from_slice(&self.footer_len.to_le_bytes());
+        out[32..36].copy_from_slice(&self.footer_crc32c.to_le_bytes());
+        out[36..44].copy_from_slice(&self.file_len.to_le_bytes());
+        let crc = crc32c(&out[..44]);
+        out[44..48].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// Parse one slot, when it is valid on its own: the magic, the slot CRC
+    /// and a footer range inside the recorded file length. Whether that file
+    /// length is the file's actual length is the caller's check.
+    fn parse(bytes: &[u8]) -> Option<Slot> {
+        let slot = bytes.get(..SLOT_LEN)?;
+        if &slot[0..8] != MAGIC_V7 {
+            return None;
+        }
+        let crc = u32::from_le_bytes(slot[44..48].try_into().ok()?);
+        if crc32c(&slot[..44]) != crc {
+            return None;
+        }
+        let slot = Slot {
+            iteration: u64::from_le_bytes(slot[8..16].try_into().ok()?),
+            footer_offset: u64::from_le_bytes(slot[16..24].try_into().ok()?),
+            footer_len: u64::from_le_bytes(slot[24..32].try_into().ok()?),
+            footer_crc32c: u32::from_le_bytes(slot[32..36].try_into().ok()?),
+            file_len: u64::from_le_bytes(slot[36..44].try_into().ok()?),
+        };
+        // The footer sits after the header slab and inside the file the slot
+        // was written for.
+        if slot.footer_offset < DATA_START
+            || slot.footer_offset.checked_add(slot.footer_len)? > slot.file_len
+        {
+            return None;
+        }
+        Some(slot)
+    }
+}
+
+/// The valid header slot with the highest `iteration`: `(index, slot)`.
+///
+/// `header` is a file's first `2 * HEADER_SLOT_LEN` bytes. A zeroed slot (the
+/// full rewrite leaves slot 1 zero), a bad magic, a bad slot CRC and a footer
+/// range past the slot's `file_len` all make a slot invalid; if neither slot
+/// is valid there is nothing to read.
+///
+/// The full rewrite writes slot 0 only; an append-only checkpoint writes the
+/// *other* slot with `iteration + 1` once the bytes it names are on disk.
+#[allow(dead_code)] // 136w3's append path reads both slots before it writes one.
+pub(crate) fn read_slots(header: &[u8]) -> Option<(usize, Slot)> {
+    pick_slot(header, u64::MAX)
+}
+
+/// [`read_slots`] for a reader that knows the file's length: a slot recording
+/// a longer file is the torn half of a write and does not count.
+fn valid_slot(header: &[u8], file_len: u64) -> Option<(usize, Slot)> {
+    pick_slot(header, file_len)
+}
+
+fn pick_slot(header: &[u8], file_len: u64) -> Option<(usize, Slot)> {
+    let mut best: Option<(usize, Slot)> = None;
+    for idx in 0..2 {
+        let start = idx * HEADER_SLOT_LEN;
+        let Some(bytes) = header.get(start..start + HEADER_SLOT_LEN) else {
+            continue;
+        };
+        let Some(slot) = Slot::parse(bytes) else {
+            continue;
+        };
+        if slot.file_len > file_len {
+            continue;
+        }
+        if best.is_none_or(|(_, best)| slot.iteration > best.iteration) {
+            best = Some((idx, slot));
+        }
+    }
+    best
+}
+
+/// Write `slot` into header slot `idx` (0 or 1) of `file`, positioned, and
+/// leave the rest of the slot zero.
+///
+/// The caller decides when: the full rewrite writes slot 0 after the data
+/// region and the footer are on disk, and an append-only checkpoint writes
+/// the *other* slot after the new footer, with `iteration + 1`. Either way a
+/// slot only ever names bytes the file already holds, so a torn write leaves
+/// the previous slot valid.
+pub(crate) fn write_slot(file: &mut std::fs::File, idx: usize, slot: &Slot) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut buf = [0u8; HEADER_SLOT_LEN];
+    buf[..SLOT_LEN].copy_from_slice(&slot.encode());
+    file.seek(SeekFrom::Start((idx * HEADER_SLOT_LEN) as u64))?;
+    file.write_all(&buf)?;
+    Ok(())
+}
 
 /// The rows per row group: 60 engine chunks of 2,048 rows.
 pub const ROW_GROUP_ROWS: usize = 122_880;
@@ -133,8 +308,9 @@ pub const ROW_GROUP_ROWS: usize = 122_880;
 pub const CHUNKS_PER_ROW_GROUP: usize = ROW_GROUP_ROWS / CHUNK_SIZE;
 
 /// The footer's own version word (bumped when the footer layout changes).
-/// Version 7 (wave 136b) adds the per-chunk row counts to every row group, so
-/// a lazy open knows every chunk's row count without decoding it. Version 6
+/// Version 7 (wave 136) adds the per-chunk row counts to every row group, so
+/// a lazy open knows every chunk's row count without decoding it, and the
+/// `free_ranges` section. Version 6
 /// (wave 132b) always carries the store's persistent-secret section and a
 /// lake's declared data-file format; 5 (wave 139a) stores a column DEFAULT as
 /// its SQL text (the text is rebound at load); 4 (wave 131a) puts every
@@ -548,6 +724,102 @@ impl Writer {
     fn str(&mut self, s: &str) {
         self.u32(s.len() as u32);
         self.bytes(s.as_bytes());
+    }
+}
+
+/// Where a serialization's bytes go: an in-memory buffer or the file itself.
+///
+/// The data region is written through this one path, so a `save`'s file and
+/// the lake's in-memory `to_pink_bytes*` images are byte-identical by
+/// construction.
+trait Sink {
+    fn bytes(&mut self, b: &[u8]) -> Result<()>;
+
+    /// The offset the next byte lands at: the row-group directory records
+    /// absolute file offsets, and the slot records the file length.
+    fn offset(&self) -> u64;
+
+    /// Write header slot `idx` (see [`Slot`]).
+    ///
+    /// Only the last write of an image uses it, so a file sink may seek away
+    /// from the end here.
+    fn write_slot(&mut self, idx: usize, slot: &Slot) -> Result<()>;
+}
+
+/// A [`Sink`] over a `Vec`: the `to_pink_bytes*` API and pink-lake's data
+/// files.
+struct VecSink {
+    buf: Vec<u8>,
+}
+
+impl VecSink {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+}
+
+impl Sink for VecSink {
+    fn bytes(&mut self, b: &[u8]) -> Result<()> {
+        self.buf.extend_from_slice(b);
+        Ok(())
+    }
+
+    fn offset(&self) -> u64 {
+        self.buf.len() as u64
+    }
+
+    fn write_slot(&mut self, idx: usize, slot: &Slot) -> Result<()> {
+        // The image starts with both slots zeroed, so the padding is already
+        // zero and only the recorded bytes change.
+        let start = idx * HEADER_SLOT_LEN;
+        debug_assert!(self.buf.len() >= start + HEADER_SLOT_LEN);
+        self.buf[start..start + SLOT_LEN].copy_from_slice(&slot.encode());
+        Ok(())
+    }
+}
+
+/// A positioned [`Sink`] over an open file: buffered appends plus the running
+/// offset. `save`/checkpoint write the data region through it, so only one
+/// row group is ever held in memory.
+struct FileSink {
+    out: std::io::BufWriter<std::fs::File>,
+    pos: u64,
+}
+
+impl FileSink {
+    fn new(file: std::fs::File) -> Self {
+        // 1 MiB: large enough that the column chunks reach the file in a few
+        // writes, small enough to stay far below a row group's payload.
+        Self {
+            out: std::io::BufWriter::with_capacity(1 << 20, file),
+            pos: 0,
+        }
+    }
+
+    /// Flush the buffered bytes and hand the file back for the fsync.
+    fn finish(self) -> Result<std::fs::File> {
+        Ok(self.out.into_inner().map_err(|e| e.into_error())?)
+    }
+}
+
+impl Sink for FileSink {
+    fn bytes(&mut self, b: &[u8]) -> Result<()> {
+        use std::io::Write;
+        self.out.write_all(b)?;
+        self.pos += b.len() as u64;
+        Ok(())
+    }
+
+    fn offset(&self) -> u64 {
+        self.pos
+    }
+
+    fn write_slot(&mut self, idx: usize, slot: &Slot) -> Result<()> {
+        use std::io::Write;
+        // Flush the buffered tail first: the slot is the last write of the
+        // image, so nothing is appended through the buffer afterwards.
+        self.out.flush()?;
+        write_slot(self.out.get_mut(), idx, slot)
     }
 }
 
@@ -2870,7 +3142,7 @@ struct DbDir {
     schemas: Vec<SchemaDir>,
 }
 
-/// The parsed footer of a `PINKDB06` file.
+/// The parsed footer of a `PINKDB07` file.
 #[derive(Debug)]
 struct StoreFooter {
     databases: Vec<DbDir>,
@@ -3345,11 +3617,11 @@ fn apply_indexes(t: &mut DataTable, defs: &[IndexDef]) -> Result<()> {
 
 impl PinkDb {
     /// Serialize every database (and every table in it) in the `.pink`
-    /// columnar format (`PINKDB06`). Databases and tables are stored in
+    /// columnar format (`PINKDB07`). Databases and tables are stored in
     /// sorted name order (deterministic bytes). Views are session-local and
     /// never persisted.
     fn to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(self.to_image_inner(true, false, false)?.0.bytes().to_vec())
+        Ok(self.to_image_inner(true, false, false)?.0)
     }
 
     /// The engine catalog image (wave 96b): every database, macro, materialized
@@ -3358,35 +3630,61 @@ impl PinkDb {
     /// holds the rows; this is the metadata a stateless server restores from
     /// the catalog.
     pub(crate) fn to_metadata_bytes(&self) -> Result<Vec<u8>> {
-        Ok(self.to_image_inner(true, false, true)?.0.bytes().to_vec())
+        Ok(self.to_image_inner(true, false, true)?.0)
     }
 
     /// [`PinkDb::to_bytes`] with the chunk-parallel encode disabled (test
     /// switch: both paths must produce identical bytes).
     #[cfg(test)]
     fn to_bytes_impl(&self, parallel: bool) -> Result<Vec<u8>> {
-        Ok(self
-            .to_image_inner(parallel, false, false)?
-            .0
-            .bytes()
-            .to_vec())
+        Ok(self.to_image_inner(parallel, false, false)?.0)
     }
 
-    /// The one serialization path: a `PINKDB06` image, optionally with the
+    /// The one serialization path: a `PINKDB07` image, optionally with the
     /// exact per-table statistics collected in the same chunk pass. The
     /// statistics never influence the bytes (`to_image_inner(_, false).0` is
     /// bit-identical to `to_image_inner(_, true).0`).
-    ///
-    /// The returned image is what the store's chunk handles point at
-    /// afterwards: an unchanged table's chunks copied through, so a save
-    /// decodes nothing, and a saved write's chunk is stored (and evictable)
-    /// without a reopen.
     fn to_image_inner(
         &self,
         parallel: bool,
         collect_stats: bool,
         omit_rows: bool,
-    ) -> Result<(Arc<crate::storage::StoreImage>, Vec<SavedTableStats>)> {
+    ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
+        let mut data = VecSink::new();
+        let saved = self.write_image(&mut data, parallel, collect_stats, omit_rows)?;
+        Ok((data.buf, saved))
+    }
+
+    /// [`PinkDb::to_image_inner`]'s image, written through `data`: the one
+    /// serialization path, shared by the `Vec` sink of the in-memory API and
+    /// the file sink of `save`/checkpoint.
+    fn write_image<S: Sink>(
+        &self,
+        data: &mut S,
+        parallel: bool,
+        collect_stats: bool,
+        omit_rows: bool,
+    ) -> Result<Vec<SavedTableStats>> {
+        #[cfg(test)]
+        let hooks = Hooks::default();
+        #[cfg(not(test))]
+        let hooks = Hooks;
+        self.write_image_hooked(data, parallel, collect_stats, omit_rows, &hooks)
+    }
+
+    /// [`PinkDb::write_image`] with the test-only knobs: a non-empty
+    /// `free_ranges` section, or a second header slot with a newer iteration.
+    fn write_image_hooked<S: Sink>(
+        &self,
+        data: &mut S,
+        parallel: bool,
+        collect_stats: bool,
+        omit_rows: bool,
+        hooks: &Hooks,
+    ) -> Result<Vec<SavedTableStats>> {
+        // Both header slots, zero: neither is valid until the slot at the end
+        // names a footer that is already on disk.
+        data.bytes(&[0u8; 2 * HEADER_SLOT_LEN])?;
         // The optional catalog sections exist iff some object needs them (the
         // flags word is written in the footer, so decide it up front).
         let all_tables: Vec<&crate::storage::DataTable> = self
@@ -3420,11 +3718,11 @@ impl PinkDb {
             | if with_rbac { FLAG_RBAC } else { 0 };
 
         // The data region.
-        let mut data = Writer::new();
         let mut saved: Vec<SavedTableStats> = Vec::new();
-        // Every table this pass wrote, with each chunk's new home: the handles
-        // point there once the image is complete.
-        let mut repoints: Vec<(&DataTable, TableRanges)> = Vec::new();
+        // Every table this pass wrote, with the new home of each chunk it
+        // re-encoded (see `write_table`).
+        let mut carry: Vec<u8> = Vec::new();
+        let mut repoints: Vec<(&DataTable, TableCarry)> = Vec::new();
         let mut dbs = self.list_databases();
         dbs.sort();
         let mut db_dirs: Vec<DbDir> = Vec::with_capacity(dbs.len());
@@ -3477,8 +3775,9 @@ impl PinkDb {
                                 zones: vec![Vec::new(); t.columns.len()],
                             }
                         } else {
-                            let (dir, ranges) = write_table(
-                                &mut data,
+                            let (dir, carried) = write_table(
+                                data,
+                                &mut carry,
                                 &ns,
                                 name,
                                 t,
@@ -3486,7 +3785,7 @@ impl PinkDb {
                                 collect_stats,
                                 &mut saved,
                             )?;
-                            repoints.push((t, ranges));
+                            repoints.push((t, carried));
                             dir
                         };
                         tables.push(dir);
@@ -3538,6 +3837,24 @@ impl PinkDb {
         let mut fw = Writer::new();
         fw.u32(FOOTER_VERSION);
         fw.u32(flags);
+        // The data-region holes no row group references: the full rewrite
+        // leaves none, an append-only checkpoint (136w3) fills them in.
+        let free_ranges: &[(u64, u64)] = {
+            #[cfg(test)]
+            {
+                &hooks.free_ranges
+            }
+            #[cfg(not(test))]
+            {
+                let _ = hooks;
+                &[]
+            }
+        };
+        fw.u32(free_ranges.len() as u32);
+        for &(offset, len) in free_ranges {
+            fw.u64(offset);
+            fw.u64(len);
+        }
         fw.u32(db_dirs.len() as u32);
         for dbdir in &db_dirs {
             fw.str(&dbdir.name);
@@ -3617,25 +3934,48 @@ impl PinkDb {
         // keeping stale ones.
         write_secrets(&mut fw, self);
         let footer = fw.buf;
-        // The footer, then the trailer: the footer's CRC32C, its length and
-        // the magic.
+        // The footer, then slot 0: the footer is on disk before any slot
+        // names it, and slot 1 stays zero, so a torn write leaves no valid
+        // slot that names a missing footer.
+        let footer_offset = data.offset();
         let crc = crc32c(&footer);
-        data.bytes(&footer);
-        data.u32(crc);
-        data.u64(footer.len() as u64);
-        data.bytes(MAGIC_V6);
-        // An encrypted store's plaintext image is overwritten when its last
-        // handle drops it, exactly like the image a keyed open decrypts.
-        let image = crate::storage::StoreImage::new(data.buf, self.encryption_key.is_some());
-        // The handles point at the bytes just written: a dirty chunk is stored
-        // now, so the cache may evict it, and a clean one was copied through,
-        // so nothing was decoded to save it.
-        for (t, ranges) in repoints {
-            for (column, ranges) in t.columns.iter().zip(ranges) {
-                column.repoint(&image, &ranges);
+        data.bytes(&footer)?;
+        let slot = Slot {
+            iteration: 1,
+            footer_offset,
+            footer_len: footer.len() as u64,
+            footer_crc32c: crc,
+            file_len: data.offset(),
+        };
+        data.write_slot(0, &slot)?;
+        #[cfg(test)]
+        if hooks.second_slot {
+            data.write_slot(
+                1,
+                &Slot {
+                    iteration: 2,
+                    ..slot
+                },
+            )?;
+        }
+        // The handles of the chunks this pass re-encoded point at the bytes it
+        // wrote (the carried column chunks): a saved write's chunk is stored
+        // (and evictable) without a reopen. A copied-through chunk already
+        // points at the old image, whose bytes are exactly these.
+        if !carry.is_empty() {
+            // An encrypted store's plaintext image is overwritten when its
+            // last handle drops it, exactly like the image a keyed open
+            // decrypts.
+            let image = crate::storage::StoreImage::new(carry, self.encryption_key.is_some());
+            for (t, carried) in repoints {
+                for (column, chunks) in t.columns.iter().zip(carried) {
+                    for (i, offset, length, rows) in chunks {
+                        column.repoint_chunk(i, &image, offset, length, rows);
+                    }
+                }
             }
         }
-        Ok((image, saved))
+        Ok(saved)
     }
 
     /// The bytes [`PinkDb::save`] would write: every database in the `.pink`
@@ -3680,8 +4020,7 @@ impl PinkDb {
     /// `COUNT`/`MIN`/`MAX` from them without decoding a data file.
     pub fn to_pink_bytes_with_stats(&self) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         self.ensure_wal_healthy()?;
-        let (image, saved) = self.to_image_inner(true, true, false)?;
-        Ok((image.bytes().to_vec(), saved))
+        self.to_image_inner(true, true, false)
     }
 
     /// Write every database to `path` in the `.pink` columnar format.
@@ -3695,11 +4034,12 @@ impl PinkDb {
     pub fn save(&self, path: &str) -> Result<()> {
         self.ensure_wal_healthy()?;
         self.guard_snapshot_target(path)?;
-        let image = self.to_image_inner(true, false, false)?.0;
-        Self::write_atomic(std::path::Path::new(path), image.bytes())
+        Self::write_atomic(std::path::Path::new(path), |sink| {
+            self.write_image(sink, true, false, false).map(|_| ())
+        })
     }
 
-    /// [`PinkDb::save`] with at-rest encryption: the `PINKDB06` bytes are
+    /// [`PinkDb::save`] with at-rest encryption: the `PINKDB07` bytes are
     /// sealed into a `PINKENC1` container (AES-256-GCM, Argon2id for
     /// passphrases). Without the `encryption` feature this fails with a
     /// clear "not compiled in" error instead of writing plaintext.
@@ -3713,17 +4053,21 @@ impl PinkDb {
         {
             self.ensure_wal_healthy()?;
             self.guard_snapshot_target(path)?;
-            let image = self.to_image_inner(true, false, false)?.0;
-            let sealed = crate::crypto::seal_container(image.bytes(), key, 0)?;
-            Self::write_atomic(std::path::Path::new(path), &sealed)
+            // Encrypted stores take the in-memory path: the `PINKENC1`
+            // container seals the whole image, so it cannot be written while
+            // it is still being produced (136w3 adds a block container that
+            // can).
+            let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
+            Self::write_atomic(std::path::Path::new(path), |sink| sink.bytes(&sealed))
         }
     }
 
     /// [`PinkDb::save`] plus `fsync` on the written file — the checkpoint
     /// primitive (the WAL is only rolled once this returns).
     pub(crate) fn save_sync(&self, path: &std::path::Path) -> Result<()> {
-        let image = self.to_image_inner(true, false, false)?.0;
-        Self::write_sync(path, image.bytes())
+        Self::write_sync(path, |sink| {
+            self.write_image(sink, true, false, false).map(|_| ())
+        })
     }
 
     /// [`PinkDb::save_sync`] with at-rest encryption (checkpoint primitive for
@@ -3734,41 +4078,56 @@ impl PinkDb {
         path: &std::path::Path,
         key: &EncryptionKey,
     ) -> Result<()> {
-        let image = self.to_image_inner(true, false, false)?.0;
-        let sealed = crate::crypto::seal_container(image.bytes(), key, 0)?;
-        Self::write_sync(path, &sealed)
+        // See `save_with_key`: the whole-buffer container is sealed in memory.
+        let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
+        Self::write_sync(path, |sink| sink.bytes(&sealed))
     }
 
-    fn write_sync(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
+    /// Stream the image into `path` and fsync it. `path` is a checkpoint's
+    /// staging file: a failure removes it, so a partial image is never left
+    /// where recovery could trust it.
+    fn write_sync<F>(path: &std::path::Path, write: F) -> Result<()>
+    where
+        F: FnOnce(&mut FileSink) -> Result<()>,
+    {
         // M-5: checkpoints (and the `.tmp` staging file they are written to)
         // are owner-only, never umask-derived.
         crate::fsutil::tighten(path);
-        let mut f = crate::fsutil::create_private(path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        Ok(())
+        let written = (|| -> Result<()> {
+            let f = crate::fsutil::create_private(path)?;
+            let mut sink = FileSink::new(f);
+            write(&mut sink)?;
+            sink.finish()?.sync_all()?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        written
     }
 
-    /// Write `bytes` to `path` atomically: a unique temp sibling is written and
-    /// fsynced, then renamed over the target, then the parent directory is
-    /// fsynced. An interrupted write leaves the previous target intact; a
-    /// failure removes the temp file.
-    fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
+    /// Write the image `write` produces to `path` atomically: a unique temp
+    /// sibling is written and fsynced, then renamed over the target, then the
+    /// parent directory is fsynced. An interrupted write leaves the previous
+    /// target intact; a failure removes the temp file.
+    fn write_atomic<F>(path: &std::path::Path, write: F) -> Result<()>
+    where
+        F: FnOnce(&mut FileSink) -> Result<()>,
+    {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(format!(".tmp-{}-{seq}", std::process::id()));
         let tmp = std::path::PathBuf::from(tmp);
-        let write = (|| -> Result<()> {
-            let mut f = crate::fsutil::create_new_private(&tmp)?;
-            f.write_all(bytes)?;
-            f.sync_all()?;
+        let written = (|| -> Result<()> {
+            let f = crate::fsutil::create_new_private(&tmp)?;
+            let mut sink = FileSink::new(f);
+            write(&mut sink)?;
+            sink.finish()?.sync_all()?;
             Ok(())
         })();
-        if let Err(e) = write {
+        if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
@@ -3782,7 +4141,7 @@ impl PinkDb {
 
     /// Load a database from a `.pink` file written by [`PinkDb::save`].
     ///
-    /// Only the current format (`PINKDB06`) is readable: a file written by
+    /// Only the current format (`PINKDB07`) is readable: a file written by
     /// an older pinkdb is refused with a clear "written by an older pinkdb"
     /// error. Truncated or malformed files return errors, never panics. An
     /// encrypted (`PINKENC1`) file is rejected: without the `encryption`
@@ -3856,7 +4215,7 @@ impl PinkDb {
         }
     }
 
-    /// Decode a serialized `.pink` image (`PINKDB06`): copy it into the
+    /// Decode a serialized `.pink` image (`PINKDB07`): copy it into the
     /// retained store image a lazily opened store decodes from.
     fn load_bytes(data: &[u8]) -> Result<PinkDb> {
         Self::load_image(crate::storage::StoreImage::new(data.to_vec(), false))
@@ -4018,109 +4377,118 @@ impl PinkDb {
     }
 }
 
-/// Whether `bytes` is a `PINKDB06` image (the trailer magic).
-///
-/// The magic lives at the **end** of the file: the last 20 bytes are the
-/// trailer (`footer_crc32c u32 | footer_len u64 | "PINKDB06"`).
-pub fn is_pinkdb06(bytes: &[u8]) -> bool {
-    bytes.len() >= TRAILER_LEN && &bytes[bytes.len() - 8..] == MAGIC_V6
+/// Whether `bytes` is a `PINKDB07` image (the magic at offset 0, the start
+/// of the first header slot).
+pub fn is_pinkdb(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && &bytes[..8] == MAGIC_V7
 }
 
-/// Where one written chunk's encoded pages sit in the new image: `(offset,
-/// length, rows)`, the same triple the footer's column-chunk entries record.
-type ChunkRange = (u64, u64, usize);
+/// Where one re-encoded column chunk sits in the save's carry buffer: `(chunk
+/// index, offset of the page, page length, rows)`.
+type CarriedChunk = (usize, u64, u64, usize);
 
-/// Every written chunk's [`ChunkRange`], per column, in chunk order.
-type TableRanges = Vec<Vec<ChunkRange>>;
+/// Every re-encoded column chunk's [`CarriedChunk`]s, per column.
+type TableCarry = Vec<Vec<CarriedChunk>>;
+
+/// The test-only knobs of a write: a non-empty `free_ranges` section, and a
+/// second header slot with a newer iteration.
+#[cfg(test)]
+#[derive(Default)]
+struct Hooks {
+    free_ranges: Vec<(u64, u64)>,
+    second_slot: bool,
+}
+
+#[cfg(not(test))]
+#[derive(Default)]
+struct Hooks;
 
 /// Write one table's data region (its column chunks) and collect its footer
-/// entry. The second value is each chunk's [`ChunkRange`] in the image written,
-/// per column, in chunk order: the handles point there once the image is
-/// complete.
-fn write_table(
-    data: &mut Writer,
+/// entry.
+///
+/// One row group is read, encoded and written at a time: a clean group's
+/// bytes are copied through, the rest are encoded in parallel, written
+/// through the sink, then dropped. The sink is a [`VecSink`] for the
+/// in-memory API and a [`FileSink`] for `save`/checkpoint, so both paths
+/// produce the same bytes.
+///
+/// The second value is the new home of every chunk this pass re-encoded,
+/// relative to `carry`; `write_image` repoints the handles there.
+#[allow(clippy::too_many_arguments)]
+fn write_table<S: Sink>(
+    data: &mut S,
+    carry: &mut Vec<u8>,
     ns: &crate::storage::SchemaPath,
     name: &str,
     t: &DataTable,
     parallel: bool,
     collect_stats: bool,
     saved: &mut Vec<SavedTableStats>,
-) -> Result<(TableDir, TableRanges)> {
+) -> Result<(TableDir, TableCarry)> {
     let schema = t.schema();
     let n_chunks = t.num_chunks();
-    // The per-column statistics of the whole table (the lake's stats block).
+    // The per-column statistics of the whole table (the lake's stats
+    // block), accumulated as each row group is encoded.
     let mut accs: Vec<ChunkColumnStats> =
         schema.iter().map(|_| ChunkColumnStats::empty()).collect();
     // The row groups: 60 engine chunks each.
     let n_groups = n_chunks.div_ceil(CHUNKS_PER_ROW_GROUP);
     let mut row_groups: Vec<RowGroupDir> = Vec::with_capacity(n_groups);
-    let mut ranges: TableRanges = vec![Vec::with_capacity(n_chunks); schema.len()];
+    let mut table_carry: TableCarry = Vec::with_capacity(schema.len());
     for g in 0..n_groups {
         let first = g * CHUNKS_PER_ROW_GROUP;
         let last = (first + CHUNKS_PER_ROW_GROUP).min(n_chunks);
         let chunk_rows: Vec<u32> = (first..last).map(|i| t.chunk_rows(i) as u32).collect();
         let rows: u64 = chunk_rows.iter().map(|&r| r as u64).sum();
-        let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(schema.len());
-        for (ci, column) in t.columns.iter().enumerate() {
-            let (dir, page_offsets) = if let Some(copy) = copy_through(column, first, last) {
-                // A clean group is already encoded exactly as the encoder
-                // would: copy its bytes, and take the chunk's statistics and
-                // encoding summary from what the footer says about them, so no
-                // page is decoded.
-                let bytes = &copy.image.bytes()[copy.start as usize..copy.end as usize];
-                let offset = data.buf.len() as u64;
-                data.bytes(bytes);
-                let mut acc = ChunkColumnStats::empty();
-                let mut encodings = 0u32;
-                let mut page_offsets = Vec::with_capacity(copy.pages.len());
-                for (i, &(rel, len)) in copy.pages.iter().enumerate() {
-                    acc.merge(t.zone(ci, first + i));
-                    encodings |= 1u32 << bytes[rel as usize];
-                    page_offsets.push((offset + rel as u64, len as u64));
+        // A clean group is already encoded exactly as the encoder would: its
+        // bytes are copied from the image the handles point at, and its
+        // statistics and encoding summary come from what the footer says
+        // about them, so no page is decoded.
+        let copies: Vec<Option<CopyThrough>> = t
+            .columns
+            .iter()
+            .map(|column| copy_through(column, first, last))
+            .collect();
+        let work: Vec<(usize, usize)> = copies
+            .iter()
+            .enumerate()
+            .filter(|(_, copy)| copy.is_none())
+            .flat_map(|(ci, _)| (first..last).map(move |i| (ci, i)))
+            .collect();
+        // The string layout stores offsets as `u32`; a chunk whose total
+        // VARCHAR bytes exceed that cannot be encoded faithfully (the offsets
+        // would wrap and the reader would reject the file). Refuse before
+        // writing instead of emitting a corrupt file.
+        let encode = |ci: usize, i: usize| -> Result<EncodedPage> {
+            let v = t.columns[ci].chunk(i)?;
+            if let VectorData::VarChar(strs) = v.data() {
+                let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
+                if !varchar_offsets_fit(total) {
+                    return Err(PinkDbError::Execution(format!(
+                        "table \"{ns}.{name}\" has a VARCHAR chunk of {total} \
+                         bytes, over the .pink format's u32 string-offset limit"
+                    )));
                 }
-                accs[ci].merge(&acc);
-                let dir = ColumnChunkDir {
-                    offset,
-                    length: bytes.len() as u64,
-                    page_count: copy.pages.len() as u32,
-                    encodings,
-                    crc32c: crc32c(bytes),
-                    null_count: acc.null_count,
-                    nan_count: acc.nan_count,
-                    min: acc.min,
-                    max: acc.max,
-                };
-                (dir, page_offsets)
-            } else {
-                // Encode the group's pages: one engine chunk per page. Order is
-                // preserved, so the bytes are identical to a serial pass.
-                let encode = |i: usize| -> Result<EncodedPage> {
-                    let v = column.chunk(i)?;
-                    // The string layout stores offsets as `u32`; a chunk whose
-                    // total VARCHAR bytes exceed that cannot be encoded
-                    // faithfully (the offsets would wrap and the reader would
-                    // reject the file). Refuse before writing instead of
-                    // emitting a corrupt file.
-                    if let VectorData::VarChar(strs) = v.data() {
-                        let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
-                        if !varchar_offsets_fit(total) {
-                            return Err(PinkDbError::Execution(format!(
-                                "table \"{ns}.{name}\" has a VARCHAR chunk of {total} \
-                                 bytes, over the .pink format's u32 string-offset limit"
-                            )));
-                        }
-                    }
-                    Ok(encode_page(&v))
-                };
-                let pages: Vec<EncodedPage> = if parallel && n_chunks >= PARALLEL_SAVE_MIN_CHUNKS {
-                    (first..last)
-                        .collect::<Vec<_>>()
-                        .par_iter()
-                        .map(|&i| encode(i))
-                        .collect::<Result<Vec<_>>>()?
-                } else {
-                    (first..last).map(encode).collect::<Result<Vec<_>>>()?
-                };
+            }
+            Ok(encode_page(&v))
+        };
+        // Encode the pages that cannot be copied in parallel; the
+        // order-preserving collect keeps the bytes identical to a serial pass.
+        let encoded: Vec<EncodedPage> = if parallel && work.len() >= PARALLEL_SAVE_MIN_CHUNKS {
+            work.par_iter()
+                .map(|&(ci, i)| encode(ci, i))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            work.iter()
+                .map(|&(ci, i)| encode(ci, i))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut encoded = encoded.into_iter();
+        let mut columns: Vec<ColumnChunkDir> = Vec::with_capacity(schema.len());
+        for (ci, copy) in copies.into_iter().enumerate() {
+            let Some(copy) = copy else {
+                let pages: Vec<EncodedPage> = encoded.by_ref().take(last - first).collect();
+                debug_assert_eq!(pages.len(), last - first);
                 // The column chunk: the page index, then the pages.
                 let page_count = pages.len() as u32;
                 let index_len = 4 + page_count as usize * 8;
@@ -4137,39 +4505,75 @@ fn write_table(
                     chunk.bytes(&page.frame);
                 }
                 let bytes = chunk.buf;
-                let crc = crc32c(&bytes);
-                let offset = data.buf.len() as u64;
+                let offset = data.offset();
                 let length = bytes.len() as u64;
-                data.bytes(&bytes);
-                // The chunk's exact statistics and encoding summary.
+                data.bytes(&bytes)?;
+                // The column chunk's exact statistics and encoding summary.
                 let mut acc = ChunkColumnStats::empty();
                 let mut encodings = 0u32;
-                let mut page_offsets = Vec::with_capacity(pages.len());
-                let mut rel = index_len as u64;
                 for page in &pages {
                     acc.merge(&page.stats);
                     encodings |= 1u32 << page.frame[0];
-                    page_offsets.push((offset + rel, page.frame.len() as u64));
-                    rel += page.frame.len() as u64;
                 }
                 accs[ci].merge(&acc);
-                let dir = ColumnChunkDir {
+                columns.push(ColumnChunkDir {
                     offset,
                     length,
                     page_count,
                     encodings,
-                    crc32c: crc,
+                    crc32c: crc32c(&bytes),
                     null_count: acc.null_count,
                     nan_count: acc.nan_count,
                     min: acc.min,
                     max: acc.max,
-                };
-                (dir, page_offsets)
+                });
+                // Chunks that have a stored form came from an image: keep them
+                // in one, so a saved write stays evictable without a reopen. A
+                // chunk built in memory has nothing worth holding (and a bulk
+                // load would hold its whole data region), so it stays dirty and
+                // the next save re-encodes it identically.
+                if !(first..last).any(|i| t.columns[ci].has_stored_form(i)) {
+                    table_carry.push(Vec::new());
+                    continue;
+                }
+                let base = carry.len() as u64;
+                let mut carried = Vec::with_capacity(pages.len());
+                let mut page_offset = index_len as u64;
+                for (i, page) in pages.iter().enumerate() {
+                    carried.push((
+                        first + i,
+                        base + page_offset,
+                        page.frame.len() as u64,
+                        chunk_rows[i] as usize,
+                    ));
+                    page_offset += page.frame.len() as u64;
+                }
+                carry.extend_from_slice(&bytes);
+                table_carry.push(carried);
+                continue;
             };
-            for (i, &(offset, length)) in page_offsets.iter().enumerate() {
-                ranges[ci].push((offset, length, chunk_rows[i] as usize));
+            let bytes = &copy.image.bytes()[copy.start as usize..copy.end as usize];
+            let offset = data.offset();
+            data.bytes(bytes)?;
+            let mut acc = ChunkColumnStats::empty();
+            let mut encodings = 0u32;
+            for (i, &(rel, _)) in copy.pages.iter().enumerate() {
+                acc.merge(t.zone(ci, first + i));
+                encodings |= 1u32 << bytes[rel as usize];
             }
-            columns.push(dir);
+            accs[ci].merge(&acc);
+            columns.push(ColumnChunkDir {
+                offset,
+                length: bytes.len() as u64,
+                page_count: copy.pages.len() as u32,
+                encodings,
+                crc32c: crc32c(bytes),
+                null_count: acc.null_count,
+                nan_count: acc.nan_count,
+                min: acc.min,
+                max: acc.max,
+            });
+            table_carry.push(Vec::new());
         }
         row_groups.push(RowGroupDir {
             rows,
@@ -4203,23 +4607,25 @@ fn write_table(
         variant_path_stats(t, &mut entry);
         saved.push(entry);
     }
-    let dir = TableDir {
-        name: name.to_string(),
-        schema,
-        constraints: t.constraints.clone(),
-        defaults: t
-            .columns
-            .iter()
-            .map(|c| c.default.as_ref().map(|d| d.text.clone()))
-            .collect(),
-        indexes: index_defs(t, &null_counts),
-        vector_indexes: vector_index_defs(t)?,
-        row_count: t.num_rows() as u64,
-        row_groups,
-        stats: t.stats().clone(),
-        zones: t.zones().to_vec(),
-    };
-    Ok((dir, ranges))
+    Ok((
+        TableDir {
+            name: name.to_string(),
+            schema,
+            constraints: t.constraints.clone(),
+            defaults: t
+                .columns
+                .iter()
+                .map(|c| c.default.as_ref().map(|d| d.text.clone()))
+                .collect(),
+            indexes: index_defs(t, &null_counts),
+            vector_indexes: vector_index_defs(t)?,
+            row_count: t.num_rows() as u64,
+            row_groups,
+            stats: t.stats().clone(),
+            zones: t.zones().to_vec(),
+        },
+        table_carry,
+    ))
 }
 
 /// A row group's column chunk as it sits in the retained store image: the
@@ -4272,49 +4678,31 @@ fn copy_through(column: &crate::storage::Column, first: usize, last: usize) -> O
     })
 }
 
-/// The footer's byte range in a `PINKDB06` image: `(offset, length)`.
+/// The footer's byte range in a `PINKDB07` image: `(offset, length)`.
 ///
-/// A ranged reader needs the 20-byte trailer and then exactly this window:
-/// two small requests, no read of the data region.
+/// A ranged reader needs the first `2 * HEADER_SLOT_LEN` bytes and then
+/// exactly this window: two small requests, no read of the data region.
 pub fn footer_span(bytes: &[u8]) -> Result<(u64, u64)> {
-    let (offset, len) = footer_span_raw(bytes)?;
-    Ok((offset as u64, len as u64))
-}
-
-/// The footer's byte range, without the format check (the internal helper).
-fn footer_span_raw(bytes: &[u8]) -> Result<(usize, usize)> {
-    if bytes.len() < TRAILER_LEN {
-        return Err(PinkDbError::Execution(
-            "not a .pink file (bad magic)".to_string(),
-        ));
-    }
-    let trailer = &bytes[bytes.len() - TRAILER_LEN..];
-    let len = u64::from_le_bytes([
-        trailer[4],
-        trailer[5],
-        trailer[6],
-        trailer[7],
-        trailer[8],
-        trailer[9],
-        trailer[10],
-        trailer[11],
-    ]) as usize;
-    let start = bytes
-        .len()
-        .checked_sub(TRAILER_LEN)
-        .and_then(|s| s.checked_sub(len))
-        .ok_or_else(|| {
-            PinkDbError::Execution("corrupt file: the footer length is out of range".to_string())
-        })?;
-    Ok((start, len))
+    let (offset, len, _) = footer_location(bytes, bytes.len() as u64)?;
+    Ok((offset, len))
 }
 
 /// The footer's flags word: which optional catalog sections the image
 /// carries (constraints, column defaults, materialized views, index
 /// definitions, procedures, macros and RBAC).
 pub fn footer_flags(bytes: &[u8]) -> Result<u32> {
-    let (start, len) = footer_span_raw(bytes)?;
-    let footer = &bytes[start..start + len];
+    let (offset, len, crc) = footer_location(bytes, bytes.len() as u64)?;
+    let start = offset as usize;
+    let end = start
+        .checked_add(len as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or_else(|| corrupt_file("the footer is out of range"))?;
+    let footer = &bytes[start..end];
+    if crc32c(footer) != crc {
+        return Err(corrupt_file(
+            "the footer checksum does not match (the file is damaged)",
+        ));
+    }
     let mut r = Reader::new(footer);
     let version = r.u32()?;
     check_footer_version(version)?;
@@ -4465,8 +4853,20 @@ fn read_storage(r: &mut Reader<'_>) -> Result<crate::lake_db::DbStorage> {
 fn older_pinkdb_error(version: u8) -> PinkDbError {
     PinkDbError::Execution(format!(
         "this .pink file was written by an older pinkdb (PINKDB0{version}); \
-         this build reads PINKDB06 only"
+         this build reads PINKDB07 only"
     ))
+}
+
+/// The refusal for a file written by a newer pinkdb.
+fn newer_pinkdb_error(version: u8) -> PinkDbError {
+    PinkDbError::Execution(format!(
+        "written by a newer pinkdb (format v{version}); upgrade pinkdb"
+    ))
+}
+
+/// A corrupt-file refusal with the format's fixed prefix.
+fn corrupt_file(why: &str) -> PinkDbError {
+    PinkDbError::Execution(format!("corrupt file: {why}"))
 }
 
 // ---------- the projected-read API (wave 102) ----------
@@ -4479,7 +4879,7 @@ fn older_pinkdb_error(version: u8) -> PinkDbError {
 // the only ones a projected reader needs, and they are used by the lake's
 // `pink` provider (crates/pink-lake).
 
-/// One column chunk of a `PINKDB06` file, as a reader outside the crate
+/// One column chunk of a `PINKDB07` file, as a reader outside the crate
 /// sees it: where its bytes are, and what they prove.
 ///
 /// A chunk is self-describing: it carries its own CRC32C (so a reader
@@ -4508,7 +4908,7 @@ pub struct PinkColumnChunk {
     pub max: Option<Value>,
 }
 
-/// One row group of a `PINKDB06` file: its row count and one entry per
+/// One row group of a `PINKDB07` file: its row count and one entry per
 /// column, in schema order.
 #[derive(Debug, Clone)]
 pub struct PinkRowGroup {
@@ -4518,7 +4918,7 @@ pub struct PinkRowGroup {
     pub columns: Vec<PinkColumnChunk>,
 }
 
-/// One table of a `PINKDB06` file: its identity, its physical schema and
+/// One table of a `PINKDB07` file: its identity, its physical schema and
 /// its row-group directory.
 #[derive(Debug, Clone)]
 pub struct PinkTableLayout {
@@ -4534,7 +4934,7 @@ pub struct PinkTableLayout {
     pub row_groups: Vec<PinkRowGroup>,
 }
 
-/// The parsed layout of a `PINKDB06` file: every table it holds, with its
+/// The parsed layout of a `PINKDB07` file: every table it holds, with its
 /// schema and its row-group directory.
 #[derive(Debug, Clone, Default)]
 pub struct PinkLayout {
@@ -4552,7 +4952,7 @@ impl PinkLayout {
     }
 }
 
-/// One fetched byte window of a `PINKDB06` file: the bytes at `offset`.
+/// One fetched byte window of a `PINKDB07` file: the bytes at `offset`.
 ///
 /// A projected reader fetches exactly the byte ranges it needs and hands
 /// them back here; [`decode_projected_columns`] slices the column chunks out
@@ -4565,85 +4965,86 @@ pub struct PinkByteWindow {
     pub bytes: Vec<u8>,
 }
 
-/// The footer's location and checksum, read from a `PINKDB06` file's
-/// 20-byte trailer.
+/// The footer's location and checksum, read from a `PINKDB07` file's header
+/// slots.
 ///
-/// Returns `(offset, length, crc32c)`: the footer's byte range in the file
-/// and the CRC32C the trailer records for it. A reader that already knows
-/// where the footer is (the lake's catalog records it, `format_version` 7)
-/// needs no trailer read at all — this function is the fallback for a
-/// reader that does not.
-pub fn footer_location(bytes: &[u8]) -> Result<(u64, u64, u32)> {
-    if bytes.len() < TRAILER_LEN {
-        return Err(PinkDbError::Execution(
-            "not a .pink file (bad magic)".to_string(),
-        ));
+/// `bytes` is the file's first `2 * HEADER_SLOT_LEN` bytes (`8,192`); a ranged
+/// reader fetches exactly that in one request. `file_len` is the file's total
+/// length: a slot that records a longer file is the torn half of a write and
+/// is ignored. Returns `(offset, length, crc32c)` of the footer the newer
+/// valid slot names. A reader that already knows where the footer is (the
+/// lake's catalog records it) needs no header read at all — this function is
+/// the fallback for a reader that does not.
+pub fn footer_location(bytes: &[u8], file_len: u64) -> Result<(u64, u64, u32)> {
+    // The whole file is at hand when the caller passes an image: a v6 file's
+    // trailer magic is the one older layout whose magic is not at offset 0.
+    if bytes.len() > 2 * HEADER_SLOT_LEN && bytes.ends_with(b"PINKDB06") {
+        return Err(older_pinkdb_error(6));
     }
-    let trailer = &bytes[bytes.len() - TRAILER_LEN..];
-    check_magic(bytes, &trailer[12..20])?;
-    let (start, len) = footer_span_raw(bytes)?;
-    Ok((
-        start as u64,
-        len as u64,
-        u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]),
-    ))
+    let header = &bytes[..bytes.len().min(2 * HEADER_SLOT_LEN)];
+    let Some((_, slot)) = valid_slot(header, file_len) else {
+        return Err(match header.first_chunk::<8>() {
+            Some(magic) if &magic[..7] == b"PINKDB0" && magic[7].is_ascii_digit() => {
+                if magic[7] < b'7' {
+                    older_pinkdb_error(magic[7] - b'0')
+                } else if magic[7] > b'7' {
+                    newer_pinkdb_error(magic[7] - b'0')
+                } else {
+                    // The right magic with no valid slot: the header itself
+                    // is damaged.
+                    corrupt_file("no header slot is valid (the file is damaged)")
+                }
+            }
+            _ => PinkDbError::Execution("not a .pink file (bad magic)".to_string()),
+        });
+    };
+    Ok((slot.footer_offset, slot.footer_len, slot.footer_crc32c))
 }
 
-/// Parse a `PINKDB06` file's 20-byte trailer: the footer's `(offset,
-/// length)` and its CRC32C.
+/// Re-seal the header slot that names the footer after the footer's bytes were
+/// edited in place, so a test can forge a footer (an old version, an unknown
+/// flag bit) without re-encoding the whole store.
 ///
-/// `trailer` is the file's last 20 bytes (`footer_crc32c u32 | footer_len
-/// u64 | "PINKDB06"`); `file_len` is the file's total length (the trailer
-/// names the footer's *length*, so its offset follows from it). A reader
-/// that fetched only the trailer (the lake's ranged read) uses this instead
-/// of [`footer_location`].
-pub fn parse_trailer(trailer: &[u8], file_len: u64) -> Result<(u64, u64, u32)> {
-    if trailer.len() < TRAILER_LEN {
-        return Err(PinkDbError::Execution(
-            "not a .pink file (bad magic)".to_string(),
+/// Test only: the writer never edits a footer it already sealed.
+#[doc(hidden)]
+pub fn reseal_footer(bytes: &mut [u8]) -> Result<()> {
+    let (offset, len, _) = footer_location(bytes, bytes.len() as u64)?;
+    let crc = crc32c(&bytes[offset as usize..(offset + len) as usize]);
+    let Some((idx, slot)) = read_slots(&bytes[..bytes.len().min(2 * HEADER_SLOT_LEN)]) else {
+        return Err(corrupt_file(
+            "no header slot is valid (the file is damaged)",
         ));
-    }
-    if &trailer[12..20] != MAGIC_V6 {
-        return Err(PinkDbError::Execution(
-            "not a .pink file (bad magic)".to_string(),
-        ));
-    }
-    let crc32c = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-    let length = u64::from_le_bytes([
-        trailer[4],
-        trailer[5],
-        trailer[6],
-        trailer[7],
-        trailer[8],
-        trailer[9],
-        trailer[10],
-        trailer[11],
-    ]);
-    let offset = file_len
-        .checked_sub(TRAILER_LEN as u64)
-        .and_then(|s| s.checked_sub(length))
-        .ok_or_else(|| {
-            PinkDbError::Execution("corrupt file: the footer length is out of range".to_string())
-        })?;
-    Ok((offset, length, crc32c))
+    };
+    let mut sealed = [0u8; HEADER_SLOT_LEN];
+    sealed[..SLOT_LEN].copy_from_slice(
+        &Slot {
+            footer_crc32c: crc,
+            ..slot
+        }
+        .encode(),
+    );
+    let start = idx * HEADER_SLOT_LEN;
+    bytes[start..start + HEADER_SLOT_LEN].copy_from_slice(&sealed);
+    Ok(())
 }
 
-/// Parse the footer region of a `PINKDB06` file into its layout.
+/// Parse the footer region of a `PINKDB07` file into its layout.
 ///
-/// `region` is the footer's bytes (the `length` bytes the trailer points
-/// at). `crc32c` is the checksum the trailer records for them; pass `None`
-/// to skip the check (a reader that fetched the footer region but not the
-/// trailer — the lake's catalog-recorded location). A mismatch is refused
-/// before a single byte of the footer is decoded.
-pub fn read_layout(region: &[u8], crc32c: Option<u32>) -> Result<PinkLayout> {
+/// `region` is the footer's bytes (the `length` bytes the header slot points
+/// at) and `footer_offset` is where they sit in the file (the data region
+/// ends there). `crc32c` is the checksum the header slot records for them;
+/// pass `None` to skip the check (a reader that fetched the footer region but
+/// not the header — the lake's catalog-recorded location). A mismatch is
+/// refused before a single byte of the footer is decoded.
+pub fn read_layout(region: &[u8], crc32c: Option<u32>, footer_offset: u64) -> Result<PinkLayout> {
     if let Some(want) = crc32c
         && crate::persist::crc32c(region) != want
     {
-        return Err(PinkDbError::Execution(
-            "corrupt file: the footer checksum does not match (the file is damaged)".to_string(),
+        return Err(corrupt_file(
+            "the footer checksum does not match (the file is damaged)",
         ));
     }
-    let footer = parse_store_footer(region)?;
+    let footer = parse_store_footer(region, footer_offset)?;
     Ok(PinkLayout {
         tables: footer
             .databases
@@ -4881,66 +5282,29 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
     Vector::from_raw(data, Vec::new())
 }
 
-/// Read (and verify) the footer of a `PINKDB06` image.
+/// Read (and verify) the footer of a `PINKDB07` image.
 fn read_store_footer(data: &[u8]) -> Result<StoreFooter> {
-    if data.len() < TRAILER_LEN {
-        return Err(PinkDbError::Execution(
-            "not a .pink file (bad magic)".to_string(),
+    let (offset, len, crc) = footer_location(data, data.len() as u64)?;
+    let start = offset as usize;
+    let end = start
+        .checked_add(len as usize)
+        .filter(|&end| end <= data.len())
+        .ok_or_else(|| corrupt_file("the footer is out of range"))?;
+    let footer = &data[start..end];
+    if crc32c(footer) != crc {
+        return Err(corrupt_file(
+            "the footer checksum does not match (the file is damaged)",
         ));
     }
-    let trailer = &data[data.len() - TRAILER_LEN..];
-    let want_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-    check_magic(data, &trailer[12..20])?;
-    let (start, len) = footer_span_raw(data)?;
-    let footer = &data[start..start + len];
-    if crc32c(footer) != want_crc {
-        return Err(PinkDbError::Execution(
-            "corrupt file: the footer checksum does not match (the file is damaged)".to_string(),
-        ));
-    }
-    parse_store_footer(footer)
+    parse_store_footer(footer, offset)
 }
 
-/// Check a file's magic: the trailer's for a `PINKDB06` image, the file's
-/// first bytes for an older layout (whose magic sat at the start).
-///
-/// The two refusals are the format's contract: an older pinkdb's file is
-/// never guessed at, and a newer one asks for an upgrade.
-fn check_magic(data: &[u8], trailer_magic: &[u8]) -> Result<()> {
-    if trailer_magic == MAGIC_V6 {
-        return Ok(());
-    }
-    // A file from a newer pinkdb?
-    if trailer_magic.starts_with(b"PINKDB0")
-        && trailer_magic[7].is_ascii_digit()
-        && trailer_magic[7] > b'6'
-    {
-        return Err(PinkDbError::Execution(format!(
-            "written by a newer pinkdb (format v{}); upgrade pinkdb",
-            trailer_magic[7] - b'0'
-        )));
-    }
-    // A file from an older pinkdb? Its magic is at the *start*.
-    if data.len() >= 8 && data.starts_with(b"PINKDB0") && data[7].is_ascii_digit() {
-        let v = data[7];
-        if v <= b'6' {
-            return Err(older_pinkdb_error(v - b'0'));
-        }
-        return Err(PinkDbError::Execution(format!(
-            "written by a newer pinkdb (format v{}); upgrade pinkdb",
-            v - b'0'
-        )));
-    }
-    Err(PinkDbError::Execution(
-        "not a .pink file (bad magic)".to_string(),
-    ))
-}
-
-/// Parse a `PINKDB06` footer region (the bytes the trailer points at) into
-/// the store's metadata and row-group directory. The region's checksum is
+/// Parse a `PINKDB07` footer region (the bytes its header slot points at)
+/// into the store's metadata and row-group directory. The region's checksum is
 /// **not** checked here — the caller checks it (see [`read_store_footer`]
-/// and [`read_layout`]).
-fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
+/// and [`read_layout`]). `data_end` is the footer's absolute offset: the data
+/// region ends there, which is what range-checks `free_ranges`.
+fn parse_store_footer(footer: &[u8], data_end: u64) -> Result<StoreFooter> {
     let mut r = Reader::new(footer);
     let version = r.u32()?;
     check_footer_version(version)?;
@@ -4970,6 +5334,18 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
     let procedures = flags & FLAG_PROCEDURES != 0;
     let triggers = flags & FLAG_TRIGGERS != 0;
     let rbac = flags & FLAG_RBAC != 0;
+
+    let n_free = r.u32()? as usize;
+    // Each range costs 16 bytes.
+    if n_free > r.remaining() / 16 {
+        return r.err("free-range count exceeds the remaining file");
+    }
+    let mut free_ranges = Vec::with_capacity(n_free);
+    for _ in 0..n_free {
+        let offset = r.u64()?;
+        let len = r.u64()?;
+        free_ranges.push((offset, len));
+    }
 
     let n_dbs = r.u32()? as usize;
     // Each database costs at least 8 bytes (its name's length prefix).
@@ -5201,11 +5577,51 @@ fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
             "corrupt file: trailing bytes after the footer".to_string(),
         ));
     }
+    check_free_ranges(&free_ranges, &databases, data_end)?;
     Ok(StoreFooter {
         databases,
         rbac,
         secrets,
     })
+}
+
+/// Refuse a `free_ranges` list a reader cannot trust.
+///
+/// The list is only a hint for an append-only checkpoint, so the full rewrite
+/// writes it empty and a reader ignores it — but a corrupted one is a damaged
+/// footer, not something to guess at: it must be sorted, disjoint, inside the
+/// data region and clear of every row group.
+fn check_free_ranges(ranges: &[(u64, u64)], databases: &[DbDir], data_end: u64) -> Result<()> {
+    for (i, &(offset, len)) in ranges.iter().enumerate() {
+        if i > 0 && ranges[i - 1].0 >= offset {
+            return Err(corrupt_file("the free ranges are not sorted"));
+        }
+        let Some(end) = offset.checked_add(len) else {
+            return Err(corrupt_file("a free range is outside the data region"));
+        };
+        if offset < DATA_START || end > data_end {
+            return Err(corrupt_file("a free range is outside the data region"));
+        }
+        if let Some((prev_offset, prev_len)) = ranges.get(i.wrapping_sub(1))
+            && prev_offset + prev_len > offset
+        {
+            return Err(corrupt_file("the free ranges overlap"));
+        }
+        for db in databases {
+            for sdir in &db.schemas {
+                for tdir in &sdir.tables {
+                    for rg in &tdir.row_groups {
+                        for c in &rg.columns {
+                            if offset < c.offset + c.length && c.offset < end {
+                                return Err(corrupt_file("a free range overlaps a row group"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Load one table's data region: verify every column chunk (CRC32C and page
@@ -6457,12 +6873,12 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
     (0..decoded.len()).map(|i| decoded.get(i)).collect()
 }
 
-/// The pinned length and footer checksum of the golden corpus's `PINKDB06`
-/// image (see `golden_pinkdb06_bytes_are_pinned`).
+/// The pinned length and footer checksum of the golden corpus's `PINKDB07`
+/// image (see `golden_pinkdb07_bytes_are_pinned`).
 #[cfg(test)]
-const GOLDEN_V6_LEN: usize = 143_770;
+const GOLDEN_LEN: usize = 151_946;
 #[cfg(test)]
-const GOLDEN_V6_FOOTER_CRC: u32 = 2_044_228_477;
+const GOLDEN_FOOTER_CRC: u32 = 2_922_773_562;
 
 #[cfg(test)]
 mod tests {
@@ -6489,8 +6905,8 @@ mod tests {
         db.save(path.to_str().unwrap()).unwrap();
         let data = std::fs::read(&path).unwrap();
         assert!(
-            is_pinkdb06(&data),
-            "the image must carry the PINKDB06 trailer"
+            is_pinkdb(&data),
+            "the image must start with the PINKDB07 magic"
         );
         let back = PinkDb::open(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
@@ -6608,11 +7024,11 @@ mod tests {
         assert!(err.to_string().contains("bad magic"), "{err}");
     }
 
-    /// A file written by an older pinkdb (`PINKDB01`–`PINKDB05`) is refused
-    /// with the documented message: this build reads `PINKDB06` only.
+    /// A file written by an older pinkdb (`PINKDB01`–`PINKDB06`) is refused
+    /// with the documented message: this build reads `PINKDB07` only.
     #[test]
     fn older_pink_files_are_refused_with_the_documented_message() {
-        for version in 1..=5u8 {
+        for version in 1..=6u8 {
             let mut bytes = format!("PINKDB0{version}").into_bytes();
             bytes.extend_from_slice(&[0xABu8; 64]);
             let err = PinkDb::from_pink_bytes(&bytes).unwrap_err().to_string();
@@ -6620,19 +7036,63 @@ mod tests {
                 err,
                 format!(
                     "this .pink file was written by an older pinkdb (PINKDB0{version}); \
-                     this build reads PINKDB06 only"
+                     this build reads PINKDB07 only"
                 ),
                 "version {version}"
             );
         }
     }
 
-    /// Relabel a `.pink` file's footer as `version`, fixing its trailer CRC.
+    /// Relabel a `.pink` file's footer as `version`, fixing its slot CRC.
     fn relabel_footer_version(bytes: &mut [u8], version: u32) {
-        let (start, len) = footer_span_raw(bytes).unwrap();
+        let (offset, _, _) = footer_location(bytes, bytes.len() as u64).unwrap();
+        let start = offset as usize;
         bytes[start..start + 4].copy_from_slice(&version.to_le_bytes());
-        let crc = crc32c(&bytes[start..start + len]);
-        bytes[start + len..start + len + 4].copy_from_slice(&crc.to_le_bytes());
+        resign(bytes);
+    }
+
+    /// Overwrite header slot `idx` with `slot`, zero paddings included.
+    fn put_slot(image: &mut [u8], idx: usize, slot: &Slot) {
+        let start = idx * HEADER_SLOT_LEN;
+        image[start..start + HEADER_SLOT_LEN].fill(0);
+        image[start..start + SLOT_LEN].copy_from_slice(&slot.encode());
+    }
+
+    /// Re-sync the winning slot's footer CRC after a test patched the footer
+    /// bytes in place.
+    fn resign(image: &mut [u8]) {
+        let (idx, slot) = read_slots(&image[..2 * HEADER_SLOT_LEN]).unwrap();
+        let start = slot.footer_offset as usize;
+        let crc = crc32c(&image[start..start + slot.footer_len as usize]);
+        put_slot(
+            image,
+            idx,
+            &Slot {
+                footer_crc32c: crc,
+                ..slot
+            },
+        );
+    }
+
+    /// A complete v7 image around a hand-built `footer`: both slots zeroed,
+    /// the footer, then slot 0 with `iteration = 1`.
+    fn image_with_footer(footer: &[u8]) -> Vec<u8> {
+        let mut data = VecSink::new();
+        data.bytes(&[0u8; 2 * HEADER_SLOT_LEN]).unwrap();
+        let footer_offset = data.offset();
+        data.bytes(footer).unwrap();
+        data.write_slot(
+            0,
+            &Slot {
+                iteration: 1,
+                footer_offset,
+                footer_len: footer.len() as u64,
+                footer_crc32c: crc32c(footer),
+                file_len: data.offset(),
+            },
+        )
+        .unwrap();
+        data.buf
     }
 
     /// Wave 124: footer version 3 records every database's storage. A
@@ -6703,6 +7163,7 @@ mod tests {
         let mut fw = Writer::new();
         fw.u32(FOOTER_VERSION);
         fw.u32(0); // no optional catalog sections
+        fw.u32(0); // no free ranges
         fw.u32(1); // one database
         fw.str("main");
         fw.u8(STORAGE_LOCAL);
@@ -6712,11 +7173,7 @@ mod tests {
         fw.str("foo");
         fw.u32(0);
         let footer = fw.buf;
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&footer);
-        bytes.extend_from_slice(&crc32c(&footer).to_le_bytes());
-        bytes.extend_from_slice(&(footer.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(MAGIC_V6);
+        let bytes = image_with_footer(&footer);
         let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
         assert!(
             err.contains("schema names are not in strictly ascending order"),
@@ -6828,26 +7285,23 @@ mod tests {
             .append_row(vec![Value::Integer(7)])
             .unwrap();
         let full = db.to_bytes().unwrap();
-        // The trailer's magic (the file's last 8 bytes).
-        let mut bad = full.clone();
-        let n = bad.len();
-        bad[n - 8..].copy_from_slice(b"PINKDB07");
-        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
-        assert!(
-            err.contains("written by a newer pinkdb (format v7)"),
-            "{err}"
-        );
-        // The magic lives at the end: a file whose *first* bytes claim
-        // another version is a damaged image, and the column chunk's own
-        // checksum is what catches it.
+        // The magic starts the file, in header slot 0.
         let mut bad = full.clone();
         bad[..8].copy_from_slice(b"PINKDB09");
         let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
-        assert!(err.contains("checksum"), "{err}");
+        assert!(
+            err.contains("written by a newer pinkdb (format v9)"),
+            "{err}"
+        );
+        // A damaged slot (its checksum no longer matches) is a corrupt file,
+        // not a version error.
+        let mut bad = full.clone();
+        bad[SLOT_LEN - 4] ^= 0x01;
+        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+        assert!(err.contains("no header slot is valid"), "{err}");
         // Not a digit → plain bad magic.
         let mut bad = full.clone();
-        let n = bad.len();
-        bad[n - 8..].copy_from_slice(b"PINKDB0X");
+        bad[..8].copy_from_slice(b"PINKDB0X");
         let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
         assert!(err.contains("bad magic"), "{err}");
     }
@@ -7410,10 +7864,11 @@ mod tests {
             }
         }
         let bytes = db.to_bytes().unwrap();
-        // The data region is everything before the footer.
+        // The data region is everything between the header slots and the
+        // footer; the slots' own bytes are covered by their checksums.
         let (footer_at, _) = footer_span(&bytes).unwrap();
         let mut detected = 0;
-        for i in 0..footer_at as usize {
+        for i in DATA_START as usize..footer_at as usize {
             let mut bad = bytes.clone();
             bad[i] ^= 0x01;
             let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
@@ -7445,12 +7900,12 @@ mod tests {
                 "footer byte {i}: {err}"
             );
         }
-        // The trailer's own CRC field is part of the check.
+        // The slot's own CRC field is part of the check: the slot stops being
+        // valid, and slot 1 was never written.
         let mut bad = bytes.clone();
-        let n = bad.len();
-        bad[n - TRAILER_LEN] ^= 0x01;
+        bad[SLOT_LEN - 4] ^= 0x01;
         let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
-        assert!(err.contains("footer checksum"), "{err}");
+        assert!(err.contains("no header slot is valid"), "{err}");
     }
 
     /// Truncating the file at *every* offset errors (never panics, never
@@ -7490,7 +7945,7 @@ mod tests {
         // Small enough for the byte-by-byte loop below. The footer carries an
         // exact distinct sketch per column (wave 122), so a 7-column table
         // pays a few hundred bytes per column even when tiny.
-        assert!(small.len() < 8192, "{}", small.len());
+        assert!(small.len() < 3 * 8192, "{}", small.len());
         for cut in 0..small.len() {
             assert!(
                 PinkDb::load_bytes(&small[..cut]).is_err(),
@@ -7661,7 +8116,7 @@ mod tests {
         std::fs::remove_file(&plain).ok();
     }
 
-    /// The encrypted container wraps the whole `PINKDB06` image: a keyed
+    /// The encrypted container wraps the whole `PINKDB07` image: a keyed
     /// save/open round-trips the data.
     #[cfg(feature = "encryption")]
     #[test]
@@ -8199,13 +8654,13 @@ mod tests {
     /// footer checksum, deterministic across parallel/serial encodes and
     /// across save→open→save.
     #[test]
-    fn golden_pinkdb06_bytes_are_pinned() {
+    fn golden_pinkdb07_bytes_are_pinned() {
         let db = golden_db();
         let bytes = db.to_bytes().unwrap();
-        assert_eq!(bytes.len(), GOLDEN_V6_LEN, "file length drifted");
+        assert_eq!(bytes.len(), GOLDEN_LEN, "file length drifted");
         assert_eq!(
             crc32c(&footer_bytes(&bytes)),
-            GOLDEN_V6_FOOTER_CRC,
+            GOLDEN_FOOTER_CRC,
             "the footer bytes drifted"
         );
         assert_eq!(db.to_bytes_impl(false).unwrap(), bytes, "serial ≠ parallel");
@@ -8213,36 +8668,199 @@ mod tests {
         assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift");
     }
 
-    /// The trailer is the last 20 bytes and the footer sits right before it:
-    /// a reader needs exactly two range requests.
+    /// The header slot is the only metadata the writer positions last, and the
+    /// footer sits after the data: a reader needs exactly two range requests.
     #[test]
-    fn the_trailer_and_the_footer_are_the_only_metadata_reads() {
+    fn the_header_slot_and_the_footer_are_the_only_metadata_reads() {
         let db = golden_db();
         let bytes = db.to_bytes().unwrap();
-        assert_eq!(&bytes[bytes.len() - 8..], MAGIC_V6);
-        // The trailer: footer_crc32c u32 | footer_len u64 | magic.
-        let n = bytes.len();
-        let want_crc = u32::from_le_bytes(
-            bytes[n - TRAILER_LEN..n - TRAILER_LEN + 4]
-                .try_into()
-                .unwrap(),
-        );
-        let want_len = u64::from_le_bytes(
-            bytes[n - TRAILER_LEN + 4..n - TRAILER_LEN + 12]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        assert_eq!(&bytes[..8], MAGIC_V7);
+        // Slot 0: the only valid one after a full rewrite.
+        let (idx, slot) = read_slots(&bytes[..2 * HEADER_SLOT_LEN]).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(slot.iteration, 1);
+        assert_eq!(slot.file_len as usize, bytes.len());
         let (offset, len) = footer_span(&bytes).unwrap();
-        assert_eq!(len as usize, want_len);
-        assert_eq!(offset as usize, n - TRAILER_LEN - want_len);
+        assert_eq!((offset, len), (slot.footer_offset, slot.footer_len));
         assert_eq!(
             crc32c(&bytes[offset as usize..(offset + len) as usize]),
-            want_crc
+            slot.footer_crc32c
         );
-        // The data region starts at 0: the footer records absolute offsets.
+        // The data region starts after the two slots: the footer records
+        // absolute offsets.
         let footer = read_store_footer(&bytes).unwrap();
         let dir = &footer.databases[0].schemas[0].tables[0].row_groups[0].columns[0];
-        assert_eq!(dir.offset, 0, "the first column chunk starts the file");
+        assert_eq!(
+            dir.offset, DATA_START,
+            "the first column chunk follows the slots"
+        );
+    }
+
+    /// A saved image with the test-only writer hooks turned on.
+    fn image_with_hooks(db: &PinkDb, free_ranges: Vec<(u64, u64)>, second_slot: bool) -> Vec<u8> {
+        let mut data = VecSink::new();
+        db.write_image_hooked(
+            &mut data,
+            true,
+            false,
+            false,
+            &Hooks {
+                free_ranges,
+                second_slot,
+            },
+        )
+        .unwrap();
+        data.buf
+    }
+
+    fn tiny_db(name: &str) -> PinkDb {
+        let mut db = PinkDb::new();
+        db.create_table(name, vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        db.table_mut(name)
+            .unwrap()
+            .append_row(vec![Value::Integer(1)])
+            .unwrap();
+        db
+    }
+
+    /// An image whose slots name two different footers: slot 0 at iteration 1,
+    /// slot 1 at iteration 2.
+    fn two_footer_image(first: &PinkDb, second: &PinkDb) -> Vec<u8> {
+        let a = first.to_bytes().unwrap();
+        let b = second.to_bytes().unwrap();
+        let (a_offset, a_len, a_crc) = footer_location(&a, a.len() as u64).unwrap();
+        let (b_offset, b_len, b_crc) = footer_location(&b, b.len() as u64).unwrap();
+        // The stores differ only in the table name, so their data regions (and
+        // the absolute chunk offsets in the second footer) are identical.
+        assert_eq!(
+            &a[DATA_START as usize..a_offset as usize],
+            &b[DATA_START as usize..b_offset as usize]
+        );
+        let mut out = a;
+        let second_at = out.len() as u64;
+        out.extend_from_slice(&b[b_offset as usize..(b_offset + b_len) as usize]);
+        let file_len = out.len() as u64;
+        put_slot(
+            &mut out,
+            0,
+            &Slot {
+                iteration: 1,
+                footer_offset: a_offset,
+                footer_len: a_len,
+                footer_crc32c: a_crc,
+                file_len: a_offset + a_len,
+            },
+        );
+        put_slot(
+            &mut out,
+            1,
+            &Slot {
+                iteration: 2,
+                footer_offset: second_at,
+                footer_len: b_len,
+                footer_crc32c: b_crc,
+                file_len,
+            },
+        );
+        out
+    }
+
+    /// The valid slot with the higher iteration wins; a torn newer slot (bad
+    /// CRC, or a file length past this file's) falls back to the older one.
+    #[test]
+    fn the_newer_header_slot_wins_and_a_torn_one_falls_back() {
+        let bytes = two_footer_image(&tiny_db("a"), &tiny_db("b"));
+        let (idx, slot) = read_slots(&bytes[..2 * HEADER_SLOT_LEN]).unwrap();
+        assert_eq!((idx, slot.iteration), (1, 2));
+        let back = PinkDb::load_bytes(&bytes).unwrap();
+        assert!(back.table("b").is_ok(), "the newer slot's footer wins");
+        assert!(back.table("a").is_err());
+
+        // The newer slot's own CRC tore: the older slot still names a footer
+        // that is there, so the file loads.
+        let mut torn = bytes.clone();
+        torn[HEADER_SLOT_LEN + SLOT_LEN - 4] ^= 0x01;
+        let (idx, slot) = read_slots(&torn[..2 * HEADER_SLOT_LEN]).unwrap();
+        assert_eq!((idx, slot.iteration), (0, 1));
+        assert!(PinkDb::load_bytes(&torn).unwrap().table("a").is_ok());
+
+        // A slot that records a longer file than this one is torn too.
+        let mut longer = bytes.clone();
+        put_slot(
+            &mut longer,
+            1,
+            &Slot {
+                file_len: u64::MAX,
+                ..read_slots(&bytes[..2 * HEADER_SLOT_LEN]).unwrap().1
+            },
+        );
+        assert!(PinkDb::load_bytes(&longer).unwrap().table("a").is_ok());
+    }
+
+    /// Two invalid slots are a corrupt file, and a valid slot whose footer CRC
+    /// fails is one too: the slot names that footer, so there is nothing to
+    /// fall back to.
+    #[test]
+    fn invalid_header_slots_are_a_corrupt_file() {
+        let bytes = tiny_db("t").to_bytes().unwrap();
+        let mut both = bytes.clone();
+        both[SLOT_LEN - 4] ^= 0x01;
+        let err = PinkDb::load_bytes(&both).unwrap_err().to_string();
+        assert!(err.contains("no header slot is valid"), "{err}");
+
+        let mut bad = bytes.clone();
+        let (offset, _, _) = footer_location(&bad, bad.len() as u64).unwrap();
+        bad[offset as usize] ^= 0x01;
+        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+        assert!(err.contains("footer checksum"), "{err}");
+    }
+
+    /// A full rewrite writes `free_ranges` empty; a non-empty section is
+    /// parsed, range-checked and otherwise ignored.
+    #[test]
+    fn free_ranges_are_validated_and_otherwise_ignored() {
+        let db = tiny_db("t");
+        let bytes = db.to_bytes().unwrap();
+        let (offset, _, _) = footer_location(&bytes, bytes.len() as u64).unwrap();
+        let mut r = Reader::new(&bytes[offset as usize..]);
+        r.u32().unwrap(); // footer version
+        r.u32().unwrap(); // flags
+        assert_eq!(r.u32().unwrap(), 0, "a full rewrite writes no free ranges");
+
+        // A zero-length range at the data region's start is valid: it is clear
+        // of the first chunk, which starts there.
+        let with_ranges = image_with_hooks(&db, vec![(DATA_START, 0)], false);
+        assert_eq!(
+            PinkDb::load_bytes(&with_ranges)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes,
+            "the section is ignored"
+        );
+
+        for (what, ranges) in [
+            ("unsorted", vec![(DATA_START + 8, 0), (DATA_START, 0)]),
+            ("overlapping", vec![(DATA_START, 16), (DATA_START + 8, 16)]),
+            ("before the data region", vec![(0, 8)]),
+            ("past the footer", vec![(DATA_START, u64::MAX / 2)]),
+            ("over a row group", vec![(DATA_START, 8)]),
+        ] {
+            let bad = image_with_hooks(&db, ranges, false);
+            let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+            assert!(err.contains("free range"), "{what}: {err}");
+        }
+    }
+
+    /// A file ending in the v6 trailer magic is an older pinkdb's: v6 kept its
+    /// magic at the end, v7 starts with it.
+    #[test]
+    fn a_v6_trailer_is_refused_as_an_older_version() {
+        let mut v6 = vec![0xABu8; 9000];
+        v6.extend_from_slice(b"PINKDB06");
+        let err = PinkDb::from_pink_bytes(&v6).unwrap_err().to_string();
+        assert!(err.contains("older pinkdb (PINKDB06)"), "{err}");
     }
 
     /// The compression frame (tag 8) round-trips every dtype bit-exactly
@@ -8599,9 +9217,7 @@ mod tests {
             bad[footer_at as usize..(footer_at + footer_len) as usize].copy_from_slice(&bad_footer);
             // The footer's checksum now fails, so re-write it: the point is
             // that the *decoder* never panics or hangs.
-            let crc = crc32c(&bad_footer);
-            let n = bad.len();
-            bad[n - TRAILER_LEN..n - TRAILER_LEN + 4].copy_from_slice(&crc.to_le_bytes());
+            resign(&mut bad);
             if PinkDb::load_bytes(&bad).is_err() {
                 capped += 1;
             }
@@ -8818,6 +9434,163 @@ mod tests {
         assert_eq!(a, b, "parallel and serial saves differ");
     }
 
+    /// A store wide enough to exercise every footer section and a table of
+    /// more than one row group: VARCHAR/DECIMAL/NULL-heavy columns, indexes,
+    /// constraints, macros, an empty table, two databases and two schemas.
+    fn multi_row_group_corpus() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE big (i INTEGER, d DECIMAL(18,4), v VARCHAR, n INTEGER);")
+            .unwrap();
+        {
+            let t = db.table_mut("big").unwrap();
+            for i in 0..(ROW_GROUP_ROWS + 137) {
+                t.append_row(vec![
+                    Value::Integer(i as i32),
+                    if i % 5 == 0 {
+                        Value::Null
+                    } else {
+                        Value::decimal(i as i128 * 12_345, 4)
+                    },
+                    if i % 7 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Varchar(format!("row-{}-{}", i % 41, "x".repeat(i % 13)))
+                    },
+                    if i % 3 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Integer((i % 97) as i32)
+                    },
+                ])
+                .unwrap();
+            }
+        }
+        db.execute("CREATE INDEX i_big_v ON big(v);").unwrap();
+        db.execute("CREATE TABLE main.small (k BIGINT PRIMARY KEY, s VARCHAR UNIQUE);")
+            .unwrap();
+        db.execute("INSERT INTO main.small VALUES (1, 'one'), (2, NULL), (3, 'three');")
+            .unwrap();
+        db.execute("CREATE MACRO twice(x) AS x + x;").unwrap();
+        db.execute("CREATE TABLE main.empty (x INTEGER);").unwrap();
+        db.execute("CREATE DATABASE analytics;").unwrap();
+        db.execute("CREATE SCHEMA analytics.audit;").unwrap();
+        db.execute("CREATE TABLE analytics.audit.events (at TIMESTAMP, msg VARCHAR);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO analytics.audit.events VALUES \
+             (TIMESTAMP '2026-01-01 00:00:00', 'start'), (NULL, NULL);",
+        )
+        .unwrap();
+        db
+    }
+
+    /// `save` streams the image through the file sink; the bytes must be
+    /// exactly the in-memory image, for the serial encode too.
+    #[test]
+    fn streamed_save_writes_the_in_memory_bytes() {
+        let db = multi_row_group_corpus();
+        let want = db.to_pink_bytes().unwrap();
+        assert_eq!(db.to_bytes_impl(false).unwrap(), want, "serial ≠ parallel");
+
+        // The parallel file path (`save`, atomic).
+        let path = temp_file("stream_parallel");
+        db.save(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            want,
+            "streamed save ≠ to_pink_bytes"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // The serial file path: the same staging writer `save_sync` uses,
+        // with the test-only serial switch on.
+        let path = temp_file("stream_serial");
+        PinkDb::write_sync(&path, |sink| {
+            db.write_image(sink, false, false, false).map(|_| ())
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            want,
+            "serial streamed save ≠ to_pink_bytes"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // The checkpoint primitive writes the same bytes.
+        let path = temp_file("stream_checkpoint");
+        db.save_sync(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), want);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            PinkDb::load_bytes(&want).unwrap().to_pink_bytes().unwrap(),
+            want,
+            "the streamed image must round-trip"
+        );
+    }
+
+    /// A save that fails after bytes have reached the staging file leaves the
+    /// previous target intact and no temp file behind.
+    #[test]
+    fn a_failed_save_keeps_the_previous_target() {
+        let path = temp_file("fail_save");
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        db.table_mut("t")
+            .unwrap()
+            .append_row(vec![Value::Integer(1)])
+            .unwrap();
+        db.save(path.to_str().unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // Tables are written in sorted order, so `a`'s data region lands in
+        // the staging file before `z`'s row group is encoded; the pending
+        // vector index serializes to an error at the end of `z`.
+        let mut bad = PinkDb::new();
+        bad.execute("CREATE TABLE a (x INTEGER);").unwrap();
+        {
+            let t = bad.table_mut("a").unwrap();
+            for i in 0..(CHUNK_SIZE + 1) {
+                t.append_row(vec![Value::Integer(i as i32)]).unwrap();
+            }
+        }
+        bad.execute("CREATE TABLE z (y INTEGER);").unwrap();
+        {
+            let t = bad.table_mut("z").unwrap();
+            t.append_row(vec![Value::Integer(7)]).unwrap();
+            t.vector_indexes.push(crate::storage::VectorIndexDef {
+                name: "v".to_string(),
+                column: 0,
+                provider: "vss".to_string(),
+                options: Vec::new(),
+                index: None,
+                blob: None,
+            });
+        }
+        let err = bad.save(path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("needs the \"vss\" extension"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a failed save must keep the previous target"
+        );
+        let stem = path.file_name().unwrap().to_string_lossy().to_string();
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(&format!("{stem}.tmp-")))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     /// save → open → save must reproduce the same bytes.
     #[test]
     fn open_save_is_byte_identity() {
@@ -8908,7 +9681,7 @@ mod tests {
     }
 
     /// A durable reopen after a checkpoint restores the data (the checkpoint
-    /// is a `PINKDB06` image).
+    /// is a `PINKDB07` image).
     #[test]
     fn durable_reopen_after_checkpoint_restores_the_rows() {
         let ckpt = temp_file("durable");
@@ -8926,9 +9699,9 @@ mod tests {
             let db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
             assert_eq!(db.table("t").unwrap().num_rows(), 2);
             assert_eq!(db.table("t").unwrap().get(1, 1).unwrap(), Some(Value::Null));
-            // The checkpoint is a PINKDB06 image.
+            // The checkpoint is a PINKDB07 image.
             let bytes = std::fs::read(&ckpt).unwrap();
-            assert!(is_pinkdb06(&bytes), "the checkpoint must be PINKDB06");
+            assert!(is_pinkdb(&bytes), "the checkpoint must be PINKDB07");
         }
         let _ = std::fs::remove_file(&ckpt);
         let _ = std::fs::remove_file(&wal);
@@ -9457,6 +10230,7 @@ mod tests {
             let mut fw = Writer::new();
             fw.u32(FOOTER_VERSION);
             fw.u32(FLAG_RBAC);
+            fw.u32(0); // no free ranges
             fw.u32(1); // one database
             fw.str("main");
             fw.u8(STORAGE_LOCAL);
@@ -9478,13 +10252,7 @@ mod tests {
             fw.u32(1);
             fw.u32(0);
             fw.bytes(rbac);
-            let footer = fw.buf;
-            let mut out = Vec::new();
-            out.extend_from_slice(&footer);
-            out.extend_from_slice(&crc32c(&footer).to_le_bytes());
-            out.extend_from_slice(&(footer.len() as u64).to_le_bytes());
-            out.extend_from_slice(MAGIC_V6);
-            out
+            image_with_footer(&fw.buf)
         };
         // One user, no roles and no memberships (the head of a section).
         let user_head = |w: &mut Writer| {
@@ -9633,9 +10401,7 @@ mod tests {
             }
             let mut bad = good.clone();
             bad[footer_at as usize..(footer_at + footer_len) as usize].copy_from_slice(&bad_footer);
-            let n = bad.len();
-            bad[n - TRAILER_LEN..n - TRAILER_LEN + 4]
-                .copy_from_slice(&crc32c(&bad_footer).to_le_bytes());
+            resign(&mut bad);
             let err = PinkDb::load_bytes(&bad)
                 .map(|_| ())
                 .unwrap_err()
@@ -9665,9 +10431,7 @@ mod tests {
         bad_footer[at + 8..at + 9].copy_from_slice(b"z");
         let mut bad = good.clone();
         bad[footer_at as usize..(footer_at + footer_len) as usize].copy_from_slice(&bad_footer);
-        let n = bad.len();
-        bad[n - TRAILER_LEN..n - TRAILER_LEN + 4]
-            .copy_from_slice(&crc32c(&bad_footer).to_le_bytes());
+        resign(&mut bad);
         let err = PinkDb::load_bytes(&bad)
             .map(|_| ())
             .unwrap_err()
@@ -9768,14 +10532,8 @@ mod tests {
     #[test]
     fn footer_v3_is_refused_with_the_older_version_message() {
         let db = wide_db(10);
-        let bytes = db.to_bytes().unwrap();
-        let (start, len) = footer_span(&bytes).unwrap();
-        let (start, len) = (start as usize, len as usize);
-        let mut old = bytes.clone();
-        old[start..start + 4].copy_from_slice(&3u32.to_le_bytes());
-        let crc = crc32c(&old[start..start + len]);
-        let n = old.len();
-        old[n - TRAILER_LEN..n - TRAILER_LEN + 4].copy_from_slice(&crc.to_le_bytes());
+        let mut old = db.to_bytes().unwrap();
+        relabel_footer_version(&mut old, 3);
         let err = PinkDb::load_bytes(&old)
             .map(|_| ())
             .unwrap_err()
