@@ -147,7 +147,7 @@ fn save_and_open_a_postgres_catalog_without_printing_the_password() {
     ));
     assert!(out.contains("Saved lake version 2"), "{out}");
     assert!(out.contains("Opened lake version 2"), "{out}");
-    assert!(out.contains("│ 2        │"), "{out}");
+    assert!(out.contains("│ 2            │"), "{out}");
     assert!(
         !out.contains(password),
         "the password must never reach the terminal: {out}"
