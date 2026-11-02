@@ -70,6 +70,28 @@ instead of being killed by the OS. Results are unchanged.
   so the caller's retry can `BEGIN` again instead of tripping over "already
   in a transaction".
 
+### Wave 136 (steps w1–w2) — the `.pink` v7 layout: two header slots, streamed writes ✅
+
+A `.pink` file no longer ends with a trailer, and a save no longer builds the
+whole file in memory. Existing v7 files are unreadable after this change —
+the layout is the v7 format; a v6 file is refused with the older-pinkdb error.
+
+- **Layout:** offsets 0 and 4096 hold two 4 KiB header slots (magic
+  `PINKDB07`, iteration, footer offset/length/CRC32C, file length, slot
+  CRC32C); the data region starts at 8192 and the footer follows it. A
+  reader takes the valid slot with the higher iteration, so a torn write
+  leaves the previous state readable, and a ranged reader (the lake) needs
+  two requests — the first 8 KiB, then the footer. Where the lake catalog
+  already records the footer location, its single request still works.
+- **Streamed save:** `.save` and `CHECKPOINT` write the data region one row
+  group at a time through a positioned writer, copy unchanged chunks byte for
+  byte, then the footer, then slot 0 — so the writer's peak memory is a row
+  group rather than the whole file. A save of an unchanged store is still
+  byte-identical.
+- **`free_ranges`:** the footer gains a sorted list of data-region ranges no
+  row group references (empty today; the append-only checkpoint fills it).
+  Readers parse it, range-check it and otherwise ignore it.
+
 ### Wave 135 (steps a–d) — pipelines, string keys, big GROUP BYs ✅
 
 QuackLab's mart refresh SELECTs run 1.5–2.9× faster than after wave 140,

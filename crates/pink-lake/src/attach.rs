@@ -199,7 +199,8 @@ struct AttachedFile {
     partition: Option<std::collections::BTreeMap<String, Option<String>>>,
     /// Where the file's footer is (wave 102, `.pink` data files): recorded by
     /// the catalog so a projected read fetches the footer without probing
-    /// the trailer. `None` for formats the catalog does not locate this way.
+    /// the header slots. `None` for formats the catalog does not locate this
+    /// way.
     footer: Option<crate::format::FooterLocation>,
 }
 
@@ -1317,7 +1318,7 @@ fn load_file(
 ) -> Result<(DataTable, Vec<bool>)> {
     let key = entry.key();
     let abs = storage.abs(&file.rel);
-    // The catalog's footer location saves the trailer probe; the file's
+    // The catalog's footer location saves the header probe; the file's
     // positional deletes tell a row-group-pruning provider not to prune this
     // file (delete positions address the file's full row sequence).
     let mut data_file =

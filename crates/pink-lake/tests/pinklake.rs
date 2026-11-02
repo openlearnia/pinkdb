@@ -1,4 +1,4 @@
-//! `.pink` (PINKDB06) lake tests: the data-file format every build reads and
+//! `.pink` (PINKDB07) lake tests: the data-file format every build reads and
 //! writes. The statistics block is written by every save here and is what
 //! `.lake attach` reads without opening a data file; queries that need data
 //! read only the projected column chunks.
@@ -175,10 +175,10 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
     assert_eq!(files.len(), all_tables(&expected).len());
     for file in &files {
         let bytes = std::fs::read(file).unwrap();
-        // The engine's current `.pink` format: `PINKDB06`, whose magic lives
-        // in the trailer (the last 20 bytes).
+        // The engine's current `.pink` format: `PINKDB07`, whose magic starts
+        // the file (header slot 0).
         assert!(
-            pinkdb::persist::is_pinkdb06(&bytes),
+            pinkdb::persist::is_pinkdb(&bytes),
             "{} is not engine `.pink` bytes",
             file.display()
         );

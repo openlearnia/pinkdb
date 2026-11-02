@@ -366,8 +366,8 @@ fn feature_on_keeps_plaintext_backcompat() {
     db.save(s.path()).unwrap();
     let bytes = std::fs::read(s.ckpt()).unwrap();
     assert!(
-        pinkdb::persist::is_pinkdb06(&bytes),
-        "plain save stays unencrypted PINKDB06"
+        pinkdb::persist::is_pinkdb(&bytes),
+        "plain save stays unencrypted PINKDB07"
     );
     assert!(!bytes.starts_with(ENC_MAGIC));
     let back = PinkDb::open(s.path()).unwrap();
@@ -404,7 +404,7 @@ fn an_older_pink_file_is_refused_with_the_documented_message() {
     assert_eq!(
         err,
         "this .pink file was written by an older pinkdb (PINKDB05); \
-         this build reads PINKDB06 only",
+         this build reads PINKDB07 only",
         "{err}"
     );
     // The same refusal with a key: the container check comes first, and a
@@ -628,7 +628,7 @@ fn keyed_database_reports_its_key_and_snapshots_encrypt() {
     let mut mem = PinkDb::new();
     mem.execute("CREATE TABLE t (a INTEGER);").unwrap();
     mem.save_snapshot(p.to_str().unwrap()).unwrap();
-    assert!(pinkdb::persist::is_pinkdb06(&std::fs::read(&p).unwrap()));
+    assert!(pinkdb::persist::is_pinkdb(&std::fs::read(&p).unwrap()));
 }
 
 /// The keyed WAL survives the crash state machine: `.tmp` publishing, roll
@@ -1022,7 +1022,7 @@ fn save_stays_explicitly_plaintext_for_a_keyed_store() {
     db.save(out.to_str().unwrap()).unwrap();
     let bytes = std::fs::read(&out).unwrap();
     assert!(
-        pinkdb::persist::is_pinkdb06(&bytes),
+        pinkdb::persist::is_pinkdb(&bytes),
         "save() is the explicit plaintext API"
     );
     assert!(!bytes.starts_with(ENC_MAGIC));

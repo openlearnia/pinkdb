@@ -86,7 +86,7 @@ pub const PINK_FORMAT_ID: &str = "pink";
 ///
 /// The lake's catalog records it for the formats that carry one (the
 /// engine's `.pink` files, `format_version` 7), so a reader fetches the
-/// footer **without** probing the file's 20-byte trailer: one ranged read
+/// footer **without** probing the file's header slots: one ranged read
 /// instead of two, and the footer is still checksum-verified before a
 /// single byte of it is decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +95,7 @@ pub struct FooterLocation {
     pub offset: u64,
     /// The footer's length in bytes.
     pub length: u64,
-    /// The footer's CRC32C (the trailer's checksum for it).
+    /// The footer's CRC32C (the header slot's checksum for it).
     pub crc32c: u32,
 }
 
@@ -111,7 +111,7 @@ pub struct EncodedFile {
     pub stats: SavedTableStats,
     /// Where the file's footer is, when the format carries one (the engine's
     /// `.pink` files do). The catalog records it, so a reader needs no
-    /// trailer probe to find the footer.
+    /// header probe to find the footer.
     pub footer: Option<FooterLocation>,
 }
 
@@ -142,7 +142,7 @@ impl<'a> DataFile<'a> {
     }
 
     /// Attach the catalog-recorded footer location (the lake knows it; a
-    /// provider uses it to fetch the footer without a trailer probe).
+    /// provider uses it to fetch the footer without a header probe).
     pub(crate) fn with_footer(mut self, footer: Option<FooterLocation>) -> Self {
         self.footer = footer;
         self
@@ -368,7 +368,7 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
     ///
     /// Returns the published statistics and, when the format carries a
     /// footer, where it is in the written file (the catalog records it, so a
-    /// reader finds the footer without probing the trailer).
+    /// reader finds the footer without probing the header slots).
     fn write_streamed(
         &self,
         db: &str,
@@ -669,10 +669,10 @@ fn is_name_component(name: &str) -> bool {
 /// The built-in engine `.pink` format: one single-table store per file, with
 /// the exact statistics its encode pass collected.
 ///
-/// The file is a `PINKDB06` image (wave 102): a data region of column chunks
-/// (row groups of 122,880 rows, one chunk per column per row group, each
-/// with its own CRC32C and exact statistics) followed by a footer and a
-/// 20-byte trailer. A reader therefore needs the footer and **only** the
+/// The file is a `PINKDB07` image (wave 136): two header slots, a data region
+/// of column chunks (row groups of 122,880 rows, one chunk per column per row
+/// group, each with its own CRC32C and exact statistics), then a footer. A
+/// reader therefore needs the first 8 KiB and the footer, and **only** the
 /// projected column chunks of the row groups that survive the scan's
 /// filters — read through the lake's positional reader, coalesced and
 /// fetched with a bounded number of requests in flight.
@@ -706,8 +706,8 @@ impl LakeFormat for PinkFormat {
                     "the single-table encoder for \"{db}.{table}\" returned no statistics"
                 ),
             })?;
-        let (offset, length, crc32c) =
-            pinkdb::persist::footer_location(&bytes).map_err(|e| LakeError::Engine {
+        let (offset, length, crc32c) = pinkdb::persist::footer_location(&bytes, bytes.len() as u64)
+            .map_err(|e| LakeError::Engine {
                 context: format!("reading the footer of the .pink file of \"{db}.{table}\""),
                 source: e,
             })?;
@@ -734,18 +734,20 @@ impl LakeFormat for PinkFormat {
     /// statistics, read from its footer alone (no data segment).
     ///
     /// The footer is fetched through the lake's positional reader: one ranged
-    /// read when the catalog records the footer's location, two (the trailer
-    /// plus the footer) when it does not.
+    /// read when the catalog records the footer's location, two (the first
+    /// 8 KiB, then the footer) when it does not.
     fn footer_stats(&self, file: &DataFile<'_>) -> Result<Option<FileFooter>> {
         let Some(source) = file.range_source() else {
             // A sealed lake has no plaintext ranges: the caller falls back to
             // the whole-object read.
             return Ok(None);
         };
-        let (bytes, crc) = read_footer(file, source.as_ref())?;
-        let layout = pinkdb::persist::read_layout(&bytes, crc).map_err(|e| LakeError::Engine {
-            context: format!("reading the footer of data file \"{}\"", file.rel()),
-            source: e,
+        let (bytes, crc, footer_offset) = read_footer(file, source.as_ref())?;
+        let layout = pinkdb::persist::read_layout(&bytes, crc, footer_offset).map_err(|e| {
+            LakeError::Engine {
+                context: format!("reading the footer of data file \"{}\"", file.rel()),
+                source: e,
+            }
         })?;
         let Some(table) = layout.tables.first() else {
             return Err(LakeError::Corrupt {
@@ -810,10 +812,12 @@ impl LakeFormat for PinkFormat {
         };
         // 1. The footer: the row-group directory (where every column chunk
         //    is, and what it proves).
-        let (bytes, crc) = read_footer(file, source.as_ref())?;
-        let layout = pinkdb::persist::read_layout(&bytes, crc).map_err(|e| LakeError::Engine {
-            context: format!("reading the footer of data file \"{}\"", file.rel()),
-            source: e,
+        let (bytes, crc, footer_offset) = read_footer(file, source.as_ref())?;
+        let layout = pinkdb::persist::read_layout(&bytes, crc, footer_offset).map_err(|e| {
+            LakeError::Engine {
+                context: format!("reading the footer of data file \"{}\"", file.rel()),
+                source: e,
+            }
         })?;
         let Some(table) = layout.tables.first() else {
             return Err(LakeError::Corrupt {
@@ -869,34 +873,49 @@ fn tighter(current: Option<Value>, other: Option<Value>) -> Option<Value> {
     }
 }
 
-/// Read one `.pink` data file's footer through the lake's positional reader.
+/// Read one `.pink` data file's footer through the lake's positional reader:
+/// `(footer bytes, their CRC32C, their file offset)`.
 ///
 /// With the catalog-recorded location (wave 102, `format_version` 7) this is
 /// **one** ranged read and the footer is still checksum-verified. Without it
-/// the reader probes the file's 20-byte trailer first (two reads).
-fn read_footer(file: &DataFile<'_>, source: &dyn RangedFile) -> Result<(Vec<u8>, Option<u32>)> {
+/// the reader fetches the file's first 8 KiB (both header slots), picks the
+/// newer valid slot, then fetches the footer it names (two reads).
+fn read_footer(
+    file: &DataFile<'_>,
+    source: &dyn RangedFile,
+) -> Result<(Vec<u8>, Option<u32>, u64)> {
     if let Some(location) = file.footer() {
         let bytes = source.read_range(location.offset, location.length)?;
-        return Ok((bytes, Some(location.crc32c)));
+        return Ok((bytes, Some(location.crc32c), location.offset));
     }
+    read_footer_by_header(source).map_err(|e| match e {
+        LakeError::Engine { source, .. } => LakeError::Engine {
+            context: format!("reading the header of data file \"{}\"", file.rel()),
+            source,
+        },
+        other => other,
+    })
+}
+
+/// [`read_footer`] without a catalog-recorded location: the header slots
+/// (one ranged read), then the footer the newer valid slot names (a second).
+fn read_footer_by_header(source: &dyn RangedFile) -> Result<(Vec<u8>, Option<u32>, u64)> {
     let len = source.len();
-    if len < pinkdb::persist::TRAILER_LEN as u64 {
+    let header_len = 2 * pinkdb::persist::HEADER_SLOT_LEN as u64;
+    if len < header_len {
         return Err(LakeError::Corrupt {
-            path: file.path().to_path_buf(),
-            message: "the .pink data file is shorter than its trailer".to_string(),
+            path: source.path().to_path_buf(),
+            message: "the .pink data file is shorter than its header".to_string(),
         });
     }
-    let trailer = source.read_range(
-        len - pinkdb::persist::TRAILER_LEN as u64,
-        pinkdb::persist::TRAILER_LEN as u64,
-    )?;
+    let header = source.read_range(0, header_len)?;
     let (offset, length, crc32c) =
-        pinkdb::persist::parse_trailer(&trailer, len).map_err(|e| LakeError::Engine {
-            context: format!("reading the trailer of data file \"{}\"", file.rel()),
-            source: e,
+        pinkdb::persist::footer_location(&header, len).map_err(|source| LakeError::Engine {
+            context: "reading the header of the .pink data file".to_string(),
+            source,
         })?;
     let bytes = source.read_range(offset, length)?;
-    Ok((bytes, Some(crc32c)))
+    Ok((bytes, Some(crc32c), offset))
 }
 
 /// The row groups of one `.pink` file that survive the scan's predicates.
@@ -1059,6 +1078,64 @@ mod tests {
         fn read(&self, _file: &DataFile<'_>) -> Result<PinkDb> {
             unreachable!("the registry tests never read")
         }
+    }
+
+    /// A counting [`RangedFile`]: every read is one object-store request.
+    #[derive(Debug)]
+    struct Counting {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        reads: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl RangedFile for Counting {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+            self.reads.lock().unwrap().push((offset, len));
+            let start = offset as usize;
+            let end = start + len as usize;
+            self.bytes
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| LakeError::Corrupt {
+                    path: self.path.clone(),
+                    message: "read past the end of the file".to_string(),
+                })
+        }
+
+        fn parallelism(&self) -> usize {
+            4
+        }
+    }
+
+    /// Without a catalog-recorded footer location a `.pink` read costs exactly
+    /// two range requests: the header slots, then the footer they name.
+    #[test]
+    fn a_read_without_a_catalog_location_costs_two_requests() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE TABLE t (a INTEGER, b VARCHAR); INSERT INTO t VALUES (1, 'x'), (2, NULL);",
+        )
+        .unwrap();
+        let file = Counting {
+            path: PathBuf::from("data/t.pink"),
+            bytes: db.to_pink_bytes().unwrap(),
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+        let (bytes, crc, offset) = read_footer_by_header(&file).unwrap();
+        let reads = file.reads.lock().unwrap().clone();
+        assert_eq!(reads.len(), 2, "header + footer: {reads:?}");
+        assert_eq!(reads[0], (0, 2 * pinkdb::persist::HEADER_SLOT_LEN as u64));
+        assert_eq!(reads[1], (offset, bytes.len() as u64));
+        let layout = pinkdb::persist::read_layout(&bytes, crc, offset).unwrap();
+        assert_eq!(layout.table("main", "t").unwrap().row_count, 2);
     }
 
     #[test]

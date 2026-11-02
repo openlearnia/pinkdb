@@ -357,7 +357,7 @@ pub(crate) enum FileRef {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         row_id_start: Option<u64>,
         /// Wave 102 (`format_version` 7): where the file's footer is, so a
-        /// reader fetches it **without** probing the file's 20-byte trailer —
+        /// reader fetches it **without** probing the file's header slots —
         /// one ranged read instead of two. Recorded for the engine's `.pink`
         /// data files (the only format whose footer the lake locates this
         /// way); absent for every other format, and for a `.pink` file
@@ -368,7 +368,8 @@ pub(crate) enum FileRef {
         ///).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         footer_len: Option<u64>,
-        /// The footer's CRC32C, as the file's trailer records it. The reader
+        /// The footer's CRC32C, as the file's header slot records it. The
+        /// reader
         /// verifies the footer against it before decoding a byte of it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         footer_crc32c: Option<u32>,
@@ -627,7 +628,7 @@ impl FileRef {
     }
 
     /// The file's recorded footer location (wave 102): where its footer is,
-    /// how long it is and the CRC32C the file's trailer records for it.
+    /// how long it is and the CRC32C the file's header slot records for it.
     /// `None` for a format whose footer the lake does not locate this way.
     /// The recorded footer offset (formats that publish one).
     pub(crate) fn footer_offset(&self) -> Option<u64> {

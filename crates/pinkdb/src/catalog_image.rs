@@ -35,7 +35,7 @@ use crate::persist::crc32c;
 use crate::storage::{DataTable, DbCatalog, PinkDb, SchemaPath};
 use crate::{PinkDbError, Result};
 
-/// `PINKDBI1`, the image magic (a `.pink` file ends with `PINKDB06`).
+/// `PINKDBI1`, the image magic (a `.pink` file starts with `PINKDB07`).
 const MAGIC: &[u8; 8] = b"PINKDBI1";
 /// The image format this build writes and reads. Format 2 (wave 131a) carries
 /// the database's schemas: the image embeds a footer whose per-database

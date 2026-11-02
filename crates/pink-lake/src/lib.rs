@@ -13,7 +13,7 @@
 //! ```text
 //! <lake>/
 //!   lake-data.json              this catalog's data-ownership marker
-//!   data/<table>/<uuid>.pink    immutable per-table data files (`PINKDB06`)
+//!   data/<table>/<uuid>.pink    immutable per-table data files (`PINKDB07`)
 //!   data/<table>/<uuid>.pinkdel positional delete files (see delete_file)
 //! ```
 //!
@@ -2182,7 +2182,7 @@ impl Lake {
                 partition: None,
                 row_id_start: None,
                 // Wave 102: the file's footer location, so a reader finds
-                // the footer without probing the file's trailer.
+                // the footer without probing the file's header.
                 footer_offset: footer.map(|f| f.offset),
                 footer_len: footer.map(|f| f.length),
                 footer_crc32c: footer.map(|f| f.crc32c),

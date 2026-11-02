@@ -1,7 +1,7 @@
-//! `.pink` lake data files (`PINKDB06`, wave 102) are read by range over
+//! `.pink` lake data files (`PINKDB07`, wave 102) are read by range over
 //! object storage: attach answers `COUNT(*)` from the catalog, a query reads
 //! only the projected column chunks of the row groups that survive its
-//! filters, and the catalog's footer location means no trailer probe.
+//! filters, and the catalog's footer location means no header probe.
 //!
 //! Measured against the mock S3 (every request and its `Range` header are
 //! recorded). The table has two row groups (200,000 rows; a row group is
@@ -145,7 +145,7 @@ fn pink_lake_reads_only_projected_chunks_of_surviving_row_groups() {
     assert_eq!((ranged, whole), (0, 0), "COUNT(*) is metadata-only");
 
     // Two of four columns over both row groups: ranged requests only — the
-    // footer (located by the catalog, no trailer probe) plus the projected
+    // footer (located by the catalog, no header probe) plus the projected
     // chunks — never a whole-object download.
     let before = mock.requests().len();
     let sql = "SELECT SUM(i), MAX(d) FROM t;";

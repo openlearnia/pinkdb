@@ -211,7 +211,7 @@ fn per_table_format_choice_and_rewrite_conversion() {
         .filter(|file| file.extension().is_some_and(|e| e == "pink"))
         .collect();
     assert_eq!(converted.len(), 1, "{converted:?}");
-    assert!(pinkdb::persist::is_pinkdb06(
+    assert!(pinkdb::persist::is_pinkdb(
         &std::fs::read(&converted[0]).unwrap()
     ));
 

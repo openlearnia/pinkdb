@@ -10,7 +10,7 @@
 //!
 //! The directory must hold the TPC-H CSVs (`lineitem.csv`, `orders.csv`, …);
 //! every `*.csv` in it is imported, in name order, as one table. The harness
-//! works against **any** `.pink` version (the v5 baseline and `PINKDB06` alike):
+//! works against **any** `.pink` version (the v5 baseline and `PINKDB07` alike):
 //! it only uses the public [`PinkDb::to_pink_bytes`] /
 //! [`PinkDb::from_pink_bytes`] API, so the same binary measures both.
 //!

@@ -460,15 +460,13 @@ fn a_version_four_footer_is_refused() {
     );
 }
 
-/// Rewrite a `.pink` image's footer version word (and its trailer CRC), so the
-/// loader sees a file an older build wrote.
+/// Rewrite a `.pink` image's footer version word (and re-seal its header
+/// slot), so the loader sees a file an older build wrote.
 fn relabel_footer_version(path: &Path, version: u32) {
     let mut bytes = std::fs::read(path).unwrap();
-    let (offset, len) = pinkdb::persist::footer_span(&bytes).unwrap();
-    let (offset, len) = (offset as usize, len as usize);
-    bytes[offset..offset + 4].copy_from_slice(&version.to_le_bytes());
-    let crc = pinkdb::persist::crc32c(&bytes[offset..offset + len]);
-    bytes[offset + len..offset + len + 4].copy_from_slice(&crc.to_le_bytes());
+    let (offset, _) = pinkdb::persist::footer_span(&bytes).unwrap();
+    bytes[offset as usize..offset as usize + 4].copy_from_slice(&version.to_le_bytes());
+    pinkdb::persist::reseal_footer(&mut bytes).unwrap();
     std::fs::write(path, bytes).unwrap();
 }
 

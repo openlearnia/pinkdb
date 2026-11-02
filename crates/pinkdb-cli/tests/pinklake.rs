@@ -148,7 +148,7 @@ fn lean_save_open_versions_tables_info() {
     for file in &files {
         assert_eq!(file.extension().unwrap(), "pink");
         assert!(
-            pinkdb::persist::is_pinkdb06(&std::fs::read(file).unwrap()),
+            pinkdb::persist::is_pinkdb(&std::fs::read(file).unwrap()),
             "{} is not engine `.pink` bytes",
             file.display()
         );

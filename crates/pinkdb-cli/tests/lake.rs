@@ -727,12 +727,16 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
         }
         tampers.push(("zeroed window", b));
     }
-    // A broken trailer (the last bytes carry the footer location and magic).
+    // A broken footer (the footer is the file's tail) and a broken header
+    // slot (the magic and the footer location live in the first 8 KiB).
     {
         let mut b = original.clone();
         let last = b.len() - 1;
         b[last] ^= 0xFF;
-        tampers.push(("broken trailer", b));
+        tampers.push(("broken footer", b));
+        let mut b = original.clone();
+        b[0] ^= 0xFF;
+        tampers.push(("broken header slot", b));
     }
 
     let mut saw_error = false;

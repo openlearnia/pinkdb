@@ -6077,8 +6077,8 @@ mod tests {
             c.execute("checkpoint;").unwrap();
             let bytes = std::fs::read(&ckpt).unwrap();
             assert!(
-                crate::persist::is_pinkdb06(&bytes),
-                "the checkpoint publishes PINKDB06"
+                crate::persist::is_pinkdb(&bytes),
+                "the checkpoint publishes PINKDB07"
             );
             // A commit after the checkpoint: the WAL record must survive.
             c.execute("INSERT INTO t VALUES (3, 'three');").unwrap();
@@ -10293,7 +10293,7 @@ mod tests {
         db.execute("CREATE INDEX a ON db1.t(a);").unwrap();
         db.checkpoint().unwrap();
         assert!(records_of(&wal_path(&p)).is_empty(), "no index re-log");
-        let flags = u32::from_le_bytes(std::fs::read(&p).unwrap()[8..12].try_into().unwrap());
+        let flags = crate::persist::footer_flags(&std::fs::read(&p).unwrap()).unwrap();
         assert_eq!(flags & 0x8, 0x8, "the checkpoint carries the index section");
         db.checkpoint().unwrap();
         assert!(records_of(&wal_path(&p)).is_empty());

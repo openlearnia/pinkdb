@@ -156,7 +156,7 @@ SQL text
 | `pinkdb::plan` | Logical plan tree |
 | `pinkdb::optimizer` | Constant folding, predicate pushdown (incl. across joins) |
 | `pinkdb::exec` | Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel) |
-| `pinkdb::persist` | `.pink` single-file columnar persistence, `PINKDB06` (row groups + a footer with a per-table row-group directory, per-chunk CRC32C and exact per-chunk statistics; typed paths + delta/dict-bitpack/ALP/FastLanes/FSST encodings + a compression frame; one format, no legacy) |
+| `pinkdb::persist` | `.pink` single-file columnar persistence, `PINKDB07` (two header slots, row groups + a footer with a per-table row-group directory, per-chunk CRC32C and exact per-chunk statistics; typed paths + delta/dict-bitpack/ALP/FastLanes/FSST encodings + a compression frame; one format, no legacy) |
 | `pinkdb::crypto` | optional at-rest encryption (`PINKENC1` container: AES-256-GCM + Argon2id) behind the `encryption` feature; a parse/identity stub otherwise |
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb::procedure` | Stored procedures: the SQL procedural language (parser + `CALL` executor), catalog definitions, `.pink` section |
@@ -168,7 +168,7 @@ SQL text
 | `pinkdb-parquet` | opt-in (`parquet` feature) read-side Parquet extension, engine-adjacent: `read_parquet`/`parquet_scan`, the four `parquet_*` metadata functions and DuckDB's replacement scan (`FROM 'file.parquet'`), with projection + row-group-statistics pushdown; flat schemas, TIMESTAMP(nanos)/TIME/UUID/FLOAT16/nested types refused by name; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects through a ranged `ChunkReader` |
 | `pinkdb-iceberg` | opt-in (`iceberg` feature) read-side Iceberg v2 extension, engine-adjacent: `iceberg_scan`, `iceberg_snapshots` and `iceberg_metadata` over a table location (the table directory, `metadata/` or a `…/metadata/vN.metadata.json` file), the current snapshot or a named one (`snapshot_from_id`, `snapshot_from_timestamp`), positional deletes, schema evolution by field id, partition-summary + column-stat pruning and `count(*)` from the manifest record counts; equality deletes are refused by name and a newer-than-v2 format is refused at open; turns `parquet` on for the data files, and its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` tables through the same ranged transport `read_parquet` uses |
 | `pinkdb-httpfs` | opt-in (`httpfs` feature) remote-file transport + `read_csv` table source: `https://` GET/HEAD/byte-range and the SigV4 `s3://` object client **shared with pink-lake and the parquet/arrow `remote` features**; `read_csv('url')`, `.import <url>`, `FROM 'https://…/x.csv'`; single objects only (no globs/compression/COPY TO yet) |
-| `pink-lake` | lake layer: a catalog database (`pink:` `.pink` file, `sqlite:`, or `postgres://`) on DuckLake v1.1's tables plus immutable data files — `.pink` (`PINKDB06`) always, Parquet with `parquetlake`; data on local disk or S3/R2 (opt-in `s3`); opt-in `encryption` seals each data/delete file with its own key in a `PNKLAKE1` container; `catalog-sqlite` / `catalog-postgres` add the SQL backends, `catalog-s3` puts the catalog on object storage |
+| `pink-lake` | lake layer: a catalog database (`pink:` `.pink` file, `sqlite:`, or `postgres://`) on DuckLake v1.1's tables plus immutable data files — `.pink` (`PINKDB07`) always, Parquet with `parquetlake`; data on local disk or S3/R2 (opt-in `s3`); opt-in `encryption` seals each data/delete file with its own key in a `PNKLAKE1` container; `catalog-sqlite` / `catalog-postgres` add the SQL backends, `catalog-s3` puts the catalog on object storage |
 
 Design rules: Rust edition 2024 (MSRV 1.97), zero async (the server's opt-in
 `async-server` transport, wave 47, is the documented I/O-boundary carve-out);
@@ -1040,15 +1040,20 @@ scan of TPC-H `lineitem` (773 MB) went from 5.03 s to 1.36 s.
 
 `db.save("x.pink")` writes every database and table in a single-file
 columnar format; `PinkDb::open("x.pink")` loads it back (`.save` / `.open`
-in the REPL). The format is **`PINKDB06`** — one format, no legacy: the
-readers of `PINKDB01`–`PINKDB05` are gone with their fixtures and their
+in the REPL). The format is **`PINKDB07`** — one format, no legacy: the
+readers of `PINKDB01`–`PINKDB06` are gone with their fixtures and their
 compatibility tests, and a file written by an older pinkdb is refused with
 `this .pink file was written by an older pinkdb (PINKDB0N); this build
-reads PINKDB06 only`.
+reads PINKDB07 only`.
 
 ### The layout (Parquet-shaped)
 
 ```text
+header slot 0 (4,096 bytes): magic "PINKDB07" | iteration | footer offset
+                             | footer length | footer crc32c | file length
+                             | slot crc32c, then zero padding
+header slot 1 (4,096 bytes): the same, for an append-only checkpoint
+
 data region: for every table (databases and tables in sorted name order)
   for every row group (122,880 rows = 60 engine chunks of 2,048)
     for every column (schema order)
@@ -1058,11 +1063,12 @@ footer: store metadata (databases, tables, schemas, column defaults,
   constraints, index definitions + statistics, materialized views,
   procedures, macros, RBAC) and, per table, the row count and the
   row-group directory:
-    row groups [ { rows, per column: offset, length, page count,
-                             encoding summary, crc32c,
-                             stats { min, max, null_count, nan_count } } ]
+    row groups [ { rows, per-chunk row counts, per column: absolute
+                   offset, length, page count, encoding summary,
+                   crc32c, stats { min, max, null_count, nan_count } } ]
 
-trailer (20 bytes): footer_crc32c u32 | footer_len u64 | "PINKDB06"
+free ranges: sorted (offset, len) pairs of data-region bytes no row group
+             references (empty after a full rewrite)
 ```
 
 A **page** is one engine chunk (2,048 rows) encoded with the per-chunk
@@ -1070,10 +1076,13 @@ encoder, so decoding stays chunk-native; a **column chunk** is the 60 pages
 of one (row group, column) pair. Every column chunk carries its own
 **CRC32C** and the footer carries its own — there is **no whole-file CRC**,
 so any chunk verifies on its own and a damaged chunk never invalidates the
-rest of the file. The magic lives in the **trailer**, at the end of the
-file: a reader needs the 20-byte trailer plus the footer (two small range
-requests), and the lake's `pink` provider reads exactly those plus the
-projected column chunks of the row groups that survive pruning.
+rest of the file. The magic starts the file, in **header slot 0**: a reader
+needs the first 8 KiB (both slots) plus the footer (two small range
+requests). The newer valid slot wins, so an append-only checkpoint writes
+its new footer first and commits it by writing the *other* slot — a torn
+write leaves the previous slot naming a footer that is still there. The
+lake's `pink` provider reads the same two windows plus the projected column
+chunks of the row groups that survive pruning.
 
 The footer records the **exact** statistics of every column chunk — its
 min and max (first-seen wins ties, exactly like the engine's MIN/MAX
@@ -1130,6 +1139,7 @@ change against the previous v5 container:
 |---|---|---|---|
 | v5 (`PINKDB05`, one CRC over the whole image) | 276,513,123 B | 2.502 s | 2.569 s |
 | `PINKDB06` (per-chunk CRC32C, footer, row groups) | **271,584,979 B** | **1.223 s** | **0.167 s** |
+| `PINKDB07` (the same layout plus two header slots) | **271,593,155 B** | — | — |
 
 (`PINKDB06` is 1.8% smaller, 2.0× faster to save and **15× faster to open**
 (the decode now runs over the columns *and* the row groups in parallel);
@@ -1460,7 +1470,7 @@ data there:
 .lake save postgres://user@host/db?schema=lake data s3://bucket/prefix
 ```
 
-**Data-file formats are providers** (wave 87). `.pink` (`PINKDB06`) is always
+**Data-file formats are providers** (wave 87). `.pink` (`PINKDB07`) is always
 available; Parquet comes with `parquetlake`. A table
 pins its provider, and appends keep it. Append-only commits add immutable data
 files (and DuckLake Parquet delete files when rows are removed); merge,
@@ -3395,7 +3405,7 @@ to the old semantics (duckdiff 60/60 + the 1M battery 64/64).
   since the log could not replay them); lake data files are plaintext unless
   the lake is keyed; one S3 object is capped at 5 GiB (no multipart uploads)
   and credentials come only from the environment or explicit config (no
-  profiles/IMDS/SSO); the lake writes and reads `.pink` (`PINKDB06`) data
+  profiles/IMDS/SSO); the lake writes and reads `.pink` (`PINKDB07`) data
   files and supports `.lake attach … write` + `.lake commit`
 - Extensions repository: artifacts are verified by SHA-256 from the catalog
   (no signatures yet), and only `darwin-arm64` builds are published
@@ -3422,7 +3432,9 @@ the per-table row-group directory, a per-column-chunk CRC32C and exact
 per-chunk statistics, a 20-byte trailer) with FastLanes bit-packing, FSST and
 a measured second compression stage (pure-Rust `lz4_flex`). One format, no
 legacy: the `PINKDB01`–`PINKDB05` readers, their fixtures and their
-compatibility tests are gone.
+compatibility tests are gone. Wave 136 replaced the trailer with two header
+slots (**`PINKDB07`**), so an append-only checkpoint can commit a new footer
+without rewriting the file.
 
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
 PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
