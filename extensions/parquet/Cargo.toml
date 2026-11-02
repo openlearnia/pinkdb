@@ -18,6 +18,10 @@ pinkdb-httpfs = { path = "../../crates/pinkdb-httpfs", optional = true }
 # (the lake's Parquet provider needs it without the httpfs transport), so this
 # is a normal dependency; it is already in the lock through parquet itself.
 bytes = "1"
+# The engine's worker pool (`crates/pinkdb` depends on it too, so cargo links
+# one instance and this crate's tasks land on the same threads): a local file
+# decodes its row groups and column chunks in parallel.
+rayon = "1.12.0"
 # The Apache Arrow `parquet` crate (arrow-rs), pinned to the 60.x family the
 # workspace's Cargo.lock already carries (the arrow extension uses the same
 # line), so a build that also enables a lake consumes one arrow generation. Only the
